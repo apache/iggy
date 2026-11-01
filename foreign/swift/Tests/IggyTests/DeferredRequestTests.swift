@@ -437,37 +437,6 @@ struct DeferredRequestTests {
         await client.shutdown()
     }
 
-    /// A permission lost before the store is a refusal that stored nothing,
-    /// so the partition stays open for the next committing read.
-    @Test func aCommittingPollRefusedAsUnauthorizedLeavesItsPartitionOpen() async throws {
-        let server = try await FakeVSRServer.started()
-        defer { Task { await server.stop() } }
-        let refused = Locked(false)
-        await server.respond { request in
-            if let code = request.code, CommandCode.isDeferred(code) {
-                let first = refused.withLock { seen -> Bool in
-                    defer { seen = true }
-                    return !seen
-                }
-                if first {
-                    return .status(IggyErrorCode.unauthorized.rawValue)
-                }
-            }
-            return FakeVSRServer.defaultReply(request, address: server.address)
-        }
-        let client = try await signedInClient(server)
-        let options = DeferredPollOptions(maxWait: .milliseconds(200), requestTimeout: .seconds(5))
-        let refusal = try await reportedError {
-            _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 1, strategy: .next, count: 1, autoCommit: true, options: options)
-        }
-        #expect(refusal.code == .unauthorized && refusal.operationID == nil)
-
-        _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 1, strategy: .next, count: 1, autoCommit: true, options: options)
-
-        #expect(await requests(server, .pollMessagesDeferred).count == 2)
-        await client.shutdown()
-    }
-
     /// A disconnect by the caller ends a committing poll that waits with an
     /// unknown outcome, and its block outlives the session.
     @Test func aDisconnectEndsAWaitingCommittingPollAsUncertain() async throws {

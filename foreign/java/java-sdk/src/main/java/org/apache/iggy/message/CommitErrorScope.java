@@ -35,10 +35,8 @@ public enum CommitErrorScope {
     public boolean provesNothingStored(long status) {
         return switch (IggyErrorCode.fromCode((int) status)) {
             // The server refuses a first message larger than the byte limit before it stores an offset, and a read
-            // that needs a new offset key above the limit returns no messages. A permission lost during the reads
-            // fails the whole request only when no read stored, and reaches only the sections that stored nothing.
-            case UNAUTHORIZED,
-                    TRANSIENT_NOT_ACCEPTED,
+            // that needs a new offset key above the limit returns no messages.
+            case TRANSIENT_NOT_ACCEPTED,
                     INVALID_SIZE_BYTES,
                     HISTORY_UNAVAILABLE,
                     NOT_PRIMARY,

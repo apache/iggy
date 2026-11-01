@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
@@ -45,12 +44,11 @@ namespace Apache.Iggy.Consumers;
 ///         before a rebalance takes a partition away, and on shutdown.
 ///     </para>
 ///     <para>
-///         A read error does not end the stream: the reader retries by itself, and the error reaches the callbacks of
-///         <see cref="SubscribeToErrorEvents" />. When the reader stops a partition with an error that is
-///         <see cref="ReadException.IsResumable" />, the consumer seeks it to <see cref="PollingStrategy.Next" />,
-///         so it reads the partition again after its stored offset once the refusal clears, unless an error handler
-///         seeks the partition before it completes. A stop that is not resumable ends the stream with its
-///         <see cref="ReadException" />, as a message that does not decode does.
+///         A read error that the reader retries by itself does not end the stream, it reaches the callbacks of
+///         <see cref="SubscribeToErrorEvents" />. An error that stops a partition (<see cref="ReadException.StopsPartition" />)
+///         ends the stream with its <see cref="ReadException" />, as a message that does not decode does, and the
+///         partition reads nothing until <see cref="SeekAsync" />. <see cref="ReadException.IsResumable" /> says that a
+///         seek to <see cref="PollingStrategy.Next" /> reads it again after its stored offset.
 ///     </para>
 /// </remarks>
 public partial class IggyConsumer : IAsyncDisposable
@@ -67,9 +65,6 @@ public partial class IggyConsumer : IAsyncDisposable
     private readonly ILogger<IggyConsumer> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly CancellationTokenSource _lifetime = new();
-
-    /// <summary>The seeks of each partition, so a seek of an error handler is not overridden.</summary>
-    private readonly ConcurrentDictionary<uint, ulong> _seeks = new();
 
     private TaskCompletionSource? _handling;
     private TaskCompletionSource? _shutdown;
@@ -279,7 +274,6 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <summary>Sets the next read position of a partition, as <see cref="PartitionReader.SeekAsync" /> does.</summary>
     public Task SeekAsync(uint partitionId, PollingStrategy start, CancellationToken ct = default)
     {
-        _seeks.AddOrUpdate(partitionId, 1, (_, seeks) => seeks + 1);
         return Reader.SeekAsync(partitionId, start, ct);
     }
 
@@ -389,11 +383,9 @@ public partial class IggyConsumer : IAsyncDisposable
 
     /// <summary>
     ///     The next batch of the reader, or null once the consumer shut down or <paramref name="ct" /> was canceled. A
-    ///     read error goes to the error events and the reader goes on. A partition that the reader stopped with an
-    ///     error that is <see cref="ReadException.IsResumable" /> is sought to <see cref="PollingStrategy.Next" />,
-    ///     so it reads again after its stored offset, unless an error handler seeks it before it completes. A message
-    ///     that does not decode, whose <see cref="ReadException.Skip" /> passes it, and a stop that is not resumable
-    ///     end the stream with their <see cref="ReadException" />.
+    ///     read error that the reader retries goes to the error events and the reader goes on. A message that does
+    ///     not decode, whose <see cref="ReadException.Skip" /> passes it, and an error that stops a partition end the
+    ///     stream with their <see cref="ReadException" />.
     /// </summary>
     private protected async Task<PolledMessages?> NextBatchAsync(CancellationToken ct)
     {
@@ -404,23 +396,9 @@ public partial class IggyConsumer : IAsyncDisposable
             {
                 return await Reader.NextAsync(cancellation.Token);
             }
-            catch (ReadException error) when (error.Skip is null && (error.IsResumable || !error.StopsPartition))
+            catch (ReadException error) when (error.Skip is null && !error.StopsPartition)
             {
-                var seeks = error.PartitionId is { } partition ? _seeks.GetValueOrDefault(partition) : 0;
-                var published = new ConsumerErrorEventArgs(error, error.Message);
-                if (error is { IsResumable: true, PartitionId: { } stopped })
-                {
-                    // The handlers run to their end first, so one that seeks the partition chooses where it reads.
-                    await _consumerErrorEvents.PublishAsync(published);
-                    if (_seeks.GetValueOrDefault(stopped) == seeks)
-                    {
-                        await ResumeAsync(stopped);
-                    }
-                }
-                else
-                {
-                    await _consumerErrorEvents.PublishAsync(published);
-                }
+                _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(error, error.Message));
             }
             catch (OperationCanceledException) when (IsDisposed || ct.IsCancellationRequested)
             {
@@ -433,23 +411,6 @@ public partial class IggyConsumer : IAsyncDisposable
         }
 
         return null;
-    }
-
-    /// <summary>Seeks a stopped partition to Next. A failed seek is logged, and the partition stays stopped.</summary>
-    private async Task ResumeAsync(uint partitionId)
-    {
-        try
-        {
-            // The stop was reported once, so a canceled seek would leave the partition stopped.
-            await Reader.SeekAsync(partitionId, PollingStrategy.Next());
-        }
-        catch (Exception error)
-        {
-            if (!IsDisposed)
-            {
-                _logger.LogWarning(error, "The consumer could not resume partition {Partition}.", partitionId);
-            }
-        }
     }
 
     /// <summary>

@@ -214,7 +214,11 @@ public actor IggyConsumer: AsyncSequence {
     /// ``IggyErrorCode/historyUnavailable`` for a position read in a history
     /// that is gone. Both stop their partition until a
     /// ``seek(partitionID:to:)``, and a seek to ``ReadError/skip`` steps over
-    /// the message. A client that is shut down or cannot come back without
+    /// the message. So does ``IggyErrorCode/partitionLaneBlocked`` under
+    /// ``CommitPolicy/onRead``: a lost committing read of another caller
+    /// blocks the partition until ``IggyClient/abandonOperation(_:)`` takes
+    /// that operation, after which the reader reads it again by itself. A
+    /// client that is shut down or cannot come back without
     /// the caller ends it, and so does an invalid address. Other read errors
     /// are logged and reading goes on. Under ``CommitAfter/processing`` a
     /// message counts once its handler returned, and a handler that throws

@@ -89,7 +89,10 @@ public struct ReadError: Error, Sendable, CustomStringConvertible {
     public let raw: [UInt8]?
     /// Whether the partition reads nothing until a
     /// ``PartitionReader/seek(partitionID:to:)``: a message that does not
-    /// decode, or a position whose history is gone.
+    /// decode, or a position whose history is gone. A partition that a lost
+    /// committing read of another caller blocks (``IggyErrorCode/partitionLaneBlocked``
+    /// under ``CommitPolicy/onRead``) reads again by itself once
+    /// ``IggyClient/abandonOperation(_:)`` took that operation.
     public let stopsPartition: Bool
 
     init(partitionID: UInt32?, error: IggyError, skip: PollingStrategy? = nil, offset: UInt64? = nil, raw: [UInt8]? = nil, stopsPartition: Bool = false) {
@@ -1664,6 +1667,7 @@ public actor PartitionReader: AsyncSequence {
     /// ``next()``.
     private func failed(_ partitions: [UInt32], with error: IggyError) {
         let until = ContinuousClock.now + configuration.retryInterval
+        var stops = false
         switch error.code {
         case .notPrimary:
             groupingEpoch += 1
@@ -1706,6 +1710,7 @@ public actor PartitionReader: AsyncSequence {
                 stopped.insert(partition)
                 blockedBy[partition] = error.operationID
             }
+            stops = true
         case .disconnected, .unauthenticated, .staleClient:
             joinedGroup = false
         default:
@@ -1715,7 +1720,7 @@ public actor PartitionReader: AsyncSequence {
             pausedUntil[partition] = until
         }
         logger.error("Failed to read messages", metadata: metadata.merging(["partitions": "\(partitions)", "error": "\(error)"]) { $1 })
-        report(ReadError(partitionID: partitions.count == 1 ? partitions.first : nil, error: error))
+        report(ReadError(partitionID: partitions.count == 1 ? partitions.first : nil, error: error, stopsPartition: stops))
     }
 
     /// Queues an error for ``next()``. The latest one of each partition and

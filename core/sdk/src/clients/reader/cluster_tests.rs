@@ -50,7 +50,6 @@ use super::fixtures::{
     CONSUMER_ID, GROUP_ID, STREAM_ID, Section, TOPIC_ID, builder_on, committing, fetch_body, group,
     identifier, partition_and_offsets, refused, served, stored_offsets,
 };
-use super::worker::MAX_LASTING_REFUSALS;
 use super::{ORDERING, PartitionReader, ReadError};
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::clients::reader_builder::ReaderBuilder;
@@ -1061,55 +1060,6 @@ async fn given_a_committing_reader_started_at_first_when_a_partition_is_sought_t
         (PARTITION, vec![RESUMED_OFFSET])
     );
     assert_eq!(cluster.count(POLL_MESSAGES_DEFERRED_CODE), 1);
-    reader.close().await.unwrap();
-}
-
-/// A permission lost on the server fails a committing fetch only while no read stored, so the
-/// refusal counts towards the stop instead of looping as a lost reply, and a seek after the stop
-/// reads the partition again.
-#[tokio::test(start_paused = true)]
-async fn given_a_committing_reader_refused_unauthorized_when_reading_should_stop_after_six_refusals_until_a_seek()
- {
-    const OFFSET: u64 = 3;
-    let (client, cluster) = connect_to_three_replicas().await;
-    script_fetches(
-        &cluster,
-        repeat_n(
-            Answer::Refuse(IggyError::Unauthorized),
-            MAX_LASTING_REFUSALS as usize,
-        )
-        .chain(once(served_answer(PARTITION, OFFSET))),
-    );
-    script_initial_next(&cluster, &[(PARTITION, OFFSET)]);
-    let mut reader = committing(standalone(client, [PARTITION]))
-        .start(PollingStrategy::first())
-        .build()
-        .await
-        .unwrap();
-
-    let stopped = timeout(POLL_TIMEOUT, reader.next()).await;
-    let fetches_at_stop = cluster.count(FETCH_MESSAGES_CODE);
-    reader
-        .seek(PARTITION, PollingStrategy::next())
-        .await
-        .unwrap();
-    let resumed = timeout(POLL_TIMEOUT, reader.next()).await.unwrap().unwrap();
-
-    assert_eq!(
-        stopped
-            .expect("a refused committing read counts as a refusal, not as a lost reply")
-            .unwrap_err(),
-        ReadError::new(Some(PARTITION), IggyError::Unauthorized)
-    );
-    assert_eq!(
-        fetches_at_stop, MAX_LASTING_REFUSALS as usize,
-        "the sixth refusal stops the partition"
-    );
-    assert_eq!(
-        partition_and_offsets(&resumed),
-        (PARTITION, vec![OFFSET]),
-        "a seek to next reads the partition again"
-    );
     reader.close().await.unwrap();
 }
 

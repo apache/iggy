@@ -19,8 +19,8 @@ use iggy::prelude::StreamCreateOptions;
 use iggy::prelude::UserCreateOptions;
 use iggy::prelude::{IggyClient, StreamClient, TopicClient, TopicCreateOptions};
 use iggy_common::{
-    Consumer, Durability, GlobalPermissions, Identifier, IggyExpiry, IggyMessage, MaxTopicSize,
-    Partitioning, Permissions, PersonalAccessTokenExpiry, UserStatus,
+    Consumer, Durability, Identifier, IggyExpiry, IggyMessage, MaxTopicSize, Partitioning,
+    PersonalAccessTokenExpiry, UserStatus,
 };
 use iggy_common::{
     ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PersonalAccessTokenClient, UserClient,
@@ -94,34 +94,6 @@ pub async fn connector_stream(client: &IggyClient) -> Result<(), SeedError> {
         .await?;
 
     Ok(())
-}
-
-/// Seed for connector tests whose runtime signs in as [`names::USER`], who can read the streams
-/// and nothing more: the stream and topic of [`connector_stream`], then that user.
-pub async fn connector_stream_with_read_user(client: &IggyClient) -> Result<(), SeedError> {
-    connector_stream(client).await?;
-    client
-        .create_user(
-            names::USER,
-            names::USER_PASSWORD,
-            UserStatus::Active,
-            Some(read_streams_permissions()),
-            &UserCreateOptions::default(),
-        )
-        .await?;
-    Ok(())
-}
-
-/// The permissions of [`connector_stream_with_read_user`]: read every stream, which includes
-/// joining a consumer group and polling messages.
-pub fn read_streams_permissions() -> Permissions {
-    Permissions {
-        global: GlobalPermissions {
-            read_streams: true,
-            ..GlobalPermissions::default()
-        },
-        streams: None,
-    }
 }
 
 /// Seed for multi-topic connector tests: creates stream with two topics.

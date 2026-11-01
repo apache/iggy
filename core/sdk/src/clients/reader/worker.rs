@@ -2215,7 +2215,7 @@ impl Worker {
                     self.positions.remove(&partition);
                     self.retry_at.remove(&partition);
                     self.stopped.insert(partition);
-                    if !reported {
+                    if !reported && !self.report_pending_loss(partition) {
                         self.report(ReadError::new(Some(partition), error.clone()));
                     }
                 }
@@ -2250,10 +2250,24 @@ impl Worker {
             self.lasting_refusals.remove(&partition);
             self.retry_at.remove(&partition);
             self.stopped.insert(partition);
-            if !self.interrupt_catch_up(partition) {
+            if !self.interrupt_catch_up(partition) && !self.report_pending_loss(partition) {
                 self.report(ReadError::new(Some(partition), error.clone()));
             }
         }
+    }
+
+    /// A stop before the next read showed what a lost committing read stored leaves that read
+    /// pending, and a seek to `Next` would then skip its range without a word. So the stop
+    /// reports the lost read instead of its own error. Returns whether it did.
+    fn report_pending_loss(&mut self, partition: u32) -> bool {
+        let Some(&operation) = self.lost_operations.get(&partition) else {
+            return false;
+        };
+        self.report(ReadError::new(
+            Some(partition),
+            IggyError::FetchProgressUncertain(operation),
+        ));
+        true
     }
 
     /// The driver blocks the partition until `abandon_operation`. With `OnRead`, the partition
@@ -4848,6 +4862,35 @@ mod tests {
         assert_eq!(error.skip, Some(at(0, 7)));
         assert_eq!(offsets(&next_batches(&mut receiver)[0]), [7, 8]);
         assert!(worker.catch_up.is_empty());
+    }
+
+    /// A lost committing read is pending until the next read shows what it stored. A stop before
+    /// that read would leave a seek to `Next` to skip the range without a word, so the stop
+    /// reports the lost read instead.
+    #[tokio::test]
+    async fn given_a_pending_lost_read_when_lasting_refusals_stop_its_partition_should_report_the_lost_read()
+     {
+        let (mut worker, mut receiver) = worker_of(committing(builder_for(group())));
+        assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0]])));
+        worker.positions.insert(0, next_at(0, 5));
+        worker.refuse(&[0], IggyError::FetchProgressUncertain(OPERATION));
+        assert!(worker.lost_operations.contains_key(&0));
+
+        for _ in 0..MAX_LASTING_REFUSALS {
+            worker.refuse(&[0], IggyError::Unauthorized);
+        }
+
+        assert!(worker.stopped.contains(&0));
+        worker.flush_errors();
+        let error = next_error(&mut receiver);
+        assert_eq!(
+            (error.partition_id, error.error, error.skip),
+            (Some(0), IggyError::FetchProgressUncertain(OPERATION), None)
+        );
+        assert!(
+            worker.lost_operations.contains_key(&0),
+            "the lost read stays pending until a seek takes the partition"
+        );
     }
 
     /// A member that the server keeps refusing after each refresh loops without a sign, so the

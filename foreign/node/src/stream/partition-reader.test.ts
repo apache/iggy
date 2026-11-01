@@ -41,6 +41,7 @@ import { IggyConsumer } from './iggy-consumer.js';
 const SERVED = { incarnation: 11n, ownerGeneration: 4n, metadataOp: 42n };
 const BATCH_BASE_OFFSET_AT = 8;
 const HISTORY_UNAVAILABLE = 87;
+const FETCH_PROGRESS_UNCERTAIN = 14010;
 const INVALID_COMMAND = 3;
 const UNAUTHORIZED = 41;
 const INVALID_SIZE_BYTES = 80;
@@ -1095,7 +1096,7 @@ describe('consumer', () => {
   });
 
   for (const [stop, status] of [['six refusals in a row', UNAUTHORIZED], ['a lost history', HISTORY_UNAVAILABLE]] as const) {
-    it(`reads a partition again after its stored offset once the reader stops it after ${stop}`, async () => {
+    it(`ends the iteration with the stop after ${stop}, and a seek to Next reads the partition again`, async () => {
       const topic = new FakeTopic(4n);
       topic.stored.set(1, 1n);
       const client = topic.client();
@@ -1103,64 +1104,43 @@ describe('consumer', () => {
       const consumer = new IggyConsumer(await PartitionReader.open(async () => client, {
         streamId: 1, topicId: 2, consumer: { kind: ConsumerKind.Single, id: 4 }, partitions: [1],
         options: { maxWait: 100 }, retryInterval: 5
-      }), undefined, (error) => {
-        errors.push(error);
-        topic.refused.delete(1);
-      });
-      const messages = consumer[Symbol.asyncIterator]();
+      }), undefined, (error) => { errors.push(error); });
       try {
+        const messages = consumer[Symbol.asyncIterator]();
         const before = [await messages.next(), await messages.next()];
         topic.refused.set(1, status);
-        const resumed = await Promise.race([messages.next(),
-          new Promise<'stalled'>((resolve) => setTimeout(resolve, 2_000, 'stalled'))]);
+        const stopped = await messages.next().then(() => undefined, (error: unknown) => error);
+        topic.refused.delete(1);
+        await consumer.seek(1, PollingStrategy.Next);
+        const resumed = await consumer[Symbol.asyncIterator]().next();
 
-        assert.notEqual(resumed, 'stalled', 'the consumer did not read the stopped partition again');
-        assert.deepEqual([...before, resumed].map((read) => typeof read === 'string' ? read : read.value?.message.headers.offset),
-          [2n, 3n, 2n]);
-        assert.deepEqual(errors.map(({ partitionId, error, resumable }) =>
-          [partitionId, (error as { errorCode: number }).errorCode, resumable]), [[1, status, true]]);
+        assert.deepEqual(before.map((read) => read.value?.message.headers.offset), [2n, 3n]);
+        assert.ok(stopped instanceof ReadError, `the iteration did not end with the stop: ${String(stopped)}`);
+        assert.deepEqual([stopped.partitionId, (stopped.error as { errorCode: number }).errorCode,
+          stopped.stopsPartition, stopped.resumable], [1, status, true, true]);
+        assert.equal(resumed.value?.message.headers.offset, 2n, 'a seek to Next reads after the stored offset');
+        assert.deepEqual(errors, [], 'a stop is thrown, not handed to onError');
       } finally {
         await consumer.shutdown();
       }
     });
   }
 
-  it('reads a stopped partition from where its error handler seeks it, not after its stored offset', async () => {
+  it('reports a pending lost read instead of the stop that ends the iteration', async () => {
     const topic = new FakeTopic(4n);
-    topic.stored.set(1, 1n);
-    const consumer: IggyConsumer = new IggyConsumer(await open(topic, [1]), undefined, () => {
-      topic.refused.delete(1);
-      void consumer.seek(1, PollingStrategy.Offset(1n));
-    });
+    topic.onLostCommittingRead = () => topic.history.add(1);
+    const consumer = new IggyConsumer(await open(topic, [1], { commit: CommitPolicy.OnRead }));
     const messages = consumer[Symbol.asyncIterator]();
     try {
-      await messages.next();
-      await messages.next();
-      topic.refused.set(1, HISTORY_UNAVAILABLE);
-      const resumed = await messages.next();
+      const first = [await messages.next(), await messages.next()];
+      topic.loseNextCommittingRead = true;
+      const stopped = await messages.next().then(() => undefined, (error: unknown) => error);
 
-      assert.equal(resumed.value?.message.headers.offset, 1n);
-    } finally {
-      await consumer.shutdown();
-    }
-  });
-
-  it('reads a stopped partition from where its error handler seeks it after an await', async () => {
-    const topic = new FakeTopic(4n);
-    topic.stored.set(1, 1n);
-    const consumer: IggyConsumer = new IggyConsumer(await open(topic, [1]), undefined, async () => {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      topic.refused.delete(1);
-      await consumer.seek(1, PollingStrategy.Offset(1n));
-    });
-    const messages = consumer[Symbol.asyncIterator]();
-    try {
-      await messages.next();
-      await messages.next();
-      topic.refused.set(1, HISTORY_UNAVAILABLE);
-      const resumed = await messages.next();
-
-      assert.equal(resumed.value?.message.headers.offset, 1n);
+      assert.deepEqual(first.map((read) => read.value?.message.headers.offset), [0n, 1n]);
+      assert.ok(stopped instanceof ReadError, `the iteration did not end with the stop: ${String(stopped)}`);
+      assert.deepEqual([stopped.partitionId, (stopped.error as { errorCode: number }).errorCode,
+        stopped.stopsPartition, stopped.resumable], [1, FETCH_PROGRESS_UNCERTAIN, true, true],
+        'a seek to Next would skip what the lost read stored, so the stop reports that read');
     } finally {
       await consumer.shutdown();
     }

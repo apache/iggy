@@ -1180,13 +1180,13 @@ await consumer.ConsumeAsync(async (message, token) =>
   ends `ConsumeAsync` with its error, and its message does not count, so it is delivered again. With
   `CommitAfter.Marked` only `Mark(checkpoint)` counts.
 
-A read error does not end the loop: the reader retries by itself and the error reaches `SubscribeToErrorEvents`.
-When the reader stops a partition with an error whose `IsResumable` is true, after six refusals in a row such as
-status 41 (Unauthorized) or at once for status 87 (HistoryUnavailable), the consumer seeks the partition to
-`PollingStrategy.Next()`, so it reads again after its stored offset once the refusal clears. The error handlers run
-to their end first, so one that seeks the partition chooses where it reads instead. Two errors end the loop with their
-`ReadException`: a message that does not decode, whose `Skip` passes it, and a stop that is not resumable, such as
-status 80 for a `Last` start whose first message is above the byte limit of a read.
+A read error that the reader retries by itself does not end the loop, it reaches `SubscribeToErrorEvents`. An error
+that stops a partition (`StopsPartition`) ends the loop with its `ReadException`, as a message that does not decode
+does, whose `Skip` passes it: six refusals in a row such as status 41 (Unauthorized), status 87 (HistoryUnavailable)
+for a position whose history is gone, and status 80 for a `Last` start whose first message is above the byte limit of
+a read. The partition reads nothing until `SeekAsync`, and `IsResumable` says that a seek to `PollingStrategy.Next()`
+reads it again after its stored offset. A stop while a committing read that lost its reply is still pending reports
+that read as status 14010 instead, since a seek to Next would skip what it stored.
 `DisposeAsync` calls `ShutdownAsync`. It waits for a handler of `ConsumeAsync` that runs, unless that handler calls
 it, counts the last message of `ReceiveAsync` under `CommitAfter.Processing`, stores or rewinds the offsets, and
 leaves the group.

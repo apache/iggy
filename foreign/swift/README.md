@@ -379,7 +379,9 @@ A handler that throws leaves its message uncounted and ends `consumeMessages(_:)
 
 `pollingStrategy` says where a partition without a position starts. A failed read is thrown as a `ReadError` and leaves the consumer usable: a caller of `next()` can call it again, and `consumeMessages(_:)` logs it and keeps reading.
 
-`consumeMessages(_:)` ends with the error once the client cannot come back on its own, and for a message that does not decode or `historyUnavailable`, which stop the partition until a seek. Without `allowReplay` a message at or below the last one handed over from the same partition history is skipped, unless `seek(partitionID:to:)` moved the partition back.
+`consumeMessages(_:)` ends with the error once the client cannot come back on its own, and for a message that does not decode or `historyUnavailable`, which stop the partition until a seek.
+
+It also ends with `partitionLaneBlocked` under `.onRead`: a lost committing read of another caller blocks the partition until `abandonOperation(_:)` takes that operation, after which the reader reads it again by itself. Without `allowReplay` a message at or below the last one handed over from the same partition history is skipped, unless `seek(partitionID:to:)` moved the partition back.
 
 `shutdown()` counts the last message under `.processing` and closes the reader within `offsetDrainTimeout`: it stores the counted positions under `.auto`, moves the offset of each partition back to the last message handed over under `.onRead`, and leaves the group.
 

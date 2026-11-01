@@ -1169,30 +1169,6 @@ describe('primary auto-commit polling', () => {
     });
   }
 
-  it('refuses a committing poll that the server refuses as unauthorized without blocking its partition', async () => {
-    let polls = 0;
-    const cluster = await startPollCluster((frame, socket) => {
-      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessages)
-        return false;
-      polls += 1;
-      if (polls > 1)
-        return false;
-      // A permission lost before the store fails the poll as a refusal that stored nothing.
-      socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), 41));
-      return true;
-    });
-    try {
-      await assert.rejects(
-        cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload(), { deadline: Date.now() + 300 }),
-        (error: unknown) => error instanceof ResponseError && error.errorCode === 41 &&
-          !(error instanceof FetchProgressUncertainError));
-      await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
-      assert.equal(polls, 2, 'the partition stays open for the next committing poll');
-    } finally {
-      await cluster.close();
-    }
-  });
-
   for (const status of [30, 40]) {
     it(`rebuilds an auxiliary rejected with session status ${status} before poll admission`, async () => {
       let attachments = 0;

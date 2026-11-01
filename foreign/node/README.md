@@ -332,13 +332,12 @@ await consumer.shutdown();
   the first and ends as it does. `seek` drops the rest of the batch of its
   partition.
 - A read error that the reader retries by itself goes to `onError` and the
-  consumer goes on. So does a `resumable` error, after which the consumer seeks
-  its partition to Next, so it resumes after its stored offset, unless
-  `onError` sought it. A promise that `onError` returns is awaited first, so a
-  seek after an await counts too. Any other stop of a partition ends the
-  iteration with
-  its `ReadError`, and so does a message that does not decode, whose `skip`
-  passes it with `seek`.
+  consumer goes on. A stop of a partition (`stopsPartition`) ends the
+  iteration with its `ReadError`, and so does a message that does not decode,
+  whose `skip` passes it with `seek`. A `resumable` stop reads again after a
+  `seek` to Next. A stop while a committing read that lost its reply is still
+  pending reports that read as 14010 instead, since a seek to Next would skip
+  what it stored.
 - `toReadable()` takes the next message only when its own reader asks for it,
   and destroying it shuts the consumer down.
 
@@ -405,7 +404,7 @@ deadline. After uncertainty, only committed-result proof can release the lane.
 
 An auto-commit poll (100/106) or a committing fetch (109) with an unknown outcome throws `FetchProgressUncertainError` (local code 14010) and retains progress blocks for every affected partition history. Its `operationId` is a client-lifetime recovery key, not a server replay receipt. A lost reply, a transport failure after the send, a disconnect or a logout while the call waits leave the outcome unknown.
 
-So does every refusal except those that prove the server stored nothing: 5, 6, 41, 58, 80, 87, 89, 90, 1009, 1010, 2010, 2011, 3007, 3024, 4100 and 5009 for a whole reply, and 41, 58, 80, 87, 89, 3007, 3024 and 5009 for a fetch section. A permission lost during the reads (41) fails the whole reply only when no read stored, and reaches only the sections that stored nothing.
+So does every refusal except those that prove the server stored nothing: 5, 6, 58, 80, 87, 89, 90, 1009, 1010, 2010, 2011, 3007, 3024, 4100 and 5009 for a whole reply, and 58, 80, 87, 89, 3007, 3024 and 5009 for a fetch section.
 
 Later progress polls, fetches, stores and deletes fail with `LaneBlockedError` carrying that ID, the blocked partition and `errorCode` 14009. Stateless reads, `GetOffset` inspection and sends remain available. Reconnect, sign-in and late replies do not clear these blocks.
 

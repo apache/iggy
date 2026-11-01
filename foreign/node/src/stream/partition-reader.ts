@@ -1035,7 +1035,15 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
     const now = Date.now();
     const code = errorCode(error);
     const report = (stop: boolean, resumable = false) => {
-      const readError = new ReadError(target.partition, error, undefined, stop, resumable);
+      if (stop) this.giveUpGap(target.partition, state);
+      // A committing read that lost its reply stays pending until the next read shows what it stored, and a seek
+      // to Next after the stop would skip that range without a word, so the stop reports the lost read instead.
+      const reported = stop && state.lost
+        ? responseError(COMMAND_CODE.PollMessagesDeferred, FETCH_PROGRESS_UNCERTAIN,
+          `a lost read may have stored offsets of partition ${target.partition} from ${state.position.value}, ` +
+          `and the partition stopped on: ${String(error)}`)
+        : error;
+      const readError = new ReadError(target.partition, reported, undefined, stop, resumable);
       if (stop) state.stopped = readError;
       this.enqueue({ partitionId: target.partition, generation: target.generation, error: readError,
         messages: 0, bytes: 0 });

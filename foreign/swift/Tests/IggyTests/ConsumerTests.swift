@@ -549,7 +549,7 @@ struct ConsumerTests {
     /// A committing section whose error leaves the outcome unknown may have
     /// stored its read, so the reader reads that range again, or the close
     /// moves the offset back over it.
-    @Test(arguments: [false, true], [IggyErrorCode.shardCommunicationError, .cannotDecryptData, .staleClient])
+    @Test(arguments: [false, true], [IggyErrorCode.shardCommunicationError, .cannotDecryptData, .staleClient, .unauthorized])
     func anUncertainCommittedSectionKeepsItsSiblingAndRecoversOrRewinds(closing: Bool, status: IggyErrorCode) async throws {
         let server = try await FakeVSRServer.started()
         let topic = FakeTopic(ends: [1: 7, 2: 1])

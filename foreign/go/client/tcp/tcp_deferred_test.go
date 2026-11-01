@@ -920,9 +920,7 @@ func TestFetchMessages_UnknownCommitBlocksEveryTargetUntilExplicitRecovery(t *te
 // refusal before the store blocks nothing.
 func TestPollMessages_UnknownCommitBlocksItsPartitionUntilAbandoned(t *testing.T) {
 	for _, deferred := range []bool{false, true} {
-		// A permission lost before the store is a refusal that stored nothing, like a partition that the member no
-		// longer owns.
-		for _, refusal := range []ierror.Code{ierror.TransientNotCommittedCode, ierror.ConsumerGroupPartitionNotOwnedCode, ierror.UnauthorizedCode} {
+		for _, refusal := range []ierror.Code{ierror.TransientNotCommittedCode, ierror.ConsumerGroupPartitionNotOwnedCode} {
 			t.Run(fmt.Sprintf("deferred_%t/status_%d", deferred, refusal), func(t *testing.T) {
 				calls := newLaneCalls(t)
 				client, serverConn := newPipeClient(t)

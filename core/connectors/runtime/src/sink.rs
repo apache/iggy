@@ -545,9 +545,11 @@ pub(crate) async fn consume_messages(
 /// Each would wait for a restart, so the sink resumes the partition. After an unknown outcome it
 /// resumes after the stored offset. The abandoned request can still store its offset later, so
 /// the sink can skip the messages of that request. A seek to `Next` stores nothing, so it
-/// resumes a refused partition while the refusal lasts, and the reader then waits longer before
-/// each read. The sink starts at `Next`, so `Next` is where it reads on. The reader retries any
-/// other error by itself.
+/// resumes a refused partition while the refusal lasts. The seek starts a new cycle of the
+/// reader, so a partition that stays refused costs six reads with a doubling wait per cycle,
+/// about half a minute at the default interval, plus one warning and one error count here. The
+/// sink starts at `Next`, so `Next` is where it reads on. The reader retries any other error by
+/// itself.
 async fn handle_read_error(
     messages: &mut impl SinkMessages,
     error: ReadError,

@@ -46,8 +46,7 @@ enum CommitErrorScope {
         switch self {
         case .request:
             switch code {
-            // A permission lost during the reads fails the whole request only when no read stored.
-            case .unauthorized, .featureUnavailable, .invalidIdentifier, .transientNotAccepted, .invalidSizeBytes, .historyUnavailable, .notPrimary,
+            case .featureUnavailable, .invalidIdentifier, .transientNotAccepted, .invalidSizeBytes, .historyUnavailable, .notPrimary,
                 .deferredPollCapacityExceeded, .streamIdNotFound, .streamNameNotFound, .topicIdNotFound, .topicNameNotFound, .partitionNotFound,
                 .tooManyConsumerOffsets, .invalidOffset, .consumerGroupPartitionNotOwned:
                 true
@@ -56,8 +55,8 @@ enum CommitErrorScope {
             }
         case .section:
             switch code {
-            case .unauthorized, .transientNotAccepted, .invalidSizeBytes, .historyUnavailable, .notPrimary, .partitionNotFound,
-                .tooManyConsumerOffsets, .consumerGroupPartitionNotOwned:
+            case .transientNotAccepted, .invalidSizeBytes, .historyUnavailable, .notPrimary, .partitionNotFound, .tooManyConsumerOffsets,
+                .consumerGroupPartitionNotOwned:
                 true
             default:
                 false
