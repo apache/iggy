@@ -1447,8 +1447,11 @@ mod ffi {
         ) -> Result<()>;
         /// Counts a checkpoint that this consumer handed over, under
         /// `CommitPolicy::Auto`.
-        fn mark(self: &IggyConsumer, checkpoint: &Checkpoint, error_info: &mut ErrorInfo)
-        -> Result<()>;
+        fn mark(
+            self: &IggyConsumer,
+            checkpoint: &Checkpoint,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
         /// Sets the next read position of a partition. With
         /// `CommitPolicy::OnRead` a seek to an offset above 0 first stores the
         /// offset before it, and a failed store fails the seek with nothing

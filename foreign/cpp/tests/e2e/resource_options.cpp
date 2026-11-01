@@ -30,7 +30,6 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
-#include "lib.rs.h"
 #include "tests/e2e/test_helpers.hpp"
 
 struct ResourceOptionsTransport {

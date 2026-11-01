@@ -22,7 +22,6 @@
 
 #include <gtest/gtest.h>
 
-#include "lib.rs.h"
 #include "tests/e2e/test_helpers.hpp"
 
 class E2E_Stream : public E2ETestFixture {};

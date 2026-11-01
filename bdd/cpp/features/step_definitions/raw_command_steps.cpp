@@ -50,10 +50,8 @@ WHEN("^I send a raw command with code ([0-9]+) and an empty payload to replica (
     context->raw_response.clear();
     context->raw_error.clear();
     try {
-        iggy::ffi::ErrorInfo error_info{};
-        const auto response = context->client->send_binary_request_to_replica(
-            code, rust::Vec<std::uint8_t>(), static_cast<std::uint8_t>(replica), error_info);
-        context->raw_response.assign(response.begin(), response.end());
+        context->raw_response =
+            context->client->SendBinaryRequestToReplica(code, {}, static_cast<std::uint8_t>(replica));
     } catch (const std::exception &error) {
         context->raw_error = error.what();
     }

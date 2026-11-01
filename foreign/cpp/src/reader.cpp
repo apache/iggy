@@ -272,8 +272,7 @@ PolledMessages IggyBlockingClient::PollMessages(const Consumer &consumer,
                                                 const PollingStrategy &strategy,
                                                 const PollOptions &options) {
     return RethrowAsIggyException([&](ffi::ErrorInfo &error_info) {
-        return PolledMessages(Handle()->poll_messages(stream.ToFfi(), topic.ToFfi(), partition_id,
-                                                      consumer.ToFfi(),
+        return PolledMessages(Handle()->poll_messages(stream.ToFfi(), topic.ToFfi(), partition_id, consumer.ToFfi(),
                                                       ToFfiStrategy(strategy), options.options_, error_info));
     });
 }
@@ -285,8 +284,7 @@ PolledMessages IggyBlockingClient::PollMessages(const Consumer &consumer,
                                                 const Continuation &continuation,
                                                 const PollOptions &options) {
     return RethrowAsIggyException([&](ffi::ErrorInfo &error_info) {
-        return PolledMessages(Handle()->poll_messages(stream.ToFfi(), topic.ToFfi(), partition_id,
-                                                      consumer.ToFfi(),
+        return PolledMessages(Handle()->poll_messages(stream.ToFfi(), topic.ToFfi(), partition_id, consumer.ToFfi(),
                                                       *continuation.inner_, options.options_, error_info));
     });
 }
@@ -296,7 +294,8 @@ PartitionReader IggyBlockingClient::Reader(const Consumer &consumer,
                                            const Identifier &topic,
                                            const ReaderOptions &options) {
     return RethrowAsIggyException([&](ffi::ErrorInfo &error_info) {
-        return PartitionReader(Handle()->reader(stream.ToFfi(), topic.ToFfi(), consumer.ToFfi(), options.ToFfi(), error_info));
+        return PartitionReader(
+            Handle()->reader(stream.ToFfi(), topic.ToFfi(), consumer.ToFfi(), options.ToFfi(), error_info));
     });
 }
 
@@ -307,8 +306,7 @@ PendingPoll IggyBlockingClient::StartPollMessages(const Consumer &consumer,
                                                   const PollingStrategy &strategy,
                                                   const PollOptions &options) {
     return RethrowAsIggyException([&] {
-        return PendingPoll(Handle()->start_poll_messages(stream.ToFfi(), topic.ToFfi(), partition_id,
-                                                         consumer.ToFfi(),
+        return PendingPoll(Handle()->start_poll_messages(stream.ToFfi(), topic.ToFfi(), partition_id, consumer.ToFfi(),
                                                          ToFfiStrategy(strategy), options.options_));
     });
 }

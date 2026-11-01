@@ -5918,71 +5918,6 @@ class SendMessagesResponse final {
 };
 
 /**
- * @brief Messages and partition state returned by PollMessages().
- *
- * CurrentOffset() is the partition's current offset observed for this request,
- * not the offset of the last returned message. For a consumer-group member
- * with no assigned partitions, an empty result can use
- * `std::numeric_limits<std::uint32_t>::max() - 1` as its partition ID.
- */
-class PolledMessages final {
-  public:
-    /**
-     * @brief Returns the partition selected for this poll.
-     * @return Numeric partition ID, or the no-assignment sentinel described by
-     *         PolledMessages when no consumer-group partition is available.
-     */
-    [[nodiscard]] std::uint32_t PartitionId() const noexcept { return partition_id_; }
-
-    /**
-     * @brief Returns the partition's current message offset.
-     * @return Current offset observed by the server for this request.
-     */
-    [[nodiscard]] std::uint64_t CurrentOffset() const noexcept { return current_offset_; }
-
-    /**
-     * @brief Returns the number of messages in this result.
-     * @return Message count reported by the server.
-     */
-    [[nodiscard]] std::uint32_t Count() const noexcept { return count_; }
-
-    /**
-     * @brief Returns the polled messages in partition order.
-     * @return Messages owned by this result. The reference remains valid while
-     *         this PolledMessages remains alive.
-     */
-    [[nodiscard]] const std::vector<IggyMessagePolled> &Messages() const noexcept { return messages_; }
-
-    /**
-     * @brief Returns the partition context accepted for this poll.
-     * @return Context to pass with an offset to StoreConsumerPosition().
-     */
-    [[nodiscard]] PartitionContext Context() const noexcept { return context_; }
-
-  private:
-    PolledMessages(std::uint32_t partition_id,
-                   std::uint64_t current_offset,
-                   std::uint32_t count,
-                   std::vector<IggyMessagePolled> messages,
-                   PartitionContext context)
-        : partition_id_(partition_id),
-          current_offset_(current_offset),
-          count_(count),
-          messages_(std::move(messages)),
-          context_(context) {}
-
-    static PolledMessages FromFfi(ffi::PolledMessages polled);
-
-    friend class IggyBlockingClient;
-
-    std::uint32_t partition_id_;
-    std::uint64_t current_offset_;
-    std::uint32_t count_;
-    std::vector<IggyMessagePolled> messages_;
-    PartitionContext context_;
-};
-
-/**
  * @brief Client-facing transport ports advertised for a cluster node.
  *
  * A port value of zero means that the corresponding transport is not
@@ -6384,6 +6319,8 @@ class PolledMessages final {
     [[nodiscard]] std::uint32_t PartitionId() const noexcept { return partition_id_; }
 
     [[nodiscard]] std::uint64_t CurrentOffset() const noexcept { return current_offset_; }
+
+    [[nodiscard]] std::uint32_t Count() const noexcept { return static_cast<std::uint32_t>(messages_.size()); }
 
     [[nodiscard]] const std::vector<IggyMessagePolled> &Messages() const noexcept { return messages_; }
 
@@ -7837,38 +7774,10 @@ class IggyBlockingClient final {
                                       const std::vector<IggyMessageToSend> &messages);
 
     /**
-     * @brief Polls messages for an individual consumer or consumer group.
+     * @brief Reads one partition with a message count and optional on-read commit.
      *
-     * For an individual consumer, an omitted partition selects partition zero.
-     * For a consumer group, an omitted partition lets the stateful client
-     * select one of this connection's assigned partitions. An explicit group
-     * partition must belong to the current connection. Group membership is not
-     * supported by the HTTP transport.
-     *
-     * With @p auto_commit enabled, the server can advance the consumer cursor
-     * before the response reaches the caller. Retrying a missing response with
-     * PollingStrategy::Next() can therefore skip messages. Applications that
-     * require controlled recovery should checkpoint processed message offsets
-     * and resume with PollingStrategy::Offset(). CurrentOffset() is not such a
-     * checkpoint because it describes the partition rather than the last
-     * message returned.
-     *
-     * @param stream Parent stream, addressed by numeric ID or name.
-     * @param topic Topic to poll, addressed by numeric ID or name.
-     * @param partition_id Partition to poll, or `std::nullopt` for the default
-     *        individual partition or client-selected group partition. The
-     *        maximum `std::uint32_t` value is reserved by the FFI and rejected.
-     * @param consumer Consumer identity that owns the polling cursor.
-     * @param strategy Starting position for this poll.
-     * @param count Maximum number of messages to return. Must be greater than
-     *        zero.
-     * @param auto_commit Whether to advance the consumer offset automatically.
-     * @return Selected partition state and the messages read from it.
-     * @throws IggyException if the client is unavailable or unauthenticated;
-     *         an identifier, partition, strategy, or count is invalid; a
-     *         resource does not exist; group membership or partition ownership
-     *         is missing; the caller lacks poll permission; or the request
-     *         fails.
+     * A partition is required. For additional read limits or a continuation,
+     * use the overload taking PollOptions.
      */
     PolledMessages PollMessages(const Identifier &stream,
                                 const Identifier &topic,
@@ -7946,6 +7855,15 @@ class IggyBlockingClient final {
      *         the command's access checks fail; or the request fails.
      */
     std::vector<std::uint8_t> SendBinaryRequest(std::uint32_t code, const std::vector<std::uint8_t> &payload);
+
+    /**
+     * @brief Sends a non-replicated raw command to a specific cluster replica.
+     * @throws IggyException for an unknown replica, a replicated or session-control command,
+     *         or a failed request.
+     */
+    std::vector<std::uint8_t> SendBinaryRequestToReplica(std::uint32_t code,
+                                                         const std::vector<std::uint8_t> &payload,
+                                                         std::uint8_t replica_id);
 
     /**
      * @brief Replaces or removes a user's complete permission assignment.

@@ -24,7 +24,6 @@
 #include <gtest/gtest.h>
 
 #include "iggy.hpp"
-#include "lib.rs.h"
 #include "tests/e2e/test_helpers.hpp"
 
 class E2E_ConsumerGroup : public E2ETestFixture {};
@@ -1800,26 +1799,22 @@ TEST_F(E2E_ConsumerGroup, GetConsumerOffsetReflectsAutoCommittedPoll) {
 }
 
 TEST_F(E2E_ConsumerGroup, StoreConsumerPositionStoresTheOffsetOfTheCheckpoint) {
-    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Stores the checkpoint of a polled message and reads its offset back.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
     auto client                   = GetLoggedInHighLevelClient();
-    auto *message_client          = GetLoggedInClient();
     const auto consumer           = iggy::Consumer::Single(iggy::Identifier::Numeric(99));
 
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
     ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
                                        iggy::TopicCreateOptions().SetPartitionsCount(1)));
-    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    std::vector<iggy::IggyMessageToSend> messages;
     for (std::uint32_t index = 0; index < 5; ++index) {
-        messages.push_back(iggy::ffi::make_message(to_payload("position-test-" + std::to_string(index)),
-                                                   rust::Vec<iggy::ffi::HeaderEntry>{}));
+        messages.push_back(iggy::IggyMessageToSend::Create("position-test-" + std::to_string(index)));
     }
-    ASSERT_NO_THROW(message_client->send_messages(make_string_identifier(stream_name),
-                                                  make_string_identifier(topic_name), "partition_id",
-                                                  partition_id_bytes(0), std::move(messages), error_info));
+    ASSERT_NO_THROW(client.SendMessages(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
+                                        iggy::Partitioning::PartitionId(0), messages));
 
     std::optional<iggy::PolledMessages> polled;
     ASSERT_NO_THROW(polled = client.PollMessages(consumer, iggy::Identifier::String(stream_name),
@@ -1837,27 +1832,23 @@ TEST_F(E2E_ConsumerGroup, StoreConsumerPositionStoresTheOffsetOfTheCheckpoint) {
 }
 
 TEST_F(E2E_ConsumerGroup, DeleteConsumerPositionDeletesTheOffsetOfThePartition) {
-    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description",
                    "Deletes the offset stored for the partition of a checkpoint, and a second delete finds none.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
     auto client                   = GetLoggedInHighLevelClient();
-    auto *message_client          = GetLoggedInClient();
     const auto consumer           = iggy::Consumer::Single(iggy::Identifier::Numeric(98));
 
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
     ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
                                        iggy::TopicCreateOptions().SetPartitionsCount(1)));
-    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    std::vector<iggy::IggyMessageToSend> messages;
     for (std::uint32_t index = 0; index < 3; ++index) {
-        messages.push_back(iggy::ffi::make_message(to_payload("delete-position-" + std::to_string(index)),
-                                                   rust::Vec<iggy::ffi::HeaderEntry>{}));
+        messages.push_back(iggy::IggyMessageToSend::Create("delete-position-" + std::to_string(index)));
     }
-    ASSERT_NO_THROW(message_client->send_messages(make_string_identifier(stream_name),
-                                                  make_string_identifier(topic_name), "partition_id",
-                                                  partition_id_bytes(0), std::move(messages), error_info));
+    ASSERT_NO_THROW(client.SendMessages(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
+                                        iggy::Partitioning::PartitionId(0), messages));
     std::optional<iggy::PolledMessages> polled;
     ASSERT_NO_THROW(polled = client.PollMessages(consumer, iggy::Identifier::String(stream_name),
                                                  iggy::Identifier::String(topic_name), 0,

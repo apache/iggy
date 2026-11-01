@@ -32,7 +32,6 @@
 
 #include <gtest/gtest.h>
 
-#include "lib.rs.h"
 #include "tests/e2e/test_helpers.hpp"
 
 class E2E_Client : public E2ETestFixture {};
@@ -2998,53 +2997,48 @@ TEST_F(E2E_Client, StoreConsumerOffsetRejectsMissingPartitionId) {
                  iggy::IggyException);
 }
 
-TEST_F(LowLevelE2E_Client, SendBinaryRequestToReplicaGetStatsReturnsNonEmptyBytes) {
+TEST_F(E2E_Client, SendBinaryRequestToReplicaGetStatsReturnsNonEmptyBytes) {
     RecordProperty("description",
                    "Returns a non-empty response body for a raw get-stats command sent to the server's own replica.");
     constexpr std::uint32_t get_stats_command_code = 10;
     constexpr std::uint8_t server_replica_id       = 0;
-    iggy::ffi::Client *client                      = GetLoggedInClient();
+    auto client                                    = GetLoggedInHighLevelClient();
 
-    rust::Vec<std::uint8_t> empty_payload;
-    rust::Vec<std::uint8_t> response;
-    ASSERT_NO_THROW({
-        iggy::ffi::ErrorInfo error_info{};
-        response = client->send_binary_request_to_replica(get_stats_command_code, empty_payload, server_replica_id,
-                                                          error_info);
-    });
+    std::vector<std::uint8_t> response;
+    ASSERT_NO_THROW(response = client.SendBinaryRequestToReplica(get_stats_command_code, {}, server_replica_id));
     EXPECT_FALSE(response.empty());
 }
 
-TEST_F(LowLevelE2E_Client, SendBinaryRequestToUnknownReplicaThrows) {
-    iggy::ffi::ErrorInfo error_info{};
+TEST_F(E2E_Client, SendBinaryRequestToUnknownReplicaThrows) {
     RecordProperty("description",
                    "Rejects a replica id that cluster metadata does not name with an invalid-identifier error.");
     constexpr std::uint32_t get_stats_command_code  = 10;
     constexpr std::uint8_t unknown_replica_id       = 9;
     constexpr std::uint32_t invalid_identifier_code = 6;
-    iggy::ffi::Client *client                       = GetLoggedInClient();
+    auto client                                     = GetLoggedInHighLevelClient();
 
-    rust::Vec<std::uint8_t> empty_payload;
-    ASSERT_THROW(
-        client->send_binary_request_to_replica(get_stats_command_code, empty_payload, unknown_replica_id, error_info),
-        std::exception);
-    EXPECT_EQ(error_info.code, invalid_identifier_code);
+    try {
+        client.SendBinaryRequestToReplica(get_stats_command_code, {}, unknown_replica_id);
+        FAIL() << "an unknown replica must be rejected";
+    } catch (const iggy::IggyException &error) {
+        EXPECT_EQ(error.Code(), invalid_identifier_code);
+    }
 }
 
-TEST_F(LowLevelE2E_Client, SendBinaryRequestToReplicaReplicatedCommandThrows) {
-    iggy::ffi::ErrorInfo error_info{};
+TEST_F(E2E_Client, SendBinaryRequestToReplicaReplicatedCommandThrows) {
     RecordProperty("description",
                    "Rejects a replicated command sent to a replica client-side with an invalid-command error.");
     constexpr std::uint32_t create_stream_command_code = 202;
     constexpr std::uint8_t server_replica_id           = 0;
     constexpr std::uint32_t invalid_command_code       = 3;
-    iggy::ffi::Client *client                          = GetLoggedInClient();
+    auto client                                        = GetLoggedInHighLevelClient();
 
-    rust::Vec<std::uint8_t> empty_payload;
-    ASSERT_THROW(client->send_binary_request_to_replica(create_stream_command_code, empty_payload, server_replica_id,
-                                                        error_info),
-                 std::exception);
-    EXPECT_EQ(error_info.code, invalid_command_code);
+    try {
+        client.SendBinaryRequestToReplica(create_stream_command_code, {}, server_replica_id);
+        FAIL() << "a replicated command must be rejected";
+    } catch (const iggy::IggyException &error) {
+        EXPECT_EQ(error.Code(), invalid_command_code);
+    }
 }
 
 TEST_F(E2E_Client, CreatePersonalAccessTokenBeforeLoginThrows) {

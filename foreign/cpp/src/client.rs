@@ -1982,7 +1982,12 @@ mod tests {
                 None,
                 IggyError::InvalidCommand,
             ),
-            (ffi::ConsumerKind::Consumer, Vec::new(), None, IggyError::InvalidCommand),
+            (
+                ffi::ConsumerKind::Consumer,
+                Vec::new(),
+                None,
+                IggyError::InvalidCommand,
+            ),
             (
                 ffi::ConsumerKind::Consumer,
                 vec![PARTITION],

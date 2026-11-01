@@ -28,7 +28,6 @@
 
 #include <gtest/gtest.h>
 
-#include "lib.rs.h"
 #include "tests/e2e/test_helpers.hpp"
 
 class E2E_Message : public E2ETestFixture {};
@@ -1266,9 +1265,8 @@ TEST_F(E2E_Message, PollMessagesWithCountZeroThrows) {
                  std::exception);
 }
 
-TEST_F(E2E_Message, PollMessagesWithoutSpecifyingPartition) {
-    RecordProperty("description",
-                   "Verifies polling with an omitted partition defaults to partition 0 and returns messages.");
+TEST_F(E2E_Message, PollMessagesWithMaximumPartitionIdThrows) {
+    RecordProperty("description", "Verifies the maximum partition ID does not select partition zero.");
     const std::string stream_name = GetRandomName();
     auto client                   = GetLoggedInHighLevelClient();
 
@@ -1290,20 +1288,10 @@ TEST_F(E2E_Message, PollMessagesWithoutSpecifyingPartition) {
     client.SendMessages(iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0),
                         iggy::Partitioning::PartitionId(0), messages);
 
-    auto polled = client.PollMessages(iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0),
-                                      std::nullopt, iggy::Consumer::Single(iggy::Identifier::Numeric(1)),
-                                      iggy::PollingStrategy::Offset(0), 100, false);
-
-    // An omitted partition lets the server pick one. With a single
-    // partition topic that should always be partition 0.
-    ASSERT_EQ(polled.PartitionId(), 0u) << "Omitted partition did not resolve to partition 0";
-    ASSERT_EQ(polled.Count(), 5u);
-    ASSERT_EQ(polled.Messages().size(), 5u);
-    for (std::uint32_t i = 0; i < 5; i++) {
-        std::string expected = "msg-" + std::to_string(i);
-        std::string actual(polled.Messages()[i].Payload().begin(), polled.Messages()[i].Payload().end());
-        EXPECT_EQ(actual, expected) << "Payload mismatch at index " << i;
-    }
+    ASSERT_THROW(client.PollMessages(iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0), UINT32_MAX,
+                                     iggy::Consumer::Single(iggy::Identifier::Numeric(1)),
+                                     iggy::PollingStrategy::Offset(0), 100, false),
+                 iggy::IggyException);
 }
 
 TEST_F(E2E_Message, PollMessagesTimestampStrategy) {
@@ -1574,10 +1562,8 @@ TEST_F(E2E_Message, PollMessagesWithSharedConsumerSplitsThePartition) {
 }
 
 TEST_F(E2E_Message, PollMessagesWithConsumerGroupReadsAssignedPartitions) {
-    RecordProperty(
-        "description",
-        "A group member polling without a partition reads its assigned partitions, one per call, rather than "
-        "falling back to partition 0.");
+    RecordProperty("description",
+                   "A group member reads each assigned partition when it names the partition explicitly.");
     const std::string stream_name = GetRandomName();
     auto client                   = GetLoggedInHighLevelClient();
 
@@ -1608,13 +1594,11 @@ TEST_F(E2E_Message, PollMessagesWithConsumerGroupReadsAssignedPartitions) {
                             iggy::Partitioning::PartitionId(partition_id), messages);
     }
 
-    // Each poll takes the next partition the member owns, so two polls cover
-    // both. A client falling back to partition 0 would read it twice instead.
     std::unordered_set<std::uint32_t> polled_partitions;
     std::unordered_set<std::string> polled_payloads;
     for (std::uint32_t poll = 0; poll < 2; poll++) {
-        auto polled = client.PollMessages(iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0),
-                                          std::nullopt, iggy::Consumer::Group(iggy::Identifier::String(group_name)),
+        auto polled = client.PollMessages(iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0), poll,
+                                          iggy::Consumer::Group(iggy::Identifier::String(group_name)),
                                           iggy::PollingStrategy::Next(), 10, true);
 
         ASSERT_EQ(polled.Count(), 2u) << "Poll " << poll << " did not read a whole partition";
@@ -1628,109 +1612,112 @@ TEST_F(E2E_Message, PollMessagesWithConsumerGroupReadsAssignedPartitions) {
     EXPECT_EQ(polled_payloads, (std::unordered_set<std::string>{"p0-0", "p0-1", "p1-0", "p1-1"}));
 }
 
-TEST_F(LowLevelE2E_Message, PollMessagesContinuationReadsTheNextBatch) {
-    iggy::ffi::ErrorInfo error_info{};
+TEST_F(E2E_Message, PollMessagesContinuationReadsTheNextBatch) {
     RecordProperty("description",
                    "Polls a partition in batches, each from the continuation of the batch before it, and checks that "
                    "the continuation of an empty batch keeps its start.");
     const std::string stream_name = GetRandomName();
-    iggy::ffi::Client *client     = GetLoggedInClient();
+    auto client                   = GetLoggedInHighLevelClient();
 
-    client->create_stream(stream_name, {}, error_info);
-    auto stream = client->get_stream(make_string_identifier(stream_name));
-    TrackStream(stream.id);
-    client->create_topic(make_numeric_identifier(stream.id), GetRandomName(), make_topic_create_options(1), error_info);
+    client.CreateStream(stream_name);
+    auto stream = client.GetStream(iggy::Identifier::String(stream_name));
+    TrackStream(stream.Id());
+    client.CreateTopic(iggy::Identifier::Numeric(stream.Id()), GetRandomName(),
+                       iggy::TopicCreateOptions().SetPartitionsCount(1));
 
-    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    std::vector<iggy::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
-        messages.push_back(
-            iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>()));
+        messages.push_back(iggy::IggyMessageToSend::Create("msg-" + std::to_string(i)));
     }
-    client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages), error_info);
+    client.SendMessages(iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0),
+                        iggy::Partitioning::PartitionId(0), messages);
 
     std::vector<std::uint64_t> offsets;
-    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
-                                        make_poll_options(4), error_info);
+    auto polled = client.PollMessages(iggy::Consumer::Single(iggy::Identifier::Numeric(1)),
+                                      iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0), 0,
+                                      iggy::PollingStrategy::Offset(0), iggy::PollOptions().SetCount(4));
     while (offsets.size() < 10) {
-        ASSERT_FALSE(polled.messages.empty()) << "Empty batch after " << offsets.size() << " messages";
-        for (const auto &message : polled.messages) {
-            offsets.push_back(message.offset);
+        ASSERT_FALSE(polled.Messages().empty()) << "Empty batch after " << offsets.size() << " messages";
+        for (const auto &message : polled.Messages()) {
+            offsets.push_back(message.Offset());
         }
-        polled =
-            client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                  make_numeric_identifier(1), *polled.continuation(), make_poll_options(4), error_info);
+        polled = client.PollMessages(iggy::Consumer::Single(iggy::Identifier::Numeric(1)),
+                                     iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0), 0,
+                                     polled.Continuation(), iggy::PollOptions().SetCount(4));
     }
     for (std::uint32_t i = 0; i < 10; i++) {
         EXPECT_EQ(offsets[i], static_cast<std::uint64_t>(i)) << "Offset mismatch at index " << i;
     }
 
-    EXPECT_TRUE(polled.messages.empty());
-    const auto continuation = polled.continuation();
-    EXPECT_EQ(std::string(continuation->kind()), "offset");
-    EXPECT_EQ(continuation->value(), 10u) << "An empty batch must keep the start of its request";
+    EXPECT_TRUE(polled.Messages().empty());
+    const auto continuation = polled.Continuation();
+    EXPECT_EQ(std::string(continuation.Kind()), "offset");
+    EXPECT_EQ(continuation.Value(), 10u) << "An empty batch must keep the start of its request";
 }
 
-TEST_F(LowLevelE2E_Message, PollMessagesContinuationOfAnotherPartitionThrows) {
-    iggy::ffi::ErrorInfo error_info{};
+TEST_F(E2E_Message, PollMessagesContinuationOfAnotherPartitionThrows) {
     RecordProperty("description", "A continuation of partition 0 is refused by a poll of partition 1.");
     const std::string stream_name = GetRandomName();
-    iggy::ffi::Client *client     = GetLoggedInClient();
+    auto client                   = GetLoggedInHighLevelClient();
 
-    client->create_stream(stream_name, {}, error_info);
-    auto stream = client->get_stream(make_string_identifier(stream_name));
-    TrackStream(stream.id);
-    client->create_topic(make_numeric_identifier(stream.id), GetRandomName(), make_topic_create_options(2), error_info);
+    client.CreateStream(stream_name);
+    auto stream = client.GetStream(iggy::Identifier::String(stream_name));
+    TrackStream(stream.Id());
+    client.CreateTopic(iggy::Identifier::Numeric(stream.Id()), GetRandomName(),
+                       iggy::TopicCreateOptions().SetPartitionsCount(2));
 
-    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
-                                        make_poll_options(4), error_info);
-    ASSERT_THROW(
-        client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 1, "consumer",
-                              make_numeric_identifier(1), *polled.continuation(), make_poll_options(4), error_info),
-        std::exception);
-    EXPECT_EQ(error_info.kind, "invalid_command");
+    auto polled = client.PollMessages(iggy::Consumer::Single(iggy::Identifier::Numeric(1)),
+                                      iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0), 0,
+                                      iggy::PollingStrategy::Offset(0), iggy::PollOptions().SetCount(4));
+    try {
+        client.PollMessages(iggy::Consumer::Single(iggy::Identifier::Numeric(1)),
+                            iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0), 1,
+                            polled.Continuation(), iggy::PollOptions().SetCount(4));
+        FAIL() << "a continuation from another partition must be rejected";
+    } catch (const iggy::IggyException &error) {
+        EXPECT_EQ(error.Kind(), "invalid_command");
+    }
 }
 
-TEST_F(LowLevelE2E_Message, StoreConsumerPositionStoresTheOffsetOfTheCheckpoint) {
-    iggy::ffi::ErrorInfo error_info{};
+TEST_F(E2E_Message, StoreConsumerPositionStoresTheOffsetOfTheCheckpoint) {
     RecordProperty("description",
                    "Stores the checkpoint of a processed part of a batch and reads the stored offset back. An empty "
                    "batch has no checkpoint.");
     const std::string stream_name = GetRandomName();
-    iggy::ffi::Client *client     = GetLoggedInClient();
+    auto client                   = GetLoggedInHighLevelClient();
 
-    client->create_stream(stream_name, {}, error_info);
-    auto stream = client->get_stream(make_string_identifier(stream_name));
-    TrackStream(stream.id);
-    client->create_topic(make_numeric_identifier(stream.id), GetRandomName(), make_topic_create_options(1), error_info);
+    client.CreateStream(stream_name);
+    auto stream = client.GetStream(iggy::Identifier::String(stream_name));
+    TrackStream(stream.Id());
+    client.CreateTopic(iggy::Identifier::Numeric(stream.Id()), GetRandomName(),
+                       iggy::TopicCreateOptions().SetPartitionsCount(1));
 
-    auto empty = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                       make_numeric_identifier(1), make_polling_strategy("offset", 0),
-                                       make_poll_options(10), error_info);
-    EXPECT_THROW(empty.checkpoint(), std::exception);
+    auto empty = client.PollMessages(iggy::Consumer::Single(iggy::Identifier::Numeric(1)),
+                                     iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0), 0,
+                                     iggy::PollingStrategy::Offset(0), iggy::PollOptions().SetCount(10));
+    EXPECT_THROW((void)empty.Checkpoint(), std::exception);
 
-    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    std::vector<iggy::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
-        messages.push_back(
-            iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>()));
+        messages.push_back(iggy::IggyMessageToSend::Create("msg-" + std::to_string(i)));
     }
-    client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages), error_info);
-    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
-                                        make_poll_options(10), error_info);
-    ASSERT_EQ(polled.messages.size(), 10u);
-    EXPECT_EQ(polled.checkpoint()->offset(), 9u);
-    EXPECT_THROW(polled.checkpoint_at(10), std::exception);
+    client.SendMessages(iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0),
+                        iggy::Partitioning::PartitionId(0), messages);
+    auto polled = client.PollMessages(iggy::Consumer::Single(iggy::Identifier::Numeric(1)),
+                                      iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0), 0,
+                                      iggy::PollingStrategy::Offset(0), iggy::PollOptions().SetCount(10));
+    ASSERT_EQ(polled.Messages().size(), 10u);
+    EXPECT_EQ(polled.Checkpoint().Offset(), 9u);
+    EXPECT_THROW((void)polled.CheckpointAt(10), std::exception);
 
-    const auto checkpoint = polled.checkpoint_at(4);
-    EXPECT_EQ(checkpoint->partition_id(), 0u);
-    EXPECT_EQ(checkpoint->offset(), 4u);
-    ASSERT_NO_THROW(client->store_consumer_position(make_numeric_identifier(stream.id), make_numeric_identifier(0),
-                                                    "consumer", make_numeric_identifier(1), *checkpoint, error_info));
-    const auto stored = client->get_consumer_offset(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
-                                                    "consumer", make_numeric_identifier(1));
-    EXPECT_EQ(stored.stored_offset, 4u);
+    const auto checkpoint = polled.CheckpointAt(4);
+    EXPECT_EQ(checkpoint.PartitionId(), 0u);
+    EXPECT_EQ(checkpoint.Offset(), 4u);
+    ASSERT_NO_THROW(client.StoreConsumerPosition(iggy::Consumer::Single(iggy::Identifier::Numeric(1)),
+                                                 iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0),
+                                                 checkpoint));
+    const auto stored =
+        client.GetConsumerOffset(iggy::Consumer::Single(iggy::Identifier::Numeric(1)),
+                                 iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0), 0);
+    EXPECT_EQ(stored.StoredOffset(), 4u);
 }

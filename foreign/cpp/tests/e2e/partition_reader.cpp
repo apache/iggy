@@ -57,14 +57,11 @@ class E2E_PartitionReader : public E2ETestFixture {
   protected:
     // One topic with one partition. The messages go to partition 0 and carry their index as payload.
     iggy::Identifier CreateTopicWithMessages(const std::uint32_t messages_count) {
-        iggy::ffi::ErrorInfo error_info{};
-        iggy::ffi::Client *client     = GetLoggedInClient();
-        const std::string stream_name = GetRandomName();
-        client->create_stream(stream_name, {}, error_info);
-        stream_id_ = client->get_stream(make_string_identifier(stream_name)).id;
+        auto client = GetLoggedInHighLevelClient();
+        stream_id_  = client.CreateStream(GetRandomName()).Id();
         TrackStream(stream_id_);
-        client->create_topic(make_numeric_identifier(stream_id_), GetRandomName(), make_topic_create_options(1),
-                             error_info);
+        client.CreateTopic(iggy::Identifier::Numeric(stream_id_), GetRandomName(),
+                           iggy::TopicCreateOptions().SetPartitionsCount(1));
         SendMessages(messages_count);
         return iggy::Identifier::Numeric(stream_id_);
     }
@@ -73,14 +70,14 @@ class E2E_PartitionReader : public E2ETestFixture {
         if (messages_count == 0) {
             return;
         }
-        iggy::ffi::ErrorInfo error_info{};
-        rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-        for (std::uint32_t i = 0; i < messages_count; i++) {
-            messages.push_back(
-                iggy::ffi::make_message(to_payload(std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>()));
+        auto client = GetLoggedInHighLevelClient();
+        std::vector<iggy::IggyMessageToSend> messages;
+        messages.reserve(messages_count);
+        for (std::uint32_t index = 0; index < messages_count; ++index) {
+            messages.push_back(iggy::IggyMessageToSend::Create(std::to_string(index)));
         }
-        GetLoggedInClient()->send_messages(make_numeric_identifier(stream_id_), make_numeric_identifier(0),
-                                           "partition_id", partition_id_bytes(0), std::move(messages), error_info);
+        client.SendMessages(iggy::Identifier::Numeric(stream_id_), iggy::Identifier::Numeric(0),
+                            iggy::Partitioning::PartitionId(0), messages);
     }
 
   private:
