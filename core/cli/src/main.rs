@@ -561,3 +561,101 @@ async fn run() -> Result<(), IggyCmdError> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod connector_command_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn explain(args: &[&str]) -> String {
+        let args =
+            IggyConsoleArgs::try_parse_from(std::iter::once("iggy").chain(args.iter().copied()))
+                .unwrap();
+        let command = args.command.unwrap();
+        get_command(command, &args.cli, "").explain()
+    }
+
+    #[test]
+    fn should_build_the_command_for_each_connector_subcommand() {
+        let cases = [
+            (
+                vec!["connector", "list", "sink"],
+                "list sinks in table mode",
+            ),
+            (
+                vec!["connector", "list", "source", "-l", "list"],
+                "list sources in list mode",
+            ),
+            (vec!["connector", "get", "sink", "k"], "get sink k"),
+            (
+                vec!["connector", "transforms", "source", "k"],
+                "get transforms of source k",
+            ),
+            (vec!["connector", "restart", "sink", "k"], "restart sink k"),
+            (
+                vec!["connector", "stats"],
+                "get connectors runtime statistics",
+            ),
+            (
+                vec!["connector", "config", "list", "sink", "k"],
+                "list configurations of sink k",
+            ),
+            (
+                vec!["connector", "config", "get", "sink", "k"],
+                "get active configuration of sink k",
+            ),
+            (
+                vec!["connector", "config", "get", "source", "k", "-v", "2"],
+                "get configuration version 2 of source k",
+            ),
+            (
+                vec!["connector", "config", "plugin", "sink", "k"],
+                "get plugin configuration of sink k",
+            ),
+            (
+                vec!["connector", "config", "create", "sink", "k"],
+                "create configuration for sink k",
+            ),
+            (
+                vec!["connector", "config", "delete", "sink", "k", "-v", "3"],
+                "delete configuration version 3 of sink k",
+            ),
+            (
+                vec!["connector", "config", "activate", "source", "k", "-v", "3"],
+                "activate configuration version 3 of source k",
+            ),
+        ];
+
+        for (args, expected) in cases {
+            assert_eq!(explain(&args), expected, "for {args:?}");
+        }
+    }
+
+    #[test]
+    fn should_take_endpoint_from_the_cli_options() {
+        let args = IggyConsoleArgs::try_parse_from([
+            "iggy",
+            "--connectors-api-url",
+            "https://runtime:8081",
+            "--connectors-api-key",
+            "secret",
+            "--connectors-tls-ca-file",
+            "ca.pem",
+            "connector",
+            "stats",
+        ])
+        .unwrap();
+
+        let endpoint = connector_endpoint(&args.cli);
+
+        assert_eq!(endpoint.api_url.as_deref(), Some("https://runtime:8081"));
+        assert_eq!(endpoint.api_key.as_deref(), Some("secret"));
+        assert_eq!(endpoint.tls_ca_file, Some(PathBuf::from("ca.pem")));
+    }
+
+    #[test]
+    fn should_map_kinds_to_routes() {
+        assert_eq!(connector_kind(ConnectorKind::Sink).path(), "sinks");
+        assert_eq!(connector_kind(ConnectorKind::Source).path(), "sources");
+    }
+}

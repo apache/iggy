@@ -7218,6 +7218,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "windows-native-keyring-store",
+ "wiremock",
  "zbus-secret-service-keyring-store",
 ]
 

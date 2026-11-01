@@ -92,9 +92,16 @@ impl ConnectorsApiClient {
         if let Some(ca_file) = tls_ca_file {
             let pem = std::fs::read(&ca_file)
                 .with_context(|| format!("problem reading CA file {}", ca_file.display()))?;
-            let certificate = reqwest::Certificate::from_pem(&pem)
+            // from_pem only stores the bytes, so a wrong file would pass here and fail
+            // later at the TLS handshake. The bundle parser checks the encoding now.
+            let certificates = reqwest::Certificate::from_pem_bundle(&pem)
                 .with_context(|| format!("problem parsing CA file {} as PEM", ca_file.display()))?;
-            builder = builder.add_root_certificate(certificate);
+            if certificates.is_empty() {
+                bail!("CA file {} contains no certificate", ca_file.display());
+            }
+            for certificate in certificates {
+                builder = builder.add_root_certificate(certificate);
+            }
         }
         let inner = builder
             .build()

@@ -23,6 +23,9 @@ pub mod get_transforms;
 pub mod restart_connector;
 pub mod stats;
 
+#[cfg(test)]
+mod api_tests;
+
 use serde_json::Value;
 
 /// Reads one string field of a JSON object, empty when missing or not a string.

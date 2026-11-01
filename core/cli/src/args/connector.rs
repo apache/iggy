@@ -195,3 +195,205 @@ pub(crate) struct ConnectorConfigActivateArgs {
     #[clap(short, long)]
     pub(crate) version: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::args::{Command, IggyConsoleArgs};
+    use clap::Parser;
+    use clap::error::ErrorKind;
+    use iggy_cli::commands::binary_connectors::get_connectors::GetConnectorsOutput;
+
+    fn parse(args: &[&str]) -> Result<IggyConsoleArgs, clap::Error> {
+        IggyConsoleArgs::try_parse_from(std::iter::once("iggy").chain(args.iter().copied()))
+    }
+
+    fn action(args: &[&str]) -> ConnectorAction {
+        match parse(args).unwrap().command {
+            Some(Command::Connector(action)) => action,
+            _ => panic!("not a connector command"),
+        }
+    }
+
+    fn config_action(args: &[&str]) -> ConnectorConfigAction {
+        match action(args) {
+            ConnectorAction::Config(action) => action,
+            _ => panic!("not a config command"),
+        }
+    }
+
+    #[test]
+    fn should_list_in_table_mode_by_default() {
+        let ConnectorAction::List(args) = action(&["connector", "list", "sink"]) else {
+            panic!("not list");
+        };
+
+        assert_eq!(args.kind, ConnectorKind::Sink);
+        assert!(matches!(args.list_mode, ListMode::Table));
+    }
+
+    #[test]
+    fn should_accept_aliases() {
+        let ConnectorAction::List(args) = action(&["conn", "l", "source", "-l", "list"]) else {
+            panic!("not list");
+        };
+
+        assert_eq!(args.kind, ConnectorKind::Source);
+        assert!(matches!(args.list_mode, ListMode::List));
+        assert!(matches!(
+            config_action(&["conn", "c", "g", "sink", "k"]),
+            ConnectorConfigAction::Get(_)
+        ));
+    }
+
+    #[test]
+    fn should_require_a_valid_kind() {
+        assert_eq!(
+            parse(&["connector", "get"]).unwrap_err().kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            parse(&["connector", "get", "orders-sink"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidValue
+        );
+    }
+
+    #[test]
+    fn should_require_a_key() {
+        assert_eq!(
+            parse(&["connector", "restart", "sink"]).unwrap_err().kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn should_read_active_config_when_no_version_is_given() {
+        let ConnectorConfigAction::Get(args) =
+            config_action(&["connector", "config", "get", "sink", "k"])
+        else {
+            panic!("not get");
+        };
+        assert_eq!(args.version, None);
+
+        let ConnectorConfigAction::Get(args) =
+            config_action(&["connector", "config", "get", "sink", "k", "--version", "3"])
+        else {
+            panic!("not get");
+        };
+        assert_eq!(args.version, Some(3));
+    }
+
+    #[test]
+    fn should_require_a_version_to_delete() {
+        assert_eq!(
+            parse(&["connector", "config", "delete", "sink", "k"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+
+        let ConnectorConfigAction::Delete(args) =
+            config_action(&["connector", "config", "delete", "sink", "k", "-v", "3"])
+        else {
+            panic!("not delete");
+        };
+        assert_eq!(args.version, 3);
+    }
+
+    #[test]
+    fn should_require_a_version_to_activate() {
+        assert_eq!(
+            parse(&["connector", "config", "activate", "source", "k"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn should_read_create_file_only_when_given() {
+        let ConnectorConfigAction::Create(args) =
+            config_action(&["connector", "config", "create", "sink", "k"])
+        else {
+            panic!("not create");
+        };
+        assert_eq!(args.file, None);
+
+        let ConnectorConfigAction::Create(args) = config_action(&[
+            "connector",
+            "config",
+            "create",
+            "sink",
+            "k",
+            "--file",
+            "c.json",
+        ]) else {
+            panic!("not create");
+        };
+        assert_eq!(args.file, Some(PathBuf::from("c.json")));
+    }
+
+    #[test]
+    fn should_pass_plugin_format() {
+        let ConnectorConfigAction::Plugin(args) = config_action(&[
+            "connector",
+            "config",
+            "plugin",
+            "source",
+            "k",
+            "--format",
+            "yaml",
+        ]) else {
+            panic!("not plugin");
+        };
+
+        assert_eq!(args.format.as_deref(), Some("yaml"));
+    }
+
+    #[test]
+    fn should_parse_stats_without_kind() {
+        assert!(matches!(
+            action(&["connector", "stats"]),
+            ConnectorAction::Stats
+        ));
+    }
+
+    #[test]
+    fn should_read_connector_options_next_to_the_command() {
+        let args = parse(&[
+            "--connectors-api-url",
+            "https://runtime:8081",
+            "--connectors-api-key",
+            "secret",
+            "--connectors-tls-ca-file",
+            "ca.pem",
+            "connector",
+            "stats",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.cli.connectors_api_url.as_deref(),
+            Some("https://runtime:8081")
+        );
+        assert_eq!(args.cli.connectors_api_key.as_deref(), Some("secret"));
+        assert_eq!(
+            args.cli.connectors_tls_ca_file,
+            Some(PathBuf::from("ca.pem"))
+        );
+    }
+
+    #[test]
+    fn should_map_list_mode_to_output() {
+        assert!(matches!(
+            GetConnectorsOutput::from(ListMode::Table),
+            GetConnectorsOutput::Table
+        ));
+        assert!(matches!(
+            GetConnectorsOutput::from(ListMode::List),
+            GetConnectorsOutput::List
+        ));
+    }
+}

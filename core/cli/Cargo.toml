@@ -95,6 +95,7 @@ cfg_aliases = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock = { workspace = true }
 
 [lints]
 workspace = true
