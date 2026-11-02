@@ -158,7 +158,7 @@ use crate::shell::{ServerShard, ShellBus, ShellShard};
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
 use consensus::Consensus;
-use consensus::{MetadataHandle, PartitionsHandle};
+use consensus::{MetadataHandle, PartitionsHandle, ReplicaSet, quorum_view_change};
 use futures::FutureExt;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_offsets::DeleteConsumerOffsetRequest;
@@ -176,7 +176,7 @@ use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::lifecycle::{
     CompleteLifecycleRequest, LIFECYCLE_COMPLETIONS_MAX, LifecycleCompletion, LifecycleFence,
-    RETIRED_PARTITION_OP,
+    RETIRED_PARTITION_OP, retired_member_op,
 };
 use metadata::stm::stream::{Partition, StatsRegistry};
 use partitions::{StreamKeyIdentity, delete_partitions_from_disk, read_created_revision};
@@ -923,7 +923,7 @@ async fn reconcile_additions(
                 topic_runtime,
                 ctx.cluster_id,
                 ctx.self_replica_id,
-                ctx.replica_count,
+                partition_metadata.replica_set(ctx.replica_count),
                 Rc::clone(&ctx.shard.bus),
                 partitions,
             )
@@ -935,10 +935,11 @@ async fn reconcile_additions(
                 ns,
                 partition_stats,
                 created_revision,
+                partition_metadata.created_at.as_micros(),
                 topic_runtime,
                 ctx.cluster_id,
                 ctx.self_replica_id,
-                ctx.replica_count,
+                partition_metadata.replica_set(ctx.replica_count),
                 created_view,
                 Rc::clone(&ctx.shard.bus),
             )
@@ -962,6 +963,17 @@ async fn reconcile_additions(
             // knows: nothing is counted, so the pass may fast-skip, and the
             // commit that moves metadata on bumps the revision and retries it.
             Ok(None) => {}
+            // Retrying cannot bring the history back; the tombstone keeps every
+            // later pass from rebuilding it empty.
+            Err(err @ crate::server_error::ServerError::PartitionLostWithStorage { .. }) => {
+                error!(
+                    shard = shard_id,
+                    ns_raw = ns.inner(),
+                    error = %err,
+                    "refusing to rebuild a partition lost with this node's storage"
+                );
+                partitions.fence(ns, created_revision);
+            }
             Err(err) => {
                 ctx.record_failure(ns, FailureCause::Add, now);
                 ctx.shard.metrics().record_partition_reconcile_failure();
@@ -1602,6 +1614,15 @@ fn snapshot_target_namespaces(ctx: &ReconcilerCtx) -> Vec<TargetPartition> {
         for (_, stream) in &inner.items {
             for (topic_id, topic) in &stream.topics {
                 for partition in &topic.partitions {
+                    // A partition this node does not store is no target: it
+                    // gets neither a build nor a routing row here.
+                    if partition
+                        .replica_set(ctx.replica_count)
+                        .member(ctx.self_replica_id)
+                        .is_none()
+                    {
+                        continue;
+                    }
                     entries.push(TargetPartition {
                         ns: IggyNamespace::new(stream.id, topic_id, partition.id),
                         epoch: partition.created_revision,
@@ -1837,67 +1858,99 @@ pub fn reconcile_partition_lifecycles<B, MJ, S, SB>(
     }
 }
 
-/// On a single-replica node, recovery fences a partition it cannot load, and
-/// then no log can install a lifecycle fence. Without this, a delete of the
-/// topic, the operator's exit from that fence, would wait forever. The durable
-/// retirement fence keeps the incarnation offline, which is what the lifecycle
-/// fence would have proven.
+/// On a partition this node alone stores, recovery fences an incarnation it
+/// cannot load, and then no log can install a lifecycle fence. Without this, a
+/// delete of the topic, the operator's exit from that fence, would wait
+/// forever. The durable retirement fence keeps the incarnation offline, which
+/// is what the lifecycle fence would have proven.
+///
+/// A wider partition being deleted gets the same exit once enough of its
+/// members lost their copies: each such member retires its copy durably and
+/// reports it, and when the members still holding one are too few to elect a
+/// primary, a member completes the target. No log could install the fence
+/// after that.
 async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) {
-    if ctx.replica_count != 1 || ctx.lifecycle_reports.batch_in_flight.get() {
+    if ctx.lifecycle_reports.batch_in_flight.get() {
         return;
     }
     let partitions = ctx.shard.plane.partitions();
     let system_path = ctx.config.get_system_path();
-    // The fence writes below await, so only the targets that failed recovery
-    // leave the borrow.
+    // The fence writes below await, so the targets leave the borrow first.
     let streams = ctx.shard.plane.metadata().mux_stm.streams();
-    let failed = streams.read(|state| {
-        let mut failed = Vec::new();
+    let pending = streams.read(|state| {
+        let mut pending = Vec::new();
         for intent in state.lifecycle_intents.values() {
-            let mut targets = Vec::new();
-            for target in intent
+            let targets: Vec<_> = intent
                 .partitions
                 .iter()
                 .filter(|target| target.partition_op.is_none())
-            {
-                let namespace = IggyNamespace::new(
-                    intent.stream_id as usize,
-                    target.topic_id as usize,
-                    target.partition_id as usize,
-                );
-                let incarnation = match target.fence {
-                    LifecycleFence::History(transition) => transition.incarnation,
-                    LifecycleFence::Owner(installation) => installation.incarnation,
-                };
-                if partitions.failed_revision(&namespace) == Some(incarnation) {
-                    targets.push((target.topic_id, target.partition_id, namespace, incarnation));
-                }
-            }
+                .map(|target| {
+                    let (incarnation, deletes) = match target.fence {
+                        LifecycleFence::History(transition) => (transition.incarnation, true),
+                        LifecycleFence::Owner(installation) => (installation.incarnation, false),
+                    };
+                    RetirementTarget {
+                        topic_id: target.topic_id,
+                        partition_id: target.partition_id,
+                        namespace: IggyNamespace::new(
+                            intent.stream_id as usize,
+                            target.topic_id as usize,
+                            target.partition_id as usize,
+                        ),
+                        incarnation,
+                        deletes,
+                        retired_members: target.retired_members,
+                    }
+                })
+                .collect();
             if !targets.is_empty() {
-                failed.push((intent.context.metadata_op, intent.stream_id, targets));
+                pending.push((intent.context.metadata_op, intent.stream_id, targets));
             }
         }
-        failed
+        pending
     });
-    for (metadata_op, stream_id, targets) in failed {
+    for (metadata_op, stream_id, targets) in pending {
         let mut completions = Vec::new();
-        for (topic_id, partition_id, namespace, incarnation) in targets {
-            // Other tasks run during the awaits, so each target is checked
-            // again right before its durable write.
-            if partitions.failed_revision(&namespace) != Some(incarnation) {
+        for target in targets {
+            let Some(members) = committed_members(ctx, target.namespace) else {
+                continue;
+            };
+            if members.member(ctx.self_replica_id).is_none() {
                 continue;
             }
-            if let Err(error) =
-                record_partition_retirement_fence(&system_path, namespace, incarnation).await
-            {
-                warn!(%error, namespace_raw = namespace.inner(),
-                    "lifecycle waits for a durable partition fence");
-                continue;
-            }
+            let partition_op = match retirement_step(ctx, &members, &target) {
+                Some(RetirementStep::Complete) => RETIRED_PARTITION_OP,
+                Some(RetirementStep::RetireCopy) => {
+                    // Other tasks run during the awaits, so the copy is checked
+                    // again right before its durable write.
+                    if !copy_lost_here(ctx, &target) {
+                        continue;
+                    }
+                    if let Err(error) = record_partition_retirement_fence(
+                        &system_path,
+                        target.namespace,
+                        target.incarnation,
+                    )
+                    .await
+                    {
+                        warn!(%error, namespace_raw = target.namespace.inner(),
+                            "lifecycle waits for a durable partition fence");
+                        continue;
+                    }
+                    if members.len() == 1 {
+                        RETIRED_PARTITION_OP
+                    } else {
+                        // A retired copy must not vote either.
+                        partitions.fence(target.namespace, target.incarnation);
+                        retired_member_op(ctx.self_replica_id)
+                    }
+                }
+                None => continue,
+            };
             completions.push(LifecycleCompletion {
-                topic_id,
-                partition_id,
-                partition_op: RETIRED_PARTITION_OP,
+                topic_id: target.topic_id,
+                partition_id: target.partition_id,
+                partition_op,
             });
             // Metadata records only the reported batch, so a fence written
             // past it is written again on the next pass.
@@ -1910,6 +1963,85 @@ async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) {
             return;
         }
     }
+}
+
+/// A pending lifecycle target as [`reconcile_retired_lifecycles`] reads it.
+struct RetirementTarget {
+    topic_id: u32,
+    partition_id: u32,
+    namespace: IggyNamespace,
+    incarnation: u64,
+    /// The lifecycle removes the partition, so retiring a copy loses nothing.
+    deletes: bool,
+    retired_members: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetirementStep {
+    /// Too few members still hold a copy to elect a primary, so no log can
+    /// fence it.
+    Complete,
+    /// This member's copy is lost: retire it durably and report it.
+    RetireCopy,
+}
+
+/// What this member does for `target`, or `None` to wait for its log.
+fn retirement_step(
+    ctx: &ReconcilerCtx,
+    members: &ReplicaSet,
+    target: &RetirementTarget,
+) -> Option<RetirementStep> {
+    if members.len() == 1 {
+        return copy_lost_here(ctx, target).then_some(RetirementStep::RetireCopy);
+    }
+    if !target.deletes {
+        return None;
+    }
+    let retired = members
+        .nodes()
+        .iter()
+        .filter(|&&node| retired_bit(node).is_some_and(|bit| target.retired_members & bit != 0))
+        .count();
+    // Electing the primary that installs the fence takes a view-change quorum
+    // of the members that kept a copy. A primary that kept its copy may still
+    // commit with fewer, but it installs the fence itself, and what it commits
+    // afterwards belongs to a partition being deleted.
+    let holding = usize::from(members.len()) - retired;
+    if holding < quorum_view_change(members.len()) {
+        return Some(RetirementStep::Complete);
+    }
+    let retired_here =
+        retired_bit(ctx.self_replica_id).is_none_or(|bit| target.retired_members & bit != 0);
+    (!retired_here && copy_lost_here(ctx, target)).then_some(RetirementStep::RetireCopy)
+}
+
+const fn retired_bit(node: u8) -> Option<u32> {
+    1_u32.checked_shl(node as u32)
+}
+
+/// Whether this node's copy of the target incarnation is gone: recovery
+/// fenced it, or it waits for a state transfer that would rebuild it.
+fn copy_lost_here(ctx: &ReconcilerCtx, target: &RetirementTarget) -> bool {
+    let partitions = ctx.shard.plane.partitions();
+    partitions.failed_revision(&target.namespace) == Some(target.incarnation)
+        || partitions
+            .get_by_ns(&target.namespace)
+            .is_some_and(|partition| {
+                partition.created_revision() == target.incarnation
+                    && partition.requires_state_transfer()
+            })
+}
+
+/// The committed members of `namespace`, every node for a partition created
+/// before replication factors.
+fn committed_members(ctx: &ReconcilerCtx, namespace: IggyNamespace) -> Option<ReplicaSet> {
+    ctx.shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .members_for_namespace(namespace)
+        .map(|members| members.unwrap_or_else(|| ReplicaSet::all(ctx.replica_count)))
 }
 
 /// The ready completions of the intent at `metadata_op` in batch order, at
@@ -2061,6 +2193,7 @@ mod tests {
     use metadata::stm::StateMachine;
     use metadata::stm::lifecycle::{
         CompleteLifecycleRequest, LIFECYCLE_COMPLETIONS_MAX, LifecycleCompletion,
+        RETIRED_PARTITION_OP, retired_member_op,
     };
     use metadata::stm::stream::Streams;
     use metadata::stm::user::Users;
@@ -2068,14 +2201,14 @@ mod tests {
     use server_common::sharding::{IggyNamespace, ShardId};
     use server_common::{Message, MessageBag};
     use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
-    use shard::{IggyShard, PartitionConsensusConfig, ReconcileOp, ShardIdentity};
+    use shard::{IggyShard, PartitionConsensusConfig, ReconcileOp, Sender, ShardIdentity};
     use std::cell::Cell;
     use std::mem::size_of;
     use std::path::Path;
     use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     type TestMux = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
@@ -2226,6 +2359,7 @@ mod tests {
             initial_view: 0,
             partition_id,
             consensus_group_id,
+            members: Vec::new(),
         }
     }
 
@@ -3327,10 +3461,11 @@ mod tests {
             ns,
             Arc::clone(&stats),
             LIVE_EPOCH,
+            0,
             iggy_common::TopicRuntimeOptions::default(),
             CLUSTER_ID,
             0,
-            1,
+            consensus::ReplicaSet::all(1),
             created_view(&ctx, ns),
             Rc::clone(&ctx.shard.bus),
         )
@@ -3358,10 +3493,11 @@ mod tests {
             ns,
             Arc::clone(&stats),
             LIVE_EPOCH + 1,
+            0,
             iggy_common::TopicRuntimeOptions::default(),
             CLUSTER_ID,
             0,
-            1,
+            consensus::ReplicaSet::all(1),
             created_view(&ctx, ns),
             Rc::clone(&ctx.shard.bus),
         )
@@ -4001,7 +4137,15 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-repair-ceiling", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        // The repair peer must be a member of the group it repairs from.
+        let ctx = Rc::new(ReconcilerCtx::new(
+            Rc::clone(&shard),
+            1,
+            Rc::new(config),
+            CLUSTER_ID,
+            0,
+            2,
+        ));
         reconcile_pass(&ctx).await;
 
         let ns = IggyNamespace::new(0, 0, 0);
@@ -4402,6 +4546,239 @@ mod tests {
             "a recreate of the recycled ids must not inherit the lifted fence"
         );
         assert!(!partitions.is_tombstoned(&ns));
+    }
+
+    #[compio::test]
+    async fn given_a_fenced_partition_only_this_node_stores_in_a_larger_cluster_when_deleted_should_complete_the_delete()
+     {
+        const NODES: u8 = 3;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        let solo = IggyNamespace::new(0, 0, 0);
+        let shared = IggyNamespace::new(1, 0, 0);
+        mux.streams()
+            .seed_namespace_on(solo, 1, 0, iggy_common::Durability::Persisted, &[0]);
+        mux.streams()
+            .seed_namespace_on(shared, 2, 0, iggy_common::Durability::Persisted, &[0, 1]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = Rc::new(ReconcilerCtx::new(
+            Rc::clone(&shard),
+            1,
+            Rc::new(config),
+            CLUSTER_ID,
+            0,
+            NODES,
+        ));
+        let stm = &shard.plane.metadata().mux_stm;
+        for namespace in [solo, shared] {
+            let revision = stm
+                .streams()
+                .created_revision_for_namespace(namespace)
+                .unwrap();
+            shard.plane.partitions().fence(namespace, revision);
+        }
+        for (op, stream_id) in [(10, 0), (11, 1)] {
+            stm.update(build_prepare(
+                op,
+                Operation::DeleteTopic,
+                &DeleteTopicRequest {
+                    stream_id: WireIdentifier::numeric(stream_id),
+                    topic_id: WireIdentifier::numeric(0),
+                },
+            ))
+            .expect("DeleteTopic apply succeeds");
+        }
+
+        reconcile_retired_lifecycles(&ctx).await;
+
+        let (_, batches) = drain_lifecycle_reports(&lanes);
+        let completed: Vec<_> = batches
+            .iter()
+            .map(|(request, _)| request.completions().to_vec())
+            .collect();
+        assert_eq!(
+            completed,
+            [vec![LifecycleCompletion {
+                topic_id: 0,
+                partition_id: 0,
+                partition_op: metadata::stm::lifecycle::RETIRED_PARTITION_OP,
+            }]],
+            "only the partition no other node stores may complete through its fence"
+        );
+    }
+
+    /// A delete of a partition whose members lost their copies: each such
+    /// member retires its copy and reports it, and once too few members still
+    /// hold one to elect a primary, a member completes the target, since no
+    /// log can install its fence any more.
+    #[compio::test]
+    async fn given_a_deleted_partition_whose_members_lost_their_copies_when_reconciling_should_complete_once_too_few_can_elect()
+     {
+        const NODES: u8 = 3;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        let namespace = IggyNamespace::new(0, 0, 0);
+        mux.streams().seed_namespace_on(
+            namespace,
+            1,
+            0,
+            iggy_common::Durability::Persisted,
+            &[0, 1, 2],
+        );
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = Rc::new(ReconcilerCtx::new(
+            Rc::clone(&shard),
+            1,
+            Rc::new(config),
+            CLUSTER_ID,
+            0,
+            NODES,
+        ));
+        let stm = &shard.plane.metadata().mux_stm;
+        let revision = stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        shard.plane.partitions().fence(namespace, revision);
+        stm.update(build_prepare(
+            10,
+            Operation::DeleteTopic,
+            &DeleteTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+            },
+        ))
+        .expect("DeleteTopic apply succeeds");
+        let completion = |partition_op| LifecycleCompletion {
+            topic_id: 0,
+            partition_id: 0,
+            partition_op,
+        };
+        let in_flight = Rc::clone(&ctx.lifecycle_reports.batch_in_flight);
+        let release = |reply: Sender<bool>| async move {
+            reply.try_send(true).unwrap();
+            compio::time::timeout(Duration::from_secs(5), async {
+                while in_flight.get() {
+                    compio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        };
+
+        reconcile_retired_lifecycles(&ctx).await;
+        let (_, mut batches) = drain_lifecycle_reports(&lanes);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].0.completions(),
+            [completion(retired_member_op(0))],
+            "a member that lost its copy retires it, and one of three cannot finish"
+        );
+        assert_eq!(
+            crate::partition_helpers::partition_retirement_fence(
+                &ctx.config.get_system_path(),
+                namespace
+            )
+            .await
+            .unwrap(),
+            Some(revision),
+            "the copy is retired durably before it is reported"
+        );
+        let (request, reply) = batches.pop().unwrap();
+        stm.update(build_prepare(11, Operation::CompleteLifecycle, &request))
+            .expect("CompleteLifecycle apply succeeds");
+        release(reply).await;
+
+        reconcile_retired_lifecycles(&ctx).await;
+        let (_, batches) = drain_lifecycle_reports(&lanes);
+        assert!(
+            batches.is_empty(),
+            "two members still hold a copy and can elect the primary that fences it"
+        );
+
+        let other =
+            CompleteLifecycleRequest::new(10, 0, vec![completion(retired_member_op(1))]).unwrap();
+        stm.update(build_prepare(12, Operation::CompleteLifecycle, &other))
+            .expect("another member's retirement applies");
+        assert!(stm.streams().lifecycle_pending(10));
+        reconcile_retired_lifecycles(&ctx).await;
+        let (_, mut batches) = drain_lifecycle_reports(&lanes);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].0.completions(),
+            [completion(RETIRED_PARTITION_OP)],
+            "one member left cannot elect, so the target completes"
+        );
+        let (request, _) = batches.pop().unwrap();
+        stm.update(build_prepare(13, Operation::CompleteLifecycle, &request))
+            .expect("the final completion applies");
+        assert!(
+            !stm.streams().lifecycle_pending(10),
+            "the delete finishes and frees the topic"
+        );
+    }
+
+    /// Four members elect with three votes and commit with two, so two lost
+    /// copies leave survivors that could commit under a primary but cannot
+    /// elect one. The target completes then, or the delete would wait forever.
+    #[compio::test]
+    async fn given_four_members_when_two_lost_their_copies_should_complete_the_delete() {
+        const NODES: u8 = 4;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        let namespace = IggyNamespace::new(0, 0, 0);
+        mux.streams().seed_namespace_on(
+            namespace,
+            1,
+            0,
+            iggy_common::Durability::Persisted,
+            &[0, 1, 2, 3],
+        );
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = Rc::new(ReconcilerCtx::new(
+            Rc::clone(&shard),
+            1,
+            Rc::new(config),
+            CLUSTER_ID,
+            0,
+            NODES,
+        ));
+        let stm = &shard.plane.metadata().mux_stm;
+        stm.update(build_prepare(
+            10,
+            Operation::DeleteTopic,
+            &DeleteTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+            },
+        ))
+        .expect("DeleteTopic apply succeeds");
+        let completion = |partition_op| LifecycleCompletion {
+            topic_id: 0,
+            partition_id: 0,
+            partition_op,
+        };
+        // This node kept its copy; nodes 1 and 2 came back without theirs.
+        assert!(!shard.plane.partitions().is_tombstoned(&namespace));
+        for (op, node) in [(11, 1), (12, 2)] {
+            let retired =
+                CompleteLifecycleRequest::new(10, 0, vec![completion(retired_member_op(node))])
+                    .unwrap();
+            stm.update(build_prepare(op, Operation::CompleteLifecycle, &retired))
+                .expect("a member's retirement applies");
+        }
+
+        reconcile_retired_lifecycles(&ctx).await;
+        let (_, batches) = drain_lifecycle_reports(&lanes);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].0.completions(),
+            [completion(RETIRED_PARTITION_OP)],
+            "two copies left cannot elect a primary of four"
+        );
     }
 
     #[compio::test]

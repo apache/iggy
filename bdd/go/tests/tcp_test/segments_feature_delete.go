@@ -51,7 +51,7 @@ var _ = ginkgo.Describe("DELETE SEGMENTS:", func() {
 			client := createAuthorizedConnection()
 			err := client.DeleteSegments(
 				context.Background(),
-				randomU32Identifier(),
+				nonExistingStreamIdentifier(client),
 				randomU32Identifier(),
 				0,
 				1,

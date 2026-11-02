@@ -229,6 +229,7 @@ func TestCreateTopic_TypedOptionConstructorsReachTheBlock(t *testing.T) {
 			iggcon.MessagesRequiredToSaveOption(7),
 			iggcon.SizeOfMessagesRequiredToSaveOption(4096),
 			iggcon.PreallocateSegmentsOption(false),
+			iggcon.ReplicationFactorOption(3),
 		}},
 	}
 
@@ -261,6 +262,7 @@ func TestCreateTopic_TypedOptionConstructorsReachTheBlock(t *testing.T) {
 		{"messages_required_to_save", iggcon.Uint32, []byte{7, 0, 0, 0}},
 		{"size_of_messages_required_to_save", iggcon.Uint64, []byte{0, 16, 0, 0, 0, 0, 0, 0}},
 		{"preallocate_segments", iggcon.Bool, []byte{0}},
+		{"replication_factor", iggcon.Uint32, []byte{3, 0, 0, 0}},
 	}
 	if len(byKey) != len(want) {
 		t.Fatalf("options block carries %d keys, want %d: %v", len(byKey), len(want), byKey)
@@ -277,6 +279,47 @@ func TestCreateTopic_TypedOptionConstructorsReachTheBlock(t *testing.T) {
 		if !bytes.Equal(got.Value, expected.value) {
 			t.Errorf("key %q value = %v, want %v", expected.key, got.Value, expected.value)
 		}
+	}
+}
+
+func TestCreateTopic_ReplicationFactorFieldRidesTheBlockAsUint32(t *testing.T) {
+	streamId, err := iggcon.NewIdentifier(uint32(1))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	replicationFactor := uint32(2)
+	command := CreateTopic{
+		StreamId: streamId,
+		Name:     "topic",
+		Options:  iggcon.TopicOptions{ReplicationFactor: &replicationFactor},
+	}
+
+	serialized, err := command.MarshalBinary()
+	if err != nil {
+		t.Fatalf("failed to serialize CreateTopic: %v", err)
+	}
+
+	const streamIdSize = 2 + 4
+	optionsOffset := streamIdSize + 4 + 1 + len(command.Name)
+	options, err := iggcon.DeserializeHeaders(serialized[optionsOffset:])
+	if err != nil {
+		t.Fatalf("options block is not valid TLV: %v", err)
+	}
+	var found bool
+	for _, entry := range options {
+		if string(entry.Key.Value) != "replication_factor" {
+			continue
+		}
+		found = true
+		if entry.Value.Kind != iggcon.Uint32 {
+			t.Errorf("replication_factor kind = %d, want Uint32", entry.Value.Kind)
+		}
+		if !bytes.Equal(entry.Value.Value, []byte{2, 0, 0, 0}) {
+			t.Errorf("replication_factor value = %v, want [2 0 0 0]", entry.Value.Value)
+		}
+	}
+	if !found {
+		t.Errorf("replication_factor is missing from the options block: %v", options)
 	}
 }
 

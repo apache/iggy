@@ -72,6 +72,12 @@ const MAX_VIEW_PROBE_ATTEMPTS: u32 = 100;
 /// static-asserts it equal to `shard::REPAIR_CHUNK_MAX`.
 pub const DEFAULT_REPAIR_CHUNK_MAX: usize = 128;
 
+/// Maximum number of replicas supported by the VSR implementation.
+///
+/// Duplicated here so `core/configs` does not depend on `core/consensus`;
+/// `core/server` pins the values together at compile time.
+pub const MAX_CLUSTER_REPLICAS: usize = 32;
+
 /// `size_of::<StateChunkHeader>()`. Duplicated here for the same reason as
 /// [`DEFAULT_REPAIR_CHUNK_MAX`]; `core/server`'s bootstrap static-asserts it
 /// against the real header. Used to reject a `[message_bus] max_message_size`
@@ -170,6 +176,16 @@ fn default_repair_retry_interval() -> IggyDuration {
     SERVER_CONFIG.cluster.repair_retry_interval.parse().unwrap()
 }
 
+/// serde fallback for configs written before the field existed; the value
+/// itself lives in `core/server/config.toml` like every other default.
+fn default_replication_factor() -> ReplicationFactorDefault {
+    SERVER_CONFIG
+        .cluster
+        .default_replication_factor
+        .parse()
+        .unwrap()
+}
+
 fn default_repair_gap_debounce_interval() -> IggyDuration {
     SERVER_CONFIG
         .cluster
@@ -200,9 +216,9 @@ fn default_superblock_wedged_fatal_timeout() -> IggyDuration {
 pub struct ClusterConfig {
     pub enabled: bool,
     pub name: String,
-    /// Backup-side liveness window for a plane's primary. A replica that
-    /// sees no primary traffic for this long starts a view change
-    /// (`normal_heartbeat_timeout`). Raise it on oversubscribed hosts where
+    /// Liveness window for the primary and its replication quorum. Backups
+    /// vote after primary silence; a primary without heartbeat replies from
+    /// a quorum relinquishes leadership. Raise it on oversubscribed hosts where
     /// scheduling stalls fake primary death; sub-`MIN_CLUSTER_HEARTBEAT_TIMEOUT`
     /// values (including the `0` / `disabled` / `unlimited` sentinels, which
     /// all parse to zero) are rejected at boot. On Linux it is also the
@@ -321,6 +337,13 @@ pub struct ClusterConfig {
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
     pub superblock_wedged_fatal_timeout: IggyDuration,
+    /// Replication factor of a topic created without one. The metadata primary
+    /// resolves it at admission and the topic stores the result, so nodes
+    /// configured differently only differ in what a create admitted through
+    /// them gets.
+    #[serde(default = "default_replication_factor")]
+    #[config_env(leaf)]
+    pub default_replication_factor: ReplicationFactorDefault,
     /// Full roster of cluster members. Intended to be byte-identical across
     /// every node so operators ship one config. The running node's identity
     /// is supplied out-of-band via the `--replica-id` CLI flag, which
@@ -491,6 +514,11 @@ pub struct ClusterNodeConfig {
     /// `nodes.len()`. Validated by [`ClusterConfig::validate`].
     pub replica_id: u8,
     pub ports: TransportPorts,
+    /// Failure domain, such as a rack or an availability zone. Placement puts
+    /// a partition's copies in as many as it can. A node without one shares a
+    /// domain with no other node.
+    #[serde(default)]
+    pub rack: Option<String>,
 }
 
 /// One client-network-scoped advertised address: clients whose IP falls
@@ -806,6 +834,128 @@ impl fmt::Display for AdvertisedAddress {
     }
 }
 
+/// What a topic created without a replication factor gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationFactorDefault {
+    /// Every node, the layout from before per-topic replication factors.
+    AllNodes,
+    /// This many nodes, lowered to the node count when larger.
+    Nodes(u8),
+}
+
+impl ReplicationFactorDefault {
+    /// Upper bound of [`Self::Nodes`], the most members a partition can have.
+    pub const MAX: u8 = 32;
+    const ALL_NODES: &'static str = "all";
+
+    /// The configured number of nodes, `None` for every node.
+    #[must_use]
+    pub const fn factor(self) -> Option<u8> {
+        match self {
+            Self::AllNodes => None,
+            Self::Nodes(factor) => Some(factor),
+        }
+    }
+
+    fn from_number(value: u64) -> Result<Self, ReplicationFactorDefaultError> {
+        u8::try_from(value)
+            .ok()
+            .filter(|factor| (1..=Self::MAX).contains(factor))
+            .map(Self::Nodes)
+            .ok_or_else(|| ReplicationFactorDefaultError {
+                value: value.to_string(),
+            })
+    }
+}
+
+impl FromStr for ReplicationFactorDefault {
+    type Err = ReplicationFactorDefaultError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.eq_ignore_ascii_case(Self::ALL_NODES) {
+            return Ok(Self::AllNodes);
+        }
+        value
+            .parse::<u64>()
+            .map_err(|_| ReplicationFactorDefaultError {
+                value: value.to_owned(),
+            })
+            .and_then(Self::from_number)
+    }
+}
+
+impl Serialize for ReplicationFactorDefault {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// Accepts a TOML integer as well as a string, because the environment
+/// provider turns a numeric `IGGY_CLUSTER_DEFAULT_REPLICATION_FACTOR` into one.
+impl<'de> Deserialize<'de> for ReplicationFactorDefault {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ReplicationFactorDefaultVisitor)
+    }
+}
+
+struct ReplicationFactorDefaultVisitor;
+
+impl serde::de::Visitor<'_> for ReplicationFactorDefaultVisitor {
+    type Value = ReplicationFactorDefault;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "\"{}\" or an integer from 1 to {}",
+            ReplicationFactorDefault::ALL_NODES,
+            ReplicationFactorDefault::MAX
+        )
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        value.parse().map_err(E::custom)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+        ReplicationFactorDefault::from_number(value).map_err(E::custom)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+        u64::try_from(value)
+            .map_err(|_| E::custom(format!("invalid default_replication_factor {value}")))
+            .and_then(|value| self.visit_u64(value))
+    }
+}
+
+impl fmt::Display for ReplicationFactorDefault {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AllNodes => formatter.write_str(Self::ALL_NODES),
+            Self::Nodes(factor) => write!(formatter, "{factor}"),
+        }
+    }
+}
+
+/// A `default_replication_factor` that is neither `all` nor 1 to 32.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationFactorDefaultError {
+    value: String,
+}
+
+impl fmt::Display for ReplicationFactorDefaultError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid default_replication_factor {:?}: expected \"{}\" or 1 to {}",
+            self.value,
+            ReplicationFactorDefault::ALL_NODES,
+            ReplicationFactorDefault::MAX
+        )
+    }
+}
+
+impl std::error::Error for ReplicationFactorDefaultError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdvertisedAddressError {
     Empty,
@@ -1083,6 +1233,14 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
+        if self.nodes.len() > MAX_CLUSTER_REPLICAS {
+            eprintln!(
+                "Invalid cluster configuration: cluster.nodes contains {} replicas, but the VSR implementation supports at most {MAX_CLUSTER_REPLICAS}",
+                self.nodes.len()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         // VSR needs every replica to have a stable, unique id strictly
         // less than the total replica count. Duplicate ids would split the
         // cluster into two replicas claiming the same slot; out-of-range
@@ -1092,6 +1250,28 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             eprintln!("Invalid cluster configuration: more than 255 replicas is unsupported");
             ConfigurationError::InvalidConfigurationValue
         })?;
+
+        // Placement treats a node without a rack as alone in one, so a single
+        // unlabeled node would take a copy of nearly every partition. Kafka
+        // likewise refuses a rack-aware assignment when only some brokers set
+        // `broker.rack`.
+        let racked = self.nodes.iter().filter(|node| node.rack.is_some()).count();
+        if racked != 0 && racked != self.nodes.len() {
+            eprintln!(
+                "Invalid cluster configuration: {racked} of {} nodes set 'rack'; set it on every \
+                 node or on none",
+                self.nodes.len()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.nodes.iter().any(|node| {
+            node.rack
+                .as_deref()
+                .is_some_and(|rack| rack.trim().is_empty())
+        }) {
+            eprintln!("Invalid cluster configuration: a node's 'rack' cannot be empty");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
 
         let mut seen_ids = std::collections::HashSet::new();
         let mut seen_names = std::collections::HashSet::new();
@@ -1536,6 +1716,7 @@ mod tests {
             request_start_view_retransmit_interval: default_request_start_view_retransmit_interval(
             ),
             view_probe_attempts_max: default_view_probe_attempts_max(),
+            default_replication_factor: default_replication_factor(),
             repair_retry_interval: default_repair_retry_interval(),
             repair_gap_debounce_interval: default_repair_gap_debounce_interval(),
             repair_chunk_max: default_repair_chunk_max(),
@@ -1745,6 +1926,7 @@ mod advertised_for_tests {
 
     fn node_with_selectors(selectors: Vec<AdvertisedAddressSelector>) -> ClusterNodeConfig {
         ClusterNodeConfig {
+            rack: None,
             name: "node-0".to_owned(),
             ip: "10.0.1.5".to_owned(),
             advertised_address: Some("203.0.113.10".to_owned()),
@@ -1935,6 +2117,7 @@ mod cluster_validate_tests {
 
     fn node(name: &str, id: u8) -> ClusterNodeConfig {
         ClusterNodeConfig {
+            rack: None,
             name: name.to_string(),
             ip: "127.0.0.1".to_string(),
             advertised_address: None,
@@ -1963,6 +2146,7 @@ mod cluster_validate_tests {
             request_start_view_retransmit_interval: default_request_start_view_retransmit_interval(
             ),
             view_probe_attempts_max: default_view_probe_attempts_max(),
+            default_replication_factor: default_replication_factor(),
             repair_retry_interval: default_repair_retry_interval(),
             repair_gap_debounce_interval: default_repair_gap_debounce_interval(),
             repair_chunk_max: default_repair_chunk_max(),
@@ -2097,6 +2281,50 @@ mod cluster_validate_tests {
     }
 
     #[test]
+    fn given_default_replication_factor_text_when_parsing_should_accept_all_or_one_to_thirty_two() {
+        assert_eq!("all".parse(), Ok(ReplicationFactorDefault::AllNodes));
+        assert_eq!("ALL".parse(), Ok(ReplicationFactorDefault::AllNodes));
+        assert_eq!("3".parse(), Ok(ReplicationFactorDefault::Nodes(3)));
+        assert_eq!("32".parse(), Ok(ReplicationFactorDefault::Nodes(32)));
+        for invalid in ["0", "33", "-1", "three", ""] {
+            assert!(
+                invalid.parse::<ReplicationFactorDefault>().is_err(),
+                "{invalid:?}"
+            );
+        }
+        for value in [
+            ReplicationFactorDefault::AllNodes,
+            ReplicationFactorDefault::Nodes(7),
+        ] {
+            assert_eq!(value.to_string().parse(), Ok(value));
+        }
+        assert_eq!(
+            ClusterConfig::default().default_replication_factor,
+            ReplicationFactorDefault::AllNodes,
+            "the shipped default keeps every partition on every node"
+        );
+    }
+
+    #[test]
+    fn given_default_replication_factor_as_integer_or_string_when_deserializing_should_accept_both()
+    {
+        let parse = |text: &str| serde_json::from_str::<ReplicationFactorDefault>(text);
+        assert_eq!(parse("2").unwrap(), ReplicationFactorDefault::Nodes(2));
+        assert_eq!(parse("\"2\"").unwrap(), ReplicationFactorDefault::Nodes(2));
+        assert_eq!(
+            parse("\"all\"").unwrap(),
+            ReplicationFactorDefault::AllNodes
+        );
+        for invalid in ["0", "-1", "33", "\"none\""] {
+            assert!(parse(invalid).is_err(), "{invalid}");
+        }
+        assert_eq!(
+            serde_json::to_string(&ReplicationFactorDefault::Nodes(2)).unwrap(),
+            "\"2\""
+        );
+    }
+
+    #[test]
     fn validate_rejects_zero_view_probe_attempts_max() {
         let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
         c.view_probe_attempts_max = 0;
@@ -2172,6 +2400,30 @@ mod cluster_validate_tests {
     }
 
     #[test]
+    fn validate_requires_a_rack_on_every_node_or_on_none() {
+        let racked = |name: &str, id: u8, rack: Option<&str>| ClusterNodeConfig {
+            rack: rack.map(str::to_owned),
+            ..node(name, id)
+        };
+        assert!(
+            cfg(vec![racked("n1", 0, Some("a")), racked("n2", 1, None)])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            cfg(vec![racked("n1", 0, Some("a")), racked("n2", 1, Some(" "))])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            cfg(vec![racked("n1", 0, Some("a")), racked("n2", 1, Some("b"))])
+                .validate()
+                .is_ok()
+        );
+        assert!(cfg(vec![node("n1", 0), node("n2", 1)]).validate().is_ok());
+    }
+
+    #[test]
     fn validate_rejects_duplicate_names() {
         let c = cfg(vec![node("n1", 0), node("n1", 1)]);
         assert!(c.validate().is_err());
@@ -2227,6 +2479,18 @@ mod cluster_validate_tests {
     fn validate_accepts_unique_contiguous_replica_ids() {
         let c = cfg(vec![node("n1", 0), node("n2", 1), node("n3", 2)]);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_the_vsr_replica_limit() {
+        let nodes = (0..32).map(|id| node(&format!("n{id}"), id)).collect();
+        assert!(cfg(nodes).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_rosters_above_the_vsr_replica_limit() {
+        let nodes = (0..33).map(|id| node(&format!("n{id}"), id)).collect();
+        assert!(cfg(nodes).validate().is_err());
     }
 
     #[test]

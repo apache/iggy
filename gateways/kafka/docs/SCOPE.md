@@ -67,7 +67,7 @@ it knows the server supports flexible encoding.
 | 14 | SyncGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Relays the leader's assignment blobs; flexible encoding at v4+ |
 | 15 | DescribeGroups | 0 | 6 | 0, 1, 2, 3, 4, 5, 6 | Members, assignment and state of groups on this coordinator. A group that is not there but holds offsets in Iggy is `Empty`. Any other missing group is `Dead`, and v6 also returns `GROUP_ID_NOT_FOUND` (69). Flexible encoding at v5+ |
 | 16 | ListGroups | 0 | 5 | 0, 1, 2, 3, 4, 5 | Groups on this coordinator, plus the groups that hold offsets in Iggy as `Empty` (see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)). v4+ state filter and v5 type filter. Flexible encoding at v3+ |
-| 22 | InitProducerId | 0 | 5 | 0, 1, 2, 3, 4, 5 | Allocate a producer id (epoch 0); a `transactional_id` gets `UNSUPPORTED_VERSION` (35); flexible encoding at v2+ |
+| 22 | InitProducerId | 0 | 5 | 0, 1, 2, 3, 4, 5 | A producer id at epoch 0, from Iggy with a bridge. A `transactional_id` gets `UNSUPPORTED_VERSION` (35). Flexible encoding at v2+ |
 | 32 | DescribeConfigs | 1 | 4 | 1, 2, 3, 4 | Topic resources only. Returns `retention.ms` and leaves out `cleanup.policy`. Flexible encoding at v4. See [`CONFIGS.md`](CONFIGS.md) |
 | 33 | AlterConfigs | 0 | 2 | 0, 1, 2 | Persists `retention.ms` only. Flexible encoding at v2. See [`CONFIGS.md`](CONFIGS.md) |
 | 42 | DeleteGroups | 0 | 2 | 0, 1, 2 | With a bridge: deletes a group without members, with its offsets in Iggy. While it has members: `NON_EMPTY_GROUP` (68). When it does not exist: `GROUP_ID_NOT_FOUND` (69). Flexible encoding at v2. v3 adds an error message that `kafka-protocol` cannot encode yet |
@@ -443,9 +443,11 @@ below it are still open for the issues that build on top of it.
     and the Java client use - fail identically and permanently once the cluster's total partition
     count crosses the trip point, since that size is the catalog's own, not anything the
     requesting client chose or can shrink.
-- [x] Several gateways as brokers (`IGGY_KAFKA_BROKERS`): Metadata lists every gateway, and
-      each one leads every partition it reports. Leaders spread over the gateways, one
-      controller, and a coordinator per group are later work (#4515).
+- [x] Several gateways as brokers (`IGGY_KAFKA_BROKERS`): Metadata lists every live gateway.
+      With the coordinator log, a hash of each partition names its leader, the owner of log
+      partition 0 is the controller, and each group has one coordinator that another gateway
+      takes over when it stops (#4515, `docs/CONSUMER_GROUPS.md`). Without it, each gateway
+      leads every partition it reports.
 - [ ] A raw/non-conformant client's extra trailing byte on some Metadata request shapes seen
       against real `kcat`/`librdkafka` traffic in earlier testing on a since-restructured branch -
       not reproduced or root-caused against the current `kafka_protocol`-based decode path in this
@@ -527,7 +529,8 @@ InitProducerId and idempotent producers
 
 - [x] InitProducerId (22) allocates a producer id so a stock idempotent producer starts; a
       transactional request is refused
-- [ ] Deduplicate an idempotent producer's retries. Delivery stays at-least-once until then
+- [x] Write each batch of an idempotent producer once, with `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`
+      ([#4513](https://github.com/apache/iggy/issues/4513)). Iggy partitions keep the producer state
 
 Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
 [`AUTHENTICATION.md`](AUTHENTICATION.md).

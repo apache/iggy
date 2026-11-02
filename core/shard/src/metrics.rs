@@ -47,6 +47,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use consensus::ReplicationStats;
 use iggy_binary_protocol::{COMMAND_TABLE, Command, command_index};
 use iggy_common::ConsumerKind;
 use message_bus::{ReplicaLinkMetrics, ReplicaReadMetrics};
@@ -363,6 +364,10 @@ pub struct ShardMetrics {
     partition_transfer_refusals_total: Counter,
     partition_applied_divergences_total: Counter,
     partitions_untrusted_log: Gauge,
+    partitions_under_replicated: Gauge,
+    partitions_below_write_quorum: Gauge,
+    partitions_owing_retirement: Gauge,
+    retirement_debts_paid_total: Counter,
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
     partition_frames_incarnation_mismatch_total: Family<FrameCommandLabel, Counter>,
@@ -376,6 +381,8 @@ pub struct ShardMetrics {
     replica_socket_reads_total: Counter,
     replica_inbound_frames_total: Counter,
     replica_outbound_drops_total: Counter,
+    replication_live_refusals_total: Counter,
+    replication_replayed_prepares_total: Counter,
     replica_bundle_teardowns_total: Counter,
     replica_preamble_refusals_total: Counter,
     replica_handshake_failures_total: Counter,
@@ -453,6 +460,10 @@ impl ShardMetrics {
             partition_transfer_refusals_total: Counter::default(),
             partition_applied_divergences_total: Counter::default(),
             partitions_untrusted_log: Gauge::default(),
+            partitions_under_replicated: Gauge::default(),
+            partitions_below_write_quorum: Gauge::default(),
+            partitions_owing_retirement: Gauge::default(),
+            retirement_debts_paid_total: Counter::default(),
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
             partition_frames_incarnation_mismatch_total: Family::default(),
@@ -466,6 +477,8 @@ impl ShardMetrics {
             replica_socket_reads_total: Counter::default(),
             replica_inbound_frames_total: Counter::default(),
             replica_outbound_drops_total: Counter::default(),
+            replication_live_refusals_total: Counter::default(),
+            replication_replayed_prepares_total: Counter::default(),
             replica_bundle_teardowns_total: Counter::default(),
             replica_preamble_refusals_total: Counter::default(),
             replica_handshake_failures_total: Counter::default(),
@@ -542,6 +555,31 @@ impl ShardMetrics {
             .inc_by(stats.outbound_drops);
         self.replica_bundles_up
             .set(i64::try_from(stats.bundles_up).unwrap_or(i64::MAX));
+    }
+
+    /// Fold one sweep's replication flow events in, drained by
+    /// `VsrConsensus::take_replication_stats`. Both stay at zero while every
+    /// backup keeps up, so a nonzero value on a run with no fault means that
+    /// flow control held prepares back.
+    pub fn record_replication(&self, stats: ReplicationStats) {
+        self.replication_live_refusals_total
+            .inc_by(stats.live_refusals);
+        self.replication_replayed_prepares_total
+            .inc_by(stats.replayed);
+    }
+
+    /// Snapshot of `replication_live_refusals_total`. Test/simulator accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn replication_live_refusals_value(&self) -> u64 {
+        self.replication_live_refusals_total.get()
+    }
+
+    /// Snapshot of `replication_replayed_prepares_total`. Test/simulator accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn replication_replayed_prepares_value(&self) -> u64 {
+        self.replication_replayed_prepares_total.get()
     }
 
     fn register_persistence(&self, registry: &mut Registry) {
@@ -813,6 +851,42 @@ impl ShardMetrics {
     #[must_use]
     pub fn partitions_untrusted_log_value(&self) -> i64 {
         self.partitions_untrusted_log.get()
+    }
+
+    /// Republished by every partition sweep, over the partitions this shard
+    /// leads: those with a member out of sync, and those with too few members
+    /// in sync to commit. The metadata primary's first shard adds the
+    /// partitions whose primary is down among too many members to commit.
+    pub fn set_partition_replication(&self, under_replicated: usize, below_write_quorum: usize) {
+        self.partitions_under_replicated
+            .set(i64::try_from(under_replicated).unwrap_or(i64::MAX));
+        self.partitions_below_write_quorum
+            .set(i64::try_from(below_write_quorum).unwrap_or(i64::MAX));
+    }
+
+    /// Republished with the replication gauges: partitions on this shard that
+    /// refuse sessions until a retirement debt payment commits.
+    pub fn set_partitions_owing_retirement(&self, owing: usize) {
+        self.partitions_owing_retirement
+            .set(i64::try_from(owing).unwrap_or(i64::MAX));
+    }
+
+    pub fn record_retirement_debt_paid(&self) {
+        self.retirement_debts_paid_total.inc();
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partitions_under_replicated_value(&self) -> i64 {
+        self.partitions_under_replicated.get()
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partitions_below_write_quorum_value(&self) -> i64 {
+        self.partitions_below_write_quorum.get()
     }
 
     /// Bumped when a parked partition frame is answered instead of served
@@ -1169,6 +1243,30 @@ impl ShardMetrics {
             self.partitions_untrusted_log.clone(),
         );
         registry.register(
+            "partitions_under_replicated",
+            "partitions this shard leads with a member it cannot reach or that has trailed \
+             the commit point for longer than the lag window",
+            self.partitions_under_replicated.clone(),
+        );
+        registry.register(
+            "partitions_below_write_quorum",
+            "partitions this shard leads with too few members in sync to commit a write; \
+             on the metadata primary's first shard also partitions with too few members up \
+             whose primary is down",
+            self.partitions_below_write_quorum.clone(),
+        );
+        registry.register(
+            "partitions_owing_retirement",
+            "partitions on this shard refusing sessions until they retire sessions that \
+             finalized while the partition lacked a quorum of its members",
+            self.partitions_owing_retirement.clone(),
+        );
+        registry.register(
+            "retirement_debts_paid",
+            "retirement debts this node paid as a partition primary",
+            self.retirement_debts_paid_total.clone(),
+        );
+        registry.register(
             "partition_frames_rejected_stale",
             "parked frames rejected for a dead incarnation; non-zero is a caught anomaly",
             self.partition_frames_rejected_stale_total.clone(),
@@ -1208,6 +1306,16 @@ impl ShardMetrics {
             "replica_outbound_drops",
             "replica frames dropped because a peer send queue was full",
             self.replica_outbound_drops_total.clone(),
+        );
+        registry.register(
+            "replication_live_refusals",
+            "live prepares that a backup's replication window, replay cursor or busy state refused",
+            self.replication_live_refusals_total.clone(),
+        );
+        registry.register(
+            "replication_replayed_prepares",
+            "prepares resent to a backup by ordered replay",
+            self.replication_replayed_prepares_total.clone(),
         );
         registry.register(
             "replica_bundle_teardowns",

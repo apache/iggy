@@ -22,7 +22,7 @@ use iggy::prelude::{
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDelta;
+use pyo3::types::{PyDelta, PyList};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
 
 use crate::duration::{iggy_duration_to_py_delta, py_delta_to_iggy_duration};
@@ -430,5 +430,59 @@ impl Partition {
     #[getter]
     pub fn context(&self) -> PartitionContext {
         self.inner.context.into()
+    }
+
+    /// Node ids that store the partition, in member order. While one is down, a write
+    /// still commits if a quorum of the others is in sync.
+    #[gen_stub(override_return_type(type_repr = "builtins.list[builtins.int]"))]
+    #[getter]
+    pub fn members<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyList>> {
+        node_id_list(py, &self.inner.members)
+    }
+
+    /// Node ids among `members` that the partition's primary last reported in sync and
+    /// that are up. Empty until the primary first reports, and while no member that is
+    /// up can lead it.
+    #[gen_stub(override_return_type(type_repr = "builtins.list[builtins.int]"))]
+    #[getter]
+    pub fn in_sync_members<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyList>> {
+        node_id_list(py, &self.inner.in_sync_members)
+    }
+}
+
+/// A `Vec<u8>` return would convert to `bytes`, so node ids are built as a list of `int`.
+fn node_id_list<'a>(py: Python<'a>, node_ids: &[u8]) -> PyResult<Bound<'a, PyList>> {
+    PyList::new(py, node_ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy::prelude::{IggyTimestamp, PartitionContext as RustPartitionContext};
+
+    #[test]
+    fn given_partition_with_members_when_converting_should_expose_node_ids_as_int_lists() {
+        Python::initialize();
+        let partition = Partition::from(RustPartition {
+            id: 1,
+            created_at: IggyTimestamp::from(11),
+            segments_count: 1,
+            current_offset: 2,
+            size: IggyByteSize::from(13),
+            messages_count: 3,
+            context: RustPartitionContext::default(),
+            members: vec![1, 3, 4],
+            in_sync_members: vec![1, 4],
+        });
+
+        Python::attach(|py| {
+            let members = partition.members(py).expect("build members list");
+            let in_sync_members = partition
+                .in_sync_members(py)
+                .expect("build in-sync members list");
+
+            assert_eq!(members.extract::<Vec<u8>>().unwrap(), [1, 3, 4]);
+            assert_eq!(in_sync_members.extract::<Vec<u8>>().unwrap(), [1, 4]);
+        });
     }
 }

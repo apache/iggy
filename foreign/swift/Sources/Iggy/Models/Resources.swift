@@ -233,10 +233,15 @@ public struct Partition: Sendable, Hashable {
     public var currentOffset: UInt64
     public var sizeBytes: UInt64
     public var messagesCount: UInt64
+    /// Node ids that store the partition, in member order.
+    public var members: [UInt8]
+    /// The members the partition's primary last reported in sync and that are
+    /// up. Empty until the primary first reports.
+    public var inSyncMembers: [UInt8]
 
     public init(
         id: UInt32, createdAt: IggyTimestamp, segmentsCount: UInt32, currentOffset: UInt64, sizeBytes: UInt64, messagesCount: UInt64,
-        context: PartitionContext = .empty
+        context: PartitionContext = .empty, members: [UInt8] = [], inSyncMembers: [UInt8] = []
     ) {
         self.context = context
         self.id = id
@@ -245,6 +250,8 @@ public struct Partition: Sendable, Hashable {
         self.currentOffset = currentOffset
         self.sizeBytes = sizeBytes
         self.messagesCount = messagesCount
+        self.members = members
+        self.inSyncMembers = inSyncMembers
     }
 }
 

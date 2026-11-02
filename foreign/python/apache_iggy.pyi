@@ -2424,7 +2424,9 @@ class IggyConsumer:
         `CommitAfter.Delivery`, and when the next iteration starts with `CommitAfter.Processing`.
         After another client deleted and created a partition again, one iteration raises
         `ReadError` with `HistoryUnavailable` (87), and the partition reads nothing until
-        `seek()` picks a start in its new history.
+        `seek()` picks a start in its new history. After six refusals in a row that a retry does
+        not change, such as `Unauthorized` (41), one iteration raises a `ReadError` whose
+        `is_lasting_refusal` is true, and the partition reads nothing until `seek()`.
         A cancelled iteration leaves its message for the next one. Iterating in a
         `consume_messages()` callback of this consumer raises `RuntimeError`.
         """
@@ -2446,7 +2448,8 @@ class IggyConsumer:
         that raises is logged and the run goes on.
         A failed read is logged, and the consumer retries by itself. The run raises `ReadError`
         if the client cannot go on without the caller, or if a read stops its partition until
-        `seek()`: `HistoryUnavailable` (87), or an unknown outcome under
+        `seek()`: `HistoryUnavailable` (87), six refusals in a row that a retry does not change,
+        such as `Unauthorized` (41) or a missing partition, or an unknown outcome under
         `CommitPolicy.OnRead()`. For a stopped partition, `ReadError.partition_id` names it.
         To resume it, abandon the operation of an unknown outcome, seek the partition and consume
         again.
@@ -3693,6 +3696,10 @@ class OptionKey:
     r"""
     Topic segment preallocation, fixed at creation.
     """
+    ReplicationFactor: typing.ClassVar[OptionKey]
+    r"""
+    Topic replication factor, fixed at creation.
+    """
     EncryptionKey: typing.ClassVar[OptionKey]
     r"""
     Stream encryption key, write-only and fixed at creation.
@@ -3810,6 +3817,19 @@ class Partition:
         r"""
         The partition incarnation and the metadata operation the details were read at.
         The owner generation is `0` because the details belong to no consumer group.
+        """
+    @property
+    def members(self) -> builtins.list[builtins.int]:
+        r"""
+        Node ids that store the partition, in member order. While one is down, a write
+        still commits if a quorum of the others is in sync.
+        """
+    @property
+    def in_sync_members(self) -> builtins.list[builtins.int]:
+        r"""
+        Node ids among `members` that the partition's primary last reported in sync and
+        that are up. Empty until the primary first reports, and while no member that is
+        up can lead it.
         """
 
 @typing.final
@@ -4424,6 +4444,12 @@ class ReadError(IggyError):
         """
     @property
     def offset(self) -> builtins.int | None: ...
+    @property
+    def is_lasting_refusal(self) -> builtins.bool:
+        r"""
+        Whether the reader stopped the partition after six refusals in a row that a retry does
+        not change, such as `Unauthorized` (41). A `seek()` of the partition reads it again.
+        """
     @property
     def error(self) -> IggyError:
         r"""
@@ -5321,6 +5347,7 @@ class TopicOptions:
         messages_required_to_save: builtins.int | None = None,
         size_of_messages_required_to_save: builtins.int | None = None,
         preallocate_segments: builtins.bool | None = None,
+        replication_factor: builtins.int | None = None,
         raw: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> TopicOptions:
         r"""
@@ -5350,6 +5377,14 @@ class TopicOptions:
             size_of_messages_required_to_save: Byte flush threshold as
                 `int | None`.
             preallocate_segments: Reserve segment bytes on open as `bool | None`.
+            replication_factor: Nodes that store each partition as
+                `int | None`, 1 to 32 and at most the cluster's node count.
+                `None` applies the server's `[cluster] default_replication_factor`,
+                every node unless an operator set a number. A write commits on
+                a quorum of these nodes, so 2 keeps two copies but stops
+                accepting writes while either node is down. The server rejects
+                an out-of-range value with an `OptionError` of kind
+                `invalid_replication_factor`.
             raw: Additional option keys as `dict[str, str]`, sent as string
                 values so a key newer than this build can be set. A typed field
                 wins on collision.

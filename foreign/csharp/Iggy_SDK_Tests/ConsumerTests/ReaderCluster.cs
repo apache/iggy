@@ -124,6 +124,9 @@ internal sealed class ReaderCluster : IDisposable
 
     internal ConcurrentBag<uint> HistoryRefused { get; } = [];
 
+    /// <summary>Partitions whose fetch section is refused as unauthorized.</summary>
+    internal ConcurrentBag<uint> Unauthorized { get; } = [];
+
     internal ConcurrentDictionary<uint, ulong> Stored { get; } = new();
 
     internal ConcurrentQueue<ReceivedFetch> Fetches { get; } = new();
@@ -286,6 +289,13 @@ internal sealed class ReaderCluster : IDisposable
             if (HistoryRefused.Contains(partition))
             {
                 sections.Add(EmptySection(partition, 0, default, VsrError.HISTORY_UNAVAILABLE));
+                served = true;
+                continue;
+            }
+
+            if (Unauthorized.Contains(partition))
+            {
+                sections.Add(EmptySection(partition, 0, default, VsrError.UNAUTHORIZED));
                 served = true;
                 continue;
             }

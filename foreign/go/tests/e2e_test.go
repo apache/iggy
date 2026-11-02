@@ -528,13 +528,14 @@ func TestE2E_TypedTopicOptionsMatchTheCatalog(t *testing.T) {
 
 	// Values inside the bounds the catalog reports: a 512-byte multiple segment
 	// size at the floor, a non-zero message threshold, preallocation off so
-	// nothing is reserved on disk.
+	// nothing is reserved on disk, and one replica, which fits any cluster.
 	typed := []iggcon.HeaderEntry{
 		iggcon.SegmentSizeOption(1024 * 1024),
 		iggcon.DurabilityOption(iggcon.DurabilityPersisted),
 		iggcon.MessagesRequiredToSaveOption(7),
 		iggcon.SizeOfMessagesRequiredToSaveOption(4096),
 		iggcon.PreallocateSegmentsOption(false),
+		iggcon.ReplicationFactorOption(1),
 	}
 
 	specs, err := connected.DescribeOptions(ctx, iggcon.OptionsScopeTopic)
@@ -582,6 +583,12 @@ func TestE2E_TypedTopicOptionsMatchTheCatalog(t *testing.T) {
 		Raw: []iggcon.HeaderEntry{iggcon.MessagesRequiredToSaveOption(0)},
 	})
 	require.Error(t, err)
+
+	// A partition needs at least one replica.
+	_, err = connected.CreateTopic(ctx, streamId, name+"-zero-replicas", &iggcon.TopicOptions{
+		Raw: []iggcon.HeaderEntry{iggcon.ReplicationFactorOption(0)},
+	})
+	require.ErrorIs(t, err, ierror.ErrInvalidReplicationFactor)
 
 	// A segment size off the 512-byte grid is refused, but zero is not: it
 	// leaves the key derived.

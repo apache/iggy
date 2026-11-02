@@ -91,6 +91,18 @@ jobs:
         with:
           download-deps: "false"
 
+      - name: Setup Swift for examples
+        if: matrix.task == 'examples-swift'
+        uses: ./.github/actions/utils/setup-swift
+        with:
+          cache-key: "examples"
+          package-path: "examples/swift/getting-started"
+
+      # Built before the server starts, so each example run only executes.
+      - name: Build Swift examples
+        if: matrix.task == 'examples-swift'
+        run: swift build --package-path examples/swift/getting-started -Xswiftc -warnings-as-errors
+
       - name: Test Go examples
         if: matrix.task == 'examples-go'
         working-directory: examples/go
@@ -177,6 +189,10 @@ jobs:
       - name: Run Java examples
         if: matrix.task == 'examples-java'
         run: ./scripts/run-examples-from-readme.sh --language java
+
+      - name: Run Swift examples
+        if: matrix.task == 'examples-swift'
+        run: ./scripts/run-examples-from-readme.sh --language swift
 
       - name: Upload reports
         if: always()

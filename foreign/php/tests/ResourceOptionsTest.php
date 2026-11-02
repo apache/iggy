@@ -23,6 +23,7 @@ use Iggy\Durability;
 use Iggy\Exception\IggyException;
 use Iggy\OptionSpec;
 use Iggy\OptionsScope;
+use Iggy\Partition;
 use Iggy\PollingStrategy;
 use Iggy\PollOptions;
 use Iggy\SendMessage;
@@ -54,6 +55,12 @@ final class ResourceOptionsTest extends TestCase
     private const NEVER = '18446744073709551615';
     // Both durabilities are always sent, so a topic created without options stores them as explicit.
     private const DURABILITY_DEFAULTS = ['consumer_offset_durability' => 'replicated', 'durability' => 'replicated'];
+    // The e2e lanes run a single-node server.
+    private const SERVER_NODES = 1;
+    private const INVALID_REPLICATION_FACTOR = 2018;
+    // A partition's primary reports who is in sync once it runs, so a read right after the
+    // create may list nobody.
+    private const IN_SYNC_WAIT_SECONDS = 15.0;
     private const STREAM_DERIVED_KEYS = ['encryption_kek_fingerprint', 'encryption_key_fingerprint', 'encryption_key_source'];
     // Create and update arguments named after the unit they take rather than the option key.
     private const PARAMETER_NAMES = ['message_expiry' => 'message_expiry_micros'];
@@ -404,10 +411,13 @@ final class ResourceOptionsTest extends TestCase
         assert_same($explicit, self::sorted($defaults->options));
         $expected = [];
         foreach (self::catalogRows('topic') as $key => $row) {
-            if ($row['storage'] === 'map' && !array_key_exists($key, $explicit)) {
+            if ($row['storage'] === 'map' && $row['default'] !== null && !array_key_exists($key, $explicit)) {
                 $expected[$key] = self::phpScalar($row['default'], $row['kind']);
             }
         }
+        // The catalog has no replication factor default: the server's
+        // default_replication_factor applies, which is every node unless configured.
+        $expected['replication_factor'] = self::SERVER_NODES;
         ksort($expected);
         $derived = $defaults->derived_options;
         ksort($derived);
@@ -419,6 +429,59 @@ final class ResourceOptionsTest extends TestCase
             self::sorted([...self::DURABILITY_DEFAULTS, 'max_topic_size' => self::NEVER, 'message_expiry' => self::NEVER]),
             self::sorted($unbounded->options),
         );
+    }
+
+    #[DataProvider('transports')]
+    #[TestDox('A topic created with a replication factor reads it back and lists node 0 for every partition on $transport')]
+    public function testGivenReplicationFactorWhenCreatingShouldListMembersOfEveryPartition(string $transport): void
+    {
+        $client = new_transport_client($transport);
+        $stream = $this->createStream($client, unique_name('replication-factor'));
+
+        $client->createTopic($stream->id, 'events', 2, null, null, null, null, replication_factor: 1);
+
+        $topic = $client->getTopic($stream->id, 'events');
+        assert_not_null($topic);
+        assert_same(1, $topic->options['replication_factor']);
+        assert_same([0, 1], array_map(static fn (Partition $partition): int => $partition->id, $topic->partitions));
+        foreach ($topic->partitions as $partition) {
+            assert_same([0], $partition->members, "partition {$partition->id}");
+        }
+        $inSync = read_until(
+            static fn (): array => array_map(
+                static fn (Partition $partition): array => $partition->in_sync_members,
+                $client->getTopic($stream->id, 'events')?->partitions ?? [],
+            ),
+            [[0], [0]],
+            self::IN_SYNC_WAIT_SECONDS,
+        );
+        assert_same([[0], [0]], $inSync);
+    }
+
+    #[DataProvider('transports')]
+    #[TestDox('A replication factor above the node count is refused with code 2018 and creates no topic on $transport')]
+    public function testGivenReplicationFactorAboveNodeCountWhenCreatingShouldRefuseWithItsCode(string $transport): void
+    {
+        $client = new_transport_client($transport);
+        $stream = $this->createStream($client, unique_name('replication-factor-refused'));
+
+        $error = assert_throws(
+            static fn () => $client->createTopic(
+                $stream->id,
+                'events',
+                1,
+                null,
+                null,
+                null,
+                null,
+                replication_factor: self::SERVER_NODES + 1,
+            ),
+            'Invalid replication factor',
+        );
+
+        Assert::assertInstanceOf(IggyException::class, $error, $error->getMessage());
+        assert_same(self::INVALID_REPLICATION_FACTOR, $error->getCode());
+        assert_null($client->getTopic($stream->id, 'events'));
     }
 
     #[TestDox('describeOptions reports every described catalog row with its kind and flags')]

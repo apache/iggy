@@ -268,7 +268,9 @@ impl IggyConsumer {
     /// `CommitAfter.Delivery`, and when the next iteration starts with `CommitAfter.Processing`.
     /// After another client deleted and created a partition again, one iteration raises
     /// `ReadError` with `HistoryUnavailable` (87), and the partition reads nothing until
-    /// `seek()` picks a start in its new history.
+    /// `seek()` picks a start in its new history. After six refusals in a row that a retry does
+    /// not change, such as `Unauthorized` (41), one iteration raises a `ReadError` whose
+    /// `is_lasting_refusal` is true, and the partition reads nothing until `seek()`.
     /// A cancelled iteration leaves its message for the next one. Iterating in a
     /// `consume_messages()` callback of this consumer raises `RuntimeError`.
     #[gen_stub(override_return_type(type_repr="collections.abc.AsyncIterator[ReceiveMessage]", imports=("collections.abc")))]
@@ -290,7 +292,8 @@ impl IggyConsumer {
     /// that raises is logged and the run goes on.
     /// A failed read is logged, and the consumer retries by itself. The run raises `ReadError`
     /// if the client cannot go on without the caller, or if a read stops its partition until
-    /// `seek()`: `HistoryUnavailable` (87), or an unknown outcome under
+    /// `seek()`: `HistoryUnavailable` (87), six refusals in a row that a retry does not change,
+    /// such as `Unauthorized` (41) or a missing partition, or an unknown outcome under
     /// `CommitPolicy.OnRead()`. For a stopped partition, `ReadError.partition_id` names it.
     /// To resume it, abandon the operation of an unknown outcome, seek the partition and consume
     /// again.

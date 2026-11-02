@@ -253,6 +253,11 @@ where
             return PartitionAdmission::Denied;
         }
     };
+    // No routing row is coming for a partition this node does not store.
+    if !crate::namespace::stores_partition(shard, IggyNamespace::from_raw(namespace)) {
+        send_deny_reply(shard, origin, &header, IggyError::NotPrimary.as_code()).await;
+        return PartitionAdmission::Denied;
+    }
     // Convergence wait: a CreateTopic commit returns to the client before the
     // per-shard reconcilers seed routing rows and materialise the partition
     // (next wake/periodic tick). An op arriving inside that window is not lost
@@ -923,6 +928,9 @@ where
         partition_id,
     )
     .map_err(ReadPolledMessagesError::Rejected)?;
+    if !crate::namespace::stores_partition(shard, namespace) {
+        return Err(ReadPolledMessagesError::Rejected(IggyError::NotPrimary));
+    }
     let read = PartitionRead::PollOnPrimary {
         consumer,
         args,
@@ -1732,6 +1740,7 @@ mod tests {
     use consensus::PartitionsHandle;
     #[cfg(target_os = "linux")]
     use consensus::Sequencer;
+    use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BATCH_PRODUCER_OFFSET};
     use iggy_binary_protocol::codes::PING_CODE;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
@@ -2209,11 +2218,13 @@ mod tests {
                             initial_view: 0,
                             partition_id: 0,
                             consensus_group_id: 1,
+                            members: Vec::new(),
                         },
                         CreatedPartitionAssignment {
                             initial_view: 0,
                             partition_id: 1,
                             consensus_group_id: 2,
+                            members: Vec::new(),
                         },
                     ],
                 }
@@ -2538,6 +2549,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         md.mux_stm
@@ -2703,6 +2715,24 @@ mod tests {
             ),
             IggyError::InvalidIdentifier,
         ));
+        for partitioning in [
+            WirePartitioning::Balanced,
+            WirePartitioning::MessagesKey(b"key".to_vec()),
+        ] {
+            let mut body = send_body(
+                WireIdentifier::Numeric(0),
+                WireIdentifier::Numeric(0),
+                partitioning,
+            );
+            let mut batch = [0; BATCH_HEADER_SIZE];
+            batch[BATCH_PRODUCER_OFFSET] = 1;
+            body.extend_from_slice(&batch);
+            cases.push((
+                Operation::SendMessages,
+                body,
+                IggyError::ProducerPartitionRequired,
+            ));
+        }
         cases.push((
             Operation::DeleteSegments,
             DeleteSegmentsRequest {
@@ -4081,6 +4111,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         md.mux_stm
@@ -4467,6 +4498,7 @@ mod tests {
                     initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 1,
+                    members: Vec::new(),
                 }],
             }
             .to_bytes(),

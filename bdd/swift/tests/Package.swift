@@ -18,17 +18,19 @@
 
 import PackageDescription
 
+// A small Gherkin interpreter that walks the shared scenarios in
+// bdd/scenarios and drives the SDK against a live server, as the other SDK
+// suites do with cucumber or godog. It depends on the SDK by path.
 let package = Package(
     name: "iggy-bdd",
     platforms: [.macOS(.v13)],
     dependencies: [
-        .package(path: "../../../foreign/swift")
+        .package(name: "apache-iggy", path: "../../../foreign/swift")
     ],
     targets: [
         .executableTarget(
             name: "iggy-bdd",
-            dependencies: [.product(name: "Iggy", package: "swift")],
-            path: "Sources"
+            dependencies: [.product(name: "Iggy", package: "apache-iggy")]
         )
     ],
     swiftLanguageModes: [.v6]

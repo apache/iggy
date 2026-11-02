@@ -77,6 +77,9 @@ mod tests {
         assert!(CommitErrorScope::Section.proves_nothing_stored(&IggyError::TransientNotAccepted));
     }
 
+    /// The server checks the grant again after the owner's read stored the offset, so a
+    /// permission lost during a committing read can come back as `Unauthorized` over a batch
+    /// that is already committed.
     #[test]
     fn given_lost_session_when_classifying_then_should_leave_outcome_unknown_in_both_scopes() {
         for error in [
