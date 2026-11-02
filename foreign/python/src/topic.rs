@@ -17,38 +17,18 @@
 
 use iggy::prelude::{
     IggyByteSize, IggyExpiry as RustIggyExpiry, MaxTopicSize as RustMaxTopicSize,
-    Partition as RustPartition, ResourceOptions, Topic as RustTopic,
-    TopicDetails as RustTopicDetails,
+    Partition as RustPartition, Topic as RustTopic, TopicDetails as RustTopicDetails,
 };
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDelta;
+use pyo3::types::{PyDelta, PyList};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
 
 use crate::duration::{iggy_duration_to_py_delta, py_delta_to_iggy_duration};
+use crate::options::options_by_provenance;
 use crate::receive_message::PartitionContext;
-use crate::user_headers::{UserHeaders, rust_user_headers_to_py};
-
-/// The entries of one provenance, as the dictionary message user headers come
-/// back as.
-///
-/// Options ride the user-headers codec, so they are handed back through the
-/// same `HeaderKey`/`HeaderValue` types rather than a second shape meaning the
-/// same thing: `to_scalar_dict()` works on the result exactly as it does on
-/// `ReceiveMessage.user_headers`.
-fn options_by_provenance<'a>(
-    py: Python<'a>,
-    options: &ResourceOptions,
-    explicit: bool,
-) -> PyResult<Bound<'a, UserHeaders>> {
-    let selected = options
-        .iter()
-        .filter(|(_, option)| option.explicit == explicit)
-        .map(|(key, option)| (key.clone(), option.value.clone()))
-        .collect();
-    rust_user_headers_to_py(py, selected)
-}
+use crate::user_headers::UserHeaders;
 
 /// The expiry of the messages in a topic.
 #[gen_stub_pyclass_complex_enum]
@@ -63,7 +43,7 @@ pub enum IggyExpiry {
     /// microsecond count a `u64` can hold (about 584,542 years): those two
     /// values are reserved on the wire for `ServerDefault` and `NeverExpire`
     /// respectively, so a `duration` at either boundary raises `ValueError`
-    /// when passed to `create_topic`/`update_topic`. A negative `timedelta`
+    /// when passed to `TopicOptions`/`update_topic`. A negative `timedelta`
     /// also raises `ValueError`.
     ExpireDuration { duration: Py<PyDelta> },
     /// Retain messages indefinitely; they never expire.
@@ -137,7 +117,7 @@ pub enum MaxTopicSize {
     /// an unsigned 64-bit integer: those two values are reserved on the wire
     /// for `ServerDefault` and `Unlimited` respectively, so a `Custom` size
     /// at either boundary raises `ValueError` when passed to
-    /// `create_topic`/`update_topic`.
+    /// `TopicOptions`/`update_topic`.
     Custom { bytes: u64 },
     /// Do not cap the topic size; it may grow without bound.
     Unlimited(),
@@ -194,9 +174,6 @@ impl From<&RustTopic> for Topic {
                 created_at: topic.created_at,
                 name: topic.name.clone(),
                 size: topic.size,
-                message_expiry: topic.message_expiry,
-                compression_algorithm: topic.compression_algorithm,
-                max_topic_size: topic.max_topic_size,
                 messages_count: topic.messages_count,
                 partitions_count: topic.partitions_count,
                 options: topic.options.clone(),
@@ -244,22 +221,27 @@ impl Topic {
         self.inner.size.as_bytes_u64()
     }
 
-    /// The expiry of the messages in the topic.
+    /// The expiry of the messages in the topic, the server default when the
+    /// topic does not set one.
     #[getter]
     pub fn message_expiry(&self) -> PyResult<IggyExpiry> {
-        self.inner.message_expiry.try_into()
+        self.inner.resolved_options().message_expiry.try_into()
     }
 
-    /// Compression algorithm for the topic.
+    /// Compression algorithm for the topic, fixed at creation.
     #[getter]
     pub fn compression_algorithm(&self) -> String {
-        self.inner.compression_algorithm.to_string()
+        self.inner
+            .resolved_options()
+            .compression_algorithm
+            .to_string()
     }
 
-    /// The maximum size of the topic.
+    /// The maximum size of the topic, the server default when the topic does
+    /// not set one.
     #[getter]
     pub fn max_topic_size(&self) -> MaxTopicSize {
-        self.inner.max_topic_size.into()
+        self.inner.resolved_options().max_topic_size.into()
     }
 
     /// Options the creating client set explicitly.
@@ -335,22 +317,27 @@ impl TopicDetails {
         self.inner.size.as_bytes_u64()
     }
 
-    /// The expiry of the messages in the topic.
+    /// The expiry of the messages in the topic, the server default when the
+    /// topic does not set one.
     #[getter]
     pub fn message_expiry(&self) -> PyResult<IggyExpiry> {
-        self.inner.message_expiry.try_into()
+        self.inner.resolved_options().message_expiry.try_into()
     }
 
-    /// Compression algorithm for the topic.
+    /// Compression algorithm for the topic, fixed at creation.
     #[getter]
     pub fn compression_algorithm(&self) -> String {
-        self.inner.compression_algorithm.to_string()
+        self.inner
+            .resolved_options()
+            .compression_algorithm
+            .to_string()
     }
 
-    /// The maximum size of the topic.
+    /// The maximum size of the topic, the server default when the topic does
+    /// not set one.
     #[getter]
     pub fn max_topic_size(&self) -> MaxTopicSize {
-        self.inner.max_topic_size.into()
+        self.inner.resolved_options().max_topic_size.into()
     }
 
     /// Options the creating client set explicitly.
@@ -443,5 +430,59 @@ impl Partition {
     #[getter]
     pub fn context(&self) -> PartitionContext {
         self.inner.context.into()
+    }
+
+    /// Node ids that store the partition, in member order. While one is down, a write
+    /// still commits if a quorum of the others is in sync.
+    #[gen_stub(override_return_type(type_repr = "builtins.list[builtins.int]"))]
+    #[getter]
+    pub fn members<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyList>> {
+        node_id_list(py, &self.inner.members)
+    }
+
+    /// Node ids among `members` that the partition's primary last reported in sync and
+    /// that are up. Empty until the primary first reports, and while no member that is
+    /// up can lead it.
+    #[gen_stub(override_return_type(type_repr = "builtins.list[builtins.int]"))]
+    #[getter]
+    pub fn in_sync_members<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyList>> {
+        node_id_list(py, &self.inner.in_sync_members)
+    }
+}
+
+/// A `Vec<u8>` return would convert to `bytes`, so node ids are built as a list of `int`.
+fn node_id_list<'a>(py: Python<'a>, node_ids: &[u8]) -> PyResult<Bound<'a, PyList>> {
+    PyList::new(py, node_ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy::prelude::{IggyTimestamp, PartitionContext as RustPartitionContext};
+
+    #[test]
+    fn given_partition_with_members_when_converting_should_expose_node_ids_as_int_lists() {
+        Python::initialize();
+        let partition = Partition::from(RustPartition {
+            id: 1,
+            created_at: IggyTimestamp::from(11),
+            segments_count: 1,
+            current_offset: 2,
+            size: IggyByteSize::from(13),
+            messages_count: 3,
+            context: RustPartitionContext::default(),
+            members: vec![1, 3, 4],
+            in_sync_members: vec![1, 4],
+        });
+
+        Python::attach(|py| {
+            let members = partition.members(py).expect("build members list");
+            let in_sync_members = partition
+                .in_sync_members(py)
+                .expect("build in-sync members list");
+
+            assert_eq!(members.extract::<Vec<u8>>().unwrap(), [1, 3, 4]);
+            assert_eq!(in_sync_members.extract::<Vec<u8>>().unwrap(), [1, 4]);
+        });
     }
 }

@@ -49,6 +49,10 @@ final class TestEnvironment {
         return require("IGGY_TCP_ADDRESS_FOLLOWER");
     }
 
+    static String noQuorumAddress() {
+        return require("IGGY_TCP_ADDRESS_NO_QUORUM");
+    }
+
     static String rootUsername() {
         return require("IGGY_ROOT_USERNAME");
     }

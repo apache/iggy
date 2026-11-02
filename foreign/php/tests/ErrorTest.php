@@ -18,12 +18,12 @@
 
 declare(strict_types=1);
 
-use Iggy\AutoCommit;
 use Iggy\Client as IggyClient;
 use Iggy\Exception\AuthenticationException;
 use Iggy\Exception\ConnectionException;
 use Iggy\Exception\IggyException;
 use Iggy\Exception\NotFoundException;
+use Iggy\Exception\ReadException;
 use Iggy\Exception\TransientException;
 use Iggy\PollingStrategy;
 use Iggy\ReceiveMessage;
@@ -33,6 +33,24 @@ use PHPUnit\Framework\TestCase;
 
 final class ErrorTest extends TestCase
 {
+    #[TestDox('Root policy refusal keeps its typed exception and shared code')]
+    public function testRootPolicyRefusalKeepsTypedCode(): void
+    {
+        $fixture = json_decode((string) file_get_contents(__DIR__ . '/fixtures/resource_options.json'), true, 512, JSON_THROW_ON_ERROR);
+        $vector = array_values(array_filter(
+            $fixture['update_resource'],
+            static fn (array $entry): bool => $entry['case'] === 'user_username_and_status',
+        ))[0];
+        $body = hex2bin($vector['body_hex']);
+        assert_true($body !== false);
+        $body[3] = "\0";
+        $client = new_client();
+
+        $error = assert_throws(static fn () => $client->sendBinaryRequest(16, $body));
+        assert_instance_of(AuthenticationException::class, $error);
+        assert_same($fixture['constants']['error_codes']['cannot_modify_root_user'], $error->getCode());
+    }
+
     #[TestDox('Connection configuration errors use the typed connection exception')]
     public function testConnectionConfigurationErrorsUseTypedException(): void
     {
@@ -71,6 +89,12 @@ final class ErrorTest extends TestCase
         assert_true(is_subclass_of(TransientException::class, IggyException::class));
     }
 
+    #[TestDox('Read exceptions share the Iggy exception base class')]
+    public function testReadExceptionUsesIggyBase(): void
+    {
+        assert_true(is_subclass_of(ReadException::class, IggyException::class));
+    }
+
     #[TestDox('Callback exceptions are rethrown without changing their PHP type')]
     public function testCallbackExceptionIsRethrownAsOriginalException(): void
     {
@@ -88,22 +112,7 @@ final class ErrorTest extends TestCase
                 [new SendMessage('callback exception payload')],
             );
 
-            $consumer = $client->consumerGroup(
-                $consumerName,
-                $streamName,
-                $topicName,
-                0,
-                PollingStrategy::next(),
-                10,
-                AutoCommit::disabled(),
-                true,
-                true,
-                micros(1),
-                null,
-                null,
-                null,
-                false,
-            );
+            $consumer = $client->consumerGroup($consumerName, $streamName, $topicName, PollingStrategy::next());
 
             $throwable = assert_throws(
                 static fn () => $consumer->consumeMessages(

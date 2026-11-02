@@ -62,11 +62,13 @@ pub async fn run(harness: &TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::offset(0),
-            MESSAGES_COUNT,
-            false,
+            PollOptions {
+                count: MESSAGES_COUNT,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -107,7 +109,10 @@ pub async fn run(harness: &TestHarness) {
 
 async fn init_system(client: &IggyClient) {
     // 1. Create the stream
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     // 2. Create the topic
     client

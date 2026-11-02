@@ -16,8 +16,7 @@
 // under the License.
 
 use crate::prelude::{
-    Durability, EncryptorKind, Identifier, IggyDuration, IggyError, NonZeroIggyDuration,
-    Partitioning,
+    Durability, EncryptorKind, Identifier, IggyDuration, IggyError, Partitioning,
 };
 use bon::Builder;
 use std::str::FromStr;
@@ -42,10 +41,6 @@ pub struct IggyProducerConfig {
     linger_time: IggyDuration,
     /// Specifies to which partition the messages should be sent.
     partitioning: Partitioning,
-    /// Sets the maximum number of send retries in case of a message sending failure.
-    send_retries_count: Option<u32>,
-    /// Sets the interval between send retries in case of a message sending failure.
-    send_retries_interval: Option<NonZeroIggyDuration>,
     /// Sets a optional client side encryptor for encrypting the messages' payloads. Currently only Aes256Gcm is supported.
     /// Note, this is independent of server side encryption meaning you can add client encryption, server encryption, or both.
     encryptor: Option<Arc<EncryptorKind>>,
@@ -62,8 +57,6 @@ impl Default for IggyProducerConfig {
             topic_partitions_count: 1,
             topic_durability: Durability::default(),
             encryptor: None,
-            send_retries_count: Some(3),
-            send_retries_interval: Some(NonZeroIggyDuration::ONE_SECOND),
         }
     }
 }
@@ -80,13 +73,10 @@ impl IggyProducerConfig {
     /// * `linger_time` - The interval between messages sent.
     /// * `partitioning` - The partitioning strategy to use.
     /// * `encryptor` - The encryptor to use.
-    /// * `send_retries_count` - The number of retries to send messages.
-    /// * `send_retries_interval` - The interval between retries.
     ///
     /// Returns:
     /// A new `IggyProducerConfig`.
     ///
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         stream_name: String,
         topic_name: String,
@@ -95,8 +85,6 @@ impl IggyProducerConfig {
         linger_time: IggyDuration,
         partitioning: Partitioning,
         encryptor: Option<Arc<EncryptorKind>>,
-        send_retries_count: Option<u32>,
-        send_retries_interval: Option<NonZeroIggyDuration>,
     ) -> Self {
         Self {
             stream_name,
@@ -107,8 +95,6 @@ impl IggyProducerConfig {
             linger_time,
             partitioning,
             encryptor,
-            send_retries_count,
-            send_retries_interval,
         }
     }
 
@@ -144,8 +130,6 @@ impl IggyProducerConfig {
             topic_partitions_count: 1,
             topic_durability: Durability::default(),
             encryptor: None,
-            send_retries_count: Some(3),
-            send_retries_interval: Some(NonZeroIggyDuration::ONE_SECOND),
         })
     }
 }
@@ -188,14 +172,6 @@ impl IggyProducerConfig {
     pub fn encryptor(&self) -> Option<Arc<EncryptorKind>> {
         self.encryptor.clone()
     }
-
-    pub fn send_retries_count(&self) -> Option<u32> {
-        self.send_retries_count
-    }
-
-    pub fn send_retries_interval(&self) -> Option<NonZeroIggyDuration> {
-        self.send_retries_interval
-    }
 }
 
 #[cfg(test)]
@@ -215,8 +191,6 @@ mod tests {
             .batch_length(100)
             .linger_time(IggyDuration::from_str("5ms").unwrap())
             .partitioning(Partitioning::balanced())
-            .send_retries_count(3)
-            .send_retries_interval(NonZeroIggyDuration::ONE_SECOND)
             .build();
 
         assert_eq!(config.stream_name(), "test_stream");
@@ -225,11 +199,6 @@ mod tests {
         assert_eq!(config.linger_time(), IggyDuration::from_str("5ms").unwrap());
         assert_eq!(config.partitioning(), &Partitioning::balanced());
         assert_eq!(config.topic_partitions_count(), 3);
-        assert_eq!(config.send_retries_count(), Some(3));
-        assert_eq!(
-            config.send_retries_interval(),
-            Some(NonZeroIggyDuration::ONE_SECOND)
-        );
     }
 
     #[test]
@@ -241,11 +210,6 @@ mod tests {
         assert_eq!(config.linger_time(), IggyDuration::from_str("5ms").unwrap());
         assert_eq!(config.partitioning(), &Partitioning::balanced());
         assert_eq!(config.topic_partitions_count(), 1);
-        assert_eq!(config.send_retries_count(), Some(3));
-        assert_eq!(
-            config.send_retries_interval(),
-            Some(NonZeroIggyDuration::ONE_SECOND)
-        );
     }
 
     #[test]
@@ -258,8 +222,6 @@ mod tests {
             IggyDuration::from_str("5ms").unwrap(),
             Partitioning::balanced(),
             None,
-            None,
-            None,
         );
         assert_eq!(config.stream_name(), "test_stream");
         assert_eq!(config.topic_name(), "test_topic");
@@ -267,8 +229,6 @@ mod tests {
         assert_eq!(config.linger_time(), IggyDuration::from_str("5ms").unwrap());
         assert_eq!(config.partitioning(), &Partitioning::balanced());
         assert_eq!(config.topic_partitions_count(), 3);
-        assert_eq!(config.send_retries_count(), None);
-        assert_eq!(config.send_retries_interval(), None);
     }
 
     #[test]

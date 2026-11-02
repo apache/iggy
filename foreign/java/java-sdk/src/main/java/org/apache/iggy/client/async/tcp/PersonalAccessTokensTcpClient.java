@@ -76,9 +76,8 @@ public class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient
 
         log.debug("Creating personal access token: {}", name);
 
-        return connection()
-                .send(CommandCode.PersonalAccessToken.CREATE.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.PersonalAccessToken.CREATE.getValue(), payload), response -> {
                     try {
                         return BytesDeserializer.readRawPersonalAccessToken(response);
                     } finally {
@@ -93,9 +92,8 @@ public class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient
 
         log.debug("Getting all personal access tokens");
 
-        return connection()
-                .send(CommandCode.PersonalAccessToken.GET_ALL.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.PersonalAccessToken.GET_ALL.getValue(), payload), response -> {
                     try {
                         List<PersonalAccessTokenInfo> tokens = new ArrayList<>();
                         while (response.isReadable()) {
@@ -114,26 +112,21 @@ public class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient
 
         log.debug("Deleting personal access token: {}", name);
 
-        return connection()
-                .send(CommandCode.PersonalAccessToken.DELETE.getValue(), payload)
-                .thenAccept(response -> {
-                    response.release();
-                });
+        return connection().sendAndRelease(CommandCode.PersonalAccessToken.DELETE, payload);
     }
 
     @Override
     public CompletableFuture<IdentityInfo> loginWithPersonalAccessToken(String token) {
-        return routingHook.loginOnLeader(() -> loginWithoutRedirect(token));
+        return routingHook.loginOnLeader(deadline -> loginWithoutRedirect(token, deadline));
     }
 
-    private CompletableFuture<IdentityInfo> loginWithoutRedirect(String token) {
+    private CompletableFuture<IdentityInfo> loginWithoutRedirect(String token, long deadline) {
         var payload = BytesSerializer.toBytes(token, "token");
 
         log.debug("Logging in with personal access token");
 
-        return connection()
-                .send(CommandCode.PersonalAccessToken.LOGIN.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.PersonalAccessToken.LOGIN.getValue(), payload, deadline), response -> {
                     try {
                         var userId = response.readUnsignedIntLE();
                         return new IdentityInfo(userId, Optional.empty());

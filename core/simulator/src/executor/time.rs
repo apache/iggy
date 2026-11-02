@@ -30,7 +30,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A point on the simulated timeline, in nanoseconds since simulation start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -57,6 +57,7 @@ impl TimerHandle {
     pub(crate) fn new() -> Self {
         Self(Rc::new(TimeShared {
             now_nanos: Cell::new(0),
+            origin: Instant::now(),
             queue: RefCell::new(TimerQueue {
                 heap: BinaryHeap::new(),
                 next_seq: 0,
@@ -68,6 +69,19 @@ impl TimerHandle {
     #[must_use]
     pub fn now(&self) -> SimInstant {
         SimInstant(self.0.now_nanos.get())
+    }
+
+    /// Local deadline time shares the virtual timeline across cloned handles.
+    /// The host origin never enters a wire frame or the deterministic trace.
+    ///
+    /// # Panics
+    /// Panics if virtual time exceeds the platform's `Instant` range.
+    #[must_use]
+    pub(crate) fn monotonic_now(&self) -> Instant {
+        self.0
+            .origin
+            .checked_add(Duration::from_nanos(self.0.now_nanos.get()))
+            .expect("virtual monotonic time exceeds Instant range")
     }
 
     /// A future that completes once virtual time has advanced past
@@ -180,6 +194,7 @@ impl Drop for SleepFuture {
 #[derive(Debug)]
 struct TimeShared {
     now_nanos: Cell<u64>,
+    origin: Instant,
     queue: RefCell<TimerQueue>,
 }
 

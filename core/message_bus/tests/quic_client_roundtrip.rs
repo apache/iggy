@@ -18,7 +18,8 @@
 //! End-to-end: a real QUIC client connects to the consensus QUIC client
 //! listener, opens a bidi per request (matching the iggy SDK pattern),
 //! sends a Request, the handler echoes a Reply back via
-//! `bus.send_to_client`, the client reads the Reply off the same bidi.
+//! `bus.send_to_client_instance`, the client reads the Reply off the same
+//! bidi.
 
 mod common;
 
@@ -28,12 +29,12 @@ use compio::BufResult;
 use compio::io::AsyncWriteExt;
 use compio_quic::{ClientBuilder, Endpoint};
 use iggy_binary_protocol::Command;
+use message_bus::IggyMessageBus;
 use message_bus::QuicTuning;
 use message_bus::client_listener::RequestHandler;
 use message_bus::client_listener::quic::{bind, run};
 use message_bus::framing;
 use message_bus::transports::quic::server_config_with_cert;
-use message_bus::{IggyMessageBus, MessageBus};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::rc::Rc;
 use std::time::Duration;
@@ -69,14 +70,11 @@ async fn request_reply_round_trip() {
     let bus_for_handler = bus.clone();
     let on_request: RequestHandler = Rc::new(move |client_id, msg| {
         assert_eq!(msg.header().command, Command::Request);
-        let bus = bus_for_handler.clone();
-        compio::runtime::spawn(async move {
-            let reply = header_only(Command::Reply, 42, 0);
-            bus.send_to_client(client_id, reply.into_frozen())
-                .await
-                .expect("send_to_client should succeed");
-        })
-        .detach();
+        let instance = bus_for_handler.client_instance(client_id);
+        let reply = header_only(Command::Reply, 42, 0).into_frozen();
+        bus_for_handler
+            .send_to_client_instance(client_id, instance, reply.into())
+            .expect("server send_to_client_instance");
     });
 
     let (cert, key) = self_signed();

@@ -64,12 +64,15 @@ async fn given_expired_token_when_cleaner_deletes_it_should_keep_committing_writ
     // The delete applies before its commit completes, so an empty list alone
     // does not prove the commit went through. A later write must commit
     // behind it.
-    timeout(WRITE_BUDGET, client.create_stream(STREAM_NAME))
-        .await
-        .unwrap_or_else(|_| {
-            panic!("a write after the cleaner's delete did not commit within {WRITE_BUDGET:?}")
-        })
-        .expect("a write after the cleaner's delete must commit");
+    timeout(
+        WRITE_BUDGET,
+        client.create_stream(STREAM_NAME, &StreamCreateOptions::default()),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!("a write after the cleaner's delete did not commit within {WRITE_BUDGET:?}")
+    })
+    .expect("a write after the cleaner's delete must commit");
 }
 
 async fn wait_for_no_tokens(client: &IggyClient) {

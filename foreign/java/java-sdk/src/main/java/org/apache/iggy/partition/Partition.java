@@ -20,7 +20,15 @@
 package org.apache.iggy.partition;
 
 import java.math.BigInteger;
+import java.util.List;
 
+/**
+ * A partition as the server reports it.
+ *
+ * @param members       node ids that store the partition, in member order
+ * @param inSyncMembers node ids among {@code members} that the partition's primary last reported in sync and that
+ *                      are up, empty until the primary first reports
+ */
 public record Partition(
         Long id,
         BigInteger createdAt,
@@ -28,4 +36,11 @@ public record Partition(
         BigInteger currentOffset,
         String size,
         BigInteger messagesCount,
-        PartitionContext context) {}
+        PartitionContext context,
+        List<Integer> members,
+        List<Integer> inSyncMembers) {
+    public Partition {
+        members = members == null ? List.of() : List.copyOf(members);
+        inSyncMembers = inSyncMembers == null ? List.of() : List.copyOf(inSyncMembers);
+    }
+}

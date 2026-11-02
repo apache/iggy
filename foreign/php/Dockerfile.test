@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.99
+ARG RUST_VERSION=1.99.1
 FROM rust:${RUST_VERSION}-slim-trixie
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -54,7 +54,7 @@ COPY foreign/php/scripts/ ./foreign/php/scripts/
 
 WORKDIR /workspace/foreign/php
 
-RUN cargo install cargo-php --locked --version 0.1.21
+RUN cargo install cargo-php --locked --version 0.2.1
 RUN composer install --no-interaction --prefer-dist
 RUN cargo php install --yes
 RUN chmod +x ./scripts/test.sh

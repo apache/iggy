@@ -68,12 +68,12 @@ type retainedMessagesClient struct {
 func (c *retainedMessagesClient) PollMessages(
 	_ context.Context,
 	_, _ iggcon.Identifier,
+	_ uint32,
 	_ iggcon.Consumer,
 	strategy iggcon.PollingStrategy,
-	count uint32,
-	_ bool,
-	_ *uint32,
+	options iggcon.PollOptions,
 ) (*iggcon.PolledMessage, error) {
+	count := options.Count
 	result := &iggcon.PolledMessage{}
 	for _, message := range c.messages {
 		if message.Header.Offset < strategy.Value {

@@ -37,7 +37,7 @@ You can also customize the server using environment variables:
 
 ```bash
 # Enable HTTP transport and set its address
-IGGY_HTTP_ENABLED=true IGGY_HTTP_ADDRESS=127.0.0.1:3000 cargo run --bin iggy-server
+IGGY_HTTP_ENABLED=true IGGY_HTTP_ADDRESS=127.0.0.1:3000 cargo run --bin iggy-server -- --with-default-root-credentials
 ```
 
 With Python 3.11 or newer and Rust/Cargo available, install dependencies from

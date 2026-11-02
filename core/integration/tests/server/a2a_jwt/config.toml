@@ -34,4 +34,4 @@ clock_skew = "5s"
 issuer = "https://test-issuer.com"
 audience = "iggy"
 jwks_url = "http://localhost:8080/.well-known/jwks.json"
-user_id = 1
+username = "a2a-test-user"

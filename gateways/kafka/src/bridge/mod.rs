@@ -19,17 +19,24 @@
 //!
 //! Maps Kafka topics to Iggy streams/topics, exposes create-if-missing provisioning and
 //! high-watermark lookups, group and translates Iggy errors to Kafka wire error codes. `ListOffsets`,
-//! Produce, Fetch, Metadata, `CreateTopics`, `OffsetCommit`, `OffsetFetch`, `DescribeConfigs` and `AlterConfigs` call it.
+//! Produce, Fetch, Metadata, `CreateTopics`, `DeleteTopics`, `CreatePartitions`, `OffsetCommit`,
+//! `OffsetFetch`, `DescribeConfigs` and `AlterConfigs` call it.
 
 pub mod config;
 pub mod error;
 pub mod iggy_bridge;
+pub mod nodes;
 pub mod topic_map;
 
-pub use config::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, ProduceSessionLimits};
+pub use config::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, ProduceSessionLimits};
 pub use error::BridgeError;
 pub use iggy_bridge::{
-    IggyBridge, KafkaTopicMetadata, OFFSET_GROUP_PREFIX, OffsetCalls, ProduceTurn, Producer,
-    StreamTopicCache, TopicCreationOutcome, TopicLoad, TopicTarget,
+    CLUSTER_ID_TOPIC, COORDINATOR_LEASE_GROUP, COORDINATOR_LOG_TOPIC, COORDINATOR_OWNER_TOPIC,
+    ClusterIdCall, CoordinatorLink, DEFAULT_TOPIC_PARTITIONS, DeletedTopic, IggyBridge,
+    KafkaTopicMetadata, LoggedRecord, MAX_TOPIC_PARTITIONS, OFFSET_GROUP_PREFIX, OffsetCalls,
+    OffsetGroupSource, OffsetGroups, PartitionBatch, PermissionBoard, ProduceTurn, Producer,
+    ScannedGroups, StreamTopicCache, TopicCreationOutcome, TopicLoad, TopicShape, TopicShapes,
+    TopicTarget, UserAccess, cluster_id_stream, iggy_producer_id, kafka_producer_id,
 };
+pub use nodes::KnownNodes;
 pub use topic_map::{TopicMapping, TopicOverride};

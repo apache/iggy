@@ -255,7 +255,6 @@ runs:
           else
             CACHE_TO=$(
               printf '%s\n' \
-                "type=registry,ref=${shared_deps}:buildcache-${arch},mode=max" \
                 "type=registry,ref=${img}:buildcache-${arch},mode=max" \
                 "type=inline" \
                 "type=gha,scope=buildkit-deps-${os}-${arch},mode=max" \

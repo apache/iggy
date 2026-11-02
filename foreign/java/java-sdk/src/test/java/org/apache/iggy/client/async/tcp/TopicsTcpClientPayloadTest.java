@@ -22,7 +22,9 @@ package org.apache.iggy.client.async.tcp;
 import io.netty.buffer.ByteBuf;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.message.HeaderKind;
+import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.topic.CompressionAlgorithm;
+import org.apache.iggy.topic.TopicOptions;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
@@ -40,8 +42,7 @@ class TopicsTcpClientPayloadTest {
 
     @Test
     void shouldWritePartitionsCountAsFixedFieldBeforeName() {
-        ByteBuf payload = TopicsTcpClient.createTopicPayload(
-                StreamId.of(1L), 3L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "orders", Map.of());
+        ByteBuf payload = BytesSerializer.toCreateTopic(StreamId.of(1L), "orders", 3L, Map.of());
 
         assertThat(payload.readUnsignedByte()).isEqualTo((short) 1); // numeric identifier kind
         assertThat(payload.readUnsignedByte()).isEqualTo((short) 4); // identifier length
@@ -53,38 +54,39 @@ class TopicsTcpClientPayloadTest {
 
     @Test
     void shouldOmitServerDefaultOptions() {
-        ByteBuf payload = TopicsTcpClient.createTopicPayload(
-                StreamId.of("my-stream"),
-                1L,
-                CompressionAlgorithm.None,
-                BigInteger.ZERO,
-                BigInteger.ZERO,
-                "events",
-                Map.of());
+        var options = TopicOptions.builder()
+                .messageExpiry(BigInteger.ZERO)
+                .maxTopicSize(BigInteger.ZERO)
+                .build();
+        ByteBuf payload = BytesSerializer.toCreateTopic(StreamId.of("my-stream"), "events", 1L, options.entries());
 
         payload.skipBytes(2 + "my-stream".length());
         assertThat(payload.readUnsignedIntLE()).isEqualTo(1L);
         assertThat(readString(payload)).isEqualTo("events");
-        assertThat(payload.isReadable()).isFalse();
+        assertThat(readOptions(payload)).containsOnlyKeys("consumer_offset_durability", "durability");
     }
 
     @Test
     void shouldEncodeExplicitOptionsWithoutPartitionsCount() {
-        ByteBuf payload = TopicsTcpClient.createTopicPayload(
-                StreamId.of(1L),
-                2L,
-                CompressionAlgorithm.Gzip,
-                BigInteger.valueOf(60_000_000L),
-                BigInteger.valueOf(1024L),
-                "orders",
-                Map.of());
+        var topicOptions = TopicOptions.builder()
+                .compressionAlgorithm(CompressionAlgorithm.Gzip)
+                .messageExpiry(BigInteger.valueOf(60_000_000L))
+                .maxTopicSize(BigInteger.valueOf(1024L))
+                .build();
+        ByteBuf payload = BytesSerializer.toCreateTopic(StreamId.of(1L), "orders", 2L, topicOptions.entries());
 
         payload.skipBytes(6);
         assertThat(payload.readUnsignedIntLE()).isEqualTo(2L);
         readString(payload);
 
         Map<String, TypedValue> options = readOptions(payload);
-        assertThat(options).containsOnlyKeys("compression_algorithm", "message_expiry", "max_topic_size");
+        assertThat(options)
+                .containsOnlyKeys(
+                        "compression_algorithm",
+                        "consumer_offset_durability",
+                        "durability",
+                        "max_topic_size",
+                        "message_expiry");
         assertThat(options.get("compression_algorithm").kind()).isEqualTo(HeaderKind.String);
         assertThat(new String(options.get("compression_algorithm").value(), StandardCharsets.UTF_8))
                 .isEqualTo("gzip");

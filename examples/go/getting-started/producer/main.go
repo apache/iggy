@@ -70,20 +70,19 @@ func main() {
 }
 
 func initSystem(ctx context.Context, client iggcon.Client) {
-	if _, err := client.CreateStream(ctx, "sample-stream"); err != nil {
+	if _, err := client.CreateStream(ctx, "sample-stream", nil); err != nil {
 		log.Printf("WARN: Stream already exists or error: %v", err)
 	}
 	log.Println("Stream was created.")
 
 	streamIdentifier, _ := iggcon.NewIdentifier(StreamId)
+	partitions := uint32(1)
+	expiry := iggcon.IggyExpiryNeverExpire
 	if _, err := client.CreateTopic(
 		ctx,
 		streamIdentifier,
 		"sample-topic",
-		1,
-		iggcon.CompressionAlgorithmNone,
-		iggcon.IggyExpiryNeverExpire,
-		0); err != nil {
+		&iggcon.TopicOptions{PartitionsCount: &partitions, MessageExpiry: &expiry}); err != nil {
 		log.Printf("WARN: Topic already exists and will not be created again or error: %v", err)
 	}
 	log.Println("Topic was created.")

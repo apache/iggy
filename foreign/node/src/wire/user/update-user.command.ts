@@ -16,64 +16,64 @@
 // under the License.
 
 import { wrapCommand } from '../command.utils.js';
-import { COMMAND_CODE } from '../command.code.js';
-import { deserializeVoidResponse } from '../../client/client.utils.js';
-import type { UserStatus } from './user.utils.js';
-import { serializeIdentifier, type Id } from '../identifier.utils.js';
-import { uint8ToBuf } from '../number.utils.js';
+import type { Id } from '../identifier.utils.js';
+import { HeaderValue } from '../message/header.utils.js';
+import type { OptionEntry, UserOptionKey } from '../options.utils.js';
+import { OptionsScope } from '../system/describe-options.command.js';
+import { UPDATE_RESOURCE, columnOption } from '../system/update-resource.command.js';
+import { UserStatus } from './user.utils.js';
 
 
 /**
- * Parameters for the update user command.
+ * Parameters for the update user command. Keys left out keep their values.
  */
 export type UpdateUser = {
   /** User identifier (ID or username) */
   userId: Id,
-  /** Optional new username (1-255 bytes) */
+  /** Optional new username (3-50 bytes) */
   username?: string,
-  /** Optional new status */
-  status?: UserStatus
+  /** Optional new status. Deactivating a user ends its sessions. */
+  status?: UserStatus,
+  /**
+   * Keys to reset to their defaults. No user key is resettable yet, so any key
+   * is refused before the request is sent.
+   */
+  reset?: UserOptionKey[],
+  /**
+   * Reset names with no typed member, for a resettable key the server catalog
+   * gained after this build shipped. The server decides on them.
+   */
+  rawReset?: readonly string[],
+  /**
+   * Option keys with no field of their own, for an updatable key the server
+   * catalog gained after this build shipped. A field above wins on collision.
+   * The server decides on them, so a create-only or unknown key comes back as
+   * a server error.
+   */
+  options?: OptionEntry[]
 };
 
 /**
  * Update user command definition.
- * Updates a user's username and/or status.
+ * Changes only the keys it names, through the generic update command.
  */
 export const UPDATE_USER = {
-  code: COMMAND_CODE.UpdateUser,
+  code: UPDATE_RESOURCE.code,
 
-  serialize: ({ userId, username, status }: UpdateUser) => {
-
-    const bId = serializeIdentifier(userId);
-    let bUsername, bStatus;
-
-    if (username) {
-      const bn = Buffer.from(username);
-
-      if (bn.length < 1 || bn.length > 255)
-        throw new Error('User username should be between 1 and 255 bytes');
-
-      bUsername = Buffer.concat([
-        uint8ToBuf(1),
-        uint8ToBuf(bn.length),
-        bn
-      ]);
-    } else
-      bUsername = uint8ToBuf(0);
-
-    if (status)
-      bStatus = Buffer.concat([uint8ToBuf(1), uint8ToBuf(status)]);
-    else
-      bStatus = uint8ToBuf(0);
-
-    return Buffer.concat([
-      bId,
-      bUsername,
-      bStatus,
-    ]);
+  serialize: ({ userId, username, status, reset, rawReset, options: rawOptions }: UpdateUser) => {
+    const options: OptionEntry[] = [];
+    if (username !== undefined)
+      options.push(columnOption('username', username));
+    if (status !== undefined)
+      options.push(status === UserStatus.Active || status === UserStatus.Inactive
+        ? { key: 'status', value: HeaderValue.String(status === UserStatus.Active ? 'active' : 'inactive') }
+        : { key: 'status', value: HeaderValue.Bool(false) });
+    return UPDATE_RESOURCE.serialize({
+      target: { scope: OptionsScope.User, userId }, options, reset, rawOptions, rawReset
+    });
   },
 
-  deserialize: deserializeVoidResponse
+  deserialize: UPDATE_RESOURCE.deserialize
 };
 
 

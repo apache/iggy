@@ -17,13 +17,16 @@
 
 use iggy::prelude::{
     HeaderValue as RustHeaderValue, OptionSpec as RustOptionSpec, OptionsScope as RustOptionsScope,
+    ResourceOptions,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::str::FromStr;
 
-use crate::user_headers::{HeaderValue, rust_header_value_to_py};
+use crate::user_headers::{
+    HeaderValue, UserHeaders, rust_header_value_to_py, rust_user_headers_to_py,
+};
 
 /// One entry of a resource's option catalog, as served by `describe_options`.
 #[gen_stub_pyclass]
@@ -48,10 +51,9 @@ impl OptionSpec {
     }
 
     /// Name of this key's canonical kind: what the server encodes its default
-    /// under, and what a value set by `create_topic` is stored as whatever kind
-    /// it was sent in, since create admission re-encodes the block from its own
-    /// parse. `update_topic` stores what the client sent verbatim and is the
-    /// exception.
+    /// under, and what a value set by a create or an update is stored as
+    /// whatever kind it was sent in, since admission re-encodes the block from
+    /// its own parse.
     #[getter]
     pub fn kind(&self) -> String {
         self.inner.kind.to_string()
@@ -86,6 +88,38 @@ impl OptionSpec {
         self.inner.description.clone()
     }
 
+    /// Whether an update may set the key.
+    #[getter]
+    pub fn updatable(&self) -> bool {
+        self.inner.updatable
+    }
+
+    /// Whether an update may reset the key to its default.
+    #[getter]
+    pub fn resettable(&self) -> bool {
+        self.inner.resettable
+    }
+
+    /// Whether the key is write-only: accepted on create, never returned.
+    #[getter]
+    pub fn secret(&self) -> bool {
+        self.inner.secret
+    }
+
+    /// Whether the server computes the key and returns it on reads, never
+    /// accepting it.
+    #[getter]
+    pub fn read_only(&self) -> bool {
+        self.inner.read_only
+    }
+
+    /// Whether a node that does not understand the key must refuse to serve
+    /// the resource.
+    #[getter]
+    pub fn critical(&self) -> bool {
+        self.inner.critical
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "OptionSpec(key='{}', kind='{}')",
@@ -108,4 +142,24 @@ pub fn options_scope_from_str(scope: &str) -> PyResult<RustOptionsScope> {
             "unknown options scope '{scope}', expected one of: topic, stream, user"
         ))
     })
+}
+
+/// The entries of one provenance, as the dictionary message user headers come
+/// back as.
+///
+/// Options ride the user-headers codec, so they are handed back through the
+/// same `HeaderKey`/`HeaderValue` types rather than a second shape meaning the
+/// same thing: `to_scalar_dict()` works on the result exactly as it does on
+/// `ReceiveMessage.user_headers`.
+pub(crate) fn options_by_provenance<'a>(
+    py: Python<'a>,
+    options: &ResourceOptions,
+    explicit: bool,
+) -> PyResult<Bound<'a, UserHeaders>> {
+    let selected = options
+        .iter()
+        .filter(|(_, option)| option.explicit == explicit)
+        .map(|(key, option)| (key.clone(), option.value.clone()))
+        .collect();
+    rust_user_headers_to_py(py, selected)
 }

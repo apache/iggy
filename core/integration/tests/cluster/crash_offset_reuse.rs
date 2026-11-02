@@ -100,7 +100,7 @@ async fn wait_until_serving(harness: &TestHarness, budget: Duration) -> IggyClie
 /// Create the stream and its single-partition topic.
 async fn create_topic(client: &IggyClient, messages_required_to_save: Option<u32>) {
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     client
@@ -394,11 +394,13 @@ async fn given_a_stored_consumer_position_when_polling_across_a_reservation_hole
         .poll_messages(
             &stream,
             &topic,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::next(),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll forward from the stored position");

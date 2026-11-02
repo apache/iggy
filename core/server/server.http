@@ -18,6 +18,8 @@
 @url = http://localhost:3000
 @stream_id = 0
 @topic_id = 0
+@metadata_cursor = mc1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+@current_page_token = REPLACE_WITH_THE_PREVIOUS_CURRENT_PAGE_TOKEN
 @partition_id = 0
 @consumer_group_id = 1
 @consumer_id = 1
@@ -72,6 +74,26 @@ Content-Type: application/json
   "compression": "Deflated",
   "snapshot_types": ["All"]
 }
+
+### Metadata changes from the oldest retained operation
+GET {{url}}/metadata/changes?from=earliest&limit=100
+Authorization: Bearer {{access_token}}
+
+### Metadata changes: a cursor at the newest record, no records
+GET {{url}}/metadata/changes?from=latest&groups=streams,topics
+Authorization: Bearer {{access_token}}
+
+### Metadata changes after a cursor, within a time range in microseconds
+GET {{url}}/metadata/changes?after={{metadata_cursor}}&since=1760352000000000&limit=100
+Authorization: Bearer {{access_token}}
+
+### Current state, first page, then continue with current_after
+GET {{url}}/metadata/changes?from=current&groups=streams,topics&limit=100
+Authorization: Bearer {{access_token}}
+
+### Current state, next page
+GET {{url}}/metadata/changes?from=current&groups=streams,topics&current_after={{current_page_token}}
+Authorization: Bearer {{access_token}}
 
 ###
 GET {{url}}/cluster/metadata

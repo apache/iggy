@@ -54,7 +54,6 @@ stream = "demo_stream"
 topics = ["demo_topic"]
 schema = "json"
 batch_length = 100
-poll_interval = "100ms"
 consumer_group = "test_cg"
 [plugin_config]
 url = "http://localhost:9090/ingest"
@@ -105,7 +104,6 @@ stream = "events"
 topics = ["notifications"]
 schema = "json"
 batch_length = 50
-poll_interval = "100ms"
 consumer_group = "http_sink"
 
 [plugin_config]
@@ -318,7 +316,6 @@ stream = "sensors"
 topics = ["temperature", "pressure"]
 schema = "raw"
 batch_length = 200
-poll_interval = "50ms"
 consumer_group = "sensor_relay"
 
 [plugin_config]
@@ -342,7 +339,6 @@ stream = "logs"
 topics = ["application", "infrastructure", "security"]
 schema = "json"
 batch_length = 500
-poll_interval = "200ms"
 consumer_group = "log_forwarder"
 
 [plugin_config]
@@ -464,7 +460,6 @@ stream = "events"
 topics = ["clicks", "views"]
 schema = "json"
 batch_length = 100
-poll_interval = "100ms"
 consumer_group = "http_sink_events"
 
 [[streams]]
@@ -472,7 +467,6 @@ stream = "orders"
 topics = ["created"]
 schema = "json"
 batch_length = 50
-poll_interval = "200ms"
 consumer_group = "http_sink_orders"
 
 [plugin_config]
@@ -534,7 +528,6 @@ stream = "app"
 topics = ["clicks"]
 schema = "json"
 batch_length = 500
-poll_interval = "50ms"
 consumer_group = "analytics_sink"
 
 [plugin_config]
@@ -561,7 +554,6 @@ stream = "app"
 topics = ["orders"]
 schema = "json"
 batch_length = 50
-poll_interval = "200ms"
 consumer_group = "billing_sink"
 
 [plugin_config]
@@ -590,7 +582,6 @@ stream = "app"
 topics = ["alerts"]
 schema = "json"
 batch_length = 1
-poll_interval = "500ms"
 consumer_group = "slack_sink"
 
 [plugin_config]

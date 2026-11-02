@@ -51,7 +51,7 @@ use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{trace, warn};
 
 /// In normal operation the primary commits a completion itself, and a backup
@@ -90,6 +90,16 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
     let bus = shard.bus.clone();
     bus.spawn(async move {
         match submit {
+            shard::MetadataSubmit::ResolveSegmentDelete {
+                namespace, count, created_revision, minimum_metadata_op, reply,
+            } => {
+                let result = super::segment_delete::resolve(&shard, namespace, count, created_revision, minimum_metadata_op).await;
+                let _ = reply.try_send(result);
+            }
+            shard::MetadataSubmit::ForwardedSegmentDelete(query) => {
+                super::segment_delete::answer(&shard, *query.header()).await;
+            }
+
             shard::MetadataSubmit::ConsumerSessionHeartbeat(message) => {
                 let metadata = shard.plane.metadata();
                 if let Some(consensus) = metadata.consensus.as_ref() {
@@ -103,7 +113,7 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                             && !consensus.is_transferring())
                         .then_some(consensus.view()),
                         &message,
-                        Instant::now(),
+                        shard.bus.monotonic_now(),
                         session_timeout,
                     );
                 }
@@ -122,21 +132,29 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                     .bind_session(vsr_client_id, session, secret.expose_secret());
                 let _ = reply.try_send(attached);
             }
+            shard::MetadataSubmit::MetadataCurrentState {
+                query,
+                user_id,
+                reply,
+            } => {
+                let page = super::metadata_changes::current_state_page(&shard, &query, user_id);
+                let _ = reply.try_send(page);
+            }
             shard::MetadataSubmit::Register {
                 vsr_client_id,
                 user_id,
-                verifier,
+                registration,
                 reply,
             } => {
                 let bound =
-                    submit_register_local_or_forward(&shard, vsr_client_id, user_id, verifier)
+                    submit_register_local_or_forward(&shard, vsr_client_id, user_id, registration)
                         .await;
                 let _ = reply.try_send(bound);
             }
             shard::MetadataSubmit::ForwardedRegister {
                 vsr_client_id,
                 user_id,
-                verifier,
+                registration,
                 nonce,
                 origin_replica,
             } => {
@@ -144,7 +162,7 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                     &shard,
                     vsr_client_id,
                     user_id,
-                    verifier,
+                    registration,
                     nonce,
                     origin_replica,
                 )
@@ -281,6 +299,15 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
             }
             shard::MetadataSubmit::ForwardedCompletion(message) => {
                 propose_relayed_completion(&shard, &message).await;
+            }
+            shard::MetadataSubmit::IsMetadataPrimary { reply } => {
+                let primary = shard
+                    .plane
+                    .metadata()
+                    .consensus
+                    .as_ref()
+                    .is_some_and(|c| c.is_normal() && c.is_primary());
+                let _ = reply.try_send(primary);
             }
         }
     });
@@ -619,7 +646,8 @@ mod tests {
     use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
     use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
     use iggy_binary_protocol::{
-        ForwardCompletionHeader, GenericHeader, Operation, WireEncode, WireIdentifier, WireName,
+        Command, ConsensusHeader, ForwardCompletionHeader, GenericHeader, HEADER_SIZE, Operation,
+        StartViewChangeHeader, WireEncode, WireIdentifier, WireName,
     };
     use iggy_common::{IggyDuration, IggyError};
     use journal::prepare_journal::PrepareJournal;
@@ -1088,9 +1116,21 @@ mod tests {
         for _ in 0..TimeoutManager::NORMAL_HEARTBEAT_TICKS {
             consensus.tick(PlaneKind::Metadata);
         }
+        let vote = Message::<StartViewChangeHeader>::new(HEADER_SIZE).transmute_header(
+            |_, header: &mut StartViewChangeHeader| {
+                header.command = Command::StartViewChange;
+                header.cluster = consensus.cluster();
+                header.group = consensus.group();
+                header.view = 1;
+                header.replica = PRIMARY;
+                header.size = u32::try_from(HEADER_SIZE).unwrap();
+                header.seal();
+            },
+        );
+        consensus.handle_start_view_change(PlaneKind::Metadata, vote.header());
         assert!(
             !consensus.is_normal(),
-            "a silent primary starts a view change"
+            "a quorum of votes starts a view change"
         );
         assert_eq!(
             metadata
@@ -1339,7 +1379,7 @@ mod tests {
         bus.instant_timers.set(true);
         let shard = Rc::new(test_shard(&bus, BACKUP, REPLICAS, FIRST_BOOT));
         let shard_handle = Rc::new(RefCell::new(Some(Rc::downgrade(&shard))));
-        let host = ServerHost::new(&bus, &shard_handle, Arc::new(server_config), 1);
+        let host = ServerHost::new(&bus, &shard_handle, Arc::new(server_config));
         let (reply, answer) = shard::channel::<bool>(1);
         host.on_metadata_submit(shard::MetadataSubmit::CompleteLifecycle {
             request: lifecycle_batch(pending_delete_intent(&shard)),

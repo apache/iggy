@@ -19,12 +19,21 @@
 declare(strict_types=1);
 
 use Iggy\Client as IggyClient;
+use Iggy\CommitPolicy;
+use Iggy\MetadataChangeGroup;
+use Iggy\MetadataChangeKind;
+use Iggy\MetadataChangeStart;
+use Iggy\MetadataChangeStatus;
+use Iggy\MetadataStreamChange;
 use Iggy\PollingStrategy;
+use Iggy\PollOptions;
 use Iggy\SendMessage;
 use PHPUnit\Framework\TestCase;
 
 final class TlsTest extends TestCase
 {
+    private const CONSUMER_ID = 1;
+
     public function testConnectionStringWithTlsParams(): void
     {
         $connectionString = getenv('IGGY_TLS_CONNECTION_STRING');
@@ -64,11 +73,48 @@ final class TlsTest extends TestCase
                 array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
             );
 
-            $polled = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::first(), 10, true);
+            $polled = $client->pollMessages(
+                $streamName,
+                $topicName,
+                $partitionId,
+                self::CONSUMER_ID,
+                PollingStrategy::first(),
+                new PollOptions(count: 10, commit: CommitPolicy::onRead()),
+            )->messages;
             assert_count(count($messages), $polled, 'expected TLS messages');
             assert_same($messages, collect_payloads($polled));
         } finally {
             cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    public function testMetadataChangesOverTls(): void
+    {
+        $connectionString = getenv('IGGY_TLS_CONNECTION_STRING');
+        if ($connectionString === false || $connectionString === '') {
+            $this->markTestSkipped('set IGGY_TLS_CONNECTION_STRING to run TLS tests');
+        }
+
+        $client = IggyClient::fromConnectionString($connectionString);
+        $client->connect();
+        $groups = [MetadataChangeGroup::Streams];
+        $latest = $client->getMetadataChanges(MetadataChangeStart::latest(), $groups);
+        assert_same(MetadataChangeStatus::Ok, $latest->status);
+        $streamName = unique_name('tls-changes-stream');
+
+        try {
+            $client->createStream($streamName);
+            $page = $client->getMetadataChanges(MetadataChangeStart::after($latest->next), $groups);
+            assert_same(MetadataChangeStatus::Ok, $page->status);
+            $created = array_values(array_filter(
+                $page->records,
+                static fn ($record): bool => $record->change instanceof MetadataStreamChange
+                    && $record->change->name === $streamName,
+            ));
+            assert_count(1, $created);
+            assert_same(MetadataChangeKind::StreamCreated, $created[0]->kind);
+        } finally {
+            cleanup_stream($client, $streamName);
         }
     }
 

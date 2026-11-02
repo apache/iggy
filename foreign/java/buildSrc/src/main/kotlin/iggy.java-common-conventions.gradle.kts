@@ -33,6 +33,15 @@ java {
     targetCompatibility = JavaVersion.VERSION_17
 }
 
+// Build timestamps change between CI's test and coverage invocations.
+normalization {
+    runtimeClasspath {
+        properties("iggy-version.properties") {
+            ignoreProperty("buildTime")
+        }
+    }
+}
+
 tasks.withType<JavaCompile> {
     options.encoding = "UTF-8"
     options.compilerArgs.add("-parameters")

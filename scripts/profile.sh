@@ -115,7 +115,7 @@ FLAMEGRAPH_POLL_SVG="flamegraph_poll_${PROFILING_MODE}_${PROFILED_APP_NAME}_${GI
 
 # Start iggy-server and capture its PID
 echo "Running iggy-server, log will be in ${SERVER_LOG_FILE}..."
-target/release/iggy-server > "${SERVER_LOG_FILE}" 2>&1 &
+IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy target/release/iggy-server > "${SERVER_LOG_FILE}" 2>&1 &
 sleep 1
 
 # Run iggy-bench pinned-producer tcp

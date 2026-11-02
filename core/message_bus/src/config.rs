@@ -33,10 +33,11 @@
 //! [`From<&ServerConfig> for MessageBusConfig`](MessageBusConfig)
 //! folds that section into [`WebSocketConfig`] once at boot.
 //!
-//! Liveness detection is NOT done via TCP keepalive on the bus: SDK
-//! clients manage their own keepalive policy at the application layer,
-//! and replica<->replica liveness is observed by VSR heartbeats rather
-//! than by `SO_KEEPALIVE`.
+//! SDK clients manage their own keepalive policy at the application
+//! layer, so client sockets get no TCP keepalive. VSR heartbeats never
+//! close a replica socket, so replica sockets get keepalive probes, and
+//! on Linux [`MessageBusConfig::replica_user_timeout`] closes a link
+//! whose peer stays silent that long, idle or not.
 //!
 //! Neither plane is authenticated at the bus layer: identity and
 //! credential checks belong to the caller (`core/server`) via
@@ -153,14 +154,18 @@ pub struct MessageBusConfig {
     /// Bound on each SDK connection's inbound and outbound queues.
     pub client_queue_capacity: usize,
 
+    /// How long a reply waits for room in a full client queue before the
+    /// connection is closed.
+    pub client_write_stall_timeout: Duration,
+
     /// Interval between outbound reconnect attempts to peers with
     /// `peer_id > self_id`.
     pub reconnect_period: Duration,
 
     /// Number of peer replicas this node expects in its mesh
     /// (`cluster.nodes.len() - 1`, or 0 with clustering disabled).
-    /// Used only for mesh-formation observability: an info log fires
-    /// when the owner table first holds this many peers.
+    /// Used only for mesh-formation observability: shard 0 logs the mesh
+    /// complete once this many peer bundles are Up.
     pub mesh_expected_peers: usize,
 
     /// Timeout for per-peer close drain (flush writer, tear down
@@ -183,8 +188,16 @@ pub struct MessageBusConfig {
     /// and the QUIC `connecting.await` + first `accept_bi.await` pair.
     /// Threaded into `compio::time::timeout(handshake_grace, ...)` at
     /// each handshake site so a slowloris peer cannot pin per-conn
-    /// channels + registry slot + spawned task indefinitely.
+    /// channels + registry slot + spawned task indefinitely. Also bounds
+    /// the read of a replica link's placement preamble and the time a
+    /// replica bundle may stay incomplete.
     pub handshake_grace: Duration,
+
+    /// `TCP_USER_TIMEOUT` of every replica link, from
+    /// `cluster.heartbeat_timeout`: sent data or keepalive probes that stay
+    /// unacknowledged this long close the link. Linux only; see
+    /// `socket_opts::apply_replica_socket_options`.
+    pub replica_user_timeout: Duration,
 
     /// WebSocket frame-layer tunables (read/write buffer sizes, max
     /// frame size, max message size, accept-unmasked-frames flag).
@@ -227,6 +240,7 @@ impl From<&ServerConfig> for MessageBusConfig {
                 .expect("message_bus.replica_read_buffer_size fits usize on supported targets"),
             peer_queue_capacity: bus.peer_queue_capacity,
             client_queue_capacity: bus.client_queue_capacity,
+            client_write_stall_timeout: bus.client_write_stall_timeout.get_duration(),
             reconnect_period: bus.reconnect_period.get_duration(),
             mesh_expected_peers: if cfg.cluster.enabled {
                 cfg.cluster.nodes.len().saturating_sub(1)
@@ -236,6 +250,7 @@ impl From<&ServerConfig> for MessageBusConfig {
             close_peer_timeout: bus.close_peer_timeout.get_duration(),
             close_grace: bus.close_grace.get_duration(),
             handshake_grace: bus.handshake_grace.get_duration(),
+            replica_user_timeout: cfg.cluster.heartbeat_timeout.get_duration(),
             ws_config: build_ws_config(&cfg.websocket),
             quic: build_quic_tuning(&cfg.quic),
         }

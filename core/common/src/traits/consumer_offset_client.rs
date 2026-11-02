@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Consumer, ConsumerOffsetInfo, ConsumerPosition, Identifier, IggyError};
+use crate::{Checkpoint, Consumer, ConsumerOffsetInfo, Identifier, IggyError};
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the consumer offset module.
@@ -29,11 +29,11 @@ use async_trait::async_trait;
 /// ([`Self::store_consumer_offset`], [`Self::delete_consumer_offset`]) can fail once with
 /// [`IggyError::HistoryUnavailable`] (87), or with [`IggyError::ConsumerGroupPartitionNotOwned`]
 /// (5009) for a consumer group. The failed route is dropped, so the next call routes again and
-/// takes the new context. [`Self::store_consumer_position`] carries the caller's context, so it
-/// keeps getting the refusal for that context.
+/// takes the new context. [`Self::store_consumer_position`] and [`Self::delete_consumer_position`]
+/// carry the caller's context, so they keep getting the refusal for that context.
 #[async_trait]
 pub trait ConsumerOffsetClient {
-    /// Commit a captured position without substituting a newer incarnation or owner.
+    /// Commit a checkpoint without substituting a newer incarnation or owner.
     /// Authentication and permission to poll messages are required.
     /// Returns [`IggyError::HistoryUnavailable`] (87) for a deleted or replaced incarnation,
     /// [`IggyError::ConsumerGroupPartitionNotOwned`] (5009) for a lost owner,
@@ -43,7 +43,7 @@ pub trait ConsumerOffsetClient {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        position: ConsumerPosition,
+        checkpoint: &Checkpoint,
     ) -> Result<(), IggyError>;
 
     /// Store the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
@@ -86,5 +86,21 @@ pub trait ConsumerOffsetClient {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partition_id: Option<u32>,
+    ) -> Result<(), IggyError>;
+
+    /// Delete the offset of the partition of a checkpoint without substituting a newer
+    /// incarnation or owner. The offset of the checkpoint is not used.
+    /// Authentication and permission to poll messages are required.
+    /// Returns [`IggyError::HistoryUnavailable`] (87) for a deleted or replaced incarnation,
+    /// [`IggyError::ConsumerGroupPartitionNotOwned`] (5009) for a lost owner,
+    /// or [`IggyError::ConsumerOffsetNotFound`] (3021) for a missing key.
+    /// HTTP cannot send a context with a delete, so there the server deletes the offset of
+    /// the incarnation that it holds.
+    async fn delete_consumer_position(
+        &self,
+        consumer: &Consumer,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        checkpoint: &Checkpoint,
     ) -> Result<(), IggyError>;
 }

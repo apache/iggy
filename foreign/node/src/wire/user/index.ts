@@ -22,3 +22,4 @@ export * from './get-user.command.js'
 export * from './get-users.command.js';
 export * from './update-permissions.command.js';
 export * from './update-user.command.js';
+export { UserStatus } from './user.utils.js';

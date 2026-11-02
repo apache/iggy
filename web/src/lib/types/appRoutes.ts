@@ -24,6 +24,7 @@ type DashboardRoutes = `dashboard/${
   | `streams/${number}/topics/${number}`
   | `streams/${number}/topics/${number}/partitions/${number}/messages`
   | 'clients'
+  | 'changes'
   | 'logs'
   | SettingsSegment}`;
 

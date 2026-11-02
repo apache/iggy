@@ -263,7 +263,6 @@ async fn restart_sink(
         .restart_connector(
             &key,
             context.config_provider.as_ref(),
-            &context.iggy_clients.consumer,
             &context.metrics,
             &context,
         )

@@ -331,7 +331,7 @@ extension HeaderKey: Comparable {
 public typealias UserHeaders = [HeaderKey: HeaderValue]
 
 extension String {
-    fileprivate func leftPadded(to width: Int) -> String {
+    func leftPadded(to width: Int) -> String {
         count >= width ? self : String(repeating: "0", count: width - count) + self
     }
 }

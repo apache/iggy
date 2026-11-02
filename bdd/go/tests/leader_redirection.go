@@ -334,7 +334,7 @@ func (s leaderSteps) whenCreateStream(ctx context.Context, streamName string) er
 		return errors.New("client should be available")
 	}
 
-	stream, err := cli.CreateStream(ctx, streamName)
+	stream, err := cli.CreateStream(ctx, streamName, nil)
 	if err != nil {
 		return err
 	}

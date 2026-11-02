@@ -41,11 +41,11 @@ impl ClientWrapper {
             }
             ClientWrapper::Tcp(client) => ConnectionInfo {
                 protocol: TransportProtocol::Tcp,
-                server_address: client.current_server_address.lock().await.clone(),
+                server_address: client.connection_address(),
             },
             ClientWrapper::Quic(client) => ConnectionInfo {
                 protocol: TransportProtocol::Quic,
-                server_address: client.current_server_address.lock().await.clone(),
+                server_address: client.connection_address(),
             },
             ClientWrapper::Http(client) => ConnectionInfo {
                 protocol: TransportProtocol::Http,
@@ -53,7 +53,7 @@ impl ClientWrapper {
             },
             ClientWrapper::WebSocket(client) => ConnectionInfo {
                 protocol: TransportProtocol::WebSocket,
-                server_address: client.current_server_address.lock().await.clone(),
+                server_address: client.connection_address(),
             },
         }
     }

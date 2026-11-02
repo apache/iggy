@@ -26,6 +26,10 @@ pub enum RuntimeError {
         max_length = crate::configs::connectors::ConnectorKey::MAX_LENGTH
     )]
     InvalidConnectorKey(String),
+    #[error(
+        "Sink stream {0:?} sets poll_interval, which is no longer supported. Set max_wait and min_count to batch messages"
+    )]
+    UnsupportedPollInterval(String),
     #[error("Failed to serialize topic metadata")]
     FailedToSerializeTopicMetadata,
     #[error("Failed to serialize messages metadata")]
@@ -93,6 +97,7 @@ impl RuntimeError {
             RuntimeError::MissingIggyCredentials => "invalid_configuration",
             RuntimeError::InvalidConfiguration(_) => "invalid_configuration",
             RuntimeError::InvalidConnectorKey(_) => "invalid_connector_key",
+            RuntimeError::UnsupportedPollInterval(_) => "invalid_configuration",
             RuntimeError::HttpRequestFailed(_) => "http_request_failed",
             RuntimeError::StateLoadFailed { .. } => "state_load_failed",
             RuntimeError::TokenFileNotFound(_) => "invalid_configuration",
