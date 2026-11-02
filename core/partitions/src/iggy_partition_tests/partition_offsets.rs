@@ -568,6 +568,7 @@ async fn given_receiver_with_only_external_offsets_when_offered_nothing_should_r
     assert!(offset_file.exists());
 
     let nothing = crate::state_transfer::ConsumerOffsetsWire {
+        producers: Vec::new(),
         dedup_capacity: receiver.dedup().capacity(),
         ..Default::default()
     };

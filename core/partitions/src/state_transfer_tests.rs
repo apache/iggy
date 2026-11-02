@@ -91,6 +91,7 @@ async fn given_persistent_offset_io_failure_when_retried_should_stop_at_attempt_
 
 fn table() -> ConsumerOffsetsWire {
     ConsumerOffsetsWire {
+        producers: Vec::new(),
         owner_retirement: None,
         owners: Vec::new(),
         history_transition: None,
@@ -137,6 +138,7 @@ fn given_zero_frontier_transfer_when_capacity_is_uncommitted_should_keep_local_l
     const LOCAL_CAPACITY: usize = 2;
     const FIRST_COMMITTED_CAPACITY: usize = 3;
     let wire = ConsumerOffsetsWire {
+        producers: Vec::new(),
         dedup_capacity: 0,
         ..Default::default()
     };
@@ -148,6 +150,7 @@ fn given_zero_frontier_transfer_when_capacity_is_uncommitted_should_keep_local_l
     assert_eq!(restored.capacity(), FIRST_COMMITTED_CAPACITY);
     assert!(checked_retry_table(&decoded, 1, LOCAL_CAPACITY).is_err());
     let with_receipt = ConsumerOffsetsWire {
+        producers: Vec::new(),
         owner_retirement: None,
         dedup: vec![dedup_entry(1, 1, 1)],
         ..wire
@@ -278,6 +281,7 @@ fn transferred_prepare_checksum_is_covered_by_the_artifact() {
 #[test]
 fn given_empty_table_when_encoded_should_round_trip() {
     let empty = ConsumerOffsetsWire {
+        producers: Vec::new(),
         owner_retirement: None,
         owners: Vec::new(),
         history_transition: None,
@@ -303,6 +307,7 @@ fn given_empty_table_when_encoded_should_round_trip() {
 #[test]
 fn given_emptied_table_when_encoded_should_round_trip_the_emptied_op() {
     let emptied = ConsumerOffsetsWire {
+        producers: Vec::new(),
         emptied_at: 9,
         consumers: Vec::new(),
         groups: Vec::new(),
@@ -359,7 +364,7 @@ fn given_truncated_bytes_when_decoded_should_reject() {
 
 #[test]
 fn given_unknown_version_when_decoded_should_reject() {
-    for version in [CONSUMER_OFFSETS_VERSION - 1, CONSUMER_OFFSETS_VERSION + 1] {
+    for version in [CONSUMER_OFFSETS_VERSION - 2, CONSUMER_OFFSETS_VERSION + 1] {
         let mut wrong = table().encode();
         wrong[CONSUMER_OFFSETS_MAGIC.len()] = version;
         let content_len = wrong.len() - size_of::<u64>();
@@ -380,11 +385,12 @@ fn given_entry_in_every_section_when_encoded_should_match_the_version_pins() {
     // every count field and every entry stride. Changing a length is the
     // reminder to change its version. The trailing `retirement_paid_through`
     // is optional on decode, so it kept version 8 readable without a bump.
-    const WITHOUT_EXTERNAL_LEN: usize = 563;
-    const WITH_EXTERNAL_LEN: usize = 575;
+    const WITHOUT_EXTERNAL_LEN: usize = 567;
+    const WITH_EXTERNAL_LEN: usize = 579;
 
     const INCARNATION: u64 = 1;
     let with_external = ConsumerOffsetsWire {
+        producers: Vec::new(),
         dedup_capacity: consensus::CLIENTS_TABLE_MAX,
         required_metadata_frontier: 3,
         prepare_checksum: Some(1),
@@ -424,6 +430,7 @@ fn given_entry_in_every_section_when_encoded_should_match_the_version_pins() {
         retirement_paid_through: 0,
     };
     let without_external = ConsumerOffsetsWire {
+        producers: Vec::new(),
         external_groups: Vec::new(),
         ..with_external.clone()
     };
@@ -440,7 +447,7 @@ fn given_entry_in_every_section_when_encoded_should_match_the_version_pins() {
         );
     }
     assert_eq!(
-        CONSUMER_OFFSETS_VERSION, 8,
+        CONSUMER_OFFSETS_VERSION, 9,
         "a consumer-offsets version moved; confirm its layout moved with it"
     );
 }
@@ -449,6 +456,7 @@ fn given_entry_in_every_section_when_encoded_should_match_the_version_pins() {
 #[test]
 fn given_server_0_9_0_artifact_when_decoded_should_reject() {
     let wire = ConsumerOffsetsWire {
+        producers: Vec::new(),
         prepare_checksum: Some(u128::MAX - 7),
         checkpoint_prepare: vec![1, 2, 3],
         ..table()
@@ -493,6 +501,7 @@ fn given_server_0_9_0_artifact_when_decoded_should_reject() {
 #[test]
 fn given_external_groups_when_encoded_should_round_trip() {
     let wire = ConsumerOffsetsWire {
+        producers: Vec::new(),
         external_groups: vec![(2, 0), (9, 1 << 40)],
         ..table()
     };
@@ -517,6 +526,7 @@ fn given_foreign_magic_when_decoded_should_reject() {
 #[test]
 fn given_unordered_dedup_clients_when_decoded_should_reject() {
     let unordered = ConsumerOffsetsWire {
+        producers: Vec::new(),
         owner_retirement: None,
         owners: Vec::new(),
         history_transition: None,
@@ -541,6 +551,7 @@ fn given_unordered_dedup_clients_when_decoded_should_reject() {
 #[test]
 fn given_reserved_client_in_dedup_when_decoded_should_reject() {
     let reserved = ConsumerOffsetsWire {
+        producers: Vec::new(),
         owner_retirement: None,
         owners: Vec::new(),
         history_transition: None,
@@ -679,6 +690,7 @@ fn given_owner_count_past_ceiling_when_decoded_should_reject_before_allocating()
 #[test]
 fn given_duplicate_or_unordered_ids_when_decoded_should_reject() {
     let duplicate = ConsumerOffsetsWire {
+        producers: Vec::new(),
         owner_retirement: None,
         owners: Vec::new(),
         history_transition: None,
@@ -702,6 +714,7 @@ fn given_duplicate_or_unordered_ids_when_decoded_should_reject() {
         })
     );
     let unordered = ConsumerOffsetsWire {
+        producers: Vec::new(),
         owner_retirement: None,
         owners: Vec::new(),
         history_transition: None,
@@ -744,12 +757,15 @@ fn given_trailing_bytes_when_decoded_should_reject() {
 #[test]
 fn given_an_artifact_without_paid_through_when_decoded_should_read_it_as_zero() {
     let paid = ConsumerOffsetsWire {
+        producers: Vec::new(),
         retirement_paid_through: 9,
         ..table()
     };
     let encoded = paid.encode();
     assert_eq!(ConsumerOffsetsWire::decode(&encoded), Ok(paid));
-    let mut legacy = encoded[..encoded.len() - 2 * size_of::<u64>()].to_vec();
+    let content_len = encoded.len() - size_of::<u64>() - size_of::<u32>() - size_of::<u64>();
+    let mut legacy = encoded[..content_len].to_vec();
+    legacy[CONSUMER_OFFSETS_MAGIC.len()] = CONSUMER_OFFSETS_VERSION_MIN;
     let trailer = state_artifact_checksum(&legacy);
     legacy.extend_from_slice(&trailer.to_le_bytes());
     assert_eq!(ConsumerOffsetsWire::decode(&legacy), Ok(table()));

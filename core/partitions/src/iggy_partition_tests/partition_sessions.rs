@@ -383,6 +383,7 @@ async fn given_retirement_debt_when_session_requests_arrive_should_refuse_them_u
 
     let wire = crate::state_transfer::ConsumerOffsetsWire::decode(
         &crate::state_transfer::ConsumerOffsetsWire {
+            producers: Vec::new(),
             retirement_paid_through: partition.retirement_paid_through,
             ..Default::default()
         }
@@ -886,6 +887,7 @@ async fn checkpoint_receipts_survive_deferred_completion_and_state_transfer() {
                 .await
                 .unwrap();
             let offsets = crate::state_transfer::ConsumerOffsetsWire {
+                producers: Vec::new(),
                 owner_retirement: None,
                 dedup_capacity: partition.dedup.capacity(),
                 required_metadata_frontier: 0,

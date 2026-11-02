@@ -253,6 +253,7 @@ async fn given_read_when_state_is_installed_should_reject_the_previous_history()
     // Offset 4 is below the new frontier, so its value alone cannot establish
     // that either result still belongs to the installed history.
     let installed_state = crate::state_transfer::ConsumerOffsetsWire {
+        producers: Vec::new(),
         owner_retirement: None,
         owners: Vec::new(),
         history_transition: None,

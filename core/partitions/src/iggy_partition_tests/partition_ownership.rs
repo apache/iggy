@@ -53,6 +53,7 @@ async fn state_transfer_rejects_corrupted_checkpoint_payload_with_zero_body_chec
     prepare.as_mut_slice()
         [size_of::<PrepareHeader>() + COMMAND_HEADER_SIZE + BATCH_MESSAGE_HEADER_SIZE] ^= 1;
     let offsets = crate::state_transfer::ConsumerOffsetsWire {
+        producers: Vec::new(),
         owner_retirement: None,
         owners: Vec::new(),
         history_transition: None,
@@ -165,6 +166,7 @@ async fn given_barrier_above_the_offer_when_state_transfer_publishes_should_serv
     assert_eq!(partition.owner_install_barrier, installed_op + 1);
 
     let offsets = crate::state_transfer::ConsumerOffsetsWire {
+        producers: Vec::new(),
         dedup_capacity: partition.dedup().capacity(),
         required_metadata_frontier: installed.installation.metadata_op,
         owners: vec![installed],
@@ -735,6 +737,7 @@ async fn given_an_index_sync_failure_when_installing_state_transfer_should_refus
     let active = partition.log.index_writers().len() - 1;
     partition.log.index_writers_mut()[active] = Some(Rc::new(writer));
     let offsets = crate::state_transfer::ConsumerOffsetsWire {
+        producers: Vec::new(),
         dedup_capacity: partition.dedup().capacity(),
         required_metadata_frontier: 0,
         prepare_checksum: Some(prepare.header().checksum),
@@ -830,6 +833,7 @@ async fn given_multi_segment_transfer_when_installing_should_keep_writers_on_the
     }
     let last = prepares.last().unwrap();
     let offsets = crate::state_transfer::ConsumerOffsetsWire {
+        producers: Vec::new(),
         owner_retirement: None,
         owners: Vec::new(),
         history_transition: None,

@@ -559,6 +559,7 @@ async fn given_an_install_below_the_adopted_head_when_reopening_should_resume_th
         .await
         .unwrap();
     let offsets = crate::state_transfer::ConsumerOffsetsWire {
+        producers: Vec::new(),
         dedup_capacity: consensus::CLIENTS_TABLE_MAX,
         prepare_checksum: Some(held.header().checksum),
         checkpoint_prepare: held.as_slice().to_vec(),
