@@ -20,6 +20,7 @@
 pub mod auth;
 pub mod bridge;
 pub mod cluster_id;
+pub mod coordinator;
 pub mod env;
 pub mod error;
 pub mod group;
@@ -29,4 +30,4 @@ pub mod server;
 pub mod tls;
 
 pub use iggy_kafka_wire::records;
-pub use server::{GatewayConfig, KafkaGateway};
+pub use server::{CoordinatorLog, GatewayConfig, KafkaGateway};

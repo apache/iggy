@@ -77,6 +77,7 @@ pub use http::streams::*;
 pub use http::system::*;
 pub use http::topics::*;
 pub use http::users::*;
+pub use iggy_binary_protocol::batch::BatchProducer;
 pub use iggy_binary_protocol::requests::messages::{
     MAX_DEFERRED_POLL_TIMEOUT_US, MAX_DEFERRED_POLL_WAIT_US, MIN_DEFERRED_POLL_MAX_BYTES,
     MIN_DEFERRED_POLL_REPLY_MARGIN_US,
@@ -108,7 +109,9 @@ pub use traits::topic_client::TopicClient;
 pub use traits::user_client::UserClient;
 pub use traits::validatable::Validatable;
 #[doc(hidden)]
-pub use traits::{BinarySendPartitioning, fetch_binary_messages, send_binary_messages};
+pub use traits::{
+    BinarySendPartitioning, fetch_binary_messages, select_send_partition, send_binary_messages,
+};
 pub use traits::{binary_sign_in, rust_sdk_version_info, sign_in_request};
 pub use traits::{decode_send_confirmations, group_cache_key, sync_group_assignment};
 pub use types::args::*;
