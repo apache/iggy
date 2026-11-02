@@ -688,11 +688,12 @@ namespace Iggy {
          * then stays uncounted under CommitAfter::Processing, so the next run reads it again.
          *
          * The consumer retries a failed read by itself and does not throw it. An error that ends
-         * the run throws Iggy\Exception\ReadException: HistoryUnavailable (87), which stops its
-         * partition until seek(), and under CommitPolicy::onRead() an unknown outcome, which
-         * stops its partition until its operation is abandoned and the partition is sought. A
-         * blocked lane, a shut down client and any error while the client cannot reconnect by
-         * itself also end the run.
+         * the run throws Iggy\Exception\ReadException: HistoryUnavailable (87) and six refusals
+         * in a row that a retry does not change, such as Unauthorized (41) or a missing partition,
+         * each of which stops its partition until seek(), and under CommitPolicy::onRead() an
+         * unknown outcome, which stops its partition until its operation is abandoned and the
+         * partition is sought. A blocked lane, a shut down client and any error while the client
+         * cannot reconnect by itself also end the run.
          *
          * With `idle_timeout_micros`, a run that gets no message for that long ends and returns
          * the count of the messages it consumed, so a single-threaded worker regains control on an
@@ -748,7 +749,8 @@ namespace Iggy {
          * Under CommitPolicy::auto(), a message counts when the iterator yields it with
          * CommitAfter::Delivery, and when the iterator moves past it with CommitAfter::Processing. A
          * failed read throws Iggy\Exception\ReadException. The consumer stays usable and retries by
-         * itself. HistoryUnavailable (87) stops its partition until seek().
+         * itself. HistoryUnavailable (87) and six refusals in a row that a retry does not change,
+         * such as Unauthorized (41), stop their partition until seek().
          *
          * @param mixed $idle_timeout_micros
          * @return \Iggy\MessageIterator
@@ -2754,6 +2756,14 @@ namespace Iggy\Exception {
      * any other call would throw it, for example a PendingOperationException.
      */
     class ReadException extends \Iggy\Exception\IggyException {
+        /**
+         * Whether the reader stopped the partition after six refusals in a row that a retry does
+         * not change, such as Unauthorized (41). A seek of the partition reads it again.
+         *
+         * @var bool
+         */
+        public readonly bool $is_lasting_refusal;
+
         /**
          * The partition of the error, or null for an error of the whole reader.
          *
