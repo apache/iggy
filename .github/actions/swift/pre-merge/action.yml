@@ -45,6 +45,37 @@ runs:
         for package in examples/swift/getting-started bdd/swift/tests; do
           swift format lint --strict --recursive --configuration foreign/swift/.swift-format "$package/Sources" "$package/Package.swift"
         done
+        swift format lint --strict --configuration foreign/swift/.swift-format Package.swift
+
+    # Consumers and CI must build the same library from the two manifests.
+    - name: Check the root manifest matches the SDK manifest
+      shell: bash
+      if: inputs.task == 'lint'
+      run: |
+        set -euo pipefail
+        root_manifest=$(swift package --package-path . dump-package)
+        sdk_manifest=$(swift package --package-path foreign/swift dump-package)
+        if ! jq -e '.products | length == 1 and .[0].name == "Iggy"' <<< "$root_manifest" >/dev/null \
+          || ! jq -e '.targets | length == 1 and .[0].name == "Iggy"' <<< "$root_manifest" >/dev/null; then
+          echo "❌ Root Package.swift must declare only the Iggy library and target"
+          exit 1
+        fi
+        root_path=$(jq -r '.targets[] | select(.name == "Iggy") | .path' <<< "$root_manifest")
+        if [ "$root_path" != "foreign/swift/Sources/Iggy" ]; then
+          echo "❌ Root Package.swift builds Iggy from '$root_path', expected foreign/swift/Sources/Iggy"
+          exit 1
+        fi
+        sdk_path=$(jq -r '.targets[] | select(.name == "Iggy") | .path // "Sources/Iggy"' <<< "$sdk_manifest")
+        if [ "$sdk_path" != "Sources/Iggy" ]; then
+          echo "❌ SDK Package.swift builds Iggy from '$sdk_path', expected Sources/Iggy"
+          exit 1
+        fi
+        projection='del(.name, .packageKind) | .products |= map(select(.name == "Iggy")) | .targets |= map(select(.name == "Iggy") | del(.path))'
+        if ! diff <(jq -S "$projection" <<< "$root_manifest") <(jq -S "$projection" <<< "$sdk_manifest"); then
+          echo "❌ Package.swift and foreign/swift/Package.swift disagree, see the diff above"
+          exit 1
+        fi
+        echo "✅ Root Package.swift matches foreign/swift/Package.swift"
 
     # A warning-free build is the lint gate the Swift compiler provides: the
     # SDK builds in Swift 6 language mode with strict concurrency checking.

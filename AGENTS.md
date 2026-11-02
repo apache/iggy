@@ -3,7 +3,7 @@
 **Apache Iggy** is a persistent message streaming platform
 in Rust. Thread-per-core shared-nothing, `io_uring` + `compio`.
 Transports: QUIC, WebSocket, TCP (custom binary), HTTP (REST). SDKs:
-Rust, .NET, Java, Python, Go, C++, Node.js. A connectors subsystem
+Rust, .NET, Java, Python, Go, C++, Node.js, Swift. A connectors subsystem
 ingests from / egresses to external systems via dlopened plugins.
 
 > Skills live under `.claude/skills/`, with per-skill links under
