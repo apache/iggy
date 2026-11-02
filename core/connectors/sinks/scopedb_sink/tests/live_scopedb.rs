@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 #[tokio::test]
 #[ignore = "requires SCOPEDB_ENDPOINT and SCOPEDB_API_KEY with catalog creation and read/write permissions"]
-async fn given_live_scopedb_when_writing_should_preserve_payloads_and_recover_valid_rows() {
+async fn given_live_scopedb_when_writing_should_preserve_payloads_and_reject_whole_batches() {
     let endpoint = env::var("SCOPEDB_ENDPOINT").expect("SCOPEDB_ENDPOINT");
     let api_key = env::var("SCOPEDB_API_KEY").expect("SCOPEDB_API_KEY");
     let client = Client::builder(&endpoint)
@@ -66,14 +66,29 @@ async fn given_live_scopedb_when_writing_should_preserve_payloads_and_recover_va
             metadata(Schema::Text),
             vec![
                 message(10, Payload::Text("{\"id\":1}".into())),
-                message(11, Payload::Text("{\"id\":\"bad\"}".into())),
                 message(12, Payload::Text("{\"id\":2}".into())),
             ],
         )
         .await
-        .expect("recover valid mapped rows");
+        .expect("write complete mapped request");
+        let failure = sink
+            .consume(
+                &topic(),
+                metadata(Schema::Text),
+                vec![
+                    message(13, Payload::Text("{\"id\":3}".into())),
+                    message(14, Payload::Text("{\"id\":\"bad\"}".into())),
+                    message(15, Payload::Text("{\"id\":4}".into())),
+                ],
+            )
+            .await;
+        assert!(matches!(
+            failure,
+            Err(iggy_connector_sdk::Error::PermanentHttpError(_))
+        ));
         assert_eq!(sink.stats().written, 2);
-        assert_eq!(sink.stats().rejected, 1);
+        assert_eq!(sink.stats().rejected, 0);
+        assert_eq!(sink.stats().failed, 3);
         let rows = client
             .query(format!(
                 "FROM `scopedb`.`{schema_name}`.`mapped` ORDER BY iggy_offset"
@@ -121,11 +136,11 @@ async fn given_live_scopedb_when_writing_should_preserve_payloads_and_recover_va
     };
     // Cleanup runs even when an assertion panics in the verification task.
     let verification = tokio::spawn(verification).await;
-    let snapshot = resource.get().await.expect("read cleanup ETag");
+    let snapshot = resource.get().await.expect("read cleanup catalog version");
     resource
         .delete(CatalogOptions {
             allow_destructive: true,
-            if_match: Some(snapshot.etag),
+            expected_version: Some(snapshot.version),
             ..CatalogOptions::default()
         })
         .await

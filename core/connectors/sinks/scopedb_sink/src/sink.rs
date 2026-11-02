@@ -22,8 +22,8 @@ use async_trait::async_trait;
 use iggy_connector_sdk::retry::{RetryPolicy, retry_async};
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
 use scopedb_client::{
-    AppendBatchError, AppendBatchReport, AppendBatchResult, AppendFailurePolicy, AppendState,
-    Client, reqwest,
+    AppendFailurePolicy, AppendOutcome, AppendRequestResult, AppendWriteReport, Client,
+    Error as ScopeDBError, reqwest,
 };
 use secrecy::ExposeSecret;
 use serde_json::Value;
@@ -146,14 +146,14 @@ impl ScopeDBSink {
             .with_database(self.config.database.as_deref().unwrap_or("scopedb"))
             .with_schema(self.config.schema.as_deref().unwrap_or("public"));
         let writer = table
-            .append_batch()
+            .append_writer()
             .target_batch_bytes(self.settings.max_request_bytes)
             .max_batch_rows(self.settings.batch_size)
             .max_concurrent_batches(self.settings.max_concurrent_requests)
             .max_retries(self.settings.max_attempts.saturating_sub(1) as usize)
             .initial_backoff(self.settings.retry_delay)
             .max_backoff(self.settings.max_retry_delay)
-            .retry_unknown(self.settings.retry_unknown)
+            .retry_ambiguous(self.settings.retry_ambiguous)
             .attempt_timeout(self.settings.timeout)
             .failure_policy(AppendFailurePolicy::Continue)
             .build()
@@ -170,12 +170,9 @@ impl ScopeDBSink {
         );
         let snapshot = timeout(
             self.settings.timeout,
-            retry_async(
-                policy,
-                &context,
-                scopedb_client::Error::is_retryable,
-                || catalog.get(),
-            ),
+            retry_async(policy, &context, ScopeDBError::is_retryable, || {
+                catalog.get()
+            }),
         )
         .await
         .map_err(|_| Error::InitError("ScopeDB startup timed out".into()))?
@@ -192,13 +189,15 @@ impl ScopeDBSink {
     async fn settle(
         &self,
         state: &OpenState,
-        failure: &AppendBatchError,
+        failure: &ScopeDBError,
         rows: &[Value],
         offsets: &[u64],
         topic: &TopicMetadata,
         metadata: &MessagesMetadata,
     ) -> Result<(), Error> {
-        let report = failure.report();
+        let report = failure
+            .append_write_report()
+            .expect("finite write errors retain their progress report");
         let mut last_error = None;
         for batch in report.batches() {
             match batch.result() {
@@ -242,13 +241,15 @@ impl ScopeDBSink {
                             }
                             Err(failure) => {
                                 self.record_final_report(
-                                    failure.report(),
+                                    failure
+                                        .append_write_report()
+                                        .expect("finite write errors retain their progress report"),
                                     &remaining_offsets,
                                     topic,
                                     metadata,
-                                    failure.cause(),
+                                    &failure,
                                 );
-                                remember_failure(&mut last_error, sink_error(failure.cause()));
+                                remember_failure(&mut last_error, sink_error(&failure));
                             }
                         }
                     } else {
@@ -259,24 +260,19 @@ impl ScopeDBSink {
             }
         }
         if !report.unsubmitted().is_empty() {
-            self.not_submitted(
-                topic,
-                metadata,
-                &offsets[report.unsubmitted()],
-                failure.cause(),
-            );
-            remember_failure(&mut last_error, sink_error(failure.cause()));
+            self.not_submitted(topic, metadata, &offsets[report.unsubmitted()], failure);
+            remember_failure(&mut last_error, sink_error(failure));
         }
         last_error.map_or(Ok(()), Err)
     }
 
     fn rejected_indexes(
         &self,
-        batch: &AppendBatchResult,
-        error: &scopedb_client::Error,
+        batch: &AppendRequestResult,
+        error: &ScopeDBError,
     ) -> Option<BTreeSet<usize>> {
         let details = error.append_details()?;
-        if details.status != AppendState::Rejected
+        if details.status != AppendOutcome::Failed
             || details.row_errors_truncated
             || details.row_errors.is_empty()
             || !error
@@ -294,11 +290,11 @@ impl ScopeDBSink {
 
     fn record_final_report(
         &self,
-        report: &AppendBatchReport,
+        report: &AppendWriteReport,
         offsets: &[u64],
         topic: &TopicMetadata,
         metadata: &MessagesMetadata,
-        cause: &scopedb_client::Error,
+        cause: &ScopeDBError,
     ) {
         for batch in report.batches() {
             match batch.result() {
@@ -332,11 +328,11 @@ impl ScopeDBSink {
         topic: &TopicMetadata,
         metadata: &MessagesMetadata,
         offsets: &[u64],
-        reason: &scopedb_client::Error,
+        reason: &ScopeDBError,
     ) {
         let unknown = reason
             .append_details()
-            .is_none_or(|details| details.status == AppendState::Unknown);
+            .is_none_or(|details| details.status == AppendOutcome::Ambiguous);
         let counter = if unknown {
             &self.counters.unconfirmed
         } else {
@@ -356,7 +352,7 @@ impl ScopeDBSink {
         topic: &TopicMetadata,
         metadata: &MessagesMetadata,
         offsets: &[u64],
-        reason: &scopedb_client::Error,
+        reason: &ScopeDBError,
     ) {
         self.counters
             .failed
@@ -370,10 +366,10 @@ impl ScopeDBSink {
     }
 }
 
-fn sink_error(error: &scopedb_client::Error) -> Error {
+fn sink_error(error: &ScopeDBError) -> Error {
     if error
         .append_details()
-        .is_none_or(|details| details.status == AppendState::Unknown)
+        .is_none_or(|details| details.status == AppendOutcome::Ambiguous)
     {
         Error::WriteFailure(error.to_string())
     } else {

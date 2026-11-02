@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::{Error, sink_connector};
-use scopedb_client::{AppendBatch, reqwest::Url};
+use scopedb_client::{AppendWriter, reqwest::Url};
 use secrecy::SecretString;
 use serde::Deserialize;
 use tracing::warn;
@@ -56,7 +56,7 @@ pub struct ScopeDBSinkConfig {
     pub max_retries: Option<u32>,
     pub retry_delay: Option<String>,
     pub max_retry_delay: Option<String>,
-    pub retry_unknown: Option<bool>,
+    pub retry_ambiguous: Option<bool>,
     pub timeout: Option<String>,
     pub verbose_logging: Option<bool>,
 }
@@ -81,14 +81,14 @@ struct Settings {
     max_attempts: u32,
     retry_delay: Duration,
     max_retry_delay: Duration,
-    retry_unknown: bool,
+    retry_ambiguous: bool,
     timeout: Duration,
     verbose: bool,
 }
 
 #[derive(Debug)]
 struct OpenState {
-    writer: AppendBatch,
+    writer: AppendWriter,
     layout: schema::Layout,
 }
 
@@ -169,7 +169,7 @@ impl Settings {
             max_attempts,
             retry_delay,
             max_retry_delay,
-            retry_unknown: config.retry_unknown.unwrap_or(false),
+            retry_ambiguous: config.retry_ambiguous.unwrap_or(false),
             timeout: duration(id, config.timeout.as_deref(), "30s"),
             verbose: config.verbose_logging.unwrap_or(false),
         }

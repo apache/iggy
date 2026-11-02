@@ -1,6 +1,6 @@
 # ScopeDB Sink Connector
 
-The ScopeDB sink appends Iggy messages to an existing ScopeDB table through the ScopeDB Rust SDK. Each `consume()` call waits for its writes and retries to settle. It keeps no buffer across calls.
+The ScopeDB sink appends Iggy messages to an existing ScopeDB table through the ScopeDB Rust SDK. Each `consume()` call waits for its writes and retries to settle. It keeps no buffer across calls. Normal close drops the settled writer; cancellation stops further scheduling and retrying, while requests already sent may still commit.
 
 ## Configuration
 
@@ -48,7 +48,7 @@ Inject credentials with `IGGY_CONNECTORS_SINK_SCOPEDB_PLUGIN_CONFIG_API_KEY`. Pl
 | `max_retries` | `3` | Total attempts per request, including the first, clamped to 1..3 |
 | `retry_delay` | `1s` | Initial exponential backoff |
 | `max_retry_delay` | `30s` | Maximum backoff, including `Retry-After` |
-| `retry_unknown` | `false` | Explicitly allow replay of transient unknown outcomes; duplicates are possible |
+| `retry_ambiguous` | `false` | Explicitly allow replay of transient ambiguous outcomes; duplicates are possible |
 | `timeout` | `30s` | Overall startup deadline and timeout per HTTP write attempt, including response body reads |
 | `verbose_logging` | `false` | Log consume summaries at info rather than debug |
 
@@ -109,9 +109,11 @@ CREATE TABLE events (
 
 ## Failures and delivery semantics
 
-The SDK splits requests at the configured byte and row limits. Temporary rejections retry with bounded exponential backoff; error metadata and `Retry-After` are preserved. Unknown outcomes are not replayed by default. Client-side write timeouts are never automatically replayed, including when `retry_unknown = true`. The connector adds no HTTP retry middleware or redirects that could replay a write behind the SDK's back.
+The SDK splits requests at the configured byte and row limits. Only validated HTTP 429 admission refusals retry by default, using bounded exponential backoff and `Retry-After`. HTTP 5xx, lost responses, and invalid success counts are ambiguous and are not replayed by default. Client-side write timeouts are never automatically replayed, including when `retry_ambiguous = true`. The connector adds no HTTP retry middleware or redirects that could replay a write behind the SDK's back.
 
-A complete, atomic rejection with row errors identifies rows known to be invalid. The connector deduplicates the indexes, logs and drops those rows, then appends the remaining rows from that request once more. Successful sibling requests are never replayed. Truncated or out-of-range row errors do not authorize this recovery. A second row-error response fails the remaining rows instead of starting an unbounded filtering loop.
+Modern ScopeDB errors describe a whole failed request, so the connector fails that batch without trying to parse row indexes from diagnostic text.
+
+When an older response supplies a complete, atomic rejection with structured row errors, those indexes identify rows known to be invalid. The connector deduplicates the indexes, logs and drops those rows, then appends the remaining rows from that request once more. Successful sibling requests are never replayed. Truncated or out-of-range row errors do not authorize this recovery. A second row-error response fails the remaining rows instead of starting an unbounded filtering loop.
 
 Every local rejection and terminal failed/unconfirmed row is logged with stream, topic, partition, and message offset. `stats()` and the shutdown log distinguish written, rejected, failed, and unconfirmed rows. These are logical input counts; opt-in unknown replay can create extra physical copies. If every message is rejected, `consume()` returns an error. There is no dead-letter queue.
 
@@ -126,7 +128,7 @@ cargo build -p iggy_connector_scopedb_sink
 cargo test -p iggy_connector_scopedb_sink
 ```
 
-The SDK dependency is pinned to a Git revision providing finite batch writes and input-index reports. Builds require access to that repository until a published SDK release replaces the Git dependency.
+The connector uses the published `scopedb-client 0.5.0` crate. `AppendWriter` owns request splitting, concurrency, retries, and timeouts; failed writes retain their per-request input ranges on `Error::append_write_report()`.
 
 The default tests use an in-process HTTP server and the real Rust SDK. They verify zstd NDJSON, schema discovery, authentication, raw/mapped payloads, metadata, request splitting, bounded retries, row-error recovery, partial success, and unknown outcomes without cloud access.
 
@@ -138,6 +140,6 @@ export SCOPEDB_API_KEY='<api-key>'
 cargo test -p iggy_connector_scopedb_sink --test live_scopedb -- --ignored --nocapture
 ```
 
-The test creates a uniquely named schema, writes mapped events including a bad row, reads back metadata, writes non-UTF-8 binary payloads, and removes its schema even when verification panics.
+The test creates a uniquely named schema, verifies mapped writes and metadata, checks that a request containing an invalid row fails as a whole, round-trips non-UTF-8 binary payloads, and removes its schema even when verification panics.
 
-For an Iggy runtime smoke test, create the sample table, build the plugin, and copy `config.toml` into the runtime's configured connectors directory. Set the endpoint/key, start the runtime, and produce `{"id":1,"event":"created"}` to the configured stream/topic. Query the target table and check the source offset and message ID. Also produce a wrong-typed `id`; verify that it is logged and counted while valid messages still arrive.
+For an Iggy runtime smoke test, create the sample table, build the plugin, and copy `config.toml` into the runtime's configured connectors directory. Set the endpoint/key, start the runtime, and produce `{"id":1,"event":"created"}` to the configured stream/topic. Query the target table and check the source offset and message ID. Also produce a wrong-typed `id`; verify that its failed request is logged with source offsets and counted without replaying successful sibling requests.

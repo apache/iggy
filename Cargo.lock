@@ -12696,10 +12696,10 @@ checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
 
 [[package]]
 name = "scopedb-client"
-version = "0.4.2"
-source = "git+https://github.com/scopedb/scopedb-client?rev=c970cd918496e0de3e6fee077fc000f2e7a5e09c#c970cd918496e0de3e6fee077fc000f2e7a5e09c"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8699b66172d93fc8cf3884f8e798a05961c813b029376ce23762242898ca0936"
 dependencies = [
- "anyhow",
  "fastrace",
  "fastrace-reqwest",
  "httpdate",

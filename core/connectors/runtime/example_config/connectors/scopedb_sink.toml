@@ -47,6 +47,6 @@ max_concurrent_requests = 1
 max_retries = 3
 retry_delay = "1s"
 max_retry_delay = "30s"
-retry_unknown = false
+retry_ambiguous = false
 timeout = "30s"
 verbose_logging = false

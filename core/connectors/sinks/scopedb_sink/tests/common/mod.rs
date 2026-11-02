@@ -28,7 +28,9 @@ use axum::routing::get;
 use iggy_connector_scopedb_sink::ScopeDBSinkConfig;
 use iggy_connector_sdk::{ConsumedMessage, MessagesMetadata, Payload, Schema, TopicMetadata};
 use serde_json::{Value, json};
+use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone)]
@@ -36,7 +38,9 @@ pub enum Reply {
     Commit,
     RowErrors { indexes: Vec<u64>, truncated: bool },
     Reject(StatusCode),
-    Unknown,
+    Ambiguous,
+    InvalidCount,
+    Blocked(watch::Receiver<bool>),
     Hang,
 }
 
@@ -55,16 +59,19 @@ pub struct Backend {
     pub replies: VecDeque<Reply>,
     pub appends: Vec<Append>,
     pub stored: Vec<Value>,
+    received: watch::Sender<usize>,
 }
 
 pub struct FakeScopeDB {
     pub endpoint: String,
     pub state: Arc<Mutex<Backend>>,
     task: JoinHandle<()>,
+    received: watch::Receiver<usize>,
 }
 
 impl FakeScopeDB {
     pub async fn start(table: Value) -> Self {
+        let (record, received) = watch::channel(0);
         let state = Arc::new(Mutex::new(Backend {
             table,
             catalog_replies: VecDeque::new(),
@@ -72,6 +79,7 @@ impl FakeScopeDB {
             replies: VecDeque::new(),
             appends: Vec::new(),
             stored: Vec::new(),
+            received: record,
         }));
         let router = Router::new()
             .route(
@@ -97,6 +105,7 @@ impl FakeScopeDB {
             endpoint,
             state,
             task,
+            received,
         }
     }
 
@@ -105,6 +114,16 @@ impl FakeScopeDB {
             "endpoint": self.endpoint, "table":"events", "include_metadata":false,
             "batch_size":2, "max_retries":3, "retry_delay":"0s", "max_retry_delay":"0s", "timeout":"1s"
         })).expect("valid test config")
+    }
+
+    pub async fn wait_for_appends(&mut self, count: usize) {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            self.received.wait_for(|received| *received >= count),
+        )
+        .await
+        .expect("request arrives")
+        .expect("backend stays open");
     }
 
     pub fn script(&self, replies: impl IntoIterator<Item = Reply>) {
@@ -162,22 +181,39 @@ async fn append(
             headers,
             bytes: decoded.len(),
         });
+        state.received.send_replace(state.appends.len());
         let reply = state.replies.pop_front().unwrap_or(Reply::Commit);
-        if matches!(reply, Reply::Commit | Reply::Unknown) {
+        if matches!(
+            reply,
+            Reply::Commit | Reply::Ambiguous | Reply::InvalidCount
+        ) {
             state.stored.extend(rows.iter().cloned());
         }
         reply
     };
     match reply {
-        Reply::Commit => Json(json!({"status":"committed", "num_rows_inserted":rows.len()})).into_response(),
+        Reply::Commit => Json(json!({"num_rows_inserted":rows.len()})).into_response(),
         Reply::RowErrors { indexes, truncated } => {
             let errors: Vec<_> = indexes.into_iter().map(|index| json!({"row_index":index,"column":"id","message":"invalid integer"})).collect();
             (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"code":"invalid_schema","message":"invalid rows","retryable":false,
                 "details":{"status":"rejected","row_errors":errors,"row_errors_truncated":truncated}}))).into_response()
         }
-        Reply::Reject(status) => (status, Json(json!({"message":"append rejected", "retryable": status == StatusCode::SERVICE_UNAVAILABLE,
-            "details":{"status":"rejected"}}))).into_response(),
-        Reply::Unknown => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"message":"append acknowledgement lost", "details":{"status":"unknown"}}))).into_response(),
+        Reply::Reject(StatusCode::SERVICE_UNAVAILABLE) => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"message":"append rejected", "retryable":true,"details":{"status":"rejected"}}))).into_response(),
+        Reply::Reject(status) => {
+            let code = match status {
+                StatusCode::TOO_MANY_REQUESTS => "too_many_requests",
+                StatusCode::BAD_REQUEST => "bad_request",
+                StatusCode::FORBIDDEN => "permission_denied",
+                _ => "append_failed",
+            };
+            (status, Json(json!({"error":{"code":code,"message":"append rejected"}}))).into_response()
+        }
+        Reply::Ambiguous => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":{"code":"service_unavailable", "message":"append acknowledgement lost"}}))).into_response(),
+        Reply::InvalidCount => Json(json!({"num_rows_inserted":0})).into_response(),
+        Reply::Blocked(mut gate) => {
+            gate.wait_for(|ready| *ready).await.expect("release response");
+            (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":{"code":"too_many_requests","message":"busy"}}))).into_response()
+        }
         Reply::Hang => std::future::pending().await,
     }
 }

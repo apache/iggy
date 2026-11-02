@@ -18,11 +18,15 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::http::StatusCode;
 use iggy_common::{HeaderKey, HeaderValue};
 use iggy_connector_scopedb_sink::{ScopeDBSink, WriteMode};
 use iggy_connector_sdk::{Error, Payload, Schema, Sink};
 use serde_json::json;
+use tokio::sync::watch;
 
 mod common;
 use common::{FakeScopeDB, Reply, json_message, message, metadata, table, topic};
@@ -67,35 +71,38 @@ async fn given_partial_writes_when_recovering_should_only_resubmit_valid_rejecte
 
 #[tokio::test]
 async fn given_unknown_outcomes_when_retries_disabled_should_not_replay_rows() {
-    let backend = FakeScopeDB::start(table(&[("id", "int")])).await;
-    backend.script([Reply::Commit, Reply::Unknown]);
-    let mut config = backend.config();
-    config.batch_size = Some(1);
-    let mut sink = ScopeDBSink::new(2, config);
-    sink.open().await.expect("open sink");
-    let result = sink
-        .consume(
-            &topic(),
-            metadata(Schema::Json),
-            vec![
-                json_message(10, json!({"id":1})),
-                json_message(11, json!({"id":2})),
-            ],
-        )
-        .await;
-    assert!(matches!(result, Err(Error::WriteFailure(_))));
-    assert_eq!(sink.stats().written, 1);
-    assert_eq!(sink.stats().unconfirmed, 1);
-    assert_eq!(backend.state.lock().expect("backend lock").appends.len(), 2);
+    for reply in [
+        Reply::Ambiguous,
+        Reply::InvalidCount,
+        Reply::Reject(StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        let backend = FakeScopeDB::start(table(&[("id", "int")])).await;
+        backend.script([Reply::Commit, reply]);
+        let mut config = backend.config();
+        config.batch_size = Some(1);
+        let mut sink = ScopeDBSink::new(2, config);
+        sink.open().await.expect("open sink");
+        let result = sink
+            .consume(
+                &topic(),
+                metadata(Schema::Json),
+                vec![
+                    json_message(10, json!({"id":1})),
+                    json_message(11, json!({"id":2})),
+                ],
+            )
+            .await;
+        assert!(matches!(result, Err(Error::WriteFailure(_))));
+        assert_eq!(sink.stats().written, 1);
+        assert_eq!(sink.stats().unconfirmed, 1);
+        assert_eq!(backend.state.lock().expect("backend lock").appends.len(), 2);
+    }
 }
 
 #[tokio::test]
-async fn given_temporary_rejections_when_writing_should_bound_retries() {
+async fn given_rate_limits_when_writing_should_bound_retries() {
     let backend = FakeScopeDB::start(table(&[("id", "int")])).await;
-    backend.script([
-        Reply::Reject(StatusCode::SERVICE_UNAVAILABLE),
-        Reply::Commit,
-    ]);
+    backend.script([Reply::Reject(StatusCode::TOO_MANY_REQUESTS), Reply::Commit]);
     let mut config = backend.config();
     config.api_key = Some("test-api-key".into());
     let mut sink = ScopeDBSink::new(3, config);
@@ -121,9 +128,9 @@ async fn given_temporary_rejections_when_writing_should_bound_retries() {
 async fn given_exhausted_rejections_when_writing_should_stop_at_three_attempts() {
     let backend = FakeScopeDB::start(table(&[("id", "int")])).await;
     backend.script([
-        Reply::Reject(StatusCode::SERVICE_UNAVAILABLE),
-        Reply::Reject(StatusCode::SERVICE_UNAVAILABLE),
-        Reply::Reject(StatusCode::SERVICE_UNAVAILABLE),
+        Reply::Reject(StatusCode::TOO_MANY_REQUESTS),
+        Reply::Reject(StatusCode::TOO_MANY_REQUESTS),
+        Reply::Reject(StatusCode::TOO_MANY_REQUESTS),
         Reply::Commit,
     ]);
     let mut config = backend.config();
@@ -390,7 +397,7 @@ async fn given_timeout_when_unknown_retries_enabled_should_not_replay_rows() {
     let backend = FakeScopeDB::start(table(&[("id", "int")])).await;
     backend.script([Reply::Hang]);
     let mut config = backend.config();
-    config.retry_unknown = Some(true);
+    config.retry_ambiguous = Some(true);
     config.timeout = Some("1s".into());
     let mut sink = ScopeDBSink::new(13, config);
     sink.open().await.expect("open sink");
@@ -410,7 +417,7 @@ async fn given_timeout_when_unknown_retries_enabled_should_not_replay_rows() {
 #[tokio::test]
 async fn given_unknown_outcome_when_later_rejection_occurs_should_preserve_unknown_error() {
     let backend = FakeScopeDB::start(table(&[("id", "int")])).await;
-    backend.script([Reply::Unknown, Reply::Reject(StatusCode::FORBIDDEN)]);
+    backend.script([Reply::Ambiguous, Reply::Reject(StatusCode::FORBIDDEN)]);
     let mut config = backend.config();
     config.batch_size = Some(1);
     let mut sink = ScopeDBSink::new(14, config);
@@ -435,14 +442,14 @@ async fn given_unknown_outcome_when_later_rejection_occurs_should_preserve_unkno
 async fn given_unknown_replay_when_later_row_errors_occur_should_not_filter_and_replay() {
     let backend = FakeScopeDB::start(table(&[("id", "int")])).await;
     backend.script([
-        Reply::Unknown,
+        Reply::Ambiguous,
         Reply::RowErrors {
             indexes: vec![0],
             truncated: false,
         },
     ]);
     let mut config = backend.config();
-    config.retry_unknown = Some(true);
+    config.retry_ambiguous = Some(true);
     let mut sink = ScopeDBSink::new(15, config);
     sink.open().await.expect("open sink");
     let result = sink
@@ -459,4 +466,91 @@ async fn given_unknown_replay_when_later_row_errors_occur_should_not_filter_and_
     assert_eq!(sink.stats().unconfirmed, 2);
     assert_eq!(sink.stats().rejected, 0);
     assert_eq!(backend.state.lock().expect("backend lock").appends.len(), 2);
+}
+
+#[tokio::test]
+async fn given_failed_batch_without_row_indexes_when_writing_should_preserve_successful_siblings() {
+    let backend = FakeScopeDB::start(table(&[("id", "int")])).await;
+    backend.script([
+        Reply::Commit,
+        Reply::Reject(StatusCode::BAD_REQUEST),
+        Reply::Commit,
+    ]);
+    let mut sink = ScopeDBSink::new(17, backend.config());
+    sink.open().await.expect("open sink");
+    let result = sink
+        .consume(
+            &topic(),
+            metadata(Schema::Json),
+            (0..6)
+                .map(|id| json_message(id, json!({"id":id})))
+                .collect(),
+        )
+        .await;
+    assert!(matches!(result, Err(Error::PermanentHttpError(_))));
+    assert_eq!(sink.stats().written, 4);
+    assert_eq!(sink.stats().failed, 2);
+    assert_eq!(sink.stats().rejected, 0);
+    let state = backend.state.lock().expect("backend lock");
+    assert_eq!(state.appends.len(), 3);
+    assert_eq!(
+        state.stored,
+        vec![
+            json!({"id":0}),
+            json!({"id":1}),
+            json!({"id":4}),
+            json!({"id":5})
+        ]
+    );
+}
+
+#[tokio::test]
+async fn given_cancelled_http_wait_when_closing_should_not_retry_or_send_the_suffix() {
+    let mut backend = FakeScopeDB::start(table(&[("id", "int")])).await;
+    let (release, gate) = watch::channel(false);
+    backend.script([Reply::Blocked(gate)]);
+    let mut config = backend.config();
+    config.batch_size = Some(1);
+    let mut sink = ScopeDBSink::new(18, config);
+    sink.open().await.expect("open sink");
+    let sink = Arc::new(sink);
+    let pending = tokio::spawn({
+        let sink = sink.clone();
+        async move {
+            sink.consume(
+                &topic(),
+                metadata(Schema::Json),
+                vec![
+                    json_message(1, json!({"id":1})),
+                    json_message(2, json!({"id":2})),
+                ],
+            )
+            .await
+        }
+    });
+    backend.wait_for_appends(1).await;
+    pending.abort();
+    assert!(pending.await.expect_err("consume cancelled").is_cancelled());
+    let mut sink = Arc::try_unwrap(sink).expect("cancelled task releases the sink");
+    sink.close().await.expect("close cancelled sink");
+    release.send(true).expect("release HTTP response");
+    sink.open().await.expect("reopen sink");
+    sink.consume(
+        &topic(),
+        metadata(Schema::Json),
+        vec![json_message(9, json!({"id":9}))],
+    )
+    .await
+    .expect("new consume succeeds");
+    sink.close().await.expect("close settled sink");
+    assert_eq!(sink.stats().written, 1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), backend.wait_for_appends(3))
+            .await
+            .is_err()
+    );
+    let state = backend.state.lock().expect("backend lock");
+    assert_eq!(state.appends.len(), 2);
+    assert_eq!(state.appends[0].rows, vec![json!({"id":1})]);
+    assert_eq!(state.appends[1].rows, vec![json!({"id":9})]);
 }
