@@ -26,7 +26,7 @@ use scopedb_client::{
     Error as ScopeDBError, reqwest,
 };
 use secrecy::ExposeSecret;
-use serde_json::Value;
+use serde_json::value::RawValue;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -50,22 +50,24 @@ impl Sink for ScopeDBSink {
         metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
-        if messages.is_empty() {
+        let total_messages = messages.len();
+        if total_messages == 0 {
             return Ok(());
         }
         let state = self
             .state
             .as_ref()
             .ok_or_else(|| Error::InitError("ScopeDB sink is not open".into()))?;
-        let mut rows = Vec::with_capacity(messages.len());
-        let mut offsets = Vec::with_capacity(messages.len());
-        for message in &messages {
+        let mut rows = Vec::with_capacity(total_messages);
+        let mut offsets = Vec::with_capacity(total_messages);
+        for message in messages {
+            let offset = message.offset;
             match encode::row(message, topic, &metadata, &state.layout, &self.settings) {
                 Ok(row) => {
                     rows.push(row);
-                    offsets.push(message.offset);
+                    offsets.push(offset);
                 }
-                Err(error) => self.reject(topic, &metadata, message.offset, &error),
+                Err(error) => self.reject(topic, &metadata, offset, &error),
             }
         }
         if rows.is_empty() {
@@ -75,9 +77,7 @@ impl Sink for ScopeDBSink {
         }
         let result = match state.writer.write(&rows).await {
             Ok(report) => {
-                self.counters
-                    .written
-                    .fetch_add(report.committed_rows() as u64, Ordering::Relaxed);
+                self.record_committed_report(&report, topic, &metadata);
                 Ok(())
             }
             Err(failure) => {
@@ -89,7 +89,7 @@ impl Sink for ScopeDBSink {
             info!(
                 "ScopeDB sink connector ID: {} settled {} messages from {}/{} partition={} current_offset={}, counters={:?}",
                 self.id,
-                messages.len(),
+                total_messages,
                 topic.stream,
                 topic.topic,
                 metadata.partition_id,
@@ -100,7 +100,7 @@ impl Sink for ScopeDBSink {
             debug!(
                 "ScopeDB sink connector ID: {} settled {} messages from {}/{} partition={} current_offset={}, counters={:?}",
                 self.id,
-                messages.len(),
+                total_messages,
                 topic.stream,
                 topic.topic,
                 metadata.partition_id,
@@ -190,7 +190,7 @@ impl ScopeDBSink {
         &self,
         state: &OpenState,
         failure: &ScopeDBError,
-        rows: &[Value],
+        rows: &[Box<RawValue>],
         offsets: &[u64],
         topic: &TopicMetadata,
         metadata: &MessagesMetadata,
@@ -202,9 +202,7 @@ impl ScopeDBSink {
         for batch in report.batches() {
             match batch.result() {
                 Ok(_) => {
-                    self.counters
-                        .written
-                        .fetch_add(batch.input_range().len() as u64, Ordering::Relaxed);
+                    self.record_committed_batch(batch, topic, metadata);
                 }
                 Err(error) => {
                     let indexes = self.rejected_indexes(batch, error);
@@ -234,10 +232,7 @@ impl ScopeDBSink {
                         // nothing. Successful sibling requests must never be replayed.
                         match state.writer.write(&remaining_rows).await {
                             Ok(recovered) => {
-                                self.counters.written.fetch_add(
-                                    recovered.committed_rows() as u64,
-                                    Ordering::Relaxed,
-                                );
+                                self.record_committed_report(&recovered, topic, metadata);
                             }
                             Err(failure) => {
                                 self.record_final_report(
@@ -264,6 +259,41 @@ impl ScopeDBSink {
             remember_failure(&mut last_error, sink_error(failure));
         }
         last_error.map_or(Ok(()), Err)
+    }
+
+    fn record_committed_report(
+        &self,
+        report: &AppendWriteReport,
+        topic: &TopicMetadata,
+        metadata: &MessagesMetadata,
+    ) {
+        for batch in report.batches() {
+            if batch.result().is_ok() {
+                self.record_committed_batch(batch, topic, metadata);
+            }
+        }
+    }
+
+    fn record_committed_batch(
+        &self,
+        batch: &AppendRequestResult,
+        topic: &TopicMetadata,
+        metadata: &MessagesMetadata,
+    ) {
+        let rows = batch.input_range().len();
+        self.counters
+            .written
+            .fetch_add(rows as u64, Ordering::Relaxed);
+        if batch.retries() > 0 {
+            debug!(
+                "ScopeDB sink connector ID: {} committed {rows} row(s) after {} retry attempt(s) stream={} topic={} partition={}",
+                self.id,
+                batch.retries(),
+                topic.stream,
+                topic.topic,
+                metadata.partition_id
+            );
+        }
     }
 
     fn rejected_indexes(
@@ -299,9 +329,7 @@ impl ScopeDBSink {
         for batch in report.batches() {
             match batch.result() {
                 Ok(_) => {
-                    self.counters
-                        .written
-                        .fetch_add(batch.input_range().len() as u64, Ordering::Relaxed);
+                    self.record_committed_batch(batch, topic, metadata);
                 }
                 Err(error) => self.fail(topic, metadata, &offsets[batch.input_range()], error),
             }
@@ -339,9 +367,10 @@ impl ScopeDBSink {
             &self.counters.failed
         };
         counter.fetch_add(offsets.len() as u64, Ordering::Relaxed);
+        let retries = reason.retries();
         for offset in offsets {
             error!(
-                "ScopeDB sink connector ID: {} append failed stream={} topic={} partition={} offset={offset} unknown={unknown}: {reason}",
+                "ScopeDB sink connector ID: {} append failed stream={} topic={} partition={} offset={offset} retries={retries} unknown={unknown}: {reason}",
                 self.id, topic.stream, topic.topic, metadata.partition_id
             );
         }

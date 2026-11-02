@@ -110,6 +110,7 @@ Each sink should have its own, custom configuration, which is passed along with 
 - **RabbitMQ Sink** - publishes messages to RabbitMQ exchanges via AMQP 0.9.1
 - **Reshift Sink** - stores messages in Redshift warehouse tables via S3 as staging
 - **S3 Sink** - writes messages to Amazon S3 and S3-compatible stores (MinIO, R2, B2, DO Spaces)
+- **ScopeDB Sink** - appends messages into ScopeDB tables with mapped columns or raw payloads
 - **Stdout Sink** - prints messages to standard output (useful for debugging/development)
 - **SurrealDB Sink** - writes messages into SurrealDB with deterministic record IDs for idempotent replay
 

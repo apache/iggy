@@ -20,23 +20,30 @@ use std::borrow::Cow;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, SecondsFormat, Utc};
-use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, TopicMetadata};
+use iggy_connector_sdk::{
+    ConsumedMessage, Error, MessagesMetadata, Payload, TopicMetadata, owned_value_into_serde_json,
+};
 use scopedb_client::DataType;
+use serde_json::value::{RawValue, to_raw_value};
 use serde_json::{Map, Value, json};
 
 use crate::schema::Layout;
 use crate::{Settings, WriteMode};
 
 pub(crate) fn row(
-    message: &ConsumedMessage,
+    message: ConsumedMessage,
     topic: &TopicMetadata,
     metadata: &MessagesMetadata,
     layout: &Layout,
     settings: &Settings,
-) -> Result<Value, Error> {
+) -> Result<Box<RawValue>, Error> {
+    let message_offset = message.offset;
+    let message_timestamp = message.timestamp;
+    let message_id = message.id;
+    let message_headers = message.headers;
     let mut row = match settings.mode {
         WriteMode::Mapped => {
-            let value = json_payload(&message.payload)?;
+            let value = json_payload(message.payload)?;
             let Value::Object(mut object) = value else {
                 return Err(Error::InvalidRecordValue(
                     "mapped payload must be a JSON object".into(),
@@ -50,12 +57,9 @@ pub(crate) fn row(
                 Some(DataType::Binary) => {
                     Value::String(BASE64.encode(payload_bytes(&message.payload)?.as_ref()))
                 }
-                Some(DataType::String) => Value::String(
-                    String::from_utf8(payload_bytes(&message.payload)?.into_owned())
-                        .map_err(|_| Error::InvalidTextPayload)?,
-                ),
+                Some(DataType::String) => Value::String(payload_string(message.payload)?),
                 Some(DataType::Object) => {
-                    let value = raw_json(&message.payload)?;
+                    let value = raw_json(message.payload)?;
                     if !value.is_object() {
                         return Err(Error::InvalidRecordValue(
                             "object payload_column requires a JSON object".into(),
@@ -63,7 +67,7 @@ pub(crate) fn row(
                     }
                     value
                 }
-                Some(DataType::Any) => raw_json(&message.payload)?,
+                Some(DataType::Any) => raw_json(message.payload)?,
                 _ => {
                     return Err(Error::SchemaMismatch(
                         "raw layout is not initialized".into(),
@@ -76,10 +80,10 @@ pub(crate) fn row(
         }
     };
     if settings.include_metadata {
-        let offset = i64::try_from(message.offset).map_err(|_| {
+        let offset = i64::try_from(message_offset).map_err(|_| {
             Error::InvalidRecordValue("iggy_offset exceeds the NDJSON signed integer limit".into())
         })?;
-        let micros = i64::try_from(message.timestamp)
+        let micros = i64::try_from(message_timestamp)
             .map_err(|_| Error::InvalidRecordValue("iggy_timestamp is out of range".into()))?;
         let timestamp = DateTime::<Utc>::from_timestamp_micros(micros)
             .ok_or_else(|| Error::InvalidRecordValue("iggy_timestamp is out of range".into()))?;
@@ -94,11 +98,11 @@ pub(crate) fn row(
             "iggy_timestamp".into(),
             Value::String(timestamp.to_rfc3339_opts(SecondsFormat::Micros, true)),
         );
-        row.insert("iggy_id".into(), Value::String(message.id.to_string()));
+        row.insert("iggy_id".into(), Value::String(message_id.to_string()));
     }
     if settings.include_headers {
         let mut headers = Map::new();
-        if let Some(values) = &message.headers {
+        if let Some(values) = &message_headers {
             for (name, value) in values {
                 let encoded = match value.as_raw() {
                     Ok(raw) => json!({"data":BASE64.encode(raw), "iggy_header_encoding":"base64"}),
@@ -111,14 +115,13 @@ pub(crate) fn row(
     }
     let row = Value::Object(row);
     validate_numbers(&row)?;
-    let encoded =
-        serde_json::to_vec(&row).map_err(|error| Error::Serialization(error.to_string()))?;
-    if encoded.len() > settings.max_request_bytes {
+    let encoded = to_raw_value(&row).map_err(|error| Error::Serialization(error.to_string()))?;
+    if encoded.get().len() > settings.max_request_bytes {
         return Err(Error::InvalidRecordValue(
             "row exceeds max_request_bytes".into(),
         ));
     }
-    Ok(row)
+    Ok(encoded)
 }
 
 fn payload_bytes(payload: &Payload) -> Result<Cow<'_, [u8]>, Error> {
@@ -131,21 +134,34 @@ fn payload_bytes(payload: &Payload) -> Result<Cow<'_, [u8]>, Error> {
     }
 }
 
-fn json_payload(payload: &Payload) -> Result<Value, Error> {
+fn payload_string(payload: Payload) -> Result<String, Error> {
     match payload {
-        Payload::Json(_) => serde_json::from_slice(payload.try_to_bytes()?.as_ref())
-            .map_err(|_| Error::InvalidJsonPayload),
+        Payload::Text(text) | Payload::Proto(text) => Ok(text),
+        Payload::Json(_) => {
+            String::from_utf8(payload.try_to_bytes()?).map_err(|_| Error::InvalidTextPayload)
+        }
+        Payload::Raw(bytes) | Payload::FlatBuffer(bytes) | Payload::Avro(bytes) => {
+            String::from_utf8(bytes).map_err(|_| Error::InvalidTextPayload)
+        }
+    }
+}
+
+fn json_payload(payload: Payload) -> Result<Value, Error> {
+    match payload {
+        Payload::Json(value) => Ok(owned_value_into_serde_json(value)),
         Payload::Text(text) | Payload::Proto(text) => {
-            serde_json::from_str(text).map_err(|_| Error::InvalidJsonPayload)
+            serde_json::from_str(&text).map_err(|_| Error::InvalidJsonPayload)
         }
         _ => Err(Error::InvalidPayloadType),
     }
 }
 
-fn raw_json(payload: &Payload) -> Result<Value, Error> {
+fn raw_json(payload: Payload) -> Result<Value, Error> {
     match payload {
-        Payload::Raw(bytes) => serde_json::from_slice(bytes).map_err(|_| Error::InvalidJsonPayload),
-        _ => json_payload(payload),
+        Payload::Raw(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|_| Error::InvalidJsonPayload)
+        }
+        payload => json_payload(payload),
     }
 }
 

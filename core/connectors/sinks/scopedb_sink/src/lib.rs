@@ -36,6 +36,7 @@ mod sink;
 sink_connector!(ScopeDBSink);
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BATCH_ROWS: usize = 200_000;
 
 /// Deserialized once from the connector's plugin configuration.
 #[derive(Clone, Deserialize)]
@@ -181,9 +182,24 @@ impl Settings {
                 "payload_column must not be empty".into(),
             ));
         }
+        if self.batch_size == 0 || self.batch_size > MAX_BATCH_ROWS {
+            return Err(Error::InvalidConfigValue(
+                "batch_size must be in 1..=200000".into(),
+            ));
+        }
         if self.max_request_bytes == 0 || self.max_request_bytes > MAX_REQUEST_BYTES {
             return Err(Error::InvalidConfigValue(
                 "max_request_bytes must be in 1..=8388608".into(),
+            ));
+        }
+        if self.max_concurrent_requests == 0 {
+            return Err(Error::InvalidConfigValue(
+                "max_concurrent_requests must be greater than zero".into(),
+            ));
+        }
+        if self.timeout.is_zero() {
+            return Err(Error::InvalidConfigValue(
+                "timeout must be greater than zero".into(),
             ));
         }
         Ok(())
@@ -289,5 +305,29 @@ mod tests {
             Settings::from_config(1, &config).timeout,
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn given_invalid_limits_when_validated_should_reject_config() {
+        let mut config = test_config();
+        config.batch_size = Some(0);
+        assert!(matches!(
+            Settings::from_config(1, &config).validate(),
+            Err(Error::InvalidConfigValue(_))
+        ));
+
+        let mut config = test_config();
+        config.max_concurrent_requests = Some(0);
+        assert!(matches!(
+            Settings::from_config(1, &config).validate(),
+            Err(Error::InvalidConfigValue(_))
+        ));
+
+        let mut config = test_config();
+        config.timeout = Some("0s".into());
+        assert!(matches!(
+            Settings::from_config(1, &config).validate(),
+            Err(Error::InvalidConfigValue(_))
+        ));
     }
 }
