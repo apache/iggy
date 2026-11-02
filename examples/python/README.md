@@ -149,6 +149,20 @@ python message-headers/typed-headers/producer.py
 python message-headers/typed-headers/consumer.py
 ```
 
+### Sink Data Producer
+
+Generates random user records as JSON messages for sink connectors:
+
+```bash
+# Using uv
+uv run sink-data-producer/producer.py
+
+# Without using uv
+python sink-data-producer/producer.py
+```
+
+Produces 100 batches of 100–499 JSON records to stream `qw` and topic `records` (configurable via `IGGY_STREAM` and `IGGY_TOPIC`, with default connection settings configurable via `IGGY_ADDRESS`, `IGGY_USERNAME`, and `IGGY_PASSWORD`). Like the Rust example, it keeps the stream and topic when finished so a sink connector can consume the produced records.
+
 ## TLS Examples
 
 To test with a TLS-enabled server, start the server with TLS configured (see main README), then run:
