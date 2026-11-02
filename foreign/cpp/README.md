@@ -10,7 +10,7 @@
 
 C++ client for [Apache Iggy](https://iggy.apache.org) message streaming.
 
-Bazel uses the Cargo and Rust toolchain provisioned by `rules_rust`. The Rust bridge builds locally into a separate target directory in the Bazel output tree. Use the Bazel version pinned in `.bazelversion` with a compatible Java runtime (Java 21 or newer for Bazel 9.2.0).
+Bazel uses the Cargo and Rust toolchain provisioned by `rules_rust`. The Rust bridge builds locally into a separate target directory in the Bazel output tree. Use the Bazel version pinned in `.bazelversion` with a compatible Java runtime (Java 21 or newer for Bazel 9.3.1).
 
 Build commands
 
@@ -18,7 +18,7 @@ Build commands
 # Build library
 bazel build //:iggy-cpp
 
-# Unit tests
+# C++ and Rust unit tests
 bazel test //:unit
 
 # Low-level integration tests (require a running server)
@@ -99,7 +99,7 @@ The blocking wrapper populates `IggyException::Code()` and `Kind()` for Rust SDK
 errors from these methods:
 
 - `Login`, `Logout`, `ResolveOperation`, and `AbandonOperation`.
-- `CreateUser`, `UpdateUser`, and `DeleteUser`.
+- `CreateUser`, `UpdateUser`, `DeleteUser`, `UpdatePermissions`, and `ChangePassword`.
 - `CreateStream`, `UpdateStream`, and `DeleteStream`.
 - `CreateTopic`, `UpdateTopic`, and `DeleteTopic`.
 - `CreatePartitions`, `DeletePartitions`, and `DeleteSegments`.
@@ -107,6 +107,7 @@ errors from these methods:
 - `StoreConsumerOffset`, `StoreConsumerPosition`, `DeleteConsumerOffset`, and `DeleteConsumerPosition`.
 - `PollMessages`, `PendingPoll::Wait`, `Reader`, and the calls of `PartitionReader`.
 - `GetMetadataChanges`.
+- `SendMessages`, `SendBinaryRequest`, and `SendBinaryRequestToReplica`.
 
 Other methods, including `Connect`, `Disconnect`, and `Shutdown`, report errors through the exception message only. C++ and bridge-local argument errors also leave `Code()` and `OperationId()` empty and `Kind()` empty, including for the methods listed above. `GetMetadataChanges` is the exception: it reports every invalid query as `invalid_command`, including one the bridge refuses.
 

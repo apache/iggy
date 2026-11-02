@@ -580,31 +580,23 @@ SendMessagesResponse IggyBlockingClient::SendMessages(const Identifier &stream,
         for (const auto &message : messages) {
             ffi_messages.push_back(message.ToFfi());
         }
-        rust::Vec<std::uint8_t> ffi_partitioning_value;
-        ffi_partitioning_value.reserve(partitioning.Value().size());
-        for (const auto byte : partitioning.Value()) {
-            ffi_partitioning_value.push_back(byte);
-        }
         return SendMessagesResponse::FromFfi(
             Handle()->send_messages(stream.ToFfi(), topic.ToFfi(), std::string(partitioning.Kind()),
-                                    std::move(ffi_partitioning_value), std::move(ffi_messages), error_info));
+                                    ToFfiBytes(partitioning.Value()), std::move(ffi_messages), error_info));
     });
 }
 
 PolledMessages IggyBlockingClient::PollMessages(const Identifier &stream,
                                                 const Identifier &topic,
-                                                const std::optional<std::uint32_t> partition_id,
+                                                const std::uint32_t partition_id,
                                                 const Consumer &consumer,
                                                 const PollingStrategy &strategy,
                                                 const std::uint32_t count,
                                                 const bool auto_commit) {
     return RethrowAsIggyException([&] {
-        if (!partition_id) {
-            throw std::invalid_argument("partition_id is required");
-        }
         const auto options =
             PollOptions().SetCount(count).SetCommit(auto_commit ? CommitPolicy::OnRead : CommitPolicy::Manual);
-        return PollMessages(consumer, stream, topic, *partition_id, strategy, options);
+        return PollMessages(consumer, stream, topic, partition_id, strategy, options);
     });
 }
 
@@ -644,12 +636,7 @@ std::vector<std::uint8_t> IggyBlockingClient::Snapshot(const SnapshotCompression
 std::vector<std::uint8_t> IggyBlockingClient::SendBinaryRequest(std::uint32_t code,
                                                                 const std::vector<std::uint8_t> &payload) {
     return RethrowAsIggyException([this, code, &payload](ffi::ErrorInfo &error_info) {
-        rust::Vec<std::uint8_t> ffi_payload;
-        ffi_payload.reserve(payload.size());
-        for (const auto byte : payload) {
-            ffi_payload.push_back(byte);
-        }
-        auto ffi_response = Handle()->send_binary_request(code, std::move(ffi_payload), error_info);
+        auto ffi_response = Handle()->send_binary_request(code, ToFfiBytes(payload), error_info);
         return std::vector<std::uint8_t>(ffi_response.begin(), ffi_response.end());
     });
 }
@@ -658,13 +645,7 @@ std::vector<std::uint8_t> IggyBlockingClient::SendBinaryRequestToReplica(std::ui
                                                                          const std::vector<std::uint8_t> &payload,
                                                                          std::uint8_t replica_id) {
     return RethrowAsIggyException([this, code, &payload, replica_id](ffi::ErrorInfo &error_info) {
-        rust::Vec<std::uint8_t> ffi_payload;
-        ffi_payload.reserve(payload.size());
-        for (const auto byte : payload) {
-            ffi_payload.push_back(byte);
-        }
-        auto ffi_response =
-            Handle()->send_binary_request_to_replica(code, std::move(ffi_payload), replica_id, error_info);
+        auto ffi_response = Handle()->send_binary_request_to_replica(code, ToFfiBytes(payload), replica_id, error_info);
         return std::vector<std::uint8_t>(ffi_response.begin(), ffi_response.end());
     });
 }

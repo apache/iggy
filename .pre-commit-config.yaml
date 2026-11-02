@@ -208,6 +208,17 @@ repos:
         pass_filenames: false
         stages: [pre-push]
 
+  # C++ SDK formatting
+  - repo: local
+    hooks:
+      - id: clang-format
+        name: clang-format (foreign/cpp)
+        entry: clang-format-18
+        args: ["--style=file", "--dry-run", "--Werror"]
+        language: system
+        files: ^foreign/cpp/.*\.(h|hpp|cc|cpp|cxx)$
+        pass_filenames: true
+
   # Go SDK formatting
   - repo: local
     hooks:

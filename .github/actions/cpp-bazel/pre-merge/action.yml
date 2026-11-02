@@ -96,7 +96,6 @@ runs:
       shell: bash
       run: |
         cd foreign/cpp
-        cargo test
         ../../scripts/ci/cpp-coverage.sh
 
     - name: Stop server after tests

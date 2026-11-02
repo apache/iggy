@@ -796,7 +796,7 @@ class Permissions final {
  *
  * @code{.cpp}
  * const auto polled{client.PollMessages(
- *     stream, topic, std::nullopt,
+ *     stream, topic, 0,
  *     iggy::Consumer::Group(iggy::Identifier::String("my-group")),
  *     iggy::PollingStrategy::Next(), 10, true)};
  * @endcode
@@ -1041,8 +1041,21 @@ class IggyMessageToSend final {
     static IggyMessageToSend Create(std::string_view payload,
                                     std::vector<HeaderEntry> user_headers = {},
                                     absl::uint128 id                      = 0) {
-        return IggyMessageToSend(id, std::vector<std::uint8_t>(payload.begin(), payload.end()),
-                                 std::move(user_headers));
+        return Create(std::vector<std::uint8_t>(payload.begin(), payload.end()), std::move(user_headers), id);
+    }
+
+    /**
+     * @brief Creates a message, taking ownership of the payload and headers.
+     * @param payload Binary message payload. Move it to avoid a copy.
+     * @param user_headers Optional typed user headers. Keys must be unique.
+     * @param id Application-defined message ID.
+     * @return Message owning @p payload and @p user_headers.
+     * @note Payload and header constraints are validated when the message is sent.
+     */
+    static IggyMessageToSend Create(std::vector<std::uint8_t> payload,
+                                    std::vector<HeaderEntry> user_headers = {},
+                                    absl::uint128 id                      = 0) {
+        return IggyMessageToSend(id, std::move(payload), std::move(user_headers));
     }
 
     /**
@@ -5974,6 +5987,12 @@ class TransportEndpoints final {
 class ClusterNode final {
   public:
     /**
+     * @brief Returns the replica ID used by SendBinaryRequestToReplica().
+     * @return Replica ID advertised by the server.
+     */
+    [[nodiscard]] std::uint8_t ReplicaId() const noexcept { return replica_id_; }
+
+    /**
      * @brief Returns the configured node name.
      * @return Node name owned by this value.
      */
@@ -6004,8 +6023,14 @@ class ClusterNode final {
     [[nodiscard]] const std::string &Status() const noexcept { return status_; }
 
   private:
-    ClusterNode(std::string name, std::string ip, TransportEndpoints endpoints, std::string role, std::string status)
-        : name_(std::move(name)),
+    ClusterNode(std::uint8_t replica_id,
+                std::string name,
+                std::string ip,
+                TransportEndpoints endpoints,
+                std::string role,
+                std::string status)
+        : replica_id_(replica_id),
+          name_(std::move(name)),
           ip_(std::move(ip)),
           endpoints_(endpoints),
           role_(std::move(role)),
@@ -6015,6 +6040,7 @@ class ClusterNode final {
 
     friend class ClusterMetadata;
 
+    std::uint8_t replica_id_;
     std::string name_;
     std::string ip_;
     TransportEndpoints endpoints_;
@@ -6704,7 +6730,7 @@ class IggyConsumer final {
  * Rust SDK errors populate IggyException::Code() and IggyException::Kind() for:
  *
  * - Login(), Logout(), ResolveOperation(), and AbandonOperation().
- * - CreateUser(), UpdateUser(), and DeleteUser().
+ * - CreateUser(), UpdateUser(), DeleteUser(), UpdatePermissions(), and ChangePassword().
  * - EncryptionKeyFingerprint() and invalid keys passed to CreateStream().
  * - CreateStream(), UpdateStream(), and DeleteStream().
  * - CreateTopic(), UpdateTopic(), and DeleteTopic().
@@ -6716,6 +6742,7 @@ class IggyConsumer final {
  * - PollMessages(), Reader(), StandaloneConsumer(), GroupConsumer(),
  *   PendingPoll::Wait(), and the calls of PartitionReader and IggyConsumer.
  * - GetMetadataChanges().
+ * - SendMessages(), SendBinaryRequest(), and SendBinaryRequestToReplica().
  *
  * Other methods report errors through the exception message only. C++ and
  * bridge-local argument validation failures also have no structured error
@@ -7781,7 +7808,7 @@ class IggyBlockingClient final {
      */
     PolledMessages PollMessages(const Identifier &stream,
                                 const Identifier &topic,
-                                std::optional<std::uint32_t> partition_id,
+                                std::uint32_t partition_id,
                                 const Consumer &consumer,
                                 const PollingStrategy &strategy,
                                 std::uint32_t count,

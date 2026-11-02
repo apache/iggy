@@ -868,8 +868,9 @@ TransportEndpoints TransportEndpoints::FromFfi(ffi::TransportEndpoints endpoints
 }
 
 ClusterNode ClusterNode::FromFfi(ffi::ClusterNode node) {
-    return ClusterNode(std::string(node.name.c_str(), node.name.size()), std::string(node.ip.c_str(), node.ip.size()),
-                       TransportEndpoints::FromFfi(node.endpoints), std::string(node.role.c_str(), node.role.size()),
+    return ClusterNode(node.replica_id, std::string(node.name.c_str(), node.name.size()),
+                       std::string(node.ip.c_str(), node.ip.size()), TransportEndpoints::FromFfi(node.endpoints),
+                       std::string(node.role.c_str(), node.role.size()),
                        std::string(node.status.c_str(), node.status.size()));
 }
 

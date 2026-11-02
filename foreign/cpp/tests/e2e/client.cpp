@@ -2762,6 +2762,7 @@ TEST_F(E2E_Client, GetClusterMetadataReturnsSingleNodeMetadata) {
     ASSERT_EQ(metadata.Nodes().size(), 1u);
 
     const auto &node = metadata.Nodes()[0];
+    EXPECT_EQ(node.ReplicaId(), 0u);
     EXPECT_FALSE(node.Name().empty());
     EXPECT_FALSE(node.Ip().empty());
     EXPECT_EQ(node.Role(), "leader");
@@ -2783,6 +2784,7 @@ TEST_F(E2E_Client, GetClusterMetadataIsStableAcrossBackToBackCalls) {
 
     const auto &first_node  = first_metadata.Nodes()[0];
     const auto &second_node = second_metadata.Nodes()[0];
+    EXPECT_EQ(first_node.ReplicaId(), second_node.ReplicaId());
     EXPECT_EQ(first_node.Name(), second_node.Name());
     EXPECT_EQ(first_node.Ip(), second_node.Ip());
     EXPECT_EQ(first_node.Role(), second_node.Role());
@@ -3001,11 +3003,13 @@ TEST_F(E2E_Client, SendBinaryRequestToReplicaGetStatsReturnsNonEmptyBytes) {
     RecordProperty("description",
                    "Returns a non-empty response body for a raw get-stats command sent to the server's own replica.");
     constexpr std::uint32_t get_stats_command_code = 10;
-    constexpr std::uint8_t server_replica_id       = 0;
     auto client                                    = GetLoggedInHighLevelClient();
+    const auto metadata                            = client.GetClusterMetadata();
+    ASSERT_EQ(metadata.Nodes().size(), 1u);
 
     std::vector<std::uint8_t> response;
-    ASSERT_NO_THROW(response = client.SendBinaryRequestToReplica(get_stats_command_code, {}, server_replica_id));
+    ASSERT_NO_THROW(response =
+                        client.SendBinaryRequestToReplica(get_stats_command_code, {}, metadata.Nodes()[0].ReplicaId()));
     EXPECT_FALSE(response.empty());
 }
 
