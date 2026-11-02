@@ -187,6 +187,53 @@ struct ResourceOptionsE2ETests {
         }
     }
 
+    @Test func givenReplicationFactorWhenCreatingTopicShouldPlaceEveryPartitionOnOneNode() async throws {
+        try await E2EEnvironment.withSession() { session in
+            let client = session.client
+            let nodes = try await client.getClusterMetadata().nodes.map(\.replicaID)
+            let name = E2EEnvironment.uniqueName("swift-factor")
+            let stream = try await client.createStream(name: name)
+            let streamID = Identifier(numeric: stream.id)
+            await session.track(stream: try Identifier(named: name))
+
+            let created = try await client.createTopic(
+                streamID: streamID, name: name, options: TopicCreateOptions(partitionsCount: 2, replicationFactor: 1))
+            let topicID = Identifier(numeric: created.id)
+            let topic = try #require(try await client.getTopic(streamID: streamID, topicID: topicID))
+            #expect(topic.options[TopicOptionKey.replicationFactor.rawValue] == .explicit(.uint32(1)))
+            #expect(topic.partitions.map(\.id) == [0, 1])
+            for partition in topic.partitions {
+                #expect(partition.members.count == 1, "partition \(partition.id) members \(partition.members)")
+                #expect(partition.members.allSatisfy { nodes.contains($0) }, "partition \(partition.id) is not on \(nodes)")
+            }
+
+            // A partition's primary reports who is in sync once it runs, so a
+            // read right after the create may list nobody.
+            let members = topic.partitions.map(\.members)
+            let inSync = try await E2EEnvironment.eventually {
+                try await client.getTopic(streamID: streamID, topicID: topicID)?.partitions.map(\.inSyncMembers) == members
+            }
+            #expect(inSync, "in-sync members never matched \(members)")
+        }
+    }
+
+    @Test func givenReplicationFactorAboveNodeCountWhenCreatingTopicShouldRefuseIt() async throws {
+        try await E2EEnvironment.withSession() { session in
+            let client = session.client
+            let nodes = try await client.getClusterMetadata().nodes.count
+            let name = E2EEnvironment.uniqueName("swift-factor-refused")
+            let stream = try await client.createStream(name: name)
+            let streamID = Identifier(numeric: stream.id)
+            await session.track(stream: try Identifier(named: name))
+
+            await expectReplicatedIggyError(.invalidReplicationFactor) {
+                _ = try await client.createTopic(
+                    streamID: streamID, name: name, options: TopicCreateOptions(replicationFactor: UInt32(nodes) + 1))
+            }
+            #expect(try await client.getTopic(streamID: streamID, topicID: Identifier(named: name)) == nil)
+        }
+    }
+
     @Test func givenUserOptionsWhenCreatingAndUpdatingShouldPreserveUserBehavior() async throws {
         try await E2EEnvironment.withSession() { session in
             let client = session.client

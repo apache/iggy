@@ -28,7 +28,8 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::batch::{
-    BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, BatchHeader, calculate_batch_checksum,
+    BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, BatchHeader, BatchProducer,
+    calculate_batch_checksum,
 };
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::*;
@@ -109,6 +110,11 @@ use secrecy::SecretString;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use twox_hash::{XxHash3_64, XxHash32};
+
+/// The SDK sends `sdkVersion` in every login handshake, so the handshake
+/// vectors take it from the Swift source instead of a copy that a version
+/// bump would leave behind.
+const IGGY_SWIFT_SOURCE: &str = include_str!("../../../Sources/Iggy/Iggy.swift");
 
 /// Hash and error tables are maps keyed by length and code, so each entry is
 /// one line of the pretty-printed fixture and the file stays reviewable.
@@ -211,8 +217,19 @@ fn version_info() -> ClientVersionInfo {
     ClientVersionInfo {
         protocol_version: IGGY_PROTOCOL_VERSION,
         sdk_name: name("swift-sdk"),
-        sdk_version: name("0.1.5"),
+        sdk_version: name(swift_sdk_version()),
     }
+}
+
+fn swift_sdk_version() -> &'static str {
+    IGGY_SWIFT_SOURCE
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("public static let sdkVersion = \"")?
+                .strip_suffix('"')
+        })
+        .expect("Iggy.swift declares sdkVersion")
 }
 
 fn sample_permissions() -> WirePermissions {
@@ -1332,6 +1349,8 @@ fn main() {
             current_offset: 99,
             size_bytes: 1024,
             messages_count: 100,
+            members: vec![0, 1, 2],
+            in_sync_members: vec![0, 1],
         },
         PartitionResponse {
             context: Default::default(),
@@ -1341,6 +1360,8 @@ fn main() {
             current_offset: 0,
             size_bytes: 0,
             messages_count: 0,
+            members: vec![1, 2, 0],
+            in_sync_members: vec![],
         },
         PartitionResponse {
             context: Default::default(),
@@ -1350,6 +1371,8 @@ fn main() {
             current_offset: 7,
             size_bytes: 512,
             messages_count: 8,
+            members: vec![2, 0, 1],
+            in_sync_members: vec![2],
         },
     ];
     add(
@@ -1789,6 +1812,23 @@ fn main() {
         }
         .encode(&mut empty);
         vectors.insert("response.poll_messages.empty".to_owned(), hex(&empty));
+
+        // A batch of an idempotent producer.
+        let mut record = batch_record(7, 200, 7_000, 3_000, &[frame(21, 0, 0, b"k", &[])]);
+        let mut header = BatchHeader::decode(&record).expect("a batch header");
+        header.producer = Some(BatchProducer::new(4_000, 3, 17).expect("a producer"));
+        header.batch_checksum = calculate_batch_checksum(&header, &record[BATCH_HEADER_SIZE..]);
+        header.encode_into(&mut record[..BATCH_HEADER_SIZE]);
+        let mut produced = BytesMut::new();
+        PollMessagesResponseHeader {
+            context: Default::default(),
+            partition_id: 7,
+            current_offset: 200,
+            messages_count: 1,
+        }
+        .encode(&mut produced);
+        produced.put_slice(&record);
+        vectors.insert("response.poll_messages.producer".to_owned(), hex(&produced));
     }
     add(
         &mut vectors,
@@ -1817,6 +1857,7 @@ fn main() {
         messages_required_to_save: Some(7),
         size_of_messages_required_to_save: Some(IggyByteSize::from(4096)),
         preallocate_segments: Some(false),
+        replication_factor: Some(2),
         raw: BTreeMap::new(),
     };
     add(

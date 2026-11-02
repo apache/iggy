@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 
+use crate::codec::read_u64_le;
 use crate::requests::system::SessionIdentity;
 use crate::{WireDecode, WireEncode, WireError};
 
@@ -24,19 +25,32 @@ pub const MAX_SESSIONS_PER_RETIREMENT: usize = 128;
 
 /// Server-originated partition barrier. Every identity is already ended in
 /// committed metadata. Admission excludes pending writes for the whole batch.
+///
+/// A nonzero `paid_through` marks the last batch of a retirement debt payment:
+/// every session the metadata op `paid_through` had finalized is retired once
+/// it commits. It rides as a trailing `u64`, absent when zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetireSessionsRequest {
     pub identities: Vec<SessionIdentity>,
+    pub paid_through: u64,
 }
 
 impl WireEncode for RetireSessionsRequest {
     fn encoded_size(&self) -> usize {
         self.identities.len() * SessionIdentity::ENCODED_SIZE
+            + if self.paid_through == 0 {
+                0
+            } else {
+                size_of::<u64>()
+            }
     }
 
     fn encode(&self, buf: &mut BytesMut) {
         for identity in &self.identities {
             identity.encode(buf);
+        }
+        if self.paid_through != 0 {
+            buf.put_u64_le(self.paid_through);
         }
     }
 }
@@ -44,7 +58,17 @@ impl WireEncode for RetireSessionsRequest {
 impl WireDecode for RetireSessionsRequest {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let (chunks, remainder) = buf.as_chunks::<{ SessionIdentity::ENCODED_SIZE }>();
-        if chunks.is_empty() || chunks.len() > MAX_SESSIONS_PER_RETIREMENT || !remainder.is_empty()
+        let paid_through = match remainder.len() {
+            0 => 0,
+            8 => read_u64_le(remainder, 0)?,
+            _ => {
+                return Err(WireError::Validation(
+                    "invalid session retirement batch length".into(),
+                ));
+            }
+        };
+        if (paid_through == 0 && (chunks.is_empty() || !remainder.is_empty()))
+            || chunks.len() > MAX_SESSIONS_PER_RETIREMENT
         {
             return Err(WireError::Validation(
                 "invalid session retirement batch length".into(),
@@ -65,7 +89,13 @@ impl WireDecode for RetireSessionsRequest {
                 Ok(identity)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok((Self { identities }, buf.len()))
+        Ok((
+            Self {
+                identities,
+                paid_through,
+            },
+            buf.len(),
+        ))
     }
 }
 
@@ -83,6 +113,7 @@ mod tests {
         for count in [1, MAX_SESSIONS_PER_RETIREMENT] {
             let request = RetireSessionsRequest {
                 identities: vec![identity; count],
+                paid_through: 0,
             };
             let bytes = request.to_bytes();
             assert_eq!(RetireSessionsRequest::decode_from(&bytes).unwrap(), request);
@@ -93,6 +124,7 @@ mod tests {
             RetireSessionsRequest::decode_from(
                 &RetireSessionsRequest {
                     identities: vec![identity; MAX_SESSIONS_PER_RETIREMENT + 1],
+                    paid_through: 0,
                 }
                 .to_bytes()
             )
@@ -108,10 +140,31 @@ mod tests {
                             ..identity
                         }
                     ],
+                    paid_through: 0,
                 }
                 .to_bytes()
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn given_a_debt_payment_when_decoding_should_carry_paid_through_even_without_identities() {
+        let identity = SessionIdentity {
+            client_id: 1,
+            session: 2,
+            metadata_watermark: 3,
+        };
+        for identities in [Vec::new(), vec![identity; MAX_SESSIONS_PER_RETIREMENT]] {
+            let request = RetireSessionsRequest {
+                identities,
+                paid_through: 17,
+            };
+            let bytes = request.to_bytes();
+            assert_eq!(bytes.len(), request.encoded_size());
+            assert_eq!(RetireSessionsRequest::decode_from(&bytes).unwrap(), request);
+            assert!(RetireSessionsRequest::decode_from(&bytes[..bytes.len() - 1]).is_err());
+        }
+        assert!(RetireSessionsRequest::decode_from(&0_u64.to_le_bytes()).is_err());
     }
 }

@@ -313,6 +313,8 @@ final class FakeVSRServer: @unchecked Sendable {
             writer.write(UInt64(0))
             writer.write(UInt64(0))
             context.encode(into: &writer)
+            writer.write(UInt8(0))
+            writer.write(UInt8(0))
         }
         return writer.bytes
     }

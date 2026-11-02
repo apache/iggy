@@ -132,6 +132,7 @@ TEST(TopicCreateOptionsTest, DefaultHasNoValues) {
     EXPECT_FALSE(options.MessagesRequiredToSave().has_value());
     EXPECT_FALSE(options.SizeOfMessagesRequiredToSave().has_value());
     EXPECT_FALSE(options.PreallocateSegments().has_value());
+    EXPECT_FALSE(options.ReplicationFactor().has_value());
     EXPECT_TRUE(options.RawEntries().empty());
 }
 
@@ -192,6 +193,13 @@ TEST(TopicCreateOptionsTest, PreallocateSegmentsStoresBool) {
     disabled.SetPreallocateSegments(false);
     ASSERT_TRUE(disabled.PreallocateSegments().has_value());
     EXPECT_EQ(*disabled.PreallocateSegments(), false);
+}
+
+TEST(TopicCreateOptionsTest, ReplicationFactorStoresValue) {
+    iggy::TopicCreateOptions options;
+    options.SetReplicationFactor(3);
+    ASSERT_TRUE(options.ReplicationFactor().has_value());
+    EXPECT_EQ(*options.ReplicationFactor(), 3u);
 }
 
 TEST(TopicCreateOptionsTest, MaximumValuesPreserved) {

@@ -16,7 +16,7 @@
 // under the License.
 
 use ext_php_rs::{boxed::ZBox, exception::PhpResult, php_class, php_impl, types::ZendHashTable};
-use iggy::prelude::TopicDetails as RustTopicDetails;
+use iggy::prelude::{Partition as RustPartition, TopicDetails as RustTopicDetails};
 
 use crate::options::options_array;
 
@@ -54,6 +54,20 @@ impl TopicDetails {
         self.inner.partitions_count
     }
 
+    /// One `Iggy\Partition` per partition of the topic.
+    ///
+    /// The partitions are rebuilt on each getter call; cache the result in PHP if they will
+    /// be read repeatedly.
+    #[php(getter)]
+    pub fn partitions(&self) -> Vec<Partition> {
+        self.inner
+            .partitions
+            .iter()
+            .cloned()
+            .map(Partition::from)
+            .collect()
+    }
+
     /// Options the creating or updating client set, as option name to scalar value.
     /// Integers above `PHP_INT_MAX`, such as never-expire and unlimited
     /// (18446744073709551615), are decimal strings.
@@ -66,5 +80,61 @@ impl TopicDetails {
     #[php(getter, change_case = "snake_case")]
     pub fn derived_options(&self) -> PhpResult<ZBox<ZendHashTable>> {
         options_array(&self.inner.options, false)
+    }
+}
+
+/// One partition of a topic.
+#[php_class]
+#[php(name = "Iggy\\Partition")]
+pub struct Partition {
+    pub(crate) inner: RustPartition,
+}
+
+impl From<RustPartition> for Partition {
+    fn from(inner: RustPartition) -> Self {
+        Self { inner }
+    }
+}
+
+#[php_impl]
+impl Partition {
+    #[php(getter)]
+    pub fn id(&self) -> u32 {
+        self.inner.id
+    }
+
+    #[php(getter, change_case = "snake_case")]
+    pub fn segments_count(&self) -> u32 {
+        self.inner.segments_count
+    }
+
+    #[php(getter, change_case = "snake_case")]
+    pub fn current_offset(&self) -> u64 {
+        self.inner.current_offset
+    }
+
+    #[php(getter, change_case = "snake_case")]
+    pub fn size_bytes(&self) -> u64 {
+        self.inner.size.as_bytes_u64()
+    }
+
+    #[php(getter, change_case = "snake_case")]
+    pub fn messages_count(&self) -> u64 {
+        self.inner.messages_count
+    }
+
+    /// Node ids that store the partition, in member order. While one is down, a write still
+    /// commits if a quorum of the others is in sync.
+    #[php(getter)]
+    pub fn members(&self) -> Vec<u8> {
+        self.inner.members.clone()
+    }
+
+    /// Node ids among `members` that the partition's primary last reported in sync and that
+    /// are up. Empty until the primary first reports, and while no member that is up can
+    /// lead it.
+    #[php(getter, change_case = "snake_case")]
+    pub fn in_sync_members(&self) -> Vec<u8> {
+        self.inner.in_sync_members.clone()
     }
 }

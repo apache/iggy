@@ -662,6 +662,8 @@ mod tests {
             size: IggyByteSize::from(size),
             messages_count,
             context: iggy::prelude::PartitionContext::default(),
+            members: Vec::new(),
+            in_sync_members: Vec::new(),
         }
     }
 

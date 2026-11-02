@@ -67,6 +67,7 @@ use message_bus::replica::handshake::ReplicaHandshakeCtx;
 use message_bus::transports::tls::install_default_crypto_provider;
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
 use metadata::change_log::{ChangeLogCapacities, MetadataChangeLog};
+use metadata::impls::metadata::StreamsFrontend;
 use metadata::impls::recovery::recover;
 use metadata::{AppliedFrontier, ReplicaIdentity};
 use server_common::bootstrap::create_directories;
@@ -604,6 +605,33 @@ async fn shard_main(
                 )
                 .await
                 .map_err(ServerError::MetadataRecovery)?;
+                let fresh_storage = recovered.last_journaled_op.unwrap_or_else(|| {
+                    recovered
+                        .snapshot
+                        .as_ref()
+                        .map_or(0, metadata::stm::snapshot::Snapshot::sequence_number)
+                }) == 0
+                    && recovered.recovered_state.is_none();
+                if let Some((namespace, node)) = recovered
+                    .mux_stm
+                    .streams()
+                    .member_outside_cluster(topology.replica_count)
+                {
+                    return Err(ServerError::PartitionMemberOutsideCluster {
+                        namespace_raw: namespace.inner(),
+                        node,
+                        nodes: topology.replica_count,
+                    });
+                }
+                // Peers may already hold partitions this node stored before
+                // it lost its storage; see `load_partition_or_fence`.
+                if fresh_storage && topology.replica_count > 1 {
+                    crate::partition_helpers::record_storage_epoch(
+                        &config.get_system_path(),
+                        iggy_common::IggyTimestamp::now().as_micros(),
+                    )
+                    .await?;
+                }
                 (
                     Rc::new(recovered.mux_stm),
                     Rc::new(recovered.change_log),
@@ -715,6 +743,14 @@ async fn shard_main(
     // session (and trip its empty-table assert).
     metadata.set_clients_table_max(config.metadata.clients_table_max);
     metadata.set_partitions_max(config.metadata.partitions_max);
+    metadata.set_default_replication_factor(config.cluster.default_replication_factor.factor());
+    let mut racks = vec![None; config.cluster.nodes.len()];
+    for node in &config.cluster.nodes {
+        if let Some(rack) = racks.get_mut(usize::from(node.replica_id)) {
+            rack.clone_from(&node.rack);
+        }
+    }
+    metadata.set_node_racks(&racks);
     metadata.set_max_tokens_per_user(config.personal_access_token.max_tokens_per_user);
     // Reinstall the sessions recovery restored from the checkpoint and the WAL
     // suffix, so a rebooted node dedups retries and admits continuations from

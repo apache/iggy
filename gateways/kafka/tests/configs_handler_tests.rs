@@ -199,6 +199,7 @@ async fn incremental_alter_configs_over_the_cap_is_rejected_even_with_the_bridge
 async fn incremental_alter_configs_requires_manage_topics_before_the_stub() {
     let principal = |manage_topics| AuthenticatedPrincipal {
         username: "alice".to_string(),
+        user: None,
         permissions: PrincipalPermissions {
             manage_topics,
             ..PrincipalPermissions::default()

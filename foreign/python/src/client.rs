@@ -290,6 +290,7 @@ fn is_option_error(error: &IggyError) -> bool {
             | IggyError::StreamEncryptionUnavailable
             | IggyError::UnsupportedCriticalOption(_)
             | IggyError::CannotModifyRootUser
+            | IggyError::InvalidReplicationFactor
     )
 }
 
@@ -2400,6 +2401,32 @@ mod tests {
                 value.getattr("kind").unwrap().extract::<String>().unwrap(),
                 "cannot_modify_root_user"
             );
+        });
+    }
+
+    #[test]
+    fn given_replication_factor_refusal_when_mapping_should_raise_option_error_on_every_transport()
+    {
+        Python::initialize();
+        Python::attach(|py| {
+            let binary = to_runtime_error(IggyError::InvalidReplicationFactor);
+            let http = to_runtime_error(IggyError::HttpResponseError(
+                400,
+                r#"{"id":2018,"code":"invalid_replication_factor","reason":"Invalid replication factor","field":null}"#
+                    .to_owned(),
+            ));
+            for error in [binary, http] {
+                assert!(error.is_instance_of::<OptionError>(py));
+                let value = error.value(py);
+                assert_eq!(
+                    value.getattr("code").unwrap().extract::<u32>().unwrap(),
+                    2018
+                );
+                assert_eq!(
+                    value.getattr("kind").unwrap().extract::<String>().unwrap(),
+                    "invalid_replication_factor"
+                );
+            }
         });
     }
 
