@@ -105,6 +105,7 @@ Each sink should have its own, custom configuration, which is passed along with 
 - **Elasticsearch Sink** - sends messages to Elasticsearch indices
 - **Iceberg Sink** - writes data to Apache Iceberg tables via REST catalog
 - **Meilisearch Sink** - indexes messages in Meilisearch
+- **OTLP Sink** - exports logs to OpenTelemetry Collectors and OTLP backends
 - **PostgreSQL Sink** - stores messages in PostgreSQL database tables
 - **Quickwit Sink** - indexes messages in Quickwit search engine
 - **RabbitMQ Sink** - publishes messages to RabbitMQ exchanges via AMQP 0.9.1
