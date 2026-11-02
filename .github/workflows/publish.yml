@@ -374,6 +374,7 @@ jobs:
               dockerComponents.push({ ...t, flavors: flavorsOf(t.key) });
               for (const f of flavorsOf(t.key)) {
                 const flavor = { flavor_name: f.name || '', flavor_suffix: f.suffix || '', flavor_stage: f.stage || '' };
+                if (f.timeout_minutes) flavor.timeout_minutes = f.timeout_minutes;
                 for (const p of platforms) {
                   dockerMatrix.push({ ...t, ...p, ...flavor });
                 }
@@ -723,7 +724,7 @@ jobs:
       (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped') &&
       (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped')
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.timeout_minutes || 60 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.docker_matrix) }}

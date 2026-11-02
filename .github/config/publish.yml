@@ -98,6 +98,8 @@ components:
       - name: fat
         suffix: ""
         stage: runtime-fat
+        # The LTO plugin links took ~39 min on amd64 and the plugin set grows.
+        timeout_minutes: 90
       - name: slim
         suffix: "-slim"
         stage: runtime
