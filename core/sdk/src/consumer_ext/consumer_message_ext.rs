@@ -16,7 +16,6 @@
 // under the License.
 
 use crate::clients::consumer::IggyConsumer;
-use crate::clients::reader::lasting_refusal;
 use crate::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
 use crate::prelude::{CommitAfter, IggyError, ReadError};
 use async_trait::async_trait;
@@ -150,7 +149,7 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
                                         | IggyError::InvalidMessagesCount
                                         | IggyError::ClientShutdown
                                 )
-                                || (err.partition_id.is_some() && lasting_refusal(&err.error))
+                                || err.is_lasting_refusal()
                                 || !self.client_can_recover().await;
                             if ends {
                                 error!("Client error: {err} for consumer: {name} on topic: {topic} and stream: {stream}",

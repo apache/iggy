@@ -44,8 +44,11 @@ namespace Apache.Iggy.Consumers;
 ///         before a rebalance takes a partition away, and on shutdown.
 ///     </para>
 ///     <para>
-///         A read error does not end the stream: the reader retries by itself, and the error reaches the callbacks of
-///         <see cref="SubscribeToErrorEvents" />.
+///         A read error that the reader retries by itself does not end the stream, it reaches the callbacks of
+///         <see cref="SubscribeToErrorEvents" />. An error that stops a partition (<see cref="ReadException.StopsPartition" />)
+///         ends the stream with its <see cref="ReadException" />, as a message that does not decode does, and the
+///         partition reads nothing until <see cref="SeekAsync" />. <see cref="ReadException.IsResumable" /> says that a
+///         seek to <see cref="PollingStrategy.Next" /> reads it again after its stored offset.
 ///     </para>
 /// </remarks>
 public partial class IggyConsumer : IAsyncDisposable
@@ -62,6 +65,7 @@ public partial class IggyConsumer : IAsyncDisposable
     private readonly ILogger<IggyConsumer> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly CancellationTokenSource _lifetime = new();
+
     private TaskCompletionSource? _handling;
     private TaskCompletionSource? _shutdown;
     private PartitionReader? _reader;
@@ -146,6 +150,11 @@ public partial class IggyConsumer : IAsyncDisposable
             if (consumer.Type == ConsumerType.Consumer)
             {
                 builder.WithPartitions([.. _config.Partitions]);
+            }
+
+            if (_config.RetryInterval is { } retryInterval)
+            {
+                builder.WithRetryInterval(retryInterval);
             }
 
             _reader = await builder.BuildAsync(ct);
@@ -374,8 +383,9 @@ public partial class IggyConsumer : IAsyncDisposable
 
     /// <summary>
     ///     The next batch of the reader, or null once the consumer shut down or <paramref name="ct" /> was canceled. A
-    ///     read error goes to the error events and the reader goes on. A message that does not decode ends the stream
-    ///     with its <see cref="ReadException" />, whose <see cref="ReadException.Skip" /> passes it.
+    ///     read error that the reader retries goes to the error events and the reader goes on. A message that does
+    ///     not decode, whose <see cref="ReadException.Skip" /> passes it, and an error that stops a partition end the
+    ///     stream with their <see cref="ReadException" />.
     /// </summary>
     private protected async Task<PolledMessages?> NextBatchAsync(CancellationToken ct)
     {
@@ -386,7 +396,7 @@ public partial class IggyConsumer : IAsyncDisposable
             {
                 return await Reader.NextAsync(cancellation.Token);
             }
-            catch (ReadException error) when (error.Skip is null)
+            catch (ReadException error) when (error.Skip is null && !error.StopsPartition)
             {
                 _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(error, error.Message));
             }

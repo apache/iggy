@@ -541,10 +541,15 @@ pub(crate) async fn consume_messages(
 }
 
 /// The reader stops a partition after a read with an unknown outcome, a message that does not
-/// decode, or a new partition history. Each would wait for a restart, so the sink resumes the
-/// partition. After an unknown outcome it resumes after the stored offset. The abandoned request
-/// can still store its offset later, so the sink can skip the messages of that request. The
-/// reader retries any other error by itself.
+/// decode, a new partition history, or refusals in a row that a quick retry does not change.
+/// Each would wait for a restart, so the sink resumes the partition. After an unknown outcome it
+/// resumes after the stored offset. The abandoned request can still store its offset later, so
+/// the sink can skip the messages of that request. A seek to `Next` stores nothing, so it
+/// resumes a refused partition while the refusal lasts. The seek starts a new cycle of the
+/// reader, so a partition that stays refused costs six reads with a doubling wait per cycle,
+/// about half a minute at the default interval, plus one warning and one error count here. The
+/// sink starts at `Next`, so `Next` is where it reads on. The reader retries any other error by
+/// itself.
 async fn handle_read_error(
     messages: &mut impl SinkMessages,
     error: ReadError,
@@ -587,9 +592,17 @@ async fn handle_read_error(
             );
             (partition_id, PollingStrategy::next())
         }
+        (Some(partition_id), _, None) if error.is_lasting_refusal() => {
+            warn!(
+                "Partition: {partition_id} of sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic} was stopped by the reader after refusals in a row. It resumes after its stored offset. {}",
+                error.error
+            );
+            (partition_id, PollingStrategy::next())
+        }
         _ => {
             error!(
-                "Failed to receive message for sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic}"
+                "Failed to receive message for sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic}. {}",
+                error.error
             );
             return;
         }
@@ -1033,7 +1046,7 @@ struct SinkBatchTiming {
 mod tests {
     use super::*;
     use dashmap::DashMap;
-    use iggy::prelude::IggyMessageHeader;
+    use iggy::prelude::{Identifier, IggyMessageHeader};
     use iggy_connector_sdk::transforms::TransformType;
     use iggy_connector_sdk::transforms::{ProtoConvert, ProtoConvertConfig};
     use iggy_connector_sdk::{Error, Payload};
@@ -1639,6 +1652,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_lasting_refusals_that_stop_a_partition_when_consumed_should_resume_it() {
+        let plugin_id = next_plugin_id();
+        let metrics = Arc::new(Metrics::init());
+        let stream = Identifier::named("test_stream").expect("valid stream name");
+        let topic = Identifier::named("test_topic").expect("valid topic name");
+        let refusals = [
+            IggyError::Unauthorized,
+            IggyError::ConsumerGroupPartitionNotOwned(1, 2),
+            IggyError::FeatureUnavailable,
+            IggyError::InvalidCommand,
+            IggyError::PartitionNotFound(3, stream.clone(), topic.clone()),
+            IggyError::StreamIdNotFound(stream.clone()),
+            IggyError::StreamNameNotFound("test_stream".to_owned()),
+            IggyError::TopicIdNotFound(topic, stream),
+            IggyError::TopicNameNotFound("test_topic".to_owned(), "test_stream".to_owned()),
+        ];
+        let count = refusals.len();
+        let stops = (1..)
+            .zip(refusals)
+            .map(|(partition_id, error)| ReadError {
+                partition_id: Some(partition_id),
+                error,
+                skip: None,
+                offset: None,
+                record: None,
+            })
+            .map(Err::<iggy::prelude::ReceivedMessage, _>);
+        let mut messages = FakeMessages::new(futures::stream::iter(stops));
+
+        consume_reads(plugin_id, &mut messages, &metrics).await;
+
+        let resumed: Vec<_> = (1..)
+            .take(count)
+            .map(|partition_id| Recovery::Seek(partition_id, PollingStrategy::next()))
+            .collect();
+        assert_eq!(messages.calls, resumed);
+        assert_eq!(
+            metrics.get_errors("test_sink", ConnectorType::Sink),
+            count as u64
+        );
+    }
+
+    #[tokio::test]
     async fn given_a_read_error_that_the_reader_retries_when_consumed_should_only_count_it() {
         let plugin_id = next_plugin_id();
         let metrics = Arc::new(Metrics::init());
@@ -1657,12 +1713,19 @@ mod tests {
                 offset: None,
                 record: None,
             }),
+            Err(ReadError {
+                partition_id: None,
+                error: IggyError::Unauthorized,
+                skip: None,
+                offset: None,
+                record: None,
+            }),
         ]));
 
         consume_reads(plugin_id, &mut messages, &metrics).await;
 
         assert_eq!(messages.calls, []);
-        assert_eq!(metrics.get_errors("test_sink", ConnectorType::Sink), 2);
+        assert_eq!(metrics.get_errors("test_sink", ConnectorType::Sink), 3);
     }
 
     #[tokio::test]

@@ -513,12 +513,28 @@ struct ClusterNode {
 pub struct TestCluster {
     data_dir: PathBuf,
     nodes: Vec<ClusterNode>,
+    /// Server settings of every node, as `IGGY_*` variables.
+    settings: Vec<(String, String)>,
+    /// Where node `n` appends its output, as `node-<n>.log`. Without it, a node writes to the
+    /// test's own output.
+    log_dir: Option<PathBuf>,
 }
 
 impl TestCluster {
     /// Starts `count` nodes and waits until each accepts connections. The cluster can still be
     /// without a metadata primary then, so a first bridge can need a retry.
     pub async fn spawn(data_dir: &std::path::Path, count: usize) -> Self {
+        Self::spawn_with(data_dir, count, &[], None).await
+    }
+
+    /// [`Self::spawn`] with server settings of its own on every node, as `IGGY_*` variables, and
+    /// each node's output appended to `node-<n>.log` in `log_dir`.
+    pub async fn spawn_with(
+        data_dir: &std::path::Path,
+        count: usize,
+        settings: &[(&str, &str)],
+        log_dir: Option<&std::path::Path>,
+    ) -> Self {
         let nodes = (0..count)
             .map(|_| ClusterNode {
                 child: None,
@@ -529,11 +545,31 @@ impl TestCluster {
         let mut cluster = Self {
             data_dir: data_dir.to_path_buf(),
             nodes,
+            settings: settings
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            log_dir: log_dir.map(std::path::Path::to_path_buf),
         };
         for node in 0..count {
             cluster.start(node).await;
         }
         cluster
+    }
+
+    pub const fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn is_running(&self, node: usize) -> bool {
+        self.nodes[node].child.is_some()
+    }
+
+    /// The log file of node `node`, when the nodes write to files.
+    pub fn log_file(&self, node: usize) -> Option<PathBuf> {
+        self.log_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("node-{node}.log")))
     }
 
     /// Starts node `node` on its data dir and ports, and waits until it accepts connections.
@@ -584,6 +620,21 @@ impl TestCluster {
                     peer_node.replica.port.to_string(),
                 );
         }
+        command.envs(
+            self.settings
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        );
+        if let Some(log_file) = self.log_file(node) {
+            let log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_file)
+                .expect("open the node log");
+            command
+                .stdout(log.try_clone().expect("share the node log"))
+                .stderr(log);
+        }
         let mut child = command.spawn().expect("spawn an iggy-server node");
         wait_for_listener(&mut child, &address, &format!("iggy-server node {node}")).await;
         self.nodes[node].child = Some(child);
@@ -593,6 +644,15 @@ impl TestCluster {
     pub fn stop(&mut self, node: usize) {
         if let Some(mut child) = self.nodes[node].child.take() {
             graceful_kill(&mut child);
+            let _ = child.wait();
+        }
+    }
+
+    /// Kills node `node` with SIGKILL, skipping its shutdown path the way a crash would. Its data
+    /// dir stays.
+    pub fn crash(&mut self, node: usize) {
+        if let Some(mut child) = self.nodes[node].child.take() {
+            let _ = child.kill();
             let _ = child.wait();
         }
     }

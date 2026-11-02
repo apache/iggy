@@ -87,13 +87,21 @@ public struct ReadError: Error, Sendable, CustomStringConvertible {
     public let offset: UInt64?
     /// The record of the message that does not decode, as the server sent it.
     public let raw: [UInt8]?
+    /// Whether the partition reads nothing until a
+    /// ``PartitionReader/seek(partitionID:to:)``: a message that does not
+    /// decode, or a position whose history is gone. A partition that a lost
+    /// committing read of another caller blocks (``IggyErrorCode/partitionLaneBlocked``
+    /// under ``CommitPolicy/onRead``) reads again by itself once
+    /// ``IggyClient/abandonOperation(_:)`` took that operation.
+    public let stopsPartition: Bool
 
-    init(partitionID: UInt32?, error: IggyError, skip: PollingStrategy? = nil, offset: UInt64? = nil, raw: [UInt8]? = nil) {
+    init(partitionID: UInt32?, error: IggyError, skip: PollingStrategy? = nil, offset: UInt64? = nil, raw: [UInt8]? = nil, stopsPartition: Bool = false) {
         self.partitionID = partitionID
         self.error = error
         self.skip = skip
         self.offset = offset
         self.raw = raw
+        self.stopsPartition = stopsPartition
     }
 
     public var description: String {
@@ -1566,7 +1574,7 @@ public actor PartitionReader: AsyncSequence {
             isolations[partition] = nil
             stopped.insert(partition)
             let skip = PollingStrategy.continuation(partitionID: partition, kind: .offset, value: isolation.first + 1, context: isolation.context)
-            report(ReadError(partitionID: partition, error: Self.iggyError(error), skip: skip, offset: isolation.first, raw: raw))
+            report(ReadError(partitionID: partition, error: Self.iggyError(error), skip: skip, offset: isolation.first, raw: raw, stopsPartition: true))
             return
         }
         if request.kind == .gap, let gap = gaps[partition] {
@@ -1583,7 +1591,7 @@ public actor PartitionReader: AsyncSequence {
             return
         }
         stopped.insert(partition)
-        report(ReadError(partitionID: partition, error: Self.iggyError(error), raw: raw))
+        report(ReadError(partitionID: partition, error: Self.iggyError(error), raw: raw, stopsPartition: true))
     }
 
     /// A message that an isolation delivered moves on the gap it lies in, or
@@ -1659,6 +1667,7 @@ public actor PartitionReader: AsyncSequence {
     /// ``next()``.
     private func failed(_ partitions: [UInt32], with error: IggyError) {
         let until = ContinuousClock.now + configuration.retryInterval
+        var stops = false
         switch error.code {
         case .notPrimary:
             groupingEpoch += 1
@@ -1677,7 +1686,7 @@ public actor PartitionReader: AsyncSequence {
             for partition in partitions {
                 if positions[partition]?.context != nil {
                     stopped.insert(partition)
-                    report(ReadError(partitionID: partition, error: error))
+                    report(ReadError(partitionID: partition, error: error, stopsPartition: true))
                 } else {
                     forget(partition)
                     pausedUntil[partition] = until
@@ -1701,6 +1710,7 @@ public actor PartitionReader: AsyncSequence {
                 stopped.insert(partition)
                 blockedBy[partition] = error.operationID
             }
+            stops = true
         case .disconnected, .unauthenticated, .staleClient:
             joinedGroup = false
         default:
@@ -1710,7 +1720,7 @@ public actor PartitionReader: AsyncSequence {
             pausedUntil[partition] = until
         }
         logger.error("Failed to read messages", metadata: metadata.merging(["partitions": "\(partitions)", "error": "\(error)"]) { $1 })
-        report(ReadError(partitionID: partitions.count == 1 ? partitions.first : nil, error: error))
+        report(ReadError(partitionID: partitions.count == 1 ? partitions.first : nil, error: error, stopsPartition: stops))
     }
 
     /// Queues an error for ``next()``. The latest one of each partition and
