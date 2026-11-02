@@ -2982,7 +2982,7 @@ TEST_F(E2E_Client, ConsumerOffsetKeepsDistinctConsumersApart) {
 }
 
 TEST_F(E2E_Client, StoreConsumerOffsetRejectsMissingPartitionId) {
-    RecordProperty("description", "Storing an offset needs an explicit partition, unlike polling.");
+    RecordProperty("description", "Storing an offset needs an explicit partition.");
     const std::string stream_name = GetRandomName();
     auto client                   = GetLoggedInHighLevelClient();
 

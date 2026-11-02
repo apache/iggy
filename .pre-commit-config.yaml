@@ -214,7 +214,7 @@ repos:
       - id: clang-format
         name: clang-format (foreign/cpp)
         entry: clang-format-18
-        args: ["--style=file", "--dry-run", "--Werror"]
+        args: ["--style=file", "-i"]
         language: system
         files: ^foreign/cpp/.*\.(h|hpp|cc|cpp|cxx)$
         pass_filenames: true
