@@ -27,6 +27,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <memory>
@@ -940,6 +941,16 @@ class HeaderField final {
     }
 
     /**
+     * @brief Creates a typed header field from a byte list.
+     * @param kind Type tag for @p value.
+     * @param value Payload encoded according to @p kind.
+     * @return Header field containing the supplied type and bytes.
+     */
+    static HeaderField Create(HeaderKind kind, std::initializer_list<std::uint8_t> value) {
+        return Create(kind, std::vector<std::uint8_t>(value));
+    }
+
+    /**
      * @brief Creates a typed header field by copying bytes from a string view.
      * @param kind Type tag for @p value.
      * @param value Bytes to copy into the field.
@@ -1056,6 +1067,20 @@ class IggyMessageToSend final {
                                     std::vector<HeaderEntry> user_headers = {},
                                     absl::uint128 id                      = 0) {
         return IggyMessageToSend(id, std::move(payload), std::move(user_headers));
+    }
+
+    /**
+     * @brief Creates a message from a byte list.
+     * @param payload Binary message payload.
+     * @param user_headers Optional typed user headers. Keys must be unique.
+     * @param id Application-defined message ID.
+     * @return Message owning the payload bytes and @p user_headers.
+     * @note Payload and header constraints are validated when the message is sent.
+     */
+    static IggyMessageToSend Create(std::initializer_list<std::uint8_t> payload,
+                                    std::vector<HeaderEntry> user_headers = {},
+                                    absl::uint128 id                      = 0) {
+        return Create(std::vector<std::uint8_t>(payload), std::move(user_headers), id);
     }
 
     /**
