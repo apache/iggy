@@ -22,6 +22,10 @@ inputs:
     description: "Cache key segment naming the package that builds in the job; one constant per package so every lane shares one cache"
     required: false
     default: "sdk"
+  package-path:
+    description: "Directory of the SwiftPM package whose build directory is cached"
+    required: false
+    default: "foreign/swift"
 
 runs:
   using: "composite"
@@ -83,11 +87,11 @@ runs:
       uses: actions/cache@v6.1.0
       with:
         path: |
-          foreign/swift/.build/checkouts
-          foreign/swift/.build/repositories
-          foreign/swift/.build/artifacts
-          foreign/swift/.build/debug
-          foreign/swift/.build/release
-        key: swiftpm-${{ runner.os }}-${{ steps.swift.outputs.version }}-${{ inputs.cache-key }}-${{ hashFiles('foreign/swift/Package.resolved') }}
+          ${{ inputs.package-path }}/.build/checkouts
+          ${{ inputs.package-path }}/.build/repositories
+          ${{ inputs.package-path }}/.build/artifacts
+          ${{ inputs.package-path }}/.build/debug
+          ${{ inputs.package-path }}/.build/release
+        key: swiftpm-${{ runner.os }}-${{ steps.swift.outputs.version }}-${{ inputs.cache-key }}-${{ hashFiles(format('{0}/Package.resolved', inputs.package-path)) }}
         restore-keys: |
           swiftpm-${{ runner.os }}-${{ steps.swift.outputs.version }}-${{ inputs.cache-key }}-

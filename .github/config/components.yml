@@ -472,12 +472,13 @@ components:
   bdd-swift:
     depends_on:
       - "rust-server"
+      - "rust-sdk"
       - "sdk-swift"
       - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/swift/**"
-      - "bdd/scenarios/deferred_polling.feature"
+      - "bdd/scenarios/**"
     tasks: ["bdd-swift"]
 
   examples-rust:
@@ -562,6 +563,18 @@ components:
       - "scripts/run-examples-from-readme.sh"
       - "scripts/utils.sh"
     tasks: ["examples-java"]
+
+  examples-swift:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "sdk-swift"
+      - "ci-infrastructure"
+    paths:
+      - "examples/swift/**"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
+    tasks: ["examples-swift"]
 
   web-ui:
     paths:
