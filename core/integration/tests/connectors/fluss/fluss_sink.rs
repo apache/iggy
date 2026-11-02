@@ -31,8 +31,8 @@ use integration::iggy_harness;
 use tokio::time::{Instant, timeout_at};
 
 use crate::connectors::fixtures::{
-    FlussMultiSinkFixture, FlussPartitionedSinkFixture, FlussPrimaryKeySinkFixture,
-    FlussSinkFixture, poll_log_rows,
+    FlussByteaSinkFixture, FlussMultiSinkFixture, FlussPartitionedSinkFixture,
+    FlussPrimaryKeySinkFixture, FlussSinkFixture, FlussStaticPrimaryKeySinkFixture, poll_log_rows,
 };
 use crate::connectors::{TestMessage, create_test_messages};
 
@@ -120,6 +120,28 @@ async fn wait_for_primary_key_value(
     })
     .await
     .unwrap_or_else(|_| panic!("Primary-key row {id} should become {expected:?} before timeout"));
+}
+
+async fn wait_for_static_payload(
+    fixture: &FlussStaticPrimaryKeySinkFixture,
+    row_id: &str,
+    expected: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(WAIT_TIMEOUT_S);
+    timeout_at(deadline, async {
+        loop {
+            let actual = fixture
+                .lookup_payload(row_id)
+                .await
+                .expect("Static primary-key row should be readable");
+            if actual.as_deref() == Some(expected) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("Static row {row_id} should contain {expected} before timeout"));
 }
 
 fn expected_decimal(value: u64) -> Decimal {
@@ -398,6 +420,85 @@ async fn sink_should_preserve_extra_fields_and_payload_in_rows(
             serde_json::from_str(payload).expect("Payload should contain a test message");
         assert_eq!(&actual_message, expected_message);
     }
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/fluss/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn bytea_sink_should_store_raw_payload_bytes(
+    harness: &TestHarness,
+    fixture: FlussByteaSinkFixture,
+) {
+    let payloads: Vec<Vec<u8>> = vec![vec![0x00, 0x9f, 0xff], vec![0xde, 0xad, 0xbe, 0xef]];
+    let messages = payloads
+        .iter()
+        .enumerate()
+        .map(|(index, payload)| {
+            IggyMessage::builder()
+                .id((index + 1) as u128)
+                .payload(Bytes::from(payload.clone()))
+                .build()
+                .expect("Iggy message should build")
+        })
+        .collect();
+
+    send_messages(harness, messages).await;
+
+    fixture
+        .wait_for_test_table(WAIT_TIMEOUT_S)
+        .await
+        .expect("Bytea Fluss test table should be created");
+    let rows = fixture
+        .read_from_test_table(payloads.len(), WAIT_TIMEOUT_S)
+        .await
+        .expect("Bytea Fluss test table rows should be readable");
+
+    let actual: Vec<&[u8]> = rows
+        .iter()
+        .map(|row| {
+            row.get_bytes(PAYLOAD_COLUMN_INDEX)
+                .expect("Payload column should contain bytes")
+        })
+        .collect();
+    assert_eq!(actual, payloads);
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/fluss/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn static_sink_with_primary_keys_should_upsert_rows_by_message_id(
+    harness: &TestHarness,
+    fixture: FlussStaticPrimaryKeySinkFixture,
+) {
+    let message_id = 1;
+    let row_id = format!("{message_id:032x}");
+    let json_message = |state: &str| {
+        IggyMessage::builder()
+            .id(message_id)
+            .payload(Bytes::from(
+                serde_json::to_vec(&serde_json::json!({ "state": state }))
+                    .expect("Test message should serialize"),
+            ))
+            .build()
+            .expect("Iggy message should build")
+    };
+
+    send_messages(harness, vec![json_message("before")]).await;
+    fixture
+        .wait_for_test_table(WAIT_TIMEOUT_S)
+        .await
+        .expect("Static primary-key Fluss test table should be created");
+    let table_info = fixture
+        .get_test_table()
+        .await
+        .expect("Static primary-key Fluss test table should be available");
+    assert!(table_info.has_primary_key());
+    wait_for_static_payload(&fixture, &row_id, r#"{"state":"before"}"#).await;
+
+    send_messages(harness, vec![json_message("after")]).await;
+    wait_for_static_payload(&fixture, &row_id, r#"{"state":"after"}"#).await;
 }
 
 #[iggy_harness(

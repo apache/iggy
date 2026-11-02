@@ -34,12 +34,16 @@ const DEFAULT_SINK_DB: &str = "fluss";
 const DEFAULT_SINK_TABLE: &str = "iggy_messages";
 const PARTITIONED_SINK_TABLE: &str = "partitioned_iggy_messages";
 const PRIMARY_KEY_SINK_TABLE: &str = "primary_key_events";
+const BYTEA_SINK_TABLE: &str = "bytea_iggy_messages";
+const STATIC_PRIMARY_KEY_SINK_TABLE: &str = "static_primary_key_messages";
+const STATIC_TABLE_COLUMN_COUNT: usize = 9;
 const TABLE_CREATION_TIMEOUT_S: u64 = 10;
 
 const ENV_SINK_BOOTSTRAP_SERVERS: &str =
     "IGGY_CONNECTORS_SINK_FLUSS_PLUGIN_CONFIG_BOOTSTRAP_SERVERS";
 const ENV_SINK_ROUTER_TYPE: &str = "IGGY_CONNECTORS_SINK_FLUSS_PLUGIN_CONFIG_ROUTER_TYPE";
 const ENV_SINK_TARGET_TABLE: &str = "IGGY_CONNECTORS_SINK_FLUSS_PLUGIN_CONFIG_TARGET_TABLE";
+const ENV_SINK_PAYLOAD_FORMAT: &str = "IGGY_CONNECTORS_SINK_FLUSS_PLUGIN_CONFIG_PAYLOAD_FORMAT";
 const ENV_SINK_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SINK_FLUSS_STREAMS_0_STREAM";
 const ENV_SINK_STREAMS_0_TOPICS: &str = "IGGY_CONNECTORS_SINK_FLUSS_STREAMS_0_TOPICS";
 const ENV_SINK_STREAMS_0_SCHEMA: &str = "IGGY_CONNECTORS_SINK_FLUSS_STREAMS_0_SCHEMA";
@@ -78,19 +82,29 @@ pub struct FlussSinkFixture {
     cluster: FlussCluster,
     router_type: &'static str,
     target_table: &'static str,
+    payload_format: &'static str,
 }
 
 impl FlussSinkFixture {
     async fn setup_with(
         router_type: &'static str,
         target_table: &'static str,
+        payload_format: &'static str,
     ) -> Result<Self, TestBinaryError> {
         let cluster = FlussCluster::new(DEFAULT_FLUSS_VERSION).await?;
         Ok(Self {
             cluster,
             router_type,
             target_table,
+            payload_format,
         })
+    }
+
+    fn stream_schema(&self) -> &'static str {
+        match self.payload_format {
+            "bytea" => "raw",
+            _ => "json",
+        }
     }
 
     pub fn test_table_path(&self) -> TablePath {
@@ -182,7 +196,7 @@ impl FlussSinkFixture {
 #[async_trait]
 impl TestFixture for FlussSinkFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
-        Self::setup_with("static", DEFAULT_SINK_TABLE).await
+        Self::setup_with("static", DEFAULT_SINK_TABLE, "json").await
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
@@ -200,6 +214,10 @@ impl TestFixture for FlussSinkFixture {
                 self.router_type.to_string(),
             ),
             (
+                ENV_SINK_PAYLOAD_FORMAT.to_string(),
+                self.payload_format.to_string(),
+            ),
+            (
                 ENV_SINK_STREAMS_0_STREAM.to_string(),
                 seeds::names::STREAM.to_string(),
             ),
@@ -207,7 +225,10 @@ impl TestFixture for FlussSinkFixture {
                 ENV_SINK_STREAMS_0_TOPICS.to_string(),
                 format!("[{}]", seeds::names::TOPIC),
             ),
-            (ENV_SINK_STREAMS_0_SCHEMA.to_string(), "json".to_string()),
+            (
+                ENV_SINK_STREAMS_0_SCHEMA.to_string(),
+                self.stream_schema().to_string(),
+            ),
             (
                 ENV_SINK_STREAMS_0_CONSUMER_GROUP.to_string(),
                 seeds::names::CONSUMER_GROUP.to_string(),
@@ -233,7 +254,7 @@ impl std::ops::Deref for FlussMultiSinkFixture {
 #[async_trait]
 impl TestFixture for FlussMultiSinkFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
-        FlussSinkFixture::setup_with("multi", DEFAULT_SINK_TABLE)
+        FlussSinkFixture::setup_with("multi", DEFAULT_SINK_TABLE, "json")
             .await
             .map(Self)
     }
@@ -333,7 +354,7 @@ impl FlussPrimaryKeySinkFixture {
 #[async_trait]
 impl TestFixture for FlussPrimaryKeySinkFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
-        let fixture = FlussSinkFixture::setup_with("multi", PRIMARY_KEY_SINK_TABLE)
+        let fixture = FlussSinkFixture::setup_with("multi", PRIMARY_KEY_SINK_TABLE, "json")
             .await
             .map(Self)?;
         fixture.create_test_table().await?;
@@ -404,7 +425,87 @@ impl FlussPartitionedSinkFixture {
 #[async_trait]
 impl TestFixture for FlussPartitionedSinkFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
-        FlussSinkFixture::setup_with("multi", PARTITIONED_SINK_TABLE)
+        FlussSinkFixture::setup_with("multi", PARTITIONED_SINK_TABLE, "json")
+            .await
+            .map(Self)
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.0.connectors_runtime_envs()
+    }
+}
+
+pub struct FlussByteaSinkFixture(FlussSinkFixture);
+
+impl std::ops::Deref for FlussByteaSinkFixture {
+    type Target = FlussSinkFixture;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[async_trait]
+impl TestFixture for FlussByteaSinkFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        FlussSinkFixture::setup_with("static", BYTEA_SINK_TABLE, "bytea")
+            .await
+            .map(Self)
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.0.connectors_runtime_envs()
+    }
+}
+
+pub struct FlussStaticPrimaryKeySinkFixture(FlussSinkFixture);
+
+impl std::ops::Deref for FlussStaticPrimaryKeySinkFixture {
+    type Target = FlussSinkFixture;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl FlussStaticPrimaryKeySinkFixture {
+    pub async fn lookup_payload(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<String>, TestBinaryError> {
+        let connection = self.get_fluss_connection().await?;
+        let table = connection
+            .get_table(&self.test_table_path())
+            .await
+            .map_err(|error| fixture_error(format!("Failed to get primary-key table: {error}")))?;
+        let mut lookuper = table
+            .new_lookup()
+            .map_err(|error| fixture_error(format!("Failed to create table lookup: {error}")))?
+            .create_lookuper()
+            .map_err(|error| fixture_error(format!("Failed to create table lookuper: {error}")))?;
+        let mut key = GenericRow::new(STATIC_TABLE_COLUMN_COUNT);
+        key.set_field(0, message_id);
+        let result = lookuper
+            .lookup(&key)
+            .await
+            .map_err(|error| fixture_error(format!("Failed to look up test row: {error}")))?;
+        let row = result
+            .get_single_row()
+            .map_err(|error| fixture_error(format!("Failed to read lookup result: {error}")))?;
+
+        row.map(|row| {
+            row.get_string(STATIC_TABLE_COLUMN_COUNT - 1)
+                .map(str::to_owned)
+                .map_err(|error| fixture_error(format!("Failed to read test payload: {error}")))
+        })
+        .transpose()
+    }
+}
+
+#[async_trait]
+impl TestFixture for FlussStaticPrimaryKeySinkFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        FlussSinkFixture::setup_with("static", STATIC_PRIMARY_KEY_SINK_TABLE, "json")
             .await
             .map(Self)
     }

@@ -20,8 +20,8 @@ mod sink;
 
 use integration::harness::TestBinaryError;
 pub use sink::{
-    FlussMultiSinkFixture, FlussPartitionedSinkFixture, FlussPrimaryKeySinkFixture,
-    FlussSinkFixture, poll_log_rows,
+    FlussByteaSinkFixture, FlussMultiSinkFixture, FlussPartitionedSinkFixture,
+    FlussPrimaryKeySinkFixture, FlussSinkFixture, FlussStaticPrimaryKeySinkFixture, poll_log_rows,
 };
 
 fn fixture_error(message: String) -> TestBinaryError {

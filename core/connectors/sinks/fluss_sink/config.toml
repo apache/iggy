@@ -90,3 +90,11 @@ bucket_count = 1
 "table.auto-partition.time-unit" = "DAY"
 "table.auto-partition.time-format" = "yyyy-MM-dd"
 "table.auto-partition.time-zone" = "UTC"
+
+[plugin_config.tables."fluss.bytea_iggy_messages"]
+primary_keys = []
+bucket_count = 1
+
+[plugin_config.tables."fluss.static_primary_key_messages"]
+primary_keys = ["id"]
+bucket_count = 1
