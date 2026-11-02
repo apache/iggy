@@ -296,6 +296,27 @@ group.shutdownGracefully();
 Do not block in a completion callback. Callbacks run on the group's loops, so a blocked
 callback stalls every client that shares the group.
 
+### Shutdown Quiet Period
+
+When a client closes, it shuts down the event loop group that it created for itself. Netty
+waits for a quiet period of 2 seconds with no new tasks before the group stops, so each close
+takes at least that long. If you open and close many short-lived clients, for example in tests,
+set a shorter quiet period:
+
+```java
+var client = Iggy.tcpClientBuilder()
+    .blocking()
+    .shutdownQuietPeriod(Duration.ZERO)
+    .shutdownTimeout(Duration.ofSeconds(5))
+    .credentials("iggy", "iggy")
+    .buildAndLogin();
+```
+
+To change the default for every client in the JVM, set the system properties
+`iggy.tcp.shutdownQuietPeriodMillis` and `iggy.tcp.shutdownTimeoutMillis`, in milliseconds.
+A value set on the builder overrides the property. These values do not apply to a group
+that you supply with `eventLoopGroup(...)`.
+
 ### Version Information
 
 ```java
