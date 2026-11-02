@@ -210,6 +210,8 @@ pub struct CreateSourceConfig {
     pub verbose: bool,
     #[serde(default)]
     pub benchmark: bool,
+    #[serde(default)]
+    pub exactly_once: bool,
 }
 
 impl CreateSourceConfig {
@@ -226,6 +228,7 @@ impl CreateSourceConfig {
             plugin_config: self.plugin_config,
             verbose: self.verbose,
             benchmark: self.benchmark,
+            exactly_once: self.exactly_once,
         }
     }
 }
@@ -251,6 +254,10 @@ pub struct SourceConfig {
     pub verbose: bool,
     #[serde(default)]
     pub benchmark: bool,
+    /// Each batch goes to one partition with the source's producer, and lands once, also after a
+    /// crash of the runtime. Needs a plugin that produces the same batch again from its state.
+    #[serde(default)]
+    pub exactly_once: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -288,6 +295,8 @@ pub struct StreamProducerConfig {
     pub avro_schema_path: Option<PathBuf>,
     pub batch_length: Option<u32>,
     pub linger_time: Option<String>,
+    /// The partition every message goes to. An exactly-once source uses 0 when it is unset.
+    pub partition_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,7 +425,7 @@ impl std::fmt::Display for SourceConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?}, verbose: {}, benchmark: {} }}",
+            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?}, verbose: {}, benchmark: {}, exactly_once: {} }}",
             self.enabled,
             self.name,
             self.path,
@@ -429,6 +438,7 @@ impl std::fmt::Display for SourceConfig {
             self.plugin_config_format,
             self.verbose,
             self.benchmark,
+            self.exactly_once,
         )
     }
 }
@@ -471,14 +481,15 @@ impl std::fmt::Display for StreamProducerConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ stream: {}, topic: {}, schema: {:?}, avro_schema_json: {:?}, avro_schema_path: {:?}, batch_length: {:?}, linger_time: {:?} }}",
+            "{{ stream: {}, topic: {}, schema: {:?}, avro_schema_json: {:?}, avro_schema_path: {:?}, batch_length: {:?}, linger_time: {:?}, partition_id: {:?} }}",
             self.stream,
             self.topic,
             self.schema,
             self.avro_schema_json,
             self.avro_schema_path,
             self.batch_length,
-            self.linger_time
+            self.linger_time,
+            self.partition_id
         )
     }
 }

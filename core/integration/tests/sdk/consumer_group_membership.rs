@@ -800,6 +800,105 @@ async fn given_weak_offset_durability_when_owner_changes_should_preserve_progres
     .expect("the installed owner's committed offset must survive whole-cluster crash");
 }
 
+// A member syncs its own share of a group. When a second member joins, each ends with a share of
+// its own in a later generation. The short rebalancing timeout bounds the handoff, so the test
+// holds however Iggy drains a partition.
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(
+        heartbeat.enabled = true,
+        heartbeat.interval = "60s",
+        consumer_group.rebalancing_timeout = "2s"
+    )
+)]
+async fn given_two_members_when_each_syncs_its_assignment_should_get_a_share_of_its_own(
+    harness: &TestHarness,
+) {
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+    let topic_id = Identifier::named(TOPIC_NAME).unwrap();
+    let group_id = Identifier::named(CONSUMER_GROUP_NAME).unwrap();
+
+    let mut clients = harness
+        .root_clients(3)
+        .await
+        .expect("Failed to create root clients");
+    let source = clients.remove(0);
+    let target = clients.remove(0);
+    let outsider = clients.remove(0);
+
+    source
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    source
+        .create_topic(
+            &stream_id,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(2),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    source
+        .create_consumer_group(&stream_id, &topic_id, CONSUMER_GROUP_NAME)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outsider
+            .sync_consumer_group(&stream_id, &topic_id, &group_id)
+            .await
+            .unwrap(),
+        None,
+        "a client that never joined has no assignment"
+    );
+
+    source
+        .join_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap();
+    wait_for_assignment(&source, 1).await;
+    let whole = source
+        .sync_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap()
+        .expect("a member has an assignment");
+    assert_eq!(whole.partitions, [0, 1]);
+
+    target
+        .join_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap();
+    let (source_share, target_share) = timeout(RESOLVE_TIMEOUT, async {
+        loop {
+            let source_share = source
+                .sync_consumer_group(&stream_id, &topic_id, &group_id)
+                .await
+                .unwrap()
+                .expect("the source stays a member");
+            let target_share = target
+                .sync_consumer_group(&stream_id, &topic_id, &group_id)
+                .await
+                .unwrap()
+                .expect("the target is a member");
+            if source_share.partitions.len() == 1 && target_share.partitions.len() == 1 {
+                return (source_share, target_share);
+            }
+            sleep(ASSIGNMENT_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("each member must end with one partition");
+    assert_ne!(source_share.partitions, target_share.partitions);
+    assert!(
+        source_share.generation > whole.generation,
+        "the rebalance advances the generation"
+    );
+}
+
 async fn wait_for_assignment(client: &IggyClient, members_count: u32) {
     wait_for_consumer_group_assignment(
         client,
