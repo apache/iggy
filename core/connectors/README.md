@@ -24,8 +24,8 @@ Published to Docker Hub as [`apache/iggy-connect`](https://hub.docker.com/r/apac
 
 | Tag | Contents |
 | --- | --- |
-| `edge`, `x.y.z`, `latest` | Runtime plus every bundled connector plugin (default) |
-| `edge-slim`, `x.y.z-slim`, `latest-slim` | Runtime binary only |
+| `x.y.z`, `latest` | Runtime plus every bundled connector plugin (default) |
+| `x.y.z-slim`, `latest-slim` | Runtime binary only |
 
 The default (fat) image bakes every connector plugin into `/usr/local/lib`, which is on the runtime's [plugin search path](#plugin-path-resolution). A connector config can therefore load a bundled plugin by library file name alone, with no directory and no extension:
 
@@ -95,17 +95,13 @@ This example runs the Iggy server, the connectors runtime with the Delta Lake si
     docker compose down -v
     ```
 
-The default `apache/iggy-connect:edge` image bundles the Delta sink plugin. To test an unreleased change to the image or the plugins, build the default image locally from the repository root and point the example at it:
+The first `docker compose up -d --build` builds the default (fat) image from source as `iggy-connect:local`, which takes a long time (roughly 40 minutes on a CI-class machine). To skip the build, point the example at a released fat tag and the matching server image:
 
 ```bash
-docker buildx build -f core/connectors/runtime/Dockerfile --target runtime-fat \
-  --platform linux/amd64 --build-arg LIBC=glibc --build-arg IGGY_CI_BUILD=true \
-  -t iggy-connect:fat-local --load .
-cd examples/rust/src/sink-data-producer
-IGGY_CONNECT_IMAGE=iggy-connect:fat-local docker compose up -d --build
+IGGY_CONNECT_IMAGE=apache/iggy-connect:x.y.z IGGY_SERVER_IMAGE=apache/iggy:x.y.z docker compose up -d
 ```
 
-IMPORTANT: make sure you have pulled the code from the latest master to ensure connectors and server protocol compatibility. The incompatibility causes obscure errors coming from the connectors' client due to frequent changes done to the protocol at the moment. Run `docker compose pull` before `docker compose up` so that the `edge` images match your checkout.
+IMPORTANT: make sure you have pulled the code from the latest master to ensure connectors and server protocol compatibility. The incompatibility causes obscure errors coming from the connectors' client due to frequent changes done to the protocol at the moment. The locally built connectors image matches your checkout, so run `docker compose pull --ignore-buildable` before `docker compose up` to refresh the `apache/iggy:edge` server image to match it.
 
 The configuration used by the example lives in `examples/rust/src/sink-data-producer/config/`.
 
