@@ -26,7 +26,7 @@
 # the C++ wire server over the wire protocol.
 
 # Stage 1: build the wire server with Bazel.
-FROM gcr.io/bazel-public/bazel:9.2.0 AS build
+FROM gcr.io/bazel-public/bazel:9.3.1 AS build
 
 USER root
 WORKDIR /workspace

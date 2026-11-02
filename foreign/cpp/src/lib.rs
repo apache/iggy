@@ -32,7 +32,7 @@ use client::{
     validate_metadata_changes_query,
 };
 use consumer::IggyConsumer;
-use messages::{BatchPositions, Checkpoint, Continuation, default_poll_options, make_message};
+use messages::{BatchPositions, Checkpoint, Continuation, default_poll_options};
 use pending_poll::PendingPoll;
 use producer::Producer;
 use reader::PartitionReader;
@@ -1263,8 +1263,6 @@ mod ffi {
         /// and every other call on a closed reader fails. Dropping a reader
         /// without `close` moves no offset back.
         fn close(self: &PartitionReader, error_info: &mut ErrorInfo) -> Result<()>;
-
-        fn make_message(payload: Vec<u8>, user_headers: Vec<HeaderEntry>) -> IggyMessageToSend;
 
         #[allow(clippy::too_many_arguments)]
         fn send_messages(
