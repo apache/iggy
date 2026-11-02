@@ -149,6 +149,20 @@ python message-headers/typed-headers/producer.py
 python message-headers/typed-headers/consumer.py
 ```
 
+### Message Envelopes
+
+Shows the message envelope pattern, where each payload is wrapped in a JSON object with a `message_type` and a `payload` string so one topic can carry several message kinds.
+
+```bash
+# Using uv
+uv run message-envelope/producer.py
+uv run message-envelope/consumer.py
+
+# Without using uv
+python message-envelope/producer.py
+python message-envelope/consumer.py
+```
+
 ## TLS Examples
 
 To test with a TLS-enabled server, start the server with TLS configured (see main README), then run:
