@@ -25,6 +25,7 @@ use iggy::prelude::IggyClient;
 use iggy_common::MessageClient;
 use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
 use iggy_common::{CommitPolicy, Consumer, Identifier, PollOptions, PollingStrategy};
+use iggy_connector_sdk::ConnectorState;
 use iggy_connector_sdk::api::{
     ConnectorRuntimeStats, ConnectorStats, ConnectorStatus, SourceInfoResponse,
 };
@@ -33,7 +34,7 @@ use integration::iggy_harness;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
@@ -57,6 +58,14 @@ struct FlussRecord {
     /// The Apache Iggy message id, read from the message header rather than the payload.
     #[serde(skip)]
     message_id: u128,
+}
+
+/// The persisted part of the source state. MessagePack stores the struct as an array, so the
+/// fields keep the order of the connector's own `State`.
+#[derive(Debug, Deserialize)]
+struct SavedState {
+    bucket_offsets: HashMap<i32, i64>,
+    messages_produced: u64,
 }
 
 /// An Apache Iggy message reduced to what the tests check.
@@ -204,6 +213,63 @@ async fn given_latest_start_when_runtime_restarts_before_any_row_should_deliver_
         &payloads,
         fixture.existing_payloads().len() as i64,
     );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/fluss/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_acknowledged_rows_when_runtime_restarts_should_resume_after_them(
+    harness: &mut TestHarness,
+    fixture: FlussSourceFixture,
+) {
+    let first_payloads = test_payloads();
+    fixture
+        .append_rows(&first_payloads)
+        .await
+        .expect("Failed to append rows");
+    let client = harness.root_client().await.unwrap();
+    let received = poll_records(&client, first_payloads.len(), POLL_ATTEMPTS).await;
+    assert_rows_delivered(&received, &first_payloads, 0);
+
+    // The rows reach Apache Iggy before the runtime saves the state that acknowledges them, and
+    // a stop in between would replay them, so wait for the saved offset first.
+    let state_path = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .state_path()
+        .join(STATE_FILE);
+    let saved = wait_for_saved_offset(&state_path, 0, TEST_ROW_COUNT as i64).await;
+    assert_eq!(
+        saved.messages_produced, TEST_ROW_COUNT as u64,
+        "Each acknowledged row should be counted once"
+    );
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors runtime");
+    let second_payloads: Vec<String> = (0..TEST_ROW_COUNT)
+        .map(|index| format!("fluss-payload-after-restart-{index}"))
+        .collect();
+    fixture
+        .append_rows(&second_payloads)
+        .await
+        .expect("Failed to append rows");
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors runtime");
+
+    let received = poll_records(&client, second_payloads.len(), POLL_ATTEMPTS).await;
+    assert!(
+        received
+            .iter()
+            .all(|record| record.offset >= TEST_ROW_COUNT as i64),
+        "Rows acknowledged before the restart should not be read again"
+    );
+    assert_rows_delivered(&received, &second_payloads, TEST_ROW_COUNT as i64);
 }
 
 #[iggy_harness(
@@ -572,6 +638,25 @@ async fn wait_for_source_status(
     })
     .await
     .unwrap_or_else(|_| panic!("Apache Fluss source never reached status {status:?}"))
+}
+
+async fn wait_for_saved_offset(path: &Path, bucket: i32, offset: i64) -> SavedState {
+    timeout(STATE_FILE_TIMEOUT, async {
+        loop {
+            if let Ok(bytes) = std::fs::read(path)
+                && let Some(state) =
+                    ConnectorState(bytes).deserialize::<SavedState>("Apache Fluss test", 1)
+                && state.bucket_offsets.get(&bucket) == Some(&offset)
+            {
+                return state;
+            }
+            sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("Apache Fluss source never saved offset {offset} for bucket {bucket}")
+    })
 }
 
 async fn wait_for_file(path: &Path) {
