@@ -133,6 +133,10 @@ pub struct IggyBridgeConfig {
     /// Transport security of every client the bridge opens.
     pub tls: IggyTls,
     pub produce_sessions: ProduceSessionLimits,
+    /// Pass the producer of an idempotent Kafka batch to Iggy, so the partition writes the batch
+    /// once. Off by default, because released consumers cannot read such batches. When off, a
+    /// retry of an idempotent producer can write its records twice.
+    pub idempotent_producers: bool,
     /// The nodes of the last roster the bridge read, which each new client dials after `address`.
     /// No variable sets it: the bridge fills it, and every clone of this config shares it.
     pub nodes: KnownNodes,
@@ -159,6 +163,7 @@ impl IggyBridgeConfig {
         "IGGY_KAFKA_IGGY_TLS_CA_FILE",
         "IGGY_KAFKA_PRODUCE_SESSIONS",
         "IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS",
+        "IGGY_KAFKA_IDEMPOTENT_PRODUCERS",
     ];
 
     /// Builds config from `IGGY_KAFKA_*` env vars, defaulting to the Iggy server's own
@@ -185,7 +190,8 @@ impl IggyBridgeConfig {
     /// `IGGY_KAFKA_IGGY_USERNAME` is set but empty, or if `IGGY_KAFKA_TOPIC_MAP_PATH` is set but
     /// the file is missing, fails to parse, or fails validation (e.g. a malformed mapping key or
     /// an empty `default_stream`), or if `IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE`,
-    /// `IGGY_KAFKA_PRODUCE_SESSIONS` or `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` does not parse.
+    /// `IGGY_KAFKA_PRODUCE_SESSIONS`, `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` or
+    /// `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` does not parse.
     pub fn from_env() -> Result<Self, BridgeError> {
         let address =
             std::env::var("IGGY_KAFKA_IGGY_ADDR").unwrap_or_else(|_| DEFAULT_IGGY_ADDR.to_string());
@@ -274,6 +280,12 @@ impl IggyBridgeConfig {
             })?;
         }
 
+        let idempotent_producers = match std::env::var("IGGY_KAFKA_IDEMPOTENT_PRODUCERS") {
+            Ok(raw) => parse_bool("IGGY_KAFKA_IDEMPOTENT_PRODUCERS", &raw)
+                .map_err(BridgeError::InvalidConfig)?,
+            Err(_) => false,
+        };
+
         Ok(Self {
             address,
             username,
@@ -282,6 +294,7 @@ impl IggyBridgeConfig {
             max_message_size,
             tls,
             produce_sessions,
+            idempotent_producers,
             nodes: KnownNodes::default(),
         })
     }
@@ -318,6 +331,7 @@ mod tests {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             tls: IggyTls::default(),
             produce_sessions: ProduceSessionLimits::default(),
+            idempotent_producers: false,
             nodes: KnownNodes::default(),
         }
     }
@@ -441,6 +455,33 @@ mod tests {
         );
         assert!(matches!(bad_count, Err(BridgeError::InvalidConfig(_))));
         assert!(matches!(no_idle, Err(BridgeError::InvalidConfig(_))));
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_reads_the_idempotent_producers_switch() {
+        // Safety: process-wide, not per-variable - see the note on
+        // from_env_uses_documented_defaults_when_only_password_is_set above.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_PASSWORD", "iggy");
+        }
+        let unset = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IDEMPOTENT_PRODUCERS", "true");
+        }
+        let on = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IDEMPOTENT_PRODUCERS", "yes");
+        }
+        let garbage = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_PASSWORD");
+            std::env::remove_var("IGGY_KAFKA_IDEMPOTENT_PRODUCERS");
+        }
+
+        assert!(!unset.unwrap().idempotent_producers, "off by default");
+        assert!(on.unwrap().idempotent_producers);
+        assert!(matches!(garbage, Err(BridgeError::InvalidConfig(_))));
     }
 
     #[test]

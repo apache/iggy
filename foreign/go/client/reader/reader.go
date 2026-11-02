@@ -785,9 +785,10 @@ func (r *PartitionReader) readLocked(targets []iggcon.FetchMessagesTarget, count
 
 func (r *PartitionReader) prepareRead(targets []iggcon.FetchMessagesTarget, generations map[uint32]uint64, options iggcon.DeferredPollOptions) ([]iggcon.FetchMessagesTarget, error) {
 	type baselineResult struct {
-		target iggcon.FetchMessagesTarget
-		batch  *iggcon.PolledMessage
-		err    error
+		target  iggcon.FetchMessagesTarget
+		batch   *iggcon.PolledMessage
+		refusal error
+		err     error
 	}
 	results := make(chan baselineResult, len(targets))
 	probes := 0
@@ -803,18 +804,19 @@ func (r *PartitionReader) prepareRead(targets []iggcon.FetchMessagesTarget, gene
 			probe.MinCount = 1
 			sections, err := r.transport.FetchMessages(r.run, r.stream, r.topic, r.consumer, []iggcon.FetchMessagesTarget{target}, 1, false, probe)
 			var polled *iggcon.PolledMessage
+			var refusal error
 			for _, section := range sections {
 				if section.PartitionId != target.PartitionId {
 					continue
 				}
 				if section.Err != nil {
-					err = section.Err
+					refusal = section.Err
 					break
 				}
 				polled, err = binaryserialization.DeserializeSectionMessages(section)
 				break
 			}
-			results <- baselineResult{target: target, batch: polled, err: err}
+			results <- baselineResult{target: target, batch: polled, refusal: refusal, err: err}
 		}()
 	}
 	r.mu.Unlock()
@@ -827,12 +829,16 @@ func (r *PartitionReader) prepareRead(targets []iggcon.FetchMessagesTarget, gene
 			failure = result.err
 		}
 		if p != nil && p.generation == generations[result.target.PartitionId] && result.err == nil {
-			if result.batch != nil && len(result.batch.Messages) > 0 {
+			switch {
+			case result.refusal != nil:
+				// A refusal of one probe affects only its partition, so the other partitions of the read go on.
+				r.refuseSectionLocked(p, result.refusal, time.Now())
+			case result.batch != nil && len(result.batch.Messages) > 0:
 				first := result.batch.Messages[0].Header.Offset
 				p.baseline = &first
 				p.context = result.batch.Context
 				p.position = iggcon.NextPollingStrategy().WithContext(p.context)
-			} else {
+			default:
 				p.retryAt = time.Now().Add(r.config.retryInterval)
 			}
 		}

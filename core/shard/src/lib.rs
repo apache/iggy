@@ -37,6 +37,7 @@ pub use poll::deferred::{
     OversizedTurn, PollQuotaIdentity, ReadinessTarget, ReadinessWait, ReadinessWatch, ReadyTarget,
     ServedState, WatchedState,
 };
+use poll::deferred::{MirrorSince, MirrorUse};
 pub use poll::{ConsumerAttachment, PollCompleted};
 /// How often the replication gauges and partition reports refresh.
 pub use primary_rebalance::PROBE_INTERVAL as PARTITION_REPORT_INTERVAL;
@@ -2758,7 +2759,12 @@ where
     /// adds its own targets that hold messages, also below `min_count`. An
     /// empty list means that the wait expired without messages. An owner
     /// that gets an `Offset` target starts to push its state here, so that
-    /// the next waits on it stay on this shard.
+    /// the next waits on it stay on this shard. A mirror without those pushes
+    /// can lag its partition, so a wait that ends on other targets asks the
+    /// owners again for the targets that such a mirror found empty, unless a
+    /// push refreshed the mirror during the wait, in which case the wait reads
+    /// the mirror once more and asks the owner only when the mirror still
+    /// holds nothing and its owner stopped pushing.
     ///
     /// # Errors
     /// Returns the first rejection. A target that no shard owns, or an inbox
@@ -2787,6 +2793,7 @@ where
         let mirrors = !wait.is_zero();
         let mut evaluators: BTreeMap<u16, (Vec<ReadinessTarget>, Vec<IggyNamespace>)> =
             BTreeMap::new();
+        let mut snapshots = Vec::new();
         for target in targets {
             let owner = self
                 .shards_table
@@ -2794,10 +2801,18 @@ where
                 .ok_or(IggyError::TransientNotAccepted)?;
             let mirrorable =
                 mirrors && owner != self.id && target.strategy.kind == PollingKind::Offset;
-            let shard = if mirrorable && self.mirror_serves(owner, &target, context.primary, now) {
-                self.id
+            let mirror = if mirrorable {
+                self.mirror_use(owner, &target, context.primary, now)
             } else {
-                owner
+                MirrorUse::Owner
+            };
+            let shard = match mirror {
+                MirrorUse::Owner => owner,
+                MirrorUse::Current => self.id,
+                MirrorUse::Snapshot { pushes } => {
+                    snapshots.push((target.clone(), pushes));
+                    self.id
+                }
             };
             let (targets, watched) = evaluators.entry(shard).or_default();
             if mirrorable && shard == owner {
@@ -2895,6 +2910,44 @@ where
         }
         if let Some(waiter) = parked.waiters.remove(&self.id) {
             ready.extend(self.take_readiness_wait(waiter)?);
+        }
+        // A push during the wait can land after the last evaluation of the
+        // wait, so a mirror that one refreshed is read once more. One that
+        // still holds nothing is trusted only while its owner keeps pushing.
+        let mut stale = Vec::new();
+        for (target, pushes) in snapshots {
+            if ready
+                .iter()
+                .any(|ready| ready.partition_id == target.partition_id)
+            {
+                continue;
+            }
+            let since = self.mirror_since(target.namespace, pushes);
+            if since != MirrorSince::Unchanged
+                && let Some(found) = self.mirror_ready(context.primary, &target)
+            {
+                ready.push(found);
+            } else if since != MirrorSince::Current {
+                stale.push(target);
+            }
+        }
+        if !ready.is_empty() && !stale.is_empty() {
+            let namespaces = stale.iter().map(|target| target.namespace).collect();
+            let budget = std::time::Duration::from_micros(
+                deadline.saturating_sub(self.bus.monotonic_micros()),
+            );
+            // A zero wait asks the owners and never a mirror. An owner that
+            // cannot answer within the wait leaves the answer as it is.
+            let owners = Box::pin(self.wait_for_messages(
+                context,
+                stale,
+                std::time::Duration::ZERO,
+                ANY_MESSAGE,
+            ));
+            if let Some(Ok(owned)) = bus_timeout(&self.bus, budget, owners).await {
+                ready.extend(owned);
+            }
+            self.hold_mirrors(namespaces);
         }
         Ok(ready)
     }

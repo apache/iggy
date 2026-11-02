@@ -42,9 +42,9 @@ use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::listener::SecurityProtocol;
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_DELETE_TOPICS, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_POLICY_VIOLATION,
-    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-    GatewayState,
+    API_KEY_DELETE_TOPICS, ConnectionState, ERROR_INVALID_REQUEST, ERROR_NONE,
+    ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_AUTHORIZATION_FAILED,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::delete_topics;
 use iggy_gateway_kafka::protocol::sasl::PlainCredentials;
@@ -113,7 +113,14 @@ fn decode_first_result(body: Bytes) -> (i16, Option<String>) {
 
 async fn send(state: &GatewayState, names: &[&str]) -> Vec<(Option<String>, i16)> {
     let body = build_request(names);
-    let outcome = delete_topics::handle(state, None, REQUEST_VERSION, body).await;
+    let outcome = delete_topics::handle(
+        state,
+        &ConnectionState::default(),
+        None,
+        REQUEST_VERSION,
+        body,
+    )
+    .await;
     let resp_body = outcome.expect_response("DeleteTopics request always answers");
     decode_all_results(resp_body)
 }
@@ -342,7 +349,14 @@ async fn delete_topics_over_cap_error_message_names_the_limit() {
     let names: Vec<String> = (0..101).map(|i| format!("topic-{i}")).collect();
     let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let body = build_request(&name_refs);
-    let outcome = delete_topics::handle(&state, None, REQUEST_VERSION, body).await;
+    let outcome = delete_topics::handle(
+        &state,
+        &ConnectionState::default(),
+        None,
+        REQUEST_VERSION,
+        body,
+    )
+    .await;
     let resp_body = outcome.expect_response("DeleteTopics request always answers");
     let (error_code, error_message) = decode_first_result(resp_body);
     assert_eq!(error_code, ERROR_POLICY_VIOLATION);

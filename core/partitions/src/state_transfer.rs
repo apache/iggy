@@ -33,6 +33,9 @@ use crate::io::PartitionIoQuiescence;
 use crate::journal::RepairTailLease;
 use crate::offset_storage::{discard_offset_replacement, stage_offset_replacement};
 use crate::partition_storage::{read_revision_record, write_revision_record};
+use crate::producer_state::{
+    PRODUCER_BATCHES_RETAINED, PRODUCERS_MAX, ProducerBatch, ProducerEntry,
+};
 use crate::segment_anchor::ANCHOR_SUFFIX;
 use crate::types::{OFFSETS_DIR, PartitionsConfig};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
@@ -42,6 +45,7 @@ use consensus::state_manifest::artifact_kind;
 use consensus::{
     ArtifactProgress, DedupWatermark, Sequencer as _, StateArtifactHasher, state_artifact_checksum,
 };
+use iggy_binary_protocol::batch::BatchProducer;
 use iggy_binary_protocol::requests::partitions::retire_consumer_group_owners::CONSUMER_GROUP_OWNERS_MAX;
 use iggy_binary_protocol::requests::partitions::{
     InstallConsumerGroupOwnerRequest, RetireConsumerGroupOwnersRequest,
@@ -78,7 +82,11 @@ pub(crate) const CONSUMER_OFFSETS_MAGIC: [u8; 4] = *b"ICO1";
 /// Version 6 dropped the purge generation that followed the version byte.
 /// Version 7 carries the installed consumer-group owners and history fence.
 /// Version 8 carries the op of the delete that emptied the offset table.
-pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 8;
+/// Version 9 carries the producer table of idempotent producers.
+pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 9;
+/// The oldest version that [`ConsumerOffsetsWire::decode`] reads. Version 8
+/// builds kept no producers, so its artifact reads as an empty producer table.
+const CONSUMER_OFFSETS_VERSION_MIN: u8 = 8;
 pub(crate) const SEGMENT_SWEEP_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 const RETRY_CHECKPOINT_MAGIC: [u8; 4] = *b"IRP2";
@@ -93,7 +101,9 @@ const RETRY_CHECKPOINT_BYTES_MAX: usize = journal::partition_journal::PREPARE_BY
     + CONSUMER_OFFSETS_ENTRIES_MAX as usize * OWNERSHIP_ENTRY_LEN
     + RetireConsumerGroupOwnersRequest::PREFIX_SIZE
     + CONSUMER_GROUP_OWNERS_MAX as usize * size_of::<u64>()
-    + size_of::<PrepareHeader>();
+    + size_of::<PrepareHeader>()
+    + size_of::<u32>()
+    + PRODUCERS_MAX * PRODUCER_ENTRY_LEN_MAX;
 
 /// Per-section entry ceiling for the consumer-offsets artifact.
 ///
@@ -108,6 +118,14 @@ const OWNERSHIP_ENTRY_LEN: usize =
     InstallConsumerGroupOwnerRequest::ENCODED_SIZE + size_of::<u64>();
 const PARTITION_RECEIPT_BYTES_MAX: usize =
     size_of::<ReplyHeader>() + size_of::<u32>() + CONFIRMATION_SIZE;
+/// `producer_id u64 | epoch u16 | last_timestamp u64 | batch_count u8`.
+const PRODUCER_ENTRY_PREFIX_LEN: usize =
+    size_of::<u64>() + size_of::<u16>() + size_of::<u64>() + size_of::<u8>();
+/// `first_sequence u32 | last_sequence u32 | base_offset u64`.
+const PRODUCER_BATCH_LEN: usize = 2 * size_of::<u32>() + size_of::<u64>();
+/// An entry holds up to `u8::MAX` batches, whatever window its writer kept.
+const PRODUCER_ENTRY_LEN_MAX: usize =
+    PRODUCER_ENTRY_PREFIX_LEN + u8::MAX as usize * PRODUCER_BATCH_LEN;
 
 /// One in-flight partition state transfer on the receiving replica.
 ///
@@ -576,9 +594,11 @@ pub(crate) struct ConsumerOffsetsWire {
     pub history_transition: Option<InstalledPartitionHistory>,
     pub owner_retirement:
         Option<iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest>,
-    /// Trailing and optional on decode, so artifacts written before
+    /// Optional on decode of version 8, so artifacts written before
     /// retirement debt read as `0`.
     pub retirement_paid_through: u64,
+    /// The committed producer table, ascending by producer id.
+    pub producers: Vec<(u64, ProducerEntry)>,
 }
 
 impl ConsumerOffsetsWire {
@@ -592,8 +612,10 @@ impl ConsumerOffsetsWire {
     /// history_present u8 | [history fence, partition_op u64] |
     /// retirement_length u32 | retirement bytes | checksum_present u8 |
     /// prepare_checksum u128 | prepare_length u32 | checkpoint_prepare bytes |
-    /// retirement_paid_through u64 | XxHash3_64 trailer`. Little-endian
-    /// throughout.
+    /// retirement_paid_through u64 | producer_count u32 | {producer_id u64,
+    /// epoch u16, last_timestamp u64, batch_count u8, {first_sequence u32,
+    /// last_sequence u32, base_offset u64}xB}xP | XxHash3_64 trailer`.
+    /// Little-endian throughout.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let sections = self.offset_sections();
@@ -671,6 +693,23 @@ impl ConsumerOffsetsWire {
         );
         out.extend_from_slice(&self.checkpoint_prepare);
         out.extend_from_slice(&self.retirement_paid_through.to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(self.producers.len())
+                .expect("bounded producer count")
+                .to_le_bytes(),
+        );
+        for (producer_id, entry) in &self.producers {
+            out.extend_from_slice(&producer_id.to_le_bytes());
+            out.extend_from_slice(&entry.epoch.to_le_bytes());
+            out.extend_from_slice(&entry.last_timestamp.to_le_bytes());
+            #[allow(clippy::cast_possible_truncation)]
+            out.push(entry.batches().len() as u8);
+            for batch in entry.batches() {
+                out.extend_from_slice(&batch.first_sequence.to_le_bytes());
+                out.extend_from_slice(&batch.last_sequence.to_le_bytes());
+                out.extend_from_slice(&batch.base_offset.to_le_bytes());
+            }
+        }
         debug_assert_eq!(out.len() + size_of::<u64>(), reserved, "encode reservation");
         let trailer = state_artifact_checksum(&out);
         out.extend_from_slice(&trailer.to_le_bytes());
@@ -703,7 +742,7 @@ impl ConsumerOffsetsWire {
         if magic != CONSUMER_OFFSETS_MAGIC {
             return Err(ConsumerOffsetsWireError::BadMagic);
         }
-        if version != CONSUMER_OFFSETS_VERSION {
+        if !(CONSUMER_OFFSETS_VERSION_MIN..=CONSUMER_OFFSETS_VERSION).contains(&version) {
             return Err(ConsumerOffsetsWireError::UnsupportedVersion { version });
         }
         let next_offset = cursor.u64()?;
@@ -762,10 +801,18 @@ impl ConsumerOffsetsWire {
             return Err(ConsumerOffsetsWireError::InvalidPrepareChecksum);
         }
         let checkpoint_prepare = cursor.take(prepare_length)?.to_vec();
-        let retirement_paid_through = if cursor.remaining().len() >= size_of::<u64>() {
+        // Version 8 builds from before retirement debt end at the prepare.
+        let retirement_paid_through = if version > CONSUMER_OFFSETS_VERSION_MIN
+            || cursor.remaining().len() >= size_of::<u64>()
+        {
             cursor.u64()?
         } else {
             0
+        };
+        let producers = if version == CONSUMER_OFFSETS_VERSION_MIN {
+            Vec::new()
+        } else {
+            Self::decode_producer_section(&mut cursor)?
         };
         if !cursor.remaining().is_empty() {
             // Distinct from `Truncated`: extra bytes point at a NEWER
@@ -790,7 +837,71 @@ impl ConsumerOffsetsWire {
             history_transition,
             owner_retirement,
             retirement_paid_through,
+            producers,
         })
+    }
+
+    /// The producer section, ascending by producer id. Every field stays
+    /// within its maximum, and each producer has at least one batch. Only the
+    /// newest [`PRODUCER_BATCHES_RETAINED`] batches are kept, so a writer with
+    /// another window needs no new version.
+    fn decode_producer_section(
+        cursor: &mut LeCursor<'_>,
+    ) -> Result<Vec<(u64, ProducerEntry)>, ConsumerOffsetsWireError> {
+        let count = cursor.u32()?;
+        if count as usize > PRODUCERS_MAX {
+            return Err(ConsumerOffsetsWireError::TooManyEntries {
+                section: "producers",
+                count,
+                max: u32::try_from(PRODUCERS_MAX).unwrap_or(u32::MAX),
+            });
+        }
+        if count as usize * PRODUCER_ENTRY_PREFIX_LEN > cursor.remaining().len() {
+            return Err(ConsumerOffsetsWireError::Truncated);
+        }
+        let mut producers = Vec::with_capacity(count as usize);
+        let mut previous = None;
+        for _ in 0..count {
+            let producer_id = cursor.u64()?;
+            let epoch = u16::from_le_bytes(
+                cursor
+                    .take(size_of::<u16>())?
+                    .try_into()
+                    .map_err(|_| ConsumerOffsetsWireError::Truncated)?,
+            );
+            let last_timestamp = cursor.u64()?;
+            let batch_count = usize::from(cursor.u8()?);
+            if producer_id > BatchProducer::PRODUCER_ID_MAX
+                || epoch > BatchProducer::EPOCH_MAX
+                || batch_count == 0
+                || previous.is_some_and(|previous| previous >= producer_id)
+            {
+                return Err(ConsumerOffsetsWireError::InvalidProducer);
+            }
+            previous = Some(producer_id);
+            let dropped = batch_count.saturating_sub(PRODUCER_BATCHES_RETAINED);
+            let mut batches = [ProducerBatch::default(); PRODUCER_BATCHES_RETAINED];
+            for index in 0..batch_count {
+                let batch = ProducerBatch {
+                    first_sequence: cursor.u32()?,
+                    last_sequence: cursor.u32()?,
+                    base_offset: cursor.u64()?,
+                };
+                if batch.first_sequence > BatchProducer::SEQUENCE_MAX
+                    || batch.last_sequence > BatchProducer::SEQUENCE_MAX
+                {
+                    return Err(ConsumerOffsetsWireError::InvalidProducer);
+                }
+                if let Some(slot) = index.checked_sub(dropped) {
+                    batches[slot] = batch;
+                }
+            }
+            let entry =
+                ProducerEntry::restored(epoch, last_timestamp, &batches[..batch_count - dropped])
+                    .ok_or(ConsumerOffsetsWireError::InvalidProducer)?;
+            producers.push((producer_id, entry));
+        }
+        Ok(producers)
     }
 
     /// The offset section of each kind, in [`ConsumerKind::ALL`] order.
@@ -830,6 +941,14 @@ impl ConsumerOffsetsWire {
                 .owner_retirement
                 .as_ref()
                 .map_or(0, WireEncode::encoded_size)
+            + size_of::<u32>()
+            + self
+                .producers
+                .iter()
+                .map(|(_, entry)| {
+                    PRODUCER_ENTRY_PREFIX_LEN + entry.batches().len() * PRODUCER_BATCH_LEN
+                })
+                .sum::<usize>()
             + size_of::<u64>()
             + size_of::<u64>()
     }
@@ -1063,6 +1182,9 @@ pub enum ConsumerOffsetsWireError {
     /// A dedup entry carries client id zero, which is reserved and refused at
     /// every ingress: a peer encoder bug.
     ReservedClient,
+    /// A producer entry is out of order, above a field maximum, or keeps no
+    /// batch or too many.
+    InvalidProducer,
 }
 
 impl From<Truncated> for ConsumerOffsetsWireError {
@@ -1100,7 +1222,7 @@ impl fmt::Display for ConsumerOffsetsWireError {
             Self::UnsupportedVersion { version } => write!(
                 f,
                 "consumer-offsets artifact version {version} is not understood \
-                 (this build speaks {CONSUMER_OFFSETS_VERSION})"
+                 (this build reads {CONSUMER_OFFSETS_VERSION_MIN} to {CONSUMER_OFFSETS_VERSION})"
             ),
             Self::ChecksumMismatch { expected, actual } => write!(
                 f,
@@ -1129,6 +1251,9 @@ impl fmt::Display for ConsumerOffsetsWireError {
                     f,
                     "consumer-offsets artifact dedup entry carries reserved client 0"
                 )
+            }
+            Self::InvalidProducer => {
+                write!(f, "invalid producer entry in consumer-offsets artifact")
             }
         }
     }
@@ -2873,6 +2998,7 @@ where
             history_transition: self.history_transition,
             owner_retirement: self.owner_retirement.clone(),
             retirement_paid_through: self.retirement_paid_through,
+            producers: self.producer_entries(),
         })
     }
 
@@ -4135,6 +4261,7 @@ where
         if let Some(retry_table) = install.retry_table.take() {
             *self.dedup_mut() = retry_table;
         }
+        self.restore_producers(std::mem::take(&mut install.offsets_wire.producers));
         self.required_metadata_frontier = self
             .required_metadata_frontier
             .max(install.offsets_wire.required_metadata_frontier);
@@ -5238,6 +5365,7 @@ where
             history_transition: self.history_transition,
             owner_retirement: self.owner_retirement.clone(),
             retirement_paid_through: self.retirement_paid_through,
+            producers: self.producer_entries(),
             ..Default::default()
         };
         Ok(retry_checkpoint_bytes(
@@ -5315,6 +5443,7 @@ where
         let table = checked_retry_table(&wire, through_op, self.dedup().capacity())
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         *self.dedup_mut() = table;
+        self.restore_producers(wire.producers);
         self.history_transition = wire.history_transition;
         self.owner_retirement = wire.owner_retirement;
         self.consumer_group_polls.clear();
