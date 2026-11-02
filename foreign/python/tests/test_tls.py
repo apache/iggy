@@ -40,10 +40,24 @@ import pytest
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.waiting_utils import wait_for_logs
 
-from apache_iggy import IggyClient, PollingStrategy
+from apache_iggy import (
+    CommitPolicy,
+    Consumer,
+    IggyClient,
+    MetadataChangeGroup,
+    MetadataChangeKind,
+    PollingStrategy,
+    PollOptions,
+)
 from apache_iggy import SendMessage as Message
 
-from .utils import wait_for_ping, wait_for_server
+from .utils import (
+    follow_stream_changes,
+    latest_metadata_cursor,
+    stream_records,
+    wait_for_ping,
+    wait_for_server,
+)
 
 # Paths resolved relative to this file → repo root
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -66,6 +80,7 @@ def tls_container():
         .with_env("IGGY_TCP_TLS_CERT_FILE", "/app/certs/iggy_cert.pem")
         .with_env("IGGY_TCP_TLS_KEY_FILE", "/app/certs/iggy_key.pem")
         .with_env("IGGY_TCP_ADDRESS", f"0.0.0.0:{CONTAINER_TCP_PORT}")
+        .with_env("IGGY_NODE_ADVERTISED_ADDRESS", "127.0.0.1")
         .with_volume_mapping(CERTS_DIR, "/app/certs", "ro")
         .with_kwargs(privileged=True)
     )
@@ -127,7 +142,7 @@ class TestTlsConnectivity:
 
         # Create stream and topic
         await tls_client.create_stream(stream_name)
-        await tls_client.create_topic(stream_name, topic_name, partitions_count=1)
+        await tls_client.create_topic(stream_name, topic_name)
 
         # Produce messages
         test_messages = [f"tls-message-{i}" for i in range(3)]
@@ -141,19 +156,35 @@ class TestTlsConnectivity:
 
         # Consume messages
         polled = await tls_client.poll_messages(
-            stream=stream_name,
-            topic=topic_name,
+            stream_name,
+            topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
-            count=10,
-            auto_commit=True,
+            options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
         )
-        assert len(polled) >= len(test_messages)
+        assert len(polled.messages) >= len(test_messages)
 
         # Verify message payloads
         for i, expected_msg in enumerate(test_messages):
-            if i < len(polled):
-                assert polled[i].payload().decode("utf-8") == expected_msg
+            if i < len(polled.messages):
+                assert polled.messages[i].payload().decode("utf-8") == expected_msg
+
+    @pytest.mark.asyncio
+    async def test_follow_metadata_changes_over_tls(
+        self, tls_client: IggyClient, unique_name
+    ):
+        """Test following the metadata change log over TLS."""
+        streams = [MetadataChangeGroup.Streams]
+        cursor = await latest_metadata_cursor(tls_client, streams)
+
+        stream = await tls_client.create_stream(unique_name())
+
+        followed = await follow_stream_changes(
+            tls_client, cursor, streams, stream.id, 1
+        )
+        records = stream_records(followed, stream.id)
+        assert [record.kind for record in records] == [MetadataChangeKind.StreamCreated]
 
 
 @pytest.mark.integration

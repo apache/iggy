@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{
-    CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize, Topic, TopicDetails,
-};
+use crate::{Identifier, IggyError, Topic, TopicCreateOptions, TopicDetails, TopicUpdateOptions};
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the topic module.
@@ -38,43 +36,36 @@ pub trait TopicClient {
     async fn get_topics(&self, stream_id: &Identifier) -> Result<Vec<Topic>, IggyError>;
     /// Create a new topic.
     ///
-    /// Authentication is required, and the permission to manage the topics.
-    #[allow(clippy::too_many_arguments)]
+    /// Every knob rides `options`; an absent key resolves against the
+    /// server's defaults at admission, so a future key costs no signature
+    /// change here. Authentication is required, and the permission to manage
+    /// the topics.
+    ///
+    /// If the new partitions would take the node past `[metadata]
+    /// partitions_max`, a binary transport returns
+    /// `IggyError::PartitionsLimitReached`. `HttpClient` returns
+    /// `IggyError::HttpResponseError` instead.
     async fn create_topic(
         &self,
         stream_id: &Identifier,
         name: &str,
-        partitions_count: u32,
-        compression_algorithm: CompressionAlgorithm,
-        replication_factor: Option<u8>,
-        message_expiry: IggyExpiry,
-        max_topic_size: MaxTopicSize,
+        options: &TopicCreateOptions,
     ) -> Result<TopicDetails, IggyError>;
-    /// Update a topic by unique ID or name.
+    /// Patch a topic by unique ID or name: rename it, change its updatable
+    /// options, or reset them to their defaults. Keys `options` leaves out keep
+    /// their values.
     ///
     /// Authentication is required, and the permission to manage the topics.
     async fn update_topic(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        name: &str,
-        compression_algorithm: CompressionAlgorithm,
-        replication_factor: Option<u8>,
-        message_expiry: IggyExpiry,
-        max_topic_size: MaxTopicSize,
+        options: &TopicUpdateOptions,
     ) -> Result<(), IggyError>;
     /// Delete a topic by unique ID or name.
     ///
     /// Authentication is required, and the permission to manage the topics.
     async fn delete_topic(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-    ) -> Result<(), IggyError>;
-    /// Purge a topic by unique ID or name.
-    ///
-    /// Authentication is required, and the permission to manage the topics.
-    async fn purge_topic(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,

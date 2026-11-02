@@ -20,11 +20,21 @@ Utility functions for tests.
 """
 
 import asyncio
+import contextlib
+import itertools
 import os
 import socket
 import time
+from collections.abc import Awaitable, Callable
 
-from apache_iggy import IggyClient
+from apache_iggy import (
+    IggyClient,
+    MetadataChangeCursor,
+    MetadataChangeGroup,
+    MetadataChangeRecord,
+    MetadataChangeStart,
+    MetadataChangeStatus,
+)
 
 # Server-side limits: usernames are 3-50 bytes, passwords 3-100 bytes.
 MIN_USERNAME_BYTES = 3
@@ -32,16 +42,35 @@ MAX_USERNAME_BYTES = 50
 MIN_PASSWORD_BYTES = 3
 MAX_PASSWORD_BYTES = 100
 
+DEFAULT_TCP_PORT = 8090
+DEFAULT_QUIC_PORT = 8080
+DEFAULT_HTTP_PORT = 3000
+DEFAULT_WEBSOCKET_PORT = 8092
 
-def get_server_config() -> tuple[str, int]:
+METADATA_CHANGES_PAGE_LIMIT = 1000
+# A two phase delete commits its record after the call returns.
+METADATA_FOLLOW_ATTEMPTS = 100
+METADATA_FOLLOW_INTERVAL_SECONDS = 0.1
+
+# Deadlines around a local round trip, so a cancel lands before, at or after a reply.
+CANCEL_DEADLINES_SECONDS = (0.0001, 0.0005, 0.001, 0.002)
+# Bounds a whole read loop, so a lost last message fails the test instead of hanging it.
+CANCELLED_READS_TIMEOUT_SECONDS = 10
+
+
+def get_transport_config(port_env_var: str, default_port: int) -> tuple[str, int]:
     """
-    Get server configuration from environment variables or defaults.
+    Get transport-specific server configuration from environment variables or defaults.
+
+    Args:
+        port_env_var: Name of the environment variable holding the port.
+        default_port: Port to use if the environment variable is not set.
 
     Returns:
         tuple: (host, port) for the Iggy server
     """
     host = os.environ.get("IGGY_SERVER_HOST", "127.0.0.1")
-    port = int(os.environ.get("IGGY_SERVER_TCP_PORT", "8090"))
+    port = int(os.environ.get(port_env_var, str(default_port)))
 
     # Convert hostname to IP address for the Rust client
     if host not in ("127.0.0.1", "localhost"):
@@ -56,6 +85,46 @@ def get_server_config() -> tuple[str, int]:
         host = "127.0.0.1"
 
     return host, port
+
+
+def get_server_config() -> tuple[str, int]:
+    """
+    Get TCP server configuration from environment variables or defaults.
+
+    Returns:
+        tuple: (host, port) for the Iggy server
+    """
+    return get_transport_config("IGGY_SERVER_TCP_PORT", DEFAULT_TCP_PORT)
+
+
+def get_quic_server_config() -> tuple[str, int]:
+    """
+    Get QUIC server configuration from environment variables or defaults.
+
+    Returns:
+        tuple: (host, port) for the Iggy server
+    """
+    return get_transport_config("IGGY_SERVER_QUIC_PORT", DEFAULT_QUIC_PORT)
+
+
+def get_http_server_config() -> tuple[str, int]:
+    """
+    Get HTTP server configuration from environment variables or defaults.
+
+    Returns:
+        tuple: (host, port) for the Iggy HTTP API
+    """
+    return get_transport_config("IGGY_SERVER_HTTP_PORT", DEFAULT_HTTP_PORT)
+
+
+def get_websocket_server_config() -> tuple[str, int]:
+    """
+    Get WebSocket server configuration from environment variables or defaults.
+
+    Returns:
+        tuple: (host, port) for the Iggy server
+    """
+    return get_transport_config("IGGY_SERVER_WS_PORT", DEFAULT_WEBSOCKET_PORT)
 
 
 def wait_for_server(host: str, port: int, timeout: int = 60, interval: int = 2) -> None:
@@ -115,6 +184,83 @@ async def wait_for_ping(
             await asyncio.sleep(interval)
 
 
+async def wait_for_consumer_group_assignment(
+    client: IggyClient,
+    stream: str | int,
+    topic: str | int,
+    group: str | int,
+    members_count: int,
+    timeout: float = 10,
+    interval: float = 0.1,
+) -> None:
+    """
+    Wait until the consumer group has the expected members and they own every partition.
+
+    A join commits the membership at once, but a member's partitions become active
+    only after each partition installs the new owner. Until then, the member owns no
+    partitions, so group polls and offset operations come back empty or fail. The
+    wait also requires a balanced assignment: one owner per partition, and member
+    partition counts that differ by at most one.
+
+    Args:
+        client: Iggy client instance
+        stream: Stream identifier
+        topic: Topic identifier
+        group: Consumer group identifier
+        members_count: Number of members the group must have
+        timeout: Maximum time to wait in seconds
+        interval: Time between checks in seconds
+
+    Raises:
+        AssertionError: If the group does not exist or a partition has two owners
+        TimeoutError: If the assignment does not converge within timeout
+    """
+    deadline = time.monotonic() + timeout
+
+    while True:
+        details = await client.get_consumer_group(stream, topic, group)
+        assert details is not None, f"Consumer group {group!r} does not exist"
+        owners = [(member.id, member.partitions) for member in details.members]
+        owned = [partition for _, partitions in owners for partition in partitions]
+        assert len(owned) == len(set(owned)), f"Duplicate partition owner: {owners}"
+        counts = [len(partitions) for _, partitions in owners]
+        if (
+            details.members_count == members_count
+            and (members_count == 0 or len(owned) == details.partitions_count)
+            and max(counts, default=0) - min(counts, default=0) <= 1
+        ):
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Consumer group {group!r} did not converge to {members_count} "
+                f"member(s) owning its {details.partitions_count} partitions within "
+                f"{timeout}s. Last (member id, partitions): {owners}"
+            )
+        await asyncio.sleep(interval)
+
+
+async def read_offsets_with_cancels(
+    read_offsets: Callable[[], Awaitable[list[int]]], last_offset: int
+) -> list[int]:
+    """
+    Read offsets up to `last_offset` with reads that time out at short deadlines.
+
+    Args:
+        read_offsets: Reads the offsets of the next batch or message
+        last_offset: The offset that ends the reading
+
+    Returns:
+        The offsets in the order read
+    """
+    offsets: list[int] = []
+    deadlines = itertools.cycle(CANCEL_DEADLINES_SECONDS)
+    async with asyncio.timeout(CANCELLED_READS_TIMEOUT_SECONDS):
+        while not offsets or offsets[-1] < last_offset:
+            with contextlib.suppress(TimeoutError):
+                offsets.extend(await asyncio.wait_for(read_offsets(), next(deadlines)))
+    return offsets
+
+
 def unique_credentials(unique_name) -> tuple[str, str]:
     """Return a unique (username, password) pair within the server limits."""
     username = unique_name(max_bytes=MAX_USERNAME_BYTES)
@@ -130,3 +276,58 @@ async def login_fresh_client(username: str, password: str) -> IggyClient:
     await wait_for_ping(client)
     await client.login_user(username, password)
     return client
+
+
+async def latest_metadata_cursor(
+    client: IggyClient, groups: list[MetadataChangeGroup]
+) -> MetadataChangeCursor:
+    """Return the cursor at the newest retained change of the groups."""
+    page = await client.get_metadata_changes(
+        MetadataChangeStart.Latest(), groups=groups
+    )
+    assert page.status == MetadataChangeStatus.Ok, page
+    assert page.next is not None
+    return page.next
+
+
+async def follow_stream_changes(
+    client: IggyClient,
+    cursor: MetadataChangeCursor,
+    groups: list[MetadataChangeGroup],
+    stream_id: int,
+    count: int,
+) -> list[MetadataChangeRecord]:
+    """
+    Follow the changes after `cursor` until `count` of them name the stream.
+
+    Returns every followed record, so callers can check the ones of other
+    streams too.
+    """
+    records: list[MetadataChangeRecord] = []
+    for _ in range(METADATA_FOLLOW_ATTEMPTS):
+        page = await client.get_metadata_changes(
+            MetadataChangeStart.After(cursor),
+            groups=groups,
+            limit=METADATA_CHANGES_PAGE_LIMIT,
+        )
+        assert page.status == MetadataChangeStatus.Ok, page
+        assert page.next is not None
+        cursor = page.next
+        records.extend(page.records)
+        if page.has_more:
+            continue
+        if len(stream_records(records, stream_id)) >= count:
+            break
+        await asyncio.sleep(METADATA_FOLLOW_INTERVAL_SECONDS)
+    return records
+
+
+def stream_records(
+    records: list[MetadataChangeRecord], stream_id: int
+) -> list[MetadataChangeRecord]:
+    """The records whose body names the stream."""
+    return [
+        record
+        for record in records
+        if getattr(record.change, "stream_id", None) == stream_id
+    ]

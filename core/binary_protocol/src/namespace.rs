@@ -26,7 +26,13 @@
 //! sharding layer; the single source of truth lives here in the wire-format
 //! crate both already depend on.
 
-pub const MAX_STREAMS: usize = 4096;
+/// Only the HIGHEST field widens for free.
+///
+/// `STREAM_SHIFT` derives from `TOPIC_SHIFT + TOPIC_BITS`, so growing
+/// `MAX_STREAMS` leaves packed values bit-identical. Growing the others shifts
+/// the fields above them and rewrites every group id on the wire, needing a
+/// version fence and a re-shard.
+pub const MAX_STREAMS: usize = 1 << 20;
 pub const MAX_TOPICS: usize = 4096;
 pub const MAX_PARTITIONS: usize = 1_000_000;
 
@@ -85,4 +91,14 @@ const _: () = {
     assert!(METADATA_GROUP > PACKED_NAMESPACE_MAX);
     assert!(PACKED_NAMESPACE_BITS == STREAM_BITS + TOPIC_BITS + PARTITION_BITS);
     assert!(PACKED_NAMESPACE_MAX == (1u64 << PACKED_NAMESPACE_BITS) - 1);
+    // Guards the ENCODING: any width change re-encodes every group id on the wire.
+    assert!(STREAM_BITS == 20 && TOPIC_BITS == 12 && PARTITION_BITS == 20);
+    // Guards the ADMITTED SET. `bits_required` rounds up, so narrowing a maximum
+    // inside its current width keeps the widths (and the assert above) intact
+    // while turning already-committed ids above the new ceiling into a panic.
+    assert!(MAX_STREAMS == 1 << 20 && MAX_TOPICS == 4096 && MAX_PARTITIONS == 1_000_000);
 };
+
+// `PARTITION_MASK` admits 48,576 ids `MAX_PARTITIONS` forbids, since only the
+// former rounds to a power of two. Bound checks compare against the `MAX_*`
+// constants: a mask is the looser bound and re-opens the aliasing.

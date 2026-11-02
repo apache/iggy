@@ -20,7 +20,7 @@
 plugins {
     java
     jacoco
-    id("com.diffplug.spotless") version "8.9.0"
+    id("com.diffplug.spotless") version "8.10.4"
 }
 
 repositories {
@@ -29,10 +29,10 @@ repositories {
 
 dependencies {
     testImplementation("org.apache.iggy:iggy")
-    testImplementation("io.cucumber:cucumber-java:7.34.6")
-    testImplementation("io.cucumber:cucumber-junit-platform-engine:7.34.6")
-    testImplementation("org.junit.jupiter:junit-jupiter:6.1.2")
-    testImplementation("org.junit.platform:junit-platform-suite:6.1.2")
+    testImplementation("io.cucumber:cucumber-java:8.0.4")
+    testImplementation("io.cucumber:cucumber-junit-platform-engine:8.0.4")
+    testImplementation("org.junit.jupiter:junit-jupiter:6.1.3")
+    testImplementation("org.junit.platform:junit-platform-suite:6.1.3")
 }
 
 spotless {
@@ -49,6 +49,10 @@ spotless {
 
 tasks.test {
     useJUnitPlatform()
+    System.getenv("CUCUMBER_FILTER_TAGS")?.let { systemProperty("cucumber.filter.tags", it) }
+    testLogging {
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+    }
 }
 
 tasks.jacocoTestReport {

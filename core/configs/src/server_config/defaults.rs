@@ -19,27 +19,29 @@
 //! `quic`, `cluster`, `metadata`, `partition`, `message_bus`), sourced
 //! from `core/server/config.toml` via [`SERVER_CONFIG`]. Sections drawn
 //! from [`crate::common`] (`http`, `system`, `telemetry`,
-//! `consumer_group`, `data_maintenance`, `message_saver`,
-//! `personal_access_token`, `heartbeat`) delegate to the `Default` impls
-//! in [`crate::common::defaults`].
+//! `consumer_group`, `data_maintenance`, `personal_access_token`,
+//! `heartbeat`) delegate to the `Default` impls in
+//! [`crate::common::defaults`].
 
 use super::cluster::{
-    ClusterAuthConfig, ClusterConfig, ClusterNodeConfig, ClusterTlsConfig, TransportPorts,
+    ClusterAuthConfig, ClusterConfig, ClusterCoordinatorConfig, ClusterNodeConfig,
+    ClusterTlsConfig, TransportPorts,
 };
+use super::external_auth::ExternalAuthConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
+use super::node::NodeConfig;
 use super::partition::PartitionConfig;
-use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
-use super::server::ServerSystemConfig;
-use super::server::{ExtraConfig, ServerConfig};
-use super::tcp::{TcpConfig, TcpSocketConfig, TcpTlsConfig};
+use super::quic::{QuicCertificateConfig, QuicConfig};
+use super::server::ServerConfig;
+use super::tcp::{TcpConfig, TcpTlsConfig};
 use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
 use crate::common::http::HttpConfig;
 use crate::common::server::{
-    ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig,
-    PersonalAccessTokenConfig, TelemetryConfig,
+    ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, PersonalAccessTokenConfig,
+    TelemetryConfig,
 };
-use std::sync::Arc;
+use std::num::NonZeroU32;
 
 // Same embedded TOML the shared sections read; re-exported so sibling
 // modules reach it as `super::defaults::SERVER_CONFIG`.
@@ -50,11 +52,15 @@ impl Default for ServerConfig {
         ServerConfig {
             consumer_group: ConsumerGroupConfig::default(),
             data_maintenance: DataMaintenanceConfig::default(),
-            extra: ExtraConfig::default(),
             heartbeat: HeartbeatConfig::default(),
-            message_saver: MessageSaverConfig::default(),
+            node: NodeConfig::default(),
             personal_access_token: PersonalAccessTokenConfig::default(),
-            system: Arc::new(ServerSystemConfig::default()),
+            path: SERVER_CONFIG.path.to_owned(),
+            runtime: Default::default(),
+            logging: Default::default(),
+            encryption: Default::default(),
+            memory_pool: Default::default(),
+            sharding: Default::default(),
             quic: QuicConfig::default(),
             tcp: TcpConfig::default(),
             websocket: WebSocketConfig::default(),
@@ -64,6 +70,7 @@ impl Default for ServerConfig {
             metadata: MetadataConfig::default(),
             partition: PartitionConfig::default(),
             message_bus: MessageBusConfig::default(),
+            external_auth: ExternalAuthConfig::default(),
         }
     }
 }
@@ -94,15 +101,30 @@ impl Default for ClusterConfig {
                 .view_change_status_timeout
                 .parse()
                 .unwrap(),
+            superblock_wedged_fatal_timeout: SERVER_CONFIG
+                .cluster
+                .superblock_wedged_fatal_timeout
+                .parse()
+                .unwrap(),
             request_start_view_retransmit_interval: SERVER_CONFIG
                 .cluster
                 .request_start_view_retransmit_interval
                 .parse()
                 .unwrap(),
             view_probe_attempts_max: SERVER_CONFIG.cluster.view_probe_attempts_max as u32,
+            default_replication_factor: SERVER_CONFIG
+                .cluster
+                .default_replication_factor
+                .parse()
+                .unwrap(),
             repair_retry_interval: SERVER_CONFIG
                 .cluster
                 .repair_retry_interval
+                .parse()
+                .unwrap(),
+            repair_gap_debounce_interval: SERVER_CONFIG
+                .cluster
+                .repair_gap_debounce_interval
                 .parse()
                 .unwrap(),
             repair_chunk_max: SERVER_CONFIG.cluster.repair_chunk_max as usize,
@@ -111,6 +133,7 @@ impl Default for ClusterConfig {
                 .nodes
                 .iter()
                 .map(|node| ClusterNodeConfig {
+                    rack: None,
                     name: node.name.parse().unwrap(),
                     ip: node.ip.parse().unwrap(),
                     advertised_address: None,
@@ -145,6 +168,7 @@ impl Default for ClusterConfig {
                 .collect(),
             auth: ClusterAuthConfig::default(),
             tls: ClusterTlsConfig::default(),
+            coordinator: ClusterCoordinatorConfig::default(),
         }
     }
 }
@@ -158,6 +182,9 @@ impl Default for MetadataConfig {
             prepare_queue_depth: metadata.prepare_queue_depth as usize,
             journal_slots: metadata.journal_slots as usize,
             clients_table_max: metadata.clients_table_max as usize,
+            partitions_max: metadata.partitions_max as u32,
+            change_log_resource_capacity: metadata.change_log_resource_capacity as usize,
+            change_log_activity_capacity: metadata.change_log_activity_capacity as usize,
         }
     }
 }
@@ -168,7 +195,23 @@ impl Default for PartitionConfig {
         // schema cannot drift (same pattern as MetadataConfig above).
         let partition = &SERVER_CONFIG.partition;
         PartitionConfig {
+            wal_bytes_max: partition
+                .wal_bytes_max
+                .parse()
+                .expect("embedded WAL capacity is valid"),
+            repair_memory_bytes_max: partition
+                .repair_memory_bytes_max
+                .parse()
+                .expect("embedded repair memory capacity is valid"),
+            wal_group_commit_delay_micros: u64::try_from(partition.wal_group_commit_delay_micros)
+                .expect("embedded WAL group commit delay is valid"),
+            validate_checksum: SERVER_CONFIG.partition.validate_checksum,
             prepare_queue_depth: partition.prepare_queue_depth as usize,
+            dedup_clients_max: partition.dedup_clients_max as usize,
+            consumer_offsets_max: partition.consumer_offsets_max as usize,
+
+            offset_reservation_lease: NonZeroU32::new(partition.offset_reservation_lease as u32)
+                .expect("the embedded config.toml carries a nonzero offset_reservation_lease"),
             evicted_ring_capacity: partition.evicted_ring_capacity as usize,
             evicted_ring_bytes_max: partition.evicted_ring_bytes_max.parse().unwrap(),
             transfer_served_cache_bytes_max: partition
@@ -186,29 +229,13 @@ impl Default for QuicConfig {
             enabled: SERVER_CONFIG.quic.enabled,
             address: SERVER_CONFIG.quic.address.parse().unwrap(),
             max_concurrent_bidi_streams: SERVER_CONFIG.quic.max_concurrent_bidi_streams as u64,
-            datagram_send_buffer_size: SERVER_CONFIG
-                .quic
-                .datagram_send_buffer_size
-                .parse()
-                .unwrap(),
             initial_mtu: SERVER_CONFIG.quic.initial_mtu.parse().unwrap(),
             send_window: SERVER_CONFIG.quic.send_window.parse().unwrap(),
             receive_window: SERVER_CONFIG.quic.receive_window.parse().unwrap(),
+            stream_receive_window: SERVER_CONFIG.quic.stream_receive_window.parse().unwrap(),
             keep_alive_interval: SERVER_CONFIG.quic.keep_alive_interval.parse().unwrap(),
             max_idle_timeout: SERVER_CONFIG.quic.max_idle_timeout.parse().unwrap(),
             certificate: QuicCertificateConfig::default(),
-            socket: QuicSocketConfig::default(),
-        }
-    }
-}
-
-impl Default for QuicSocketConfig {
-    fn default() -> QuicSocketConfig {
-        QuicSocketConfig {
-            override_defaults: SERVER_CONFIG.quic.socket.override_defaults,
-            recv_buffer_size: SERVER_CONFIG.quic.socket.recv_buffer_size.parse().unwrap(),
-            send_buffer_size: SERVER_CONFIG.quic.socket.send_buffer_size.parse().unwrap(),
-            keepalive: SERVER_CONFIG.quic.socket.keepalive,
         }
     }
 }
@@ -228,10 +255,7 @@ impl Default for TcpConfig {
         TcpConfig {
             enabled: SERVER_CONFIG.tcp.enabled,
             address: SERVER_CONFIG.tcp.address.parse().unwrap(),
-            ipv6: SERVER_CONFIG.tcp.ipv_6,
             tls: TcpTlsConfig::default(),
-            socket: TcpSocketConfig::default(),
-            socket_migration: SERVER_CONFIG.tcp.socket_migration,
         }
     }
 }
@@ -243,19 +267,6 @@ impl Default for TcpTlsConfig {
             self_signed: SERVER_CONFIG.tcp.tls.self_signed,
             cert_file: SERVER_CONFIG.tcp.tls.cert_file.parse().unwrap(),
             key_file: SERVER_CONFIG.tcp.tls.key_file.parse().unwrap(),
-        }
-    }
-}
-
-impl Default for TcpSocketConfig {
-    fn default() -> TcpSocketConfig {
-        TcpSocketConfig {
-            override_defaults: SERVER_CONFIG.tcp.socket.override_defaults,
-            recv_buffer_size: SERVER_CONFIG.tcp.socket.recv_buffer_size.parse().unwrap(),
-            send_buffer_size: SERVER_CONFIG.tcp.socket.send_buffer_size.parse().unwrap(),
-            keepalive: SERVER_CONFIG.tcp.socket.keepalive,
-            nodelay: SERVER_CONFIG.tcp.socket.nodelay,
-            linger: SERVER_CONFIG.tcp.socket.linger.parse().unwrap(),
         }
     }
 }
@@ -300,11 +311,16 @@ impl Default for MessageBusConfig {
         MessageBusConfig {
             max_batch: bus.max_batch as usize,
             max_message_size: bus.max_message_size.parse().unwrap(),
+            replica_read_buffer_size: bus.replica_read_buffer_size.parse().unwrap(),
             peer_queue_capacity: bus.peer_queue_capacity as usize,
+            client_queue_capacity: bus.client_queue_capacity as usize,
+            client_write_stall_timeout: bus.client_write_stall_timeout.parse().unwrap(),
+            client_request_queue_bytes_max: bus.client_request_queue_bytes_max.parse().unwrap(),
             reconnect_period: bus.reconnect_period.parse().unwrap(),
             close_peer_timeout: bus.close_peer_timeout.parse().unwrap(),
             close_grace: bus.close_grace.parse().unwrap(),
             handshake_grace: bus.handshake_grace.parse().unwrap(),
+            connections_max: None,
         }
     }
 }

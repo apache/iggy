@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 /**
  * `Operation` values and classification, ported from
@@ -35,21 +34,25 @@ export const Operation = {
   RemoveConsumerGroupMember: 66,
   CompleteConsumerGroupRevocation: 67,
   TruncatePartition: 68,
+  FinalizeSession: 70,
+  CompleteLifecycle: 71,
+  UpdateStreamResolved: 72,
+  UpdateTopicResolved: 73,
+  UpdateUserResolved: 74,
+  RewrapStreamKeys: 75,
   CreateStream: 128,
-  UpdateStream: 129,
+  // 129 was UpdateStream. Never reuse it.
   DeleteStream: 130,
-  PurgeStream: 131,
   CreateTopic: 132,
-  UpdateTopic: 133,
+  // 133 was UpdateTopic. Never reuse it.
   DeleteTopic: 134,
-  PurgeTopic: 135,
   CreatePartitions: 136,
   DeletePartitions: 137,
   DeleteSegments: 138,
   CreateConsumerGroup: 139,
   DeleteConsumerGroup: 140,
   CreateUser: 141,
-  UpdateUser: 142,
+  // 142 was UpdateUser. Never reuse it.
   DeleteUser: 143,
   ChangePassword: 144,
   UpdatePermissions: 145,
@@ -57,16 +60,18 @@ export const Operation = {
   DeletePersonalAccessToken: 147,
   JoinConsumerGroup: 148,
   LeaveConsumerGroup: 149,
+  UpdateResource: 150,
   SendMessages: 160,
   StoreConsumerOffset: 161,
   DeleteConsumerOffset: 162,
-  StoreConsumerOffset2: 164,
-  DeleteConsumerOffset2: 165
+  RetireSession: 166,
+  InstallConsumerGroupOwner: 167,
+  TransitionPartitionHistory: 168,
+  RetireConsumerGroupOwners: 169
 } as const;
 
 const INTERNAL_START = 64;
 const METADATA_START = 128;
-const PARTITION_START = 160;
 
 /**
  * Replicated command code to `Operation` mapping, the client half of the
@@ -76,7 +81,6 @@ const PARTITION_START = 160;
 const REPLICATED_OPERATION: ReadonlyMap<number, number> = new Map([
   [COMMAND_CODE.CreateUser, Operation.CreateUser],
   [COMMAND_CODE.DeleteUser, Operation.DeleteUser],
-  [COMMAND_CODE.UpdateUser, Operation.UpdateUser],
   [COMMAND_CODE.UpdatePermissions, Operation.UpdatePermissions],
   [COMMAND_CODE.ChangePassword, Operation.ChangePassword],
   [COMMAND_CODE.CreateAccessToken, Operation.CreatePersonalAccessToken],
@@ -84,23 +88,18 @@ const REPLICATED_OPERATION: ReadonlyMap<number, number> = new Map([
   [COMMAND_CODE.SendMessages, Operation.SendMessages],
   [COMMAND_CODE.StoreOffset, Operation.StoreConsumerOffset],
   [COMMAND_CODE.DeleteConsumerOffset, Operation.DeleteConsumerOffset],
-  [COMMAND_CODE.StoreOffset2, Operation.StoreConsumerOffset2],
-  [COMMAND_CODE.DeleteConsumerOffset2, Operation.DeleteConsumerOffset2],
   [COMMAND_CODE.CreateStream, Operation.CreateStream],
   [COMMAND_CODE.DeleteStream, Operation.DeleteStream],
-  [COMMAND_CODE.UpdateStream, Operation.UpdateStream],
-  [COMMAND_CODE.PurgeStream, Operation.PurgeStream],
   [COMMAND_CODE.CreateTopic, Operation.CreateTopic],
   [COMMAND_CODE.DeleteTopic, Operation.DeleteTopic],
-  [COMMAND_CODE.UpdateTopic, Operation.UpdateTopic],
-  [COMMAND_CODE.PurgeTopic, Operation.PurgeTopic],
   [COMMAND_CODE.CreatePartitions, Operation.CreatePartitions],
   [COMMAND_CODE.DeletePartitions, Operation.DeletePartitions],
   [COMMAND_CODE.DeleteSegments, Operation.DeleteSegments],
   [COMMAND_CODE.CreateGroup, Operation.CreateConsumerGroup],
   [COMMAND_CODE.DeleteGroup, Operation.DeleteConsumerGroup],
   [COMMAND_CODE.JoinGroup, Operation.JoinConsumerGroup],
-  [COMMAND_CODE.LeaveGroup, Operation.LeaveConsumerGroup]
+  [COMMAND_CODE.LeaveGroup, Operation.LeaveConsumerGroup],
+  [COMMAND_CODE.UpdateResource, Operation.UpdateResource]
 ]);
 
 const KNOWN_OPERATIONS: ReadonlySet<number> =
@@ -114,9 +113,13 @@ const KNOWN_OPERATIONS: ReadonlySet<number> =
 export const isKnownOperation = (operation: number): boolean =>
   KNOWN_OPERATIONS.has(operation);
 
-/** Internal band, never client-sent. */
+/** Replica-only operations, never client-sent. */
 export const isInternal = (operation: number): boolean =>
-  operation >= INTERNAL_START && operation < METADATA_START;
+  (operation >= INTERNAL_START && operation < METADATA_START) ||
+    operation === Operation.RetireSession ||
+    operation === Operation.InstallConsumerGroupOwner ||
+    operation === Operation.TransitionPartitionHistory ||
+    operation === Operation.RetireConsumerGroupOwners;
 
 /**
  * Metadata classification is an explicit allowlist, not a range:
@@ -125,23 +128,39 @@ export const isInternal = (operation: number): boolean =>
  * `Operation::is_metadata`.
  */
 export const isMetadata = (operation: number): boolean => {
-  if (isInternal(operation)) return true;
+  if (isInternal(operation) && operation < Operation.SendMessages) return true;
   if (operation === Operation.DeleteSegments) return false;
   return operation >= METADATA_START &&
-    operation <= Operation.LeaveConsumerGroup;
+    operation <= Operation.UpdateResource;
 };
 
-/** Partition band is a bare range, mirroring `Operation::is_partition`. */
-export const isPartition = (operation: number): boolean =>
-  operation >= PARTITION_START;
+/**
+ * The client operation a committed reply answers. Preparation rewrites some
+ * requests into an internal operation, so retry identity maps it back. Port of
+ * `Operation::request_operation`.
+ */
+export const requestOperation = (operation: number): number => {
+  switch (operation) {
+    case Operation.CreateTopicWithAssignments:
+      return Operation.CreateTopic;
+    case Operation.CreatePartitionsWithAssignments:
+      return Operation.CreatePartitions;
+    case Operation.UpdateStreamResolved:
+    case Operation.UpdateTopicResolved:
+    case Operation.UpdateUserResolved:
+      return Operation.UpdateResource;
+    case Operation.TruncatePartition:
+      return Operation.DeleteSegments;
+    default:
+      return operation;
+  }
+};
 
 /** Whether a reply body leads with a committed result section. */
 export const isResultFramed = (operation: number): boolean =>
   isMetadata(operation) ||
   operation === Operation.StoreConsumerOffset ||
-  operation === Operation.StoreConsumerOffset2 ||
-  operation === Operation.DeleteConsumerOffset ||
-  operation === Operation.DeleteConsumerOffset2;
+  operation === Operation.DeleteConsumerOffset;
 
 /**
  * Picks the header operation for a command code. Unknown extension codes are

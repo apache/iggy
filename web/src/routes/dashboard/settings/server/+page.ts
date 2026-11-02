@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { clientApi } from '$lib/api/clientApi';
-import { statsMapper } from '$lib/domain/Stats';
+import { clientApi } from '#lib/api/clientApi.js';
+import { statsMapper } from '#lib/domain/Stats.js';
 import type { PageLoad } from './$types';
 
 export const load: PageLoad = async () => {

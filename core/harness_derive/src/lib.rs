@@ -31,7 +31,7 @@
 //!
 //! Test with transport matrix:
 //! ```ignore
-//! #[iggy_harness(transport = [Tcp, Http, Quic, WebSocket])]
+//! #[iggy_harness(test_client_transport = [Tcp, Http, Quic, WebSocket])]
 //! async fn test_all_transports(client: &IggyClient) {
 //!     client.ping().await.unwrap();
 //! }
@@ -40,11 +40,11 @@
 //! Test with server config matrix:
 //! ```ignore
 //! #[iggy_harness(server(
-//!     segment_size = ["512B", "1MiB"],
-//!     cache_indexes = ["none", "all"],
+//!     heartbeat.interval = ["30s", "60s"],
+//!     partition.validate_checksum = [true, false],
 //! ))]
-//! async fn test_caching(client: &IggyClient) {
-//!     // 2 segment sizes × 2 cache modes = 4 tests
+//! async fn test_persistence(client: &IggyClient) {
+//!     // 2 intervals × 2 checksum modes = 4 tests
 //! }
 //! ```
 
@@ -65,7 +65,7 @@ use codegen::generate_tests;
 ///
 /// # Attributes
 ///
-/// - `transport = [Tcp, Http, Quic, WebSocket]` - Generate variants for each transport
+/// - `test_client_transport = [Tcp, Http, Quic, WebSocket]` - Generate variants for each transport
 /// - `server(key = value)` - Static server config
 /// - `server(key = [v1, v2])` - Generate variants for each config value
 ///

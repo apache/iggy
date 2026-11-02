@@ -19,6 +19,7 @@ package tcp
 
 import (
 	"context"
+	"encoding/binary"
 	"strings"
 	"testing"
 
@@ -31,16 +32,28 @@ import (
 
 func TestCreateTopic_DecodesTheCreatedTopic(t *testing.T) {
 	client, serverConn := newPipeClient(t)
+	body := append(resultSection(), topicDetailsBody(t, 3)...)
+	body = append(body, partitionDetailsBody(1, []uint8{0, 1, 2}, []uint8{0})...)
+	body = append(body, partitionDetailsBody(2, nil, nil)...)
+	body = append(body, partitionDetailsBody(3, []uint8{2, 0, 1}, []uint8{2, 0, 1})...)
 	serve(serverConn, func(_ int, _ request) []byte {
-		return replyFrame(vsr.OperationCreateTopic,
-			append(resultSection(), topicDetailsBody(t, 3)...))
+		return replyFrame(vsr.OperationCreateTopic, body)
 	})
 
+	partitions := uint32(3)
 	topic, err := client.CreateTopic(context.Background(),
-		numericIdentifier(t, 1), "orders", 3, 0, iggcon.Duration(0), 0, nil)
+		numericIdentifier(t, 1), "orders", &iggcon.TopicOptions{PartitionsCount: &partitions})
 	require.NoError(t, err)
 	assert.Equal(t, uint32(3), topic.PartitionsCount)
 	assert.Equal(t, "orders", topic.Name)
+	require.Len(t, topic.Partitions, 3)
+	assert.Equal(t, []uint8{0, 1, 2}, topic.Partitions[0].Members)
+	assert.Equal(t, []uint8{0}, topic.Partitions[0].InSyncMembers)
+	assert.Empty(t, topic.Partitions[1].Members)
+	assert.Empty(t, topic.Partitions[1].InSyncMembers)
+	assert.Equal(t, uint32(3), topic.Partitions[2].Id)
+	assert.Equal(t, []uint8{2, 0, 1}, topic.Partitions[2].Members)
+	assert.Equal(t, []uint8{2, 0, 1}, topic.Partitions[2].InSyncMembers)
 }
 
 func TestCreateTopic_RejectsInvalidArgumentsWithoutWriting(t *testing.T) {
@@ -50,13 +63,11 @@ func TestCreateTopic_RejectsInvalidArgumentsWithoutWriting(t *testing.T) {
 	})
 
 	streamId := numericIdentifier(t, 1)
-	zeroReplication := uint8(0)
 	tests := []struct {
-		name        string
-		topicName   string
-		partitions  uint32
-		replication *uint8
-		want        error
+		name       string
+		topicName  string
+		partitions uint32
+		want       error
 	}{
 		{name: "empty name", topicName: "", partitions: 1,
 			want: ierror.ErrInvalidTopicName},
@@ -64,13 +75,11 @@ func TestCreateTopic_RejectsInvalidArgumentsWithoutWriting(t *testing.T) {
 			partitions: 1, want: ierror.ErrInvalidTopicName},
 		{name: "too many partitions", topicName: "orders",
 			partitions: MaxPartitionCount + 1, want: ierror.ErrTooManyPartitions},
-		{name: "zero replication factor", topicName: "orders", partitions: 1,
-			replication: &zeroReplication, want: ierror.ErrInvalidReplicationFactor},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := client.CreateTopic(context.Background(), streamId,
-				test.topicName, test.partitions, 0, iggcon.Duration(0), 0, test.replication)
+				test.topicName, &iggcon.TopicOptions{PartitionsCount: &test.partitions})
 			assert.ErrorIs(t, err, test.want)
 		})
 	}
@@ -80,36 +89,53 @@ func TestCreateTopic_RejectsInvalidArgumentsWithoutWriting(t *testing.T) {
 func TestUpdateTopic_RejectsInvalidArgumentsWithoutWriting(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	server := serve(serverConn, func(_ int, _ request) []byte {
-		return replyFrame(vsr.OperationUpdateTopic, resultSection())
+		return replyFrame(vsr.OperationUpdateTopicResolved, resultSection())
 	})
 
 	streamId := numericIdentifier(t, 1)
 	topicId := numericIdentifier(t, 2)
-	zeroReplication := uint8(0)
 
-	err := client.UpdateTopic(context.Background(), streamId, topicId,
-		"", 0, iggcon.Duration(0), 0, nil)
-	assert.ErrorIs(t, err, ierror.ErrInvalidTopicName)
-	err = client.UpdateTopic(context.Background(), streamId, topicId,
-		"orders", 0, iggcon.Duration(0), 0, &zeroReplication)
-	assert.ErrorIs(t, err, ierror.ErrInvalidReplicationFactor)
+	empty := ""
+	serverDefault := iggcon.IggyExpiryServerDefault
+	tests := []struct {
+		name   string
+		update iggcon.TopicUpdate
+		want   error
+	}{
+		{name: "empty name", update: iggcon.TopicUpdate{Name: &empty}, want: ierror.ErrInvalidTopicName},
+		{name: "nothing to change", update: iggcon.TopicUpdate{}, want: ierror.ErrInvalidCommand},
+		{name: "sentinel only", update: iggcon.TopicUpdate{MessageExpiry: &serverDefault}, want: ierror.ErrInvalidCommand},
+		{name: "create-only reset", update: iggcon.TopicUpdate{Reset: []iggcon.TopicOptionKey{iggcon.TopicOptionSegmentSize}}, want: ierror.ErrOptionNotUpdatable},
+		{name: "unknown reset", update: iggcon.TopicUpdate{Reset: []iggcon.TopicOptionKey{"not_a_key"}}, want: ierror.ErrUnsupportedOptionKey},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := client.UpdateTopic(context.Background(), streamId, topicId, test.update)
+			assert.ErrorIs(t, err, test.want)
+		})
+	}
 	assert.Empty(t, server.recorded())
 }
 
 func TestUpdateTopic_AcceptsACommittedUpdate(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	serve(serverConn, func(_ int, _ request) []byte {
-		return replyFrame(vsr.OperationUpdateTopic, resultSection())
+	serve(serverConn, func(_ int, read request) []byte {
+		reply := committedReply(read, 0)
+		reply[replyFrameOffsetOperation] = byte(vsr.OperationUpdateTopicResolved)
+		return reply
 	})
 
+	name := "renamed"
 	assert.NoError(t, client.UpdateTopic(context.Background(),
 		numericIdentifier(t, 1), numericIdentifier(t, 2),
-		"renamed", 0, iggcon.Duration(0), 0, nil))
+		iggcon.TopicUpdate{Name: &name, Reset: []iggcon.TopicOptionKey{iggcon.TopicOptionMaxTopicSize}}))
 }
 
 func TestGetTopics_DecodesTheRoster(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	body := append(topicDetailsBody(t, 3), topicDetailsBody(t, 5)...)
+	body := binary.LittleEndian.AppendUint32(nil, 2)
+	body = append(body, topicDetailsBody(t, 3)...)
+	body = append(body, topicDetailsBody(t, 5)...)
 	serve(serverConn, func(_ int, _ request) []byte {
 		return replyFrame(vsr.OperationNonReplicated, body)
 	})

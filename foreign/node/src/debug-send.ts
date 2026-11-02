@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import assert from 'node:assert/strict';
 import { type ClientConfig, SingleClient } from './client/index.js';
@@ -90,8 +89,7 @@ try {
     streamId: streamName,
     topicId: topicName,
     pollingStrategy: PollingStrategy.Next,
-    count: 1,
-    interval: 5000
+    count: 1
   };
 
   const cs = await groupConsumerStream(opt)(pollReq);

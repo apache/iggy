@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 export * from './change-password.command.js';
 export * from './create-user.command.js'
@@ -23,3 +22,4 @@ export * from './get-user.command.js'
 export * from './get-users.command.js';
 export * from './update-permissions.command.js';
 export * from './update-user.command.js';
+export { UserStatus } from './user.utils.js';

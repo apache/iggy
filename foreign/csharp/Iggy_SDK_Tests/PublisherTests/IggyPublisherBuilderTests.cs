@@ -28,6 +28,33 @@ public class IggyPublisherBuilderTests
     private static readonly Identifier TopicId = Identifier.Numeric(1);
 
     [Fact]
+    public void Build_WithDefaultSocketBufferSizes_CreatesTheClient()
+    {
+        var builder = IggyPublisherBuilder
+            .Create(StreamId, TopicId)
+            .WithConnection(Protocol.Tcp, "127.0.0.1:8090", "user", "pass");
+
+        Assert.Null(builder.Config.ReceiveBufferSize);
+        Assert.Null(builder.Config.SendBufferSize);
+        Assert.NotNull(builder.Build());
+    }
+
+    [Theory]
+    [InlineData(0, null)]
+    [InlineData(-1, null)]
+    [InlineData(null, 0)]
+    [InlineData(null, -1)]
+    public void Build_WithNonPositiveSocketBufferSize_Throws(int? receiveBufferSize, int? sendBufferSize)
+    {
+        var builder = IggyPublisherBuilder
+            .Create(StreamId, TopicId)
+            .WithConnection(Protocol.Tcp, "127.0.0.1:8090", "user", "pass",
+                receiveBufferSize: receiveBufferSize, sendBufferSize: sendBufferSize);
+
+        Assert.Throws<InvalidOperationException>(() => builder.Build());
+    }
+
+    [Fact]
     public void TypedBuild_OverTcp_CreatesTheClient()
     {
         IggyPublisherBuilder<string> builder

@@ -24,6 +24,10 @@ type UserInfo struct {
 	CreatedAt uint64     `json:"CreatedAt"`
 	Status    UserStatus `json:"Status"`
 	Username  string     `json:"Username"`
+	// Options are the keys the client set.
+	Options map[string]HeaderValue `json:"Options,omitempty"`
+	// DerivedOptions are the values the server filled.
+	DerivedOptions map[string]HeaderValue `json:"DerivedOptions,omitempty"`
 }
 
 type UserInfoDetails struct {

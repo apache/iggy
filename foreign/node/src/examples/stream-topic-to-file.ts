@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { PollingStrategy, singleConsumerStream, Consumer } from '../index.js';
 import { open } from 'node:fs/promises';
@@ -55,7 +54,6 @@ export const topicToFile = async (
     partitionId,
     pollingStrategy: PollingStrategy.Next,
     count: 1,
-    interval: 1000,
     endOnLastOffset: true
   });
 

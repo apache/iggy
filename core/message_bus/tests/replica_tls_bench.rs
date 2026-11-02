@@ -37,8 +37,8 @@ use common::{
     install_dialed_replicas_locally, install_replicas_locally, loopback,
     self_signed_replica_tls_ctx, set_replica_ctx, set_replica_ctx_with_tls,
 };
-use iggy_binary_protocol::{Command2, GenericHeader};
-use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
+use iggy_binary_protocol::{Command, GenericHeader};
+use message_bus::connector::start as start_connector;
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus, SendError};
 use server_common::Message;
@@ -108,7 +108,7 @@ async fn run_one(tls: bool) -> Duration {
         0,
         vec![(1, addr1)],
         dial_delegate_0,
-        DEFAULT_RECONNECT_PERIOD,
+        bus0.config().reconnect_period,
     )
     .await;
     wait_until(|| bus0.replicas().contains(1), Duration::from_secs(5)).await;
@@ -121,7 +121,7 @@ async fn run_one(tls: bool) -> Duration {
         loop {
             let frame = Message::<GenericHeader>::new(FRAME_SIZE)
                 .transmute_header(|_, h: &mut GenericHeader| {
-                    h.command = Command2::Prepare;
+                    h.command = Command::Prepare;
                     h.cluster = CLUSTER;
                     h.size = FRAME_SIZE as u32;
                 })

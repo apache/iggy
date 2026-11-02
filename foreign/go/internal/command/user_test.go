@@ -207,3 +207,78 @@ func TestSerialize_UpdatePermissions_WithPermissions(t *testing.T) {
 		t.Errorf("permissions payload mismatch")
 	}
 }
+
+func TestUserIdentifierCommandsMarshalBinary(t *testing.T) {
+	numericID, err := iggcon.NewIdentifier(uint32(0x01020304))
+	if err != nil {
+		t.Fatal(err)
+	}
+	namedID, err := iggcon.NewIdentifier("admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name    string
+		request Command
+		code    Code
+		want    []byte
+	}{
+		{"GetUser numeric", &GetUser{Id: numericID}, 31, []byte{1, 4, 4, 3, 2, 1}},
+		{"GetUser named", &GetUser{Id: namedID}, 31, []byte{2, 5, 'a', 'd', 'm', 'i', 'n'}},
+		{"DeleteUser numeric", &DeleteUser{Id: numericID}, 34, []byte{1, 4, 4, 3, 2, 1}},
+		{"DeleteUser named", &DeleteUser{Id: namedID}, 34, []byte{2, 5, 'a', 'd', 'm', 'i', 'n'}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.request.Code(); got != test.code {
+				t.Fatalf("command code = %d, want %d", got, test.code)
+			}
+			got, err := test.request.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, test.want) {
+				t.Fatalf("command body = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestGetUsersMarshalBinary(t *testing.T) {
+	request := &GetUsers{}
+	if got := request.Code(); got != 32 {
+		t.Fatalf("GetUsers code = %d, want 32", got)
+	}
+
+	got, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("GetUsers body = %v, want empty", got)
+	}
+}
+
+func TestChangePasswordMarshalBinary(t *testing.T) {
+	userID, err := iggcon.NewIdentifier(uint32(0x01020304))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := &ChangePassword{
+		UserID:          userID,
+		CurrentPassword: "old",
+		NewPassword:     "n3w!",
+	}
+	if got := request.Code(); got != 37 {
+		t.Fatalf("ChangePassword code = %d, want 37", got)
+	}
+
+	got, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{1, 4, 4, 3, 2, 1, 3, 'o', 'l', 'd', 4, 'n', '3', 'w', '!'}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("ChangePassword body = %v, want %v", got, want)
+	}
+}

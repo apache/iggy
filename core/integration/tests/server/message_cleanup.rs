@@ -82,8 +82,9 @@ async fn run_cleanup_scenario(scenario: CleanupScenarioFn) {
     let mut harness = TestHarness::builder()
         .server(
             TestServerConfig::builder()
+                // Segment size, flush threshold and fsync are topic creation
+                // options now; `message_cleanup_scenario` sets them per topic.
                 .extra_envs(HashMap::from([
-                    ("IGGY_SYSTEM_SEGMENT_SIZE".to_string(), "10KiB".to_string()),
                     (
                         "IGGY_DATA_MAINTENANCE_MESSAGES_CLEANER_ENABLED".to_string(),
                         "true".to_string(),
@@ -92,13 +93,17 @@ async fn run_cleanup_scenario(scenario: CleanupScenarioFn) {
                         "IGGY_DATA_MAINTENANCE_MESSAGES_INTERVAL".to_string(),
                         "100ms".to_string(),
                     ),
+                    // Size retention floors each partition's budget at one
+                    // SEALED segment, `segment_size + max_message_size`, so the
+                    // shipped 64 MiB bus cap would put the floor far above the
+                    // few MiB these scenarios produce and no size-based
+                    // deletion could ever fire. 2 MiB keeps the floor under the
+                    // topic caps below while still clearing the largest request
+                    // any scenario sends (a 10-message batch, ~1.002 MiB).
+                    // Byte-size env leaves carry a raw byte count.
                     (
-                        "IGGY_SYSTEM_PARTITION_MESSAGES_REQUIRED_TO_SAVE".to_string(),
-                        "1".to_string(),
-                    ),
-                    (
-                        "IGGY_SYSTEM_PARTITION_ENFORCE_FSYNC".to_string(),
-                        "true".to_string(),
+                        "IGGY_MESSAGE_BUS_MAX_MESSAGE_SIZE".to_string(),
+                        (2 * 1024 * 1024).to_string(),
                     ),
                 ]))
                 .build(),

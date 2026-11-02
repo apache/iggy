@@ -148,6 +148,14 @@ function construct_bench_command() {
         ;;
     esac
 
+    # The persisted variants select the topic policy at creation.
+    local durability_arg=""
+    case "$remark" in
+    *"no_cache_fsync"*)
+        durability_arg="--durability persisted"
+        ;;
+    esac
+
     local commit_hash
     commit_hash=$(get_git_iggy_server_tag_or_sha1 .) || {
         echo "Failed to get git commit or tag."
@@ -159,7 +167,7 @@ function construct_bench_command() {
         exit 1
     }
 
-    echo "$bench_command ${rate_limit:+ --rate-limit ${rate_limit}} \
+    echo "$bench_command ${rate_limit:+ --rate-limit ${rate_limit}} ${durability_arg} \
 --message-size ${message_size} \
 --messages-per-batch ${messages_per_batch} \
 --message-batches ${message_batches} \

@@ -16,7 +16,7 @@
 // under the License.
 
 use super::{CONSUMER_GROUP_BASE_ID, CONSUMER_GROUP_NAME_PREFIX};
-use crate::utils::{ClientFactory, authenticate};
+use crate::utils::ClientFactory;
 use crate::{
     actors::{
         consumer::typed_benchmark_consumer::TypedBenchmarkConsumer,
@@ -44,7 +44,11 @@ pub async fn create_consumer(
                 "Consumer #{} → joining consumer group #{}",
                 consumer_id, consumer_group_id
             );
-            let cg_identifier = Identifier::try_from(*consumer_group_id).unwrap();
+            // By name: the group was created by name and the server assigns its
+            // own numeric id, which need not equal the bench's counter.
+            let cg_identifier =
+                Identifier::named(&format!("{CONSUMER_GROUP_NAME_PREFIX}-{consumer_group_id}"))
+                    .unwrap();
             client
                 .join_consumer_group(stream_id, topic_id, &cg_identifier)
                 .await
@@ -71,16 +75,9 @@ pub async fn init_consumer_groups(
     client_factory: &Arc<dyn ClientFactory>,
     args: &IggyBenchArgs,
 ) -> Result<(), IggyError> {
-    let client = client_factory.create_client().await;
-    let client = IggyClient::create(client, None, None);
+    let client = client_factory.create_authenticated_client().await?;
     let cg_count = args.number_of_consumer_groups();
 
-    authenticate(
-        &client,
-        client_factory.username(),
-        client_factory.password(),
-    )
-    .await;
     for i in 1..=cg_count {
         let consumer_group_id = CONSUMER_GROUP_BASE_ID + i;
         let stream_name = format!("bench-stream-{i}");
@@ -170,6 +167,7 @@ pub fn build_consumer_futures(
     let moving_average_window = args.moving_average_window();
     let kind = args.kind();
     let pretty = args.pretty;
+    let poll_options = args.poll_options();
     let polling_kind = if cg_count > 0 {
         PollingKind::Next
     } else {
@@ -216,8 +214,10 @@ pub fn build_consumer_futures(
                 consumer_id
             };
             let stream_id = format!("bench-stream-{stream_idx}");
+            // Groups are created as `BASE + 1..=cg_count`, one per stream, so the
+            // consumer must land on the group of the stream it polls.
             let consumer_group_id = if cg_count > 0 {
-                Some(CONSUMER_GROUP_BASE_ID + (consumer_id % cg_count))
+                Some(CONSUMER_GROUP_BASE_ID + stream_idx)
             } else {
                 None
             };
@@ -236,6 +236,7 @@ pub fn build_consumer_futures(
                     sampling_time,
                     moving_average_window,
                     polling_kind,
+                    poll_options,
                     rate_limit,
                     origin_timestamp_latency_calculation,
                     pretty,
@@ -300,6 +301,7 @@ pub fn build_producing_consumers_futures(
                     args_clone.moving_average_window(),
                     rate_limit,
                     polling_kind,
+                    args_clone.poll_options(),
                     origin_timestamp_latency_calculation,
                     args_clone.pretty,
                 );
@@ -360,8 +362,8 @@ pub fn build_producing_consumer_groups_futures(
             };
 
             let consumer_group_id = if should_consume {
-                // Each stream has exactly one CG, server assigns IDs starting from 0
-                Some(start_consumer_group_id)
+                // Match the group name created for this stream.
+                Some(start_consumer_group_id + stream_idx)
             } else {
                 None
             };
@@ -403,6 +405,7 @@ pub fn build_producing_consumer_groups_futures(
                     args_clone.moving_average_window(),
                     rate_limit,
                     polling_kind,
+                    args_clone.poll_options(),
                     origin_timestamp_latency_calculation,
                     args_clone.pretty,
                 );

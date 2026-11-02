@@ -14,9 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { toDate } from '../serialize.utils.js';
+import { deserializePrefixedOptions, type ParsedOptions } from '../options.utils.js';
+import { EncryptionKeySource } from './stream-options.js';
 
 /**
  * Stream information returned from the server.
@@ -33,7 +34,17 @@ export type Stream = {
   /** Total number of messages in the stream */
   messagesCount: bigint,
   /** Stream creation timestamp */
-  createdAt: Date
+  createdAt: Date,
+  /** Options the client explicitly sent at create */
+  options: ParsedOptions,
+  /** Options the server filled or computes, such as the encryption key source */
+  derivedOptions: ParsedOptions,
+  /** Who chose the stream's at-rest key, `null` when the server reported none */
+  encryptionKeySource: EncryptionKeySource | null,
+  /** Fingerprint of the stream's data key, `null` for a plaintext stream */
+  encryptionKeyFingerprint: string | null,
+  /** Fingerprints of the server keys wrapping the data key, empty for a plaintext stream */
+  encryptionKekFingerprints: string[]
 }
 
 /**
@@ -65,11 +76,25 @@ export const deserializeToStream = (r: Buffer, pos = 0): StreamDeserialized => {
   const messagesCount = r.readBigUint64LE(pos + 24);
   const nameLength = r.readUInt8(pos + 32);
   const name = r.subarray(pos + 33, pos + 33 + nameLength).toString();
+  const explicit = deserializePrefixedOptions(r, pos + 33 + nameLength);
+  const derived = deserializePrefixedOptions(r, pos + 33 + nameLength + explicit.bytesRead);
+  const text = (key: string) => {
+    const value = derived.options[key] ?? explicit.options[key];
+    return typeof value === 'string' ? value : null;
+  };
+  const source = text('encryption_key_source');
+  const keks = text('encryption_kek_fingerprint');
 
   return {
-    bytesRead: 33 + nameLength,
+    bytesRead: 33 + nameLength + explicit.bytesRead + derived.bytesRead,
     data: {
-      id, name, topicsCount, messagesCount, sizeBytes, createdAt
+      id, name, topicsCount, messagesCount, sizeBytes, createdAt,
+      options: explicit.options,
+      derivedOptions: derived.options,
+      encryptionKeySource: Object.values<string>(EncryptionKeySource).includes(source ?? '')
+        ? source as EncryptionKeySource : null,
+      encryptionKeyFingerprint: text('encryption_key_fingerprint'),
+      encryptionKekFingerprints: keks === null ? [] : keks.split(',')
     }
   };
 };

@@ -24,7 +24,6 @@ using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Publishers;
-using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
@@ -47,10 +46,10 @@ public class IggyTypedPublisherTests
 
         await publisher.SendAsync("hello", id, ct: Ct);
 
-        var sent = recorder.AllMessages.Should().ContainSingle().Subject;
-        sent.Id.Should().Be(id.ToUInt128());
-        Decode(sent).Should().Be("hello");
-        sent.UserHeaders.Should().BeNull();
+        var sent = Assert.Single(recorder.AllMessages);
+        Assert.Equal(id.ToUInt128(), sent.Id);
+        Assert.Equal("hello", Decode(sent));
+        Assert.Null(sent.UserHeaders);
     }
 
     [Fact]
@@ -61,9 +60,9 @@ public class IggyTypedPublisherTests
 
         await publisher.SendAsync("hello", ct: Ct);
 
-        var sent = recorder.AllMessages.Should().ContainSingle().Subject;
-        sent.Id.Should().Be(UInt128.Zero);
-        Decode(sent).Should().Be("hello");
+        var sent = Assert.Single(recorder.AllMessages);
+        Assert.Equal(UInt128.Zero, sent.Id);
+        Assert.Equal("hello", Decode(sent));
     }
 
     [Fact]
@@ -78,8 +77,9 @@ public class IggyTypedPublisherTests
 
         await publisher.SendAsync("hello", userHeaders: headers, ct: Ct);
 
-        var sent = recorder.AllMessages.Should().ContainSingle().Subject;
-        sent.UserHeaders.Should().ContainKey(HeaderKey.FromString("k"));
+        var sent = Assert.Single(recorder.AllMessages);
+        Assert.NotNull(sent.UserHeaders);
+        Assert.Contains(HeaderKey.FromString("k"), sent.UserHeaders);
     }
 
     [Fact]
@@ -90,7 +90,7 @@ public class IggyTypedPublisherTests
 
         await publisher.SendAsync(new[] { "a", "b", "c" }, Ct);
 
-        recorder.AllMessages.Select(Decode).Should().Equal("a", "b", "c");
+        Assert.Equal(["a", "b", "c"], recorder.AllMessages.Select(Decode));
     }
 
     [Fact]
@@ -101,7 +101,7 @@ public class IggyTypedPublisherTests
 
         await publisher.SendAsync(Array.Empty<string>(), Ct);
 
-        recorder.Calls.Should().BeEmpty();
+        Assert.Empty(recorder.Calls);
     }
 
     [Fact]
@@ -118,16 +118,17 @@ public class IggyTypedPublisherTests
         await publisher.SendAsync(
             new (string, Guid?, Dictionary<HeaderKey, HeaderValue>?)[] { ("a", id, headers), ("b", null, null) }, Ct);
 
-        recorder.AllMessages.Should().HaveCount(2);
+        Assert.Equal(2, recorder.AllMessages.Count);
         var first = recorder.AllMessages[0];
-        first.Id.Should().Be(id.ToUInt128());
-        Decode(first).Should().Be("a");
-        first.UserHeaders.Should().ContainKey(HeaderKey.FromString("k"));
+        Assert.Equal(id.ToUInt128(), first.Id);
+        Assert.Equal("a", Decode(first));
+        Assert.NotNull(first.UserHeaders);
+        Assert.Contains(HeaderKey.FromString("k"), first.UserHeaders);
 
         var second = recorder.AllMessages[1];
-        Decode(second).Should().Be("b");
-        second.Id.Should().Be(UInt128.Zero);
-        second.UserHeaders.Should().BeNull();
+        Assert.Equal("b", Decode(second));
+        Assert.Equal(UInt128.Zero, second.Id);
+        Assert.Null(second.UserHeaders);
     }
 
     [Fact]
@@ -140,10 +141,10 @@ public class IggyTypedPublisherTests
 
         await publisher.SendAsync("hello", ct: Ct);
 
-        var (stream, topic, partitioning, _) = recorder.Calls.Should().ContainSingle().Subject;
-        stream.Should().Be(Stream);
-        topic.Should().Be(Topic);
-        partitioning.Kind.Should().Be(Enums.Partitioning.PartitionId);
+        var (stream, topic, partitioning, _) = Assert.Single(recorder.Calls);
+        Assert.Equal(Stream, stream);
+        Assert.Equal(Topic, topic);
+        Assert.Equal(Enums.Partitioning.PartitionId, partitioning.Kind);
     }
 
     [Fact]
@@ -187,9 +188,9 @@ public class IggyTypedPublisherTests
         await publisher.SendAsync("hello", id, ct: Ct);
         await publisher.WaitUntilAllSendsAsync(Ct);
 
-        var sent = recorder.AllMessages.Should().ContainSingle().Subject;
-        sent.Id.Should().Be(id.ToUInt128());
-        Decode(sent).Should().Be("hello");
+        var sent = Assert.Single(recorder.AllMessages);
+        Assert.Equal(id.ToUInt128(), sent.Id);
+        Assert.Equal("hello", Decode(sent));
     }
 
     [Fact]
@@ -201,7 +202,7 @@ public class IggyTypedPublisherTests
         await publisher.SendAsync(new[] { "a", "b", "c" }, Ct);
         await publisher.WaitUntilAllSendsAsync(Ct);
 
-        recorder.AllMessages.Select(Decode).Should().BeEquivalentTo("a", "b", "c");
+        Assert.Equivalent(new[] { "a", "b", "c" }, recorder.AllMessages.Select(Decode), true);
     }
 
     [Fact]
@@ -219,10 +220,11 @@ public class IggyTypedPublisherTests
             Ct);
         await publisher.WaitUntilAllSendsAsync(Ct);
 
-        var sent = recorder.AllMessages.Should().ContainSingle().Subject;
-        sent.Id.Should().Be(id.ToUInt128());
-        Decode(sent).Should().Be("a");
-        sent.UserHeaders.Should().ContainKey(HeaderKey.FromString("k"));
+        var sent = Assert.Single(recorder.AllMessages);
+        Assert.Equal(id.ToUInt128(), sent.Id);
+        Assert.Equal("a", Decode(sent));
+        Assert.NotNull(sent.UserHeaders);
+        Assert.Contains(HeaderKey.FromString("k"), sent.UserHeaders);
     }
 
     [Fact]
@@ -234,7 +236,7 @@ public class IggyTypedPublisherTests
         await publisher.SendAsync(Array.Empty<string>(), Ct);
         await publisher.WaitUntilAllSendsAsync(Ct);
 
-        recorder.Calls.Should().BeEmpty();
+        Assert.Empty(recorder.Calls);
     }
 
     [Fact]
@@ -260,7 +262,90 @@ public class IggyTypedPublisherTests
 
         IEnumerable<string> expected = Enumerable.Range(0, producers)
             .SelectMany(producer => Enumerable.Range(0, perProducer).Select(i => $"p{producer}-{i}"));
-        recorder.AllMessages.Select(Decode).Should().BeEquivalentTo(expected);
+        Assert.Equivalent(expected, recorder.AllMessages.Select(Decode), true);
+    }
+
+    [Theory]
+    [InlineData(true, true)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(false, false)]
+    public async Task DisposeAsync_AfterLogoutFailure_Should_DisposeOnlyOwnedClient(bool ownsClient, bool initialized)
+    {
+        var client = Mock.Get(BuildClient(new SendRecorder()));
+        client.Setup(value => value.LogoutUserAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IOException("Connection lost during logout."));
+        var config = Config();
+        config.CreateIggyClient = ownsClient;
+        var publisher = new IggyPublisher<string>(client.Object, config,
+            NullLogger<IggyPublisher<string>>.Instance);
+
+        if (initialized)
+        {
+            await publisher.InitAsync(Ct);
+        }
+        else
+        {
+            client.Setup(value => value.GetStreamByIdAsync(It.IsAny<Identifier>(), It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new IOException("Connection lost during initialization."));
+            await Assert.ThrowsAsync<IOException>(() => publisher.InitAsync(Ct));
+        }
+
+        await publisher.DisposeAsync();
+        await publisher.DisposeAsync();
+
+        client.Verify(value => value.Dispose(), ownsClient ? Times.Once() : Times.Never());
+        client.Verify(value => value.LogoutUserAsync(It.IsAny<CancellationToken>()),
+            ownsClient && initialized ? Times.Once() : Times.Never());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DisposeAsync_ConcurrentCalls_Should_DisposeOwnedClientOnce(bool logoutFails)
+    {
+        var logout = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = Mock.Get(BuildClient(new SendRecorder()));
+        client.Setup(value => value.LogoutUserAsync(It.IsAny<CancellationToken>()))
+            .Returns(logout.Task);
+        var config = Config();
+        config.CreateIggyClient = true;
+        var publisher = await CreatePublisherAsync(client.Object, config);
+
+        var first = publisher.DisposeAsync().AsTask();
+        var second = publisher.DisposeAsync().AsTask();
+        if (logoutFails)
+        {
+            logout.SetException(new IOException("Connection lost during logout."));
+        }
+        else
+        {
+            logout.SetResult();
+        }
+
+        await Task.WhenAll(first, second).WaitAsync(Ct);
+
+        client.Verify(value => value.LogoutUserAsync(It.IsAny<CancellationToken>()), Times.Once());
+        client.Verify(value => value.Dispose(), Times.Once());
+    }
+
+    [Fact]
+    public async Task DisposeAsync_WhenBackgroundCleanupFails_Should_DisposeOwnedClient()
+    {
+        var client = Mock.Get(BuildClient(new SendRecorder()));
+        client.Setup(value => value.UnsubscribeConnectionEvents(
+                It.IsAny<Func<ConnectionStateChangedEventArgs, Task>>()))
+            .Throws(new IOException("Connection cleanup failed."));
+        var config = Config(true);
+        config.CreateIggyClient = true;
+        var publisher = new IggyPublisher<string>(client.Object, config,
+            NullLogger<IggyPublisher<string>>.Instance);
+
+        await Assert.ThrowsAsync<IOException>(() => publisher.DisposeAsync().AsTask());
+        await publisher.DisposeAsync();
+
+        client.Verify(value => value.Dispose(), Times.Once());
+        client.Verify(value => value.LogoutUserAsync(It.IsAny<CancellationToken>()), Times.Never());
     }
 
     private static string Decode(SentMessage message)
@@ -343,10 +428,8 @@ public class IggyTypedPublisherTests
             Name = "topic",
             Size = 0,
             CreatedAt = default,
-            MaxTopicSize = 0,
             MessagesCount = 0,
-            PartitionsCount = 1,
-            ReplicationFactor = 1
+            PartitionsCount = 1
         };
     }
 

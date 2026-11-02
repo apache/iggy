@@ -20,14 +20,19 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <initializer_list>
+#include <memory>
 #include <random>
+#include <set>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include <gtest/gtest.h>
 
+#include "iggy.hpp"
 #include "lib.rs.h"
 
 inline iggy::ffi::Identifier make_string_identifier(const std::string &value) {
@@ -59,9 +64,25 @@ inline rust::Vec<std::uint8_t> partition_id_bytes(std::uint32_t id) {
     return v;
 }
 
+inline iggy::ffi::PollingStrategy make_polling_strategy(const std::string &kind, const std::uint64_t value) {
+    iggy::ffi::PollingStrategy strategy{};
+    strategy.kind  = kind;
+    strategy.value = value;
+    return strategy;
+}
+
+inline iggy::ffi::PollOptions make_poll_options(
+    const std::uint32_t count,
+    const iggy::ffi::CommitPolicy commit = iggy::ffi::CommitPolicy::Manual) {
+    iggy::ffi::PollOptions options = iggy::ffi::default_poll_options();
+    options.count                  = count;
+    options.commit                 = commit;
+    return options;
+}
+
 inline rust::Vec<rust::String> make_snapshot_types(std::initializer_list<const char *> values) {
     rust::Vec<rust::String> snapshot_types;
-    for (const auto value : values) {
+    for (const auto *const value : values) {
         snapshot_types.push_back(value);
     }
     return snapshot_types;
@@ -99,6 +120,73 @@ inline bool has_header(const rust::Vec<iggy::ffi::HeaderEntry> &headers,
     return false;
 }
 
+inline iggy::ffi::TopicCreateOptions make_topic_create_options(
+    std::uint32_t partitions_count,
+    const std::string &compression_algorithm = "none",
+    const std::string &message_expiry_kind   = "server_default",
+    std::uint64_t message_expiry_value       = 0,
+    const std::string &max_topic_size        = "server_default") {
+    iggy::ffi::TopicCreateOptions opts{};
+    opts.has_partitions_count      = true;
+    opts.partitions_count          = partitions_count;
+    opts.has_compression_algorithm = true;
+    opts.compression_algorithm     = compression_algorithm;
+    opts.has_message_expiry        = true;
+    opts.message_expiry_kind       = message_expiry_kind;
+    opts.message_expiry_value      = message_expiry_value;
+    opts.has_max_topic_size        = true;
+    opts.max_topic_size            = max_topic_size;
+    return opts;
+}
+
+inline iggy::ffi::UserUpdateOptions make_user_update_options(const std::string &username,
+                                                             const iggy::ffi::UserStatus status) {
+    iggy::ffi::UserUpdateOptions options{};
+    options.has_username = true;
+    options.username     = username;
+    options.has_status   = true;
+    options.status       = status;
+    return options;
+}
+
+// Joining commits the membership at once, but a member owns its partitions only after every
+// affected partition installs it as owner. Until then group polls and group offset calls fail
+// with ConsumerGroupPartitionNotOwned (5009).
+inline ::testing::AssertionResult wait_for_consumer_group_assignment(iggy::ffi::Client *client,
+                                                                     const iggy::ffi::Identifier &stream_id,
+                                                                     const iggy::ffi::Identifier &topic_id,
+                                                                     const iggy::ffi::Identifier &group_id,
+                                                                     const std::uint32_t members_count) {
+    constexpr auto assignment_timeout       = std::chrono::seconds(10);
+    constexpr auto assignment_poll_interval = std::chrono::milliseconds(100);
+    const auto deadline                     = std::chrono::steady_clock::now() + assignment_timeout;
+    while (true) {
+        const auto group = client->get_consumer_group(stream_id, topic_id, group_id);
+        std::set<std::uint32_t> assigned;
+        std::uint32_t fewest = group.partitions_count;
+        std::uint32_t most   = 0;
+        for (const auto &member : group.members) {
+            for (const auto partition : member.partitions) {
+                if (!assigned.insert(partition).second) {
+                    return ::testing::AssertionFailure() << "partition " << partition << " has more than one owner";
+                }
+            }
+            fewest = std::min(fewest, member.partitions_count);
+            most   = std::max(most, member.partitions_count);
+        }
+        if (group.members_count == members_count && assigned.size() == group.partitions_count && most <= fewest + 1) {
+            return ::testing::AssertionSuccess();
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return ::testing::AssertionFailure()
+                   << "consumer group did not converge to " << members_count << " members owning all "
+                   << group.partitions_count << " partitions within " << assignment_timeout.count() << " s; "
+                   << group.members_count << " members own " << assigned.size() << " partitions";
+        }
+        std::this_thread::sleep_for(assignment_poll_interval);
+    }
+}
+
 struct TrackedConsumerGroup {
     std::string stream_name;
     std::string topic_name;
@@ -107,7 +195,7 @@ struct TrackedConsumerGroup {
 
 class E2ETestFixture : public ::testing::Test {
   public:
-    ~E2ETestFixture() { CleanupBestEffort(); }
+    ~E2ETestFixture() override { CleanupBestEffort(); }
     void TearDown() override { Cleanup(); }
 
   protected:
@@ -118,7 +206,7 @@ class E2ETestFixture : public ::testing::Test {
 
     iggy::ffi::Client *GetLoggedOutClient() {
         iggy::ffi::Client *client = nullptr;
-        EXPECT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+        EXPECT_NO_THROW({ client = iggy::ffi::new_connection({}); });
         EXPECT_NE(client, nullptr);
         if (client == nullptr) {
             return nullptr;
@@ -129,21 +217,36 @@ class E2ETestFixture : public ::testing::Test {
     }
 
     iggy::ffi::Client *GetLoggedInClient() {
+        iggy::ffi::ErrorInfo error_info{};
         iggy::ffi::Client *client = GetLoggedOutClient();
         if (client == nullptr) {
             return nullptr;
         }
 
         EXPECT_NO_THROW(client->connect());
-        EXPECT_NO_THROW(client->login_user("iggy", "iggy"));
+        EXPECT_NO_THROW(client->login_user("iggy", "iggy", error_info));
 
         return client;
     }
 
-    std::string GetRandomName() {
+    iggy::IggyBlockingClient GetLoggedOutHighLevelClient() { return iggy::IggyBlockingClient::Builder().Build(); }
+
+    iggy::IggyBlockingClient GetLoggedInHighLevelClient(std::string username = "iggy", std::string password = "iggy") {
+        auto client = GetLoggedOutHighLevelClient();
+        client.Connect();
+        client.Login(std::move(username), std::move(password));
+        return client;
+    }
+
+    std::string GetRandomName(const std::size_t max_length = 255) {
+        if (max_length == 0) {
+            return {};
+        }
+
         static constexpr char alphabet[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         static thread_local std::mt19937 generator(std::random_device{}());
-        std::uniform_int_distribution<std::size_t> length_distribution(8, 255);
+        const std::size_t min_length = std::min<std::size_t>(8, max_length);
+        std::uniform_int_distribution<std::size_t> length_distribution(min_length, max_length);
         std::uniform_int_distribution<std::size_t> distribution(0, sizeof(alphabet) - 2);
         const std::size_t length = length_distribution(generator);
 
@@ -155,6 +258,41 @@ class E2ETestFixture : public ::testing::Test {
         }
 
         return name;
+    }
+
+    iggy::ffi::UserInfoDetails CreateUser(iggy::ffi::Client *client,
+                                          const std::string &username,
+                                          const std::string &password,
+                                          const iggy::ffi::UserStatus status,
+                                          const bool has_permissions         = false,
+                                          iggy::ffi::Permissions permissions = {}) {
+        iggy::ffi::ErrorInfo error_info{};
+        auto user =
+            client->create_user(username, password, status, has_permissions, std::move(permissions), {}, error_info);
+        tracked_user_names_.push_back(username);
+        return user;
+    }
+
+    iggy::UserInfoDetails CreateUser(iggy::IggyBlockingClient &client,
+                                     const std::string &username,
+                                     const std::string &password,
+                                     const iggy::UserStatus status,
+                                     std::optional<iggy::Permissions> permissions = std::nullopt,
+                                     const iggy::UserCreateOptions &options       = {}) {
+        auto user = client.CreateUser(username, password, status, permissions, options);
+        tracked_user_names_.push_back(username);
+        return user;
+    }
+
+    void ForgetUser(const std::string &username) {
+        tracked_user_names_.erase(std::remove(tracked_user_names_.begin(), tracked_user_names_.end(), username),
+                                  tracked_user_names_.end());
+    }
+
+    void RenameTrackedUser(const std::string &from, const std::string &to) {
+        const auto tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), from);
+        ASSERT_NE(tracked_user, tracked_user_names_.end());
+        *tracked_user = to;
     }
 
     void TrackStream(const std::string &stream_name) { tracked_stream_names_.push_back(stream_name); }
@@ -199,19 +337,31 @@ class E2ETestFixture : public ::testing::Test {
         iggy::ffi::Client *client_to_delete = client;
         client                              = nullptr;
         ForgetClient(client_to_delete);
-        EXPECT_NO_THROW(iggy::ffi::delete_client(client_to_delete));
+        iggy::ffi::delete_client(client_to_delete);
     }
 
     void Cleanup() {
-        CleanupConsumerGroups();
-        CleanupStreams();
+        if (HasTrackedResources()) {
+            RunAsRoot([this](iggy::ffi::Client *client) {
+                CleanupConsumerGroups(client);
+                CleanupStreams(client);
+                CleanupUsers(client);
+            });
+        }
         CleanupClients();
     }
 
   private:
+    using ClientPtr = std::unique_ptr<iggy::ffi::Client, decltype(&iggy::ffi::delete_client)>;
+
     void CleanupBestEffort() noexcept {
-        CleanupConsumerGroupsBestEffort();
-        CleanupStreamsBestEffort();
+        if (HasTrackedResources()) {
+            RunAsRootBestEffort([this](iggy::ffi::Client *client) {
+                CleanupConsumerGroupsBestEffort(client);
+                CleanupStreamsBestEffort(client);
+                CleanupUsersBestEffort(client);
+            });
+        }
         CleanupClientsBestEffort();
     }
 
@@ -222,119 +372,111 @@ class E2ETestFixture : public ::testing::Test {
         }
     }
 
-    void CleanupStreams() {
-        if (tracked_stream_names_.empty() && tracked_stream_ids_.empty()) {
-            return;
+    void CleanupUsers(iggy::ffi::Client *client) {
+        for (const auto &username : tracked_user_names_) {
+            iggy::ffi::ErrorInfo error_info{};
+            EXPECT_NO_THROW(client->delete_user(make_string_identifier(username), error_info));
+        }
+        tracked_user_names_.clear();
+    }
+
+    void CleanupUsersBestEffort(iggy::ffi::Client *client) noexcept {
+        try {
+            for (const auto &username : tracked_user_names_) {
+                iggy::ffi::ErrorInfo error_info{};
+                client->delete_user(make_string_identifier(username), error_info);
+            }
+        } catch (...) {
         }
 
-        iggy::ffi::Client *cleanup_client = nullptr;
-        EXPECT_NO_THROW({ cleanup_client = iggy::ffi::new_connection(""); });
-        EXPECT_NE(cleanup_client, nullptr);
-        if (cleanup_client != nullptr) {
-            EXPECT_NO_THROW(cleanup_client->connect());
-            EXPECT_NO_THROW(cleanup_client->login_user("iggy", "iggy"));
+        tracked_user_names_.clear();
+    }
+
+    void CleanupStreams(iggy::ffi::Client *client) {
+        for (const auto &stream_name : tracked_stream_names_) {
+            iggy::ffi::ErrorInfo error_info{};
+            EXPECT_NO_THROW(client->delete_stream(make_string_identifier(stream_name), error_info));
+        }
+        for (const auto stream_id : tracked_stream_ids_) {
+            iggy::ffi::ErrorInfo error_info{};
+            EXPECT_NO_THROW(client->delete_stream(make_numeric_identifier(stream_id), error_info));
+        }
+        tracked_stream_names_.clear();
+        tracked_stream_ids_.clear();
+    }
+
+    void CleanupStreamsBestEffort(iggy::ffi::Client *client) noexcept {
+        try {
             for (const auto &stream_name : tracked_stream_names_) {
-                EXPECT_NO_THROW(cleanup_client->delete_stream(make_string_identifier(stream_name)));
+                iggy::ffi::ErrorInfo error_info{};
+                client->delete_stream(make_string_identifier(stream_name), error_info);
             }
             for (const auto stream_id : tracked_stream_ids_) {
-                EXPECT_NO_THROW(cleanup_client->delete_stream(make_numeric_identifier(stream_id)));
-            }
-            EXPECT_NO_THROW(iggy::ffi::delete_client(cleanup_client));
-        }
-
-        tracked_stream_names_.clear();
-        tracked_stream_ids_.clear();
-    }
-
-    void CleanupConsumerGroups() {
-        if (tracked_consumer_groups_.empty()) {
-            return;
-        }
-
-        iggy::ffi::Client *cleanup_client = nullptr;
-        EXPECT_NO_THROW({ cleanup_client = iggy::ffi::new_connection(""); });
-        EXPECT_NE(cleanup_client, nullptr);
-        if (cleanup_client != nullptr) {
-            EXPECT_NO_THROW(cleanup_client->connect());
-            EXPECT_NO_THROW(cleanup_client->login_user("iggy", "iggy"));
-            for (const auto &group : tracked_consumer_groups_) {
-                EXPECT_NO_THROW(cleanup_client->delete_consumer_group(make_string_identifier(group.stream_name),
-                                                                      make_string_identifier(group.topic_name),
-                                                                      make_string_identifier(group.group_name)));
-            }
-            EXPECT_NO_THROW(iggy::ffi::delete_client(cleanup_client));
-        }
-
-        tracked_consumer_groups_.clear();
-    }
-
-    void CleanupStreamsBestEffort() noexcept {
-        if (tracked_stream_names_.empty() && tracked_stream_ids_.empty()) {
-            return;
-        }
-
-        iggy::ffi::Client *cleanup_client = nullptr;
-        try {
-            cleanup_client = iggy::ffi::new_connection("");
-            if (cleanup_client != nullptr) {
-                cleanup_client->connect();
-                cleanup_client->login_user("iggy", "iggy");
-                for (const auto &stream_name : tracked_stream_names_) {
-                    cleanup_client->delete_stream(make_string_identifier(stream_name));
-                }
-                for (const auto stream_id : tracked_stream_ids_) {
-                    cleanup_client->delete_stream(make_numeric_identifier(stream_id));
-                }
+                iggy::ffi::ErrorInfo error_info{};
+                client->delete_stream(make_numeric_identifier(stream_id), error_info);
             }
         } catch (...) {
         }
 
-        if (cleanup_client != nullptr) {
-            try {
-                iggy::ffi::delete_client(cleanup_client);
-            } catch (...) {
-            }
-        }
-
         tracked_stream_names_.clear();
         tracked_stream_ids_.clear();
     }
 
-    void CleanupConsumerGroupsBestEffort() noexcept {
-        if (tracked_consumer_groups_.empty()) {
-            return;
-        }
-
-        iggy::ffi::Client *cleanup_client = nullptr;
-        try {
-            cleanup_client = iggy::ffi::new_connection("");
-            if (cleanup_client != nullptr) {
-                cleanup_client->connect();
-                cleanup_client->login_user("iggy", "iggy");
-                for (const auto &group : tracked_consumer_groups_) {
-                    cleanup_client->delete_consumer_group(make_string_identifier(group.stream_name),
+    void CleanupConsumerGroups(iggy::ffi::Client *client) {
+        for (const auto &group : tracked_consumer_groups_) {
+            iggy::ffi::ErrorInfo error_info{};
+            EXPECT_NO_THROW(client->delete_consumer_group(make_string_identifier(group.stream_name),
                                                           make_string_identifier(group.topic_name),
-                                                          make_string_identifier(group.group_name));
-                }
+                                                          make_string_identifier(group.group_name), error_info));
+        }
+        tracked_consumer_groups_.clear();
+    }
+
+    void CleanupConsumerGroupsBestEffort(iggy::ffi::Client *client) noexcept {
+        try {
+            for (const auto &group : tracked_consumer_groups_) {
+                iggy::ffi::ErrorInfo error_info{};
+                client->delete_consumer_group(make_string_identifier(group.stream_name),
+                                              make_string_identifier(group.topic_name),
+                                              make_string_identifier(group.group_name), error_info);
             }
         } catch (...) {
         }
 
-        if (cleanup_client != nullptr) {
-            try {
-                iggy::ffi::delete_client(cleanup_client);
-            } catch (...) {
-            }
-        }
-
         tracked_consumer_groups_.clear();
+    }
+
+    template <typename Cleanup>
+    void RunAsRoot(Cleanup &&cleanup) {
+        iggy::ffi::ErrorInfo error_info{};
+        ClientPtr cleanup_client{nullptr, iggy::ffi::delete_client};
+        ASSERT_NO_THROW(cleanup_client.reset(iggy::ffi::new_connection({})));
+        ASSERT_NE(cleanup_client, nullptr);
+        ASSERT_NO_THROW(cleanup_client->connect());
+        ASSERT_NO_THROW(cleanup_client->login_user("iggy", "iggy", error_info));
+        cleanup(cleanup_client.get());
+    }
+
+    template <typename Cleanup>
+    void RunAsRootBestEffort(Cleanup &&cleanup) noexcept {
+        ClientPtr cleanup_client{nullptr, iggy::ffi::delete_client};
+        try {
+            cleanup_client.reset(iggy::ffi::new_connection({}));
+            if (cleanup_client != nullptr) {
+                iggy::ffi::ErrorInfo error_info{};
+                cleanup_client->connect();
+                cleanup_client->login_user("iggy", "iggy", error_info);
+                cleanup(cleanup_client.get());
+            }
+        } catch (...) {
+        }
     }
 
     void CleanupClients() {
         for (iggy::ffi::Client *&client : clients_) {
             iggy::ffi::Client *client_to_delete = client;
             client                              = nullptr;
-            EXPECT_NO_THROW(iggy::ffi::delete_client(client_to_delete));
+            iggy::ffi::delete_client(client_to_delete);
         }
         clients_.clear();
     }
@@ -343,15 +485,18 @@ class E2ETestFixture : public ::testing::Test {
         for (iggy::ffi::Client *&client : clients_) {
             iggy::ffi::Client *client_to_delete = client;
             client                              = nullptr;
-            try {
-                iggy::ffi::delete_client(client_to_delete);
-            } catch (...) {
-            }
+            iggy::ffi::delete_client(client_to_delete);
         }
         clients_.clear();
     }
 
+    bool HasTrackedResources() const {
+        return !tracked_consumer_groups_.empty() || !tracked_stream_names_.empty() || !tracked_stream_ids_.empty() ||
+               !tracked_user_names_.empty();
+    }
+
     std::vector<iggy::ffi::Client *> clients_;
+    std::vector<std::string> tracked_user_names_;
     std::vector<std::string> tracked_stream_names_;
     std::vector<std::uint32_t> tracked_stream_ids_;
     std::vector<TrackedConsumerGroup> tracked_consumer_groups_;

@@ -18,17 +18,25 @@
 use dashmap::DashMap;
 use dlopen2::wrapper::Container;
 use flume::{Receiver, Sender};
+use iggy::prelude::StreamCreateOptions;
 use iggy::prelude::{
-    DirectConfig, HeaderKey, HeaderValue, IggyClient, IggyDuration, IggyError, IggyMessage,
-    IggyProducer,
+    Client, DirectConfig, HeaderKey, HeaderValue, Identifier, IggyClient, IggyDuration, IggyError,
+    IggyMessage, Partitioning, StreamClient, TopicClient, TopicCreateOptions,
 };
+use iggy_common::{BINARY_OPERATION_TIMEOUT, Durability, TopicRuntimeOptions};
 use iggy_connector_sdk::encoders::avro::{AvroEncoderConfig, AvroStreamEncoder};
 use iggy_connector_sdk::{
-    ConnectorState, DecodedMessage, ProducedMessages, Schema, StreamEncoder, TopicMetadata,
-    source::HandleCallback, transforms::Transform,
+    ConnectorState, DecodedMessage, Error as SdkError, ProducedMessages, Schema, StreamEncoder,
+    TopicMetadata,
+    source::{
+        BatchResultCallback, HandleCallback, SourceBatchResult, SourceStopReason,
+        SourceStoppedCallback,
+    },
+    transforms::Transform,
 };
 use std::{
     collections::{BTreeMap, HashMap},
+    future::Future,
     str::FromStr,
     sync::{Arc, LazyLock, atomic::Ordering},
     time::Instant,
@@ -38,23 +46,40 @@ use tracing::{debug, error, info, trace, warn};
 use crate::benchmark;
 use crate::configs::connectors::SourceConfig;
 use crate::context::RuntimeContext;
+use crate::exactly_once::{ExactlyOnce, ExactlyOnceTarget, StoredState};
 use crate::log::LOG_CALLBACK;
+use crate::manager::source::StopReport;
 use crate::metrics::SourceLabels;
+use crate::plugin_instance::PluginInstanceGuard;
 use crate::{
     FailedPlugin, PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
     SourceConnectorProducer, SourceConnectorWrapper, resolve_plugin_path,
-    state::{FileStateProvider, StateProvider, StateStorage},
+    state::{StateStorage, StateStorageFactory},
     transform,
 };
 use iggy_connector_sdk::api::ConnectorStatus;
 use prometheus_client::metrics::counter::Counter;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
+
+const MAX_FAILED_TAIL_RETRIES: u32 = 3;
+const SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE: u32 = 1;
+
+pub(crate) type RegisterStopCallback = extern "C" fn(u32, SourceStoppedCallback) -> i32;
 
 pub(crate) struct SourceSenderEntry {
-    pub(crate) sender: Sender<ProducedMessages>,
+    pub(crate) sender: Sender<ProducedBatch>,
+    stop_sender: mpsc::UnboundedSender<SourceStopReason>,
     // Owned errors counter (Arc<AtomicU64> inside) so the FFI callback bumps
     // it with one relaxed atomic - no Family RwLock + HashMap lookup per call.
     pub(crate) error_counter: Counter,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProducedBatch {
+    id: u64,
+    messages: ProducedMessages,
 }
 
 pub(crate) static SOURCE_SENDERS: LazyLock<DashMap<u32, SourceSenderEntry>> =
@@ -64,20 +89,30 @@ pub(crate) fn cleanup_sender(plugin_id: u32) {
     SOURCE_SENDERS.remove(&plugin_id);
 }
 
+extern "C" fn source_stopped(plugin_id: u32, reason: u8) {
+    if let Some(entry) = SOURCE_SENDERS.get(&plugin_id) {
+        let _ = entry.stop_sender.send(SourceStopReason::from(reason));
+    }
+}
+
 /// Initializes all enabled source connectors.
 ///
-/// Per-connector failures (path resolution, dlopen, state load, plugin init,
+/// Per-connector failures (path resolution, dlopen, plugin init,
 /// producer/encoder/transform setup) are captured against the offending
 /// connector and do not abort the runtime. Connectors that fail before their
 /// FFI container can be loaded are returned in the second tuple element so
 /// they remain visible in health/status output.
 ///
-/// Only system-level errors that prevent any connector from running (e.g. a
-/// poisoned global state) are propagated as `Err`.
+/// Only system-level errors that prevent any connector from running are
+/// propagated as `Err`. That includes classified state-store failures
+/// (`TransientState`/`PermanentState`/`StateLatched`) while loading an
+/// enabled source's state: the store is unhealthy, so the process must fail
+/// rather than rewind the source or mint a `FailedPlugin`. Unclassified
+/// state-load failures (the file backend) keep the per-connector path.
 pub async fn init(
     source_configs: HashMap<String, SourceConfig>,
     iggy_client: &IggyClient,
-    state_path: &str,
+    state_factory: &Arc<dyn StateStorageFactory>,
 ) -> Result<(HashMap<String, SourceConnector>, Vec<FailedPlugin>), RuntimeError> {
     let mut source_connectors: HashMap<String, SourceConnector> = HashMap::new();
     let mut failed_plugins: Vec<FailedPlugin> = Vec::new();
@@ -114,25 +149,58 @@ pub async fn init(
             &config.version
         );
 
-        let state_storage = get_state_storage(state_path, &key);
-        let state = match &state_storage {
-            StateStorage::File(file) => match file.load().await {
-                Ok(state) => state,
-                Err(error) => {
-                    let message = format!("Failed to load source state: {error}");
-                    error!("Source: {name} ({key}) - {message}");
-                    failed_plugins.push(FailedPlugin::new(
-                        plugin_id,
-                        &key,
-                        &name,
-                        &config.path,
-                        config.plugin_config_format,
-                        config.enabled,
-                        message,
-                    ));
-                    continue;
-                }
-            },
+        let state_storage = state_factory.storage_for(&key)?;
+        let state = match state_storage.load().await {
+            Ok(state) => state,
+            Err(
+                load_error @ (SdkError::TransientState(_)
+                | SdkError::PermanentState(_)
+                | SdkError::StateLatched),
+            ) => {
+                // A classified failure means the state store is unhealthy,
+                // not the plugin. Treating it as "no state" would silently
+                // rewind the source, and parking it as a failed plugin would
+                // hide an outage the next restart could clear, so abort boot.
+                error!("Source: {name} ({key}) - failed to load state: {load_error}");
+                return Err(RuntimeError::StateLoadFailed {
+                    connector_key: key,
+                    source: load_error,
+                });
+            }
+            Err(error) => {
+                let message = format!("Failed to load source state: {error}");
+                error!("Source: {name} ({key}) - {message}");
+                failed_plugins.push(FailedPlugin::new(
+                    plugin_id,
+                    &key,
+                    &name,
+                    &config.path,
+                    config.plugin_config_format,
+                    config.enabled,
+                    message,
+                ));
+                continue;
+            }
+        };
+
+        // An exactly-once source keeps its producer around the plugin's bytes. The plugin gets
+        // only its own.
+        let stored = match StoredState::split(state) {
+            Ok(stored) => stored,
+            Err(error) => {
+                let message = format!("Failed to read source state: {error}");
+                error!("Source: {name} ({key}) - {message}");
+                failed_plugins.push(FailedPlugin::new(
+                    plugin_id,
+                    &key,
+                    &name,
+                    &config.path,
+                    config.plugin_config_format,
+                    config.enabled,
+                    message,
+                ));
+                continue;
+            }
         };
 
         if !source_connectors.contains_key(&path) {
@@ -157,7 +225,7 @@ pub async fn init(
             source_connectors.insert(
                 path.clone(),
                 SourceConnector {
-                    container,
+                    container: Arc::new(container),
                     plugins: Vec::new(),
                 },
             );
@@ -173,7 +241,7 @@ pub async fn init(
             &connector.container,
             &config.plugin_config.clone().unwrap_or_default(),
             plugin_id,
-            state,
+            stored.plugin_state(),
         )
         .err()
         .map(|error| error.to_string());
@@ -198,8 +266,17 @@ pub async fn init(
             continue;
         }
 
-        match setup_source_producer(&key, &config, iggy_client).await {
-            Ok((producer, encoder, transforms)) => {
+        // A plugin left with `error` set is skipped by `handle`, so nothing
+        // would ever reach the instance `init_source` just created.
+        let instance_guard = {
+            let connector = source_connectors
+                .get_mut(&path)
+                .expect("source connector was inserted above");
+            PluginInstanceGuard::for_source(connector.container.clone(), plugin_id, &key)
+        };
+
+        match setup_source_producer(&key, &config, iggy_client, stored).await {
+            Ok((producer, transforms)) => {
                 let connector = source_connectors
                     .get_mut(&path)
                     .expect("source connector was inserted above");
@@ -208,8 +285,9 @@ pub async fn init(
                     .iter_mut()
                     .find(|plugin| plugin.id == plugin_id)
                     .expect("source plugin was pushed above");
-                plugin.producer = Some(SourceConnectorProducer { producer, encoder });
+                plugin.producer = Some(producer);
                 plugin.transforms = transforms;
+                instance_guard.disarm();
                 info!(
                     "Source container with name: {name} ({key}) initialized successfully with ID: {plugin_id}."
                 );
@@ -217,15 +295,10 @@ pub async fn init(
             Err(error) => {
                 let message = format!("Failed to set up source producer: {error}");
                 error!("Source: {name} ({key}) - {message}");
+                instance_guard.close().await;
                 let connector = source_connectors
                     .get_mut(&path)
                     .expect("source connector was inserted above");
-                let close_result = (connector.container.iggy_source_close)(plugin_id);
-                if close_result != 0 {
-                    warn!(
-                        "iggy_source_close returned {close_result} while cleaning up failed source connector with ID: {plugin_id} ({key})"
-                    );
-                }
                 if let Some(plugin) = connector
                     .plugins
                     .iter_mut()
@@ -255,7 +328,9 @@ pub(crate) fn init_source(
     id: u32,
     state: Option<ConnectorState>,
 ) -> Result<(), RuntimeError> {
-    trace!("Initializing source plugin with config: {plugin_config:?} (ID: {id})");
+    // The configuration holds credentials, and the runtime cannot tell which
+    // fields they are.
+    trace!("Initializing source plugin (ID: {id})");
     let plugin_config =
         serde_json::to_string(plugin_config).expect("Invalid source plugin config.");
     let state_ptr = state.as_ref().map_or(std::ptr::null(), |s| s.0.as_ptr());
@@ -277,23 +352,14 @@ pub(crate) fn init_source(
     }
 }
 
-pub(crate) fn get_state_storage(state_path: &str, key: &str) -> StateStorage {
-    let path = format!("{state_path}/source_{key}.state");
-    StateStorage::File(FileStateProvider::new(path))
-}
-
+/// Returns the last stream's producer with its encoder, and the transforms.
+/// `stored` is the state that init gave the plugin. An exactly-once source starts from it.
 pub(crate) async fn setup_source_producer(
     key: &str,
     config: &SourceConfig,
     iggy_client: &IggyClient,
-) -> Result<
-    (
-        IggyProducer,
-        Arc<dyn StreamEncoder>,
-        Vec<Arc<dyn Transform>>,
-    ),
-    RuntimeError,
-> {
+    stored: StoredState,
+) -> Result<(SourceConnectorProducer, Vec<Arc<dyn Transform>>), RuntimeError> {
     let transforms = if let Some(transforms_config) = &config.transforms {
         let loaded = transform::load(transforms_config).map_err(|error| {
             RuntimeError::InvalidConfiguration(format!("Failed to load transforms: {error}"))
@@ -308,22 +374,40 @@ pub(crate) async fn setup_source_producer(
 
     let mut last_producer = None;
     let mut last_encoder = None;
+    let mut last_target = None;
     for stream in config.streams.iter() {
         let linger_time = IggyDuration::from_str(stream.linger_time.as_deref().unwrap_or("5ms"))
             .map_err(|error| {
                 RuntimeError::InvalidConfiguration(format!("Invalid linger time: {error}"))
             })?;
+        ensure_durable_source_topic(iggy_client, &stream.stream, &stream.topic).await?;
         let batch_length = stream.batch_length.unwrap_or(1000);
-        let producer = iggy_client
+        let mut builder = iggy_client
             .producer(&stream.stream, &stream.topic)?
+            // The topic was validated above. If it disappears before init,
+            // recreating it with producer defaults would drop the durability guarantee.
+            .do_not_create_stream_if_not_exists()
+            .do_not_create_topic_if_not_exists()
             .direct(
                 DirectConfig::builder()
                     .batch_length(batch_length)
                     .linger_time(linger_time)
                     .build(),
-            )
-            .build();
+            );
+        if let Some(partition_id) = stream.partition_id {
+            builder = builder.partitioning(Partitioning::partition_id(partition_id));
+        }
+        let producer = builder.build();
         producer.init().await?;
+        last_target = if config.exactly_once {
+            Some(ExactlyOnceTarget {
+                stream: Identifier::named(&stream.stream)?,
+                topic: Identifier::named(&stream.topic)?,
+                partition_id: stream.partition_id.unwrap_or(0),
+            })
+        } else {
+            None
+        };
         let encoder: Arc<dyn StreamEncoder> = match stream.schema {
             Schema::Avro => {
                 let config = AvroEncoderConfig {
@@ -351,7 +435,67 @@ pub(crate) async fn setup_source_producer(
         RuntimeError::InvalidConfiguration("No encoder configured for source".to_string())
     })?;
 
-    Ok((producer, encoder, transforms))
+    Ok((
+        SourceConnectorProducer {
+            encoder,
+            producer,
+            exactly_once: last_target.map(|target| ExactlyOnce::new(key, target, stored)),
+        },
+        transforms,
+    ))
+}
+
+async fn ensure_durable_source_topic(
+    client: &IggyClient,
+    stream_name: &str,
+    topic_name: &str,
+) -> Result<(), RuntimeError> {
+    let stream_id = Identifier::named(stream_name)?;
+    if client.get_stream(&stream_id).await?.is_none() {
+        client
+            .create_stream(stream_name, &StreamCreateOptions::default())
+            .await?;
+    }
+
+    let topic_id = Identifier::named(topic_name)?;
+    let topic = match client.get_topic(&stream_id, &topic_id).await? {
+        Some(topic) => topic,
+        None => {
+            client
+                .create_topic(
+                    &stream_id,
+                    topic_name,
+                    &TopicCreateOptions {
+                        partitions_count: Some(1),
+                        durability: Durability::Persisted,
+                        messages_required_to_save: Some(SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE),
+                        ..TopicCreateOptions::default()
+                    },
+                )
+                .await?
+        }
+    };
+
+    validate_source_topic_durability(
+        stream_name,
+        topic_name,
+        TopicRuntimeOptions::from_resource_options(&topic.options),
+    )
+}
+
+fn validate_source_topic_durability(
+    stream_name: &str,
+    topic_name: &str,
+    options: TopicRuntimeOptions,
+) -> Result<(), RuntimeError> {
+    if options.durability == Durability::Persisted {
+        return Ok(());
+    }
+
+    Err(RuntimeError::InvalidConfiguration(format!(
+        "Source destination topic '{stream_name}/{topic_name}' must use durability=persisted; found durability={}",
+        options.durability
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -360,14 +504,20 @@ pub(crate) async fn source_forwarding_loop(
     plugin_key: String,
     verbose: bool,
     benchmark: bool,
-    producer: IggyProducer,
-    encoder: Arc<dyn StreamEncoder>,
+    producer: SourceConnectorProducer,
     transforms: Vec<Arc<dyn Transform>>,
     state_storage: StateStorage,
-    receiver: Receiver<ProducedMessages>,
+    receiver: Receiver<ProducedBatch>,
+    mut stop_receiver: mpsc::UnboundedReceiver<SourceStopReason>,
+    batch_result_callback: BatchResultCallback,
     context: Arc<RuntimeContext>,
     labels: Arc<SourceLabels>,
 ) {
+    let SourceConnectorProducer {
+        encoder,
+        producer,
+        mut exactly_once,
+    } = producer;
     info!("Source connector with ID: {plugin_id} started.");
     if benchmark {
         info!(
@@ -390,8 +540,27 @@ pub(crate) async fn source_forwarding_loop(
         topic: producer.topic().to_string(),
     };
 
-    while let Ok(produced_messages) = receiver.recv_async().await {
+    let mut stop_reason = None;
+    let mut stop_receiver_open = true;
+    loop {
+        let produced_batch = tokio::select! {
+            biased;
+            stopped = stop_receiver.recv(), if stop_receiver_open => {
+                if let Some(reason) = stopped {
+                    stop_reason = Some(reason);
+                    break;
+                }
+                stop_receiver_open = false;
+                continue;
+            },
+            batch = receiver.recv_async() => batch,
+        };
+        let Ok(produced_batch) = produced_batch else {
+            break;
+        };
         let total_start = Instant::now();
+        let batch_id = produced_batch.id;
+        let produced_messages = produced_batch.messages;
         let count = produced_messages.messages.len();
         context
             .metrics
@@ -437,7 +606,7 @@ pub(crate) async fn source_forwarding_loop(
             .observe_stage_with_labels(&labels.stage_decode, decode_elapsed);
 
         let prepare_start = Instant::now();
-        let iggy_messages = process_messages(
+        let processed = process_messages(
             plugin_id,
             &encoder,
             &topic_metadata,
@@ -450,10 +619,51 @@ pub(crate) async fn source_forwarding_loop(
         context
             .metrics
             .observe_stage_with_labels(&labels.stage_prepare, prepare_elapsed);
-        let sent_count = iggy_messages.len();
+        let prepared_count = processed.messages.len();
+        let processing_errors = decode_errors + processed.error_count;
+        let pending_state_error = state_storage.resolve_pending().await.err();
+        let state_latched = state_storage.is_latched();
+        let state_unavailable = pending_state_error.is_some() || state_latched;
 
         let iggy_send_start = Instant::now();
-        let send_result = producer.send(iggy_messages).await;
+        let send_result = if state_unavailable {
+            Err(IggyError::Error)
+        } else if processing_errors == 0 {
+            match exactly_once.as_mut() {
+                Some(exactly_once) => {
+                    let mut messages = processed.messages;
+                    exactly_once
+                        .send(
+                            &context.iggy_clients.producer,
+                            &state_storage,
+                            &mut messages,
+                        )
+                        .await
+                }
+                None => {
+                    send_with_failed_tail_retries(
+                        processed.messages,
+                        plugin_id,
+                        &context.iggy_clients.producer,
+                        |messages| producer.send(messages),
+                        |op| {
+                            context
+                                .iggy_clients
+                                .producer
+                                .resolve_operation(op, Instant::now() + BINARY_OPERATION_TIMEOUT)
+                        },
+                    )
+                    .await
+                }
+            }
+        } else {
+            Err(IggyError::Error)
+        };
+        let sent_count = if send_result.is_ok() {
+            prepared_count
+        } else {
+            0
+        };
         let iggy_send_elapsed = iggy_send_start.elapsed();
         context
             .metrics
@@ -461,15 +671,38 @@ pub(crate) async fn source_forwarding_loop(
 
         // Total histogram + emit (below) run regardless of send outcome.
         let mut state_save_us: Option<u64> = None;
+        let mut batch_result = SourceBatchResult::Nack;
         if let Err(error) = send_result {
-            let error_msg = format!(
-                "Failed to send {sent_count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}. {error}",
-                producer.stream(),
-                producer.topic(),
-            );
+            let error_msg = if let Some(state_error) = pending_state_error.as_ref() {
+                format!(
+                    "Rejected source batch {batch_id} while resolving a pending checkpoint for source connector with ID: {plugin_id}. {state_error}"
+                )
+            } else if state_latched {
+                format!(
+                    "Rejected source batch {batch_id} because state storage is latched for source connector with ID: {plugin_id}"
+                )
+            } else if processing_errors > 0 {
+                format!(
+                    "Rejected source batch {batch_id} after {processing_errors} decode or processing errors for source connector with ID: {plugin_id}"
+                )
+            } else {
+                format!(
+                    "Failed to send {prepared_count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}. {error}",
+                    producer.stream(),
+                    producer.topic(),
+                )
+            };
             error!("{error_msg}");
             context.metrics.inc_errors_with_labels(&labels.counter);
-            context.sources.set_error(&plugin_key, &error_msg).await;
+            let preserve_original_error =
+                matches!(pending_state_error.as_ref(), Some(SdkError::StateLatched))
+                    || (pending_state_error.is_none() && state_latched);
+            if !preserve_original_error {
+                context
+                    .sources
+                    .set_error(&plugin_key, &error_msg, Some(&context.metrics))
+                    .await;
+            }
         } else {
             context
                 .metrics
@@ -489,31 +722,85 @@ pub(crate) async fn source_forwarding_loop(
                 );
             }
 
-            if let Some(state) = produced_messages.state {
-                let state_save_start = Instant::now();
-                match &state_storage {
-                    StateStorage::File(file) => {
-                        if let Err(error) = file.save(state).await {
-                            let error_msg = format!(
-                                "Failed to save state for source connector with ID: {plugin_id}. {error}"
-                            );
-                            error!("{error_msg}");
-                            context.metrics.inc_errors_with_labels(&labels.counter);
-                            context.sources.set_error(&plugin_key, &error_msg).await;
-                        } else {
-                            debug!("State saved for source connector with ID: {plugin_id}");
-                            let state_save_elapsed = state_save_start.elapsed();
-                            context.metrics.observe_stage_with_labels(
-                                &labels.stage_state_save,
-                                state_save_elapsed,
-                            );
-                            state_save_us = Some(benchmark::as_micros(state_save_elapsed));
-                        }
+            let mut state_saved = true;
+            let state_save_start = Instant::now();
+            // An exactly-once source saves its producer only with new plugin bytes. Without
+            // them, a restart produces the batch again with the same producer section.
+            let saved = match exactly_once.as_mut() {
+                Some(exactly_once) => {
+                    exactly_once
+                        .commit(
+                            &context.iggy_clients.producer,
+                            &state_storage,
+                            produced_messages.state,
+                        )
+                        .await
+                }
+                None => match produced_messages.state {
+                    Some(state) => Some(state_storage.save(state).await),
+                    None => None,
+                },
+            };
+            if let Some(saved) = saved {
+                match saved {
+                    Ok(()) => {
+                        debug!("State saved for source connector with ID: {plugin_id}");
+                        let state_save_elapsed = state_save_start.elapsed();
+                        context.metrics.observe_stage_with_labels(
+                            &labels.stage_state_save,
+                            state_save_elapsed,
+                        );
+                        state_save_us = Some(benchmark::as_micros(state_save_elapsed));
+                    }
+                    Err(error) => {
+                        state_saved = false;
+                        let error_msg = format!(
+                            "Failed to save state for source connector with ID: {plugin_id}. {error}"
+                        );
+                        error!("{error_msg}");
+                        context.metrics.inc_errors_with_labels(&labels.counter);
+                        context
+                            .sources
+                            .set_error(&plugin_key, &error_msg, Some(&context.metrics))
+                            .await;
                     }
                 }
             } else {
                 debug!("No state provided for source connector with ID: {plugin_id}");
             }
+
+            if state_saved {
+                batch_result = SourceBatchResult::Ack;
+            }
+        }
+
+        // The plugin applies its async batch-result hook before this FFI call returns.
+        let result_code = tokio::task::spawn_blocking(move || {
+            batch_result_callback(plugin_id, batch_id, batch_result as u8)
+        })
+        .await
+        .unwrap_or(-1);
+        if result_code != 0 {
+            if context.sources.is_stopping_or_stopped(&plugin_key).await {
+                trace!(
+                    "Source connector with ID: {plugin_id} stopped before {batch_result:?} could be delivered for batch ID: {batch_id}"
+                );
+            } else {
+                let error_msg = format!(
+                    "Failed to deliver {batch_result:?} for source connector with ID: {plugin_id}, batch ID: {batch_id}. Plugin returned: {result_code}"
+                );
+                error!("{error_msg}");
+                context.metrics.inc_errors_with_labels(&labels.counter);
+                context
+                    .sources
+                    .set_error(&plugin_key, &error_msg, Some(&context.metrics))
+                    .await;
+            }
+        } else if should_recover_source(batch_result, sent_count) {
+            context
+                .sources
+                .recover_from_error(&plugin_key, Some(&context.metrics))
+                .await;
         }
 
         let total_elapsed = total_start.elapsed();
@@ -538,14 +825,38 @@ pub(crate) async fn source_forwarding_loop(
     }
 
     info!("Source connector with ID: {plugin_id} stopped.");
-    context
-        .sources
-        .update_status(
-            &plugin_key,
-            ConnectorStatus::Stopped,
-            Some(&context.metrics),
-        )
-        .await;
+    // A self-stopped source must release its sender even when no manager stop follows.
+    cleanup_sender(plugin_id);
+    if let Some(reason) = stop_reason {
+        let error_msg = format!(
+            "Source polling stopped for connector with ID: {plugin_id}: {reason}; restart required"
+        );
+        match context
+            .sources
+            .report_unexpected_stop(&plugin_key, &error_msg, &context.metrics)
+            .await
+        {
+            StopReport::NewError => {
+                error!("{error_msg}");
+                context.metrics.inc_errors_with_labels(&labels.counter);
+            }
+            StopReport::AlreadyError => error!("{error_msg}"),
+            StopReport::Ignored => {}
+        }
+    } else {
+        context
+            .sources
+            .update_status(
+                &plugin_key,
+                ConnectorStatus::Stopped,
+                Some(&context.metrics),
+            )
+            .await;
+    }
+}
+
+fn should_recover_source(batch_result: SourceBatchResult, sent_count: usize) -> bool {
+    batch_result == SourceBatchResult::Ack && sent_count > 0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -554,26 +865,29 @@ pub(crate) fn spawn_source_handler(
     plugin_key: &str,
     verbose: bool,
     benchmark: bool,
-    producer: IggyProducer,
-    encoder: Arc<dyn StreamEncoder>,
+    producer: SourceConnectorProducer,
     transforms: Vec<Arc<dyn Transform>>,
     state_storage: StateStorage,
-    callback: HandleCallback,
+    handle_callback: HandleCallback,
+    register_stop_callback: Option<RegisterStopCallback>,
+    batch_result_callback: BatchResultCallback,
     context: Arc<RuntimeContext>,
 ) -> Vec<JoinHandle<()>> {
     let (sender, receiver) = flume::unbounded();
+    let (stop_sender, stop_receiver) = mpsc::unbounded_channel();
     let plugin_key = plugin_key.to_string();
     let labels = Arc::new(SourceLabels::new(&plugin_key));
     SOURCE_SENDERS.insert(
         plugin_id,
         SourceSenderEntry {
             sender,
+            stop_sender,
             error_counter: context.metrics.error_counter(&labels.counter),
         },
     );
 
     let blocking_handle = tokio::task::spawn_blocking(move || {
-        callback(plugin_id, handle_produced_messages);
+        start_source_polling(plugin_id, handle_callback, register_stop_callback)
     });
     let handler_task = tokio::spawn(async move {
         source_forwarding_loop(
@@ -582,10 +896,11 @@ pub(crate) fn spawn_source_handler(
             verbose,
             benchmark,
             producer,
-            encoder,
             transforms,
             state_storage,
             receiver,
+            stop_receiver,
+            batch_result_callback,
             context,
             labels,
         )
@@ -593,6 +908,32 @@ pub(crate) fn spawn_source_handler(
     });
 
     vec![blocking_handle, handler_task]
+}
+
+fn start_source_polling(
+    plugin_id: u32,
+    handle_callback: HandleCallback,
+    register_stop_callback: Option<RegisterStopCallback>,
+) {
+    let registration_failed = match register_stop_callback {
+        Some(register) => register(plugin_id, source_stopped) != 0,
+        None => {
+            warn!(
+                "Source connector with ID: {plugin_id} has no stop callback export; rebuild it with the current connector SDK to report poll-task stops"
+            );
+            false
+        }
+    };
+    let stop_reason = if registration_failed {
+        Some(SourceStopReason::RegistrationFailed)
+    } else if handle_callback(plugin_id, handle_produced_messages) != 0 {
+        Some(SourceStopReason::HandlerFailed)
+    } else {
+        None
+    };
+    if let Some(reason) = stop_reason {
+        source_stopped(plugin_id, reason as u8);
+    }
 }
 
 pub fn handle(
@@ -613,7 +954,7 @@ pub fn handle(
             }
             info!("Starting handler for source connector with ID: {plugin_id}...");
 
-            let Some(producer_wrapper) = plugin.producer else {
+            let Some(producer) = plugin.producer else {
                 error!("Producer not initialized for source connector with ID: {plugin_id}");
                 continue;
             };
@@ -623,11 +964,12 @@ pub fn handle(
                 &plugin_key,
                 plugin.verbose,
                 plugin.benchmark,
-                producer_wrapper.producer,
-                producer_wrapper.encoder,
+                producer,
                 plugin.transforms,
                 plugin.state_storage,
-                source.callback,
+                source.handle_callback,
+                source.register_stop_callback,
+                source.batch_result_callback,
                 context.clone(),
             );
 
@@ -635,6 +977,11 @@ pub fn handle(
         }
     }
     handles
+}
+
+struct ProcessedMessages {
+    messages: Vec<IggyMessage>,
+    error_count: u64,
 }
 
 fn process_messages(
@@ -645,7 +992,7 @@ fn process_messages(
     transforms: &Vec<Arc<dyn Transform>>,
     metrics: &Arc<crate::metrics::Metrics>,
     labels: &SourceLabels,
-) -> Vec<IggyMessage> {
+) -> ProcessedMessages {
     let mut iggy_messages = Vec::with_capacity(messages.len());
     // Accumulate per-message drops, flush once after the loop - one Family
     // lookup instead of one per message under filter/error storms.
@@ -708,14 +1055,114 @@ fn process_messages(
     if filtered_count > 0 {
         metrics.inc_messages_filtered_with_labels(&labels.counter, filtered_count);
     }
-    iggy_messages
+    ProcessedMessages {
+        messages: iggy_messages,
+        error_count,
+    }
+}
+
+/// Sends `messages`, then resends only the failed tail of a partial failure, at most
+/// [`MAX_FAILED_TAIL_RETRIES`] times.
+///
+/// The caller NACKs the batch on any error returned here. The plugin can then poll the same
+/// messages again, and all of them are sent again. Chunks that committed before the error land
+/// twice, and so does an uncertain chunk that committed: delivery is at-least-once. At the retry
+/// limit the uncertain chunk is not resolved first, because its outcome would not change the
+/// NACK. The producer resolves it before its next send to that partition.
+async fn send_with_failed_tail_retries<S, SendFut, T, R, ResolveFut>(
+    mut messages: Vec<IggyMessage>,
+    plugin_id: u32,
+    client: &IggyClient,
+    mut send: S,
+    mut resolve: R,
+) -> Result<(), IggyError>
+where
+    S: FnMut(Vec<IggyMessage>) -> SendFut,
+    SendFut: Future<Output = Result<T, IggyError>>,
+    R: FnMut(u64) -> ResolveFut,
+    ResolveFut: Future<Output = Result<(), IggyError>>,
+{
+    let mut retry = 0;
+    loop {
+        match send(messages).await {
+            Ok(_) => return Ok(()),
+            Err(IggyError::ProducerSendFailed {
+                cause,
+                failed,
+                uncertain,
+                committed,
+                stream_name,
+                topic_name,
+            }) => {
+                warn!(
+                    cause_code = cause.as_code(),
+                    "Source connector with ID: {plugin_id} send failed after {} chunks committed; {} messages remain",
+                    committed.len(),
+                    failed.len()
+                );
+                // Exhausted SDK reconnect tasks need an explicit connect. A possibly
+                // submitted binary chunk returns OperationUncertain instead.
+                if retry >= MAX_FAILED_TAIL_RETRIES
+                    || failed.is_empty()
+                    || (matches!(*cause, IggyError::NotConnected | IggyError::Disconnected)
+                        && !matches!(
+                            timeout(BINARY_OPERATION_TIMEOUT, client.connect()).await,
+                            Ok(Ok(()))
+                        ))
+                {
+                    return Err(IggyError::ProducerSendFailed {
+                        cause,
+                        failed,
+                        uncertain,
+                        committed,
+                        stream_name,
+                        topic_name,
+                    });
+                }
+
+                messages = match Arc::try_unwrap(failed) {
+                    Ok(messages) => messages,
+                    Err(failed) => {
+                        return Err(IggyError::ProducerSendFailed {
+                            cause,
+                            failed,
+                            uncertain,
+                            committed,
+                            stream_name,
+                            topic_name,
+                        });
+                    }
+                };
+                // The tail starts with the `uncertain` messages that `op` sent. A
+                // resend under a new request id would append them twice if they
+                // committed, so only a proved commit lets the rest go out.
+                if let IggyError::OperationUncertain(op) = *cause {
+                    resolve(op).await?;
+                    messages.drain(..uncertain.min(messages.len()));
+                    if messages.is_empty() {
+                        return Ok(());
+                    }
+                } else if let IggyError::LaneBlocked(op) = *cause {
+                    // A restart loses the old producer's ownership set. Replaying
+                    // its blocker preserves the outcome for its original caller
+                    // and never confirms any messages in this unsent tail.
+                    if matches!(resolve(op).await, Err(IggyError::OperationUncertain(_))) {
+                        return Err(IggyError::LaneBlocked(op));
+                    }
+                }
+                retry += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub(crate) extern "C" fn handle_produced_messages(
     plugin_id: u32,
+    batch_id: u64,
     messages_ptr: *const u8,
     messages_len: usize,
-) {
+) -> i32 {
     unsafe {
         // Entry missing = SOURCE_SENDERS cleaned up at shutdown; benign race
         // expected on stop/restart. No metric (would conflate with real failures).
@@ -724,23 +1171,29 @@ pub(crate) extern "C" fn handle_produced_messages(
                 plugin_id,
                 "dropping produced batch: sender already cleaned up"
             );
-            return;
+            return -1;
         };
         let messages = std::slice::from_raw_parts(messages_ptr, messages_len);
         match postcard::from_bytes::<ProducedMessages>(messages) {
             Ok(messages) => {
-                if let Err(send_error) = entry.sender.send(messages) {
+                if let Err(send_error) = entry.sender.send(ProducedBatch {
+                    id: batch_id,
+                    messages,
+                }) {
                     error!(
                         "Failed to send messages for source connector with ID: {plugin_id}. Channel closed: {send_error}"
                     );
                     entry.error_counter.inc();
+                    return -1;
                 }
+                0
             }
             Err(err) => {
                 error!(
                     "Failed to deserialize produced messages for source connector with ID: {plugin_id}. {err}"
                 );
                 entry.error_counter.inc();
+                -1
             }
         }
     }
@@ -766,5 +1219,916 @@ fn build_iggy_message(
             .user_headers(h)
             .build(),
         (None, None) => IggyMessage::builder().payload(payload.into()).build(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::configs::connectors::create_connectors_config_provider;
+    use crate::configs::runtime::{ConnectorsConfig, IggyConfig, LocalConnectorsConfig};
+    use crate::manager::sink::SinkManager;
+    use crate::manager::source::{SourceDetails, SourceInfo, SourceManager};
+    use crate::metrics::Metrics;
+    use crate::state::FileStateFactory;
+    use crate::stream::IggyClients;
+    use iggy_common::IggyTimestamp;
+    use iggy_connector_sdk::source::SendCallback;
+    use secrecy::SecretString;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::future::{Ready, ready};
+    use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    static TEST_PLUGIN_ID: AtomicU32 = AtomicU32::new(u32::MAX / 2);
+    static HANDLE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DRAINED_BATCH_ID: AtomicU64 = AtomicU64::new(0);
+    static DRAINED_BATCH_RESULT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+    extern "C" fn reject_stop_registration(_: u32, _: SourceStoppedCallback) -> i32 {
+        -1
+    }
+
+    extern "C" fn accept_stop_registration(_: u32, _: SourceStoppedCallback) -> i32 {
+        0
+    }
+
+    extern "C" fn reject_source_handle(_: u32, _: SendCallback) -> i32 {
+        HANDLE_CALLS.fetch_add(1, Ordering::SeqCst);
+        -1
+    }
+
+    extern "C" fn reject_source_handle_untracked(_: u32, _: SendCallback) -> i32 {
+        -1
+    }
+
+    extern "C" fn ignore_batch_result(_: u32, _: u64, _: u8) -> i32 {
+        0
+    }
+
+    extern "C" fn record_drained_batch_result(_: u32, batch_id: u64, result: u8) -> i32 {
+        DRAINED_BATCH_RESULT.store(u32::from(result), Ordering::SeqCst);
+        DRAINED_BATCH_ID.store(batch_id, Ordering::SeqCst);
+        0
+    }
+
+    async fn test_source_runtime(
+        plugin_id: u32,
+        plugin_key: &str,
+        directory: &std::path::Path,
+    ) -> (Arc<RuntimeContext>, StateStorage, SourceConnectorProducer) {
+        let config_provider =
+            create_connectors_config_provider(&ConnectorsConfig::Local(LocalConnectorsConfig {
+                config_dir: directory.display().to_string(),
+            }))
+            .await
+            .expect("local config provider should initialize");
+        let state_factory = Arc::new(FileStateFactory::new(directory.display().to_string()));
+        let state_storage = state_factory
+            .storage_for(plugin_key)
+            .expect("file state storage should initialize");
+        let producer = SourceConnectorProducer {
+            encoder: Schema::Raw.encoder(),
+            producer: IggyClient::default()
+                .producer("stream", "topic")
+                .expect("producer builder should initialize")
+                .build(),
+            exactly_once: None,
+        };
+        let context = Arc::new(RuntimeContext {
+            sinks: SinkManager::new(vec![]),
+            sources: SourceManager::new(vec![SourceDetails {
+                info: SourceInfo {
+                    id: plugin_id,
+                    key: plugin_key.to_string(),
+                    name: plugin_key.to_string(),
+                    path: "test".to_string(),
+                    version: "test".to_string(),
+                    enabled: true,
+                    status: ConnectorStatus::Stopped,
+                    last_error: None,
+                    plugin_config_format: None,
+                },
+                config: SourceConfig {
+                    key: plugin_key.to_string(),
+                    ..SourceConfig::default()
+                },
+                handler_tasks: vec![],
+                container: None,
+                restart_guard: Arc::new(tokio::sync::Mutex::new(())),
+            }]),
+            api_key: SecretString::from("test".to_string()),
+            config_provider: Arc::from(config_provider),
+            metrics: Arc::new(Metrics::init()),
+            start_time: IggyTimestamp::now(),
+            iggy_clients: Arc::new(IggyClients {
+                producer: IggyClient::default(),
+                config: IggyConfig::default(),
+            }),
+            state_factory,
+        });
+        (context, state_storage, producer)
+    }
+
+    async fn assert_start_failure(
+        register_stop_callback: Option<RegisterStopCallback>,
+        expected_reason: SourceStopReason,
+    ) {
+        let plugin_id = next_plugin_id();
+        let plugin_key = format!("source_{plugin_id}");
+        let directory = tempfile::tempdir().expect("test directory should exist");
+        let (context, state_storage, producer) =
+            test_source_runtime(plugin_id, &plugin_key, directory.path()).await;
+
+        let tasks = spawn_source_handler(
+            plugin_id,
+            &plugin_key,
+            false,
+            false,
+            producer,
+            vec![],
+            state_storage,
+            reject_source_handle_untracked,
+            register_stop_callback,
+            ignore_batch_result,
+            Arc::clone(&context),
+        );
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("source task should stop")
+                .expect("source task should complete");
+        }
+        let source = context
+            .sources
+            .get(&plugin_key)
+            .await
+            .expect("source should be registered");
+        let source = source.lock().await;
+        assert_eq!(source.info.status, ConnectorStatus::Error);
+        let message = &source
+            .info
+            .last_error
+            .as_ref()
+            .expect("stop should record the reason")
+            .message;
+        assert!(message.contains(&expected_reason.to_string()));
+        assert!(message.contains("restart required"));
+        assert_eq!(context.metrics.get_sources_running(), 0);
+        assert_eq!(
+            context
+                .metrics
+                .error_counter(&SourceLabels::new(&plugin_key).counter)
+                .get(),
+            1
+        );
+    }
+
+    fn next_plugin_id() -> u32 {
+        TEST_PLUGIN_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn test_message(marker: u8) -> IggyMessage {
+        IggyMessage::builder()
+            .payload(vec![marker].into())
+            .build()
+            .expect("test message should be valid")
+    }
+
+    fn failed_send(messages: Vec<IggyMessage>) -> IggyError {
+        IggyError::ProducerSendFailed {
+            cause: Box::new(IggyError::Error),
+            failed: Arc::new(messages),
+            uncertain: 0,
+            committed: Arc::new(Vec::new()),
+            stream_name: "test-stream".into(),
+            topic_name: "test-topic".into(),
+        }
+    }
+
+    /// A send whose first `chunk_length` messages were operation `op` and may
+    /// have committed.
+    fn uncertain_send(op: u64, chunk_length: usize, messages: Vec<IggyMessage>) -> IggyError {
+        let mut failure = failed_send(messages);
+        if let IggyError::ProducerSendFailed {
+            cause, uncertain, ..
+        } = &mut failure
+        {
+            **cause = IggyError::OperationUncertain(op);
+            *uncertain = chunk_length;
+        }
+        failure
+    }
+
+    fn blocked_send(op: u64, messages: Vec<IggyMessage>) -> IggyError {
+        let mut failure = failed_send(messages);
+        if let IggyError::ProducerSendFailed { cause, .. } = &mut failure {
+            **cause = IggyError::LaneBlocked(op);
+        }
+        failure
+    }
+
+    fn no_resolve(op: u64) -> Ready<Result<(), IggyError>> {
+        panic!("operation {op} must not be resolved");
+    }
+
+    fn markers(messages: &[IggyMessage]) -> Vec<u8> {
+        messages.iter().map(|message| message.payload[0]).collect()
+    }
+
+    #[test]
+    fn given_serialized_batch_when_callback_runs_should_forward_batch_id() {
+        let plugin_id = next_plugin_id();
+        let batch_id = 73;
+        let (sender, receiver) = flume::unbounded();
+        let (stop_sender, _stop_receiver) = mpsc::unbounded_channel();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender,
+                stop_sender,
+                error_counter: Counter::default(),
+            },
+        );
+        let messages = ProducedMessages {
+            schema: Schema::Raw,
+            messages: Vec::new(),
+            state: Some(ConnectorState(vec![1, 2, 3])),
+        };
+        let serialized = postcard::to_allocvec(&messages).expect("failed to serialize batch");
+
+        assert_eq!(
+            handle_produced_messages(plugin_id, batch_id, serialized.as_ptr(), serialized.len()),
+            0
+        );
+        let forwarded = receiver.recv().expect("batch was not forwarded");
+        assert_eq!(forwarded.id, batch_id);
+        assert_eq!(
+            forwarded
+                .messages
+                .state
+                .expect("state should be preserved")
+                .0,
+            vec![1, 2, 3]
+        );
+
+        cleanup_sender(plugin_id);
+    }
+
+    #[test]
+    fn given_source_stop_when_callback_runs_should_signal_forwarder() {
+        let plugin_id = next_plugin_id();
+        let (sender, receiver) = flume::unbounded();
+        let (stop_sender, mut stop_receiver) = mpsc::unbounded_channel();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender,
+                stop_sender,
+                error_counter: Counter::default(),
+            },
+        );
+
+        source_stopped(plugin_id, SourceStopReason::NackLimit as u8);
+        assert_eq!(stop_receiver.try_recv(), Ok(SourceStopReason::NackLimit));
+
+        cleanup_sender(plugin_id);
+        assert!(receiver.is_disconnected());
+    }
+
+    #[test]
+    fn given_registration_failure_should_stop_without_starting_handle() {
+        let plugin_id = next_plugin_id();
+        let (sender, _receiver) = flume::unbounded();
+        let (stop_sender, mut stop_receiver) = mpsc::unbounded_channel();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender,
+                stop_sender,
+                error_counter: Counter::default(),
+            },
+        );
+        HANDLE_CALLS.store(0, Ordering::SeqCst);
+
+        start_source_polling(
+            plugin_id,
+            reject_source_handle,
+            Some(reject_stop_registration),
+        );
+        assert_eq!(
+            stop_receiver.try_recv(),
+            Ok(SourceStopReason::RegistrationFailed)
+        );
+        assert_eq!(HANDLE_CALLS.load(Ordering::SeqCst), 0);
+        cleanup_sender(plugin_id);
+    }
+
+    #[test]
+    fn given_handle_failure_should_signal_stop_reason() {
+        let plugin_id = next_plugin_id();
+        let (sender, _receiver) = flume::unbounded();
+        let (stop_sender, mut stop_receiver) = mpsc::unbounded_channel();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender,
+                stop_sender,
+                error_counter: Counter::default(),
+            },
+        );
+
+        start_source_polling(
+            plugin_id,
+            reject_source_handle_untracked,
+            Some(accept_stop_registration),
+        );
+        assert_eq!(
+            stop_receiver.try_recv(),
+            Ok(SourceStopReason::HandlerFailed)
+        );
+        cleanup_sender(plugin_id);
+    }
+
+    #[test]
+    fn given_old_plugin_without_stop_export_should_still_start_handle() {
+        let plugin_id = next_plugin_id();
+        let (sender, _receiver) = flume::unbounded();
+        let (stop_sender, mut stop_receiver) = mpsc::unbounded_channel();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender,
+                stop_sender,
+                error_counter: Counter::default(),
+            },
+        );
+
+        start_source_polling(plugin_id, reject_source_handle_untracked, None);
+        assert_eq!(
+            stop_receiver.try_recv(),
+            Ok(SourceStopReason::HandlerFailed)
+        );
+        cleanup_sender(plugin_id);
+    }
+
+    #[tokio::test]
+    async fn given_stop_registration_failure_should_report_restart_required() {
+        assert_start_failure(
+            Some(reject_stop_registration),
+            SourceStopReason::RegistrationFailed,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn given_source_handle_failure_should_report_restart_required() {
+        assert_start_failure(
+            Some(accept_stop_registration),
+            SourceStopReason::HandlerFailed,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn given_queued_batch_and_existing_error_when_stopped_should_not_process_or_recount() {
+        let plugin_id = next_plugin_id();
+        let plugin_key = format!("source_{plugin_id}");
+        let directory = tempfile::tempdir().expect("test directory should exist");
+        let (context, state_storage, producer) =
+            test_source_runtime(plugin_id, &plugin_key, directory.path()).await;
+        let (sender, receiver) = flume::unbounded();
+        let queued = receiver.clone();
+        let (stop_sender, stop_receiver) = mpsc::unbounded_channel();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender: sender.clone(),
+                stop_sender: stop_sender.clone(),
+                error_counter: Counter::default(),
+            },
+        );
+        let labels = Arc::new(SourceLabels::new(&plugin_key));
+        let forwarding = tokio::spawn(source_forwarding_loop(
+            plugin_id,
+            plugin_key.clone(),
+            false,
+            false,
+            producer,
+            vec![],
+            state_storage,
+            receiver,
+            stop_receiver,
+            ignore_batch_result,
+            Arc::clone(&context),
+            Arc::clone(&labels),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while context.metrics.get_sources_running() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("forwarding loop should reach Running");
+        context
+            .sources
+            .set_error(&plugin_key, "prior send failure", Some(&context.metrics))
+            .await;
+        sender
+            .send(ProducedBatch {
+                id: 1,
+                messages: ProducedMessages {
+                    schema: Schema::Raw,
+                    messages: vec![],
+                    state: None,
+                },
+            })
+            .expect("batch should enter the queue");
+        stop_sender
+            .send(SourceStopReason::NackLimit)
+            .expect("stop should reach the forwarding loop");
+
+        tokio::time::timeout(Duration::from_secs(2), forwarding)
+            .await
+            .expect("forwarding loop should stop")
+            .expect("forwarding task should complete");
+        assert_eq!(queued.try_recv().expect("queued batch must remain").id, 1);
+        let source = context
+            .sources
+            .get(&plugin_key)
+            .await
+            .expect("source should remain registered");
+        let source = source.lock().await;
+        assert_eq!(source.info.status, ConnectorStatus::Error);
+        assert!(
+            source
+                .info
+                .last_error
+                .as_ref()
+                .expect("stop reason should replace the prior error")
+                .message
+                .contains("consecutive NACK limit reached")
+        );
+        assert_eq!(context.metrics.get_sources_running(), 0);
+        assert_eq!(context.metrics.error_counter(&labels.counter).get(), 0);
+        assert!(!SOURCE_SENDERS.contains_key(&plugin_id));
+    }
+
+    #[tokio::test]
+    async fn given_queued_batch_when_stop_channel_closes_should_deliver_result_before_stopping() {
+        DRAINED_BATCH_ID.store(0, Ordering::SeqCst);
+        DRAINED_BATCH_RESULT.store(u32::MAX, Ordering::SeqCst);
+        let plugin_id = next_plugin_id();
+        let plugin_key = format!("source_{plugin_id}");
+        let directory = tempfile::tempdir().expect("test directory should exist");
+        let (context, state_storage, producer) =
+            test_source_runtime(plugin_id, &plugin_key, directory.path()).await;
+        let (sender, receiver) = flume::unbounded();
+        let (stop_sender, stop_receiver) = mpsc::unbounded_channel();
+        sender
+            .send(ProducedBatch {
+                id: 41,
+                messages: ProducedMessages {
+                    schema: Schema::Raw,
+                    messages: vec![],
+                    state: None,
+                },
+            })
+            .expect("batch should enter the queue");
+        drop(sender);
+        drop(stop_sender);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            source_forwarding_loop(
+                plugin_id,
+                plugin_key.clone(),
+                false,
+                false,
+                producer,
+                vec![],
+                state_storage,
+                receiver,
+                stop_receiver,
+                record_drained_batch_result,
+                Arc::clone(&context),
+                Arc::new(SourceLabels::new(&plugin_key)),
+            ),
+        )
+        .await
+        .expect("forwarding loop should drain and stop");
+
+        assert_eq!(DRAINED_BATCH_ID.load(Ordering::SeqCst), 41);
+        assert_eq!(
+            DRAINED_BATCH_RESULT.load(Ordering::SeqCst),
+            u32::from(SourceBatchResult::Ack as u8)
+        );
+        let source = context
+            .sources
+            .get(&plugin_key)
+            .await
+            .expect("source should remain registered");
+        assert_eq!(source.lock().await.info.status, ConnectorStatus::Stopped);
+    }
+
+    #[test]
+    fn given_invalid_payload_when_callback_runs_should_reject_batch() {
+        let plugin_id = next_plugin_id();
+        let (sender, _receiver) = flume::unbounded();
+        let (stop_sender, _stop_receiver) = mpsc::unbounded_channel();
+        let error_counter = Counter::default();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender,
+                stop_sender,
+                error_counter: error_counter.clone(),
+            },
+        );
+        let invalid_payload = [0xff];
+
+        assert_eq!(
+            handle_produced_messages(
+                plugin_id,
+                1,
+                invalid_payload.as_ptr(),
+                invalid_payload.len(),
+            ),
+            -1
+        );
+        assert_eq!(error_counter.get(), 1);
+
+        cleanup_sender(plugin_id);
+    }
+
+    #[test]
+    fn given_missing_sender_when_callback_runs_should_reject_batch() {
+        let plugin_id = next_plugin_id();
+        let serialized = postcard::to_allocvec(&ProducedMessages {
+            schema: Schema::Raw,
+            messages: Vec::new(),
+            state: None,
+        })
+        .expect("failed to serialize batch");
+
+        assert_eq!(
+            handle_produced_messages(plugin_id, 1, serialized.as_ptr(), serialized.len()),
+            -1
+        );
+    }
+
+    #[test]
+    fn given_acknowledged_nonempty_batch_when_recovering_should_restore_source_status() {
+        assert!(should_recover_source(SourceBatchResult::Ack, 1));
+    }
+
+    #[test]
+    fn given_acknowledged_empty_batch_when_recovering_should_preserve_source_error() {
+        assert!(!should_recover_source(SourceBatchResult::Ack, 0));
+    }
+
+    #[test]
+    fn given_rejected_nonempty_batch_when_recovering_should_preserve_source_error() {
+        assert!(!should_recover_source(SourceBatchResult::Nack, 1));
+    }
+
+    #[test]
+    fn given_persisted_per_batch_topic_when_validating_source_destination_should_accept() {
+        let options = TopicRuntimeOptions {
+            durability: Durability::Persisted,
+            messages_required_to_save: Some(1),
+            ..TopicRuntimeOptions::default()
+        };
+
+        assert!(validate_source_topic_durability("stream", "topic", options).is_ok());
+    }
+
+    #[test]
+    fn given_replicated_topic_when_validating_source_destination_should_reject() {
+        let options = TopicRuntimeOptions {
+            durability: Durability::Replicated,
+            messages_required_to_save: Some(1),
+            ..TopicRuntimeOptions::default()
+        };
+
+        let error = validate_source_topic_durability("stream", "topic", options)
+            .expect_err("replicated topic must not receive checkpointed source data");
+
+        assert!(error.to_string().contains("durability=replicated"));
+    }
+
+    #[test]
+    fn given_persisted_buffered_topic_when_validating_source_destination_should_accept() {
+        let options = TopicRuntimeOptions {
+            durability: Durability::Persisted,
+            messages_required_to_save: Some(10),
+            ..TopicRuntimeOptions::default()
+        };
+
+        assert!(validate_source_topic_durability("stream", "topic", options).is_ok());
+    }
+
+    #[test]
+    fn given_partially_committed_send_should_retry_only_failed_tail() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let mut attempts = Vec::new();
+            let mut responses = VecDeque::from([
+                Err(failed_send(vec![test_message(2), test_message(3)])),
+                Ok(()),
+            ]);
+
+            let result = send_with_failed_tail_retries(
+                vec![test_message(1), test_message(2), test_message(3)],
+                31,
+                &IggyClient::default(),
+                |messages| {
+                    attempts.push(
+                        messages
+                            .iter()
+                            .map(|message| message.payload[0])
+                            .collect::<Vec<_>>(),
+                    );
+                    ready(responses.pop_front().expect("send response should exist"))
+                },
+                no_resolve,
+            )
+            .await;
+
+            assert!(result.is_ok());
+            assert_eq!(attempts, vec![vec![1, 2, 3], vec![2, 3]]);
+        });
+    }
+
+    #[test]
+    fn given_repeated_failed_tail_when_retries_are_exhausted_should_return_error() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let mut attempts = 0;
+            let mut responses = VecDeque::from(
+                (0..=MAX_FAILED_TAIL_RETRIES)
+                    .map(|_| Err::<(), _>(failed_send(vec![test_message(1)])))
+                    .collect::<Vec<_>>(),
+            );
+
+            let result = send_with_failed_tail_retries(
+                vec![test_message(1)],
+                37,
+                &IggyClient::default(),
+                |_| {
+                    attempts += 1;
+                    ready(responses.pop_front().expect("send response should exist"))
+                },
+                no_resolve,
+            )
+            .await;
+
+            assert!(matches!(result, Err(IggyError::ProducerSendFailed { .. })));
+            assert_eq!(attempts, MAX_FAILED_TAIL_RETRIES + 1);
+        });
+    }
+
+    #[test]
+    fn given_shared_failed_tail_when_retrying_should_return_original_error() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let failed = Arc::new(vec![test_message(2)]);
+            let retained = Arc::clone(&failed);
+            let mut response = Some(Err::<(), _>(IggyError::ProducerSendFailed {
+                cause: Box::new(IggyError::Error),
+                failed,
+                uncertain: 0,
+                committed: Arc::new(Vec::new()),
+                stream_name: "test-stream".into(),
+                topic_name: "test-topic".into(),
+            }));
+            let mut attempts = 0;
+
+            let result = send_with_failed_tail_retries(
+                vec![test_message(1), test_message(2)],
+                41,
+                &IggyClient::default(),
+                |_| {
+                    attempts += 1;
+                    ready(response.take().expect("send response should exist"))
+                },
+                no_resolve,
+            )
+            .await;
+
+            assert!(matches!(result, Err(IggyError::ProducerSendFailed { .. })));
+            assert_eq!(attempts, 1);
+            assert_eq!(retained.len(), 1);
+        });
+    }
+
+    #[test]
+    fn given_unsent_tail_when_reconnect_fails_should_preserve_the_original_failure() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            for failure_cause in [IggyError::NotConnected, IggyError::Disconnected] {
+                let client = IggyClient::default();
+                client.shutdown().await.expect("client should shut down");
+                let mut failure = failed_send(vec![test_message(2), test_message(3)]);
+                let IggyError::ProducerSendFailed { cause, .. } = &mut failure else {
+                    panic!("expected producer failure");
+                };
+                **cause = failure_cause.clone();
+                let mut responses = VecDeque::from([Err(failure), Ok(())]);
+                let mut attempts = 0;
+
+                let result = send_with_failed_tail_retries(
+                    vec![test_message(1), test_message(2), test_message(3)],
+                    43,
+                    &client,
+                    |_| {
+                        attempts += 1;
+                        ready(responses.pop_front().expect("send response should exist"))
+                    },
+                    no_resolve,
+                )
+                .await;
+
+                let Err(IggyError::ProducerSendFailed {
+                    cause,
+                    failed,
+                    committed,
+                    stream_name,
+                    topic_name,
+                    ..
+                }) = result
+                else {
+                    panic!("reconnect failure must preserve the producer failure");
+                };
+                assert_eq!(*cause, failure_cause);
+                assert_eq!(
+                    failed
+                        .iter()
+                        .map(|message| message.payload[0])
+                        .collect::<Vec<_>>(),
+                    [2, 3]
+                );
+                assert!(committed.is_empty());
+                assert_eq!(stream_name.as_ref(), "test-stream");
+                assert_eq!(topic_name.as_ref(), "test-topic");
+                assert_eq!(attempts, 1, "reconnect failure must not resubmit the tail");
+            }
+        });
+    }
+
+    #[test]
+    fn given_previous_source_blocker_when_resolved_should_send_the_entire_unsent_tail() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            for outcome in [
+                Ok(()),
+                Err(IggyError::StreamNameNotFound("previous-stream".to_string())),
+                Err(IggyError::OperationNotRetained(7)),
+            ] {
+                let resolved = Cell::new(false);
+                let mut attempts = Vec::new();
+                let result = send_with_failed_tail_retries(
+                    vec![test_message(1), test_message(2), test_message(3)],
+                    47,
+                    &IggyClient::default(),
+                    |messages| {
+                        attempts.push(markers(&messages));
+                        ready(if resolved.get() {
+                            Ok(())
+                        } else {
+                            Err(blocked_send(7, messages))
+                        })
+                    },
+                    |op| {
+                        assert_eq!(op, 7);
+                        resolved.set(true);
+                        ready(outcome.clone())
+                    },
+                )
+                .await;
+
+                assert_eq!(result, Ok(()), "earlier operation outcome: {outcome:?}");
+                assert_eq!(attempts, [vec![1, 2, 3], vec![1, 2, 3]]);
+            }
+        });
+    }
+
+    #[test]
+    fn given_previous_source_blocker_when_still_uncertain_should_not_send_the_unsent_tail() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let mut attempts = Vec::new();
+            let mut resolved = Vec::new();
+            let result = send_with_failed_tail_retries(
+                vec![test_message(1), test_message(2), test_message(3)],
+                47,
+                &IggyClient::default(),
+                |messages| {
+                    attempts.push(markers(&messages));
+                    ready(Err::<(), _>(blocked_send(7, messages)))
+                },
+                |op| {
+                    resolved.push(op);
+                    ready(Err(IggyError::OperationUncertain(op)))
+                },
+            )
+            .await;
+
+            assert_eq!(result, Err(IggyError::LaneBlocked(7)));
+            assert_eq!(attempts, [vec![1, 2, 3]]);
+            assert_eq!(resolved, [7]);
+        });
+    }
+
+    #[test]
+    fn given_uncertain_chunk_when_resolve_proves_it_should_resend_only_the_rest() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let failed = vec![
+                test_message(1),
+                test_message(2),
+                test_message(3),
+                test_message(4),
+            ];
+            let mut responses = VecDeque::from([Err(uncertain_send(7, 2, failed)), Ok(())]);
+            let mut attempts = Vec::new();
+            let mut resolved = Vec::new();
+
+            let result = send_with_failed_tail_retries(
+                vec![
+                    test_message(1),
+                    test_message(2),
+                    test_message(3),
+                    test_message(4),
+                ],
+                47,
+                &IggyClient::default(),
+                |messages| {
+                    attempts.push(markers(&messages));
+                    ready(responses.pop_front().expect("send response should exist"))
+                },
+                |op| {
+                    resolved.push(op);
+                    ready(Ok(()))
+                },
+            )
+            .await;
+
+            assert_eq!(result, Ok(()));
+            assert_eq!(attempts, [vec![1, 2, 3, 4], vec![3, 4]]);
+            assert_eq!(resolved, [7]);
+        });
+    }
+
+    #[test]
+    fn given_uncertain_chunk_when_resolve_fails_should_return_that_error_without_a_resend() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let failed = vec![test_message(1), test_message(2), test_message(3)];
+            let mut responses = VecDeque::from([Err(uncertain_send(7, 1, failed)), Ok(())]);
+            let mut attempts = Vec::new();
+
+            let result = send_with_failed_tail_retries(
+                vec![test_message(1), test_message(2), test_message(3)],
+                53,
+                &IggyClient::default(),
+                |messages| {
+                    attempts.push(markers(&messages));
+                    ready(responses.pop_front().expect("send response should exist"))
+                },
+                |op| ready(Err(IggyError::OperationNotRetained(op))),
+            )
+            .await;
+
+            assert_eq!(result, Err(IggyError::OperationNotRetained(7)));
+            assert_eq!(attempts, [vec![1, 2, 3]]);
+        });
+    }
+
+    #[test]
+    fn given_uncertain_last_chunk_when_resolve_proves_it_should_not_send_again() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let failed = vec![test_message(1), test_message(2), test_message(3)];
+            let mut responses = VecDeque::from([Err(uncertain_send(7, 3, failed)), Ok(())]);
+            let mut attempts = Vec::new();
+
+            let result = send_with_failed_tail_retries(
+                vec![test_message(1), test_message(2), test_message(3)],
+                59,
+                &IggyClient::default(),
+                |messages| {
+                    attempts.push(markers(&messages));
+                    ready(responses.pop_front().expect("send response should exist"))
+                },
+                |_| ready(Ok(())),
+            )
+            .await;
+
+            assert_eq!(result, Ok(()));
+            assert_eq!(attempts, [vec![1, 2, 3]]);
+        });
     }
 }

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -29,8 +30,19 @@ const CONSUMER_GROUP_NAME: &str = "consumer-group-rejoin-group";
 const CONSUMER_USERNAME: &str = "consumer-group-rejoin-user";
 const CONSUMER_PASSWORD: &str = "password123";
 const CONSUMER_REJOIN_TIMEOUT: Duration = Duration::from_secs(10);
+const PARTITIONS_COUNT: u32 = 2;
+const MESSAGES_PER_PARTITION: u32 = 5;
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
+// Pins a 60s server heartbeat because harness clients never ping on their own:
+// the SDK pinger is spawned by `IggyClient::connect`, which the harness builder
+// does not call. With heartbeat checks on, the server logs out a group member
+// that stays silent too long, and the failure surfaces as a short member count
+// instead of anything about the scenario under test.
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(heartbeat.enabled = true, heartbeat.interval = "60s")
+)]
 async fn consumer_group_retries_rejoin_after_failure(harness: &TestHarness) {
     let root_client = harness
         .root_client()
@@ -48,16 +60,19 @@ async fn consumer_group_retries_rejoin_after_failure(harness: &TestHarness) {
         streams: None,
     };
 
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &stream_id,
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -71,6 +86,7 @@ async fn consumer_group_retries_rejoin_after_failure(harness: &TestHarness) {
             CONSUMER_PASSWORD,
             UserStatus::Active,
             Some(consumer_permissions.clone()),
+            &UserCreateOptions::default(),
         )
         .await
         .unwrap();
@@ -84,8 +100,10 @@ async fn consumer_group_retries_rejoin_after_failure(harness: &TestHarness) {
     let mut consumer = consumer_client
         .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
-        .batch_length(1)
-        .auto_join_consumer_group()
+        .poll_options(PollOptions {
+            count: 1,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .build();
     consumer.init().await.unwrap();
 
@@ -139,7 +157,13 @@ async fn consumer_group_retries_rejoin_after_failure(harness: &TestHarness) {
         .await
         .expect("Consumer rejoin should fail before timeout")
         .expect("Consumer stream should remain open");
-    assert!(matches!(rejoin_result, Err(IggyError::Unauthorized)));
+    assert!(matches!(
+        rejoin_result,
+        Err(ReadError {
+            error: IggyError::Unauthorized,
+            ..
+        })
+    ));
 
     root_client
         .update_permissions(&user_id, Some(consumer_permissions))
@@ -160,4 +184,88 @@ async fn consumer_group_retries_rejoin_after_failure(harness: &TestHarness) {
         .expect("Consumer group should exist");
     assert_eq!(group.members_count, 1);
     assert_eq!(group.members.len(), 1);
+}
+
+// A group member reads all of its partitions. Under a strategy other than `next()` the
+// continuation must be kept per partition: one shared cursor would ask the second partition for
+// the offset reached in the first one and skip its beginning.
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(heartbeat.enabled = true, heartbeat.interval = "60s")
+)]
+async fn given_offset_strategy_when_member_polls_two_partitions_should_read_each_from_its_start(
+    harness: &TestHarness,
+) {
+    let root_client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+    let topic_id = Identifier::named(TOPIC_NAME).unwrap();
+
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    root_client
+        .create_topic(
+            &stream_id,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS_COUNT),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    for partition_id in 0..PARTITIONS_COUNT {
+        let mut messages: Vec<IggyMessage> = (0..MESSAGES_PER_PARTITION)
+            .map(|index| IggyMessage::from_str(&format!("{partition_id}-{index}")).unwrap())
+            .collect();
+        root_client
+            .send_messages(
+                &stream_id,
+                &topic_id,
+                &Partitioning::partition_id(partition_id),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut consumer = root_client
+        .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
+        .unwrap()
+        .polling_strategy(PollingStrategy::offset(0))
+        .poll_options(PollOptions {
+            count: MESSAGES_PER_PARTITION,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
+        .build();
+    consumer.init().await.unwrap();
+
+    let expected_total = (PARTITIONS_COUNT * MESSAGES_PER_PARTITION) as usize;
+    let mut offsets_by_partition: HashMap<u32, Vec<u64>> = HashMap::new();
+    for _ in 0..expected_total {
+        let received = timeout(READ_TIMEOUT, consumer.next())
+            .await
+            .expect("every partition must be read from its start before the timeout")
+            .expect("consumer stream should remain open")
+            .expect("polling must not fail");
+        offsets_by_partition
+            .entry(received.partition_id)
+            .or_default()
+            .push(received.message.header.offset);
+    }
+    consumer.shutdown().await.unwrap();
+
+    let expected_offsets: Vec<u64> = (0..u64::from(MESSAGES_PER_PARTITION)).collect();
+    for partition_id in 0..PARTITIONS_COUNT {
+        assert_eq!(
+            offsets_by_partition.get(&partition_id),
+            Some(&expected_offsets),
+            "partition {partition_id} must be read from offset 0 without gaps"
+        );
+    }
 }

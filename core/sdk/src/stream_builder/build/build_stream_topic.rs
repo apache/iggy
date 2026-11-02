@@ -17,8 +17,8 @@
  */
 
 use crate::prelude::{
-    CompressionAlgorithm, IdKind, Identifier, IggyClient, IggyError, IggyExpiry, MaxTopicSize,
-    StreamClient, TopicClient,
+    Identifier, IggyClient, IggyError, StreamClient, StreamCreateOptions, TopicClient,
+    TopicCreateOptions,
 };
 
 use crate::stream_builder::IggyConsumerConfig;
@@ -44,13 +44,14 @@ pub(crate) async fn build_iggy_stream_topic_if_not_exists(
     client: &IggyClient,
     config: &IggyConsumerConfig,
 ) -> Result<(), IggyError> {
-    let stream_id = config.stream_id();
     let stream_name = config.stream_name();
-    let topic_id = config.topic_id();
     let topic_name = config.topic_name();
 
+    let stream_id = Identifier::named(stream_name)?;
+    let topic_id = Identifier::named(topic_name)?;
+
     trace!("Check if stream exists.");
-    if client.get_stream(config.stream_id()).await?.is_none() {
+    if client.get_stream(&stream_id).await?.is_none() {
         trace!("Check if stream should be created.");
         if !config.create_stream_if_not_exists() {
             warn!(
@@ -60,17 +61,14 @@ pub(crate) async fn build_iggy_stream_topic_if_not_exists(
             return Ok(());
         }
 
-        let (name, _id) = extract_name_id_from_identifier(stream_id, stream_name)?;
-        trace!("Creating stream: {name}");
-        client.create_stream(&name).await?;
+        trace!("Creating stream: {stream_name}");
+        client
+            .create_stream(stream_name, &StreamCreateOptions::default())
+            .await?;
     }
 
     trace!("Check if topic exists.");
-    if client
-        .get_topic(config.stream_id(), config.topic_id())
-        .await?
-        .is_none()
-    {
+    if client.get_topic(&stream_id, &topic_id).await?.is_none() {
         trace!("Check if topic should be created.");
         if !config.create_topic_if_not_exists() {
             warn!(
@@ -80,36 +78,18 @@ pub(crate) async fn build_iggy_stream_topic_if_not_exists(
             return Ok(());
         }
 
-        let stream_id = config.stream_id();
-        let stream_name = config.stream_name();
-        let topic_partitions_count = config.partitions_count();
-        let topic_replication_factor = config.replication_factor();
-
-        let (name, _id) = extract_name_id_from_identifier(topic_id, topic_name)?;
-        trace!("Create topic: {name} for stream: {}", stream_name);
+        trace!("Create topic: {topic_name} for stream: {stream_name}");
         client
             .create_topic(
-                stream_id,
+                &stream_id,
                 topic_name,
-                topic_partitions_count,
-                CompressionAlgorithm::None,
-                topic_replication_factor,
-                IggyExpiry::ServerDefault,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(config.partitions_count()),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await?;
     }
 
     Ok(())
-}
-
-fn extract_name_id_from_identifier(
-    stream_id: &Identifier,
-    stream_name: &str,
-) -> Result<(String, Option<u32>), IggyError> {
-    let (name, id) = match stream_id.kind {
-        IdKind::Numeric => (stream_name.to_owned(), Some(stream_id.get_u32_value()?)),
-        IdKind::String => (stream_id.get_string_value()?, None),
-    };
-    Ok((name, id))
 }

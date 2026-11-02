@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 /** Identifier kind for numeric IDs */
 const NUMERIC = 1;
@@ -29,6 +28,10 @@ type STRING = typeof STRING;
  * Used to identify streams, topics, partitions, and other resources.
  */
 export type Id = number | string;
+
+/** Map key of an identifier that keeps numeric and named ids apart. */
+export const idKey = (id: Id): string =>
+  typeof id === 'number' ? `number:${id}` : `string:${id}`;
 
 /**
  * Serializes an identifier (numeric or string) to a Buffer for wire protocol.

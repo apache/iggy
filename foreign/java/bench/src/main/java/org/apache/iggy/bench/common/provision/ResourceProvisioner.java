@@ -25,14 +25,13 @@ import org.apache.iggy.bench.models.cli.PinnedProducerCliArgs;
 import org.apache.iggy.bench.models.common.provision.ProvisionedResources;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.identifier.StreamId;
-import org.apache.iggy.topic.CompressionAlgorithm;
+import org.apache.iggy.topic.TopicOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 
 public final class ResourceProvisioner {
 
@@ -83,12 +82,12 @@ public final class ResourceProvisioner {
                     client.topics()
                             .createTopic(
                                     StreamId.of(streamName),
+                                    topicNames.get(0),
                                     1L,
-                                    CompressionAlgorithm.None,
-                                    BigInteger.valueOf(pinnedProducerCliArgs.messageExpiry()),
-                                    BigInteger.valueOf(pinnedProducerCliArgs.maxTopicSize()),
-                                    Optional.empty(),
-                                    topicNames.get(0));
+                                    TopicOptions.builder()
+                                            .messageExpiry(BigInteger.valueOf(pinnedProducerCliArgs.messageExpiry()))
+                                            .maxTopicSize(BigInteger.valueOf(pinnedProducerCliArgs.maxTopicSize()))
+                                            .build());
                 }
             }
         } catch (RuntimeException exception) {

@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { translateCommandCode } from './command.code.js';
 import { translateErrorCode } from './error.code.js';
@@ -22,11 +21,14 @@ import { translateErrorCode } from './error.code.js';
 export class ResponseError extends Error {
   readonly commandCode: number;
   readonly errorCode: number;
+  fromServer = false;
+  committed = false;
 
-  constructor(commandCode: number, errorCode: number) {
+  constructor(commandCode: number, errorCode: number, detail?: string) {
     super(
       `command: { code: ${commandCode}, name: ${translateCommandCode(commandCode)} } ` +
-      `error: {code: ${errorCode}, message: ${translateErrorCode(errorCode)} }`
+      `error: {code: ${errorCode}, message: ${translateErrorCode(errorCode)} }` +
+      (detail ? ` ${detail}` : '')
     );
     this.name = 'ResponseError';
     this.commandCode = commandCode;
@@ -35,13 +37,29 @@ export class ResponseError extends Error {
   }
 }
 
-export const responseError = (cmdCode: number, errCode: number) =>
-  new ResponseError(cmdCode, errCode);
+export const responseError = (cmdCode: number, errCode: number, detail?: string) =>
+  new ResponseError(cmdCode, errCode, detail);
+
+export type DeserializeErrorOptions = {
+  cause?: unknown,
+  /** The offset of a record that does not decode, when its frame decoded and a later step failed. */
+  offset?: bigint,
+  /**
+   * The received bytes that do not decode: the frame of the record whose
+   * offset is known, otherwise the remaining bytes from where decoding stopped.
+   */
+  record?: Buffer
+};
 
 export class DeserializeError extends Error {
-  constructor(message: string, cause?: Record<string , unknown>) {
-    super(message, cause);
+  readonly offset?: bigint;
+  readonly record?: Buffer;
+
+  constructor(message: string, options?: DeserializeErrorOptions) {
+    super(message, options?.cause === undefined ? undefined : { cause: options.cause });
     this.name = "DeserializeError";
+    this.offset = options?.offset;
+    this.record = options?.record;
     Object.setPrototypeOf(this, DeserializeError.prototype);
   }
 }

@@ -16,10 +16,9 @@
 // under the License.
 
 //! Config vocabulary shared across the crate: the generic
-//! [`system::SystemConfig`], the HTTP section, and the top-level sections
+//! [`crate::server::ServerConfig`], the HTTP section, and the top-level sections
 //! that [`crate::server_config::server::ServerConfig`] composes.
 
-pub mod cache_indexes;
 pub mod defaults;
 pub mod displays;
 pub mod http;

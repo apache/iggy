@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text.Json.Serialization;
 using Apache.Iggy.Enums;
+using Apache.Iggy.Headers;
+using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Contracts.Auth;
 
@@ -48,4 +51,32 @@ public sealed class UserResponse
     ///     Optional user permissions.
     /// </summary>
     public Permissions? Permissions { get; init; }
+
+    /// <summary>
+    ///     Options the client set on the user.
+    /// </summary>
+    [JsonIgnore]
+    public Dictionary<HeaderKey, HeaderValue>? Options { get; init; }
+
+    /// <summary>
+    ///     Options the server filled for the user.
+    /// </summary>
+    [JsonIgnore]
+    public Dictionary<HeaderKey, HeaderValue>? DerivedOptions { get; init; }
+
+    /// <summary>
+    ///     REST renders both provenances into one object keyed by option name, so one JSON property
+    ///     fills <see cref="Options" /> and <see cref="DerivedOptions" />.
+    /// </summary>
+    [JsonInclude]
+    [JsonPropertyName("options")]
+    [JsonConverter(typeof(ResourceOptionsConverter))]
+    internal ResourceOptions RestOptions
+    {
+        init
+        {
+            Options = value.Explicit;
+            DerivedOptions = value.Derived;
+        }
+    }
 }

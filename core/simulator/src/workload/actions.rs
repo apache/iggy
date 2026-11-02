@@ -18,6 +18,8 @@
 //! Workload-emittable server commands. Variant order is part of the
 //! determinism contract; the first three positions lock the hash baseline.
 //! Append only; never reorder or insert.
+//!
+//! Removing a variant changes the op trace, so pinned seeds need a re-scan.
 
 use strum::{EnumCount, EnumIter};
 
@@ -27,14 +29,12 @@ pub enum Action {
     // DO NOT REORDER (hash baseline depends on these indices).
     CreateStream,
     SendMessages,
-    StoreConsumerOffset2,
+    StoreConsumerOffset,
     DeleteStream,
     UpdateStream,
-    PurgeStream,
     CreateTopic,
     UpdateTopic,
     DeleteTopic,
-    PurgeTopic,
     CreatePartitions,
     DeletePartitions,
     DeleteSegments,
@@ -47,9 +47,13 @@ pub enum Action {
     UpdatePermissions,
     CreatePersonalAccessToken,
     DeletePersonalAccessToken,
-    StoreConsumerOffset,
     DeleteConsumerOffset,
-    DeleteConsumerOffset2,
+    ReplaceFixtureTopic,
+    JoinFixtureGroup,
+    LeaveFixtureGroup,
+    StoreStaleOwnerOffset,
+    PollMessages,
+    CreateKeyedStream,
 }
 
 // Lock the discriminants of the first three variants. Inserting a new variant before
@@ -58,5 +62,5 @@ pub enum Action {
 const _: () = {
     assert!(Action::CreateStream as u8 == 0);
     assert!(Action::SendMessages as u8 == 1);
-    assert!(Action::StoreConsumerOffset2 as u8 == 2);
+    assert!(Action::StoreConsumerOffset as u8 == 2);
 };

@@ -21,11 +21,35 @@ package org.apache.iggy.client.blocking.tcp;
 
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.StreamClientBaseTest;
+import org.apache.iggy.identifier.StreamId;
+import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 class StreamTcpClientTest extends StreamClientBaseTest {
 
     @Override
     protected IggyBaseClient getClient() {
         return TcpClientFactory.create(serverHost(), serverTcpPort());
+    }
+
+    /*
+     * TCP only: the HTTP client does not percent-encode path segments yet, so
+     * a non-ASCII name cannot be looked up over HTTP.
+     */
+    @Test
+    void shouldCreateAndFetchStreamWithNonAsciiName() {
+        // given
+        var name = "strumień-世界";
+
+        // when
+        var streamDetails = client.streams().createStream(name);
+        trackStream(streamDetails.id());
+        var streamByName = client.streams().getStream(StreamId.of(name));
+
+        // then
+        assertThat(streamDetails.name()).isEqualTo(name);
+        assertThat(streamByName).isPresent();
+        assertThat(streamByName.get().id()).isEqualTo(streamDetails.id());
     }
 }

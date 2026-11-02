@@ -16,6 +16,7 @@
 // under the License.
 
 use clap::ValueEnum;
+use iggy::prelude::OptionKey;
 use iggy_cli::commands::binary_client::get_clients::GetClientsOutput;
 use iggy_cli::commands::binary_cluster::get_cluster_metadata::GetClusterMetadataOutput;
 use iggy_cli::commands::binary_consumer_groups::get_consumer_groups::GetConsumerGroupsOutput;
@@ -25,6 +26,7 @@ use iggy_cli::commands::binary_streams::get_streams::GetStreamsOutput;
 use iggy_cli::commands::binary_system::stats::GetStatsOutput;
 use iggy_cli::commands::binary_topics::get_topics::GetTopicsOutput;
 use iggy_cli::commands::binary_users::get_users::GetUsersOutput;
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum ListMode {
@@ -121,4 +123,52 @@ impl From<ListModeExt> for GetStatsOutput {
             ListModeExt::Toml => GetStatsOutput::Toml,
         }
     }
+}
+
+/// Longest an option key or value may be, matching the header-field codec the
+/// options block rides. Enforced here so `--set` reports the offending pair
+/// with clap's own error rather than failing at encode time.
+const MAX_OPTION_FIELD_LEN: usize = 255;
+
+/// Parse a repeatable `--set KEY=VALUE` pair.
+///
+/// Shared by every resource's option args: divergent copies disagreed on
+/// whether an empty value was legal, which decided whether a pair reached the
+/// encoder at all.
+pub(crate) fn parse_key_value(raw: &str) -> Result<(String, String), String> {
+    let (key, value) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("expected KEY=VALUE, got: {raw}"))?;
+    for (label, field) in [("key", key), ("value", value)] {
+        if field.is_empty() {
+            return Err(format!(
+                "expected non-empty {label} in KEY=VALUE, got: {raw}"
+            ));
+        }
+        if field.len() > MAX_OPTION_FIELD_LEN {
+            return Err(format!(
+                "option {label} is {} bytes, maximum {MAX_OPTION_FIELD_LEN}",
+                field.len()
+            ));
+        }
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+/// Split repeated `--reset` names into keys this build checks before sending
+/// and newer keys the server decides on.
+pub(crate) fn split_reset(names: &[String]) -> (BTreeSet<OptionKey>, BTreeSet<String>) {
+    let mut known = BTreeSet::new();
+    let mut newer = BTreeSet::new();
+    for name in names {
+        match name.parse::<OptionKey>() {
+            Ok(key) => {
+                known.insert(key);
+            }
+            Err(_) => {
+                newer.insert(name.clone());
+            }
+        }
+    }
+    (known, newer)
 }

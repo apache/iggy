@@ -23,7 +23,7 @@ namespace Apache.Iggy.Tests.Utils.Topics;
 internal static class TopicFactory
 {
     internal static (uint topicId, uint partitionsCount, string topicName, uint messageExpriy, ulong sizeBytes, ulong
-        messagesCount, ulong createdAt, byte replicationFactor, ulong maxTopicSize)
+        messagesCount, ulong createdAt, ulong maxTopicSize)
         CreateTopicResponseFields()
     {
         var topicId = (uint)Random.Shared.Next(1, 69);
@@ -34,8 +34,7 @@ internal static class TopicFactory
         var messagesCount = (ulong)Random.Shared.Next(69, 42069);
         var createdAt = (ulong)Random.Shared.Next(69, 42069);
         var maxTopicSize = (ulong)Random.Shared.NextInt64(2_000_000_000, 10_000_000_000);
-        var replicationFactor = (byte)Random.Shared.Next(1, 8);
         return (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt,
-            replicationFactor, maxTopicSize);
+            maxTopicSize);
     }
 }

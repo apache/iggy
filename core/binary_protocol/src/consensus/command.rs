@@ -21,7 +21,7 @@ use enumset::EnumSetType;
 /// VSR message type discriminant.
 #[derive(Default, Debug, EnumSetType)]
 #[repr(u8)]
-pub enum Command2 {
+pub enum Command {
     #[default]
     Reserved = 0,
 
@@ -70,17 +70,45 @@ pub enum Command2 {
     StateTransferTarget = 23,
     RequestStateChunk = 24,
     StateChunk = 25,
+
+    // Register forwarding: a client that dialed a backup authenticates
+    // there, and only the consensus proposal travels to the primary. The
+    // backup forwards the verified identity and parks the login on the
+    // matching `ForwardRegisterResult`.
+    ForwardRegister = 26,
+    ForwardRegisterResult = 27,
+
+    // Logout forwarding: a session bound on a backup asks the primary to
+    // commit its replicated teardown, then the backup answers the client on
+    // the connection it owns.
+    ForwardLogout = 28,
+    ForwardLogoutResult = 29,
+
+    // Backups report transport-bound sessions to the metadata primary. No reply.
+    ConsumerSessionHeartbeat = 30,
+    SessionRetirementProgress = 31,
+
+    // A backup relays a partition completion to the metadata primary, which
+    // may hold no replica of that partition. No reply: the commit replicates
+    // back.
+    ForwardCompletion = 32,
+
+    // Fresh metadata and partition readiness for primary rebalancing.
+    PrimaryRebalance = 33,
+    SegmentDelete = 34,
+    CommitReply = 35,
+    PrepareProgress = 36,
 }
 
-// SAFETY: Command2 is #[repr(u8)] with no padding bytes.
-unsafe impl NoUninit for Command2 {}
+// SAFETY: Command is #[repr(u8)] with no padding bytes.
+unsafe impl NoUninit for Command {}
 
-// SAFETY: Command2 is #[repr(u8)]; is_valid_bit_pattern matches all defined discriminants.
-unsafe impl CheckedBitPattern for Command2 {
+// SAFETY: Command is #[repr(u8)]; is_valid_bit_pattern matches all defined discriminants.
+unsafe impl CheckedBitPattern for Command {
     type Bits = u8;
 
     fn is_valid_bit_pattern(bits: &u8) -> bool {
-        *bits <= Self::StateChunk as u8
+        *bits <= Self::PrepareProgress as u8
     }
 }
 
@@ -101,8 +129,7 @@ mod tests {
 
     #[test]
     fn replica_auth_commands_are_valid_bit_patterns() {
-        // Locks the is_valid_bit_pattern bump: 14..=25 parse, 26 still rejects.
-        for command in 14u8..=25 {
+        for command in 14u8..=36 {
             let mut buf: AVec<u8, ConstAlign<16>> = AVec::new(16);
             buf.resize(256, 0);
             buf[60] = command;
@@ -110,7 +137,7 @@ mod tests {
         }
         let mut buf: AVec<u8, ConstAlign<16>> = AVec::new(16);
         buf.resize(256, 0);
-        buf[60] = 26;
+        buf[60] = 37;
         assert!(bytemuck::checked::try_from_bytes::<GenericHeader>(&buf).is_err());
     }
 }

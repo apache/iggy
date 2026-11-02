@@ -15,20 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ConnectionStringOptions, IggyDuration, IggyError, TcpClientReconnectionConfig};
+use crate::{
+    ConnectionStringOptions, IggyDuration, IggyError, NonZeroIggyDuration, PendingOperationsConfig,
+    TcpClientReconnectionConfig,
+};
 use std::str::FromStr;
 
 #[derive(Debug)]
 pub struct TcpConnectionStringOptions {
+    pending_operations: PendingOperationsConfig,
     tls_enabled: bool,
     tls_domain: String,
     tls_ca_file: Option<String>,
     reconnection: TcpClientReconnectionConfig,
-    heartbeat_interval: IggyDuration,
+    heartbeat_interval: NonZeroIggyDuration,
     nodelay: bool,
 }
 
 impl TcpConnectionStringOptions {
+    pub fn pending_operations(&self) -> PendingOperationsConfig {
+        self.pending_operations
+    }
+
     pub fn tls_enabled(&self) -> bool {
         self.tls_enabled
     }
@@ -55,12 +63,13 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
         self.reconnection.max_retries
     }
 
-    fn heartbeat_interval(&self) -> IggyDuration {
+    fn heartbeat_interval(&self) -> NonZeroIggyDuration {
         self.heartbeat_interval
     }
 
     fn parse_options(options: &str) -> Result<TcpConnectionStringOptions, IggyError> {
         let options = options.split('&').collect::<Vec<&str>>();
+        let mut pending_operations = PendingOperationsConfig::default();
         let mut tls_enabled = false;
         let mut tls_domain = "".to_string();
         let mut tls_ca_file = None;
@@ -76,6 +85,16 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
                 return Err(IggyError::InvalidConnectionString);
             }
             match option_parts[0] {
+                "max_pending_operations" => {
+                    pending_operations.max_operations = option_parts[1]
+                        .parse()
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
+                }
+                "max_pending_operation_bytes" => {
+                    pending_operations.max_bytes = option_parts[1]
+                        .parse()
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
+                }
                 "tls" => {
                     tls_enabled = option_parts[1] == "true";
                 }
@@ -116,16 +135,16 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
                         .map_err(|_| IggyError::InvalidNumberValue)?,
                 ),
             },
-            interval: IggyDuration::from_str(reconnection_interval.as_str())
+            interval: NonZeroIggyDuration::from_str(reconnection_interval.as_str())
                 .map_err(|_| IggyError::InvalidConnectionString)?,
             reestablish_after: IggyDuration::from_str(reestablish_after.as_str())
                 .map_err(|_| IggyError::InvalidConnectionString)?,
         };
 
-        let heartbeat_interval = IggyDuration::from_str(heartbeat_interval.as_str())
+        let heartbeat_interval = NonZeroIggyDuration::from_str(heartbeat_interval.as_str())
             .map_err(|_| IggyError::InvalidConnectionString)?;
 
-        let connection_string_options = TcpConnectionStringOptions::new(
+        let mut connection_string_options = TcpConnectionStringOptions::new(
             tls_enabled,
             tls_domain,
             tls_ca_file,
@@ -134,6 +153,7 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
             nodelay,
         );
 
+        connection_string_options.pending_operations = pending_operations;
         Ok(connection_string_options)
     }
 }
@@ -144,10 +164,11 @@ impl TcpConnectionStringOptions {
         tls_domain: String,
         tls_ca_file: Option<String>,
         reconnection: TcpClientReconnectionConfig,
-        heartbeat_interval: IggyDuration,
+        heartbeat_interval: NonZeroIggyDuration,
         nodelay: bool,
     ) -> Self {
         Self {
+            pending_operations: PendingOperationsConfig::default(),
             tls_enabled,
             tls_domain,
             tls_ca_file,
@@ -161,11 +182,12 @@ impl TcpConnectionStringOptions {
 impl Default for TcpConnectionStringOptions {
     fn default() -> Self {
         TcpConnectionStringOptions {
+            pending_operations: PendingOperationsConfig::default(),
             tls_enabled: false,
             tls_domain: "".to_string(),
             tls_ca_file: None,
             reconnection: Default::default(),
-            heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
+            heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
             nodelay: false,
         }
     }

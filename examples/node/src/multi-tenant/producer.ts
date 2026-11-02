@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { Client, Partitioning } from 'apache-iggy';
 import { BATCHES_LIMIT, log, MESSAGES_PER_BATCH } from '../utils';
@@ -74,7 +73,6 @@ async function setupTenants(
         name: topicName,
         partitionCount: 2,
         compressionAlgorithm: 1, // None
-        replicationFactor: 1,
       });
 
       log('Topic created for tenant %d with ID: %d', tenantId, topic.id);

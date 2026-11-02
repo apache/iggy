@@ -41,26 +41,37 @@ simulator = []
 ahash = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
+compio = { workspace = true }
 consensus = { workspace = true }
+futures = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 journal = { workspace = true }
 left-right = { workspace = true }
 message_bus = { workspace = true }
 paste = { workspace = true }
+rmp = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 server_common = { workspace = true }
-slab = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }
-compio = { workspace = true }
-futures = { workspace = true }
 tempfile = { workspace = true }
+
+# Seeds root the way the simulator does, so it needs that feature.
+[[bench]]
+name = "change_log"
+harness = false
+required-features = ["simulator"]
 
 [lints.clippy]
 enum_glob_use = "deny"
-pedantic = "deny"
+pedantic = { level = "deny", priority = -1 }
 nursery = "warn"
+# Sync impls of async traits are deliberate (non-blocking bus, in-memory storage, test doubles).
+unused_async_trait_impl = "allow"
+
+[lints.rust]
+warnings = "deny"

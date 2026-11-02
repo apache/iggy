@@ -22,3 +22,11 @@ type ConsumerOffsetInfo struct {
 	CurrentOffset uint64 `json:"currentOffset"`
 	StoredOffset  uint64 `json:"storedOffset"`
 }
+
+// ConsumerPosition is a checkpoint that keeps the partition context of the
+// poll that delivered its messages, PolledMessage.Context.
+type ConsumerPosition struct {
+	PartitionId uint32           `json:"partitionId"`
+	Offset      uint64           `json:"offset"`
+	Context     PartitionContext `json:"context"`
+}

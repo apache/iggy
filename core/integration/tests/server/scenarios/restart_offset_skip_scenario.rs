@@ -57,16 +57,23 @@ pub async fn run(harness: &mut TestHarness) {
 
     // Step 1-2: Create stream/topic, send pre-restart messages
     let setup_client = harness.tcp_root_client().await.unwrap();
-    setup_client.create_stream(STREAM_NAME).await.unwrap();
+    setup_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     setup_client
         .create_topic(
             &stream_id,
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            // High flush threshold so post-restart messages accumulate in the
+            // journal (which is what exposed the base_offset=0 bug).
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                messages_required_to_save: Some(10_000),
+                durability: iggy_common::Durability::Replicated,
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -95,9 +102,8 @@ pub async fn run(harness: &mut TestHarness) {
         .await
         .unwrap();
 
-    // No flush primitive exists (FLUSH_UNSAVED_BUFFER denies typed); graceful
-    // shutdown flushes the committed journal, which this scenario's restart
-    // exercises instead.
+    // No flush primitive exists; graceful shutdown flushes the committed
+    // journal, which this scenario's restart exercises instead.
     tokio::time::sleep(Duration::from_secs(2)).await;
     drop(setup_client);
 
@@ -172,11 +178,14 @@ pub async fn run(harness: &mut TestHarness) {
                 .poll_messages(
                     &stream,
                     &topic,
-                    Some(0),
+                    0,
                     &consumer,
                     &PollingStrategy::next(),
-                    CONSUMER_BATCH_SIZE,
-                    true, // auto_commit
+                    PollOptions {
+                        count: CONSUMER_BATCH_SIZE,
+                        commit: CommitPolicy::OnRead,
+                        ..PollOptions::default()
+                    },
                 )
                 .await;
 

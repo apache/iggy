@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -41,6 +40,29 @@ describe('e2e -> raw', async () => {
       Buffer.alloc(0)
     );
     assert.ok(response.length > 0);
+  });
+
+  it('e2e -> raw::getStatsFromTheServerReplica', async () => {
+    const response = await c.sendBinaryRequestToReplica(
+      COMMAND_CODE.GetStats,
+      Buffer.alloc(0),
+      0
+    );
+    assert.ok(response.length > 0);
+  });
+
+  it('e2e -> raw::unknownReplicaRejected', async () => {
+    await assert.rejects(
+      () => c.sendBinaryRequestToReplica(COMMAND_CODE.GetStats, Buffer.alloc(0), 9),
+      /code: 6, message: Invalid identifier/
+    );
+  });
+
+  it('e2e -> raw::replicatedCommandToAReplicaRejectedClientSide', async () => {
+    await assert.rejects(
+      () => c.sendBinaryRequestToReplica(COMMAND_CODE.CreateStream, Buffer.alloc(0), 0),
+      /code: 3/
+    );
   });
 
   it('e2e -> raw::sessionControlCodeRejectedClientSide', async () => {

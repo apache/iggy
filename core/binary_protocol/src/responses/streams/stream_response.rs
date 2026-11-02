@@ -18,14 +18,22 @@
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le};
 use crate::primitives::identifier::WireName;
+use crate::primitives::options::{
+    WireOptions, decode_options_prefixed, encode_options_prefixed, options_prefixed_size,
+};
 use bytes::{BufMut, BytesMut};
 
 /// Stream header on the wire. Used in both single-stream and multi-stream responses.
 ///
-/// Wire format (33 + `name_len` bytes):
+/// Wire format (33 + `name_len` + options bytes):
 /// ```text
 /// [id:4][created_at:8][topics_count:4][size_bytes:8][messages_count:8][name_len:1][name:N]
+/// [explicit_options_len:4][explicit options TLV]
+/// [derived_options_len:4][derived options TLV]
 /// ```
+///
+/// `options` are the keys the client set, `derived_options` the values the
+/// server filled or computes, such as the encryption key source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamResponse {
     pub id: u32,
@@ -34,6 +42,8 @@ pub struct StreamResponse {
     pub size_bytes: u64,
     pub messages_count: u64,
     pub name: WireName,
+    pub options: WireOptions,
+    pub derived_options: WireOptions,
 }
 
 impl StreamResponse {
@@ -42,7 +52,10 @@ impl StreamResponse {
 
 impl WireEncode for StreamResponse {
     fn encoded_size(&self) -> usize {
-        Self::FIXED_SIZE + self.name.len()
+        Self::FIXED_SIZE
+            + self.name.len()
+            + options_prefixed_size(&self.options)
+            + options_prefixed_size(&self.derived_options)
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -52,6 +65,8 @@ impl WireEncode for StreamResponse {
         buf.put_u64_le(self.size_bytes);
         buf.put_u64_le(self.messages_count);
         self.name.encode(buf);
+        encode_options_prefixed(&self.options, buf);
+        encode_options_prefixed(&self.derived_options, buf);
     }
 }
 
@@ -63,7 +78,11 @@ impl WireDecode for StreamResponse {
         let size_bytes = read_u64_le(buf, 16)?;
         let messages_count = read_u64_le(buf, 24)?;
         let (name, name_consumed) = WireName::decode(&buf[32..])?;
-        let consumed = 32 + name_consumed;
+        let mut consumed = 32 + name_consumed;
+        let (options, options_consumed) = decode_options_prefixed(buf, consumed)?;
+        consumed += options_consumed;
+        let (derived_options, derived_consumed) = decode_options_prefixed(buf, consumed)?;
+        consumed += derived_consumed;
 
         Ok((
             Self {
@@ -73,6 +92,8 @@ impl WireDecode for StreamResponse {
                 size_bytes,
                 messages_count,
                 name,
+                options,
+                derived_options,
             },
             consumed,
         ))
@@ -91,6 +112,8 @@ mod tests {
             size_bytes: 1024,
             messages_count: 100,
             name: WireName::new("test-stream").unwrap(),
+            options: WireOptions::empty(),
+            derived_options: WireOptions::empty(),
         }
     }
 
@@ -98,7 +121,7 @@ mod tests {
     fn roundtrip() {
         let resp = sample();
         let bytes = resp.to_bytes();
-        assert_eq!(bytes.len(), StreamResponse::FIXED_SIZE + 11);
+        assert_eq!(bytes.len(), StreamResponse::FIXED_SIZE + 11 + 4 + 4);
         let (decoded, consumed) = StreamResponse::decode(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, resp);

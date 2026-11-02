@@ -75,12 +75,12 @@ internal static class Extensions
     {
         bytes[startPos] = streamId.Kind.GetByte();
         bytes[startPos + 1] = (byte)streamId.Length;
-        streamId.Value.CopyTo(bytes[(startPos + 2)..(startPos + 2 + streamId.Length)]);
+        streamId.Bytes.CopyTo(bytes[(startPos + 2)..(startPos + 2 + streamId.Length)]);
 
         var position = startPos + 2 + streamId.Length;
         bytes[position] = topicId.Kind.GetByte();
         bytes[position + 1] = (byte)topicId.Length;
-        topicId.Value.CopyTo(bytes[(position + 2)..(position + 2 + topicId.Length)]);
+        topicId.Bytes.CopyTo(bytes[(position + 2)..(position + 2 + topicId.Length)]);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -88,7 +88,7 @@ internal static class Extensions
     {
         bytes[startPos + 0] = identifier.Kind.GetByte();
         bytes[startPos + 1] = (byte)identifier.Length;
-        identifier.Value.CopyTo(bytes[(startPos + 2)..]);
+        identifier.Bytes.CopyTo(bytes[(startPos + 2)..]);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -96,7 +96,7 @@ internal static class Extensions
     {
         bytes[startPos + 0] = identifier.Kind.GetByte();
         bytes[startPos + 1] = (byte)identifier.Length;
-        identifier.Value.CopyTo(bytes[(startPos + 2)..]);
+        identifier.Bytes.CopyTo(bytes[(startPos + 2)..]);
     }
 }
 
@@ -104,11 +104,11 @@ internal static class DateTimeOffsetUtils
 {
     internal static DateTimeOffset FromUnixTimeMicroSeconds(ulong microSeconds)
     {
-        return DateTimeOffset.FromUnixTimeMilliseconds((long)(microSeconds / 1000));
+        return DateTimeOffset.UnixEpoch.AddTicks((long)microSeconds * TimeSpan.TicksPerMicrosecond);
     }
 
     internal static ulong ToUnixTimeMicroSeconds(DateTimeOffset date)
     {
-        return (ulong)(date.ToUnixTimeMilliseconds() * 1000);
+        return (ulong)((date - DateTimeOffset.UnixEpoch).Ticks / TimeSpan.TicksPerMicrosecond);
     }
 }

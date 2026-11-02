@@ -16,23 +16,19 @@
 // under the License.
 
 use super::{MAX_NAME_LENGTH, MAX_PARTITIONS_COUNT};
-use crate::CompressionAlgorithm;
 use crate::Identifier;
+use crate::OptionInputMap;
 use crate::Validatable;
 use crate::error::IggyError;
-use crate::utils::expiry::IggyExpiry;
-use crate::utils::topic_size::MaxTopicSize;
 use serde::{Deserialize, Serialize};
 
 /// `CreateTopic` command is used to create a new topic in a stream.
 /// It has additional payload:
 /// - `stream_id` - unique stream ID (numeric or name).
 /// - `partitions_count` - number of partitions in the topic, max value is 1000.
-/// - `message_expiry` - message expiry, if `NeverExpire` then messages will never expire.
-/// - `max_topic_size` - maximum size of the topic, if `Unlimited` then topic size is unlimited.
-///   Can't be lower than segment size in the config.
-/// - `replication_factor` - replication factor for the topic.
 /// - `name` - unique topic name, max length is 255 characters.
+/// - `options` - topic options keyed by option name, including
+///   `compression_algorithm`, `message_expiry` and `max_topic_size`.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct CreateTopic {
     /// Unique stream ID (numeric or name).
@@ -40,17 +36,13 @@ pub struct CreateTopic {
     pub stream_id: Identifier,
     /// Number of partitions in the topic, max value is 1000.
     pub partitions_count: u32,
-    /// Compression algorithm for the topic.
-    pub compression_algorithm: CompressionAlgorithm,
-    /// Message expiry, if `NeverExpire` then messages will never expire.
-    pub message_expiry: IggyExpiry,
-    /// Max topic size, if `Unlimited` then topic size is unlimited.
-    /// Can't be lower than segment size in the config.
-    pub max_topic_size: MaxTopicSize,
-    /// Replication factor for the topic.
-    pub replication_factor: Option<u8>,
     /// Unique topic name, max length is 255 characters.
     pub name: String,
+    /// Topic options keyed by option name: a JSON string in the config-file
+    /// form (`"7 days"`, `"1 GiB"`), a JSON integer, or a boolean. Unknown keys
+    /// are rejected.
+    #[serde(default, skip_serializing_if = "OptionInputMap::is_empty")]
+    pub options: OptionInputMap,
 }
 
 impl Default for CreateTopic {
@@ -58,11 +50,8 @@ impl Default for CreateTopic {
         CreateTopic {
             stream_id: Identifier::default(),
             partitions_count: 1,
-            compression_algorithm: CompressionAlgorithm::None,
-            message_expiry: IggyExpiry::NeverExpire,
-            max_topic_size: MaxTopicSize::ServerDefault,
-            replication_factor: None,
             name: "topic".to_string(),
+            options: OptionInputMap::default(),
         }
     }
 }
@@ -75,12 +64,6 @@ impl Validatable<IggyError> for CreateTopic {
 
         if !(0..=MAX_PARTITIONS_COUNT).contains(&self.partitions_count) {
             return Err(IggyError::TooManyPartitions);
-        }
-
-        if let Some(replication_factor) = self.replication_factor
-            && replication_factor == 0
-        {
-            return Err(IggyError::InvalidReplicationFactor);
         }
 
         Ok(())

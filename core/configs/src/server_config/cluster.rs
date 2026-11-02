@@ -50,6 +50,10 @@ const MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO: u32 = 4;
 /// than escalating a progressing view change into a fresh cluster-wide election.
 const MIN_STATUS_TO_RETRANSMIT_RATIO: u32 = 4;
 
+/// Floor for a nonzero `superblock_wedged_fatal_timeout`: a shorter window
+/// would fail-stop the process on a transient disk hiccup instead of a wedge.
+const MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Default recovering-replica probe-attempt ceiling. Duplicated here rather
 /// than imported so `core/configs` keeps off a build-time edge onto
 /// `core/consensus` (mirroring [`super::partition`]); `core/server`'s
@@ -67,6 +71,12 @@ const MAX_VIEW_PROBE_ATTEMPTS: u32 = 100;
 /// [`DEFAULT_VIEW_PROBE_ATTEMPTS_MAX`]); `core/server`'s bootstrap
 /// static-asserts it equal to `shard::REPAIR_CHUNK_MAX`.
 pub const DEFAULT_REPAIR_CHUNK_MAX: usize = 128;
+
+/// Maximum number of replicas supported by the VSR implementation.
+///
+/// Duplicated here so `core/configs` does not depend on `core/consensus`;
+/// `core/server` pins the values together at compile time.
+pub const MAX_CLUSTER_REPLICAS: usize = 32;
 
 /// `size_of::<StateChunkHeader>()`. Duplicated here for the same reason as
 /// [`DEFAULT_REPAIR_CHUNK_MAX`]; `core/server`'s bootstrap static-asserts it
@@ -168,8 +178,36 @@ fn default_repair_retry_interval() -> IggyDuration {
 
 /// serde fallback for configs written before the field existed; the value
 /// itself lives in `core/server/config.toml` like every other default.
+fn default_replication_factor() -> ReplicationFactorDefault {
+    SERVER_CONFIG
+        .cluster
+        .default_replication_factor
+        .parse()
+        .unwrap()
+}
+
+fn default_repair_gap_debounce_interval() -> IggyDuration {
+    SERVER_CONFIG
+        .cluster
+        .repair_gap_debounce_interval
+        .parse()
+        .unwrap()
+}
+
+/// serde fallback for configs written before the field existed; the value
+/// itself lives in `core/server/config.toml` like every other default.
 fn default_repair_chunk_max() -> usize {
     SERVER_CONFIG.cluster.repair_chunk_max as usize
+}
+
+/// serde fallback for configs written before the field existed; the value
+/// itself lives in `core/server/config.toml` like every other default.
+fn default_superblock_wedged_fatal_timeout() -> IggyDuration {
+    SERVER_CONFIG
+        .cluster
+        .superblock_wedged_fatal_timeout
+        .parse()
+        .unwrap()
 }
 
 #[serde_as]
@@ -178,12 +216,13 @@ fn default_repair_chunk_max() -> usize {
 pub struct ClusterConfig {
     pub enabled: bool,
     pub name: String,
-    /// Backup-side liveness window for a plane's primary. A replica that
-    /// sees no primary traffic for this long starts a view change
-    /// (`normal_heartbeat_timeout`). Raise it on oversubscribed hosts where
+    /// Liveness window for the primary and its replication quorum. Backups
+    /// vote after primary silence; a primary without heartbeat replies from
+    /// a quorum relinquishes leadership. Raise it on oversubscribed hosts where
     /// scheduling stalls fake primary death; sub-`MIN_CLUSTER_HEARTBEAT_TIMEOUT`
     /// values (including the `0` / `disabled` / `unlimited` sentinels, which
-    /// all parse to zero) are rejected at boot.
+    /// all parse to zero) are rejected at boot. On Linux it is also the
+    /// `TCP_USER_TIMEOUT` of every replica link.
     #[serde(default = "default_heartbeat_timeout")]
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
@@ -250,11 +289,31 @@ pub struct ClusterConfig {
     /// partition repair loops. Sizes the retry threshold in consensus ticks.
     /// Zero (and the `0` / `disabled` / `unlimited` sentinels, which all parse
     /// to zero) is rejected at boot.
+    ///
+    /// Paces streams that are already open only. How long a hole waits before a
+    /// stream is opened for it is `repair_gap_debounce_interval`.
     #[serde(default = "default_repair_retry_interval")]
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
     pub repair_retry_interval: IggyDuration,
-    /// Prepares a peer serves per repair round before the requester walks to
+    /// How long a backup must hold committed ops it cannot walk to before the
+    /// shard tick OPENS a repair session for it. Paces both planes' detectors:
+    /// the partition sweep in `tick_partitions` and the metadata one in
+    /// `tick_metadata`.
+    ///
+    /// Separate from `repair_retry_interval`, which paces an already-open
+    /// stream: this one decides how long a replication hole stays open, so
+    /// raising the retry interval to quiet repair chatter must not widen it.
+    /// Floored at `REPAIR_GAP_DEBOUNCE_TICKS_MIN` consensus ticks, since one
+    /// tick of lag is ordinary pipelining and repair against it would fire on
+    /// healthy traffic; the shard crate owns the floor and `config.toml` states
+    /// its value. Zero (and the `0` / `disabled` / `unlimited` sentinels, which
+    /// all parse to zero) is rejected at boot.
+    #[serde(default = "default_repair_gap_debounce_interval")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub repair_gap_debounce_interval: IggyDuration,
+    /// Prepares a peer serves per repair round before the requester asks for
     /// the next chunk. Each frame rides the per-peer message-bus queue, so this
     /// must stay below `message_bus.peer_queue_capacity` or a full round
     /// overruns the queue and silently drops frames (enforced at the top
@@ -262,6 +321,29 @@ pub struct ClusterConfig {
     /// be > 0 and <= `MAX_REPAIR_CHUNK_MAX`.
     #[serde(default = "default_repair_chunk_max")]
     pub repair_chunk_max: usize,
+    /// How long a superblock may stay unwritable before the replica fail-stops.
+    /// Applies per plane: the metadata superblock, and each PARTITION's own. While
+    /// wedged the group is already fenced quorum-invisible and peers elect around
+    /// it; this converts the log-only limp into a distinct exit status a
+    /// supervisor can act on. It is also the deadline of each running
+    /// partition file job (`sharding.partition_io_capacity`), counted in pump
+    /// ticks. Expiry fences the partition that owns the job and stops the
+    /// node, and the timed-out job keeps its slot and allocation charge until
+    /// shutdown. Zero (and the `0` / `disabled` / `unlimited` sentinels, which
+    /// all parse to zero) disables both the fail-stop and the file-job
+    /// deadline; nonzero values below `MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT` are
+    /// rejected at boot.
+    #[serde(default = "default_superblock_wedged_fatal_timeout")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub superblock_wedged_fatal_timeout: IggyDuration,
+    /// Replication factor of a topic created without one. The metadata primary
+    /// resolves it at admission and the topic stores the result, so nodes
+    /// configured differently only differ in what a create admitted through
+    /// them gets.
+    #[serde(default = "default_replication_factor")]
+    #[config_env(leaf)]
+    pub default_replication_factor: ReplicationFactorDefault,
     /// Full roster of cluster members. Intended to be byte-identical across
     /// every node so operators ship one config. The running node's identity
     /// is supplied out-of-band via the `--replica-id` CLI flag, which
@@ -274,6 +356,56 @@ pub struct ClusterConfig {
     /// Replica-to-replica TLS settings for the consensus (`tcp_replica`) port.
     #[serde(default)]
     pub tls: ClusterTlsConfig,
+    /// Shard-0 coordinator placement tunables.
+    #[serde(default)]
+    pub coordinator: ClusterCoordinatorConfig,
+}
+
+/// Placement tunables for the shard-0 coordinator, converted into the shard
+/// crate's `CoordinatorConfig` at bootstrap (the domain type lives there
+/// because `configs` and `shard` share no dependency edge).
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterCoordinatorConfig {
+    /// Keep replica links off shard 0 while the shard range of link 0 has
+    /// another shard. Shard 0 already hosts the coordinator, the metadata
+    /// writer, and both listeners; replica links are long-lived steady
+    /// flows, so offload them to peer shards by default.
+    #[serde(default = "default_skip_shard_zero_for_replicas")]
+    pub skip_shard_zero_for_replicas: bool,
+    /// TCP links to each peer replica, at most the shard count. Link `j`
+    /// carries the frames of the shards in range `j`, so more links spread
+    /// replication over more shards. Every node must run the same value:
+    /// the replica handshake refuses a peer that differs. Shard counts may
+    /// differ between nodes. A range with fewer shards than there are peers
+    /// puts links to two peers on one shard. With
+    /// `skip_shard_zero_for_replicas` on, range 0 keeps its links off shard
+    /// 0, so it needs one shard more than there are peers.
+    #[serde(default = "default_replica_connections_per_peer")]
+    pub replica_connections_per_peer: u16,
+    /// When `total_shards > 1`, exclude shard 0 from client placement.
+    /// Default false: client connections are short-lived and benefit from
+    /// shard-0 parallelism more than replicas do.
+    #[serde(default)]
+    pub skip_shard_zero_for_clients: bool,
+}
+
+fn default_skip_shard_zero_for_replicas() -> bool {
+    true
+}
+
+fn default_replica_connections_per_peer() -> u16 {
+    1
+}
+
+impl Default for ClusterCoordinatorConfig {
+    fn default() -> Self {
+        Self {
+            skip_shard_zero_for_replicas: default_skip_shard_zero_for_replicas(),
+            replica_connections_per_peer: default_replica_connections_per_peer(),
+            skip_shard_zero_for_clients: false,
+        }
+    }
 }
 
 /// Replica-to-replica authentication for the consensus (`tcp_replica`) port.
@@ -361,6 +493,7 @@ pub struct ClusterTlsConfig {
 #[serde(deny_unknown_fields)]
 pub struct ClusterNodeConfig {
     pub name: String,
+    /// Replica-plane address, dialed verbatim by every peer, a literal IP.
     pub ip: String,
     /// Optional client-facing address: a literal IP or a DNS hostname,
     /// validated as [`AdvertisedAddress`] at boot. Replica traffic continues
@@ -381,6 +514,11 @@ pub struct ClusterNodeConfig {
     /// `nodes.len()`. Validated by [`ClusterConfig::validate`].
     pub replica_id: u8,
     pub ports: TransportPorts,
+    /// Failure domain, such as a rack or an availability zone. Placement puts
+    /// a partition's copies in as many as it can. A node without one shares a
+    /// domain with no other node.
+    #[serde(default)]
+    pub rack: Option<String>,
 }
 
 /// One client-network-scoped advertised address: clients whose IP falls
@@ -413,10 +551,7 @@ pub struct AdvertisedAddressSelector {
 /// once, built wherever a roster is assembled for serving clients
 /// (listener/shard start). Per-request resolution never re-parses config
 /// strings: everything is snapshotted here, so mutating the source config
-/// after conversion has no effect on what clients are told. Entries that do
-/// not parse are dropped at build time; validation already rejects them
-/// whenever the cluster is enabled, and a disabled cluster never consults
-/// the roster.
+/// after conversion has no effect on what clients are told.
 #[derive(Debug, Clone)]
 pub struct ResolvedClusterNode {
     config: ClusterNodeConfig,
@@ -424,38 +559,82 @@ pub struct ResolvedClusterNode {
     /// addresses, in declaration order.
     selectors: Vec<(IpNet, AdvertisedAddress)>,
     /// Parsed catch-all: [`ClusterNodeConfig::advertised_address`], else the
-    /// roster [`ClusterNodeConfig::ip`]. `None` when the configured value
-    /// does not parse - a set `advertised_address` never falls through to
-    /// the private roster ip.
-    catch_all: Option<AdvertisedAddress>,
+    /// roster [`ClusterNodeConfig::ip`]. A set `advertised_address` never
+    /// falls through to the private roster ip.
+    catch_all: AdvertisedAddress,
     /// Parsed roster [`ClusterNodeConfig::ip`], the replica-plane dial
-    /// address. `None` when the roster ip is not a literal IP (boot only
-    /// requires it non-empty); internal forwarding then has no dial target.
-    replica_ip: Option<IpAddr>,
+    /// address.
+    replica_ip: IpAddr,
 }
 
-impl From<ClusterNodeConfig> for ResolvedClusterNode {
-    fn from(config: ClusterNodeConfig) -> Self {
-        let selectors = config
-            .advertised_addresses
-            .iter()
-            .filter_map(|selector| {
-                let network = selector.client_cidr.parse::<IpNet>().ok()?;
-                let address = selector.address.parse::<AdvertisedAddress>().ok()?;
-                Some((canonical_ip_net(network.trunc()), address))
-            })
-            .collect();
-        let catch_all = match config.advertised_address.as_deref() {
-            Some(advertised_address) => advertised_address.parse().ok(),
-            None => config.ip.parse().ok(),
-        };
-        let replica_ip = config.ip.parse().ok();
-        Self {
+impl TryFrom<ClusterNodeConfig> for ResolvedClusterNode {
+    type Error = ConfigurationError;
+
+    fn try_from(config: ClusterNodeConfig) -> Result<Self, Self::Error> {
+        let replica_ip = config.ip.parse::<IpAddr>().map_err(|error| {
+            eprintln!(
+                "Invalid cluster configuration: IP '{}' for node '{}' is not a literal IP \
+                 address: {error}; set cluster.nodes[*].advertised_address for the name clients \
+                 dial",
+                config.ip, config.name
+            );
+            ConfigurationError::InvalidConfigurationValue
+        })?;
+
+        if replica_ip.to_canonical().is_unspecified() {
+            eprintln!(
+                "Invalid cluster configuration: IP '{}' for node '{}' is the unspecified \
+                 address; declare the address peers and clients reach this node at",
+                config.ip, config.name
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        let catch_all =
+            match config.advertised_address.as_deref() {
+                Some(advertised_address) => advertised_address
+                    .parse::<AdvertisedAddress>()
+                    .map_err(|error| {
+                        eprintln!(
+                            "Invalid cluster configuration: advertised_address \
+                         '{advertised_address}' for node '{}': {error}",
+                            config.name
+                        );
+                        ConfigurationError::InvalidConfigurationValue
+                    })?,
+                None => AdvertisedAddress::Ip(replica_ip.to_canonical()),
+            };
+
+        let mut selectors = Vec::with_capacity(config.advertised_addresses.len());
+        for selector in &config.advertised_addresses {
+            let network = selector.client_cidr.parse::<IpNet>().map_err(|error| {
+                eprintln!(
+                    "Invalid cluster configuration: advertised_addresses client_cidr '{}' for \
+                     node '{}': {error}",
+                    selector.client_cidr, config.name
+                );
+                ConfigurationError::InvalidConfigurationValue
+            })?;
+            let address = selector
+                .address
+                .parse::<AdvertisedAddress>()
+                .map_err(|error| {
+                    eprintln!(
+                        "Invalid cluster configuration: advertised_addresses address '{}' for \
+                         node '{}': {error}",
+                        selector.address, config.name
+                    );
+                    ConfigurationError::InvalidConfigurationValue
+                })?;
+            selectors.push((canonical_ip_net(network.trunc()), address));
+        }
+
+        Ok(Self {
             config,
             selectors,
             catch_all,
             replica_ip,
-        }
+        })
     }
 }
 
@@ -471,33 +650,19 @@ impl ResolvedClusterNode {
     /// internal request forwarding. Never routed through the advertised
     /// ladder: this is what servers dial, not what clients are told.
     #[must_use]
-    pub fn replica_ip(&self) -> Option<IpAddr> {
+    pub fn replica_ip(&self) -> IpAddr {
         self.replica_ip
     }
 
     /// The client-facing address for a client connecting from `client_ip`:
-    /// longest-prefix match over the selector networks, then the parsed
-    /// catch-all. `None` when no selector matches and the catch-all did not
-    /// parse; callers choose whether to fail closed (redirect URLs) or to
-    /// publish [`Self::raw_advertised_fallback`] verbatim (cluster metadata).
+    /// longest-prefix match over the selector networks, then the catch-all.
+    /// Always an address, since construction refused a node whose sources did
+    /// not parse.
     #[must_use]
-    pub fn advertised_for(&self, client_ip: Option<IpAddr>) -> Option<&AdvertisedAddress> {
+    pub fn advertised_for(&self, client_ip: Option<IpAddr>) -> &AdvertisedAddress {
         client_ip
             .and_then(|client_ip| self.selector_address(client_ip))
-            .or(self.catch_all.as_ref())
-    }
-
-    /// The catch-all ladder ([`ClusterNodeConfig::advertised_address`], else
-    /// the roster [`ClusterNodeConfig::ip`]) as configured, unparsed. Cluster
-    /// metadata publishes this verbatim when [`Self::advertised_for`] finds
-    /// nothing: the roster `ip` is only validated non-empty, and Docker
-    /// service names with underscores exist in the wild.
-    #[must_use]
-    pub fn raw_advertised_fallback(&self) -> &str {
-        self.config
-            .advertised_address
-            .as_deref()
-            .unwrap_or(&self.config.ip)
+            .unwrap_or(&self.catch_all)
     }
 
     /// Longest-prefix match over the boot-parsed selector networks. The
@@ -556,12 +721,13 @@ pub struct TransportPorts {
 ///
 /// Hostnames follow RFC 1123: ASCII letters, digits and hyphens in labels of
 /// 1-63 characters that do not start or end with a hyphen, at most
-/// [`MAX_HOSTNAME_LEN`] characters total, no port and no trailing dot. Names
+/// `MAX_HOSTNAME_LEN` characters total, no port and no trailing dot. Names
 /// consisting solely of digits and dots are rejected as malformed IPv4 rather
 /// than accepted as hostnames, so `10.0.0.256` fails loudly instead of being
 /// handed to DNS. Hostnames normalize to lowercase and IPs to their canonical
-/// form ([`IpAddr`]), so textual variants of one address (`Broker.Example.COM`,
-/// `2001:DB8::1`, `[2001:db8::1]`) compare equal.
+/// form ([`IpAddr::to_canonical`]), so textual variants of one address
+/// (`Broker.Example.COM`, `2001:DB8::1`, `[2001:db8::1]`, `::ffff:10.0.0.1`)
+/// compare equal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AdvertisedAddress {
     Ip(IpAddr),
@@ -577,6 +743,17 @@ impl AdvertisedAddress {
             Self::Hostname(hostname) => format!("{hostname}:{port}"),
         }
     }
+
+    /// Canonicalize first, so the v4-mapped spellings of one address
+    /// (`::ffff:10.0.0.1`, `::ffff:0.0.0.0`) are the same value as their v4
+    /// form for both the comparison and the wildcard refusal.
+    fn from_ip(ip: IpAddr) -> Result<Self, AdvertisedAddressError> {
+        let ip = ip.to_canonical();
+        if ip.is_unspecified() {
+            return Err(AdvertisedAddressError::Unspecified);
+        }
+        Ok(Self::Ip(ip))
+    }
 }
 
 impl FromStr for AdvertisedAddress {
@@ -587,7 +764,7 @@ impl FromStr for AdvertisedAddress {
             return Err(AdvertisedAddressError::Empty);
         }
         if let Ok(ip) = address.parse::<IpAddr>() {
-            return Ok(Self::Ip(ip));
+            return Self::from_ip(ip);
         }
         // URL-style bracketed IPv6 (`[2001:db8::1]`) is unambiguous; accept
         // it and store the inner address.
@@ -596,7 +773,7 @@ impl FromStr for AdvertisedAddress {
             .and_then(|rest| rest.strip_suffix(']'))
             && let Ok(ip) = inner.parse::<Ipv6Addr>()
         {
-            return Ok(Self::Ip(IpAddr::V6(ip)));
+            return Self::from_ip(IpAddr::V6(ip));
         }
         if let Some((host, port)) = address.rsplit_once(':') {
             // `host:port` and `[v6]:port` are the common misconfigurations;
@@ -657,9 +834,132 @@ impl fmt::Display for AdvertisedAddress {
     }
 }
 
+/// What a topic created without a replication factor gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationFactorDefault {
+    /// Every node, the layout from before per-topic replication factors.
+    AllNodes,
+    /// This many nodes, lowered to the node count when larger.
+    Nodes(u8),
+}
+
+impl ReplicationFactorDefault {
+    /// Upper bound of [`Self::Nodes`], the most members a partition can have.
+    pub const MAX: u8 = 32;
+    const ALL_NODES: &'static str = "all";
+
+    /// The configured number of nodes, `None` for every node.
+    #[must_use]
+    pub const fn factor(self) -> Option<u8> {
+        match self {
+            Self::AllNodes => None,
+            Self::Nodes(factor) => Some(factor),
+        }
+    }
+
+    fn from_number(value: u64) -> Result<Self, ReplicationFactorDefaultError> {
+        u8::try_from(value)
+            .ok()
+            .filter(|factor| (1..=Self::MAX).contains(factor))
+            .map(Self::Nodes)
+            .ok_or_else(|| ReplicationFactorDefaultError {
+                value: value.to_string(),
+            })
+    }
+}
+
+impl FromStr for ReplicationFactorDefault {
+    type Err = ReplicationFactorDefaultError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.eq_ignore_ascii_case(Self::ALL_NODES) {
+            return Ok(Self::AllNodes);
+        }
+        value
+            .parse::<u64>()
+            .map_err(|_| ReplicationFactorDefaultError {
+                value: value.to_owned(),
+            })
+            .and_then(Self::from_number)
+    }
+}
+
+impl Serialize for ReplicationFactorDefault {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// Accepts a TOML integer as well as a string, because the environment
+/// provider turns a numeric `IGGY_CLUSTER_DEFAULT_REPLICATION_FACTOR` into one.
+impl<'de> Deserialize<'de> for ReplicationFactorDefault {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ReplicationFactorDefaultVisitor)
+    }
+}
+
+struct ReplicationFactorDefaultVisitor;
+
+impl serde::de::Visitor<'_> for ReplicationFactorDefaultVisitor {
+    type Value = ReplicationFactorDefault;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "\"{}\" or an integer from 1 to {}",
+            ReplicationFactorDefault::ALL_NODES,
+            ReplicationFactorDefault::MAX
+        )
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        value.parse().map_err(E::custom)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+        ReplicationFactorDefault::from_number(value).map_err(E::custom)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+        u64::try_from(value)
+            .map_err(|_| E::custom(format!("invalid default_replication_factor {value}")))
+            .and_then(|value| self.visit_u64(value))
+    }
+}
+
+impl fmt::Display for ReplicationFactorDefault {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AllNodes => formatter.write_str(Self::ALL_NODES),
+            Self::Nodes(factor) => write!(formatter, "{factor}"),
+        }
+    }
+}
+
+/// A `default_replication_factor` that is neither `all` nor 1 to 32.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationFactorDefaultError {
+    value: String,
+}
+
+impl fmt::Display for ReplicationFactorDefaultError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid default_replication_factor {:?}: expected \"{}\" or 1 to {}",
+            self.value,
+            ReplicationFactorDefault::ALL_NODES,
+            ReplicationFactorDefault::MAX
+        )
+    }
+}
+
+impl std::error::Error for ReplicationFactorDefaultError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdvertisedAddressError {
     Empty,
+    Unspecified,
     PortNotAllowed,
     MalformedIpv4,
     MalformedIpv6,
@@ -674,9 +974,15 @@ impl fmt::Display for AdvertisedAddressError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => write!(formatter, "address cannot be empty"),
+            Self::Unspecified => write!(
+                formatter,
+                "address is the unspecified address, which tells a client which interfaces this \
+                 node accepts on rather than where to reach it; declare a routable address"
+            ),
             Self::PortNotAllowed => write!(
                 formatter,
-                "address must not include a port; ports are configured in cluster.nodes.ports"
+                "address must not include a port; each transport's port comes from its own \
+                 listener address in single-node mode and from cluster.nodes.ports in a cluster"
             ),
             Self::MalformedIpv4 => write!(
                 formatter,
@@ -712,20 +1018,31 @@ impl fmt::Display for AdvertisedAddressError {
 
 impl std::error::Error for AdvertisedAddressError {}
 
-/// Whether cluster-wide JWT key material exists: a configured `http.jwt`
-/// secret, or the signing key derived from the cluster PSK. When it does, a
-/// bearer minted on any node verifies on every node - the invariant
-/// follower-to-primary HTTP forwarding depends on. Callers gate `http.enabled`
-/// themselves; this covers only the key material.
+/// The cluster-wide JWT key material, when it exists: a configured `http.jwt`
+/// secret, else the cluster PSK the signing key derives from - the precedence
+/// the JWT manager applies. With it, a bearer minted on any node verifies on
+/// every node - the invariant follower-to-primary HTTP forwarding depends on.
+/// The key that proves a relay comes from a node derives from the same
+/// material, so relay proofs verify exactly where bearers do. Callers gate
+/// `http.enabled` themselves; this covers only the key material.
 ///
 /// Forwarding targets resolve from the roster (`ip:ports.http`); the config
 /// validator unconditionally requires a roster port for every enabled
 /// transport, so a forward never dials a node without a declared http port.
-pub fn http_forwarding_key_material(jwt: &HttpJwtConfig, cluster: &ClusterConfig) -> bool {
-    cluster.enabled
-        && ((cluster.auth.enabled && !cluster.auth.shared_secret.is_empty())
-            || !jwt.encoding_secret.is_empty()
-            || !jwt.decoding_secret.is_empty())
+pub fn http_forwarding_key_material<'a>(
+    jwt: &'a HttpJwtConfig,
+    cluster: &'a ClusterConfig,
+) -> Option<&'a str> {
+    if !cluster.enabled {
+        return None;
+    }
+    let psk = (cluster.auth.enabled && !cluster.auth.shared_secret.is_empty())
+        .then_some(&cluster.auth.shared_secret);
+    [&jwt.encoding_secret, &jwt.decoding_secret]
+        .into_iter()
+        .find(|secret| !secret.is_empty())
+        .or(psk)
+        .map(String::as_str)
 }
 
 impl Validatable<ConfigurationError> for ClusterConfig {
@@ -743,6 +1060,22 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                 "Invalid cluster configuration: cluster.repair_chunk_max ({}) exceeds the maximum \
                  ({MAX_REPAIR_CHUNK_MAX})",
                 self.repair_chunk_max
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // Also ahead of the enabled gate: a solo replica persists the
+        // superblock too, so the fail-stop window applies regardless.
+        let superblock_fatal_window = self.superblock_wedged_fatal_timeout.get_duration();
+        if !superblock_fatal_window.is_zero()
+            && superblock_fatal_window < MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT
+        {
+            eprintln!(
+                "Invalid cluster configuration: cluster.superblock_wedged_fatal_timeout '{}' must \
+                 be zero (disabled) or at least {}s (a shorter window fail-stops the process on a \
+                 transient disk hiccup)",
+                self.superblock_wedged_fatal_timeout,
+                MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT.as_secs()
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -878,6 +1211,13 @@ impl Validatable<ConfigurationError> for ClusterConfig {
         // The repair retry interval sizes a tick threshold that has to advance;
         // `0` / `disabled` / `unlimited` all collapse to zero and would wedge
         // every stalled repair stream - reject them.
+        if self.repair_gap_debounce_interval.get_duration().is_zero() {
+            eprintln!(
+                "Invalid cluster configuration: cluster.repair_gap_debounce_interval must be \
+                 nonzero (it debounces the partition sweep's repair arm)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         if self.repair_retry_interval.get_duration().is_zero() {
             eprintln!(
                 "Invalid cluster configuration: cluster.repair_retry_interval must be nonzero \
@@ -893,6 +1233,14 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
+        if self.nodes.len() > MAX_CLUSTER_REPLICAS {
+            eprintln!(
+                "Invalid cluster configuration: cluster.nodes contains {} replicas, but the VSR implementation supports at most {MAX_CLUSTER_REPLICAS}",
+                self.nodes.len()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         // VSR needs every replica to have a stable, unique id strictly
         // less than the total replica count. Duplicate ids would split the
         // cluster into two replicas claiming the same slot; out-of-range
@@ -902,6 +1250,28 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             eprintln!("Invalid cluster configuration: more than 255 replicas is unsupported");
             ConfigurationError::InvalidConfigurationValue
         })?;
+
+        // Placement treats a node without a rack as alone in one, so a single
+        // unlabeled node would take a copy of nearly every partition. Kafka
+        // likewise refuses a rack-aware assignment when only some brokers set
+        // `broker.rack`.
+        let racked = self.nodes.iter().filter(|node| node.rack.is_some()).count();
+        if racked != 0 && racked != self.nodes.len() {
+            eprintln!(
+                "Invalid cluster configuration: {racked} of {} nodes set 'rack'; set it on every \
+                 node or on none",
+                self.nodes.len()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.nodes.iter().any(|node| {
+            node.rack
+                .as_deref()
+                .is_some_and(|rack| rack.trim().is_empty())
+        }) {
+            eprintln!("Invalid cluster configuration: a node's 'rack' cannot be empty");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
 
         let mut seen_ids = std::collections::HashSet::new();
         let mut seen_names = std::collections::HashSet::new();
@@ -914,13 +1284,7 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                 return Err(ConfigurationError::InvalidConfigurationValue);
             }
 
-            if node.ip.trim().is_empty() {
-                eprintln!(
-                    "Invalid cluster configuration: IP cannot be empty for node '{}'",
-                    node.name
-                );
-                return Err(ConfigurationError::InvalidConfigurationValue);
-            }
+            let resolved = ResolvedClusterNode::try_from(node.clone())?;
 
             if !seen_names.insert(node.name.clone()) {
                 eprintln!(
@@ -964,8 +1328,12 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                         return Err(ConfigurationError::InvalidConfigurationValue);
                     }
 
-                    let endpoint = format!("{}:{}", node.ip, port);
-                    if !used_endpoints.insert(endpoint.clone()) {
+                    // Keyed on the canonical form, and rendered from it, so
+                    // two spellings of one address ('::ffff:10.0.0.1' and
+                    // '10.0.0.1') cannot claim the same port twice and an IPv6
+                    // endpoint reads back with its port separable.
+                    let endpoint = SocketAddr::new(resolved.replica_ip().to_canonical(), port);
+                    if !used_endpoints.insert(endpoint) {
                         eprintln!(
                             "Invalid cluster configuration: port conflict - {endpoint} is already bound (node '{}', transport {name})",
                             node.name
@@ -974,28 +1342,6 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                     }
                 }
             }
-
-            // An advertised address must parse strictly (IP or RFC 1123
-            // hostname): the value is handed verbatim to every client via
-            // cluster metadata and redirect URLs, so a bad one poisons them
-            // all. The roster `ip` predates this check and is only validated
-            // as non-empty (Docker service names with underscores exist in
-            // the wild), so when it backs the client endpoints an unparsable
-            // value falls back to raw-string comparison instead of failing
-            // boot.
-            let client_address = match node.advertised_address.as_deref() {
-                Some(advertised_address) => match advertised_address.parse::<AdvertisedAddress>() {
-                    Ok(address) => Some(address),
-                    Err(error) => {
-                        eprintln!(
-                            "Invalid cluster configuration: advertised_address '{advertised_address}' for node '{}': {error}",
-                            node.name
-                        );
-                        return Err(ConfigurationError::InvalidConfigurationValue);
-                    }
-                },
-                None => node.ip.parse::<AdvertisedAddress>().ok(),
-            };
 
             if node.advertised_addresses.len() > MAX_ADVERTISED_SELECTORS {
                 eprintln!(
@@ -1007,45 +1353,20 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                 return Err(ConfigurationError::InvalidConfigurationValue);
             }
 
-            // Selector CIDRs and addresses feed clients the same way the
-            // catch-all advertised address does, so they get the same strict
-            // parse. Networks are compared truncated (`10.0.1.0/16` ==
+            // Networks are compared truncated (`10.0.1.0/16` ==
             // `10.0.0.0/16`) and canonicalized (`::ffff:10.0.0.0/104` ==
-            // `10.0.0.0/8`) since matching truncates and canonicalizes too.
-            // Parsed before the catch-all enters the conflict pool because
-            // every entry's effective client set depends on the node's full
-            // selector list.
-            let mut selectors = Vec::with_capacity(node.advertised_addresses.len());
+            // `10.0.0.0/8`), the form resolution matched them in, so two
+            // spellings of one network cannot both be declared.
+            let selectors = &resolved.selectors;
             let mut seen_selector_cidrs = std::collections::HashSet::new();
-            for selector in &node.advertised_addresses {
-                let client_cidr = match selector.client_cidr.parse::<IpNet>() {
-                    Ok(client_cidr) => canonical_ip_net(client_cidr.trunc()),
-                    Err(error) => {
-                        eprintln!(
-                            "Invalid cluster configuration: advertised_addresses client_cidr '{}' for node '{}': {error}",
-                            selector.client_cidr, node.name
-                        );
-                        return Err(ConfigurationError::InvalidConfigurationValue);
-                    }
-                };
-                if !seen_selector_cidrs.insert(client_cidr) {
+            for ((client_cidr, _), declared) in selectors.iter().zip(&node.advertised_addresses) {
+                if !seen_selector_cidrs.insert(*client_cidr) {
                     eprintln!(
                         "Invalid cluster configuration: duplicate advertised_addresses client_cidr '{}' for node '{}'",
-                        selector.client_cidr, node.name
+                        declared.client_cidr, node.name
                     );
                     return Err(ConfigurationError::InvalidConfigurationValue);
                 }
-                let address = match selector.address.parse::<AdvertisedAddress>() {
-                    Ok(address) => address,
-                    Err(error) => {
-                        eprintln!(
-                            "Invalid cluster configuration: advertised_addresses address '{}' for node '{}': {error}",
-                            selector.address, node.name
-                        );
-                        return Err(ConfigurationError::InvalidConfigurationValue);
-                    }
-                };
-                selectors.push((client_cidr, address));
             }
             let selector_ranges: Vec<ClientAddressRange> = selectors
                 .iter()
@@ -1060,26 +1381,21 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             // override shadowing the same node's wider selector); a conflict
             // means some client wins both entries and would resolve both
             // nodes to one endpoint. The catch-all is an implicit
-            // match-everything-else selector, so it pools the same way. A
-            // roster ip that fails the strict parse skips the pool: it can
-            // never equal a parsed host, and two raw ips sharing host:port
-            // are already rejected by the bind-endpoint check above.
-            if let Some(address) = &client_address {
-                let catch_all_clients = EffectiveClients::for_catch_all(&selector_ranges);
-                for (name, port) in &client_ports {
-                    if let Some(port) = port {
-                        insert_advertised_endpoint(
-                            &mut advertised_endpoints,
-                            AdvertisedEndpoint {
-                                node_name: &node.name,
-                                transport: name,
-                                network: None,
-                                clients: catch_all_clients.clone(),
-                                host: address.clone(),
-                                port: *port,
-                            },
-                        )?;
-                    }
+            // match-everything-else selector, so it pools the same way.
+            let catch_all_clients = EffectiveClients::for_catch_all(&selector_ranges);
+            for (name, port) in &client_ports {
+                if let Some(port) = port {
+                    insert_advertised_endpoint(
+                        &mut advertised_endpoints,
+                        AdvertisedEndpoint {
+                            node_name: &node.name,
+                            transport: name,
+                            network: None,
+                            clients: catch_all_clients.clone(),
+                            host: resolved.catch_all.clone(),
+                            port: *port,
+                        },
+                    )?;
                 }
             }
 
@@ -1400,8 +1716,11 @@ mod tests {
             request_start_view_retransmit_interval: default_request_start_view_retransmit_interval(
             ),
             view_probe_attempts_max: default_view_probe_attempts_max(),
+            default_replication_factor: default_replication_factor(),
             repair_retry_interval: default_repair_retry_interval(),
+            repair_gap_debounce_interval: default_repair_gap_debounce_interval(),
             repair_chunk_max: default_repair_chunk_max(),
+            superblock_wedged_fatal_timeout: default_superblock_wedged_fatal_timeout(),
             nodes: Vec::new(),
             auth: ClusterAuthConfig {
                 enabled: true,
@@ -1409,6 +1728,7 @@ mod tests {
                 previous_shared_secret: "retiring-psk-MUST-NOT-be-persisted".to_owned(),
             },
             tls: ClusterTlsConfig::default(),
+            coordinator: ClusterCoordinatorConfig::default(),
         };
         let serialized = serde_json::to_string(&config).expect("serialize cluster config");
         assert!(
@@ -1461,6 +1781,25 @@ mod tests {
             "selector env expansion must stop at max_elements = 16"
         );
     }
+
+    #[test]
+    fn advertised_addresses_env_template_keeps_each_vector_limit() {
+        let template = <ClusterConfig as configs::ConfigEnvMappings>::env_templates()
+            .iter()
+            .find(|template| template.env_name == "NODES_<N>_ADVERTISED_ADDRESSES_<N>_CLIENT_CIDR")
+            .expect("advertised address template");
+
+        assert_eq!(template.max_elements, &[256, 16]);
+
+        let mapping = <ClusterConfig as configs::ConfigEnvMappings>::env_mappings()
+            .iter()
+            .find(|mapping| mapping.env_name == "NODES_3_ADVERTISED_ADDRESSES_7_CLIENT_CIDR")
+            .expect("expanded advertised address mapping");
+        assert_eq!(
+            mapping.config_path,
+            "nodes.3.advertised_addresses.7.client_cidr"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1480,6 +1819,47 @@ mod advertised_address_tests {
                 "'{equivalent_address}' must parse to canonical 2001:db8::1"
             );
         }
+    }
+
+    #[test]
+    fn rejects_every_spelling_of_the_unspecified_address() {
+        for wildcard in [
+            "0.0.0.0",
+            "::",
+            "::ffff:0.0.0.0",
+            "[::]",
+            "[::ffff:0.0.0.0]",
+        ] {
+            assert_eq!(
+                wildcard.parse::<AdvertisedAddress>(),
+                Err(AdvertisedAddressError::Unspecified),
+                "'{wildcard}' names interfaces, not a dial target"
+            );
+        }
+        for routable in ["203.0.113.1", "2001:db8::1", "::ffff:203.0.113.1", "broker"] {
+            assert!(
+                routable.parse::<AdvertisedAddress>().is_ok(),
+                "'{routable}' is dialable"
+            );
+        }
+    }
+
+    /// A v4-mapped IPv6 address and its v4 form are one address, so they must
+    /// be one value: the conflict pool compares advertised endpoints for
+    /// equality, and two spellings would let one host:port slip past it twice.
+    #[test]
+    fn canonicalizes_a_v4_mapped_address_to_its_v4_form() {
+        assert_eq!(
+            "::ffff:10.0.0.1".parse::<AdvertisedAddress>(),
+            "10.0.0.1".parse::<AdvertisedAddress>()
+        );
+        assert_eq!(
+            "::ffff:10.0.0.1"
+                .parse::<AdvertisedAddress>()
+                .unwrap()
+                .authority(8090),
+            "10.0.0.1:8090"
+        );
     }
 
     #[test]
@@ -1546,6 +1926,7 @@ mod advertised_for_tests {
 
     fn node_with_selectors(selectors: Vec<AdvertisedAddressSelector>) -> ClusterNodeConfig {
         ClusterNodeConfig {
+            rack: None,
             name: "node-0".to_owned(),
             ip: "10.0.1.5".to_owned(),
             advertised_address: Some("203.0.113.10".to_owned()),
@@ -1563,7 +1944,7 @@ mod advertised_for_tests {
     }
 
     fn resolved(node: ClusterNodeConfig) -> ResolvedClusterNode {
-        node.into()
+        ResolvedClusterNode::try_from(node).expect("a roster node the validator would accept")
     }
 
     fn ip(address: &str) -> IpAddr {
@@ -1575,7 +1956,7 @@ mod advertised_for_tests {
         let node = node_with_selectors(Vec::new());
         assert_eq!(
             resolved(node).advertised_for(Some(ip("10.0.0.7"))),
-            Some(&AdvertisedAddress::Ip(ip("203.0.113.10")))
+            &AdvertisedAddress::Ip(ip("203.0.113.10"))
         );
     }
 
@@ -1585,16 +1966,47 @@ mod advertised_for_tests {
         node.advertised_address = None;
         assert_eq!(
             resolved(node).advertised_for(Some(ip("10.0.0.7"))),
-            Some(&AdvertisedAddress::Ip(ip("10.0.1.5")))
+            &AdvertisedAddress::Ip(ip("10.0.1.5"))
         );
     }
 
     #[test]
-    fn is_none_when_no_fallback_parses() {
+    fn refuses_a_node_whose_ip_is_not_an_address() {
+        // Nothing downstream carries a fallback for an unparsable source, so
+        // the conversion is where such a node has to stop.
         let mut node = node_with_selectors(Vec::new());
         node.advertised_address = None;
         node.ip = "iggy_node".to_owned();
-        assert_eq!(resolved(node).advertised_for(Some(ip("10.0.0.7"))), None);
+        assert!(ResolvedClusterNode::try_from(node).is_err());
+    }
+
+    #[test]
+    fn refuses_a_node_advertising_the_unspecified_address() {
+        // The conversion is reachable without the validator, so the "every
+        // resolved node is dialable" invariant has to hold here rather than
+        // rely on validation having run first.
+        for wildcard in ["0.0.0.0", "::", "::ffff:0.0.0.0"] {
+            let mut roster_ip = node_with_selectors(Vec::new());
+            roster_ip.advertised_address = None;
+            roster_ip.ip = wildcard.to_owned();
+            assert!(
+                ResolvedClusterNode::try_from(roster_ip).is_err(),
+                "roster ip '{wildcard}' is not dialable"
+            );
+
+            let mut catch_all = node_with_selectors(Vec::new());
+            catch_all.advertised_address = Some(wildcard.to_owned());
+            assert!(
+                ResolvedClusterNode::try_from(catch_all).is_err(),
+                "advertised_address '{wildcard}' is not dialable"
+            );
+
+            let selectors = node_with_selectors(vec![selector("10.0.0.0/16", wildcard)]);
+            assert!(
+                ResolvedClusterNode::try_from(selectors).is_err(),
+                "selector address '{wildcard}' is not dialable"
+            );
+        }
     }
 
     #[test]
@@ -1602,7 +2014,7 @@ mod advertised_for_tests {
         let node = node_with_selectors(vec![selector("10.0.0.0/16", "10.0.1.5")]);
         assert_eq!(
             resolved(node).advertised_for(Some(ip("10.0.200.7"))),
-            Some(&AdvertisedAddress::Ip(ip("10.0.1.5")))
+            &AdvertisedAddress::Ip(ip("10.0.1.5"))
         );
     }
 
@@ -1611,7 +2023,7 @@ mod advertised_for_tests {
         let node = node_with_selectors(vec![selector("10.0.0.0/16", "10.0.1.5")]);
         assert_eq!(
             resolved(node).advertised_for(Some(ip("192.168.0.7"))),
-            Some(&AdvertisedAddress::Ip(ip("203.0.113.10")))
+            &AdvertisedAddress::Ip(ip("203.0.113.10"))
         );
     }
 
@@ -1620,7 +2032,7 @@ mod advertised_for_tests {
         let node = node_with_selectors(vec![selector("10.0.0.0/16", "10.0.1.5")]);
         assert_eq!(
             resolved(node).advertised_for(None),
-            Some(&AdvertisedAddress::Ip(ip("203.0.113.10")))
+            &AdvertisedAddress::Ip(ip("203.0.113.10"))
         );
     }
 
@@ -1632,12 +2044,12 @@ mod advertised_for_tests {
         ]));
         assert_eq!(
             node.advertised_for(Some(ip("10.0.200.7"))),
-            Some(&AdvertisedAddress::Ip(ip("10.0.1.5"))),
+            &AdvertisedAddress::Ip(ip("10.0.1.5")),
             "the /16 must win over the /8 even though it is declared second"
         );
         assert_eq!(
             node.advertised_for(Some(ip("10.9.0.7"))),
-            Some(&AdvertisedAddress::Ip(ip("10.255.255.1"))),
+            &AdvertisedAddress::Ip(ip("10.255.255.1")),
             "a client outside the /16 but inside the /8 must match the /8"
         );
     }
@@ -1654,7 +2066,7 @@ mod advertised_for_tests {
         ]);
         assert_eq!(
             resolved(node).advertised_for(Some(ip("10.0.200.7"))),
-            Some(&AdvertisedAddress::Ip(ip("10.0.1.5")))
+            &AdvertisedAddress::Ip(ip("10.0.1.5"))
         );
     }
 
@@ -1664,7 +2076,7 @@ mod advertised_for_tests {
         let node = node_with_selectors(vec![selector("10.0.0.0/16", "10.0.1.5")]);
         assert_eq!(
             resolved(node).advertised_for(Some(ip("::ffff:10.0.0.7"))),
-            Some(&AdvertisedAddress::Ip(ip("10.0.1.5")))
+            &AdvertisedAddress::Ip(ip("10.0.1.5"))
         );
     }
 
@@ -1676,7 +2088,7 @@ mod advertised_for_tests {
         let node = node_with_selectors(vec![selector("::ffff:10.0.0.0/104", "10.0.1.5")]);
         assert_eq!(
             resolved(node).advertised_for(Some(ip("10.0.0.7"))),
-            Some(&AdvertisedAddress::Ip(ip("10.0.1.5")))
+            &AdvertisedAddress::Ip(ip("10.0.1.5"))
         );
     }
 
@@ -1685,7 +2097,7 @@ mod advertised_for_tests {
         let node = node_with_selectors(vec![selector("2001:db8::/32", "2001:db8::1")]);
         assert_eq!(
             resolved(node).advertised_for(Some(ip("2001:db8::7"))),
-            Some(&AdvertisedAddress::Ip(ip("2001:db8::1")))
+            &AdvertisedAddress::Ip(ip("2001:db8::1"))
         );
     }
 
@@ -1694,9 +2106,7 @@ mod advertised_for_tests {
         let node = node_with_selectors(vec![selector("10.0.0.0/16", "Broker.Internal.Example")]);
         assert_eq!(
             resolved(node).advertised_for(Some(ip("10.0.0.7"))),
-            Some(&AdvertisedAddress::Hostname(
-                "broker.internal.example".to_owned()
-            ))
+            &AdvertisedAddress::Hostname("broker.internal.example".to_owned())
         );
     }
 }
@@ -1707,6 +2117,7 @@ mod cluster_validate_tests {
 
     fn node(name: &str, id: u8) -> ClusterNodeConfig {
         ClusterNodeConfig {
+            rack: None,
             name: name.to_string(),
             ip: "127.0.0.1".to_string(),
             advertised_address: None,
@@ -1735,12 +2146,50 @@ mod cluster_validate_tests {
             request_start_view_retransmit_interval: default_request_start_view_retransmit_interval(
             ),
             view_probe_attempts_max: default_view_probe_attempts_max(),
+            default_replication_factor: default_replication_factor(),
             repair_retry_interval: default_repair_retry_interval(),
+            repair_gap_debounce_interval: default_repair_gap_debounce_interval(),
             repair_chunk_max: default_repair_chunk_max(),
+            superblock_wedged_fatal_timeout: default_superblock_wedged_fatal_timeout(),
             nodes,
             auth: ClusterAuthConfig::default(),
             tls: ClusterTlsConfig::default(),
+            coordinator: ClusterCoordinatorConfig::default(),
         }
+    }
+
+    /// Every node must pick the same material, or nodes refuse each other's
+    /// relay proofs: the secret the JWT manager signs with, else the PSK.
+    #[test]
+    fn given_jwt_secrets_and_a_psk_when_choosing_key_material_should_follow_the_jwt_signing_secret()
+    {
+        let jwt = |encoding: &str, decoding: &str| HttpJwtConfig {
+            encoding_secret: encoding.to_owned(),
+            decoding_secret: decoding.to_owned(),
+            ..HttpJwtConfig::default()
+        };
+        let mut cluster = cfg(Vec::new());
+        cluster.auth = ClusterAuthConfig {
+            enabled: true,
+            shared_secret: "psk".to_owned(),
+            previous_shared_secret: String::new(),
+        };
+        let material = |jwt: &HttpJwtConfig, cluster: &ClusterConfig| {
+            http_forwarding_key_material(jwt, cluster).map(str::to_owned)
+        };
+        assert_eq!(
+            material(&jwt("enc", "dec"), &cluster).as_deref(),
+            Some("enc")
+        );
+        assert_eq!(material(&jwt("", "dec"), &cluster).as_deref(), Some("dec"));
+        assert_eq!(material(&jwt("", ""), &cluster).as_deref(), Some("psk"));
+
+        cluster.auth.enabled = false;
+        assert_eq!(material(&jwt("", ""), &cluster), None);
+        assert_eq!(material(&jwt("enc", ""), &cluster).as_deref(), Some("enc"));
+
+        cluster.enabled = false;
+        assert_eq!(material(&jwt("enc", "dec"), &cluster), None);
     }
 
     #[test]
@@ -1832,6 +2281,50 @@ mod cluster_validate_tests {
     }
 
     #[test]
+    fn given_default_replication_factor_text_when_parsing_should_accept_all_or_one_to_thirty_two() {
+        assert_eq!("all".parse(), Ok(ReplicationFactorDefault::AllNodes));
+        assert_eq!("ALL".parse(), Ok(ReplicationFactorDefault::AllNodes));
+        assert_eq!("3".parse(), Ok(ReplicationFactorDefault::Nodes(3)));
+        assert_eq!("32".parse(), Ok(ReplicationFactorDefault::Nodes(32)));
+        for invalid in ["0", "33", "-1", "three", ""] {
+            assert!(
+                invalid.parse::<ReplicationFactorDefault>().is_err(),
+                "{invalid:?}"
+            );
+        }
+        for value in [
+            ReplicationFactorDefault::AllNodes,
+            ReplicationFactorDefault::Nodes(7),
+        ] {
+            assert_eq!(value.to_string().parse(), Ok(value));
+        }
+        assert_eq!(
+            ClusterConfig::default().default_replication_factor,
+            ReplicationFactorDefault::AllNodes,
+            "the shipped default keeps every partition on every node"
+        );
+    }
+
+    #[test]
+    fn given_default_replication_factor_as_integer_or_string_when_deserializing_should_accept_both()
+    {
+        let parse = |text: &str| serde_json::from_str::<ReplicationFactorDefault>(text);
+        assert_eq!(parse("2").unwrap(), ReplicationFactorDefault::Nodes(2));
+        assert_eq!(parse("\"2\"").unwrap(), ReplicationFactorDefault::Nodes(2));
+        assert_eq!(
+            parse("\"all\"").unwrap(),
+            ReplicationFactorDefault::AllNodes
+        );
+        for invalid in ["0", "-1", "33", "\"none\""] {
+            assert!(parse(invalid).is_err(), "{invalid}");
+        }
+        assert_eq!(
+            serde_json::to_string(&ReplicationFactorDefault::Nodes(2)).unwrap(),
+            "\"2\""
+        );
+    }
+
+    #[test]
     fn validate_rejects_zero_view_probe_attempts_max() {
         let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
         c.view_probe_attempts_max = 0;
@@ -1858,6 +2351,16 @@ mod cluster_validate_tests {
         // stalled repair streams.
         let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
         c.repair_retry_interval = IggyDuration::new(Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_repair_gap_debounce_interval() {
+        // Same sentinel family as the retry interval above: `0`, `disabled` and
+        // `unlimited` all parse to zero, and a zero debounce would arm repair
+        // against a single reordered prepare on every partition.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.repair_gap_debounce_interval = IggyDuration::new(Duration::ZERO);
         assert!(c.validate().is_err());
     }
 
@@ -1897,9 +2400,72 @@ mod cluster_validate_tests {
     }
 
     #[test]
+    fn validate_requires_a_rack_on_every_node_or_on_none() {
+        let racked = |name: &str, id: u8, rack: Option<&str>| ClusterNodeConfig {
+            rack: rack.map(str::to_owned),
+            ..node(name, id)
+        };
+        assert!(
+            cfg(vec![racked("n1", 0, Some("a")), racked("n2", 1, None)])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            cfg(vec![racked("n1", 0, Some("a")), racked("n2", 1, Some(" "))])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            cfg(vec![racked("n1", 0, Some("a")), racked("n2", 1, Some("b"))])
+                .validate()
+                .is_ok()
+        );
+        assert!(cfg(vec![node("n1", 0), node("n2", 1)]).validate().is_ok());
+    }
+
+    #[test]
     fn validate_rejects_duplicate_names() {
         let c = cfg(vec![node("n1", 0), node("n1", 1)]);
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_an_unspecified_node_ip() {
+        for wildcard in ["0.0.0.0", "::", "::ffff:0.0.0.0"] {
+            let mut nodes = vec![node("n1", 0), node("n2", 1)];
+            nodes[0].ip = wildcard.to_owned();
+            assert!(cfg(nodes).validate().is_err(), "{wildcard} is not dialable");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_hostname_node_ip() {
+        for hostname in ["iggy_leader", "node-1.example.com"] {
+            let mut nodes = vec![node("n1", 0), node("n2", 1)];
+            nodes[0].ip = hostname.to_owned();
+            assert!(
+                cfg(nodes).validate().is_err(),
+                "'{hostname}' must not pass as a roster ip"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_unspecified_advertised_address() {
+        for wildcard in ["0.0.0.0", "::", "::ffff:0.0.0.0"] {
+            let mut nodes = vec![node("n1", 0), node("n2", 1)];
+            nodes[0].advertised_address = Some(wildcard.to_owned());
+            assert!(cfg(nodes).validate().is_err(), "{wildcard} is not dialable");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_unspecified_selector_address() {
+        for wildcard in ["0.0.0.0", "::", "::ffff:0.0.0.0"] {
+            let mut nodes = vec![node("n1", 0), node("n2", 1)];
+            nodes[0].advertised_addresses = vec![selector("10.0.0.0/16", wildcard)];
+            assert!(cfg(nodes).validate().is_err(), "{wildcard} is not dialable");
+        }
     }
 
     #[test]
@@ -1913,6 +2479,18 @@ mod cluster_validate_tests {
     fn validate_accepts_unique_contiguous_replica_ids() {
         let c = cfg(vec![node("n1", 0), node("n2", 1), node("n3", 2)]);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_the_vsr_replica_limit() {
+        let nodes = (0..32).map(|id| node(&format!("n{id}"), id)).collect();
+        assert!(cfg(nodes).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_rosters_above_the_vsr_replica_limit() {
+        let nodes = (0..33).map(|id| node(&format!("n{id}"), id)).collect();
+        assert!(cfg(nodes).validate().is_err());
     }
 
     #[test]
@@ -2108,19 +2686,6 @@ mod cluster_validate_tests {
         let mut n2 = node("n2", 1);
         n2.ip = "10.0.0.2".to_owned();
         n2.advertised_address = Some("Broker.Example.COM".to_owned());
-        n2.ports.tcp = Some(8090);
-
-        assert!(cfg(vec![n1, n2]).validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_node_ip_hostname_clashing_with_advertised_hostname() {
-        let mut n1 = node("n1", 0);
-        n1.ip = "10.0.0.1".to_owned();
-        n1.advertised_address = Some("broker.example.com".to_owned());
-        n1.ports.tcp = Some(8090);
-        let mut n2 = node("n2", 1);
-        n2.ip = "broker.example.com".to_owned();
         n2.ports.tcp = Some(8090);
 
         assert!(cfg(vec![n1, n2]).validate().is_err());

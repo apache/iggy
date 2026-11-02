@@ -17,6 +17,7 @@
 
 use crate::common::leader_context::LeaderContext;
 use crate::helpers::cluster;
+use crate::helpers::env::{root_password, root_username};
 use cucumber::{given, then, when};
 use iggy::prelude::*;
 use std::time::Duration;
@@ -33,7 +34,7 @@ async fn given_cluster_config(world: &mut LeaderContext, node_count: usize) {
 }
 
 #[given(regex = r"^node (\d+) is configured on port (\d+)$")]
-async fn given_node_configured(world: &mut LeaderContext, node_id: u32, port: u16) {
+async fn given_node_configured(world: &mut LeaderContext, node_id: u8, port: u16) {
     let (quic_port, http_port, ws_port) = match port {
         8091 => (8081, 3001, 8071),               // Leader ports
         8092 => (8082, 3002, 8072),               // Follower ports
@@ -41,6 +42,7 @@ async fn given_node_configured(world: &mut LeaderContext, node_id: u32, port: u1
     };
 
     let node = ClusterNode {
+        replica_id: node_id,
         name: format!("node-{}", node_id),
         ip: "iggy-server".to_string(),
         endpoints: TransportEndpoints::new(
@@ -160,7 +162,7 @@ async fn when_authenticate_root(world: &mut LeaderContext) {
             .unwrap_or_else(|| panic!("Client {} should be created", client_name));
 
         client
-            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .login_user(&root_username(), &root_password())
             .await
             .expect("Failed to login as root");
 
@@ -178,7 +180,7 @@ async fn when_create_stream(world: &mut LeaderContext, stream_name: String) {
         .expect("Client should be available");
 
     let stream = client
-        .create_stream(&stream_name)
+        .create_stream(&stream_name, &StreamCreateOptions::default())
         .await
         .expect("Should be able to create stream");
 
@@ -288,10 +290,16 @@ async fn then_both_use_same_server(world: &mut LeaderContext) {
     let conn_info_a = client_a.get_connection_info().await;
     let conn_info_b = client_b.get_connection_info().await;
 
-    // Verify both clients are connected to the same server
-    assert_eq!(
-        conn_info_a.server_address, conn_info_b.server_address,
-        "Both clients should be connected to the same server"
+    // Verify both clients are connected to the same server. Client A holds
+    // the address it was configured with and client B the one the roster
+    // published for the leader, so the spellings differ even when the node
+    // is the same.
+    assert!(
+        cluster::is_same_endpoint(&conn_info_a.server_address, &conn_info_b.server_address)
+            .expect("Server addresses should resolve"),
+        "Both clients should be connected to the same server, got {} and {}",
+        conn_info_a.server_address,
+        conn_info_b.server_address
     );
 
     // Verify both can communicate

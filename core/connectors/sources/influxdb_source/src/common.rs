@@ -110,10 +110,8 @@ pub struct V2SourceConfig {
     pub(crate) initial_offset: Option<String>,
     pub(crate) payload_column: Option<String>,
     pub(crate) payload_format: Option<String>,
-    /// When `false`, non-cursor measurement and field columns are excluded from
-    /// the emitted JSON payload. Note: the `_time` cursor column is always
-    /// present in V2 Flux CSV output and cannot be stripped at query time —
-    /// it will appear in the payload regardless of this setting.
+    /// When `false`, whole-row JSON retains only `_time` and `_value` in its
+    /// `row` object. The surrounding measurement/field/timestamp/value envelope remains.
     pub(crate) include_metadata: Option<bool>,
     pub(crate) verbose_logging: Option<bool>,
     pub(crate) max_retries: Option<u32>,
@@ -140,9 +138,8 @@ pub struct V3SourceConfig {
     pub(crate) initial_offset: Option<String>,
     pub(crate) payload_column: Option<String>,
     pub(crate) payload_format: Option<String>,
-    /// When `false`, the cursor column (`time` by default) is excluded from the
-    /// emitted JSON payload. Useful when consumers don't need the timestamp in
-    /// the message body since it's available as message metadata.
+    /// When `false`, the cursor column is excluded from whole-row JSON.
+    /// The runtime does not copy the database timestamp into broker metadata.
     pub(crate) include_metadata: Option<bool>,
     pub(crate) verbose_logging: Option<bool>,
     pub(crate) max_retries: Option<u32>,
@@ -153,11 +150,9 @@ pub struct V3SourceConfig {
     pub(crate) retry_max_delay: Option<String>,
     pub(crate) circuit_breaker_threshold: Option<u32>,
     pub(crate) circuit_breaker_cool_down: Option<String>,
-    /// Maximum factor by which batch_size may be inflated before the stuck-timestamp
-    /// circuit breaker trips. Defaults to 10 (i.e. up to 10× the configured batch_size).
-    /// Maximum accepted value is 100; higher values risk OOM-inducing queries.
-    /// Set to `0` to disable stuck-timestamp detection entirely (cursor advances
-    /// even when a full batch shares one timestamp, risking re-delivery of tied rows).
+    /// Maximum batch inflation before recording a circuit-breaker failure.
+    /// Defaults to 10; accepts 2 through 100, or 0 to disable the guards.
+    /// Disabling them can skip rows in timestamp groups spanning multiple batches.
     pub(crate) stuck_batch_cap_factor: Option<u32>,
 }
 
@@ -209,8 +204,7 @@ impl InfluxDbSourceConfig {
         delegate!(opt    self.poll_interval)
     }
     pub fn batch_size(&self) -> u32 {
-        // Floor at 1 — callers build LIMIT $limit queries; LIMIT 0 stalls silently.
-        // open() also rejects 0 explicitly, but defense-in-depth here costs nothing.
+        // LIMIT 0 would stall polling.
         delegate!(unwrap self.batch_size, 500).max(1)
     }
     pub fn initial_offset(&self) -> Option<&str> {

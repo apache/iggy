@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 export * from './client/index.js';
 export * from './consumer-group/index.js';
@@ -29,4 +28,8 @@ export * from './topic/index.js';
 export * from './user/index.js';
 export * from './command-set.js';
 export { type Id } from './identifier.utils.js';
+export {
+  StreamOptionKey, TopicOptionKey, UserOptionKey,
+  type OptionEntry, type ParsedOptions
+} from './options.utils.js';
 

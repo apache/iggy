@@ -24,7 +24,7 @@
 use bytes::Bytes;
 use iggy_binary_protocol::RoutedRequestHeader;
 use rand::RngExt;
-use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 
@@ -51,7 +51,7 @@ pub const OUTCOMES: &[Outcome] = &[Outcome::Success];
 pub fn sample(
     shadow: &mut Shadow,
     outcome: Outcome,
-    prng: &mut Xoshiro256Plus,
+    prng: &mut Xoshiro256PlusPlus,
     options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {

@@ -23,22 +23,23 @@ import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.TopicsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
+import org.apache.iggy.topic.TopicOptions;
+import org.apache.iggy.topic.TopicUpdate;
 
-import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
 import static org.apache.iggy.serde.BytesSerializer.toBytes;
-import static org.apache.iggy.serde.BytesSerializer.toBytesAsU64;
 
 /**
  * Async TCP implementation of TopicsClient using Netty for non-blocking I/O.
@@ -46,9 +47,19 @@ import static org.apache.iggy.serde.BytesSerializer.toBytesAsU64;
 public class TopicsTcpClient implements TopicsClient {
 
     private final Supplier<AsyncTcpConnection> connectionSupplier;
+    private final Runnable topologyChanged;
 
     public TopicsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
+        this(connectionSupplier, () -> {});
+    }
+
+    /**
+     * @param topologyChanged runs after this client deletes a topic, when the
+     *     partition contexts cached for it no longer hold
+     */
+    TopicsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier, Runnable topologyChanged) {
         this.connectionSupplier = connectionSupplier;
+        this.topologyChanged = topologyChanged;
     }
 
     private AsyncTcpConnection connection() {
@@ -61,87 +72,59 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
 
-        return connection().send(CommandCode.Topic.GET.getValue(), payload).thenApply(response -> {
-            try {
-                if (response.isReadable()) {
-                    return Optional.of(BytesDeserializer.readTopicDetails(response));
-                }
-                return Optional.<TopicDetails>empty();
-            } finally {
-                response.release();
-            }
-        });
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.Topic.GET.getValue(), payload), response -> {
+                    try {
+                        if (response.isReadable()) {
+                            return Optional.of(BytesDeserializer.readTopicDetails(response));
+                        }
+                        return Optional.<TopicDetails>empty();
+                    } finally {
+                        response.release();
+                    }
+                });
     }
 
     @Override
     public CompletableFuture<List<Topic>> getTopics(StreamId streamId) {
         var payload = toBytes(streamId);
 
-        return connection().send(CommandCode.Topic.GET_ALL.getValue(), payload).thenApply(response -> {
-            try {
-                List<Topic> topics = new ArrayList<>();
-                while (response.isReadable()) {
-                    topics.add(BytesDeserializer.readTopic(response));
-                }
-                return topics;
-            } finally {
-                response.release();
-            }
-        });
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.Topic.GET_ALL.getValue(), payload), response -> {
+                    try {
+                        var topicsCount = response.readUnsignedIntLE();
+                        List<Topic> topics = new ArrayList<>(Math.toIntExact(topicsCount));
+                        for (long i = 0; i < topicsCount; i++) {
+                            topics.add(BytesDeserializer.readTopic(response));
+                        }
+                        return topics;
+                    } finally {
+                        response.release();
+                    }
+                });
     }
 
     @Override
     public CompletableFuture<TopicDetails> createTopic(
-            StreamId streamId,
-            Long partitionsCount,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
-            String name) {
+            StreamId streamId, String name, long partitionsCount, Map<String, HeaderValue> options) {
+        var payload = BytesSerializer.toCreateTopic(
+                streamId, name, partitionsCount, TopicOptions.withDurabilityDefaults(options));
 
-        var streamIdBytes = toBytes(streamId);
-        var payload = Unpooled.buffer(23 + streamIdBytes.readableBytes() + name.length());
-
-        payload.writeBytes(streamIdBytes);
-        payload.writeIntLE(partitionsCount.intValue());
-        payload.writeByte(compressionAlgorithm.asCode());
-        payload.writeBytes(toBytesAsU64(messageExpiry));
-        payload.writeBytes(toBytesAsU64(maxTopicSize));
-        payload.writeByte(replicationFactor.orElse((short) 0));
-        payload.writeBytes(BytesSerializer.toBytes(name));
-
-        return connection().send(CommandCode.Topic.CREATE.getValue(), payload).thenApply(response -> {
-            try {
-                return BytesDeserializer.readTopicDetails(response);
-            } finally {
-                response.release();
-            }
-        });
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.Topic.CREATE.getValue(), payload), response -> {
+                    try {
+                        return BytesDeserializer.readTopicDetails(response);
+                    } finally {
+                        response.release();
+                    }
+                });
     }
 
     @Override
-    public CompletableFuture<Void> updateTopic(
-            StreamId streamId,
-            TopicId topicId,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
-            String name) {
+    public CompletableFuture<Void> updateTopic(StreamId streamId, TopicId topicId, TopicUpdate update) {
+        var payload = BytesSerializer.toUpdateResource(streamId, topicId, update);
 
-        var payload = Unpooled.buffer();
-        payload.writeBytes(toBytes(streamId));
-        payload.writeBytes(toBytes(topicId));
-        payload.writeByte(compressionAlgorithm.asCode());
-        payload.writeBytes(toBytesAsU64(messageExpiry));
-        payload.writeBytes(toBytesAsU64(maxTopicSize));
-        payload.writeByte(replicationFactor.orElse((short) 0));
-        payload.writeBytes(BytesSerializer.toBytes(name));
-
-        return connection()
-                .send(CommandCode.Topic.UPDATE.getValue(), payload)
-                .thenAccept(response -> response.release());
+        return connection().sendAndRelease(CommandCode.System.UPDATE_RESOURCE, payload);
     }
 
     @Override
@@ -150,8 +133,10 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
 
-        return connection()
-                .send(CommandCode.Topic.DELETE.getValue(), payload)
-                .thenAccept(response -> response.release());
+        return AsyncTcpConnection.mapResponse(connection().send(CommandCode.Topic.DELETE, payload), response -> {
+            response.release();
+            topologyChanged.run();
+            return null;
+        });
     }
 }

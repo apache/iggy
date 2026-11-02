@@ -37,31 +37,34 @@ use tracing::{error, warn};
 // ─── Body builders ───────────────────────────────────────────────────────────
 
 /// Build a newline-delimited JSON body for `FORMAT JSONEachRow`.
-/// Each `Payload::Json` message becomes one line. Other payload types are skipped.
+/// Each message holding a JSON document (`Payload::Json`, or `Payload::Proto`
+/// text that parses as JSON) becomes one line. Other payloads are skipped.
+///
+/// Proto text is re-serialised rather than copied through: a `proto_convert`
+/// transform with `pretty_json` set hands over a multi-line document, and
+/// JSONEachRow needs one document per line.
 pub(crate) fn build_json_body(messages: &[ConsumedMessage]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(messages.len() * 64);
     for msg in messages {
-        match &msg.payload {
-            Payload::Json(value) => {
-                if simd_json::to_writer(&mut buf, value).is_ok() {
-                    buf.push(b'\n');
-                } else {
-                    warn!("Failed to serialise JSON payload at offset {}", msg.offset);
-                }
-            }
-            _ => {
-                error!(
-                    "JSONEachRow mode: skipping unsupported payload type at offset {}",
-                    msg.offset
-                );
-            }
+        let Some(value) = msg.payload.json_document() else {
+            error!(
+                "JSONEachRow mode: skipping payload with no JSON document at offset {}",
+                msg.offset
+            );
+            continue;
+        };
+        if simd_json::to_writer(&mut buf, value.as_ref()).is_ok() {
+            buf.push(b'\n');
+        } else {
+            warn!("Failed to serialise JSON payload at offset {}", msg.offset);
         }
     }
     buf
 }
 
 /// Build a RowBinaryWithDefaults body.
-/// Each `Payload::Json` message is serialised to binary using the table schema.
+/// Each message holding a JSON document (`Payload::Json`, or `Payload::Proto`
+/// text that parses as JSON) is serialised to binary using the table schema.
 ///
 /// Returns `Err` on the first row that fails to serialise. Unlike the JSON and
 /// string builders this cannot skip the bad row: rows are written directly into
@@ -73,24 +76,24 @@ pub(crate) fn build_row_binary_body(
 ) -> Result<Vec<u8>, Error> {
     let mut buf = Vec::with_capacity(messages.len() * 128);
     for msg in messages {
-        match &msg.payload {
-            Payload::Json(value) => {
-                crate::binary::serialize_row(value, schema, &mut buf)?;
-            }
-            _ => {
-                error!(
-                    "RowBinary mode: skipping unsupported payload type at offset {}",
-                    msg.offset
-                );
-            }
-        }
+        let Some(value) = msg.payload.json_document() else {
+            error!(
+                "RowBinary mode: skipping payload with no JSON document at offset {}",
+                msg.offset
+            );
+            continue;
+        };
+        crate::binary::serialize_row(value.as_ref(), schema, &mut buf)?;
     }
     Ok(buf)
 }
 
 /// Build a raw string body for CSV / TSV / JSONEachRow string passthrough.
-/// Each `Payload::Text` message is written as-is with a trailing newline
-/// appended if not already present.
+/// Each `Payload::Text` or `Payload::Proto` message is written as-is with a
+/// trailing newline appended if not already present. Nothing is re-serialised
+/// here, so a `proto_convert` transform with `pretty_json` set combined with
+/// the `json_each_row` string format is a misconfiguration: the multi-line
+/// document is written as several lines.
 pub(crate) fn build_string_body(
     messages: &[ConsumedMessage],
     string_format: StringFormat,
@@ -98,7 +101,7 @@ pub(crate) fn build_string_body(
     let mut buf = Vec::with_capacity(messages.len() * 64);
     for msg in messages {
         match &msg.payload {
-            Payload::Text(s) => {
+            Payload::Text(s) | Payload::Proto(s) => {
                 buf.extend_from_slice(s.as_bytes());
                 if string_format.requires_newline() && !s.ends_with('\n') {
                     buf.push(b'\n');
@@ -280,6 +283,38 @@ mod tests {
         assert!(build_string_body(&messages, StringFormat::Csv).is_empty());
     }
 
+    /// A `proto_convert` transform that cannot encode falls back to proto text,
+    /// and the runtime tags that run `Schema::Proto`. Passthrough mode takes it
+    /// as text, the way it reached this sink before batches were tagged from
+    /// the payload.
+    #[test]
+    fn string_body_proto_payload_is_written_as_text() {
+        let messages = vec![msg(Payload::Proto("a,b,c".to_owned()))];
+        assert_eq!(build_string_body(&messages, StringFormat::Csv), b"a,b,c\n");
+    }
+
+    /// A `proto_convert` transform with no descriptor hands over the JSON it
+    /// was given as proto text, so the row is the document that text holds.
+    #[test]
+    fn json_body_proto_payload_holding_json_is_written() {
+        let messages = vec![msg(Payload::Proto(r#"{"name":"alice"}"#.into()))];
+        assert_eq!(build_json_body(&messages), b"{\"name\":\"alice\"}\n");
+    }
+
+    /// `pretty_json` puts newlines in the proto text and JSONEachRow needs one
+    /// document per line, so the document is re-serialised rather than copied.
+    #[test]
+    fn json_body_pretty_proto_json_is_written_as_one_line() {
+        let messages = vec![msg(Payload::Proto("{\n  \"name\": \"alice\"\n}".into()))];
+        assert_eq!(build_json_body(&messages), b"{\"name\":\"alice\"}\n");
+    }
+
+    #[test]
+    fn json_body_non_json_proto_payload_is_skipped() {
+        let messages = vec![msg(Payload::Proto("name: \"alice\"".into()))];
+        assert!(build_json_body(&messages).is_empty());
+    }
+
     // ── build_row_binary_body ────────────────────────────────────────────────
 
     #[test]
@@ -308,6 +343,21 @@ mod tests {
         let body = build_row_binary_body(&messages, &schema).unwrap();
         // RowBinaryWithDefaults: 0x00 (value follows) + LEB128 length (5) + UTF-8 bytes
         assert_eq!(body, b"\x00\x05alice");
+    }
+
+    #[test]
+    fn row_binary_body_proto_payload_holding_json_writes_bytes() {
+        let messages = vec![msg(Payload::Proto(r#"{"name":"alice"}"#.into()))];
+        let schema = vec![col("name", ChType::String)];
+        let body = build_row_binary_body(&messages, &schema).unwrap();
+        assert_eq!(body, b"\x00\x05alice");
+    }
+
+    #[test]
+    fn row_binary_body_non_json_proto_payload_is_skipped() {
+        let messages = vec![msg(Payload::Proto("name: \"alice\"".into()))];
+        let body = build_row_binary_body(&messages, &[col("name", ChType::String)]).unwrap();
+        assert!(body.is_empty());
     }
 
     #[test]

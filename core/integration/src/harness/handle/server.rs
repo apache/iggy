@@ -16,23 +16,26 @@
 // under the License.
 
 use super::client_builder::{ClientBuilder, ServerConnection};
+use super::common::SIGTERM_TIMEOUT;
 use super::connectors_runtime::ConnectorsRuntimeHandle;
 use super::mcp::McpHandle;
-use crate::harness::config::{ConnectorsRuntimeConfig, IpAddrKind, McpConfig, TestServerConfig};
+use crate::harness::config::{ConnectorsRuntimeConfig, McpConfig, TestServerConfig};
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::port_reserver::PortReserver;
 use crate::harness::traits::{IggyServerDependent, Restartable, TestBinary};
 use assert_cmd::prelude::CommandCargoExt;
 use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
-use iggy_common::TransportProtocol;
+use iggy_common::{IggyDuration, TransportProtocol};
 use rand::RngExt as _;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle, available_parallelism, sleep};
@@ -42,6 +45,26 @@ use toml::Value;
 const SLEEP_INTERVAL_MS: u64 = 20;
 const MAX_PORT_WAIT_DURATION_S: u64 = 60;
 const TEST_VERBOSITY_ENV_VAR: &str = "IGGY_TEST_VERBOSE";
+const FAILURE_LOG_TAIL_BYTES: u64 = 4096;
+const FAILURE_LOG_TAIL_LINES: usize = 8;
+/// The server truncates the dump and then writes it in one go, so a read in
+/// between parses as valid TOML with sections or keys missing; readiness
+/// retries on this message.
+const INCOMPLETE_DUMP_MESSAGE: &str = "Failed to parse server config: the dump is incomplete";
+/// The effective config the server dumps at boot, relative to its data path.
+const CONFIG_DUMP_PATH: &str = "runtime/current_config.toml";
+
+/// How the last [`TestBinary::stop`] of a running server ended.
+#[derive(Debug, Clone, Copy)]
+pub struct StopOutcome {
+    /// `None` when the status could not be collected.
+    pub exit_status: Option<ExitStatus>,
+    /// The server did not exit within [`SIGTERM_TIMEOUT`] of SIGTERM and got
+    /// SIGKILL, so its shutdown flush may not have run.
+    pub killed_after_timeout: bool,
+    /// Waiting for the process failed, so neither field above is reliable.
+    pub wait_error: Option<io::ErrorKind>,
+}
 
 #[derive(Debug, Clone)]
 struct ServerProtocolAddr {
@@ -71,6 +94,7 @@ pub struct ServerHandle {
     addrs: ServerProtocolAddr,
     stdout_path: Option<PathBuf>,
     stderr_path: Option<PathBuf>,
+    log_incarnation: usize,
     watchdog_handle: Option<JoinHandle<()>>,
     watchdog_stop: Arc<AtomicBool>,
     generated_cert_dir: Option<PathBuf>,
@@ -78,6 +102,11 @@ pub struct ServerHandle {
     test_transport: Option<iggy_common::TransportProtocol>,
     mcp: Option<McpHandle>,
     connectors_runtime: Option<ConnectorsRuntimeHandle>,
+    open_files_limit: Option<u64>,
+    last_stop: Option<StopOutcome>,
+    /// When [`ServerHandle::signal_stop`] sent SIGTERM; the next stop waits
+    /// out the rest of the grace from then instead of signalling again.
+    sigterm_sent_at: Option<Instant>,
 }
 
 impl std::fmt::Debug for ServerHandle {
@@ -129,6 +158,30 @@ impl ServerHandle {
             .join(format!("server_{}_local_data", self.server_id))
     }
 
+    /// The `cluster.commit_broadcast_interval` the server runs with, read from
+    /// the config it dumped at boot.
+    ///
+    /// # Errors
+    ///
+    /// [`TestBinaryError::InvalidState`] when the dump cannot be read or holds
+    /// no valid interval.
+    pub fn commit_broadcast_interval(&self) -> Result<Duration, TestBinaryError> {
+        let path = self.data_path().join(CONFIG_DUMP_PATH);
+        let invalid = |reason: String| TestBinaryError::InvalidState {
+            message: format!("{}: {reason}", path.display()),
+        };
+        let dump = fs::read_to_string(&path).map_err(|error| invalid(error.to_string()))?;
+        let config: Value = toml::from_str(&dump).map_err(|error| invalid(error.to_string()))?;
+        let interval = config
+            .get("cluster")
+            .and_then(|cluster| cluster.get("commit_broadcast_interval"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("no cluster.commit_broadcast_interval".to_string()))?;
+        IggyDuration::from_str(interval)
+            .map(|interval| interval.get_duration())
+            .map_err(|error| invalid(format!("commit_broadcast_interval {interval:?}: {error}")))
+    }
+
     fn stdout_log_path(&self) -> PathBuf {
         self.context
             .base_dir()
@@ -165,8 +218,64 @@ impl ServerHandle {
         self.config.extra_envs.insert(key.into(), value.into());
     }
 
+    pub fn remove_env(&mut self, key: impl Into<String>) {
+        self.config.removed_envs.push(key.into());
+    }
+
     pub fn collect_logs(&self) -> (String, String) {
         super::common::collect_logs(&self.stdout_path, &self.stderr_path)
+    }
+
+    fn failure_logs(&self) -> (String, String) {
+        failure_logs(
+            &self.stdout_path,
+            &self.stderr_path,
+            self.config.dump_logs_on_failure,
+        )
+    }
+
+    fn archive_previous_logs(&mut self) -> Result<(), TestBinaryError> {
+        if !self.config.preserve_logs_on_restart {
+            return Ok(());
+        }
+        let (Some(stdout_path), Some(stderr_path)) = (&self.stdout_path, &self.stderr_path) else {
+            return Ok(());
+        };
+        let archive_dir = self.context.base_dir().join(format!(
+            "server_{}_incarnation_{}",
+            self.server_id, self.log_incarnation
+        ));
+        archive_log_files(stdout_path, stderr_path, &archive_dir)?;
+        self.log_incarnation += 1;
+        Ok(())
+    }
+
+    /// How the most recent stop of a running process ended. A stop of a
+    /// server that was not running clears it.
+    pub fn last_stop(&self) -> Option<StopOutcome> {
+        self.last_stop
+    }
+
+    /// Send SIGTERM without waiting, so a caller can signal every node before
+    /// it waits for any of them. The next [`TestBinary::stop`] waits for the
+    /// exit and records the outcome. No-op when the server is not running.
+    pub fn signal_stop(&mut self) {
+        // The watchdog panics on any exit it did not expect.
+        self.stop_watchdog();
+        if let Some(child) = self.child_handle.as_ref() {
+            // A child the watchdog already reaped may have handed its pid to
+            // another process, so a dead node gets no signal; `stop` still
+            // collects what the wait can tell about it.
+            if super::common::is_process_alive(child.id()) {
+                super::common::send_sigterm(child);
+            }
+            self.sigterm_sent_at = Some(Instant::now());
+        }
+    }
+
+    /// The stderr log when it holds a panic that can leave a dead task behind.
+    pub fn stderr_panic_report(&self) -> Option<String> {
+        super::common::stderr_panic_report(&self.stderr_path)
     }
 
     /// True once this node has logged that its replica mesh is fully formed
@@ -179,6 +288,15 @@ impl ServerHandle {
         self.stdout_contains("replica mesh complete")
     }
 
+    /// True once this node has logged that it admits partition requests.
+    /// A replica in a multi-node cluster refuses them as transient until it
+    /// holds fresh quorum evidence, which arrives one probe round after the
+    /// mesh forms. A single-node server never emits the marker.
+    #[must_use]
+    pub fn partition_admission_open(&self) -> bool {
+        self.stdout_contains("partition admission opened")
+    }
+
     /// True once this node's stdout log contains `marker`. Spec tests use
     /// this to pin server-side behavior that has no client-visible effect on
     /// this node (e.g. a follower completing a state transfer).
@@ -187,35 +305,46 @@ impl ServerHandle {
         self.stdout_occurrences(marker) > 0
     }
 
-    /// Number of times `marker` appears in this node's stdout log. The log
-    /// file is TRUNCATED on every (re)start (it captures one process run),
-    /// so counts never carry across a restart; a marker seen after
-    /// `restart_server` was logged by the new process.
+    /// Number of times `marker` appears in this node's captured stdout, or in
+    /// its own logs when verbose mode makes the child inherit stdout. Captured
+    /// stdout is truncated on restart. The server log may span restarts, so
+    /// restart-sensitive callers must compare against a pre-restart baseline.
     ///
     /// ANSI escape sequences are stripped before matching: the server colors
     /// its tracing fields, so a `key=value` marker never matches the raw
     /// bytes (`key\x1b[0m\x1b[2m=\x1b[0m value`).
     #[must_use]
     pub fn stdout_occurrences(&self, marker: &str) -> usize {
-        self.stdout_path
-            .as_ref()
-            .and_then(|path| fs::read_to_string(path).ok())
-            .map_or(0, |log| strip_ansi(&log).matches(marker).count())
+        self.stdout_plain().matches(marker).count()
     }
 
-    /// This node's stdout log with ANSI escapes stripped, the same text
-    /// [`Self::stdout_occurrences`] matches against. Empty when the log is
-    /// missing or unreadable.
+    /// This node's captured stdout with ANSI escapes stripped, or its own logs
+    /// when verbose mode disables the capture. Empty when neither source is
+    /// readable.
     ///
     /// For callers that need to PARSE a marker's fields (`checkpoint_op=193`
     /// reaches the file as `checkpoint_op\x1b[0m\x1b[2m=\x1b[0m193`) rather
     /// than just count occurrences of it.
     #[must_use]
     pub fn stdout_plain(&self) -> String {
-        self.stdout_path
+        let captured = self
+            .stdout_path
             .as_ref()
             .and_then(|path| fs::read_to_string(path).ok())
-            .map_or_else(String::new, |log| strip_ansi(&log))
+            .map(|log| strip_ansi(&log));
+        captured.unwrap_or_else(|| {
+            let own_logs = self.data_path().join("logs");
+            let Ok(entries) = fs::read_dir(own_logs) else {
+                return String::new();
+            };
+            let mut log = String::new();
+            for entry in entries.flatten() {
+                if let Ok(contents) = fs::read_to_string(entry.path()) {
+                    log.push_str(&contents);
+                }
+            }
+            log
+        })
     }
 
     /// Returns a `ClientBuilder` using the test transport.
@@ -266,7 +395,7 @@ impl ServerHandle {
     fn build_envs(&mut self) -> Result<(), TestBinaryError> {
         // Pass through IGGY_* env vars from parent process, except those critical for test isolation.
         const PROTECTED_PREFIXES: &[&str] = &[
-            "IGGY_SYSTEM_PATH",
+            "IGGY_PATH",
             "IGGY_TCP_ADDRESS",
             "IGGY_HTTP_ADDRESS",
             "IGGY_QUIC_ADDRESS",
@@ -294,14 +423,14 @@ impl ServerHandle {
             Err(_) => "0..4".to_string(),
         };
         self.envs
-            .entry("IGGY_SYSTEM_SHARDING_CPU_ALLOCATION".to_string())
+            .entry("IGGY_SHARDING_CPU_ALLOCATION".to_string())
             .or_insert(cpu_allocation);
-
-        if self.config.ip_kind == IpAddrKind::V6 {
-            self.envs
-                .entry("IGGY_TCP_IPV6".to_string())
-                .or_insert_with(|| "true".to_string());
-        }
+        // On a 4-core CI runner every server computes the same `0..4` range, so
+        // pinned shards of concurrently running tests pile onto the same cores
+        // and starve each other. Leave thread placement to the scheduler.
+        self.envs
+            .entry("IGGY_SHARDING_PIN_CORES".to_string())
+            .or_insert_with(|| "false".to_string());
 
         self.envs
             .entry("IGGY_ROOT_USERNAME".to_string())
@@ -311,10 +440,8 @@ impl ServerHandle {
             .or_insert_with(|| DEFAULT_ROOT_PASSWORD.to_string());
 
         let data_path = self.data_path();
-        self.envs.insert(
-            "IGGY_SYSTEM_PATH".to_string(),
-            data_path.display().to_string(),
-        );
+        self.envs
+            .insert("IGGY_PATH".to_string(), data_path.display().to_string());
 
         // Protocol enablement (special handling for defaults)
         if !self.config.quic_enabled {
@@ -336,10 +463,10 @@ impl ServerHandle {
         // Encryption (special handling for key injection)
         if let Some(ref enc) = self.config.encryption {
             self.envs
-                .entry("IGGY_SYSTEM_ENCRYPTION_ENABLED".to_string())
+                .entry("IGGY_ENCRYPTION_ENABLED".to_string())
                 .or_insert_with(|| "true".to_string());
             self.envs
-                .entry("IGGY_SYSTEM_ENCRYPTION_KEY".to_string())
+                .entry("IGGY_ENCRYPTION_KEY".to_string())
                 .or_insert_with(|| enc.key.clone());
         }
 
@@ -350,7 +477,14 @@ impl ServerHandle {
             self.set_tls_envs("WEBSOCKET", &tls);
         }
 
-        // Extra envs from config (includes resolved config paths from macro)
+        // Extra envs from config (includes resolved config paths from macro).
+        // Validated first: a name no config leaf reads is a silent no-op, and
+        // a test that believes it configured the server but did not is worse
+        // than one that fails to start.
+        if let Err(report) = crate::harness::config::validate_env_var_names(&self.config.extra_envs)
+        {
+            panic!("invalid extra_envs for the test server:\n{report}");
+        }
         for (k, v) in &self.config.extra_envs {
             self.envs.insert(k.clone(), v.clone());
         }
@@ -389,6 +523,30 @@ impl ServerHandle {
                     || self.addrs.websocket.is_some(),
                 "port_reserver set but no addresses configured"
             );
+            return Ok(());
+        }
+
+        // Ephemeral ports: every enabled transport binds `:0` and
+        // `verify_bound_ports` adopts what the OS chose from the dumped runtime
+        // config. Ahead of the restart branch so a restart discovers afresh
+        // instead of pinning a port the OS may have handed out elsewhere since.
+        if self.config.ephemeral_ports {
+            self.addrs = ServerProtocolAddr::empty();
+            let unbound = SocketAddr::new(self.config.ip_kind.loopback(), 0).to_string();
+            self.envs
+                .insert("IGGY_TCP_ADDRESS".to_string(), unbound.clone());
+            if self.config.http_enabled {
+                self.envs
+                    .insert("IGGY_HTTP_ADDRESS".to_string(), unbound.clone());
+            }
+            if self.config.quic_enabled {
+                self.envs
+                    .insert("IGGY_QUIC_ADDRESS".to_string(), unbound.clone());
+            }
+            if self.config.websocket_enabled {
+                self.envs
+                    .insert("IGGY_WEBSOCKET_ADDRESS".to_string(), unbound);
+            }
             return Ok(());
         }
 
@@ -450,7 +608,7 @@ impl ServerHandle {
 
     fn wait_for_server_ready(&mut self) -> Result<(), TestBinaryError> {
         let data_path = self.data_path();
-        let config_path = data_path.join("runtime/current_config.toml");
+        let config_path = data_path.join(CONFIG_DUMP_PATH);
 
         let max_attempts = (MAX_PORT_WAIT_DURATION_S * 1000) / SLEEP_INTERVAL_MS;
         let deadline = Instant::now() + Duration::from_secs(MAX_PORT_WAIT_DURATION_S);
@@ -459,7 +617,7 @@ impl ServerHandle {
             if let Some(child) = self.child_handle.as_mut()
                 && let Ok(Some(status)) = child.try_wait()
             {
-                let (stdout, stderr) = self.collect_logs();
+                let (stdout, stderr) = self.failure_logs();
                 return Err(TestBinaryError::ProcessCrashed {
                     binary: self.launched_binary(),
                     exit_code: status.code(),
@@ -491,7 +649,11 @@ impl ServerHandle {
         })
     }
 
-    fn verify_bound_ports(&self, config_path: &Path) -> Result<(), TestBinaryError> {
+    /// Reconcile the dumped runtime config with the addresses this handle
+    /// holds: a pre-reserved address must be the one the server bound, and an
+    /// address the handle does not know yet (`ephemeral_ports`) is adopted
+    /// from the dump.
+    fn verify_bound_ports(&mut self, config_path: &Path) -> Result<(), TestBinaryError> {
         let content =
             fs::read_to_string(config_path).map_err(|e| TestBinaryError::InvalidState {
                 message: format!(
@@ -505,32 +667,21 @@ impl ServerHandle {
                 message: format!("Failed to parse server config: {e}"),
             })?;
 
-        let bound_tcp = Self::extract_address(&config, "tcp");
-        let bound_http = Self::extract_address(&config, "http");
-        let bound_quic = Self::extract_address(&config, "quic");
-        let bound_websocket = Self::extract_address(&config, "websocket");
-
+        let transports = [
+            ("TCP", "tcp", &mut self.addrs.tcp),
+            ("HTTP", "http", &mut self.addrs.http),
+            ("QUIC", "quic", &mut self.addrs.quic),
+            ("WebSocket", "websocket", &mut self.addrs.websocket),
+        ];
         let mut mismatches = Vec::new();
-
-        if let (Some(expected), Some(bound)) = (self.addrs.tcp, bound_tcp)
-            && expected != bound
-        {
-            mismatches.push(format!("TCP: expected {expected}, got {bound}"));
-        }
-        if let (Some(expected), Some(bound)) = (self.addrs.http, bound_http)
-            && expected != bound
-        {
-            mismatches.push(format!("HTTP: expected {expected}, got {bound}"));
-        }
-        if let (Some(expected), Some(bound)) = (self.addrs.quic, bound_quic)
-            && expected != bound
-        {
-            mismatches.push(format!("QUIC: expected {expected}, got {bound}"));
-        }
-        if let (Some(expected), Some(bound)) = (self.addrs.websocket, bound_websocket)
-            && expected != bound
-        {
-            mismatches.push(format!("WebSocket: expected {expected}, got {bound}"));
+        for (label, section, expected) in transports {
+            match (*expected, Self::extract_address(&config, section)?) {
+                (Some(expected), Some(bound)) if expected != bound => {
+                    mismatches.push(format!("{label}: expected {expected}, got {bound}"));
+                }
+                (None, Some(bound)) => *expected = Some(bound),
+                _ => {}
+            }
         }
 
         if !mismatches.is_empty() {
@@ -545,8 +696,38 @@ impl ServerHandle {
         Ok(())
     }
 
-    fn extract_address(config: &Value, protocol: &str) -> Option<SocketAddr> {
-        config.get(protocol)?.get("address")?.as_str()?.parse().ok()
+    /// The address a transport section reports, when it marks the transport
+    /// enabled: a disabled transport keeps its configured address in the dump
+    /// without ever binding it. Every section is serialized with both keys
+    /// whether or not the transport is enabled, so a section or key still
+    /// absent is a dump being written, not a disabled transport.
+    fn extract_address(
+        config: &Value,
+        protocol: &str,
+    ) -> Result<Option<SocketAddr>, TestBinaryError> {
+        let incomplete = || TestBinaryError::InvalidState {
+            message: INCOMPLETE_DUMP_MESSAGE.to_string(),
+        };
+        let section = config.get(protocol).ok_or_else(incomplete)?;
+        let enabled = section
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .ok_or_else(incomplete)?;
+        if !enabled {
+            return Ok(None);
+        }
+        let address = section
+            .get("address")
+            .and_then(Value::as_str)
+            .ok_or_else(incomplete)?;
+        address
+            .parse()
+            .map(Some)
+            .map_err(|error| TestBinaryError::InvalidState {
+                message: format!(
+                    "Server config {protocol}.address {address:?} is not a socket address: {error}"
+                ),
+            })
     }
 
     fn start_watchdog(&mut self) {
@@ -557,11 +738,18 @@ impl ServerHandle {
         let stop_signal = self.watchdog_stop.clone();
         let stdout_path = self.stdout_path.clone();
         let stderr_path = self.stderr_path.clone();
+        let dump_logs_on_failure = self.config.dump_logs_on_failure;
 
         let handle = thread::Builder::new()
             .name("test-server-watchdog".to_string())
             .spawn(move || {
-                Self::watchdog_loop(pid, stop_signal, stdout_path, stderr_path);
+                Self::watchdog_loop(
+                    pid,
+                    stop_signal,
+                    stdout_path,
+                    stderr_path,
+                    dump_logs_on_failure,
+                );
             })
             .expect("Failed to spawn watchdog thread");
 
@@ -573,6 +761,7 @@ impl ServerHandle {
         stop_signal: Arc<AtomicBool>,
         stdout_path: Option<PathBuf>,
         stderr_path: Option<PathBuf>,
+        dump_logs_on_failure: bool,
     ) {
         const CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -582,15 +771,8 @@ impl ServerHandle {
             }
 
             if !super::common::is_process_alive(pid) {
-                let stdout_content = stdout_path
-                    .as_ref()
-                    .and_then(|p| fs::read_to_string(p).ok())
-                    .unwrap_or_else(|| "[No stdout log]".to_string());
-
-                let stderr_content = stderr_path
-                    .as_ref()
-                    .and_then(|p| fs::read_to_string(p).ok())
-                    .unwrap_or_else(|| "[No stderr log]".to_string());
+                let (stdout_content, stderr_content) =
+                    failure_logs(&stdout_path, &stderr_path, dump_logs_on_failure);
 
                 let exit_status = super::common::reap_exit_status(pid)
                     .unwrap_or_else(|| "unavailable (already reaped)".to_string());
@@ -632,6 +814,7 @@ impl ServerHandle {
             addrs: ServerProtocolAddr::empty(),
             stdout_path: None,
             stderr_path: None,
+            log_incarnation: 0,
             watchdog_handle: None,
             watchdog_stop: Arc::new(AtomicBool::new(false)),
             generated_cert_dir: None,
@@ -639,6 +822,9 @@ impl ServerHandle {
             test_transport: None,
             mcp: None,
             connectors_runtime: None,
+            open_files_limit: None,
+            last_stop: None,
+            sigterm_sent_at: None,
         }
     }
 
@@ -655,6 +841,24 @@ impl ServerHandle {
     /// Set the test transport (used by harness builder).
     pub fn set_test_transport(&mut self, transport: iggy_common::TransportProtocol) {
         self.test_transport = Some(transport);
+    }
+
+    /// Point the next `start()` at a different server binary.
+    ///
+    /// `start()` re-reads `config.executable_path` on every call, so a test
+    /// can boot one build, then restart the SAME data directory under another
+    /// one. `None` restores the cargo-built binary of the crate under test,
+    /// which is why this takes an explicit `Option` rather than
+    /// `impl Into<String>`.
+    pub fn set_executable_path(&mut self, path: Option<String>) {
+        self.config.executable_path = path;
+    }
+
+    /// Set the soft and hard `RLIMIT_NOFILE` of the next `start()`, or `None`
+    /// to inherit the limits of the test process. The server raises its soft
+    /// limit to the hard one at boot, so only a lowered hard limit holds.
+    pub fn set_open_files_limit(&mut self, limit: Option<u64>) {
+        self.open_files_limit = limit;
     }
 
     /// Configure MCP server for this iggy server.
@@ -792,6 +996,7 @@ impl TestBinary for ServerHandle {
             addrs: ServerProtocolAddr::empty(),
             stdout_path: None,
             stderr_path: None,
+            log_incarnation: 0,
             watchdog_handle: None,
             watchdog_stop: Arc::new(AtomicBool::new(false)),
             generated_cert_dir: None,
@@ -799,6 +1004,9 @@ impl TestBinary for ServerHandle {
             test_transport: None,
             mcp: None,
             connectors_runtime: None,
+            open_files_limit: None,
+            last_stop: None,
+            sigterm_sent_at: None,
         }
     }
 
@@ -845,7 +1053,7 @@ impl TestBinary for ServerHandle {
         self.build_envs()?;
 
         let data_path = self.data_path();
-        let config_path = data_path.join("runtime/current_config.toml");
+        let config_path = data_path.join(CONFIG_DUMP_PATH);
         if config_path.exists() {
             let _ = fs::remove_file(&config_path);
         }
@@ -871,7 +1079,7 @@ impl TestBinary for ServerHandle {
             })?
         };
 
-        command.env("IGGY_SYSTEM_PATH", data_path.display().to_string());
+        command.env("IGGY_PATH", data_path.display().to_string());
         // VSR multi-node tests spawn N shards per node * M nodes per test;
         // the 4096-entry per-ring default exhausts dev memlock budgets
         // (`ulimit -l` is commonly 8 MiB). Shrink unless the caller already
@@ -881,22 +1089,59 @@ impl TestBinary for ServerHandle {
         {
             command.env("IGGY_SHARD_RUNTIME_CAPACITY", "256");
         }
+        // An explicit config-level override must be the test's logging
+        // contract. The server gives `RUST_LOG` precedence, so inheriting an
+        // ambient value could silently filter out markers the test asserts.
+        // A caller that explicitly puts `RUST_LOG` in `extra_envs` adds it back
+        // through `command.envs` below.
+        if self.config.extra_envs.contains_key("IGGY_LOGGING_LEVEL") {
+            command.env_remove("RUST_LOG");
+        }
         command.envs(&self.envs);
+        for key in &self.config.removed_envs {
+            command.env_remove(key);
+        }
+        if let Some(current_dir) = &self.config.current_dir {
+            command.current_dir(current_dir);
+        }
+
+        if let Some(limit) = self.open_files_limit {
+            let rlimit = libc::rlimit {
+                rlim_cur: limit as libc::rlim_t,
+                rlim_max: limit as libc::rlim_t,
+            };
+            // SAFETY: the hook runs in the forked child before `exec`, where
+            // only async-signal-safe calls are sound. `setrlimit` is one, and
+            // the hook touches nothing but its own copy of `rlimit`.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &rlimit) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+        }
 
         // `--replica-id` is the single identity input expected by the
-        // server when cluster mode is enabled; all other cluster config is
-        // byte-identical across nodes. Pass the harness's `server_id`
+        // server when cluster mode is enabled; every node sees the same
+        // roster, except that with peer relays each node's peers carry the
+        // relay ports that node dials. Pass the harness's `server_id`
         // unconditionally; bootstrap only validates it when
         // `cluster.enabled=true`, so single-node tests see no effect.
         command.arg("--replica-id").arg(self.server_id.to_string());
 
-        let verbose = std::env::var(TEST_VERBOSITY_ENV_VAR).is_ok()
-            || self.envs.contains_key(TEST_VERBOSITY_ENV_VAR);
+        let verbose = (std::env::var(TEST_VERBOSITY_ENV_VAR).is_ok()
+            || self.envs.contains_key(TEST_VERBOSITY_ENV_VAR))
+            && self.config.dump_logs_on_failure
+            && !self.config.preserve_logs_on_restart;
 
         if verbose {
             command.stdout(Stdio::inherit());
             command.stderr(Stdio::inherit());
         } else {
+            self.archive_previous_logs()?;
             let stdout_path = self.stdout_log_path();
             let stderr_path = self.stderr_log_path();
 
@@ -923,6 +1168,7 @@ impl TestBinary for ServerHandle {
             source: e,
         })?;
         self.child_handle = Some(child);
+        self.sigterm_sent_at = None;
         self.watchdog_stop = Arc::new(AtomicBool::new(false));
 
         self.wait_for_server_ready()?;
@@ -934,11 +1180,24 @@ impl TestBinary for ServerHandle {
 
     fn stop(&mut self) -> Result<(), TestBinaryError> {
         self.stop_watchdog();
+        self.last_stop = None;
+        let sigterm_sent_at = self.sigterm_sent_at.take();
 
         if let Some(child) = self.child_handle.take() {
-            let child = super::common::graceful_kill(child);
+            let stopped = match sigterm_sent_at {
+                Some(sent_at) => super::common::wait_or_kill(child, sent_at + SIGTERM_TIMEOUT),
+                None => super::common::graceful_kill(child),
+            };
+            let output = stopped.child.wait_with_output();
+            self.last_stop = Some(StopOutcome {
+                exit_status: output.as_ref().ok().map(|output| output.status),
+                killed_after_timeout: stopped.killed_after_timeout,
+                wait_error: stopped
+                    .wait_error
+                    .or_else(|| output.as_ref().err().map(io::Error::kind)),
+            });
 
-            if let Ok(output) = child.wait_with_output() {
+            if let Ok(output) = output {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -965,7 +1224,7 @@ impl TestBinary for ServerHandle {
 
     fn assert_running(&self) {
         if let Some(pid) = self.pid().filter(|&p| !super::common::is_process_alive(p)) {
-            let (stdout, stderr) = self.collect_logs();
+            let (stdout, stderr) = self.failure_logs();
             panic!(
                 "Server process (pid {}) has crashed\n\n\
                  === STDOUT ===\n{}\n\n\
@@ -1019,6 +1278,76 @@ impl ServerHandle {
 
         self.start()
     }
+
+    /// Kill the server with SIGKILL: no shutdown hook runs, nothing buffered
+    /// in process memory is flushed. Models a real crash, unlike
+    /// [`TestBinary::stop`] whose graceful shutdown flushes state before exit.
+    ///
+    /// Restart afterwards with [`TestBinary::start`]. Taking `child_handle`
+    /// makes the eventual `Drop -> stop()` a no-op.
+    pub fn kill(&mut self) -> Result<(), TestBinaryError> {
+        // Watchdog must stop BEFORE the signal lands: it polls liveness every
+        // 100ms and panics on unexpected process death.
+        self.stop_watchdog();
+        self.last_stop = None;
+        self.sigterm_sent_at = None;
+        if let Some(mut child) = self.child_handle.take() {
+            // SAFETY: plain syscall. The watchdog is already joined, so its
+            // unexpected-death path (a raw waitpid) can no longer reap this
+            // pid, and `Child` has not waited yet; the worst case is a signal
+            // to an already-dead but unreaped zombie, which is harmless. The
+            // result is deliberately discarded for the same reason.
+            unsafe {
+                libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+            }
+            // Reap via the owned Child, not reap_exit_status: a raw waitpid
+            // would race Child's own bookkeeping.
+            let _ = child.wait();
+        }
+        Ok(())
+    }
+
+    /// Disarm the watchdog ahead of an exit the test causes on purpose. The
+    /// watchdog panics on any exit, and its reap would take the exit status
+    /// that [`Self::wait_for_exit`] reports.
+    pub fn expect_exit(&mut self) {
+        self.stop_watchdog();
+    }
+
+    /// Wait up to `timeout` for the server to exit by itself, after
+    /// [`Self::expect_exit`], and return its exit status. Restart it
+    /// afterwards with [`TestBinary::start`].
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> Result<ExitStatus, TestBinaryError> {
+        let child = self
+            .child_handle
+            .as_mut()
+            .ok_or(TestBinaryError::NotStarted)?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                self.child_handle = None;
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(TestBinaryError::InvalidState {
+                    message: format!(
+                        "the server was still running {timeout:?} after the test expected it to exit"
+                    ),
+                });
+            }
+            sleep(Duration::from_millis(SLEEP_INTERVAL_MS));
+        }
+    }
+
+    /// Names this node in the log dumps. A cluster failure prints every
+    /// node's logs back to back and the server never logs its own identity,
+    /// so without this the reader cannot tell which replica wrote what.
+    fn log_label(&self) -> String {
+        match self.addrs.tcp {
+            Some(tcp) => format!("Iggy server replica {} (tcp {tcp})", self.server_id),
+            None => format!("Iggy server replica {}", self.server_id),
+        }
+    }
 }
 
 impl Drop for ServerHandle {
@@ -1027,8 +1356,95 @@ impl Drop for ServerHandle {
         // without waiting, so the freed slot could be reused while this server
         // still holds its ports.
         let _ = self.stop();
-        super::common::dump_logs_on_panic("Iggy server", &self.stdout_path, &self.stderr_path);
+        let label = self.log_label();
+        if let Some(report) = super::common::stderr_panic_report(&self.stderr_path) {
+            let report = if self.config.dump_logs_on_failure {
+                report
+            } else {
+                concise_log(self.stderr_path.as_deref())
+            };
+            if std::thread::panicking() {
+                // Ahead of the full dump, which buries these lines under the
+                // complete stdout of every node.
+                eprintln!("{label} panicked:\n{report}");
+            } else {
+                // A dead task leaves the process alive and the test green;
+                // failing here is the only thing that surfaces it. The panic
+                // unwinds out of this `Drop` before the dump below runs, so
+                // print this node's logs first.
+                let (stdout, stderr) = self.failure_logs();
+                eprintln!("{label} stdout:\n{stdout}");
+                eprintln!("{label} stderr:\n{stderr}");
+                panic!("{label} panicked:\n{report}");
+            }
+        }
+        if std::thread::panicking() {
+            let (stdout, stderr) = self.failure_logs();
+            eprintln!("{label} stdout:\n{stdout}");
+            eprintln!("{label} stderr:\n{stderr}");
+        }
     }
+}
+
+fn archive_log_files(
+    stdout_path: &Path,
+    stderr_path: &Path,
+    archive_dir: &Path,
+) -> Result<(), TestBinaryError> {
+    fs::create_dir(archive_dir).map_err(|source| TestBinaryError::FileSystemError {
+        path: archive_dir.to_path_buf(),
+        source,
+    })?;
+    for (source_path, name) in [(stdout_path, "stdout.log"), (stderr_path, "stderr.log")] {
+        let archive_path = archive_dir.join(name);
+        fs::copy(source_path, &archive_path).map_err(|source| {
+            TestBinaryError::FileSystemError {
+                path: archive_path,
+                source,
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn failure_logs(
+    stdout_path: &Option<PathBuf>,
+    stderr_path: &Option<PathBuf>,
+    dump_logs_on_failure: bool,
+) -> (String, String) {
+    if dump_logs_on_failure {
+        super::common::collect_logs(stdout_path, stderr_path)
+    } else {
+        (
+            concise_log(stdout_path.as_deref()),
+            concise_log(stderr_path.as_deref()),
+        )
+    }
+}
+
+fn concise_log(path: Option<&Path>) -> String {
+    let Some(path) = path else {
+        return "[No captured log]".to_owned();
+    };
+    match log_tail(path) {
+        Ok(tail) => format!("{} (tail):\n{tail}", path.display()),
+        Err(error) => format!("{} (unreadable: {error})", path.display()),
+    }
+}
+
+fn log_tail(path: &Path) -> std::io::Result<String> {
+    let mut file = File::open(path)?;
+    let start = file
+        .metadata()?
+        .len()
+        .saturating_sub(FAILURE_LOG_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(FAILURE_LOG_TAIL_BYTES).read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<&str> = text.lines().rev().take(FAILURE_LOG_TAIL_LINES).collect();
+    lines.reverse();
+    Ok(lines.join("\n"))
 }
 
 /// Drop ANSI escape sequences (`ESC [ ... <letter>`) so log markers match
@@ -1070,4 +1486,84 @@ fn generate_test_certificates(cert_dir: &str) -> Result<(), Box<dyn std::error::
     key_file.write_all(cert.signing_key.serialize_pem().as_bytes())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FAILURE_LOG_TAIL_LINES, TestBinaryError, archive_log_files, failure_logs};
+    use std::fs;
+    use std::io::ErrorKind;
+    use tempfile::tempdir;
+
+    #[test]
+    fn given_restarts_when_captures_are_truncated_should_preserve_each_incarnation() {
+        let directory = tempdir().unwrap();
+        let stdout_path = directory.path().join("stdout.log");
+        let stderr_path = directory.path().join("stderr.log");
+        let incarnations: [(&[u8], &[u8]); 2] = [
+            (b"first stdout\xff", b"first stderr\xfe"),
+            (b"second stdout", b"second stderr"),
+        ];
+
+        for (incarnation, (stdout, stderr)) in incarnations.iter().enumerate() {
+            fs::write(&stdout_path, stdout).unwrap();
+            fs::write(&stderr_path, stderr).unwrap();
+            let archive_dir = directory.path().join(format!("incarnation_{incarnation}"));
+            archive_log_files(&stdout_path, &stderr_path, &archive_dir).unwrap();
+            fs::write(&stdout_path, []).unwrap();
+            fs::write(&stderr_path, []).unwrap();
+        }
+
+        for (incarnation, (stdout, stderr)) in incarnations.iter().enumerate() {
+            let archive_dir = directory.path().join(format!("incarnation_{incarnation}"));
+            assert_eq!(fs::read(archive_dir.join("stdout.log")).unwrap(), *stdout);
+            assert_eq!(fs::read(archive_dir.join("stderr.log")).unwrap(), *stderr);
+        }
+        assert!(fs::read(&stdout_path).unwrap().is_empty());
+        assert!(fs::read(&stderr_path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn given_existing_archive_when_archiving_should_fail_without_overwriting_evidence() {
+        let directory = tempdir().unwrap();
+        let stdout_path = directory.path().join("stdout.log");
+        let stderr_path = directory.path().join("stderr.log");
+        let archive_dir = directory.path().join("incarnation_0");
+        fs::write(&stdout_path, b"original stdout").unwrap();
+        fs::write(&stderr_path, b"original stderr").unwrap();
+        archive_log_files(&stdout_path, &stderr_path, &archive_dir).unwrap();
+        fs::write(&stdout_path, b"new stdout").unwrap();
+
+        let error = archive_log_files(&stdout_path, &stderr_path, &archive_dir).unwrap_err();
+        assert!(matches!(
+            error,
+            TestBinaryError::FileSystemError { path, source }
+                if path == archive_dir && source.kind() == ErrorKind::AlreadyExists
+        ));
+        assert_eq!(
+            fs::read(archive_dir.join("stdout.log")).unwrap(),
+            b"original stdout"
+        );
+        assert_eq!(fs::read(&stdout_path).unwrap(), b"new stdout");
+    }
+
+    #[test]
+    fn given_large_capture_when_concise_failure_requested_should_show_path_and_bounded_tail() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("stdout.log");
+        let mut contents = "older output\n".repeat(1000);
+        for line in 0..FAILURE_LOG_TAIL_LINES {
+            contents.push_str(&format!("tail {line}\n"));
+        }
+        fs::write(&path, &contents).unwrap();
+
+        let (concise, _) = failure_logs(&Some(path.clone()), &None, false);
+        assert!(concise.starts_with(&format!("{} (tail):\n", path.display())));
+        assert!(!concise.contains("older output"));
+        assert_eq!(concise.lines().count(), FAILURE_LOG_TAIL_LINES + 1);
+        assert!(concise.ends_with(&format!("tail {}", FAILURE_LOG_TAIL_LINES - 1)));
+
+        let (complete, _) = failure_logs(&Some(path), &None, true);
+        assert_eq!(complete, contents);
+    }
 }

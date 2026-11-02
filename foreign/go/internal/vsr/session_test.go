@@ -19,6 +19,7 @@ package vsr
 
 import (
 	"math"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -90,7 +91,7 @@ func TestSessionNextRequestID_RejectsAnExhaustedCounter(t *testing.T) {
 	session := NewSessionWithClientID(ClientID{Lo: 7})
 	session.BeginRegister()
 	require.NoError(t, session.Bind(42))
-	session.requestCounter = math.MaxUint64
+	session.requestCounter.Store(math.MaxUint64)
 
 	_, err := session.NextRequestID()
 	assert.ErrorIs(t, err, ErrRequestCounterExhausted)
@@ -106,7 +107,7 @@ func TestSessionBeginRegister_RearmsWithAFreshClientID(t *testing.T) {
 	assert.Zero(t, session.BeginRegister())
 	assert.False(t, session.Bound())
 	assert.Zero(t, session.SessionID())
-	assert.Equal(t, uint64(1), session.CurrentRequestID())
+	assert.Equal(t, uint64(2), session.CurrentRequestID())
 	assert.NotEqual(t, ClientID{Lo: 7}, session.ClientID())
 }
 
@@ -156,8 +157,47 @@ func TestSessionHasActivity_TracksEveryEntryPoint(t *testing.T) {
 	})
 }
 
-func TestNewClientID_NeverReturnsZero(t *testing.T) {
+func TestNewClientID_NonZeroWithTopBitClear(t *testing.T) {
 	for range 64 {
-		assert.False(t, newClientID().IsZero())
+		client := newClientID()
+		assert.False(t, client.IsZero())
+		assert.LessOrEqual(t, client.Hi, uint64(math.MaxInt64))
 	}
+}
+
+func TestSessionNextRequestID_StaysUniqueAcrossGoroutinesAndAReset(t *testing.T) {
+	session := NewSession()
+	require.NoError(t, session.Bind(42))
+	const callers = 4
+	const requests = 128
+	ids := make(chan uint64, callers*requests)
+	var workers sync.WaitGroup
+	for range callers {
+		workers.Go(func() {
+			for range requests {
+				id, err := session.NextRequestID()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				ids <- id
+			}
+		})
+	}
+	workers.Wait()
+	close(ids)
+	seen := make(map[uint64]bool, callers*requests)
+	previous := uint64(0)
+	for id := range ids {
+		require.False(t, seen[id], "duplicate request id %d", id)
+		seen[id] = true
+		previous = max(previous, id)
+	}
+	require.Len(t, seen, callers*requests)
+	require.Equal(t, uint64(callers*requests), previous, "no id is skipped")
+	session.Reset()
+	require.NoError(t, session.Bind(43))
+	id, err := session.NextRequestID()
+	require.NoError(t, err)
+	assert.Equal(t, previous+1, id)
 }

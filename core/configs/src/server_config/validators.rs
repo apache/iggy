@@ -19,17 +19,27 @@
 //!
 //! Delegates section by section, including
 //! [`super::message_bus::MessageBusConfig::validate`], then applies the
-//! cross-section invariants: topic vs segment sizing, JWT gating when
-//! HTTP is enabled, and server-default expiry sanity.
+//! cross-section invariants: JWT gating when HTTP is enabled and
+//! server-default expiry sanity.
 
 use super::COMPONENT;
 use super::cluster::STATE_CHUNK_HEADER_LEN;
-use super::server::{ExtraConfig, NamespaceConfig, ServerConfig};
-use crate::ConfigurationError;
+use super::partition::{CONCURRENT_SERVED_SEGMENTS, SEGMENT_SIZE_OVERSHOOT_BYTES};
+use super::server::ServerConfig;
+use crate::common::http::HMAC_JWT_ALGORITHMS;
+use crate::common::validators::SEGMENT_MAX_SIZE_BYTES;
+use crate::{ConfigEnvMappings, ConfigurationError};
 use err_trail::ErrContext;
-use iggy_common::{IggyExpiry, MaxTopicSize, Validatable};
-use server_common::sharding::IggyNamespace;
-use tracing::warn;
+use iggy_common::{IggyExpiry, MAX_MESSAGE_SIZE_UPPER_BYTES, Validatable};
+use server_common::sharding::{
+    CONSUMER_SESSION_REPORT_TIMEOUT, LIST_CLIENTS_GATHER_TIMEOUT,
+    MIN_CONSUMER_SESSION_HEARTBEAT_SIZE,
+};
+use std::ffi::OsStr;
+use std::net::SocketAddr;
+use std::path::Path;
+
+const CONSUMER_SESSION_MISSED_REPORT_TOLERANCE: u32 = 1;
 
 /// compio-ws (tungstenite 0.29) `write_buffer_size` default. Used to
 /// evaluate the `max_write_buffer_size > write_buffer_size` invariant
@@ -39,8 +49,7 @@ const WS_DEFAULT_WRITE_BUFFER_SIZE: u64 = 128 * 1024;
 
 impl Validatable<ConfigurationError> for ServerConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
-        self.system
-            .memory_pool
+        self.memory_pool
             .validate()
             .error(|e: &ConfigurationError| {
                 format!("{COMPONENT} (error: {e}) - failed to validate memory pool config")
@@ -57,80 +66,60 @@ impl Validatable<ConfigurationError> for ServerConfig {
                     "{COMPONENT} (error: {e}) - failed to validate personal access token config"
                 )
             })?;
-        self.extra.validate().error(|e: &ConfigurationError| {
-            format!("{COMPONENT} (error: {e}) - failed to validate extra config")
-        })?;
-        self.system
-            .segment
-            .validate()
-            .error(|e: &ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate segment config")
-            })?;
-        self.system
-            .compression
-            .validate()
-            .error(|e: &ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate compression config")
-            })?;
         self.telemetry.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate telemetry config")
         })?;
-        self.system
-            .sharding
-            .validate()
-            .error(|e: &ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate sharding config")
-            })?;
+        self.sharding.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate sharding config")
+        })?;
         self.cluster.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate cluster config")
         })?;
+        self.node.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate node config")
+        })?;
+        self.validate_tcp_bind_address()?;
+        self.validate_client_facing_address()?;
         self.metadata.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate metadata config")
         })?;
         self.partition.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate partition config")
         })?;
-        self.system
-            .logging
+        self.logging.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate logging config")
+        })?;
+        self.encryption.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate encryption config")
+        })?;
+        self.external_auth
             .validate()
             .error(|e: &ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate logging config")
+                format!("{COMPONENT} (error: {e}) - failed to validate external auth config")
             })?;
-        self.message_saver
-            .validate()
-            .error(|e: &ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate message saver config")
-            })?;
-
-        let topic_size = match self.system.topic.max_size {
-            MaxTopicSize::Custom(size) => Ok(size.as_bytes_u64()),
-            MaxTopicSize::Unlimited => Ok(u64::MAX),
-            MaxTopicSize::ServerDefault => {
-                eprintln!("system.topic.max_size cannot be ServerDefault in the server config");
-                Err(ConfigurationError::InvalidConfigurationValue)
-            }
-        }?;
-
-        if let IggyExpiry::ServerDefault = self.system.topic.message_expiry {
-            eprintln!("system.topic.message_expiry cannot be ServerDefault in the server config");
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        // A zero duration encodes to wire value 0, the same value the wire uses
-        // for ServerDefault, so it would silently collide with that sentinel.
-        if let IggyExpiry::ExpireDuration(duration) = self.system.topic.message_expiry
-            && duration.as_micros() == 0
-        {
-            eprintln!(
-                "system.topic.message_expiry is a zero duration, which collides with the server-default sentinel on the wire; use \"none\" to never expire or a positive duration"
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
 
         if self.http.enabled
             && let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry
         {
             eprintln!("http.jwt.access_token_expiry cannot be ServerDefault when HTTP is enabled");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // The signing key is always HMAC (built from a shared secret; there is
+        // no PEM loading path), and jsonwebtoken refuses a header algorithm
+        // whose family does not match the key. An asymmetric algorithm builds
+        // the manager fine and then fails every login at token generation, so
+        // the server would serve HTTP that nobody can authenticate against.
+        if self.http.enabled && self.http.jwt.get_algorithm().is_err() {
+            let supported = HMAC_JWT_ALGORITHMS.map(|(name, _)| name).join(", ");
+            eprintln!(
+                "http.jwt.algorithm '{}' is not supported: the server signs with a shared \
+                 secret, so only {supported} can be used. This field governs self-issued \
+                 tokens only; [[http.jwt.trusted_issuers]] is unaffected, because an issuer's \
+                 token is verified with the algorithm named in its own header and the matching \
+                 JWKS key, never with this field",
+                self.http.jwt.algorithm
+            );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
@@ -171,11 +160,35 @@ impl Validatable<ConfigurationError> for ServerConfig {
             }
         }
 
-        if topic_size < self.system.segment.size.as_bytes_u64() {
+        // Validate the bus knobs BEFORE any cross-section bound derived from
+        // them: `max_message_size` has a frozen ceiling in there, and an
+        // operator who raised it past the ceiling must meet that error first
+        // -- not the artifact-floor error below, which would send them off
+        // to raise `transfer_artifact_bytes_max` and only then learn the
+        // edit was impossible.
+        self.message_bus
+            .validate()
+            .error(|e: &ConfigurationError| {
+                format!("{COMPONENT} (error: {e}) - failed to validate message_bus config")
+            })?;
+
+        // The HTTP produce path builds its bus message in-process, so the
+        // framing decoder's `max_message_size` cap never runs on it: the
+        // request body is the only bound on the widest batch record that
+        // path can persist. A produce request carries at most one batch and
+        // base64 leaves ~25% slack, so bounding the body above the frozen
+        // recovery ceiling would let a legally admitted, checksum-valid
+        // batch be refused as implausible by boot-time segment recovery.
+        if self.http.enabled
+            && self.http.max_request_size.as_bytes_u64() > MAX_MESSAGE_SIZE_UPPER_BYTES
+        {
             eprintln!(
-                "system.topic.max_size ({} B) must be >= system.segment.size ({} B)",
-                topic_size,
-                self.system.segment.size.as_bytes_u64()
+                "{COMPONENT} http.max_request_size ({}) exceeds the frozen ceiling of \
+                 {MAX_MESSAGE_SIZE_UPPER_BYTES} bytes: the HTTP produce path is not framed by \
+                 the message bus, so its body size is what bounds the widest persistable batch \
+                 record, and records above the ceiling are refused as implausible by boot-time \
+                 segment recovery",
+                self.http.max_request_size.as_bytes_u64()
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -188,31 +201,48 @@ impl Validatable<ConfigurationError> for ServerConfig {
         // partition livelocks re-requesting the same segment from every peer at
         // the backoff ceiling. Caught here so it is a boot error rather than one
         // partition that silently never rejoins.
-        let artifact_floor = self
-            .system
-            .segment
-            .size
-            .as_bytes_u64()
-            .saturating_add(self.message_bus.max_message_size.as_bytes_u64());
+        // Segment size is per topic now, so the floor is the LARGEST segment
+        // any topic may legally be created with, not a configured value.
+        let artifact_floor =
+            SEGMENT_MAX_SIZE_BYTES.saturating_add(self.message_bus.max_message_size.as_bytes_u64());
         if self.partition.transfer_artifact_bytes_max.as_bytes_u64() < artifact_floor {
             eprintln!(
-                "{COMPONENT} partition.transfer_artifact_bytes_max ({} B) must be at least \
-                 system.segment.size ({} B) + message_bus.max_message_size ({} B) = \
-                 {artifact_floor} B: a segment may close one whole batch past its cap, and an \
-                 artifact ceiling below that refuses a legal segment and livelocks the \
-                 partition's rejoin",
+                "{COMPONENT} partition.transfer_artifact_bytes_max ({} B) must be at least the \
+                 largest legal segment ({SEGMENT_MAX_SIZE_BYTES} B) + \
+                 message_bus.max_message_size ({} B) = {artifact_floor} B: a segment may close \
+                 one whole batch past its cap, and an artifact ceiling below that refuses a \
+                 legal segment and livelocks the partition's rejoin",
                 self.partition.transfer_artifact_bytes_max.as_bytes_u64(),
-                self.system.segment.size.as_bytes_u64(),
                 self.message_bus.max_message_size.as_bytes_u64(),
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        self.message_bus
-            .validate()
-            .error(|e: &ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate message_bus config")
-            })?;
+        // Raising the artifact ceiling (or the segment size) without raising the
+        // served-payload budget silently serialises rejoins: a whole-node rejoin
+        // then walks its partitions one at a time. Warn rather than reject,
+        // because running under the budget costs re-reads, not failures, and an
+        // operator deliberately trading serving concurrency for memory still
+        // boots.
+        let (resident_len, served_slots) = served_transfer_slots(self);
+        if served_slots < CONCURRENT_SERVED_SEGMENTS {
+            let served_cache = self
+                .partition
+                .transfer_served_cache_bytes_max
+                .as_bytes_u64();
+            eprintln!(
+                "{COMPONENT} partition.transfer_served_cache_bytes_max ({served_cache} B) holds \
+                 only {served_slots} state-transfer slot(s) of {resident_len} B (the larger of \
+                 partition.transfer_artifact_bytes_max and the built-in segment ceiling of \
+                 {SEGMENT_MAX_SIZE_BYTES} B + {SEGMENT_SIZE_OVERSHOOT_BYTES} B of overshoot), \
+                 below the {CONCURRENT_SERVED_SEGMENTS} this shard is sized to serve at once, so \
+                 rejoins serialise and every cache miss re-reads and re-hashes a whole segment to \
+                 serve one chunk. The segment ceiling is a compile-time constant, so the only \
+                 knobs here are these two: raise transfer_served_cache_bytes_max to {} B, or \
+                 lower transfer_artifact_bytes_max",
+                resident_len.saturating_mul(CONCURRENT_SERVED_SEGMENTS)
+            );
+        }
 
         // Repair frames ride the bounded per-peer message-bus queue. A repair
         // round of cluster.repair_chunk_max frames that meets or overruns
@@ -236,6 +266,12 @@ impl Validatable<ConfigurationError> for ServerConfig {
         if bus_cap <= STATE_CHUNK_HEADER_LEN {
             eprintln!(
                 "{COMPONENT} message_bus.max_message_size ({bus_cap}) must exceed the {STATE_CHUNK_HEADER_LEN}-byte state-chunk header: state transfer serves artifact chunks over this bus, and a frame above the cap is rejected by the receiving transport, which tears down the whole replica connection"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if bus_cap < MIN_CONSUMER_SESSION_HEARTBEAT_SIZE as u64 {
+            eprintln!(
+                "{COMPONENT} message_bus.max_message_size ({bus_cap}) must hold a consumer-session heartbeat of at least {MIN_CONSUMER_SESSION_HEARTBEAT_SIZE} bytes"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -328,9 +364,37 @@ impl Validatable<ConfigurationError> for ServerConfig {
             format!("{COMPONENT} (error: {e}) - failed to validate quic config")
         })?;
 
-        // Both knobs below sit on shared section structs, so the rejects live
+        // These knobs sit on shared section structs, so the rejects live
         // here rather than in those types' own `Validatable` impls. `0` /
         // `disabled` / `unlimited` all parse to the same zero duration.
+        let session_timeout = self.heartbeat.session_timeout();
+        let heartbeat_interval = self.consumer_group.heartbeat_interval.get_duration();
+        if heartbeat_interval.is_zero() {
+            eprintln!(
+                "{COMPONENT} consumer_group.heartbeat_interval ({heartbeat_interval:?}) must be nonzero; the session timeout, 1.2 x heartbeat.interval, is {session_timeout:?}"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        // Cover a missed pass, gather/send deadlines, and one interval of scheduling headroom.
+        let minimum_timeout = heartbeat_interval
+            .saturating_add(LIST_CLIENTS_GATHER_TIMEOUT)
+            .saturating_add(CONSUMER_SESSION_REPORT_TIMEOUT)
+            .saturating_mul(CONSUMER_SESSION_MISSED_REPORT_TOLERANCE + 1)
+            .saturating_add(heartbeat_interval);
+        if session_timeout <= minimum_timeout {
+            eprintln!(
+                "{COMPONENT} the session timeout, 1.2 x heartbeat.interval ({session_timeout:?}), must exceed {minimum_timeout:?}, covering three consumer_group.heartbeat_interval periods and two gather/send deadlines, allowing one missed report. Raise heartbeat.interval, which sets the session timeout also with heartbeat.enabled = false, or lower consumer_group.heartbeat_interval"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        let cluster_timeout = self.cluster.heartbeat_timeout.get_duration();
+        if self.cluster.enabled && session_timeout <= cluster_timeout {
+            eprintln!(
+                "{COMPONENT} the session timeout, 1.2 x heartbeat.interval ({session_timeout:?}), must exceed cluster.heartbeat_timeout ({cluster_timeout:?}). Raise heartbeat.interval"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         if self
             .consumer_group
             .rebalancing_timeout
@@ -342,117 +406,183 @@ impl Validatable<ConfigurationError> for ServerConfig {
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
-        if self.heartbeat.enabled && self.heartbeat.interval.get_duration().is_zero() {
-            eprintln!(
-                "{COMPONENT} heartbeat.interval must be nonzero when heartbeat.enabled: it sizes both the verifier's sleep and the staleness window, so zero spins the verifier and reaps every live session on its first pass"
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
+        Ok(())
+    }
+}
+
+/// `(resident_len, slots)`: the size a SEALED segment actually reaches, and how
+/// many of them the served-payload budget holds at once.
+///
+/// Reproduces what `IggyShard::partition_transfer_admission_cap` computes at the
+/// shipped defaults, which is what really decides how many rejoins one shard
+/// serves concurrently. The shard divides by the CONFIGURED segment size plus
+/// overshoot; this divides by the compile-time segment ceiling, and the two
+/// coincide only because bootstrap pins the deployed segment size to
+/// `DEFAULT_SEGMENT_SIZE`. Where they diverge this side is the conservative one,
+/// so the warning it drives can over-fire but never under-fire.
+///
+/// The divisor is the sealed size rather than the configured target because
+/// rotation checks the cap after appending. Segment size is per topic now, so
+/// the sealed bound is the LARGEST segment any topic may legally declare, not a
+/// configured value. The `max` floor is never zero, so the division always
+/// holds, and the quotient carries the shard's own one-slot clamp so the warning
+/// never claims a slot count the runtime would not admit.
+fn served_transfer_slots(config: &ServerConfig) -> (u64, u64) {
+    let resident_len = config
+        .partition
+        .transfer_artifact_bytes_max
+        .as_bytes_u64()
+        .max(SEGMENT_MAX_SIZE_BYTES.saturating_add(SEGMENT_SIZE_OVERSHOOT_BYTES));
+    let slots = (config
+        .partition
+        .transfer_served_cache_bytes_max
+        .as_bytes_u64()
+        / resident_len)
+        .max(1);
+    (resident_len, slots)
+}
+
+impl ServerConfig {
+    fn validate_tcp_bind_address(&self) -> Result<(), ConfigurationError> {
+        parse_bind_address("tcp.address", &self.tcp.address)?;
+        Ok(())
+    }
+
+    /// The listener the client-facing address is derived from must not bind a
+    /// wildcard unless that address is declared outright.
+    ///
+    /// When running inside a container, any client listener binding loopback
+    /// is unreachable from outside that network namespace, which is warned.
+    fn validate_client_facing_address(&self) -> Result<(), ConfigurationError> {
+        self.validate_client_facing_address_in_env(is_container())?;
+        Ok(())
+    }
+
+    fn validate_client_facing_address_in_env(
+        &self,
+        is_container: bool,
+    ) -> Result<Vec<String>, ConfigurationError> {
+        if self.cluster.enabled {
+            return Ok(Vec::new());
         }
 
-        reject_unsupported_and_warn_inert(self)?;
+        if let Some(listener) = self.derived_address_listener() {
+            let bind = parse_bind_address(listener.key, listener.address)?;
+            if bind.ip().to_canonical().is_unspecified() && self.node.advertised_address.is_none() {
+                eprintln!(
+                    "{COMPONENT} - {} binds the wildcard {bind}, which says which interfaces this node \
+                     accepts on rather than where a client reaches it, so cluster metadata would carry no \
+                     address for this node. Set node.advertised_address to the address clients dial, or \
+                     bind a concrete address.",
+                    listener.key
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+        }
 
-        Ok(())
+        let mut warnings = Vec::new();
+        for listener in self.client_listeners() {
+            if !listener.enabled {
+                continue;
+            }
+            let bind = parse_bind_address(listener.key, listener.address)?;
+            let ip = bind.ip().to_canonical();
+
+            if ip.is_loopback() && is_container {
+                let env_var = ServerConfig::find_by_config_path(listener.key)
+                    .map_or(listener.key, |m| m.env_name);
+                let port = bind.port();
+                let hint = if self.node.advertised_address.is_none() {
+                    format!(
+                        " Set {env_var}=0.0.0.0:{port} together with IGGY_NODE_ADVERTISED_ADDRESS, or bind a concrete address."
+                    )
+                } else {
+                    format!(" Set {env_var} or bind a concrete address.")
+                };
+                let msg = format!(
+                    "{COMPONENT} - {} binds the loopback address {bind} inside a container; the \
+                     server will not be reachable from outside this network namespace.{hint}",
+                    listener.key
+                );
+                eprintln!("{msg}");
+                warnings.push(msg);
+            }
+        }
+
+        Ok(warnings)
     }
 }
 
-/// The server parses the whole config surface but does not yet honor every
-/// knob. Make the still-inert ones loud at boot: reject the unsupported
-/// features (all off by default, so only a deliberate opt-in trips this) and
-/// warn once for tuning knobs the server silently ignores. Warnings fire only
-/// when a knob deviates from its [`ServerConfig::default`] baseline, so a
-/// pristine config.toml boots without noise. The guard test below pins the
-/// compared knobs against drift.
-fn reject_unsupported_and_warn_inert(config: &ServerConfig) -> Result<(), ConfigurationError> {
-    if config.system.message_deduplication.enabled {
-        eprintln!("system.message_deduplication.enabled is not supported");
-        return Err(ConfigurationError::InvalidConfigurationValue);
-    }
-    if config.system.segment.archive_expired {
-        eprintln!("system.segment.archive_expired is not supported");
-        return Err(ConfigurationError::InvalidConfigurationValue);
-    }
-    if config.system.recovery.recreate_missing_state {
-        eprintln!("system.recovery.recreate_missing_state is not supported");
-        return Err(ConfigurationError::InvalidConfigurationValue);
-    }
+#[cfg(target_os = "linux")]
+const CONTAINER_CGROUP_MARKERS: &[&str] = &[
+    "/docker/",
+    "/docker-",
+    "/libpod-",
+    "/podman/",
+    "/kubepods/",
+    "/kubepods-",
+    "/containerd/",
+    "/lxc/",
+];
 
-    let defaults = ServerConfig::default();
-
-    if config.tcp.socket.override_defaults {
-        warn!("tcp.socket tuning is set but not applied");
-    }
-    if config.quic.socket.override_defaults {
-        warn!("quic.socket tuning is set but not applied");
-    }
-    if config.tcp.ipv6 {
-        warn!("tcp.ipv6 is ignored; IPv4 vs IPv6 is decided by the tcp.address string");
-    }
-    if config.tcp.socket_migration != defaults.tcp.socket_migration {
-        warn!("tcp.socket_migration is not implemented");
-    }
-    if config.system.segment.cache_indexes != defaults.system.segment.cache_indexes {
-        warn!("system.segment.cache_indexes is not applied");
-    }
-    if config.system.logging.sysinfo_print_interval
-        != defaults.system.logging.sysinfo_print_interval
-    {
-        warn!("system.logging.sysinfo_print_interval is not applied");
-    }
-    if config.system.backup.path != defaults.system.backup.path
-        || config.system.backup.compatibility.path != defaults.system.backup.compatibility.path
-    {
-        warn!("backup is not supported");
-    }
-    // default_algorithm deviation is already warned by the delegated legacy
-    // CompressionConfig::validate; only allow_override needs a signal here.
-    if config.system.compression.allow_override != defaults.system.compression.allow_override {
-        warn!(
-            "system.compression.allow_override is inert; live compression is per-topic from the request"
-        );
-    }
-    if config.system.state.enforce_fsync != defaults.system.state.enforce_fsync
-        || config.system.state.max_file_operation_retries
-            != defaults.system.state.max_file_operation_retries
-        || config.system.state.retry_delay != defaults.system.state.retry_delay
-    {
-        warn!(
-            "system.state tuning (enforce_fsync, max_file_operation_retries, retry_delay) is not applied"
-        );
-    }
-    if config.consumer_group.rebalancing_check_interval
-        != defaults.consumer_group.rebalancing_check_interval
-    {
-        warn!(
-            "consumer_group.rebalancing_check_interval is not applied; rebalancing cadence uses system.sharding.reconcile_periodic_interval"
-        );
-    }
-    if config.message_saver.interval != defaults.message_saver.interval
-        || config.message_saver.enforce_fsync != defaults.message_saver.enforce_fsync
-    {
-        warn!("periodic message_saver is not implemented; only shutdown-flush is active");
-    }
-
-    Ok(())
+/// Returns true when the process is executing inside a container.
+fn is_container() -> bool {
+    is_container_indicators(
+        Path::new("/.dockerenv"),
+        Path::new("/run/.containerenv"),
+        std::env::var_os("container").as_deref(),
+        std::env::var_os("KUBERNETES_SERVICE_HOST").as_deref(),
+        "/proc/self/cgroup",
+    )
 }
 
-impl Validatable<ConfigurationError> for ExtraConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        self.namespace.validate().error(|e: &ConfigurationError| {
-            format!("{COMPONENT} (error: {e}) - failed to validate namespace config")
-        })?;
-        Ok(())
+fn is_container_indicators(
+    dockerenv_path: &Path,
+    containerenv_path: &Path,
+    container_env: Option<&OsStr>,
+    k8s_env: Option<&OsStr>,
+    cgroup_path: &str,
+) -> bool {
+    if dockerenv_path.exists() || containerenv_path.exists() {
+        return true;
     }
+
+    if container_env.is_some() || k8s_env.is_some() {
+        return true;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(cgroup) = std::fs::read_to_string(cgroup_path)
+            && cgroup.lines().any(|line| {
+                CONTAINER_CGROUP_MARKERS
+                    .iter()
+                    .any(|marker| line.contains(marker))
+            })
+        {
+            return true;
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = cgroup_path;
+
+    false
 }
 
-impl Validatable<ConfigurationError> for NamespaceConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        IggyNamespace::validate_capacity(self.max_streams, self.max_topics, self.max_partitions)
-            .map_err(|error| {
-                eprintln!("extra.namespace is invalid: {error}");
-                ConfigurationError::InvalidConfigurationValue
-            })?;
-        Ok(())
-    }
+/// A listener's bind address, which is a literal IP and a port and nothing
+/// else. `context` names the config key so the operator reads back the one
+/// they wrote.
+fn parse_bind_address(context: &str, address: &str) -> Result<SocketAddr, ConfigurationError> {
+    address.parse::<SocketAddr>().map_err(|error| {
+        eprintln!(
+            "{COMPONENT} - {context} '{address}' is not an address and port: {error}. The host \
+             is required and must be a literal IP, so ':PORT' and 'hostname:PORT' are both \
+             rejected; use 127.0.0.1:PORT for loopback or 0.0.0.0:PORT to accept on every \
+             interface."
+        );
+        ConfigurationError::InvalidConfigurationValue
+    })
 }
 
 #[cfg(test)]
@@ -474,6 +604,270 @@ mod tests {
             .expect("config deserializes")
     }
 
+    /// The per-topic `segment_size` ceiling lives in `iggy_common`, which cannot
+    /// import this crate. Admission reads it from there; boot validation reads
+    /// the constant here. This is the only place both are visible.
+    #[test]
+    fn given_segment_maximum_when_compared_to_the_option_ceiling_should_match() {
+        assert_eq!(
+            SEGMENT_MAX_SIZE_BYTES,
+            iggy_common::MAX_TOPIC_SEGMENT_SIZE,
+            "the option ceiling and the segment maximum must move together"
+        );
+    }
+
+    /// Admission may cap a topic's `segment_size` at
+    /// [`iggy_common::MAX_TOPIC_SEGMENT_SIZE`] flat only while boot refuses any
+    /// config whose artifact budget cannot carry a segment that large plus one
+    /// bus frame. Without that refusal the ceiling would have to be per node.
+    #[test]
+    fn given_artifact_budget_below_the_segment_ceiling_when_validating_should_reject() {
+        let config = config_with_override(
+            "[partition]\ntransfer_artifact_bytes_max = \"1 GiB\"\n[message_bus]\nmax_message_size = \"1 MiB\"\n",
+        );
+        assert!(
+            config.validate().is_err(),
+            "an artifact budget under segment maximum + one frame must refuse boot"
+        );
+    }
+
+    #[test]
+    fn given_wildcard_bind_without_advertised_address_when_validating_should_reject() {
+        for wildcard in ["0.0.0.0:8090", "[::]:8090", "[::ffff:0.0.0.0]:8090"] {
+            let config = config_with_override(&format!(
+                "[tcp]\naddress = \"{wildcard}\"\n[cluster]\nenabled = false\n"
+            ));
+            assert!(
+                config.validate().is_err(),
+                "{wildcard} names no address a client can dial"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_hostless_or_named_bind_address_when_validating_should_reject() {
+        for address in [":8090", "localhost:8090", "0.0.0.0", "not-an-address"] {
+            let config = config_with_override(&format!("[tcp]\naddress = \"{address}\"\n"));
+            assert!(
+                config.validate().is_err(),
+                "{address} does not name a bind address"
+            );
+        }
+    }
+
+    #[test]
+    fn given_wildcard_bind_with_advertised_address_when_validating_should_pass() {
+        let config = config_with_override(
+            "[tcp]\naddress = \"0.0.0.0:8090\"\n[cluster]\nenabled = false\n\
+             [node]\nadvertised_address = \"broker-1.example.com\"\n",
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_concrete_bind_without_advertised_address_when_validating_should_pass() {
+        let config = config_with_override(
+            "[tcp]\naddress = \"192.0.2.10:8090\"\n[cluster]\nenabled = false\n",
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_loopback_bind_in_container_when_validating_should_warn_and_pass() {
+        let config = config_with_override(
+            "[tcp]\naddress = \"127.0.0.1:8090\"\n[cluster]\nenabled = false\n",
+        );
+        let warnings = config
+            .validate_client_facing_address_in_env(true)
+            .expect("validation should pass");
+        assert_eq!(warnings.len(), 4);
+        for warning in &warnings {
+            assert!(warning.contains("outside this network namespace"));
+            assert!(warning.contains("together with IGGY_NODE_ADVERTISED_ADDRESS"));
+        }
+        assert!(warnings[0].contains("IGGY_TCP_ADDRESS=0.0.0.0:8090"));
+        assert!(warnings[1].contains("IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8092"));
+        assert!(warnings[2].contains("IGGY_QUIC_ADDRESS=0.0.0.0:8080"));
+        assert!(warnings[3].contains("IGGY_HTTP_ADDRESS=0.0.0.0:3000"));
+    }
+
+    #[test]
+    fn given_loopback_bind_outside_container_when_validating_should_pass_without_warning() {
+        let config = config_with_override(
+            "[tcp]\naddress = \"127.0.0.1:8090\"\n[cluster]\nenabled = false\n",
+        );
+        let warnings = config
+            .validate_client_facing_address_in_env(false)
+            .expect("validation should pass");
+        assert!(
+            warnings.is_empty(),
+            "loopback outside container must not produce a warning"
+        );
+    }
+
+    #[test]
+    fn given_loopback_bind_in_container_with_advertised_address_when_validating_should_warn_and_pass()
+     {
+        let config = config_with_override(
+            "[tcp]\naddress = \"0.0.0.0:8090\"\n[cluster]\nenabled = false\n\
+             [node]\nadvertised_address = \"broker-1.example.com\"\n",
+        );
+        let warnings = config
+            .validate_client_facing_address_in_env(true)
+            .expect("validation should pass");
+        assert_eq!(warnings.len(), 3);
+        for warning in &warnings {
+            assert!(warning.contains("outside this network namespace"));
+            assert!(!warning.contains("0.0.0.0"));
+            assert!(!warning.contains("together with IGGY_NODE_ADVERTISED_ADDRESS"));
+        }
+        assert!(warnings[0].contains("Set IGGY_WEBSOCKET_ADDRESS or bind a concrete address."));
+        assert!(warnings[1].contains("Set IGGY_QUIC_ADDRESS or bind a concrete address."));
+        assert!(warnings[2].contains("Set IGGY_HTTP_ADDRESS or bind a concrete address."));
+    }
+
+    #[test]
+    fn given_dockerenv_file_when_checking_container_should_return_true() {
+        let temp_dir = std::env::temp_dir();
+        let marker = temp_dir.join(format!("test_dockerenv_{}", std::process::id()));
+        std::fs::write(&marker, "").unwrap();
+        let non_existent = temp_dir.join("non_existent_indicator");
+        let result =
+            is_container_indicators(&marker, &non_existent, None, None, "/non/existent/cgroup");
+        let _ = std::fs::remove_file(&marker);
+        assert!(result);
+    }
+
+    #[test]
+    fn given_containerenv_file_when_checking_container_should_return_true() {
+        let temp_dir = std::env::temp_dir();
+        let marker = temp_dir.join(format!("test_containerenv_{}", std::process::id()));
+        std::fs::write(&marker, "").unwrap();
+        let non_existent = temp_dir.join("non_existent_indicator");
+        let result =
+            is_container_indicators(&non_existent, &marker, None, None, "/non/existent/cgroup");
+        let _ = std::fs::remove_file(&marker);
+        assert!(result);
+    }
+
+    #[test]
+    fn given_container_env_var_when_checking_container_should_return_true() {
+        let non_existent = Path::new("/non/existent/path/to/indicator");
+        assert!(is_container_indicators(
+            non_existent,
+            non_existent,
+            Some(OsStr::new("docker")),
+            None,
+            "/non/existent/cgroup"
+        ));
+    }
+
+    #[test]
+    fn given_kubernetes_env_var_when_checking_container_should_return_true() {
+        let non_existent = Path::new("/non/existent/path/to/indicator");
+        assert!(is_container_indicators(
+            non_existent,
+            non_existent,
+            None,
+            Some(OsStr::new("10.0.0.1")),
+            "/non/existent/cgroup"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn given_cgroup_with_docker_marker_when_checking_container_should_return_true() {
+        let temp_dir = std::env::temp_dir();
+        let cgroup_file = temp_dir.join(format!("test_docker_cgroup_{}", std::process::id()));
+        std::fs::write(
+            &cgroup_file,
+            "0::/system.slice/docker-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.scope\n",
+        )
+        .unwrap();
+        let non_existent = temp_dir.join("non_existent_indicator");
+        let result = is_container_indicators(
+            &non_existent,
+            &non_existent,
+            None,
+            None,
+            cgroup_file.to_str().unwrap(),
+        );
+        let _ = std::fs::remove_file(&cgroup_file);
+        assert!(result);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn given_host_cgroup_without_markers_when_checking_container_should_return_false() {
+        let temp_dir = std::env::temp_dir();
+        let cgroup_file = temp_dir.join(format!("test_host_cgroup_{}", std::process::id()));
+        std::fs::write(
+            &cgroup_file,
+            "0::/user.slice/user-1000.slice/session-1.scope\n",
+        )
+        .unwrap();
+        let non_existent = temp_dir.join("non_existent_indicator");
+        let result = is_container_indicators(
+            &non_existent,
+            &non_existent,
+            None,
+            None,
+            cgroup_file.to_str().unwrap(),
+        );
+        let _ = std::fs::remove_file(&cgroup_file);
+        assert!(!result);
+    }
+
+    #[test]
+    fn given_missing_container_indicators_when_checking_container_should_return_false() {
+        let non_existent = Path::new("/non/existent/path/to/indicator");
+        assert!(!is_container_indicators(
+            non_existent,
+            non_existent,
+            None,
+            None,
+            "/non/existent/cgroup"
+        ));
+    }
+
+    #[test]
+    fn given_wildcard_bind_on_a_disabled_listener_when_validating_should_pass() {
+        let config = config_with_override(
+            "[tcp]\nenabled = false\naddress = \"0.0.0.0:8090\"\n[cluster]\nenabled = false\n",
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_wildcard_bind_on_the_first_enabled_listener_when_validating_should_reject() {
+        let config = config_with_override(
+            "[tcp]\nenabled = false\n[websocket]\nenabled = false\n[quic]\nenabled = false\n\
+             [http]\naddress = \"0.0.0.0:3000\"\n[cluster]\nenabled = false\n",
+        );
+        assert!(
+            config.validate().is_err(),
+            "an http-only server derives its address from http.address"
+        );
+    }
+
+    #[test]
+    fn given_every_client_listener_disabled_when_validating_should_pass() {
+        let config = config_with_override(
+            "[tcp]\nenabled = false\naddress = \"0.0.0.0:8090\"\n[websocket]\nenabled = false\n\
+             [quic]\nenabled = false\n[http]\nenabled = false\n[cluster]\nenabled = false\n",
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_clustered_wildcard_bind_without_advertised_address_when_validating_should_pass() {
+        // The roster answers the client-facing address per node, so the bind
+        // address is free to be a wildcard with nothing declared here.
+        let config =
+            config_with_override("[tcp]\naddress = \"0.0.0.0:8090\"\n[cluster]\nenabled = true\n");
+        assert!(config.validate().is_ok());
+    }
+
     #[test]
     fn given_shipped_default_config_when_validating_should_pass() {
         let config: ServerConfig = Figment::new()
@@ -481,12 +875,6 @@ mod tests {
             .extract()
             .expect("default config deserializes");
         config.validate().expect("pristine config must validate");
-    }
-
-    #[test]
-    fn given_message_deduplication_enabled_when_validating_should_reject() {
-        let config = config_with_override("[system.message_deduplication]\nenabled = true\n");
-        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -498,21 +886,71 @@ mod tests {
     }
 
     #[test]
-    fn given_archive_expired_enabled_when_validating_should_reject() {
-        let config = config_with_override("[system.segment]\narchive_expired = true\n");
-        assert!(config.validate().is_err());
+    fn given_asymmetric_jwt_algorithm_when_validating_should_reject() {
+        // Boots clean today and then fails every login: the key is HMAC and
+        // jsonwebtoken refuses a mismatched algorithm family at sign time.
+        for algorithm in ["RS256", "RS384", "RS512", "ES256", "not-an-algorithm"] {
+            let config =
+                config_with_override(&format!("[http.jwt]\nalgorithm = \"{algorithm}\"\n"));
+            assert!(
+                config.validate().is_err(),
+                "{algorithm} has no key material and must not boot"
+            );
+        }
     }
 
     #[test]
-    fn given_recreate_missing_state_enabled_when_validating_should_reject() {
-        let config = config_with_override("[system.recovery]\nrecreate_missing_state = true\n");
-        assert!(config.validate().is_err());
+    fn given_hmac_jwt_algorithm_when_validating_should_pass() {
+        for (algorithm, _) in HMAC_JWT_ALGORITHMS {
+            let config =
+                config_with_override(&format!("[http.jwt]\nalgorithm = \"{algorithm}\"\n"));
+            config
+                .validate()
+                .unwrap_or_else(|_| panic!("{algorithm} is signable and must validate"));
+        }
     }
 
     #[test]
-    fn given_zero_message_expiry_when_validating_should_reject() {
-        let config = config_with_override("[system.topic]\nmessage_expiry = \"0s\"\n");
-        assert!(config.validate().is_err());
+    fn given_asymmetric_jwt_algorithm_when_http_disabled_should_pass() {
+        // No listener means no token is ever issued, so a stale algorithm is
+        // inert rather than a broken deployment.
+        let config =
+            config_with_override("[http]\nenabled = false\n\n[http.jwt]\nalgorithm = \"RS256\"\n");
+        config
+            .validate()
+            .expect("a disabled HTTP listener never signs a token");
+    }
+
+    // The shipped budget is exactly two artifact ceilings, so the pristine
+    // config sits on the boundary and a single MiB past it starves a slot.
+    #[test]
+    fn given_artifact_ceiling_starving_transfer_slots_when_validating_should_warn_only() {
+        let config =
+            config_with_override("[partition]\ntransfer_artifact_bytes_max = \"1089 MiB\"\n");
+        assert_eq!(served_transfer_slots(&config).1, 1);
+        config
+            .validate()
+            .expect("a starved served cache warns but still boots");
+    }
+
+    #[test]
+    fn given_artifact_ceiling_at_transfer_slot_boundary_when_sizing_should_keep_full_slot_count() {
+        let config = config_with_override("");
+        assert_eq!(
+            served_transfer_slots(&config).1,
+            CONCURRENT_SERVED_SEGMENTS,
+            "the shipped defaults must serve the concurrency they are sized for"
+        );
+    }
+
+    #[test]
+    fn given_served_cache_raised_with_artifact_ceiling_when_validating_should_keep_transfer_slots()
+    {
+        let config = config_with_override(
+            "[partition]\ntransfer_artifact_bytes_max = \"2 GiB\"\ntransfer_served_cache_bytes_max = \"4 GiB\"\n",
+        );
+        assert_eq!(served_transfer_slots(&config).1, CONCURRENT_SERVED_SEGMENTS);
+        config.validate().expect("budget raised in step must boot");
     }
 
     #[test]
@@ -526,13 +964,17 @@ mod tests {
 
     #[test]
     fn given_repair_chunk_max_at_peer_queue_capacity_when_validating_should_reject() {
-        let config = config_with_override("[cluster]\nrepair_chunk_max = 256\n");
+        let config = config_with_override(
+            "[cluster]\nrepair_chunk_max = 256\n\n[message_bus]\npeer_queue_capacity = 256\n",
+        );
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn given_repair_chunk_max_below_peer_queue_capacity_when_validating_should_pass() {
-        let config = config_with_override("[cluster]\nrepair_chunk_max = 255\n");
+        let config = config_with_override(
+            "[cluster]\nrepair_chunk_max = 255\n\n[message_bus]\npeer_queue_capacity = 256\n",
+        );
         config
             .validate()
             .expect("a chunk below the peer queue capacity must validate");
@@ -557,6 +999,27 @@ mod tests {
     fn given_ws_frame_size_above_bus_max_message_size_when_validating_should_reject() {
         let config = config_with_override("[websocket]\nmax_frame_size = \"128 MiB\"\n");
         assert!(config.validate().is_err());
+    }
+
+    // The HTTP produce path is not bus-framed, so its body cap is the only
+    // bound on the widest record that path can persist.
+    #[test]
+    fn given_http_max_request_size_above_recovery_ceiling_when_validating_should_reject() {
+        let config = config_with_override("[http]\nmax_request_size = \"257 MiB\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_http_max_request_size_at_recovery_ceiling_when_validating_should_pass() {
+        let config = config_with_override("[http]\nmax_request_size = \"256 MiB\"\n");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_http_disabled_when_max_request_size_above_ceiling_should_pass() {
+        let config =
+            config_with_override("[http]\nenabled = false\nmax_request_size = \"257 MiB\"\n");
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -639,6 +1102,66 @@ mod tests {
     }
 
     #[test]
+    fn given_invalid_session_liveness_intervals_when_validating_should_reject() {
+        for (report_interval, heartbeat_interval) in [
+            ("0", "30s"),
+            ("5s", "0"),
+            ("5s", "disabled"),
+            ("5s", "unlimited"),
+            ("500ms", "2s"),
+            ("500ms", "5s"),
+            ("500ms", "6250ms"),
+            ("500ms", "6416ms"),
+            ("20s", "22500ms"),
+            ("20s", "55s"),
+            ("30s", "25s"),
+            ("31s", "25s"),
+        ] {
+            let config = config_with_override(&format!(
+                "[consumer_group]\nheartbeat_interval = \"{report_interval}\"\n[heartbeat]\ninterval = \"{heartbeat_interval}\"\n"
+            ));
+            assert!(
+                config.validate().is_err(),
+                "accepted {report_interval} reports with a {heartbeat_interval} heartbeat"
+            );
+        }
+    }
+
+    #[test]
+    fn given_session_timeout_above_missed_report_budget_when_validating_should_pass() {
+        let config = config_with_override(
+            "[consumer_group]\nheartbeat_interval = \"500ms\"\n[heartbeat]\ninterval = \"6417ms\"\n",
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_consumer_heartbeat_frame_limits_when_validating_should_require_one_session() {
+        for (cap, valid) in [
+            (MIN_CONSUMER_SESSION_HEARTBEAT_SIZE - 1, false),
+            (MIN_CONSUMER_SESSION_HEARTBEAT_SIZE, true),
+        ] {
+            let config =
+                config_with_override(&format!("[message_bus]\nmax_message_size = \"{cap} B\"\n"));
+            assert_eq!(config.validate().is_ok(), valid, "frame cap {cap}");
+        }
+    }
+
+    #[test]
+    fn given_session_timeout_within_cluster_liveness_window_when_validating_should_reject() {
+        for interval in ["12500ms", "15s"] {
+            let config = config_with_override(&format!(
+                "[cluster]\nenabled = true\nheartbeat_timeout = \"18s\"\n[consumer_group]\nheartbeat_interval = \"500ms\"\n[heartbeat]\ninterval = \"{interval}\"\n"
+            ));
+            assert!(config.validate().is_err(), "accepted {interval}");
+        }
+        let config = config_with_override(
+            "[cluster]\nenabled = true\nheartbeat_timeout = \"18s\"\n[consumer_group]\nheartbeat_interval = \"500ms\"\n[heartbeat]\ninterval = \"16s\"\n",
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn given_zero_rebalancing_timeout_when_validating_should_reject() {
         let config = config_with_override("[consumer_group]\nrebalancing_timeout = \"0\"\n");
         assert!(config.validate().is_err());
@@ -653,73 +1176,15 @@ mod tests {
     }
 
     #[test]
-    fn given_zero_heartbeat_interval_when_heartbeat_enabled_should_reject() {
-        let config = config_with_override("[heartbeat]\nenabled = true\ninterval = \"0\"\n");
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn given_zero_heartbeat_interval_when_heartbeat_disabled_should_pass() {
-        let config = config_with_override("[heartbeat]\nenabled = false\ninterval = \"0\"\n");
-        config
-            .validate()
-            .expect("a disabled heartbeat never reads its interval");
-    }
-
-    /// The warn-helper baseline is [`ServerConfig::default`], but the reused
-    /// legacy sections source that default from the legacy server config.toml,
-    /// not this NG file. Pin the knobs the helper compares so any drift between
-    /// the two config.toml files fails here instead of as a spurious boot warn.
-    #[test]
-    fn given_shipped_ng_config_when_compared_to_default_should_match_warned_knobs() {
-        let shipped: ServerConfig = Figment::new()
-            .merge(Toml::string(DEFAULT_CONFIG))
-            .extract()
-            .expect("default config deserializes");
-        let defaults = ServerConfig::default();
-
-        assert_eq!(shipped.tcp.socket_migration, defaults.tcp.socket_migration);
-        assert_eq!(
-            shipped.system.segment.cache_indexes,
-            defaults.system.segment.cache_indexes
-        );
-        assert_eq!(
-            shipped.system.logging.sysinfo_print_interval,
-            defaults.system.logging.sysinfo_print_interval
-        );
-        assert_eq!(shipped.system.backup.path, defaults.system.backup.path);
-        assert_eq!(
-            shipped.system.backup.compatibility.path,
-            defaults.system.backup.compatibility.path
-        );
-        assert_eq!(
-            shipped.system.compression.allow_override,
-            defaults.system.compression.allow_override
-        );
-        assert_eq!(
-            shipped.system.state.enforce_fsync,
-            defaults.system.state.enforce_fsync
-        );
-        assert_eq!(
-            shipped.system.state.max_file_operation_retries,
-            defaults.system.state.max_file_operation_retries
-        );
-        assert_eq!(
-            shipped.system.state.retry_delay,
-            defaults.system.state.retry_delay
-        );
-        assert_eq!(
-            shipped.consumer_group.rebalancing_check_interval,
-            defaults.consumer_group.rebalancing_check_interval
-        );
-        assert_eq!(
-            shipped.message_saver.interval,
-            defaults.message_saver.interval
-        );
-        assert_eq!(
-            shipped.message_saver.enforce_fsync,
-            defaults.message_saver.enforce_fsync
-        );
+    fn given_zero_heartbeat_interval_when_validating_should_reject() {
+        // The session timeout derives from the interval even with heartbeat
+        // checks off, so zero would expire every session on its first pass.
+        for enabled in [true, false] {
+            let config = config_with_override(&format!(
+                "[heartbeat]\nenabled = {enabled}\ninterval = \"0\"\n"
+            ));
+            assert!(config.validate().is_err(), "accepted enabled = {enabled}");
+        }
     }
 
     // http.enabled needs a non-ServerDefault JWT expiry to clear the sibling
@@ -747,6 +1212,7 @@ mod tests {
 
     fn cluster_node(replica_id: u8, http: Option<u16>) -> ClusterNodeConfig {
         ClusterNodeConfig {
+            rack: None,
             name: format!("node-{replica_id}"),
             ip: "127.0.0.1".to_string(),
             advertised_address: None,

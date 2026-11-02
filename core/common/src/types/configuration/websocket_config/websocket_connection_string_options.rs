@@ -15,12 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ConnectionStringOptions, IggyDuration, IggyError, WebSocketClientReconnectionConfig};
+use crate::{
+    ConnectionStringOptions, IggyDuration, IggyError, NonZeroIggyDuration, PendingOperationsConfig,
+    WebSocketClientReconnectionConfig,
+};
 use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct WebSocketConnectionStringOptions {
-    heartbeat_interval: IggyDuration,
+    pending_operations: PendingOperationsConfig,
+    heartbeat_interval: NonZeroIggyDuration,
     reconnection: WebSocketClientReconnectionConfig,
 
     read_buffer_size: Option<usize>,
@@ -38,7 +42,11 @@ pub struct WebSocketConnectionStringOptions {
 }
 
 impl WebSocketConnectionStringOptions {
-    pub fn heartbeat_interval(&self) -> IggyDuration {
+    pub fn pending_operations(&self) -> PendingOperationsConfig {
+        self.pending_operations
+    }
+
+    pub fn heartbeat_interval(&self) -> NonZeroIggyDuration {
         self.heartbeat_interval
     }
 
@@ -92,7 +100,7 @@ impl ConnectionStringOptions for WebSocketConnectionStringOptions {
         self.reconnection.max_retries
     }
 
-    fn heartbeat_interval(&self) -> IggyDuration {
+    fn heartbeat_interval(&self) -> NonZeroIggyDuration {
         self.heartbeat_interval
     }
 
@@ -110,8 +118,18 @@ impl ConnectionStringOptions for WebSocketConnectionStringOptions {
             }
 
             match parts[0] {
+                "max_pending_operations" => {
+                    parsed_options.pending_operations.max_operations = parts[1]
+                        .parse()
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
+                }
+                "max_pending_operation_bytes" => {
+                    parsed_options.pending_operations.max_bytes = parts[1]
+                        .parse()
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
+                }
                 "heartbeat_interval" => {
-                    parsed_options.heartbeat_interval = IggyDuration::from_str(parts[1])
+                    parsed_options.heartbeat_interval = NonZeroIggyDuration::from_str(parts[1])
                         .map_err(|_| IggyError::InvalidConnectionString)?;
                 }
                 "reconnection_retries" => {
@@ -125,7 +143,7 @@ impl ConnectionStringOptions for WebSocketConnectionStringOptions {
                     parsed_options.reconnection.max_retries = retries;
                 }
                 "reconnection_interval" => {
-                    parsed_options.reconnection.interval = IggyDuration::from_str(parts[1])
+                    parsed_options.reconnection.interval = NonZeroIggyDuration::from_str(parts[1])
                         .map_err(|_| IggyError::InvalidConnectionString)?;
                 }
                 "reestablish_after" => {
@@ -192,7 +210,8 @@ impl ConnectionStringOptions for WebSocketConnectionStringOptions {
 impl Default for WebSocketConnectionStringOptions {
     fn default() -> Self {
         WebSocketConnectionStringOptions {
-            heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
+            pending_operations: PendingOperationsConfig::default(),
+            heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
             reconnection: WebSocketClientReconnectionConfig::default(),
             read_buffer_size: None,
             write_buffer_size: None,

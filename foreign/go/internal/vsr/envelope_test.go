@@ -80,6 +80,18 @@ func TestEncodeRequest_EncodesALogoutFrame(t *testing.T) {
 	assert.Equal(t, uint64(2), session.CurrentRequestID())
 }
 
+func TestEncodeRequest_StampsRandomIdentifierForDeleteSegments(t *testing.T) {
+	payload := []byte{1, 2, 3}
+	session := boundSession(t)
+	frame, err := EncodeRequest(session, uint32(command.DeleteSegmentsCode), payload)
+	require.NoError(t, err)
+	another, err := EncodeRequest(session, uint32(command.DeleteSegmentsCode), payload)
+	require.NoError(t, err)
+	require.NotEqual(t, [16]byte{}, [16]byte(frame[requestOffsetChecksum:requestOffsetChecksum+16]))
+	require.NotEqual(t, frame[requestOffsetChecksum:requestOffsetChecksum+16],
+		another[requestOffsetChecksum:requestOffsetChecksum+16])
+}
+
 func TestEncodeRequest_CarriesTheCodeOfANonReplicatedCommand(t *testing.T) {
 	session := boundSession(t)
 
@@ -115,20 +127,29 @@ func TestEncodeRequest_SendsNonReplicatedCommandsBeforeRegister(t *testing.T) {
 	assert.Equal(t, uint64(1), binary.LittleEndian.Uint64(header[requestOffsetRequest:]))
 }
 
-func TestEncodeRequest_DoesNotAdvanceTheWatermarkOffTheMetadataPlane(t *testing.T) {
+func TestEncodeRequest_AllocatesUniqueIDsForNonReplicated(t *testing.T) {
 	session := boundSession(t)
 
 	for range 3 {
 		_, err := EncodeRequest(session, uint32(command.PingCode), nil)
 		require.NoError(t, err)
 	}
-	assert.Equal(t, uint64(1), session.CurrentRequestID())
+	assert.Equal(t, uint64(4), session.CurrentRequestID())
+}
 
-	for range 3 {
-		_, err := EncodeRequest(session, uint32(command.SendMessagesCode), []byte{1})
+func TestEncodeRequest_PartitionCommandConsumesTheWatermark(t *testing.T) {
+	// Dedup identity requires each send to carry a distinct id, so partition
+	// commands advance the counter exactly like metadata commands and the two
+	// planes interleave on one sequence.
+	session := boundSession(t)
+
+	for expected := uint64(1); expected <= 3; expected++ {
+		frame, err := EncodeRequest(session, uint32(command.SendMessagesCode), []byte{1})
 		require.NoError(t, err)
+		header := frameHeader(t, frame)
+		assert.Equal(t, expected, binary.LittleEndian.Uint64(header[requestOffsetRequest:]))
 	}
-	assert.Equal(t, uint64(1), session.CurrentRequestID())
+	assert.Equal(t, uint64(4), session.CurrentRequestID())
 }
 
 func TestEncodeRequest_AdvancesTheWatermarkPerMetadataCommand(t *testing.T) {
@@ -157,6 +178,7 @@ func TestEncodeRequest_RejectsAPartitionCommandOnAnUnboundSession(t *testing.T) 
 
 	_, err := EncodeRequest(session, uint32(command.SendMessagesCode), []byte{1})
 	assert.ErrorIs(t, err, ierror.ErrUnauthenticated)
+	assert.Equal(t, uint64(1), session.CurrentRequestID(), "the rejection burns no id")
 }
 
 func TestEncodeRequest_EncodesASendMessagesFrame(t *testing.T) {
@@ -229,4 +251,41 @@ func TestStampRequestHeader_ClearsAReusedPrologue(t *testing.T) {
 
 	assert.Zero(t, binary.LittleEndian.Uint32(frame[requestOffsetReserved:]))
 	assert.Zero(t, binary.LittleEndian.Uint64(frame[requestOffsetTimestamp:]))
+}
+
+func TestDeferredCancellation_NamesTheParkedRequestWithoutABody(t *testing.T) {
+	session := boundSession(t)
+	for _, code := range []command.Code{command.PollMessagesDeferredCode, command.FetchMessagesCode} {
+		frame, err := EncodeRequest(session, uint32(code), []byte{1, 2, 3})
+		require.NoError(t, err)
+		// The partition context of the request must not reach its cancellation.
+		binary.LittleEndian.PutUint64(frame[requestOffsetContext:], 17)
+
+		cancellation, ok := DeferredCancellation(frame)
+
+		require.True(t, ok, "code %d", code)
+		require.Len(t, cancellation, HeaderSize, "a cancellation has no body")
+		header := frameHeader(t, cancellation)
+		assert.Equal(t, uint32(HeaderSize), binary.LittleEndian.Uint32(header[requestOffsetSize:]))
+		assert.Equal(t, byte(FrameRequest), header[requestOffsetCommand])
+		assert.Equal(t, frame[requestOffsetClient:requestOffsetClient+16], cancellation[requestOffsetClient:requestOffsetClient+16])
+		assert.Equal(t, StampedRequestID(frame), StampedRequestID(cancellation))
+		assert.Equal(t, frame[requestOffsetSession:requestOffsetSession+8], cancellation[requestOffsetSession:requestOffsetSession+8])
+		assert.Equal(t, byte(OperationNonReplicated), header[requestOffsetOperation])
+		assert.Equal(t, uint32(command.CancelDeferredRequestCode), binary.LittleEndian.Uint32(header[requestOffsetReserved:]))
+		assert.Equal(t, make([]byte, 16), cancellation[requestOffsetChecksum:requestOffsetChecksum+16])
+		assert.Equal(t, make([]byte, HeaderSize-requestOffsetContext), cancellation[requestOffsetContext:])
+	}
+}
+
+func TestDeferredCancellation_RefusesAnyOtherRequest(t *testing.T) {
+	session := boundSession(t)
+	for _, code := range []command.Code{command.PollMessagesCode, command.CancelDeferredRequestCode, command.CreateStreamCode} {
+		frame, err := EncodeRequest(session, uint32(code), nil)
+		require.NoError(t, err)
+
+		_, ok := DeferredCancellation(frame)
+
+		assert.False(t, ok, "code %d", code)
+	}
 }

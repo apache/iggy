@@ -31,6 +31,7 @@ use crate::error::{CmdToolError, IggyCmdError};
 use crate::logging::Logging;
 use args::context::ContextAction;
 use args::message::MessageAction;
+use args::metadata::MetadataAction;
 use args::partition::PartitionAction;
 use args::segment::SegmentAction;
 use args::user::UserAction;
@@ -38,14 +39,20 @@ use args::{CliOptions, IggyMergedConsoleArgs};
 use clap::Parser;
 use iggy::client_provider::{self, ClientProviderConfig};
 use iggy::clients::client::IggyClient;
-use iggy::prelude::{Aes256GcmEncryptor, Args, EncryptorKind, PersonalAccessTokenExpiry};
-use iggy_cli::commands::binary_context::common::ContextManager;
+use iggy::prelude::{
+    Aes256GcmEncryptor, ClientError, EncryptorKind, MetadataChangesQuery,
+    PersonalAccessTokenExpiry, StreamUpdateOptions, TopicUpdateOptions,
+};
+use iggy_cli::commands::binary_context::common::{ContextManager, validate_transport};
 use iggy_cli::commands::binary_context::create_context::CreateContextCmd;
 use iggy_cli::commands::binary_context::delete_context::DeleteContextCmd;
 use iggy_cli::commands::binary_context::show_context::ShowContextCmd;
 use iggy_cli::commands::binary_context::use_context::UseContextCmd;
 use iggy_cli::commands::binary_segments::delete_segments::DeleteSegmentsCmd;
+use iggy_cli::commands::binary_system::metadata_changes::GetMetadataChangesCmd;
 use iggy_cli::commands::binary_system::snapshot::GetSnapshotCmd;
+#[cfg(feature = "login-session")]
+use iggy_cli::commands::cli_command::DIAGNOSTIC_TARGET;
 use iggy_cli::commands::cli_command::{CliCommand, PRINT_TARGET};
 use iggy_cli::commands::{
     binary_client::{get_client::GetClientCmd, get_clients::GetClientsCmd},
@@ -59,10 +66,7 @@ use iggy_cli::commands::{
         get_consumer_offset::GetConsumerOffsetCmd, set_consumer_offset::SetConsumerOffsetCmd,
     },
     binary_context::get_contexts::GetContextsCmd,
-    binary_message::{
-        flush_messages::FlushMessagesCmd, poll_messages::PollMessagesCmd,
-        send_messages::SendMessagesCmd,
-    },
+    binary_message::{poll_messages::PollMessagesCmd, send_messages::SendMessagesCmd},
     binary_partitions::{
         create_partitions::CreatePartitionsCmd, delete_partitions::DeletePartitionsCmd,
     },
@@ -73,12 +77,12 @@ use iggy_cli::commands::{
     },
     binary_streams::{
         create_stream::CreateStreamCmd, delete_stream::DeleteStreamCmd, get_stream::GetStreamCmd,
-        get_streams::GetStreamsCmd, purge_stream::PurgeStreamCmd, update_stream::UpdateStreamCmd,
+        get_streams::GetStreamsCmd, update_stream::UpdateStreamCmd,
     },
-    binary_system::{me::GetMeCmd, ping::PingCmd, stats::GetStatsCmd},
+    binary_system::{me::GetMeCmd, options::DescribeOptionsCmd, ping::PingCmd, stats::GetStatsCmd},
     binary_topics::{
         create_topic::CreateTopicCmd, delete_topic::DeleteTopicCmd, get_topic::GetTopicCmd,
-        get_topics::GetTopicsCmd, purge_topic::PurgeTopicCmd, update_topic::UpdateTopicCmd,
+        get_topics::GetTopicsCmd, update_topic::UpdateTopicCmd,
     },
     binary_users::{
         change_password::ChangePasswordCmd,
@@ -90,6 +94,7 @@ use iggy_cli::commands::{
         update_user::{UpdateUserCmd, UpdateUserType},
     },
 };
+use std::error::Error;
 use std::sync::Arc;
 use tracing::{Level, event};
 
@@ -108,20 +113,22 @@ use main_login_session::*;
 fn get_command(
     command: Command,
     cli_options: &CliOptions,
-    iggy_args: &Args,
+    server_address: &str,
 ) -> Box<dyn CliCommand> {
     #[warn(clippy::let_and_return)]
     match command {
         Command::Stream(command) => match command {
-            StreamAction::Create(args) => Box::new(CreateStreamCmd::new(args.name.clone())),
+            StreamAction::Create(args) => Box::new(CreateStreamCmd::new(
+                args.name.clone(),
+                args.stream_key_file.clone(),
+            )),
             StreamAction::Delete(args) => Box::new(DeleteStreamCmd::new(args.stream_id.clone())),
             StreamAction::Update(args) => Box::new(UpdateStreamCmd::new(
                 args.stream_id.clone(),
-                args.name.clone(),
+                StreamUpdateOptions::from(&args),
             )),
             StreamAction::Get(args) => Box::new(GetStreamCmd::new(args.stream_id.clone())),
             StreamAction::List(args) => Box::new(GetStreamsCmd::new(args.list_mode.into())),
-            StreamAction::Purge(args) => Box::new(PurgeStreamCmd::new(args.stream_id.clone())),
         },
         Command::Topic(command) => match command {
             TopicAction::Create(args) => Box::new(CreateTopicCmd::new(
@@ -131,7 +138,9 @@ fn get_command(
                 args.name.clone(),
                 args.message_expiry.clone().into(),
                 args.max_topic_size,
-                args.replication_factor,
+                args.set.iter().cloned().collect(),
+                args.durability,
+                args.consumer_offset_durability,
             )),
             TopicAction::Delete(args) => Box::new(DeleteTopicCmd::new(
                 args.stream_id.clone(),
@@ -140,11 +149,7 @@ fn get_command(
             TopicAction::Update(args) => Box::new(UpdateTopicCmd::new(
                 args.stream_id.clone(),
                 args.topic_id.clone(),
-                args.compression_algorithm,
-                args.name.clone(),
-                args.message_expiry.clone().into(),
-                args.max_topic_size,
-                args.replication_factor,
+                TopicUpdateOptions::from(&args),
             )),
             TopicAction::Get(args) => Box::new(GetTopicCmd::new(
                 args.stream_id.clone(),
@@ -153,10 +158,6 @@ fn get_command(
             TopicAction::List(args) => Box::new(GetTopicsCmd::new(
                 args.stream_id.clone(),
                 args.list_mode.into(),
-            )),
-            TopicAction::Purge(args) => Box::new(PurgeTopicCmd::new(
-                args.stream_id.clone(),
-                args.topic_id.clone(),
             )),
         },
         Command::Partition(command) => match command {
@@ -181,12 +182,20 @@ fn get_command(
         },
         Command::Ping(args) => Box::new(PingCmd::new(args.count)),
         Command::Me => Box::new(GetMeCmd::new()),
+        Command::Options(args) => Box::new(DescribeOptionsCmd::new(args.scope)),
         Command::Stats(args) => Box::new(GetStatsCmd::new(cli_options.quiet, args.output.into())),
         Command::Snapshot(args) => Box::new(GetSnapshotCmd::new(
             args.compression,
             args.snapshot_types,
             args.out_dir,
         )),
+        Command::Metadata(command) => match command {
+            MetadataAction::Changes(args) => Box::new(GetMetadataChangesCmd::new(
+                MetadataChangesQuery::from(&args),
+                args.follow,
+                args.interval,
+            )),
+        },
         Command::Pat(command) => match command {
             PersonalAccessTokenAction::Create(pat_create_args) => {
                 Box::new(CreatePersonalAccessTokenCmd::new(
@@ -194,13 +203,13 @@ fn get_command(
                     PersonalAccessTokenExpiry::new(pat_create_args.expiry.clone()),
                     cli_options.quiet,
                     pat_create_args.store_token,
-                    iggy_args.get_server_address().unwrap(),
+                    server_address.to_string(),
                 ))
             }
             PersonalAccessTokenAction::Delete(pat_delete_args) => {
                 Box::new(DeletePersonalAccessTokenCmd::new(
                     pat_delete_args.name.clone(),
-                    iggy_args.get_server_address().unwrap(),
+                    server_address.to_string(),
                 ))
             }
             PersonalAccessTokenAction::List(pat_list_args) => Box::new(
@@ -302,12 +311,6 @@ fn get_command(
                 poll_args.show_headers,
                 poll_args.output_file.clone(),
             )),
-            MessageAction::Flush(flush_args) => Box::new(FlushMessagesCmd::new(
-                flush_args.stream_id.clone(),
-                flush_args.topic_id.clone(),
-                flush_args.partition_id,
-                flush_args.fsync,
-            )),
         },
         Command::ConsumerOffset(command) => match command {
             ConsumerOffsetAction::Get(get_args) => Box::new(GetConsumerOffsetCmd::new(
@@ -346,22 +349,32 @@ fn get_command(
         },
         #[cfg(feature = "login-session")]
         Command::Login(login_args) => Box::new(LoginCmd::new(
-            iggy_args.get_server_address().unwrap(),
+            server_address.to_string(),
             LoginSessionExpiry::new(login_args.expiry.clone()),
         )),
         #[cfg(feature = "login-session")]
-        Command::Logout => Box::new(LogoutCmd::new(iggy_args.get_server_address().unwrap())),
+        Command::Logout => Box::new(LogoutCmd::new(server_address.to_string())),
         #[cfg(feature = "login-session")]
         Command::Session(command) => match command {
-            SessionAction::Status => Box::new(SessionStatusCmd::new(
-                iggy_args.get_server_address().unwrap(),
-            )),
+            SessionAction::Status => Box::new(SessionStatusCmd::new(server_address.to_string())),
         },
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), IggyCmdError> {
+async fn main() {
+    if let Err(err) = run().await {
+        eprintln!("Error: {}", err);
+        let mut source = err.source();
+        while let Some(cause) = source {
+            eprintln!("Caused by: {}", cause);
+            source = cause.source();
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), IggyCmdError> {
     let args = IggyConsoleArgs::parse();
 
     if let Some(generator) = args.cli.generator {
@@ -382,7 +395,7 @@ async fn main() -> Result<(), IggyCmdError> {
     // token-name lookup) sees the backend regardless of code-path ordering.
     #[cfg(feature = "login-session")]
     if let Err(e) = ensure_default_store() {
-        tracing::warn!(target: PRINT_TARGET, "keyring backend unavailable: {e}");
+        tracing::warn!(target: DIAGNOSTIC_TARGET, "keyring backend unavailable: {e}");
     }
 
     let command = args.command.clone().unwrap();
@@ -394,13 +407,18 @@ async fn main() -> Result<(), IggyCmdError> {
     let iggy_args = merged_args.iggy;
     let cli_options = merged_args.cli;
 
+    validate_transport(&iggy_args.transport)?;
+    let server_address = iggy_args
+        .get_server_address()
+        .ok_or_else(|| ClientError::InvalidTransport(iggy_args.transport.clone()))?;
+
     // Get command based on command line arguments
-    let mut command = get_command(command, &cli_options, &iggy_args);
+    let mut command = get_command(command, &cli_options, &server_address);
 
     // Create credentials based on command line arguments and command
     let mut credentials = IggyCredentials::new(
         &cli_options,
-        &iggy_args,
+        &server_address,
         command.login_required(),
         command.prefer_explicit_credentials(),
     )?;
@@ -430,7 +448,11 @@ async fn main() -> Result<(), IggyCmdError> {
     credentials.set_iggy_client(&client);
     credentials.login_user().await?;
 
-    if command.use_tracing() {
+    if command.stdout_is_data() {
+        if !cli_options.quiet {
+            eprintln!("Executing {}", command.explain());
+        }
+    } else if command.use_tracing() {
         event!(target: PRINT_TARGET, Level::INFO, "Executing {}", command.explain());
     } else {
         println!("Executing {}", command.explain());

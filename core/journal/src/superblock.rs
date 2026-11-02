@@ -50,15 +50,18 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
+use server_common::fatal::NoteDescriptorExhaustion;
 
-use crate::prepare_journal::TmpFileGuard;
+use crate::prepare_journal::{TmpFileGuard, sweep_tmp_files};
+use futures::lock::Mutex;
+use std::sync::Arc;
 use twox_hash::XxHash3_64;
 
 /// Identifies a superblock file and rejects a foreign or zeroed one. "SBLK".
 const SUPERBLOCK_MAGIC: u32 = 0x5342_4C4B;
 /// On-disk record format version. Bump when the framing or payload contract
 /// changes; `read` rejects an unknown version rather than misparsing it.
-const SUPERBLOCK_VERSION: u16 = 1;
+const SUPERBLOCK_VERSION: u16 = 2;
 
 /// Fixed framing ahead of the payload (28 bytes): magic, version, a reserved
 /// half-word, sequence, parent checksum, and payload length.
@@ -68,15 +71,9 @@ const CHECKSUM_LEN: usize = 8;
 /// Smallest well-formed record (empty payload).
 const MIN_RECORD_LEN: usize = HEADER_LEN + CHECKSUM_LEN;
 
-/// Ceiling on a record's payload, bounding every allocation this module makes from
-/// a length it read off disk (`PrepareJournal::MAX_ENTRY_SIZE` bounds the WAL for the
-/// same reason). The only payload today is a [`consensus::VsrState`], 66 bytes now
-/// that it carries the offset frontier (58 before it, a length its decode still
-/// accepts); the headroom is for a payload that grows fields, not for bulk data.
-/// `read_slot` treats a longer file as corrupt WITHOUT reading it, and
-/// `build_record` refuses to write one, so a length this store could have
-/// produced is always in bounds.
-const MAX_PAYLOAD_LEN: usize = 4096;
+/// Bounds allocations before reading a slot. The VSR payload includes at most
+/// 128 exact 256-byte adopted headers, plus its fixed state and extension fields.
+const MAX_PAYLOAD_LEN: usize = 64 * 1024;
 /// Largest record `read_slot` will read into memory.
 const MAX_RECORD_LEN: usize = HEADER_LEN + MAX_PAYLOAD_LEN + CHECKSUM_LEN;
 
@@ -167,6 +164,7 @@ impl Slot {
 /// Two-file ping-pong superblock. See the module docs for the durability
 /// argument.
 pub struct PingPongSuperblock {
+    temporary_file_gate: Arc<Mutex<()>>,
     dir: PathBuf,
     /// Sequence to stamp on the next `write`. Monotonic; selects the latest
     /// record on read.
@@ -211,6 +209,7 @@ impl PingPongSuperblock {
         dir: impl Into<PathBuf>,
     ) -> io::Result<(Self, SuperblockContents)> {
         let dir = dir.into();
+        sweep_tmp_files(&[FILE_A, FILE_B].map(|name| dir.join(format!("{name}.tmp")))).await;
         let slot_a = read_slot(&dir.join(FILE_A)).await?;
         let slot_b = read_slot(&dir.join(FILE_B)).await?;
         let seq_a = sequence_of(&slot_a);
@@ -232,6 +231,7 @@ impl PingPongSuperblock {
         let next_slot = if a_is_newest { Slot::B } else { Slot::A };
 
         let store = Self {
+            temporary_file_gate: Arc::new(Mutex::new(())),
             dir,
             next_sequence: Cell::new(latest + 1),
             next_slot: Cell::new(next_slot),
@@ -271,7 +271,13 @@ impl SuperblockStore for PingPongSuperblock {
         // contract nobody violated, sending whoever debugs it to audit the lock.
         #[cfg(debug_assertions)]
         let _writing = WritingGuard::acquire(&self.writing);
-        atomic_replace(&self.dir, slot.file_name(), record).await?;
+        atomic_replace(
+            &self.dir,
+            slot.file_name(),
+            record,
+            &self.temporary_file_gate,
+        )
+        .await?;
         self.next_sequence.set(sequence + 1);
         self.next_slot.set(slot.other());
         Ok(())
@@ -390,7 +396,7 @@ fn classify(bytes: &[u8]) -> SlotClass {
         return corrupt;
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    if version != SUPERBLOCK_VERSION {
+    if version != 1 && version != SUPERBLOCK_VERSION {
         // Magic matched, so a superblock writer produced this, but the framing past
         // the version field may differ, so neither the payload length nor the checksum
         // can validate it.
@@ -491,7 +497,12 @@ const fn has_unreadable_sequence(slot: &SlotClass) -> bool {
 }
 
 async fn read_slot(path: &Path) -> io::Result<SlotClass> {
-    let file = match compio::fs::File::open(path).await {
+    // Read-only, but the load gates every later write of the group, so it
+    // counts like a write open.
+    let file = match compio::fs::File::open(path)
+        .await
+        .note_descriptor_exhaustion(|| format!("opening {}", path.display()))
+    {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(SlotClass::Absent),
         Err(e) => return Err(e),
@@ -519,24 +530,32 @@ async fn read_slot(path: &Path) -> io::Result<SlotClass> {
 
 /// Replace `dir/file_name` atomically: write a temp, fsync it, rename over the
 /// target, then fsync the directory so the rename itself is durable.
-async fn atomic_replace(dir: &Path, file_name: &str, bytes: Vec<u8>) -> io::Result<()> {
-    let tmp_path = dir.join(format!("{file_name}.tmp"));
+async fn atomic_replace(
+    dir: &Path,
+    file_name: &str,
+    bytes: Vec<u8>,
+    gate: &Arc<Mutex<()>>,
+) -> io::Result<()> {
+    let (mut tmp, guard) =
+        TmpFileGuard::create(&dir.join(format!("{file_name}.tmp")), gate).await?;
     let final_path = dir.join(file_name);
 
-    // Unlink the temp on any failure before the rename. Not a correctness matter,
-    // since `File::create` truncates and `next_sequence` / `next_slot` stay
-    // un-advanced so a retry re-targets the same slot; it keeps a failing disk from
-    // littering `superblock.{a,b}.tmp` next to the slots an operator is inspecting.
-    let guard = TmpFileGuard::new(tmp_path.clone());
-    let mut tmp = compio::fs::File::create(&tmp_path).await?;
-    let (result, _buf) = tmp.write_all_at(bytes, 0).await.into();
-    result?;
-    tmp.sync_all().await?;
-
-    compio::fs::rename(&tmp_path, &final_path).await?;
+    let prepared = async {
+        let (result, _buf) = tmp.write_all_at(bytes, 0).await.into();
+        result?;
+        tmp.sync_all().await?;
+        compio::fs::rename(guard.path(), &final_path).await
+    }
+    .await;
+    if let Err(error) = prepared {
+        guard.cleanup().await;
+        return Err(error);
+    }
     guard.defuse();
 
-    let dir_file = compio::fs::File::open(dir).await?;
+    let dir_file = compio::fs::File::open(dir)
+        .await
+        .note_descriptor_exhaustion(|| format!("opening directory {}", dir.display()))?;
     dir_file.sync_all().await?;
     Ok(())
 }
@@ -586,6 +605,39 @@ mod tests {
         // Writes alternate slots, so both files exist.
         assert!(dir.path().join(FILE_A).exists());
         assert!(dir.path().join(FILE_B).exists());
+    }
+
+    #[compio::test]
+    async fn given_a_legacy_slot_when_writing_recovery_evidence_should_upgrade_and_reopen() {
+        const LEGACY_VERSION: u16 = 1;
+        const LEGACY_LENGTHS: [usize; 2] = [66, 74];
+        for length in LEGACY_LENGTHS {
+            let directory = tempdir().unwrap();
+            let legacy_payload = vec![0x31; length];
+            let mut legacy = build_record(1, &legacy_payload).unwrap();
+            legacy[4..6].copy_from_slice(&LEGACY_VERSION.to_le_bytes());
+            let checksum_offset = legacy.len() - CHECKSUM_LEN;
+            let legacy_checksum = checksum(&legacy[..checksum_offset]);
+            legacy[checksum_offset..].copy_from_slice(&legacy_checksum.to_le_bytes());
+            std::fs::write(directory.path().join(FILE_A), legacy).unwrap();
+
+            let (store, latest) = PingPongSuperblock::open_with_latest(directory.path())
+                .await
+                .unwrap();
+            assert_eq!(latest, SuperblockContents::Present(legacy_payload));
+            let recovery_payload = vec![0x52; MAX_PAYLOAD_LEN];
+            store.write(&recovery_payload).await.unwrap();
+            drop(store);
+            let (_, latest) = PingPongSuperblock::open_with_latest(directory.path())
+                .await
+                .unwrap();
+            assert_eq!(latest, SuperblockContents::Present(recovery_payload));
+            let written = std::fs::read(directory.path().join(FILE_B)).unwrap();
+            assert_eq!(
+                u16::from_le_bytes([written[4], written[5]]),
+                SUPERBLOCK_VERSION
+            );
+        }
     }
 
     #[compio::test]

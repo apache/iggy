@@ -35,8 +35,8 @@ use bench_report::{
 use iggy::prelude::*;
 
 pub enum TypedBenchmarkConsumer {
-    High(BenchmarkConsumer<HighLevelConsumerClient>),
-    Low(BenchmarkConsumer<LowLevelConsumerClient>),
+    High(Box<BenchmarkConsumer<HighLevelConsumerClient>>),
+    Low(Box<BenchmarkConsumer<LowLevelConsumerClient>>),
 }
 
 impl TypedBenchmarkConsumer {
@@ -54,6 +54,7 @@ impl TypedBenchmarkConsumer {
         sampling_time: IggyDuration,
         moving_average_window: u32,
         polling_kind: PollingKind,
+        poll_options: PollOptions,
         limit_bytes_per_second: Option<IggyByteSize>,
         origin_timestamp_latency_calculation: bool,
         pretty: bool,
@@ -65,12 +66,13 @@ impl TypedBenchmarkConsumer {
             messages_per_batch,
             warmup_time,
             polling_kind,
+            poll_options,
             origin_timestamp_latency_calculation,
             pretty,
         };
 
         if use_high_level_api {
-            Self::High(BenchmarkConsumer::new(
+            Self::High(Box::new(BenchmarkConsumer::new(
                 HighLevelConsumerClient::new(client_factory, config.clone()),
                 benchmark_kind,
                 finish_condition,
@@ -78,9 +80,9 @@ impl TypedBenchmarkConsumer {
                 moving_average_window,
                 limit_bytes_per_second,
                 config,
-            ))
+            )))
         } else {
-            Self::Low(BenchmarkConsumer::new(
+            Self::Low(Box::new(BenchmarkConsumer::new(
                 LowLevelConsumerClient::new(client_factory, config.clone()),
                 benchmark_kind,
                 finish_condition,
@@ -88,7 +90,7 @@ impl TypedBenchmarkConsumer {
                 moving_average_window,
                 limit_bytes_per_second,
                 config,
-            ))
+            )))
         }
     }
 

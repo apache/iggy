@@ -115,7 +115,9 @@ impl TestMessagePollCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestMessagePollCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name).await;
+        let stream = client
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
         let stream = stream.unwrap();
         self.actual_stream_id = Some(stream.id);
@@ -124,11 +126,11 @@ impl IggyCmdTestCase for TestMessagePollCmd {
             .create_topic(
                 &stream.id.try_into().unwrap(),
                 &self.topic_name,
-                self.partitions_count,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(self.partitions_count),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await;
         assert!(topic.is_ok());

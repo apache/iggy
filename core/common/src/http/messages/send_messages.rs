@@ -17,6 +17,7 @@
 
 use crate::Identifier;
 use crate::IggyMessageView;
+use crate::PartitionContext;
 use crate::PartitioningKind;
 use crate::Validatable;
 use crate::error::IggyError;
@@ -39,6 +40,7 @@ use std::fmt::Formatter;
 /// - `topic_id` - unique topic ID (numeric or name).
 /// - `partitioning` - to which partition the messages should be sent - either provided by the client or calculated by the server.
 /// - `batch` - collection of messages to be sent.
+/// - `context` - optional partition context the HTTP send is fenced with.
 #[derive(Debug, PartialEq)]
 pub struct SendMessages {
     /// Length of stream_id, topic_id, partitioning and messages_count (4 bytes)
@@ -51,6 +53,10 @@ pub struct SendMessages {
     pub partitioning: Partitioning,
     /// Messages collection
     pub batch: IggyMessagesBatch,
+    /// HTTP only. A send captured under this context is refused once the partition is deleted or
+    /// recreated, so a resend never lands in another incarnation. Without one, the server fences
+    /// the send with the context current when it receives it.
+    pub context: Option<PartitionContext>,
 }
 
 impl Default for SendMessages {
@@ -61,6 +67,7 @@ impl Default for SendMessages {
             topic_id: Identifier::default(),
             partitioning: Partitioning::default(),
             batch: IggyMessagesBatch::empty(),
+            context: None,
         }
     }
 }
@@ -118,9 +125,14 @@ impl Serialize for SendMessages {
             })
             .collect();
 
-        let mut state = serializer.serialize_struct("SendMessages", 2)?;
+        let mut state =
+            serializer.serialize_struct("SendMessages", 2 + usize::from(self.context.is_some()))?;
         state.serialize_field("partitioning", &self.partitioning)?;
         state.serialize_field("messages", &messages)?;
+        // Omitted when absent: a server that predates the field rejects unknown fields.
+        if let Some(context) = &self.context {
+            state.serialize_field("context", context)?;
+        }
         state.end()
     }
 }
@@ -130,9 +142,12 @@ impl<'de> Deserialize<'de> for SendMessages {
     where
         D: Deserializer<'de>,
     {
+        const FIELDS: &[&str] = &["partitioning", "messages", "context"];
+
         enum Field {
             Partitioning,
             Messages,
+            Context,
         }
 
         impl<'de> Deserialize<'de> for Field {
@@ -146,7 +161,7 @@ impl<'de> Deserialize<'de> for SendMessages {
                     type Value = Field;
 
                     fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
-                        formatter.write_str("`partitioning` or `messages`")
+                        formatter.write_str("`partitioning`, `messages` or `context`")
                     }
 
                     fn visit_str<E>(self, value: &str) -> Result<Field, E>
@@ -156,10 +171,8 @@ impl<'de> Deserialize<'de> for SendMessages {
                         match value {
                             "partitioning" => Ok(Field::Partitioning),
                             "messages" => Ok(Field::Messages),
-                            _ => Err(de::Error::unknown_field(
-                                value,
-                                &["partitioning", "messages"],
-                            )),
+                            "context" => Ok(Field::Context),
+                            _ => Err(de::Error::unknown_field(value, FIELDS)),
                         }
                     }
                 }
@@ -183,6 +196,7 @@ impl<'de> Deserialize<'de> for SendMessages {
             {
                 let mut partitioning = None;
                 let mut messages = None;
+                let mut context = None;
 
                 while let Some(key) = map.next_key()? {
                     match key {
@@ -191,6 +205,12 @@ impl<'de> Deserialize<'de> for SendMessages {
                                 return Err(de::Error::duplicate_field("partitioning"));
                             }
                             partitioning = Some(map.next_value()?);
+                        }
+                        Field::Context => {
+                            if context.is_some() {
+                                return Err(de::Error::duplicate_field("context"));
+                            }
+                            context = Some(map.next_value::<Option<PartitionContext>>()?);
                         }
                         Field::Messages => {
                             if messages.is_some() {
@@ -292,15 +312,12 @@ impl<'de> Deserialize<'de> for SendMessages {
                     topic_id: Identifier::default(),
                     partitioning,
                     batch,
+                    context: context.flatten(),
                 })
             }
         }
 
-        deserializer.deserialize_struct(
-            "SendMessages",
-            &["partitioning", "messages"],
-            SendMessagesVisitor,
-        )
+        deserializer.deserialize_struct("SendMessages", FIELDS, SendMessagesVisitor)
     }
 }
 
@@ -391,6 +408,62 @@ fn parse_message_id(value: Option<&serde_json::Value>) -> Result<u128, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Consumer;
+    use crate::store_consumer_offset::StoreConsumerOffset;
+
+    const CONTEXT: PartitionContext = PartitionContext {
+        incarnation: 7,
+        owner_generation: 3,
+        metadata_op: 11,
+    };
+
+    fn send_body(context: Option<PartitionContext>) -> serde_json::Value {
+        let messages = vec![
+            IggyMessage::builder()
+                .id(1)
+                .payload(Bytes::from_static(b"fenced"))
+                .build()
+                .unwrap(),
+        ];
+        serde_json::to_value(SendMessages {
+            partitioning: Partitioning::partition_id(2),
+            batch: IggyMessagesBatch::from(&messages),
+            context,
+            ..SendMessages::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn given_context_when_sending_should_use_the_offset_store_shape_and_round_trip() {
+        let body = send_body(Some(CONTEXT));
+        let offset_store = serde_json::to_value(StoreConsumerOffset {
+            consumer: Consumer::default(),
+            partition_id: Some(2),
+            offset: 0,
+            context: Some(CONTEXT),
+        })
+        .unwrap();
+
+        assert_eq!(body["context"], offset_store["context"]);
+        let command: SendMessages = serde_json::from_value(body).unwrap();
+        assert_eq!(command.context, Some(CONTEXT));
+    }
+
+    /// A server that predates the field rejects unknown fields, and one that has it captures the
+    /// current context for a body without one.
+    #[test]
+    fn given_no_context_when_sending_should_omit_the_field_and_decode_as_none() {
+        let body = send_body(None);
+        assert!(body.get("context").is_none(), "{body}");
+
+        let mut explicit_null = body.clone();
+        explicit_null["context"] = serde_json::Value::Null;
+        for body in [body, explicit_null] {
+            let command: SendMessages = serde_json::from_value(body).unwrap();
+            assert_eq!(command.context, None);
+        }
+    }
 
     #[test]
     fn deserialize_send_messages_with_invalid_uuid_fails() {

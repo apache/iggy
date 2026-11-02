@@ -24,11 +24,32 @@ import org.apache.iggy.personalaccesstoken.RawPersonalAccessToken;
 import org.apache.iggy.user.IdentityInfo;
 
 import java.math.BigInteger;
+import java.time.Duration;
 import java.util.List;
 
 public interface PersonalAccessTokensClient {
 
+    /**
+     * Creates a new personal access token.
+     *
+     * @param name The name of the token
+     * @param expiry The token lifetime in microseconds, the wire unit
+     *     (0 for the server default, u64 max for no expiration)
+     * @return The created raw personal access token
+     */
     RawPersonalAccessToken createPersonalAccessToken(String name, BigInteger expiry);
+
+    /**
+     * Creates a new personal access token, converting the lifetime to the
+     * wire's microsecond unit.
+     *
+     * @param name The name of the token
+     * @param expiry The token lifetime
+     * @return The created raw personal access token
+     */
+    default RawPersonalAccessToken createPersonalAccessToken(String name, Duration expiry) {
+        return createPersonalAccessToken(name, BigInteger.valueOf(expiry.toNanos() / 1_000));
+    }
 
     List<PersonalAccessTokenInfo> getPersonalAccessTokens();
 

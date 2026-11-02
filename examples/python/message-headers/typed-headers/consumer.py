@@ -70,7 +70,7 @@ def get_message_type(headers: UserHeaders | None) -> OrderType | None:
 async def main() -> None:
     args = parse_args()
     client = await connect(args.connection_string)
-    await consume_messages(client, handle_message)
+    await consume_messages(client, handle_message, "typed-headers-consumer")
 
 
 if __name__ == "__main__":

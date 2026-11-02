@@ -27,15 +27,21 @@
 //!
 //! This lives in `binary_protocol` because every client decodes it: the SDK
 //! (mapping `result` to `IggyError`) and the simulator both read it, and
-//! neither can depend on the server-side `metadata` crate. The encode mirror is
-//! `metadata::stm::result::ApplyReply::write_reply_body`; the two share the
-//! widths below so they cannot drift.
+//! neither can depend on the server-side `metadata` crate. The success encode
+//! is `metadata::stm::result::ApplyReply::write_reply_body`, which shares the
+//! widths below so the two cannot drift; the rejection encode is
+//! [`write_rejection_section`] here, so the primary can emit it without a
+//! metadata dependency.
 
 /// Little-endian width of the leading `[count]` field.
 pub const RESULT_COUNT_LEN: usize = 4;
 
 /// Little-endian width of one `{index: u32, result: u32}` entry.
 pub const RESULT_ENTRY_LEN: usize = 8;
+
+/// Byte length of the single-entry rejection section
+/// [`write_rejection_section`] emits.
+pub const REJECTION_SECTION_LEN: usize = RESULT_COUNT_LEN + RESULT_ENTRY_LEN;
 
 fn read_u32(reply_body: &[u8], offset: usize) -> Option<u32> {
     reply_body
@@ -53,8 +59,8 @@ fn read_u32(reply_body: &[u8], offset: usize) -> Option<u32> {
 /// caller treats `None` as malformed, never Ok ("classify never guesses").
 #[must_use]
 pub fn result_code(reply_body: &[u8]) -> Option<u32> {
-    let count = read_u32(reply_body, 0)?;
-    if count == 0 {
+    let section_len = result_section_len(reply_body)?;
+    if section_len == RESULT_COUNT_LEN {
         Some(0)
     } else {
         // First entry's `result` sits past the count and its leading index; a
@@ -74,9 +80,28 @@ pub fn result_code(reply_body: &[u8]) -> Option<u32> {
 /// guessed offset.
 #[must_use]
 pub fn result_section_len(reply_body: &[u8]) -> Option<usize> {
-    let count = read_u32(reply_body, 0)? as usize;
-    let len = RESULT_COUNT_LEN + count * RESULT_ENTRY_LEN;
+    let count = usize::try_from(read_u32(reply_body, 0)?).ok()?;
+    let len = count
+        .checked_mul(RESULT_ENTRY_LEN)?
+        .checked_add(RESULT_COUNT_LEN)?;
     (reply_body.len() >= len).then_some(len)
+}
+
+/// Writes the single-entry rejection section `[count=1][index=0][result=code]`
+/// into the first `REJECTION_SECTION_LEN` bytes of `dst`.
+///
+/// The production encoder for that shape: a primary rejecting a request
+/// before commit and a committed metadata rejection emit identical bytes,
+/// which [`result_code`] reads back.
+///
+/// # Panics
+/// If `dst` is shorter than `REJECTION_SECTION_LEN`.
+pub fn write_rejection_section(dst: &mut [u8], code: u32) {
+    let (count, entry) = dst[..REJECTION_SECTION_LEN].split_at_mut(RESULT_COUNT_LEN);
+    count.copy_from_slice(&1u32.to_le_bytes());
+    let (index, result) = entry.split_at_mut(size_of::<u32>());
+    index.copy_from_slice(&0u32.to_le_bytes());
+    result.copy_from_slice(&code.to_le_bytes());
 }
 
 #[cfg(test)]
@@ -115,6 +140,15 @@ mod tests {
     }
 
     #[test]
+    fn written_rejection_section_is_the_frame_the_decoders_read() {
+        let mut section = [0u8; REJECTION_SECTION_LEN];
+        write_rejection_section(&mut section, 1009);
+        assert_eq!(section.as_slice(), rejection_body(1009).as_slice());
+        assert_eq!(result_code(&section), Some(1009));
+        assert_eq!(result_section_len(&section), Some(REJECTION_SECTION_LEN));
+    }
+
+    #[test]
     fn malformed_body_is_none_never_zero() {
         // Too short for the count, or claiming an entry it cannot hold: `None`,
         // never `Some(0)`. A rejection silently flipping to success is the bug
@@ -125,5 +159,32 @@ mod tests {
         assert_eq!(result_section_len(&1u32.to_le_bytes()), None);
         assert_eq!(result_code(&[1, 0, 0, 0, 0, 0, 0, 0]), None); // result missing
         assert_eq!(result_section_len(&[1, 0, 0, 0, 0, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn given_truncated_result_entries_when_decoding_should_not_return_the_first_error() {
+        let mut body = rejection_body(1009);
+        body[..RESULT_COUNT_LEN].copy_from_slice(&2u32.to_le_bytes());
+        for missing_tail in [0, RESULT_ENTRY_LEN - 1] {
+            let mut truncated = body.clone();
+            truncated.extend(std::iter::repeat_n(0, missing_tail));
+            assert_eq!(result_code(&truncated), None);
+            assert_eq!(result_section_len(&truncated), None);
+        }
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&1010u32.to_le_bytes());
+        assert_eq!(result_code(&body), Some(1009));
+        assert_eq!(
+            result_section_len(&body),
+            Some(RESULT_COUNT_LEN + 2 * RESULT_ENTRY_LEN)
+        );
+    }
+
+    #[test]
+    fn given_maximum_result_count_when_body_is_short_should_reject_without_overflow() {
+        let mut body = rejection_body(1009);
+        body[..RESULT_COUNT_LEN].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(result_code(&body), None);
+        assert_eq!(result_section_len(&body), None);
     }
 }

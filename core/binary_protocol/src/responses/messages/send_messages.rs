@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::codec::{WireDecode, WireEncode, capped_capacity, read_u32_le, read_u64_le};
+use crate::codec::{WireDecode, WireEncode, bounded_capacity, read_u32_le, read_u64_le};
 use crate::error::WireError;
 use bytes::{BufMut, BytesMut};
 use std::borrow::Cow;
@@ -28,7 +28,7 @@ use std::borrow::Cow;
 /// against the old stride would take its second entry from the middle of the
 /// first and return the garbage as a successful decode. Extra data needs a new
 /// response type or a protocol-version gate. The entry count may grow freely.
-const CONFIRMATION_SIZE: usize = 20;
+pub const CONFIRMATION_SIZE: usize = 20;
 
 /// Commit confirmation for one partition written by a `SendMessages` request.
 ///
@@ -37,14 +37,9 @@ const CONFIRMATION_SIZE: usize = 20;
 /// [stream_id:4][topic_id:4][partition_id:4][base_offset:8]
 /// ```
 ///
-/// `base_offset` is the offset assigned to the first message of the batch in
-/// that partition, bounded by three properties of the send path:
-/// - Delivery is at-least-once. An earlier retry of the same batch may already
-///   have committed at a lower offset, so the value never implies uniqueness.
-/// - A batch is confirmed once it is committed in memory, not once it is
-///   fsynced. A crash-restart can stamp a later batch with an offset a client
-///   has already recorded.
-/// - The legacy server confirms nothing, so its confirmation list is empty.
+/// `base_offset` identifies the first message in this partition. Retrying the
+/// unresolved request under the same live session returns the original receipt.
+/// Replicated topics accept these writes; Persisted adds crash-safe receipts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendMessagesConfirmationResponse {
     pub stream_id: u32,
@@ -91,9 +86,8 @@ impl WireDecode for SendMessagesConfirmationResponse {
 /// [confirmations_count:4][SendMessagesConfirmationResponse]*
 /// ```
 ///
-/// `confirmations_count == 0` means the batch committed with no offsets to
-/// report. The legacy server goes further and answers a successful send with no
-/// body at all, so a caller sees an empty list either way and must handle it.
+/// `confirmations_count == 0` supplies no offset information. An explicit
+/// session's successful send retains the original confirmation on retries.
 ///
 /// The server currently reports a single partition per request; the list
 /// decodes any count, so a later multi-partition send needs no wire change.
@@ -122,7 +116,7 @@ impl WireDecode for SendMessagesResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let confirmations_count = read_u32_le(buf, 0)?;
         let remaining = buf.len().saturating_sub(4);
-        let mut confirmations = Vec::with_capacity(capped_capacity(
+        let mut confirmations = Vec::with_capacity(bounded_capacity(
             confirmations_count as usize,
             remaining,
             CONFIRMATION_SIZE,

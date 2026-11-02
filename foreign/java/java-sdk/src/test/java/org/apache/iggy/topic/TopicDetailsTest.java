@@ -19,11 +19,14 @@
 
 package org.apache.iggy.topic;
 
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.partition.Partition;
+import org.apache.iggy.partition.PartitionContext;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -35,13 +38,24 @@ class TopicDetailsTest {
                 BigInteger.TEN,
                 "foo",
                 "size",
-                BigInteger.valueOf(10000L),
-                CompressionAlgorithm.Gzip,
-                BigInteger.TWO,
-                (short) 12,
                 BigInteger.ZERO,
-                1L);
-        var partitions = List.of(new Partition(1L, BigInteger.TEN, 2L, BigInteger.ZERO, "size", BigInteger.ONE));
+                1L,
+                Map.of(
+                        "message_expiry",
+                        HeaderValue.fromUint64(BigInteger.valueOf(10000L)),
+                        "compression_algorithm",
+                        HeaderValue.fromString("gzip")),
+                Map.of("max_topic_size", HeaderValue.fromUint64(BigInteger.TWO)));
+        var partitions = List.of(new Partition(
+                1L,
+                BigInteger.TEN,
+                2L,
+                BigInteger.ZERO,
+                "size",
+                BigInteger.ONE,
+                PartitionContext.EMPTY,
+                List.of(0, 1, 2),
+                List.of(0)));
 
         var topicDetails = new TopicDetails(topic, partitions);
 
@@ -49,10 +63,9 @@ class TopicDetailsTest {
         assertThat(topicDetails.createdAt()).isEqualTo(BigInteger.TEN);
         assertThat(topicDetails.name()).isEqualTo("foo");
         assertThat(topicDetails.size()).isEqualTo("size");
-        assertThat(topicDetails.messageExpiry()).isEqualTo(BigInteger.valueOf(10000L));
-        assertThat(topicDetails.compressionAlgorithm()).isEqualTo(CompressionAlgorithm.Gzip);
-        assertThat(topicDetails.maxTopicSize()).isEqualTo(BigInteger.TWO);
-        assertThat(topicDetails.replicationFactor()).isEqualTo((short) 12);
+        assertThat(topicDetails.messageExpiry()).contains(BigInteger.valueOf(10000L));
+        assertThat(topicDetails.compressionAlgorithm()).contains(CompressionAlgorithm.Gzip);
+        assertThat(topicDetails.maxTopicSize()).contains(BigInteger.TWO);
         assertThat(topicDetails.messagesCount()).isEqualTo(BigInteger.ZERO);
         assertThat(topicDetails.partitionsCount()).isEqualTo(1L);
         assertThat(topicDetails.partitions()).isEqualTo(partitions);

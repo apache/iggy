@@ -33,103 +33,169 @@ internal sealed class BinaryFactory
         return result.ToArray();
     }
 
-    internal static byte[] CreateOffsetPayload(int partitionId, ulong currentOffset, ulong offset)
+    internal static byte[] CreateOffsetPayload(uint partitionId, ulong currentOffset, ulong offset)
     {
         var payload = new byte[20];
-        BinaryPrimitives.WriteInt32LittleEndian(payload, partitionId);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, partitionId);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(4), currentOffset);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(12), offset);
         return payload;
     }
 
-    internal static byte[] CreateMessagePayload(ulong offset, ulong timestamp, int headersLength, uint checkSum,
-        Guid guid, ReadOnlySpan<byte> payload)
+    internal static byte[] CreateMessageFrame(ulong checksum, Guid guid, uint offsetDelta, uint timestampDelta,
+        ReadOnlySpan<byte> userHeaders, ReadOnlySpan<byte> payload)
     {
-        var messageLength = payload.Length;
-        var totalSize = 64 + payload.Length;
-        Span<byte> payloadBuffer = new byte[totalSize].AsSpan();
+        Span<byte> frame = new byte[48 + payload.Length + userHeaders.Length].AsSpan();
 
-        BinaryPrimitives.WriteUInt64LittleEndian(payloadBuffer[..8], checkSum);
-        BinaryPrimitives.WriteUInt128LittleEndian(payloadBuffer[8..24], guid.ToUInt128());
-        BinaryPrimitives.WriteUInt64LittleEndian(payloadBuffer[24..32], offset);
-        BinaryPrimitives.WriteUInt64LittleEndian(payloadBuffer[32..+40], timestamp);
-        BinaryPrimitives.WriteUInt64LittleEndian(payloadBuffer[40..48], timestamp);
-        BinaryPrimitives.WriteInt32LittleEndian(payloadBuffer[48..52], headersLength);
-        BinaryPrimitives.WriteInt32LittleEndian(payloadBuffer[52..56], payload.Length);
-        BinaryPrimitives.WriteUInt64LittleEndian(payloadBuffer[56..64], 0); // reserved
+        BinaryPrimitives.WriteUInt64LittleEndian(frame[..8], checksum);
+        BinaryPrimitives.WriteUInt128LittleEndian(frame[8..24], guid.ToUInt128());
+        BinaryPrimitives.WriteUInt32LittleEndian(frame[24..28], offsetDelta);
+        BinaryPrimitives.WriteUInt32LittleEndian(frame[28..32], timestampDelta);
+        BinaryPrimitives.WriteUInt32LittleEndian(frame[32..36], (uint)userHeaders.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(frame[36..40], (uint)payload.Length);
+        BinaryPrimitives.WriteUInt64LittleEndian(frame[40..48], 0); // reserved
 
-        payload.CopyTo(payloadBuffer[64..(64 + messageLength)]);
+        payload.CopyTo(frame[48..(48 + payload.Length)]);
+        userHeaders.CopyTo(frame[(48 + payload.Length)..]);
 
-        return payloadBuffer.ToArray();
+        return frame.ToArray();
     }
 
-    internal static byte[] CreateStreamPayload(uint id, int topicsCount, string name, ulong sizeBytes,
+    /// <summary>
+    ///     One batch record: a 256-byte batch header followed by the given frames. The batch checksum is
+    ///     left zero; the poll decoder does not verify it.
+    /// </summary>
+    internal static byte[] CreateBatchRecord(ulong baseOffset, ulong baseTimestamp, ulong originTimestamp,
+        params byte[][] frames)
+    {
+        var blobLength = frames.Sum(frame => frame.Length);
+        var record = new byte[256 + blobLength];
+        Span<byte> header = record.AsSpan(0, 256);
+
+        BinaryPrimitives.WriteUInt64LittleEndian(header[8..16], baseOffset);
+        BinaryPrimitives.WriteUInt64LittleEndian(header[16..24], baseTimestamp);
+        BinaryPrimitives.WriteUInt64LittleEndian(header[24..32], originTimestamp);
+        BinaryPrimitives.WriteUInt64LittleEndian(header[32..40], (ulong)record.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(header[48..52], (uint)frames.Length);
+
+        var position = 256;
+        foreach (var frame in frames)
+        {
+            frame.CopyTo(record.AsSpan(position));
+            position += frame.Length;
+        }
+
+        return record;
+    }
+
+    internal static byte[] CreateStreamPayload(uint id, uint topicsCount, string name, ulong sizeBytes,
         ulong messagesCount, ulong createdAt)
     {
         var nameBytes = Encoding.UTF8.GetBytes(name);
-        var totalSize = 4 + 4 + 8 + 8 + 1 + 8 + nameBytes.Length;
+        var totalSize = 4 + 4 + 8 + 8 + 1 + 8 + nameBytes.Length + 4 + 4;
         var payload = new byte[totalSize];
         BinaryPrimitives.WriteUInt32LittleEndian(payload, id);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(4), createdAt);
-        BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(12), topicsCount);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(12), topicsCount);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(16), sizeBytes);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(24), messagesCount);
         payload[32] = (byte)nameBytes.Length;
         nameBytes.CopyTo(payload.AsSpan(33));
+        // Empty length-prefixed explicit and derived options blocks.
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(33 + nameBytes.Length), 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(37 + nameBytes.Length), 0);
         return payload;
     }
 
-    internal static byte[] CreateTopicPayload(uint id, uint partitionsCount, uint messageExpiry, string name,
-        ulong sizeBytes, ulong messagesCount, ulong createdAt, byte replicationFactor, ulong maxTopicSize,
-        int compressionType)
+    internal static byte[] CreateTopicPayload(uint id, uint partitionsCount, string name, ulong sizeBytes,
+        ulong messagesCount, ulong createdAt, byte[]? options = null, byte[]? derivedOptions = null)
     {
         var nameBytes = Encoding.UTF8.GetBytes(name);
-        var totalSize = 4 + 8 + 4 + 8 + 1 + 8 + 8 + 8 + 1 + 1 + name.Length;
+        var optionsBytes = options ?? [];
+        var derivedBytes = derivedOptions ?? [];
+        var totalSize = 4 + 8 + 4 + 8 + 8 + 1 + nameBytes.Length + 4 + optionsBytes.Length + 4 + derivedBytes.Length;
 
         var payload = new byte[totalSize];
         BinaryPrimitives.WriteUInt32LittleEndian(payload, id);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(4), createdAt);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(12), partitionsCount);
-        BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(16), messageExpiry);
-        payload[24] = (byte)compressionType;
-        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(25), maxTopicSize);
-        payload[33] = replicationFactor;
-        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(34), sizeBytes);
-        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(42), messagesCount);
-        payload[50] = (byte)nameBytes.Length;
-        nameBytes.CopyTo(payload.AsSpan(51));
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(16), sizeBytes);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(24), messagesCount);
+        payload[32] = (byte)nameBytes.Length;
+        nameBytes.CopyTo(payload.AsSpan(33));
+        // Length-prefixed explicit options block, then the derived one.
+        var position = 33 + nameBytes.Length;
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(position), (uint)optionsBytes.Length);
+        optionsBytes.CopyTo(payload.AsSpan(position + 4));
+        position += 4 + optionsBytes.Length;
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(position), (uint)derivedBytes.Length);
+        derivedBytes.CopyTo(payload.AsSpan(position + 4));
         return payload;
     }
 
-    internal static byte[] CreatePartitionPayload(int id, int segmentsCount, int currentOffset, ulong sizeBytes,
-        ulong messagesCount)
+    /// <summary>
+    ///     One partition record of a topic details reply: 40 bytes of counters, the 24-byte context, then the
+    ///     members and the in-sync members, each a u8 count followed by that many u8 node ids.
+    /// </summary>
+    internal static byte[] CreatePartitionPayload(uint id, ulong createdAt, uint segmentsCount, ulong currentOffset,
+        ulong sizeBytes, ulong messagesCount, PartitionContext context, byte[] members, byte[] inSyncMembers)
     {
-        var payload = new byte[16];
-        BinaryPrimitives.WriteInt32LittleEndian(payload, id);
-        BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(4), segmentsCount);
-        BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(8), currentOffset);
-        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(12), sizeBytes);
-        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(16), messagesCount);
+        var countersSize = 40 + PartitionContext.ENCODED_SIZE;
+        var payload = new byte[countersSize + 1 + members.Length + 1 + inSyncMembers.Length];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, id);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(4), createdAt);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(12), segmentsCount);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(16), currentOffset);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(24), sizeBytes);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(32), messagesCount);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(40), context.Incarnation);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(48), context.OwnerGeneration);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(56), context.MetadataOp);
+        payload[countersSize] = (byte)members.Length;
+        members.CopyTo(payload.AsSpan(countersSize + 1));
+        var inSyncPosition = countersSize + 1 + members.Length;
+        payload[inSyncPosition] = (byte)inSyncMembers.Length;
+        inSyncMembers.CopyTo(payload.AsSpan(inSyncPosition + 1));
         return payload;
+    }
+
+    /// <summary>
+    ///     One options entry: <c>[key_kind][key_len:u32][key][value_kind][value_len:u32][value]</c>. The kinds are
+    ///     taken as raw wire codes so a test can encode a code this SDK has no name for.
+    /// </summary>
+    internal static byte[] CreateOptionEntry(byte keyKind, string key, byte valueKind, byte[] value)
+    {
+        var keyBytes = Encoding.UTF8.GetBytes(key);
+        var entry = new byte[1 + 4 + keyBytes.Length + 1 + 4 + value.Length];
+        entry[0] = keyKind;
+        BinaryPrimitives.WriteUInt32LittleEndian(entry.AsSpan(1), (uint)keyBytes.Length);
+        keyBytes.CopyTo(entry.AsSpan(5));
+
+        var position = 5 + keyBytes.Length;
+        entry[position] = valueKind;
+        BinaryPrimitives.WriteUInt32LittleEndian(entry.AsSpan(position + 1), (uint)value.Length);
+        value.CopyTo(entry.AsSpan(position + 5));
+        return entry;
     }
 
     internal static byte[] CreateGroupPayload(uint id, uint membersCount, uint partitionsCount, string name,
-        List<int>? partitionsOnMember = null)
+        List<uint>? partitionsOnMember = null)
     {
-        var payload = new byte[13 + name.Length + (partitionsOnMember?.Count * 4 + 8 ?? 0)];
+        var nameBytes = Encoding.UTF8.GetBytes(name);
+        var payload = new byte[13 + nameBytes.Length + (partitionsOnMember?.Count * 4 + 8 ?? 0)];
         BinaryPrimitives.WriteUInt32LittleEndian(payload, id);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4), partitionsCount);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(8), membersCount);
-        payload[12] = (byte)name.Length;
-        var nameBytes = Encoding.UTF8.GetBytes(name);
+        payload[12] = (byte)nameBytes.Length;
         nameBytes.CopyTo(payload.AsSpan(13));
         if (partitionsOnMember is not null)
         {
-            BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(13 + name.Length), 30);
-            BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(17 + name.Length), partitionsOnMember.Count);
+            var memberStart = 13 + nameBytes.Length;
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(memberStart), 30);
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(memberStart + 4), (uint)partitionsOnMember.Count);
             for (var i = 0; i < partitionsOnMember.Count; i++)
             {
-                BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(21 + name.Length + i * 4),
+                BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(memberStart + 8 + i * 4),
                     partitionsOnMember[i]);
             }
         }
@@ -137,10 +203,19 @@ internal sealed class BinaryFactory
         return payload;
     }
 
-    internal static byte[] CreateStatsPayload(StatsResponse stats)
+    internal static byte[] CreateStatsPayload(StatsResponse stats, bool withOpenFiles = true)
     {
-        var bytes = new byte[1024];
-        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(0, 4), stats.ProcessId);
+        var hostnameBytes = Encoding.UTF8.GetBytes(stats.Hostname);
+        var osNameBytes = Encoding.UTF8.GetBytes(stats.OsName);
+        var osVersionBytes = Encoding.UTF8.GetBytes(stats.OsVersion);
+        var kernelVersionBytes = Encoding.UTF8.GetBytes(stats.KernelVersion);
+        var iggyServerVersionBytes = Encoding.UTF8.GetBytes(stats.IggyServerVersion);
+        var stringsSize = 5 * 4 + hostnameBytes.Length + osNameBytes.Length + osVersionBytes.Length
+                          + kernelVersionBytes.Length + iggyServerVersionBytes.Length;
+        var tailSize = 4 + 4 + stats.CacheMetrics.Count * 32 + 4 + 8 + 8 + (withOpenFiles ? 16 : 0);
+
+        var bytes = new byte[108 + stringsSize + tailSize];
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(0, 4), stats.ProcessId);
         BinaryPrimitives.WriteSingleLittleEndian(bytes.AsSpan(4, 4), stats.CpuUsage);
         BinaryPrimitives.WriteSingleLittleEndian(bytes.AsSpan(8, 8), stats.TotalCpuUsage);
         BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(12, 8), stats.MemoryUsage);
@@ -152,34 +227,56 @@ internal sealed class BinaryFactory
         BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(52, 8), stats.ReadBytes);
         BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(60, 8), stats.WrittenBytes);
         BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(68, 8), stats.MessagesSizeBytes);
-        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(76, 4), stats.StreamsCount);
-        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(80, 4), stats.TopicsCount);
-        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(84, 4), stats.PartitionsCount);
-        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(88, 4), stats.SegmentsCount);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(76, 4), stats.StreamsCount);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(80, 4), stats.TopicsCount);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(84, 4), stats.PartitionsCount);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(88, 4), stats.SegmentsCount);
         BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(92, 8), stats.MessagesCount);
-        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(100, 4), stats.ClientsCount);
-        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(104, 4), stats.ConsumerGroupsCount);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(100, 4), stats.ClientsCount);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(104, 4), stats.ConsumerGroupsCount);
 
-        // Convert string properties to bytes and set them in the byte array
-        var hostnameBytes = Encoding.UTF8.GetBytes(stats.Hostname);
-        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(108, 4), hostnameBytes.Length);
-        hostnameBytes.CopyTo(bytes, 112);
+        var position = 108;
+        position = WriteString(bytes, position, hostnameBytes);
+        position = WriteString(bytes, position, osNameBytes);
+        position = WriteString(bytes, position, osVersionBytes);
+        position = WriteString(bytes, position, kernelVersionBytes);
+        position = WriteString(bytes, position, iggyServerVersionBytes);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position, 4), stats.IggyServerSemver);
+        position += 4;
 
-        var osNameBytes = Encoding.UTF8.GetBytes(stats.OsName);
-        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(112 + hostnameBytes.Length, 4), osNameBytes.Length);
-        osNameBytes.CopyTo(bytes, 116 + hostnameBytes.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position, 4), (uint)stats.CacheMetrics.Count);
+        position += 4;
+        foreach (var (key, metrics) in stats.CacheMetrics)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position, 4), key.StreamId);
+            BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position + 4, 4), key.TopicId);
+            BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position + 8, 4), key.PartitionId);
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(position + 12, 8), metrics.Hits);
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(position + 20, 8), metrics.Misses);
+            BinaryPrimitives.WriteSingleLittleEndian(bytes.AsSpan(position + 28, 4), metrics.HitRatio);
+            position += 32;
+        }
 
-        var osVersionBytes = Encoding.UTF8.GetBytes(stats.OsVersion);
-        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(116 + hostnameBytes.Length + osNameBytes.Length, 4),
-            osVersionBytes.Length);
-        osVersionBytes.CopyTo(bytes, 120 + hostnameBytes.Length + osNameBytes.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position, 4), stats.ThreadsCount);
+        position += 4;
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(position, 8), stats.FreeDiskSpace);
+        position += 8;
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(position, 8), stats.TotalDiskSpace);
+        position += 8;
 
-        var kernelVersionBytes = Encoding.UTF8.GetBytes(stats.KernelVersion);
-        BinaryPrimitives.WriteInt32LittleEndian(
-            bytes.AsSpan(120 + hostnameBytes.Length + osNameBytes.Length + osVersionBytes.Length, 4),
-            kernelVersionBytes.Length);
-        kernelVersionBytes.CopyTo(bytes, 124 + hostnameBytes.Length + osNameBytes.Length + osVersionBytes.Length);
+        if (withOpenFiles)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(position, 8), stats.OpenFilesCount);
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(position + 8, 8), stats.OpenFilesLimit);
+        }
 
         return bytes;
+    }
+
+    private static int WriteString(byte[] bytes, int position, byte[] value)
+    {
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position, 4), (uint)value.Length);
+        value.CopyTo(bytes, position + 4);
+        return position + 4 + value.Length;
     }
 }

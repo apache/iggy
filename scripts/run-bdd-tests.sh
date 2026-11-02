@@ -35,8 +35,8 @@ log(){ printf "%b\n" "$*"; }
 usage(){
   log "Usage: $0 [--coverage] <sdk> [feature]"
   log ""
-  log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | all | clean (default: all)"
-  log "  feature: basic_messaging | leader_redirection | raw_command | all  (default: all)"
+  log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | swift | all | clean (default: all)"
+  log "  feature: basic_messaging | leader_redirection | raw_command | session_contract | stream_crud | stream_options | resource_options_patch | metadata_changes | deferred_polling | all  (default: all)"
   log ""
   log "  Every suite runs against iggy-server, taken from IGGY_SERVER_PATH"
   log "  (default: target/debug/iggy-server) with an iggy CLI at IGGY_CLI_PATH."
@@ -49,7 +49,7 @@ usage(){
 }
 
 case "$FEATURE" in
-  basic_messaging|leader_redirection|raw_command|all) ;;
+  basic_messaging|leader_redirection|raw_command|session_contract|stream_crud|stream_options|resource_options_patch|metadata_changes|deferred_polling|all) ;;
   *)
     log "Unknown feature: ${FEATURE}"
     usage
@@ -64,21 +64,27 @@ ALL_COMPOSE_FILES=(
   -f docker-compose.yml
   -f docker-compose.server.yml
   -f docker-compose.cluster.yml
+  -f docker-compose.no-quorum.yml
   -f docker-compose.coverage.yml
 )
 
 COMPOSE_FILES=(-f docker-compose.yml)
 case "$FEATURE" in
-  basic_messaging|leader_redirection|raw_command|all)
+  basic_messaging|leader_redirection|raw_command|session_contract|stream_crud|stream_options|resource_options_patch|metadata_changes|deferred_polling|all)
     COMPOSE_FILES+=(-f docker-compose.server.yml) ;;
 esac
 case "$FEATURE" in
   leader_redirection|all)
     COMPOSE_FILES+=(-f docker-compose.cluster.yml) ;;
 esac
+case "$FEATURE" in
+  session_contract|all)
+    COMPOSE_FILES+=(-f docker-compose.no-quorum.yml) ;;
+esac
 if [ "$COVERAGE" = "1" ]; then
   COMPOSE_FILES+=(-f docker-compose.coverage.yml)
-  mkdir -p ../reports
+  mkdir -p ../reports ../target
+  export BDD_SERVER_PROFILE_FILE="/profiles/bdd-server-%h-%p-%m.profraw"
 fi
 
 cleanup(){
@@ -94,21 +100,54 @@ if [ "$COVERAGE" = "1" ]; then
   log "📊 Coverage collection enabled → reports will be in ./reports/"
 fi
 
+unsupported(){
+  local feature="$1" svc="$2"
+  if [ "$SDK" = "all" ]; then
+    log "⚠️ skipping ${svc%-bdd} (does not support ${feature})"
+    return 0
+  else
+    log "❌ ${SDK} does not support feature '${feature}'"
+    return 1
+  fi
+}
+
 run_suite(){
   local svc="$1" emoji="$2" label="$3"
   if [ "$FEATURE" = "leader_redirection" ]; then
     case "$svc" in
       rust-bdd|go-bdd|csharp-bdd|java-bdd) ;;
       *)
-        if [ "$SDK" = "all" ]; then
-          log "⚠️ skipping ${svc%-bdd} (does not support ${FEATURE})"
-          return 0
-        else
-          log "❌ ${SDK} does not support feature '${FEATURE}'"
-          return 1
-        fi
-        ;;
+        unsupported "$FEATURE" "$svc" || return 1
+        return 0 ;;
     esac
+  fi
+
+  if [ "$FEATURE" = "stream_crud" ]; then
+    case "$svc" in
+      rust-bdd|java-bdd) ;;
+      *)
+        unsupported "$FEATURE" "$svc" || return 1
+        return 0 ;;
+    esac
+  fi
+
+  if [ "$FEATURE" = "deferred_polling" ]; then
+    case "$svc" in
+      rust-bdd|python-bdd|php-bdd|cpp-bdd|swift-bdd|go-bdd|node-bdd|csharp-bdd|java-bdd) ;;
+      *)
+        unsupported "$FEATURE" "$svc" || return 1
+        return 0 ;;
+    esac
+  fi
+
+  if [ "$svc" = "swift-bdd" ] && [ "$FEATURE" != "deferred_polling" ] && [ "$FEATURE" != "all" ]; then
+    unsupported "$FEATURE" "$svc" || return 1
+    return 0
+  fi
+
+  if [ "$FEATURE" = "resource_options_patch" ] && [ "$svc" = "php-bdd" ]; then
+    unsupported "$FEATURE" "$svc" || return 1
+    return 0
   fi
 
   log "${emoji} ${label}..."
@@ -137,6 +176,7 @@ case "$SDK" in
   csharp)   run_suite csharp-bdd "🔷"   "Running C# BDD tests"     ;;
   java)     run_suite java-bdd   "☕"   "Running Java BDD tests"   ;;
   cpp)      run_suite cpp-bdd    "⚙️"   "Running C++ BDD tests"    ;;
+  swift)    run_suite swift-bdd  "🐦"   "Running Swift BDD tests"  ;;
   all)
     run_suite rust-bdd   "🦀"   "Running Rust BDD tests"                       || exit $?
     run_suite python-bdd "🐍"   "Running Python BDD tests"                     || exit $?
@@ -148,6 +188,7 @@ case "$SDK" in
     run_suite csharp-bdd "🔷"   "Running C# BDD tests"                         || exit $?
     run_suite java-bdd   "☕"   "Running Java BDD tests"                       || exit $?
     run_suite cpp-bdd    "⚙️"   "Running C++ BDD tests"                        || exit $?
+    run_suite swift-bdd  "🐦"   "Running Swift BDD tests"                      || exit $?
     ;;
   clean)
     cleanup

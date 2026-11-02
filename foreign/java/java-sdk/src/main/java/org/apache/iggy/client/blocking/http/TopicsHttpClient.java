@@ -22,13 +22,17 @@ package org.apache.iggy.client.blocking.http;
 import org.apache.iggy.client.blocking.TopicsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
-import org.apache.iggy.topic.CompressionAlgorithm;
+import org.apache.iggy.message.HeaderValue;
+import org.apache.iggy.partition.Partition;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
+import org.apache.iggy.topic.TopicOptions;
+import org.apache.iggy.topic.TopicUpdate;
 import tools.jackson.core.type.TypeReference;
 
 import java.math.BigInteger;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 class TopicsHttpClient implements TopicsClient {
@@ -36,51 +40,45 @@ class TopicsHttpClient implements TopicsClient {
     private static final String STREAMS = "/streams";
     private static final String TOPICS = "/topics";
     private final InternalHttpClient httpClient;
+    private final SendContexts sendContexts;
 
-    public TopicsHttpClient(InternalHttpClient httpClient) {
+    public TopicsHttpClient(InternalHttpClient httpClient, SendContexts sendContexts) {
         this.httpClient = httpClient;
+        this.sendContexts = sendContexts;
     }
 
     @Override
     public Optional<TopicDetails> getTopic(StreamId streamId, TopicId topicId) {
         var request = httpClient.prepareGetRequest(STREAMS + "/" + streamId + TOPICS + "/" + topicId);
-        return httpClient.executeWithOptionalResponse(request, TopicDetails.class);
+        return httpClient
+                .executeWithOptionalResponse(request, HttpTopicDetails.class)
+                .map(HttpTopicDetails::toTopicDetails);
     }
 
     @Override
     public List<Topic> getTopics(StreamId streamId) {
         var request = httpClient.prepareGetRequest(STREAMS + "/" + streamId + TOPICS);
-        return httpClient.execute(request, new TypeReference<>() {});
+        List<HttpTopic> topics = httpClient.execute(request, new TypeReference<>() {});
+        return topics.stream().map(HttpTopic::toTopic).toList();
     }
 
     @Override
     public TopicDetails createTopic(
-            StreamId streamId,
-            Long partitionsCount,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
-            String name) {
+            StreamId streamId, String name, long partitionsCount, Map<String, HeaderValue> options) {
         var request = httpClient.preparePostRequest(
                 STREAMS + "/" + streamId + TOPICS,
                 new CreateTopic(
-                        partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, replicationFactor, name));
-        return httpClient.execute(request, new TypeReference<>() {});
+                        partitionsCount,
+                        name,
+                        HttpOptionValue.requestValues(TopicOptions.withDurabilityDefaults(options))));
+        return httpClient.execute(request, HttpTopicDetails.class).toTopicDetails();
     }
 
     @Override
-    public void updateTopic(
-            StreamId streamId,
-            TopicId topicId,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
-            String name) {
+    public void updateTopic(StreamId streamId, TopicId topicId, TopicUpdate update) {
         var request = httpClient.preparePutRequest(
                 STREAMS + "/" + streamId + TOPICS + "/" + topicId,
-                new UpdateTopic(compressionAlgorithm, messageExpiry, maxTopicSize, replicationFactor, name));
+                HttpOptionValue.updateBody(update.entries(), update.resetKeys()));
         httpClient.execute(request);
     }
 
@@ -88,20 +86,63 @@ class TopicsHttpClient implements TopicsClient {
     public void deleteTopic(StreamId streamId, TopicId topicId) {
         var request = httpClient.prepareDeleteRequest(STREAMS + "/" + streamId + TOPICS + "/" + topicId);
         httpClient.execute(request);
+        sendContexts.clear();
     }
 
-    record CreateTopic(
-            Long partitionsCount,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
-            String name) {}
+    record CreateTopic(long partitionsCount, String name, Map<String, Object> options) {}
 
-    record UpdateTopic(
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
-            String name) {}
+    /**
+     * The REST shape of a topic.
+     *
+     * <p>It differs from {@link Topic} in one place: REST reports every option in a single map with a
+     * per-entry {@code explicit} flag, where the binary protocol sends an explicit block and a derived
+     * block. Splitting here is what lets a caller read {@code options()} and {@code derivedOptions()}
+     * the same way on either transport, each value in the kind the server stored.
+     */
+    record HttpTopic(
+            Long id,
+            BigInteger createdAt,
+            String name,
+            String size,
+            BigInteger messagesCount,
+            Long partitionsCount,
+            Map<String, HttpOptionValue> options) {
+
+        Topic toTopic() {
+            return new Topic(
+                    id,
+                    createdAt,
+                    name,
+                    size,
+                    messagesCount,
+                    partitionsCount,
+                    HttpOptionValue.select(options, true),
+                    HttpOptionValue.select(options, false));
+        }
+    }
+
+    /** The REST shape of a topic with its partitions. See {@link HttpTopic}. */
+    record HttpTopicDetails(
+            Long id,
+            BigInteger createdAt,
+            String name,
+            String size,
+            BigInteger messagesCount,
+            Long partitionsCount,
+            List<Partition> partitions,
+            Map<String, HttpOptionValue> options) {
+
+        TopicDetails toTopicDetails() {
+            return new TopicDetails(
+                    id,
+                    createdAt,
+                    name,
+                    size,
+                    messagesCount,
+                    partitionsCount,
+                    partitions == null ? List.of() : partitions,
+                    HttpOptionValue.select(options, true),
+                    HttpOptionValue.select(options, false));
+        }
+    }
 }

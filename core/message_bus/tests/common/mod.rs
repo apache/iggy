@@ -26,19 +26,24 @@
 
 #![allow(dead_code)] // each test binary uses a subset
 
-use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE};
+use compio::io::{AsyncRead, AsyncWriteExt};
+use compio::net::{TcpListener, TcpStream};
+use compio::runtime::JoinHandle;
+use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE};
 use message_bus::ConnectionInstaller;
 use message_bus::client_listener::RequestHandler;
-use message_bus::replica::auth::ReplicaAuth;
-use message_bus::replica::handshake::{ReplicaHandshakeCtx, ReplicaTlsCtx};
-use message_bus::replica::listener::MessageHandler;
+use message_bus::replica::auth::{ChannelBinding, LinkPlacement, ReplicaAuth};
+use message_bus::replica::handshake::{ReplicaHandshakeCtx, ReplicaTlsCtx, acceptor_handshake};
+use message_bus::replica::listener::{self, MessageHandler};
+use message_bus::replica::preamble::{Preamble, read_preamble};
 use message_bus::transports::tls::{
     AcceptAnyServerCert, REPLICA_ALPN, install_default_crypto_provider, self_signed_for_loopback,
 };
 use message_bus::{
     AcceptedClientFn, AcceptedQuicClientFn, AcceptedQuicConn, AcceptedReplicaFn,
     AcceptedTlsClientFn, AcceptedWsClientFn, AcceptedWssClientFn, ClientConnMeta,
-    ClientTransportKind, DialedReplicaFn, IggyMessageBus, fd_transfer, installer,
+    ClientTransportKind, ConnectionCap, ConnectionPermit, DialedReplicaFn, IggyMessageBus,
+    fd_transfer, installer,
 };
 use rustls::pki_types::ServerName;
 use server_common::Message;
@@ -46,6 +51,10 @@ use std::cell::Cell;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
+
+const CLIENT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const CLIENT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Build a stub [`ClientConnMeta`] for tests that don't care about
 /// peer addr / transport details. Uses `127.0.0.1:0` and the given
@@ -67,7 +76,7 @@ pub fn loopback() -> SocketAddr {
 /// Used by tests to fabricate `Request`, `Reply`, `Ping`, etc. directly.
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
-pub fn header_only(command: Command2, cluster: u128, replica: u8) -> Message<GenericHeader> {
+pub fn header_only(command: Command, cluster: u128, replica: u8) -> Message<GenericHeader> {
     Message::<GenericHeader>::new(HEADER_SIZE).transmute_header(|_, h: &mut GenericHeader| {
         h.command = command;
         h.cluster = cluster;
@@ -87,6 +96,7 @@ pub fn set_replica_ctx(
     auth: Option<ReplicaAuth>,
 ) {
     bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
+        binary_identity: [0x5a; 32],
         cluster_id,
         self_id,
         replica_count,
@@ -105,6 +115,7 @@ pub fn set_replica_ctx_with_tls(
     tls: Rc<ReplicaTlsCtx>,
 ) {
     bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
+        binary_identity: [0x5a; 32],
         cluster_id,
         self_id,
         replica_count,
@@ -150,51 +161,111 @@ pub fn self_signed_replica_tls_ctx(replica_count: u8) -> Rc<ReplicaTlsCtx> {
 /// Build an [`AcceptedReplicaFn`] that runs the owning-shard inbound
 /// path (acceptor handshake + install) locally on the given bus,
 /// bypassing the coordinator but exercising the same admission (cap
-/// slot) and handshake code the production owning shard runs. Requires
-/// [`set_replica_ctx`] on the bus.
+/// slot + placement preamble) and handshake code the production shards
+/// run. The handshake ack refreshes the bundle, so a single-shard bus
+/// brings the peer Up. Requires [`set_replica_ctx`] on the bus.
 #[must_use]
 pub fn install_replicas_locally(
     bus: Rc<IggyMessageBus>,
     on_message: MessageHandler,
 ) -> AcceptedReplicaFn {
     Rc::new(move |stream| {
-        let Some(slot) = bus.try_acquire_replica_handshake_slot() else {
-            return;
-        };
-        let release_bus = Rc::clone(&bus);
-        installer::install_replica_inbound(
-            &bus,
-            stream,
-            on_message.clone(),
-            Box::new(move || {
-                release_bus.release_replica_handshake_slot(slot);
-            }),
-        );
+        let install_bus = Rc::clone(&bus);
+        let on_message = on_message.clone();
+        listener::admit_inbound(&bus, stream, move |stream, link, _owner, slot, deadline| {
+            let done_bus = Rc::clone(&install_bus);
+            installer::install_replica_inbound(
+                &install_bus,
+                stream,
+                link,
+                deadline,
+                on_message,
+                Box::new(move || done_bus.replica_inbound_handshake_done(slot, link)),
+            );
+        });
     })
 }
 
 /// Build a [`DialedReplicaFn`] that runs the owning-shard outbound path
-/// (dialer handshake + install) locally on the given bus, including the
-/// pending-dial mark / clear the production shard-0 callback and router
-/// perform. Requires [`set_replica_ctx`] on the bus.
+/// (preamble + dialer handshake + install) locally on the given bus,
+/// including the pending-dial mark and the handshake ack the production
+/// shard-0 callback and router perform. Requires [`set_replica_ctx`] on
+/// the bus.
 #[must_use]
 pub fn install_dialed_replicas_locally(
     bus: Rc<IggyMessageBus>,
     on_message: MessageHandler,
 ) -> DialedReplicaFn {
-    Rc::new(move |stream, peer_id| {
-        bus.mark_dial_pending(peer_id);
-        let clear_bus = Rc::clone(&bus);
+    Rc::new(move |stream, link, _owner| {
+        bus.mark_dial_pending(link.replica, link.link);
+        let done_bus = Rc::clone(&bus);
         installer::install_replica_outbound(
             &bus,
-            peer_id,
+            link,
             stream,
             on_message.clone(),
-            Box::new(move || {
-                clear_bus.clear_dial_pending(peer_id);
-            }),
+            Box::new(move || done_bus.replica_outbound_handshake_done(link)),
         );
     })
+}
+
+/// Bind a raw replica `self_id` that admits each dialed link with the real
+/// acceptor handshake and then never reads again, so the dialer's frames
+/// back up in the kernel buffers of both ends. The cluster, the build
+/// identity and the link layout come from `template`, a bus of the same
+/// cluster. Dropping the returned task closes the held links.
+#[allow(clippy::future_not_send)]
+pub async fn spawn_stalled_replica(
+    template: &IggyMessageBus,
+    self_id: u8,
+) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind(loopback())
+        .await
+        .expect("bind the stalled replica");
+    let addr = listener.local_addr().expect("stalled replica address");
+    let ctx = ReplicaHandshakeCtx {
+        self_id,
+        ..template
+            .replica_handshake_ctx()
+            .expect("template bus has a replica handshake ctx")
+            .clone()
+    };
+    let layout = template.link_layout();
+    let grace = template.config().handshake_grace;
+    let accept = compio::runtime::spawn(async move {
+        // Held only to keep the links open; the stalled replica never reads.
+        #[allow(clippy::collection_is_never_read)]
+        let mut held = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let bytes = read_preamble(&mut stream, grace)
+                .await
+                .expect("dialer must send its preamble");
+            let preamble = Preamble::admit(bytes, self_id, ctx.replica_count, layout.links())
+                .expect("valid preamble");
+            acceptor_handshake(
+                &mut stream,
+                &ctx,
+                preamble.dialer,
+                LinkPlacement {
+                    links: layout.links(),
+                    link: preamble.link,
+                },
+                ChannelBinding::Plaintext,
+                HEADER_SIZE,
+            )
+            .await
+            .expect("stalled replica must complete replica admission");
+            held.push(stream);
+        }
+    });
+    (addr, accept)
+}
+
+/// A slot in an uncapped connection cap, for installs that do not test the cap.
+pub fn test_permit() -> ConnectionPermit {
+    ConnectionCap::new(None)
+        .try_acquire()
+        .expect("an uncapped cap admits every socket")
 }
 
 /// Build an [`AcceptedClientFn`] that mints a local client id (top 16 bits =
@@ -214,7 +285,7 @@ pub fn install_clients_locally(
         counter.set(seq.wrapping_add(1));
         let client_id = (shard_id << 112) | seq;
         let meta = test_client_meta(client_id, ClientTransportKind::Tcp);
-        installer::install_client_tcp(&bus, meta, stream, on_request.clone());
+        installer::install_client_tcp(&bus, meta, stream, test_permit(), on_request.clone());
     })
 }
 
@@ -258,14 +329,14 @@ pub fn install_ws_clients_locally(
         let fd = fd_transfer::dup_fd(&stream).expect("dup_fd");
         drop(stream);
         let meta = test_client_meta(client_id, ClientTransportKind::Ws);
-        bus.install_client_ws_fd(fd, meta, on_request.clone());
+        bus.install_client_ws_fd(fd, meta, test_permit(), on_request.clone());
     })
 }
 
 /// Build an [`AcceptedTlsClientFn`] that mints a local client id and
-/// installs the accepted TCP-TLS stream directly on the given bus. The
-/// install path drives the rustls handshake on its own task, mirroring
-/// the production shard-0 coordinator.
+/// duplicates the raw TCP-TLS fd into the owning-shard installer. This
+/// exercises fd wrapping locally; server integration tests cover routing
+/// from the production accept callback to a different shard.
 #[must_use]
 pub fn install_tls_clients_locally(
     bus: Rc<IggyMessageBus>,
@@ -278,12 +349,14 @@ pub fn install_tls_clients_locally(
         counter.set(seq.wrapping_add(1));
         let client_id = (shard_id << 112) | seq;
         let meta = test_client_meta(client_id, ClientTransportKind::TcpTls);
-        installer::install_client_tcp_tls(&bus, meta, stream, config, on_request.clone());
+        let fd = fd_transfer::dup_fd(&stream).expect("dup_fd");
+        drop(stream);
+        bus.install_client_tcp_tls_fd(fd, meta, config, test_permit(), on_request.clone());
     })
 }
 
 /// Build an [`AcceptedWssClientFn`] that mints a local client id and
-/// installs the accepted WSS stream directly on the given bus. The
+/// duplicates the raw WSS fd into the owning-shard installer. The
 /// install path drives both the rustls handshake and the WS HTTP-Upgrade
 /// inside the transport's `run` body.
 #[must_use]
@@ -298,6 +371,97 @@ pub fn install_wss_clients_locally(
         counter.set(seq.wrapping_add(1));
         let client_id = (shard_id << 112) | seq;
         let meta = test_client_meta(client_id, ClientTransportKind::Wss);
-        installer::install_client_wss(&bus, meta, stream, config, on_request.clone());
+        let fd = fd_transfer::dup_fd(&stream).expect("dup_fd");
+        drop(stream);
+        bus.install_client_wss_fd(fd, meta, config, test_permit(), on_request.clone());
     })
+}
+
+#[allow(clippy::future_not_send)]
+pub async fn wait_for_client_count(bus: &IggyMessageBus, count: usize) {
+    compio::time::timeout(CLIENT_CLEANUP_TIMEOUT, async {
+        while bus.clients().len() != count {
+            compio::time::sleep(CLIENT_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected {count} clients, got {}", bus.clients().len()));
+}
+
+#[allow(clippy::future_not_send)]
+pub async fn assert_failed_tls_installs_are_removed(transport: ClientTransportKind) {
+    const OWNER: u16 = 1;
+    const FIRST_CLIENT_ID: u128 = (OWNER as u128) << 112 | 1;
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+    let bus = Rc::new(IggyMessageBus::new(OWNER));
+    let request_seen = Rc::new(Cell::new(false));
+    let seen_by_handler = Rc::clone(&request_seen);
+    let on_request: RequestHandler = Rc::new(move |_, _| seen_by_handler.set(true));
+    let credentials = self_signed_for_loopback();
+    let (listener, config, address, accepted) = match transport {
+        ClientTransportKind::TcpTls => {
+            let (listener, config, address) =
+                message_bus::client_listener::tcp_tls::bind(loopback(), credentials).unwrap();
+            (
+                listener,
+                config,
+                address,
+                install_tls_clients_locally(Rc::clone(&bus), on_request),
+            )
+        }
+        ClientTransportKind::Wss => {
+            let (listener, config, address) =
+                message_bus::client_listener::wss::bind(loopback(), credentials).unwrap();
+            (
+                listener,
+                config,
+                address,
+                install_wss_clients_locally(Rc::clone(&bus), on_request),
+            )
+        }
+        _ => panic!("expected encrypted TCP transport"),
+    };
+
+    let mut invalid = TcpStream::connect(address).await.unwrap();
+    accepted(listener.accept().await.unwrap().0, Arc::clone(&config));
+    assert!(bus.client_meta(FIRST_CLIENT_ID).is_some());
+    invalid
+        .write_all(b"GET / HTTP/1.1\r\n\r\n")
+        .await
+        .0
+        .unwrap();
+    wait_for_client_count(&bus, 0).await;
+    assert!(bus.client_meta(FIRST_CLIENT_ID).is_none());
+
+    let stalled = TcpStream::connect(address).await.unwrap();
+    accepted(listener.accept().await.unwrap().0, Arc::clone(&config));
+    assert!(bus.client_meta(FIRST_CLIENT_ID + 1).is_some());
+    // Poll the spawned transport so shutdown interrupts a pending handshake.
+    compio::time::sleep(CLIENT_POLL_INTERVAL).await;
+    assert_eq!(
+        bus.shutdown(SHUTDOWN_TIMEOUT).await.force,
+        0,
+        "stalled {transport:?} handshake must observe shutdown without force-cancellation"
+    );
+    assert!(bus.clients().is_empty());
+    assert!(bus.client_meta(FIRST_CLIENT_ID + 1).is_none());
+
+    let late = TcpStream::connect(address).await.unwrap();
+    accepted(listener.accept().await.unwrap().0, config);
+    assert!(
+        bus.clients().is_empty(),
+        "setup after shutdown must be rejected"
+    );
+    assert!(bus.client_meta(FIRST_CLIENT_ID + 2).is_none());
+    for mut peer in [stalled, late] {
+        let result = compio::time::timeout(CLIENT_CLEANUP_TIMEOUT, peer.read(vec![0]))
+            .await
+            .expect("shutdown must close pending and late handshake sockets")
+            .0;
+        assert_eq!(result.unwrap(), 0);
+    }
+    assert!(
+        !request_seen.get(),
+        "failed handshakes must not dispatch requests"
+    );
 }

@@ -27,30 +27,32 @@ import org.junit.jupiter.api.BeforeAll;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
 import java.util.List;
 
 /**
- * Base for integration tests. The SDK speaks the VSR wire protocol, so the
- * server under test must support it.
+ * Base for integration tests. By default the server under test is the
+ * {@code apache/iggy:edge} image started via testcontainers. Set {@code IGGY_SERVER_DOCKER_IMAGE}
+ * to test a local server build. The default tag tracks
+ * master, so refresh the local copy with {@code docker pull apache/iggy:edge}
+ * whenever the SDK's wire protocol moves ahead of it.
  *
- * <p>With {@code USE_EXTERNAL_SERVER} set, tests target an externally
- * started VSR server on localhost, running standalone (single-node) mode.
- * Start it from the repo root:
+ * <p>With {@code USE_EXTERNAL_SERVER} set, tests instead target an externally
+ * started server on localhost, running standalone (single-node) mode. Start
+ * it from the repo root:
  * <pre>{@code
  * IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy cargo run --bin iggy-server
  * }</pre>
- *
- * <p>Otherwise a server container is started via testcontainers. This works
- * once the published image ships a VSR-capable server; until then the
- * external-server mode is the only one that can pass.
  */
 @Testcontainers
 public abstract class BaseIntegrationTest {
 
     protected static GenericContainer<?> iggyServer;
+    private static final DockerImageName IGGY_IMAGE =
+            DockerImageName.parse(System.getenv().getOrDefault("IGGY_SERVER_DOCKER_IMAGE", "apache/iggy:edge"));
     private static final String LOCALHOST_IP = "127.0.0.1";
     private static final int HTTP_PORT = 3000;
     private static final int TCP_PORT = 8090;
@@ -58,11 +60,18 @@ public abstract class BaseIntegrationTest {
     private static final boolean USE_EXTERNAL_SERVER = System.getenv("USE_EXTERNAL_SERVER") != null;
 
     public static int serverTcpPort() {
-        return USE_EXTERNAL_SERVER ? TCP_PORT : iggyServer.getMappedPort(TCP_PORT);
+        return USE_EXTERNAL_SERVER ? externalPort("EXTERNAL_TCP_PORT", TCP_PORT) : iggyServer.getMappedPort(TCP_PORT);
     }
 
     public static int serverHttpPort() {
-        return USE_EXTERNAL_SERVER ? HTTP_PORT : iggyServer.getMappedPort(HTTP_PORT);
+        return USE_EXTERNAL_SERVER
+                ? externalPort("EXTERNAL_HTTP_PORT", HTTP_PORT)
+                : iggyServer.getMappedPort(HTTP_PORT);
+    }
+
+    private static int externalPort(String variable, int defaultPort) {
+        var configured = System.getenv(variable);
+        return configured != null ? Integer.parseInt(configured) : defaultPort;
     }
 
     public static String serverHost() {
@@ -73,21 +82,20 @@ public abstract class BaseIntegrationTest {
     static void setupContainer() {
         ResourceLeakDetector.setLevel(ResourceLeakDetector.Level.PARANOID);
         if (!USE_EXTERNAL_SERVER) {
-            // The published image still ships the legacy server, which does
-            // not speak the VSR wire protocol, so tests against this
-            // container fail until a VSR-capable server is released. Use
-            // USE_EXTERNAL_SERVER until then.
             log.info("Starting Iggy Server Container...");
-            iggyServer = new GenericContainer<>(DockerImageName.parse("apache/iggy:edge"))
+            iggyServer = new GenericContainer<>(IGGY_IMAGE)
                     .withExposedPorts(HTTP_PORT, TCP_PORT)
                     .withEnv("IGGY_ROOT_USERNAME", "iggy")
                     .withEnv("IGGY_ROOT_PASSWORD", "iggy")
-                    .withEnv("IGGY_TCP_ADDRESS", "0.0.0.0:8090")
-                    .withEnv("IGGY_HTTP_ADDRESS", "0.0.0.0:3000")
+                    .withEnv("IGGY_TCP_ADDRESS", "0.0.0.0:" + TCP_PORT)
+                    .withEnv("IGGY_HTTP_ADDRESS", "0.0.0.0:" + HTTP_PORT)
+                    .withEnv("IGGY_NODE_ADVERTISED_ADDRESS", LOCALHOST_IP)
+                    .withEnv("IGGY_SHARDING_CPU_ALLOCATION", "all")
                     .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig()
                             .withCapAdd(Capability.SYS_NICE)
                             .withSecurityOpts(List.of("seccomp:unconfined"))
                             .withUlimits(List.of(new Ulimit("memlock", -1L, -1L))))
+                    .waitingFor(Wait.forHttp("/ping").forPort(HTTP_PORT))
                     .withLogConsumer(frame -> System.out.print(frame.getUtf8String()));
             iggyServer.start();
         } else {

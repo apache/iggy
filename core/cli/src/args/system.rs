@@ -17,7 +17,7 @@
 
 use crate::args::common::ListModeExt;
 use clap::Args;
-use iggy::prelude::{SnapshotCompression, SystemSnapshotType};
+use iggy::prelude::{OptionsScope, SnapshotCompression, SystemSnapshotType};
 use iggy_cli::commands::utils::login_session_expiry::LoginSessionExpiry;
 
 #[derive(Debug, Clone, Args)]
@@ -36,6 +36,13 @@ pub(crate) struct LoginArgs {
     #[clap(verbatim_doc_comment)]
     #[arg(value_parser = clap::value_parser!(LoginSessionExpiry), group = "store")]
     pub(crate) expiry: Option<Vec<LoginSessionExpiry>>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct OptionsArgs {
+    /// Resource whose option catalog to print (topic, stream, user)
+    #[arg(value_parser = clap::value_parser!(OptionsScope))]
+    pub(crate) scope: OptionsScope,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -60,7 +67,7 @@ pub(crate) struct SnapshotArgs {
     ///
     /// Examples:
     /// - `--compression bzip2` for higher compression.
-    /// - `--compression none` to store without compression.
+    /// - `--compression stored` to store without compression.
     #[arg(verbatim_doc_comment, short, long, value_parser = clap::value_parser!(SnapshotCompression))]
     pub(crate) compression: Option<SnapshotCompression>,
 

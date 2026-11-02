@@ -9,7 +9,9 @@ Source connectors are responsible for ingesting data from external sources into 
 | Source | Description |
 | ------ | ----------- |
 | **elasticsearch_source** | Polls documents from Elasticsearch indices with timestamp-based tracking |
+| **http_source** | Webhook gateway: an embedded HTTP server shared by every instance, with per-endpoint bearer/HMAC auth and a management API for endpoints registered at runtime |
 | **influxdb_source** | Polls InfluxDB with cursor-based timestamp tracking; supports V2 (Flux, annotated CSV) and V3 (SQL, JSONL) |
+| **mqtt_source** | Subscribes to MQTT 3.1.1 or MQTT 5 brokers with QoS 0, 1, or 2 |
 | **postgres_source** | Reads rows from PostgreSQL tables with multiple strategies: delete after read, mark as processed, or timestamp tracking |
 | **random_source** | Generates random test messages (useful for testing and development) |
 
@@ -23,6 +25,9 @@ pub trait Source: Send + Sync {
 
     /// Invoked every time a batch of messages is produced to the configured stream and topic.
     async fn poll(&self) -> Result<ProducedMessages, Error>;
+
+    /// Invoked after the runtime sends the batch and persists its candidate state.
+    async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error>;
 
     /// Invoked when the source is closed, allowing it to perform any necessary cleanup.
     async fn close(&mut self) -> Result<(), Error>;
@@ -46,6 +51,7 @@ pub struct SourceConfig {
     pub plugin_config: Option<serde_json::Value>,
     pub verbose: bool, // Log message processing at info level instead of debug (default: false)
     pub benchmark: bool, // Emit per-batch timing events on the `iggy_connectors::benchmark` target (default: false)
+    pub exactly_once: bool, // Write each batch once, also after a crash of the runtime (default: false)
 }
 ```
 
@@ -69,9 +75,10 @@ enabled = true # Toggle source on/off
 version = 0
 name = "Random source" # Name of the source
 path = "libiggy_connector_random_source" # Path to the source connector
-config_format = "toml"
+plugin_config_format = "toml"
 verbose = false # Log message processing at info level instead of debug
 benchmark = false # Emit per-batch timing events on `iggy_connectors::benchmark` target
+exactly_once = false # Write each batch once, also after a crash of the runtime
 
 # Collection of the streams to which the produced messages are sent
 [[streams]]
@@ -80,6 +87,7 @@ topic = "example_topic"
 schema = "json"
 batch_length = 100
 linger_time = "5ms"
+partition_id = 0 # Optional: the partition of every message, 0 for an exactly-once source when unset
 
 # Custom configuration for the source connector, deserialized to type T from `plugin_config` field
 [plugin_config]
@@ -104,6 +112,8 @@ For example, to override the `enabled` property for a source with ID `random`:
 ```bash
 IGGY_CONNECTORS_SOURCE_RANDOM_ENABLED=false
 ```
+
+The [runtime README](../runtime/README.md#exactly-once-sources) describes `exactly_once` and its limits.
 
 ## Sample implementation
 
@@ -131,7 +141,8 @@ struct State {
 pub struct RandomSource {
     id: u32,
     messages_count: u32,
-    state: Mutex<State>
+    state: Mutex<State>,
+    pending_state: Mutex<Option<State>>,
 }
 ```
 
@@ -162,8 +173,9 @@ impl RandomSource {
 
         RandomSource {
             id,
-            payload_size: config.payload_size.unwrap_or(100),
+            messages_count: config.messages_count.unwrap_or(10),
             state: Mutex::new(State { current_id }),
+            pending_state: Mutex::new(None),
         }
     }
 }
@@ -172,7 +184,7 @@ impl RandomSource {
 We can invoke the expected macro to expose the FFI interface and allow the connector runtime to register the source within the runtime.
 
 ```rust
-source_connector!(TestSource);
+source_connector!(RandomSource);
 ```
 
 At a bare minimum, we need to add the following dependencies to the `Cargo.toml` file to compile the plugin at all:
@@ -205,8 +217,7 @@ impl Source for RandomSource {
 
     async fn poll(&self) -> Result<ProducedMessages, iggy_connector_sdk::Error> {
         sleep(Duration::from_millis(100)).await;
-        let mut state = self.state.lock().await;
-        let current_id = state.current_id;
+        let mut current_id = self.state.lock().await.current_id;
 
         let mut messages = Vec::new();
         for _ in 0..self.messages_count {
@@ -234,17 +245,28 @@ impl Source for RandomSource {
             messages.push(message);
         }
 
-        state.current_id += current_id;
+        let candidate_state = State { current_id };
+        *self.pending_state.lock().await = Some(candidate_state);
         info!(
-            "Generated {} messages by random source connector with ID: {}"
+            "Generated {} messages by random source connector with ID: {}",
             messages.len(),
             self.id,
         );
         Ok(ProducedMessages {
             schema: Schema::Json,
             messages,
-            state: Some(ConnectorState(state.current_id.to_le_bytes().to_vec())),
+            state: Some(ConnectorState(current_id.to_le_bytes().to_vec())),
         })
+    }
+
+    async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
+        let candidate_state = self.pending_state.lock().await.take();
+        if result == SourceBatchResult::Ack
+            && let Some(candidate_state) = candidate_state
+        {
+            *self.state.lock().await = candidate_state;
+        }
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -253,6 +275,8 @@ impl Source for RandomSource {
     }
 }
 ```
+
+The source keeps its committed cursor unchanged while the batch is in flight. An ACK commits the staged cursor; a NACK discards it so the same range can be polled again. Sources that delete or mark upstream rows should stage those operations in the same way.
 
 As you can see, the `ProducedMessage` can be customized to fit your needs, as all the fields will be directly mapped to the existing Iggy message struct.
 
@@ -267,7 +291,7 @@ And before starting the runtime, do not forget to create the specified stream an
 ```bash
 iggy --username iggy --password iggy stream create example_stream
 
-iggy --username iggy --password iggy topic create example_stream example_topic 1 none 1d
+iggy --username iggy --password iggy topic create example_stream example_topic 1 none 1d --durability persisted
 ```
 
 And that's all, enjoy using the source connector!

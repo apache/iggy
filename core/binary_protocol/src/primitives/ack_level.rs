@@ -20,9 +20,12 @@ use crate::WireError;
 /// Acknowledgement policy for consumer-offset write commands.
 ///
 /// Wire format: single `u8` discriminant.
-/// - `NoAck(0)`:  leader-local write only; respond as soon as the in-memory
-///   and on-disk state have been updated. Matches the fast path used by
-///   `PollMessages` auto-commit.
+/// - `NoAck(0)`: local fast path for a single-replica partition. Replicated
+///   partitions commit offset writes through VSR before replying, including
+///   when this acknowledgement value is selected.
+///   On a single replica, a directory-sync failure can be reported after the
+///   mutation became visible. Its crash durability is then unknown. Retrying
+///   a deletion that already took effect can return `ConsumerOffsetNotFound`.
 /// - `Quorum(1)`: submit through the partition VSR consensus pipeline and
 ///   respond only after the write has been committed by a quorum of replicas.
 ///   This is the default for explicit client writes.

@@ -26,7 +26,7 @@
 
 use iggy_binary_protocol::{MAX_PARTITIONS_PER_REQUEST, RoutedRequestHeader};
 use rand::RngExt;
-use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use server_common::Message;
 
 use crate::client::SimClient;
@@ -53,10 +53,11 @@ pub const OUTCOMES: &[Outcome] = &[
 pub fn sample(
     shadow: &mut Shadow,
     outcome: Outcome,
-    prng: &mut Xoshiro256Plus,
+    prng: &mut Xoshiro256PlusPlus,
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
+        Outcome::PartitionResizeDisabled => None,
         Outcome::Ok => {
             let (stream, topic) = shadow.pick_topic_pair(prng)?;
             let live = *shadow

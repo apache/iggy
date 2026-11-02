@@ -20,7 +20,7 @@ import { describe, it } from 'node:test';
 import { COMMAND_CODE } from '../command.code.js';
 import { ResponseError } from '../error.utils.js';
 import {
-  Command2,
+  Command,
   EVICTION_OFFSET,
   EvictionReason,
   HEADER_SIZE,
@@ -40,7 +40,7 @@ const reply = (
 ): Buffer => {
   const frame = Buffer.alloc(HEADER_SIZE + body.length);
   frame.writeUInt32LE(frame.length, REPLY_OFFSET.size);
-  frame.writeUInt8(Command2.Reply, REPLY_OFFSET.command);
+  frame.writeUInt8(Command.Reply, REPLY_OFFSET.command);
   frame.writeUInt8(operation, REPLY_OFFSET.operation);
   frame.writeUInt32LE(status, REPLY_OFFSET.status);
   body.copy(frame, HEADER_SIZE);
@@ -50,7 +50,7 @@ const reply = (
 const eviction = (reason: number): Buffer => {
   const frame = Buffer.alloc(HEADER_SIZE);
   frame.writeUInt32LE(HEADER_SIZE, REPLY_OFFSET.size);
-  frame.writeUInt8(Command2.Eviction, REPLY_OFFSET.command);
+  frame.writeUInt8(Command.Eviction, REPLY_OFFSET.command);
   frame.writeUInt8(reason, EVICTION_OFFSET.reason);
   return frame;
 };
@@ -64,7 +64,7 @@ describe('VSR reply decoding', () => {
     assert.throws(() => decodeResponse(undersized), ResponseError);
 
     const unsupported = reply(Operation.NonReplicated);
-    unsupported.writeUInt8(Command2.Request, REPLY_OFFSET.command);
+    unsupported.writeUInt8(Command.Request, REPLY_OFFSET.command);
     assert.throws(() => decodeResponse(unsupported), ResponseError);
   });
 
@@ -75,7 +75,7 @@ describe('VSR reply decoding', () => {
   });
 
   it('rejects an undeclared reply operation discriminant', () => {
-    for (const operation of [69, 150, 163, 255])
+    for (const operation of [69, 129, 133, 142, 163, 255])
       assert.throws(
         () => decodeResponse(reply(operation)),
         (error: unknown) =>
@@ -118,6 +118,20 @@ describe('VSR reply decoding', () => {
       decodeResponse(reply(Operation.CreateStream, body)),
       Buffer.from('stream')
     );
+  });
+
+  it('strips the result section of every resolved update reply', () => {
+    for (const operation of [Operation.UpdateStreamResolved, Operation.UpdateTopicResolved,
+      Operation.UpdateUserResolved]) {
+      assert.deepEqual(decodeResponse(reply(operation, Buffer.alloc(4))), Buffer.alloc(0));
+      const refused = Buffer.alloc(12);
+      refused.writeUInt32LE(1, 0);
+      refused.writeUInt32LE(4103, 8);
+      assert.throws(
+        () => decodeResponse(reply(operation, refused), COMMAND_CODE.UpdateResource),
+        (error: unknown) => error instanceof ResponseError && error.errorCode === 4103
+      );
+    }
   });
 
   it('strips a non-empty successful result section', () => {

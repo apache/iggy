@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::utils::{ClientFactory, authenticate};
+use crate::utils::ClientFactory;
 use crate::{
     actors::{
         ApiLabel, BatchMetrics, BenchmarkInit,
@@ -33,6 +33,11 @@ use tokio::time::Instant;
 pub struct HighLevelProducerClient {
     client_factory: Arc<dyn ClientFactory>,
     config: BenchmarkProducerConfig,
+    /// `IggyProducer` only borrows the transport, so the owning client has to
+    /// outlive it: dropping the client aborts the SDK heartbeat task, and the
+    /// producer stops being pinged for the rest of the run.
+    #[allow(dead_code)]
+    client: Option<IggyClient>,
     producer: Option<IggyProducer>,
 }
 
@@ -41,6 +46,7 @@ impl HighLevelProducerClient {
         Self {
             client_factory,
             config,
+            client: None,
             producer: None,
         }
     }
@@ -59,12 +65,16 @@ impl ProducerClient for HighLevelProducerClient {
         let user_data_bytes = batch.user_data_bytes;
         let total_bytes = batch.total_bytes;
 
+        // Boxed because the send future is above the `clippy::large_futures` limit. The box is
+        // allocated before the clock starts, so the measured latency leaves it out.
+        let send = Box::pin(
+            self.producer
+                .as_mut()
+                .expect("Producer not initialized")
+                .send(batch.messages),
+        );
         let before_send = Instant::now();
-        self.producer
-            .as_mut()
-            .expect("Producer not initialized")
-            .send(batch.messages)
-            .await?;
+        send.await?;
         let latency = before_send.elapsed();
 
         Ok(Some(BatchMetrics {
@@ -81,14 +91,7 @@ impl BenchmarkInit for HighLevelProducerClient {
         let topic_id_str = "topic-1";
         let default_partition_id = 0u32;
 
-        let client = self.client_factory.create_client().await;
-        let client = IggyClient::create(client, None, None);
-        authenticate(
-            &client,
-            self.client_factory.username(),
-            self.client_factory.password(),
-        )
-        .await;
+        let client = self.client_factory.create_authenticated_client().await?;
 
         let stream_id_str = self.config.stream_id.clone();
 
@@ -105,13 +108,13 @@ impl BenchmarkInit for HighLevelProducerClient {
                 .create_stream_if_not_exists()
                 .create_topic_if_not_exists(
                     self.config.partitions,
-                    Some(1),
                     IggyExpiry::NeverExpire,
                     MaxTopicSize::ServerDefault,
                 )
                 .build(),
         );
         self.producer.as_mut().unwrap().init().await?;
+        self.client = Some(client);
         Ok(())
     }
 }

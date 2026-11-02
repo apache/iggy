@@ -16,9 +16,10 @@
 // under the License.
 
 use crate::OutputFormat;
+use crate::buffer::FileBuffer;
 use chrono::{DateTime, Utc};
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, TopicMetadata, owned_value_to_serde_json,
+    ConsumedMessage, Error, MessagesMetadata, Payload, TopicMetadata, owned_value_into_serde_json,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -41,7 +42,7 @@ struct JsonMessage<'a> {
 }
 
 pub(crate) fn format_message(
-    message: &ConsumedMessage,
+    message: ConsumedMessage,
     topic_metadata: &TopicMetadata,
     messages_metadata: &MessagesMetadata,
     include_metadata: bool,
@@ -61,7 +62,7 @@ pub(crate) fn format_message(
 }
 
 fn format_json_message(
-    message: &ConsumedMessage,
+    message: ConsumedMessage,
     topic_metadata: &TopicMetadata,
     messages_metadata: &MessagesMetadata,
     include_metadata: bool,
@@ -99,7 +100,7 @@ fn format_json_message(
         } else {
             None
         },
-        payload: payload_to_json_value(&message.payload),
+        payload: payload_to_json_value(message.payload),
     };
 
     serde_json::to_vec(&msg).map_err(|e| {
@@ -110,8 +111,8 @@ fn format_json_message(
     })
 }
 
-fn format_raw_message(message: &ConsumedMessage) -> Result<Vec<u8>, Error> {
-    message.payload.try_to_bytes().map_err(|e| {
+fn format_raw_message(message: ConsumedMessage) -> Result<Vec<u8>, Error> {
+    message.payload.try_into_vec().map_err(|e| {
         Error::CannotStoreData(format!(
             "Failed to extract raw bytes at offset {}: {e}",
             message.offset
@@ -164,17 +165,17 @@ fn serialize_headers(
     Value::Object(obj)
 }
 
-fn payload_to_json_value(payload: &Payload) -> Value {
-    match payload {
-        Payload::Json(value) => owned_value_to_serde_json(value),
-        Payload::Text(text) => Value::String(text.clone()),
-        Payload::Raw(bytes) => match serde_json::from_slice(bytes) {
+// Proto text holding JSON is written as the document it holds, like a native `json` batch.
+fn payload_to_json_value(payload: Payload) -> Value {
+    match payload.into_json_document() {
+        Payload::Json(value) => owned_value_into_serde_json(value),
+        Payload::Text(text) | Payload::Proto(text) => Value::String(text),
+        Payload::Raw(bytes) => match serde_json::from_slice(&bytes) {
             Ok(v) => v,
-            Err(_) => Value::String(base64_encode(bytes)),
+            Err(_) => Value::String(base64_encode(&bytes)),
         },
-        Payload::Proto(text) => Value::String(text.clone()),
-        Payload::FlatBuffer(bytes) => Value::String(base64_encode(bytes)),
-        Payload::Avro(bytes) => Value::String(base64_encode(bytes)),
+        Payload::FlatBuffer(bytes) => Value::String(base64_encode(&bytes)),
+        Payload::Avro(bytes) => Value::String(base64_encode(&bytes)),
     }
 }
 
@@ -192,31 +193,24 @@ fn timestamp_to_rfc3339(micros: u64) -> String {
 }
 
 /// Finalize buffer entries into the output byte format.
-pub(crate) fn finalize_buffer<'a>(
-    entries: impl Iterator<Item = &'a [u8]>,
-    format: OutputFormat,
-) -> Vec<u8> {
+pub(crate) fn finalize_buffer(buffer: &mut FileBuffer, format: OutputFormat) -> Vec<u8> {
     match format {
         OutputFormat::JsonLines => {
-            let mut result = Vec::new();
-            for entry in entries {
+            let mut result =
+                Vec::with_capacity(buffer.byte_len() + buffer.message_count() as usize);
+            for entry in buffer.entries() {
                 result.extend_from_slice(entry);
                 result.push(b'\n');
             }
             result
         }
-        OutputFormat::Raw => {
-            let mut result = Vec::new();
-            for entry in entries {
-                result.extend_from_slice(entry);
-            }
-            result
-        }
+        OutputFormat::Raw => buffer.take_data(),
         OutputFormat::JsonArray => {
-            let mut result = Vec::new();
+            let separators = (buffer.message_count() as usize).saturating_sub(1);
+            let mut result = Vec::with_capacity(buffer.byte_len() + separators + b"[]".len());
             result.push(b'[');
             let mut first = true;
-            for entry in entries {
+            for entry in buffer.entries() {
                 if !first {
                     result.push(b',');
                 }
@@ -276,7 +270,7 @@ mod tests {
         let meta = make_messages_metadata();
 
         let bytes =
-            format_message(&msg, &topic, &meta, true, false, OutputFormat::JsonLines).unwrap();
+            format_message(msg, &topic, &meta, true, false, OutputFormat::JsonLines).unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(value["offset"], 42);
@@ -295,7 +289,7 @@ mod tests {
         let meta = make_messages_metadata();
 
         let bytes =
-            format_message(&msg, &topic, &meta, false, false, OutputFormat::JsonLines).unwrap();
+            format_message(msg, &topic, &meta, false, false, OutputFormat::JsonLines).unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert!(value.get("offset").is_none());
@@ -318,11 +312,78 @@ mod tests {
         let meta = make_messages_metadata();
 
         let bytes =
-            format_message(&msg, &topic, &meta, false, true, OutputFormat::JsonLines).unwrap();
+            format_message(msg, &topic, &meta, false, true, OutputFormat::JsonLines).unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert!(value["headers"].is_object());
         assert_eq!(value["headers"]["content-type"], "application/json");
+    }
+
+    #[test]
+    fn proto_payload_holding_json_is_written_as_a_document() {
+        let payload = Payload::Proto(r#"{"id":1,"name":"row-1"}"#.to_string());
+
+        assert_eq!(
+            payload_to_json_value(payload),
+            serde_json::json!({"id": 1, "name": "row-1"})
+        );
+    }
+
+    #[test]
+    fn text_payload_holding_json_looking_content_stays_a_string() {
+        let payload = Payload::Text(r#"{"id":1}"#.to_string());
+
+        assert_eq!(
+            payload_to_json_value(payload),
+            Value::String(r#"{"id":1}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn proto_text_that_is_not_json_is_written_as_a_string() {
+        let payload = Payload::Proto("name: \"row-1\"".to_string());
+
+        assert_eq!(
+            payload_to_json_value(payload),
+            Value::String("name: \"row-1\"".to_string())
+        );
+    }
+
+    #[test]
+    fn raw_payload_holding_json_bytes_is_parsed() {
+        let payload = Payload::Raw(br#"{"id":1}"#.to_vec());
+
+        assert_eq!(payload_to_json_value(payload), serde_json::json!({"id": 1}));
+    }
+
+    #[test]
+    fn raw_payload_that_is_not_json_is_base64_encoded() {
+        let payload = Payload::Raw(vec![0xff, 0x00, 0x10]);
+
+        assert_eq!(
+            payload_to_json_value(payload),
+            Value::String("/wAQ".to_string())
+        );
+    }
+
+    #[test]
+    fn flatbuffer_payload_is_base64_encoded() {
+        let payload = Payload::FlatBuffer(vec![1, 2, 3]);
+
+        assert_eq!(
+            payload_to_json_value(payload),
+            Value::String("AQID".to_string())
+        );
+    }
+
+    #[test]
+    fn avro_payload_is_base64_encoded() {
+        let payload = Payload::Avro(vec![4, 5, 6]);
+
+        assert_eq!(
+            payload_to_json_value(payload),
+            Value::String("BAUG".to_string())
+        );
     }
 
     #[test]
@@ -332,7 +393,7 @@ mod tests {
         let topic = make_topic_metadata();
         let meta = make_messages_metadata();
 
-        let bytes = format_message(&msg, &topic, &meta, true, false, OutputFormat::Raw).unwrap();
+        let bytes = format_message(msg, &topic, &meta, true, false, OutputFormat::Raw).unwrap();
         assert_eq!(bytes, b"hello world");
     }
 
@@ -340,8 +401,8 @@ mod tests {
     fn finalize_json_lines() {
         let data = b"{\"a\":1}{\"b\":2}";
         let boundaries = [7usize, 14];
-        let entries = entries_from_boundaries(data, &boundaries);
-        let result = finalize_buffer(entries, OutputFormat::JsonLines);
+        let mut buffer = buffer_from_boundaries(data, &boundaries);
+        let result = finalize_buffer(&mut buffer, OutputFormat::JsonLines);
         assert_eq!(result, b"{\"a\":1}\n{\"b\":2}\n");
     }
 
@@ -349,8 +410,14 @@ mod tests {
     fn finalize_raw_no_delimiter() {
         let data = b"\x00\x01\x02\x0a\xff\xfe";
         let boundaries = [4usize, 6];
-        let entries = entries_from_boundaries(data, &boundaries);
-        let result = finalize_buffer(entries, OutputFormat::Raw);
+        let mut buffer = buffer_from_boundaries(data, &boundaries);
+        let original_allocation = buffer.entries().next().unwrap().as_ptr();
+        let result = finalize_buffer(&mut buffer, OutputFormat::Raw);
+        assert_eq!(
+            result.as_ptr(),
+            original_allocation,
+            "Raw output must reuse the buffer allocation"
+        );
         assert_eq!(
             result, data,
             "Raw must concatenate without inserting delimiters"
@@ -361,8 +428,8 @@ mod tests {
     fn finalize_json_array() {
         let data = b"{\"a\":1}{\"b\":2}";
         let boundaries = [7usize, 14];
-        let entries = entries_from_boundaries(data, &boundaries);
-        let result = finalize_buffer(entries, OutputFormat::JsonArray);
+        let mut buffer = buffer_from_boundaries(data, &boundaries);
+        let result = finalize_buffer(&mut buffer, OutputFormat::JsonArray);
         assert_eq!(result, b"[{\"a\":1},{\"b\":2}]");
     }
 
@@ -379,15 +446,13 @@ mod tests {
         assert_eq!(ts, "1970-01-01T00:00:00Z");
     }
 
-    fn entries_from_boundaries<'a>(
-        data: &'a [u8],
-        boundaries: &'a [usize],
-    ) -> impl Iterator<Item = &'a [u8]> {
+    fn buffer_from_boundaries(data: &[u8], boundaries: &[usize]) -> FileBuffer {
+        let mut buffer = FileBuffer::new();
         let mut start = 0;
-        boundaries.iter().map(move |&end| {
-            let s = &data[start..end];
+        for (offset, &end) in boundaries.iter().enumerate() {
+            buffer.append(&data[start..end], offset as u64, 0);
             start = end;
-            s
-        })
+        }
+        buffer
     }
 }

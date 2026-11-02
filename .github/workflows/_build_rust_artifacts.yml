@@ -46,7 +46,7 @@ on:
       connector_plugins:
         type: string
         required: false
-        default: "iggy_connector_elasticsearch_sink,iggy_connector_elasticsearch_source,iggy_connector_iceberg_sink,iggy_connector_postgres_sink,iggy_connector_postgres_source,iggy_connector_quickwit_sink,iggy_connector_random_source,iggy_connector_s3_sink,iggy_connector_stdout_sink,iggy_connector_surrealdb_sink"
+        default: "iggy_connector_elasticsearch_sink,iggy_connector_elasticsearch_source,iggy_connector_iceberg_sink,iggy_connector_postgres_sink,iggy_connector_postgres_source,iggy_connector_quickwit_sink,iggy_connector_random_source,iggy_connector_s3_sink,iggy_connector_stdout_sink,iggy_connector_surrealdb_sink, iggy_connector_rabbitmq_sink"
         description: "Comma-separated list of connector plugin crates to build as shared libraries"
     outputs:
       artifact_name:
@@ -69,22 +69,22 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-26.04
             libc: gnu
           - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
+            runner: ubuntu-26.04
             libc: musl
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             libc: gnu
           - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             libc: musl
     steps:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
 
@@ -100,18 +100,19 @@ jobs:
 
       - name: Install musl-tools
         if: matrix.libc == 'musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: ./scripts/ci/apt-install.sh musl-tools
 
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
 
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7.0.0
+        uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
+          package-manager-cache: false
 
       - name: Build Web UI static files
         run: npm --prefix web ci && npm --prefix web run build:static
@@ -133,6 +134,9 @@ jobs:
           if [[ "${{ matrix.libc }}" == "musl" ]]; then
             export PKG_CONFIG_ALLOW_CROSS=1
             export PKG_CONFIG_ALL_STATIC=1
+            # liblzma-sys links the system liblzma when pkg-config reports 5.8
+            # or newer, and the glibc library dir it adds shadows the musl libc.
+            export LZMA_API_STATIC=1
           fi
 
           # musl builds: use musl-gcc as linker to ensure proper linking against musl libc
@@ -189,14 +193,14 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-26.04
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
     steps:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
 
@@ -210,8 +214,8 @@ jobs:
           /tmp/copy-latest-from-master.sh save .github scripts
           /tmp/copy-latest-from-master.sh apply
 
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
 
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
@@ -264,7 +268,7 @@ jobs:
     name: Collect artifacts
     needs: [build-binaries, build-connector-plugins]
     if: inputs.upload_artifacts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       artifact_name: ${{ steps.output.outputs.artifact_name }}
     steps:

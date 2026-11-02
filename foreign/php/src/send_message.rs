@@ -131,17 +131,17 @@ impl From<RustSendMessagesConfirmationResponse> for SendMessagesConfirmation {
 
 #[php_impl]
 impl SendMessagesConfirmation {
-    #[php(getter)]
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_id(&self) -> u32 {
         self.inner.stream_id
     }
 
-    #[php(getter)]
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_id(&self) -> u32 {
         self.inner.topic_id
     }
 
-    #[php(getter)]
+    #[php(getter, change_case = "snake_case")]
     pub fn partition_id(&self) -> u32 {
         self.inner.partition_id
     }
@@ -151,10 +151,9 @@ impl SendMessagesConfirmation {
     /// Delivery is at-least-once, so an earlier retry may already have committed the
     /// same batch at a lower offset. The value never implies uniqueness.
     ///
-    /// A batch is confirmed once it is committed in memory, not once it is fsynced. A
-    /// crash-restart can stamp a later batch with an offset a client has already
-    /// recorded.
-    #[php(getter)]
+    /// Confirmation follows VSR quorum commit. Persisted message durability also
+    /// requires recoverable stable-storage copies on the quorum.
+    #[php(getter, change_case = "snake_case")]
     pub fn base_offset(&self) -> u64 {
         self.inner.base_offset
     }

@@ -435,6 +435,13 @@ async fn given_runtime_processing_batches_when_metrics_scraped_should_expose_sta
         "expected stage histogram in /metrics, got:\n{metrics_body}"
     );
 
+    // Both connectors have processed batches by now, so every counter family
+    // renders a sample and a doubled suffix would be visible on the wire.
+    assert!(
+        !metrics_body.contains("_total_total"),
+        "counter names must carry exactly one `_total`, got:\n{metrics_body}"
+    );
+
     let sink_total_count = parse_metric_value(
         &metrics_body,
         "iggy_connector_stage_duration_seconds_count",

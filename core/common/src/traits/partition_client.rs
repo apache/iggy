@@ -26,6 +26,16 @@ pub trait PartitionClient {
     /// For example, given a topic with 3 partitions, if you create 2 partitions, the topic will have 5 partitions (from 1 to 5).
     ///
     /// Authentication is required, and the permission to manage the partitions.
+    ///
+    /// A topic created with `PartitionResizePolicy::Fixed` rejects resizing
+    /// with `IggyError::PartitionResizeDisabled`. HTTP reports `HttpResponseError`.
+    /// Mutable topics do not guarantee per-key ordering across layouts or move
+    /// existing messages to new partitions.
+    ///
+    /// If the new partitions would take the node past `[metadata]
+    /// partitions_max`, a binary transport returns
+    /// `IggyError::PartitionsLimitReached`. `HttpClient` returns
+    /// `IggyError::HttpResponseError` instead.
     async fn create_partitions(
         &self,
         stream_id: &Identifier,
@@ -37,6 +47,8 @@ pub trait PartitionClient {
     /// For example, given a topic with 5 partitions, if you delete 2 partitions, the topic will have 3 partitions left (from 1 to 3).
     ///
     /// Authentication is required, and the permission to manage the partitions.
+    /// Topics created with `PartitionResizePolicy::Fixed` reject this operation
+    /// with `IggyError::PartitionResizeDisabled`. HTTP reports `HttpResponseError`.
     async fn delete_partitions(
         &self,
         stream_id: &Identifier,

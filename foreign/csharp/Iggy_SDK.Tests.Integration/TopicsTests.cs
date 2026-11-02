@@ -21,7 +21,6 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
-using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -29,6 +28,13 @@ namespace Apache.Iggy.Tests.Integrations;
 
 public class TopicsTests
 {
+    private static readonly TopicOptions GzipTenMinutes = new()
+    {
+        CompressionAlgorithm = CompressionAlgorithm.Gzip,
+        MessageExpiry = TimeSpan.FromMinutes(10),
+        MaxTopicSize = 2_000_000_000
+    };
+
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
     public required IggyServerFixture Fixture { get; init; }
 
@@ -41,12 +47,9 @@ public class TopicsTests
         var streamName = $"topic-create-{Guid.NewGuid():N}";
         await client.CreateStreamAsync(streamName);
 
-        var response = await client.CreateTopicAsync(Identifier.String(streamName), "Test Topic", 2,
-            CompressionAlgorithm.Gzip,
-            1, TimeSpan.FromMinutes(10), 2_000_000_000);
+        var response = await client.CreateTopicAsync(Identifier.String(streamName), "Test Topic", 2, GzipTenMinutes);
 
         response.ShouldNotBeNull();
-        response.Id.ShouldBeGreaterThanOrEqualTo(0u);
         response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
         response.Name.ShouldBe("Test Topic");
         response.CompressionAlgorithm.ShouldBe(CompressionAlgorithm.Gzip);
@@ -54,7 +57,6 @@ public class TopicsTests
         response.MessageExpiry.ShouldBe(TimeSpan.FromMinutes(10));
         response.Size.ShouldBe(0u);
         response.PartitionsCount.ShouldBe(2u);
-        response.ReplicationFactor.ShouldBe((byte?)1);
         response.MaxTopicSize.ShouldBe(2_000_000_000u);
         response.MessagesCount.ShouldBe(0u);
     }
@@ -81,21 +83,19 @@ public class TopicsTests
 
         var streamName = $"topic-get-{Guid.NewGuid():N}";
         await client.CreateStreamAsync(streamName);
-        await client.CreateTopicAsync(Identifier.String(streamName), "Get Topic", 2,
-            CompressionAlgorithm.Gzip, 1, TimeSpan.FromMinutes(10), 2_000_000_000);
+        await client.CreateTopicAsync(Identifier.String(streamName), "Get Topic", 2, GzipTenMinutes);
 
         var response = await client.GetTopicByIdAsync(Identifier.String(streamName), Identifier.Numeric(0));
 
         response.ShouldNotBeNull();
-        response.Id.ShouldBeGreaterThanOrEqualTo(0u);
         response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
         response.Name.ShouldBe("Get Topic");
         response.CompressionAlgorithm.ShouldBe(CompressionAlgorithm.Gzip);
         response.Partitions!.Count().ShouldBe(2);
+        response.Partitions!.ShouldAllBe(partition => partition.Members.Count > 0);
         response.MessageExpiry.ShouldBe(TimeSpan.FromMinutes(10));
         response.Size.ShouldBe(0u);
         response.PartitionsCount.ShouldBe(2u);
-        response.ReplicationFactor.ShouldBe((byte?)1);
         response.MaxTopicSize.ShouldBe(2_000_000_000u);
         response.MessagesCount.ShouldBe(0u);
     }
@@ -108,21 +108,18 @@ public class TopicsTests
 
         var streamName = $"topic-getname-{Guid.NewGuid():N}";
         await client.CreateStreamAsync(streamName);
-        await client.CreateTopicAsync(Identifier.String(streamName), "Name Topic", 2,
-            CompressionAlgorithm.Gzip, 1, TimeSpan.FromMinutes(10), 2_000_000_000);
+        await client.CreateTopicAsync(Identifier.String(streamName), "Name Topic", 2, GzipTenMinutes);
 
         var response = await client.GetTopicByIdAsync(Identifier.String(streamName),
             Identifier.String("Name Topic"));
 
         response.ShouldNotBeNull();
-        response.Id.ShouldBeGreaterThanOrEqualTo(0u);
         response.Name.ShouldBe("Name Topic");
         response.CompressionAlgorithm.ShouldBe(CompressionAlgorithm.Gzip);
         response.Partitions!.Count().ShouldBe(2);
         response.MessageExpiry.ShouldBe(TimeSpan.FromMinutes(10));
         response.Size.ShouldBe(0u);
         response.PartitionsCount.ShouldBe(2u);
-        response.ReplicationFactor.ShouldBe((byte?)1);
         response.MaxTopicSize.ShouldBe(2_000_000_000u);
         response.MessagesCount.ShouldBe(0u);
     }
@@ -135,10 +132,8 @@ public class TopicsTests
 
         var streamName = $"topic-list-{Guid.NewGuid():N}";
         await client.CreateStreamAsync(streamName);
-        await client.CreateTopicAsync(Identifier.String(streamName), "List Topic 1", 2,
-            CompressionAlgorithm.Gzip, 1, TimeSpan.FromMinutes(10), 2_000_000_000);
-        await client.CreateTopicAsync(Identifier.String(streamName), "List Topic 2", 2,
-            CompressionAlgorithm.Gzip, 1, TimeSpan.FromMinutes(10), 2_000_000_000);
+        await client.CreateTopicAsync(Identifier.String(streamName), "List Topic 1", 2, GzipTenMinutes);
+        await client.CreateTopicAsync(Identifier.String(streamName), "List Topic 2", 2, GzipTenMinutes);
 
         IReadOnlyList<TopicResponse> response = await client.GetTopicsAsync(Identifier.String(streamName));
 
@@ -168,11 +163,11 @@ public class TopicsTests
                 Partitioning.None(), GetMessages(i + 2));
         }
 
-        var response = await client.GetTopicByIdAsync(Identifier.String(streamName),
-            Identifier.String("Parts Topic"));
+        var response = await IggyServerFixture.ReadConvergedStatsAsync(
+            () => client.GetTopicByIdAsync(Identifier.String(streamName), Identifier.String("Parts Topic")),
+            topic => topic?.MessagesCount == 9);
 
         response.ShouldNotBeNull();
-        response.Id.ShouldBeGreaterThanOrEqualTo(0u);
         response.Name.ShouldBe("Parts Topic");
         response.Partitions!.Count().ShouldBe(3);
         response.Size.ShouldBeGreaterThan(0u);
@@ -199,48 +194,21 @@ public class TopicsTests
         topicToUpdate.ShouldNotBeNull();
 
         await Should.NotThrowAsync(client.UpdateTopicAsync(Identifier.String(streamName),
-            Identifier.Numeric(topicToUpdate.Id), "Updated Topic",
-            CompressionAlgorithm.Gzip, 3_000_000_000, TimeSpan.FromMinutes(10), 3));
+            Identifier.Numeric(topicToUpdate.Id), new TopicUpdate
+            {
+                Name = "Updated Topic",
+                MaxTopicSize = 3_000_000_000,
+                MessageExpiry = TimeSpan.FromMinutes(10)
+            }));
 
         var result = await client.GetTopicByIdAsync(Identifier.String(streamName),
             Identifier.Numeric(topicToUpdate.Id));
         result.ShouldNotBeNull();
         result!.Name.ShouldBe("Updated Topic");
         result.MessageExpiry.ShouldBe(TimeSpan.FromMinutes(10));
-        result.CompressionAlgorithm.ShouldBe(CompressionAlgorithm.Gzip);
+        // Compression is set only at creation, so the update leaves the default in place.
+        result.CompressionAlgorithm.ShouldBe(CompressionAlgorithm.None);
         result.MaxTopicSize.ShouldBe(3_000_000_000u);
-        result.ReplicationFactor.ShouldBe((byte?)3);
-    }
-
-    [Test]
-    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task Purge_ExistingTopic_Should_PurgeTopic_Successfully(Protocol protocol)
-    {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
-
-        var streamName = $"topic-purge-{Guid.NewGuid():N}";
-        await client.CreateStreamAsync(streamName);
-        await client.CreateTopicAsync(Identifier.String(streamName), "Purge Topic", 1);
-
-        await client.SendMessagesAsync(Identifier.String(streamName),
-            Identifier.String("Purge Topic"), Partitioning.None(), GetMessages(5));
-
-        var beforePurge = await client.GetTopicByIdAsync(Identifier.String(streamName),
-            Identifier.String("Purge Topic"));
-        beforePurge.ShouldNotBeNull();
-        beforePurge.MessagesCount.ShouldBe(5u);
-        beforePurge.Size.ShouldBeGreaterThan(0u);
-
-        await Should.NotThrowAsync(client.PurgeTopicAsync(Identifier.String(streamName),
-            Identifier.String("Purge Topic")));
-
-        // The server commits the purge by advancing a generation its reconciler acts on a tick later.
-        var afterPurge = await Eventually.ReadAsync(
-            () => client.GetTopicByIdAsync(Identifier.String(streamName), Identifier.String("Purge Topic")),
-            topic => topic?.MessagesCount == 0, TimeSpan.FromSeconds(10));
-        afterPurge.ShouldNotBeNull();
-        afterPurge!.MessagesCount.ShouldBe(0u);
-        afterPurge.Size.ShouldBe(0u);
     }
 
     [Test]

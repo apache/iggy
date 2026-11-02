@@ -33,13 +33,18 @@ services:
       - "3000:3000"
       - "8080:8080"
       - "8090:8090"
+      - "8092:8092"
     environment:
       - IGGY_HTTP_ADDRESS=0.0.0.0:3000
       - IGGY_TCP_ADDRESS=0.0.0.0:8090
+      - IGGY_NODE_ADVERTISED_ADDRESS=iggy-server
       - IGGY_QUIC_ADDRESS=0.0.0.0:8080
       - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8092
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
+      # Stream key tests need server encryption. Test-only key.
+      - IGGY_ENCRYPTION_ENABLED=true
+      - IGGY_ENCRYPTION_KEY=/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=
     healthcheck:
       test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8090", "ping" ]
       interval: 5s
@@ -64,6 +69,7 @@ services:
       - IGGY_SERVER_TCP_PORT=8090
       - IGGY_SERVER_HTTP_PORT=3000
       - IGGY_SERVER_QUIC_PORT=8080
+      - IGGY_SERVER_WS_PORT=8092
       - PYTHONPATH=/workspace/foreign/python
       - PYTEST_ARGS=-v --tb=short
     volumes:

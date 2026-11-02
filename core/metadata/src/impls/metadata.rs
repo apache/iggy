@@ -16,40 +16,73 @@
 // under the License.
 
 use crate::MuxStateMachine;
-use crate::stm::authz::gated_apply;
+use crate::applied_frontier::AppliedFrontier;
+use crate::change_log::{
+    AppliedChange, ChangeLogCapacities, ChangeLogSnapshot, CurrentState, MetadataChangeLog,
+    change_actor, change_page, current_page, session_closed, session_registered, session_revoked,
+};
+use crate::impls::placement::{PlacementCounts, PlacementState};
+use crate::stm::authz::{
+    PartitionsCreate, admits_partitions_create, gated_apply, reject_stale_session,
+};
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{
-    FillSnapshot, MetadataSnapshot, RestoreSnapshotInPlace, Snapshot, SnapshotError,
+    FillSnapshot, MetadataSnapshot, PersistStage, RestoreSnapshotInPlace, Snapshot, SnapshotError,
 };
 use crate::stm::stream::{Streams, TruncatePartitionRequest};
-use crate::stm::user::{DeletePersonalAccessTokenRequest, Users};
-use crate::stm::{ConsensusGroupAllocator, StateMachine};
+use crate::stm::user::{CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest, Users};
+use crate::stm::{ApplyContext, ConsensusGroupAllocator, StateMachine};
+use bytes::Bytes;
+use compio::io::AsyncWriteAtExt;
 use consensus::{
     CLIENTS_TABLE_MAX, Canceled, ClientTable, ClientTableSnapshot, CommitLogEvent, CommitReply,
-    Consensus, EvictionContext, Pipeline, PipelineEntry, Plane, PlaneIdentity, PlaneKind,
-    PreflightOutcome, Project, ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind,
+    Consensus, ContradictionSource, EXPIRED_SESSION_REQUEST_ID, EvictionContext, FatalReason,
+    Pipeline, PipelineEntry, Plane, PlaneIdentity, PlaneKind, PreflightOutcome, PrepareRollback,
+    Project, RESERVED_CLIENT_ID, ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind,
     VsrConsensus, ack_preflight, ack_quorum_reached, apply_preflight_consensus_plane,
     build_eviction_message, build_reply_message, build_reply_message_with,
-    build_result_rejection_reply, emit_sim_event, fence_old_prepare_by_commit,
-    is_caught_up_primary, panic_if_hash_chain_would_break_in_same_view, peek_committable_head,
-    pipeline_prepare_common, register_preflight, replicate_preflight, replicate_to_next_in_chain,
-    request_preflight, send_eviction_to_client, send_prepare_ok as send_prepare_ok_common,
-    verify_prepare_integrity,
+    build_result_rejection_reply, emit_sim_event, fatal, fence_old_prepare_by_commit,
+    is_caught_up_primary, is_caught_up_primary_except_barrier,
+    panic_if_hash_chain_would_break_in_same_view, peek_committable_head, pipeline_prepare_common,
+    register_preflight, replicate_preflight, replicate_prepare, request_preflight,
+    send_eviction_to_client, send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
+use futures::channel::oneshot;
+use futures::lock::Mutex;
 use iggy_binary_protocol::WireIdentifier;
+use iggy_binary_protocol::consensus::CHECKSUM_UNSEALED;
+use iggy_binary_protocol::primitives::metadata_changes::WireUserKey;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest as WireCreatePartitionsRequest;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsRequest as PersistedCreatePartitionsRequest;
+use iggy_binary_protocol::requests::streams::{
+    CreateStreamRequest as WireCreateStreamRequest, RewrapStreamKeysRequest,
+    UpdateStreamResolvedRequest,
+};
+use iggy_binary_protocol::requests::system::{
+    FinalizeSessionRequest, ResourceTarget, RetirementDebt, SessionIdentity, UpdateResourceRequest,
+};
 use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopicRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
+use iggy_binary_protocol::requests::topics::UpdateTopicResolvedRequest;
+use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
+use iggy_binary_protocol::requests::users::{CreateUserRequest, UpdateUserResolvedRequest};
+use iggy_binary_protocol::responses::system::GetMetadataChangesResponse;
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, EvictionReason, GenericHeader, Operation, PrepareHeader,
-    PrepareOkHeader, ReplyHeader, RoutedRequestHeader, WireDecode, WireEncode, WireName,
+    Command, ConsensusHeader, EvictionReason, GenericHeader, Operation, PrepareHeader,
+    PrepareOkHeader, ProtocolVersion, ReplyHeader, RoutedRequestHeader, WireDecode, WireEncode,
+    WireName,
 };
-use iggy_common::IggyError;
-use iggy_common::UserId;
 use iggy_common::calculate_checksum;
 use iggy_common::variadic;
+use iggy_common::wire_conversions::{resource_options_from_wire, resource_options_to_wire};
+use iggy_common::{
+    HeaderKey, HeaderValue, IggyError, MetadataChangeStart, MetadataChangesQuery,
+    OptionAdmissionContext, OptionKey, OptionOperation, OptionValue, OptionVisibility,
+    OptionsProvenance, OptionsScope, ResourceOptions, ServerKeyContext, TopicCreateOptions,
+    TopicResolvedOptions, UserId, admit, critical_keys_marker, derived_defaults, stream_wrap_set,
+    topic_option_keys, validate_topic_segment_size,
+};
 use journal::local_gate::LocalGate;
 use journal::superblock::{
     PingPongSuperblock, SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS, SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS,
@@ -58,17 +91,46 @@ use journal::superblock::{
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use server_common::Message;
+use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
+use server_common::sharding::IggyNamespace;
 use std::cell::{Cell, RefCell};
+use std::io;
+#[cfg(feature = "simulator")]
+use std::io::Write;
 use std::mem::size_of;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::thread;
 use tracing::{debug, error, info, warn};
+
+// The writer retains this gate after caller cancellation, until the rename is durable.
+static SNAPSHOT_IO: Mutex<()> = Mutex::new(());
 
 fn freeze_client_reply(
     message: Message<GenericHeader>,
 ) -> server_common::iobuf::Frozen<{ server_common::MESSAGE_ALIGN }> {
     message.into_frozen()
+}
+
+/// Last locally observed normal view of one committed partition incarnation.
+/// Absence of a newer report preserves this view; it is not a health signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionPlacementView {
+    pub namespace: IggyNamespace,
+    pub created_revision: u64,
+    pub view: u32,
+}
+
+/// One suggested transfer, fenced by the observed view and committed incarnation.
+/// Execution must separately confirm source and target partition readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionPrimaryTransfer {
+    pub namespace: IggyNamespace,
+    pub created_revision: u64,
+    pub view: u32,
+    pub target: u8,
 }
 
 pub trait StreamsFrontend {
@@ -86,6 +148,36 @@ impl StreamsFrontend for MuxStateMachine<variadic!(Users, Streams)> {
     fn streams(&self) -> &Streams {
         &self.inner().1.0
     }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointBoundary {
+    TableCaptured,
+    TemporaryCreated,
+    Written,
+    FileSynced,
+    Renamed,
+    DirectorySynced,
+    SuperblockWritten,
+    WalDrained,
+}
+
+#[cfg(test)]
+thread_local! {
+    static STOP_CHECKPOINT_AFTER: Cell<Option<CheckpointBoundary>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+fn checkpoint_boundary(boundary: CheckpointBoundary) -> Result<(), SnapshotError> {
+    if STOP_CHECKPOINT_AFTER.get() == Some(boundary) {
+        STOP_CHECKPOINT_AFTER.set(None);
+        return Err(SnapshotError::Io(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "checkpoint crash boundary",
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -119,8 +211,8 @@ impl IggySnapshot {
     ///
     /// # Errors
     /// Returns `SnapshotError` if serialization or I/O fails.
-    pub fn persist(&self, path: &Path) -> Result<(), SnapshotError> {
-        Self::write_durably(path, &self.encode()?)
+    pub async fn persist(&self, path: &Path) -> Result<(), SnapshotError> {
+        Self::write_durably(path, self.encode()?).await
     }
 
     /// Write already-encoded snapshot bytes to `path` durably: temp, fsync,
@@ -133,55 +225,89 @@ impl IggySnapshot {
     ///
     /// # Errors
     /// `SnapshotError::Persist` if any write, fsync, or rename fails.
-    fn write_durably(path: &Path, encoded: &[u8]) -> Result<(), SnapshotError> {
-        use crate::stm::snapshot::PersistStage;
-        use std::fs;
-        use std::io::Write;
+    pub(super) async fn write_durably(path: &Path, encoded: Vec<u8>) -> Result<(), SnapshotError> {
+        let permit = SNAPSHOT_IO.lock().await;
+        let path = path.to_path_buf();
+        let (sender, receiver) = oneshot::channel();
+        compio::runtime::spawn(async move {
+            let _permit = permit;
+            let result = Self::write_durably_inner(&path, encoded, SnapshotIo::Compio).await;
+            if let Err(Err(error)) = sender.send(result) {
+                warn!(path = %path.display(), %error, "snapshot write failed after its caller stopped");
+            }
+        })
+        .detach();
+        receiver
+            .await
+            .map_err(|_| SnapshotError::Io(io::Error::other("snapshot writer stopped")))?
+    }
 
+    #[allow(clippy::future_not_send)]
+    async fn write_durably_inner(
+        path: &Path,
+        mut encoded: Vec<u8>,
+        storage: SnapshotIo,
+    ) -> Result<(), SnapshotError> {
+        let trailer = snapshot_trailer(&encoded);
+        // TODO: Write payload and trailer as separate buffers to avoid growing the payload.
+        encoded.extend_from_slice(&trailer);
         let tmp_path = path.with_extension("bin.tmp");
 
-        let mut file = fs::File::create(&tmp_path).map_err(|e| SnapshotError::Persist {
-            stage: PersistStage::Write,
-            source: e,
-        })?;
+        let mut file = storage
+            .create(&tmp_path)
+            .await
+            .note_descriptor_exhaustion(|| format!("creating {}", tmp_path.display()))
+            .map_err(|e| SnapshotError::Persist {
+                stage: PersistStage::Write,
+                source: e,
+            })?;
+        #[cfg(test)]
+        checkpoint_boundary(CheckpointBoundary::TemporaryCreated)?;
         file.write_all(encoded)
-            .map_err(|e| SnapshotError::Persist {
+            .await
+            .map_err(|source| SnapshotError::Persist {
                 stage: PersistStage::Write,
-                source: e,
+                source,
             })?;
-        // Self-verifying trailer. The superblock's checkpoint pairing cannot stand in:
-        // phase 1 of a checkpoint renames the new snapshot over `snapshot.bin`, so a
-        // crash before the pairing write is the NORMAL crash-inside-a-checkpoint
-        // outcome, and it recovers through the `checkpoint_op < snapshot_op` arm, which
-        // accepts the snapshot with nothing to check it against.
-        file.write_all(&snapshot_trailer(encoded))
-            .map_err(|e| SnapshotError::Persist {
-                stage: PersistStage::Write,
-                source: e,
-            })?;
-        file.sync_all().map_err(|e| SnapshotError::Persist {
+        #[cfg(test)]
+        checkpoint_boundary(CheckpointBoundary::Written)?;
+        file.sync_all().await.map_err(|e| SnapshotError::Persist {
             stage: PersistStage::Sync,
             source: e,
         })?;
+        #[cfg(test)]
+        checkpoint_boundary(CheckpointBoundary::FileSynced)?;
         drop(file);
 
-        fs::rename(&tmp_path, path).map_err(|e| SnapshotError::Persist {
-            stage: PersistStage::Rename,
-            source: e,
-        })?;
+        storage
+            .rename(&tmp_path, path)
+            .await
+            .map_err(|e| SnapshotError::Persist {
+                stage: PersistStage::Rename,
+                source: e,
+            })?;
+
+        #[cfg(test)]
+        checkpoint_boundary(CheckpointBoundary::Renamed)?;
 
         // Fsync the parent directory to ensure the rename is durable.
         if let Some(parent) = path.parent() {
-            let dir = fs::File::open(parent).map_err(|e| SnapshotError::Persist {
-                stage: PersistStage::DirSync,
-                source: e,
-            })?;
-            dir.sync_all().map_err(|e| SnapshotError::Persist {
+            let dir = storage
+                .open(parent)
+                .await
+                .note_descriptor_exhaustion(|| format!("opening directory {}", parent.display()))
+                .map_err(|e| SnapshotError::Persist {
+                    stage: PersistStage::DirSync,
+                    source: e,
+                })?;
+            dir.sync_all().await.map_err(|e| SnapshotError::Persist {
                 stage: PersistStage::DirSync,
                 source: e,
             })?;
         }
 
+        #[cfg(test)]
+        checkpoint_boundary(CheckpointBoundary::DirectorySynced)?;
         Ok(())
     }
 
@@ -190,27 +316,131 @@ impl IggySnapshot {
     ///
     /// The checksum comes from the file's bytes, never from re-encoding what was
     /// decoded: the pairing must survive a schema change. Adding a trailing
-    /// `#[serde(default)]` field is the repo's forward-compatible migration, and an
-    /// older file re-encodes with one MORE msgpack array element after it, so a
-    /// re-encode checksum would diverge on the first boot of the new build and refuse
-    /// every checkpointed node with its WAL prefix already drained.
+    /// `#[serde(default)]` field is the repo's forward-compatible migration (see
+    /// [`SNAPSHOT_FORMAT_VERSION`](crate::stm::snapshot::SNAPSHOT_FORMAT_VERSION) for
+    /// the rules), and an older file re-encodes with one MORE msgpack array element
+    /// after it, so a re-encode checksum would diverge on the first boot of the new
+    /// build and refuse every checkpointed node with its WAL prefix already drained.
     ///
     /// # Errors
-    /// `SnapshotError::ChecksumMismatch` if the file carries an integrity trailer that
-    /// does not match its payload, or `SnapshotError` if the file cannot be read or
-    /// deserialized.
+    /// `SnapshotError::InvalidTrailer` if integrity framing is absent or damaged,
+    /// `SnapshotError::ChecksumMismatch` if the trailer does not match its payload,
+    /// `SnapshotError::UnsupportedFormatVersion` if it was
+    /// written in a format version this build does not read, or `SnapshotError` if the
+    /// file cannot be read or deserialized.
     pub fn load(path: &Path) -> Result<(Self, u128), SnapshotError> {
         let data = std::fs::read(path)?;
-        let (payload, checksum) = split_trailer(&data, path)?;
+        let (payload, checksum) = split_trailer(&data)?;
         Ok((Self::decode(payload)?, checksum))
     }
 }
 
-/// Framing marker for the snapshot integrity trailer, "ISNP". Distinguishes a sealed
-/// snapshot from one written before the trailer existed, so a MISSING trailer can be
-/// accepted (unverified, loudly) while a PRESENT but mismatching one refuses boot. A
-/// bare checksum could not tell those apart, and guessing wrong in either direction is
-/// unacceptable: silently accepting corruption, or bricking a healthy node.
+#[derive(Clone, Copy)]
+enum SnapshotIo {
+    Compio,
+    #[cfg(feature = "simulator")]
+    Synchronous,
+}
+
+enum SnapshotFile {
+    Compio(compio::fs::File),
+    #[cfg(feature = "simulator")]
+    Synchronous(std::fs::File),
+}
+
+#[allow(clippy::future_not_send)]
+impl SnapshotIo {
+    async fn create(self, path: &Path) -> io::Result<SnapshotFile> {
+        match self {
+            Self::Compio => compio::fs::File::create(path)
+                .await
+                .map(SnapshotFile::Compio),
+            #[cfg(feature = "simulator")]
+            Self::Synchronous => std::fs::File::create(path).map(SnapshotFile::Synchronous),
+        }
+    }
+
+    async fn open(self, path: &Path) -> io::Result<SnapshotFile> {
+        match self {
+            Self::Compio => compio::fs::File::open(path).await.map(SnapshotFile::Compio),
+            #[cfg(feature = "simulator")]
+            Self::Synchronous => std::fs::File::open(path).map(SnapshotFile::Synchronous),
+        }
+    }
+
+    async fn read(self, path: &Path) -> io::Result<Vec<u8>> {
+        match self {
+            Self::Compio => compio::fs::read(path).await,
+            #[cfg(feature = "simulator")]
+            Self::Synchronous => std::fs::read(path),
+        }
+    }
+
+    async fn rename(self, source: &Path, target: &Path) -> io::Result<()> {
+        match self {
+            Self::Compio => compio::fs::rename(source, target).await,
+            #[cfg(feature = "simulator")]
+            Self::Synchronous => std::fs::rename(source, target),
+        }
+    }
+}
+
+#[allow(clippy::future_not_send)]
+impl SnapshotFile {
+    async fn write_all(&mut self, encoded: Vec<u8>) -> io::Result<()> {
+        match self {
+            Self::Compio(file) => file.write_all_at(encoded, 0).await.0,
+            #[cfg(feature = "simulator")]
+            Self::Synchronous(file) => file.write_all(&encoded),
+        }
+    }
+
+    async fn sync_all(&self) -> io::Result<()> {
+        match self {
+            Self::Compio(file) => file.sync_all().await,
+            #[cfg(feature = "simulator")]
+            Self::Synchronous(file) => file.sync_all(),
+        }
+    }
+}
+
+/// Committed ops one [`IggyMetadata::commit_journal`] call applies before
+/// returning to the pump.
+///
+/// The twin of `partitions::COMMIT_WALK_OPS_MAX`, and needed for the same
+/// reason: the walk reads a WAL body and applies it per op with no await the
+/// pump can interleave, and the resident `(commit_min, commit_max]` run is the
+/// whole backlog after a repair or a rejoin, not the pipeline depth.
+///
+/// Every caller is re-driven, so a truncated walk resumes rather than losing
+/// anything: `tick_metadata`'s walk backstop covers a follower and
+/// `resume_stranded_commits` covers the primary, both level-triggered on
+/// `commit_min < commit_max` every tick.
+const COMMIT_WALK_OPS_MAX: usize = 64;
+
+/// Why one [`IggyMetadata::commit_journal`] call stopped walking.
+///
+/// Only [`Self::BodyMissing`] names an op whose header the journal holds but
+/// cannot serve. A [`Self::PipelineHead`] op is committed from the journal by
+/// the pipeline driver (`commit_committable_prefix`, via `on_ack` or
+/// `resume_stranded_commits`), so its prepare must stay resident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitWalkStop {
+    /// `commit_min` reached `commit_max`.
+    CaughtUp,
+    /// The view's log is not yet proven, so the walk did not start.
+    ViewLogUnproven,
+    /// The per-call walk cap was reached; the next call resumes.
+    WalkCap,
+    /// The next op is the pipeline head; the pipeline driver commits it.
+    PipelineHead,
+    /// No header is resident at `op`.
+    HeaderMissing { op: u64 },
+    /// The header at `op` is resident but the WAL cannot produce its body.
+    BodyMissing { op: u64 },
+}
+
+/// Integrity framing is mandatory because the superblock can lag snapshot publication.
 const SNAPSHOT_TRAILER_MAGIC: u32 = 0x4953_4E50;
 
 /// `magic` + the payload's [`checkpoint_checksum`].
@@ -224,27 +454,18 @@ fn snapshot_trailer(encoded: &[u8]) -> [u8; SNAPSHOT_TRAILER_LEN] {
     trailer
 }
 
-/// Split a snapshot file into `(payload, checkpoint_checksum)`, verifying the trailer
-/// when one is present.
-///
-/// A file without the trailer is a snapshot written before sealing: its whole contents
-/// are the payload and the checksum is computed over them, exactly as the pairing
-/// recorded it, so an upgrade boots. It replays unverified, which is the same trade the
-/// WAL makes for entries no producer sealed, so it is warned about rather than
-/// silently accepted.
-fn split_trailer<'a>(data: &'a [u8], path: &Path) -> Result<(&'a [u8], u128), SnapshotError> {
-    let sealed = data.len() >= SNAPSHOT_TRAILER_LEN
-        && data[data.len() - SNAPSHOT_TRAILER_LEN..][..4] == SNAPSHOT_TRAILER_MAGIC.to_le_bytes();
-    if !sealed {
-        tracing::warn!(
-            path = %path.display(),
-            "metadata snapshot carries no integrity trailer; restored unverified \
-             (written before snapshot sealing)"
-        );
-        return Ok((data, checkpoint_checksum(data)));
+/// Verify the mandatory trailer before exposing the snapshot payload.
+fn split_trailer(data: &[u8]) -> Result<(&[u8], u128), SnapshotError> {
+    if data.len() < SNAPSHOT_TRAILER_LEN {
+        return Err(SnapshotError::Truncated {
+            size: data.len() as u64,
+        });
     }
 
     let (payload, trailer) = data.split_at(data.len() - SNAPSHOT_TRAILER_LEN);
+    if trailer[..size_of::<u32>()] != SNAPSHOT_TRAILER_MAGIC.to_le_bytes() {
+        return Err(SnapshotError::InvalidTrailer);
+    }
     let expected = u128::from_le_bytes(
         trailer[4..]
             .try_into()
@@ -269,6 +490,52 @@ fn split_trailer<'a>(data: &'a [u8], path: &Path) -> Result<(&'a [u8], u128), Sn
 #[must_use]
 pub fn checkpoint_checksum(encoded: &[u8]) -> u128 {
     u128::from(calculate_checksum(encoded))
+}
+
+/// The encoded snapshot and the checksum over exactly those bytes.
+fn encode_with_checksum(snapshot: &IggySnapshot) -> Result<(Vec<u8>, u128), SnapshotError> {
+    let encoded = snapshot.encode()?;
+    let checksum = checkpoint_checksum(&encoded);
+    Ok((encoded, checksum))
+}
+
+/// [`encode_with_checksum`] on a dedicated thread. The runtime has no blocking
+/// pool, and a full change log alone keeps a core busy for milliseconds.
+async fn encode_on_own_thread(snapshot: IggySnapshot) -> Result<(Vec<u8>, u128), SnapshotError> {
+    let (sender, receiver) = oneshot::channel();
+    thread::Builder::new()
+        .name("iggy-checkpoint-encode".to_owned())
+        .spawn(move || {
+            // The receiver is gone only with its checkpoint, which then needs no result.
+            let _ = sender.send(encode_with_checksum(&snapshot));
+        })
+        .map_err(SnapshotError::Io)?;
+    receiver.await.map_err(|_| {
+        SnapshotError::InvalidState("checkpoint encode thread ended without a result")
+    })?
+}
+
+/// The highest resident WAL entry at or above the snapshot floor and below
+/// `bound`, or the snapshot floor with no checksum when no such entry remains.
+#[must_use]
+pub fn metadata_wal_head<J>(journal: &J, bound: u64) -> (u64, u128)
+where
+    J: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+{
+    let floor = journal.snapshot_op();
+    let top = journal
+        .last_op()
+        .unwrap_or(floor)
+        .min(bound.saturating_sub(1));
+    (floor..=top)
+        .rev()
+        .find_map(|op| {
+            usize::try_from(op)
+                .ok()
+                .and_then(|slot| journal.header(slot))
+                .map(|header| (op, header.checksum))
+        })
+        .unwrap_or((floor, 0))
 }
 
 impl Snapshot for IggySnapshot {
@@ -311,12 +578,13 @@ impl Snapshot for IggySnapshot {
 ///
 /// Owns the data directory path and the snapshot creation function. The
 /// three-phase checkpoint (persist snapshot, record the pairing durably, drain the
-/// WAL) is orchestrated one layer up in [`IggyMetadata::checkpoint_if_needed`], so
+/// WAL) is orchestrated one layer up in `IggyMetadata::checkpoint_if_needed`, so
 /// the superblock write can sit between persist and drain; this type owns only the
 /// snapshot I/O and the last-checkpoint bookkeeping.
 pub struct SnapshotCoordinator<M> {
     data_dir: std::path::PathBuf,
     create_snapshot: fn(&M, u64, u64) -> Result<IggySnapshot, SnapshotError>,
+    io: SnapshotIo,
     /// Remaining-journal-slots threshold at which a checkpoint is forced.
     /// Defaults to [`Self::CHECKPOINT_MARGIN`]; bootstrap raises it to at
     /// least the configured prepare-queue depth (see the static assert and
@@ -326,6 +594,9 @@ pub struct SnapshotCoordinator<M> {
     /// recovered at boot, `(0, 0)` when none. A view-change superblock write reads
     /// this so it records the current pairing instead of regressing it to zero.
     last_checkpoint: Cell<(u64, u128)>,
+    // The snapshot pairing is published before superblock persistence and WAL drain.
+    // An incomplete attempt must remain retryable at the same applied frontier.
+    checkpoint_pending: Cell<bool>,
 }
 
 impl<M> SnapshotCoordinator<M> {
@@ -333,7 +604,10 @@ impl<M> SnapshotCoordinator<M> {
     /// forced. Must stay >= the prepare-queue depth: the ops already
     /// pipelined while a checkpoint runs skip it and append into this
     /// margin.
-    const CHECKPOINT_MARGIN: usize = 64;
+    ///
+    /// Public so a caller sizing a journal can refuse a slot count at or below it:
+    /// such a journal checkpoints on every commit rather than on occupancy.
+    pub const CHECKPOINT_MARGIN: usize = 64;
 
     #[must_use]
     pub fn new(
@@ -343,9 +617,18 @@ impl<M> SnapshotCoordinator<M> {
         Self {
             data_dir,
             create_snapshot,
+            io: SnapshotIo::Compio,
             checkpoint_margin: Cell::new(Self::CHECKPOINT_MARGIN),
             last_checkpoint: Cell::new((0, 0)),
+            checkpoint_pending: Cell::new(false),
         }
+    }
+
+    /// Complete snapshot I/O within one poll so host completions cannot change
+    /// the deterministic simulator's schedule. Select during replica construction.
+    #[cfg(feature = "simulator")]
+    pub const fn use_synchronous_io(&mut self) {
+        self.io = SnapshotIo::Synchronous;
     }
 
     /// Raise (never lower) the forced-checkpoint margin. Bootstrap calls
@@ -361,7 +644,9 @@ impl<M> SnapshotCoordinator<M> {
     /// transfer serves and installs.
     #[must_use]
     pub fn snapshot_path(&self) -> std::path::PathBuf {
-        self.data_dir.join(super::METADATA_DIR).join("snapshot.bin")
+        self.data_dir
+            .join(super::METADATA_DIR)
+            .join(super::SNAPSHOT_FILE_NAME)
     }
 
     /// The last persisted checkpoint's `(op, checksum)`, `(0, 0)` when none.
@@ -390,29 +675,47 @@ impl<M> SnapshotCoordinator<M> {
     /// Create and durably persist a snapshot at `commit_op`, record the pairing, and
     /// return its checksum. Does NOT drain the WAL: the caller must durably record
     /// the pairing in the superblock first, so a crash between persist and drain
-    /// recovers a consistent checkpoint with the WAL intact. Synchronous, since
-    /// snapshot creation and `std::fs` persistence never await.
-    fn persist_snapshot(
+    /// recovers a consistent checkpoint with the WAL intact. Snapshot creation
+    /// finishes before the first await, preserving the captured frontier. The owned
+    /// capture is then encoded on its own thread, so a large catalog or change log
+    /// does not stall this core.
+    #[allow(clippy::future_not_send)]
+    async fn persist_snapshot(
         &self,
         stm: &M,
         commit_op: u64,
         created_at: u64,
         client_table: Option<ClientTableSnapshot>,
+        change_log: ChangeLogSnapshot,
     ) -> Result<u128, SnapshotError> {
         let mut snapshot = (self.create_snapshot)(stm, commit_op, created_at)?;
-        // Fold in the client table, which `create_snapshot` does not see since it is
-        // not a state machine. Recovery restores it as the reconstruction floor for
-        // the drained WAL prefix.
+        // Fold in the client table and the change log, which `create_snapshot`
+        // does not see since neither is a state machine. Recovery restores the
+        // table as the reconstruction floor for the drained WAL prefix.
         snapshot.snapshot.client_table = client_table;
+        snapshot.snapshot.change_log = change_log;
         // Encode once: the checksum and the on-disk record share one buffer, so the
-        // snapshot is not serialized twice while the checkpoint lock freezes this
-        // core, and the pairing is provably over the bytes that reach the file.
-        let encoded = snapshot.encode()?;
-        let checksum = checkpoint_checksum(&encoded);
-        let path = self.snapshot_path();
-        IggySnapshot::write_durably(&path, &encoded)?;
+        // pairing is provably over the bytes that reach the file.
+        let (encoded, checksum) = match self.io {
+            SnapshotIo::Compio => encode_on_own_thread(snapshot).await?,
+            #[cfg(feature = "simulator")]
+            SnapshotIo::Synchronous => encode_with_checksum(&snapshot)?,
+        };
+        self.write_snapshot(encoded).await?;
         self.last_checkpoint.set((commit_op, checksum));
         Ok(checksum)
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn write_snapshot(&self, encoded: Vec<u8>) -> Result<(), SnapshotError> {
+        let path = self.snapshot_path();
+        match self.io {
+            SnapshotIo::Compio => IggySnapshot::write_durably(&path, encoded).await,
+            #[cfg(feature = "simulator")]
+            SnapshotIo::Synchronous => {
+                IggySnapshot::write_durably_inner(&path, encoded, self.io).await
+            }
+        }
     }
 
     /// Drain the snapshotted prefix below `last_op` to reclaim WAL space. Runs
@@ -493,8 +796,14 @@ pub enum MetadataSubmitError {
     /// the pipeline). The caller retries; the SDK read-timeout replay reaches
     /// the new primary.
     Canceled,
+    /// The node this view names primary is not reachable from this shard, so
+    /// a forwarded session operation never left. Nothing was proposed.
+    PrimaryUnreachable,
+    /// A forwarded session operation left but no verdict came back within the
+    /// forward timeout. The proposal's outcome is unknown.
+    ForwardTimedOut,
     /// The presented `client_id` already has a table entry owned by a
-    /// DIFFERENT user. TERMINAL, unlike every sibling: retrying cannot help,
+    /// DIFFERENT user. Terminal: retrying cannot help,
     /// and admitting it would run the caller's replicated ops under the
     /// entry owner's authority (`resolve_acting_user_id` reads the table).
     ///
@@ -506,14 +815,28 @@ pub enum MetadataSubmitError {
     ///   the previous boot's ids while the HTTP id minter restarts at 1, so
     ///   an honest login lands on a recovered entry owned by another user.
     ClientIdOwnedByAnotherUser,
+    /// The verified account is no longer active or the client ID is reserved.
+    Unauthenticated,
+    /// The request is at or below the watermark without a retained receipt.
+    RequestTooOld,
+    /// The request identity already belongs to another operation.
+    OperationMismatch,
 }
 
 impl MetadataSubmitError {
     /// Whether a retry (here, or against another replica) could succeed.
-    /// Every variant is transient by contract except the ownership refusal.
+    /// Ownership and request-identity refusals are terminal.
+    /// Deliberately a deny-list: a new variant is transient by default, so
+    /// adding one cannot silently surface a terminal error to clients.
     #[must_use]
     pub const fn is_transient(&self) -> bool {
-        !matches!(self, Self::ClientIdOwnedByAnotherUser)
+        !matches!(
+            self,
+            Self::ClientIdOwnedByAnotherUser
+                | Self::Unauthenticated
+                | Self::RequestTooOld
+                | Self::OperationMismatch
+        )
     }
 }
 
@@ -524,10 +847,19 @@ impl std::fmt::Display for MetadataSubmitError {
             Self::NotCaughtUp => f.write_str("primary not yet caught up on commit_journal"),
             Self::PipelineFull => f.write_str("metadata prepare queue is full"),
             Self::InProgress => f.write_str("another in-flight prepare from this client"),
+            Self::RequestTooOld => {
+                f.write_str("request is at or below the watermark without a retained receipt")
+            }
+            Self::OperationMismatch => f.write_str("request identity belongs to another operation"),
             Self::Canceled => f.write_str("view change canceled the pending prepare"),
+            Self::PrimaryUnreachable => f.write_str("no route to the metadata primary"),
+            Self::ForwardTimedOut => {
+                f.write_str("the metadata primary did not answer the forwarded register")
+            }
             Self::ClientIdOwnedByAnotherUser => {
                 f.write_str("client id already registered to a different user")
             }
+            Self::Unauthenticated => f.write_str("verified account is no longer active"),
         }
     }
 }
@@ -557,35 +889,44 @@ fn require_shard_zero<'a, T>(
     slot
 }
 
+/// What one committed prepare produced: the reply to cache and send, and the
+/// public changes the change log records for it, in canonical order.
+#[derive(Debug)]
+pub struct CommittedApply {
+    pub reply: Message<ReplyHeader>,
+    pub changes: Vec<AppliedChange>,
+}
+
 /// Apply one committed prepare to the state machine and client table.
 ///
 /// The backup commit walk's per-op logic, shared so the simulator's WAL
 /// reconstruction reaches identical state from the same log through one apply path.
-/// Register creates or rebinds a session (no state-machine op); Logout drops the
-/// session and rebalances consumer groups; every other op applies to the state
+/// Register creates an identity or resolves its matching retry. Logout ends the
+/// exact session and rebalances its memberships; `FinalizeSession` removes it once
+/// every partition group retired it or records that group's retirement debt. Every
+/// other op applies to the state
 /// machine and caches the reply for at-most-once dedup. `fire_notifier` runs the
-/// post-commit hook (a no-op during reconstruction, before it is wired). Does not
-/// advance `commit_min`; the caller owns that counter.
+/// post-commit hook (a no-op during reconstruction, before it is wired). Returns
+/// the committed reply without advancing `commit_min`; the caller owns that counter.
 ///
-/// `table_mutations_allowed` gates the CLIENT-TABLE half only; the state
-/// machine always applies. After a state transfer the two artifacts sit at
-/// different frontiers -- the snapshot at `S`, the transferred table at
-/// `C >= S` -- so the tail replay over `(S, commit_max]` must run every state
-/// machine effect (they are above the snapshot) while skipping table effects at
-/// or below `C` (they are already in the transferred table). Pass `true`
-/// wherever no transfer is in play.
+/// `table_mutations_allowed` gates table updates only. Passing `false` requires
+/// the table to retain the session identities needed by state-machine effects.
+/// Live state transfer instead passes its separate replay table with `true`:
+/// the newer protection table may already have finalized those identities.
 ///
 /// # Panics
 /// If a committed op fails to apply, which is a decode/corruption bug, since a
 /// business rejection commits as a no-op rather than erroring: the committed log
 /// must apply cleanly on every replica.
+#[allow(clippy::too_many_lines)]
 pub fn apply_committed_prepare<M>(
     mux_stm: &M,
     client_table: &RefCell<ClientTable>,
     table_mutations_allowed: bool,
     fire_notifier: impl Fn(Operation),
     prepare: Message<PrepareHeader>,
-) where
+) -> CommittedApply
+where
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
@@ -594,48 +935,229 @@ pub fn apply_committed_prepare<M>(
         >,
 {
     let header = *prepare.header();
+    if table_mutations_allowed
+        && let Err(error) = client_table
+            .borrow_mut()
+            .commit_capacity(header.retry_capacity as usize)
+    {
+        fatal(
+            FatalReason::UnreconcilableLogFrontier,
+            &format!(
+                "invalid committed metadata retry capacity at op={}: {error}",
+                header.op
+            ),
+        );
+    }
     if header.operation == Operation::Register {
-        // Register: commit_register creates the session, no state-machine op.
+        let registration = RegisterRequest::decode_from(prepare.body()).unwrap_or_else(|_| {
+            fatal(
+                FatalReason::UnreconcilableLogFrontier,
+                "invalid committed Register identity",
+            )
+        });
+        if !mux_stm
+            .users()
+            .is_active_account(header.user_id, registration.user_created_at)
+        {
+            let denied = crate::stm::result::ApplyReply::err(IggyError::Unauthenticated.as_code());
+            return CommittedApply {
+                reply: build_reply_message_with(&header, denied.reply_body_len(), |dst| {
+                    denied.write_reply_body(dst);
+                }),
+                changes: Vec::new(),
+            };
+        }
+        // A retry resolves to the existing entry and keeps its epoch, so only
+        // an inserted client is a new session.
+        let inserted = table_mutations_allowed && !client_table.borrow().contains(header.client);
         if table_mutations_allowed {
             let reply = build_reply_message(&header, &bytes::Bytes::new());
             client_table
                 .borrow_mut()
-                .commit_register(header.client, header.user_id, reply);
+                .commit_register(
+                    header.client,
+                    header.user_id,
+                    registration.bind_verifier,
+                    reply,
+                )
+                .unwrap_or_else(|error| {
+                    fatal(
+                        FatalReason::UnreconcilableLogFrontier,
+                        &format!("cannot retain committed session: {error}"),
+                    )
+                });
         }
-        return;
+        let epoch = client_table
+            .borrow()
+            .get_epoch(header.client)
+            .unwrap_or(header.op);
+        // The session record comes first, then the handovers its memberships
+        // took from the session change.
+        let mut changes: Vec<AppliedChange> = inserted
+            .then(|| session_registered(&header, registration.user_created_at, epoch))
+            .into_iter()
+            .collect();
+        changes.extend(mux_stm.streams().refresh_consumer_group_session(
+            header.client,
+            epoch,
+            header.op,
+            iggy_common::IggyTimestamp::from(header.timestamp),
+            change_actor(&ApplyContext::from(&header)),
+        ));
+        return CommittedApply {
+            reply: build_reply_message(&header, &bytes::Bytes::new()),
+            changes,
+        };
     }
     if header.operation == Operation::Logout {
-        if table_mutations_allowed {
-            client_table.borrow_mut().remove_client(header.client);
+        let ended = if table_mutations_allowed {
+            client_table
+                .borrow_mut()
+                .commit_logout(
+                    header.client,
+                    header.user_id,
+                    header.session,
+                    build_reply_message(&header, &bytes::Bytes::new()),
+                )
+                .unwrap_or_else(|error| {
+                    fatal(
+                        FatalReason::UnreconcilableLogFrontier,
+                        &format!("cannot retain Logout receipt: {error}"),
+                    )
+                })
+        } else {
+            mux_stm.streams().consumer_group_session(header.client) == Some(header.session)
+        };
+        let mut changes = Vec::new();
+        if ended {
+            // The session record comes first, then the memberships it ended.
+            let user = mux_stm.users().read(|users| {
+                users
+                    .items
+                    .get(header.user_id as usize)
+                    .map(WireUserKey::from)
+            });
+            let closed = user.map(|user| session_closed(&header, user));
+            let actor = closed.as_ref().and_then(|closed| closed.actor_user_id);
+            changes.extend(closed);
+            changes.extend(mux_stm.streams().remove_consumer_group_member(
+                header.client,
+                iggy_common::IggyTimestamp::from(header.timestamp),
+                header.op,
+                actor,
+            ));
         }
-        // Drop the disconnected client from every consumer group it joined and
-        // rebalance, Logout's only state-machine effect.
-        mux_stm.streams().remove_consumer_group_member(
-            header.client,
-            iggy_common::IggyTimestamp::from(header.timestamp),
-        );
-        return;
+        return CommittedApply {
+            reply: build_reply_message(&header, &bytes::Bytes::new()),
+            changes,
+        };
+    }
+    if header.operation == Operation::FinalizeSession {
+        let request = FinalizeSessionRequest::decode_from(prepare.body()).unwrap_or_else(|_| {
+            fatal(
+                FatalReason::UnreconcilableLogFrontier,
+                "invalid session finalization",
+            )
+        });
+        if mux_stm.streams().read(|inner| inner.namespace_revision) == request.namespace_revision {
+            if table_mutations_allowed {
+                client_table.borrow_mut().finalize_session(request.identity);
+            }
+            mux_stm
+                .streams()
+                .record_retirement_debt(&request.debt, header.op);
+        }
+        return CommittedApply {
+            reply: build_reply_message(&header, &bytes::Bytes::new()),
+            changes: Vec::new(),
+        };
     }
     // Normal op: apply, build the reply. `Err` is decode/corruption only; a
     // business rejection commits as a deterministic no-op whose code rides
     // the reply body, replayed on retry.
-    let apply = gated_apply(mux_stm, prepare).unwrap_or_else(|err| {
-        panic!(
-            "apply_committed_prepare: committed metadata op={} failed to apply: {err}",
-            header.op
+    let mut apply = reject_stale_session(&header, &client_table.borrow())
+        .map_or_else(|| gated_apply(mux_stm, prepare), Ok)
+        .unwrap_or_else(|err| {
+            panic!(
+                "apply_committed_prepare: committed metadata op={} failed to apply: {err}",
+                header.op
+            );
+        });
+    if let Some(user) = apply.revoked_user {
+        let ended = apply_user_revocation(
+            mux_stm,
+            client_table,
+            table_mutations_allowed,
+            user,
+            &header,
         );
-    });
+        apply.changes.extend(ended);
+    }
     fire_notifier(header.operation);
     let reply = build_reply_message_with(&header, apply.reply_body_len(), |dst| {
         apply.write_reply_body(dst);
     });
-    // Best-effort cache; a WAL replay may carry a reply for a later-evicted
-    // client, and replica-local eviction makes a stale-request replay
-    // reachable. Both are skips, not faults.
-    if table_mutations_allowed {
-        let outcome = client_table.borrow_mut().commit_reply(header.client, reply);
+    if table_mutations_allowed
+        && header.client != RESERVED_CLIENT_ID
+        && !message_bus::is_auto_commit_client(header.client)
+        && !matches!(
+            header.operation,
+            Operation::CompleteConsumerGroupRevocation | Operation::CompleteLifecycle
+        )
+    {
+        let outcome =
+            client_table
+                .borrow_mut()
+                .commit_reply(header.client, header.user_id, reply.clone());
         log_commit_reply_outcome(outcome, header.client, header.op);
     }
+    CommittedApply {
+        reply,
+        changes: apply.changes,
+    }
+}
+
+/// Ends the user's sessions and returns their close records, then the records
+/// of the memberships that ended with them.
+fn apply_user_revocation<M: StreamsFrontend>(
+    mux_stm: &M,
+    client_table: &RefCell<ClientTable>,
+    table_mutations_allowed: bool,
+    user: WireUserKey,
+    header: &PrepareHeader,
+) -> Vec<AppliedChange> {
+    if table_mutations_allowed {
+        client_table
+            .borrow_mut()
+            .end_user_sessions(user.user_id, header.op);
+    }
+    // A transferred table may already contain this end marker while the
+    // streams snapshot still needs the matching membership release.
+    let mut sessions: Vec<SessionIdentity> = {
+        let table = client_table.borrow();
+        table
+            .ended_sessions()
+            .filter(|identity| {
+                identity.metadata_watermark == header.op
+                    && table.get_user_id(identity.client_id) == Some(user.user_id)
+            })
+            .collect()
+    };
+    // Slot order may differ after a restore, so every apply path orders by client.
+    sessions.sort_by_key(|identity| identity.client_id);
+    let actor = change_actor(&ApplyContext::from(header));
+    let client_ids: Vec<u128> = sessions.iter().map(|identity| identity.client_id).collect();
+    let mut changes: Vec<AppliedChange> = sessions
+        .iter()
+        .map(|identity| session_revoked(user, identity.client_id, identity.session, actor))
+        .collect();
+    changes.extend(mux_stm.streams().remove_consumer_group_members(
+        &client_ids,
+        iggy_common::IggyTimestamp::from(header.timestamp),
+        header.op,
+        actor,
+    ));
+    changes
 }
 
 /// Late-bound callback invoked after every committed op on shard 0's metadata
@@ -649,7 +1171,7 @@ pub fn apply_committed_prepare<M>(
 pub type CommitNotifier = std::rc::Rc<dyn Fn(Operation)>;
 
 pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
-    /// `Some` on shard 0, `None` on other shards. Server-ng bootstrap
+    /// `Some` on shard 0, `None` on other shards. Server bootstrap
     /// holds the invariant: only shard 0 owns the metadata consensus
     /// replica; every other shard reconstructs `mux_stm` from the
     /// `MetadataHandoff::Waiter` factory bundle broadcast by shard 0
@@ -660,7 +1182,7 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// the WAL at all. They receive a `MetadataHandoff::Waiter` factory
     /// bundle from shard 0 over the bootstrap broadcast channel and
     /// reconstruct `mux_stm` from the in-memory snapshot it carries (see
-    /// `server/src/bootstrap.rs` `await_metadata_bundle` /
+    /// `server/src/boot/handoff.rs` `await_metadata_bundle` /
     /// `broadcast_metadata_bundle`).
     pub journal: Option<J>,
     /// `Some` on shard 0, `None` on other shards.
@@ -682,7 +1204,7 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// Scoped to the write itself, NOT to a whole checkpoint. A pending view persist
     /// blocks every gated send behind it, including the ack path's
     /// `send_prepare_ok`, so it must not also wait out a checkpoint's snapshot
-    /// encode, two `std::fs` fsyncs and an async WAL drain. Whoever writes builds
+    /// encode, filesystem syncs and the WAL drain. Whoever writes builds
     /// its `VsrState` inside this section with no await in between, so the last
     /// writer carries the freshest view and the durable view cannot regress.
     ///
@@ -706,9 +1228,15 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// policy.
     superblock_write_failures: Cell<u64>,
     superblock_retry_after_micros: Cell<u64>,
-    /// State machine - lives on all shards
-    pub mux_stm: M,
+    /// State machine - lives on all shards.
+    ///
+    /// Shared so shard 0's bootstrap can keep a clone alive past every
+    /// fallible step that owns this struct: the peer shards read through
+    /// handles minted off this writer, and dropping it makes their
+    /// `LeftRight::read` panic. See `server/src/boot::shard_main`.
+    pub mux_stm: Rc<M>,
     pub allocator: ConsensusGroupAllocator,
+    placement: RefCell<PlacementState>,
     /// Snapshot coordinator - present when persistent checkpointing is configured.
     pub coordinator: Option<SnapshotCoordinator<M>>,
     /// Serializes `on_replicate`'s journal-mutation section (forced
@@ -731,28 +1259,70 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// [`Self::set_commit_notifier`] runs (the server bootstrap on shard
     /// 0 sets it; peer shards and tests leave it `None`).
     commit_notifier: RefCell<Option<CommitNotifier>>,
-    /// Resolved byte value for `MaxTopicSize::ServerDefault` (`0` on the
-    /// wire). Primary admission rewrites the sentinel to this value before
-    /// replication so the committed state carries a concrete size and every
-    /// replica resolves identically regardless of local config. Set from
-    /// server config at bootstrap ([`Self::set_default_max_topic_size`]);
-    /// defaults to unlimited, matching the shipped server config.
-    default_max_topic_size: Cell<u64>,
-    /// Resolved micros value for `IggyExpiry::ServerDefault` (`0` on the wire).
-    /// Same admission-time sentinel resolution as [`Self::default_max_topic_size`];
-    /// set from server config at bootstrap ([`Self::set_default_message_expiry`]).
-    /// Defaults to never-expire, matching the shipped server config.
-    default_message_expiry: Cell<u64>,
     /// Client-table mutations at or below this op are already reflected in a
     /// state-transferred table, so the tail-repair commit walk must skip
-    /// them (re-running `commit_register` would double-bump epochs). `0`
+    /// them to preserve newer receipts and incarnations. `0`
     /// outside state transfer (no op is skipped). Monotone per install.
     client_table_frontier: Cell<u64>,
+    /// Session history at the state machine's replay frontier. The transferred
+    /// protection table can have already forgotten sessions whose membership
+    /// effects still need replaying. Dropped once replay reaches that table.
+    replay_client_table: RefCell<Option<RefCell<ClientTable>>>,
     /// Last built [`StateTransferOffer`], shared by every requester of the same
     /// snapshot generation. Rebuilding per request re-reads and re-decodes the
     /// whole snapshot on shard 0's pump, and hands each requester its own
     /// multi-MB copy.
     transfer_offer_cache: RefCell<Option<Rc<StateTransferOffer>>>,
+    /// Prepares the backup gap check destroyed since `tick_metadata` last
+    /// drained the count into `metadata_prepare_gap_drops_total`. What it does
+    /// and does not prove is `IggyPartition::prepare_gap_drops`, verbatim; what
+    /// differs is the frontier the check runs against, the journal head rather
+    /// than the sequencer, so this also counts the ops that fall outside what
+    /// metadata repair can refill (an interior hole below the head, a forward
+    /// gap above `commit_max`).
+    ///
+    /// `Cell` because every method on this type takes `&self`.
+    prepare_gap_drops: Cell<u64>,
+    /// `[metadata] partitions_max`, zero for no cap. See
+    /// [`Self::admit_partitions`].
+    partitions_max: Cell<u32>,
+    /// `[personal_access_token] max_tokens_per_user`, zero for no cap. See
+    /// [`Self::admit_personal_access_token`].
+    max_tokens_per_user: Cell<u32>,
+    /// `[cluster] default_replication_factor`, `None` for every node. See
+    /// [`Self::default_replication_factor`].
+    default_replication_factor: Cell<Option<u8>>,
+    /// Highest metadata op whose apply has been PUBLISHED on this node, plus
+    /// the reads parked on it. Shared by every shard; see
+    /// [`AppliedFrontier`] for the ordering and the wake contract.
+    applied_frontier: Arc<AppliedFrontier>,
+    /// This node's server keys. The primary refuses to prepare a
+    /// `CreateStream` whose wrap set none of them opens.
+    stream_key_context: Arc<ServerKeyContext>,
+    /// The public results of applied operations. The write side lives on
+    /// shard 0 with the state machines, every other shard reads it.
+    change_log: Rc<MetadataChangeLog>,
+}
+
+impl<B, J, S, M, SB> IggyMetadata<VsrConsensus<B>, J, S, M, SB>
+where
+    B: MessageBus,
+    M: StreamsFrontend,
+{
+    /// Resume the applied frontier where recovery left the state machine.
+    ///
+    /// Recovery replays the committed WAL prefix before any listener binds, so
+    /// without this the frontier reads zero on a rebooted node and every read
+    /// whose caller holds a pre-restart commit parks until its deadline. A
+    /// no-op on a peer shard, which owns no consensus and shares shard 0's
+    /// cell.
+    pub fn seed_applied_frontier_from_consensus(&self) {
+        if let Some(consensus) = self.consensus.as_ref() {
+            self.applied_frontier
+                .record_recovery_revision(self.mux_stm.streams().read(|inner| inner.revision));
+            self.advance_applied_frontier(consensus.commit_min());
+        }
+    }
 }
 
 impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB>
@@ -769,9 +1339,10 @@ where
         journal: Option<J>,
         snapshot: Option<S>,
         superblock: Option<Rc<SB>>,
-        mux_stm: M,
+        mux_stm: impl Into<Rc<M>>,
         data_dir: Option<std::path::PathBuf>,
     ) -> Self {
+        let mux_stm = mux_stm.into();
         let allocator =
             ConsensusGroupAllocator::new(mux_stm.streams().highest_partition_consensus_group_id());
         let coordinator = data_dir.map(|dir| SnapshotCoordinator::new(dir, IggySnapshot::create));
@@ -786,19 +1357,152 @@ where
             superblock_retry_after_micros: Cell::new(0),
             mux_stm,
             allocator,
+            placement: RefCell::default(),
             coordinator,
             journal_gate: LocalGate::new(),
             client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
             commit_notifier: RefCell::new(None),
-            default_max_topic_size: Cell::new(u64::MAX),
-            default_message_expiry: Cell::new(u64::MAX),
             client_table_frontier: Cell::new(0),
+            replay_client_table: RefCell::new(None),
             transfer_offer_cache: RefCell::new(None),
+            prepare_gap_drops: Cell::new(0),
+            partitions_max: Cell::new(0),
+            max_tokens_per_user: Cell::new(0),
+            default_replication_factor: Cell::new(None),
+            applied_frontier: Arc::default(),
+            stream_key_context: Arc::default(),
+            change_log: Rc::new(MetadataChangeLog::new(ChangeLogCapacities::default())),
         }
     }
 }
 
+impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB>
+where
+    M: StreamsFrontend,
+{
+    /// One change page of this node's log. Every shard answers it from its
+    /// read view, on an image coherent with the applied frontier.
+    ///
+    /// # Errors
+    /// `InvalidCommand` for a request the rules refuse or a current state
+    /// start, `TransientNotAccepted` when no coherent image was captured.
+    pub fn metadata_changes(
+        &self,
+        query: &MetadataChangesQuery,
+    ) -> Result<GetMetadataChangesResponse, IggyError> {
+        let groups = query.validate()?;
+        self.change_log
+            .read_coherent(&self.applied_frontier, |log, head_op| {
+                change_page(log, head_op, query, groups)
+            })
+            .ok_or(IggyError::TransientNotAccepted)?
+    }
+
+    /// One current state page, assembled in one synchronous pass over the
+    /// applied state. Only the metadata shard holds the client table and
+    /// writes the state, so only it answers.
+    ///
+    /// # Errors
+    /// `InvalidCommand` for a request the rules refuse or a change start,
+    /// `InvalidConfiguration` on any other shard, `TransientNotAccepted` once
+    /// the log's write side is gone.
+    pub fn metadata_current_state(
+        &self,
+        query: &MetadataChangesQuery,
+    ) -> Result<GetMetadataChangesResponse, IggyError> {
+        let groups = query.validate()?;
+        let MetadataChangeStart::Current(token) = &query.start else {
+            return Err(IggyError::InvalidCommand);
+        };
+        if self.consensus.is_none() {
+            return Err(IggyError::InvalidConfiguration);
+        }
+        let head_op = self.applied_frontier.get();
+        let client_table = self.client_table.borrow();
+        // A transferred protection table can run ahead of the applied state.
+        let sessions = (self.client_table_frontier.get() <= head_op).then_some(&*client_table);
+        self.mux_stm.streams().read(|streams| {
+            self.mux_stm.users().read(|users| {
+                self.change_log
+                    .read(|log| {
+                        current_page(
+                            log,
+                            head_op,
+                            groups,
+                            token.as_ref().map(AsRef::as_ref),
+                            query.limit,
+                            &CurrentState {
+                                streams,
+                                users,
+                                sessions,
+                            },
+                        )
+                    })
+                    .ok_or(IggyError::TransientNotAccepted)?
+            })
+        })
+    }
+}
+
 impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
+    /// Take and clear the gap-drop count (`prepare_gap_drops`).
+    #[must_use = "dropping the count loses the only record those prepares existed"]
+    pub const fn take_prepare_gap_drops(&self) -> u64 {
+        self.prepare_gap_drops.replace(0)
+    }
+
+    /// Share one process-wide applied frontier with every other shard.
+    ///
+    /// Consumed at construction rather than swapped in later: a shard that
+    /// served a read against its own private cell would gate on a number that
+    /// never moves. Shard 0 mints the cell in bootstrap, before any shard is
+    /// built, and hands each shard a clone.
+    #[must_use]
+    pub fn with_applied_frontier(mut self, applied_frontier: Arc<AppliedFrontier>) -> Self {
+        self.applied_frontier = applied_frontier;
+        self
+    }
+
+    /// Install the change log: the one recovery rebuilt on shard 0, a read
+    /// view of it on every other shard.
+    #[must_use]
+    pub fn with_change_log(mut self, change_log: impl Into<Rc<MetadataChangeLog>>) -> Self {
+        self.change_log = change_log.into();
+        self
+    }
+
+    #[must_use]
+    pub const fn change_log(&self) -> &Rc<MetadataChangeLog> {
+        &self.change_log
+    }
+
+    /// Admit `CreateStream` wrap sets against this node's server keys, the
+    /// ones its partitions open stream keys with. Without them every wrapped
+    /// create is refused.
+    #[must_use]
+    pub fn with_stream_key_context(mut self, stream_key_context: Arc<ServerKeyContext>) -> Self {
+        self.stream_key_context = stream_key_context;
+        self
+    }
+
+    /// The node-wide applied frontier, readable on every shard. Reads gate on
+    /// it so a client cannot be served state older than a write it already saw
+    /// acked, and park on its wait when it is behind.
+    #[must_use]
+    pub const fn applied_frontier(&self) -> &Arc<AppliedFrontier> {
+        &self.applied_frontier
+    }
+
+    /// Publish `op` as applied and wake the reads waiting at or below it.
+    /// Monotone, so a lower value is a no-op.
+    ///
+    /// Must run AFTER the apply's `publish()` and, on the commit path, in the
+    /// same await-free region as `advance_commit_min`: a reader that sees the
+    /// frontier must be guaranteed to see the op's effects.
+    pub fn advance_applied_frontier(&self, op: u64) {
+        self.applied_frontier.advance(op);
+    }
+
     /// Slot capacity of the LIVE client table, i.e. the largest transferred
     /// table this replica can absorb.
     ///
@@ -822,7 +1526,7 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     }
 
     /// Install (or replace) the post-commit notifier. Passing `None`
-    /// removes any previous one. Server-ng bootstrap calls this on shard 0
+    /// removes any previous one. Server bootstrap calls this on shard 0
     /// only; peer shards never commit metadata locally.
     pub fn set_commit_notifier(&self, notifier: Option<CommitNotifier>) {
         *self.commit_notifier.borrow_mut() = notifier;
@@ -831,7 +1535,7 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     /// Seed the coordinator's last-checkpoint pairing at boot from the recovered
     /// snapshot, so the first post-boot view-change superblock write records the real
     /// `(checkpoint_op, checksum)` instead of `(0, 0)`. No-op without a coordinator
-    /// (peer shards, the simulator). Server-ng bootstrap calls this on shard 0 after
+    /// (peer shards, the simulator). Server bootstrap calls this on shard 0 after
     /// cross-checking the pairing.
     pub fn seed_checkpoint_ref(&self, checkpoint_op: u64, checkpoint_checksum: u128) {
         if let Some(coordinator) = &self.coordinator {
@@ -867,33 +1571,67 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
             );
             return false;
         }
+        if client_table.capacity_committed() && current.capacity() != client_table.capacity() {
+            warn!(
+                configured_capacity = current.capacity(),
+                committed_capacity = client_table.capacity(),
+                "metadata retry capacity is fixed by committed state; ignoring local configuration"
+            );
+        }
         *current = client_table;
         true
     }
 
     /// Client-table mutations at or below the frontier are already in the
-    /// state-transferred table; the commit walk skips them (re-running
-    /// `commit_register` would double-bump epochs). STM effects still apply
-    /// -- the frontier fences the TABLE only.
+    /// state-transferred protection table. Replay uses a separate table at the
+    /// state machine's frontier until it catches up.
     const fn client_table_mutation_allowed(&self, op: u64) -> bool {
         op > self.client_table_frontier.get()
     }
 
-    /// Install the resolved byte value used for `MaxTopicSize::ServerDefault`.
-    /// Server-ng bootstrap calls this with `system.topic.max_size` on every
-    /// shard (responses read it too); only shard 0's copy feeds admission.
-    pub fn set_default_max_topic_size(&self, max_topic_size_bytes: u64) {
-        self.default_max_topic_size.set(max_topic_size_bytes);
-    }
-
-    /// Byte value a stored `MaxTopicSize::ServerDefault` resolves to on this
-    /// node. Read by the per-shard segment cleaner, which enforces retention
-    /// locally and so must resolve the sentinel at enforcement time: create
-    /// admission rewrites it before replication, but an UPDATE back to
-    /// `ServerDefault` leaves the sentinel in committed state.
-    #[must_use]
-    pub const fn default_max_topic_size(&self) -> u64 {
-        self.default_max_topic_size.get()
+    fn apply_prepare(&self, prepare: Message<PrepareHeader>) -> Message<ReplyHeader>
+    where
+        M: StreamsFrontend
+            + StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = crate::stm::result::ApplyReply,
+                Error = IggyError,
+            >,
+    {
+        let header = *prepare.header();
+        let op = header.op;
+        let committed = if self.client_table_mutation_allowed(op) {
+            apply_committed_prepare(
+                &*self.mux_stm,
+                &self.client_table,
+                true,
+                |operation| self.fire_commit_notifier(operation),
+                prepare,
+            )
+        } else {
+            let history = self.replay_client_table.borrow();
+            let table = history
+                .as_ref()
+                .expect("transferred history must retain its replay table");
+            let committed = apply_committed_prepare(
+                &*self.mux_stm,
+                table,
+                true,
+                |operation| self.fire_commit_notifier(operation),
+                prepare,
+            );
+            drop(history);
+            if op == self.client_table_frontier.get() {
+                self.replay_client_table.borrow_mut().take();
+            }
+            committed
+        };
+        // Published before the caller advances the applied frontier and
+        // `commit_min`, so no reader sees a record above them.
+        if let Err(error) = self.change_log.append(&header, committed.changes) {
+            panic!("apply_prepare: change log refused committed metadata op={op}: {error}");
+        }
+        committed.reply
     }
 
     /// Raise the forced-checkpoint margin to cover a configured
@@ -914,11 +1652,70 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
         self.client_table.borrow_mut().set_capacity(max_clients);
     }
 
-    /// Install the resolved micros value used for `IggyExpiry::ServerDefault`.
-    /// Server-ng bootstrap calls this with `system.topic.message_expiry`; only
-    /// shard 0's copy feeds admission.
-    pub fn set_default_message_expiry(&self, message_expiry_micros: u64) {
-        self.default_message_expiry.set(message_expiry_micros);
+    /// Cap the partitions of all streams and topics at `[metadata]
+    /// partitions_max`, zero for no cap. Only the primary checks it, with the
+    /// value of its own node, when it admits a `CreateTopic` or
+    /// `CreatePartitions`, so every node needs the same value.
+    pub fn set_partitions_max(&self, partitions_max: u32) {
+        self.partitions_max.set(partitions_max);
+    }
+
+    /// Give a topic created without a replication factor `factor` nodes, or
+    /// every node for `None`, from `[cluster] default_replication_factor`. Only
+    /// the primary reads it, when it admits a `CreateTopic`, and the topic
+    /// stores the factor it resolved, so every node needs the same value.
+    pub fn set_default_replication_factor(&self, factor: Option<u8>) {
+        self.default_replication_factor.set(factor);
+    }
+
+    /// The failure domain of each node, indexed by node id, from `[cluster]
+    /// nodes`. Placement spreads a partition's members over as many as it can.
+    /// Only the primary reads it, when it admits a create, so every node needs
+    /// the same list.
+    pub fn set_node_racks(&self, racks: &[Option<String>]) {
+        let mut names: Vec<&str> = Vec::new();
+        let domains = racks
+            .iter()
+            .map(|rack| {
+                rack.as_deref().map(|rack| {
+                    let index = names
+                        .iter()
+                        .position(|known| *known == rack)
+                        .unwrap_or_else(|| {
+                            names.push(rack);
+                            names.len() - 1
+                        });
+                    u32::try_from(index).unwrap_or(u32::MAX)
+                })
+            })
+            .collect();
+        self.placement.borrow_mut().set_racks(domains);
+    }
+
+    /// The replication factor a topic created without one gets in a cluster
+    /// of `nodes` nodes: the configured number lowered to `nodes`, or every
+    /// node.
+    #[must_use]
+    pub fn default_replication_factor(&self, nodes: u8) -> u8 {
+        self.default_replication_factor
+            .get()
+            .map_or(nodes, |factor| factor.min(nodes))
+    }
+
+    /// Cap the personal access tokens of each user at `[personal_access_token]
+    /// max_tokens_per_user`, zero for no cap. Only the primary checks it, with
+    /// the value of its own node, when it admits a `CreatePersonalAccessToken`,
+    /// so every node needs the same value.
+    pub fn set_max_tokens_per_user(&self, max_tokens_per_user: u32) {
+        self.max_tokens_per_user.set(max_tokens_per_user);
+    }
+
+    /// The cap that [`Self::set_max_tokens_per_user`] set. Its rejection
+    /// carries only the error code, so an edge that names the cap reads it
+    /// here.
+    #[must_use]
+    pub const fn max_tokens_per_user(&self) -> u32 {
+        self.max_tokens_per_user.get()
     }
 
     /// Fire post-commit notifier. Clones the `Rc` out under a short
@@ -932,13 +1729,41 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     }
 }
 
+/// Stop the process after a WAL append failed and left a claim
+/// [`VsrConsensus::rollback_pipelined_prepare`] could not prove was still its own.
+///
+/// The frontier is then an op ahead of the WAL with no local path back: the failed
+/// prepare was never broadcast, so no peer can repair from it. Stopping IS the repair,
+/// not an escalation: recovery re-derives the frontier from the WAL, which the failed
+/// write never reached. Every alternative keeps serving on numbers this replica just
+/// proved it cannot trust.
+fn fatal_on_unreconcilable_frontier<B>(
+    consensus: &VsrConsensus<B>,
+    op: u64,
+    error: &std::io::Error,
+    rollback: PrepareRollback,
+) -> !
+where
+    B: MessageBus,
+{
+    fatal(
+        FatalReason::UnreconcilableLogFrontier,
+        &format!(
+            "metadata replica {replica} failed to append op {op} ({error}) and could not hand \
+             the op back ({rollback:?}); the in-memory frontier is ahead of the WAL with no \
+             local path back, so this node stops and recovers its frontier from the log",
+            replica = consensus.replica(),
+        ),
+    );
+}
+
 #[allow(clippy::future_not_send)]
 impl<B, J, S, M, SB> Plane<VsrConsensus<B>> for IggyMetadata<VsrConsensus<B>, J, S, M, SB>
 where
     B: MessageBus,
     SB: SuperblockStore,
     J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
@@ -946,6 +1771,7 @@ where
             Error = iggy_common::IggyError,
         >,
 {
+    #[allow(clippy::too_many_lines)]
     async fn on_request(
         &self,
         message: <VsrConsensus<B> as Consensus>::Message<RoutedRequestHeader>,
@@ -967,7 +1793,23 @@ where
         // home-shard transport context, so resends fall back to the
         // consensus-plane (best-effort by VSR id).
         let dispatch = if operation == Operation::Register {
-            register_preflight(consensus, &self.client_table, client_id, user_id)
+            {
+                let outcome = register_preflight(
+                    consensus,
+                    &self.client_table,
+                    client_id,
+                    user_id,
+                    message.body(),
+                    request_checksum,
+                    |created_at| self.mux_stm.users().is_active_account(user_id, created_at),
+                );
+                apply_preflight_consensus_plane(
+                    consensus,
+                    self.fence_lifecycle_preflight(outcome, &message),
+                    client_id,
+                )
+                .await
+            }
         } else {
             let outcome = request_preflight(
                 consensus,
@@ -975,9 +1817,14 @@ where
                 client_id,
                 session,
                 request,
-                request_checksum,
+                operation,
             );
-            apply_preflight_consensus_plane(consensus, outcome, client_id).await
+            apply_preflight_consensus_plane(
+                consensus,
+                self.fence_lifecycle_preflight(outcome, &message),
+                client_id,
+            )
+            .await
         };
         if !dispatch {
             return;
@@ -996,11 +1843,8 @@ where
         // Two-queue admission: prepare slot then project+replicate; prepare
         // full + request room then buffer; both full then drop+warn (SDK
         // retries via read-timeout).
-        if consensus.pipeline().borrow().is_full() {
-            let push_result = consensus
-                .pipeline()
-                .borrow_mut()
-                .push_request(consensus::RequestEntry::new(message));
+        if consensus.pipeline_is_full() {
+            let push_result = consensus.push_queued_request(consensus::RequestEntry::new(message));
             if push_result.is_err() {
                 warn!(
                     target: "iggy.metadata.diag",
@@ -1014,8 +1858,24 @@ where
             return;
         }
 
+        let request_header = *message.header();
         let prepare = match self.prepare_request(message) {
             Ok(prepare) => prepare,
+            Err(refusal) if is_admission_refusal(&refusal) => {
+                let reply = build_result_rejection_reply(
+                    &request_header,
+                    consensus.commit_max(),
+                    refusal.as_code(),
+                );
+                if let Err(error) = consensus
+                    .message_bus()
+                    .send_to_client(client_id, freeze_client_reply(reply.into_generic()))
+                    .await
+                {
+                    debug!(%error, client_id, "admission refusal could not reach client");
+                }
+                return;
+            }
             Err(error) => {
                 // Structurally-invalid request (not client-allowed, undecodable
                 // body, or partition-id overflow). Evict instead of dropping: a
@@ -1088,11 +1948,23 @@ where
             }
         };
 
-        // Fenced by commit: the whole chain has already committed this op, so
-        // nobody needs it again. Drop entirely. (Mirror of the partition
-        // plane's split in `IggyPartition::on_replicate`.)
+        // Fenced by commit: this replica already applied the op, so it is not
+        // journaled or forwarded again. A new primary can still need the ack:
+        // a `DoViewChange` caps its commit at the sender's head, so the view can
+        // restart an op as uncommitted that this replica applied. `send_prepare_ok`
+        // acks only a journaled copy with the same checksum. (Mirror of the
+        // partition plane's split in `IggyPartition::on_replicate`.)
         #[allow(clippy::cast_possible_truncation)]
         if fence_old_prepare_by_commit(consensus, &header) {
+            if consensus.contradicts_applied_log(
+                PlaneKind::Metadata,
+                ContradictionSource::Prepare,
+                header.view,
+                [&header],
+                |op| self.applied_header(op),
+            ) {
+                return;
+            }
             warn!(
                 target: "iggy.metadata.diag",
                 plane = "metadata",
@@ -1101,22 +1973,21 @@ where
                 op = header.op,
                 commit = consensus.commit_max(),
                 operation = ?header.operation,
-                "received old prepare (<= commit), skipping replication"
+                "received old prepare (<= commit), re-acking a matching journaled copy"
             );
+            self.send_prepare_ok(&header).await;
             return;
         }
 
         // Durable here but not yet committed, and the primary is retransmitting
         // it: our original PrepareOk was lost (e.g. the primary's inbox
-        // overflowed under a client burst). Re-forward the tail down the chain
-        // so a downstream replica that missed it recovers, then re-ack ONLY
-        // the retransmitted op. The primary's retransmit cycle walks every
-        // un-acked op in the window (`retransmit_targets`), so a lost ack for
-        // a lower op gets its own retransmit and its own re-ack; re-acking the
+        // overflowed under a client burst). Re-ack only the retransmitted op.
+        // The primary's retransmit cycle walks every
+        // un-acked op in the window (`prepare_timeout_targets`), so a lost ack
+        // for a lower op gets its own retransmit and its own re-ack; re-acking the
         // whole suffix here is O(window^2) PrepareOks per cycle across the
         // backups, which can overflow the primary's inbox -- the very failure
-        // this path recovers from. Both downstream and primary are idempotent
-        // on a duplicate (replica, op).
+        // this path recovers from. The primary is idempotent on duplicate acks.
         #[allow(clippy::cast_possible_truncation)]
         if journal.handle().header(header.op as usize).is_some() {
             warn!(
@@ -1127,16 +1998,12 @@ where
                 op = header.op,
                 commit = consensus.commit_max(),
                 operation = ?header.operation,
-                "journal already holds prepare, re-forwarding + re-acking it"
+                "journal already holds prepare, re-acking it"
             );
             self.replicate(&message).await;
             self.send_prepare_ok(&header).await;
             return;
         }
-
-        // TODO add assertions for valid state here.
-
-        // TODO handle gap in ops.
 
         // Verify hash chain integrity BEFORE checkpoint. `checkpoint_if_needed`
         // can drain WAL entries, making previous_header return None.
@@ -1164,23 +2031,52 @@ where
         // guard, not here.
         self.checkpoint_if_needed(consensus, journal).await;
 
-        // Backup: gap check (op == current_op + 1).
-        // Primary: sequencer pre-advanced by push_prepare_entry (guards
-        // sibling on_request races during journal.append await).
-        // TODO: promote the backup gap warn below to a hard assert or a
-        // repair-session trigger (message repair has landed; the drop-and-
-        // wait-for-retransmit path is the last soft handling left here).
+        // Backup: gap check against the JOURNAL head, not the sequencer.
+        //
+        // The two frontiers can disagree. The sequencer is pre-advanced on the
+        // primary by `push_prepare_entry` and re-synced on a backup only after a
+        // successful append, so a replica can carry a sequencer one ahead of what
+        // its WAL holds. Gating admission on it then rejects the very prepare that
+        // would heal the log: a backup with `last_op = 44` refused op 45 because
+        // its sequencer said to expect 46. The primary retransmits that op for the
+        // life of the process, every backup logs an out-of-order gap, it never
+        // reaches a commit quorum, and its client is never answered.
+        //
+        // `max(last_op, snapshot_op)`, never `last_op` alone. A state transfer
+        // installs a snapshot that IS ops `..=snapshot_op` applied and truncates the
+        // WAL above that floor rather than refilling below it, so `last_op` reads the
+        // receiver as needing an op the snapshot already contains and no peer will
+        // send again. That drop
+        // never heals: an offer built on a quiet cluster carries `commit_op ==
+        // snapshot_seq`, so the install lands `commit_min == commit_max`, and
+        // `maybe_request_metadata_repair`, the only path that refills the head,
+        // arms on `commit_min < commit_max`. With the other backup down the primary
+        // needs this replica's ack to commit anything, so the plane stops on a
+        // cluster still inside its quorum.
+        //
+        // The journal is the only frontier that answers "what can be appended
+        // next", which is what this check is for, and the hash-chain verification
+        // below is stated against it too. A prepare at or below the head that this
+        // replica already holds was re-acked and returned above. What reaches HERE
+        // is the next op or a gap, and not every gap is fillable: metadata repair
+        // covers only `commit_min + 1 ..= commit_max`, so an interior hole below
+        // the head and a forward gap above `commit_max` both sit outside it.
         let is_backup = consensus.is_follower();
         if is_backup {
-            if header.op != current_op + 1 {
+            let handle = journal.handle();
+            let journal_head = handle.last_op().unwrap_or(0).max(handle.snapshot_op());
+            if header.op != journal_head + 1 {
                 warn!(
                     target: "iggy.metadata.diag",
                     plane = "metadata",
                     replica_id = consensus.replica(),
                     op = header.op,
-                    expected = current_op + 1,
+                    expected = journal_head + 1,
+                    sequencer_op = current_op,
                     "on_replicate: dropping out-of-order prepare (gap)"
                 );
+                self.prepare_gap_drops
+                    .set(self.prepare_gap_drops.get().saturating_add(1));
                 return;
             }
         } else {
@@ -1188,6 +2084,13 @@ where
                 header.op, current_op,
                 "primary: sequencer pre-advance broken"
             );
+        }
+
+        // A backup journals only in a state the superblock holds, as the repair
+        // ingest does: a restart then finds the entry under a recorded view, and
+        // drops it when that view's log was never proven here.
+        if is_backup && !self.persist_superblock_if_needed(consensus).await {
+            return;
         }
 
         // Journal append first; sequencer + checksum after successful append
@@ -1198,19 +2101,13 @@ where
         // violates VSR tail-ahead-of-head, recoverable only via hash-chain
         // fence + view change (burns a view).
         //
-        // TODO(hubcio): the primary path violates the invariant in the
-        // comment above. `consensus::impls::push_prepare_entry` pre-advances
-        // `sequencer.set_sequence(header.op)` and
-        // `set_last_prepare_checksum(header.checksum)` BEFORE this append.
-        // If the append below returns `Err`, sequencer + checksum stay
-        // advanced while the WAL holds no matching entry: the next prepare
-        // chains off a phantom op, cluster state diverges, and the
-        // `MetadataHandoff::Waiter` factory bundle propagates the divergence
-        // to peers. Fix: rollback `sequencer.set_sequence` +
-        // `set_last_prepare_checksum` to their captured prior values on
-        // append failure (preferred per CLAUDE.md "no panics in libraries"),
-        // or abort the shard.
+        // On the primary the pre-advance in `push_prepare_entry` already claimed
+        // this op, so a failed append has to hand it back or the next prepare
+        // chains off a phantom (see `rollback_pipelined_prepare`). A refused rollback
+        // leaves the op claimed with nothing durable behind it and no protocol path
+        // back, so the process stops rather than serving on it.
         if let Err(e) = journal.handle().append(message.clone()).await {
+            let rollback = consensus.rollback_pipelined_prepare(&header);
             error!(
                 target: "iggy.metadata.diag",
                 plane = "metadata",
@@ -1218,10 +2115,33 @@ where
                 op = header.op,
                 operation = ?header.operation,
                 error = %e,
+                rollback = ?rollback,
                 "journal append failed"
             );
+            match rollback {
+                // `Unwound`: the op went back and the waiting client wakes with
+                // `Canceled`. `NotPreAdvanced`: a backup never claimed it, advancing
+                // only after its own append succeeds. Neither leaves a disagreement.
+                PrepareRollback::Unwound | PrepareRollback::NotPreAdvanced => {}
+                // Every refusal means the same thing: the claim could not be proved
+                // still this prepare's, so it cannot be safely reversed. Not split
+                // further, since deciding per variant which disagreements are
+                // survivable is the case analysis stopping exists to avoid.
+                PrepareRollback::Superseded { .. }
+                | PrepareRollback::Overtaken { .. }
+                | PrepareRollback::TailMismatch => {
+                    fatal_on_unreconcilable_frontier(consensus, header.op, &e, rollback);
+                }
+            }
             return;
         }
+
+        // Paired with the append, not with the sequencer advance below: a backup
+        // repairing under a `StartView` it already adopted is at the announced head
+        // already, so the entry arriving moves neither number the suffix snapshot
+        // is otherwise tagged by.
+        consensus.note_journal_mutation();
+        consensus.extend_history_certificate(header.op, header.checksum);
 
         // Journal mutation done; wire traffic below must not hold the gate.
         drop(journal_gate);
@@ -1269,11 +2189,8 @@ where
         }
 
         {
-            let pipeline = consensus.pipeline().borrow();
-            if pipeline
-                .entry_by_op_and_checksum(header.op, header.prepare_checksum)
-                .is_none()
-            {
+            if !consensus.pipeline_holds_entry(header.op, header.prepare_checksum) {
+                consensus.handle_late_prepare_ok(header);
                 debug!(
                     target: "iggy.metadata.diag",
                     plane = "metadata",
@@ -1307,7 +2224,7 @@ where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
     J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StateMachine<Input = Message<PrepareHeader>>,
 {
     fn is_applicable<H>(&self, message: &<VsrConsensus<B, P> as Consensus>::Message<H>) -> bool
@@ -1316,7 +2233,7 @@ where
     {
         assert!(matches!(
             message.header().command(),
-            Command2::Request | Command2::Prepare | Command2::PrepareOk
+            Command::Request | Command::Prepare | Command::PrepareOk
         ));
         message.header().operation().is_metadata_plane()
     }
@@ -1386,14 +2303,16 @@ impl StateTransferOffer {
 /// corrupt" call for opposite operator responses.
 #[derive(Debug)]
 pub enum StateTransferUnavailable {
-    /// Not a caught-up primary, so a client-table read would not be
-    /// authoritative.
+    /// Not a caught-up primary (its recovery barrier aside), so a client-table
+    /// read would not be authoritative.
     NotCaughtUpPrimary,
     /// This shard has no snapshot coordinator, so it never checkpoints.
     NoCoordinator,
     /// No snapshot has ever been persisted. The WAL still holds the full
     /// history, so the requester's journal repair covers its whole gap.
     NoSnapshot,
+    /// A checkpoint or detached snapshot writer still owns the snapshot.
+    CheckpointInProgress,
     /// `snapshot.bin` exists but could not be read, or failed its integrity
     /// trailer. Refusing is strictly better than shipping it: the receiver
     /// would re-seal the corruption under a fresh valid trailer.
@@ -1406,6 +2325,7 @@ impl std::fmt::Display for StateTransferUnavailable {
             Self::NotCaughtUpPrimary => write!(f, "not a caught-up primary"),
             Self::NoCoordinator => write!(f, "no snapshot coordinator on this shard"),
             Self::NoSnapshot => write!(f, "no snapshot has been persisted yet"),
+            Self::CheckpointInProgress => write!(f, "snapshot checkpoint is in progress"),
             Self::SnapshotUnreadable(source) => {
                 write!(f, "persisted snapshot is unreadable: {source}")
             }
@@ -1425,23 +2345,28 @@ impl std::error::Error for StateTransferUnavailable {
 /// What a completed [`IggyMetadata::install_state_transfer`] landed.
 ///
 /// A degraded install is reported HERE rather than as an `Err`, because it is
-/// a success: the snapshot, table, frontiers and commit point are all in
-/// place by the time the pairing write is attempted. Returning it as an error
-/// invites a caller to treat a completed install as a failure and redo it.
+/// a success: the snapshot, table, frontiers and commit point all land, and
+/// only the superblock record of the new pairing is missing. Returning it as an
+/// error invites a caller to treat a completed install as a failure and redo it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstallOutcome {
-    /// The receiver's new applied frontier, `max(snapshot_seq,
+    /// The receiver's applied position after the install, `max(snapshot_seq,
     /// local_applied)`. These differ whenever a serving peer offered a
     /// snapshot BEHIND this replica and the local state machine was kept.
-    pub applied_frontier: u64,
+    ///
+    /// Named apart from [`IggyMetadata::applied_frontier`] deliberately: that
+    /// one is the node-wide cell the read gate consults, which the install
+    /// raises to `snapshot_seq` alone, so the two carry different numbers
+    /// exactly when a behind-snapshot was kept.
+    pub installed_frontier: u64,
     /// Whether the transferred checkpoint's `(checkpoint_op, checksum)`
     /// pairing reached the durable superblock.
     ///
     /// `false` leaves the install fully usable: the coordinator already holds
     /// the new pairing, so the next superblock write (view change or
-    /// checkpoint) records it. Until then a crash recovers the PREVIOUS
-    /// checkpoint and this replica transfers again -- correct, just wasted
-    /// work.
+    /// checkpoint) records it. Until then a crash boots the transferred
+    /// snapshot under the PREVIOUS pairing, which recovery accepts as a lagging
+    /// checkpoint.
     pub pairing_durable: bool,
 }
 
@@ -1450,7 +2375,7 @@ where
     B: MessageBus,
     SB: SuperblockStore,
     J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
@@ -1481,29 +2406,62 @@ where
     /// generation reuses it instead of re-reading and re-decoding the file on
     /// shard 0's pump.
     ///
+    /// Served below the recovery barrier too, see
+    /// [`consensus::is_caught_up_primary_except_barrier`]: everything shipped is at
+    /// or below `commit_min`, and the requester may be the only replica left that
+    /// can ack the recovered suffix the barrier waits for.
+    ///
     /// # Errors
     /// [`StateTransferUnavailable`] naming why this replica cannot serve.
-    pub fn state_transfer_offer(&self) -> Result<Rc<StateTransferOffer>, StateTransferUnavailable> {
+    #[allow(clippy::future_not_send)]
+    pub async fn state_transfer_offer(
+        &self,
+    ) -> Result<Rc<StateTransferOffer>, StateTransferUnavailable> {
+        let _checkpoint = self
+            .checkpoint_lock
+            .try_acquire()
+            .ok_or(StateTransferUnavailable::CheckpointInProgress)?;
+        let _snapshot_io = if self
+            .coordinator
+            .as_ref()
+            .is_none_or(|coordinator| matches!(coordinator.io, SnapshotIo::Compio))
+        {
+            Some(
+                SNAPSHOT_IO
+                    .try_lock()
+                    .ok_or(StateTransferUnavailable::CheckpointInProgress)?,
+            )
+        } else {
+            None
+        };
         let consensus = self
             .consensus
             .as_ref()
             .ok_or(StateTransferUnavailable::NoCoordinator)?;
-        if !is_caught_up_primary(consensus) {
+        if !is_caught_up_primary_except_barrier(consensus) {
             return Err(StateTransferUnavailable::NotCaughtUpPrimary);
         }
         let coordinator = self
             .coordinator
             .as_ref()
             .ok_or(StateTransferUnavailable::NoCoordinator)?;
-        let path = coordinator.snapshot_path();
-        if !path.exists() {
-            return Err(StateTransferUnavailable::NoSnapshot);
+        if let Some(cached) = self.transfer_offer_cache.borrow().as_ref() {
+            return Ok(Rc::clone(cached));
         }
-        let sealed = std::fs::read(&path)
-            .map_err(|source| StateTransferUnavailable::SnapshotUnreadable(source.into()))?;
+        let path = coordinator.snapshot_path();
+        let sealed = coordinator.io.read(&path).await.map_err(|source| {
+            if source.kind() == io::ErrorKind::NotFound {
+                StateTransferUnavailable::NoSnapshot
+            } else {
+                StateTransferUnavailable::SnapshotUnreadable(source.into())
+            }
+        })?;
+        if !is_caught_up_primary_except_barrier(consensus) {
+            return Err(StateTransferUnavailable::NotCaughtUpPrimary);
+        }
         // Verifies the trailer and hands back the payload alone.
         let (payload, _) =
-            split_trailer(&sealed, &path).map_err(StateTransferUnavailable::SnapshotUnreadable)?;
+            split_trailer(&sealed).map_err(StateTransferUnavailable::SnapshotUnreadable)?;
         // Still decoded rather than read off `last_checkpoint()`: `write_durably`
         // renames before the parent-dir fsync, so a DirSync failure leaves the new
         // file live with that cell stale, and the offer would then under-advertise
@@ -1511,16 +2469,6 @@ where
         let snapshot_seq = IggySnapshot::decode(payload)
             .map_err(StateTransferUnavailable::SnapshotUnreadable)?
             .sequence_number();
-
-        // Reuse the cached offer for this generation. Only the SNAPSHOT half is
-        // expensive to rebuild, and the cached table is merely older, never
-        // incoherent: its frontier is stamped at its own encode, and the receiver
-        // replays everything above that frontier during tail repair.
-        if let Some(cached) = self.transfer_offer_cache.borrow().as_ref()
-            && cached.snapshot_seq == snapshot_seq
-        {
-            return Ok(Rc::clone(cached));
-        }
 
         let commit_op = consensus.commit_min();
         let table = self.client_table.borrow().encode();
@@ -1550,14 +2498,23 @@ where
         Ok(offer)
     }
 
-    /// Install a fetched state transfer: persist + restore the snapshot,
-    /// replace the client table, and jump the commit state to the snapshot
-    /// floor so the tail repair takes over from there.
+    /// Hold the checkpoint gate as a checkpoint that never finishes would: every
+    /// state transfer offer is refused as `CheckpointInProgress` until the guard
+    /// drops. `None` while a checkpoint holds it.
+    #[cfg(feature = "simulator")]
+    #[must_use]
+    pub const fn hold_checkpoint_gate(&self) -> Option<journal::local_gate::LocalGateGuard<'_>> {
+        self.checkpoint_lock.try_acquire()
+    }
+
+    /// Install a fetched state transfer without rewinding either the state
+    /// machine or client table, then let tail repair continue above the local
+    /// applied frontier.
     ///
     /// Ordering: persist FIRST (a crash mid-install must reboot from the
-    /// transferred state, not the pre-transfer one), then the in-place STM
-    /// restore (readers observe it on their next read), then the table +
-    /// frontier, then journal/commit bookkeeping.
+    /// transferred state, not the pre-transfer one), then the WAL truncate, then
+    /// the in-place STM restore (readers observe it on their next read), then the
+    /// table + frontier, then commit bookkeeping.
     ///
     /// The partition plane is deliberately untouched: partitions load
     /// whatever their disks hold at boot and repair through their own
@@ -1567,18 +2524,20 @@ where
     /// reconciler's periodic full diff against the committed STM, which
     /// reads the restored state on its next tick.
     ///
-    /// Returns an [`InstallOutcome`]: the new applied frontier, plus whether
+    /// Returns an [`InstallOutcome`]: the installed frontier, plus whether
     /// the transferred checkpoint's pairing reached the durable superblock.
     ///
     /// # Errors
     /// [`SnapshotError`] when the snapshot bytes do not decode, the persist
-    /// fails, or the in-place restore is rejected. Every `Err` here means
-    /// NOTHING was installed.
+    /// fails, or the in-place restore is rejected. An `Err` leaves the state
+    /// machine, client table and frontiers as they were. The snapshot file, the
+    /// superblock record and the WAL suffix above the incoming floor can already
+    /// have moved, each in an order a restart recovers from.
     ///
     /// # Panics
     /// If called on a shard without consensus (state transfer is a shard-0
     /// concern).
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn install_state_transfer(
         &self,
         snapshot_bytes: &[u8],
@@ -1594,8 +2553,19 @@ where
             .as_ref()
             .expect("install_state_transfer: consensus only exists on shard 0");
 
+        // Refuses a format version this build does not read, ahead of every frontier
+        // move below: the bytes come from a peer, so its build picked the shape.
         let snapshot = IggySnapshot::decode(snapshot_bytes)?;
         let snapshot_seq = snapshot.sequence_number();
+
+        // The one place a snapshot crosses builds, so the only place the release
+        // stamp answers a question the local logs cannot.
+        tracing::info!(
+            snapshot_seq,
+            format_version = snapshot.snapshot().version,
+            writer_release = %ProtocolVersion(snapshot.snapshot().writer_release),
+            "decoded a transferred metadata snapshot"
+        );
 
         // Manifest coherence. `commit_op` and `table_frontier` arrive from the
         // serving peer and are applied to THIS replica's frontiers, so a
@@ -1605,7 +2575,7 @@ where
         // built from one caught-up-primary read in `state_transfer_offer`.
         // Refuse rather than install, which drops the caller back to journal
         // repair with the local state untouched.
-        if commit_op < snapshot_seq || table_frontier > commit_op {
+        if commit_op < snapshot_seq || table_frontier < snapshot_seq || table_frontier > commit_op {
             tracing::error!(
                 snapshot_seq,
                 commit_op,
@@ -1627,9 +2597,8 @@ where
         // commit walk never revisits ops it already counted as applied, so
         // the rewound-over effects would be lost until the next transfer.
         // Keep the local STM (it is a superset) and let tail repair cover
-        // `(commit_min, commit_op]`. The client table still installs below:
-        // it comes from the serving primary's LIVE state at `table_frontier
-        // == commit_op`, which is never behind this replica.
+        // `(commit_min, commit_op]`. The table is checked separately below:
+        // a cached offer can also lag the local table's committed protection.
         // Preliminary read, only to decide whether the gates are needed; the
         // binding decision is re-derived under them below.
         let snapshot_ahead = snapshot_seq > consensus.commit_min();
@@ -1652,8 +2621,7 @@ where
         // withholds acks, but "should not be committing" is not an invariant
         // this path can rest on.
         //
-        // Deadlock-free: nothing between here and the superblock write awaits,
-        // and `write_superblock` takes no lock of its own.
+        // `write_superblock` takes no lock of its own.
         let _install_gates = if snapshot_ahead {
             let checkpoint = self.checkpoint_lock.acquire().await;
             let superblock = if self.superblock.is_some() {
@@ -1674,9 +2642,20 @@ where
         // snapshot.bin, regress its pairing, and rewind the STM below the
         // applied frontier -- then panic on `set_commit_floor`'s anti-rewind
         // assert with the damage already durable.
-        let local_applied = consensus.commit_min();
-        let snapshot_ahead = snapshot_seq > local_applied;
+        let mut local_applied = consensus.commit_min();
+        let mut snapshot_ahead = snapshot_seq > local_applied;
 
+        let snapshot_table = if snapshot_ahead {
+            let table = snapshot
+                .snapshot()
+                .client_table
+                .clone()
+                .ok_or(SnapshotError::MissingClientTable)?;
+            Some(ClientTable::from_snapshot(table).map_err(SnapshotError::ClientTable)?)
+        } else {
+            None
+        };
+        let mut pairing_durable = true;
         if snapshot_ahead {
             if let Some(coordinator) = &self.coordinator {
                 // The transferred snapshot REPLACES the one the superblock's
@@ -1692,16 +2671,19 @@ where
                 // Write the received bytes verbatim rather than re-encoding the
                 // decoded snapshot: the checksum below is taken over exactly the
                 // bytes that reach the file, so the pairing provably describes it.
-                debug_assert!(
-                    snapshot_seq >= coordinator.last_checkpoint().0,
-                    "a transferred snapshot must not land below the recorded \
-                     checkpoint op ({} < {}); recovery would refuse boot with \
-                     CheckpointAheadOfSnapshot",
-                    snapshot_seq,
-                    coordinator.last_checkpoint().0
-                );
+                // A failed earlier install can leave the durable checkpoint ahead
+                // of the STM. Replacing it with an older snapshot would make a
+                // crash before the next superblock write refuse recovery.
+                if snapshot_seq < coordinator.last_checkpoint().0 {
+                    return Err(SnapshotError::InvalidState(
+                        "state transfer snapshot is older than the durable checkpoint",
+                    ));
+                }
                 let checksum = checkpoint_checksum(snapshot_bytes);
-                IggySnapshot::write_durably(&coordinator.snapshot_path(), snapshot_bytes)?;
+                self.clear_state_transfer_offer_cache();
+                let mut encoded = Vec::with_capacity(snapshot_bytes.len() + SNAPSHOT_TRAILER_LEN);
+                encoded.extend_from_slice(snapshot_bytes);
+                coordinator.write_snapshot(encoded).await?;
                 coordinator.seed_last_checkpoint(snapshot_seq, checksum);
                 tracing::info!(
                     checkpoint_op = snapshot_seq,
@@ -1715,21 +2697,208 @@ where
                 );
             }
 
-            self.mux_stm
-                .restore_snapshot_in_place(snapshot.snapshot())?;
+            let (truncate_from, remove_boundary) =
+                self.journal
+                    .as_ref()
+                    .map_or((snapshot_seq + 1, false), |journal| {
+                        let journal = journal.handle();
+                        let head = journal.last_op().unwrap_or(snapshot_seq).max(snapshot_seq);
+                        let pending = consensus
+                            .pending_view_log()
+                            .or_else(|| consensus.adopted_view_log());
+                        let log_proven = consensus.is_normal()
+                            && consensus.log_view() == consensus.view()
+                            && !consensus.view_log_unproven()
+                            && consensus.history_certified();
+                        let is_vouched = |header: &PrepareHeader| {
+                            header.checksum != CHECKSUM_UNSEALED
+                                && header.op <= consensus.sequencer().current_sequence()
+                                && (log_proven
+                                    || pending.as_ref().is_some_and(|pending| {
+                                        pending
+                                            .headers
+                                            .iter()
+                                            .chain(pending.committed_elsewhere.iter())
+                                            .any(|named| {
+                                                named.op == header.op
+                                                    && named.checksum == header.checksum
+                                            })
+                                    }))
+                        };
+                        let remove_boundary = usize::try_from(snapshot_seq)
+                            .ok()
+                            .and_then(|slot| journal.header(slot))
+                            .is_some_and(|header| !is_vouched(&header));
+                        let truncate_from = (snapshot_seq + 1..=head)
+                            .find(|op| {
+                                usize::try_from(*op)
+                                    .ok()
+                                    .and_then(|slot| journal.header(slot))
+                                    .is_none_or(|header| !is_vouched(&header))
+                            })
+                            .unwrap_or_else(|| head.saturating_add(1));
+                        if remove_boundary && truncate_from == snapshot_seq + 1 {
+                            (snapshot_seq, false)
+                        } else {
+                            (truncate_from, remove_boundary)
+                        }
+                    });
+
+            // The truncate below can remove the entry the history certificate is
+            // bound to, so the binding moves to the highest entry it keeps and
+            // reaches the superblock first, in one record with the pairing above.
+            // Bound to an entry rather than to the snapshot alone: without a
+            // coordinator the record pairs no checkpoint, and only the entry's
+            // checksum proves the binding after a restart.
+            if let Some(journal) = &self.journal {
+                let (mut op, mut checksum) = metadata_wal_head(journal.handle(), truncate_from);
+                if remove_boundary && op == snapshot_seq {
+                    (op, checksum) = metadata_wal_head(journal.handle(), snapshot_seq);
+                }
+                consensus.lower_history_certificate(truncate_from, op, checksum);
+                if remove_boundary
+                    && consensus
+                        .history_certificate()
+                        .is_some_and(|certificate| certificate.op == snapshot_seq)
+                {
+                    let (op, checksum) = metadata_wal_head(journal.handle(), snapshot_seq);
+                    consensus.lower_history_certificate(snapshot_seq, op, checksum);
+                }
+            }
+            if let Some(superblock) = self.superblock.as_ref() {
+                // Already under `_install_gates`, acquired above; re-acquiring here
+                // would deadlock on the same non-reentrant gate.
+                pairing_durable = self.write_superblock(consensus, superblock.as_ref()).await;
+                // A failed write is only DEGRADED while the durable binding survives
+                // the truncate: the snapshot on disk subsumes the recorded pairing,
+                // which `verify_checkpoint_pairing` accepts as a lagging checkpoint.
+                if !pairing_durable {
+                    if consensus.history_certificate_needs_persist() {
+                        return Err(SnapshotError::HistoryBindingNotDurable { snapshot_seq });
+                    }
+                    tracing::error!(
+                        snapshot_seq,
+                        commit_op,
+                        "state transfer superblock write failed; the transferred \
+                         checkpoint is not durable yet"
+                    );
+                }
+            }
+            if let Some(journal) = &self.journal {
+                // An acknowledged entry may be committed above the offered checkpoint.
+                // Keep the prefix whose identities the installed view proves, or a
+                // later DoViewChange could falsely nack it. The commit walk matches
+                // by op, so the first unvouched entry and everything above still go
+                // before the snapshot advances its floor. Appends are excluded while
+                // transferring, and the lowered binding is already durable above.
+                let removed = journal
+                    .handle()
+                    .truncate_from(truncate_from)
+                    .await
+                    .map_err(SnapshotError::Io)?;
+                if removed > 0 {
+                    // The DVC snapshot's head and commit point do not move when
+                    // entries are removed under them; left stale it would advertise
+                    // headers this replica can no longer serve.
+                    consensus.note_journal_mutation();
+                }
+                // The checkpoint replaces an unvouched boundary, but a separately
+                // vouched suffix may contain the last copy of a committed entry.
+                let boundary_removed = if remove_boundary {
+                    let removed = journal
+                        .handle()
+                        .remove_range(snapshot_seq..=snapshot_seq)
+                        .await
+                        .map_err(SnapshotError::Io)?;
+                    if removed > 0 {
+                        consensus.note_journal_mutation();
+                    }
+                    removed
+                } else {
+                    0
+                };
+                let removed = removed + boundary_removed;
+                if removed > 0 {
+                    tracing::warn!(
+                        snapshot_seq,
+                        truncate_from,
+                        removed,
+                        "state transfer dropped {removed} unvouched journal entries"
+                    );
+                }
+            }
+
+            // Commits may progress while the snapshot reaches disk. Its bytes remain
+            // a valid checkpoint, but must not replace a newer in-memory state.
+            local_applied = consensus.commit_min();
+            snapshot_ahead = snapshot_seq > local_applied;
+            if snapshot_ahead {
+                let capacities = self.change_log.capacities().map_err(|_| {
+                    SnapshotError::InvalidState("change log restore reached a read-only view")
+                })?;
+                let change_log = snapshot.snapshot().change_log.restore(capacities)?;
+                self.mux_stm
+                    .restore_snapshot_in_place(snapshot.snapshot())?;
+                // Replaced with the state machines and before the frontier
+                // jumps. The kept WAL suffix appends through the commit walk.
+                self.change_log.restore(change_log).map_err(|_| {
+                    SnapshotError::InvalidState("change log restore reached a read-only view")
+                })?;
+            }
         } else {
             tracing::info!(
                 snapshot_seq,
                 local_applied,
                 "transferred snapshot at or below the local applied frontier; \
-                 keeping the local state machine and installing the table only"
+                 keeping the local state machine"
             );
         }
 
-        *self.client_table.borrow_mut() = client_table;
-        self.client_table_frontier.set(table_frontier);
+        let protection_frontier = table_frontier.max(self.client_table_frontier.get());
+        let replay_table = if snapshot_ahead && protection_frontier > snapshot_seq {
+            snapshot_table
+        } else if !snapshot_ahead
+            && table_frontier > local_applied
+            && self.replay_client_table.borrow().is_none()
+        {
+            let local_table = self.client_table.borrow();
+            Some(if local_table.capacity_committed() {
+                ClientTable::from_snapshot(local_table.to_snapshot())
+                    .map_err(SnapshotError::ClientTable)?
+            } else {
+                ClientTable::new(local_table.capacity())
+            })
+        } else {
+            None
+        };
+        if snapshot_ahead || replay_table.is_some() {
+            *self.replay_client_table.borrow_mut() = replay_table.map(RefCell::new);
+        }
 
+        // Commits can advance while the install awaits. A prior transfer may
+        // also have installed a table ahead of the local state machine.
+        let local_table_frontier = consensus.commit_min().max(self.client_table_frontier.get());
+        if table_frontier >= local_table_frontier {
+            let configured_capacity = self.client_table.borrow().capacity();
+            if client_table.capacity_committed() && configured_capacity != client_table.capacity() {
+                warn!(
+                    configured_capacity,
+                    committed_capacity = client_table.capacity(),
+                    "metadata retry capacity is fixed by committed state; ignoring local configuration"
+                );
+            }
+            *self.client_table.borrow_mut() = client_table;
+            self.client_table_frontier.set(table_frontier);
+        } else {
+            tracing::info!(
+                table_frontier,
+                local_table_frontier,
+                "transferred client table below the local table frontier; keeping the local client table"
+            );
+        }
         if snapshot_ahead {
+            self.applied_frontier
+                .record_recovery_revision(self.mux_stm.streams().read(|inner| inner.revision));
             // Entries at or below the installed floor are superseded by the
             // snapshot; without this the journal's wrap-eviction assert trips
             // on pre-transfer residents the next time slots recycle.
@@ -1743,249 +2912,137 @@ where
             // The snapshot IS ops `..=snapshot_seq` applied: jump the applied
             // frontier (this is the op-jump the tail repair resumes from) and
             // let the announced commit point pull the walk target forward.
-            //
-            // TODO(suffix-truncation): this hands the commit walk a floor it never
-            // verified. `set_snapshot_op` above only marks entries at or below the
-            // floor EVICTABLE -- everything above it stays resident -- and the walk
-            // matches WAL entries by op number alone, with no view or hash-chain
-            // check. A node carrying a pre-crash prepared-but-uncommitted suffix that
-            // a view change has since reassigned cluster-side will therefore apply
-            // those stale bodies as committed. The client table is shielded (the
-            // `client_table_frontier` fence skips table effects at or below the
-            // transferred frontier); the state machine is not.
-            //
-            // Same root cause as the `TODO(suffix-truncation)` in
-            // `VsrConsensus::handle_start_view`, and the same missing piece closes
-            // both: a durable truncate-from-op primitive on the journal, so a floor
-            // jump can discard the suffix above it instead of leaving it to be
-            // matched by op number. The floor jump does not create the hole, but it
-            // widens exposure to it precisely on the nodes guaranteed to have a stale
-            // log -- every state-transfer receiver is one. Deliberately out of scope
-            // here (flagged in review as follow-up): the primitive is a journal
-            // durability change, not a state-transfer one.
+            // The walk matches WAL entries by op number alone, so every retained
+            // entry above the floor must be vouched for by the installed view.
             consensus.set_commit_floor(snapshot_seq);
             if snapshot_seq > consensus.sequencer().current_sequence() {
                 consensus.sequencer().set_sequence(snapshot_seq);
             }
+            self.advance_applied_frontier(snapshot_seq);
         }
-        // Before the superblock write, so the durable record carries the frontier
-        // this transfer just established rather than the pre-transfer one.
         consensus.advance_commit_max(commit_op);
 
-        // Make the transferred checkpoint durable, mirroring the ordering a local
-        // checkpoint uses (persist snapshot -> record the pairing -> only then treat
-        // it as the recovery floor). A crash before this lands recovers the previous
-        // checkpoint with the WAL intact and the transfer simply retries; a crash
-        // after it recovers the transferred state. Failing here withholds nothing
-        // already written -- the snapshot on disk subsumes the recorded pairing, which
-        // `verify_checkpoint_pairing` accepts -- so it is reported as a DEGRADED
-        // install rather than a failed one.
-        let mut pairing_durable = true;
-        if snapshot_ahead && let Some(superblock) = self.superblock.as_ref() {
-            // Already under `_install_gates`, acquired above; re-acquiring here
-            // would deadlock on the same non-reentrant gate.
-            pairing_durable = self.write_superblock(consensus, superblock.as_ref()).await;
-            if !pairing_durable {
-                tracing::error!(
-                    snapshot_seq,
-                    commit_op,
-                    "state transfer installed but the superblock write failed; the \
-                     transferred checkpoint is not durable yet"
-                );
-            }
-        }
-
         Ok(InstallOutcome {
-            applied_frontier: snapshot_seq.max(local_applied),
+            installed_frontier: snapshot_seq.max(local_applied),
             pairing_durable,
         })
     }
 
-    /// Submit `Register` from in-process, await commit. Wire reply still fires
-    /// via `message_bus.send_to_client`; subscriber is additive.
+    /// Register a new identity or resolve a matching login retry to its original session.
     ///
-    /// Every bind proposes -- there is deliberately no fast path returning an
-    /// existing entry's state. A bind is a fencing event: only a committed
-    /// Register moves the entry's epoch (to the register's commit op), and
-    /// that bump is what fences the previous holder of this session
-    /// (`RequestStatus::Fenced`). Short-circuiting a rebind would leave two
-    /// live holders sharing one fence, the zombie scenario the epoch exists
-    /// to kill. Rebinding onto an existing entry preserves its watermark and
-    /// reply ring, which is how session resume works.
-    ///
-    /// # Returns
-    /// [`BoundSession`]: the fence epoch the client must stamp into `session`,
-    /// plus the entry's current watermark so a caller that lost its position
-    /// (the HTTP gateway after a restart) can resume numbering above it.
+    /// A primary behind its committed frontier queues the request and checks
+    /// ownership and capacity after catch-up.
     ///
     /// # Errors
-    /// [`MetadataSubmitError`]. All transient except
-    /// `ClientIdOwnedByAnotherUser`, which is terminal: `NotPrimary`,
-    /// `NotCaughtUp`, `PipelineFull`, `InProgress`, `Canceled`. `Canceled`
-    /// dominates on view change; the new primary inherits via
-    /// `commit_journal` and the SDK retries.
+    /// Returns a terminal ownership conflict or a transient admission failure.
     ///
     /// # Panics
-    /// On `client_id == 0` or shard without consensus.
-    ///
-    /// # Safety
-    /// Catch-up gate load-bearing: a Register dispatched with
-    /// `commit_min < commit_max` can double-commit against an inherited one,
-    /// fencing the live client's fresh reply for no reason.
+    /// If called with client zero or outside the metadata consensus shard.
     #[allow(clippy::future_not_send)]
     pub async fn submit_register_in_process(
         &self,
         client_id: u128,
         user_id: u32,
+        registration: RegisterRequest,
     ) -> Result<BoundSession, MetadataSubmitError> {
         assert!(client_id != 0, "client_id 0 is reserved for internal use");
+        if message_bus::is_server_internal_client(client_id) {
+            return Err(MetadataSubmitError::Unauthenticated);
+        }
         let consensus = self
             .consensus
             .as_ref()
-            .expect("submit_register_in_process: consensus only exists on shard 0");
-
-        // Wrong node: waiting or queueing cannot fix that, the client must
-        // re-route to the primary.
+            .expect("registration only exists on the metadata shard");
         if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
             return Err(MetadataSubmitError::NotPrimary);
         }
-
-        // OWNERSHIP GATE: the login frame's `client` field is caller-supplied,
-        // and `resolve_acting_user_id` resolves authority for every replicated
-        // op from this entry, so rebinding someone else's entry would run the
-        // caller's ops under that user (and `commit_register` would clobber
-        // its `user_id`). Refuse unless the authenticated user owns it.
-        // Terminal (see `ClientIdOwnedByAnotherUser`). An owned entry falls
-        // through: the rebind must commit so the epoch actually moves.
-        //
-        // Only a CAUGHT-UP primary may issue it, like both sibling readers of
-        // this table (`request_preflight` and `register_preflight`, which gate
-        // the same way): the refusal is terminal, so a lagging or diverged
-        // replica answering it would deny a legitimate login off state it has
-        // not finished applying, and the client would never learn to redirect.
-        // Not caught up therefore SKIPS the check rather than refusing -- the
-        // register goes on to park in the request queue below, and
-        // `register_preflight` re-applies this gate when the commit path
-        // promotes it, by which point the table is authoritative.
         if is_caught_up_primary(consensus) {
-            let table = self.client_table.borrow();
-            if let Some(owner) = table.get_user_id(client_id)
-                && owner != user_id
+            if !self
+                .mux_stm
+                .users()
+                .is_active_account(user_id, registration.user_created_at)
             {
-                warn!(
-                    target: "iggy.metadata.diag",
-                    client_id,
-                    authenticated_user = user_id,
-                    entry_owner = owner,
-                    "refusing register: client id is registered to a different user"
-                );
-                return Err(MetadataSubmitError::ClientIdOwnedByAnotherUser);
+                return Err(MetadataSubmitError::Unauthenticated);
             }
-        }
-
-        // Mirror wire-path register_preflight: a racing second prepare would
-        // commit a second register and bump the epoch past the first reply's.
-        // Surface pre-synthesis. Scans both the prepare queue and the request
-        // queue, so a register absorbed below dedups its own replays.
-        if consensus
-            .pipeline()
-            .borrow()
-            .has_message_from_client(client_id)
-        {
-            return Err(MetadataSubmitError::InProgress);
-        }
-
-        let request = build_register_request_message(consensus, client_id, user_id);
-        // Wire path runs `RoutedRequestHeader::validate` at network boundary;
-        // in-process skips it. debug_assert pins drift.
-        debug_assert!(
-            {
-                use iggy_binary_protocol::ConsensusHeader;
-                request.header().validate().is_ok()
-            },
-            "build_register_request_message produced a header that fails validate()"
-        );
-
-        // Fence floor, snapshotted BEFORE dispatch. This register's op is
-        // assigned above the journal tail, so it is strictly greater than
-        // `commit_max` is now -- which is what lets the cancel path below tell
-        // OUR fence from an older entry's that happened to survive.
-        let epoch_floor = consensus.commit_max();
-
-        // Not caught up (admitting a register while a committed op is still
-        // unapplied risks a double-register fence bump) or prepare queue full:
-        // absorb into the request queue instead of bouncing with a transient
-        // error. The queued entry carries this caller's reply subscriber; the
-        // commit path promotes it (`drain_request_queue_into_prepares`, which
-        // re-runs `register_preflight` and so applies the ownership gate) as
-        // soon as the in-flight batch drains, and the await below resolves
-        // exactly like the direct dispatch would.
-        if !is_caught_up_primary(consensus) || consensus.pipeline().borrow().is_full() {
-            let (entry, receiver) = consensus::RequestEntry::with_subscriber(request);
-            if consensus
-                .pipeline()
-                .borrow_mut()
-                .push_request(entry)
-                .is_err()
-            {
-                // Both queues full: honest terminal backpressure.
+            let table = self.client_table.borrow();
+            match table.registered_session(client_id, user_id, registration.bind_verifier) {
+                Ok(Some(epoch)) => {
+                    return Ok(BoundSession {
+                        epoch,
+                        watermark: table.get_watermark(client_id).unwrap_or(0),
+                    });
+                }
+                Err(_) => return Err(MetadataSubmitError::ClientIdOwnedByAnotherUser),
+                Ok(None) => {}
+            }
+            if !consensus.has_retry_capacity(&table, client_id) {
                 return Err(MetadataSubmitError::PipelineFull);
             }
-            return match receiver.await {
-                // The reply's `commit` IS the fence `commit_register` just
-                // stored (`build_reply_message` stamps it from the prepare's
-                // op), so take it from there rather than re-reading the table.
-                Ok(reply) => {
-                    self.bound_session(client_id, Some(reply.header().commit), epoch_floor)
-                }
-                // Entry dropped before commit: view-change reset, or a
-                // promotion-time preflight rejection.
-                Err(Canceled) => self.bound_session(client_id, None, epoch_floor),
-            };
         }
-        // `prepare_request` only fails on `!is_client_allowed`; Register is
-        // allowed, so unreachable. Panic loudly on regression instead of
-        // smuggling through wire-eviction.
-        let prepare = self
-            .prepare_request(request)
-            .expect("Operation::Register is client-allowed; prepare projection cannot fail");
-
-        match self.dispatch_prepare_and_await(consensus, prepare).await {
-            Ok(reply) => self.bound_session(client_id, Some(reply.header().commit), epoch_floor),
-            Err(Canceled) => self.bound_session(client_id, None, epoch_floor),
+        if consensus.pipeline_has_message_from_client(client_id) {
+            return Err(MetadataSubmitError::InProgress);
         }
+        let request = build_register_request_message(consensus, client_id, user_id, registration);
+        if !is_caught_up_primary(consensus) || consensus.pipeline_is_full() {
+            let (entry, receiver) = consensus::RequestEntry::with_subscriber(request);
+            if consensus.push_queued_request(entry).is_err() {
+                return Err(MetadataSubmitError::PipelineFull);
+            }
+            let _ = receiver.await;
+        } else {
+            let prepare = self
+                .prepare_request(request)
+                .expect("Register is a client-allowed operation");
+            let _ = self.dispatch_prepare_and_await(consensus, prepare).await;
+        }
+        self.bound_session(client_id, user_id, registration)
     }
 
-    /// Assemble the bind result in one table borrow.
-    ///
-    /// `committed_epoch` is `Some` when this call's own Register committed, in
-    /// which case the fence comes from the reply that carries it. `None` is the
-    /// view-change cancel path, where the fence has to be read back -- and is
-    /// only ours if it sits above `epoch_floor`. An entry at or below the floor
-    /// predates this register, so returning its epoch would hand the caller a
-    /// fence that never moved, and nothing downstream would notice: a stale
-    /// epoch satisfies `check_request`'s equality test, so there is no `Fenced`
-    /// and no `EpochAhead` to surface it. `Canceled` instead, and the retry
-    /// gets a real bind.
-    ///
-    /// `Canceled` also covers an absent entry (evicted between commit and
-    /// read).
     fn bound_session(
         &self,
         client_id: u128,
-        committed_epoch: Option<u64>,
-        epoch_floor: u64,
+        user_id: u32,
+        registration: RegisterRequest,
     ) -> Result<BoundSession, MetadataSubmitError> {
+        if !self
+            .mux_stm
+            .users()
+            .is_active_account(user_id, registration.user_created_at)
+        {
+            return Err(MetadataSubmitError::Unauthenticated);
+        }
         let table = self.client_table.borrow();
-        let epoch = committed_epoch.or_else(|| {
-            table
-                .get_epoch(client_id)
-                .filter(|&epoch| epoch > epoch_floor)
-        });
-        epoch
-            .zip(table.get_watermark(client_id))
-            .map(|(epoch, watermark)| BoundSession { epoch, watermark })
-            .ok_or(MetadataSubmitError::Canceled)
+        let epoch = table
+            .registered_session(client_id, user_id, registration.bind_verifier)
+            .map_err(|_| MetadataSubmitError::ClientIdOwnedByAnotherUser)?
+            .ok_or(MetadataSubmitError::Canceled)?;
+        Ok(BoundSession {
+            epoch,
+            watermark: table.get_watermark(client_id).unwrap_or(0),
+        })
+    }
+
+    fn fence_lifecycle_preflight(
+        &self,
+        outcome: PreflightOutcome,
+        request: &Message<RoutedRequestHeader>,
+    ) -> PreflightOutcome {
+        if let PreflightOutcome::Replay(reply) = &outcome
+            && let Some(bytes) = reply.as_slice().get(..size_of::<ReplyHeader>())
+            && let Ok(header) = bytemuck::checked::try_from_bytes::<ReplyHeader>(bytes)
+            && self.mux_stm.streams().lifecycle_pending(header.op)
+        {
+            return PreflightOutcome::NotReady;
+        }
+        if matches!(outcome, PreflightOutcome::Dispatch)
+            && self
+                .mux_stm
+                .streams()
+                .request_lifecycle_blocked(request.header().operation, request.body())
+        {
+            return PreflightOutcome::Reject(IggyError::TransientNotAccepted.as_code());
+        }
+        outcome
     }
 
     /// Turn a non-`Dispatch` [`PreflightOutcome`] into the answer the home
@@ -1998,19 +3055,16 @@ where
     /// commit.
     fn answer_preflight(
         consensus: &VsrConsensus<B>,
-        request_header: &RoutedRequestHeader,
+        users: &Users,
+        request: &Message<RoutedRequestHeader>,
         outcome: PreflightOutcome,
     ) -> Option<Result<Message<GenericHeader>, MetadataSubmitError>> {
+        let request_header = request.header();
         let client_id = request_header.client;
         match outcome {
             PreflightOutcome::Dispatch => None,
             PreflightOutcome::Replay(reply) => {
-                if let Some(refusal) = unreplayable_secret_refusal(
-                    request_header,
-                    &reply,
-                    consensus.commit_max(),
-                    client_id,
-                ) {
+                if let Some(refusal) = unreplayable_secret_refusal(request, &reply, users) {
                     return Some(Ok(refusal));
                 }
                 let owned =
@@ -2042,9 +3096,6 @@ where
                 code,
             )
             .into_generic())),
-            // Client-bug shapes (future epoch, id reused for a different
-            // operation): replaying cannot help, so the home shard stays silent.
-            PreflightOutcome::Drop => Some(Err(MetadataSubmitError::Canceled)),
         }
     }
 
@@ -2057,7 +3108,9 @@ where
     /// # Errors
     /// Returns a consensus submission error when this node cannot accept the
     /// logout prepare, the metadata pipeline is saturated, or the pending
-    /// request is canceled before commit.
+    /// request is canceled before commit. Returns `RequestTooOld` when its
+    /// receipt is unavailable, and `OperationMismatch` when the id belongs
+    /// to another operation.
     ///
     /// # Panics
     /// Panics when called with the reserved client id `0`, on a non-consensus
@@ -2076,6 +3129,27 @@ where
             .as_ref()
             .expect("submit_logout_in_process: consensus only exists on shard 0");
 
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
+            return Err(MetadataSubmitError::NotPrimary);
+        }
+        // A live commit window is safe to pipeline behind: the per-client
+        // guard sees every unapplied request. Inherited history awaiting WAL
+        // replay is absent from the pipeline and can hide a newer watermark.
+        let committed_in_pipeline = consensus.with_pipeline(|pipeline| {
+            (consensus.commit_min()..consensus.commit_max())
+                .all(|previous_op| pipeline.entry_by_op(previous_op + 1).is_some())
+        });
+        if consensus.has_ceded_primaryship()
+            || consensus.commit_max() < consensus.recovery_barrier()
+            || !committed_in_pipeline
+        {
+            return Err(MetadataSubmitError::NotCaughtUp);
+        }
+
+        if consensus.pipeline_has_message_from_client(client_id) {
+            return Err(MetadataSubmitError::InProgress);
+        }
+
         // Epoch guard: only propose a Logout when the slot still holds the
         // exact epoch this logout targets. A late disconnect-logout for a
         // reused client id (slot since rebound to a newer epoch) carries the
@@ -2085,22 +3159,27 @@ where
             return Ok(consensus.commit_min());
         }
 
-        // No catch-up gate here: a logout admitted mid-commit-window is
-        // safe — the wire path has always dispatched non-register ops
-        // without one, and the per-client dedup below covers the only
-        // logout-vs-logout race. It simply pipelines behind the in-flight
-        // batch and commits with it, so a one-shot client's session
-        // teardown is latency, never an error.
-        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
-            return Err(MetadataSubmitError::NotPrimary);
-        }
-
-        if consensus
-            .pipeline()
-            .borrow()
-            .has_message_from_client(client_id)
-        {
-            return Err(MetadataSubmitError::InProgress);
+        match self.client_table.borrow().check_request(
+            client_id,
+            session,
+            request,
+            Operation::Logout,
+        ) {
+            consensus::client_table::RequestStatus::New => {}
+            consensus::client_table::RequestStatus::Duplicate(reply) => {
+                return Ok(reply.header().commit);
+            }
+            consensus::client_table::RequestStatus::AlreadyApplied { .. } => {
+                return Err(MetadataSubmitError::RequestTooOld);
+            }
+            consensus::client_table::RequestStatus::OperationMismatch { .. } => {
+                return Err(MetadataSubmitError::OperationMismatch);
+            }
+            consensus::client_table::RequestStatus::NoSession
+            | consensus::client_table::RequestStatus::Fenced { .. }
+            | consensus::client_table::RequestStatus::EpochAhead { .. } => {
+                return Ok(consensus.commit_min());
+            }
         }
 
         let request = build_logout_request_message(consensus, client_id, session, request);
@@ -2115,14 +3194,9 @@ where
         // Prepare queue full: absorb into the request queue with this
         // caller's reply subscriber, promoted as
         // commits free slots.
-        if consensus.pipeline().borrow().is_full() {
+        if consensus.pipeline_is_full() {
             let (entry, receiver) = consensus::RequestEntry::with_subscriber(request);
-            if consensus
-                .pipeline()
-                .borrow_mut()
-                .push_request(entry)
-                .is_err()
-            {
+            if consensus.push_queued_request(entry).is_err() {
                 return Err(MetadataSubmitError::PipelineFull);
             }
             return match receiver.await {
@@ -2152,10 +3226,140 @@ where
         }
     }
 
+    /// Remove an expired consumer-group member only if its session is unchanged.
+    /// The caller must establish timeout expiry on the caught-up metadata primary.
+    /// Returns `Ok(None)` when the session changed or membership already ended.
+    ///
+    /// # Errors
+    /// Returns a submission error while consensus cannot accept or commit the logout.
+    ///
+    /// # Panics
+    /// Requires metadata shard 0 and a nonzero client id.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_expired_logout_in_process(
+        &self,
+        client_id: u128,
+        expected_session: Option<u64>,
+    ) -> Result<Option<u64>, MetadataSubmitError> {
+        assert_ne!(client_id, 0, "client_id 0 is reserved for internal use");
+        let consensus = self
+            .consensus
+            .as_ref()
+            .expect("session expiry runs on shard 0");
+        if !consensus.is_primary() || !consensus.is_normal() || consensus.is_transferring() {
+            return Err(MetadataSubmitError::NotPrimary);
+        }
+        if !is_caught_up_primary(consensus) {
+            return Err(MetadataSubmitError::NotCaughtUp);
+        }
+        if consensus.pipeline_has_message_from_client(client_id) {
+            return Err(MetadataSubmitError::InProgress);
+        }
+        if consensus.pipeline_is_full() {
+            return Err(MetadataSubmitError::PipelineFull);
+        }
+
+        let (user_id, capacity) = {
+            let table = self.client_table.borrow();
+            if expected_session.is_none() || table.get_epoch(client_id) != expected_session {
+                return Ok(None);
+            }
+            let user_id = table
+                .get_user_id(client_id)
+                .ok_or(MetadataSubmitError::NotCaughtUp)?;
+            (user_id, consensus.retry_capacity(&table))
+        };
+        let header = RoutedRequestHeader {
+            client: client_id,
+            session: expected_session.unwrap_or_default(),
+            user_id,
+            request: EXPIRED_SESSION_REQUEST_ID,
+            group: server_common::sharding::METADATA_GROUP,
+            ..RoutedRequestHeader::default()
+        };
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(consensus, &header, Operation::Logout, &[]),
+            capacity,
+        );
+        self.dispatch_prepare_and_await(consensus, prepare)
+            .await
+            .map(|reply| Some(reply.header().commit))
+            .map_err(|Canceled| MetadataSubmitError::Canceled)
+    }
+
+    /// Finalize once every currently allocated partition group either proved
+    /// this exact ended session retired on a quorum of its members or is
+    /// listed in `debt`, which its next primary pays before serving sessions.
+    ///
+    /// # Errors
+    /// Returns an admission or consensus error before finalization commits.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_session_finalization(
+        &self,
+        identity: SessionIdentity,
+        namespace_revision: u64,
+        debt: Vec<RetirementDebt>,
+    ) -> Result<Option<u64>, MetadataSubmitError> {
+        let consensus = self
+            .consensus
+            .as_ref()
+            .ok_or(MetadataSubmitError::NotPrimary)?;
+        if !self.is_caught_up_primary() {
+            return Err(MetadataSubmitError::NotCaughtUp);
+        }
+        if self
+            .mux_stm
+            .streams()
+            .read(|inner| inner.namespace_revision)
+            != namespace_revision
+        {
+            return Ok(None);
+        }
+        if !self
+            .client_table
+            .borrow()
+            .ended_sessions()
+            .any(|ended| ended == identity)
+        {
+            return Ok(None);
+        }
+        if consensus.pipeline_is_full() {
+            return Err(MetadataSubmitError::PipelineFull);
+        }
+        let capacity = consensus.retry_capacity(&self.client_table.borrow());
+        let header = RoutedRequestHeader {
+            client: message_bus::AUTO_COMMIT_CLIENT_ID,
+            session: 1,
+            request: identity.metadata_watermark,
+            group: server_common::sharding::METADATA_GROUP,
+            ..RoutedRequestHeader::default()
+        };
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(
+                consensus,
+                &header,
+                Operation::FinalizeSession,
+                &FinalizeSessionRequest {
+                    identity,
+                    namespace_revision,
+                    debt,
+                }
+                .to_bytes(),
+            ),
+            capacity,
+        );
+        self.dispatch_prepare_and_await(consensus, prepare)
+            .await
+            .map(|reply| Some(reply.header().commit))
+            .map_err(|Canceled| MetadataSubmitError::Canceled)
+    }
+
     /// Submit a server-originated `CompleteConsumerGroupRevocation` through the
-    /// metadata consensus group (shard 0). The partition reconciler calls this
-    /// to complete a cooperative revocation once the source has drained the
-    /// partition (or it timed out).
+    /// metadata consensus group (shard 0). A partition reconciler, on this node
+    /// or on a relaying backup, asks for this to complete a cooperative
+    /// revocation once the source has drained the partition (or it timed out).
+    /// `namespace` is the partition that `request` completes, and keys its
+    /// internal client.
     ///
     /// Unlike a client op there is no session: a reserved internal client id
     /// (never coordinator-minted) carries it, `request_preflight` is skipped
@@ -2175,28 +3379,59 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn submit_complete_revocation_in_process(
         &self,
-        stream_id: u32,
-        topic_id: u32,
-        group_id: u64,
-        source_client_id: u128,
-        partition_id: u32,
+        request: CompleteConsumerGroupRevocationRequest,
+        namespace: server_common::sharding::IggyNamespace,
     ) -> Result<u64, MetadataSubmitError> {
-        const INTERNAL_REQUEST_ID: u64 = u64::MAX;
-        // Reserved internal client id, distinct per (group, partition) target.
-        // The high 64 bits are all-ones -- never coordinator-minted (those carry
-        // a small home-shard number in the top bits) -- and the low 64 bits pack
-        // (group_id, partition_id). Distinct ids matter: the pipeline dedups by
-        // client id, so a shared id would cap internal completions at one
-        // in-flight cluster-wide and drain a wide rebalance one per consensus
-        // round-trip. Per-target ids let completions for different partitions
-        // pipeline concurrently while still deduping a retry of the same target.
-        let internal_client_id: u128 =
-            (u128::from(u64::MAX) << 64) | (u128::from(group_id) << 32) | u128::from(partition_id);
+        self.submit_partition_completion(
+            Operation::CompleteConsumerGroupRevocation,
+            namespace.inner(),
+            &request.to_bytes(),
+        )
+        .await
+        .map(|reply| reply.header().commit)
+    }
 
+    /// Commit one batch of lifecycle completions on the metadata primary.
+    /// `true` when the batch committed and applied.
+    ///
+    /// Each reporter shard owns one internal client, so batches of different
+    /// shards share the pipeline. Partition namespaces never set
+    /// `METADATA_GROUP`, so a reporter client cannot collide with the
+    /// per-partition clients of revocations.
+    ///
+    /// # Errors
+    /// Returns the same leadership, pipeline and cancellation errors as
+    /// [`Self::submit_complete_revocation_in_process`].
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_complete_lifecycle_in_process(
+        &self,
+        request: crate::stm::lifecycle::CompleteLifecycleRequest,
+        reporter: u16,
+    ) -> Result<bool, MetadataSubmitError> {
+        let reply = self
+            .submit_partition_completion(
+                Operation::CompleteLifecycle,
+                server_common::sharding::METADATA_GROUP | u64::from(reporter),
+                &request.to_bytes(),
+            )
+            .await?;
+        Ok(iggy_binary_protocol::result_code(reply.body()) == Some(0))
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn submit_partition_completion(
+        &self,
+        operation: Operation,
+        internal_client: u64,
+        body: &[u8],
+    ) -> Result<Message<ReplyHeader>, MetadataSubmitError> {
+        // One internal client per key serializes the completions of that key.
+        const INTERNAL_REQUEST_ID: u64 = u64::MAX;
+        let internal_client_id = message_bus::server_internal_client_id(internal_client);
         let consensus = self
             .consensus
             .as_ref()
-            .expect("submit_complete_revocation_in_process: consensus only exists on shard 0");
+            .expect("submit_partition_completion: consensus only exists on shard 0");
 
         // Deliberately bounce-based (no request-queue absorption, unlike the
         // client submit paths above): the caller is the partition
@@ -2212,37 +3447,28 @@ where
                 },
             );
         }
-        if consensus
-            .pipeline()
-            .borrow()
-            .has_message_from_client(internal_client_id)
-        {
+        if consensus.pipeline_has_message_from_client(internal_client_id) {
             return Err(MetadataSubmitError::InProgress);
         }
-        if consensus.pipeline().borrow().is_full() {
+        if consensus.pipeline_is_full() {
             return Err(MetadataSubmitError::PipelineFull);
         }
 
-        let request = CompleteConsumerGroupRevocationRequest {
-            stream_id: WireIdentifier::numeric(stream_id),
-            topic_id: WireIdentifier::numeric(topic_id),
-            group_id,
-            source_client_id,
-            partition_id,
-        };
-        let body = request.to_bytes();
-        let message = build_complete_revocation_request_message(
+        let message = build_partition_completion_request_message(
             consensus,
+            operation,
             internal_client_id,
             INTERNAL_REQUEST_ID,
-            &body,
+            body,
         );
-        let prepare = message.project(consensus);
+        let prepare = consensus::seal_prepare_capacity(
+            message.project(consensus),
+            consensus.retry_capacity(&self.client_table.borrow()),
+        );
 
-        match self.dispatch_prepare_and_await(consensus, prepare).await {
-            Ok(reply) => Ok(reply.header().commit),
-            Err(Canceled) => Err(MetadataSubmitError::Canceled),
-        }
+        self.dispatch_prepare_and_await(consensus, prepare)
+            .await
+            .map_err(|Canceled| MetadataSubmitError::Canceled)
     }
 
     /// `true` when this node is the caught-up primary of the metadata
@@ -2253,16 +3479,59 @@ where
         self.consensus.as_ref().is_some_and(is_caught_up_primary)
     }
 
+    /// Replicate initial root creation with a precomputed password hash.
+    ///
+    /// # Errors
+    /// Returns a submission error if this replica cannot commit the initial root user.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_root_user_in_process(
+        &self,
+        request: &CreateUserRequest,
+    ) -> Result<u32, MetadataSubmitError> {
+        let consensus = self
+            .consensus
+            .as_ref()
+            .ok_or(MetadataSubmitError::NotPrimary)?;
+        if !is_caught_up_primary(consensus) {
+            return Err(MetadataSubmitError::NotCaughtUp);
+        }
+        if !self.mux_stm.users().read(|users| users.items.is_empty()) {
+            return Ok(0);
+        }
+        if consensus.pipeline_has_message_from_client(RESERVED_CLIENT_ID) {
+            return Err(MetadataSubmitError::InProgress);
+        }
+        if consensus.pipeline_is_full() {
+            return Err(MetadataSubmitError::PipelineFull);
+        }
+        let header = RoutedRequestHeader {
+            client: RESERVED_CLIENT_ID,
+            group: server_common::sharding::METADATA_GROUP,
+            ..RoutedRequestHeader::default()
+        };
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(
+                consensus,
+                &header,
+                Operation::CreateUser,
+                &request.to_bytes(),
+            ),
+            consensus.retry_capacity(&self.client_table.borrow()),
+        );
+        self.dispatch_prepare_and_await(consensus, prepare)
+            .await
+            .map(|reply| reply.header().status)
+            .map_err(|Canceled| MetadataSubmitError::Canceled)
+    }
+
     /// Submit a replicated `DeletePersonalAccessToken` originated by the
     /// server (the PAT cleaner), not a client.
     ///
     /// No client session exists, so this skips `request_preflight` (like
     /// the logout precedent) and uses the reserved internal `client` id
-    /// `0`: never registered, so the commit path's `get_epoch(0)` is
-    /// `None` and skips `commit_reply` (and its `assert!(client_id != 0)`),
+    /// `0`: never registered, so the commit path skips receipt caching,
     /// while the preflight and register asserts never run. Delete is
-    /// idempotent, so the dropped dedup is harmless and a re-proposal on the
-    /// next tick is a no-op.
+    /// idempotent, so a re-proposal on the next tick is a no-op.
     ///
     /// # Errors
     /// `NotPrimary` / `NotCaughtUp` when this node cannot replicate,
@@ -2295,7 +3564,7 @@ where
             );
         }
 
-        if consensus.pipeline().borrow().is_full() {
+        if consensus.pipeline_is_full() {
             return Err(MetadataSubmitError::PipelineFull);
         }
 
@@ -2312,17 +3581,73 @@ where
         // client-header validation in `prepare_request` / `Project::project`
         // (the in-process path `build_prepare_message` documents).
         let header = RoutedRequestHeader {
-            client: 0,
+            client: RESERVED_CLIENT_ID,
             group: server_common::sharding::METADATA_GROUP,
             ..RoutedRequestHeader::default()
         };
-        let prepare = build_prepare_message(
-            consensus,
-            &header,
-            Operation::DeletePersonalAccessToken,
-            &body,
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(
+                consensus,
+                &header,
+                Operation::DeletePersonalAccessToken,
+                &body,
+            ),
+            consensus.retry_capacity(&self.client_table.borrow()),
         );
 
+        match self.dispatch_prepare_and_await(consensus, prepare).await {
+            Ok(reply) => Ok(reply.header().commit),
+            Err(Canceled) => Err(MetadataSubmitError::Canceled),
+        }
+    }
+
+    /// Submit a replicated `RewrapStreamKeys` originated by the server (the
+    /// stream key rewrapper during a key-encryption key rotation).
+    ///
+    /// Same in-process path as the PAT cleaner's delete: the reserved
+    /// internal client `0`, no request preflight. Apply skips any entry that
+    /// no longer matches its stream, so a re-proposal on the next tick is
+    /// harmless.
+    ///
+    /// # Errors
+    /// `NotPrimary` / `NotCaughtUp` when this node cannot replicate,
+    /// `PipelineFull` under pipeline pressure, `Canceled` if the prepare is
+    /// dropped before commit.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_rewrap_stream_keys_in_process(
+        &self,
+        request: RewrapStreamKeysRequest,
+    ) -> Result<u64, MetadataSubmitError> {
+        let consensus = self
+            .consensus
+            .as_ref()
+            .ok_or(MetadataSubmitError::NotPrimary)?;
+        if !is_caught_up_primary(consensus) {
+            return Err(
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring() {
+                    MetadataSubmitError::NotCaughtUp
+                } else {
+                    MetadataSubmitError::NotPrimary
+                },
+            );
+        }
+        if consensus.pipeline_is_full() {
+            return Err(MetadataSubmitError::PipelineFull);
+        }
+        let header = RoutedRequestHeader {
+            client: RESERVED_CLIENT_ID,
+            group: server_common::sharding::METADATA_GROUP,
+            ..RoutedRequestHeader::default()
+        };
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(
+                consensus,
+                &header,
+                Operation::RewrapStreamKeys,
+                &request.to_bytes(),
+            ),
+            consensus.retry_capacity(&self.client_table.borrow()),
+        );
         match self.dispatch_prepare_and_await(consensus, prepare).await {
             Ok(reply) => Ok(reply.header().commit),
             Err(Canceled) => Err(MetadataSubmitError::Canceled),
@@ -2363,27 +3688,29 @@ where
         let client_id = request_header.client;
         let session = request_header.session;
         let request = request_header.request;
-        let request_checksum = request_header.request_checksum;
+        let operation = request_header.operation;
 
         let consensus = self
             .consensus
             .as_ref()
             .expect("submit_request_in_process: consensus only exists on shard 0");
 
-        // Not-primary is transient: the same request replayed against the
-        // current primary commits fine. Reply with the explicit transient
-        // frame (relayed to the socket by the home shard) so the client
-        // replays immediately rather than waiting out its read-timeout.
-        // `TransientNotAccepted` specifically: the request never entered the
-        // pipeline here, so the client may re-issue it ANYWHERE -- including
-        // under a fresh session after failing over to the current leader --
-        // without double-apply risk. (`TransientNotCommitted` conversely means
-        // the outcome is unknown and only a same-session replay is safe.)
+        // Reply before admission so the client can retry without a read timeout.
+        // This refusal covers only this attempt; earlier copies may still commit.
+        // Retrying with their session and request id preserves deduplication.
         //
         // No catch-up gate: a non-register op admitted mid-commit-window
         // simply pipelines behind the in-flight batch (the wire path has
         // always done this); the register-specific invariant is guarded in
         // `submit_register_in_process` / `register_preflight`.
+        if consensus.is_normal_backup() {
+            return Ok(build_result_rejection_reply(
+                &request_header,
+                consensus.commit_max(),
+                IggyError::NotPrimary.as_code(),
+            )
+            .into_generic());
+        }
         if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
             return Ok(build_result_rejection_reply(
                 &request_header,
@@ -2397,35 +3724,34 @@ where
         // consensus `client_id` (its top bits are random, not home-shard
         // routing), so a Replay/Evict/NotReady is returned to the home shard as
         // the reply -- `handle_client_request` writes it to the originating
-        // socket by transport id, exactly like a fresh commit. Drop (client-bug
-        // already-applied / future-epoch) surfaces as Canceled so the home
-        // shard stays silent.
+        // socket by transport id, exactly like a fresh commit. A cached reply
+        // that does not decode surfaces as Canceled, and the home shard answers
+        // it with `TransientNotCommitted`.
         let outcome = request_preflight(
             consensus,
             &self.client_table,
             client_id,
             session,
             request,
-            request_checksum,
+            operation,
         );
-        if let Some(answer) = Self::answer_preflight(consensus, &request_header, outcome) {
+        if let Some(answer) = Self::answer_preflight(
+            consensus,
+            self.mux_stm.users(),
+            &message,
+            self.fence_lifecycle_preflight(outcome, &message),
+        ) {
             return answer;
         }
 
         // Prepare queue full: backpressure, not failure. Absorb into the
         // request queue with this caller's reply subscriber; the commit
         // path promotes it as slots free up and the await below resolves
-        // with the committed reply. Only a full request queue is terminal
-        // (`TransientNotAccepted`, re-issuable anywhere: the request never
-        // entered a queue).
-        if consensus.pipeline().borrow().is_full() {
+        // with the committed reply. A full request queue refuses this attempt
+        // before admission, without settling the outcome of earlier copies.
+        if consensus.pipeline_is_full() {
             let (entry, receiver) = consensus::RequestEntry::with_subscriber(message);
-            if consensus
-                .pipeline()
-                .borrow_mut()
-                .push_request(entry)
-                .is_err()
-            {
+            if consensus.push_queued_request(entry).is_err() {
                 return Ok(build_result_rejection_reply(
                     &request_header,
                     consensus.commit_max(),
@@ -2446,16 +3772,27 @@ where
             };
         }
 
-        // The acting-user RBAC stamp lives in the shared `prepare_request`
-        // (op-guarded, fail-closed on an unknown session). `request_preflight`
-        // above proved this client's session is live, so it resolves there.
-        let Ok(prepare) = self.prepare_request(message) else {
-            // Structurally-invalid request. Return an eviction frame (relayed to
-            // the socket by the home shard) rather than `Canceled`, which leaves
-            // the shard silent and the SDK retrying forever.
-            let reason = eviction_reason_for_invalid(request_header.operation);
-            let ctx = EvictionContext::from_consensus(consensus);
-            return Ok(build_eviction_message(ctx, client_id, reason).into_generic());
+        // The acting-user RBAC stamp and the cap admission live in the shared
+        // `prepare_request` (op-guarded, fail-closed on an unknown session).
+        // `request_preflight` above proved this client's session is live, so it
+        // resolves there. It also served a same-id replay of a create that
+        // already committed, so that create is never counted twice.
+        let prepare = match self.prepare_request(message) {
+            Ok(prepare) => prepare,
+            Err(refusal) if is_admission_refusal(&refusal) => {
+                return Ok(build_result_rejection_reply(
+                    &request_header,
+                    consensus.commit_max(),
+                    refusal.as_code(),
+                )
+                .into_generic());
+            }
+            Err(_) => {
+                // Malformed requests retain the existing session eviction policy.
+                let reason = eviction_reason_for_invalid(request_header.operation);
+                let ctx = EvictionContext::from_consensus(consensus);
+                return Ok(build_eviction_message(ctx, client_id, reason).into_generic());
+            }
         };
 
         // A view change canceled the pending prepare before commit. The op may
@@ -2494,11 +3831,9 @@ where
     ) -> Result<Message<ReplyHeader>, Canceled> {
         consensus.verify_pipeline();
         let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
-        // Register is the one op whose admission requires the catch-up gate
-        // (double-register epoch bump); its submit path checks the gate and
-        // the check-to-dispatch section is synchronous. Non-register ops
-        // dispatch mid-window by design (they pipeline behind the in-flight
-        // batch, like the wire path always has).
+        // Register and expired-session Logout require the catch-up gate for
+        // their epoch checks. Both check-to-dispatch sections are synchronous.
+        // Other submits can pipeline behind the in-flight batch.
         debug_assert!(
             prepare.header().operation != Operation::Register || is_caught_up_primary(consensus),
             "dispatch_prepare_and_await: register dispatched with the catch-up gate closed"
@@ -2513,7 +3848,7 @@ where
         consensus.drain_loopback_into(&mut loopback);
         for message in loopback {
             match message.header().command {
-                Command2::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
+                Command::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
                     Ok(prepare_ok) => self.on_ack(prepare_ok).await,
                     Err(error) => warn!(
                         error = %error,
@@ -2535,12 +3870,10 @@ where
     /// The primary's `PrepareOk` for its own prepare is produced exactly once,
     /// as a loopback right after the WAL append (see `on_replicate`). If that
     /// one-shot is lost or suppressed (e.g. the `send_prepare_ok` persistence
-    /// gate races the sequencer pre-advance under a client burst), no
-    /// retransmit path regenerates it: `retransmit_targets` lists the primary
-    /// itself among the missing replicas, but `RetransmitPrepares` to self is a
-    /// no-op. The op then sits one vote short of quorum forever and pins the
-    /// contiguous commit prefix, so `commit_min` never catches up to
-    /// `commit_max` and the cluster wedges.
+    /// gate races the sequencer pre-advance under a client burst), only this
+    /// sweep regenerates it. Without it the op sits one vote short of quorum
+    /// forever and pins the contiguous commit prefix, so `commit_min` never
+    /// catches up to `commit_max` and the cluster wedges.
     ///
     /// This is a re-ack-only repair: for each pending op the primary holds
     /// DURABLY but has not self-acked, re-emit the self `PrepareOk` and drain
@@ -2565,8 +3898,7 @@ where
         // Snapshot durable, self-unacked pending ops, dropping the pipeline and
         // journal borrows before the `send_prepare_ok` awaits below.
         let mut headers: Vec<PrepareHeader> = Vec::new();
-        {
-            let pipeline = consensus.pipeline().borrow();
+        consensus.with_pipeline(|pipeline| {
             let from = consensus.commit_max() + 1;
             let to = consensus.sequencer().current_sequence();
             for op in from..=to {
@@ -2582,7 +3914,7 @@ where
                     headers.push(header);
                 }
             }
-        }
+        });
         if headers.is_empty() {
             return;
         }
@@ -2620,7 +3952,7 @@ where
         }
         for message in loopback.drain(..) {
             match message.header().command {
-                Command2::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
+                Command::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
                     Ok(prepare_ok) => self.on_ack(prepare_ok).await,
                     Err(error) => warn!(
                         error = %error,
@@ -2669,9 +4001,11 @@ where
         // else re-peeks and moves on to the next committable op.
         let mut wire_replies: Vec<(CommitLogEvent, Message<ReplyHeader>)> = Vec::new();
         while let Some(prepare_header) = peek_committable_head(consensus) {
-            // TODO(hubcio): should we replace this with graceful fallback (warn + return)?
-            // When journal compaction is implemented compaction could race
-            // with this lookup if it removes entries below the commit number.
+            // A committed prepare missing from the journal is divergence; a
+            // warn-and-return here would strand `commit_min` behind
+            // `commit_max` forever (nothing re-applies a skipped op), so
+            // panicking is the answer. Journal compaction, if ever added,
+            // must not remove entries at or above the commit floor.
             let prepare = journal
                 .handle()
                 .entry(&prepare_header)
@@ -2685,21 +4019,18 @@ where
 
             // Revalidate after the await: a sibling driver may have
             // committed this op (and more) while we were parked.
-            let head_is_ours = consensus.pipeline().borrow().head().is_some_and(|head| {
-                head.header.op == prepare_header.op
-                    && head.header.checksum == prepare_header.checksum
+            let head_is_ours = consensus.pipeline_head_header().is_some_and(|head| {
+                head.op == prepare_header.op && head.checksum == prepare_header.checksum
             });
             if !head_is_ours {
                 continue;
             }
 
             let mut entry = consensus
-                .pipeline()
-                .borrow_mut()
-                .pop()
+                .pop_committed_prepare()
                 .expect("on_ack: revalidated head exists");
 
-            let pipeline_depth = consensus.pipeline().borrow().len();
+            let pipeline_depth = consensus.pipeline_len();
             let event = CommitLogEvent {
                 replica: ReplicaLogContext::from_consensus(consensus, PlaneKind::Metadata),
                 op: prepare_header.op,
@@ -2719,73 +4050,34 @@ where
             // Sync-only — this is what makes pop/apply/advance atomic on
             // the single-threaded shard and keeps the head revalidation
             // sound.
-            let reply = if prepare_header.operation == Operation::Register {
-                // Register: commit_register creates session, no SM.
-                let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
-                if self.client_table_mutation_allowed(prepare_header.op) {
-                    self.client_table.borrow_mut().commit_register(
-                        prepare_header.client,
-                        prepare_header.user_id,
-                        reply.clone(),
-                    );
-                }
-                reply
-            } else if prepare_header.operation == Operation::Logout {
-                // Logout unregisters the VSR client session on every replica.
-                let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
-                if self.client_table_mutation_allowed(prepare_header.op) {
-                    self.client_table
-                        .borrow_mut()
-                        .remove_client(prepare_header.client);
-                }
-                // Drop the disconnected client from every consumer group it
-                // joined and rebalance. Deterministic side-effect of the
-                // Logout commit, applied identically on every replica. Runs
-                // regardless of the table frontier: the STM was restored at
-                // the snapshot floor, so ops above it still owe their STM
-                // effects even where the table already reflects them.
-                self.mux_stm.streams().remove_consumer_group_member(
-                    prepare_header.client,
-                    iggy_common::IggyTimestamp::from(prepare_header.timestamp),
-                );
-                reply
-            } else {
-                // Normal op: apply SM, commit_reply. `Err` is decode/corruption
-                // only; a business rejection commits as a deterministic no-op
-                // whose `code` rides the reply body, replayed on retry.
-                let apply = gated_apply(&self.mux_stm, prepare).unwrap_or_else(|err| {
-                    panic!(
-                        "on_ack: committed metadata op={} failed to apply: {err}",
-                        prepare_header.op
-                    );
-                });
-                // Post-commit notifier (e.g. partition reconciler
-                // wake-up). Filtering by operation is the
-                // recipient's responsibility.
-                self.fire_commit_notifier(prepare_header.operation);
-                let reply =
-                    build_reply_message_with(&prepare_header, apply.reply_body_len(), |dst| {
-                        apply.write_reply_body(dst);
-                    });
-                // Best-effort cache; the wire reply ships either way. Ops at
-                // or below the state-transfer frontier are already reflected
-                // in the transferred table and are skipped.
-                if self.client_table_mutation_allowed(prepare_header.op) {
-                    let outcome = self
-                        .client_table
-                        .borrow_mut()
-                        .commit_reply(prepare_header.client, reply.clone());
-                    log_commit_reply_outcome(outcome, prepare_header.client, prepare_header.op);
-                }
-                reply
-            };
+            let reply = self.apply_prepare(prepare);
             consensus.advance_commit_min(prepare_header.op);
+            // Partition primaries on metadata backups act on this op (fences,
+            // joins, revocations), so the backups must not wait for the heartbeat.
+            consensus.request_eager_commit();
+            // Paired with the counter bump, and before the reply leaves: a
+            // client that holds this reply may re-home onto any shard and read,
+            // and the read gate admits it only once the frontier covers the op.
+            self.advance_applied_frontier(prepare_header.op);
             emit_sim_event(SimEventKind::OperationCommitted, &event);
 
             // Fire subscriber BEFORE wire send. Slot already updated
             // (slot-first ordering, see take_reply_sender). Dropped
             // receiver: ignored. Still inside the sync region, so an
             // in-process awaiter is woken atomically with its commit.
+            let reply = if self.mux_stm.streams().lifecycle_pending(prepare_header.op) {
+                let pending =
+                    crate::stm::result::ApplyReply::err(IggyError::TransientNotCommitted.as_code());
+                build_reply_message_with(&prepare_header, pending.reply_body_len(), |dst| {
+                    pending.write_reply_body(dst);
+                })
+                .transmute_header::<ReplyHeader>(|old, header| {
+                    *header = old;
+                    header.clear_committed_result();
+                })
+            } else {
+                reply
+            };
             let had_in_process_subscriber = entry.has_reply_sender();
             if let Some(sender) = entry.take_reply_sender() {
                 let _ = sender.send(reply.clone());
@@ -2797,7 +4089,14 @@ where
             // the same socket. Sending both desyncs the SDK -- it reads
             // the first frame, fails to decode the typed body, and
             // leaves the second frame stuck in the socket buffer.
-            if !had_in_process_subscriber {
+            //
+            // A server-originated op has no socket either. Its entry loses the
+            // in-process sender after a view change or a boot re-pipeline, and
+            // a send to the reserved id only fails with a false error.
+            if !had_in_process_subscriber
+                && prepare_header.client != RESERVED_CLIENT_ID
+                && !message_bus::is_server_internal_client(prepare_header.client)
+            {
                 wire_replies.push((event, reply));
             }
         }
@@ -2811,18 +4110,19 @@ where
             let reply_buffers = freeze_client_reply(generic_reply);
             emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
 
+            // The production bus refuses it, and a resend gets the cached reply.
             if let Err(e) = consensus
                 .message_bus()
                 .send_to_client(event.client_id, reply_buffers)
                 .await
             {
-                error!(
+                debug!(
                     client = event.client_id,
                     op = event.op,
                     request_id = event.request_id,
                     operation = ?event.operation,
                     %e,
-                    "client reply forward failed, no retransmit path; client will time out",
+                    "client reply has no route by client id",
                 );
             }
         }
@@ -2861,10 +4161,8 @@ where
             return;
         }
         let stranded_commits = consensus.commit_min() < consensus.commit_max();
-        let promotable_requests = {
-            let pipeline = consensus.pipeline().borrow();
-            !pipeline.request_queue_is_empty() && !pipeline.is_full()
-        };
+        let promotable_requests = consensus
+            .with_pipeline(|pipeline| !pipeline.request_queue_is_empty() && !pipeline.is_full());
         if !stranded_commits && !promotable_requests {
             return;
         }
@@ -2879,7 +4177,7 @@ where
     /// client's watermark between push and drain (`Duplicate` /
     /// `AlreadyApplied` / `AlreadyRegistered`). Skipping produces a duplicate
     /// prepare and panics.
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     async fn drain_request_queue_into_prepares(&self) {
         let consensus = self.consensus.as_ref().unwrap();
         // Promote while prepare slots exist. Requests are queued for two
@@ -2889,10 +4187,10 @@ where
         // one commit window drains the moment the window closes. Promoted
         // prepares are un-quorum'd, so they never re-close the gate here.
         loop {
-            if consensus.pipeline().borrow().is_full() {
+            if consensus.pipeline_is_full() {
                 break;
             }
-            let req = consensus.pipeline().borrow_mut().pop_request();
+            let req = consensus.pop_queued_request();
             let Some(mut req) = req else { break };
 
             let client_id = req.message.header().client;
@@ -2906,7 +4204,23 @@ where
             // `Canceled`; its submit path re-checks the client table.
             let reply_sender = req.take_reply_sender();
             let dispatch = if operation == Operation::Register {
-                register_preflight(consensus, &self.client_table, client_id, user_id)
+                {
+                    let outcome = register_preflight(
+                        consensus,
+                        &self.client_table,
+                        client_id,
+                        user_id,
+                        req.message.body(),
+                        request_checksum,
+                        |created_at| self.mux_stm.users().is_active_account(user_id, created_at),
+                    );
+                    apply_preflight_consensus_plane(
+                        consensus,
+                        self.fence_lifecycle_preflight(outcome, &req.message),
+                        client_id,
+                    )
+                    .await
+                }
             } else {
                 let outcome = request_preflight(
                     consensus,
@@ -2914,16 +4228,39 @@ where
                     client_id,
                     session,
                     request,
-                    request_checksum,
+                    operation,
                 );
-                apply_preflight_consensus_plane(consensus, outcome, client_id).await
+                apply_preflight_consensus_plane(
+                    consensus,
+                    self.fence_lifecycle_preflight(outcome, &req.message),
+                    client_id,
+                )
+                .await
             };
             if !dispatch {
                 continue;
             }
 
+            let request_header = *req.message.header();
             let prepare = match self.prepare_request(req.message) {
                 Ok(prepare) => prepare,
+                Err(refusal) if is_admission_refusal(&refusal) => {
+                    let reply = build_result_rejection_reply(
+                        &request_header,
+                        consensus.commit_max(),
+                        refusal.as_code(),
+                    );
+                    if let Some(sender) = reply_sender {
+                        let _ = sender.send(reply);
+                    } else if let Err(error) = consensus
+                        .message_bus()
+                        .send_to_client(client_id, freeze_client_reply(reply.into_generic()))
+                        .await
+                    {
+                        debug!(%error, client_id, "queued admission refusal could not reach client");
+                    }
+                    continue;
+                }
                 Err(error) => {
                     // Same invariant as `on_request`: a structurally-invalid
                     // request evicts, never a silent drop, or the SDK retries
@@ -2992,6 +4329,12 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn persist_superblock_if_needed(&self, consensus: &VsrConsensus<B, P>) -> bool {
         let Some(superblock) = self.superblock.as_ref() else {
+            // Nothing to write, so the in-memory state is the durable one, as on a
+            // partition without a store.
+            let state = consensus.vsr_state(0, 0);
+            consensus.mark_superblock_durable(state.view, state.log_view);
+            consensus.mark_adopted_view_durable(state.adopted_view.as_ref());
+            consensus.mark_history_certificate_durable(consensus.history_certificate());
             return true;
         };
         // Lock-free fast path: the steady state is an unchanged view with nothing to
@@ -3041,8 +4384,8 @@ where
     /// first failure and then at each backoff step rather than per tick.
     ///
     /// TODO(fail-stop): a replica wedged here is dead weight an operator has to notice
-    /// from logs. Fail-stopping the process is the TigerBeetle-style answer, but this
-    /// layer holds no process-lifecycle handle; wire it where the shard owns shutdown.
+    /// from logs. Fail-stopping the process is the answer, and
+    /// [`fatal`] is now that primitive; wire it where the shard owns shutdown.
     #[allow(clippy::future_not_send)]
     async fn write_superblock(&self, consensus: &VsrConsensus<B, P>, superblock: &SB) -> bool {
         // Carry the last durable pairing forward so a view-change write never
@@ -3056,6 +4399,8 @@ where
         match superblock.write(&state.to_bytes()).await {
             Ok(()) => {
                 consensus.mark_superblock_durable(state.view, state.log_view);
+                consensus.mark_adopted_view_durable(state.adopted_view.as_ref());
+                consensus.mark_history_certificate_durable(state.history_certificate());
                 self.superblock_write_failures.set(0);
                 self.superblock_retry_after_micros.set(0);
                 true
@@ -3103,7 +4448,7 @@ where
     P: Pipeline<Entry = PipelineEntry>,
     SB: SuperblockStore,
     J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
@@ -3119,6 +4464,7 @@ where
     /// to its append regardless (see the phantom-op comment at the call
     /// site). The next prepare over the boundary simply retries.
     #[allow(clippy::future_not_send)]
+    #[allow(clippy::too_many_lines)]
     async fn checkpoint_if_needed(&self, consensus: &VsrConsensus<B, P>, journal: &J) {
         let Some(coordinator) = &self.coordinator else {
             return;
@@ -3144,6 +4490,18 @@ where
         // between commit_min+1 and commit_max haven't been applied to the
         // state machine yet, draining them would lose data on crash.
         let snap_op = consensus.commit_min();
+        let checkpoint_op = coordinator.last_checkpoint().0;
+        if snap_op < checkpoint_op
+            || (snap_op == checkpoint_op && !coordinator.checkpoint_pending.get())
+        {
+            return;
+        }
+        // A transferred table may include replies above the restored STM floor.
+        // Recovery must never replay that interval against its later protection.
+        if snap_op < self.client_table_frontier.get() {
+            return;
+        }
+        coordinator.checkpoint_pending.set(true);
         // Stamp created_at from the injected consensus clock (seed-derived
         // under the simulator), not the wall clock, so replayed snapshots are
         // byte-identical.
@@ -3160,12 +4518,22 @@ where
         // then-current commit_min. The prepare being replicated appends regardless
         // (see the phantom-op comment at the call site).
         let client_table = self.client_table.borrow().to_snapshot();
-        let checksum = match coordinator.persist_snapshot(
-            &self.mux_stm,
-            snap_op,
-            created_at,
-            Some(client_table),
-        ) {
+        let change_log = self.change_log.snapshot();
+        #[cfg(test)]
+        if checkpoint_boundary(CheckpointBoundary::TableCaptured).is_err() {
+            return;
+        }
+        self.clear_state_transfer_offer_cache();
+        let checksum = match coordinator
+            .persist_snapshot(
+                &*self.mux_stm,
+                snap_op,
+                created_at,
+                Some(client_table),
+                change_log,
+            )
+            .await
+        {
             Ok(checksum) => checksum,
             Err(e) => {
                 error!(
@@ -3205,7 +4573,19 @@ where
             }
         }
 
-        if let Err(e) = coordinator.drain(journal, snap_op).await {
+        #[cfg(test)]
+        if checkpoint_boundary(CheckpointBoundary::SuperblockWritten).is_err() {
+            return;
+        }
+        let drained = coordinator.drain(journal, snap_op).await;
+        // On the error path too: a drain that fails part-way still removed
+        // whatever it reached, and a snapshot left offering those bodies strands
+        // the peer that picks this replica as a repair source.
+        consensus.note_journal_mutation();
+        if drained.is_ok() {
+            coordinator.checkpoint_pending.set(false);
+        }
+        if let Err(e) = drained {
             error!(
                 target: "iggy.metadata.diag",
                 plane = "metadata",
@@ -3214,6 +4594,11 @@ where
                 error = %e,
                 "checkpoint WAL drain failed"
             );
+            return;
+        }
+
+        #[cfg(test)]
+        if checkpoint_boundary(CheckpointBoundary::WalDrained).is_err() {
             return;
         }
 
@@ -3228,6 +4613,316 @@ where
             checkpoint_op = snap_op,
             "forced checkpoint completed"
         );
+    }
+
+    /// Merge locally published normal views without treating missing reports as
+    /// failures. Incarnation checks keep deleted namespaces from transferring load.
+    pub fn observe_partition_views(&self, reports: &[PartitionPlacementView]) {
+        self.placement
+            .borrow_mut()
+            .observe(self.mux_stm.streams(), reports);
+    }
+
+    /// Initial placement uses readiness only within the metadata view that observed it.
+    /// An empty slice clears the evidence when the coordinator loses authority.
+    pub fn observe_replica_readiness(&self, eligible: &[bool]) {
+        if let Some(consensus) = self.consensus.as_ref() {
+            self.placement
+                .borrow_mut()
+                .observe_replicas(consensus.view(), eligible);
+        }
+    }
+
+    /// Suggest one count-balancing move only after normal failover has settled.
+    /// `after` rotates candidates so a recovering target cannot starve other groups.
+    pub fn primary_rebalance_candidate(
+        &self,
+        eligible: &[bool],
+        after: Option<IggyNamespace>,
+    ) -> Option<PartitionPrimaryTransfer> {
+        self.placement.borrow_mut().primary_rebalance_candidate(
+            self.mux_stm.streams(),
+            self.consensus.as_ref()?.replica_count(),
+            eligible,
+            after,
+        )
+    }
+
+    /// Return an observed normal view only for the current, unblocked incarnation.
+    pub fn partition_placement_view(
+        &self,
+        namespace: IggyNamespace,
+        created_revision: u64,
+    ) -> Option<PartitionPlacementView> {
+        self.placement.borrow().partition_placement_view(
+            self.mux_stm.streams(),
+            namespace,
+            created_revision,
+        )
+    }
+
+    /// Reconstruct at most one missing reservation per metadata tick. Admission
+    /// stays synchronous and refuses creates until every canonical summary exists.
+    #[allow(clippy::future_not_send)]
+    pub async fn refresh_placement(&self) {
+        let (Some(consensus), Some(journal)) = (self.consensus.as_ref(), self.journal.as_ref())
+        else {
+            return;
+        };
+        let Ok(headers) = self.pending_placement_headers() else {
+            return;
+        };
+        let Some(header) = headers
+            .into_iter()
+            .find(|header| !self.placement.borrow().contains(header))
+        else {
+            return;
+        };
+        let view = consensus.view();
+        let Some(prepare) = journal.handle().entry(&header).await else {
+            return;
+        };
+        if prepare.header().op != header.op
+            || prepare.header().checksum != header.checksum
+            || verify_prepare_integrity(prepare.header(), prepare.as_slice()).is_err()
+            || consensus.view() != view
+            || !is_caught_up_primary(consensus)
+            || header.op <= consensus.commit_min()
+            || !consensus.pipeline_holds_entry(header.op, header.checksum)
+        {
+            return;
+        }
+        if let Ok(Some(highest_group_id)) = self
+            .placement
+            .borrow_mut()
+            .remember(&prepare, consensus.replica_count())
+        {
+            self.allocator.observe(highest_group_id);
+        }
+    }
+
+    /// `[metadata] partitions_max` admission for a `CreateTopic` or
+    /// `CreatePartitions`. Other operations pass.
+    ///
+    /// The apply must not branch on node config, so the primary checks the cap
+    /// in `prepare_request`, right before the create enters the prepare
+    /// pipeline with no await between. It counts the committed partitions and
+    /// those of every create in that pipeline, so creates admitted before any
+    /// of them commits cannot take the node past the cap. A create leaves the
+    /// count when it leaves the pipeline: it commits, the apply refuses it, or
+    /// a view change drops it. A create parked in the request queue is checked
+    /// when it is promoted. The apply can still refuse a create in flight, so a
+    /// create that fits the committed partitions alone is refused as transient,
+    /// and only one past the cap on committed partitions gets the cap's error.
+    ///
+    /// A body that does not decode passes here, and `prepare_request` evicts
+    /// the session for it. A create that the gated apply refuses, for a
+    /// missing target, a missing grant or a topic name already in use, also
+    /// passes, so it gets that error and not the cap's. That verdict reads the
+    /// committed state, and an op in flight can create the target, grant the
+    /// permission or free the name before the create applies, so while any op
+    /// is in flight such a create is refused as transient instead.
+    fn admit_partitions(&self, message: &Message<RoutedRequestHeader>) -> Result<(), IggyError> {
+        let partitions_max = self.partitions_max.get();
+        if partitions_max == 0 {
+            return Ok(());
+        }
+        let header = message.header();
+        let body = &message.as_slice()[size_of::<RoutedRequestHeader>()..header.size as usize];
+        let (requested, stream_id, create) = match header.operation {
+            Operation::CreateTopic => match WireCreateTopicRequest::decode_from(body) {
+                Ok(request) => (
+                    request.partitions_count,
+                    request.stream_id,
+                    PartitionsCreate::Topic { name: request.name },
+                ),
+                Err(_) => return Ok(()),
+            },
+            Operation::CreatePartitions => match WireCreatePartitionsRequest::decode_from(body) {
+                Ok(request) => (
+                    request.partitions_count,
+                    request.stream_id,
+                    PartitionsCreate::Partitions {
+                        topic_id: request.topic_id,
+                    },
+                ),
+                Err(_) => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        let committed = u64::try_from(self.mux_stm.streams().partition_count()).unwrap_or(u64::MAX);
+        let pending = self.pending_partitions()?;
+        let admitted =
+            validate_partitions_limit(partitions_max, requested, committed.saturating_add(pending));
+        if admitted.is_err() {
+            let applies =
+                resolve_acting_user_id(header.operation, header.client, &self.client_table)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|user_id| {
+                        admits_partitions_create(
+                            self.mux_stm.users(),
+                            self.mux_stm.streams(),
+                            user_id,
+                            &stream_id,
+                            &create,
+                        )
+                    });
+            if !applies {
+                // Any pending metadata may change validity. Conservatively defer
+                // even unrelated work; steady traffic can leave this request at
+                // 58 until its deadline. A valid create gets the cap error only
+                // when the committed partitions alone exceed the cap.
+                let consensus = self
+                    .consensus
+                    .as_ref()
+                    .ok_or(IggyError::TransientNotAccepted)?;
+                if consensus.sequencer().current_sequence() > consensus.commit_min() {
+                    return Err(IggyError::TransientNotAccepted);
+                }
+                return Ok(());
+            }
+            if validate_partitions_limit(partitions_max, requested, committed).is_ok() {
+                return Err(IggyError::TransientNotAccepted);
+            }
+            warn!(
+                operation = ?header.operation,
+                partitions_max,
+                committed,
+                pending,
+                requested,
+                "refused a create that would take the node past metadata.partitions_max"
+            );
+        }
+        admitted
+    }
+
+    /// `[personal_access_token] max_tokens_per_user` admission for a
+    /// `CreatePersonalAccessToken`. Other operations pass, so a user at the
+    /// cap can still delete a token to free a slot.
+    ///
+    /// Checked where and how [`Self::admit_partitions`] checks its cap: the
+    /// user's committed tokens plus the user's creates in the prepare
+    /// pipeline. A pipeline entry keeps only its header, so a create in flight
+    /// counts for its acting user. Every transport rewrites the body for the
+    /// session's user, and `prepare_request` stamps that same user into the
+    /// header. The apply can still refuse a create in flight, for a taken name
+    /// or an expiry already past, so a create that fits the committed tokens
+    /// alone is refused as transient. It runs before the apply, so a create
+    /// past the cap on committed tokens reports the cap even when its name is
+    /// taken, as the legacy server did.
+    ///
+    /// The PAT rewrite of every transport encodes the body, so the decode
+    /// cannot fail for a client request.
+    fn admit_personal_access_token(
+        &self,
+        message: &Message<RoutedRequestHeader>,
+    ) -> Result<(), IggyError> {
+        let max_tokens_per_user = self.max_tokens_per_user.get();
+        if max_tokens_per_user == 0
+            || message.header().operation != Operation::CreatePersonalAccessToken
+        {
+            return Ok(());
+        }
+        let Ok(request) = CreatePersonalAccessTokenRequest::decode_from(message.body()) else {
+            return Ok(());
+        };
+        let consensus = self
+            .consensus
+            .as_ref()
+            .ok_or(IggyError::TransientNotAccepted)?;
+        let pending = pending_headers(consensus, |header| {
+            header.operation == Operation::CreatePersonalAccessToken
+                && header.user_id == request.user_id
+        })?
+        .len();
+        let committed = self
+            .mux_stm
+            .users()
+            .read(|users| users.pat_count_of(request.user_id));
+        if committed.saturating_add(pending) >= max_tokens_per_user as usize {
+            if committed < max_tokens_per_user as usize {
+                return Err(IggyError::TransientNotAccepted);
+            }
+            return Err(IggyError::PersonalAccessTokensLimitReached(
+                request.user_id,
+                max_tokens_per_user,
+            ));
+        }
+        Ok(())
+    }
+
+    fn placement_counts(&self) -> Result<PlacementCounts, IggyError> {
+        let headers = self.pending_placement_headers()?;
+        let consensus = self.consensus.as_ref().unwrap();
+        let mut placement = self.placement.borrow_mut();
+        let mut counts =
+            placement.committed_counts(self.mux_stm.streams(), consensus.replica_count());
+        for header in headers {
+            placement.add_reservation(&header, &mut counts)?;
+        }
+        Ok(counts)
+    }
+
+    /// The committed topic's replication factor. `None` for a topic created
+    /// before replication factors, or one that does not exist. A topic not
+    /// committed yet refuses transiently while a create waits in the pipeline:
+    /// that create may be the one named, and its factor is unknown until it
+    /// commits.
+    fn committed_replication_factor(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+    ) -> Result<Option<u8>, IggyError> {
+        let committed = self.mux_stm.streams().read(|inner| {
+            let stream = inner.resolve_stream_id(stream_id)?;
+            let topic = inner.resolve_topic_id(stream, topic_id)?;
+            let topic = inner.items.get(stream)?.topics.get(topic)?;
+            Some(TopicCreateOptions::from_resource_options(&topic.options).replication_factor)
+        });
+        let Some(factor) = committed else {
+            let creating_topic = self
+                .pending_placement_headers()?
+                .iter()
+                .any(|header| header.operation == Operation::CreateTopicWithAssignments);
+            return if creating_topic {
+                Err(IggyError::TransientNotAccepted)
+            } else {
+                Ok(None)
+            };
+        };
+        factor
+            .map(|factor| u8::try_from(factor).map_err(|_| IggyError::InvalidReplicationFactor))
+            .transpose()
+    }
+
+    /// Partitions the creates in the prepare pipeline add when they commit.
+    fn pending_partitions(&self) -> Result<u64, IggyError> {
+        let headers = self.pending_placement_headers()?;
+        let placement = self.placement.borrow();
+        headers
+            .iter()
+            .map(|header| placement.reserved_partitions(header))
+            .sum()
+    }
+
+    fn pending_placement_headers(&self) -> Result<Vec<PrepareHeader>, IggyError> {
+        let consensus = self
+            .consensus
+            .as_ref()
+            .ok_or(IggyError::TransientNotAccepted)?;
+        if !is_caught_up_primary(consensus) {
+            return Err(IggyError::TransientNotAccepted);
+        }
+        self.placement.borrow_mut().prune(|op, checksum| {
+            op > consensus.commit_min() && consensus.pipeline_holds_entry(op, checksum)
+        });
+        pending_headers(consensus, |header| {
+            matches!(
+                header.operation,
+                Operation::CreateTopicWithAssignments | Operation::CreatePartitionsWithAssignments
+            )
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3251,7 +4946,7 @@ where
 
         // Stamp the acting user id into the replicated header so the in-apply
         // RBAC gate (`crate::stm::authz`) resolves the same identity on every
-        // replica, WAL replay included (no session table there). Every client-op
+        // replica, WAL replay included. Every client-op
         // prepare funnels through here, primary-only by construction, so stamping
         // here -- not in the in-process client path alone -- also covers the
         // wire-plane ingresses (`on_request` and the request-queue drain). The
@@ -3261,6 +4956,22 @@ where
         // (see `resolve_acting_user_id`); server-originated internal ops
         // (`CompleteConsumerGroupRevocation`, the PAT-cleaner delete) build their
         // prepare directly, bypassing this path, and keep `user_id` 0 (gate skips).
+        // A Logout is not gated, so it gets no acting user above, yet its apply
+        // removes a dedup fence keyed by user. Resolve the owner of the session
+        // it ends here, on the primary, from the live entry or its fence, so
+        // every replica drops the same fence; an unmatched session stamps 0
+        // and the apply leaves the fences alone.
+        if operation == Operation::Logout {
+            let request_header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
+                &mut message.as_mut_slice()[..size_of::<RoutedRequestHeader>()],
+            )
+            .expect("a routed request header was validated on receipt");
+            request_header.user_id = self
+                .client_table
+                .borrow()
+                .user_id_for_session(client_id, request_header.session)
+                .unwrap_or(0);
+        }
         if let Some(acting_user_id) =
             resolve_acting_user_id(operation, client_id, &self.client_table)?
         {
@@ -3269,6 +4980,12 @@ where
             );
             request_header.user_id = acting_user_id;
         }
+
+        // The caps count the creates already in the prepare pipeline, and every
+        // caller pushes this prepare before its next await, so no create passes
+        // on a count that misses another.
+        self.admit_partitions(&message)?;
+        self.admit_personal_access_token(&message)?;
 
         // Must be read AFTER the stamp: the `CreateTopic` / `CreatePartitions`
         // arms hand this `header` copy to `build_prepare_message`, so it has to
@@ -3280,34 +4997,83 @@ where
         let header = *message.header();
         let body = &message.as_slice()[size_of::<RoutedRequestHeader>()..header.size as usize];
 
-        match header.operation {
+        let prepare = match header.operation {
             Operation::CreateTopic => {
                 let mut request = WireCreateTopicRequest::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
-                // Resolve the `ServerDefault` sentinel (0) against server config
-                // here, at primary admission, so the replicated payload carries a
-                // concrete size and every replica commits the same value.
-                if request.max_topic_size == 0 {
-                    request.max_topic_size = self.default_max_topic_size.get();
+                // Resolve every absent catalog key to its catalog default here,
+                // at primary admission, so the replicated payload carries
+                // concrete values and every replica commits the same state
+                // whatever its build. Resolved defaults ride a separate derived
+                // block, preserving per-key provenance for `GetTopic`.
+                let admitted = admit(
+                    OptionsScope::Topic,
+                    OptionOperation::Create,
+                    &request.options,
+                    &[],
+                    &OptionAdmissionContext::default(),
+                )?;
+                // Re-encode the admitted block rather than forwarding the
+                // client's bytes. Admission drops a zero sentinel, so the
+                // resolved value goes in the derived block, but apply merges
+                // with explicit winning, so a forwarded literal `0` would land
+                // back on top as the stored effective value. Re-encoding also
+                // canonicalizes kinds (a `"128MiB"` string becomes `Uint64`).
+                request.options =
+                    resource_options_to_wire(&admitted.explicit, OptionsProvenance::All)?;
+                let mut derived = derived_defaults(OptionsScope::Topic, &admitted.explicit)?;
+                let replication_factor = resolve_replication_factor(
+                    TopicCreateOptions::from_resource_options(&admitted.explicit)
+                        .replication_factor,
+                    self.default_replication_factor(consensus.replica_count()),
+                    consensus.replica_count(),
+                    &mut derived,
+                )?;
+                let mut stored = derived.clone();
+                stored.extend(admitted.explicit.clone());
+                let resolved = TopicResolvedOptions::from(&stored);
+                let resolved_segment_size = resolved.runtime.effective_segment_size();
+                // Backstop for the transport-side typed checks: an explicit
+                // segment size outside its bounds, or a topic cap below one
+                // segment, must never enter the WAL.
+                if let Some(segment_size) =
+                    TopicCreateOptions::from_resource_options(&admitted.explicit).segment_size
+                {
+                    validate_topic_segment_size(
+                        segment_size.as_bytes_u64(),
+                        iggy_common::MAX_TOPIC_SEGMENT_SIZE,
+                    )?;
                 }
-                if request.message_expiry == 0 {
-                    request.message_expiry = self.default_message_expiry.get();
+                if resolved.max_topic_size.as_bytes_u64() < resolved_segment_size.as_bytes_u64() {
+                    return Err(IggyError::InvalidOptionValue(
+                        topic_option_keys::MAX_TOPIC_SIZE.to_string(),
+                    ));
                 }
+                let derived_options = resource_options_to_wire(&derived, OptionsProvenance::All)?;
+                let mut counts = self.placement_counts()?;
                 let partitions = self
                     .allocator
                     .allocate_many(request.partitions_count as usize)
                     .into_iter()
                     .enumerate()
                     .map(|(partition_id, consensus_group_id)| {
+                        let (members, initial_view) = self.placement.borrow().select(
+                            &mut counts,
+                            consensus.view(),
+                            Some(replication_factor),
+                        )?;
                         Ok(CreatedPartitionAssignment {
                             partition_id: u32::try_from(partition_id)
                                 .map_err(|_| IggyError::InvalidCommand)?,
                             consensus_group_id,
+                            initial_view,
+                            members,
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let body = PersistedCreateTopicRequest {
                     request,
+                    derived_options,
                     partitions,
                 }
                 .to_bytes();
@@ -3325,17 +5091,29 @@ where
                 // `CreatePartitionsResult::{Stream,Topic}NotFound`. A preflight
                 // read here would decide against possibly-uncommitted state and
                 // drop without a reply (TOCTOU + wedge). See the metadata
-                // validation design doc.
+                // validation design doc. The replication factor comes from the
+                // committed topic: a missing topic gets no member list, and
+                // apply answers it with `TopicNotFound`.
+                let replication_factor =
+                    self.committed_replication_factor(&request.stream_id, &request.topic_id)?;
+                let mut counts = self.placement_counts()?;
                 let partitions = self
                     .allocator
                     .allocate_many(request.partitions_count as usize)
                     .into_iter()
                     .enumerate()
                     .map(|(offset, consensus_group_id)| {
+                        let (members, initial_view) = self.placement.borrow().select(
+                            &mut counts,
+                            consensus.view(),
+                            replication_factor,
+                        )?;
                         Ok(CreatedPartitionAssignment {
                             partition_id: u32::try_from(offset)
                                 .map_err(|_| IggyError::InvalidCommand)?,
                             consensus_group_id,
+                            initial_view,
+                            members,
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -3351,12 +5129,43 @@ where
                     &body,
                 ))
             }
-            // `UpdateTopic` deliberately takes the default arm: unlike create,
-            // an update stores `ServerDefault` sentinels verbatim (legacy
-            // parity), so a later get echoes `ServerDefault` instead of the
-            // node default frozen at update time.
+            Operation::CreateStream => {
+                let request = WireCreateStreamRequest::decode_from(body)
+                    .map_err(|_| IggyError::InvalidCommand)?;
+                let options = resource_options_from_wire(&request.options, true)?;
+                // Apply refuses a plaintext key too, but only after every replica journaled it.
+                if let Some(secret) = options
+                    .keys()
+                    .filter_map(|key| OptionKey::try_from(key).ok())
+                    .find(|key| key.descriptor().visibility == OptionVisibility::Secret)
+                {
+                    return Err(IggyError::InvalidOptionValue(secret.to_string()));
+                }
+                // An edge whose keys no peer holds wraps only under its own, and
+                // data committed under such a wrap opens nowhere else.
+                if let Some(set) = stream_wrap_set(&options)?
+                    && self.stream_key_context.open(&set).is_err()
+                {
+                    return Err(IggyError::StreamEncryptionUnavailable);
+                }
+                Ok(message.project(consensus))
+            }
+            Operation::UpdateResource => {
+                let request = UpdateResourceRequest::decode_from(body)
+                    .map_err(|_| IggyError::InvalidCommand)?;
+                let (operation, body) = resolve_update_resource(&request)?;
+                Ok(build_prepare_message(consensus, &header, operation, &body))
+            }
             _ => Ok(message.project(consensus)),
-        }
+        }?;
+        let prepare = consensus::seal_prepare_capacity(
+            prepare,
+            consensus.retry_capacity(&self.client_table.borrow()),
+        );
+        self.placement
+            .borrow_mut()
+            .remember(&prepare, consensus.replica_count())?;
+        Ok(prepare)
     }
 
     /// Replicate a prepare message to the next replica in the chain.
@@ -3377,21 +5186,17 @@ where
 
         let header = *message.header();
 
-        // TODO: calculate the index;
         #[allow(clippy::cast_possible_truncation)]
-        let idx = header.op as usize;
-        assert_eq!(header.command, Command2::Prepare);
+        let op = header.op as usize;
+        assert_eq!(header.command, Command::Prepare);
         assert!(
-            journal.handle().header(idx).is_some(),
+            journal.handle().header(op).is_some(),
             "replicate: prepare must be durable in local journal before chain-forward"
         );
-        if let Err(e) = replicate_to_next_in_chain(consensus, message).await {
-            tracing::warn!(op = header.op, error = ?e, "chain replication failed");
+        if let Err(e) = replicate_prepare(consensus, message).await {
+            tracing::warn!(op = header.op, error = ?e, "prepare replication enqueue failed");
         }
     }
-
-    // TODO: Implement jump_to_newer_op
-    // fn jump_to_newer_op(&self, header: &PrepareHeader) {}
 
     /// Apply ops `[commit_min+1 .. commit_max]` to state machine and
     /// `client_table`. Backup does NOT ship wire replies (primary's job).
@@ -3400,7 +5205,7 @@ where
     ///
     /// `advance_commit_min(op)` and matching `client_table` mutation
     /// (`commit_register` / `commit_reply`) run back-to-back, no `.await`
-    /// between. [`crate::metadata_helpers::is_caught_up_primary`] reads
+    /// between. [`consensus::is_caught_up_primary`] reads
     /// `commit_min == commit_max` as proof the table is caught up; an await
     /// here lets another task observe transient equality with stale table,
     /// dispatch a fresh Register on an already-registered client, and bump
@@ -3412,28 +5217,63 @@ where
     ///    `is_caught_up_primary` on a higher "applied frontier".
     ///
     /// `is_caught_up_primary_gate_states` pins clauses, NOT intra-loop window.
+    ///
+    /// Returns why the walk stopped; callers that only drive the walk ignore
+    /// it.
     #[allow(clippy::cast_possible_truncation, clippy::missing_panics_doc)]
     #[allow(clippy::future_not_send)]
-    pub async fn commit_journal(&self) {
+    pub async fn commit_journal(&self) -> CommitWalkStop {
         let consensus = self.consensus.as_ref().unwrap();
+        if consensus.view_log_unproven() {
+            return CommitWalkStop::ViewLogUnproven;
+        }
         let journal = self.journal.as_ref().unwrap();
 
+        let mut applied = 0usize;
         while consensus.commit_min() < consensus.commit_max() {
+            if applied == COMMIT_WALK_OPS_MAX {
+                debug!(
+                    "commit_journal: stopping at op={} after {applied} ops; resuming next tick",
+                    consensus.commit_min()
+                );
+                return CommitWalkStop::WalkCap;
+            }
+            applied += 1;
             let op = consensus.commit_min() + 1;
+
+            // Never apply the op the pipeline holds: `on_ack` pops that entry
+            // and advances past it, so applying it here strands it below
+            // `peek_committable_head`'s floor. Nothing pops it after that (the
+            // only `pop_committed_prepare` sits inside that loop), so its wire
+            // reply is never built and its `reply_sender` neither fires nor drops.
+            //
+            // Compared per op, not hoisted: the body read below awaits and a
+            // sibling driver can move the head. Comparing against `op` also gets
+            // the two edge cases right for free -- an absent head is a backup's
+            // empty pipeline and caps nothing, and a head at or below `commit_min`
+            // is already stranded and must not freeze the walk on top of that.
+            if consensus
+                .pipeline_head_header()
+                .is_some_and(|head| head.op == op)
+            {
+                return CommitWalkStop::PipelineHead;
+            }
 
             let Some(header) = journal.handle().header(op as usize) else {
                 // Gap-stop: the walk halts at the first missing prepare and
-                // resumes once it is refilled. Live drops refill via the
-                // primary's prepare retransmit; a replica behind at recovery
-                // or after StartView adoption arms a `MetadataRepairSession`
-                // (shard) that re-requests the missing window.
-                break;
+                // resumes once it is refilled -- by the primary's retransmit
+                // while the op still lacks quorum, otherwise by a
+                // `MetadataRepairSession` (shard), armed at recovery, at
+                // StartView adoption, or by `tick_metadata`'s gap detector,
+                // which is the only one of those a live drop under sustained
+                // traffic reaches.
+                return CommitWalkStop::HeaderMissing { op };
             };
             let header = *header;
 
             let Some(prepare) = journal.handle().entry(&header).await else {
                 warn!("commit_journal: prepare body missing for op={op}, stopping");
-                break;
+                return CommitWalkStop::BodyMissing { op };
             };
 
             // SM apply + client_table mutation BEFORE `advance_commit_min`
@@ -3443,20 +5283,14 @@ where
             // after replicated commits, not only quorum-acked ones reached via
             // `on_ack` on the primary.
             //
-            // Table mutations are skipped at or below the state-transfer
-            // frontier: those ops are already reflected in the transferred
-            // table, while their state-machine effects still have to replay
-            // (the snapshot sits at a lower op).
-            apply_committed_prepare(
-                &self.mux_stm,
-                &self.client_table,
-                self.client_table_mutation_allowed(header.op),
-                |operation| self.fire_commit_notifier(operation),
-                prepare,
-            );
+            // The replay table follows the snapshot while the transferred table
+            // retains newer protection for client admission.
+            self.apply_prepare(prepare);
             consensus.advance_commit_min(op);
+            self.advance_applied_frontier(op);
             debug!("commit_journal: committed op={op}");
         }
+        CommitWalkStop::CaughtUp
     }
 
     fn observe_prepare_runtime_state(&self, prepare: &Message<PrepareHeader>) {
@@ -3505,42 +5339,71 @@ where
         if !self.persist_superblock_if_needed(consensus).await {
             return;
         }
+        // Containment, not occupancy: after a refused append (slot collision,
+        // view-change race) the slot can hold a DIFFERENT prepare at this op,
+        // and acking it would vouch durability for bytes this replica never
+        // journaled. Checksum equality withholds the ack; the primary's
+        // retransmit re-drives it once the right prepare lands.
         let journal = self.journal.as_ref().unwrap();
-        let persisted = journal.handle().header(header.op as usize).is_some();
-        send_prepare_ok_common(consensus, header, Some(persisted)).await;
+        let persisted = journal
+            .handle()
+            .header(header.op as usize)
+            .is_some_and(|stored| stored.checksum == header.checksum);
+        send_prepare_ok_common(consensus, header, persisted).await;
+    }
+
+    /// The header of the prepare this replica applied at `op`, while the journal
+    /// still holds it: the `applied_at` of
+    /// [`VsrConsensus::contradicts_applied_log`].
+    ///
+    /// Above the snapshot floor only. A state-transfer install keeps the entries
+    /// at or below the floor it installed, and this replica applied the snapshot
+    /// there, not those entries.
+    #[must_use]
+    pub fn applied_header(&self, op: u64) -> Option<PrepareHeader> {
+        let handle = self.journal.as_ref()?.handle();
+        if op <= handle.snapshot_op() {
+            return None;
+        }
+        usize::try_from(op)
+            .ok()
+            .and_then(|slot| handle.header(slot))
+            .map(|header| *header)
     }
 }
 
 /// In-process Register `Message<RoutedRequestHeader>`. Mirrors
 /// `SimClient::register`: `session=0`, `request=0` per
-/// [`RoutedRequestHeader::validate`]; empty body.
+/// [`RoutedRequestHeader::validate`]; the body identifies the verified account.
 ///
 /// `cluster` + `view` from `consensus` for self-consistency before
 /// `Project::project` overwrites. `release = 0` matches wire today; both
 /// paths should switch to `consensus.release()` once
 /// `ClientReleaseTooLow/TooHigh` lands.
 ///
-/// Buffer is `size_of::<RoutedRequestHeader>()`; `prepare_request` transmutes into
-/// `PrepareHeader` (also 256 bytes), no realloc.
+/// `prepare_request` transmutes the header into `PrepareHeader` without reallocating.
 fn build_register_request_message<B, P>(
     consensus: &VsrConsensus<B, P>,
     client_id: u128,
     user_id: u32,
+    registration: RegisterRequest,
 ) -> Message<RoutedRequestHeader>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     let header_size = size_of::<RoutedRequestHeader>();
-    let mut msg = Message::<RoutedRequestHeader>::new(header_size);
+    let body = registration.to_bytes();
+    let message_size = header_size + body.len();
+    let mut msg = Message::<RoutedRequestHeader>::new(message_size);
     let header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
         &mut msg.as_mut_slice()[..header_size],
     )
     .expect("zeroed bytes are a valid RoutedRequestHeader");
     *header = RoutedRequestHeader {
-        command: Command2::Request,
+        command: Command::Request,
         operation: Operation::Register,
-        size: u32::try_from(header_size).expect("RoutedRequestHeader size fits u32"),
+        size: u32::try_from(message_size).expect("Register size fits u32"),
         cluster: consensus.cluster(),
         view: consensus.view(),
         release: 0,
@@ -3556,6 +5419,7 @@ where
         group: server_common::sharding::METADATA_GROUP,
         ..RoutedRequestHeader::default()
     };
+    msg.as_mut_slice()[header_size..].copy_from_slice(&body);
     msg
 }
 
@@ -3576,7 +5440,7 @@ where
     )
     .expect("zeroed bytes are a valid RoutedRequestHeader");
     *header = RoutedRequestHeader {
-        command: Command2::Request,
+        command: Command::Request,
         operation: Operation::Logout,
         size: u32::try_from(header_size).expect("RoutedRequestHeader size fits u32"),
         cluster: consensus.cluster(),
@@ -3592,8 +5456,9 @@ where
     msg
 }
 
-fn build_complete_revocation_request_message<B, P>(
+fn build_partition_completion_request_message<B, P>(
     consensus: &VsrConsensus<B, P>,
+    operation: Operation,
     client_id: u128,
     request: u64,
     body: &[u8],
@@ -3612,8 +5477,8 @@ where
             bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size])
                 .expect("zeroed bytes are a valid RoutedRequestHeader");
         *header = RoutedRequestHeader {
-            command: Command2::Request,
-            operation: Operation::CompleteConsumerGroupRevocation,
+            command: Command::Request,
+            operation,
             size: u32::try_from(total).expect("request size fits u32"),
             cluster: consensus.cluster(),
             view: consensus.view(),
@@ -3630,69 +5495,19 @@ where
     msg
 }
 
-/// Build a `TruncatePartition` request attributed to the originating client.
-///
-/// Replicated through the standard client-request path so the commit records
-/// `(client, session, request)` in the `ClientTable` and advances that
-/// session's watermark. Attributing the truncate to an internal id (or
-/// skipping the commit) would leave this request id unrecorded, so the
-/// client's own retry of it would re-execute instead of deduping.
-///
-/// `template` is the client's own `DeleteSegments` header: it supplies the wire
-/// `cluster` / `view` / `release` and the client's `request` number.
-/// `client_id` / `session` are the bound VSR identity.
+/// Build a truncate attributed to the client's original request and session.
+/// Committed rejections also advance the client table, so retries deduplicate.
 ///
 /// # Panics
-/// If the total request size exceeds `u32::MAX`; a `TruncatePartition` body is
-/// a few fixed-width fields, so this cannot happen in practice.
+/// If the request size exceeds `u32::MAX`; this fixed-size command cannot.
 #[must_use]
 pub fn build_truncate_partition_client_message(
     template: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
-    stream_id: u32,
-    topic_id: u32,
-    partition_id: u32,
-    up_to_offset: u64,
+    request: &TruncatePartitionRequest,
 ) -> Message<RoutedRequestHeader> {
-    build_truncate_partition_client_message_with_identifiers(
-        template,
-        client_id,
-        session,
-        WireIdentifier::numeric(stream_id),
-        WireIdentifier::numeric(topic_id),
-        partition_id,
-        up_to_offset,
-    )
-}
-
-/// [`build_truncate_partition_client_message`] with the client's raw wire
-/// identifiers (name or id) instead of resolved numeric ids.
-///
-/// Used when the target does not resolve on the handling node: the truncate
-/// still commits, and the apply rejects it as a committed result, keeping the
-/// client's request sequence contiguous while surfacing the typed error.
-///
-/// # Panics
-/// If the total request size exceeds `u32::MAX`; a `TruncatePartition` body is
-/// a few small fields, so this cannot happen in practice.
-#[must_use]
-pub fn build_truncate_partition_client_message_with_identifiers(
-    template: &RoutedRequestHeader,
-    client_id: u128,
-    session: u64,
-    stream_id: WireIdentifier,
-    topic_id: WireIdentifier,
-    partition_id: u32,
-    up_to_offset: u64,
-) -> Message<RoutedRequestHeader> {
-    let body = TruncatePartitionRequest {
-        stream_id,
-        topic_id,
-        partition_id,
-        up_to_offset,
-    }
-    .to_bytes();
+    let body = request.to_bytes();
     let header_size = size_of::<RoutedRequestHeader>();
     let total = header_size + body.len();
     let mut msg = Message::<RoutedRequestHeader>::new(total);
@@ -3703,7 +5518,7 @@ pub fn build_truncate_partition_client_message_with_identifiers(
             bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size])
                 .expect("zeroed bytes are a valid RoutedRequestHeader");
         *header = RoutedRequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::TruncatePartition,
             size: u32::try_from(total).expect("request size fits u32"),
             cluster: template.cluster,
@@ -3712,11 +5527,168 @@ pub fn build_truncate_partition_client_message_with_identifiers(
             client: client_id,
             session,
             request: template.request,
+            request_checksum: template.request_checksum,
             group: server_common::sharding::METADATA_GROUP,
             ..RoutedRequestHeader::default()
         };
     }
     msg
+}
+
+/// Build a committed rejection for a target that did not resolve locally.
+/// Keeping the raw identifiers lets metadata report the missing resource.
+///
+/// # Panics
+/// If the request size exceeds `u32::MAX`; this fixed-size command cannot.
+#[must_use]
+pub fn build_truncate_partition_client_message_with_identifiers(
+    template: &RoutedRequestHeader,
+    client_id: u128,
+    session: u64,
+    stream_id: WireIdentifier,
+    topic_id: WireIdentifier,
+    partition_id: u32,
+    up_to_offset: u64,
+) -> Message<RoutedRequestHeader> {
+    build_truncate_partition_client_message(
+        template,
+        client_id,
+        session,
+        &TruncatePartitionRequest {
+            stream_id,
+            topic_id,
+            partition_id,
+            up_to_offset,
+            expected_history: None,
+        },
+    )
+}
+
+/// A new topic's replication factor: the explicit value, which must fit the
+/// cluster's `nodes`, or this node's `default`. The default is written back
+/// into `derived`, so the topic stores what placement used.
+fn resolve_replication_factor(
+    explicit: Option<u32>,
+    default: u8,
+    nodes: u8,
+    derived: &mut ResourceOptions,
+) -> Result<u8, IggyError> {
+    let factor = explicit.unwrap_or_else(|| {
+        let factor = u32::from(default);
+        derived.insert(
+            HeaderKey::from(OptionKey::ReplicationFactor),
+            OptionValue::derived(HeaderValue::from(factor)),
+        );
+        factor
+    });
+    match u8::try_from(factor) {
+        Ok(factor) if factor >= 1 && factor <= nodes => Ok(factor),
+        _ => {
+            debug!(
+                replication_factor = factor,
+                nodes, "refusing a topic whose replication factor the cluster cannot hold"
+            );
+            Err(IggyError::InvalidReplicationFactor)
+        }
+    }
+}
+
+/// Rewrite a generic patch into the resolved operation of its scope: the
+/// column values extracted, the set keys canonical and explicit, each reset key
+/// resolved to its catalog default in the derived block.
+///
+/// The defaults come from the catalog, never from node configuration, so the
+/// replicated body is the same whichever primary admits it. The capacity of
+/// the patched map is checked at apply, against committed state.
+fn resolve_update_resource(
+    request: &UpdateResourceRequest,
+) -> Result<(Operation, Bytes), IggyError> {
+    let scope = OptionsScope::from_code(request.target.scope_code())?;
+    let reset: Vec<String> = request
+        .reset
+        .iter()
+        .map(|name| name.as_str().to_owned())
+        .collect();
+    let admitted = admit(
+        scope,
+        OptionOperation::Update,
+        &request.options,
+        &reset,
+        &OptionAdmissionContext::default(),
+    )?;
+    let set_keys: Vec<OptionKey> = admitted
+        .explicit
+        .keys()
+        .filter_map(|key| OptionKey::try_from(key).ok())
+        .collect();
+    // No update path wraps a secret, so one would be replicated as sent.
+    if let Some(secret) = set_keys
+        .iter()
+        .find(|key| key.descriptor().visibility == OptionVisibility::Secret)
+    {
+        return Err(IggyError::OptionNotUpdatable(secret.to_string()));
+    }
+    let critical: Vec<OptionKey> = set_keys
+        .into_iter()
+        .chain(admitted.reset.iter().copied())
+        .filter(|key| key.descriptor().critical)
+        .collect();
+    let mut explicit = admitted.explicit;
+    if !critical.is_empty() {
+        explicit.insert(
+            HeaderKey::from(OptionKey::CriticalKeys),
+            OptionValue::explicit(critical_keys_marker(&critical)?),
+        );
+    }
+    let explicit_options = resource_options_to_wire(&explicit, OptionsProvenance::All)?;
+    let mut derived = ResourceOptions::new();
+    for key in &admitted.reset {
+        if let Some(default) = key.descriptor().default_value()? {
+            derived.insert(HeaderKey::from(*key), OptionValue::derived(default));
+        }
+    }
+    let derived_options = resource_options_to_wire(&derived, OptionsProvenance::All)?;
+    let column_name = |name: Option<String>, error: IggyError| {
+        name.map(|name| WireName::new(name).map_err(|_| error))
+            .transpose()
+    };
+    Ok(match &request.target {
+        ResourceTarget::Topic {
+            stream_id,
+            topic_id,
+        } => (
+            Operation::UpdateTopicResolved,
+            UpdateTopicResolvedRequest {
+                stream_id: stream_id.clone(),
+                topic_id: topic_id.clone(),
+                name: column_name(admitted.columns.name, IggyError::InvalidTopicName)?,
+                explicit_options,
+                derived_options,
+            }
+            .to_bytes(),
+        ),
+        ResourceTarget::Stream { stream_id } => (
+            Operation::UpdateStreamResolved,
+            UpdateStreamResolvedRequest {
+                stream_id: stream_id.clone(),
+                name: column_name(admitted.columns.name, IggyError::InvalidStreamName)?,
+                explicit_options,
+                derived_options,
+            }
+            .to_bytes(),
+        ),
+        ResourceTarget::User { user_id } => (
+            Operation::UpdateUserResolved,
+            UpdateUserResolvedRequest {
+                user_id: user_id.clone(),
+                username: column_name(admitted.columns.username, IggyError::InvalidUsername)?,
+                status: admitted.columns.status.map(|status| status.as_code()),
+                explicit_options,
+                derived_options,
+            }
+            .to_bytes(),
+        ),
+    })
 }
 
 fn build_prepare_message<B, P>(
@@ -3756,12 +5728,13 @@ where
         size: u32::try_from(size).expect("prepare message size exceeds u32"),
         view: consensus.view(),
         release: request.release,
-        command: Command2::Prepare,
+        command: Command::Prepare,
         replica: consensus.replica(),
         client: request.client,
         parent: consensus.last_prepare_checksum(),
         request_checksum: request.request_checksum,
         request: request.request,
+        session: request.session,
         commit: consensus.commit_max(),
         op,
         timestamp,
@@ -3833,27 +5806,20 @@ fn resolve_acting_user_id(
         .map(Some)
 }
 
-/// Surface a non-`Cached` [`CommitReply`]. Both non-cached outcomes are
-/// expected under replica-local eviction, so they are diagnostics, never
-/// faults: the wire reply already shipped and only this entry's dedup is
-/// degraded.
 fn log_commit_reply_outcome(outcome: CommitReply, client_id: u128, op: u64) {
     match outcome {
         CommitReply::Cached => {}
-        CommitReply::NoEntry => tracing::trace!(
-            target: "iggy.metadata.diag",
+        CommitReply::SessionEnded { ended_op } => debug!(
             client_id,
             op,
-            "commit_reply: client evicted while being prepared; reply shipped, cache skipped"
+            ended_op,
+            "metadata op committed after its session ended, so its outcome stays uncertain"
         ),
-        CommitReply::SkippedRegression { stored, received } => warn!(
-            target: "iggy.metadata.diag",
-            client_id,
-            op,
-            stored,
-            received,
-            "commit_reply: committed op is older than the cached entry \
-             (replica-local eviction replayed out of order); cache skipped"
+        CommitReply::NoEntry | CommitReply::SkippedRegression { .. } => fatal(
+            FatalReason::UnreconcilableLogFrontier,
+            &format!(
+                "cannot retain committed metadata receipt for client={client_id} op={op}: {outcome:?}"
+            ),
         ),
     }
 }
@@ -3869,64 +5835,737 @@ fn log_commit_reply_outcome(outcome: CommitReply, client_id: u128, op: u64) {
 /// `ApplyReply::ok(Bytes::new())` and the cache holds no token. The secret
 /// existed only on the wire of the original reply, spliced in by
 /// `build_raw_pat_reply`, and is unrecoverable once that reply is lost.
-/// Meanwhile the ingress rewrite has already minted a FRESH secret for the
-/// replayed frame whose hash never reached consensus, so serving the cached
+/// Meanwhile the binary ingress rewrite has already minted a FRESH secret for
+/// the replayed frame whose hash never reached consensus, so serving the cached
 /// success would splice that orphan onto it and hand the caller a credential
 /// that authenticates against nothing.
 ///
+/// A replay that still carries the committed hash is served from the cache.
+/// The HTTP write path resends the frame it minted after a transient, so its
+/// caller holds the matching secret and splices it into the cached success.
+///
 /// `PersonalAccessTokenAlreadyExists` is the honest code: the original create
 /// committed, so the name IS taken, and the remedy it implies (delete by name,
-/// then recreate) is exactly right.
+/// then recreate) is exactly right. The refusal is the cached reply with only
+/// its result section replaced. It keeps the commit marker, the original op
+/// and the request identity, so a client that holds the create as uncertain
+/// gets a committed outcome for it.
 ///
 /// A cached REJECTION replays untouched: it carries no secret, so serving it
 /// is both safe and useful.
 fn unreplayable_secret_refusal(
-    request_header: &RoutedRequestHeader,
+    request: &Message<RoutedRequestHeader>,
     cached: &Frozen<{ server_common::MESSAGE_ALIGN }>,
-    commit: u64,
-    client_id: u128,
+    users: &Users,
 ) -> Option<Message<GenericHeader>> {
+    let request_header = request.header();
     if request_header.operation != Operation::CreatePersonalAccessToken {
         return None;
     }
-    let cached_body = cached
+    let (cached_header, cached_body) = cached
         .as_slice()
-        .get(size_of::<ReplyHeader>()..)
-        .unwrap_or_default();
-    if iggy_binary_protocol::result_code(cached_body) != Some(0) {
+        .split_at_checked(size_of::<ReplyHeader>())?;
+    if iggy_binary_protocol::result_code(cached_body) != Some(0)
+        || carries_committed_token_hash(request.body(), users)
+    {
         return None;
     }
+    let committed = bytemuck::checked::try_from_bytes::<ReplyHeader>(cached_header).ok()?;
     warn!(
         target: "iggy.metadata.diag",
-        client_id,
+        client_id = request_header.client,
         request = request_header.request,
         "refusing replayed CreatePersonalAccessToken: the committed secret is \
          unrecoverable and a re-minted one would not match the stored hash"
     );
-    Some(
-        build_result_rejection_reply(
-            request_header,
-            commit,
-            IggyError::PersonalAccessTokenAlreadyExists(String::new(), 0).as_code(),
-        )
-        .into_generic(),
+    let mut refusal = build_result_rejection_reply(
+        request_header,
+        committed.commit,
+        IggyError::PersonalAccessTokenAlreadyExists(String::new(), 0).as_code(),
+    );
+    let header = ReplyHeader {
+        size: refusal.header().size,
+        checksum: 0,
+        checksum_body: 0,
+        ..*committed
+    };
+    refusal.as_mut_slice()[..size_of::<ReplyHeader>()].copy_from_slice(bytemuck::bytes_of(&header));
+    Some(refusal.into_generic())
+}
+
+/// Whether a replicated `CreatePersonalAccessToken` body carries the hash
+/// stored for its token, so its sender still holds the committed secret.
+fn carries_committed_token_hash(body: &[u8], users: &Users) -> bool {
+    let Ok(request) = CreatePersonalAccessTokenRequest::decode_from(body) else {
+        return false;
+    };
+    users.read(|users| {
+        users
+            .personal_access_tokens
+            .get(&request.user_id)
+            .and_then(|tokens| tokens.get(request.name.as_str()))
+            .is_some_and(|token| token.token.as_bytes() == request.token_hash.as_slice())
+    })
+}
+
+/// A `prepare_request` error that the client gets as a reply. Any other error
+/// marks a malformed request, and its session is evicted.
+const fn is_admission_refusal(error: &IggyError) -> bool {
+    matches!(
+        error,
+        IggyError::TransientNotAccepted
+            | IggyError::PartitionsLimitReached
+            | IggyError::PersonalAccessTokensLimitReached(..)
     )
+}
+
+/// Headers that `keep` selects among the ops prepared after `commit_min`,
+/// oldest first. Refuses while one of those ops is missing from the pipeline:
+/// it could be a create that the caller has to count.
+fn pending_headers<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    keep: impl Fn(&PrepareHeader) -> bool,
+) -> Result<Vec<PrepareHeader>, IggyError>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    consensus.with_pipeline(|pipeline| {
+        let committed = consensus.commit_min();
+        let sequence = consensus.sequencer().current_sequence();
+        if sequence < committed || sequence - committed > pipeline.prepare_queue_max() as u64 {
+            return Err(IggyError::TransientNotAccepted);
+        }
+        let mut headers = Vec::new();
+        for op in committed.saturating_add(1)..=sequence {
+            let header = pipeline
+                .entry_by_op(op)
+                .ok_or(IggyError::TransientNotAccepted)?
+                .header;
+            if keep(&header) {
+                headers.push(header);
+            }
+        }
+        Ok(headers)
+    })
+}
+
+/// `requested` more partitions on top of the `held` ones, committed or in
+/// flight, against a nonzero `partitions_max` cap. A create of zero partitions
+/// adds nothing, so it passes also on a node already past the cap, for example
+/// after the cap was lowered.
+fn validate_partitions_limit(
+    partitions_max: u32,
+    requested: u32,
+    held: u64,
+) -> Result<(), IggyError> {
+    if requested == 0 {
+        return Ok(());
+    }
+    if held.saturating_add(u64::from(requested)) > u64::from(partitions_max) {
+        return Err(IggyError::PartitionsLimitReached);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stm::stream::Streams;
-    use crate::stm::user::Users;
-    use consensus::LocalPipeline;
-    use iggy_binary_protocol::requests::topics::CreateTopicRequest;
-    use iggy_common::variadic;
-    use journal::prepare_journal::PrepareJournal;
-    use message_bus::{ClientForwardFn, ConnectionLostFn, JoinHandle, ReplicaForwardFn, SendError};
+    use crate::impls::recovery::{ReplicaIdentity, recover};
+    use crate::stm::StateHandler;
+    use crate::stm::authz::GatedApply;
+    use crate::stm::consumer_group::JoinConsumerGroupRequest;
+    use crate::stm::lifecycle::{
+        CompleteLifecycleRequest, LifecycleCompletion, apply_with_lifecycle_completion,
+    };
+    use crate::stm::stream::{Streams, StreamsInner};
+    use crate::stm::user::{PAT_TOKEN_HASH_BYTES, Users, UsersInner};
+    use consensus::{HistoryRecovery, LocalPipeline};
+    use iggy_binary_protocol::codes::CREATE_USER_CODE;
+    use iggy_binary_protocol::primitives::metadata_changes::{
+        WireMetadataChangeKind, WireMetadataChangeStatus,
+    };
+    use iggy_binary_protocol::primitives::permissions::{
+        WireGlobalPermissions, WirePermissions, WireStreamPermissions,
+    };
+    use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::topics::{CreateTopicRequest, DeleteTopicRequest};
+    use iggy_binary_protocol::requests::users::{CreateUserRequest, DeleteUserRequest};
+    use iggy_binary_protocol::{RequestHeader, StartViewHeader, WireOptions};
+    use iggy_common::MetadataChangeGroup;
+    use iggy_common::{
+        HeaderValue, IggyExpiry, IggyTimestamp, OptionKey, OptionStorage, OptionValueCodec,
+        ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, TopicUpdateOptions, UserStatus,
+        UserUpdateOptions, WrapSet, critical_keys_marker, descriptors_for, stream_wrap_set,
+        variadic,
+    };
+    use journal::prepare_journal::{DEFAULT_SLOT_COUNT, PrepareJournal};
+    use journal::superblock::SuperblockContents;
+    use message_bus::{BusMessage, ConnectionLostFn, JoinHandle, ReplicaForwardFn, SendError};
     use server_common::MESSAGE_ALIGN;
     use server_common::iobuf::Frozen;
     use std::cell::RefCell;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::rc::Rc;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn given_create_user_when_building_prepare_should_not_store_body_hash_as_request_identifier() {
+        let body = CreateUserRequest {
+            username: WireName::new("alice").expect("valid username"),
+            password: "guessable-password".to_owned(),
+            status: UserStatus::Active.as_code(),
+            permissions: None,
+            options: WireOptions::empty(),
+        }
+        .to_bytes();
+        let client =
+            RequestHeader::for_request(CREATE_USER_CODE, 7, 1, 3, &body).expect("request header");
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let routed = RoutedRequestHeader {
+            request_checksum: client.request_checksum,
+            ..RoutedRequestHeader::default()
+        };
+        let prepare = build_prepare_message(&consensus, &routed, Operation::CreateUser, &body);
+        assert_ne!(prepare.header().request_checksum, 0);
+        assert_eq!(prepare.header().request_checksum, client.request_checksum);
+        assert_ne!(
+            prepare.header().request_checksum,
+            u128::from(iggy_common::calculate_checksum(&body))
+        );
+    }
+
+    #[test]
+    fn given_topic_patch_when_resolving_should_extract_name_and_resolve_reset_defaults() {
+        let patch = TopicUpdateOptions {
+            name: Some("renamed".to_owned()),
+            message_expiry: Some(IggyExpiry::from(9_000_000u64)),
+            reset: BTreeSet::from([OptionKey::MaxTopicSize]),
+            ..TopicUpdateOptions::default()
+        }
+        .to_patch()
+        .unwrap();
+        let request = UpdateResourceRequest {
+            target: ResourceTarget::Topic {
+                stream_id: WireIdentifier::numeric(1),
+                topic_id: WireIdentifier::named("orders").unwrap(),
+            },
+            reset: patch.reset,
+            options: patch.set,
+        };
+
+        let (operation, body) = resolve_update_resource(&request).unwrap();
+
+        assert_eq!(operation, Operation::UpdateTopicResolved);
+        let resolved = UpdateTopicResolvedRequest::decode_from(&body).unwrap();
+        let mut explicit = ResourceOptions::new();
+        explicit.insert(
+            HeaderKey::from(OptionKey::MessageExpiry),
+            OptionValue::explicit(IggyExpiry::from(9_000_000u64).encode().unwrap()),
+        );
+        let mut derived = ResourceOptions::new();
+        derived.insert(
+            HeaderKey::from(OptionKey::MaxTopicSize),
+            OptionValue::derived(
+                OptionKey::MaxTopicSize
+                    .descriptor()
+                    .default_value()
+                    .unwrap()
+                    .unwrap(),
+            ),
+        );
+        assert_eq!(
+            resolved,
+            UpdateTopicResolvedRequest {
+                stream_id: WireIdentifier::numeric(1),
+                topic_id: WireIdentifier::named("orders").unwrap(),
+                name: Some(WireName::new("renamed").unwrap()),
+                explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All)
+                    .unwrap(),
+                derived_options: resource_options_to_wire(&derived, OptionsProvenance::All)
+                    .unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn given_default_sentinel_when_resolving_patch_should_leave_the_key_unchanged() {
+        let patch = TopicUpdateOptions {
+            name: Some("renamed".to_owned()),
+            raw: BTreeMap::from([(
+                OptionKey::MessageExpiry.to_string(),
+                "server_default".to_owned(),
+            )]),
+            ..TopicUpdateOptions::default()
+        }
+        .to_patch()
+        .unwrap();
+        let request = UpdateResourceRequest {
+            target: ResourceTarget::Topic {
+                stream_id: WireIdentifier::numeric(1),
+                topic_id: WireIdentifier::numeric(2),
+            },
+            reset: patch.reset,
+            options: patch.set,
+        };
+
+        let (_, body) = resolve_update_resource(&request).unwrap();
+
+        let resolved = UpdateTopicResolvedRequest::decode_from(&body).unwrap();
+        assert_eq!(resolved.name, Some(WireName::new("renamed").unwrap()));
+        assert!(resolved.explicit_options.is_empty());
+        assert!(resolved.derived_options.is_empty());
+    }
+
+    #[test]
+    fn given_create_only_or_foreign_key_when_resolving_patch_should_refuse_before_replication() {
+        let topic = ResourceTarget::Topic {
+            stream_id: WireIdentifier::numeric(1),
+            topic_id: WireIdentifier::numeric(2),
+        };
+        let stream = ResourceTarget::Stream {
+            stream_id: WireIdentifier::numeric(1),
+        };
+        let raw = |key: OptionKey, value: &str| TopicUpdateOptions {
+            raw: BTreeMap::from([(key.to_string(), value.to_owned())]),
+            ..TopicUpdateOptions::default()
+        };
+        let cases = [
+            (
+                topic.clone(),
+                raw(OptionKey::PartitionResizePolicy, "fixed"),
+                IggyError::OptionNotUpdatable(OptionKey::PartitionResizePolicy.to_string()),
+            ),
+            (
+                topic,
+                raw(OptionKey::EncryptionKeySource, "stream"),
+                IggyError::UnsupportedOptionKey(OptionKey::EncryptionKeySource.to_string()),
+            ),
+            (
+                stream,
+                raw(OptionKey::MessageExpiry, "1000"),
+                IggyError::UnsupportedOptionKey(OptionKey::MessageExpiry.to_string()),
+            ),
+        ];
+        for (target, options, expected) in cases {
+            let patch = options.to_patch().unwrap();
+            let request = UpdateResourceRequest {
+                target,
+                reset: patch.reset,
+                options: patch.set,
+            };
+            assert_eq!(
+                resolve_update_resource(&request).unwrap_err().as_code(),
+                expected.as_code()
+            );
+        }
+    }
+
+    #[test]
+    fn given_user_patch_when_resolving_should_carry_username_and_status_columns() {
+        let patch = UserUpdateOptions {
+            username: Some("alicia".to_owned()),
+            status: Some(UserStatus::Inactive),
+            ..UserUpdateOptions::default()
+        }
+        .to_patch()
+        .unwrap();
+        let request = UpdateResourceRequest {
+            target: ResourceTarget::User {
+                user_id: WireIdentifier::numeric(3),
+            },
+            reset: patch.reset,
+            options: patch.set,
+        };
+
+        let (operation, body) = resolve_update_resource(&request).unwrap();
+
+        assert_eq!(operation, Operation::UpdateUserResolved);
+        assert_eq!(
+            UpdateUserResolvedRequest::decode_from(&body).unwrap(),
+            UpdateUserResolvedRequest {
+                user_id: WireIdentifier::numeric(3),
+                username: Some(WireName::new("alicia").unwrap()),
+                status: Some(UserStatus::Inactive.as_code()),
+                explicit_options: WireOptions::empty(),
+                derived_options: WireOptions::empty(),
+            }
+        );
+    }
+
+    #[test]
+    fn given_cancelled_snapshot_writer_when_replaced_should_keep_the_new_snapshot() {
+        let runtime = server_common::executor::create_shard_executor().unwrap();
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("snapshot.bin");
+            let first = IggySnapshot::create(&TestMux::default(), 1, 1).unwrap();
+            let mut cancelled = Box::pin(first.persist(&path));
+            assert!(futures::poll!(&mut cancelled).is_pending());
+            drop(cancelled);
+
+            let replacement = IggySnapshot::create(&TestMux::default(), 2, 2).unwrap();
+            replacement.persist(&path).await.unwrap();
+            let (loaded, checksum) = IggySnapshot::load(&path).unwrap();
+            assert_eq!(loaded.sequence_number(), 2);
+            assert_eq!(
+                checksum,
+                checkpoint_checksum(&replacement.encode().unwrap())
+            );
+            assert!(!path.with_extension("bin.tmp").exists());
+        });
+    }
+
+    #[compio::test]
+    async fn given_cached_offer_when_installing_snapshot_should_invalidate_without_rereading() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let mut metadata = metadata_plane();
+        metadata.coordinator = Some(SnapshotCoordinator::new(
+            directory.path().to_path_buf(),
+            IggySnapshot::create,
+        ));
+        let path = metadata.coordinator.as_ref().unwrap().snapshot_path();
+        IggySnapshot::create(&TestMux::default(), 0, 1)
+            .unwrap()
+            .persist(&path)
+            .await
+            .unwrap();
+        let checkpoint = metadata.checkpoint_lock.acquire().await;
+        {
+            let mut blocked_offer = std::pin::pin!(metadata.state_transfer_offer());
+            assert!(matches!(
+                futures::poll!(&mut blocked_offer),
+                std::task::Poll::Ready(Err(StateTransferUnavailable::CheckpointInProgress))
+            ));
+        }
+        drop(checkpoint);
+        let first = settled_transfer_offer(&metadata).await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let cached = settled_transfer_offer(&metadata).await.unwrap();
+        assert!(
+            Rc::ptr_eq(&first, &cached),
+            "a cache hit must need no disk read"
+        );
+
+        let mut snapshot = IggySnapshot::create(&TestMux::default(), 1, 2).unwrap();
+        snapshot.snapshot_mut().client_table = Some(metadata.client_table.borrow().to_snapshot());
+        let incoming = snapshot.encode().unwrap();
+        metadata
+            .install_state_transfer(&incoming, ClientTable::new(CLIENTS_TABLE_MAX), 1, 1)
+            .await
+            .unwrap();
+        let replaced = settled_transfer_offer(&metadata).await.unwrap();
+        assert_eq!(replaced.snapshot_seq, 1);
+        assert!(!Rc::ptr_eq(&first, &replaced));
+
+        metadata.clear_state_transfer_offer_cache();
+        let mut damaged = std::fs::read(&path).unwrap();
+        damaged[0] ^= 1;
+        std::fs::write(&path, damaged).unwrap();
+        assert!(matches!(
+            settled_transfer_offer(&metadata).await,
+            Err(StateTransferUnavailable::SnapshotUnreadable(_))
+        ));
+    }
+
+    #[test]
+    fn given_log_and_frontier_when_reading_changes_should_answer_only_a_coherent_image() {
+        let metadata = metadata_plane();
+        let latest = MetadataChangesQuery {
+            start: MetadataChangeStart::Latest,
+            ..MetadataChangesQuery::default()
+        };
+        let header = |op| PrepareHeader {
+            op,
+            checksum: 0x5eed,
+            timestamp: op,
+            ..PrepareHeader::default()
+        };
+        assert_eq!(
+            metadata.metadata_changes(&latest).unwrap().status,
+            WireMetadataChangeStatus::Behind,
+            "no op 1 applied yet"
+        );
+
+        metadata
+            .change_log()
+            .append(
+                &header(1),
+                vec![AppliedChange {
+                    kind: WireMetadataChangeKind::UserCreated,
+                    actor_user_id: None,
+                    body: Bytes::new(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            metadata.metadata_changes(&latest),
+            Err(IggyError::TransientNotAccepted),
+            "a log ahead of the frontier is not a coherent image"
+        );
+        metadata.advance_applied_frontier(1);
+        let page = metadata.metadata_changes(&latest).unwrap();
+        assert_eq!(page.status, WireMetadataChangeStatus::Ok);
+        assert_eq!(page.head_op, 1);
+        assert_eq!(page.next.map(|next| (next.op, next.ordinal)), Some((1, 0)));
+
+        let current = MetadataChangesQuery {
+            start: MetadataChangeStart::Current(None),
+            groups: vec![MetadataChangeGroup::Streams],
+            ..MetadataChangesQuery::default()
+        };
+        assert_eq!(
+            metadata.metadata_changes(&current),
+            Err(IggyError::InvalidCommand)
+        );
+        assert_eq!(
+            metadata.metadata_current_state(&current).unwrap().status,
+            WireMetadataChangeStatus::Ok
+        );
+        assert_eq!(
+            peer_metadata().metadata_current_state(&current),
+            Err(IggyError::InvalidConfiguration),
+            "only the metadata shard holds the client table"
+        );
+    }
+
+    #[compio::test]
+    async fn given_state_transfer_when_installing_should_replace_the_change_log_only_with_the_state_machines()
+     {
+        const TRANSFER_OP: u64 = 2;
+        let metadata = metadata_plane();
+        let local = |op, checksum| PrepareHeader {
+            op,
+            checksum,
+            timestamp: op,
+            ..PrepareHeader::default()
+        };
+        metadata
+            .change_log()
+            .append(&local(1, 0xaa), Vec::new())
+            .unwrap();
+        let before = metadata.change_log().snapshot();
+        let transferred = |sequence_number, log_id| {
+            let mut snapshot =
+                IggySnapshot::create(&TestMux::default(), sequence_number, 1).unwrap();
+            snapshot.snapshot_mut().client_table =
+                Some(ClientTable::new(CLIENTS_TABLE_MAX).to_snapshot());
+            let log = MetadataChangeLog::new(ChangeLogCapacities::default());
+            log.append(&local(1, log_id), Vec::new()).unwrap();
+            log.append(
+                &local(sequence_number, log_id),
+                vec![AppliedChange {
+                    kind: WireMetadataChangeKind::StreamCreated,
+                    actor_user_id: None,
+                    body: Bytes::from_static(b"body"),
+                }],
+            )
+            .unwrap();
+            snapshot.snapshot_mut().change_log = log.snapshot();
+            snapshot
+        };
+
+        let incoherent = transferred(TRANSFER_OP, 0xbb).encode().unwrap();
+        assert!(matches!(
+            metadata
+                .install_state_transfer(
+                    &incoherent,
+                    ClientTable::new(CLIENTS_TABLE_MAX),
+                    TRANSFER_OP,
+                    TRANSFER_OP - 1,
+                )
+                .await,
+            Err(SnapshotError::IncoherentManifest { .. })
+        ));
+        assert_eq!(
+            metadata.change_log().snapshot(),
+            before,
+            "a refused transfer leaves the log untouched"
+        );
+
+        let ahead = transferred(TRANSFER_OP, 0xbb);
+        metadata
+            .install_state_transfer(
+                &ahead.encode().unwrap(),
+                ClientTable::new(CLIENTS_TABLE_MAX),
+                TRANSFER_OP,
+                TRANSFER_OP,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata.change_log().snapshot(),
+            ahead.snapshot().change_log,
+            "the transfer replaces the log with the state machines"
+        );
+
+        let behind = transferred(TRANSFER_OP, 0xcc);
+        metadata
+            .install_state_transfer(
+                &behind.encode().unwrap(),
+                ClientTable::new(CLIENTS_TABLE_MAX),
+                TRANSFER_OP,
+                TRANSFER_OP,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata.change_log().snapshot(),
+            ahead.snapshot().change_log,
+            "a transfer at the applied frontier keeps the local state and log"
+        );
+    }
+
+    /// The offer ships state at or below `commit_min`, which a recovered suffix
+    /// above `commit_max` cannot change, so the barrier waiting on that suffix must
+    /// not withhold it.
+    #[compio::test]
+    async fn given_a_primary_below_its_recovery_barrier_when_a_peer_asks_for_state_should_serve_its_checkpoint()
+     {
+        const SNAPSHOT_OP: u64 = 3;
+        const COMMITTED: u64 = 5;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let mut metadata = metadata_plane();
+        metadata.coordinator = Some(SnapshotCoordinator::new(
+            directory.path().to_path_buf(),
+            IggySnapshot::create,
+        ));
+        let path = metadata.coordinator.as_ref().unwrap().snapshot_path();
+        IggySnapshot::create(&TestMux::default(), SNAPSHOT_OP, 1)
+            .unwrap()
+            .persist(&path)
+            .await
+            .unwrap();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        consensus.restore_commit_state(COMMITTED, COMMITTED);
+        consensus.set_recovery_barrier(COMMITTED + 1);
+
+        let offer = settled_transfer_offer(&metadata)
+            .await
+            .expect("a primary below its recovery barrier must still serve committed state");
+        assert_eq!(offer.snapshot_seq, SNAPSHOT_OP);
+        assert_eq!(
+            offer.commit_op, COMMITTED,
+            "the offer must stop at the applied commit point, below the barrier"
+        );
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn settled_transfer_offer(
+        metadata: &IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux>,
+    ) -> Result<Rc<StateTransferOffer>, StateTransferUnavailable> {
+        const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        compio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                match metadata.state_transfer_offer().await {
+                    Err(StateTransferUnavailable::CheckpointInProgress) => {
+                        compio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    result => return result,
+                }
+            }
+        })
+        .await
+        .expect("concurrent snapshot writers settle")
+    }
+
+    #[compio::test]
+    async fn given_commits_during_snapshot_io_when_installing_should_preserve_the_newer_frontier() {
+        const SNAPSHOT_OP: u64 = 1;
+        const LOCAL_OP: u64 = 2;
+        const TRANSFER_OP: u64 = 3;
+        const CLIENT: u128 = 9;
+        const USER: u32 = 7;
+        const BIND_VERIFIER: [u8; 32] = [0x5a; 32];
+        for table_frontier in [SNAPSHOT_OP, TRANSFER_OP] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::create_dir(directory.path().join(crate::impls::METADATA_DIR)).unwrap();
+            let mut metadata = metadata_plane();
+            metadata.coordinator = Some(SnapshotCoordinator::new(
+                directory.path().to_path_buf(),
+                IggySnapshot::create,
+            ));
+            let mut table = ClientTable::new(CLIENTS_TABLE_MAX);
+            table.commit_capacity(CLIENTS_TABLE_MAX).unwrap();
+            let mut snapshot = IggySnapshot::create(&TestMux::default(), SNAPSHOT_OP, 1).unwrap();
+            snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+            let incoming = snapshot.encode().unwrap();
+            let held = SNAPSHOT_IO.lock().await;
+            let mut install = Box::pin(metadata.install_state_transfer(
+                &incoming,
+                table,
+                table_frontier,
+                table_frontier,
+            ));
+            assert!(futures::poll!(&mut install).is_pending());
+            let consensus = metadata.consensus.as_ref().unwrap();
+            consensus.advance_commit_max(LOCAL_OP);
+            consensus.set_commit_floor(LOCAL_OP);
+            {
+                let mut local_table = metadata.client_table.borrow_mut();
+                local_table.commit_capacity(CLIENTS_TABLE_MAX).unwrap();
+                local_table
+                    .commit_register(
+                        CLIENT,
+                        USER,
+                        BIND_VERIFIER,
+                        register_reply(CLIENT, LOCAL_OP),
+                    )
+                    .unwrap();
+            }
+            drop(held);
+            let outcome = install.await.unwrap();
+            assert_eq!(outcome.installed_frontier, LOCAL_OP);
+            assert_eq!(consensus.commit_min(), LOCAL_OP);
+            if table_frontier > LOCAL_OP {
+                assert_eq!(metadata.client_table.borrow().get_epoch(CLIENT), None);
+                let replay = metadata.replay_client_table.borrow();
+                assert_eq!(
+                    replay.as_ref().unwrap().borrow().get_epoch(CLIENT),
+                    Some(LOCAL_OP),
+                    "tail replay must retain the session committed during snapshot I/O"
+                );
+            } else {
+                assert_eq!(
+                    metadata.client_table.borrow().get_epoch(CLIENT),
+                    Some(LOCAL_OP)
+                );
+                assert!(metadata.replay_client_table.borrow().is_none());
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn given_failed_snapshot_replacement_when_retrying_should_publish_valid_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot.bin");
+        std::fs::create_dir(&path).unwrap();
+        let snapshot = IggySnapshot::create(&TestMux::default(), 1, 1).unwrap();
+        assert!(matches!(
+            snapshot.persist(&path).await,
+            Err(SnapshotError::Persist {
+                stage: PersistStage::Rename,
+                ..
+            })
+        ));
+        std::fs::remove_dir(&path).unwrap();
+        snapshot.persist(&path).await.unwrap();
+        let (loaded, _) = IggySnapshot::load(&path).unwrap();
+        assert_eq!(loaded.sequence_number(), 1);
+    }
 
     #[test]
     fn eviction_reason_splits_client_and_internal_ops() {
@@ -3953,26 +6592,29 @@ mod tests {
         // `crate::stm::stream::tests::populated_streams_snapshot_reencode_is_byte_stable`.
         let mut snapshot = IggySnapshot::new(7);
         snapshot.snapshot.client_table = Some(consensus::ClientTableSnapshot {
+            capacity: 4,
             slots: vec![
                 (
                     0,
                     consensus::ClientEntrySnapshot {
+                        bind_verifier: [0x5a; 32],
+                        ended_op: None,
                         client_id: 1,
                         epoch: 10,
                         user_id: 1,
                         watermark: 3,
-                        watermark_checksum: 0xabc,
                         reply: vec![1, 2, 3],
                     },
                 ),
                 (
                     2,
                     consensus::ClientEntrySnapshot {
+                        bind_verifier: [0x5a; 32],
+                        ended_op: None,
                         client_id: 2,
                         epoch: 20,
                         user_id: 2,
                         watermark: 0,
-                        watermark_checksum: 0,
                         reply: vec![4, 5],
                     },
                 ),
@@ -4004,14 +6646,16 @@ mod tests {
         const REPLY_LEN: usize = 512;
         let mut snapshot = IggySnapshot::new(1);
         snapshot.snapshot.client_table = Some(consensus::ClientTableSnapshot {
+            capacity: 4,
             slots: vec![(
                 0,
                 consensus::ClientEntrySnapshot {
+                    bind_verifier: [0x5a; 32],
+                    ended_op: None,
                     client_id: 1,
                     epoch: 1,
                     user_id: 1,
                     watermark: 0,
-                    watermark_checksum: 0,
                     reply: vec![0xFF; REPLY_LEN],
                 },
             )],
@@ -4034,6 +6678,28 @@ mod tests {
 
     type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
 
+    #[derive(Default)]
+    struct CheckpointSuperblock {
+        fail: Cell<bool>,
+        writes: Cell<usize>,
+    }
+
+    #[allow(clippy::future_not_send)]
+    impl SuperblockStore for CheckpointSuperblock {
+        async fn write(&self, _payload: &[u8]) -> io::Result<()> {
+            self.writes.set(self.writes.get() + 1);
+            if self.fail.get() {
+                Err(io::Error::other("injected checkpoint superblock failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn read_latest(&self) -> io::Result<SuperblockContents> {
+            Ok(SuperblockContents::Empty)
+        }
+    }
+
     /// Build a peer-shard-style `IggyMetadata` with `consensus`,
     /// `journal`, and `snapshot` all `None`. Enough to test the
     /// commit-notifier slot without standing up VSR / WAL infrastructure:
@@ -4041,6 +6707,20 @@ mod tests {
     /// touches their methods.
     fn peer_metadata() -> IggyMetadata<(), (), (), TestMux> {
         IggyMetadata::new(None, None, None, None, TestMux::default(), None)
+    }
+
+    #[test]
+    fn take_prepare_gap_drops_drains_the_count() {
+        let md = peer_metadata();
+        assert_eq!(md.take_prepare_gap_drops(), 0);
+
+        md.prepare_gap_drops.set(2);
+        assert_eq!(md.take_prepare_gap_drops(), 2);
+        assert_eq!(
+            md.take_prepare_gap_drops(),
+            0,
+            "a second drain must not re-report drops the metrics already counted"
+        );
     }
 
     #[test]
@@ -4110,24 +6790,16 @@ mod tests {
         );
     }
 
-    /// Minimal committed `Register` reply for `ClientTable::commit_register`,
-    /// which reads only `client` and `commit` (the assigned session).
     fn register_reply(client: u128, session: u64) -> Message<ReplyHeader> {
-        let header_size = size_of::<ReplyHeader>();
-        let mut reply = Message::<ReplyHeader>::new(header_size);
-        let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
-            &mut reply.as_mut_slice()[..header_size],
+        build_reply_message(
+            &PrepareHeader {
+                client,
+                op: session,
+                operation: Operation::Register,
+                ..Default::default()
+            },
+            &bytes::Bytes::new(),
         )
-        .expect("zeroed bytes are a valid ReplyHeader");
-        *header = ReplyHeader {
-            client,
-            request: 0,
-            commit: session,
-            command: Command2::Reply,
-            operation: Operation::Register,
-            ..Default::default()
-        };
-        reply
     }
 
     #[test]
@@ -4181,15 +6853,24 @@ mod tests {
                 Some(journal),
                 None,
                 None,
-                TestMux::default(),
+                TestMux::new((session_users(), (Streams::default(), ()))),
                 None,
             );
         md.client_table
             .borrow_mut()
-            .commit_register(CLIENT, OWNER, register_reply(CLIENT, 1));
+            .commit_register(CLIENT, OWNER, [0x5a; 32], register_reply(CLIENT, 1))
+            .unwrap();
 
         assert_eq!(
-            md.submit_register_in_process(CLIENT, IMPOSTOR).await,
+            md.submit_register_in_process(
+                CLIENT,
+                IMPOSTOR,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32]
+                }
+            )
+            .await,
             Err(MetadataSubmitError::ClientIdOwnedByAnotherUser),
             "a different user must not be resumed onto this entry"
         );
@@ -4203,16 +6884,55 @@ mod tests {
             "the refused attempt must not rewrite the entry's owner"
         );
 
-        // The owner itself passes the gate. Its rebind now goes through
-        // consensus (a bind is a fencing event), which this NoopBus harness
-        // never commits -- so passing the gate is observable as Pending,
-        // while a refusal resolves immediately.
-        let mut rebind = std::pin::pin!(md.submit_register_in_process(CLIENT, OWNER));
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(
-            rebind.as_mut().poll(&mut cx).is_pending(),
-            "the owner's rebind must pass the gate and dispatch"
+        assert_eq!(
+            md.submit_register_in_process(
+                CLIENT,
+                OWNER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32]
+                }
+            )
+            .await,
+            Ok(BoundSession {
+                epoch: 1,
+                watermark: 0
+            })
         );
+    }
+
+    #[compio::test]
+    async fn given_reserved_client_id_when_registering_in_process_should_reject_before_queueing() {
+        const REGISTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+        let metadata = metadata_plane();
+        metadata.mux_stm.users().ensure_root_user("root", "hash");
+        let consensus = metadata.consensus.as_ref().unwrap();
+        for commit_max in [0, 1] {
+            consensus.advance_commit_max(commit_max);
+            for client in [
+                message_bus::server_internal_client_id(server_common::sharding::METADATA_GROUP),
+                message_bus::AUTO_COMMIT_CLIENT_ID,
+            ] {
+                let result = compio::time::timeout(
+                    REGISTRATION_TIMEOUT,
+                    metadata.submit_register_in_process(
+                        client,
+                        0,
+                        RegisterRequest {
+                            user_created_at: 1,
+                            bind_verifier: [0x5a; 32],
+                        },
+                    ),
+                )
+                .await
+                .expect("reserved IDs must be rejected without waiting for consensus");
+                let error = result.expect_err("reserved IDs cannot acquire a session");
+                assert_eq!(error, MetadataSubmitError::Unauthenticated);
+                assert!(!error.is_transient());
+                assert_eq!(metadata.client_table.borrow().get_epoch(client), None);
+                assert!(!consensus.pipeline_has_message_from_client(client));
+            }
+        }
     }
 
     #[test]
@@ -4223,7 +6943,14 @@ mod tests {
         const SESSION: u64 = 10;
         const ACTING_USER: u32 = 7;
         let mut table = ClientTable::new(CLIENTS_TABLE_MAX);
-        table.commit_register(CLIENT, ACTING_USER, register_reply(CLIENT, SESSION));
+        table
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
         let client_table = RefCell::new(table);
 
         match resolve_acting_user_id(Operation::CreateStream, CLIENT, &client_table) {
@@ -4253,7 +6980,7 @@ mod tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
             Ok(())
         }
@@ -4266,7 +6993,6 @@ mod tests {
         }
         fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: ClientForwardFn) {}
     }
 
     /// Single-node metadata plane whose `prepare_request` is callable. `J` is
@@ -4285,15 +7011,122 @@ mod tests {
         IggyMetadata::new(Some(consensus), None, None, None, TestMux::default(), None)
     }
 
+    #[compio::test]
+    async fn given_committed_lifecycle_intent_when_waiting_for_completion_should_not_prove_final_result()
+     {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ROOT_USER: u32 = 0;
+        let directory = tempfile::tempdir().unwrap();
+        let mut metadata = metadata_plane();
+        metadata.journal = Some(
+            PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+                .await
+                .unwrap(),
+        );
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ROOT_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let request_header = RoutedRequestHeader {
+            client: CLIENT,
+            session: SESSION,
+            request: 1,
+            user_id: ROOT_USER,
+            group: server_common::sharding::METADATA_GROUP,
+            ..Default::default()
+        };
+        let body = DeleteTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+        }
+        .to_bytes();
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(consensus, &request_header, Operation::DeleteTopic, &body),
+            consensus.retry_capacity(&metadata.client_table.borrow()),
+        );
+        let intent_op = prepare.header().op;
+        let pending = metadata
+            .dispatch_prepare_and_await(consensus, prepare)
+            .await
+            .unwrap();
+        assert!(metadata.mux_stm.streams().lifecycle_pending(intent_op));
+        assert_eq!(
+            iggy_binary_protocol::result_code(pending.body()),
+            Some(IggyError::TransientNotCommitted.as_code())
+        );
+        assert!(
+            !pending.header().has_committed_result(),
+            "a committed intent cannot prove its final outcome before every partition finishes"
+        );
+
+        metadata
+            .submit_complete_lifecycle_in_process(
+                CompleteLifecycleRequest::new(
+                    intent_op,
+                    0,
+                    vec![LifecycleCompletion {
+                        topic_id: 0,
+                        partition_id: 0,
+                        partition_op: 1,
+                    }],
+                )
+                .unwrap(),
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(!metadata.mux_stm.streams().lifecycle_pending(intent_op));
+        let final_reply = metadata
+            .client_table
+            .borrow()
+            .get_reply(CLIENT)
+            .unwrap()
+            .clone()
+            .into_message();
+        assert!(final_reply.header().has_committed_result());
+        assert_eq!(
+            iggy_binary_protocol::result_code(final_reply.body()),
+            Some(0)
+        );
+    }
+
     fn create_topic_request(client: u128, wire_user_id: u32) -> Message<RoutedRequestHeader> {
+        create_named_topic_request(client, wire_user_id, WireIdentifier::numeric(0), "t")
+    }
+
+    fn create_named_topic_request(
+        client: u128,
+        wire_user_id: u32,
+        stream_id: WireIdentifier,
+        name: &str,
+    ) -> Message<RoutedRequestHeader> {
+        create_topic_request_with_count(client, wire_user_id, stream_id, name, 1)
+    }
+
+    fn create_topic_request_with_count(
+        client: u128,
+        wire_user_id: u32,
+        stream_id: WireIdentifier,
+        name: &str,
+        partitions_count: u32,
+    ) -> Message<RoutedRequestHeader> {
         let body = CreateTopicRequest {
-            stream_id: WireIdentifier::numeric(1),
-            partitions_count: 1,
-            compression_algorithm: 0,
-            message_expiry: 0,
-            max_topic_size: 0,
-            replication_factor: 1,
-            name: WireName::new("t").unwrap(),
+            stream_id,
+            partitions_count,
+            name: WireName::new(name).unwrap(),
+            options: WireOptions::empty(),
         }
         .to_bytes();
         let header_size = size_of::<RoutedRequestHeader>();
@@ -4305,7 +7138,7 @@ mod tests {
             let header =
                 bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size]);
             *header = RoutedRequestHeader {
-                command: Command2::Request,
+                command: Command::Request,
                 operation: Operation::CreateTopic,
                 size: u32::try_from(total).unwrap(),
                 client,
@@ -4317,6 +7150,568 @@ mod tests {
             };
         }
         message
+    }
+
+    fn placement_metadata() -> IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux> {
+        placement_metadata_with_bus(NoopBus)
+    }
+
+    fn placement_metadata_with_bus<B: MessageBus>(
+        bus: B,
+    ) -> IggyMetadata<VsrConsensus<B>, PrepareJournal, (), TestMux> {
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            bus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let metadata =
+            IggyMetadata::new(Some(consensus), None, None, None, TestMux::default(), None);
+        for client in 1..=3 {
+            metadata
+                .client_table
+                .borrow_mut()
+                .commit_register(client, 0, [0x5a; 32], register_reply(client, 1))
+                .unwrap();
+        }
+        metadata
+    }
+
+    fn placement_request(client: u128, name: &str, count: u32) -> Message<RoutedRequestHeader> {
+        create_topic_request_with_count(client, 0, WireIdentifier::numeric(0), name, count)
+    }
+
+    fn assigned_views(prepare: &Message<PrepareHeader>) -> Vec<u32> {
+        PersistedCreateTopicRequest::decode_from(prepare.body())
+            .unwrap()
+            .partitions
+            .into_iter()
+            .map(|partition| partition.initial_view)
+            .collect()
+    }
+
+    #[test]
+    fn given_a_configured_default_factor_when_admitting_a_create_without_one_should_place_that_many_members()
+     {
+        for (configured, expected) in [(None, 3), (Some(2), 2), (Some(5), 3)] {
+            let metadata = placement_metadata();
+            metadata.set_default_replication_factor(configured);
+            assert_eq!(metadata.default_replication_factor(3), expected);
+            let prepare = metadata
+                .prepare_request(placement_request(1, "topic", 2))
+                .unwrap();
+            let request = PersistedCreateTopicRequest::decode_from(prepare.body()).unwrap();
+            assert!(
+                request
+                    .partitions
+                    .iter()
+                    .all(|partition| partition.members.len() == usize::from(expected)),
+                "configured {configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_an_offline_replica_when_admitting_creates_should_spread_over_responsive_replicas() {
+        let metadata = placement_metadata();
+        metadata.observe_replica_readiness(&[false, true, true]);
+        let first = metadata
+            .prepare_request(placement_request(1, "first", 4))
+            .unwrap();
+        assert_eq!(assigned_views(&first), [1, 2, 1, 2]);
+        metadata
+            .consensus
+            .as_ref()
+            .unwrap()
+            .pipeline_message(PlaneKind::Metadata, &first);
+        let second = metadata
+            .prepare_request(placement_request(2, "second", 2))
+            .unwrap();
+        assert_eq!(assigned_views(&second), [1, 2]);
+        metadata.observe_replica_readiness(&[true; 3]);
+        let returned = metadata
+            .prepare_request(placement_request(3, "returned", 2))
+            .unwrap();
+        assert_eq!(assigned_views(&returned), [0, 0]);
+    }
+
+    #[test]
+    fn given_pending_placement_when_admitting_another_batch_should_spread_before_wal_append() {
+        let metadata = placement_metadata();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let first = metadata
+            .prepare_request(placement_request(1, "first", 4))
+            .unwrap();
+        assert_eq!(assigned_views(&first), [0, 1, 2, 0]);
+        consensus.pipeline_message(PlaneKind::Metadata, &first);
+        let second = metadata
+            .prepare_request(placement_request(2, "second", 2))
+            .unwrap();
+        assert_eq!(
+            assigned_views(&second),
+            [1, 2],
+            "admitted assignments reserve load before append can yield"
+        );
+        assert!(metadata.journal.is_none());
+    }
+
+    #[test]
+    fn given_a_pending_create_topic_when_admitting_create_partitions_should_refuse_transiently() {
+        let add_partitions = || {
+            let body = WireCreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::named("pending").unwrap(),
+                partitions_count: 1,
+            }
+            .to_bytes();
+            pat_request(2, 1, Operation::CreatePartitions, &body)
+        };
+        let metadata = placement_metadata();
+        assert!(
+            metadata.prepare_request(add_partitions()).is_ok(),
+            "a topic nobody is creating is apply's TopicNotFound"
+        );
+
+        let metadata = placement_metadata();
+        let create = metadata
+            .prepare_request(placement_request(1, "pending", 2))
+            .unwrap();
+        metadata
+            .consensus
+            .as_ref()
+            .unwrap()
+            .pipeline_message(PlaneKind::Metadata, &create);
+        assert!(matches!(
+            metadata.prepare_request(add_partitions()),
+            Err(IggyError::TransientNotAccepted)
+        ));
+    }
+
+    #[test]
+    fn given_rolled_back_placement_when_admitting_another_batch_should_release_reservations() {
+        let metadata = placement_metadata();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let first = metadata
+            .prepare_request(placement_request(1, "first", 2))
+            .unwrap();
+        consensus.pipeline_message(PlaneKind::Metadata, &first);
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(first.header()),
+            PrepareRollback::Unwound
+        );
+        let second = metadata
+            .prepare_request(placement_request(2, "second", 1))
+            .unwrap();
+        assert_eq!(assigned_views(&second), [0]);
+    }
+
+    #[test]
+    fn given_rejected_create_when_committed_should_release_its_placement_reservations() {
+        let metadata = placement_metadata();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let first = metadata
+            .prepare_request(placement_request(1, "missing-stream", 2))
+            .unwrap();
+        consensus.pipeline_message(PlaneKind::Metadata, &first);
+        consensus.with_pipeline_mut(|pipeline| {
+            pipeline.pop().unwrap();
+        });
+        let op = first.header().op;
+        let reply = metadata.apply_prepare(first);
+        assert_ne!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        consensus.advance_commit_max(op);
+        consensus.advance_commit_min(op);
+        let second = metadata
+            .prepare_request(placement_request(2, "next", 1))
+            .unwrap();
+        assert_eq!(
+            assigned_views(&second),
+            [0],
+            "a committed rejection leaves no partition load"
+        );
+    }
+
+    #[test]
+    fn given_committed_create_when_admitting_another_should_count_it_once() {
+        let mut metadata = placement_metadata();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let first = metadata
+            .prepare_request(placement_request(1, "new-topic", 2))
+            .unwrap();
+        assert_eq!(assigned_views(&first), [1, 2]);
+        consensus.pipeline_message(PlaneKind::Metadata, &first);
+        consensus.with_pipeline_mut(|pipeline| {
+            pipeline.pop().unwrap();
+        });
+        let op = first.header().op;
+        let reply = metadata.apply_prepare(first);
+        assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        consensus.advance_commit_max(op);
+        consensus.advance_commit_min(op);
+        let second = metadata
+            .prepare_request(placement_request(2, "next", 1))
+            .unwrap();
+        assert_eq!(assigned_views(&second), [0]);
+    }
+
+    #[test]
+    fn given_unrelated_metadata_inflight_when_over_cap_create_is_invalid_should_defer_it() {
+        let mut metadata = placement_metadata();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+        metadata.set_partitions_max(1);
+        assert!(matches!(
+            metadata.admit_partitions(&placement_request(1, "over-cap", 1)),
+            Err(IggyError::PartitionsLimitReached)
+        ));
+        let mut invalid = placement_request(1, "over-cap", 1);
+        let mut request = WireCreateTopicRequest::decode_from(invalid.body()).unwrap();
+        request.stream_id = WireIdentifier::numeric(99);
+        let body = request.to_bytes();
+        invalid.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
+        assert!(metadata.admit_partitions(&invalid).is_ok());
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let body = CreateStreamRequest {
+            name: WireName::new("unrelated").unwrap(),
+            options: WireOptions::empty(),
+        }
+        .to_bytes();
+        let mut pending = Message::<PrepareHeader>::new(size_of::<PrepareHeader>() + body.len());
+        pending.as_mut_slice()[size_of::<PrepareHeader>()..].copy_from_slice(&body);
+        let pending = pending.transmute_header(|_, header: &mut PrepareHeader| {
+            header.command = Command::Prepare;
+            header.operation = Operation::CreateStream;
+            header.op = 1;
+            header.group = server_common::sharding::METADATA_GROUP;
+            header.size = u32::try_from(size_of::<PrepareHeader>() + body.len()).unwrap();
+        });
+        consensus.pipeline_message(PlaneKind::Metadata, &pending);
+        consensus.sequencer().set_sequence(pending.header().op);
+        assert!(matches!(
+            metadata.admit_partitions(&placement_request(1, "over-cap", 1)),
+            Err(IggyError::PartitionsLimitReached)
+        ));
+        assert!(
+            matches!(
+                metadata.admit_partitions(&invalid),
+                Err(IggyError::TransientNotAccepted)
+            ),
+            "an unrelated prepared mutation currently defers the missing-stream result"
+        );
+    }
+
+    #[test]
+    fn given_missing_pipeline_entry_when_creating_should_refuse_without_allocating() {
+        let metadata = placement_metadata();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        consensus.sequencer().set_sequence(1);
+        assert!(matches!(
+            metadata.prepare_request(placement_request(1, "missing", 2)),
+            Err(IggyError::TransientNotAccepted)
+        ));
+        consensus.sequencer().set_sequence(0);
+        let first = metadata
+            .prepare_request(placement_request(1, "ready", 1))
+            .unwrap();
+        let assignments = PersistedCreateTopicRequest::decode_from(first.body())
+            .unwrap()
+            .partitions;
+        assert_eq!(
+            assignments[0].consensus_group_id, 1,
+            "refusal cannot consume group ids"
+        );
+        assert_eq!(assignments[0].initial_view, 0);
+    }
+
+    #[test]
+    fn given_unknown_session_when_creating_should_not_allocate_groups() {
+        let metadata = placement_metadata();
+        assert!(matches!(
+            metadata.prepare_request(placement_request(99, "unauthorized", 2)),
+            Err(IggyError::Unauthenticated)
+        ));
+        let first = metadata
+            .prepare_request(placement_request(1, "authorized", 1))
+            .unwrap();
+        assert_eq!(
+            PersistedCreateTopicRequest::decode_from(first.body())
+                .unwrap()
+                .partitions[0]
+                .consensus_group_id,
+            1
+        );
+    }
+
+    #[test]
+    fn given_partition_observations_when_creating_should_keep_highest_matching_incarnation() {
+        let mut metadata = placement_metadata();
+        let streams = stream_with_one_partition_in_view(2);
+        let revision = streams
+            .items
+            .get(0)
+            .unwrap()
+            .topics
+            .get(0)
+            .unwrap()
+            .partitions[0]
+            .created_revision;
+        let mut recreated = streams.clone();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (streams.into(), ()),
+        )));
+        let namespace = IggyNamespace::new(0, 0, 0);
+        metadata.observe_partition_views(&[
+            PartitionPlacementView {
+                namespace,
+                created_revision: revision,
+                view: 6,
+            },
+            PartitionPlacementView {
+                namespace,
+                created_revision: revision,
+                view: 4,
+            },
+            PartitionPlacementView {
+                namespace,
+                created_revision: revision - 1,
+                view: 100,
+            },
+            PartitionPlacementView {
+                namespace,
+                created_revision: revision + 1,
+                view: 101,
+            },
+        ]);
+        let first = metadata
+            .prepare_request(placement_request(1, "observed", 1))
+            .unwrap();
+        assert_eq!(
+            assigned_views(&first),
+            [1],
+            "view 6 keeps load on replica 0 despite older reports"
+        );
+        metadata.observe_partition_views(&[]);
+        let unchanged = metadata
+            .prepare_request(placement_request(2, "missing-report", 1))
+            .unwrap();
+        assert_eq!(assigned_views(&unchanged), [1]);
+
+        assert_eq!(
+            apply_with_lifecycle_completion(
+                &DeleteTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                },
+                &mut recreated,
+                IggyTimestamp::now(),
+            )
+            .code,
+            0
+        );
+        create_topic_in_view(&mut recreated, 2);
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (recreated.into(), ()),
+        )));
+        metadata.observe_partition_views(&[PartitionPlacementView {
+            namespace,
+            created_revision: revision,
+            view: 102,
+        }]);
+        let next = metadata
+            .prepare_request(placement_request(3, "recreated", 1))
+            .unwrap();
+        assert_eq!(
+            assigned_views(&next),
+            [0],
+            "recreation falls back to its own committed view 2"
+        );
+        metadata.mux_stm = Rc::new(TestMux::default());
+        let empty = metadata
+            .prepare_request(placement_request(3, "deleted", 1))
+            .unwrap();
+        assert_eq!(assigned_views(&empty), [0]);
+    }
+
+    #[compio::test]
+    async fn given_inherited_create_when_summary_missing_should_refuse_then_restore_from_wal() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+            .await
+            .unwrap();
+        let old_primary = placement_metadata();
+        let inherited = old_primary
+            .prepare_request(placement_request(1, "inherited", 2))
+            .unwrap();
+        journal.handle().append(inherited.clone()).await.unwrap();
+        let mut metadata = placement_metadata();
+        metadata.journal = Some(journal);
+        let consensus = metadata.consensus.as_ref().unwrap();
+        consensus.pipeline_message(PlaneKind::Metadata, &inherited);
+        assert!(matches!(
+            metadata.prepare_request(placement_request(2, "waiting", 1)),
+            Err(IggyError::TransientNotAccepted)
+        ));
+        let reply = metadata
+            .submit_request_in_process(placement_request(2, "waiting", 1))
+            .await
+            .unwrap()
+            .try_into_typed::<ReplyHeader>()
+            .unwrap();
+        assert_eq!(
+            iggy_binary_protocol::result_code(reply.body()),
+            Some(IggyError::TransientNotAccepted.as_code())
+        );
+        assert!(!reply.header().has_committed_result());
+        metadata.refresh_placement().await;
+        let next = metadata
+            .prepare_request(placement_request(2, "ready", 1))
+            .unwrap();
+        let assignments = PersistedCreateTopicRequest::decode_from(next.body())
+            .unwrap()
+            .partitions;
+        assert_eq!(assignments[0].initial_view, 2);
+        assert_eq!(
+            assignments[0].consensus_group_id, 3,
+            "inherited ids must seed the allocator before admission"
+        );
+    }
+
+    #[compio::test]
+    async fn given_missing_placement_summary_when_wire_or_queue_submits_should_reply_58_without_eviction()
+     {
+        let old_primary = placement_metadata();
+        let inherited = old_primary
+            .prepare_request(placement_request(1, "inherited", 2))
+            .unwrap();
+        let metadata = placement_metadata_with_bus(ClientSendSpyBus::default());
+        let consensus = metadata.consensus.as_ref().unwrap();
+        consensus.pipeline_message(PlaneKind::Metadata, &inherited);
+        metadata.on_request(placement_request(2, "wire", 1)).await;
+        {
+            let replies = consensus.message_bus().client_replies.borrow();
+            assert_eq!(replies.len(), 1);
+            let frame = replies[0].first();
+            let header =
+                bytemuck::checked::from_bytes::<ReplyHeader>(&frame[..size_of::<ReplyHeader>()]);
+            assert_eq!(header.command, Command::Reply);
+            assert!(!header.has_committed_result());
+            assert_eq!(
+                iggy_binary_protocol::result_code(&frame[size_of::<ReplyHeader>()..]),
+                Some(IggyError::TransientNotAccepted.as_code())
+            );
+        }
+        let (queued, receiver) =
+            consensus::RequestEntry::with_subscriber(placement_request(3, "queued", 1));
+        assert!(consensus.push_queued_request(queued).is_ok());
+        metadata.drain_request_queue_into_prepares().await;
+        let reply = receiver.await.unwrap();
+        assert_eq!(
+            iggy_binary_protocol::result_code(reply.body()),
+            Some(IggyError::TransientNotAccepted.as_code())
+        );
+        assert!(!reply.header().has_committed_result());
+        assert_eq!(metadata.allocator.highest(), 0);
+        assert_eq!(
+            resolve_acting_user_id(Operation::CreateTopic, 2, &metadata.client_table).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            resolve_acting_user_id(Operation::CreateTopic, 3, &metadata.client_table).unwrap(),
+            Some(0)
+        );
+    }
+
+    #[compio::test]
+    async fn given_wrong_canonical_wal_body_when_refreshing_placement_should_keep_admission_closed()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+            .await
+            .unwrap();
+        let source = placement_metadata();
+        let expected = source
+            .prepare_request(placement_request(1, "expected", 2))
+            .unwrap();
+        let different = source
+            .prepare_request(placement_request(2, "different", 1))
+            .unwrap();
+        assert_eq!(expected.header().op, different.header().op);
+        assert_ne!(expected.header().checksum, different.header().checksum);
+        journal.handle().append(different).await.unwrap();
+        let mut metadata = placement_metadata();
+        metadata.journal = Some(journal);
+        metadata
+            .consensus
+            .as_ref()
+            .unwrap()
+            .pipeline_message(PlaneKind::Metadata, &expected);
+        metadata.refresh_placement().await;
+        assert!(matches!(
+            metadata.prepare_request(placement_request(3, "blocked", 1)),
+            Err(IggyError::TransientNotAccepted)
+        ));
+        assert_eq!(
+            metadata.allocator.highest(),
+            0,
+            "an op-only WAL match must not supply assignment ids"
+        );
+    }
+
+    #[compio::test]
+    async fn given_replaced_pipeline_create_when_refreshing_should_discard_old_summary() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut metadata = placement_metadata();
+        metadata.journal = Some(
+            PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+                .await
+                .unwrap(),
+        );
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let old = metadata
+            .prepare_request(placement_request(1, "old", 2))
+            .unwrap();
+        consensus.pipeline_message(PlaneKind::Metadata, &old);
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(old.header()),
+            PrepareRollback::Unwound
+        );
+        let source = placement_metadata();
+        let replacement = source
+            .prepare_request(placement_request(2, "replacement", 1))
+            .unwrap();
+        consensus.pipeline_message(PlaneKind::Metadata, &replacement);
+        metadata
+            .journal
+            .as_ref()
+            .unwrap()
+            .handle()
+            .append(replacement)
+            .await
+            .unwrap();
+        assert!(matches!(
+            metadata.prepare_request(placement_request(3, "blocked", 1)),
+            Err(IggyError::TransientNotAccepted)
+        ));
+        metadata.refresh_placement().await;
+        let next = metadata
+            .prepare_request(placement_request(3, "ready", 1))
+            .unwrap();
+        assert_eq!(
+            assigned_views(&next),
+            [1],
+            "only the replacement's one assignment remains reserved"
+        );
     }
 
     #[test]
@@ -4331,11 +7726,16 @@ mod tests {
         const ACTING_USER: u32 = 7;
         const WIRE_USER: u32 = 999;
         let plane = metadata_plane();
-        plane.client_table.borrow_mut().commit_register(
-            CLIENT,
-            ACTING_USER,
-            register_reply(CLIENT, SESSION),
-        );
+        plane
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
 
         let prepare = plane
             .prepare_request(create_topic_request(CLIENT, WIRE_USER))
@@ -4354,32 +7754,219 @@ mod tests {
 
     #[test]
     fn prepare_request_stamps_create_topic_message_expiry_default() {
-        // A `CreateTopic` carrying the `ServerDefault` sentinel (0) must be
-        // rewritten at primary admission to the configured default, so the
-        // replicated prepare -- and thus every replica's commit -- holds a
-        // concrete expiry. Mirrors the `max_topic_size` sentinel resolution.
+        // A `CreateTopic` without an explicit `message_expiry` option must be
+        // resolved at primary admission to the build default, riding the
+        // derived block, so the replicated prepare -- and thus every
+        // replica's commit -- holds a concrete expiry.
         const CLIENT: u128 = 1;
         const SESSION: u64 = 10;
         const ACTING_USER: u32 = 7;
-        const CONFIGURED_EXPIRY_MICROS: u64 = 7_200_000_000;
         let plane = metadata_plane();
-        plane.set_default_message_expiry(CONFIGURED_EXPIRY_MICROS);
-        plane.client_table.borrow_mut().commit_register(
-            CLIENT,
-            ACTING_USER,
-            register_reply(CLIENT, SESSION),
-        );
+        plane
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
 
-        // `create_topic_request` builds the body with `message_expiry == 0`.
+        // `create_topic_request` builds the body with no options at all.
         let prepare = plane
             .prepare_request(create_topic_request(CLIENT, ACTING_USER))
             .expect("CreateTopic is client-allowed");
         let body = &prepare.as_slice()[size_of::<PrepareHeader>()..prepare.header().size as usize];
         let persisted = PersistedCreateTopicRequest::decode_from(body)
             .expect("create topic with assignments prepare must decode");
+        assert!(
+            persisted.request.options.is_empty(),
+            "a client that sent no options gets an empty explicit block"
+        );
+        let derived = iggy_common::TopicCreateOptions::parse(&persisted.derived_options)
+            .expect("derived block parses against the catalog");
         assert_eq!(
-            persisted.request.message_expiry, CONFIGURED_EXPIRY_MICROS,
-            "ServerDefault expiry must be stamped to the configured default at admission"
+            derived.message_expiry,
+            Some(iggy_common::IggyExpiry::from(
+                iggy_common::DEFAULT_MESSAGE_EXPIRY
+            )),
+            "ServerDefault expiry must be resolved into the derived block at admission"
+        );
+        assert_eq!(
+            persisted.partitions.len(),
+            1,
+            "absent partitions_count defaults to one partition"
+        );
+    }
+
+    #[test]
+    fn given_keyless_create_topic_when_preparing_should_derive_every_catalog_default() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 10;
+        const ACTING_USER: u32 = 7;
+        let plane = metadata_plane();
+        plane
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .expect("register commits");
+
+        let prepare = plane
+            .prepare_request(create_topic_request(CLIENT, ACTING_USER))
+            .expect("CreateTopic is client-allowed");
+        let body = &prepare.as_slice()[size_of::<PrepareHeader>()..prepare.header().size as usize];
+        let persisted = PersistedCreateTopicRequest::decode_from(body)
+            .expect("create topic with assignments prepare must decode");
+        let derived = resource_options_from_wire(&persisted.derived_options, false)
+            .expect("derived block decodes");
+        let mut expected = ResourceOptions::new();
+        for descriptor in descriptors_for(OptionsScope::Topic)
+            .filter(|descriptor| descriptor.storage == OptionStorage::Map)
+        {
+            if let Some(default) = descriptor.default_value().expect("default encodes") {
+                expected.insert(
+                    HeaderKey::from(descriptor.key),
+                    OptionValue::derived(default),
+                );
+            }
+        }
+        assert!(!expected.is_empty(), "the topic catalog has defaulted rows");
+        // The factor default is lowered to this single-node cluster.
+        expected.insert(
+            HeaderKey::from(OptionKey::ReplicationFactor),
+            OptionValue::derived(HeaderValue::from(1u32)),
+        );
+        assert_eq!(derived, expected);
+        assert!(
+            persisted
+                .partitions
+                .iter()
+                .all(|partition| partition.members == [0]),
+            "every partition lists the one node"
+        );
+    }
+
+    #[test]
+    fn given_plaintext_stream_key_when_preparing_create_stream_should_refuse_before_replication() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 10;
+        const ACTING_USER: u32 = 7;
+        let plane = metadata_plane();
+        plane
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .expect("register commits");
+        let mut options = ResourceOptions::new();
+        options.insert(
+            HeaderKey::from(OptionKey::EncryptionKey),
+            OptionValue::explicit(
+                HeaderValue::try_from([7u8; 32].as_slice()).expect("raw key encodes"),
+            ),
+        );
+        let options =
+            resource_options_to_wire(&options, OptionsProvenance::All).expect("options encode");
+
+        let Err(refusal) =
+            plane.prepare_request(create_stream_request_with(CLIENT, 1, "secrets", options))
+        else {
+            panic!("a plaintext stream key must not be sealed into a prepare");
+        };
+
+        assert!(
+            matches!(
+                &refusal,
+                IggyError::InvalidOptionValue(key) if *key == OptionKey::EncryptionKey.to_string()
+            ),
+            "expected the plaintext key refusal, got {refusal:?}"
+        );
+    }
+
+    #[test]
+    fn given_wrap_set_no_primary_key_opens_when_preparing_create_stream_should_refuse_before_replication()
+     {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 10;
+        const ACTING_USER: u32 = 7;
+        let primary_keys = Arc::new(
+            ServerKeyContext::from_config(
+                "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=",
+                &[],
+                true,
+            )
+            .expect("valid key"),
+        );
+        let stranger_keys = ServerKeyContext::from_config(
+            "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+            &[],
+            true,
+        )
+        .expect("valid key");
+        let plane = metadata_plane().with_stream_key_context(Arc::clone(&primary_keys));
+        plane
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .expect("register commits");
+        let wrapped_under = |keys: &ServerKeyContext| {
+            let set = keys
+                .wrap_set(
+                    &StreamEncryptionKey::try_from([7u8; 32].as_slice()).expect("32 bytes"),
+                    StreamKeyOrigin::Server,
+                )
+                .expect("wraps");
+            let mut options = ResourceOptions::new();
+            options.insert(
+                HeaderKey::from(OptionKey::EncryptionKeyWrapped),
+                OptionValue::explicit(HeaderValue::try_from(set.as_ref()).expect("fits")),
+            );
+            options.insert(
+                HeaderKey::from(OptionKey::CriticalKeys),
+                OptionValue::explicit(
+                    critical_keys_marker(&[OptionKey::EncryptionKeyWrapped]).expect("marker"),
+                ),
+            );
+            resource_options_to_wire(&options, OptionsProvenance::All).expect("options encode")
+        };
+
+        let Err(refusal) = plane.prepare_request(create_stream_request_with(
+            CLIENT,
+            1,
+            "stranger",
+            wrapped_under(&stranger_keys),
+        )) else {
+            panic!("a wrap set the primary cannot open must not be sealed into a prepare");
+        };
+
+        assert_eq!(
+            refusal.as_code(),
+            IggyError::StreamEncryptionUnavailable.as_code()
+        );
+        assert!(
+            plane
+                .prepare_request(create_stream_request_with(
+                    CLIENT,
+                    2,
+                    "own",
+                    wrapped_under(&primary_keys),
+                ))
+                .is_ok()
         );
     }
 
@@ -4400,7 +7987,7 @@ mod tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
             if self.stall.get() {
                 self.stall_hits.set(self.stall_hits.get() + 1);
@@ -4417,19 +8004,154 @@ mod tests {
         }
         fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: ClientForwardFn) {}
+    }
+
+    /// Bus that records the client id of every `send_to_client`.
+    #[derive(Debug, Default)]
+    struct ClientSendSpyBus {
+        client_sends: RefCell<Vec<u128>>,
+        client_replies: RefCell<Vec<BusMessage>>,
+    }
+
+    #[allow(clippy::future_not_send)]
+    impl MessageBus for ClientSendSpyBus {
+        fn track_background(&self, _handle: JoinHandle<()>) {}
+        async fn send_to_client(
+            &self,
+            client_id: u128,
+            data: impl Into<BusMessage>,
+        ) -> Result<(), SendError> {
+            self.client_sends.borrow_mut().push(client_id);
+            self.client_replies.borrow_mut().push(data.into());
+            Ok(())
+        }
+        async fn send_to_replica(
+            &self,
+            _replica: u8,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), SendError> {
+            Ok(())
+        }
+        fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
+        fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
+    }
+
+    /// A view change or a boot re-pipeline rebuilds a pending expired-token
+    /// delete without its in-process sender. Committing it must not send a
+    /// reply to the reserved client id, which no connection owns.
+    #[compio::test]
+    async fn given_repipelined_server_operations_when_committed_should_send_no_client_reply() {
+        const USER: u32 = 7;
+        const TOKEN: &str = "expired";
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+            .await
+            .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_GROUP,
+            ClientSendSpyBus::default(),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, PrepareJournal, (), TestMux> = IggyMetadata::new(
+            Some(consensus),
+            Some(journal),
+            None,
+            None,
+            TestMux::default(),
+            None,
+        );
+        let consensus = md.consensus.as_ref().unwrap();
+
+        let body = DeletePersonalAccessTokenRequest {
+            user_id: USER,
+            name: WireName::new(TOKEN).unwrap(),
+            only_if_expired: true,
+        }
+        .to_bytes();
+        let header = RoutedRequestHeader {
+            client: RESERVED_CLIENT_ID,
+            group: server_common::sharding::METADATA_GROUP,
+            ..RoutedRequestHeader::default()
+        };
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(
+                consensus,
+                &header,
+                Operation::DeletePersonalAccessToken,
+                &body,
+            ),
+            consensus.retry_capacity(&md.client_table.borrow()),
+        );
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        md.on_replicate(prepare).await;
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        let ack = loopback
+            .pop()
+            .expect("one self-ack per prepare")
+            .try_into_typed::<PrepareOkHeader>()
+            .expect("loopback holds self PrepareOks");
+        md.on_ack(ack).await;
+
+        assert_eq!(consensus.commit_min(), 1, "the delete must commit");
+        assert!(
+            consensus.message_bus().client_sends.borrow().is_empty(),
+            "no connection owns the reserved client id, so nothing may be sent to it"
+        );
+
+        let body = CompleteLifecycleRequest::new(
+            1,
+            1,
+            vec![LifecycleCompletion {
+                topic_id: 1,
+                partition_id: 0,
+                partition_op: 1,
+            }],
+        )
+        .unwrap()
+        .to_bytes();
+        let header = RoutedRequestHeader {
+            client: message_bus::server_internal_client_id(server_common::sharding::METADATA_GROUP),
+            ..header
+        };
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(consensus, &header, Operation::CompleteLifecycle, &body),
+            consensus.retry_capacity(&md.client_table.borrow()),
+        );
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        md.on_replicate(prepare).await;
+        consensus.drain_loopback_into(&mut loopback);
+        let ack = loopback
+            .pop()
+            .unwrap()
+            .try_into_typed::<PrepareOkHeader>()
+            .unwrap();
+        md.on_ack(ack).await;
+        assert_eq!(consensus.commit_min(), 2, "the completion must commit");
+        assert!(
+            consensus.message_bus().client_sends.borrow().is_empty(),
+            "a completion without its in-process sender must never send a wire reply"
+        );
     }
 
     /// A replayed `CreatePersonalAccessToken` must be refused, not served from
     /// the dedup cache: the committed secret is unrecoverable (never
     /// replicated) and the rewrite has already minted a fresh one whose hash
     /// never reached consensus, so replaying would hand back a credential that
-    /// authenticates against nothing. A cached REJECTION still replays -- it
-    /// carries no secret.
+    /// authenticates against nothing. The refusal keeps the committed header,
+    /// so the client can still prove that the original create committed. A
+    /// cached REJECTION still replays -- it carries no secret.
     #[compio::test]
     async fn replayed_pat_create_is_refused_but_other_replays_pass_through() {
         const CLIENT: u128 = 1;
         const USER: u32 = 7;
+        const PAT_OP: u64 = 2;
+        const PAT_REQUEST_CHECKSUM: u128 = 0x2a;
 
         let dir = tempfile::tempdir().unwrap();
         let journal =
@@ -4456,26 +8178,60 @@ mod tests {
             );
         md.client_table
             .borrow_mut()
-            .commit_register(CLIENT, USER, register_reply(CLIENT, 1));
+            .commit_register(CLIENT, USER, [0x5a; 32], register_reply(CLIENT, 1))
+            .unwrap();
 
         // Cache a committed SUCCESS for request 1 under the PAT operation,
         // exactly as the commit path would (empty apply body + result section).
-        let pat_success = committed_reply(CLIENT, 1, Operation::CreatePersonalAccessToken, 0);
+        let pat_success = build_reply_message(
+            &PrepareHeader {
+                client: CLIENT,
+                request: 1,
+                request_checksum: PAT_REQUEST_CHECKSUM,
+                operation: Operation::CreatePersonalAccessToken,
+                op: PAT_OP,
+                user_id: USER,
+                ..PrepareHeader::default()
+            },
+            &bytes::Bytes::copy_from_slice(&0u32.to_le_bytes()),
+        );
+        let committed = *pat_success.header();
         md.client_table
             .borrow_mut()
-            .commit_reply(CLIENT, pat_success);
+            .commit_reply(CLIENT, USER, pat_success);
 
         // Replaying request 1 as a PAT create must NOT return the cached
         // success; it must refuse with the name-taken code.
-        let reply = md
-            .submit_request_in_process(pat_create_request(CLIENT, 1))
+        let refusal = md
+            .submit_request_in_process(pat_request(
+                CLIENT,
+                1,
+                Operation::CreatePersonalAccessToken,
+                &[],
+            ))
             .await
-            .expect("refusal is a reply, not a submit error");
-        let body = &reply.as_slice()[size_of::<ReplyHeader>()..];
+            .expect("refusal is a reply, not a submit error")
+            .try_into_typed::<ReplyHeader>()
+            .unwrap();
         assert_eq!(
-            iggy_binary_protocol::result_code(body),
+            iggy_binary_protocol::result_code(refusal.body()),
             Some(IggyError::PersonalAccessTokenAlreadyExists(String::new(), 0).as_code()),
             "a replayed PAT create must be refused, never answered from cache"
+        );
+        let header = refusal.header();
+        assert!(
+            header.has_committed_result(),
+            "the refusal must prove that the original create committed"
+        );
+        assert_eq!((header.op, header.commit), (PAT_OP, PAT_OP));
+        let expected = ReplyHeader {
+            size: header.size,
+            ..committed
+        };
+        assert_eq!(
+            bytemuck::bytes_of(header),
+            bytemuck::bytes_of(&expected),
+            "the refusal must keep the committed client, request, request checksum and operation"
         );
 
         // A cached REJECTION for the same operation carries no secret, so it
@@ -4489,9 +8245,14 @@ mod tests {
         );
         md.client_table
             .borrow_mut()
-            .commit_reply(CLIENT, pat_rejection);
+            .commit_reply(CLIENT, USER, pat_rejection);
         let reply = md
-            .submit_request_in_process(pat_create_request(CLIENT, 2))
+            .submit_request_in_process(pat_request(
+                CLIENT,
+                2,
+                Operation::CreatePersonalAccessToken,
+                &[],
+            ))
             .await
             .expect("cached rejection replays");
         let body = &reply.as_slice()[size_of::<ReplyHeader>()..];
@@ -4500,6 +8261,790 @@ mod tests {
             Some(rejected_code),
             "a cached PAT rejection is safe to replay verbatim"
         );
+    }
+
+    /// A same-id replay of a `CreateTopic` that already committed must get its
+    /// cached reply at the partitions cap. Admitting it again would count the
+    /// committed topic's own partitions a second time and deny an op that
+    /// succeeded.
+    #[compio::test]
+    async fn given_committed_create_topic_at_partitions_cap_when_replayed_should_serve_cached_reply()
+     {
+        const CLIENT: u128 = 1;
+        const USER: u32 = TOPIC_MANAGER;
+        let mut metadata = metadata_plane();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+        metadata.set_partitions_max(1);
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(CLIENT, USER, [0x5a; 32], register_reply(CLIENT, 1))
+            .unwrap();
+        // The commit that created the topic above cached its success.
+        metadata.client_table.borrow_mut().commit_reply(
+            CLIENT,
+            USER,
+            committed_reply(CLIENT, 1, Operation::CreateTopicWithAssignments, 0),
+        );
+
+        let replay = metadata
+            .submit_request_in_process(create_topic_request(CLIENT, USER))
+            .await
+            .expect("a replay is a reply, not a submit error");
+        assert_eq!(
+            iggy_binary_protocol::result_code(&replay.as_slice()[size_of::<ReplyHeader>()..]),
+            Some(0),
+            "the replay must get the cached success, not a cap denial"
+        );
+
+        let mut fresh = create_topic_request(CLIENT, USER);
+        bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(
+            &mut fresh.as_mut_slice()[..size_of::<RoutedRequestHeader>()],
+        )
+        .request = 2;
+        let denied = metadata
+            .submit_request_in_process(fresh)
+            .await
+            .expect("a denial is a reply, not a submit error");
+        assert_eq!(
+            iggy_binary_protocol::result_code(&denied.as_slice()[size_of::<ReplyHeader>()..]),
+            Some(IggyError::PartitionsLimitReached.as_code()),
+            "a new create past the cap must be denied"
+        );
+    }
+
+    /// A normal backup names the primary of its view as the place to retry,
+    /// and a backup in transfer cannot. Neither admits the mutation.
+    #[compio::test]
+    async fn given_backup_when_mutation_is_submitted_should_refuse_by_role() {
+        const CLIENT: u128 = 1;
+        const USER: u32 = TOPIC_MANAGER;
+        const BACKUP_REPLICA: u8 = 1;
+        const REPLICA_COUNT: u8 = 3;
+        for (transferring, expected) in [
+            (false, IggyError::NotPrimary),
+            (true, IggyError::TransientNotAccepted),
+        ] {
+            let consensus = VsrConsensus::new(
+                1,
+                BACKUP_REPLICA,
+                REPLICA_COUNT,
+                server_common::sharding::METADATA_GROUP,
+                NoopBus,
+                LocalPipeline::new(),
+            );
+            consensus.init();
+            if transferring {
+                consensus.begin_state_transfer_await();
+            }
+            let metadata: IggyMetadata<_, PrepareJournal, (), TestMux> = IggyMetadata::new(
+                Some(consensus),
+                None,
+                None,
+                None,
+                TestMux::new((
+                    users_with_topic_manager(),
+                    (stream_with_one_partition().into(), ()),
+                )),
+                None,
+            );
+            metadata
+                .client_table
+                .borrow_mut()
+                .commit_register(CLIENT, USER, [0x5a; 32], register_reply(CLIENT, 1))
+                .unwrap();
+
+            let reply = metadata
+                .submit_request_in_process(create_topic_request(CLIENT, USER))
+                .await
+                .expect("a refusal is a reply, not a submit error");
+            assert_eq!(
+                iggy_binary_protocol::result_code(&reply.as_slice()[size_of::<ReplyHeader>()..]),
+                Some(expected.as_code()),
+                "transferring {transferring}"
+            );
+            assert_eq!(
+                metadata.consensus.as_ref().unwrap().pipeline_len(),
+                0,
+                "a backup must not prepare the mutation"
+            );
+        }
+    }
+
+    #[test]
+    fn given_no_partitions_cap_when_admitting_create_topic_should_admit() {
+        let mut metadata = metadata_plane();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+
+        assert!(
+            metadata
+                .admit_partitions(&create_topic_request(1, TOPIC_MANAGER))
+                .is_ok(),
+            "a zero partitions_max must admit a create on a node with partitions"
+        );
+    }
+
+    /// The gated apply answers a create from a user without the grant, for a
+    /// stream that does not exist, or of a topic name in use, with
+    /// `Unauthorized`, `NotFound` or `TopicNameAlreadyExists`. The cap must not
+    /// answer first, or that user could probe the cap state, and a client that
+    /// creates a topic only when it is missing would get the wrong error.
+    #[test]
+    fn given_create_topic_past_partitions_cap_when_apply_would_refuse_should_leave_it_to_apply() {
+        const UNGRANTED_CLIENT: u128 = 1;
+        const MANAGER_CLIENT: u128 = 2;
+        let mut metadata = metadata_plane();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+        metadata.set_partitions_max(1);
+
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                UNGRANTED_CLIENT,
+                UNGRANTED,
+                [0x5a; 32],
+                register_reply(UNGRANTED_CLIENT, 1),
+            )
+            .unwrap();
+        assert!(
+            metadata
+                .admit_partitions(&create_topic_request(UNGRANTED_CLIENT, UNGRANTED))
+                .is_ok(),
+            "a user without create_topic must get Unauthorized from apply"
+        );
+
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                MANAGER_CLIENT,
+                TOPIC_MANAGER,
+                [0x5a; 32],
+                register_reply(MANAGER_CLIENT, 1),
+            )
+            .unwrap();
+        let missing_stream = create_named_topic_request(
+            MANAGER_CLIENT,
+            TOPIC_MANAGER,
+            WireIdentifier::numeric(9),
+            "t",
+        );
+        assert!(
+            metadata.admit_partitions(&missing_stream).is_ok(),
+            "a create for a missing stream must get NotFound from apply"
+        );
+
+        let taken_name = create_named_topic_request(
+            MANAGER_CLIENT,
+            TOPIC_MANAGER,
+            WireIdentifier::numeric(0),
+            "existing",
+        );
+        assert!(
+            metadata.admit_partitions(&taken_name).is_ok(),
+            "a create of a topic name in use must get TopicNameAlreadyExists from apply"
+        );
+
+        assert!(
+            matches!(
+                metadata.admit_partitions(&create_topic_request(MANAGER_CLIENT, TOPIC_MANAGER)),
+                Err(IggyError::PartitionsLimitReached)
+            ),
+            "a create that apply would carry out is denied at the cap"
+        );
+    }
+
+    /// The cap is graded before the apply grades the name, so a create at the
+    /// cap reports the cap even when its name is taken, as the legacy server
+    /// did.
+    #[test]
+    fn given_at_limit_duplicate_name_when_admitting_should_report_limit_not_duplicate() {
+        let metadata = metadata_capped_over(users_holding_token());
+
+        let error = metadata
+            .admit_personal_access_token(&pat_request(
+                1,
+                1,
+                Operation::CreatePersonalAccessToken,
+                &token_create(TOKEN_NAME).to_bytes(),
+            ))
+            .expect_err("a create at the cap must be denied even for a taken name");
+
+        assert!(
+            matches!(
+                error,
+                IggyError::PersonalAccessTokensLimitReached(TOKEN_OWNER, TOKEN_CAP)
+            ),
+            "expected the cap error before the name grading, got {error:?}"
+        );
+    }
+
+    /// A delete is how a user at the cap frees a slot, so capping it too
+    /// would lock the account at the cap.
+    #[test]
+    fn given_user_at_token_cap_when_deleting_should_admit() {
+        let metadata = metadata_capped_over(users_holding_token());
+
+        assert!(
+            metadata
+                .admit_personal_access_token(&pat_request(
+                    1,
+                    1,
+                    Operation::DeletePersonalAccessToken,
+                    &token_delete().to_bytes(),
+                ))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn given_deletion_freed_a_slot_when_admitting_should_admit_the_next_create() {
+        let mut users = users_holding_token();
+        let deleted = StateHandler::apply(&token_delete(), &mut users, IggyTimestamp::now());
+        assert_eq!(deleted.code, 0, "the fixture token must be deleted");
+        let metadata = metadata_capped_over(users);
+
+        let admitted = metadata.admit_personal_access_token(&pat_request(
+            1,
+            1,
+            Operation::CreatePersonalAccessToken,
+            &token_create("replacement").to_bytes(),
+        ));
+
+        assert!(
+            admitted.is_ok(),
+            "a freed slot must admit the next create, got {admitted:?}"
+        );
+    }
+
+    /// The cap counts the creates in flight, not only the committed tokens, so
+    /// creates pipelined at the boundary never take a user past it. A create
+    /// in flight holds its slot until it leaves the pipeline: the apply
+    /// refuses it, it commits as a token, or a view change drops it. Only the
+    /// committed tokens prove that a create cannot fit, so until then a create
+    /// waits instead of getting the cap's error.
+    #[test]
+    fn given_token_creates_in_flight_when_admitting_at_cap_should_count_them_until_they_leave_the_pipeline()
+     {
+        const TOKENS_MAX: u32 = 3;
+        let metadata = primary_with_clients(
+            NoopBus,
+            users_holding_token().into(),
+            StreamsInner::new(),
+            TOKEN_OWNER,
+            FIRST_CLIENT..=FIRST_CLIENT + 4,
+        );
+        metadata.set_max_tokens_per_user(TOKENS_MAX);
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let create = |client: u128, name: &str| {
+            metadata.prepare_request(pat_request(
+                client,
+                1,
+                Operation::CreatePersonalAccessToken,
+                &token_create(name).to_bytes(),
+            ))
+        };
+        let assert_deferred = |client: u128, name: &str| {
+            let refused = create(client, name);
+            assert!(
+                matches!(refused, Err(IggyError::TransientNotAccepted)),
+                "{name} must wait for the creates in flight, got {:?}",
+                refused.err()
+            );
+        };
+        // Committed the way `on_ack` commits the pipeline head.
+        let commit_head = |prepare: Message<PrepareHeader>| {
+            let op = prepare.header().op;
+            consensus.with_pipeline_mut(|pipeline| {
+                pipeline.pop().unwrap();
+            });
+            let reply = metadata.apply_prepare(prepare);
+            consensus.advance_commit_max(op);
+            consensus.advance_commit_min(op);
+            iggy_binary_protocol::result_code(reply.body())
+        };
+
+        // The committed token leaves two slots. The first create reuses its
+        // name, so the apply will refuse it.
+        let mut in_flight = Vec::new();
+        for (client, name) in (FIRST_CLIENT..).zip([TOKEN_NAME, "second", "third", "fourth"]) {
+            if let Ok(prepare) = create(client, name) {
+                consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+                in_flight.push(prepare);
+            }
+        }
+        assert_eq!(in_flight.len(), 2, "two slots admit two creates in flight");
+        assert_deferred(FIRST_CLIENT + 2, "third");
+
+        assert_ne!(
+            commit_head(in_flight.remove(0)),
+            Some(0),
+            "the apply must refuse the taken name"
+        );
+        let third = create(FIRST_CLIENT + 2, "third").expect("the refused create freed its slot");
+        consensus.pipeline_message(PlaneKind::Metadata, &third);
+        assert_deferred(FIRST_CLIENT + 3, "fourth");
+
+        assert_eq!(commit_head(in_flight.remove(0)), Some(0));
+        assert_deferred(FIRST_CLIENT + 3, "fourth");
+
+        drop_uncommitted_suffix(consensus);
+        let fourth =
+            create(FIRST_CLIENT + 3, "fourth").expect("a dropped create must free its slot");
+        consensus.pipeline_message(PlaneKind::Metadata, &fourth);
+        assert_eq!(commit_head(fourth), Some(0));
+        let refused = create(FIRST_CLIENT + 4, "fifth");
+        assert!(
+            matches!(
+                refused,
+                Err(IggyError::PersonalAccessTokensLimitReached(
+                    TOKEN_OWNER,
+                    TOKENS_MAX
+                ))
+            ),
+            "a create past the cap on committed tokens keeps the cap error, got {:?}",
+            refused.err()
+        );
+    }
+
+    /// `partitions_max` counts the partitions of the creates in flight the
+    /// same way, and frees them when a view change drops those creates.
+    #[test]
+    fn given_topic_creates_in_flight_when_admitting_at_cap_should_count_them_until_they_leave_the_pipeline()
+     {
+        const PARTITIONS_MAX: u32 = 4;
+        let metadata = primary_with_clients(
+            NoopBus,
+            users_with_topic_manager(),
+            stream_with_one_partition(),
+            TOPIC_MANAGER,
+            FIRST_CLIENT..=FIRST_CLIENT + 4,
+        );
+        metadata.set_partitions_max(PARTITIONS_MAX);
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let create = |client: u128, name: &str| {
+            metadata.prepare_request(create_named_topic_request(
+                client,
+                TOPIC_MANAGER,
+                WireIdentifier::numeric(0),
+                name,
+            ))
+        };
+
+        // The committed partition leaves room for three one-partition topics.
+        let mut in_flight = 0;
+        for (client, name) in (FIRST_CLIENT..).zip(["a", "b", "c", "d", "e"]) {
+            match create(client, name) {
+                Ok(prepare) => {
+                    consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+                    in_flight += 1;
+                }
+                Err(error) => assert!(
+                    matches!(error, IggyError::TransientNotAccepted),
+                    "{name} must wait for the creates in flight, got {error:?}"
+                ),
+            }
+        }
+        assert_eq!(in_flight, 3, "three free partitions admit three creates");
+
+        drop_uncommitted_suffix(consensus);
+        assert!(
+            create(FIRST_CLIENT + 3, "d").is_ok(),
+            "a dropped create must free its partitions"
+        );
+    }
+
+    /// A create in flight that its apply refuses holds a reservation until it
+    /// commits. A valid create that fits once that reservation is freed must
+    /// not get the terminal cap error before then.
+    #[test]
+    fn given_refused_create_in_flight_when_a_valid_create_fits_committed_partitions_should_defer_it()
+     {
+        const PARTITIONS_MAX: u32 = 3;
+        let metadata = primary_with_clients(
+            NoopBus,
+            users_with_topic_manager(),
+            stream_with_one_partition(),
+            TOPIC_MANAGER,
+            FIRST_CLIENT..=FIRST_CLIENT + 2,
+        );
+        metadata.set_partitions_max(PARTITIONS_MAX);
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let create = |client: u128, name: &str, partitions_count: u32| {
+            metadata.prepare_request(create_topic_request_with_count(
+                client,
+                TOPIC_MANAGER,
+                WireIdentifier::numeric(0),
+                name,
+                partitions_count,
+            ))
+        };
+
+        let taken_name = create(FIRST_CLIENT, "existing", 2).unwrap();
+        consensus.pipeline_message(PlaneKind::Metadata, &taken_name);
+        assert!(
+            matches!(
+                create(FIRST_CLIENT + 1, "fresh", 1),
+                Err(IggyError::TransientNotAccepted)
+            ),
+            "a create that fits the committed partitions must wait"
+        );
+        assert!(
+            matches!(
+                create(FIRST_CLIENT + 2, "large", PARTITIONS_MAX),
+                Err(IggyError::PartitionsLimitReached)
+            ),
+            "a create past the cap on committed partitions keeps the cap error"
+        );
+
+        let op = taken_name.header().op;
+        consensus.with_pipeline_mut(|pipeline| {
+            pipeline.pop().unwrap();
+        });
+        let reply = metadata.apply_prepare(taken_name);
+        assert_ne!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        consensus.advance_commit_max(op);
+        consensus.advance_commit_min(op);
+        assert!(
+            create(FIRST_CLIENT + 1, "fresh", 1).is_ok(),
+            "the refused create must free its reservation"
+        );
+    }
+
+    /// The gate that lets a create past the cap reach its own apply error reads
+    /// the committed state, and an op in flight can change its verdict before
+    /// the create applies: here it creates the create's stream. Such a create
+    /// must not take the node past the cap.
+    #[test]
+    fn given_create_behind_its_uncommitted_stream_when_past_partitions_cap_should_not_pass_the_cap()
+    {
+        const PARTITIONS_MAX: u32 = 2;
+        const STREAM: &str = "pending";
+        const ROOT_CLIENT: u128 = 1;
+        let metadata = primary_with_clients(
+            NoopBus,
+            users_with_topic_manager(),
+            stream_with_one_partition(),
+            TOPIC_MANAGER,
+            [],
+        );
+        metadata.set_partitions_max(PARTITIONS_MAX);
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let create = || {
+            metadata.prepare_request(create_topic_request_with_count(
+                ROOT_CLIENT + 1,
+                0,
+                WireIdentifier::named(STREAM).unwrap(),
+                "topic",
+                PARTITIONS_MAX,
+            ))
+        };
+        let mut in_flight = vec![
+            metadata
+                .prepare_request(create_stream_request(ROOT_CLIENT, 1, STREAM))
+                .unwrap(),
+        ];
+        consensus.pipeline_message(PlaneKind::Metadata, &in_flight[0]);
+
+        let behind = create();
+        if let Ok(prepare) = &behind {
+            consensus.pipeline_message(PlaneKind::Metadata, prepare);
+            in_flight.push(prepare.clone());
+        }
+        for prepare in in_flight {
+            let op = prepare.header().op;
+            consensus.with_pipeline_mut(|pipeline| {
+                pipeline.pop().unwrap();
+            });
+            metadata.apply_prepare(prepare);
+            consensus.advance_commit_max(op);
+            consensus.advance_commit_min(op);
+        }
+        let partitions = metadata.mux_stm.streams().partition_count();
+        assert!(
+            partitions <= PARTITIONS_MAX as usize,
+            "{partitions} partitions committed past the cap of {PARTITIONS_MAX}"
+        );
+        assert!(
+            matches!(behind, Err(IggyError::TransientNotAccepted)),
+            "a create whose gate an op in flight can change must wait, got {:?}",
+            behind.err()
+        );
+        assert!(
+            matches!(create(), Err(IggyError::PartitionsLimitReached)),
+            "once its stream committed, the create must get the cap's error"
+        );
+    }
+
+    /// A cap refusal answers a well-formed request: the wire ingress and the
+    /// promotion of a queued create reply with the cap's code and keep the
+    /// session.
+    #[compio::test]
+    async fn given_create_past_token_cap_when_wire_or_queue_submits_should_reply_52_without_eviction()
+     {
+        const WIRE_CLIENT: u128 = FIRST_CLIENT;
+        const QUEUED_CLIENT: u128 = FIRST_CLIENT + 1;
+        let metadata = primary_with_clients(
+            ClientSendSpyBus::default(),
+            users_holding_token().into(),
+            StreamsInner::new(),
+            TOKEN_OWNER,
+            WIRE_CLIENT..=QUEUED_CLIENT,
+        );
+        metadata.set_max_tokens_per_user(TOKEN_CAP);
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let create = |client: u128| {
+            pat_request(
+                client,
+                1,
+                Operation::CreatePersonalAccessToken,
+                &token_create("next").to_bytes(),
+            )
+        };
+        let cap_code =
+            IggyError::PersonalAccessTokensLimitReached(TOKEN_OWNER, TOKEN_CAP).as_code();
+
+        metadata.on_request(create(WIRE_CLIENT)).await;
+        {
+            let replies = consensus.message_bus().client_replies.borrow();
+            assert_eq!(replies.len(), 1, "the wire ingress must answer the refusal");
+            let frame = replies[0].first();
+            let header =
+                bytemuck::checked::from_bytes::<ReplyHeader>(&frame[..size_of::<ReplyHeader>()]);
+            assert_eq!(
+                header.command,
+                Command::Reply,
+                "a cap refusal must not evict"
+            );
+            assert_eq!(
+                iggy_binary_protocol::result_code(&frame[size_of::<ReplyHeader>()..]),
+                Some(cap_code)
+            );
+        }
+
+        let (queued, mut receiver) =
+            consensus::RequestEntry::with_subscriber(create(QUEUED_CLIENT));
+        assert!(consensus.push_queued_request(queued).is_ok());
+        metadata.drain_request_queue_into_prepares().await;
+        let std::task::Poll::Ready(Ok(reply)) = futures::poll!(&mut receiver) else {
+            panic!("the promotion must answer a queued create past the cap");
+        };
+        assert_eq!(
+            iggy_binary_protocol::result_code(reply.body()),
+            Some(cap_code)
+        );
+        assert_eq!(
+            consensus.pipeline_len(),
+            0,
+            "a create past the cap must not be prepared"
+        );
+    }
+
+    /// Clients the cap tests register, above those `placement_metadata`
+    /// registers as root.
+    const FIRST_CLIENT: u128 = 11;
+
+    /// A primary of three replicas, so its prepares wait in the pipeline, over
+    /// `users` and `streams`, with `clients` registered as `user_id`.
+    fn primary_with_clients<B: MessageBus>(
+        bus: B,
+        users: Users,
+        streams: StreamsInner,
+        user_id: u32,
+        clients: impl IntoIterator<Item = u128>,
+    ) -> IggyMetadata<VsrConsensus<B>, PrepareJournal, (), TestMux> {
+        let mut metadata = placement_metadata_with_bus(bus);
+        metadata.mux_stm = Rc::new(TestMux::new((users, (streams.into(), ()))));
+        for client in clients {
+            metadata
+                .client_table
+                .borrow_mut()
+                .commit_register(client, user_id, [0x5a; 32], register_reply(client, 1))
+                .unwrap();
+        }
+        metadata
+    }
+
+    /// What a view change that truncates the uncommitted suffix leaves on the
+    /// old primary: `handle_start_view` clears the pipeline and moves the head
+    /// to the announced op, here the commit.
+    fn drop_uncommitted_suffix<B: MessageBus>(consensus: &VsrConsensus<B>) {
+        consensus.clear_pipeline();
+        consensus.sequencer().set_sequence(consensus.commit_min());
+    }
+
+    const TOKEN_OWNER: u32 = 7;
+    const TOKEN_NAME: &str = "token";
+    const TOKEN_CAP: u32 = 1;
+
+    fn token_create(name: &str) -> CreatePersonalAccessTokenRequest {
+        CreatePersonalAccessTokenRequest {
+            user_id: TOKEN_OWNER,
+            name: WireName::new(name).unwrap(),
+            expiry: 0,
+            token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
+        }
+    }
+
+    fn token_delete() -> DeletePersonalAccessTokenRequest {
+        DeletePersonalAccessTokenRequest {
+            user_id: TOKEN_OWNER,
+            name: WireName::new(TOKEN_NAME).unwrap(),
+            only_if_expired: false,
+        }
+    }
+
+    /// `TOKEN_OWNER` holding `TOKEN_NAME`, which fills `TOKEN_CAP`.
+    fn users_holding_token() -> UsersInner {
+        let mut users = UsersInner::new();
+        let created =
+            StateHandler::apply(&token_create(TOKEN_NAME), &mut users, IggyTimestamp::now());
+        assert_eq!(created.code, 0, "the fixture token must be created");
+        users
+    }
+
+    /// A plane over `users` that caps each user at `TOKEN_CAP` tokens.
+    fn metadata_capped_over(
+        users: UsersInner,
+    ) -> IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux> {
+        let mut metadata = metadata_plane();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users.into(),
+            (StreamsInner::new().into(), ()),
+        )));
+        metadata.set_max_tokens_per_user(TOKEN_CAP);
+        metadata
+    }
+
+    /// Slab ids of `users_with_topic_manager`: root takes 0.
+    const TOPIC_MANAGER: u32 = 1;
+    const UNGRANTED: u32 = 2;
+
+    /// Root, then `TOPIC_MANAGER` with `manage_topics` on stream 0, then
+    /// `UNGRANTED` with no permissions.
+    fn users_with_topic_manager() -> Users {
+        let mut inner = UsersInner::new();
+        let timestamp = IggyTimestamp::now();
+        let no_grants = WireGlobalPermissions {
+            manage_servers: false,
+            read_servers: false,
+            manage_users: false,
+            read_users: false,
+            manage_streams: false,
+            read_streams: false,
+            manage_topics: false,
+            read_topics: false,
+            poll_messages: false,
+            send_messages: false,
+        };
+        for (username, streams) in [
+            ("iggy", Vec::new()),
+            (
+                "manager",
+                vec![WireStreamPermissions {
+                    stream_id: 0,
+                    manage_stream: false,
+                    read_stream: false,
+                    manage_topics: true,
+                    read_topics: false,
+                    poll_messages: false,
+                    send_messages: false,
+                    topics: Vec::new(),
+                }],
+            ),
+            ("ungranted", Vec::new()),
+        ] {
+            let reply = StateHandler::apply(
+                &CreateUserRequest {
+                    username: WireName::new(username).unwrap(),
+                    password: "hash".to_string(),
+                    status: UserStatus::Active.as_code(),
+                    permissions: Some(WirePermissions {
+                        global: no_grants.clone(),
+                        streams,
+                    }),
+                    options: WireOptions::empty(),
+                },
+                &mut inner,
+                timestamp,
+            );
+            assert_eq!(reply.code, 0, "fixture user {username} must be created");
+        }
+        inner.into()
+    }
+
+    /// Stream 0 holding one topic with one partition.
+    fn stream_with_one_partition() -> StreamsInner {
+        stream_with_one_partition_in_view(0)
+    }
+
+    fn stream_with_one_partition_in_view(view: u32) -> StreamsInner {
+        let mut inner = StreamsInner::new();
+        let _ = StateHandler::apply(
+            &CreateStreamRequest {
+                name: WireName::new("stream").unwrap(),
+                options: WireOptions::empty(),
+            },
+            &mut inner,
+            IggyTimestamp::now(),
+        );
+        create_topic_in_view(&mut inner, view);
+        inner
+    }
+
+    /// Topic "existing" in stream 0, with one partition created in `view`.
+    fn create_topic_in_view(inner: &mut StreamsInner, view: u32) {
+        let _ = StateHandler::apply(
+            &PersistedCreateTopicRequest {
+                request: CreateTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    partitions_count: 1,
+                    name: WireName::new("existing").unwrap(),
+                    options: WireOptions::empty(),
+                },
+                derived_options: WireOptions::empty(),
+                partitions: vec![CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 1,
+                    initial_view: view,
+                    members: Vec::new(),
+                }],
+            },
+            inner,
+            IggyTimestamp::now(),
+        );
+    }
+
+    #[test]
+    fn given_zero_partitions_create_past_partitions_cap_when_validating_should_admit() {
+        assert!(validate_partitions_limit(10, 0, 12).is_ok());
+    }
+
+    #[test]
+    fn given_create_reaching_partitions_cap_when_validating_should_admit() {
+        assert!(validate_partitions_limit(10, 4, 6).is_ok());
+    }
+
+    #[test]
+    fn given_create_past_partitions_cap_when_validating_should_deny() {
+        assert!(matches!(
+            validate_partitions_limit(10, 5, 6),
+            Err(IggyError::PartitionsLimitReached)
+        ));
+        assert!(matches!(
+            validate_partitions_limit(10, 1, 10),
+            Err(IggyError::PartitionsLimitReached)
+        ));
     }
 
     /// Committed-reply fixture shaped like the commit path's output: a result
@@ -4527,7 +9072,7 @@ mod tests {
                 request,
                 commit: request,
                 size: u32::try_from(total).unwrap(),
-                command: Command2::Reply,
+                command: Command::Reply,
                 operation,
                 ..Default::default()
             };
@@ -4535,22 +9080,31 @@ mod tests {
         reply
     }
 
-    fn pat_create_request(client: u128, request: u64) -> Message<RoutedRequestHeader> {
+    fn pat_request(
+        client: u128,
+        request: u64,
+        operation: Operation,
+        body: &[u8],
+    ) -> Message<RoutedRequestHeader> {
         let header_size = size_of::<RoutedRequestHeader>();
-        let mut message = Message::<RoutedRequestHeader>::new(header_size);
-        let header = bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(
-            &mut message.as_mut_slice()[..header_size],
-        );
-        *header = RoutedRequestHeader {
-            command: Command2::Request,
-            operation: Operation::CreatePersonalAccessToken,
-            size: u32::try_from(header_size).unwrap(),
-            client,
-            session: 1,
-            request,
-            group: server_common::sharding::METADATA_GROUP,
-            ..Default::default()
-        };
+        let total = header_size + body.len();
+        let mut message = Message::<RoutedRequestHeader>::new(total);
+        {
+            let slice = message.as_mut_slice();
+            slice[header_size..total].copy_from_slice(body);
+            let header =
+                bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size]);
+            *header = RoutedRequestHeader {
+                command: Command::Request,
+                operation,
+                size: u32::try_from(total).unwrap(),
+                client,
+                session: 1,
+                request,
+                group: server_common::sharding::METADATA_GROUP,
+                ..Default::default()
+            };
+        }
         message
     }
 
@@ -4559,8 +9113,18 @@ mod tests {
         request: u64,
         name: &str,
     ) -> Message<RoutedRequestHeader> {
+        create_stream_request_with(client, request, name, WireOptions::empty())
+    }
+
+    fn create_stream_request_with(
+        client: u128,
+        request: u64,
+        name: &str,
+        options: WireOptions,
+    ) -> Message<RoutedRequestHeader> {
         let body = iggy_binary_protocol::requests::streams::CreateStreamRequest {
             name: WireName::new(name).unwrap(),
+            options,
         }
         .to_bytes();
         let header_size = size_of::<RoutedRequestHeader>();
@@ -4572,7 +9136,7 @@ mod tests {
             let header =
                 bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size]);
             *header = RoutedRequestHeader {
-                command: Command2::Request,
+                command: Command::Request,
                 operation: Operation::CreateStream,
                 size: u32::try_from(total).unwrap(),
                 client,
@@ -4637,11 +9201,15 @@ mod tests {
             );
         let consensus = md.consensus.as_ref().unwrap();
 
-        md.client_table.borrow_mut().commit_register(
-            CLIENT,
-            ACTING_USER,
-            register_reply(CLIENT, SESSION),
-        );
+        md.client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
 
         // Three prepares through the real primary path: pipeline entry, WAL
         // append, self-ack onto the loopback queue.
@@ -4730,6 +9298,729 @@ mod tests {
         );
     }
 
+    /// A backup admits the prepare its JOURNAL needs next, even when its
+    /// sequencer has run ahead of the journal.
+    ///
+    /// The two frontiers legitimately disagree: `on_start_view` sets the sequencer
+    /// to the view's announced head, deliberately ahead of what this replica
+    /// holds, because the bodies arrive afterwards by retransmit or repair. Gating
+    /// admission on the sequencer therefore rejected exactly the prepare that
+    /// would heal the log: a backup with journal head 44 refusing op 45 because
+    /// its adopted head said to expect 46. The primary retransmits that op
+    /// forever, every backup logs an out-of-order gap, it never reaches a commit
+    /// quorum, and its client is never answered. Systematic for any rejoining
+    /// replica, so the deterministic simulator wedged on every metadata workload
+    /// under crash/restart injection until this was gated on the journal.
+    #[compio::test]
+    async fn backup_admits_the_prepare_its_journal_needs_despite_a_leading_sequencer() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        /// Stands in for a head adopted from a `StartView` whose bodies have not
+        /// arrived, so it sits well above the empty journal.
+        const ADOPTED_HEAD: u64 = 5;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        // Replica 1 of 3 at view 0, so `primary_index(0) == 0` makes this a backup
+        // and `on_replicate` takes the gap-check branch.
+        let consensus = VsrConsensus::new(
+            1,
+            1,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                Some(dir.path().to_path_buf()),
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        assert!(
+            consensus.is_follower(),
+            "replica 1 of 3 at view 0 must be a backup for this to exercise the gap check"
+        );
+        md.client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+
+        // Minted while the sequencer is still at 0, so it carries op 1: exactly
+        // what the empty journal needs next.
+        let prepare = md
+            .prepare_request(create_stream_request(CLIENT, 1, "s1"))
+            .expect("CreateStream is client-allowed");
+        assert_eq!(prepare.header().op, 1, "the first prepare must be op 1");
+
+        // Now run the sequencer ahead, as adopting a started view does.
+        consensus.sequencer().set_sequence(ADOPTED_HEAD);
+        let journal = md.journal.as_ref().unwrap();
+        assert_eq!(
+            journal.last_op(),
+            None,
+            "the journal must still be empty, else the divergence under test is absent"
+        );
+
+        md.on_replicate(prepare).await;
+
+        assert!(
+            journal.header(1).is_some(),
+            "backup dropped the prepare its journal needed next because its sequencer \
+             was ahead; the primary's retransmit of this op can never be accepted, so \
+             the op never commits and its client never gets a reply"
+        );
+    }
+
+    /// The walk cap bounds ONE `commit_journal` call, not the backlog.
+    ///
+    /// The resident `(commit_min, commit_max]` run after a repair window or a
+    /// rejoin is the whole backlog, and the walk applies each op with no await
+    /// the pump can interleave, so an uncapped call holds the shard for all of
+    /// it. Every caller is re-driven every tick, so stopping short loses
+    /// nothing; a cap that did NOT resume would pin `commit_min` until the next
+    /// op to commit trips `advance_commit_min`'s sequential assert.
+    #[compio::test]
+    async fn commit_journal_stops_at_the_walk_cap_and_resumes_on_the_next_call() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        /// The cap, as an op count.
+        const CAP: u64 = COMMIT_WALK_OPS_MAX as u64;
+        /// One op past the cap, so the first call must stop short and the
+        /// second must have something left to finish.
+        const OPS: u64 = CAP + 1;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        // Replica 1 of 3 at view 0: a backup, so `on_replicate` journals each
+        // prepare without the primary's pipeline commit path running under it.
+        let consensus = VsrConsensus::new(
+            1,
+            1,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                Some(dir.path().to_path_buf()),
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+
+        for request in 1..=OPS {
+            let prepare = md
+                .prepare_request(create_stream_request(
+                    CLIENT,
+                    request,
+                    &format!("s{request}"),
+                ))
+                .expect("CreateStream is client-allowed");
+            md.on_replicate(prepare).await;
+        }
+        let journal = md.journal.as_ref().unwrap();
+        assert_eq!(journal.last_op(), Some(OPS), "every op must be resident");
+        assert_eq!(consensus.commit_min(), 0, "no commit heartbeat has landed");
+
+        // What a repair window or a rejoin leaves behind: the whole run
+        // committed by the group and resident here, none of it walked.
+        consensus.advance_commit_max(OPS);
+
+        assert_eq!(md.commit_journal().await, CommitWalkStop::WalkCap);
+        assert_eq!(
+            consensus.commit_min(),
+            CAP,
+            "one call walked the whole backlog; the pump is blocked for as long \
+             as the resident run is, however long that is"
+        );
+
+        assert_eq!(md.commit_journal().await, CommitWalkStop::CaughtUp);
+        assert_eq!(
+            consensus.commit_min(),
+            OPS,
+            "the walk did not resume where it stopped, so `commit_min` is pinned \
+             below `commit_max` with no other re-driver"
+        );
+    }
+
+    /// The walk leaves the pipeline head to `on_ack` and says so.
+    ///
+    /// A primary-elect inherits a committed head at `commit_min + 1` and the
+    /// walk moves nothing over it. `tick_metadata`'s stall detector truncates
+    /// on `BodyMissing` only, so this has to come back as `PipelineHead` with
+    /// the prepare still journaled for the pipeline driver to read.
+    #[compio::test]
+    async fn given_committed_pipeline_head_at_next_op_when_walking_should_stop_as_pipeline_head() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                None,
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+
+        let prepare = md
+            .prepare_request(create_stream_request(CLIENT, 1, "s1"))
+            .expect("CreateStream is client-allowed");
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        md.on_replicate(prepare).await;
+        // Committed with no driver to apply it: the inherited-head shape.
+        consensus.advance_commit_max(1);
+
+        assert_eq!(md.commit_journal().await, CommitWalkStop::PipelineHead);
+        assert_eq!(
+            consensus.commit_min(),
+            0,
+            "the walk applied the pipeline head"
+        );
+        assert!(
+            md.journal.as_ref().unwrap().handle().header(1).is_some(),
+            "the head's prepare must stay journaled for the pipeline driver"
+        );
+
+        md.resume_stranded_commits().await;
+        assert_eq!(
+            consensus.commit_min(),
+            1,
+            "the pipeline driver commits the head the walk left to it"
+        );
+    }
+
+    /// A committed op with no resident header is a plain gap: the walk names it
+    /// as `HeaderMissing`, never as a missing body that needs truncating.
+    #[compio::test]
+    async fn given_committed_op_without_header_when_walking_should_stop_as_header_missing() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        const RESIDENT_OPS: u64 = 2;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        // A backup, so no pipeline head caps the walk.
+        let consensus = VsrConsensus::new(
+            1,
+            1,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                Some(dir.path().to_path_buf()),
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+
+        for request in 1..=RESIDENT_OPS {
+            let prepare = md
+                .prepare_request(create_stream_request(
+                    CLIENT,
+                    request,
+                    &format!("s{request}"),
+                ))
+                .expect("CreateStream is client-allowed");
+            md.on_replicate(prepare).await;
+        }
+        consensus.advance_commit_max(RESIDENT_OPS + 1);
+
+        assert_eq!(
+            md.commit_journal().await,
+            CommitWalkStop::HeaderMissing {
+                op: RESIDENT_OPS + 1
+            }
+        );
+        assert_eq!(
+            consensus.commit_min(),
+            RESIDENT_OPS,
+            "the walk applies the resident run before stopping at the gap"
+        );
+    }
+
+    /// Bus that records every frame sent to a replica.
+    #[derive(Debug, Default)]
+    struct ReplicaSendSpyBus {
+        replica_sends: RefCell<Vec<(u8, Frozen<MESSAGE_ALIGN>)>>,
+    }
+
+    #[allow(clippy::future_not_send)]
+    impl MessageBus for ReplicaSendSpyBus {
+        fn track_background(&self, _handle: JoinHandle<()>) {}
+        async fn send_to_client(
+            &self,
+            _client_id: u128,
+            _data: impl Into<BusMessage>,
+        ) -> Result<(), SendError> {
+            Ok(())
+        }
+        async fn send_to_replica(
+            &self,
+            replica: u8,
+            data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), SendError> {
+            self.replica_sends.borrow_mut().push((replica, data));
+            Ok(())
+        }
+        fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
+        fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
+    }
+
+    /// `(target replica, op, prepare checksum)` of every `PrepareOk` sent on `bus`.
+    fn sent_prepare_oks(bus: &ReplicaSendSpyBus) -> Vec<(u8, u64, u128)> {
+        bus.replica_sends
+            .borrow()
+            .iter()
+            .filter_map(|(replica, frame)| {
+                bytemuck::checked::try_from_bytes::<PrepareOkHeader>(frame.as_slice())
+                    .ok()
+                    .filter(|header| header.command == Command::PrepareOk)
+                    .map(|header| (*replica, header.op, header.prepare_checksum))
+            })
+            .collect()
+    }
+
+    /// A backup re-acks the retransmit of an op it already applied.
+    ///
+    /// A `DoViewChange` caps its commit at the sender's head, so a backup that
+    /// learned a commit without holding the op hands the next primary a lower
+    /// commit than the cluster reached. That primary restarts the op as
+    /// uncommitted and retransmits it. With the third replica down, this backup's
+    /// ack is the only quorum the op can get: dropping the retransmit keeps the
+    /// primary below its recovery barrier, refusing every metadata request.
+    ///
+    /// A prepare naming a different prepare at the applied op is no retransmit:
+    /// it contradicts a committed op, so it is refused and counted.
+    #[compio::test]
+    async fn given_an_applied_op_when_the_primary_retransmits_it_should_ack_only_the_journaled_copy()
+     {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        const PRIMARY: u8 = 0;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        // Replica 1 of 3 at view 0: a backup of replica 0.
+        let consensus = VsrConsensus::new(
+            1,
+            1,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            ReplicaSendSpyBus::default(),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                Some(dir.path().to_path_buf()),
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+
+        let prepare = md
+            .prepare_request(create_stream_request(CLIENT, 1, "s1"))
+            .expect("CreateStream is client-allowed");
+        let op = prepare.header().op;
+        let checksum = prepare.header().checksum;
+        let conflicting = consensus::seal_prepare_checksum(prepare.clone().transmute_header(
+            |old, header: &mut PrepareHeader| {
+                *header = old;
+                header.timestamp += 1;
+            },
+        ));
+        assert!(
+            verify_prepare_integrity(conflicting.header(), conflicting.as_slice()).is_ok(),
+            "the conflicting prepare must reach the commit fence, not the integrity check"
+        );
+        md.on_replicate(prepare.clone()).await;
+        consensus.advance_commit_max(op);
+        md.commit_journal().await;
+        assert_eq!(
+            consensus.commit_min(),
+            op,
+            "the backup must apply the op first"
+        );
+        consensus.message_bus().replica_sends.borrow_mut().clear();
+
+        md.on_replicate(prepare).await;
+        assert_eq!(
+            sent_prepare_oks(consensus.message_bus()),
+            vec![(PRIMARY, op, checksum)],
+            "the retransmit of an applied op went unacked, so a primary that restarted \
+             it as uncommitted never reaches quorum while the third replica is down"
+        );
+        consensus.message_bus().replica_sends.borrow_mut().clear();
+
+        md.on_replicate(conflicting).await;
+        assert!(
+            sent_prepare_oks(consensus.message_bus()).is_empty(),
+            "a prepare that conflicts with the journaled op must never be acked"
+        );
+        assert_eq!(
+            consensus.applied_log_contradictions(),
+            1,
+            "a prepare naming another prepare at an applied op must be reported, not \
+             skipped as an old retransmit"
+        );
+    }
+
+    /// A state-transfer receiver admits the first live prepare above the floor it
+    /// installed, instead of waiting for an op the snapshot already contains.
+    ///
+    /// `install_state_transfer` moves the snapshot floor, the commit floor, the
+    /// sequencer and `commit_max`, and leaves the WAL head where it was: the
+    /// snapshot IS every op below the floor, so there is nothing left to append
+    /// for them. A gap check reading `last_op` alone therefore has the receiver
+    /// ask for `last_op + 1`, an op inside the snapshot that no peer will send
+    /// again, and it drops every live prepare forever.
+    ///
+    /// Nothing recovers it. An offer built on a quiet cluster carries `commit_op
+    /// == snapshot_seq`, so the install lands `commit_min == commit_max` and
+    /// `maybe_request_metadata_repair`, gated on `commit_min < commit_max`, never
+    /// arms; repair is the only path that could refill the head. With the
+    /// other backup down the primary needs this replica's ack to commit at all,
+    /// so a 3-node cluster still inside its quorum stops serving metadata.
+    #[compio::test]
+    async fn state_transfer_receiver_admits_the_first_prepare_above_the_installed_floor() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        /// The `snapshot_seq` of a transferred offer, far above anything this
+        /// replica's own WAL holds.
+        const INSTALLED_FLOOR: u64 = 400;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        // Replica 1 of 3 at view 0, so `primary_index(0) == 0` makes this a backup
+        // and `on_replicate` takes the gap-check branch.
+        let consensus = VsrConsensus::new(
+            1,
+            1,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                Some(dir.path().to_path_buf()),
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        assert!(
+            consensus.is_follower(),
+            "replica 1 of 3 at view 0 must be a backup for this to exercise the gap check"
+        );
+        md.client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+
+        // Give the WAL a head far below the floor about to be installed, which is
+        // what a replica that fell behind its peers' retention actually carries.
+        let first = md
+            .prepare_request(create_stream_request(CLIENT, 1, "s1"))
+            .expect("CreateStream is client-allowed");
+        md.on_replicate(first).await;
+        let journal = md.journal.as_ref().unwrap();
+        assert_eq!(
+            journal.last_op(),
+            Some(1),
+            "the WAL head must sit below the installed floor, else the divergence \
+             under test is absent"
+        );
+
+        // Exactly the frontiers `install_state_transfer` leaves for a quiet-cluster
+        // offer, where the manifest's `commit_op` equals its `snapshot_seq`.
+        journal.set_snapshot_op(INSTALLED_FLOOR);
+        consensus.set_commit_floor(INSTALLED_FLOOR);
+        consensus.sequencer().set_sequence(INSTALLED_FLOOR);
+        consensus.advance_commit_max(INSTALLED_FLOOR);
+        assert_eq!(
+            consensus.commit_min(),
+            consensus.commit_max(),
+            "the wedge needs an install with no repair left to arm; diverged \
+             frontiers heal through `maybe_request_metadata_repair`"
+        );
+
+        let next = md
+            .prepare_request(create_stream_request(CLIENT, 2, "s2"))
+            .expect("CreateStream is client-allowed");
+        assert_eq!(
+            next.header().op,
+            INSTALLED_FLOOR + 1,
+            "the primary numbers the next op off the installed floor"
+        );
+
+        md.on_replicate(next).await;
+
+        assert!(
+            journal
+                .header(usize::try_from(INSTALLED_FLOOR + 1).unwrap())
+                .is_some(),
+            "state-transfer receiver dropped the first prepare above its installed \
+             floor; the ops the snapshot already holds are never re-sent, and with \
+             `commit_min == commit_max` no repair arms, so this op never commits"
+        );
+    }
+
+    #[compio::test]
+    async fn given_committed_receipts_when_checkpoint_stops_at_each_boundary_should_reopen_them() {
+        const CLIENT: u128 = 1;
+        for boundary in [
+            CheckpointBoundary::TableCaptured,
+            CheckpointBoundary::TemporaryCreated,
+            CheckpointBoundary::Written,
+            CheckpointBoundary::FileSynced,
+            CheckpointBoundary::Renamed,
+            CheckpointBoundary::DirectorySynced,
+            CheckpointBoundary::SuperblockWritten,
+            CheckpointBoundary::WalDrained,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let metadata_directory = directory.path().join(crate::impls::METADATA_DIR);
+            std::fs::create_dir_all(&metadata_directory).unwrap();
+            let journal = PrepareJournal::open(&metadata_directory.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            let superblock = journal::superblock::PingPongSuperblock::open(&metadata_directory)
+                .await
+                .unwrap();
+            let consensus = VsrConsensus::new(
+                1,
+                0,
+                1,
+                server_common::sharding::METADATA_GROUP,
+                NoopBus,
+                LocalPipeline::new(),
+            );
+            consensus.init();
+            let metadata: IggyMetadata<_, PrepareJournal, (), TestMux> = IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                Some(Rc::new(superblock)),
+                TestMux::new((session_users(), (StreamsInner::new().into(), ()))),
+                Some(directory.path().to_path_buf()),
+            );
+            let registration = metadata
+                .submit_register_in_process(
+                    CLIENT,
+                    0,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32],
+                    },
+                )
+                .await
+                .unwrap();
+            let consensus = metadata.consensus.as_ref().unwrap();
+            let journal = metadata.journal.as_ref().unwrap();
+            metadata.set_checkpoint_margin(usize::MAX);
+            metadata.checkpoint_if_needed(consensus, journal).await;
+            metadata.set_checkpoint_margin(0);
+            for request in 1..=3 {
+                let message = create_stream_request(CLIENT, request, &format!("receipt-{request}"))
+                    .transmute_header(|old, header: &mut RoutedRequestHeader| {
+                        *header = old;
+                        header.session = registration.epoch;
+                    });
+                let reply = metadata.submit_request_in_process(message).await.unwrap();
+                assert_eq!(
+                    iggy_binary_protocol::result_code(
+                        &reply.as_slice()[size_of::<ReplyHeader>()..]
+                    ),
+                    Some(0)
+                );
+            }
+            let expected = metadata
+                .client_table
+                .borrow()
+                .get_reply(CLIENT)
+                .unwrap()
+                .clone()
+                .into_wire_bytes()
+                .as_slice()
+                .to_vec();
+            let committed = consensus.commit_min();
+            metadata.set_checkpoint_margin(usize::MAX);
+            STOP_CHECKPOINT_AFTER.set(Some(boundary));
+            metadata.checkpoint_if_needed(consensus, journal).await;
+            assert!(
+                STOP_CHECKPOINT_AFTER.get().is_none(),
+                "{boundary:?} must be reached"
+            );
+            drop(metadata);
+            let recovered = crate::impls::recovery::recover::<TestMux>(
+                directory.path(),
+                crate::impls::recovery::ReplicaIdentity {
+                    cluster: 1,
+                    replica_id: 0,
+                    replica_count: 1,
+                },
+                journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |_| {},
+                ChangeLogCapacities::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{boundary:?}: {error}"));
+            let consensus::client_table::RequestStatus::Duplicate(reply) = recovered
+                .client_table
+                .check_request(CLIENT, registration.epoch, 3, Operation::CreateStream)
+            else {
+                panic!("{boundary:?}: latest unresolved result must remain replayable");
+            };
+            assert_eq!(
+                reply.into_wire_bytes().as_slice(),
+                expected,
+                "{boundary:?}: latest receipt identity and body must survive reopen"
+            );
+            assert_eq!(recovered.client_table.get_user_id(CLIENT), Some(0));
+            for request in 1..3 {
+                assert!(
+                    matches!(
+                        recovered.client_table.check_request(
+                            CLIENT,
+                            registration.epoch,
+                            request,
+                            Operation::CreateStream
+                        ),
+                        consensus::client_table::RequestStatus::Duplicate(_)
+                            | consensus::client_table::RequestStatus::AlreadyApplied { .. }
+                    ),
+                    "{boundary:?}: earlier acknowledged request {request} must not execute again"
+                );
+            }
+            assert_eq!(recovered.client_table.get_watermark(CLIENT), Some(3));
+            assert!(
+                recovered
+                    .last_journaled_op
+                    .or_else(|| recovered
+                        .snapshot
+                        .as_ref()
+                        .map(IggySnapshot::sequence_number))
+                    .is_some_and(|op| op >= committed),
+                "{boundary:?}: reopened state must cover the acknowledged prefix"
+            );
+        }
+    }
+
     /// A checkpoint reclaims the WAL prefix the snapshot supersedes, but must
     /// stop one op short of the checkpoint op itself.
     ///
@@ -4773,11 +10064,15 @@ mod tests {
                 Some(dir.path().to_path_buf()),
             );
         let consensus = md.consensus.as_ref().unwrap();
-        md.client_table.borrow_mut().commit_register(
-            CLIENT,
-            ACTING_USER,
-            register_reply(CLIENT, SESSION),
-        );
+        md.client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
 
         for op in 1..=OPS {
             let prepare = md
@@ -4868,11 +10163,15 @@ mod tests {
                 Some(dir.path().to_path_buf()),
             );
         let consensus = md.consensus.as_ref().unwrap();
-        md.client_table.borrow_mut().commit_register(
-            CLIENT,
-            ACTING_USER,
-            register_reply(CLIENT, SESSION),
-        );
+        md.client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
 
         // Fill to one op under the boundary through the real primary path,
         // acking each op so `commit_min` tracks `last_op` and the pipeline
@@ -4966,6 +10265,37 @@ mod tests {
         );
     }
 
+    #[compio::test]
+    async fn logout_waits_for_inherited_committed_history_before_checking_the_session() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const USER: u32 = 7;
+        let metadata = metadata_plane();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(CLIENT, USER, [0x5a; 32], register_reply(CLIENT, SESSION))
+            .unwrap();
+        consensus.advance_commit_max(1);
+
+        assert_eq!(
+            metadata.submit_logout_in_process(CLIENT, SESSION, 2).await,
+            Err(MetadataSubmitError::NotCaughtUp)
+        );
+        assert_eq!(
+            metadata
+                .submit_logout_in_process(CLIENT + 1, SESSION, 2)
+                .await,
+            Err(MetadataSubmitError::NotCaughtUp)
+        );
+        assert_eq!(
+            metadata.client_table.borrow().get_epoch(CLIENT),
+            Some(SESSION)
+        );
+        assert!(consensus.pipeline_is_empty());
+    }
+
     /// The exact window behind the historical "logout/unregister failed
     /// ... primary not yet caught up on `commit_journal`".
     /// ANOTHER client's op sits between quorum-ack (`commit_max` advanced
@@ -5015,11 +10345,15 @@ mod tests {
             );
         let consensus = md.consensus.as_ref().unwrap();
         for client in [CLIENT_A, CLIENT_B] {
-            md.client_table.borrow_mut().commit_register(
-                client,
-                ACTING_USER,
-                register_reply(client, SESSION),
-            );
+            md.client_table
+                .borrow_mut()
+                .commit_register(
+                    client,
+                    ACTING_USER,
+                    [0x5a; 32],
+                    register_reply(client, SESSION),
+                )
+                .unwrap();
         }
 
         // B's op: prepared, journaled, self-acked onto the loopback queue.
@@ -5095,6 +10429,1169 @@ mod tests {
         );
     }
 
+    #[compio::test]
+    async fn expired_logout_waits_for_catchup_and_preserves_registered_members() {
+        const CLIENT: u128 = 1;
+        const USER: u32 = 7;
+        let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
+        let session = metadata
+            .submit_register_in_process(
+                CLIENT,
+                USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32],
+                },
+            )
+            .await
+            .unwrap()
+            .epoch;
+        let consensus = metadata.consensus.as_ref().unwrap();
+        consensus.advance_commit_max(consensus.commit_min() + 1);
+        assert_eq!(
+            metadata
+                .submit_expired_logout_in_process(CLIENT, Some(session))
+                .await,
+            Err(MetadataSubmitError::NotCaughtUp)
+        );
+        assert_eq!(
+            metadata
+                .mux_stm
+                .streams()
+                .consumer_group_memberships(CLIENT)
+                .len(),
+            1
+        );
+    }
+
+    #[compio::test]
+    async fn expired_logout_removes_only_the_observed_session() {
+        const CLIENT: u128 = 1;
+        const USER: u32 = 7;
+        let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
+        let session = metadata
+            .submit_register_in_process(
+                CLIENT,
+                USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32],
+                },
+            )
+            .await
+            .unwrap()
+            .epoch;
+        let logout_op = metadata.consensus.as_ref().unwrap().commit_min() + 1;
+        assert_eq!(
+            metadata
+                .submit_expired_logout_in_process(CLIENT, Some(session))
+                .await
+                .unwrap(),
+            Some(logout_op)
+        );
+        assert_eq!(
+            metadata
+                .mux_stm
+                .streams()
+                .consumer_group_memberships(CLIENT),
+            []
+        );
+        assert_eq!(metadata.client_table.borrow().get_epoch(CLIENT), None);
+        assert_eq!(metadata.mux_stm.streams().consumer_group_count(), 1);
+    }
+
+    #[compio::test]
+    async fn expired_logout_removes_a_member_without_a_client_table_entry() {
+        const CLIENT: u128 = 1;
+        let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
+        let session = metadata.client_table.borrow().get_epoch(CLIENT).unwrap();
+        let logout_op = metadata.consensus.as_ref().unwrap().commit_min() + 1;
+
+        assert_eq!(
+            metadata
+                .submit_expired_logout_in_process(CLIENT, Some(session))
+                .await
+                .unwrap(),
+            Some(logout_op)
+        );
+        assert_eq!(
+            metadata
+                .submit_expired_logout_in_process(CLIENT, None)
+                .await
+                .unwrap(),
+            None
+        );
+
+        assert_eq!(
+            metadata
+                .mux_stm
+                .streams()
+                .consumer_group_memberships(CLIENT),
+            []
+        );
+        assert_eq!(metadata.mux_stm.streams().consumer_group_count(), 1);
+        assert_eq!(metadata.consensus.as_ref().unwrap().commit_min(), logout_op);
+    }
+
+    #[compio::test]
+    async fn stale_logout_request_preserves_the_latest_receipt_and_group_membership() {
+        const CLIENT: u128 = 1;
+        const WATERMARK: u64 = 5;
+        let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
+        let session = metadata.client_table.borrow().get_epoch(CLIENT).unwrap();
+        let committed_op = metadata.consensus.as_ref().unwrap().commit_min();
+        let reply = committed_reply(CLIENT, WATERMARK, Operation::CreateStream, 0);
+        assert_eq!(
+            metadata
+                .client_table
+                .borrow_mut()
+                .commit_reply(CLIENT, 7, reply),
+            consensus::client_table::CommitReply::Cached
+        );
+        for (request, expected) in [
+            (1, MetadataSubmitError::RequestTooOld),
+            (WATERMARK, MetadataSubmitError::OperationMismatch),
+        ] {
+            assert_eq!(
+                metadata
+                    .submit_logout_in_process(CLIENT, session, request)
+                    .await,
+                Err(expected)
+            );
+            assert_eq!(
+                metadata.client_table.borrow().get_epoch(CLIENT),
+                Some(session)
+            );
+            assert_eq!(
+                metadata
+                    .mux_stm
+                    .streams()
+                    .consumer_group_memberships(CLIENT)
+                    .len(),
+                1
+            );
+            assert_eq!(
+                metadata.consensus.as_ref().unwrap().commit_min(),
+                committed_op,
+                "a refused logout must not commit a metadata operation"
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn recovery_frontier_records_partition_revisions_separately_from_metadata_ops() {
+        let (_dir, metadata) = metadata_with_group_member(1).await;
+        for client in 2..=8 {
+            metadata
+                .submit_register_in_process(
+                    client,
+                    7,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32],
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let revision = metadata.mux_stm.streams().read(|inner| inner.revision);
+        let commit = metadata.consensus.as_ref().unwrap().commit_min();
+        assert!(
+            commit > revision,
+            "registration churn must exceed the partition revision in this fixture"
+        );
+        metadata.seed_applied_frontier_from_consensus();
+        assert_eq!(metadata.applied_frontier.get(), commit);
+        assert_eq!(metadata.applied_frontier.recovered_revision(), revision);
+    }
+
+    #[compio::test]
+    async fn given_group_logout_when_finalizing_session_should_preserve_retirement_coverage() {
+        const CLIENT: u128 = 1;
+        let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
+        let namespace_revision = metadata.mux_stm.namespace_revision();
+        let session = metadata.client_table.borrow().get_epoch(CLIENT).unwrap();
+        metadata
+            .submit_logout_in_process(CLIENT, session, 1)
+            .await
+            .unwrap();
+        let identity = metadata
+            .client_table
+            .borrow()
+            .ended_sessions()
+            .next()
+            .unwrap();
+        assert_eq!(metadata.mux_stm.namespace_revision(), namespace_revision);
+        assert_ne!(
+            metadata.mux_stm.streams().read(|inner| inner.revision),
+            namespace_revision
+        );
+
+        assert!(
+            metadata
+                .submit_session_finalization(identity, namespace_revision, Vec::new())
+                .await
+                .unwrap()
+                .is_some(),
+            "membership changes must preserve retirement coverage"
+        );
+        assert_eq!(
+            metadata.client_table.borrow().ended_sessions().next(),
+            None,
+            "successful finalization must release the ended session's slot"
+        );
+    }
+
+    #[compio::test]
+    async fn given_retirement_reports_when_namespace_changes_before_apply_should_keep_the_session()
+    {
+        const CLIENT: u128 = 1;
+        let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
+        let session = metadata.client_table.borrow().get_epoch(CLIENT).unwrap();
+        metadata
+            .submit_logout_in_process(CLIENT, session, 1)
+            .await
+            .unwrap();
+        let identity = metadata
+            .client_table
+            .borrow()
+            .ended_sessions()
+            .next()
+            .unwrap();
+        let revision = metadata.mux_stm.namespace_revision();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let create = build_prepare_message(
+            consensus,
+            &RoutedRequestHeader::default(),
+            Operation::CreatePartitionsWithAssignments,
+            &PersistedCreatePartitionsRequest {
+                request: WireCreatePartitionsRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    partitions_count: 1,
+                },
+                partitions: vec![CreatedPartitionAssignment {
+                    partition_id: 1,
+                    consensus_group_id: 2,
+                    initial_view: 0,
+                    members: Vec::new(),
+                }],
+            }
+            .to_bytes(),
+        );
+        assert_eq!(
+            gated_apply(metadata.mux_stm.as_ref(), create).unwrap().code,
+            0
+        );
+        let current_revision = metadata.mux_stm.namespace_revision();
+        assert_ne!(current_revision, revision);
+        assert_eq!(
+            metadata
+                .submit_session_finalization(identity, revision, Vec::new())
+                .await
+                .unwrap(),
+            None
+        );
+
+        for (reported_revision, expected_session) in
+            [(revision, Some(identity)), (current_revision, None)]
+        {
+            let prepare = consensus::seal_prepare_capacity(
+                build_prepare_message(
+                    consensus,
+                    &RoutedRequestHeader::default(),
+                    Operation::FinalizeSession,
+                    &FinalizeSessionRequest {
+                        identity,
+                        namespace_revision: reported_revision,
+                        debt: Vec::new(),
+                    }
+                    .to_bytes(),
+                ),
+                metadata.client_table_capacity(),
+            );
+            apply_committed_prepare(
+                metadata.mux_stm.as_ref(),
+                &metadata.client_table,
+                true,
+                |_| {},
+                prepare,
+            );
+            assert_eq!(
+                metadata.client_table.borrow().ended_sessions().next(),
+                expected_session,
+                "finalization must use the namespace revision at ordered apply"
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn given_finalization_with_debt_when_applied_should_record_it_for_the_named_incarnation_only()
+     {
+        const CLIENT: u128 = 1;
+        let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
+        let session = metadata.client_table.borrow().get_epoch(CLIENT).unwrap();
+        metadata
+            .submit_logout_in_process(CLIENT, session, 1)
+            .await
+            .unwrap();
+        let identity = metadata
+            .client_table
+            .borrow()
+            .ended_sessions()
+            .next()
+            .unwrap();
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let created_revision = metadata
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(
+                consensus,
+                &RoutedRequestHeader::default(),
+                Operation::FinalizeSession,
+                &FinalizeSessionRequest {
+                    identity,
+                    namespace_revision: metadata.mux_stm.namespace_revision(),
+                    debt: vec![
+                        RetirementDebt {
+                            namespace: namespace.inner(),
+                            created_revision,
+                        },
+                        RetirementDebt {
+                            namespace: namespace.inner(),
+                            created_revision: created_revision + 1,
+                        },
+                    ],
+                }
+                .to_bytes(),
+            ),
+            metadata.client_table_capacity(),
+        );
+        let finalize_op = prepare.header().op;
+        apply_committed_prepare(
+            metadata.mux_stm.as_ref(),
+            &metadata.client_table,
+            true,
+            |_| {},
+            prepare,
+        );
+        assert_eq!(metadata.client_table.borrow().ended_sessions().next(), None);
+        let streams = metadata.mux_stm.streams();
+        assert_eq!(
+            streams.retirement_debt_for(namespace, created_revision),
+            Some(finalize_op)
+        );
+        assert_eq!(
+            streams.retirement_debt_for(namespace, created_revision + 1),
+            None
+        );
+        assert_eq!(
+            streams.retirement_debts_stored_by(0, 1),
+            (
+                vec![(namespace, created_revision, finalize_op)],
+                finalize_op
+            )
+        );
+        assert_eq!(
+            streams.retirement_debts_since(0, 0, 1),
+            Some((
+                vec![(namespace, created_revision, finalize_op)],
+                finalize_op
+            ))
+        );
+        assert_eq!(
+            streams.retirement_debts_since(finalize_op, 0, 1),
+            Some((Vec::new(), finalize_op))
+        );
+        let restored = <Streams as crate::stm::snapshot::Snapshotable>::from_snapshot(
+            crate::stm::snapshot::Snapshotable::to_snapshot(streams),
+        )
+        .expect("snapshot restores");
+        assert_eq!(
+            restored.retirement_debt_for(namespace, created_revision),
+            Some(finalize_op)
+        );
+        assert_eq!(
+            restored.read(|inner| inner.retirement_debt_revision),
+            finalize_op
+        );
+        assert_eq!(
+            restored.retirement_debts_since(0, 0, 1),
+            None,
+            "a restored reader must rescan"
+        );
+    }
+
+    #[compio::test]
+    async fn stale_logout_preserves_a_newer_session_and_its_membership() {
+        const CLIENT: u128 = 1;
+        const OLD_SESSION: u64 = 0;
+        const USER: u32 = 7;
+        let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
+        let new_session = metadata
+            .submit_register_in_process(
+                CLIENT,
+                USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32],
+                },
+            )
+            .await
+            .unwrap()
+            .epoch;
+        let committed_op = metadata.consensus.as_ref().unwrap().commit_min();
+
+        metadata
+            .submit_logout_in_process(CLIENT, OLD_SESSION, EXPIRED_SESSION_REQUEST_ID)
+            .await
+            .unwrap();
+        for expired_session in [None, Some(OLD_SESSION)] {
+            assert_eq!(
+                metadata
+                    .submit_expired_logout_in_process(CLIENT, expired_session)
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+
+        assert_eq!(
+            metadata
+                .mux_stm
+                .streams()
+                .consumer_group_memberships(CLIENT)
+                .len(),
+            1
+        );
+        assert_eq!(
+            metadata.client_table.borrow().get_epoch(CLIENT),
+            Some(new_session)
+        );
+        assert_eq!(
+            metadata.consensus.as_ref().unwrap().commit_min(),
+            committed_op,
+            "an old session must not advance the committed frontier"
+        );
+    }
+
+    #[compio::test]
+    async fn capacity_pressure_preserves_membership_until_session_expiry() {
+        const CLIENT: u128 = 1;
+        const USER: u32 = 7;
+        let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
+        let session = metadata.client_table.borrow().get_epoch(CLIENT).unwrap();
+        let capacity = metadata.client_table.borrow().capacity();
+        {
+            let mut table = metadata.client_table.borrow_mut();
+            for client in 2..=capacity as u128 {
+                table
+                    .commit_register(
+                        client,
+                        USER,
+                        [0x5a; 32],
+                        register_reply(client, u64::try_from(client).unwrap() + 1),
+                    )
+                    .unwrap();
+            }
+            assert!(
+                table
+                    .commit_register(
+                        capacity as u128 + 1,
+                        USER,
+                        [0x5a; 32],
+                        register_reply(capacity as u128 + 1, capacity as u64 + 2)
+                    )
+                    .is_err()
+            );
+            assert_eq!(table.get_epoch(CLIENT), Some(session));
+        }
+        assert_eq!(
+            metadata.mux_stm.streams().consumer_group_session(CLIENT),
+            Some(session)
+        );
+        assert_eq!(
+            metadata
+                .submit_expired_logout_in_process(CLIENT, Some(session - 1))
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            metadata
+                .submit_expired_logout_in_process(CLIENT, Some(session))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            metadata
+                .mux_stm
+                .streams()
+                .consumer_group_memberships(CLIENT),
+            []
+        );
+        assert_eq!(metadata.client_table.borrow().count(), capacity);
+    }
+
+    #[compio::test]
+    async fn replayed_register_preserves_the_original_epoch_below_the_table_frontier() {
+        const CLIENT: u128 = 1;
+        let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
+        let epoch = metadata.client_table.borrow().get_epoch(CLIENT).unwrap();
+        let request = RoutedRequestHeader {
+            client: CLIENT,
+            user_id: GROUP_MEMBER_USER,
+            ..Default::default()
+        };
+        let prepare = build_prepare_message(
+            metadata.consensus.as_ref().unwrap(),
+            &request,
+            Operation::Register,
+            &RegisterRequest {
+                user_created_at: 1,
+                bind_verifier: [0x5a; 32],
+            }
+            .to_bytes(),
+        );
+        apply_committed_prepare(
+            &*metadata.mux_stm,
+            &metadata.client_table,
+            false,
+            |_| {},
+            prepare,
+        );
+        assert_eq!(
+            metadata.client_table.borrow().get_epoch(CLIENT),
+            Some(epoch)
+        );
+        assert_eq!(
+            metadata.mux_stm.streams().consumer_group_session(CLIENT),
+            Some(epoch)
+        );
+    }
+
+    #[compio::test]
+    async fn given_user_revocation_when_committed_should_release_group_memberships() {
+        const CLIENT: u128 = 1;
+        const USER: u32 = 7;
+        for (transferred, finalized, primary, snapshot_ahead) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, true, true, false),
+            (true, true, false, true),
+            (true, true, true, true),
+        ] {
+            let (_directory, mut metadata) = metadata_with_group_member(CLIENT).await;
+            metadata.mux_stm.users().ensure_root_user("root", "hash");
+            let consensus = metadata.consensus.as_ref().unwrap();
+            let request = RoutedRequestHeader::default();
+            for user_id in 1..=USER {
+                let create = CreateUserRequest {
+                    username: WireName::new(format!("user-{user_id}")).unwrap(),
+                    password: "hash".to_owned(),
+                    status: UserStatus::Active.as_code(),
+                    permissions: None,
+                    options: WireOptions::empty(),
+                };
+                metadata
+                    .mux_stm
+                    .update(build_prepare_message(
+                        consensus,
+                        &request,
+                        Operation::CreateUser,
+                        &create.to_bytes(),
+                    ))
+                    .unwrap();
+            }
+            let mut snapshot =
+                <IggySnapshot as Snapshot>::create(&*metadata.mux_stm, consensus.commit_min(), 1)
+                    .unwrap();
+            snapshot.snapshot_mut().client_table =
+                Some(metadata.client_table.borrow().to_snapshot());
+            let deletion = consensus::seal_prepare_capacity(
+                build_prepare_message(
+                    consensus,
+                    &request,
+                    Operation::DeleteUser,
+                    &DeleteUserRequest {
+                        user_id: WireIdentifier::numeric(USER),
+                    }
+                    .to_bytes(),
+                ),
+                metadata.client_table_capacity(),
+            );
+            let mut tail = vec![deletion];
+            if transferred {
+                let mut table =
+                    ClientTable::decode(&metadata.client_table.borrow().encode()).unwrap();
+                let ended = table.end_user_sessions(USER, tail[0].header().op);
+                if finalized {
+                    assert!(table.finalize_session(ended[0]));
+                    consensus.sequencer().set_sequence(tail[0].header().op);
+                    tail.push(consensus::seal_prepare_capacity(
+                        build_prepare_message(
+                            consensus,
+                            &request,
+                            Operation::FinalizeSession,
+                            &FinalizeSessionRequest {
+                                identity: ended[0],
+                                namespace_revision: metadata.mux_stm.namespace_revision(),
+                                debt: Vec::new(),
+                            }
+                            .to_bytes(),
+                        ),
+                        metadata.client_table_capacity(),
+                    ));
+                }
+                let frontier = tail.last().unwrap().header().op;
+                if snapshot_ahead {
+                    let journal = metadata.journal.take();
+                    metadata = metadata_plane();
+                    metadata.journal = journal;
+                }
+                metadata
+                    .install_state_transfer(&snapshot.encode().unwrap(), table, frontier, frontier)
+                    .await
+                    .unwrap();
+            }
+            let transferred_bytes = transferred.then(|| metadata.client_table.borrow().encode());
+            let consensus = metadata.consensus.as_ref().unwrap();
+            for prepare in tail {
+                let op = prepare.header().op;
+                if primary {
+                    consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+                    metadata
+                        .journal
+                        .as_ref()
+                        .unwrap()
+                        .handle()
+                        .append(prepare)
+                        .await
+                        .unwrap();
+                    metadata.resume_stranded_commits().await;
+                } else {
+                    metadata
+                        .journal
+                        .as_ref()
+                        .unwrap()
+                        .handle()
+                        .append(prepare)
+                        .await
+                        .unwrap();
+                    consensus.advance_commit_max(op);
+                    metadata.commit_journal().await;
+                }
+            }
+            if let Some(expected) = transferred_bytes {
+                assert_eq!(
+                    metadata.client_table.borrow().encode(),
+                    expected,
+                    "tail replay must preserve transferred retry protection"
+                );
+            }
+            assert_eq!(
+                metadata.client_table.borrow().ended_sessions().count(),
+                usize::from(!finalized)
+            );
+            assert!(
+                metadata.replay_client_table.borrow().is_none(),
+                "replay state must be released after catch-up"
+            );
+            assert!(
+                metadata
+                    .mux_stm
+                    .streams()
+                    .consumer_group_memberships(CLIENT)
+                    .is_empty(),
+                "revoked sessions must release their consumer assignments: transferred={transferred} finalized={finalized} primary={primary} snapshot_ahead={snapshot_ahead} committed={}",
+                consensus.commit_min()
+            );
+        }
+    }
+
+    /// The primary admits a request of a live session while a revocation of
+    /// its user is still uncommitted, so the request commits right behind it.
+    /// A checkpoint of the resulting table must restart, and a state transfer
+    /// of it must install on a fresh replica.
+    #[compio::test]
+    async fn given_request_pipelined_behind_user_revocation_when_checkpointed_should_restart_and_transfer()
+     {
+        const ADMIN: u128 = 1;
+        const VICTIM: u128 = 2;
+        const ROOT_USER: u32 = 0;
+        const VICTIM_USER: u32 = 7;
+        const REQUEST: u64 = 1;
+        let registration = || RegisterRequest {
+            user_created_at: 1,
+            bind_verifier: [0x5a; 32],
+        };
+        let with_session = |request: Message<RoutedRequestHeader>, session: u64| {
+            request.transmute_header(|old, header: &mut RoutedRequestHeader| {
+                *header = old;
+                header.session = session;
+            })
+        };
+        for revocation in [Operation::DeleteUser, Operation::UpdateResource] {
+            let directory = tempfile::tempdir().unwrap();
+            let metadata_directory = directory.path().join(crate::impls::METADATA_DIR);
+            std::fs::create_dir_all(&metadata_directory).unwrap();
+            let journal = PrepareJournal::open(&metadata_directory.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            let consensus = VsrConsensus::new(
+                1,
+                0,
+                1,
+                server_common::sharding::METADATA_GROUP,
+                NoopBus,
+                LocalPipeline::new(),
+            );
+            consensus.init();
+            let metadata: IggyMetadata<_, PrepareJournal, (), TestMux> = IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::new((session_users(), (StreamsInner::new().into(), ()))),
+                Some(directory.path().to_path_buf()),
+            );
+            let admin = metadata
+                .submit_register_in_process(ADMIN, ROOT_USER, registration())
+                .await
+                .unwrap();
+            let victim = metadata
+                .submit_register_in_process(VICTIM, VICTIM_USER, registration())
+                .await
+                .unwrap();
+            let body = if revocation == Operation::DeleteUser {
+                DeleteUserRequest {
+                    user_id: WireIdentifier::numeric(VICTIM_USER),
+                }
+                .to_bytes()
+            } else {
+                let patch = UserUpdateOptions {
+                    status: Some(UserStatus::Inactive),
+                    ..UserUpdateOptions::default()
+                }
+                .to_patch()
+                .unwrap();
+                UpdateResourceRequest {
+                    target: ResourceTarget::User {
+                        user_id: WireIdentifier::numeric(VICTIM_USER),
+                    },
+                    reset: patch.reset,
+                    options: patch.set,
+                }
+                .to_bytes()
+            };
+            let consensus = metadata.consensus.as_ref().unwrap();
+            let journal = metadata.journal.as_ref().unwrap();
+            let revocation_op = consensus.commit_min() + 1;
+            for request in [
+                with_session(pat_request(ADMIN, REQUEST, revocation, &body), admin.epoch),
+                with_session(
+                    create_stream_request(VICTIM, REQUEST, "pipelined"),
+                    victim.epoch,
+                ),
+            ] {
+                let prepare = metadata.prepare_request(request).unwrap();
+                let op = prepare.header().op;
+                consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+                journal.handle().append(prepare).await.unwrap();
+                consensus.advance_commit_max(op);
+            }
+            metadata.resume_stranded_commits().await;
+            let pipelined_op = revocation_op + 1;
+            assert_eq!(consensus.commit_min(), pipelined_op);
+            assert!(
+                metadata
+                    .mux_stm
+                    .streams()
+                    .read(|streams| streams.items.is_empty()),
+                "{revocation:?}: the op behind the revocation must not apply"
+            );
+            let ended = vec![SessionIdentity {
+                client_id: VICTIM,
+                session: victim.epoch,
+                metadata_watermark: revocation_op,
+            }];
+            assert_eq!(
+                metadata
+                    .client_table
+                    .borrow()
+                    .ended_sessions()
+                    .collect::<Vec<_>>(),
+                ended
+            );
+            let table = metadata.client_table.borrow().encode();
+            let transferred =
+                ClientTable::decode(&table).expect("the transferred table must decode");
+
+            metadata.set_checkpoint_margin(usize::MAX);
+            metadata.checkpoint_if_needed(consensus, journal).await;
+            let checkpoint =
+                IggySnapshot::load(&metadata.coordinator.as_ref().unwrap().snapshot_path())
+                    .unwrap()
+                    .0;
+            assert_eq!(checkpoint.sequence_number(), pipelined_op);
+            let live_log = metadata.change_log().snapshot();
+            assert_eq!(
+                checkpoint.snapshot().change_log,
+                live_log,
+                "{revocation:?}: the checkpoint must carry the applied change log"
+            );
+            assert_eq!(
+                live_log.activity.entries.len(),
+                3,
+                "{revocation:?}: both registrations and the revoked session are recorded"
+            );
+
+            let receiver = metadata_plane();
+            receiver
+                .install_state_transfer(
+                    &checkpoint.encode().unwrap(),
+                    transferred,
+                    pipelined_op,
+                    pipelined_op,
+                )
+                .await
+                .expect("the transferred checkpoint must install");
+            assert!(
+                receiver.client_table.borrow().encode() == table,
+                "{revocation:?}: the receiver must hold the transferred table"
+            );
+            assert_eq!(receiver.change_log().snapshot(), live_log);
+
+            drop(metadata);
+            let recovered = crate::impls::recovery::recover::<TestMux>(
+                directory.path(),
+                crate::impls::recovery::ReplicaIdentity {
+                    cluster: 1,
+                    replica_id: 0,
+                    replica_count: 1,
+                },
+                journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |_| {},
+                ChangeLogCapacities::default(),
+            )
+            .await
+            .expect("restart must accept the checkpointed table");
+            assert_eq!(
+                recovered.client_table.ended_sessions().collect::<Vec<_>>(),
+                ended
+            );
+            assert_eq!(recovered.change_log.snapshot(), live_log);
+        }
+    }
+
+    /// All owner decisions of one revocation share its op as generation, and a
+    /// reconciler on another shard installs what it reads. A reader that holds
+    /// a guard across the revocation stalls any second publish, so a racing
+    /// reader would then see one removal alone.
+    #[compio::test]
+    async fn given_two_sessions_of_one_user_when_revoked_should_publish_both_removals_at_once() {
+        const FIRST: u128 = 1;
+        const SECOND: u128 = 2;
+        const PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
+        let (_directory, metadata) = metadata_with_group_member(FIRST).await;
+        join_group_member(&metadata, SECOND).await;
+        let header = PrepareHeader {
+            op: metadata.consensus.as_ref().unwrap().commit_min() + 1,
+            operation: Operation::DeleteUser,
+            ..Default::default()
+        };
+        let factory = metadata.mux_stm.streams().factory();
+        // One guard for both members: two reads could straddle a publish.
+        let memberships = |streams: &Streams| {
+            streams.read(|inner| {
+                [FIRST, SECOND].map(|client_id| {
+                    inner
+                        .items
+                        .iter()
+                        .flat_map(|(_, stream)| stream.topics.iter())
+                        .flat_map(|(_, topic)| topic.consumer_groups.values())
+                        .filter(|group| {
+                            group
+                                .members
+                                .iter()
+                                .any(|(_, member)| member.client_id == client_id)
+                        })
+                        .count()
+                })
+            })
+        };
+        let (held_sender, held_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel::<()>();
+
+        let seen = thread::scope(|scope| {
+            let holder_factory = factory.clone();
+            let holder = scope.spawn(move || {
+                Streams::from_factory(holder_factory)
+                    .read(|_| {
+                        held_sender.send(()).unwrap();
+                        release_receiver.recv()
+                    })
+                    .unwrap();
+            });
+            held_receiver.recv().unwrap();
+            let observer = scope.spawn(move || {
+                let streams = Streams::from_factory(factory);
+                let deadline = Instant::now() + PUBLISH_TIMEOUT;
+                let seen = loop {
+                    let seen = memberships(&streams);
+                    if seen != [1, 1] {
+                        break seen;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the revocation never reached readers"
+                    );
+                    thread::yield_now();
+                };
+                release_sender.send(()).unwrap();
+                seen
+            });
+            apply_user_revocation(
+                &*metadata.mux_stm,
+                &metadata.client_table,
+                true,
+                WireUserKey {
+                    user_id: GROUP_MEMBER_USER,
+                    user_created_at: 0,
+                },
+                &header,
+            );
+            let seen = observer.join().unwrap();
+            holder.join().unwrap();
+            seen
+        });
+
+        assert_eq!(
+            seen,
+            [0, 0],
+            "a reader saw one member removal of the revocation without the other"
+        );
+    }
+
+    #[test]
+    fn given_rejected_or_older_user_deletion_when_applying_should_preserve_newer_sessions() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 100;
+        const USER: u32 = 1;
+        for (frontier, acting_user) in [(SESSION, 0), (0, u32::MAX)] {
+            let metadata = metadata_plane();
+            metadata.mux_stm.users().ensure_root_user("root", "hash");
+            let consensus = metadata.consensus.as_ref().unwrap();
+            let request = RoutedRequestHeader::default();
+            let create = CreateUserRequest {
+                username: WireName::new("original").unwrap(),
+                password: "hash".to_owned(),
+                status: UserStatus::Active.as_code(),
+                permissions: None,
+                options: WireOptions::empty(),
+            };
+            metadata
+                .mux_stm
+                .update(build_prepare_message(
+                    consensus,
+                    &request,
+                    Operation::CreateUser,
+                    &create.to_bytes(),
+                ))
+                .unwrap();
+            metadata
+                .client_table
+                .borrow_mut()
+                .commit_register(CLIENT, USER, [0x5a; 32], register_reply(CLIENT, SESSION))
+                .unwrap();
+            metadata.client_table_frontier.set(frontier);
+            let request = RoutedRequestHeader {
+                user_id: acting_user,
+                ..request
+            };
+            let deletion = build_prepare_message(
+                consensus,
+                &request,
+                Operation::DeleteUser,
+                &DeleteUserRequest {
+                    user_id: WireIdentifier::numeric(USER),
+                }
+                .to_bytes(),
+            )
+            .transmute_header(|old, header: &mut PrepareHeader| {
+                *header = old;
+                header.retry_capacity = u32::try_from(metadata.client_table_capacity()).unwrap();
+            });
+            apply_committed_prepare(
+                &*metadata.mux_stm,
+                &metadata.client_table,
+                metadata.client_table_mutation_allowed(deletion.header().op),
+                |_| {},
+                consensus::seal_prepare_checksum(deletion),
+            );
+            assert_eq!(
+                metadata.client_table.borrow().get_epoch(CLIENT),
+                Some(SESSION)
+            );
+            assert_eq!(metadata.client_table.borrow().ended_sessions().count(), 0);
+            assert_eq!(
+                metadata
+                    .mux_stm
+                    .users()
+                    .read(|users| users.items.get(USER as usize).is_some()),
+                acting_user != 0,
+                "only the authorized deletion updates the state machine"
+            );
+        }
+    }
+
+    fn session_users() -> Users {
+        const LAST_USER: u32 = 9;
+        let mut users = UsersInner::new();
+        for user_id in 0..=LAST_USER {
+            let created = StateHandler::apply(
+                &CreateUserRequest {
+                    username: WireName::new(format!("session-user-{user_id}")).unwrap(),
+                    password: "hash".to_owned(),
+                    status: UserStatus::Active.as_code(),
+                    permissions: None,
+                    options: WireOptions::empty(),
+                },
+                &mut users,
+                IggyTimestamp::from(1),
+            );
+            assert_eq!(created.code, 0);
+        }
+        users.into()
+    }
+
+    /// The user of every session that [`join_group_member`] registers.
+    const GROUP_MEMBER_USER: u32 = 7;
+
+    #[allow(clippy::future_not_send)]
+    async fn metadata_with_group_member(
+        client_id: u128,
+    ) -> (
+        tempfile::TempDir,
+        IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux>,
+    ) {
+        let mut inner = StreamsInner::new();
+        let timestamp = IggyTimestamp::now();
+        let _ = StateHandler::apply(
+            &CreateStreamRequest {
+                name: WireName::new("stream").unwrap(),
+                options: WireOptions::empty(),
+            },
+            &mut inner,
+            timestamp,
+        );
+        let _ = StateHandler::apply(
+            &PersistedCreateTopicRequest {
+                request: CreateTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    partitions_count: 1,
+                    name: WireName::new("topic").unwrap(),
+                    options: WireOptions::empty(),
+                },
+                derived_options: WireOptions::empty(),
+                partitions: vec![CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 1,
+                    initial_view: 0,
+                    members: Vec::new(),
+                }],
+            },
+            &mut inner,
+            timestamp,
+        );
+        let _ = StateHandler::apply(
+            &CreateConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                name: WireName::new("group").unwrap(),
+            },
+            &mut inner,
+            timestamp,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut metadata = metadata_plane();
+        metadata.journal = Some(
+            PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap(),
+        );
+        metadata.mux_stm = Rc::new(TestMux::new((session_users(), (inner.into(), ()))));
+        metadata.mux_stm.users().ensure_root_user("root", "hash");
+        join_group_member(&metadata, client_id).await;
+        (dir, metadata)
+    }
+
+    /// Registers `client_id` as a session of `GROUP_MEMBER_USER` and commits
+    /// its join to the group of [`metadata_with_group_member`].
+    #[allow(clippy::future_not_send)]
+    async fn join_group_member(
+        metadata: &IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux>,
+        client_id: u128,
+    ) {
+        metadata
+            .submit_register_in_process(
+                client_id,
+                GROUP_MEMBER_USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32],
+                },
+            )
+            .await
+            .unwrap();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let join = consensus::seal_prepare_capacity(
+            build_prepare_message(
+                consensus,
+                &RoutedRequestHeader::default(),
+                Operation::JoinConsumerGroup,
+                &JoinConsumerGroupRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    group_id: WireIdentifier::numeric(0),
+                    client_id,
+                    session: metadata.client_table.borrow().get_epoch(client_id).unwrap(),
+                }
+                .to_bytes(),
+            ),
+            metadata.client_table_capacity(),
+        );
+        let join_op = join.header().op;
+        consensus.pipeline_message(PlaneKind::Metadata, &join);
+        metadata
+            .journal
+            .as_ref()
+            .unwrap()
+            .handle()
+            .append(join)
+            .await
+            .unwrap();
+        consensus.advance_commit_max(join_op);
+        metadata.resume_stranded_commits().await;
+        assert_eq!(consensus.commit_min(), join_op);
+        assert_eq!(
+            metadata
+                .mux_stm
+                .streams()
+                .consumer_group_memberships(client_id)
+                .len(),
+            1
+        );
+    }
+
     /// Register is the one op that still honors the catch-up gate (its
     /// admission races a committed-but-unapplied register; a double commit
     /// bumps the epoch past the first reply's and fences a live client).
@@ -5135,15 +11632,19 @@ mod tests {
                 Some(journal),
                 None,
                 None,
-                TestMux::default(),
+                TestMux::new((session_users(), (Streams::default(), ()))),
                 None,
             );
         let consensus = md.consensus.as_ref().unwrap();
-        md.client_table.borrow_mut().commit_register(
-            CLIENT_B,
-            ACTING_USER,
-            register_reply(CLIENT_B, SESSION),
-        );
+        md.client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT_B,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT_B, SESSION),
+            )
+            .unwrap();
 
         // B's op journaled + self-acked; park its commit mid-window.
         let prepare = md
@@ -5166,13 +11667,20 @@ mod tests {
         assert_eq!(consensus.commit_min(), 0);
 
         // C's register lands in the window: absorbed, not bounced.
-        let mut register = Box::pin(md.submit_register_in_process(CLIENT_C, ACTING_USER));
+        let mut register = Box::pin(md.submit_register_in_process(
+            CLIENT_C,
+            ACTING_USER,
+            RegisterRequest {
+                user_created_at: 1,
+                bind_verifier: [0x5a; 32],
+            },
+        ));
         assert!(
             register.as_mut().poll(&mut cx).is_pending(),
             "mid-window register must park in the request queue, not error"
         );
         assert_eq!(
-            consensus.pipeline().borrow().request_queue_len(),
+            consensus.request_queue_len(),
             1,
             "register buffered in the request queue"
         );
@@ -5190,7 +11698,7 @@ mod tests {
         assert!(resumed, "B's commit must complete and promote the register");
         assert_eq!(consensus.commit_min(), 1, "B's op committed");
         assert_eq!(
-            consensus.pipeline().borrow().request_queue_len(),
+            consensus.request_queue_len(),
             0,
             "promotion emptied the request queue"
         );
@@ -5229,6 +11737,527 @@ mod tests {
         );
     }
 
+    #[compio::test]
+    async fn given_retried_keyless_create_when_committed_should_store_one_envelope() {
+        const CLIENT: u128 = 9;
+        const USER: u32 = 0;
+        let directory = tempfile::tempdir().unwrap();
+        let context = Arc::new(
+            ServerKeyContext::from_config(
+                "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=",
+                &[],
+                true,
+            )
+            .unwrap(),
+        );
+        let mut metadata = metadata_plane().with_stream_key_context(Arc::clone(&context));
+        metadata.journal = Some(
+            PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+                .await
+                .unwrap(),
+        );
+        metadata.mux_stm.users().ensure_root_user("root", "hash");
+        metadata
+            .submit_register_in_process(
+                CLIENT,
+                USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32],
+                },
+            )
+            .await
+            .unwrap();
+        // Two edge rewrites of the same keyless create generate two keys.
+        let envelope_block = |seed: u8| {
+            let set = WrapSet::from(
+                context
+                    .wrap(
+                        &StreamEncryptionKey::try_from([seed; 32].as_slice()).unwrap(),
+                        StreamKeyOrigin::Server,
+                    )
+                    .unwrap(),
+            );
+            let mut options = ResourceOptions::new();
+            options.insert(
+                HeaderKey::from(OptionKey::EncryptionKeyWrapped),
+                OptionValue::explicit(HeaderValue::try_from(set.as_ref()).unwrap()),
+            );
+            options.insert(
+                HeaderKey::from(OptionKey::CriticalKeys),
+                OptionValue::explicit(
+                    critical_keys_marker(&[OptionKey::EncryptionKeyWrapped]).unwrap(),
+                ),
+            );
+            (
+                set,
+                resource_options_to_wire(&options, OptionsProvenance::All).unwrap(),
+            )
+        };
+        let (first_set, first) = envelope_block(1);
+        let (_, retry) = envelope_block(2);
+
+        let committed = metadata
+            .submit_request_in_process(create_stream_request_with(CLIENT, 1, "orders", first))
+            .await
+            .unwrap();
+        let replayed = metadata
+            .submit_request_in_process(create_stream_request_with(CLIENT, 1, "orders", retry))
+            .await
+            .unwrap();
+
+        assert_eq!(replayed.as_slice(), committed.as_slice());
+        let stored = metadata.mux_stm.streams().read(|inner| {
+            let (_, stream) = inner.items.iter().next().expect("one stream");
+            stream_wrap_set(&stream.options).unwrap()
+        });
+        assert_eq!(stored, Some(first_set));
+        assert_eq!(
+            metadata.mux_stm.streams().read(|inner| inner.items.len()),
+            1
+        );
+    }
+
+    #[compio::test]
+    async fn given_newer_local_state_when_installing_stale_transfer_should_preserve_sessions() {
+        const CLIENT: u128 = 9;
+        const NEW_CLIENT: u128 = 10;
+        const USER: u32 = 0;
+        const BIND_VERIFIER: [u8; 32] = [0x5a; 32];
+        let directory = tempfile::tempdir().unwrap();
+        let mut metadata = metadata_plane();
+        metadata.journal = Some(
+            PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+                .await
+                .unwrap(),
+        );
+        metadata.mux_stm.users().ensure_root_user("root", "hash");
+        let original_session = metadata
+            .submit_register_in_process(
+                CLIENT,
+                USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: BIND_VERIFIER,
+                },
+            )
+            .await
+            .unwrap();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let transfer_op = consensus.commit_min();
+        let snapshot = <IggySnapshot as Snapshot>::create(&*metadata.mux_stm, transfer_op, 1)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let transferred_table =
+            ClientTable::decode(&metadata.client_table.borrow().encode()).unwrap();
+
+        let original_reply = metadata
+            .submit_request_in_process(create_stream_request(CLIENT, 1, "original"))
+            .await
+            .unwrap();
+        assert_eq!(
+            iggy_binary_protocol::result_code(original_reply.body()),
+            Some(0),
+        );
+        let new_session = metadata
+            .submit_register_in_process(
+                NEW_CLIENT,
+                USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: BIND_VERIFIER,
+                },
+            )
+            .await
+            .unwrap();
+        let local_applied = consensus.commit_min();
+        let local_table = metadata.client_table.borrow().encode();
+        let local_snapshot =
+            <IggySnapshot as Snapshot>::create(&*metadata.mux_stm, local_applied, 1)
+                .unwrap()
+                .encode()
+                .unwrap();
+
+        let outcome = metadata
+            .install_state_transfer(&snapshot, transferred_table, transfer_op, transfer_op)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.installed_frontier, local_applied);
+        assert_eq!(consensus.commit_min(), local_applied);
+        assert_eq!(consensus.commit_max(), local_applied);
+        assert_eq!(
+            metadata.client_table.borrow().get_epoch(NEW_CLIENT),
+            Some(new_session.epoch),
+            "a stale transfer must preserve registrations above its frontier",
+        );
+        assert_eq!(
+            metadata.client_table.borrow().encode(),
+            local_table,
+            "a stale transfer must preserve committed registrations and receipts",
+        );
+        assert_eq!(
+            <IggySnapshot as Snapshot>::create(&*metadata.mux_stm, local_applied, 1)
+                .unwrap()
+                .encode()
+                .unwrap(),
+            local_snapshot,
+        );
+        assert_eq!(
+            metadata
+                .bound_session(
+                    CLIENT,
+                    USER,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: BIND_VERIFIER
+                    }
+                )
+                .unwrap()
+                .epoch,
+            original_session.epoch,
+        );
+        assert_eq!(
+            metadata
+                .bound_session(
+                    NEW_CLIENT,
+                    USER,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: BIND_VERIFIER
+                    }
+                )
+                .unwrap()
+                .epoch,
+            new_session.epoch,
+        );
+        let replay = metadata
+            .submit_request_in_process(create_stream_request(CLIENT, 1, "original"))
+            .await
+            .unwrap();
+        assert_eq!(replay.as_slice(), original_reply.as_slice());
+        assert_eq!(consensus.commit_min(), local_applied);
+
+        let mut request = create_stream_request(NEW_CLIENT, 1, "after-transfer");
+        bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(
+            &mut request.as_mut_slice()[..size_of::<RoutedRequestHeader>()],
+        )
+        .session = new_session.epoch;
+        let prepare = metadata.prepare_request(request).unwrap();
+        let op = prepare.header().op;
+        metadata
+            .journal
+            .as_ref()
+            .unwrap()
+            .handle()
+            .append(prepare)
+            .await
+            .unwrap();
+        consensus.advance_commit_max(op);
+        metadata.commit_journal().await;
+        assert_eq!(consensus.commit_min(), op);
+        assert_eq!(
+            metadata.client_table.borrow().get_watermark(NEW_CLIENT),
+            Some(1)
+        );
+    }
+
+    #[compio::test]
+    async fn given_ahead_client_table_when_installing_older_transfer_should_preserve_its_frontier()
+    {
+        const CLIENT: u128 = 9;
+        const OTHER_CLIENT: u128 = 10;
+        const NEW_CLIENT: u128 = 11;
+        const USER: u32 = 7;
+        const SESSION: u64 = 1;
+        const TABLE_FRONTIER: u64 = 3;
+        const OLDER_FRONTIER: u64 = 2;
+        let metadata = metadata_plane();
+        let mut table = ClientTable::new(CLIENTS_TABLE_MAX);
+        table.commit_capacity(CLIENTS_TABLE_MAX).unwrap();
+        let mut snapshot =
+            <IggySnapshot as Snapshot>::create(&TestMux::default(), SESSION, 1).unwrap();
+        let mut older_table = None;
+        for (client, epoch) in [
+            (CLIENT, SESSION),
+            (OTHER_CLIENT, OLDER_FRONTIER),
+            (NEW_CLIENT, TABLE_FRONTIER),
+        ] {
+            let reply = build_reply_message(
+                &PrepareHeader {
+                    client,
+                    user_id: USER,
+                    op: epoch,
+                    operation: Operation::Register,
+                    ..Default::default()
+                },
+                &bytes::Bytes::new(),
+            );
+            table
+                .commit_register(client, USER, [0x5a; 32], reply)
+                .unwrap();
+            if epoch == SESSION {
+                snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+            }
+            if epoch == OLDER_FRONTIER {
+                older_table = Some(ClientTable::decode(&table.encode()).unwrap());
+            }
+        }
+        let snapshot = snapshot.encode().unwrap();
+        let expected_table = table.encode();
+        metadata
+            .install_state_transfer(&snapshot, table, TABLE_FRONTIER, TABLE_FRONTIER)
+            .await
+            .unwrap();
+        metadata
+            .install_state_transfer(
+                &snapshot,
+                older_table.unwrap(),
+                OLDER_FRONTIER,
+                OLDER_FRONTIER,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(metadata.consensus.as_ref().unwrap().commit_min(), SESSION);
+        assert_eq!(metadata.client_table.borrow().encode(), expected_table);
+        assert_eq!(metadata.client_table_frontier.get(), TABLE_FRONTIER);
+        assert!(!metadata.client_table_mutation_allowed(TABLE_FRONTIER));
+        assert!(metadata.client_table_mutation_allowed(TABLE_FRONTIER + 1));
+    }
+
+    #[compio::test]
+    async fn given_a_saved_snapshot_and_failed_superblock_when_retrying_should_finish_the_same_checkpoint()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let metadata_dir = directory.path().join(crate::impls::METADATA_DIR);
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+            .await
+            .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let superblock = Rc::new(CheckpointSuperblock::default());
+        superblock.fail.set(true);
+        let metadata: IggyMetadata<_, PrepareJournal, (), TestMux, CheckpointSuperblock> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                Some(Rc::clone(&superblock)),
+                TestMux::default(),
+                Some(directory.path().to_path_buf()),
+            );
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let journal = metadata.journal.as_ref().unwrap();
+        let request = CreateUserRequest {
+            username: WireName::new("root").unwrap(),
+            password: "hash".to_owned(),
+            status: UserStatus::Active.as_code(),
+            permissions: None,
+            options: WireOptions::empty(),
+        };
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(
+                consensus,
+                &RoutedRequestHeader::default(),
+                Operation::CreateUser,
+                &request.to_bytes(),
+            ),
+            consensus.retry_capacity(&metadata.client_table.borrow()),
+        );
+        assert_eq!(
+            metadata
+                .mux_stm
+                .gated_update(prepare.deep_copy())
+                .unwrap()
+                .code,
+            0
+        );
+        journal.append(prepare).await.unwrap();
+        consensus.sequencer().set_sequence(1);
+        consensus.restore_commit_state(1, 1);
+        metadata.set_checkpoint_margin(usize::MAX);
+        metadata.checkpoint_if_needed(consensus, journal).await;
+        let coordinator = metadata.coordinator.as_ref().unwrap();
+        assert_eq!(coordinator.last_checkpoint().0, 1);
+        assert!(coordinator.snapshot_path().exists());
+        assert!(coordinator.checkpoint_pending.get());
+        assert_eq!(superblock.writes.get(), 1);
+        superblock.fail.set(false);
+        metadata.checkpoint_if_needed(consensus, journal).await;
+        assert!(!coordinator.checkpoint_pending.get());
+        assert_eq!(superblock.writes.get(), 2);
+        metadata.checkpoint_if_needed(consensus, journal).await;
+        assert_eq!(superblock.writes.get(), 2);
+    }
+
+    #[compio::test]
+    async fn given_no_applied_progress_when_forcing_checkpoints_should_not_persist_empty_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let metadata_dir = directory.path().join(crate::impls::METADATA_DIR);
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+            .await
+            .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            1,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let metadata: IggyMetadata<_, PrepareJournal, (), TestMux> = IggyMetadata::new(
+            Some(consensus),
+            Some(journal),
+            None,
+            None,
+            TestMux::default(),
+            Some(directory.path().to_path_buf()),
+        );
+        metadata.set_checkpoint_margin(usize::MAX);
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let journal = metadata.journal.as_ref().unwrap();
+        for _ in 0..3 {
+            metadata.checkpoint_if_needed(consensus, journal).await;
+        }
+        let coordinator = metadata.coordinator.as_ref().unwrap();
+        assert_eq!(coordinator.last_checkpoint(), (0, 0));
+        assert!(!coordinator.snapshot_path().exists());
+        assert!(!coordinator.checkpoint_pending.get());
+    }
+
+    #[compio::test]
+    async fn transferred_client_table_waits_for_applied_frontier_before_checkpoint() {
+        const CLIENT: u128 = 9;
+        const USER: u32 = 7;
+        const SNAPSHOT_OP: u64 = 1;
+        const TABLE_FRONTIER: u64 = 3;
+        const JOURNAL_SLOTS: usize = 16;
+        let directory = tempfile::tempdir().unwrap();
+        let metadata_directory = directory.path().join(crate::impls::METADATA_DIR);
+        std::fs::create_dir_all(&metadata_directory).unwrap();
+        let journal = PrepareJournal::open(&metadata_directory.join("journal.wal"), 0)
+            .await
+            .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let metadata: IggyMetadata<_, PrepareJournal, (), TestMux> = IggyMetadata::new(
+            Some(consensus),
+            Some(journal),
+            None,
+            None,
+            TestMux::default(),
+            Some(directory.path().to_path_buf()),
+        );
+        let mut transferred_table = ClientTable::new(CLIENTS_TABLE_MAX);
+        transferred_table
+            .commit_capacity(CLIENTS_TABLE_MAX)
+            .unwrap();
+        transferred_table
+            .commit_register(
+                CLIENT,
+                USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SNAPSHOT_OP),
+            )
+            .unwrap();
+        let mut snapshot =
+            <IggySnapshot as Snapshot>::create(&TestMux::default(), SNAPSHOT_OP, 1).unwrap();
+        snapshot.snapshot_mut().client_table = Some(transferred_table.to_snapshot());
+        for request in 1..TABLE_FRONTIER {
+            let reply = build_reply_message(
+                &PrepareHeader {
+                    client: CLIENT,
+                    user_id: USER,
+                    session: SNAPSHOT_OP,
+                    request,
+                    op: request + SNAPSHOT_OP,
+                    operation: Operation::CreateStream,
+                    ..Default::default()
+                },
+                &bytes::Bytes::new(),
+            );
+            assert_eq!(
+                transferred_table.commit_reply(CLIENT, USER, reply),
+                CommitReply::Cached,
+            );
+        }
+        metadata
+            .install_state_transfer(
+                &snapshot.encode().unwrap(),
+                transferred_table,
+                TABLE_FRONTIER,
+                TABLE_FRONTIER,
+            )
+            .await
+            .unwrap();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let journal = metadata.journal.as_ref().unwrap();
+        let coordinator = metadata.coordinator.as_ref().unwrap();
+        metadata.set_checkpoint_margin(usize::MAX);
+        metadata.checkpoint_if_needed(consensus, journal).await;
+        let persisted = IggySnapshot::load(&coordinator.snapshot_path()).unwrap().0;
+        assert_eq!(persisted.sequence_number(), SNAPSHOT_OP);
+        assert_eq!(
+            persisted.snapshot().client_table.as_ref().unwrap().slots[0]
+                .1
+                .watermark,
+            0,
+            "ahead retry protection cannot be persisted at an earlier state-machine floor",
+        );
+        drop(persisted);
+        for (request, name) in [(1, "s1"), (2, "s2")] {
+            let prepare = metadata
+                .prepare_request(create_stream_request(CLIENT, request, name))
+                .unwrap();
+            consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+            journal.handle().append(prepare).await.unwrap();
+        }
+        metadata.resume_stranded_commits().await;
+        assert_eq!(consensus.commit_min(), TABLE_FRONTIER);
+        metadata.checkpoint_if_needed(consensus, journal).await;
+        let persisted = IggySnapshot::load(&coordinator.snapshot_path()).unwrap().0;
+        assert_eq!(persisted.sequence_number(), TABLE_FRONTIER);
+        drop(persisted);
+        drop(metadata);
+        let recovered = crate::impls::recovery::recover::<TestMux>(
+            directory.path(),
+            crate::impls::recovery::ReplicaIdentity {
+                cluster: 1,
+                replica_id: 0,
+                replica_count: 1,
+            },
+            JOURNAL_SLOTS,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            ChangeLogCapacities::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered.client_table.get_watermark(CLIENT),
+            Some(TABLE_FRONTIER - 1)
+        );
+    }
+
     /// The commit loop and the promotion of queued requests run at the tail
     /// of `on_ack`, inside whichever future delivered the quorum ack. Drop
     /// that future mid-commit and — on an idle server — nothing re-drives
@@ -5240,6 +12269,995 @@ mod tests {
     /// `resume_stranded_commits` (wired into the shard pump tick) is the
     /// backstop: it re-enters the commit path, applies the stranded prefix,
     /// and promotes the queued register, whose awaiter then resolves.
+    /// A state-transfer receiver's WAL can hold a pre-crash suffix above the
+    /// incoming floor. The commit walk matches entries by op number alone, so
+    /// installing without discarding that suffix would later apply its stale
+    /// bodies as committed. The install discards that suffix and keeps the
+    /// boundary header only when the adopted peer log confirms its checksum.
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_a_state_transfer_when_installing_should_keep_only_a_verified_boundary() {
+        for peer_matches in [None, Some(false), Some(true)] {
+            const CLIENT: u128 = 9;
+            const SESSION: u64 = 1;
+            const ACTING_USER: u32 = 7;
+            const SNAPSHOT_SEQ: u64 = 2;
+
+            let dir = tempfile::tempdir().unwrap();
+            let journal =
+                journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                    .await
+                    .unwrap();
+            let consensus = VsrConsensus::new(
+                1,
+                0,
+                3,
+                server_common::sharding::METADATA_GROUP,
+                NoopBus,
+                LocalPipeline::new(),
+            );
+            consensus.init();
+            let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+                IggyMetadata::new(
+                    Some(consensus),
+                    Some(journal),
+                    None,
+                    None,
+                    TestMux::default(),
+                    None,
+                );
+            let consensus = md.consensus.as_ref().unwrap();
+            md.client_table
+                .borrow_mut()
+                .commit_register(
+                    CLIENT,
+                    ACTING_USER,
+                    [0x5a; 32],
+                    register_reply(CLIENT, SESSION),
+                )
+                .unwrap();
+
+            // Journal ops 1..=3 directly (no acks, so `commit_min` stays 0 and the
+            // transfer is "ahead"): 1 and 2 sit at or below the incoming floor, 3 is
+            // the relic suffix a view change has since reassigned.
+            for (request_id, name) in [(1, "s1"), (2, "s2"), (3, "s3")] {
+                let projected = md
+                    .prepare_request(create_stream_request(CLIENT, request_id, name))
+                    .expect("CreateStream is client-allowed");
+                consensus.pipeline_message(PlaneKind::Metadata, &projected);
+                md.journal
+                    .as_ref()
+                    .unwrap()
+                    .handle()
+                    .append(projected)
+                    .await
+                    .expect("seeding the WAL succeeds");
+            }
+            let journal_handle = md.journal.as_ref().unwrap().handle();
+            assert_eq!(journal_handle.last_op(), Some(3));
+            consensus.fence_view_log(SNAPSHOT_SEQ + 1, u64::MAX);
+
+            // A donor mux fills the snapshot the way a serving primary would, so
+            // the restore path sees populated sections rather than a bare envelope.
+            for missing in [true, false] {
+                for frontier in [SNAPSHOT_SEQ, SNAPSHOT_SEQ + 1] {
+                    let mut invalid_snapshot =
+                        <IggySnapshot as Snapshot>::create(&TestMux::default(), SNAPSHOT_SEQ, 1)
+                            .unwrap();
+                    if !missing {
+                        let mut table = ClientTable::new(CLIENTS_TABLE_MAX).to_snapshot();
+                        table.capacity = 0;
+                        invalid_snapshot.snapshot_mut().client_table = Some(table);
+                    }
+                    assert!(matches!(
+                        md.install_state_transfer(
+                            &invalid_snapshot.encode().unwrap(),
+                            ClientTable::new(CLIENTS_TABLE_MAX),
+                            frontier,
+                            frontier
+                        )
+                        .await,
+                        Err(SnapshotError::MissingClientTable | SnapshotError::ClientTable(_))
+                    ));
+                    assert_eq!(
+                        journal_handle.last_op(),
+                        Some(3),
+                        "invalid protection must not truncate the WAL"
+                    );
+                    assert_eq!(consensus.commit_min(), 0);
+                    assert_eq!(md.client_table.borrow().get_epoch(CLIENT), Some(SESSION));
+                }
+            }
+            let table = ClientTable::new(CLIENTS_TABLE_MAX);
+            let mut snapshot =
+                <IggySnapshot as Snapshot>::create(&TestMux::default(), SNAPSHOT_SEQ, 1)
+                    .expect("donor snapshot builds");
+            snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+            let snapshot_bytes = snapshot.encode().expect("donor snapshot encodes");
+            if let Some(matches) = peer_matches {
+                let mut peer = *journal_handle
+                    .header(usize::try_from(SNAPSHOT_SEQ).unwrap())
+                    .unwrap();
+                if !matches {
+                    peer.timestamp += 1;
+                    peer.checksum = peer.identity_checksum();
+                }
+                let header = StartViewHeader {
+                    checksum: 0,
+                    checksum_body: 0,
+                    cluster: 1,
+                    size: u32::try_from(size_of::<StartViewHeader>() + size_of::<PrepareHeader>())
+                        .unwrap(),
+                    view: 1,
+                    release: 0,
+                    command: Command::StartView,
+                    replica: 1,
+                    reserved_frame: [0; 66],
+                    op: SNAPSHOT_SEQ,
+                    commit: SNAPSHOT_SEQ,
+                    group: server_common::sharding::METADATA_GROUP,
+                    partition_incarnation: 0,
+                    reserved: [0; 80],
+                    incarnation: 0,
+                };
+                let _ = consensus.handle_start_view(
+                    PlaneKind::Metadata,
+                    &header,
+                    bytemuck::bytes_of(&peer),
+                );
+                assert!(consensus.view_log_is_pending());
+            }
+            md.install_state_transfer(&snapshot_bytes, table, SNAPSHOT_SEQ, SNAPSHOT_SEQ)
+                .await
+                .expect("install succeeds");
+
+            assert_eq!(
+                journal_handle.last_op(),
+                Some(if peer_matches == Some(true) {
+                    SNAPSHOT_SEQ
+                } else {
+                    SNAPSHOT_SEQ - 1
+                }),
+                "the unverified boundary and relic above it must be gone"
+            );
+            assert!(
+                journal_handle.header(3).is_none(),
+                "op 3 was above the floor; the commit walk must never see it again"
+            );
+            assert!(
+                journal_handle.header(1).is_some()
+                    && journal_handle.header(2).is_some() == (peer_matches == Some(true)),
+                "the snapshot replaces an unverified boundary header too"
+            );
+            assert_eq!(
+                md.applied_frontier().get(),
+                SNAPSHOT_SEQ,
+                "the snapshot IS ops up to its sequence applied, so the read gate has \
+             to admit reads at the floor the install jumped to"
+            );
+        }
+    }
+
+    /// The replica [`transfer_receiver`] builds: replica 0 of a 3-node cluster.
+    const TRANSFER_RECEIVER: ReplicaIdentity = ReplicaIdentity {
+        cluster: 1,
+        replica_id: 0,
+        replica_count: 3,
+    };
+    /// The receiver's WAL head, which its certificate is bound to.
+    const TRANSFER_RECEIVER_HEAD: u64 = 4;
+    const CERTIFIED_VIEW: u32 = 0;
+    /// Recorded but never proven, so a restart proves the WAL through the
+    /// certificate rather than through the recorded view.
+    const ADOPTED_VIEW: u32 = 1;
+    /// The transferred snapshot's op, below the certified head.
+    const TRANSFER_FLOOR: u64 = 2;
+    /// Polls before a stepped install counts as hung. Each one waits a millisecond.
+    const INSTALL_POLL_BUDGET: usize = 10_000;
+
+    /// A state transfer receiver whose superblock records [`ADOPTED_VIEW`] and a
+    /// certificate for [`CERTIFIED_VIEW`] bound to op [`TRANSFER_RECEIVER_HEAD`].
+    /// `coordinated` gives it a snapshot coordinator. A simulator replica has none,
+    /// so its superblock pairs no checkpoint.
+    #[allow(clippy::future_not_send)]
+    async fn transfer_receiver(
+        data_dir: &Path,
+        coordinated: bool,
+    ) -> IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux> {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        let metadata_dir = data_dir.join(crate::impls::METADATA_DIR);
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+            .await
+            .unwrap();
+        let superblock = PingPongSuperblock::open(&metadata_dir).await.unwrap();
+        let consensus = VsrConsensus::new(
+            TRANSFER_RECEIVER.cluster,
+            TRANSFER_RECEIVER.replica_id,
+            TRANSFER_RECEIVER.replica_count,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let mut md = IggyMetadata::new(
+            Some(consensus),
+            Some(journal),
+            None,
+            Some(Rc::new(superblock)),
+            TestMux::default(),
+            coordinated.then(|| data_dir.to_path_buf()),
+        );
+        md.client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+        {
+            let consensus = md.consensus.as_ref().unwrap();
+            for request in 1..=TRANSFER_RECEIVER_HEAD {
+                let prepare = md
+                    .prepare_request(create_stream_request(
+                        CLIENT,
+                        request,
+                        &format!("s{request}"),
+                    ))
+                    .expect("CreateStream is client-allowed");
+                consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+                let (op, checksum) = (prepare.header().op, prepare.header().checksum);
+                md.journal
+                    .as_ref()
+                    .unwrap()
+                    .handle()
+                    .append(prepare)
+                    .await
+                    .unwrap();
+                consensus.extend_history_certificate(op, checksum);
+            }
+        }
+        let consensus = md.consensus.as_mut().unwrap();
+        consensus.set_view(ADOPTED_VIEW);
+        consensus.set_log_view(ADOPTED_VIEW);
+        assert!(
+            md.persist_superblock_if_needed(md.consensus.as_ref().unwrap())
+                .await
+        );
+        md
+    }
+
+    /// The metadata directory as a crash at this instant leaves it.
+    fn crash_image(data_dir: &Path) -> tempfile::TempDir {
+        let image = tempfile::tempdir().unwrap();
+        let image_dir = image.path().join(crate::impls::METADATA_DIR);
+        std::fs::create_dir_all(&image_dir).unwrap();
+        for entry in std::fs::read_dir(data_dir.join(crate::impls::METADATA_DIR)).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), image_dir.join(entry.file_name())).unwrap();
+            }
+        }
+        image
+    }
+
+    /// What a restart from `image` decides about its WAL, and the WAL head left
+    /// after that decision.
+    #[allow(clippy::future_not_send)]
+    async fn restarted_history(image: &Path) -> (HistoryRecovery, Option<u64>) {
+        let recovered = recover::<crate::MuxStateMachine<()>>(
+            image,
+            TRANSFER_RECEIVER,
+            DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            ChangeLogCapacities::default(),
+        )
+        .await
+        .unwrap();
+        (recovered.history, recovered.journal.last_op())
+    }
+
+    #[compio::test]
+    async fn given_an_adopted_log_when_persistence_fails_or_completes_should_reopen_one_complete_identity()
+     {
+        const ANNOUNCED_VIEW: u32 = ADOPTED_VIEW + 3;
+        const ANNOUNCED_HEAD: u64 = TRANSFER_RECEIVER_HEAD + consensus::DVC_HEADERS_MAX as u64;
+        let directory = tempfile::tempdir().unwrap();
+        let md = transfer_receiver(directory.path(), true).await;
+        let consensus = md.consensus.as_ref().unwrap();
+        let journal = md.journal.as_ref().unwrap().handle();
+        let original: Vec<_> = (1..=TRANSFER_RECEIVER_HEAD)
+            .map(|op| *journal.header(usize::try_from(op).unwrap()).unwrap())
+            .collect();
+        let mut headers = Vec::new();
+        let mut parent = *original.last().unwrap();
+        for op in TRANSFER_RECEIVER_HEAD + 1..=ANNOUNCED_HEAD {
+            let mut header = PrepareHeader {
+                op,
+                view: ANNOUNCED_VIEW,
+                timestamp: parent.timestamp + 1,
+                request: op,
+                parent: parent.checksum,
+                ..parent
+            };
+            header.checksum = header.identity_checksum();
+            headers.push(header);
+            parent = header;
+        }
+        headers.reverse();
+        let start_view = Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
+            .transmute_header(|_, header: &mut StartViewHeader| {
+                header.command = Command::StartView;
+                header.cluster = TRANSFER_RECEIVER.cluster;
+                header.group = server_common::sharding::METADATA_GROUP;
+                header.view = ANNOUNCED_VIEW;
+                header.replica = consensus.primary_index(ANNOUNCED_VIEW);
+                header.op = ANNOUNCED_HEAD;
+                header.commit = ANNOUNCED_HEAD - 1;
+                header.size = u32::try_from(size_of::<StartViewHeader>()).unwrap();
+            });
+        consensus.handle_start_view(
+            PlaneKind::Metadata,
+            start_view.header(),
+            bytemuck::cast_slice(&headers),
+        );
+        assert_eq!(consensus.log_view_claim(), ANNOUNCED_VIEW);
+        assert!(!consensus.history_certified());
+        assert!(consensus.needs_superblock_persist());
+        let before = crash_image(directory.path());
+        {
+            let mut write = Box::pin(md.persist_superblock_if_needed(consensus));
+            assert!(futures::poll!(&mut write).is_pending());
+        }
+        let cancelled = crash_image(directory.path());
+
+        // The first write used A. Refuse B's atomic rename without touching A.
+        let blocked_slot = directory
+            .path()
+            .join(crate::impls::METADATA_DIR)
+            .join(journal::superblock::SLOT_FILE_NAMES[1]);
+        std::fs::create_dir(&blocked_slot).unwrap();
+        assert!(!md.persist_superblock_if_needed(consensus).await);
+        assert!(consensus.needs_superblock_persist());
+        std::fs::remove_dir(&blocked_slot).unwrap();
+        let failed = crash_image(directory.path());
+        md.superblock_retry_after_micros.set(0);
+        assert!(md.persist_superblock_if_needed(consensus).await);
+        assert!(!consensus.needs_superblock_persist());
+        let completed = crash_image(directory.path());
+
+        for (image, persisted) in [
+            (before, false),
+            (cancelled, false),
+            (failed, false),
+            (completed, true),
+        ] {
+            let recovered = recover::<TestMux>(
+                image.path(),
+                TRANSFER_RECEIVER,
+                DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |_| {},
+                ChangeLogCapacities::default(),
+            )
+            .await
+            .unwrap();
+            let state = recovered.recovered_state.as_ref().unwrap();
+            assert_eq!(state.adopted_view.is_some(), persisted);
+            assert_eq!(recovered.journal.last_op(), Some(TRANSFER_RECEIVER_HEAD));
+            for header in &original {
+                assert_eq!(
+                    recovered
+                        .journal
+                        .header(usize::try_from(header.op).unwrap())
+                        .unwrap()
+                        .checksum,
+                    header.checksum
+                );
+            }
+            let mut restarted = VsrConsensus::new(
+                TRANSFER_RECEIVER.cluster,
+                TRANSFER_RECEIVER.replica_id,
+                TRANSFER_RECEIVER.replica_count,
+                server_common::sharding::METADATA_GROUP,
+                NoopBus,
+                LocalPipeline::new(),
+            );
+            restarted.set_view(state.view);
+            restarted.set_log_view(recovered.history.log_view());
+            restarted.sequencer().set_sequence(TRANSFER_RECEIVER_HEAD);
+            restarted.restore_history(
+                recovered.history,
+                (TRANSFER_RECEIVER_HEAD, original.last().unwrap().checksum),
+                Some(state),
+            );
+            restarted.restore_adopted_view(state.adopted_view.as_ref());
+            restarted.resume_adopted_view();
+            if persisted {
+                assert_eq!(
+                    restarted.adopted_view_head(),
+                    Some((ANNOUNCED_VIEW, ANNOUNCED_HEAD))
+                );
+                assert_eq!(restarted.log_view_claim(), ANNOUNCED_VIEW);
+                assert_eq!(restarted.sequencer().current_sequence(), ANNOUNCED_HEAD);
+                assert_eq!(restarted.adopted_view_log().unwrap().headers, headers);
+                assert!(restarted.view_log_unproven());
+                assert!(!restarted.history_certified());
+                assert!(
+                    recovered
+                        .journal
+                        .header(usize::try_from(ANNOUNCED_HEAD).unwrap())
+                        .is_none()
+                );
+            } else {
+                assert_eq!(restarted.log_view_claim(), CERTIFIED_VIEW);
+                assert_eq!(
+                    restarted.sequencer().current_sequence(),
+                    TRANSFER_RECEIVER_HEAD
+                );
+            }
+        }
+    }
+
+    /// The unvouched boundary is removed too. A durable snapshot can anchor the
+    /// certificate through that floor; without it, only the retained WAL can.
+    const fn transfer_restart(coordinated: bool) -> (HistoryRecovery, Option<u64>) {
+        (
+            HistoryRecovery::Certified {
+                view: CERTIFIED_VIEW,
+                truncate_from: Some(if coordinated {
+                    TRANSFER_FLOOR + 1
+                } else {
+                    TRANSFER_FLOOR
+                }),
+            },
+            Some(TRANSFER_FLOOR - 1),
+        )
+    }
+
+    /// A crash right after the install truncates the WAL above the incoming floor
+    /// must restart certified. The truncate removes the entry the certificate was
+    /// bound to, so the superblock must already hold a binding the restart can
+    /// prove. One naming a removed entry restarts `Unproven`, which keeps the
+    /// replica out of every election until a `StartView` proves its log.
+    #[compio::test]
+    async fn given_a_crash_after_the_transfer_truncate_when_restarting_should_stay_certified() {
+        for coordinated in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let md = transfer_receiver(dir.path(), coordinated).await;
+            let table = ClientTable::new(CLIENTS_TABLE_MAX);
+            let mut snapshot =
+                IggySnapshot::create(&TestMux::default(), TRANSFER_FLOOR, 1).unwrap();
+            snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+            let snapshot_bytes = snapshot.encode().unwrap();
+            let journal = md.journal.as_ref().unwrap().handle();
+            let mut install = Box::pin(md.install_state_transfer(
+                &snapshot_bytes,
+                table,
+                TRANSFER_FLOOR,
+                TRANSFER_FLOOR,
+            ));
+            let mut image = None;
+            let mut outcome = None;
+            for _ in 0..INSTALL_POLL_BUDGET {
+                let polled = futures::poll!(&mut install);
+                if image.is_none() && journal.last_op() == Some(TRANSFER_FLOOR - 1) {
+                    image = Some(crash_image(dir.path()));
+                }
+                if let std::task::Poll::Ready(result) = polled {
+                    outcome = Some(result);
+                    break;
+                }
+                compio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert!(
+                matches!(outcome, Some(Ok(_))),
+                "coordinated {coordinated}: the install did not complete: {outcome:?}"
+            );
+            let image = image.expect("the install truncates the WAL above its floor");
+            assert_eq!(
+                restarted_history(image.path()).await,
+                transfer_restart(coordinated),
+                "coordinated {coordinated}"
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_vouched_transfer_suffix_when_installing_and_restarting_should_keep_its_prefix()
+    {
+        const FIRST_TAIL: u64 = TRANSFER_FLOOR + 1;
+        for coordinated in [true, false] {
+            for (retained, boundary_matches, bound_at_boundary) in [
+                (TRANSFER_FLOOR, true, false),
+                (FIRST_TAIL, true, false),
+                (TRANSFER_RECEIVER_HEAD, true, false),
+                (FIRST_TAIL, false, false),
+                (TRANSFER_RECEIVER_HEAD, false, false),
+                (FIRST_TAIL, false, true),
+                (TRANSFER_RECEIVER_HEAD, false, true),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let md = transfer_receiver(directory.path(), coordinated).await;
+                let consensus = md.consensus.as_ref().unwrap();
+                consensus.set_log_view(CERTIFIED_VIEW);
+                let journal = md.journal.as_ref().unwrap().handle();
+                let mut headers: Vec<_> = (TRANSFER_FLOOR..=TRANSFER_RECEIVER_HEAD)
+                    .map(|op| *journal.header(usize::try_from(op).unwrap()).unwrap())
+                    .collect();
+                for index in 1..headers.len() {
+                    if headers[index].op > retained {
+                        headers[index].timestamp += 1;
+                        headers[index].parent = headers[index - 1].checksum;
+                        headers[index].checksum = headers[index].identity_checksum();
+                    }
+                }
+                headers.reverse();
+                let start_view = Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
+                    .transmute_header(|_, header: &mut StartViewHeader| {
+                        header.command = Command::StartView;
+                        header.cluster = TRANSFER_RECEIVER.cluster;
+                        header.replica = consensus.primary_index(ADOPTED_VIEW);
+                        header.view = ADOPTED_VIEW;
+                        header.op = TRANSFER_RECEIVER_HEAD;
+                        header.commit = TRANSFER_FLOOR;
+                        header.group = server_common::sharding::METADATA_GROUP;
+                        header.size = u32::try_from(size_of::<StartViewHeader>()).unwrap();
+                    });
+                consensus.handle_start_view(
+                    PlaneKind::Metadata,
+                    start_view.header(),
+                    bytemuck::cast_slice(&headers),
+                );
+                assert!(consensus.view_log_unproven());
+                if !boundary_matches {
+                    let mut boundary = *journal
+                        .header(usize::try_from(TRANSFER_FLOOR).unwrap())
+                        .unwrap();
+                    let entry = journal.entry_at(&boundary).await.unwrap().unwrap();
+                    if bound_at_boundary {
+                        consensus.lower_history_certificate(
+                            TRANSFER_FLOOR,
+                            TRANSFER_FLOOR,
+                            boundary.checksum,
+                        );
+                    }
+                    journal
+                        .remove_range(TRANSFER_FLOOR..=TRANSFER_FLOOR)
+                        .await
+                        .unwrap();
+                    boundary.timestamp += 1;
+                    boundary.checksum = boundary.identity_checksum();
+                    let stale =
+                        entry.transmute_header(|_, header: &mut PrepareHeader| *header = boundary);
+                    let original = *journal
+                        .header(usize::try_from(FIRST_TAIL).unwrap())
+                        .unwrap();
+                    assert_ne!(original.parent, boundary.checksum);
+                    journal.append(stale).await.unwrap();
+                }
+                let expected: Vec<_> = (FIRST_TAIL..=retained)
+                    .map(|op| {
+                        (
+                            op,
+                            journal
+                                .header(usize::try_from(op).unwrap())
+                                .unwrap()
+                                .checksum,
+                        )
+                    })
+                    .collect();
+                let table = ClientTable::new(CLIENTS_TABLE_MAX);
+                let mut snapshot =
+                    IggySnapshot::create(&TestMux::default(), TRANSFER_FLOOR, 1).unwrap();
+                snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+                md.install_state_transfer(
+                    &snapshot.encode().unwrap(),
+                    table,
+                    TRANSFER_FLOOR,
+                    TRANSFER_FLOOR,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    journal.last_op(),
+                    Some(retained),
+                    "coordinated {coordinated}"
+                );
+                assert_eq!(
+                    journal
+                        .header(usize::try_from(TRANSFER_FLOOR).unwrap())
+                        .is_some(),
+                    boundary_matches
+                );
+                if bound_at_boundary {
+                    assert!(consensus.history_certificate().unwrap().op < TRANSFER_FLOOR);
+                }
+                for (op, checksum) in &expected {
+                    assert_eq!(
+                        journal
+                            .header(usize::try_from(*op).unwrap())
+                            .unwrap()
+                            .checksum,
+                        *checksum
+                    );
+                }
+                let image = crash_image(directory.path());
+                assert_eq!(
+                    restarted_history(image.path()).await,
+                    (
+                        HistoryRecovery::Certified {
+                            view: CERTIFIED_VIEW,
+                            truncate_from: Some(retained + 1)
+                        },
+                        Some(retained)
+                    ),
+                    "coordinated {coordinated}, retained {retained}"
+                );
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_proven_log_with_a_gap_below_the_snapshot_when_installing_should_keep_the_suffix_across_crashes()
+     {
+        const MISSING: u64 = TRANSFER_FLOOR;
+        let directory = tempfile::tempdir().unwrap();
+        let md = transfer_receiver(directory.path(), true).await;
+        let consensus = md.consensus.as_ref().unwrap();
+        let journal = md.journal.as_ref().unwrap().handle();
+        consensus.certify_view_log(
+            TRANSFER_RECEIVER_HEAD,
+            journal
+                .header(usize::try_from(TRANSFER_RECEIVER_HEAD).unwrap())
+                .unwrap()
+                .checksum,
+        );
+        assert!(consensus.history_certified());
+        journal.remove_range(MISSING..=MISSING).await.unwrap();
+        let expected: Vec<_> = (TRANSFER_FLOOR + 1..=TRANSFER_RECEIVER_HEAD)
+            .map(|op| {
+                (
+                    op,
+                    journal
+                        .header(usize::try_from(op).unwrap())
+                        .unwrap()
+                        .checksum,
+                )
+            })
+            .collect();
+        let table = ClientTable::new(CLIENTS_TABLE_MAX);
+        let mut snapshot = IggySnapshot::create(&TestMux::default(), TRANSFER_FLOOR, 1).unwrap();
+        snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+        let bytes = snapshot.encode().unwrap();
+        let mut install =
+            Box::pin(md.install_state_transfer(&bytes, table, TRANSFER_FLOOR, TRANSFER_FLOOR));
+        let mut image = None;
+        let mut outcome = None;
+        for _ in 0..INSTALL_POLL_BUDGET {
+            let polled = futures::poll!(&mut install);
+            if image.is_none()
+                && let journal::superblock::SuperblockContents::Present(record) =
+                    md.superblock.as_ref().unwrap().read_latest().await.unwrap()
+                && consensus::VsrState::try_from(record.as_slice())
+                    .unwrap()
+                    .checkpoint_op
+                    == TRANSFER_FLOOR
+            {
+                image = Some(crash_image(directory.path()));
+            }
+            if let std::task::Poll::Ready(result) = polled {
+                outcome = Some(result);
+                break;
+            }
+            compio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(matches!(outcome, Some(Ok(_))), "{outcome:?}");
+        assert_eq!(journal.last_op(), Some(TRANSFER_RECEIVER_HEAD));
+        let image = image.expect("the snapshot pairing reached the superblock");
+        for image in [image, crash_image(directory.path())] {
+            let recovered = recover::<crate::MuxStateMachine<()>>(
+                image.path(),
+                TRANSFER_RECEIVER,
+                DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |_| {},
+                ChangeLogCapacities::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.journal.last_op(), Some(TRANSFER_RECEIVER_HEAD));
+            for (op, checksum) in &expected {
+                assert_eq!(
+                    recovered
+                        .journal
+                        .header(usize::try_from(*op).unwrap())
+                        .unwrap()
+                        .checksum,
+                    *checksum
+                );
+            }
+            assert_eq!(recovered.chain_break_op, None);
+        }
+    }
+
+    /// An install that fails once the binding moved must also restart certified,
+    /// at once and after the next tick persists what the failed install left in
+    /// memory. A snapshot with no state machine sections fails the in-place
+    /// restore, the last step that can fail.
+    #[compio::test]
+    async fn given_an_install_error_after_the_binding_moved_when_restarting_should_stay_certified()
+    {
+        for coordinated in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let md = transfer_receiver(dir.path(), coordinated).await;
+            let table = ClientTable::new(CLIENTS_TABLE_MAX);
+            let mut snapshot = IggySnapshot::new(TRANSFER_FLOOR);
+            snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+            let installed = md
+                .install_state_transfer(
+                    &snapshot.encode().unwrap(),
+                    table,
+                    TRANSFER_FLOOR,
+                    TRANSFER_FLOOR,
+                )
+                .await;
+            assert!(
+                matches!(installed, Err(SnapshotError::Deserialize(_))),
+                "coordinated {coordinated}: {installed:?}"
+            );
+            let failed = crash_image(dir.path());
+            assert!(
+                md.persist_superblock_if_needed(md.consensus.as_ref().unwrap())
+                    .await
+            );
+            let ticked = crash_image(dir.path());
+            for (image, moment) in [(failed, "the failed install"), (ticked, "the next tick")] {
+                assert_eq!(
+                    restarted_history(image.path()).await,
+                    transfer_restart(coordinated),
+                    "coordinated {coordinated}, crash after {moment}"
+                );
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_failed_install_when_an_older_offer_arrives_should_keep_the_durable_checkpoint()
+    {
+        const OLDER: u64 = TRANSFER_FLOOR - 1;
+        let directory = tempfile::tempdir().unwrap();
+        let md = transfer_receiver(directory.path(), true).await;
+        let consensus = md.consensus.as_ref().unwrap();
+        let metadata_dir = directory.path().join(crate::impls::METADATA_DIR);
+        let wal_path = metadata_dir.join("journal.wal");
+        let saved_wal = metadata_dir.join("journal.saved");
+        let table = ClientTable::new(CLIENTS_TABLE_MAX);
+        let incoming_state = TestMux::default();
+        incoming_state.users().ensure_root_user("restored", "hash");
+        let mut snapshot = IggySnapshot::create(&incoming_state, TRANSFER_FLOOR, 1).unwrap();
+        snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+        let bytes = snapshot.encode().unwrap();
+
+        // Keep the open WAL readable but make the truncate's rename fail, after
+        // the new snapshot and its superblock pairing have reached disk.
+        std::fs::rename(&wal_path, &saved_wal).unwrap();
+        std::fs::create_dir(&wal_path).unwrap();
+        let failed = md
+            .install_state_transfer(&bytes, table, TRANSFER_FLOOR, TRANSFER_FLOOR)
+            .await;
+        std::fs::remove_dir(&wal_path).unwrap();
+        std::fs::rename(&saved_wal, &wal_path).unwrap();
+        assert!(matches!(failed, Err(SnapshotError::Io(_))), "{failed:?}");
+        assert_eq!(consensus.commit_min(), 0);
+        assert_eq!(
+            md.coordinator.as_ref().unwrap().last_checkpoint().0,
+            TRANSFER_FLOOR
+        );
+        let before = std::fs::read(metadata_dir.join("snapshot.bin")).unwrap();
+        let failed_image = crash_image(directory.path());
+
+        let older_table = ClientTable::new(CLIENTS_TABLE_MAX);
+        let mut older = IggySnapshot::create(&TestMux::default(), OLDER, 1).unwrap();
+        older.snapshot_mut().client_table = Some(older_table.to_snapshot());
+        let refused = md
+            .install_state_transfer(&older.encode().unwrap(), older_table, OLDER, OLDER)
+            .await;
+        assert!(
+            matches!(refused, Err(SnapshotError::InvalidState(_))),
+            "an older offer must not replace a newer durable checkpoint: {refused:?}"
+        );
+        assert_eq!(
+            std::fs::read(metadata_dir.join("snapshot.bin")).unwrap(),
+            before
+        );
+        assert_eq!(consensus.commit_min(), 0);
+        let refused_image = crash_image(directory.path());
+        for image in [failed_image, refused_image] {
+            let recovered = recover::<TestMux>(
+                image.path(),
+                TRANSFER_RECEIVER,
+                DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |_| {},
+                ChangeLogCapacities::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.snapshot_checkpoint.0, TRANSFER_FLOOR);
+            assert_eq!(recovered.journal.last_op(), Some(TRANSFER_FLOOR));
+        }
+
+        // The durable floor must not make an equal retry skip the STM restore.
+        for retry_floor in [TRANSFER_FLOOR, TRANSFER_FLOOR + 1] {
+            let table = ClientTable::new(CLIENTS_TABLE_MAX);
+            let mut retry = IggySnapshot::create(&incoming_state, retry_floor, 1).unwrap();
+            let expected_state = retry.encode().unwrap();
+            retry.snapshot_mut().client_table = Some(table.to_snapshot());
+            let retried = md
+                .install_state_transfer(&retry.encode().unwrap(), table, retry_floor, retry_floor)
+                .await
+                .unwrap();
+            assert_eq!(retried.installed_frontier, retry_floor);
+            assert_eq!(consensus.commit_min(), retry_floor);
+            assert_eq!(
+                IggySnapshot::create(&*md.mux_stm, retry_floor, 1)
+                    .unwrap()
+                    .encode()
+                    .unwrap(),
+                expected_state
+            );
+            let recovered = recover::<TestMux>(
+                crash_image(directory.path()).path(),
+                TRANSFER_RECEIVER,
+                DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |_| {},
+                ChangeLogCapacities::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.snapshot_checkpoint.0, retry_floor);
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_pending_checkpoint_after_failed_transfer_when_retried_should_keep_the_newer_snapshot()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let md = transfer_receiver(directory.path(), true).await;
+        let consensus = md.consensus.as_ref().unwrap();
+        let journal = md.journal.as_ref().unwrap();
+        let coordinator = md.coordinator.as_ref().unwrap();
+        consensus.clear_pipeline();
+        consensus.advance_commit_max(TRANSFER_FLOOR - 1);
+        md.commit_journal().await;
+        assert_eq!(consensus.commit_min(), TRANSFER_FLOOR - 1);
+        md.set_checkpoint_margin(usize::MAX);
+        STOP_CHECKPOINT_AFTER.set(Some(CheckpointBoundary::TableCaptured));
+        md.checkpoint_if_needed(consensus, journal).await;
+        assert!(STOP_CHECKPOINT_AFTER.get().is_none());
+        assert!(coordinator.checkpoint_pending.get());
+
+        let metadata_dir = directory.path().join(crate::impls::METADATA_DIR);
+        let wal_path = metadata_dir.join("journal.wal");
+        let saved_wal = metadata_dir.join("journal.saved");
+        let table = ClientTable::new(CLIENTS_TABLE_MAX);
+        let mut snapshot = IggySnapshot::create(&TestMux::default(), TRANSFER_FLOOR, 1).unwrap();
+        snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+        std::fs::rename(&wal_path, &saved_wal).unwrap();
+        std::fs::create_dir(&wal_path).unwrap();
+        let failed = md
+            .install_state_transfer(
+                &snapshot.encode().unwrap(),
+                table,
+                TRANSFER_FLOOR,
+                TRANSFER_FLOOR,
+            )
+            .await;
+        std::fs::remove_dir(&wal_path).unwrap();
+        std::fs::rename(&saved_wal, &wal_path).unwrap();
+        assert!(matches!(failed, Err(SnapshotError::Io(_))), "{failed:?}");
+        assert_eq!(consensus.commit_min(), TRANSFER_FLOOR - 1);
+        assert_eq!(coordinator.last_checkpoint().0, TRANSFER_FLOOR);
+        assert!(coordinator.checkpoint_pending.get());
+        let before = std::fs::read(coordinator.snapshot_path()).unwrap();
+
+        md.checkpoint_if_needed(consensus, journal).await;
+        assert_eq!(std::fs::read(coordinator.snapshot_path()).unwrap(), before);
+        let recovered = recover::<TestMux>(
+            crash_image(directory.path()).path(),
+            TRANSFER_RECEIVER,
+            DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            ChangeLogCapacities::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.snapshot_checkpoint.0, TRANSFER_FLOOR);
+
+        let table = ClientTable::new(CLIENTS_TABLE_MAX);
+        md.install_state_transfer(
+            &snapshot.encode().unwrap(),
+            table,
+            TRANSFER_FLOOR,
+            TRANSFER_FLOOR,
+        )
+        .await
+        .unwrap();
+        md.checkpoint_if_needed(consensus, journal).await;
+        assert_eq!(consensus.commit_min(), TRANSFER_FLOOR);
+        assert!(!coordinator.checkpoint_pending.get());
+    }
+
+    #[compio::test]
+    async fn given_a_vouched_suffix_when_commits_walk_during_snapshot_io_should_preserve_their_receipts()
+     {
+        const CLIENT: u128 = 1;
+        let directory = tempfile::tempdir().unwrap();
+        let md = transfer_receiver(directory.path(), true).await;
+        let consensus = md.consensus.as_ref().unwrap();
+        let journal = md.journal.as_ref().unwrap().handle();
+        consensus.clear_pipeline();
+        consensus.certify_view_log(
+            TRANSFER_RECEIVER_HEAD,
+            journal
+                .header(usize::try_from(TRANSFER_RECEIVER_HEAD).unwrap())
+                .unwrap()
+                .checksum,
+        );
+        let table = ClientTable::new(CLIENTS_TABLE_MAX);
+        let mut snapshot = IggySnapshot::create(&TestMux::default(), TRANSFER_FLOOR, 1).unwrap();
+        snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+        let bytes = snapshot.encode().unwrap();
+        let held = SNAPSHOT_IO.lock().await;
+        let mut install =
+            Box::pin(md.install_state_transfer(&bytes, table, TRANSFER_FLOOR, TRANSFER_FLOOR));
+        assert!(futures::poll!(&mut install).is_pending());
+        consensus.advance_commit_max(TRANSFER_RECEIVER_HEAD);
+        md.commit_journal().await;
+        assert_eq!(consensus.commit_min(), TRANSFER_RECEIVER_HEAD);
+        assert_eq!(
+            md.client_table.borrow().get_watermark(CLIENT),
+            Some(TRANSFER_RECEIVER_HEAD)
+        );
+        let applied = IggySnapshot::create(&*md.mux_stm, TRANSFER_RECEIVER_HEAD, 1)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let table_after_walk = md.client_table.borrow().encode();
+        drop(held);
+        let outcome = install.await.unwrap();
+        assert_eq!(outcome.installed_frontier, TRANSFER_RECEIVER_HEAD);
+        assert_eq!(journal.last_op(), Some(TRANSFER_RECEIVER_HEAD));
+        assert_eq!(md.client_table.borrow().encode(), table_after_walk);
+        assert_eq!(
+            IggySnapshot::create(&*md.mux_stm, TRANSFER_RECEIVER_HEAD, 1)
+                .unwrap()
+                .encode()
+                .unwrap(),
+            applied
+        );
+        let recovered = recover::<TestMux>(
+            crash_image(directory.path()).path(),
+            TRANSFER_RECEIVER,
+            DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            ChangeLogCapacities::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.journal.last_op(), Some(TRANSFER_RECEIVER_HEAD));
+        assert_eq!(recovered.chain_break_op, None);
+    }
+
     #[compio::test]
     async fn tick_backstop_must_resume_stranded_commits_and_promotions() {
         use std::future::Future;
@@ -5271,15 +13289,19 @@ mod tests {
                 Some(journal),
                 None,
                 None,
-                TestMux::default(),
+                TestMux::new((session_users(), (Streams::default(), ()))),
                 None,
             );
         let consensus = md.consensus.as_ref().unwrap();
-        md.client_table.borrow_mut().commit_register(
-            CLIENT_B,
-            ACTING_USER,
-            register_reply(CLIENT_B, SESSION),
-        );
+        md.client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT_B,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT_B, SESSION),
+            )
+            .unwrap();
 
         // B's op journaled + self-acked; park its commit driver mid-window
         // at the journal read.
@@ -5303,9 +13325,16 @@ mod tests {
         assert_eq!(consensus.commit_min(), 0);
 
         // C's register lands in the window: absorbed into the request queue.
-        let mut register = Box::pin(md.submit_register_in_process(CLIENT_C, ACTING_USER));
+        let mut register = Box::pin(md.submit_register_in_process(
+            CLIENT_C,
+            ACTING_USER,
+            RegisterRequest {
+                user_created_at: 1,
+                bind_verifier: [0x5a; 32],
+            },
+        ));
         assert!(register.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(consensus.pipeline().borrow().request_queue_len(), 1);
+        assert_eq!(consensus.request_queue_len(), 1);
 
         // The committing driver dies at its await — the hyper-disconnect
         // analogue. Commit and promotion are now stranded: op 1 is quorum'd
@@ -5314,7 +13343,7 @@ mod tests {
         drop(driver);
         assert_eq!(consensus.commit_max(), 1);
         assert_eq!(consensus.commit_min(), 0);
-        assert_eq!(consensus.pipeline().borrow().request_queue_len(), 1);
+        assert_eq!(consensus.request_queue_len(), 1);
         assert!(
             register.as_mut().poll(&mut cx).is_pending(),
             "queued register must still be parked with no driver alive"
@@ -5325,11 +13354,7 @@ mod tests {
         // (its self-ack lands on the loopback).
         md.resume_stranded_commits().await;
         assert_eq!(consensus.commit_min(), 1, "stranded op 1 applied");
-        assert_eq!(
-            consensus.pipeline().borrow().request_queue_len(),
-            0,
-            "queued register promoted"
-        );
+        assert_eq!(consensus.request_queue_len(), 0, "queued register promoted");
 
         // Commit the promoted register (production: pump loopback drain)
         // and the parked caller resolves with its session.
@@ -5359,5 +13384,86 @@ mod tests {
         );
         assert_eq!(md.client_table.borrow().get_epoch(CLIENT_C), Some(2));
         assert!(is_caught_up_primary(consensus));
+    }
+
+    #[compio::test]
+    async fn failed_journal_append_hands_the_op_back_instead_of_leaving_a_phantom() {
+        // The primary claims its op before the append (`push_prepare_entry`), so a
+        // failed append used to leave the sequencer one ahead of the WAL forever:
+        // the next request projected over the hole, and no repair path refilled it.
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                None,
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+
+        let projected = md
+            .prepare_request(create_stream_request(CLIENT, 1, "s1"))
+            .expect("CreateStream is client-allowed");
+        let op = projected.header().op;
+        let parent = projected.header().parent;
+        let sequence_before = consensus.sequencer().current_sequence();
+
+        // Forces the append to fail deterministically, before any disk write: the
+        // buffer carries eight bytes of slack past the header's `size`, which
+        // `PrepareJournal::append` refuses rather than write slack that would
+        // mis-frame the recovery scan. Any append failure reaches the same arm.
+        let size = projected.header().size as usize;
+        let mut padded = Message::<PrepareHeader>::new(size + 8);
+        padded.as_mut_slice()[..size].copy_from_slice(projected.as_slice());
+
+        consensus.pipeline_message(PlaneKind::Metadata, &padded);
+        assert_eq!(consensus.sequencer().current_sequence(), op);
+
+        md.on_replicate(padded).await;
+
+        assert_eq!(
+            consensus.sequencer().current_sequence(),
+            sequence_before,
+            "the claimed op must be handed back so the next request reuses it"
+        );
+        assert_eq!(consensus.last_prepare_checksum(), parent);
+        assert!(
+            consensus.pipeline_is_empty(),
+            "the undurable prepare must not stay live in the pipeline"
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        let journaled = md.journal.as_ref().unwrap().handle().header(op as usize);
+        assert!(
+            journaled.is_none(),
+            "the append failed, so the WAL must hold nothing at that op"
+        );
     }
 }

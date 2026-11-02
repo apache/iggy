@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import crypto from 'crypto';
 import { Client } from 'apache-iggy';
@@ -45,7 +44,6 @@ export async function initSystem(client: Client) {
     name: `sample-topic-${crypto.randomBytes(4).toString('hex')}`,
     partitionCount: PARTITION_COUNT,
     compressionAlgorithm: 1, // None
-    replicationFactor: 1,
   });
 
   log('Topic was created successfully.', 'Topic ID: %s', topic?.id);

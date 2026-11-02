@@ -23,11 +23,14 @@ from datetime import timedelta
 
 from apache_iggy import (
     AutoLogin,
+    HttpConfig,
     IggyClient,
+    QuicConfig,
     StreamDetails,
     TcpConfig,
     TcpReconnectionConfig,
     TopicDetails,
+    WebSocketConfig,
 )
 from apache_iggy import SendMessage as Message
 from loguru import logger
@@ -100,8 +103,41 @@ def parse_args() -> ArgNamespace:
     return ArgNamespace(**vars(args))
 
 
-def build_config(args: ArgNamespace) -> TcpConfig:
-    """Build a TCP client configuration with auto-login and reconnection."""
+def build_config(
+    args: ArgNamespace,
+) -> TcpConfig | QuicConfig | HttpConfig | WebSocketConfig:
+    """Build the client configuration, TCP with auto-login and reconnection."""
+
+    # IggyClient(...) also accepts a QuicConfig for the QUIC transport. To use
+    # it, uncomment the return below and import QuicReconnectionConfig, which is
+    # left out above because only the commented block names it:
+    #
+    # return QuicConfig(
+    #     server_address="127.0.0.1:8080",
+    #     server_name="localhost",
+    #     auto_login=AutoLogin.username_password(args.username, args.password),
+    #     reconnection=QuicReconnectionConfig(
+    #         enabled=True, interval=timedelta(seconds=1)
+    #     ),
+    # )
+
+    # IggyClient(...) also accepts an HttpConfig for the HTTP transport. HTTP
+    # has no AutoLogin or reconnection policy, so main() below would also need
+    # an explicit `await client.login_user(args.username, args.password)`
+    # after connecting:
+    # return HttpConfig(api_url="http://127.0.0.1:3000")
+
+    # IggyClient(...) also accepts a WebSocketConfig for the WebSocket transport.
+    # To use it, uncomment the return below and import WebSocketReconnectionConfig,
+    # which is left out above because only the commented block names it:
+    #
+    # return WebSocketConfig(
+    #     server_address="127.0.0.1:8092",
+    #     auto_login=AutoLogin.username_password(args.username, args.password),
+    #     reconnection=WebSocketReconnectionConfig(
+    #         enabled=True, interval=timedelta(seconds=1)
+    #     ),
+    # )
 
     return TcpConfig(
         server_address=args.tcp_server_address,
@@ -122,7 +158,7 @@ async def main():
     except ValueError as error:
         logger.error(f"Invalid client configuration: {error}")
         return
-    logger.info(f"Connecting to {args.tcp_server_address} (TLS: {args.tls})")
+    logger.info(f"Connecting with {config}")
 
     client = IggyClient(config)
     logger.info("Connecting to IggyClient")
@@ -145,12 +181,7 @@ async def init_system(client: IggyClient):
     logger.info(f"Creating topic {TOPIC_NAME} in stream {STREAM_NAME}")
     topic: TopicDetails | None = await client.get_topic(STREAM_NAME, TOPIC_NAME)
     if topic is None:
-        await client.create_topic(
-            stream=STREAM_NAME,
-            partitions_count=1,
-            name=TOPIC_NAME,
-            replication_factor=1,
-        )
+        await client.create_topic(stream=STREAM_NAME, name=TOPIC_NAME)
         logger.info("Topic was created successfully.")
     else:
         logger.warning(f"Topic {topic.name} already exists with ID {topic.id}")

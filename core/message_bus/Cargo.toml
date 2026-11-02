@@ -43,7 +43,6 @@ futures-rustls = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 libc = { workspace = true }
-rand = { workspace = true }
 ring = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
@@ -60,5 +59,10 @@ tempfile = { workspace = true }
 
 [lints.clippy]
 enum_glob_use = "deny"
-pedantic = "deny"
+pedantic = { level = "deny", priority = -1 }
 nursery = "warn"
+# Sync impls of async traits are deliberate (non-blocking bus, in-memory storage, test doubles).
+unused_async_trait_impl = "allow"
+
+[lints.rust]
+warnings = "deny"

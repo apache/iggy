@@ -26,11 +26,12 @@
 //! - `classify_reply`: decode reply into a declared outcome
 //! - `predicted_effect`: predicted shadow mutation on commit
 //!
-//! Dispatch via the [`op_dispatch!`] macro; missing variants are a compile
+//! Dispatch via the `op_dispatch!` macro; missing variants are a compile
 //! error.
 
 pub mod change_password;
 pub mod create_consumer_group;
+pub mod create_keyed_stream;
 pub mod create_partitions;
 pub mod create_personal_access_token;
 pub mod create_stream;
@@ -38,32 +39,50 @@ pub mod create_topic;
 pub mod create_user;
 pub mod delete_consumer_group;
 pub mod delete_consumer_offset;
-pub mod delete_consumer_offset_2;
 pub mod delete_partitions;
 pub mod delete_personal_access_token;
 pub mod delete_segments;
 pub mod delete_stream;
 pub mod delete_topic;
 pub mod delete_user;
-pub mod purge_stream;
-pub mod purge_topic;
+pub mod join_fixture_group;
+pub mod leave_fixture_group;
+pub mod poll_messages;
+pub mod replace_fixture_topic;
 pub mod send_messages;
 pub mod store_consumer_offset;
-pub mod store_consumer_offset_2;
+pub mod store_stale_owner_offset;
 pub mod update_permissions;
 pub mod update_stream;
 pub mod update_topic;
 pub mod update_user;
 
-use iggy_binary_protocol::RoutedRequestHeader;
-use rand_xoshiro::Xoshiro256Plus;
+use iggy_binary_protocol::{
+    KIND_CONSUMER, KIND_CONSUMER_GROUP, KIND_EXTERNAL_GROUP, RoutedRequestHeader,
+};
+use rand::RngExt;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use server_common::Message;
 
 use crate::client::SimClient;
 use crate::workload::actions::Action;
 use crate::workload::effect::Effect;
 use crate::workload::options::WorkloadOptions;
-use crate::workload::shadow::Shadow;
+use crate::workload::shadow::{Replacements, Shadow};
+
+/// Draw a consumer kind for the four consumer-offset ops, as the WIRE
+/// discriminant.
+///
+/// `WireConsumer::decode` accepts only [`KIND_CONSUMER`] (1),
+/// [`KIND_CONSUMER_GROUP`] (2) and [`KIND_EXTERNAL_GROUP`] (3). Anything else
+/// maps to `IggyError::InvalidCommand`, which the partition plane answers by
+/// logging a WARN and dropping the frame with NO reply, so one malformed draw
+/// wedges that client's in-flight slot for the rest of the run. One range draw
+/// over every kind.
+pub(crate) fn sample_consumer_kind(prng: &mut Xoshiro256PlusPlus) -> u8 {
+    const KINDS: [u8; 3] = [KIND_CONSUMER, KIND_CONSUMER_GROUP, KIND_EXTERNAL_GROUP];
+    KINDS[prng.random_range(0..KINDS.len())]
+}
 
 /// Generates per-op enums (`InFlightInput`, `InFlightOutcome`) plus four
 /// dispatch fns over a fixed `(Action, module)` table. Missing variants
@@ -94,6 +113,8 @@ macro_rules! op_dispatch {
             pub input: InFlightInput,
             pub outcome: InFlightOutcome,
             pub request_namespace: u64,
+            /// Fixture replacements of `request_namespace` at sample time.
+            pub replacements: Replacements,
         }
 
         /// Sample an `Input` for `action` realizing the outcome at `outcome_id`
@@ -102,7 +123,7 @@ macro_rules! op_dispatch {
         pub fn sample(
             action: Action,
             shadow: &mut Shadow,
-            prng: &mut Xoshiro256Plus,
+            prng: &mut Xoshiro256PlusPlus,
             options: &WorkloadOptions,
             outcome_id: usize,
         ) -> Option<(InFlightInput, InFlightOutcome)> {
@@ -172,15 +193,13 @@ op_dispatch! {
     // First three positions lock the hash baseline (do not reorder).
     CreateStream              => create_stream,
     SendMessages              => send_messages,
-    StoreConsumerOffset2      => store_consumer_offset_2,
+    StoreConsumerOffset       => store_consumer_offset,
     // Append-only; mirrors actions::Action declaration order.
     DeleteStream              => delete_stream,
     UpdateStream              => update_stream,
-    PurgeStream               => purge_stream,
     CreateTopic               => create_topic,
     UpdateTopic               => update_topic,
     DeleteTopic               => delete_topic,
-    PurgeTopic                => purge_topic,
     CreatePartitions          => create_partitions,
     DeletePartitions          => delete_partitions,
     DeleteSegments            => delete_segments,
@@ -193,7 +212,11 @@ op_dispatch! {
     UpdatePermissions         => update_permissions,
     CreatePersonalAccessToken => create_personal_access_token,
     DeletePersonalAccessToken => delete_personal_access_token,
-    StoreConsumerOffset       => store_consumer_offset,
     DeleteConsumerOffset      => delete_consumer_offset,
-    DeleteConsumerOffset2     => delete_consumer_offset_2,
+    ReplaceFixtureTopic       => replace_fixture_topic,
+    JoinFixtureGroup          => join_fixture_group,
+    LeaveFixtureGroup         => leave_fixture_group,
+    StoreStaleOwnerOffset      => store_stale_owner_offset,
+    PollMessages              => poll_messages,
+    CreateKeyedStream          => create_keyed_stream,
 }

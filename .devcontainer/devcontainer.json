@@ -33,7 +33,8 @@
     "IGGY_HTTP_ADDRESS": "0.0.0.0:3000",
     "IGGY_QUIC_ADDRESS": "0.0.0.0:8080",
     "IGGY_TCP_ADDRESS": "0.0.0.0:8090",
-    "IGGY_WEBSOCKET_ADDRESS": "0.0.0.0:8092"
+    "IGGY_WEBSOCKET_ADDRESS": "0.0.0.0:8092",
+    "IGGY_NODE_ADVERTISED_ADDRESS": "localhost"
   },
   "forwardPorts": [3000, 3050, 8080, 8090, 8092],
   "portsAttributes": {

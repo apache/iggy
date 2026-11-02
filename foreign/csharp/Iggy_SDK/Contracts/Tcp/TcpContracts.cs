@@ -17,6 +17,7 @@
 
 using System.Buffers;
 using System.Buffers.Binary;
+using System.IO.Hashing;
 using System.Runtime.CompilerServices;
 using System.Text;
 using Apache.Iggy.Contracts.Auth;
@@ -26,34 +27,95 @@ using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
+using Apache.Iggy.Utils;
+using Apache.Iggy.Vsr;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Contracts.Tcp;
 
 internal static class TcpContracts
 {
+
+    /// <summary>Frames wider than this are built on the heap instead of the stack.</summary>
+    private const int MaxStackAllocBytes = 1024;
+
+    /// <summary>Offset mutations always request quorum acknowledgement.</summary>
+    private const byte AckQuorum = 1;
+
+    /// <summary>The bytes a deferred poll (code 106) appends to the body of code 100.</summary>
+    internal const int DEFERRED_POLL_TAIL_SIZE = sizeof(ulong) + sizeof(uint) + sizeof(uint) + sizeof(ulong);
+
+    /// <summary>The most partitions one fetch names.</summary>
+    internal const int MAX_PARTITIONS_PER_REQUEST = 1000;
+
+    /// <summary>
+    ///     The largest record of one message in a read reply: the batch header, the message header, the largest
+    ///     payload and the largest user headers. A read returns a first record up to this size even above its byte
+    ///     limit, so a reply frame limit below <see cref="MAX_RECORD_REPLY_SIZE" /> cannot read every message.
+    /// </summary>
+    internal const int MAX_RECORD_SIZE = BatchWireFormat.BATCH_HEADER_SIZE + BatchWireFormat.FRAME_HEADER_SIZE
+                                         + 64_000_000 + 100_000;
+
+    /// <summary>The largest reply frame of a read of one such record: the frame header, the largest fetch table and the record.</summary>
+    internal const int MAX_RECORD_REPLY_SIZE = VsrHeader.HEADER_SIZE + FetchedMessages.SECTIONS_COUNT_SIZE
+                                               + MAX_PARTITIONS_PER_REQUEST * FetchedMessages.SECTION_HEADER_SIZE
+                                               + MAX_RECORD_SIZE;
+
+    /// <summary>The wait and the request timeout that follow the fetch topic.</summary>
+    private const int WaitBudgetSize = sizeof(ulong) + sizeof(ulong);
+
+    private const int ConsumerKindSize = 1;
+    private const int IdentifierPrefixSize = 2;
+    private const int PollingStrategySize = 1 + sizeof(ulong);
+    private const int PartitionStrategySize = sizeof(uint) + PollingStrategySize;
+
+    private const int FetchMinCountOffset = WaitBudgetSize;
+    private const int FetchCountOffset = FetchMinCountOffset + sizeof(uint);
+    private const int FetchMaxBytesOffset = FetchCountOffset + sizeof(uint);
+    private const int FetchAutoCommitOffset = FetchMaxBytesOffset + sizeof(uint);
+    private const int FetchTargetsCountOffset = FetchAutoCommitOffset + 1;
+
+    /// <summary>
+    ///     What a fetch (code 109) carries between its topic and its targets: the wait, the request timeout, the
+    ///     minimum count, the count, the byte limit, the commit flag and the target count.
+    /// </summary>
+    private const int FetchFieldsSize = FetchTargetsCountOffset + sizeof(uint);
+
+    /// <summary>
+    ///     A fetch target: the partition id, the strategy, its own byte limit, then its fence, the incarnation and
+    ///     the owner generation that a poll carries in its request header.
+    /// </summary>
+    private const int FetchTargetSize = PartitionStrategySize + sizeof(uint) + sizeof(ulong) + sizeof(ulong);
+
+    private const int FetchTargetStrategyOffset = sizeof(uint);
+    private const int FetchTargetMaxBytesOffset = PartitionStrategySize;
+    private const int FetchTargetFenceOffset = FetchTargetMaxBytesOffset + sizeof(uint);
+
     internal static byte[] LoginWithPersonalAccessToken(string token)
     {
-        Span<byte> bytes = stackalloc byte[5 + token.Length];
-        bytes[0] = (byte)token.Length;
-        Encoding.UTF8.GetBytes(token, bytes[1..(1 + token.Length)]);
+        var tokenLength = WireName.ByteCount(token, nameof(token));
+        Span<byte> bytes = stackalloc byte[5 + tokenLength];
+        bytes[0] = (byte)tokenLength;
+        Encoding.UTF8.GetBytes(token, bytes[1..(1 + tokenLength)]);
         return bytes.ToArray();
     }
 
     internal static byte[] DeletePersonalRequestToken(string name)
     {
-        Span<byte> bytes = stackalloc byte[5 + name.Length];
-        bytes[0] = (byte)name.Length;
-        Encoding.UTF8.GetBytes(name, bytes[1..(1 + name.Length)]);
+        var nameLength = WireName.ByteCount(name, nameof(name));
+        Span<byte> bytes = stackalloc byte[5 + nameLength];
+        bytes[0] = (byte)nameLength;
+        Encoding.UTF8.GetBytes(name, bytes[1..(1 + nameLength)]);
         return bytes.ToArray();
     }
 
     internal static byte[] CreatePersonalAccessToken(string name, ulong? expiry)
     {
-        Span<byte> bytes = stackalloc byte[1 + name.Length + 8];
-        bytes[0] = (byte)name.Length;
-        Encoding.UTF8.GetBytes(name, bytes[1..(1 + name.Length)]);
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(1 + name.Length)..], expiry ?? 0);
+        var nameLength = WireName.ByteCount(name, nameof(name));
+        Span<byte> bytes = stackalloc byte[1 + nameLength + 8];
+        bytes[0] = (byte)nameLength;
+        Encoding.UTF8.GetBytes(name, bytes[1..(1 + nameLength)]);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(1 + nameLength)..], expiry ?? 0);
         return bytes.ToArray();
     }
 
@@ -82,12 +144,10 @@ internal static class TcpContracts
     {
         var bytes = new List<byte>();
 
-        var usernameLength = (byte)userName.Length;
-        bytes.Add(usernameLength);
+        bytes.Add((byte)WireName.ByteCount(userName, nameof(userName)));
         bytes.AddRange(Encoding.UTF8.GetBytes(userName));
 
-        var passwordLength = (byte)password.Length;
-        bytes.Add(passwordLength);
+        bytes.Add((byte)WireName.ByteCount(password, nameof(password)));
         bytes.AddRange(Encoding.UTF8.GetBytes(password));
 
         if (!string.IsNullOrEmpty(version))
@@ -117,256 +177,151 @@ internal static class TcpContracts
 
     internal static byte[] ChangePassword(Identifier userId, string currentPassword, string newPassword)
     {
-        var length = userId.Length + 2 + currentPassword.Length + newPassword.Length + 2;
+        CredentialBounds.ValidatePassword(currentPassword);
+        CredentialBounds.ValidatePassword(newPassword);
+        var currentPasswordLength = Encoding.UTF8.GetByteCount(currentPassword);
+        var newPasswordLength = Encoding.UTF8.GetByteCount(newPassword);
+        var length = userId.Length + 2 + currentPasswordLength + newPasswordLength + 2;
         Span<byte> bytes = stackalloc byte[length];
 
         bytes.WriteBytesFromIdentifier(userId);
         var position = userId.Length + 2;
-        bytes[position] = (byte)currentPassword.Length;
+        bytes[position] = (byte)currentPasswordLength;
         position += 1;
-        Encoding.UTF8.GetBytes(currentPassword, bytes[position..(position + currentPassword.Length)]);
-        position += currentPassword.Length;
-        bytes[position] = (byte)newPassword.Length;
+        Encoding.UTF8.GetBytes(currentPassword, bytes[position..(position + currentPasswordLength)]);
+        position += currentPasswordLength;
+        bytes[position] = (byte)newPasswordLength;
         position += 1;
-        Encoding.UTF8.GetBytes(newPassword, bytes[position..(position + newPassword.Length)]);
+        Encoding.UTF8.GetBytes(newPassword, bytes[position..(position + newPasswordLength)]);
         return bytes.ToArray();
     }
 
     internal static byte[] UpdatePermissions(Identifier userId, Permissions? permissions)
     {
-        var length = userId.Length + 2 +
-                     (permissions is not null ? 1 + 4 + CalculatePermissionsSize(permissions) : 0);
-        Span<byte> bytes = stackalloc byte[length];
-        bytes.WriteBytesFromIdentifier(userId);
-        var position = userId.Length + 2;
-        if (permissions is not null)
-        {
-            bytes[position++] = 1;
-            var permissionsBytes = GetBytesFromPermissions(permissions);
-            BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)],
-                permissionsBytes.Length);
-            position += 4;
-            permissionsBytes.CopyTo(bytes[position..(position + permissionsBytes.Length)]);
-        }
-        else
-        {
-            bytes[position++] = 0;
-        }
-
-        return bytes.ToArray();
+        var permissionsBytes = permissions is not null ? GetBytesFromPermissions(permissions) : [];
+        var bytes = new byte[userId.Length + 2 + 1 + (permissions is not null ? 4 + permissionsBytes.Length : 0)];
+        bytes.AsSpan().WriteBytesFromIdentifier(userId);
+        WritePermissionsBlock(bytes.AsSpan(userId.Length + 2), permissions, permissionsBytes);
+        return bytes;
     }
 
-    internal static byte[] UpdateUser(Identifier userId, string? userName, UserStatus? status)
+    internal static byte[] UpdateUser(Identifier userId, OptionsPatch patch)
     {
-        var length = userId.Length + 2 + (userName?.Length ?? 0)
-                     + (status is not null ? 2 : 1) + 1 + 1;
-        Span<byte> bytes = stackalloc byte[length];
-
-        bytes.WriteBytesFromIdentifier(userId);
-        var position = userId.Length + 2;
-        if (userName is not null)
-        {
-            bytes[position] = 1;
-            position += 1;
-            bytes[position] = (byte)userName.Length;
-            position += 1;
-            Encoding.UTF8.GetBytes(userName,
-                bytes[position..(position + userName.Length)]);
-            position += userName.Length;
-        }
-        else
-        {
-            bytes[userId.Length] = 0;
-            position += 1;
-        }
-
-        if (status is not null)
-        {
-            bytes[position++] = 1;
-            bytes[position++] = (byte)status;
-        }
-        else
-        {
-            bytes[position++] = 0;
-        }
-
-        return bytes.ToArray();
+        return UpdateResource(patch, userId);
     }
 
     internal static byte[] CreateUser(string userName, string password, UserStatus status,
-        Permissions? permissions = null)
+        Permissions? permissions = null, IReadOnlyDictionary<string, HeaderValue>? options = null)
     {
-        var capacity = 3 + userName.Length + password.Length
-                       + (permissions is not null ? 1 + 4 + CalculatePermissionsSize(permissions) : 1);
-
-        Span<byte> bytes = stackalloc byte[capacity];
+        CredentialBounds.ValidateUsername(userName);
+        CredentialBounds.ValidatePassword(password);
+        var userNameLength = Encoding.UTF8.GetByteCount(userName);
+        var passwordLength = Encoding.UTF8.GetByteCount(password);
+        var permissionsBytes = permissions is not null ? GetBytesFromPermissions(permissions) : [];
+        var optionsBlock = OptionsBlock(options);
+        var bytes = new byte[3 + userNameLength + passwordLength + 1
+                             + (permissions is not null ? 4 + permissionsBytes.Length : 0) + optionsBlock.Length];
         var position = 0;
 
-        bytes[position++] = (byte)userName.Length;
-        position += Encoding.UTF8.GetBytes(userName, bytes[position..(position + userName.Length)]);
+        bytes[position++] = (byte)userNameLength;
+        position += Encoding.UTF8.GetBytes(userName, bytes.AsSpan(position, userNameLength));
 
-        bytes[position++] = (byte)password.Length;
-        position += Encoding.UTF8.GetBytes(password, bytes[position..(position + password.Length)]);
+        bytes[position++] = (byte)passwordLength;
+        position += Encoding.UTF8.GetBytes(password, bytes.AsSpan(position, passwordLength));
 
         bytes[position++] = (byte)status;
 
-        if (permissions is not null)
+        WritePermissionsBlock(bytes.AsSpan(position), permissions, permissionsBytes);
+        optionsBlock.CopyTo(bytes.AsSpan(bytes.Length - optionsBlock.Length));
+        return bytes;
+    }
+
+    private static void WritePermissionsBlock(Span<byte> destination, Permissions? permissions,
+        byte[] permissionsBytes)
+    {
+        if (permissions is null)
         {
-            bytes[position++] = 1;
-            var permissionsBytes = GetBytesFromPermissions(permissions);
-            BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], permissionsBytes.Length);
-            position += 4;
-            permissionsBytes.CopyTo(bytes[position..(position + permissionsBytes.Length)]);
-        }
-        else
-        {
-            bytes[position++] = 0;
+            destination[0] = 0;
+            return;
         }
 
-        return bytes.ToArray();
+        destination[0] = 1;
+        BinaryPrimitives.WriteInt32LittleEndian(destination[1..5], permissionsBytes.Length);
+        permissionsBytes.CopyTo(destination[5..]);
     }
 
     private static byte[] GetBytesFromPermissions(Permissions data)
     {
-        var size = CalculatePermissionsSize(data);
-        Span<byte> bytes = stackalloc byte[size];
+        var writer = new ArrayBufferWriter<byte>();
 
-        bytes[0] = data.Global.ManageServers ? (byte)1 : (byte)0;
-        bytes[1] = data.Global.ReadServers ? (byte)1 : (byte)0;
-        bytes[2] = data.Global.ManageUsers ? (byte)1 : (byte)0;
-        bytes[3] = data.Global.ReadUsers ? (byte)1 : (byte)0;
-        bytes[4] = data.Global.ManageStreams ? (byte)1 : (byte)0;
-        bytes[5] = data.Global.ReadStreams ? (byte)1 : (byte)0;
-        bytes[6] = data.Global.ManageTopics ? (byte)1 : (byte)0;
-        bytes[7] = data.Global.ReadTopics ? (byte)1 : (byte)0;
-        bytes[8] = data.Global.PollMessages ? (byte)1 : (byte)0;
-        bytes[9] = data.Global.SendMessages ? (byte)1 : (byte)0;
+        WriteFlag(writer, data.Global.ManageServers);
+        WriteFlag(writer, data.Global.ReadServers);
+        WriteFlag(writer, data.Global.ManageUsers);
+        WriteFlag(writer, data.Global.ReadUsers);
+        WriteFlag(writer, data.Global.ManageStreams);
+        WriteFlag(writer, data.Global.ReadStreams);
+        WriteFlag(writer, data.Global.ManageTopics);
+        WriteFlag(writer, data.Global.ReadTopics);
+        WriteFlag(writer, data.Global.PollMessages);
+        WriteFlag(writer, data.Global.SendMessages);
 
-
-        if (data.Streams is not null)
+        var hasStreams = data.Streams is { Count: > 0 };
+        WriteFlag(writer, hasStreams);
+        if (!hasStreams)
         {
-            var streamsCount = data.Streams.Count;
-            var currentStream = 1;
-            bytes[10] = 1;
-            var position = 11;
-            foreach (var (streamId, stream) in data.Streams)
+            return writer.WrittenSpan.ToArray();
+        }
+
+        var remainingStreams = data.Streams!.Count;
+        foreach (var (streamId, stream) in data.Streams)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(writer.GetSpan(4), streamId);
+            writer.Advance(4);
+            WriteFlag(writer, stream.ManageStream);
+            WriteFlag(writer, stream.ReadStream);
+            WriteFlag(writer, stream.ManageTopics);
+            WriteFlag(writer, stream.ReadTopics);
+            WriteFlag(writer, stream.PollMessages);
+            WriteFlag(writer, stream.SendMessages);
+
+            var hasTopics = stream.Topics is { Count: > 0 };
+            WriteFlag(writer, hasTopics);
+            if (hasTopics)
             {
-                BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], streamId);
-                position += 4;
-
-                bytes[position] = stream.ManageStream ? (byte)1 : (byte)0;
-                bytes[position + 1] = stream.ReadStream ? (byte)1 : (byte)0;
-                bytes[position + 2] = stream.ManageTopics ? (byte)1 : (byte)0;
-                bytes[position + 3] = stream.ReadTopics ? (byte)1 : (byte)0;
-                bytes[position + 4] = stream.PollMessages ? (byte)1 : (byte)0;
-                bytes[position + 5] = stream.SendMessages ? (byte)1 : (byte)0;
-                position += 6;
-
-                if (stream.Topics != null)
+                var remainingTopics = stream.Topics!.Count;
+                foreach (var (topicId, topic) in stream.Topics)
                 {
-                    var topicsCount = stream.Topics.Count;
-                    var currentTopic = 1;
-                    bytes[position] = 1;
-                    position += 1;
-
-                    foreach (var (topicId, topic) in stream.Topics)
-                    {
-                        BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], topicId);
-                        position += 4;
-
-                        bytes[position] = topic.ManageTopic ? (byte)1 : (byte)0;
-                        bytes[position + 1] = topic.ReadTopic ? (byte)1 : (byte)0;
-                        bytes[position + 2] = topic.PollMessages ? (byte)1 : (byte)0;
-                        bytes[position + 3] = topic.SendMessages ? (byte)1 : (byte)0;
-                        position += 4;
-                        if (currentTopic < topicsCount)
-                        {
-                            currentTopic++;
-                            bytes[position++] = 1;
-                        }
-                        else
-                        {
-                            bytes[position++] = 0;
-                        }
-                    }
-                }
-                else
-                {
-                    bytes[position++] = 0;
-                }
-
-                if (currentStream < streamsCount)
-                {
-                    currentStream++;
-                    bytes[position++] = 1;
-                }
-                else
-                {
-                    bytes[position++] = 0;
+                    BinaryPrimitives.WriteUInt32LittleEndian(writer.GetSpan(4), topicId);
+                    writer.Advance(4);
+                    WriteFlag(writer, topic.ManageTopic);
+                    WriteFlag(writer, topic.ReadTopic);
+                    WriteFlag(writer, topic.PollMessages);
+                    WriteFlag(writer, topic.SendMessages);
+                    WriteFlag(writer, --remainingTopics > 0);
                 }
             }
-        }
-        else
-        {
-            bytes[0] = 0;
+
+            WriteFlag(writer, --remainingStreams > 0);
         }
 
-        return bytes.ToArray();
+        return writer.WrittenSpan.ToArray();
     }
 
-    private static int CalculatePermissionsSize(Permissions data)
+    private static void WriteFlag(ArrayBufferWriter<byte> writer, bool value)
     {
-        var size = 10;
-
-        if (data.Streams is not null)
-        {
-            size += 1;
-            foreach (var (_, stream) in data.Streams)
-            {
-                size += 4;
-                size += 6;
-                size += 1;
-
-                if (stream.Topics is not null)
-                {
-                    size += 1;
-                    size += stream.Topics.Count * 9;
-                }
-                else
-                {
-                    size += 1;
-                }
-            }
-        }
-        else
-        {
-            size += 1;
-        }
-
-        return size;
+        writer.GetSpan(1)[0] = value ? (byte)1 : (byte)0;
+        writer.Advance(1);
     }
 
-    public static byte[] FlushUnsavedBuffer(Identifier streamId, Identifier topicId, uint partitionId, bool fsync)
-    {
-        var length = streamId.Length + 2 + topicId.Length + 2 + 4 + 1;
-        Span<byte> bytes = stackalloc byte[length];
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId);
-        var position = streamId.Length + 2 + topicId.Length + 2;
-        BinaryPrimitives.WriteUInt32LittleEndian(bytes[position..(position + 4)], partitionId);
-        bytes[position + 4] = fsync ? (byte)1 : (byte)0;
-
-        return bytes.ToArray();
-    }
-
+    /// <summary>
+    ///     Encodes a PollMessages body (code 100), or with <paramref name="deferred" /> a PollMessagesDeferred body
+    ///     (code 106): the same body followed by the wait, the minimum count, the byte limit and the request timeout.
+    /// </summary>
     internal static void GetMessages(Span<byte> bytes, Consumer consumer, Identifier streamId, Identifier topicId,
         PollingStrategy pollingStrategy,
-        uint count, bool autoCommit, uint? partitionId)
+        uint count, bool autoCommit, uint? partitionId, DeferredPollOptions? deferred = null)
     {
-        bytes[0] = GetConsumerTypeByte(consumer.Type);
-        bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
-        var position = 1 + consumer.ConsumerId.Length + 2;
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, position);
-        position += 2 + streamId.Length + 2 + topicId.Length;
+        var position = WriteConsumerStreamAndTopic(bytes, consumer, streamId, topicId);
 
         // Encode partition_id with a flag byte: 1 = Some, 0 = None
         if (partitionId.HasValue)
@@ -380,16 +335,161 @@ internal static class TcpContracts
             BinaryPrimitives.WriteUInt32LittleEndian(bytes[(position + 1)..(position + 5)], 0); // Padding
         }
 
-        bytes[position + 5] = GetPollingStrategyByte(pollingStrategy.Kind);
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 6)..(position + 14)], pollingStrategy.Value);
+        WritePollingStrategy(bytes[(position + 5)..], pollingStrategy);
         BinaryPrimitives.WriteUInt32LittleEndian(bytes[(position + 14)..(position + 18)], count);
 
         bytes[position + 18] = autoCommit ? (byte)1 : (byte)0;
+        if (deferred is not null)
+        {
+            var tail = bytes[(position + 19)..];
+            BinaryPrimitives.WriteUInt64LittleEndian(tail, deferred.MaxWaitUs);
+            BinaryPrimitives.WriteUInt32LittleEndian(tail[8..], deferred.MinCount);
+            BinaryPrimitives.WriteUInt32LittleEndian(tail[12..], deferred.MaxBytes);
+            BinaryPrimitives.WriteUInt64LittleEndian(tail[16..], deferred.RequestTimeoutUs);
+        }
     }
 
+    /// <summary>
+    ///     Encodes a FetchMessages body (code 109): the consumer, stream and topic as code 100 carries them, the
+    ///     budget and the limits of the whole reply, then each target with its position, the byte limit
+    ///     <paramref name="targetMaxBytes" /> and the fence of <see cref="PollingStrategy.Context" />.
+    /// </summary>
+    internal static byte[] FetchMessages(Consumer consumer, Identifier streamId, Identifier topicId,
+        DeferredPollOptions options, uint count, bool autoCommit, uint targetMaxBytes,
+        IReadOnlyList<(uint PartitionId, PollingStrategy Strategy)> targets)
+    {
+        var fieldsOffset = ConsumerStreamAndTopicSize(consumer, streamId, topicId);
+        var bytes = new byte[fieldsOffset + FetchFieldsSize + targets.Count * FetchTargetSize];
+        WriteConsumerStreamAndTopic(bytes, consumer, streamId, topicId);
+        var fields = bytes.AsSpan(fieldsOffset);
+        BinaryPrimitives.WriteUInt64LittleEndian(fields, options.MaxWaitUs);
+        BinaryPrimitives.WriteUInt64LittleEndian(fields[sizeof(ulong)..], options.RequestTimeoutUs);
+        BinaryPrimitives.WriteUInt32LittleEndian(fields[FetchMinCountOffset..], options.MinCount);
+        BinaryPrimitives.WriteUInt32LittleEndian(fields[FetchCountOffset..], count);
+        BinaryPrimitives.WriteUInt32LittleEndian(fields[FetchMaxBytesOffset..], options.MaxBytes);
+        fields[FetchAutoCommitOffset] = autoCommit ? (byte)1 : (byte)0;
+        BinaryPrimitives.WriteUInt32LittleEndian(fields[FetchTargetsCountOffset..], (uint)targets.Count);
+        var target = fields[FetchFieldsSize..];
+        foreach (var (partitionId, strategy) in targets)
+        {
+            var fence = strategy.Context ?? default;
+            BinaryPrimitives.WriteUInt32LittleEndian(target, partitionId);
+            WritePollingStrategy(target[FetchTargetStrategyOffset..], strategy);
+            BinaryPrimitives.WriteUInt32LittleEndian(target[FetchTargetMaxBytesOffset..], targetMaxBytes);
+            BinaryPrimitives.WriteUInt64LittleEndian(target[FetchTargetFenceOffset..], fence.Incarnation);
+            BinaryPrimitives.WriteUInt64LittleEndian(target[(FetchTargetFenceOffset + sizeof(ulong))..],
+                fence.OwnerGeneration);
+            target = target[FetchTargetSize..];
+        }
+
+        return bytes;
+    }
+
+    /// <summary>Whether a FetchMessages body commits the offsets of what it reads.</summary>
+    internal static bool FetchAutoCommits(ReadOnlySpan<byte> body)
+    {
+        return body[FetchFieldsOffset(body) + FetchAutoCommitOffset] != 0;
+    }
+
+    /// <summary>Whether a PollMessages, PollMessagesDeferred or FetchMessages body commits what it reads.</summary>
+    internal static bool ReadAutoCommits(int code, ReadOnlySpan<byte> body)
+    {
+        return code switch
+        {
+            CommandCodes.FETCH_MESSAGES_CODE => FetchAutoCommits(body),
+            CommandCodes.POLL_MESSAGES_DEFERRED_CODE => body.Length > DEFERRED_POLL_TAIL_SIZE
+                                                        && body[^(DEFERRED_POLL_TAIL_SIZE + 1)] != 0,
+            CommandCodes.POLL_MESSAGES_CODE => body.Length > 0 && body[^1] != 0,
+            _ => false
+        };
+    }
+
+    /// <summary>Whether a FetchMessages body moves its consumer: it commits, or a target starts at Next.</summary>
+    internal static bool FetchMovesConsumer(ReadOnlySpan<byte> body)
+    {
+        if (FetchAutoCommits(body))
+        {
+            return true;
+        }
+
+        var next = GetPollingStrategyByte(MessagePolling.Next);
+        for (var targets = FetchTargets(body); !targets.IsEmpty; targets = targets[FetchTargetSize..])
+        {
+            if (targets[FetchTargetStrategyOffset] == next)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>The partition and the incarnation of each target of a FetchMessages body, in body order.</summary>
+    internal static (uint PartitionId, ulong Incarnation)[] FetchTargetFences(ReadOnlySpan<byte> body)
+    {
+        var targets = FetchTargets(body);
+        var fences = new (uint PartitionId, ulong Incarnation)[targets.Length / FetchTargetSize];
+        for (var index = 0; index < fences.Length; index++)
+        {
+            var target = targets[(index * FetchTargetSize)..];
+            fences[index] = (BinaryPrimitives.ReadUInt32LittleEndian(target),
+                BinaryPrimitives.ReadUInt64LittleEndian(target[FetchTargetFenceOffset..]));
+        }
+
+        return fences;
+    }
+
+    private static ReadOnlySpan<byte> FetchTargets(ReadOnlySpan<byte> body)
+    {
+        return body[(FetchFieldsOffset(body) + FetchFieldsSize)..];
+    }
+
+    private static int FetchFieldsOffset(ReadOnlySpan<byte> body)
+    {
+        var streamId = ConsumerKindSize + IdentifierSize(body, ConsumerKindSize);
+        var topicId = streamId + IdentifierSize(body, streamId);
+        return topicId + IdentifierSize(body, topicId);
+    }
+
+    private static int IdentifierSize(ReadOnlySpan<byte> body, int position)
+    {
+        return IdentifierPrefixSize + body[position + 1];
+    }
+
+    private static int ConsumerStreamAndTopicSize(Consumer consumer, Identifier streamId, Identifier topicId)
+    {
+        return 1 + 2 + consumer.ConsumerId.Length + 2 + streamId.Length + 2 + topicId.Length;
+    }
+
+    private static int WriteConsumerStreamAndTopic(Span<byte> bytes, Consumer consumer, Identifier streamId,
+        Identifier topicId)
+    {
+        bytes[0] = GetConsumerTypeByte(consumer.Type);
+        bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
+        var position = 1 + consumer.ConsumerId.Length + 2;
+        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, position);
+        return position + 2 + streamId.Length + 2 + topicId.Length;
+    }
+
+    private static void WritePollingStrategy(Span<byte> bytes, PollingStrategy pollingStrategy)
+    {
+        bytes[0] = GetPollingStrategyByte(pollingStrategy.Kind);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[1..PollingStrategySize], pollingStrategy.Value);
+    }
+
+    /// <summary>
+    ///     Encodes a SendMessages body: routing metadata followed by one canonical batch record
+    ///     (a 256-byte batch header plus per-message frames). The server stamps
+    ///     <c>partition_id</c>, <c>base_offset</c>, and <c>base_timestamp</c>. They stay zero here.
+    /// </summary>
     internal static int CreateMessage(Span<byte> bytes, Identifier streamId, Identifier topicId,
         Partitioning partitioning, ReadOnlySpan<Message> messages, IMessageEncryptor? encryptor = null)
     {
+        if (messages.IsEmpty)
+        {
+            throw new ArgumentException("Batch must contain at least one message.", nameof(messages));
+        }
+
         var metadataLength = 2 + streamId.Length + 2 + topicId.Length + 2 + partitioning.Length + 4;
         BinaryPrimitives.WriteInt32LittleEndian(bytes[..4], metadataLength);
         bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, 4);
@@ -399,12 +499,26 @@ internal static class TcpContracts
         BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], messages.Length);
         position += 4;
 
-        var indexPosition = position;
-        position += 16 * messages.Length;
+        // The producer owns message ids: a zero id is minted before the frame checksum covers it.
+        var originTimestamp = ulong.MaxValue;
+        Span<byte> idBytes = stackalloc byte[16];
+        foreach (var message in messages)
+        {
+            if (message.Header.Id == 0)
+            {
+                Random.Shared.NextBytes(idBytes);
+                message.Header = message.Header with { Id = BinaryPrimitives.ReadUInt128LittleEndian(idBytes) };
+            }
+            originTimestamp = Math.Min(originTimestamp, message.Header.OriginTimestamp);
+        }
 
-        var msgSize = 0;
+        var batchStart = position;
+        bytes[batchStart..(batchStart + BatchWireFormat.BATCH_HEADER_SIZE)].Clear();
+        position += BatchWireFormat.BATCH_HEADER_SIZE;
+        var blobStart = position;
+        var offsetDelta = 0u;
 
-        // One scratch buffer reused across the batch (grown on demand); holds plaintext headers, so it is
+        // One scratch buffer reused across the batch (grown on demand). Holds plaintext headers, so it is
         // returned cleared on every path, including a mid-batch throw from the encryptor or header serialization.
         byte[]? headerScratch = null;
         try
@@ -412,7 +526,16 @@ internal static class TcpContracts
             foreach (var message in messages)
             {
                 var header = message.Header;
-                var payloadStart = position + 64;
+                var timestampDelta = header.OriginTimestamp - originTimestamp;
+                if (timestampDelta > uint.MaxValue)
+                {
+                    throw new ArgumentException(
+                        $"Message origin timestamp runs {timestampDelta} microseconds ahead of the batch's " +
+                        $"earliest one; the frame field holds at most {uint.MaxValue}.", nameof(messages));
+                }
+
+                var frameStart = position;
+                var payloadStart = frameStart + BatchWireFormat.FRAME_HEADER_SIZE;
 
                 int payloadLength;
                 if (encryptor is null)
@@ -476,26 +599,19 @@ internal static class TcpContracts
                     }
                 }
 
-                BinaryPrimitives.WriteUInt64LittleEndian(bytes[position..(position + 8)], 0);
-                BinaryPrimitives.WriteUInt128LittleEndian(bytes[(position + 8)..(position + 24)], header.Id);
-                BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 24)..(position + 32)], header.Offset);
-                BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 32)..(position + 40)],
-                    DateTimeOffsetUtils.ToUnixTimeMicroSeconds(header.Timestamp));
-                BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 40)..(position + 48)],
-                    header.OriginTimestamp);
-                BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 48)..(position + 52)], headersLength);
-                BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 52)..(position + 56)], payloadLength);
-                // Reserved must be zero on the wire; the server rejects non-zero values.
-                BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 56)..(position + 64)], 0);
+                BinaryPrimitives.WriteUInt128LittleEndian(bytes[(frameStart + 8)..(frameStart + 24)], header.Id);
+                BinaryPrimitives.WriteUInt32LittleEndian(bytes[(frameStart + 24)..(frameStart + 28)], offsetDelta);
+                BinaryPrimitives.WriteUInt32LittleEndian(bytes[(frameStart + 28)..(frameStart + 32)],
+                    (uint)timestampDelta);
+                BinaryPrimitives.WriteInt32LittleEndian(bytes[(frameStart + 32)..(frameStart + 36)], headersLength);
+                BinaryPrimitives.WriteInt32LittleEndian(bytes[(frameStart + 36)..(frameStart + 40)], payloadLength);
+                // Reserved must be zero on the wire. The server rejects non-zero values.
+                BinaryPrimitives.WriteUInt64LittleEndian(bytes[(frameStart + 40)..(frameStart + 48)], 0);
 
-                position += 64 + payloadLength + headersLength;
-
-                msgSize += 64 + payloadLength + headersLength;
-
-                BinaryPrimitives.WriteInt32LittleEndian(bytes[indexPosition..(indexPosition + 4)], 0);
-                BinaryPrimitives.WriteInt32LittleEndian(bytes[(indexPosition + 4)..(indexPosition + 8)], msgSize);
-                BinaryPrimitives.WriteInt64LittleEndian(bytes[(indexPosition + 8)..(indexPosition + 16)], 0);
-                indexPosition += 16;
+                position = headersStart + headersLength;
+                var frameChecksum = XxHash3.HashToUInt64(bytes[(frameStart + 8)..position]);
+                BinaryPrimitives.WriteUInt64LittleEndian(bytes[frameStart..(frameStart + 8)], frameChecksum);
+                offsetDelta++;
             }
         }
         finally
@@ -506,7 +622,36 @@ internal static class TcpContracts
             }
         }
 
+        var batchLength = (ulong)(BatchWireFormat.BATCH_HEADER_SIZE + (position - blobStart));
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(batchStart + 24)..(batchStart + 32)], originTimestamp);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(batchStart + 32)..(batchStart + 40)], batchLength);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes[(batchStart + 48)..(batchStart + 52)], (uint)messages.Length);
+        var batchChecksum = CalculateBatchChecksum(bytes, batchStart, blobStart, position);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(batchStart + 40)..(batchStart + 48)], batchChecksum);
+
         return position;
+    }
+
+    /// <summary>
+    ///     Batch checksum: XXH3-64 over the batch header meta fields followed by each frame's stored
+    ///     8-byte checksum field in message order. Bodies are bound transitively through the
+    ///     per-frame checksums. The header fields must already be backpatched into <paramref name="bytes" />.
+    /// </summary>
+    private static ulong CalculateBatchChecksum(ReadOnlySpan<byte> bytes, int batchStart, int blobStart, int blobEnd)
+    {
+        var hasher = new XxHash3();
+        hasher.Append(bytes.Slice(batchStart, 40));
+        hasher.Append(bytes.Slice(batchStart + 48, 4));
+        var cursor = blobStart;
+        while (cursor < blobEnd)
+        {
+            hasher.Append(bytes.Slice(cursor, 8));
+            var headersLength = BinaryPrimitives.ReadInt32LittleEndian(bytes[(cursor + 32)..(cursor + 36)]);
+            var payloadLength = BinaryPrimitives.ReadInt32LittleEndian(bytes[(cursor + 36)..(cursor + 40)]);
+            cursor += BatchWireFormat.FRAME_HEADER_SIZE + payloadLength + headersLength;
+        }
+
+        return hasher.GetCurrentHashAsUInt64();
     }
 
     internal static int HeadersByteLength(Dictionary<HeaderKey, HeaderValue>? headers)
@@ -568,30 +713,29 @@ internal static class TcpContracts
         }
     }
 
-    internal static byte[] CreateStream(string name)
+    internal static byte[] CreateStream(string name, IReadOnlyDictionary<string, HeaderValue>? options = null)
     {
-        Span<byte> bytes = stackalloc byte[name.Length + 1];
-        bytes[0] = (byte)name.Length;
-        Encoding.UTF8.GetBytes(name, bytes[1..]);
-        return bytes.ToArray();
+        var nameLength = WireName.ByteCount(name, nameof(name));
+        var optionsBlock = OptionsBlock(options);
+        var bytes = new byte[1 + nameLength + optionsBlock.Length];
+        bytes[0] = (byte)nameLength;
+        Encoding.UTF8.GetBytes(name, bytes.AsSpan(1, nameLength));
+        optionsBlock.CopyTo(bytes.AsSpan(1 + nameLength));
+        return bytes;
     }
 
-    internal static byte[] UpdateStream(Identifier streamId, string name)
+    internal static byte[] UpdateStream(Identifier streamId, OptionsPatch patch)
     {
-        Span<byte> bytes = stackalloc byte[streamId.Length + name.Length + 3];
-        bytes.WriteBytesFromIdentifier(streamId);
-        var position = 2 + streamId.Length;
-        bytes[position] = (byte)name.Length;
-        Encoding.UTF8.GetBytes(name, bytes[(position + 1)..]);
-        return bytes.ToArray();
+        return UpdateResource(patch, streamId);
     }
 
     internal static byte[] CreateGroup(Identifier streamId, Identifier topicId, string name)
     {
-        Span<byte> bytes = stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 1 + name.Length];
+        var nameLength = WireName.ByteCount(name, nameof(name));
+        Span<byte> bytes = stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 1 + nameLength];
         bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId);
         var position = 2 + streamId.Length + 2 + topicId.Length;
-        bytes[position] = (byte)name.Length;
+        bytes[position] = (byte)nameLength;
         Encoding.UTF8.GetBytes(name, bytes[(position + 1)..]);
         return bytes.ToArray();
     }
@@ -639,39 +783,88 @@ internal static class TcpContracts
         return bytes.ToArray();
     }
 
-    internal static byte[] UpdateTopic(Identifier streamId, Identifier topicId, string name,
-        CompressionAlgorithm compressionAlgorithm, ulong maxTopicSize, ulong messageExpiry, byte? replicationFactor)
+    internal static byte[] UpdateTopic(Identifier streamId, Identifier topicId, OptionsPatch patch)
     {
-        Span<byte> bytes = stackalloc byte[4 + streamId.Length + topicId.Length + 19 + name.Length];
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId);
-        var position = 4 + streamId.Length + topicId.Length;
-        bytes[position] = (byte)compressionAlgorithm;
-        position += 1;
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes[position..(position + 8)],
-            messageExpiry);
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 8)..(position + 16)],
-            maxTopicSize);
-        bytes[position + 16] = replicationFactor ?? 0;
-        bytes[position + 17] = (byte)name.Length;
-        Encoding.UTF8.GetBytes(name, bytes[(position + 18)..]);
-        return bytes.ToArray();
+        return UpdateResource(patch, streamId, topicId);
     }
 
     internal static byte[] CreateTopic(Identifier streamId, string name, uint partitionCount,
-        CompressionAlgorithm compressionAlgorithm, byte? replicationFactor, ulong messageExpiry,
-        ulong maxTopicSize)
+        IReadOnlyDictionary<string, HeaderValue>? options = null)
     {
-        Span<byte> bytes = stackalloc byte[2 + streamId.Length + 23 + name.Length];
-        bytes.WriteBytesFromIdentifier(streamId);
+        var nameLength = WireName.ByteCount(name, nameof(name));
+        var optionsBlock = OptionsBlock(options);
+        var bytes = new byte[2 + streamId.Length + 4 + 1 + nameLength + optionsBlock.Length];
+        bytes.AsSpan().WriteBytesFromIdentifier(streamId);
         var position = 2 + streamId.Length;
-        BinaryPrimitives.WriteUInt32LittleEndian(bytes[position..(position + 4)], partitionCount);
-        bytes[position + 4] = (byte)compressionAlgorithm;
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 5)..(position + 13)], messageExpiry);
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 13)..(position + 21)], maxTopicSize);
-        bytes[position + 21] = replicationFactor ?? 0;
-        bytes[position + 22] = (byte)name.Length;
-        Encoding.UTF8.GetBytes(name, bytes[(position + 23)..]);
-        return bytes.ToArray();
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position, 4), partitionCount);
+        position += 4;
+        bytes[position] = (byte)nameLength;
+        Encoding.UTF8.GetBytes(name, bytes.AsSpan(position + 1, nameLength));
+        optionsBlock.CopyTo(bytes.AsSpan(position + 1 + nameLength));
+        return bytes;
+    }
+
+    /// <summary>
+    ///     <c>[scope:u8][identifiers][reset_count:u8][reset_key:u8 len + name]*[options to end of body]</c>, the
+    ///     identifiers being the stream and topic, the stream, or the user the update targets.
+    /// </summary>
+    private static byte[] UpdateResource(OptionsPatch patch, params Identifier[] targets)
+    {
+        var optionsBlock = OptionsBlock(patch.Set);
+        var resetLength = patch.Reset.Sum(key => 1 + WireName.ByteCount(key, nameof(patch.Reset)));
+        var bytes = new byte[1 + targets.Sum(target => 2 + target.Length) + 1 + resetLength + optionsBlock.Length];
+        var position = 0;
+        bytes[position++] = (byte)patch.Scope;
+        foreach (var target in targets)
+        {
+            bytes.AsSpan().WriteBytesFromIdentifier(target, position);
+            position += 2 + target.Length;
+        }
+
+        bytes[position++] = (byte)patch.Reset.Count;
+        foreach (var key in patch.Reset)
+        {
+            bytes[position] = (byte)Encoding.UTF8.GetBytes(key, bytes.AsSpan(position + 1));
+            position += 1 + bytes[position];
+        }
+
+        optionsBlock.CopyTo(bytes.AsSpan(position));
+        return bytes;
+    }
+
+    /// <summary>
+    ///     An options block in ascending key byte order, the order the server writes its own blocks in, so a
+    ///     request is byte-identical to the one any other SDK sends for the same options.
+    /// </summary>
+    private static byte[] OptionsBlock(IReadOnlyDictionary<string, HeaderValue>? options)
+    {
+        if (options is null || options.Count == 0)
+        {
+            return [];
+        }
+
+        List<(HeaderKey Key, HeaderValue Value)> entries = options
+            .Select(option => (HeaderKey.FromString(option.Key), option.Value))
+            .ToList();
+        entries.Sort((left, right) => left.Key.Value.AsSpan().SequenceCompareTo(right.Key.Value));
+
+        var block = new byte[entries.Sum(entry => 1 + 4 + entry.Key.Value.Length + 1 + 4 + entry.Value.Value.Length)];
+        var position = 0;
+        foreach (var (key, value) in entries)
+        {
+            position = WriteOptionField(block, position, key.Kind, key.Value);
+            position = WriteOptionField(block, position, value.Kind, value.Value);
+        }
+
+        return block;
+    }
+
+    private static int WriteOptionField(byte[] block, int position, HeaderKind kind, byte[] value)
+    {
+        block[position] = HeaderKindToByte(kind);
+        BinaryPrimitives.WriteInt32LittleEndian(block.AsSpan(position + 1, 4), value.Length);
+        value.CopyTo(block, position + 5);
+        return position + 5 + value.Length;
     }
 
     internal static byte[] GetTopicById(Identifier streamId, Identifier topicId)
@@ -689,23 +882,11 @@ internal static class TcpContracts
         return bytes.ToArray();
     }
 
-    internal static byte[] PurgeTopic(Identifier streamId, Identifier topicId)
-    {
-        Span<byte> bytes = stackalloc byte[2 + streamId.Length + 2 + topicId.Length];
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId);
-        return bytes.ToArray();
-    }
-
     internal static byte[] UpdateOffset(Identifier streamId, Identifier topicId, Consumer consumer, ulong offset,
         uint? partitionId)
     {
-        Span<byte> bytes =
-            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 13 + 1 + 2 + consumer.ConsumerId.Length];
-        bytes[0] = GetConsumerTypeByte(consumer.Type);
-        bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
-        var position = 1 + consumer.ConsumerId.Length + 2;
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, position);
-        position += 2 + streamId.Length + 2 + topicId.Length;
+        Span<byte> bytes = stackalloc byte[ConsumerStreamAndTopicSize(consumer, streamId, topicId) + 14];
+        var position = WriteConsumerStreamAndTopic(bytes, consumer, streamId, topicId);
 
         // Encode partition_id with a flag byte: 1 = Some, 0 = None
         if (partitionId.HasValue)
@@ -720,18 +901,14 @@ internal static class TcpContracts
         }
 
         BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 5)..(position + 13)], offset);
+        bytes[position + 13] = AckQuorum;
         return bytes.ToArray();
     }
 
     internal static byte[] GetOffset(Identifier streamId, Identifier topicId, Consumer consumer, uint? partitionId)
     {
-        Span<byte> bytes =
-            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 5 + 1 + 2 + consumer.ConsumerId.Length];
-        bytes[0] = GetConsumerTypeByte(consumer.Type);
-        bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
-        var position = 1 + consumer.ConsumerId.Length + 2;
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, position);
-        position += 2 + streamId.Length + 2 + topicId.Length;
+        Span<byte> bytes = stackalloc byte[ConsumerStreamAndTopicSize(consumer, streamId, topicId) + 5];
+        var position = WriteConsumerStreamAndTopic(bytes, consumer, streamId, topicId);
 
         // Encode partition_id with a flag byte: 1 = Some, 0 = None
         if (partitionId.HasValue)
@@ -820,15 +997,50 @@ internal static class TcpContracts
         return bytes.ToArray();
     }
 
+    /// <summary>
+    ///     Encodes a validated metadata changes query:
+    ///     <c>[start:u8][cursor:44][has_since:u8][since:u64]?[has_until:u8][until:u64]?[limit:u32][groups_count:u8][group:u8]*[token_len:u16][token]</c>.
+    ///     The cursor is all zero unless the query starts after one, and groups keep the caller's order.
+    /// </summary>
+    internal static byte[] GetMetadataChanges(MetadataChangesQuery query)
+    {
+        var groups = query.Groups.Count > byte.MaxValue ? query.Groups.Distinct().ToArray() : query.Groups;
+        var groupsCount = groups.Count;
+        var token = query.Start.PageToken is { } pageToken ? pageToken.Payload : ReadOnlySpan<byte>.Empty;
+        var length = 1 + MetadataChangeCursor.SIZE + (query.Since.HasValue ? 9 : 1) + (query.Until.HasValue ? 9 : 1)
+                     + 4 + 1 + groupsCount + 2 + token.Length;
+        var bytes = new byte[length];
+        bytes[0] = (byte)query.Start.Mode;
+        query.Start.Cursor?.WriteTo(bytes.AsSpan(1, MetadataChangeCursor.SIZE));
+        var position = 1 + MetadataChangeCursor.SIZE;
+        foreach (var bound in new[] { query.Since, query.Until })
+        {
+            bytes[position++] = bound.HasValue ? (byte)1 : (byte)0;
+            if (bound is { } value)
+            {
+                BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(position, 8), value);
+                position += 8;
+            }
+        }
+
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position, 4), query.Limit);
+        position += 4;
+        bytes[position++] = (byte)groupsCount;
+        for (var index = 0; index < groupsCount; index++)
+        {
+            bytes[position++] = (byte)groups[index];
+        }
+
+        BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(position, 2), (ushort)token.Length);
+        position += 2;
+        token.CopyTo(bytes.AsSpan(position));
+        return bytes;
+    }
+
     internal static byte[] DeleteOffset(Identifier streamId, Identifier topicId, Consumer consumer, uint? partitionId)
     {
-        Span<byte> bytes =
-            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 5 + 1 + 2 + consumer.ConsumerId.Length];
-        bytes[0] = GetConsumerTypeByte(consumer.Type);
-        bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
-        var position = 1 + consumer.ConsumerId.Length + 2;
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, position);
-        position += 2 + streamId.Length + 2 + topicId.Length;
+        Span<byte> bytes = stackalloc byte[ConsumerStreamAndTopicSize(consumer, streamId, topicId) + 6];
+        var position = WriteConsumerStreamAndTopic(bytes, consumer, streamId, topicId);
 
         // Encode partition_id with a flag byte: 1 = Some, 0 = None
         if (partitionId.HasValue)
@@ -842,6 +1054,7 @@ internal static class TcpContracts
             BinaryPrimitives.WriteUInt32LittleEndian(bytes[(position + 1)..(position + 5)], 0); // Padding
         }
 
+        bytes[position + 5] = AckQuorum;
         return bytes.ToArray();
     }
 }

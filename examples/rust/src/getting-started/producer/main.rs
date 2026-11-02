@@ -54,7 +54,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 async fn init_system(client: &IggyClient) -> (u32, u32) {
-    let stream = match client.create_stream(STREAM_NAME).await {
+    let stream = match client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+    {
         Ok(stream) => {
             info!("Stream was created.");
             stream
@@ -73,11 +76,11 @@ async fn init_system(client: &IggyClient) -> (u32, u32) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
     {

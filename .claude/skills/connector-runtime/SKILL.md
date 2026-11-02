@@ -110,13 +110,15 @@ Don't mix.
 1. `iggy_source_handle(id, send_callback)` - plugin registers itself.
 2. Plugin polls + invokes `send_callback(plugin_id, ptr, len)`.
 3. Callback runs in the SDK macro's spawned async task. Pushes postcard `ProducedMessages` into a `flume` channel keyed by `plugin_id` in `SOURCE_SENDERS: Lazy<DashMap<u32, SourceSenderEntry>>` (`pub(crate)`). `SourceSenderEntry` wraps the sender + a pre-extracted owned `Counter` (the `errors` series, `Arc<AtomicU64>` inside). The FFI callback bumps errors on deserialize or channel-closed failure with one relaxed atomic - no `Family` lookup, no `Arc<Metrics>` handle.
-4. `source_forwarding_loop` pulls from the channel, deserializes, applies transforms, encodes via `StreamEncoder`, sends to Iggy producer.
-5. On success, save returned `ConnectorState` via `FileStateProvider`.
+4. The runtime registers the optional source-stop callback, then `source_forwarding_loop` pulls from the channel, deserializes, applies transforms, encodes via `StreamEncoder`, and sends to the Iggy producer. The SDK warns after 30 seconds without a result but keeps the same batch pending; it does not poll or enqueue another copy.
+5. On success, save returned `ConnectorState` via `FileStateProvider`, then return the batch result to the plugin. A result NACK may cause replay with capped backoff.
+6. A stop-callback reason ends the forwarding loop and reports an unexpected stop. Closing the stop channel on normal shutdown disables that select arm, allowing already queued batches to receive results before the forwarding channel disconnects.
+7. At loop exit, clean up `SOURCE_SENDERS` and update status and metrics. A self-stop reports `Error` and removes the source from the running gauge; normal shutdown reports `Stopped`.
 
 **Shutdown ordering (`manager/source.rs::stop_connector`):**
 
 1. Call `iggy_source_close` FIRST. It blocks until the plugin's polling task stops, so no new send callbacks fire after it returns.
-2. `cleanup_sender(plugin_id)` NEXT - dropping the channel sender makes the forwarding task's `recv_async()` resolve with `Disconnected` and exit cleanly, instead of blocking until the abort timeout.
+2. `cleanup_sender(plugin_id)` NEXT - dropping the channel sender lets the forwarding task finish any queued batches before `recv_async()` resolves with `Disconnected` and exits cleanly, instead of blocking until the abort timeout.
 3. Finally await spawned handlers with `tokio::time::timeout`. On timeout, `handle.abort()` + drain - prevents leaked tasks colliding with the next `start_connector` (a late `file.save()` could otherwise race the new instance). The silent-drop branch in `handle_produced_messages` only covers the window between close and cleanup.
 
 Gotchas:
@@ -131,7 +133,8 @@ Per `[[streams]]` entry per sink:
 
 1. Build / ensure consumer group `iggy-connect-sink-{key}` (`connect` matches the docker image name `apache/iggy-connect` - see `runtime/src/sink.rs::default_consumer_group`). Overridable via the stream config's `consumer_group`.
 2. Spawn one task per topic (`spawn_consume_tasks`).
-3. Poll Iggy → batch messages (default `batch_length = 1000`, `poll_interval = 5ms`). A `consumer.next()` `Err` (transport/decode at the Iggy client boundary) bumps `errors` and `continue`s - offset already auto-committed via `AutoCommit::When(AutoCommitWhen::PollingMessages)`, message effectively dropped.
+3. Poll Iggy → batch messages (default `batch_length = 1000`, the poll `count`). Polls use `CommitPolicy::OnRead`: the server stores the offset of each reply, so a reply lost after that store skips its batch. A `consumer.next()` `Err` (a `ReadError`) bumps `errors` and `continue`s.
+   The reader retries most errors by itself. For a partition that it stops, `handle_read_error` seeks: after a read with an unknown outcome (`FetchProgressUncertain`, `PartitionLaneBlocked`) it first calls `abandon_operation` and then seeks `Next` (after the stored offset). It seeks the `skip` of a message that does not decode, and `Next` after `HistoryUnavailable`.
 4. Decode via `Schema::decoder()`. Decode failure logs + bumps `errors`. `messages_filtered` is reserved for the transform filter contract (`Ok(None)`).
 5. Apply transforms (chain). A transform `Err` is logged, bumps `errors`, and drops only that message (drop-and-continue, mirroring the source) - one bad payload never kills the batch. `Ok(None)` filters the message - bumps `messages_filtered{connector_type="sink"}`.
 6. Postcard-encode batch as `RawMessages`. Headers as a separate postcard blob. Per-message failures (missing field, payload conversion, header serialization) bump `errors` + skip. Batch-level failures (postcard serialization of metadata / `RawMessages`) propagate `Err` -> `spawn_consume_tasks` wrapper bumps `errors` + `set_error`. The total histogram and benchmark emit still fire for the failed batch before the `Err` propagates.
@@ -144,8 +147,9 @@ Stages (both labels snake_case): `decode` (schema decode loop), `prepare` (trans
 
 Gotchas:
 
-- Batch flushes on `current_offset != message_offset` (gap) OR batch full - higher latency for low-volume topics.
-- Auto-commit happens on poll - idempotency at the sink protects against re-delivery on crash before plugin write.
+- Batch flushes when a message is the last one in its partition (`message_offset == current_offset`), when the batch is full, OR before a message of another partition, because the plugin gets one partition id per batch. `max_wait` and `min_count` on the stream make the server collect larger replies.
+- The server stores the offset on read (`OnRead`), so sink delivery is at-most-once while the primary stays up: a crash after the poll and before the plugin write loses that batch. A failover before the store replicates can deliver the last batch again.
+- A stop still flushes the batch the loop holds, and the task then awaits `IggyConsumer::shutdown`, which rewinds over the batches the consumer holds. Without either step, the next run skips messages that the polls committed.
 
 ## Logging format
 
@@ -211,17 +215,18 @@ Fatal errors propagate to `main` and exit. Per-connector / per-message errors ar
 
 All families labeled by `connector_key` + `connector_type` (histogram adds `stage`):
 
-- **Counters**: `iggy_connector_messages_{produced,sent,consumed,processed,filtered,errors}_total`.
+- **Counters**: `iggy_connector_messages_{produced,sent,consumed,processed,filtered}_total` and `iggy_connector_errors_total`. These are the *rendered* names; each is registered without the `_total`, which the OpenMetrics encoder appends.
   - `messages_filtered_total` - intentional drops via transform `Ok(None)`.
-  - `errors_total` - unexpected drops (decode/encode/build failure, missing field, ...) + batch-level failures.
-- **Histograms**: `iggy_connector_stage_duration_seconds{stage}` (snake_case stage labels - `prepare`, `ffi`, `decode`, `iggy_send`, `state_save`, `total`). Buckets `STAGE_BUCKETS_SECONDS`. Always populated regardless of any flag. Scraped at `/metrics` when `[http.metrics] enabled = true`.
+  - `errors_total` - unexpected drops (decode/encode/build failure, missing field, ...) + batch-level failures, one per failed run.
+  - `sink_runs_total` - FFI `consume()` calls for sink batches, one per contiguous payload-variant run. Divide by `stage_duration_seconds_count{stage="total"}` for runs per batch.
+- **Histograms**: `iggy_connector_stage_duration_seconds{stage}` (snake_case stage labels - `prepare`, `ffi`, `decode`, `iggy_send`, `state_save`, `total`). Buckets `STAGE_BUCKETS_SECONDS`. Always populated regardless of any flag. One sample per batch for every stage; `ffi` is summed over the batch's runs. Scraped at `/metrics` when `[http.metrics] enabled = true`.
 - **Gauges**: `iggy_connectors_{sources,sinks}_{total,running}`.
 
 `/stats` JSON surface mirrors counters per-connector via `ConnectorStats` (`sdk/api.rs`): `messages_filtered`, `errors`, kind-specific counters.
 
 When adding a metric:
 
-- Add family to `Metrics` struct + `init`, register with name + help text.
+- Add family to `Metrics` struct + `init`, register with name + help text. Never end a `Counter` family's registered name in `_total`: the encoder appends it and the series renders `_total_total`. Gauges get no suffix, so a gauge name may end in `_total` literally.
 - New label sets define `EncodeLabelSet` struct + label enum (hand-impl `EncodeLabelValue` for snake_case values - the derive emits PascalCase).
 - Histograms: pass `fn() -> Histogram` to `Family::new_with_constructor`.
 - Add unit tests under `mod tests` with `given_*_when_*_should_*` BDD names.

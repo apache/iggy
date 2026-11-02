@@ -24,14 +24,16 @@
 //!
 //! Not a general lock: single-threaded (`Cell`/`RefCell`, never `Sync`),
 //! release wakes every waiter and poll order re-races (arrival-order FIFO
-//! under `futures::join!`-style drivers), cancel-safe (dropping the guard
-//! releases; dropping a waiter leaves only a stale waker). Non-reentrant: a
-//! holder that re-acquires deadlocks itself.
+//! under `futures::join!`-style drivers). Dropping a borrowed guard releases;
+//! dropping a waiter leaves only a stale waker. An owned lease requires explicit
+//! release after physical completion: dropping it keeps the resource fenced.
+//! Non-reentrant: a holder that re-acquires deadlocks itself.
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
-/// See the module docs. Callers hold the returned guard across the awaited
-/// critical section; dropping it releases the gate and wakes every waiter.
+/// See the module docs. Borrowed guards release on drop; owned leases release
+/// explicitly after physical completion and otherwise keep the gate closed.
 ///
 /// Its exclusion is load-bearing in RELEASE, not only under
 /// `debug_assertions`: this gate is the only enforcement of the superblock
@@ -58,6 +60,48 @@ impl LocalGate {
     #[must_use = "acquire does nothing until awaited"]
     pub const fn acquire(&self) -> LocalGateAcquire<'_> {
         LocalGateAcquire { gate: self }
+    }
+
+    #[must_use]
+    pub const fn try_acquire(&self) -> Option<LocalGateGuard<'_>> {
+        if self.busy.replace(true) {
+            None
+        } else {
+            Some(LocalGateGuard { gate: self })
+        }
+    }
+
+    /// A dropped owned lease leaves the resource fenced. Only an owner that
+    /// observed physical completion may release it.
+    #[must_use]
+    pub fn try_acquire_owned(self: &Rc<Self>) -> Option<OwnedLocalGateGuard> {
+        if self.busy.replace(true) {
+            return None;
+        }
+        Some(OwnedLocalGateGuard {
+            gate: Rc::clone(self),
+        })
+    }
+
+    fn release(&self) {
+        self.busy.set(false);
+        // Move waiters out before waking: a waker that polls inline can
+        // re-enter acquire and borrow the waiter list again.
+        let waiters = std::mem::take(&mut *self.waiters.borrow_mut());
+        for waker in waiters {
+            waker.wake();
+        }
+    }
+}
+
+#[must_use = "release only after physical work has settled"]
+pub struct OwnedLocalGateGuard {
+    gate: Rc<LocalGate>,
+}
+
+impl OwnedLocalGateGuard {
+    pub fn release(self) {
+        self.gate.release();
     }
 }
 
@@ -103,14 +147,7 @@ pub struct LocalGateGuard<'a> {
 
 impl Drop for LocalGateGuard<'_> {
     fn drop(&mut self) {
-        self.gate.busy.set(false);
-        // Move the waiters out before waking: `wake()` only schedules under
-        // compio today, but a waker that ever polled a waiter inline would
-        // re-enter `acquire`'s `waiters.borrow_mut()` and panic the RefCell.
-        let waiters = std::mem::take(&mut *self.gate.waiters.borrow_mut());
-        for waker in waiters {
-            waker.wake();
-        }
+        self.gate.release();
     }
 }
 
@@ -119,7 +156,17 @@ mod tests {
     use super::*;
     use futures::FutureExt;
     use futures::future::join;
-    use std::rc::Rc;
+
+    #[test]
+    fn owned_lease_requires_explicit_settlement_before_reuse() {
+        let gate = Rc::new(LocalGate::new());
+        let held = gate.try_acquire_owned().unwrap();
+        assert!(gate.try_acquire_owned().is_none());
+        held.release();
+        let interrupted = gate.try_acquire_owned().unwrap();
+        drop(interrupted);
+        assert!(gate.try_acquire_owned().is_none());
+    }
 
     /// Two writers queued on the same gate run one after the other, never
     /// interleaved -- the property a torn superblock slot depends on.

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Net;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
@@ -24,20 +25,29 @@ using Apache.Iggy.IggyClient;
 using Reqnroll;
 using Shouldly;
 using TestContext = Apache.Iggy.Tests.BDD.Context.TestContext;
+using TestEnvironment = Apache.Iggy.Tests.BDD.Context.TestEnvironment;
 
 namespace Apache.Iggy.Tests.BDD.StepDefinitions;
 
 [Binding]
 public class LeaderRedirectionSteps
 {
-    private const string RootUsername = "iggy";
-    private const string RootPassword = "iggy";
-
     private readonly TestContext _context;
+    private IIggyClient? _streamClient;
 
     public LeaderRedirectionSteps(TestContext context)
     {
         _context = context;
+    }
+
+    // The single-server scenario shares its server with the other features, and this runs before the clients close.
+    [AfterScenario(Order = 0)]
+    public async Task DeleteCreatedStream()
+    {
+        if (_streamClient is not null && _context.LastStreamId is { } streamId)
+        {
+            await _streamClient.DeleteStreamAsync(Identifier.Numeric(streamId));
+        }
     }
 
     // ---------- Background ----------
@@ -140,11 +150,10 @@ public class LeaderRedirectionSteps
         {
             var client = GetClient(name);
             var initialAddress = client.GetCurrentAddress();
-            var result = await client.LoginUserAsync(RootUsername, RootPassword);
+            var result = await client.LoginUserAsync(TestEnvironment.RootUsername, TestEnvironment.RootPassword);
             result.ShouldNotBeNull("Failed to login as root");
 
-            // RedirectAsync runs inside LoginUserAsync; if address changed, redirection happened.
-            if (client.GetCurrentAddress() != initialAddress)
+            if (!await HaveSameEndpointAsync(client.GetCurrentAddress(), initialAddress))
             {
                 _context.RedirectionOccurred = true;
             }
@@ -164,6 +173,7 @@ public class LeaderRedirectionSteps
         var client = GetClient("main");
         var stream = await client.CreateStreamAsync(streamName);
         stream.ShouldNotBeNull("Should be able to create stream");
+        _streamClient = client;
         _context.LastStreamId = stream.Id;
     }
 
@@ -222,8 +232,10 @@ public class LeaderRedirectionSteps
         var clientA = GetClient("A");
         var clientB = GetClient("B");
 
-        clientA.GetCurrentAddress().ShouldBe(clientB.GetCurrentAddress(),
-            "Both clients should be connected to the same server");
+        var addressA = clientA.GetCurrentAddress();
+        var addressB = clientB.GetCurrentAddress();
+        (await HaveSameEndpointAsync(addressA, addressB))
+            .ShouldBeTrue($"Both clients should be connected to the same server, got {addressA} and {addressB}");
 
         await clientA.PingAsync();
         await clientB.PingAsync();
@@ -239,6 +251,26 @@ public class LeaderRedirectionSteps
     }
 
     // ---------- Helpers ----------
+
+    private static async Task<bool> HaveSameEndpointAsync(string left, string right)
+    {
+        static (string Host, int Port) Split(string address)
+        {
+            var separator = address.LastIndexOf(':');
+            return (address[..separator], int.Parse(address[(separator + 1)..]));
+        }
+
+        var (leftHost, leftPort) = Split(left);
+        var (rightHost, rightPort) = Split(right);
+        if (leftPort != rightPort)
+        {
+            return false;
+        }
+
+        var leftIps = await Dns.GetHostAddressesAsync(leftHost);
+        var rightIps = await Dns.GetHostAddressesAsync(rightHost);
+        return leftIps.Intersect(rightIps).Any();
+    }
 
     private string ResolveAddressForRole(string role) => role.ToLowerInvariant() switch
     {

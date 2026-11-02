@@ -24,8 +24,8 @@ use common::{
     header_only, install_dialed_replicas_locally, install_replicas_locally, loopback,
     set_replica_ctx,
 };
-use iggy_binary_protocol::Command2;
-use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
+use iggy_binary_protocol::Command;
+use message_bus::connector::start as start_connector;
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus};
 use std::cell::Cell;
@@ -61,7 +61,14 @@ async fn writer_batches_pipelined_sends_in_order() {
     set_replica_ctx(&bus0, CLUSTER, 0, 2, None);
     let on_reply: MessageHandler = Rc::new(|_, _| {});
     let dial_0 = install_dialed_replicas_locally(bus0.clone(), on_reply);
-    start_connector(&bus0, 0, vec![(1, addr1)], dial_0, DEFAULT_RECONNECT_PERIOD).await;
+    start_connector(
+        &bus0,
+        0,
+        vec![(1, addr1)],
+        dial_0,
+        bus0.config().reconnect_period,
+    )
+    .await;
 
     // Wait for connect.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -73,7 +80,7 @@ async fn writer_batches_pipelined_sends_in_order() {
     // Pipeline N sends back-to-back without yielding. The writer task
     // should drain many of them in single writev calls.
     for i in 0..N {
-        let msg = header_only(Command2::Prepare, i as u128, 0);
+        let msg = header_only(Command::Prepare, i as u128, 0);
         bus0.send_to_replica(1, msg.into_frozen())
             .await
             .expect("send should succeed - queue capacity is 256");

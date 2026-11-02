@@ -73,6 +73,44 @@ pub struct HttpCorsConfig {
     pub allow_private_network: bool,
 }
 
+impl HttpCorsConfig {
+    /// Whether `configure_cors` will turn this into `AllowOrigin::any()`.
+    ///
+    /// Only the first entry decides, because that is what the mapping below
+    /// reads. A `"*"` in any later position never reaches a served request:
+    /// `AllowOrigin::list` panics on a wildcard, so such a config takes the
+    /// process down at startup rather than allowing anything.
+    ///
+    /// Compared untrimmed, because `configure_cors` compares untrimmed: `" *"`
+    /// becomes a list entry no `Origin` matches, so it allows nothing and there
+    /// is nothing to warn about. `core/server/src/http.rs` trims before the same
+    /// comparison; porting that here means trimming in both places at once,
+    /// since trimming only this one would warn about a closed config and
+    /// trimming only the mapping would open one silently.
+    pub fn allows_any_origin(&self) -> bool {
+        self.allowed_origins
+            .first()
+            .is_some_and(|origin| origin == "*")
+    }
+
+    /// Whether the resulting policy admits an origin nobody owns, assuming one
+    /// gets built: a wildcard past the first position panics `configure_cors`,
+    /// so that shape warns and then dies.
+    ///
+    /// `*` is one. `null` is the other: a browser sends it from a sandboxed
+    /// iframe, a `data:` URL and a `file://` page, so listing it hands the
+    /// cross-origin read to whoever gets the operator to open a page.
+    /// `AllowOrigin::list` echoes any listed value back on a match, so a
+    /// `null` anywhere counts, not only first. Untrimmed for the reason above.
+    ///
+    /// Separate from `allows_any_origin` because `configure_cors` has to keep
+    /// mapping `["null"]` to a one-entry list rather than widening it, and
+    /// defined in terms of it so the two cannot disagree about `*`.
+    pub fn allows_unowned_origin(&self) -> bool {
+        self.allows_any_origin() || self.allowed_origins.iter().any(|origin| origin == "null")
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct HttpTlsConfig {
     pub enabled: bool,
@@ -111,7 +149,7 @@ pub fn map_connector_config(
 pub fn configure_cors(config: &HttpCorsConfig) -> CorsLayer {
     let allowed_origins = match &config.allowed_origins {
         origins if origins.is_empty() => AllowOrigin::default(),
-        origins if origins.first().unwrap() == "*" => AllowOrigin::any(),
+        _ if config.allows_any_origin() => AllowOrigin::any(),
         origins => AllowOrigin::list(origins.iter().map(|s| s.parse().unwrap())),
     };
 
@@ -221,5 +259,76 @@ impl std::fmt::Display for HttpCorsConfig {
             self.allow_credentials,
             self.allow_private_network
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cors(allowed_origins: &[&str]) -> HttpCorsConfig {
+        HttpCorsConfig {
+            allowed_origins: allowed_origins.iter().map(|s| (*s).to_owned()).collect(),
+            ..HttpCorsConfig::default()
+        }
+    }
+
+    #[test]
+    fn given_a_leading_wildcard_when_classified_should_allow_any_origin() {
+        assert!(cors(&["*"]).allows_any_origin());
+        assert!(cors(&["*"]).allows_unowned_origin());
+    }
+
+    #[test]
+    fn given_pinned_or_absent_origins_when_classified_should_allow_none() {
+        assert!(
+            !cors(&[]).allows_any_origin(),
+            "an empty list emits no header"
+        );
+        assert!(!cors(&[]).allows_unowned_origin());
+        assert!(!cors(&["https://console.example"]).allows_any_origin());
+        assert!(!cors(&["https://console.example"]).allows_unowned_origin());
+        assert!(
+            !cors(&["https://console.example", "*"]).allows_any_origin(),
+            "only the first entry reaches `AllowOrigin::any`; a later `*` makes \
+             `AllowOrigin::list` panic, so that config never serves a request"
+        );
+    }
+
+    #[test]
+    fn given_the_classified_origin_shapes_when_built_should_produce_a_layer() {
+        // The predicates above describe what `configure_cors` does with each
+        // shape, so a shape that cannot build would make the warning the last
+        // line an operator sees before the process dies.
+        for origins in [
+            &["*"][..],
+            &[][..],
+            &["https://console.example"][..],
+            &["null"][..],
+        ] {
+            let _layer = configure_cors(&cors(origins));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Wildcard origin")]
+    fn given_a_trailing_wildcard_when_built_should_panic_rather_than_allow_nothing() {
+        let _layer = configure_cors(&cors(&["https://console.example", "*"]));
+    }
+
+    #[test]
+    fn given_a_null_origin_when_classified_should_report_an_unowned_one() {
+        assert!(
+            cors(&["null"]).allows_unowned_origin(),
+            "a sandboxed iframe, a data: URL and a file:// page all send Origin: null"
+        );
+        assert!(
+            cors(&["https://console.example", "null"]).allows_unowned_origin(),
+            "`AllowOrigin::list` echoes any listed value, so position does not matter"
+        );
+        assert!(
+            !cors(&["null"]).allows_any_origin(),
+            "`configure_cors` still has to build a one-entry list, not widen to any()"
+        );
     }
 }

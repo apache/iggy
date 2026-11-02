@@ -32,7 +32,7 @@ namespace Apache.Iggy.Publishers;
 public partial class IggyPublisher : IAsyncDisposable
 {
     private readonly ILogger<IggyPublisher> _logger;
-    private bool _disposed;
+    private int _disposeState;
 
     /// <summary>
     ///     Gets the identifier of the stream this publisher sends messages to.
@@ -86,32 +86,45 @@ public partial class IggyPublisher : IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposeState, 1) == 1)
         {
             return;
         }
 
         LogDisposingPublisher();
 
-        if (BackgroundProcessor != null)
+        try
         {
-            await BackgroundProcessor.DisposeAsync();
-        }
-
-        if (Config.CreateIggyClient && IsInitialized)
-        {
-            try
+            if (BackgroundProcessor != null)
             {
-                await Client.LogoutUserAsync();
-                Client.Dispose();
-            }
-            catch (Exception e)
-            {
-                LogFailedToLogoutOrDispose(e);
+                await BackgroundProcessor.DisposeAsync();
             }
         }
+        finally
+        {
+            if (Config.CreateIggyClient)
+            {
+                try
+                {
+                    try
+                    {
+                        if (IsInitialized)
+                        {
+                            await Client.LogoutUserAsync();
+                        }
+                    }
+                    finally
+                    {
+                        Client.Dispose();
+                    }
+                }
+                catch (Exception e)
+                {
+                    LogFailedToLogoutOrDispose(e);
+                }
+            }
+        }
 
-        _disposed = true;
         LogPublisherDisposed();
     }
 
@@ -216,11 +229,11 @@ public partial class IggyPublisher : IAsyncDisposable
 
         if (Config.StreamId.Kind is IdKind.String)
         {
-            await Client.CreateStreamAsync(Config.StreamId.GetString(), ct);
+            await Client.CreateStreamAsync(Config.StreamId.GetString(), token: ct);
         }
         else
         {
-            await Client.CreateStreamAsync(Config.StreamName, ct);
+            await Client.CreateStreamAsync(Config.StreamName, token: ct);
         }
 
         LogStreamCreated(Config.StreamId);
@@ -247,18 +260,16 @@ public partial class IggyPublisher : IAsyncDisposable
 
         LogCreatingTopic(Config.TopicId, Config.TopicName, Config.StreamId);
 
-        if (Config.TopicId.Kind is IdKind.String)
+        var options = new TopicOptions
         {
-            await Client.CreateTopicAsync(Config.StreamId, Config.TopicId.GetString(),
-                Config.TopicPartitionsCount, Config.TopicCompressionAlgorithm, Config.TopicReplicationFactor,
-                Config.TopicMessageExpiry, Config.TopicMaxTopicSize, ct);
-        }
-        else
-        {
-            await Client.CreateTopicAsync(Config.StreamId, Config.TopicName, Config.TopicPartitionsCount,
-                Config.TopicCompressionAlgorithm, Config.TopicReplicationFactor,
-                Config.TopicMessageExpiry, Config.TopicMaxTopicSize, ct);
-        }
+            CompressionAlgorithm = Config.TopicCompressionAlgorithm == CompressionAlgorithm.None
+                ? null
+                : Config.TopicCompressionAlgorithm,
+            MessageExpiry = Config.TopicMessageExpiry,
+            MaxTopicSize = Config.TopicMaxTopicSize
+        };
+        var topicName = Config.TopicId.Kind is IdKind.String ? Config.TopicId.GetString() : Config.TopicName;
+        await Client.CreateTopicAsync(Config.StreamId, topicName, Config.TopicPartitionsCount, options, ct);
 
         LogTopicCreated(Config.TopicId, Config.StreamId);
     }

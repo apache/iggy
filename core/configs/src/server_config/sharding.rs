@@ -18,11 +18,12 @@
 //! Sharding config: the full thread-per-core + bus surface, with
 //! defaults read from the embedded `core/server/config.toml`.
 
-use iggy_common::IggyDuration;
-use iggy_common::Validatable;
+use std::time::Duration;
+
+use iggy_common::{IggyByteSize, IggyDuration, MAX_DEFERRED_POLL_WAIT_US, Validatable};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
-use std::time::Duration;
+use server_common::sharding::PARTITION_IO_CAPACITY_MAX;
 
 use super::defaults::SERVER_CONFIG;
 use crate::ConfigurationError;
@@ -33,8 +34,8 @@ use configs::ConfigEnv;
 // alongside the rest of the section.
 pub use cpu_allocation::{CpuAllocation, NumaConfig};
 
-/// Maximum permitted per-shard inbox depth. The channel is allocated
-/// up-front per shard, so a runaway value here OOMs the process at boot.
+/// Maximum permitted capacity of an inbox or completion lane on each shard.
+/// Channels are allocated at boot, so a runaway value can exhaust memory.
 /// `1 << 20` (~1M frames) is several orders of magnitude above any
 /// realistic backpressure target and still fits comfortably in process
 /// address space.
@@ -62,11 +63,15 @@ pub const SHUTDOWN_JOIN_TIMEOUT_MAX: Duration = Duration::from_secs(900);
 /// production values.
 pub const RECONCILE_PERIODIC_INTERVAL_MAX: Duration = Duration::from_secs(30);
 
+/// Hard upper bound on `deferred_poll_max_inflight_bytes`, the read memory
+/// that each shard can reserve for deferred polls.
+pub const DEFERRED_POLL_INFLIGHT_BYTES_MAX: u64 = 1024 * 1024 * 1024;
+
 // Every omitted field falls back to the frozen `Default`, so a partial
-// `[system.sharding]` table resolves each key independently instead of
+// `[sharding]` table resolves each key independently instead of
 // failing on the first missing one (parity with the legacy type).
 #[serde_as]
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 #[serde(default)]
 pub struct ShardingConfig {
     #[serde(default)]
@@ -83,22 +88,54 @@ pub struct ShardingConfig {
     /// `false` drops both the CPU and memory-node bindings (and logs a
     /// warning, since NUMA placement without pinning is meaningless).
     pub pin_cores: bool,
-    /// Per-shard inter-shard inbox channel capacity. Bounded by design.
-    /// Drops on full inbox of consensus frames are recovered by VSR
-    /// retransmit. Drops of cross-shard client Reply frames are terminal:
-    /// the client never receives the reply (no in-protocol retransmit).
-    /// Both frame classes share this one channel, so a consensus burst
-    /// can starve client-reply forwards: size against the worst-case sum
-    /// of consensus working set + peak client-reply fan-out per shard
-    /// occurring together.
-    ///
-    // TODO(hubcio): split into two priority lanes - one bounded queue for
-    // consensus frames (drops recovered by VSR retransmit) and one for
-    // client `Reply` frames (drops terminal, must be sized for worst-case
-    // fan-out). Current single-channel design is the minimum-viable
-    // wiring so `frame_drops_total{variant,reason}` surfaces under load
-    // and yields real numbers to size the split against.
+    /// Per-shard inter-shard inbox channel capacity (the main lane:
+    /// consensus frames, connection setup, reconcile wakes). Bounded by
+    /// design; drops of consensus frames on a full inbox are recovered by
+    /// VSR retransmit. Size against the consensus working set per shard.
     pub inbox_capacity: usize,
+    /// Capacity of the reply lane: the separate bounded channel carrying
+    /// cross-shard client `Reply` forwards, whose drops are terminal (no
+    /// in-protocol retransmit; the client never receives the reply). Split
+    /// from [`Self::inbox_capacity`] so a consensus burst cannot evict
+    /// reply forwards and each lane is sized for its own worst case: this
+    /// one against peak client-reply fan-out per shard.
+    pub reply_inbox_capacity: usize,
+    /// Maximum number of running disk polls plus queued completions per shard.
+    /// A read reserves a slot before I/O and retains it until the owner dequeues
+    /// or discards its result, including after a requester timeout. Exhaustion
+    /// rejects new disk polls before I/O. Main and reply inbox traffic uses
+    /// separate capacity. This counts operations, not retained message bytes.
+    pub poll_completion_capacity: usize,
+    /// Active partition file jobs and results awaiting owner acceptance.
+    pub partition_io_capacity: usize,
+    /// Retained job allocations, resolved at boot against the largest legal record.
+    /// Omission selects the single-job minimum, slightly above 4 GiB per shard.
+    /// This is an admission ceiling; memory is allocated only for admitted jobs.
+    /// Config validation checks representability; boot checks the minimum against
+    /// the compiled file-job layout.
+    #[config_env(leaf)]
+    pub partition_io_bytes_max: Option<IggyByteSize>,
+    /// Longest wait of a deferred poll or readiness wait. A longer requested
+    /// wait is shortened to it. At most 10 minutes.
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub deferred_poll_max_wait: IggyDuration,
+    /// Deferred polls and readiness waits parked on one shard. A request
+    /// above the limit is refused with a retryable error.
+    pub deferred_poll_max_pending: usize,
+    /// The part of [`Self::deferred_poll_max_pending`] that one session may
+    /// hold. An HTTP request without a binary session counts against its user.
+    pub deferred_poll_max_pending_per_session: usize,
+    /// The most disk bytes that one deferred poll reserves for its read: three
+    /// times its `max_bytes`, and at least three times the largest disk chunk
+    /// (1 MiB), up to this value. Its reply carries no more than this value, unless the
+    /// first message alone is wider.
+    #[config_env(leaf)]
+    pub deferred_poll_max_read_bytes: IggyByteSize,
+    /// Disk bytes that the deferred reads of one shard reserve together. A
+    /// read that finds no room waits for one. At most 1 GiB.
+    #[config_env(leaf)]
+    pub deferred_poll_max_inflight_bytes: IggyByteSize,
     /// Wall-clock budget for a single shard's bus drain on shutdown.
     /// Drives `IggyMessageBus::shutdown(..)` from the per-shard watchdog
     /// and the parallel-join survivor path. Sized larger than typical
@@ -143,28 +180,48 @@ impl Default for ShardingConfig {
     fn default() -> Self {
         Self {
             cpu_allocation: CpuAllocation::default(),
-            pin_cores: SERVER_CONFIG.system.sharding.pin_cores,
-            inbox_capacity: SERVER_CONFIG.system.sharding.inbox_capacity as usize,
+            pin_cores: SERVER_CONFIG.sharding.pin_cores,
+            inbox_capacity: SERVER_CONFIG.sharding.inbox_capacity as usize,
+            reply_inbox_capacity: SERVER_CONFIG.sharding.reply_inbox_capacity as usize,
+            poll_completion_capacity: SERVER_CONFIG.sharding.poll_completion_capacity as usize,
+            partition_io_capacity: SERVER_CONFIG.sharding.partition_io_capacity as usize,
+            partition_io_bytes_max: None,
+            deferred_poll_max_wait: SERVER_CONFIG
+                .sharding
+                .deferred_poll_max_wait
+                .parse()
+                .unwrap(),
+            deferred_poll_max_pending: SERVER_CONFIG.sharding.deferred_poll_max_pending as usize,
+            deferred_poll_max_pending_per_session: SERVER_CONFIG
+                .sharding
+                .deferred_poll_max_pending_per_session
+                as usize,
+            deferred_poll_max_read_bytes: SERVER_CONFIG
+                .sharding
+                .deferred_poll_max_read_bytes
+                .parse()
+                .unwrap(),
+            deferred_poll_max_inflight_bytes: SERVER_CONFIG
+                .sharding
+                .deferred_poll_max_inflight_bytes
+                .parse()
+                .unwrap(),
             shutdown_drain_timeout: SERVER_CONFIG
-                .system
                 .sharding
                 .shutdown_drain_timeout
                 .parse()
                 .unwrap(),
             shutdown_poll_interval: SERVER_CONFIG
-                .system
                 .sharding
                 .shutdown_poll_interval
                 .parse()
                 .unwrap(),
             shutdown_join_timeout: SERVER_CONFIG
-                .system
                 .sharding
                 .shutdown_join_timeout
                 .parse()
                 .unwrap(),
             reconcile_periodic_interval: SERVER_CONFIG
-                .system
                 .sharding
                 .reconcile_periodic_interval
                 .parse()
@@ -175,6 +232,24 @@ impl Default for ShardingConfig {
 
 impl Validatable<ConfigurationError> for ShardingConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
+        if self.partition_io_capacity == 0 || self.partition_io_capacity > PARTITION_IO_CAPACITY_MAX
+        {
+            eprintln!(
+                "Invalid sharding.partition_io_capacity: {} must be in 1..={PARTITION_IO_CAPACITY_MAX}",
+                self.partition_io_capacity
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if let Some(bytes) = self.partition_io_bytes_max
+            && (bytes.as_bytes_u64() == 0 || bytes.as_bytes_u64() > isize::MAX as u64)
+        {
+            eprintln!(
+                "Invalid sharding.partition_io_bytes_max: {} bytes must be in 1..={}",
+                bytes.as_bytes_u64(),
+                isize::MAX
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         if self.inbox_capacity == 0 {
             eprintln!(
                 "Invalid sharding configuration: inbox_capacity must be > 0 (crossfire silently \
@@ -188,6 +263,79 @@ impl Validatable<ConfigurationError> for ShardingConfig {
                  shard preallocates a channel of this size; oversizing here OOMs the process at \
                  boot)",
                 self.inbox_capacity, INBOX_CAPACITY_MAX
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.reply_inbox_capacity == 0 {
+            eprintln!(
+                "Invalid sharding configuration: reply_inbox_capacity must be > 0 (crossfire \
+                 silently rounds 0 to 1, masking config errors)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.reply_inbox_capacity > INBOX_CAPACITY_MAX {
+            eprintln!(
+                "Invalid sharding configuration: reply_inbox_capacity {} exceeds the {} cap \
+                 (each shard preallocates a channel of this size; oversizing here OOMs the \
+                 process at boot)",
+                self.reply_inbox_capacity, INBOX_CAPACITY_MAX
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.poll_completion_capacity == 0 {
+            eprintln!(
+                "Invalid sharding configuration: poll_completion_capacity must be > 0 \
+                 (each disk poll must reserve a completion slot before I/O)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.poll_completion_capacity > INBOX_CAPACITY_MAX {
+            eprintln!(
+                "Invalid sharding configuration: poll_completion_capacity {} exceeds the {} \
+                 cap (each shard preallocates a completion lane of this size)",
+                self.poll_completion_capacity, INBOX_CAPACITY_MAX
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        let max_wait = IggyDuration::from(Duration::from_micros(MAX_DEFERRED_POLL_WAIT_US));
+        if self.deferred_poll_max_wait.is_zero()
+            || self.deferred_poll_max_wait.get_duration() > max_wait.get_duration()
+        {
+            eprintln!(
+                "Invalid sharding.deferred_poll_max_wait: {} must be above 0 and at most {max_wait}",
+                self.deferred_poll_max_wait
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        let pending = self.deferred_poll_max_pending;
+        if pending == 0 || pending > INBOX_CAPACITY_MAX {
+            eprintln!(
+                "Invalid sharding.deferred_poll_max_pending: {pending} must be in 1..={INBOX_CAPACITY_MAX}"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        let per_session = self.deferred_poll_max_pending_per_session;
+        if per_session == 0 || per_session > pending {
+            eprintln!(
+                "Invalid sharding.deferred_poll_max_pending_per_session: {per_session} must be in \
+                 1..={pending} (deferred_poll_max_pending)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        let read_bytes = self.deferred_poll_max_read_bytes.as_bytes_u64();
+        let inflight_bytes = self.deferred_poll_max_inflight_bytes.as_bytes_u64();
+        if read_bytes == 0 || read_bytes > inflight_bytes {
+            eprintln!(
+                "Invalid sharding.deferred_poll_max_read_bytes: {read_bytes} bytes must be in \
+                 1..={inflight_bytes} (deferred_poll_max_inflight_bytes)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if inflight_bytes > DEFERRED_POLL_INFLIGHT_BYTES_MAX {
+            eprintln!(
+                "Invalid sharding.deferred_poll_max_inflight_bytes: {inflight_bytes} bytes must be \
+                 at most {DEFERRED_POLL_INFLIGHT_BYTES_MAX}"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -290,6 +438,101 @@ mod tests {
     }
 
     #[test]
+    fn partition_io_limits_preserve_omission_and_accept_explicit_env_mappings() {
+        let omitted: ShardingConfig = Figment::new()
+            .merge(Toml::string("inbox_capacity = 7"))
+            .extract()
+            .unwrap();
+        assert_eq!(omitted.partition_io_capacity, 16);
+        assert_eq!(omitted.partition_io_bytes_max, None);
+
+        let configured: ShardingConfig = Figment::new()
+            .merge(Toml::string(
+                "partition_io_capacity = 3\npartition_io_bytes_max = \"8 GiB\"",
+            ))
+            .extract()
+            .unwrap();
+        assert_eq!(configured.partition_io_capacity, 3);
+        assert_eq!(
+            configured.partition_io_bytes_max,
+            Some(IggyByteSize::from(8 * 1024 * 1024 * 1024))
+        );
+        assert!(configured.validate().is_ok());
+        let mappings = <ShardingConfig as configs::ConfigEnvMappings>::env_mappings();
+        for name in ["PARTITION_IO_CAPACITY", "PARTITION_IO_BYTES_MAX"] {
+            assert!(mappings.iter().any(|mapping| mapping.env_name == name));
+        }
+        for (capacity, bytes) in [
+            (0, None),
+            (PARTITION_IO_CAPACITY_MAX + 1, None),
+            (1, Some(IggyByteSize::from(0))),
+            (1, Some(IggyByteSize::from(u64::MAX))),
+        ] {
+            let invalid = ShardingConfig {
+                partition_io_capacity: capacity,
+                partition_io_bytes_max: bytes,
+                ..ShardingConfig::default()
+            };
+            assert!(
+                invalid.validate().is_err(),
+                "capacity={capacity}, bytes={bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_invalid_poll_completion_capacity_when_validated_should_reject() {
+        for capacity in [0, INBOX_CAPACITY_MAX + 1] {
+            let config = ShardingConfig {
+                poll_completion_capacity: capacity,
+                ..ShardingConfig::default()
+            };
+            assert!(config.validate().is_err(), "accepted capacity {capacity}");
+        }
+    }
+
+    #[test]
+    fn given_poll_completion_capacity_at_boundaries_when_validated_should_accept() {
+        for capacity in [1, INBOX_CAPACITY_MAX] {
+            let config = ShardingConfig {
+                poll_completion_capacity: capacity,
+                ..ShardingConfig::default()
+            };
+            assert!(config.validate().is_ok(), "rejected capacity {capacity}");
+        }
+    }
+
+    #[test]
+    fn given_legacy_inbox_settings_when_deserialized_should_default_poll_completion_capacity() {
+        let sharding: ShardingConfig = Figment::new()
+            .merge(Toml::string(
+                "inbox_capacity = 7\nreply_inbox_capacity = 11",
+            ))
+            .extract()
+            .expect("existing inbox settings remain valid without the new field");
+
+        assert_eq!(sharding.inbox_capacity, 7);
+        assert_eq!(sharding.reply_inbox_capacity, 11);
+        assert_eq!(sharding.poll_completion_capacity, 1024);
+        assert!(sharding.validate().is_ok());
+    }
+
+    #[test]
+    fn given_explicit_poll_completion_capacity_when_deserialized_should_use_independent_limit() {
+        let sharding: ShardingConfig = Figment::new()
+            .merge(Toml::string(
+                "inbox_capacity = 7\nreply_inbox_capacity = 11\npoll_completion_capacity = 17",
+            ))
+            .extract()
+            .expect("completion capacity can be configured independently");
+
+        assert_eq!(sharding.inbox_capacity, 7);
+        assert_eq!(sharding.reply_inbox_capacity, 11);
+        assert_eq!(sharding.poll_completion_capacity, 17);
+        assert!(sharding.validate().is_ok());
+    }
+
+    #[test]
     fn zero_drain_is_rejected() {
         let cfg = ShardingConfig {
             shutdown_drain_timeout: IggyDuration::new(Duration::ZERO),
@@ -382,9 +625,11 @@ mod tests {
             .expect("embedded TOML deserializes");
         config.validate().expect("embedded config validates");
 
-        let sharding = &config.system.sharding;
+        let sharding = &config.sharding;
         assert!(sharding.pin_cores);
-        assert_eq!(sharding.inbox_capacity, 1024);
+        assert_eq!(sharding.inbox_capacity, 65536);
+        assert_eq!(sharding.reply_inbox_capacity, 1024);
+        assert_eq!(sharding.poll_completion_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
         assert_eq!(sharding.shutdown_poll_interval, "50 ms".parse().unwrap());
         assert_eq!(sharding.shutdown_join_timeout, "30 s".parse().unwrap());
@@ -402,7 +647,9 @@ mod tests {
             .expect("partial sharding table deserializes");
 
         assert!(!sharding.pin_cores);
-        assert_eq!(sharding.inbox_capacity, 1024);
+        assert_eq!(sharding.inbox_capacity, 65536);
+        assert_eq!(sharding.reply_inbox_capacity, 1024);
+        assert_eq!(sharding.poll_completion_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
         assert_eq!(sharding.shutdown_poll_interval, "50 ms".parse().unwrap());
         assert_eq!(sharding.shutdown_join_timeout, "30 s".parse().unwrap());
@@ -417,7 +664,9 @@ mod tests {
             .expect("empty sharding table deserializes");
 
         assert!(sharding.pin_cores);
-        assert_eq!(sharding.inbox_capacity, 1024);
+        assert_eq!(sharding.inbox_capacity, 65536);
+        assert_eq!(sharding.reply_inbox_capacity, 1024);
+        assert_eq!(sharding.poll_completion_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
         assert_eq!(sharding.shutdown_poll_interval, "50 ms".parse().unwrap());
         assert_eq!(sharding.shutdown_join_timeout, "30 s".parse().unwrap());

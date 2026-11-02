@@ -19,11 +19,11 @@ namespace Apache.Iggy.Tests.Utils.Streams;
 
 internal static class StreamFactory
 {
-    internal static (uint id, int topicsCount, ulong sizeBytes, ulong messagesCount, string name, ulong createdAt)
+    internal static (uint id, uint topicsCount, ulong sizeBytes, ulong messagesCount, string name, ulong createdAt)
         CreateStreamsResponseFields()
     {
         var id = (uint)Random.Shared.Next(1, 69);
-        var topicsCount = Random.Shared.Next(1, 69);
+        var topicsCount = (uint)Random.Shared.Next(1, 69);
         var sizeBytes = (ulong)Random.Shared.Next(69, 42069);
         var messageCount = (ulong)Random.Shared.Next(2, 3);
         var name = "Stream " + Random.Shared.Next(1, 4) + Utility.RandomString(3).ToLower();

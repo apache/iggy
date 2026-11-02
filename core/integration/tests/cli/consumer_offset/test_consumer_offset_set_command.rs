@@ -96,7 +96,9 @@ impl TestConsumerOffsetSetCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestConsumerOffsetSetCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name).await;
+        let stream = client
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
         let stream_details = stream.unwrap();
         self.stream_id = stream_details.id;
@@ -105,11 +107,11 @@ impl IggyCmdTestCase for TestConsumerOffsetSetCmd {
             .create_topic(
                 &self.stream_id.try_into().unwrap(),
                 &self.topic_name,
-                1,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await;
         assert!(topic.is_ok());
@@ -335,11 +337,12 @@ Arguments:
 
 Options:
   -k, --kind <KIND>
-          Consumer kind: "consumer" for regular consumer, "consumer_group" for consumer group
+          Consumer kind: "consumer" for regular consumer, "consumer-group" for consumer group, "external-group" for a group managed outside Iggy
 
           Possible values:
           - consumer:       `Consumer` represents a regular consumer
           - consumer-group: `ConsumerGroup` represents a consumer group
+          - external-group: `ExternalGroup` holds the offsets of a group managed outside Iggy, such as a Kafka group
 {CLAP_INDENT}
           [default: consumer]
 
@@ -372,7 +375,8 @@ Arguments:
   <OFFSET>        Offset to set
 
 Options:
-  -k, --kind <KIND>  Consumer kind: "consumer" for regular consumer, "consumer_group" for consumer group [default: consumer] [possible values: consumer, consumer-group]
+  -k, --kind <KIND>  Consumer kind: "consumer" for regular consumer, "consumer-group" for consumer group, "external-group" for a group managed outside Iggy [default: consumer] [possible values:
+                     consumer, consumer-group, external-group]
   -h, --help         Print help (see more with '--help')
 "#,
             ),

@@ -20,16 +20,18 @@
 package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.Unpooled;
-import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.async.UsersClient;
 import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.serde.BytesDeserializer;
+import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserInfo;
 import org.apache.iggy.user.UserInfoDetails;
+import org.apache.iggy.user.UserOptions;
 import org.apache.iggy.user.UserStatus;
+import org.apache.iggy.user.UserUpdate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,6 +40,10 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
+import static org.apache.iggy.serde.BytesSerializer.MAX_PASSWORD_LENGTH;
+import static org.apache.iggy.serde.BytesSerializer.MAX_USERNAME_LENGTH;
+import static org.apache.iggy.serde.BytesSerializer.MIN_PASSWORD_LENGTH;
+import static org.apache.iggy.serde.BytesSerializer.MIN_USERNAME_LENGTH;
 import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
 /**
@@ -77,19 +83,12 @@ public class UsersTcpClient implements UsersClient {
 
     @Override
     public CompletableFuture<UserInfoDetails> createUser(
-            String username, String password, UserStatus status, Optional<Permissions> permissions) {
-        var payload = Unpooled.buffer();
-        payload.writeBytes(toBytes(username));
-        payload.writeBytes(toBytes(password));
-        payload.writeByte(status.asCode());
-        permissions.ifPresentOrElse(
-                perms -> {
-                    payload.writeByte(1);
-                    var permissionBytes = toBytes(perms);
-                    payload.writeIntLE(permissionBytes.readableBytes());
-                    payload.writeBytes(permissionBytes);
-                },
-                () -> payload.writeByte(0));
+            String username,
+            String password,
+            UserStatus status,
+            Optional<Permissions> permissions,
+            UserOptions options) {
+        var payload = BytesSerializer.toCreateUser(username, password, status, permissions, options.entries());
 
         return connection().exchangeForEntity(CommandCode.User.CREATE, payload, BytesDeserializer::readUserInfoDetails);
     }
@@ -101,22 +100,10 @@ public class UsersTcpClient implements UsersClient {
     }
 
     @Override
-    public CompletableFuture<Void> updateUser(UserId userId, Optional<String> username, Optional<UserStatus> status) {
-        var payload = toBytes(userId);
-        username.ifPresentOrElse(
-                un -> {
-                    payload.writeByte(1);
-                    payload.writeBytes(toBytes(un));
-                },
-                () -> payload.writeByte(0));
-        status.ifPresentOrElse(
-                s -> {
-                    payload.writeByte(1);
-                    payload.writeByte(s.asCode());
-                },
-                () -> payload.writeByte(0));
+    public CompletableFuture<Void> updateUser(UserId userId, UserUpdate update) {
+        var payload = BytesSerializer.toUpdateResource(userId, update);
 
-        return connection().sendAndRelease(CommandCode.User.UPDATE, payload);
+        return connection().sendAndRelease(CommandCode.System.UPDATE_RESOURCE, payload);
     }
 
     @Override
@@ -138,53 +125,58 @@ public class UsersTcpClient implements UsersClient {
     @Override
     public CompletableFuture<Void> changePassword(UserId userId, String currentPassword, String newPassword) {
         var payload = toBytes(userId);
-        payload.writeBytes(toBytes(currentPassword));
-        payload.writeBytes(toBytes(newPassword));
+        payload.writeBytes(toBytes(currentPassword, "current password", MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH));
+        payload.writeBytes(toBytes(newPassword, "new password", MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH));
 
         return connection().sendAndRelease(CommandCode.User.CHANGE_PASSWORD, payload);
     }
 
     @Override
     public CompletableFuture<IdentityInfo> login(String username, String password) {
-        return routingHook.loginOnLeader(() -> loginWithoutRedirect(username, password));
+        return routingHook.loginOnLeader(deadline -> loginWithoutRedirect(username, password, deadline));
     }
 
-    private CompletableFuture<IdentityInfo> loginWithoutRedirect(String username, String password) {
-        String version = IggyVersion.getInstance().getUserAgent();
-        String context = IggyVersion.getInstance().toString();
-
-        var payload = Unpooled.buffer();
-        var usernameBytes = toBytes(username);
-        var passwordBytes = toBytes(password);
-
-        payload.writeBytes(usernameBytes);
-        payload.writeBytes(passwordBytes);
-        payload.writeIntLE(version.length());
-        payload.writeBytes(version.getBytes());
-        payload.writeIntLE(context.length());
-        payload.writeBytes(context.getBytes());
+    CompletableFuture<IdentityInfo> loginWithoutRedirect(String username, String password, long deadline) {
+        // The VSR codec re-frames this into a Register and carries the SDK
+        // version itself, so the payload is only the two credentials.
+        var payload = toBytes(username, "username", MIN_USERNAME_LENGTH, MAX_USERNAME_LENGTH);
+        try {
+            var encodedPassword = toBytes(password, "password", MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH);
+            try {
+                payload.writeBytes(encodedPassword);
+            } finally {
+                encodedPassword.release();
+            }
+        } catch (RuntimeException invalidCredentials) {
+            payload.release();
+            throw invalidCredentials;
+        }
 
         log.debug("Logging in user: {}", username);
 
-        return connection().send(CommandCode.User.LOGIN.getValue(), payload).thenApply(response -> {
-            try {
-                var userId = response.readUnsignedIntLE();
-                return new IdentityInfo(userId, Optional.empty());
-            } finally {
-                response.release();
-            }
-        });
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.User.LOGIN.getValue(), payload, deadline), response -> {
+                    try {
+                        var userId = response.readUnsignedIntLE();
+                        return new IdentityInfo(userId, Optional.empty());
+                    } finally {
+                        response.release();
+                    }
+                });
     }
 
     @Override
     public CompletableFuture<Void> logout() {
+        Runnable forgetLogin = routingHook.logoutCompletion();
         var payload = Unpooled.buffer(0); // Empty payload for logout
 
         log.debug("Logging out");
 
-        return connection().send(CommandCode.User.LOGOUT.getValue(), payload).thenAccept(response -> {
+        return AsyncTcpConnection.mapResponse(connection().send(CommandCode.User.LOGOUT, payload), response -> {
             response.release();
+            forgetLogin.run();
             log.debug("Logged out successfully");
+            return null;
         });
     }
 }

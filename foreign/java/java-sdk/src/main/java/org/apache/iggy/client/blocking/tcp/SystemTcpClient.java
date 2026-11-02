@@ -23,6 +23,10 @@ import org.apache.iggy.client.blocking.SystemClient;
 import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
+import org.apache.iggy.system.MetadataChanges;
+import org.apache.iggy.system.MetadataChangesQuery;
+import org.apache.iggy.system.OptionSpec;
+import org.apache.iggy.system.OptionsScope;
 import org.apache.iggy.system.Stats;
 
 import java.util.List;
@@ -43,6 +47,16 @@ final class SystemTcpClient implements SystemClient {
     @Override
     public ClusterMetadata getClusterMetadata() {
         return FutureUtil.resolve(delegate.getClusterMetadata());
+    }
+
+    @Override
+    public List<OptionSpec> describeOptions(OptionsScope scope) {
+        return FutureUtil.resolve(delegate.describeOptions(scope));
+    }
+
+    @Override
+    public MetadataChanges getMetadataChanges(MetadataChangesQuery query) {
+        return FutureUtil.resolve(delegate.getMetadataChanges(query));
     }
 
     @Override

@@ -50,57 +50,80 @@ use crate::client_listener::RequestHandler;
 use crate::fd_transfer::{self, DupedFd};
 use crate::installer::conn_info::ClientConnMeta;
 use crate::replica::listener::MessageHandler;
-use crate::{ClientConnectionLostFn, IggyMessageBus, ReplicaHandshakeDoneFn};
+use crate::{
+    BusMessage, ClientConnectionLostFn, ConnectionPermit, IggyMessageBus, InstanceToken,
+    ReplicaHandshakeDoneFn, ReplicaLinkId, SendError, SharedTlsServerConfig,
+};
 use std::rc::Rc;
+use std::time::Instant;
 use tracing::warn;
 
 /// Operations a shard needs to perform on its local bus when the router
 /// receives an inter-shard connection-setup frame.
 ///
-/// The production implementation is on `Rc<IggyMessageBus>`. The simulator
-/// does not exercise this path; if it ever does, add a no-op impl on
-/// `SharedSimOutbox`.
+/// The production implementation is on `Rc<IggyMessageBus>`.
 pub trait ConnectionInstaller {
-    /// Wrap a blind-delegated inbound replica fd into a `TcpStream` on
-    /// the local compio runtime, run the acceptor handshake in a spawned
-    /// task (bounded by `handshake_grace`), and register the connection
-    /// on this shard on success. `on_done` is the shard-0 outcome ack;
-    /// the install path fires it exactly once, on every exit path.
+    /// Wrap a delegated inbound replica fd into a `TcpStream` on the
+    /// local compio runtime, run the acceptor handshake in a spawned task
+    /// that ends by `deadline` (set by shard 0 when it took the in-flight
+    /// slot), and register the connection on this shard as `link` on
+    /// success. Shard 0 read the placement
+    /// preamble and nothing else, so `link` names the peer and the link
+    /// the hello must announce. `on_done` is the shard-0 outcome ack; the
+    /// install path fires it exactly once, on every exit path.
     ///
     /// Takes ownership of `fd`. On any failure the fd is closed by
     /// dropping the wrapping `TcpStream`.
     fn install_replica_inbound_fd(
         &self,
         fd: DupedFd,
+        link: ReplicaLinkId,
+        deadline: Instant,
         on_message: MessageHandler,
         on_done: ReplicaHandshakeDoneFn,
     );
 
-    /// Same for a delegated outbound replica connection: runs the dialer
-    /// handshake half toward the configured `replica_id`.
+    /// Same for a delegated outbound replica link: writes the placement
+    /// preamble and runs the dialer handshake half toward `link.replica`.
     fn install_replica_outbound_fd(
         &self,
         fd: DupedFd,
-        replica_id: u8,
+        link: ReplicaLinkId,
         on_message: MessageHandler,
         on_done: ReplicaHandshakeDoneFn,
     );
 
-    /// Release a shard-0 in-flight inbound handshake slot. Routed here
-    /// when shard 0's router processes the owning shard's
-    /// handshake-outcome ack. Idempotent (the slot may have expired).
-    fn release_replica_handshake_slot(&self, slot: u64);
+    /// Shard 0: an inbound handshake of `link` finished. Releases its
+    /// in-flight slot and refreshes the bundle of the peer. Idempotent
+    /// (the slot may have expired).
+    fn replica_inbound_handshake_done(&self, slot: u64, link: ReplicaLinkId);
 
-    /// Clear a shard-0 pending-dial entry. Routed here when shard 0's
-    /// router processes the owning shard's handshake-outcome ack.
+    /// Shard 0: an outbound handshake of `link` finished. Clears its
+    /// pending-dial entry and refreshes the bundle of the peer.
     /// Idempotent (the entry may have expired).
-    fn clear_replica_dial_pending(&self, replica_id: u8);
+    fn replica_outbound_handshake_done(&self, link: ReplicaLinkId);
+
+    /// Shard 0: an installed link closed on its owner shard. See
+    /// [`IggyMessageBus::replica_link_closed`].
+    fn replica_link_closed(&self, link: ReplicaLinkId);
+
+    /// Owner shard: close `link` if this shard still holds it in the epoch
+    /// of `link`. See [`IggyMessageBus::close_replica_link`].
+    fn close_replica_link(&self, link: ReplicaLinkId);
 
     /// Same for an SDK client connection. The owning shard is already
     /// encoded in the top 16 bits of `meta.client_id`. `meta` is stored
     /// on the bus and exposed via [`IggyMessageBus::client_meta`] for
-    /// the lifetime of the connection.
-    fn install_client_fd(&self, fd: DupedFd, meta: ClientConnMeta, on_request: RequestHandler);
+    /// the lifetime of the connection. `permit` is the socket's slot in
+    /// the node's connection cap, and the install holds it until the socket
+    /// closes.
+    fn install_client_fd(
+        &self,
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        permit: ConnectionPermit,
+        on_request: RequestHandler,
+    );
 
     /// Same for an SDK WebSocket client's pre-upgrade TCP fd. The
     /// receiving shard wraps the fd, runs
@@ -111,7 +134,35 @@ pub trait ConnectionInstaller {
     /// the fd is closed by dropping the wrapping `TcpStream`. No
     /// subprotocol negotiation: the caller (the server) gates command
     /// access via the LOGIN allowlist.
-    fn install_client_ws_fd(&self, fd: DupedFd, meta: ClientConnMeta, on_request: RequestHandler);
+    fn install_client_ws_fd(
+        &self,
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        permit: ConnectionPermit,
+        on_request: RequestHandler,
+    );
+
+    /// Wrap an unhandshaken TCP-TLS fd on this runtime and install its
+    /// transport task. The task owns the handshake, I/O and cleanup.
+    fn install_client_tcp_tls_fd(
+        &self,
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
+        on_request: RequestHandler,
+    );
+
+    /// Install an unhandshaken WSS fd on this runtime. TLS and the WebSocket
+    /// upgrade share the existing `handshake_grace` deadline in the task.
+    fn install_client_wss_fd(
+        &self,
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
+        on_request: RequestHandler,
+    );
 
     /// Per-connection metadata stored at install time, or `None` if the client
     /// is not (or no longer) connected on this bus. Dispatch reads `peer_addr`
@@ -121,44 +172,96 @@ pub trait ConnectionInstaller {
     /// Register the callback fired when a client connection is lost, so
     /// dispatch can drive session removal + logout on disconnect.
     fn set_client_connection_lost_fn(&self, f: ClientConnectionLostFn);
+
+    /// The installation serving `client_id` on this shard, captured when its
+    /// request arrives. `None` when no connection is installed under it here.
+    fn client_instance(&self, client_id: u128) -> Option<InstanceToken>;
+
+    /// Deliver a reply to the installation [`Self::client_instance`] captured
+    /// on this bus. A stale or missing installation refuses it with
+    /// `ClientNotFound`, so the reply never reaches, or closes on refusal, a
+    /// later connection under the same id.
+    fn send_to_client_instance(
+        &self,
+        client_id: u128,
+        instance: Option<InstanceToken>,
+        message: BusMessage,
+    ) -> impl Future<Output = Result<(), SendError>>;
+
+    /// [`Self::send_to_client_instance`] that waits for room in a full queue
+    /// instead of closing the connection, until the bus's write stall timeout
+    /// closes it. A bus whose queues never fill sends at once.
+    fn send_to_client_instance_waiting(
+        &self,
+        client_id: u128,
+        instance: Option<InstanceToken>,
+        message: BusMessage,
+    ) -> impl Future<Output = Result<(), SendError>> {
+        self.send_to_client_instance(client_id, instance, message)
+    }
 }
 
 impl ConnectionInstaller for Rc<IggyMessageBus> {
     fn install_replica_inbound_fd(
         &self,
         fd: DupedFd,
+        link: ReplicaLinkId,
+        deadline: Instant,
         on_message: MessageHandler,
         on_done: ReplicaHandshakeDoneFn,
     ) {
         let stream = fd_transfer::wrap_duped_fd(fd);
-        install_replica_inbound(self, stream, on_message, on_done);
+        install_replica_inbound(self, stream, link, deadline, on_message, on_done);
     }
 
     fn install_replica_outbound_fd(
         &self,
         fd: DupedFd,
-        replica_id: u8,
+        link: ReplicaLinkId,
         on_message: MessageHandler,
         on_done: ReplicaHandshakeDoneFn,
     ) {
         let stream = fd_transfer::wrap_duped_fd(fd);
-        install_replica_outbound(self, replica_id, stream, on_message, on_done);
+        install_replica_outbound(self, link, stream, on_message, on_done);
     }
 
-    fn release_replica_handshake_slot(&self, slot: u64) {
-        IggyMessageBus::release_replica_handshake_slot(self, slot);
+    fn replica_inbound_handshake_done(&self, slot: u64, link: ReplicaLinkId) {
+        self.release_replica_handshake_slot(slot);
+        self.refresh_replica_bundle(link.replica);
     }
 
-    fn clear_replica_dial_pending(&self, replica_id: u8) {
-        self.clear_dial_pending(replica_id);
+    fn replica_outbound_handshake_done(&self, link: ReplicaLinkId) {
+        self.clear_dial_pending(link.replica, link.link);
+        self.refresh_replica_bundle(link.replica);
     }
 
-    fn install_client_fd(&self, fd: DupedFd, meta: ClientConnMeta, on_request: RequestHandler) {
+    // Fully qualified: the inherent methods share the trait method names.
+    fn replica_link_closed(&self, link: ReplicaLinkId) {
+        IggyMessageBus::replica_link_closed(self, link);
+    }
+
+    fn close_replica_link(&self, link: ReplicaLinkId) {
+        IggyMessageBus::close_replica_link(self, link);
+    }
+
+    fn install_client_fd(
+        &self,
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        permit: ConnectionPermit,
+        on_request: RequestHandler,
+    ) {
         let stream = fd_transfer::wrap_duped_fd(fd);
-        install_client_tcp(self, meta, stream, on_request);
+        install_client_tcp(self, meta, stream, permit, on_request);
     }
 
-    fn install_client_ws_fd(&self, fd: DupedFd, meta: ClientConnMeta, on_request: RequestHandler) {
+    fn install_client_ws_fd(
+        &self,
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        permit: ConnectionPermit,
+        on_request: RequestHandler,
+    ) {
         let stream = fd_transfer::wrap_duped_fd(fd);
         let bus = Self::clone(self);
         let cfg = bus.config();
@@ -173,11 +276,7 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
             )
             .await;
             match outcome {
-                Ok(Ok(ws)) => {
-                    if !bus.is_shutting_down() {
-                        install_client_ws(&bus, meta, ws, on_request);
-                    }
-                }
+                Ok(Ok(ws)) => install_client_ws(&bus, meta, ws, permit, on_request),
                 Ok(Err(e)) => {
                     warn!(client_id = meta.client_id, "WS upgrade failed: {e}");
                 }
@@ -193,11 +292,59 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
         self.track_background(handle);
     }
 
+    fn install_client_tcp_tls_fd(
+        &self,
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
+        on_request: RequestHandler,
+    ) {
+        let stream = fd_transfer::wrap_duped_fd(fd);
+        install_client_tcp_tls(self, meta, stream, config, permit, on_request);
+    }
+
+    fn install_client_wss_fd(
+        &self,
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
+        on_request: RequestHandler,
+    ) {
+        let stream = fd_transfer::wrap_duped_fd(fd);
+        install_client_wss(self, meta, stream, config, permit, on_request);
+    }
+
     fn client_meta(&self, client_id: u128) -> Option<Rc<ClientConnMeta>> {
         IggyMessageBus::client_meta(self, client_id)
     }
 
     fn set_client_connection_lost_fn(&self, f: ClientConnectionLostFn) {
         IggyMessageBus::set_client_connection_lost_fn(self, f);
+    }
+
+    fn client_instance(&self, client_id: u128) -> Option<InstanceToken> {
+        IggyMessageBus::client_instance(self, client_id)
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn send_to_client_instance(
+        &self,
+        client_id: u128,
+        instance: Option<InstanceToken>,
+        message: BusMessage,
+    ) -> Result<(), SendError> {
+        IggyMessageBus::send_to_client_instance(self, client_id, instance, message)
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn send_to_client_instance_waiting(
+        &self,
+        client_id: u128,
+        instance: Option<InstanceToken>,
+        message: BusMessage,
+    ) -> Result<(), SendError> {
+        IggyMessageBus::send_to_client_instance_waiting(self, client_id, instance, message).await
     }
 }

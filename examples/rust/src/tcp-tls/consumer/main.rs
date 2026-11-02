@@ -25,7 +25,9 @@
 //     IGGY_TCP_TLS_ENABLED=true \
 //     IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
 //     IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
-//     cargo run --bin iggy-server
+//     cargo run --bin iggy-server -- --with-default-root-credentials
+//   Use local test certificates and credentials with disposable development state.
+//   Environment credentials take precedence; recovered credentials are unchanged.
 //
 // Run this example (from repo root):
 //   cargo run --example tcp-tls-consumer -p iggy_examples
@@ -96,11 +98,13 @@ async fn consume_messages(client: &dyn Client) -> Result<(), Box<dyn Error>> {
             .poll_messages(
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &consumer,
                 &PollingStrategy::offset(offset),
-                messages_per_batch,
-                false,
+                PollOptions {
+                    count: messages_per_batch,
+                    ..PollOptions::default()
+                },
             )
             .await?;
 

@@ -41,9 +41,9 @@ def running_server(context):
 
 
 @given("I am authenticated as the root user")
-def authenticated_root_user(context):
+def authenticated_root_user(context, root_credentials):
     async def login():
-        await context.client.login_user("iggy", "iggy")
+        await context.client.login_user(*root_credentials)
 
     asyncio.run(login())
 
@@ -54,6 +54,26 @@ def send_raw_command(context, code):
         try:
             context.last_raw_response = await context.client.send_binary_request(
                 code, b""
+            )
+            context.last_raw_error = None
+        except RuntimeError as error:
+            context.last_raw_response = None
+            context.last_raw_error = error
+
+    asyncio.run(send())
+
+
+@when(
+    parsers.parse(
+        "I send a raw command with code {code:d} "
+        "and an empty payload to replica {replica:d}"
+    )
+)
+def send_raw_command_to_replica(context, code, replica):
+    async def send():
+        try:
+            context.last_raw_response = (
+                await context.client.send_binary_request_to_replica(code, b"", replica)
             )
             context.last_raw_error = None
         except RuntimeError as error:
@@ -80,3 +100,10 @@ def raw_command_fails_with_invalid_command(context):
     assert context.last_raw_response is None
     assert context.last_raw_error is not None
     assert "invalid command" in str(context.last_raw_error).lower()
+
+
+@then("the raw command should fail with an invalid identifier error")
+def raw_command_fails_with_invalid_identifier(context):
+    assert context.last_raw_response is None
+    assert context.last_raw_error is not None
+    assert "invalid identifier" in str(context.last_raw_error).lower()

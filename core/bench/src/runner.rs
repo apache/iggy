@@ -22,7 +22,7 @@ use crate::plot::{ChartType, plot_chart};
 use crate::utils::cpu_name::append_cpu_name_lowercase;
 use crate::utils::{collect_server_logs_and_save_to_file, params_from_args_and_metrics};
 use bench_report::hardware::BenchmarkHardware;
-use iggy::prelude::{Client, IggyClient, IggyError, UserClient};
+use iggy::prelude::IggyError;
 use std::path::Path;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -64,12 +64,7 @@ impl BenchmarkRunner {
         info!("All actors joined!");
 
         let client_factory = benchmark.client_factory();
-        let admin_client_wrapper = client_factory.create_client().await;
-        let admin_client = IggyClient::create(admin_client_wrapper, None, None);
-        admin_client.connect().await?;
-        admin_client
-            .login_user(client_factory.username(), client_factory.password())
-            .await?;
+        let admin_client = client_factory.create_authenticated_client().await?;
 
         let hardware =
             BenchmarkHardware::get_system_info_with_identifier(benchmark.args().identifier());

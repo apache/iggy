@@ -21,8 +21,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 
+	"github.com/apache/iggy/bdd/go/tests/env"
 	"github.com/apache/iggy/foreign/go/client"
 	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -52,10 +52,7 @@ type basicMessagingSteps struct{}
 
 func (s basicMessagingSteps) givenRunningServer(ctx context.Context) error {
 	c := getBasicMessagingCtx(ctx)
-	addr := os.Getenv("IGGY_TCP_ADDRESS")
-	if addr == "" {
-		addr = "127.0.0.1:8090"
-	}
+	addr := env.ServerAddress()
 	c.serverAddr = &addr
 	return nil
 }
@@ -80,7 +77,8 @@ func (s basicMessagingSteps) givenAuthenticationAsRoot(ctx context.Context) erro
 		return fmt.Errorf("error pinging client: %w", err)
 	}
 
-	if _, err = cli.LoginUser(ctx, "iggy", "iggy"); err != nil {
+	username, password := env.RootCredentials()
+	if _, err = cli.LoginUser(ctx, username, password); err != nil {
 		return fmt.Errorf("error logging in: %v", err)
 	}
 
@@ -136,15 +134,16 @@ func (s basicMessagingSteps) whenPollMessages(
 	streamIdentifier, _ := iggcon.NewIdentifier(streamID)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicID)
 	uint32PartitionID := partitionID
+	options := iggcon.DefaultPollOptions()
+	options.Count = 100
 	polledMessages, err := c.client.PollMessages(
 		ctx,
 		streamIdentifier,
 		topicIdentifier,
+		uint32PartitionID,
 		consumer,
 		iggcon.OffsetPollingStrategy(startOffset),
-		100,
-		false,
-		&uint32PartitionID,
+		options,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to poll messages: %w", err)
@@ -230,7 +229,7 @@ func (s basicMessagingSteps) givenNoStreams(ctx context.Context) error {
 
 func (s basicMessagingSteps) whenCreateStream(ctx context.Context, streamName string) error {
 	c := getBasicMessagingCtx(ctx)
-	stream, err := c.client.CreateStream(ctx, streamName)
+	stream, err := c.client.CreateStream(ctx, streamName, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create stream: %w", err)
 	}
@@ -261,15 +260,12 @@ func (s basicMessagingSteps) whenCreateTopic(ctx context.Context,
 	partitionsCount uint32) error {
 	c := getBasicMessagingCtx(ctx)
 	streamIdentifier, _ := iggcon.NewIdentifier(streamID)
+	expiry := iggcon.IggyExpiryNeverExpire
 	topic, err := c.client.CreateTopic(
 		ctx,
 		streamIdentifier,
 		topicName,
-		partitionsCount,
-		iggcon.CompressionAlgorithmNone,
-		iggcon.IggyExpiryNeverExpire,
-		0,
-		nil,
+		&iggcon.TopicOptions{PartitionsCount: &partitionsCount, MessageExpiry: &expiry},
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create topic: %w", err)

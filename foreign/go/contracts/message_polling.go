@@ -17,9 +17,42 @@
 
 package iggcon
 
+import ierror "github.com/apache/iggy/foreign/go/errors"
+
 type PollingStrategy struct {
 	Kind  MessagePolling
 	Value uint64
+	// Context is the partition incarnation and owner a continuation offset was
+	// polled under. A stale context refuses the poll instead of reading that
+	// offset in another incarnation. Nil takes the context the route reports.
+	Context *PartitionContext
+	// partition binds a continuation to the partition that it continues.
+	partition *uint32
+}
+
+// Partition is the partition of a continuation, which a poll or a seek of
+// another partition refuses.
+func (s PollingStrategy) Partition() (uint32, bool) {
+	if s.partition == nil {
+		return 0, false
+	}
+	return *s.partition, true
+}
+
+// RequirePartition refuses a continuation of another partition with
+// ierror.ErrInvalidCommand.
+func (s PollingStrategy) RequirePartition(partition uint32) error {
+	if s.partition != nil && *s.partition != partition {
+		return ierror.ErrInvalidCommand
+	}
+	return nil
+}
+
+// WithContext continues at an offset under the incarnation and owner that
+// produced it, as PolledMessage.Context reports them.
+func (s PollingStrategy) WithContext(context PartitionContext) PollingStrategy {
+	s.Context = &context
+	return s
 }
 
 type MessagePolling byte

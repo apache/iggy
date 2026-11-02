@@ -36,13 +36,13 @@ func TestClusterMetadataUnmarshalBinaryRejectsOversizedName(t *testing.T) {
 func TestClusterNodeUnmarshalBinaryRejectsOversizedLengths(t *testing.T) {
 	tests := map[string][]byte{
 		"name": func() []byte {
-			payload := make([]byte, 10)
-			binary.LittleEndian.PutUint32(payload, math.MaxUint32)
+			payload := make([]byte, 19)
+			binary.LittleEndian.PutUint32(payload[1:], math.MaxUint32)
 			return payload
 		}(),
 		"IP": func() []byte {
-			payload := make([]byte, 14)
-			binary.LittleEndian.PutUint32(payload[4:], math.MaxUint32)
+			payload := make([]byte, 19)
+			binary.LittleEndian.PutUint32(payload[5:], math.MaxUint32)
 			return payload
 		}(),
 	}
@@ -54,5 +54,53 @@ func TestClusterNodeUnmarshalBinaryRejectsOversizedLengths(t *testing.T) {
 				t.Fatal("expected an error for an oversized field")
 			}
 		})
+	}
+}
+
+func TestClusterMetadataPreservesReplicaIDsIndependentOfOrder(t *testing.T) {
+	want := ClusterMetadata{Name: "cluster", Nodes: []ClusterNode{
+		{ReplicaID: 2, Name: "third", IP: "127.0.0.3", Endpoints: TransportEndpoints{Tcp: 8090}, Role: RoleFollower, Status: Healthy},
+		{ReplicaID: 0, Name: "first", IP: "127.0.0.1", Endpoints: TransportEndpoints{Tcp: 8091}, Role: RoleLeader, Status: Healthy},
+	}}
+	body, err := want.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body[4+len(want.Name)+4] != 2 {
+		t.Fatal("node encoding must begin with configured replica id")
+	}
+	var got ClusterMetadata
+	if err := got.UnmarshalBinary(body); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Nodes) != 2 || got.Nodes[0] != want.Nodes[0] || got.Nodes[1] != want.Nodes[1] {
+		t.Fatalf("replica ids or fields changed: %#v", got)
+	}
+}
+
+func TestPartitionRouteRequiresItsExactWireLayout(t *testing.T) {
+	body := binary.LittleEndian.AppendUint64(nil, 17)
+	body = binary.LittleEndian.AppendUint64(body, 42)
+	body = binary.LittleEndian.AppendUint32(body, 7)
+	body = binary.LittleEndian.AppendUint32(body, 3)
+	body = append(body, 2)
+	var route PartitionRoute
+	if err := route.UnmarshalBinary(body); err != nil {
+		t.Fatal(err)
+	}
+	want := PartitionRoute{Incarnation: 17, MetadataOp: 42, View: 7, PartitionsCount: 3, PrimaryReplica: 2}
+	if route != want {
+		t.Fatalf("route: %#v, want %#v", route, want)
+	}
+	if context := route.Context(); context != (PartitionContext{Incarnation: 17, MetadataOp: 42}) {
+		t.Fatalf("route fabricated an owner or misplaced metadata: %#v", context)
+	}
+	for length := range PartitionRouteSize {
+		if err := route.UnmarshalBinary(body[:length]); err == nil {
+			t.Fatalf("accepted %d-byte route", length)
+		}
+	}
+	if err := route.UnmarshalBinary(append(body, 0)); err == nil {
+		t.Fatal("accepted trailing byte")
 	}
 }

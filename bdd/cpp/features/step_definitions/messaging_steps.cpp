@@ -27,10 +27,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 
-#include "iggy.hpp"
 #include "world.hpp"
 
 GIVEN("^I have no streams in the system$") {
@@ -42,10 +42,11 @@ GIVEN("^I have no streams in the system$") {
 }
 
 WHEN("^I create a stream with name \"([^\"]{1,255})\"$") {
+    iggy::ffi::ErrorInfo error_info{};
     REGEX_PARAM(std::string, name);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    context->client->create_stream(name);
+    context->client->create_stream(name, {}, error_info);
 }
 
 THEN("^the stream should be created successfully$") {
@@ -64,23 +65,25 @@ THEN("^the stream should have name \"([^\"]{1,255})\"$") {
 }
 
 WHEN("^I create a topic with name \"([^\"]{1,255})\" in stream ([0-9]+) with ([0-9]+) partitions$") {
+    iggy::ffi::ErrorInfo error_info{};
     REGEX_PARAM(std::string, topic_name);
     REGEX_PARAM(int, stream_id);
     REGEX_PARAM(int, partitions_count);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    // Drive the SDK through the typed helpers in iggy.hpp rather than raw strings. Options that
-    // still take plain strings below (partitioning kind, consumer kind) mark where the C++ SDK
-    // does not yet expose a typed wrapper.
-    const auto compression    = iggy::CompressionAlgorithm::none();
-    const auto message_expiry = iggy::Expiry::never_expire();
-    const auto max_topic_size = iggy::MaxTopicSize::server_default();
+    iggy::ffi::TopicCreateOptions opts{};
+    opts.has_partitions_count      = true;
+    opts.partitions_count          = static_cast<std::uint32_t>(partitions_count);
+    opts.has_compression_algorithm = true;
+    opts.compression_algorithm     = "none";
+    opts.has_message_expiry        = true;
+    opts.message_expiry_kind       = "never_expire";
+    opts.message_expiry_value      = std::numeric_limits<std::uint64_t>::max();
+    opts.has_max_topic_size        = true;
+    opts.max_topic_size            = "server_default";
 
     context->client->create_topic(bdd::make_numeric_identifier(static_cast<std::uint32_t>(stream_id)), topic_name,
-                                  static_cast<std::uint32_t>(partitions_count),
-                                  std::string(compression.compression_algorithm_value()), 0,
-                                  std::string(message_expiry.expiry_kind()), message_expiry.expiry_value(),
-                                  std::string(max_topic_size.max_topic_size()));
+                                  std::move(opts), error_info);
 }
 
 THEN("^the topic should be created successfully$") {
@@ -109,6 +112,7 @@ THEN("^the topic should have ([0-9]+) partitions$") {
 }
 
 WHEN("^I send ([0-9]+) messages to stream ([0-9]+), topic ([0-9]+), partition ([0-9]+)$") {
+    iggy::ffi::ErrorInfo error_info{};
     REGEX_PARAM(int, message_count);
     REGEX_PARAM(int, stream_id);
     REGEX_PARAM(int, topic_id);
@@ -117,18 +121,18 @@ WHEN("^I send ([0-9]+) messages to stream ([0-9]+), topic ([0-9]+), partition ([
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (int index = 0; index < message_count; ++index) {
-        iggy::ffi::IggyMessageToSend message = iggy::ffi::make_message(
-            bdd::to_payload(bdd::expected_payload(static_cast<std::uint32_t>(index))),
-            rust::Vec<iggy::ffi::HeaderEntry>());
+        iggy::ffi::IggyMessageToSend message =
+            iggy::ffi::make_message(bdd::to_payload(bdd::expected_payload(static_cast<std::uint32_t>(index))),
+                                    rust::Vec<iggy::ffi::HeaderEntry>());
         // Assign an explicit, 1-based id so the last-sent/last-polled comparison is meaningful.
-        message.id_lo = static_cast<std::uint64_t>(index + 1);
+        message.id_lo = static_cast<std::uint64_t>(index) + 1;
         messages.push_back(std::move(message));
     }
 
     context->client->send_messages(bdd::make_numeric_identifier(static_cast<std::uint32_t>(stream_id)),
                                    bdd::make_numeric_identifier(static_cast<std::uint32_t>(topic_id)), "partition_id",
                                    bdd::partition_id_bytes(static_cast<std::uint32_t>(partition_id)),
-                                   std::move(messages));
+                                   std::move(messages), error_info);
 
     context->last_sent_payload = bdd::expected_payload(static_cast<std::uint32_t>(message_count - 1));
     context->last_sent_id_lo   = static_cast<std::uint64_t>(message_count);
@@ -140,18 +144,18 @@ THEN("^all messages should be sent successfully$") {
 }
 
 WHEN("^I poll messages from stream ([0-9]+), topic ([0-9]+), partition ([0-9]+) starting from offset ([0-9]+)$") {
+    iggy::ffi::ErrorInfo error_info{};
     REGEX_PARAM(int, stream_id);
     REGEX_PARAM(int, topic_id);
     REGEX_PARAM(int, partition_id);
     REGEX_PARAM(int, offset);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    const auto polling_strategy = iggy::PollingStrategy::offset(static_cast<std::uint64_t>(offset));
-    const auto polled           = context->client->poll_messages(
+    const auto polled = context->client->poll_messages(
         bdd::make_numeric_identifier(static_cast<std::uint32_t>(stream_id)),
         bdd::make_numeric_identifier(static_cast<std::uint32_t>(topic_id)), static_cast<std::uint32_t>(partition_id),
-        "consumer", bdd::make_numeric_identifier(1), std::string(polling_strategy.polling_strategy_kind()),
-        polling_strategy.polling_strategy_value(), 100, false);
+        "consumer", bdd::make_numeric_identifier(1), bdd::make_offset_strategy(static_cast<std::uint64_t>(offset)),
+        bdd::make_poll_options(100), error_info);
 
     context->polled.count = polled.count;
     context->polled.offsets.clear();

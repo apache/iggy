@@ -17,10 +17,17 @@
 
 [http] # Optional HTTP API configuration
 enabled = true
+# Loopback on purpose: the configuration endpoints return plugin credentials in
+# plaintext and also accept writes. Set api_key in the same edit if you move
+# this off loopback, and http.tls unless cleartext is acceptable.
 address = "127.0.0.1:8081"
-api_key = "" # Optional API key for authentication to be passed as `api-key` header
+api_key = "" # Optional API key for authentication to be passed as `api-key` header; empty disables authentication
 
 [http.cors] # Optional CORS configuration for HTTP API
+# Enabling this with the shipped allowed_origins = ["*"] lets any page the
+# operator visits read these endpoints cross-origin, whatever address is bound.
+# Pin the origins you own, or set api_key, before turning it on.
+# "*" is honored only as the first entry; anywhere else it panics at startup.
 enabled = false
 allowed_methods = ["GET", "POST", "PUT", "DELETE"]
 allowed_origins = ["*"]
@@ -45,7 +52,27 @@ enabled = false
 ca_file = "core/certs/iggy_ca_cert.pem"
 
 [state]
-path = "local_state"
+path = "local_state" # Used by storage = "file"
+storage = "file" # "file" | "http"
+
+# HTTP state storage backend, used when storage = "http". Source state is
+# stored at {url}/source_{key} with optimistic concurrency (ETag/If-Match)
+# and idempotent retries (Idempotency-Key).
+# [state.http]
+# url = "http://127.0.0.1:8080/connectors/state"
+# load_method = "get"
+# save_method = "put"
+# timeout = "5s"
+#
+# [state.http.request_headers]
+# authorization = "Bearer ..."
+#
+# [state.http.retry]
+# enabled = true
+# max_attempts = 4
+# initial_backoff = "200ms"
+# max_backoff = "2s"
+# backoff_multiplier = 2
 
 [connectors]
 config_type = "local"

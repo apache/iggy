@@ -29,7 +29,7 @@ pub fn notify_stopping() {
 }
 
 /// Spawn the watchdog keep-alive task. It stops cooperatively when `cancel`
-/// fires (driven by the SIGINT/SIGTERM handler in `main`).
+/// fires during server shutdown.
 pub fn spawn_watchdog(cancel: CancellationToken) {
     let Some(timeout) = sd_notify::watchdog_enabled() else {
         return;

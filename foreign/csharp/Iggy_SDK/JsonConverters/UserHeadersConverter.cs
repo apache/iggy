@@ -179,7 +179,7 @@ internal class UserHeadersConverter : JsonConverter<Dictionary<HeaderKey, Header
         return new HeaderValue { Kind = kind.Value, Value = value };
     }
 
-    private static HeaderKind ParseHeaderKind(string? kindStr)
+    internal static HeaderKind ParseHeaderKind(string? kindStr)
     {
         return kindStr switch
         {

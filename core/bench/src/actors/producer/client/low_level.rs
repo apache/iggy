@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use crate::utils::{ClientFactory, authenticate};
+use crate::utils::ClientFactory;
 use crate::{
     actors::{
         ApiLabel, BatchMetrics, BenchmarkInit,
@@ -89,14 +89,7 @@ impl BenchmarkInit for LowLevelProducerClient {
         let default_partition_id = 0u32;
         let partitions = self.config.partitions;
 
-        let client = self.client_factory.create_client().await;
-        let client = IggyClient::create(client, None, None);
-        authenticate(
-            &client,
-            self.client_factory.username(),
-            self.client_factory.password(),
-        )
-        .await;
+        let client = self.client_factory.create_authenticated_client().await?;
 
         let partitioning = match partitions {
             0 => panic!("Partition count must be greater than 0"),

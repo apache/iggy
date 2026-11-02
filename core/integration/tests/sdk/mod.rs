@@ -15,11 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod client_lifecycle;
 mod consumer_group;
 mod consumer_group_membership;
+mod consumer_offset;
+mod consumer_shutdown;
+mod decode_diagnostics;
+mod disconnect_relogin;
 mod hello_world;
 mod http_refresh;
+mod metadata_changes;
+mod options;
 mod producer;
 mod protocol_version;
 mod raw;
 mod send_confirmation;
+mod stream_builder;

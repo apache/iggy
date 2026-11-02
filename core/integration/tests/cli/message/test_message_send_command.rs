@@ -20,11 +20,14 @@ use crate::cli::common::{
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
+use iggy::prelude::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use iggy::prelude::*;
-use predicates::str::diff;
+use integration::harness::wait_for_topic_messages_count;
+use predicates::str::{contains, diff};
 use serial_test::parallel;
 use std::collections::BTreeMap;
 use std::str::from_utf8;
+use std::time::Duration;
 use twox_hash::XxHash32;
 
 #[derive(Debug)]
@@ -58,12 +61,14 @@ struct TestMessageSendCmd {
     message_input: ProvideMessages,
     partitioning: PartitionSelection,
     header: Option<BTreeMap<HeaderKey, HeaderValue>>,
+    commit_budget: Duration,
     // These will be populated after creating the resources
     actual_stream_id: Option<u32>,
     actual_topic_id: Option<u32>,
 }
 
 impl TestMessageSendCmd {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         stream_name: String,
         topic_name: String,
@@ -72,6 +77,7 @@ impl TestMessageSendCmd {
         message_input: ProvideMessages,
         partitioning: PartitionSelection,
         header: Option<BTreeMap<HeaderKey, HeaderValue>>,
+        commit_budget: Duration,
     ) -> Self {
         Self {
             stream_name,
@@ -81,6 +87,7 @@ impl TestMessageSendCmd {
             message_input,
             partitioning,
             header,
+            commit_budget,
             actual_stream_id: None,
             actual_topic_id: None,
         }
@@ -152,7 +159,7 @@ impl IggyCmdTestCase for TestMessageSendCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         // Create stream and capture its actual ID
         let stream = client
-            .create_stream(&self.stream_name)
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
             .await
             .expect("Failed to create stream");
         self.actual_stream_id = Some(stream.id);
@@ -162,11 +169,11 @@ impl IggyCmdTestCase for TestMessageSendCmd {
             .create_topic(
                 &stream.id.try_into().unwrap(),
                 &self.topic_name,
-                self.partitions_count,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(self.partitions_count),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await
             .expect("Failed to create topic");
@@ -209,15 +216,14 @@ impl IggyCmdTestCase for TestMessageSendCmd {
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
-        let topic = client
-            .get_topic(
-                &self.actual_stream_id.unwrap().try_into().unwrap(),
-                &self.actual_topic_id.unwrap().try_into().unwrap(),
-            )
-            .await;
-        assert!(topic.is_ok());
-        let topic_details = topic.unwrap().expect("Failed to get topic");
-        assert_eq!(topic_details.messages_count, self.messages.len() as u64);
+        wait_for_topic_messages_count(
+            client,
+            &self.actual_stream_id.unwrap().try_into().unwrap(),
+            &self.actual_topic_id.unwrap().try_into().unwrap(),
+            self.messages.len() as u64,
+            self.commit_budget,
+        )
+        .await;
 
         // For Balanced partitioning, messages are distributed across all partitions
         // so we need to poll from all partitions and collect messages
@@ -229,11 +235,13 @@ impl IggyCmdTestCase for TestMessageSendCmd {
                         .poll_messages(
                             &self.actual_stream_id.unwrap().try_into().unwrap(),
                             &self.actual_topic_id.unwrap().try_into().unwrap(),
-                            Some(partition_id),
+                            partition_id,
                             &Consumer::default(),
                             &PollingStrategy::offset(0),
-                            self.messages.len() as u32,
-                            false,
+                            PollOptions {
+                                count: self.messages.len() as u32,
+                                ..PollOptions::default()
+                            },
                         )
                         .await;
                     if let Ok(polled) = polled {
@@ -248,11 +256,13 @@ impl IggyCmdTestCase for TestMessageSendCmd {
                     .poll_messages(
                         &self.actual_stream_id.unwrap().try_into().unwrap(),
                         &self.actual_topic_id.unwrap().try_into().unwrap(),
-                        Some(self.get_partition_id()),
+                        self.get_partition_id(),
                         &Consumer::default(),
                         &PollingStrategy::offset(0),
-                        self.messages.len() as u32,
-                        false,
+                        PollOptions {
+                            count: self.messages.len() as u32,
+                            ..PollOptions::default()
+                        },
                     )
                     .await;
 
@@ -331,6 +341,7 @@ pub async fn should_be_successful() {
     ];
 
     iggy_cmd_test.setup().await;
+    let commit_budget = iggy_cmd_test.backup_commit_budget();
     for (message_input, using_partitioning) in test_parameters {
         iggy_cmd_test
             .execute_test(TestMessageSendCmd::new(
@@ -351,6 +362,7 @@ pub async fn should_be_successful() {
                     ),
                     (HeaderKey::try_from("key2").unwrap(), 42i32.into()),
                 ])),
+                commit_budget,
             ))
             .await;
     }
@@ -405,7 +417,7 @@ Options:
   -m, --message-key <MESSAGE_KEY>
           Messages key which will be used to partition the messages
 {CLAP_INDENT}
-          Value of the key will be used by the server to calculate the partition ID
+          The key must contain 1 to 255 bytes. Binary clients resolve the partition ID; HTTP resolves it on the server.
 
   -H, --headers <HEADERS>
           Comma separated list of key:kind:value, sent as header with the message
@@ -460,4 +472,42 @@ Options:
             ),
         ))
         .await;
+}
+
+#[test]
+#[parallel]
+fn given_invalid_message_key_when_sending_should_reject_before_connecting() {
+    const UNREACHABLE_SERVER_ADDRESS: &str = "127.0.0.1:0";
+    const ARGUMENT_PARSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let cli_home = tempfile::tempdir().unwrap();
+    let oversized_key = "x".repeat(usize::from(u8::MAX) + 1);
+    let oversized_unicode_key = "é".repeat(usize::from(u8::MAX) / "é".len() + 1);
+
+    for key in ["", oversized_key.as_str(), oversized_unicode_key.as_str()] {
+        #[allow(deprecated)]
+        let mut command = assert_cmd::Command::cargo_bin("iggy").unwrap();
+        command
+            .env("IGGY_HOME", cli_home.path())
+            .args([
+                "--tcp-server-address",
+                UNREACHABLE_SERVER_ADDRESS,
+                "-u",
+                DEFAULT_ROOT_USERNAME,
+                "-p",
+                DEFAULT_ROOT_PASSWORD,
+                "message",
+                "send",
+                "--message-key",
+                key,
+                "stream",
+                "topic",
+                "payload",
+            ])
+            .timeout(ARGUMENT_PARSE_TIMEOUT)
+            .assert()
+            .code(2)
+            .stderr(contains("--message-key <MESSAGE_KEY>"))
+            .stderr(contains("Invalid command"));
+    }
 }

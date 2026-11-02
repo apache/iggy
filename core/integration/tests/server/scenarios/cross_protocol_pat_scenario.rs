@@ -35,10 +35,7 @@ async fn create_root_client(harness: &TestHarness, transport: TransportProtocol)
 }
 
 /// Create PAT via HTTP, list via multiple TCP connections.
-#[iggy_harness(server(
-    tcp.socket.override_defaults = true,
-    tcp.socket.nodelay = true
-))]
+#[iggy_harness]
 pub async fn should_see_pat_created_via_http_when_listing_via_tcp(harness: &TestHarness) {
     let http_client = create_root_client(harness, TransportProtocol::Http).await;
 
@@ -94,10 +91,7 @@ pub async fn should_see_pat_created_via_http_when_listing_via_tcp(harness: &Test
 }
 
 /// Create PAT via TCP, list via HTTP. Should work since TCP handlers broadcast.
-#[iggy_harness(server(
-    tcp.socket.override_defaults = true,
-    tcp.socket.nodelay = true
-))]
+#[iggy_harness]
 pub async fn should_see_pat_created_via_tcp_when_listing_via_http(harness: &TestHarness) {
     let tcp_client = create_root_client(harness, TransportProtocol::Tcp).await;
 
@@ -122,10 +116,7 @@ pub async fn should_see_pat_created_via_tcp_when_listing_via_http(harness: &Test
 }
 
 /// Create via TCP, delete via HTTP, verify deletion visible via TCP.
-#[iggy_harness(server(
-    tcp.socket.override_defaults = true,
-    tcp.socket.nodelay = true
-))]
+#[iggy_harness]
 pub async fn should_not_see_pat_deleted_via_http_when_listing_via_tcp(harness: &TestHarness) {
     let tcp_client = create_root_client(harness, TransportProtocol::Tcp).await;
 

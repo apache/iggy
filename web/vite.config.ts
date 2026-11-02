@@ -15,11 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import adapterNode from '@sveltejs/adapter-node';
+import adapterStatic from '@sveltejs/adapter-static';
 import { sveltekit } from '@sveltejs/kit/vite';
+import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
 import { defineConfig } from 'vite';
 
+// Use static adapter when STATIC_BUILD env is set (for embedding in Rust server)
+const useStaticAdapter = process.env.STATIC_BUILD === 'true';
+
 export default defineConfig({
-  base: '/',
   preview: {
     port: 3050,
     strictPort: true,
@@ -27,10 +32,28 @@ export default defineConfig({
     allowedHosts: true
   },
   build: {
-    outDir: '../dist',
-    emptyOutDir: true
+    outDir: '../dist'
   },
-  plugins: [sveltekit()],
+  plugins: [
+    sveltekit({
+      preprocess: vitePreprocess(),
+      adapter: useStaticAdapter
+        ? adapterStatic({
+            pages: 'build/static',
+            assets: 'build/static',
+            fallback: 'index.html'
+          })
+        : adapterNode({
+            out: 'build'
+          }),
+      paths: {
+        base: useStaticAdapter ? '/ui' : ''
+      },
+      csrf: {
+        trustedOrigins: ['*']
+      }
+    })
+  ],
   define: {
     SUPERFORMS_LEGACY: true
   }

@@ -16,13 +16,90 @@
 // under the License.
 
 pub mod delete_consumer_offset;
-pub mod delete_consumer_offset_2;
 pub mod get_consumer_offset;
 pub mod store_consumer_offset;
-pub mod store_consumer_offset_2;
 
 pub use delete_consumer_offset::DeleteConsumerOffsetRequest;
-pub use delete_consumer_offset_2::DeleteConsumerOffset2Request;
 pub use get_consumer_offset::GetConsumerOffsetRequest;
 pub use store_consumer_offset::StoreConsumerOffsetRequest;
-pub use store_consumer_offset_2::StoreConsumerOffset2Request;
+
+/// Server projection appends this immutable owner token to replicated offset bodies.
+pub const PREPARED_OWNER_GENERATION_SIZE: usize = size_of::<u64>();
+
+/// Split a partition-log body from its owner generation without accepting a truncated token.
+///
+/// # Errors
+/// Returns an error when the prepared offset context is incomplete.
+pub fn split_prepared_offset(body: &[u8]) -> Result<(&[u8], u64), crate::WireError> {
+    let offset = body
+        .len()
+        .checked_sub(PREPARED_OWNER_GENERATION_SIZE)
+        .ok_or(crate::WireError::UnexpectedEof {
+            offset: 0,
+            need: PREPARED_OWNER_GENERATION_SIZE,
+            have: body.len(),
+        })?;
+    Ok((&body[..offset], crate::codec::read_u64_le(body, offset)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::WireIdentifier;
+    use crate::codec::{WireDecode, WireEncode};
+    use crate::primitives::ack_level::AckLevel;
+    use crate::primitives::consumer::WireConsumer;
+
+    #[test]
+    fn offset_writes_share_the_routing_request_prefix() {
+        let identifiers = [
+            WireIdentifier::numeric(7),
+            WireIdentifier::named("named-resource").unwrap(),
+        ];
+        for consumer_id in &identifiers {
+            for consumer in [
+                WireConsumer::consumer(consumer_id.clone()),
+                WireConsumer::consumer_group(consumer_id.clone()),
+            ] {
+                for stream_id in &identifiers {
+                    for topic_id in &identifiers {
+                        for partition_id in [None, Some(0), Some(u32::MAX)] {
+                            let route = GetConsumerOffsetRequest {
+                                consumer: consumer.clone(),
+                                stream_id: stream_id.clone(),
+                                topic_id: topic_id.clone(),
+                                partition_id,
+                            };
+                            for ack in [AckLevel::NoAck, AckLevel::Quorum] {
+                                let store = StoreConsumerOffsetRequest {
+                                    consumer: consumer.clone(),
+                                    stream_id: stream_id.clone(),
+                                    topic_id: topic_id.clone(),
+                                    partition_id,
+                                    offset: u64::MAX,
+                                    ack,
+                                }
+                                .to_bytes();
+                                let delete = DeleteConsumerOffsetRequest {
+                                    consumer: consumer.clone(),
+                                    stream_id: stream_id.clone(),
+                                    topic_id: topic_id.clone(),
+                                    partition_id,
+                                    ack,
+                                }
+                                .to_bytes();
+                                for payload in [store, delete] {
+                                    let (decoded, consumed) =
+                                        GetConsumerOffsetRequest::decode(&payload).unwrap();
+                                    assert_eq!(decoded, route);
+                                    assert_eq!(consumed, route.encoded_size());
+                                    assert_eq!(&payload[..consumed], route.to_bytes().as_ref());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

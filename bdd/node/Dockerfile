@@ -15,23 +15,16 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Apache Iggy (Incubating) is an effort undergoing incubation at the Apache
-# Software Foundation (ASF), sponsored by the Apache Incubator PMC.
-#
-# Incubation is required of all newly accepted projects until a further review
-# indicates that the infrastructure, communications, and decision making
-# process have stabilized in a manner consistent with other successful ASF
-# projects.
-#
-# While incubation status is not necessarily a reflection of the completeness
-# or stability of the code, it does indicate that the project has yet to be
-# fully endorsed by the ASF.
-
 FROM node:26-slim
 
 COPY ./foreign/node .
 COPY ./bdd/scenarios/basic_messaging.feature ./bdd/
 COPY ./bdd/scenarios/raw_command.feature ./bdd/
+COPY ./bdd/scenarios/stream_options.feature ./bdd/
+COPY ./bdd/scenarios/resource_options_patch.feature ./bdd/
+COPY ./bdd/scenarios/session_contract.feature ./bdd/
+COPY ./bdd/scenarios/metadata_changes.feature ./bdd/
+COPY ./bdd/scenarios/deferred_polling.feature ./bdd/
 
 RUN npm ci
 

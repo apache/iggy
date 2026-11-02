@@ -32,24 +32,33 @@ import java.util.Set;
 public class IggyValidationException extends IggyServerException {
 
     private static final Set<IggyErrorCode> CODES = EnumSet.of(
+            IggyErrorCode.INVALID_CONFIGURATION,
             IggyErrorCode.INVALID_COMMAND,
             IggyErrorCode.INVALID_FORMAT,
             IggyErrorCode.FEATURE_UNAVAILABLE,
             IggyErrorCode.INVALID_IDENTIFIER,
-            IggyErrorCode.CANNOT_PARSE_INT,
-            IggyErrorCode.CANNOT_PARSE_SLICE,
-            IggyErrorCode.CANNOT_PARSE_UTF8,
+            IggyErrorCode.INVALID_NUMBER_ENCODING,
+            IggyErrorCode.INVALID_SIZE_BYTES,
+            IggyErrorCode.INVALID_UTF8,
             IggyErrorCode.INVALID_STREAM_NAME,
             IggyErrorCode.CANNOT_CREATE_STREAM_DIRECTORY,
             IggyErrorCode.INVALID_TOPIC_NAME,
+            IggyErrorCode.INVALID_TOPIC_ID,
             IggyErrorCode.INVALID_REPLICATION_FACTOR,
             IggyErrorCode.CANNOT_CREATE_TOPIC_DIRECTORY,
             IggyErrorCode.CONSUMER_GROUP_MEMBER_NOT_FOUND,
             IggyErrorCode.INVALID_CONSUMER_GROUP_NAME,
             IggyErrorCode.TOO_MANY_MESSAGES,
-            IggyErrorCode.EMPTY_MESSAGES,
-            IggyErrorCode.TOO_BIG_MESSAGE,
-            IggyErrorCode.INVALID_MESSAGE_CHECKSUM);
+            IggyErrorCode.EMPTY_MESSAGE_PAYLOAD,
+            IggyErrorCode.TOO_BIG_MESSAGE_PAYLOAD,
+            IggyErrorCode.INVALID_MESSAGE_CHECKSUM,
+            IggyErrorCode.INVALID_ENCRYPTION_KEY,
+            IggyErrorCode.UNSUPPORTED_OPTION_KEY,
+            IggyErrorCode.INVALID_OPTION_VALUE,
+            IggyErrorCode.OPTIONS_BLOCK_TOO_LARGE,
+            IggyErrorCode.OPTION_NOT_UPDATABLE,
+            IggyErrorCode.OPTION_NOT_RESETTABLE,
+            IggyErrorCode.READ_ONLY_OPTION);
 
     /**
      * Constructs a new IggyValidationException.

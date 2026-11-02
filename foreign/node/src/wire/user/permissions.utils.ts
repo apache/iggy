@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { uint8ToBuf, uint32ToBuf } from '../number.utils.js';
 

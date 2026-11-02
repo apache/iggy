@@ -15,21 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Error, Payload, Schema, StreamEncoder};
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use base64::{Engine as Base64Engine, engine::general_purpose};
 use iggy_common::IggyTimestamp;
 use prost::Message;
 use prost_types::Any;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use tracing::{error, info};
+
+use crate::{Error, Payload, Schema, StreamEncoder, convert::apply_field_mappings};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtoEncoderConfig {
     pub schema_path: Option<PathBuf>,
     pub message_type: Option<String>,
     pub use_any_wrapper: bool,
+    #[serde(default, deserialize_with = "deserialize_field_mappings")]
     pub field_mappings: Option<HashMap<String, String>>,
     pub schema_registry_url: Option<String>,
     pub descriptor_set: Option<Vec<u8>>,
@@ -73,6 +76,40 @@ impl Default for ProtoFormatOptions {
     }
 }
 
+fn deserialize_field_mappings<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let field_mappings = Option::<HashMap<String, String>>::deserialize(deserializer)?;
+    validate_field_mappings(field_mappings.as_ref()).map_err(D::Error::custom)?;
+
+    Ok(field_mappings)
+}
+
+fn validate_field_mappings(field_mappings: Option<&HashMap<String, String>>) -> Result<(), Error> {
+    let Some(field_mappings) = field_mappings else {
+        return Ok(());
+    };
+
+    let mut ordered_mappings = field_mappings.iter().collect::<Vec<_>>();
+    ordered_mappings.sort_unstable_by_key(|(protobuf_name, _)| *protobuf_name);
+
+    let mut protobuf_names_by_json_name = HashMap::with_capacity(field_mappings.len());
+    for (protobuf_name, json_name) in ordered_mappings {
+        if let Some(existing_protobuf_name) =
+            protobuf_names_by_json_name.insert(json_name.as_str(), protobuf_name.as_str())
+        {
+            return Err(Error::InvalidConfigValue(format!(
+                "protobuf fields '{existing_protobuf_name}' and '{protobuf_name}' both map to JSON field '{json_name}'"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 pub struct ProtoStreamEncoder {
     config: ProtoEncoderConfig,
     message_descriptor: Option<prost_types::DescriptorProto>,
@@ -84,6 +121,7 @@ impl ProtoStreamEncoder {
         Self::new_with_config(ProtoEncoderConfig::default())
     }
 
+    /// For fail-fast configuration and schema validation, use [`try_new`](Self::try_new).
     pub fn new_with_config(config: ProtoEncoderConfig) -> Self {
         let mut encoder = Self {
             config,
@@ -91,13 +129,27 @@ impl ProtoStreamEncoder {
             file_descriptor_set: None,
         };
 
-        if (encoder.config.schema_path.is_some() || encoder.config.descriptor_set.is_some())
-            && let Err(e) = encoder.load_schema()
+        if let Err(error) = validate_field_mappings(encoder.config.field_mappings.as_ref()) {
+            error!("Failed to validate protobuf encoder config during creation: {error}");
+        } else if (encoder.config.schema_path.is_some() || encoder.config.descriptor_set.is_some())
+            && let Err(error) = encoder.load_schema()
         {
-            tracing::error!("Failed to load schema during encoder creation: {}", e);
+            error!("Failed to load schema during encoder creation: {error}");
         }
 
         encoder
+    }
+
+    pub fn try_new(config: ProtoEncoderConfig) -> Result<Self, Error> {
+        validate_field_mappings(config.field_mappings.as_ref())?;
+
+        let mut encoder = Self {
+            config,
+            message_descriptor: None,
+            file_descriptor_set: None,
+        };
+        encoder.load_schema()?;
+        Ok(encoder)
     }
 
     pub fn update_config(
@@ -105,26 +157,34 @@ impl ProtoStreamEncoder {
         config: ProtoEncoderConfig,
         reload_schema: bool,
     ) -> Result<(), Error> {
-        self.config = config;
-        if reload_schema
-            && (self.config.schema_path.is_some() || self.config.descriptor_set.is_some())
-        {
-            self.load_schema()
-        } else {
-            Ok(())
+        validate_field_mappings(config.field_mappings.as_ref())?;
+
+        let old_config = std::mem::replace(&mut self.config, config);
+        if reload_schema && let Err(error) = self.load_schema() {
+            self.config = old_config;
+            return Err(error);
         }
+        Ok(())
     }
 
     pub fn load_schema(&mut self) -> Result<(), Error> {
         let schema_path = self.config.schema_path.clone();
         let descriptor_set = self.config.descriptor_set.clone();
 
-        if let Some(path) = schema_path {
-            self.compile_schema_internal(&path)?;
+        let old_message_descriptor = self.message_descriptor.take();
+        let old_file_descriptor_set = self.file_descriptor_set.take();
+        let result = if let Some(path) = schema_path {
+            self.compile_schema_internal(&path)
         } else if let Some(descriptor_bytes) = descriptor_set {
-            self.load_descriptor_set_internal(&descriptor_bytes)?;
+            self.load_descriptor_set_internal(&descriptor_bytes)
+        } else {
+            Ok(())
+        };
+        if result.is_err() {
+            self.message_descriptor = old_message_descriptor;
+            self.file_descriptor_set = old_file_descriptor_set;
         }
-        Ok(())
+        result
     }
 
     fn compile_schema_internal(&mut self, schema_path: &PathBuf) -> Result<(), Error> {
@@ -137,14 +197,8 @@ impl ProtoStreamEncoder {
             schema_path
         );
 
-        let proto_content = match fs::read_to_string(schema_path) {
-            Ok(content) => content,
-            Err(e) => {
-                error!("Failed to read proto file: {}", e);
-                error!("Falling back to Any wrapper mode");
-                return Ok(());
-            }
-        };
+        let proto_content = fs::read_to_string(schema_path)
+            .map_err(|error| Error::InitError(format!("Failed to read proto file: {error}")))?;
 
         let parsed_file = parse(&schema_path.to_string_lossy(), &proto_content)
             .map_err(|e| Error::InitError(format!("Failed to parse proto file: {e}")))?;
@@ -181,11 +235,9 @@ impl ProtoStreamEncoder {
                 self.file_descriptor_set = Some(file_descriptor_set);
                 Ok(())
             }
-            Err(e) => {
-                error!("Failed to compile proto schema: {}", e);
-                error!("Falling back to Any wrapper mode");
-                Ok(())
-            }
+            Err(error) => Err(Error::InitError(format!(
+                "Failed to compile proto schema: {error}"
+            ))),
         }
     }
 
@@ -231,14 +283,15 @@ impl ProtoStreamEncoder {
         package: &str,
     ) -> Option<prost_types::DescriptorProto> {
         let parent_name = parent_message.name.as_deref().unwrap_or("");
+        let parent_prefix = if package.is_empty() {
+            parent_name.to_string()
+        } else {
+            format!("{package}.{parent_name}")
+        };
 
         for nested_message in &parent_message.nested_type {
             let nested_name = nested_message.name.as_deref().unwrap_or("");
-            let full_name = if package.is_empty() {
-                format!("{parent_name}.{nested_name}")
-            } else {
-                format!("{package}.{parent_name}.{nested_name}")
-            };
+            let full_name = format!("{parent_prefix}.{nested_name}");
 
             if full_name == target_type {
                 info!(
@@ -248,7 +301,9 @@ impl ProtoStreamEncoder {
                 return Some(nested_message.clone());
             }
 
-            if let Some(deeper) = self.find_nested_message(nested_message, target_type, package) {
+            if let Some(deeper) =
+                self.find_nested_message(nested_message, target_type, &parent_prefix)
+            {
                 return Some(deeper);
             }
         }
@@ -278,37 +333,17 @@ impl ProtoStreamEncoder {
         Ok(())
     }
 
-    fn apply_field_transformations(&self, payload: Payload) -> Result<Payload, Error> {
+    fn apply_field_transformations(&self, payload: Payload) -> Payload {
         if let Some(mappings) = &self.config.field_mappings {
-            match payload {
-                Payload::Json(json_value) => {
-                    if let simd_json::OwnedValue::Object(mut map) = json_value {
-                        let mut new_entries = Vec::new();
-
-                        for (key, value) in map.iter() {
-                            let proto_key = mappings
-                                .iter()
-                                .find(|(_, json_name)| *json_name == key)
-                                .map(|(proto_name, _)| proto_name.clone())
-                                .unwrap_or_else(|| key.clone());
-
-                            new_entries.push((proto_key, value.clone()));
-                        }
-
-                        map.clear();
-                        for (key, value) in new_entries {
-                            map.insert(key, value);
-                        }
-
-                        Ok(Payload::Json(simd_json::OwnedValue::Object(map)))
-                    } else {
-                        Ok(Payload::Json(json_value))
-                    }
-                }
-                other => Ok(other),
-            }
+            apply_field_mappings(payload, |key| {
+                mappings
+                    .iter()
+                    .find(|(_, json_name)| json_name.as_str() == key.as_str())
+                    .map(|(proto_name, _)| proto_name.clone())
+                    .unwrap_or(key)
+            })
         } else {
-            Ok(payload)
+            payload
         }
     }
 
@@ -432,30 +467,58 @@ impl ProtoStreamEncoder {
                 self.encode_varint(&mut bytes, value);
                 Ok(bytes)
             }
-            Type::Int32 | Type::Sint32 | Type::Sfixed32 => {
+            Type::Int32 => {
                 let value = self.extract_i32_from_json(json_value)? as i64 as u64;
                 let mut bytes = Vec::new();
                 self.encode_varint(&mut bytes, value);
                 Ok(bytes)
             }
-            Type::Int64 | Type::Sint64 | Type::Sfixed64 => {
+            Type::Int64 => {
                 let value = self.extract_i64_from_json(json_value)? as u64;
                 let mut bytes = Vec::new();
                 self.encode_varint(&mut bytes, value);
                 Ok(bytes)
             }
-            Type::Uint32 | Type::Fixed32 => {
-                let value = self.extract_u32_from_json(json_value)? as u64;
+            Type::Uint32 => {
+                let value = Self::extract_u32_from_json(json_value)? as u64;
                 let mut bytes = Vec::new();
                 self.encode_varint(&mut bytes, value);
                 Ok(bytes)
             }
-            Type::Uint64 | Type::Fixed64 => {
-                let value = self.extract_u64_from_json(json_value)?;
+            Type::Uint64 => {
+                let value = Self::extract_u64_from_json(json_value)?;
                 let mut bytes = Vec::new();
                 self.encode_varint(&mut bytes, value);
                 Ok(bytes)
             }
+            Type::Sint32 => {
+                let value = self.extract_i32_from_json(json_value)?;
+                let zigzag = ((value << 1) ^ (value >> 31)) as u32;
+                let mut bytes = Vec::new();
+                self.encode_varint(&mut bytes, u64::from(zigzag));
+                Ok(bytes)
+            }
+            Type::Sint64 => {
+                let value = self.extract_i64_from_json(json_value)?;
+                let zigzag = ((value << 1) ^ (value >> 63)) as u64;
+                let mut bytes = Vec::new();
+                self.encode_varint(&mut bytes, zigzag);
+                Ok(bytes)
+            }
+            Type::Fixed32 => Ok(Self::extract_u32_from_json(json_value)?
+                .to_le_bytes()
+                .to_vec()),
+            Type::Fixed64 => Ok(Self::extract_u64_from_json(json_value)?
+                .to_le_bytes()
+                .to_vec()),
+            Type::Sfixed32 => Ok(self
+                .extract_i32_from_json(json_value)?
+                .to_le_bytes()
+                .to_vec()),
+            Type::Sfixed64 => Ok(self
+                .extract_i64_from_json(json_value)?
+                .to_le_bytes()
+                .to_vec()),
             Type::String => {
                 let text = match json_value {
                     simd_json::OwnedValue::String(s) => s.as_str(),
@@ -468,33 +531,11 @@ impl ProtoStreamEncoder {
                 result.extend_from_slice(text_bytes);
                 Ok(result)
             }
-            Type::Bytes => {
-                let bytes = match json_value {
-                    simd_json::OwnedValue::String(s) => general_purpose::STANDARD
-                        .decode(s.as_str())
-                        .map_err(|_| Error::InvalidJsonPayload)?,
-                    _ => return Err(Error::InvalidJsonPayload),
-                };
+            Type::Bytes | Type::Message => {
+                let bytes = Self::extract_bytes_from_json(json_value)?;
                 let mut result = Vec::new();
-
                 self.encode_varint(&mut result, bytes.len() as u64);
                 result.extend_from_slice(&bytes);
-                Ok(result)
-            }
-            Type::Message => {
-                let message_bytes = match json_value {
-                    simd_json::OwnedValue::String(s) => general_purpose::STANDARD
-                        .decode(s.as_str())
-                        .map_err(|_| Error::InvalidJsonPayload)?,
-                    simd_json::OwnedValue::Object(_) => {
-                        return Err(Error::InvalidJsonPayload);
-                    }
-                    _ => return Err(Error::InvalidJsonPayload),
-                };
-                let mut result = Vec::new();
-
-                self.encode_varint(&mut result, message_bytes.len() as u64);
-                result.extend_from_slice(&message_bytes);
                 Ok(result)
             }
             _ => {
@@ -554,7 +595,18 @@ impl ProtoStreamEncoder {
         }
     }
 
-    fn extract_u32_from_json(&self, json_value: &simd_json::OwnedValue) -> Result<u32, Error> {
+    pub(crate) fn extract_bytes_from_json(
+        json_value: &simd_json::OwnedValue,
+    ) -> Result<Vec<u8>, Error> {
+        let simd_json::OwnedValue::String(value) = json_value else {
+            return Err(Error::InvalidJsonPayload);
+        };
+        general_purpose::STANDARD
+            .decode(value)
+            .map_err(|_| Error::InvalidJsonPayload)
+    }
+
+    pub(crate) fn extract_u32_from_json(json_value: &simd_json::OwnedValue) -> Result<u32, Error> {
         match json_value {
             simd_json::OwnedValue::String(s) => {
                 s.parse::<u32>().map_err(|_| Error::InvalidJsonPayload)
@@ -566,7 +618,7 @@ impl ProtoStreamEncoder {
         }
     }
 
-    fn extract_u64_from_json(&self, json_value: &simd_json::OwnedValue) -> Result<u64, Error> {
+    pub(crate) fn extract_u64_from_json(json_value: &simd_json::OwnedValue) -> Result<u64, Error> {
         match json_value {
             simd_json::OwnedValue::String(s) => {
                 s.parse::<u64>().map_err(|_| Error::InvalidJsonPayload)
@@ -588,7 +640,7 @@ impl ProtoStreamEncoder {
                         "{}/google.protobuf.StringValue",
                         self.config.format_options.type_url_prefix
                     ),
-                    json_string.into_bytes(),
+                    json_string.encode_to_vec(),
                 )
             }
             Payload::Text(text) => {
@@ -604,7 +656,7 @@ impl ProtoStreamEncoder {
                         "{}/google.protobuf.StringValue",
                         self.config.format_options.type_url_prefix
                     ),
-                    json_string.into_bytes(),
+                    json_string.encode_to_vec(),
                 )
             }
             Payload::Raw(data) => (
@@ -612,28 +664,28 @@ impl ProtoStreamEncoder {
                     "{}/google.protobuf.BytesValue",
                     self.config.format_options.type_url_prefix
                 ),
-                data,
+                data.encode_to_vec(),
             ),
             Payload::Proto(text) => (
                 format!(
                     "{}/google.protobuf.StringValue",
                     self.config.format_options.type_url_prefix
                 ),
-                text.into_bytes(),
+                text.encode_to_vec(),
             ),
             Payload::FlatBuffer(data) => (
                 format!(
                     "{}/google.protobuf.BytesValue",
                     self.config.format_options.type_url_prefix
                 ),
-                data,
+                data.encode_to_vec(),
             ),
             Payload::Avro(data) => (
                 format!(
                     "{}/google.protobuf.BytesValue",
                     self.config.format_options.type_url_prefix
                 ),
-                data,
+                data.encode_to_vec(),
             ),
         };
 
@@ -712,7 +764,7 @@ impl StreamEncoder for ProtoStreamEncoder {
     }
 
     fn encode(&self, payload: Payload) -> Result<Vec<u8>, Error> {
-        let transformed_payload = self.apply_field_transformations(payload)?;
+        let transformed_payload = self.apply_field_transformations(payload);
 
         self.encode_with_schema(transformed_payload)
     }
@@ -729,6 +781,94 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    fn config_value_with_field_mappings(field_mappings: serde_json::Value) -> serde_json::Value {
+        let mut config = serde_json::to_value(ProtoEncoderConfig::default())
+            .expect("serialize default proto encoder config");
+        config["field_mappings"] = field_mappings;
+        config
+    }
+
+    fn duplicate_field_mappings() -> HashMap<String, String> {
+        HashMap::from([
+            ("id".to_string(), "shared".to_string()),
+            ("legacy_id".to_string(), "shared".to_string()),
+        ])
+    }
+
+    #[test]
+    fn given_duplicate_json_names_when_deserializing_config_should_fail() {
+        let config = config_value_with_field_mappings(serde_json::json!({
+            "id": "shared",
+            "legacy_id": "shared"
+        }));
+
+        let error = serde_json::from_value::<ProtoEncoderConfig>(config)
+            .expect_err("duplicate JSON field names should be rejected");
+
+        assert!(error.is_data());
+    }
+
+    #[test]
+    fn given_unique_json_names_when_deserializing_config_should_preserve_mappings() {
+        let expected = HashMap::from([
+            ("id".to_string(), "user_id".to_string()),
+            ("name".to_string(), "full_name".to_string()),
+        ]);
+        let config = config_value_with_field_mappings(
+            serde_json::to_value(&expected).expect("serialize field mappings"),
+        );
+
+        let deserialized = serde_json::from_value::<ProtoEncoderConfig>(config)
+            .expect("unique JSON field names should be accepted");
+
+        assert_eq!(deserialized.field_mappings, Some(expected));
+    }
+
+    #[test]
+    fn given_optional_field_mappings_when_deserializing_config_should_preserve_state() {
+        let cases = [
+            (None, None),
+            (Some(serde_json::Value::Null), None),
+            (Some(serde_json::json!({})), Some(HashMap::new())),
+        ];
+
+        for (field_mappings, expected) in cases {
+            let mut config = serde_json::to_value(ProtoEncoderConfig::default())
+                .expect("serialize default proto encoder config");
+            if let Some(field_mappings) = field_mappings {
+                config["field_mappings"] = field_mappings;
+            } else {
+                config
+                    .as_object_mut()
+                    .expect("proto encoder config should serialize as an object")
+                    .remove("field_mappings");
+            }
+
+            let deserialized = serde_json::from_value::<ProtoEncoderConfig>(config)
+                .expect("optional field mappings should be accepted");
+
+            assert_eq!(deserialized.field_mappings, expected);
+        }
+    }
+
+    #[test]
+    fn given_duplicate_json_names_when_trying_new_should_fail_with_both_protobuf_names() {
+        let config = ProtoEncoderConfig {
+            field_mappings: Some(duplicate_field_mappings()),
+            ..ProtoEncoderConfig::default()
+        };
+
+        let result = ProtoStreamEncoder::try_new(config);
+
+        let Err(Error::InvalidConfigValue(message)) = result else {
+            panic!("duplicate JSON field names should return an invalid config value");
+        };
+        assert_eq!(
+            message,
+            "protobuf fields 'id' and 'legacy_id' both map to JSON field 'shared'"
+        );
+    }
 
     #[test]
     fn encode_should_succeed_given_json_payload_with_any_wrapper() {
@@ -751,7 +891,19 @@ mod tests {
 
         let any = decoded_any.unwrap();
         assert!(any.type_url.contains("google.protobuf.StringValue"));
-        assert!(!any.value.is_empty());
+        let mut json_bytes = any
+            .to_msg::<String>()
+            .expect("unpack StringValue")
+            .into_bytes();
+        let decoded_json = simd_json::to_owned_value(&mut json_bytes).expect("decode JSON");
+        assert_eq!(
+            decoded_json,
+            simd_json::json!({
+                "user_id": 123,
+                "name": "John Doe",
+                "email": "john@example.com"
+            })
+        );
     }
 
     #[test]
@@ -765,7 +917,7 @@ mod tests {
         let encoded_bytes = result.unwrap();
 
         let decoded_any = Any::decode(encoded_bytes.as_slice()).unwrap();
-        let json_string = String::from_utf8(decoded_any.value).unwrap();
+        let json_string = decoded_any.to_msg::<String>().expect("unpack StringValue");
         let mut json_bytes = json_string.into_bytes();
         let json_value = simd_json::to_owned_value(&mut json_bytes).unwrap();
 
@@ -790,7 +942,10 @@ mod tests {
 
         let decoded_any = Any::decode(encoded_bytes.as_slice()).unwrap();
         assert!(decoded_any.type_url.contains("google.protobuf.BytesValue"));
-        assert_eq!(decoded_any.value, raw_data);
+        assert_eq!(
+            decoded_any.to_msg::<Vec<u8>>().expect("unpack BytesValue"),
+            raw_data
+        );
     }
 
     #[test]
@@ -805,7 +960,29 @@ mod tests {
 
         let decoded_any = Any::decode(encoded_bytes.as_slice()).unwrap();
         assert!(decoded_any.type_url.contains("google.protobuf.StringValue"));
-        assert_eq!(decoded_any.value, proto_text.as_bytes());
+        assert_eq!(
+            decoded_any.to_msg::<String>().expect("unpack StringValue"),
+            proto_text
+        );
+    }
+
+    #[test]
+    fn given_binary_payload_when_wrapped_should_unpack_bytes_value() {
+        let encoder = ProtoStreamEncoder::default();
+        for data in [Vec::new(), vec![0, 255, 128, 10]] {
+            for payload in [
+                Payload::Raw(data.clone()),
+                Payload::FlatBuffer(data.clone()),
+                Payload::Avro(data.clone()),
+            ] {
+                let encoded = encoder.encode(payload).expect("encode binary payload");
+                let wrapped = Any::decode(encoded.as_slice()).expect("decode Any");
+                assert_eq!(
+                    wrapped.to_msg::<Vec<u8>>().expect("unpack BytesValue"),
+                    data
+                );
+            }
+        }
     }
 
     #[test]
@@ -854,14 +1031,42 @@ mod tests {
         let decoded_json = simd_json::to_owned_value(&mut encoded_bytes_mut).unwrap();
 
         if let simd_json::OwnedValue::Object(map) = decoded_json {
-            assert!(map.contains_key("user_id"));
-            assert!(map.contains_key("full_name"));
-            assert!(map.contains_key("email"));
+            assert_eq!(
+                map.get("user_id").unwrap(),
+                &simd_json::OwnedValue::from(123)
+            );
+            assert_eq!(
+                map.get("full_name").unwrap(),
+                &simd_json::OwnedValue::from("John Doe")
+            );
+            assert_eq!(
+                map.get("email").unwrap(),
+                &simd_json::OwnedValue::from("john@example.com")
+            );
             assert!(!map.contains_key("id"));
             assert!(!map.contains_key("name"));
         } else {
             panic!("Expected JSON object");
         }
+    }
+
+    #[test]
+    fn given_duplicate_json_names_when_updating_config_should_reject_change() {
+        let original_field_mappings =
+            HashMap::from([("original_proto".to_string(), "original_json".to_string())]);
+        let mut encoder = ProtoStreamEncoder::new_with_config(ProtoEncoderConfig {
+            field_mappings: Some(original_field_mappings.clone()),
+            ..ProtoEncoderConfig::default()
+        });
+        let config = ProtoEncoderConfig {
+            field_mappings: Some(duplicate_field_mappings()),
+            ..ProtoEncoderConfig::default()
+        };
+
+        let result = encoder.update_config(config, false);
+
+        assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
+        assert_eq!(encoder.config.field_mappings, Some(original_field_mappings));
     }
 
     #[test]
@@ -901,18 +1106,14 @@ mod tests {
     }
 
     #[test]
-    fn load_schema_should_handle_missing_proto_file_gracefully() {
-        let mut encoder = ProtoStreamEncoder::new_with_config(ProtoEncoderConfig {
+    fn given_missing_proto_file_when_trying_new_should_return_error() {
+        let result = ProtoStreamEncoder::try_new(ProtoEncoderConfig {
             schema_path: Some(PathBuf::from("nonexistent.proto")),
             message_type: Some("com.example.Test".to_string()),
             ..ProtoEncoderConfig::default()
         });
 
-        let result = encoder.load_schema();
-        assert!(
-            result.is_ok(),
-            "Should handle missing proto file gracefully"
-        );
+        assert!(matches!(result, Err(Error::InitError(_))));
     }
 
     #[test]

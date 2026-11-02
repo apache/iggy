@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::PLUGIN_CONFIG_ENV_SEGMENT;
 use super::env_mapping::ConfigEnvMappings;
 use super::error::ConfigurationError;
 use super::parsing::parse_env_value;
@@ -37,34 +38,20 @@ enum EnvNameResolution<'a> {
 
 /// Controls filtering and messaging for unknown env var warnings.
 enum WarningContext<'a> {
-    /// Main config: filter IGNORED_ENV_VARS and DELEGATED prefixes
+    /// Main config: filter runtime env vars and delegated prefixes.
     MainConfig,
     /// Connector config: filter PLUGIN_CONFIG_ prefix
     ConnectorConfig(&'a str),
 }
 
-/// Environment variables starting with IGGY_ that are NOT config values.
-/// These are used for test control, CI, CLI behavior, config file paths, etc.
-const IGNORED_ENV_VARS: &[&str] = &[
-    "IGGY_CI_BUILD",
-    // Test-harness knob: overrides the default cluster size the integration
-    // harness builds; leaks to spawned servers via the IGGY_ env forwarding.
-    "IGGY_TEST_CLUSTER_NODES",
-    "IGGY_CONFIG_PATH",
-    "IGGY_CONNECTORS_CONFIG_PATH",
-    "IGGY_MCP_CONFIG_PATH",
-    "IGGY_ROOT_PASSWORD",
-    "IGGY_ROOT_USERNAME",
-    // Tunes per-shard io_uring SQ/CQ capacity; read directly by
-    // `server_common::executor::create_shard_executor` (see that fn for rationale).
-    "IGGY_SHARD_RUNTIME_CAPACITY",
-    "IGGY_TEST_CLEANUP_DISABLED",
-    "IGGY_TEST_VERBOSE",
-];
-
 /// Prefixes for env vars handled by separate providers with runtime prefixes.
 /// The main config provider skips these; each sub-provider validates its own vars.
 const DELEGATED_ENV_VAR_PREFIXES: &[&str] = &["IGGY_CONNECTORS_SINK_", "IGGY_CONNECTORS_SOURCE_"];
+
+fn is_runtime_env_var(name: &str) -> bool {
+    super::CONNECTORS_RUNTIME_ENV_VARS.contains(&name)
+        || super::MCP_RUNTIME_ENV_VARS.contains(&name)
+}
 
 type ProfileMap = FigmentMap<Profile, Dict>;
 
@@ -75,12 +62,13 @@ type ProfileMap = FigmentMap<Profile, Dict>;
 ///
 /// # Example
 /// ```ignore
-/// let provider = TypedEnvProvider::<ServerConfig>::new("IGGY_", &["IGGY_SYSTEM_ENCRYPTION_KEY"]);
+/// let provider = TypedEnvProvider::<ServerConfig>::new("IGGY_", &["IGGY_ENCRYPTION_KEY"]);
 /// ```
 #[derive(Debug, Clone)]
 pub struct TypedEnvProvider<T: ConfigEnvMappings> {
     prefix: String,
     secret_keys: Vec<String>,
+    check_unknown_env_vars: bool,
     _phantom: PhantomData<T>,
 }
 
@@ -94,6 +82,7 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
         Self {
             prefix: prefix.to_string(),
             secret_keys: secret_keys.iter().map(|s| s.to_string()).collect(),
+            check_unknown_env_vars: true,
             _phantom: PhantomData,
         }
     }
@@ -130,8 +119,19 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
         Self {
             prefix: prefix.to_string(),
             secret_keys,
+            check_unknown_env_vars: true,
             _phantom: PhantomData,
         }
+    }
+
+    /// Skip the unknown-variable scan in [`Self::deserialize`] and
+    /// [`Self::deserialize_with_runtime_prefix`].
+    ///
+    /// For a loader that checks every name itself: a second check with its
+    /// own list would flag names that loader accepts.
+    pub fn without_unknown_env_var_check(mut self) -> Self {
+        self.check_unknown_env_vars = false;
+        self
     }
 
     /// Deserialize with runtime prefix prepended to each mapping's env_name.
@@ -139,17 +139,22 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
     /// Unlike `deserialize()`, this method prepends `self.prefix` to each mapping's
     /// env_name, allowing for dynamic prefix construction at runtime.
     pub fn deserialize_with_runtime_prefix(&self) -> Result<ProfileMap, ConfigurationError> {
-        self.warn_unknown_env_vars_inner(WarningContext::ConnectorConfig(&self.prefix));
+        if self.check_unknown_env_vars {
+            self.warn_unknown_env_vars_inner(WarningContext::ConnectorConfig(&self.prefix));
+        }
         self.deserialize_inner(EnvNameResolution::PrependPrefix(&self.prefix))
     }
 
     /// Deserialize environment variables into a configuration profile map.
     ///
     /// This method:
-    /// 1. Validates that all env vars with the prefix are known (warns on unknown)
+    /// 1. Validates that all env vars with the prefix are known (warns on unknown),
+    ///    unless [`Self::without_unknown_env_var_check`] turned that off
     /// 2. Iterates over compile-time generated mappings and applies set values
     pub fn deserialize(&self) -> Result<ProfileMap, ConfigurationError> {
-        self.warn_unknown_env_vars_inner(WarningContext::MainConfig);
+        if self.check_unknown_env_vars {
+            self.warn_unknown_env_vars_inner(WarningContext::MainConfig);
+        }
         self.deserialize_inner(EnvNameResolution::Direct)
     }
 
@@ -282,14 +287,23 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
 
             let should_skip = match &context {
                 WarningContext::MainConfig => {
-                    IGNORED_ENV_VARS.contains(&key.as_str())
+                    is_runtime_env_var(&key)
                         || DELEGATED_ENV_VAR_PREFIXES
                             .iter()
                             .any(|p| key.starts_with(p))
                 }
                 WarningContext::ConnectorConfig(prefix) => {
-                    let plugin_config_prefix = format!("{}PLUGIN_CONFIG_", prefix);
-                    key.starts_with(&plugin_config_prefix)
+                    let plugin_config_prefix = format!("{}{PLUGIN_CONFIG_ENV_SEGMENT}", prefix);
+                    if key.starts_with(&plugin_config_prefix) {
+                        true
+                    } else if key == format!("{prefix}KEY") || key == format!("{prefix}VERSION") {
+                        info!(
+                            "Environment variable '{key}' is ignored: connector identity comes from the config file."
+                        );
+                        true
+                    } else {
+                        false
+                    }
                 }
             };
             if should_skip {
@@ -305,8 +319,9 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
 
             let debug_msg = match &context {
                 WarningContext::MainConfig => format!(
-                    "Unknown IGGY_ env var: '{}'.{}. Add to IGNORED_ENV_VARS if intentional, \
-                     or add #[derive(ConfigEnv)] to the config struct.",
+                    "Unknown IGGY_ env var: '{}'.{}. Add advertised process variables to \
+                     MCP_RUNTIME_ENV_VARS or CONNECTORS_RUNTIME_ENV_VARS, add a dedicated scan-only \
+                     list for internal variables, or add #[derive(ConfigEnv)] to the config struct.",
                     key, suggestion_hint
                 ),
                 WarningContext::ConnectorConfig(_) => format!(
@@ -322,11 +337,7 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
 
     fn warn_unknown_var(unknown_var: &str, suggestions: &[String]) {
         if suggestions.is_empty() {
-            warn!(
-                "Unknown environment variable '{}' will be ignored. \
-                 Use --list-env-vars to see all valid environment variables.",
-                unknown_var
-            );
+            warn!("Unknown environment variable '{unknown_var}' will be ignored.");
         } else {
             warn!(
                 "Unknown environment variable '{}' will be ignored. Similar variables: {}?",
@@ -573,6 +584,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn typed_provider_deserializes_env_vars() {
         unsafe {
             env::set_var("TEST_ENABLED", "true");
@@ -608,6 +620,68 @@ mod tests {
             assert_eq!(*n, 42);
         } else {
             panic!("count should be u64");
+        }
+    }
+
+    /// A sibling binary's path arrives here through a shared environment, or
+    /// through one `.env` that every binary loads. Neither path is a config
+    /// value, and a debug build refuses to boot on an unknown name, so the scan
+    /// has to skip all four. The list check holds in both build profiles, and
+    /// the scan adds the `debug_assert!` path in a debug build.
+    #[test]
+    #[serial_test::serial]
+    fn ignored_env_vars_are_skipped_by_the_unknown_variable_scan() {
+        let runtime_env_vars = [
+            "IGGY_CONNECTORS_CONFIG_PATH",
+            "IGGY_CONNECTORS_ENV_PATH",
+            "IGGY_MCP_CONFIG_PATH",
+            "IGGY_MCP_ENV_PATH",
+        ];
+
+        for name in runtime_env_vars {
+            assert!(
+                is_runtime_env_var(name),
+                "{name} is read before config loading and must be skipped by the scan"
+            );
+        }
+
+        for name in runtime_env_vars {
+            // SAFETY: the race is process-wide, not per key: `set_var` is unsound
+            // against any concurrent environment access. `serial_test::serial` on
+            // this test is what prevents that.
+            unsafe { env::set_var(name, "/etc/iggy/ignored") };
+        }
+
+        for prefix in ["IGGY_CONNECTORS_", "IGGY_MCP_"] {
+            TypedEnvProvider::<TestConfig>::new(prefix, &[])
+                .warn_unknown_env_vars_inner(WarningContext::MainConfig);
+        }
+
+        for name in runtime_env_vars {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
+        }
+    }
+
+    /// Retired KEY/VERSION overrides must not trip the unknown-variable scan.
+    #[test]
+    #[serial_test::serial]
+    fn retired_connector_identity_vars_are_skipped_by_the_unknown_variable_scan() {
+        let prefix = "IGGY_CONNECTORS_SINK_TEST_";
+        let retired = [format!("{prefix}KEY"), format!("{prefix}VERSION")];
+        for name in &retired {
+            // SAFETY: the race is process-wide, not per key: `set_var` is unsound
+            // against any concurrent environment access. `serial_test::serial` on
+            // this test is what prevents that.
+            unsafe { env::set_var(name, "stale") };
+        }
+
+        TypedEnvProvider::<TestConfig>::new(prefix, &[])
+            .warn_unknown_env_vars_inner(WarningContext::ConnectorConfig(prefix));
+
+        for name in &retired {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
         }
     }
 }

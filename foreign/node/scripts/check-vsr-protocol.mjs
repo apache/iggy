@@ -31,7 +31,7 @@ const [
   rustHeader,
   rustCommand,
   rustOperation,
-  rustProtocolCargo,
+  rustProtocolVersion,
   nodeCodes,
   nodeHeader,
   nodeOperation,
@@ -42,7 +42,7 @@ const [
   read('core/binary_protocol/src/consensus/header.rs'),
   read('core/binary_protocol/src/consensus/command.rs'),
   read('core/binary_protocol/src/consensus/operation.rs'),
-  read('core/binary_protocol/Cargo.toml'),
+  read('core/binary_protocol/src/version.rs'),
   readNode('src/wire/command.code.ts'),
   readNode('src/wire/vsr/header.ts'),
   readNode('src/wire/vsr/operation.ts'),
@@ -150,22 +150,22 @@ assert.deepEqual(
   'Node EvictionReason differs from the Rust consensus enum'
 );
 
-const rustCommand2Block =
-  rustCommand.match(/pub enum Command2 \{([\s\S]*?)\n\}/)?.[1] ?? '';
-const rustCommand2 = enumValues(
-  rustCommand2Block,
+const rustCommandBlock =
+  rustCommand.match(/pub enum Command \{([\s\S]*?)\n\}/)?.[1] ?? '';
+const rustCommandTable = enumValues(
+  rustCommandBlock,
   /^\s+([A-Za-z0-9]+)\s*=\s*([0-9]+),$/gm
 );
-const nodeCommand2 = enumValues(
-  nodeHeader.match(/export const Command2 = \{([\s\S]*?)\n\}/)?.[1] ?? '',
+const nodeCommandTable = enumValues(
+  nodeHeader.match(/export const Command = \{([\s\S]*?)\n\}/)?.[1] ?? '',
   /^\s+([A-Za-z0-9]+):\s*([0-9]+),?$/gm
 );
-assert.ok(nodeCommand2.size > 0, 'Node Command2 table was not found');
-for (const [name, value] of nodeCommand2)
+assert.ok(nodeCommandTable.size > 0, 'Node Command table was not found');
+for (const [name, value] of nodeCommandTable)
   assert.equal(
-    rustCommand2.get(name),
+    rustCommandTable.get(name),
     value,
-    `Node Command2.${name} differs from Rust`
+    `Node Command.${name} differs from Rust`
   );
 
 const rustHeaderSize = Number(
@@ -185,7 +185,7 @@ const FIELD_LAYOUT = new Map([
   ['u32', [4, 4]],
   ['u64', [8, 8]],
   ['u128', [16, 16]],
-  ['Command2', [1, 1]],
+  ['Command', [1, 1]],
   ['Operation', [1, 1]],
   ['EvictionReason', [1, 1]]
 ]);
@@ -253,6 +253,12 @@ const operationModule = await import(
 const internalStart = rustOperations.get('CreateTopicWithAssignments');
 const metadataStart = rustOperations.get('CreateStream');
 const partitionStart = rustOperations.get('SendMessages');
+const rustInternalNames = new Set(
+  [...(rustOperation.match(
+    /fn is_internal[\s\S]*?matches!\(\s*self,([\s\S]*?)\)\s*\n\s*\}/
+  )?.[1] ?? '').matchAll(/Self::([A-Za-z0-9]+)/g)].map((match) => match[1])
+);
+assert.ok(rustInternalNames.size > 0, 'Rust is_internal allowlist not found');
 const rustMetadataNames = new Set(
   [...(rustOperation.match(
     /fn is_metadata[\s\S]*?matches!\(\s*self,([\s\S]*?)\)\s*\n\s*\}/
@@ -269,17 +275,17 @@ assert.ok(
   'Rust is_result_framed allowlist not found'
 );
 for (const [name, value] of rustOperations) {
-  const internal = value >= internalStart && value < metadataStart;
-  const metadata = internal || rustMetadataNames.has(name);
+  const internal = (value >= internalStart && value < metadataStart) || rustInternalNames.has(name);
+  const metadata = (internal && value < partitionStart) || rustMetadataNames.has(name);
+  assert.equal(
+    operationModule.isInternal(value),
+    internal,
+    `Node isInternal(${name}) differs from Rust is_internal`
+  );
   assert.equal(
     operationModule.isMetadata(value),
     metadata,
     `Node isMetadata(${name}) differs from Rust is_metadata`
-  );
-  assert.equal(
-    operationModule.isPartition(value),
-    value >= partitionStart,
-    `Node isPartition(${name}) differs from Rust is_partition`
   );
   assert.equal(
     operationModule.isResultFramed(value),
@@ -288,17 +294,39 @@ for (const [name, value] of rustOperations) {
   );
 }
 
+// Retry identity: a committed reply can carry the operation the primary
+// resolved the request into, and reply correlation maps it back.
+const rustRequestOperationBody = rustOperation.match(
+  /fn request_operation\(&self\) -> Self \{\s*match self \{([\s\S]*?)\n\s*\}\n\s*\}/
+)?.[1] ?? '';
+const rustRequestOperations = new Map();
+for (const [, sources, target] of rustRequestOperationBody.matchAll(
+  /((?:Self::[A-Za-z0-9]+\s*\|?\s*)+)=>\s*\{?\s*Self::([A-Za-z0-9]+)/g
+))
+  for (const [, source] of sources.matchAll(/Self::([A-Za-z0-9]+)/g))
+    rustRequestOperations.set(source, target);
+assert.ok(
+  rustRequestOperations.size > 0,
+  'Rust request_operation mapping not found'
+);
+for (const [name, value] of rustOperations)
+  assert.equal(
+    operationModule.requestOperation?.(value),
+    rustOperations.get(rustRequestOperations.get(name) ?? name),
+    `Node requestOperation(${name}) differs from Rust request_operation`
+  );
+
 const protocolVersion =
-  rustProtocolCargo.match(/^version = "([0-9]+)\.([0-9]+)\.([0-9]+)/m);
-assert.ok(protocolVersion, 'binary protocol crate version is missing');
+  rustProtocolVersion.match(/pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version\(([0-9]+), ([0-9]+), ([0-9]+)\);/);
+assert.ok(protocolVersion, 'binary protocol wire version is missing');
 const nodePackedVersion = nodeRegister.match(
   /export const IGGY_PROTOCOL_VERSION =\s*\(([0-9]+) << 20\) \| \(([0-9]+) << 10\) \| ([0-9]+);/
 );
 assert.ok(nodePackedVersion, 'Node packed protocol version source changed');
 assert.deepEqual(
-  [Number(nodePackedVersion[1]), Number(nodePackedVersion[2])],
-  [Number(protocolVersion[1]), Number(protocolVersion[2])],
-  'Node protocol major.minor differs from iggy_binary_protocol'
+  [Number(nodePackedVersion[1]), Number(nodePackedVersion[2]), Number(nodePackedVersion[3])],
+  [Number(protocolVersion[1]), Number(protocolVersion[2]), Number(protocolVersion[3])],
+  'Node protocol major.minor.patch differs from the Rust wire version'
 );
 
 console.log('Node VSR protocol mirror matches Rust sources');

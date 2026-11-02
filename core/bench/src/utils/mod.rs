@@ -20,6 +20,7 @@ use bench_report::{
     numeric_parameter::BenchmarkNumericParameter, params::BenchmarkParams,
     transport::BenchmarkTransport,
 };
+use configs::{ConfigEnvMappings, server::ServerConfig};
 use iggy::prelude::*;
 use std::{fs, path::Path};
 use tracing::{error, info};
@@ -32,17 +33,24 @@ use crate::args::{
         DEFAULT_MESSAGES_PER_BATCH, DEFAULT_NUMBER_OF_CONSUMER_GROUPS, DEFAULT_NUMBER_OF_CONSUMERS,
         DEFAULT_NUMBER_OF_PRODUCERS, DEFAULT_PINNED_NUMBER_OF_PARTITIONS,
         DEFAULT_PINNED_NUMBER_OF_STREAMS, DEFAULT_QUIC_SERVER_ADDRESS, DEFAULT_TCP_SERVER_ADDRESS,
-        DEFAULT_TOTAL_MESSAGES_SIZE, DEFAULT_WARMUP_TIME,
+        DEFAULT_TOTAL_MESSAGES_SIZE, DEFAULT_WARMUP_TIME, DEFAULT_WEBSOCKET_SERVER_ADDRESS,
     },
 };
 
-pub use client_factory::{ClientFactory, authenticate};
+pub use client_factory::ClientFactory;
 
 pub mod batch_generator;
 pub mod client_factory;
 pub mod cpu_name;
 pub mod finish_condition;
 pub mod rate_limiter;
+
+const BENCHMARK_SERVER_ENV_VARS: &[&str] = &[
+    "IGGY_CONFIG_PATH",
+    "IGGY_ENV_PATH",
+    "IGGY_SHARD_RUNTIME_CAPACITY",
+    "IGGY_SHARD_EVENT_INTERVAL",
+];
 
 pub fn batch_total_size_bytes(polled_messages: &PolledMessages) -> u64 {
     polled_messages
@@ -187,7 +195,11 @@ fn add_environment_variables(parts: &mut Vec<String>, server_address: &str) {
 
     if is_localhost {
         let iggy_vars: Vec<_> = std::env::vars()
-            .filter(|(k, _)| k.starts_with("IGGY_"))
+            .filter(|(name, _)| {
+                BENCHMARK_SERVER_ENV_VARS.contains(&name.as_str())
+                    || ServerConfig::find_by_env_name(name)
+                        .is_some_and(|mapping| !mapping.is_secret)
+            })
             .collect();
 
         if !iggy_vars.is_empty() {
@@ -198,6 +210,15 @@ fn add_environment_variables(parts: &mut Vec<String>, server_address: &str) {
 }
 
 fn add_basic_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
+    parts.push(format!("--durability {}", args.durability()));
+    parts.push(format!(
+        "--consumer-offset-durability {}",
+        args.consumer_offset_durability()
+    ));
+    if let Some(threshold) = args.messages_required_to_save() {
+        parts.push(format!("--messages-required-to-save {threshold}"));
+    }
+
     let messages_per_batch = args.messages_per_batch();
     if messages_per_batch != BenchmarkNumericParameter::Value(DEFAULT_MESSAGES_PER_BATCH.get()) {
         parts.push(format!("--messages-per-batch {messages_per_batch}"));
@@ -212,7 +233,7 @@ fn add_basic_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
     if let Some(total_messages_size) = args.total_data()
         && total_messages_size != DEFAULT_TOTAL_MESSAGES_SIZE
     {
-        parts.push(format!("--total-messages-size {total_messages_size}"));
+        parts.push(format!("--total-data {total_messages_size}"));
     }
 
     let message_size = args.message_size();
@@ -226,6 +247,17 @@ fn add_basic_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
 
     if args.warmup_time().to_string() != DEFAULT_WARMUP_TIME {
         parts.push(format!("--warmup-time \'{}\'", args.warmup_time()));
+    }
+
+    let poll_defaults = PollOptions::wait(IggyDuration::ONE_SECOND);
+    if args.max_wait != poll_defaults.max_wait {
+        parts.push(format!("--max-wait \'{}\'", args.max_wait));
+    }
+    if args.min_count != poll_defaults.min_count {
+        parts.push(format!("--min-count {}", args.min_count));
+    }
+    if let Some(max_bytes) = args.max_bytes {
+        parts.push(format!("--max-bytes {max_bytes}"));
     }
 }
 
@@ -291,7 +323,8 @@ fn add_infrastructure_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
     let default_streams = match args.benchmark_kind.as_simple_kind() {
         BenchmarkKind::BalancedProducerAndConsumerGroup
         | BenchmarkKind::BalancedConsumerGroup
-        | BenchmarkKind::BalancedProducer => DEFAULT_BALANCED_NUMBER_OF_STREAMS.get(),
+        | BenchmarkKind::BalancedProducer
+        | BenchmarkKind::EndToEndProducingConsumerGroup => DEFAULT_BALANCED_NUMBER_OF_STREAMS.get(),
         _ => DEFAULT_PINNED_NUMBER_OF_STREAMS.get(),
     };
     if streams != default_streams {
@@ -302,10 +335,13 @@ fn add_infrastructure_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
     let default_partitions = match args.benchmark_kind.as_simple_kind() {
         BenchmarkKind::BalancedProducerAndConsumerGroup
         | BenchmarkKind::BalancedConsumerGroup
-        | BenchmarkKind::BalancedProducer => DEFAULT_BALANCED_NUMBER_OF_PARTITIONS.get(),
+        | BenchmarkKind::BalancedProducer
+        | BenchmarkKind::EndToEndProducingConsumerGroup => {
+            DEFAULT_BALANCED_NUMBER_OF_PARTITIONS.get()
+        }
         _ => DEFAULT_PINNED_NUMBER_OF_PARTITIONS.get(),
     };
-    if partitions != default_partitions {
+    if partitions != 0 && partitions != default_partitions {
         parts.push(format!("--partitions {partitions}"));
     }
 
@@ -321,14 +357,15 @@ fn add_infrastructure_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
         parts.push(format!("--max-topic-size \'{max_topic_size}\'"));
     }
 
-    let transport = args.transport().to_string().to_lowercase();
-    parts.push(transport.clone());
+    let transport = args.transport_command().as_str();
+    parts.push(transport.to_owned());
 
     let server_address = args.server_address();
-    let default_address = match transport.as_str() {
+    let default_address = match transport {
         "tcp" => DEFAULT_TCP_SERVER_ADDRESS,
         "quic" => DEFAULT_QUIC_SERVER_ADDRESS,
         "http" => DEFAULT_HTTP_SERVER_ADDRESS,
+        "websocket" => DEFAULT_WEBSOCKET_SERVER_ADDRESS,
         _ => "",
     };
 
@@ -343,5 +380,131 @@ fn add_output_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
 
     if let Some(remark) = args.remark() {
         parts.push(format!("--remark \'{remark}\'"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recreate_bench_command;
+    use crate::args::common::IggyBenchArgs;
+    use clap::Parser;
+
+    #[test]
+    fn reproduced_commands_preserve_consumer_only_and_end_to_end_topologies() {
+        for arguments in [
+            vec!["iggy-bench", "pinned-consumer", "tcp"],
+            vec!["iggy-bench", "balanced-consumer-group", "tcp"],
+            vec!["iggy-bench", "end-to-end-producing-consumer-group", "tcp"],
+            vec![
+                "iggy-bench",
+                "end-to-end-producing-consumer-group",
+                "--streams",
+                "6",
+                "--consumer-groups",
+                "6",
+                "--partitions",
+                "1",
+                "tcp",
+            ],
+        ] {
+            let mut original = IggyBenchArgs::try_parse_from(arguments).unwrap();
+            original.validate();
+            let command = recreate_bench_command(&original);
+            let arguments = command
+                .split_ascii_whitespace()
+                .skip_while(|argument| *argument != "iggy-bench");
+            let mut reproduced = IggyBenchArgs::try_parse_from(arguments).unwrap();
+            reproduced.validate();
+            assert_eq!(reproduced.streams(), original.streams(), "{command}");
+            assert_eq!(
+                reproduced.number_of_partitions(),
+                original.number_of_partitions(),
+                "{command}"
+            );
+            assert_eq!(
+                reproduced.number_of_consumer_groups(),
+                original.number_of_consumer_groups(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn reproduced_commands_preserve_poll_options() {
+        let original = IggyBenchArgs::try_parse_from([
+            "iggy-bench",
+            "--max-wait",
+            "1m 30s",
+            "--min-count",
+            "100",
+            "--max-bytes",
+            "65536",
+            "pinned-consumer",
+            "tcp",
+        ])
+        .unwrap();
+        let command = recreate_bench_command(&original);
+        let reproduced = IggyBenchArgs::try_parse_from(shell_words(&command)).unwrap();
+        assert_eq!(
+            reproduced.poll_options(),
+            original.poll_options(),
+            "{command}"
+        );
+    }
+
+    /// Splits on spaces outside single quotes, as a shell does for these commands.
+    fn shell_words(command: &str) -> Vec<String> {
+        let mut words = vec![String::new()];
+        let mut quoted = false;
+        for character in command.chars() {
+            match character {
+                '\'' => quoted = !quoted,
+                ' ' if !quoted => words.push(String::new()),
+                character => words.last_mut().unwrap().push(character),
+            }
+        }
+        words
+            .into_iter()
+            .skip_while(|word| word != "iggy-bench")
+            .collect()
+    }
+
+    #[test]
+    fn reproduced_websocket_commands_preserve_independent_topic_policies() {
+        for messages in ["replicated", "persisted"] {
+            for offsets in ["replicated", "persisted"] {
+                let original = IggyBenchArgs::try_parse_from([
+                    "iggy-bench",
+                    "--durability",
+                    messages,
+                    "--consumer-offset-durability",
+                    offsets,
+                    "--messages-required-to-save",
+                    "128",
+                    "pinned-producer",
+                    "ws",
+                ])
+                .unwrap();
+                let command = recreate_bench_command(&original);
+                let arguments = command
+                    .split_ascii_whitespace()
+                    .skip_while(|argument| *argument != "iggy-bench");
+                let reproduced = IggyBenchArgs::try_parse_from(arguments).unwrap();
+                assert!(
+                    command
+                        .split_ascii_whitespace()
+                        .any(|argument| argument == "websocket")
+                );
+                assert_eq!(reproduced.durability(), original.durability());
+                assert_eq!(
+                    reproduced.consumer_offset_durability(),
+                    original.consumer_offset_durability()
+                );
+                assert_eq!(
+                    reproduced.messages_required_to_save(),
+                    original.messages_required_to_save()
+                );
+            }
+        }
     }
 }

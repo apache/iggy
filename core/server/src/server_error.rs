@@ -15,23 +15,59 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::shard_allocator::ShardingError;
 use consensus::VsrStateError;
+use iggy_binary_protocol::Operation;
 use metadata::impls::recovery::RecoveryError;
+use partitions::PartitionRecoveryError;
 use server_common::log::LogError;
 use shard::ShardCtorError;
-use shard_allocator::ShardingError;
+use std::error::Error as _;
 use std::path::PathBuf;
 use thiserror::Error;
+
+const ROOT_BOOTSTRAP_RECOVERY: &str = "Restore a compatible data directory containing metadata/snapshot.bin, or use --fresh to delete local data. In multi-node clusters, use --fresh on at most one replica at a time while the others hold quorum.";
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ServerError {
+    #[error(
+        "storage at {path} does not match this build's storage format; startup refused without modifying data. No in-place upgrade is supported"
+    )]
+    UnsupportedStorage { path: PathBuf },
+    #[error("cannot validate or publish the storage format at {path}: {source}")]
+    StorageFormatIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Iggy(Box<iggy_common::IggyError>),
+    #[error(
+        "stream {stream_id} is encrypted under server keys with fingerprints [{stored_kek_fingerprints}], this node holds [{node_kek_fingerprints}]: {source}. Configure the key the stream was wrapped with as the encryption key or as a previous key"
+    )]
+    StreamKeyUnavailable {
+        stream_id: usize,
+        stored_kek_fingerprints: String,
+        node_kek_fingerprints: String,
+        #[source]
+        source: Box<iggy_common::IggyError>,
+    },
+    #[error(
+        "topic {topic_id} of stream {stream_id} holds critical options this build cannot read: {source}. Run a build that understands them"
+    )]
+    TopicOptionsUnavailable {
+        stream_id: usize,
+        topic_id: usize,
+        #[source]
+        source: Box<iggy_common::IggyError>,
+    },
     #[error("failed to load server config")]
     Config(#[source] configs::ConfigurationError),
     #[error("failed to allocate shards from sharding.cpu_allocation")]
     ShardAllocator(#[source] ShardingError),
+    #[error("cluster.coordinator.replica_connections_per_peer cannot run on this node")]
+    ReplicaLinkLayout(#[source] message_bus::LinkLayoutError),
     #[error("failed to bind shard {shard_id} to its CPU set")]
     CpuAffinityFailed {
         shard_id: u16,
@@ -50,6 +86,11 @@ pub enum ServerError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to spawn the system stats sampler: {source}")]
+    SystemStatsSamplerSpawnFailed {
+        #[source]
+        source: std::io::Error,
+    },
     // `{source}` is deliberately part of the Display text: the shard-join
     // failure report and `%error` log fields print Display only, and the
     // source carries the io_uring remediation folded in by
@@ -62,7 +103,7 @@ pub enum ServerError {
     },
     #[error(
         "shard allocator produced zero shards; server must run at least one \
-         shard (check [system.sharding] cpu_allocation)"
+         shard (check [sharding] cpu_allocation)"
     )]
     ShardsCountZero,
     #[error(
@@ -72,25 +113,80 @@ pub enum ServerError {
         message_bus::OWNER_NONE - 1
     )]
     ShardsCountOverflow { count: usize },
-    #[error("system.sharding.inbox_capacity must be in 1..={max}; got {value}")]
+    #[error(
+        "shard {shard_id} message pump died instead of draining ({reason}); \
+         committed journal tail may not have flushed"
+    )]
+    ShardPumpDied { shard_id: u16, reason: String },
+    /// A shard's message pump stopped because a partition could not commit
+    /// an op the cluster had already committed. The partition is fenced and
+    /// the server is shutting down; the exit is non-zero so an orchestrator
+    /// does not read a durability fault as a clean stop.
+    #[error(
+        "shard {shard_id} stopped: partition {namespace_raw} could not commit op {op}, \
+         which the cluster had already committed. The replica is divergent and was \
+         fenced; the server shut down so it cannot serve a prefix the cluster has \
+         moved past"
+    )]
+    ShardFatal {
+        shard_id: u16,
+        namespace_raw: u64,
+        op: u64,
+    },
+    #[error(
+        "shard {shard_id} message pump did not drain within {timeout:?}. \
+         Committed journal tail may not have flushed"
+    )]
+    ShardPumpDrainTimedOut {
+        shard_id: u16,
+        timeout: std::time::Duration,
+    },
+    #[error("sharding.inbox_capacity must be in 1..={max}; got {value}")]
     InvalidInboxCapacity { value: usize, max: usize },
-    #[error("system.sharding.shutdown_drain_timeout must be in (0, {max:?}]; got {value:?}")]
+    #[error("sharding.reply_inbox_capacity must be in 1..={max}; got {value}")]
+    InvalidReplyInboxCapacity { value: usize, max: usize },
+    #[error("sharding.poll_completion_capacity must be in 1..={max}; got {value}")]
+    InvalidPollCompletionCapacity { value: usize, max: usize },
+    #[error(transparent)]
+    InvalidPartitionIoLimits(#[from] shard::PartitionIoLimitsError),
+    #[error("sharding.shutdown_drain_timeout must be in (0, {max:?}]; got {value:?}")]
     InvalidShutdownDrainTimeout {
         value: std::time::Duration,
         max: std::time::Duration,
     },
-    #[error("system.sharding.shutdown_poll_interval must be in (0, {max:?}]; got {value:?}")]
+    #[error("sharding.shutdown_poll_interval must be in (0, {max:?}]; got {value:?}")]
     InvalidShutdownPollInterval {
         value: std::time::Duration,
         max: std::time::Duration,
     },
     #[error(
-        "system.sharding.shutdown_poll_interval ({poll:?}) must be <= \
+        "sharding.shutdown_poll_interval ({poll:?}) must be <= \
          shutdown_drain_timeout ({drain:?})"
     )]
     ShutdownPollExceedsDrain {
         poll: std::time::Duration,
         drain: std::time::Duration,
+    },
+    #[error("sharding.shutdown_join_timeout must be <= {max:?}; got {value:?}")]
+    InvalidShutdownJoinTimeout {
+        value: std::time::Duration,
+        max: std::time::Duration,
+    },
+    #[error(
+        "sharding.shutdown_join_timeout ({join:?}) must be >= \
+         shutdown_drain_timeout ({drain:?})"
+    )]
+    ShutdownJoinBelowDrain {
+        join: std::time::Duration,
+        drain: std::time::Duration,
+    },
+    #[error(
+        "sharding.reconcile_periodic_interval must be in (0, {max:?}]; got {value:?}. \
+         Note that \"0\", \"none\", \"unlimited\", and \"disabled\" all parse to zero"
+    )]
+    InvalidReconcilePeriodicInterval {
+        value: std::time::Duration,
+        max: std::time::Duration,
     },
     #[error("failed to serialize current server config")]
     CurrentConfigSerialize(#[source] toml::ser::Error),
@@ -109,6 +205,40 @@ pub enum ServerError {
         dir: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    #[error("failed to recover partition prepare WAL at {dir}: {source}")]
+    PartitionPrepareWalIo {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to read or write the created revision of partition directory {dir}: {source}")]
+    PartitionCreatedRevisionIo {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to read or write partition retirement fence at {dir}: {source}")]
+    PartitionRetirementFenceIo {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "partition {namespace_raw} incarnation {created_revision} is durably fenced for session retirement"
+    )]
+    PartitionRetirementFenced {
+        namespace_raw: u64,
+        created_revision: u64,
+    },
+    #[error(
+        "partition {namespace_raw} incarnation {created_revision} is stored only on this node, \
+         and this node's storage began after it was created without any record of it: \
+         refusing to serve it from offset 0; delete and recreate the topic to accept the loss"
+    )]
+    PartitionLostWithStorage {
+        namespace_raw: u64,
+        created_revision: u64,
     },
     // Quarantines the one partition rather than treating the group as fresh or
     // reading through to a superseded view: mirrors the metadata plane's
@@ -147,21 +277,45 @@ pub enum ServerError {
         expected: u128,
         found: u128,
     },
-    // Per-partition, not fatal: the boot path fences this one group (quarantines
-    // its segment files and materialises it fresh) instead of taking the node
-    // down for one damaged local chain. The shapes it reports are exactly what a
-    // failed state-transfer quarantine leaves behind, and the rebuild recovers
-    // the data from a peer.
     #[error(
-        "partition {stream_id}/{topic_id}/{partition_id} at {dir} recovered an \
-         unusable segment chain: {reason}"
+        "partition superblock at {dir} falls below committed creation view {created_view}: \
+         view {view}, log_view {log_view} (written by an older server, or left behind by a \
+         deleted partition with the same ids)"
     )]
-    PartitionChainRefused {
+    PartitionViewBelowCreation {
         dir: PathBuf,
+        view: u32,
+        log_view: u32,
+        created_view: u32,
+    },
+    #[error(
+        "partition WAL certificate at {dir} falls below committed creation view {created_view}: \
+         log_view {log_view} (written by an older server)"
+    )]
+    PartitionWalViewBelowCreation {
+        dir: PathBuf,
+        log_view: u32,
+        created_view: u32,
+    },
+    // Only the `Refused` shape is per-partition: the loader's fence-or-tombstone
+    // arm catches it. Everything else the partition readers raise fails the
+    // boot, and the reconciler logs it and retries the partition with backoff.
+    #[error(transparent)]
+    PartitionRecovery(#[from] PartitionRecoveryError),
+    /// Fails the create rather than letting the partition go live without its
+    /// first reservation: the failed write arms the group's superblock retry
+    /// backoff, and a send arriving inside that window is refused with a
+    /// transient the HTTP plane does not replay. `namespace_raw` joins this to
+    /// the write's own `iggy.partitions.diag` line, which carries the cause.
+    #[error(
+        "partition {stream_id}/{topic_id}/{partition_id} (namespace {namespace_raw}) could not \
+         claim its first offset reservation"
+    )]
+    PartitionOffsetReservationClaim {
         stream_id: usize,
         topic_id: usize,
         partition_id: usize,
-        reason: PartitionChainRefusal,
+        namespace_raw: u64,
     },
     #[error(
         "shard {shard_id} aborted while waiting for shard-0 to broadcast the metadata \
@@ -182,10 +336,21 @@ pub enum ServerError {
     },
     #[error("cluster enabled but no node is configured for replica {replica_id}")]
     ClusterNodeNotFound { replica_id: u8 },
+    #[error("server listeners start on shard 0 only, not on shard {shard_id}")]
+    ListenersOffShardZero { shard_id: u16 },
     #[error("cluster node count {count} exceeds supported u8 replica count")]
     ClusterReplicaCountTooLarge { count: usize },
     #[error("cluster mode requires --replica-id to identify the current node")]
     MissingReplicaId,
+    #[error(
+        "committed metadata places partition {namespace_raw} on node {node}, but the cluster \
+         has {nodes} nodes; adding or removing nodes is not supported"
+    )]
+    PartitionMemberOutsideCluster {
+        namespace_raw: u64,
+        node: u8,
+        nodes: u8,
+    },
     #[error(
         "--replica-id {supplied} was passed with cluster.enabled=false; the WAL would commit \
          under replica {default} which permanently fixes this node's identity. Either set \
@@ -201,12 +366,30 @@ pub enum ServerError {
         replica_id: u8,
     },
     #[error(
-        "cluster bootstrap with empty metadata requires both {username_env} and {password_env} to be set before server can create the root user deterministically"
+        "Root credentials are required. Set both {username_env} and {password_env}, or use --with-default-root-credentials for local development only."
     )]
-    ClusterRootCredentialsRequired {
+    RootCredentialsRequired {
         username_env: &'static str,
         password_env: &'static str,
     },
+    #[error("Root initialization was rejected with status {status}")]
+    RootInitializationRejected { status: u32 },
+    #[error(
+        "Metadata journal at {path} has op {op}, operation {operation:?}, client {client}, user_id {user_id}. Expected root CreateUser at op 1 from client 0 and user_id 0. {recovery}",
+        recovery = ROOT_BOOTSTRAP_RECOVERY
+    )]
+    RootBootstrapNotPersisted {
+        path: PathBuf,
+        op: u64,
+        operation: Operation,
+        client: u128,
+        user_id: u32,
+    },
+    #[error(
+        "Metadata journal at {path} contains complete prepares but no validated op 1. {recovery}",
+        recovery = ROOT_BOOTSTRAP_RECOVERY
+    )]
+    RootBootstrapMissing { path: PathBuf },
     #[error(
         "{provided_env} is set but {missing_env} is not; the root user credentials must be \
          provided as a pair"
@@ -228,41 +411,6 @@ pub enum ServerError {
         #[source]
         source: std::io::Error,
     },
-    #[error(
-        "recovered segment for stream {stream_id}, topic {topic_id}, partition {partition_id} at start_offset {start_offset} has message/index divergence (messages_size={messages_size_bytes}, indexed_size={indexed_size_bytes}, end_offset={end_offset}); recovery aborted before opening listeners. Restore the partition from a healthy replica or snapshot, or move the segment aside for offline repair before restarting."
-    )]
-    RecoveredSegmentSizeDivergence {
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        start_offset: u64,
-        end_offset: u64,
-        messages_size_bytes: u64,
-        indexed_size_bytes: u64,
-    },
-    #[error(
-        "failed to load persisted {consumer_kind} offsets for stream {stream_id}, topic {topic_id}, partition {partition_id} from {path}"
-    )]
-    ConsumerOffsetsLoad {
-        consumer_kind: &'static str,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        path: String,
-        #[source]
-        source: Box<iggy_common::IggyError>,
-    },
-    #[error(
-        "recovered namespace stream {stream_id}, topic {topic_id}, partition {partition_id} exceeds configured limits (max_streams={max_streams}, max_topics={max_topics}, max_partitions={max_partitions})"
-    )]
-    RecoveredNamespaceOutOfBounds {
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        max_streams: usize,
-        max_topics: usize,
-        max_partitions: usize,
-    },
     #[error("failed to load {transport} listener credentials")]
     ListenerCredentials {
         transport: &'static str,
@@ -275,52 +423,20 @@ pub enum ServerError {
     ShardConstruction(#[source] ShardCtorError),
     #[error("{} shard thread(s) failed: {}", failures.len(), format_shard_failures(failures))]
     ShardJoinFailures { failures: Vec<ShardJoinFailure> },
+    /// A panic no shard thread could surface: compio's `spawn` catches task
+    /// panics, so a dead listener or connection task leaves every thread
+    /// exiting `Ok`. The panic hook records the first one and the join path
+    /// fails the exit on it, so an orchestrator does not read the shutdown
+    /// as clean.
+    #[error("server shut down after a panic: {description}")]
+    Panicked { description: String },
+    #[error("Failed to list config environment variables")]
+    ListConfigEnvVars(#[source] std::io::Error),
+    #[error("failed to build the external auth HTTP client: {reason}")]
+    ExternalAuthClient { reason: String },
 }
 
-/// Why a recovered segment chain cannot be served.
-///
-/// Both shapes mean the same thing operationally -- the local files do not form
-/// a chain this replica can serve -- but they are distinguished because they
-/// point at different causes: an empty non-tail segment is a failed rebuild's
-/// orphan pairing, a hole is a stray or half-unlinked file.
-#[derive(Debug)]
-pub enum PartitionChainRefusal {
-    EmptyNonTailSegment {
-        empty_start: u64,
-        next_start: u64,
-    },
-    Hole {
-        previous_start: u64,
-        previous_end: u64,
-        next_start: u64,
-    },
-}
-
-impl std::fmt::Display for PartitionChainRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::EmptyNonTailSegment {
-                empty_start,
-                next_start,
-            } => write!(
-                f,
-                "segment {empty_start} is empty yet {next_start} follows it, so the \
-                 chain cannot be served past it"
-            ),
-            Self::Hole {
-                previous_start,
-                previous_end,
-                next_start,
-            } => write!(
-                f,
-                "segment {previous_start} ends at offset {previous_end} but the next \
-                 starts at {next_start}, leaving a hole"
-            ),
-        }
-    }
-}
-
-/// Per-shard outcome captured by [`crate::bootstrap::ShardHandles::join_all`]
+/// Per-shard outcome captured by [`crate::boot::ShardHandles::join_all`]
 /// when a shard either returned `Err` or panicked.
 ///
 /// Bundled into [`ServerError::ShardJoinFailures`] so the operator sees
@@ -354,7 +470,14 @@ fn format_shard_failures(failures: &[ShardJoinFailure]) -> String {
         }
         match &failure.kind {
             ShardJoinFailureKind::Error(err) => {
+                // The process prints only this error's own source chain, so each
+                // shard's cause has to be inlined or the operator never sees it.
                 let _ = write!(out, "shard {} -> {err}", failure.shard_id);
+                let mut source = err.source();
+                while let Some(cause) = source {
+                    let _ = write!(out, ": {cause}");
+                    source = cause.source();
+                }
             }
             ShardJoinFailureKind::Panic { message } => {
                 let _ = write!(out, "shard {} panicked: {message}", failure.shard_id);
@@ -407,6 +530,25 @@ mod tests {
         assert!(
             rendered.contains("shard 2 panicked: boom"),
             "shard 2 panic entry missing: {rendered}"
+        );
+    }
+
+    #[test]
+    fn given_shard_error_with_a_source_when_rendering_join_failures_should_inline_the_cause() {
+        let failures = vec![ShardJoinFailure {
+            shard_id: 0,
+            kind: ShardJoinFailureKind::Error(Box::new(ServerError::ListConfigEnvVars(
+                std::io::Error::other("refusing to truncate"),
+            ))),
+        }];
+
+        let rendered = ServerError::ShardJoinFailures { failures }.to_string();
+
+        assert!(
+            rendered.contains(
+                "shard 0 -> Failed to list config environment variables: refusing to truncate"
+            ),
+            "source chain missing: {rendered}"
         );
     }
 }

@@ -160,8 +160,8 @@ impl ClickHouseClient {
 
     /// Insert `body` into `table` using the given ClickHouse FORMAT string.
     ///
-    /// Retries up to `max_retries` times on transient errors (network errors,
-    /// HTTP 429, HTTP 5xx). Does not retry on HTTP 4xx (data errors).
+    /// Makes up to `max_retries` total attempts (at least one) on network errors
+    /// and HTTP 408, 429 or 5xx. Other HTTP errors stop retries.
     ///
     /// # At-least-once semantics
     ///

@@ -28,11 +28,8 @@ use std::time::{Duration, Instant};
 /// already told both tasks to skip post-loop cleanup. Closing the
 /// sender wakes the transport's writer; triggering the per-connection
 /// shutdown wakes the transport's reader off its `io_uring` read SQE
-/// without waiting for peer EOF. Awaiting both handles with
-/// `close_peer_timeout` budget guarantees neither task can outlive the
-/// race on a half-open socket. `compio::runtime::JoinHandle::drop`
-/// detaches, so letting the handles go out of scope would leak the
-/// tasks.
+/// without waiting for peer EOF. Awaiting both handles allows cooperative
+/// cleanup; dropping a timed-out handle cancels its task.
 ///
 /// Both handles share a single `timeout` budget: after the transport
 /// returns (or is cancelled) the dispatch only gets the remaining time.

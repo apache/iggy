@@ -15,6 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
+macro_rules! with_client {
+    ($self:expr, $client:ident => $body:expr) => {
+        $crate::clients::with_client!($self, iggy_common::binary_operation_deadline(), $client => $body)
+    };
+    ($self:expr, $deadline:expr, $client:ident => $body:expr) => {{
+        let deadline = $deadline;
+        iggy_common::with_binary_deadline(deadline, async {
+            let $client = tokio::time::timeout_at(deadline, $self.client.read())
+                .await
+                .map_err(|_| iggy_common::IggyError::TransientNotAccepted)?;
+            $body
+        })
+        .await
+    }};
+}
+
+pub(crate) use with_client;
+
 mod binary_cluster;
 mod binary_consumer_group;
 mod binary_consumer_offset;
@@ -35,8 +53,13 @@ pub mod producer_builder;
 pub mod producer_config;
 pub mod producer_dispatcher;
 pub mod producer_error_callback;
+pub(crate) mod producer_idempotence;
 pub mod producer_sharding;
+pub mod reader;
+pub mod reader_builder;
 
 const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
-const MAX_BATCH_LENGTH: usize = 1000000;
+
+/// The messages per request of a direct producer whose `batch_length` is 0.
+pub const MAX_BATCH_LENGTH: std::num::NonZeroU32 = std::num::NonZeroU32::new(1_000_000).unwrap();
 const MIB: usize = 1_048_576;

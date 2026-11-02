@@ -19,14 +19,14 @@ name: _test_bdd
 on:
   workflow_call:
     inputs:
-      component:
+      matrix:
         type: string
         required: true
-        description: "Component to test (e.g., 'bdd-rust', 'bdd-python', etc.)"
-      task:
-        type: string
-        required: true
-        description: "Task to run (e.g., 'bdd-rust', 'bdd-python', etc.)"
+        description: "Selected component/task entries"
+
+    secrets:
+      CODECOV_TOKEN:
+        required: false
 
 permissions:
   contents: read
@@ -34,76 +34,18 @@ permissions:
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name || matrix.task }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7.0.1
 
-      - name: Skip noop
-        if: inputs.component == 'noop'
-        run: echo "No changes detected, skipping tests"
-
-      - name: Setup Rust with cache for BDD
-        if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
-        uses: ./.github/actions/utils/setup-rust-with-cache
-
-      - name: Build server for BDD tests
-        if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
-        run: |
-          SERVER_BIN="iggy-server"
-          echo "Building server binary and CLI for BDD tests..."
-          cargo build --locked --bin iggy-server --bin iggy
-
-          echo "Server binary built at: target/debug/${SERVER_BIN}"
-          ls -lh "target/debug/${SERVER_BIN}"
-
-          echo "CLI binary built at: target/debug/iggy"
-          ls -lh target/debug/iggy
-
-          # Verify the binary exists and is executable
-          if [ ! -f "target/debug/${SERVER_BIN}" ]; then
-            echo "ERROR: Server binary not found at target/debug/${SERVER_BIN}"
-            exit 1
-          fi
-
-          if [ ! -f "target/debug/iggy" ]; then
-            echo "ERROR: CLI binary not found at target/debug/iggy"
-            exit 1
-          fi
-
-      - name: Run BDD tests
-        if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
-        run: |
-          # Extract SDK name from task (format: bdd-<sdk>).
-          SDK_NAME=$(echo "${{ inputs.task }}" | sed 's/^bdd-//')
-          export IGGY_SERVER_PATH="target/debug/iggy-server"
-          echo "Server binary location: $(ls -lh target/debug/iggy-server)"
-
-          echo "Running BDD tests for SDK: $SDK_NAME"
-          echo "Current directory: $(pwd)"
-          echo "CLI binary location: $(ls -lh target/debug/iggy)"
-
-          # Export path to the pre-built cli binary (relative to repo root)
-          export IGGY_CLI_PATH="target/debug/iggy"
-          export IGGY_ROOT_USERNAME="iggy"
-          export IGGY_ROOT_PASSWORD="iggy"
-          ./scripts/run-bdd-tests.sh "$SDK_NAME"
-
-      - name: Clean up Docker resources (BDD)
-        if: always() && startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
-        run: |
-          ./scripts/run-bdd-tests.sh clean || true
-          docker system prune -f || true
-
-      - name: Upload reports
-        if: always()
-        uses: actions/upload-artifact@v7
+      - name: Run BDD suite
+        uses: ./.github/actions/bdd/pre-merge
         with:
-          name: ${{ inputs.component }}-${{ inputs.task }}-reports-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            reports/**
-            target/llvm-cov/**
-            coverage.lcov
-          if-no-files-found: ignore
-          retention-days: 7
+          component: ${{ matrix.component }}
+          task: ${{ matrix.task }}
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}

@@ -15,75 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::cache_indexes::CacheIndexesConfig;
-use super::server::MemoryPoolConfig;
-use configs::{ConfigEnv, ConfigEnvMappings};
+use super::defaults::default_sysinfo_print_interval;
+use configs::ConfigEnv;
 use iggy_common::IggyByteSize;
-use iggy_common::IggyError;
-use iggy_common::IggyExpiry;
-use iggy_common::MaxTopicSize;
-use iggy_common::{CompressionAlgorithm, IggyDuration};
+use iggy_common::IggyDuration;
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
-use serde_with::serde_as;
-use server_common::bootstrap::SystemPaths;
+use serde_with::formats::PreferMany;
+use serde_with::{OneOrMany, serde_as};
 use server_common::log::LoggingSettings;
 
-pub const INDEX_EXTENSION: &str = "index";
-pub const LOG_EXTENSION: &str = "log";
-
-// Generic over the sharding config so every server flavour binds its own
-// `ShardingConfig` (different knob sets, different default source) while
-// sharing this whole struct and its path helpers.
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct SystemConfig<S: ConfigEnvMappings> {
-    pub path: String,
-    pub backup: BackupConfig,
-    pub state: StateConfig,
-    pub runtime: RuntimeConfig,
-    pub logging: LoggingConfig,
-    pub stream: StreamConfig,
-    pub topic: TopicConfig,
-    pub partition: PartitionConfig,
-    pub segment: SegmentConfig,
-    pub encryption: EncryptionConfig,
-    pub compression: CompressionConfig,
-    pub message_deduplication: MessageDeduplicationConfig,
-    pub recovery: RecoveryConfig,
-    pub memory_pool: MemoryPoolConfig,
-    pub sharding: S,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct BackupConfig {
-    pub path: String,
-    pub compatibility: CompatibilityConfig,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct CompatibilityConfig {
-    pub path: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct DatabaseConfig {
-    pub path: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct RuntimeConfig {
     pub path: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct CompressionConfig {
-    pub allow_override: bool,
-    #[config_env(leaf)]
-    pub default_algorithm: CompressionAlgorithm,
-}
-
 #[serde_as]
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct LoggingConfig {
     pub path: String,
     pub level: String,
@@ -100,6 +48,7 @@ pub struct LoggingConfig {
     pub retention: IggyDuration,
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_sysinfo_print_interval")]
     pub sysinfo_print_interval: IggyDuration,
 }
 
@@ -117,7 +66,8 @@ impl From<&LoggingConfig> for LoggingSettings {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
+#[serde_as]
+#[derive(Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct EncryptionConfig {
     pub enabled: bool,
     // skip_serializing keeps the key out of the runtime current_config.toml (and
@@ -126,261 +76,23 @@ pub struct EncryptionConfig {
     #[serde(default, skip_serializing)]
     #[config_env(secret)]
     pub key: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct StreamConfig {
-    pub path: String,
-}
-
-#[serde_as]
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct TopicConfig {
-    pub path: String,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub max_size: MaxTopicSize,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub message_expiry: IggyExpiry,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct PartitionConfig {
-    pub path: String,
-    pub messages_required_to_save: u32,
-    #[config_env(leaf)]
-    pub size_of_messages_required_to_save: IggyByteSize,
-    pub enforce_fsync: bool,
-    pub validate_checksum: bool,
-}
-
-#[serde_as]
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct MessageDeduplicationConfig {
-    pub enabled: bool,
-    pub max_entries: u64,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub expiry: IggyDuration,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct RecoveryConfig {
-    pub recreate_missing_state: bool,
-}
-
-#[serde_as]
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct SegmentConfig {
-    #[config_env(leaf)]
-    pub size: IggyByteSize,
+    /// Retired keys a node still unwraps stream keys with during a rotation.
+    // A bare string is one key, so a type error can never echo the key into the log.
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
+    #[serde(default, skip_serializing)]
+    #[config_env(secret)]
+    pub previous_keys: Vec<String>,
+    /// Fingerprints of retired keys whose stream key wraps the primary drops.
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
-    pub preallocate: bool,
-    #[config_env(leaf)]
-    pub cache_indexes: CacheIndexesConfig,
-    pub archive_expired: bool,
-}
-
-#[serde_as]
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct StateConfig {
-    pub enforce_fsync: bool,
-    pub max_file_operation_retries: u32,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub retry_delay: IggyDuration,
-}
-
-impl<S: ConfigEnvMappings> SystemConfig<S> {
-    pub fn get_system_path(&self) -> String {
-        self.path.to_string()
-    }
-
-    pub fn get_state_path(&self) -> String {
-        format!("{}/state", self.get_system_path())
-    }
-
-    pub fn get_state_messages_file_path(&self) -> String {
-        format!("{}/log", self.get_state_path())
-    }
-
-    pub fn get_state_info_path(&self) -> String {
-        format!("{}/info", self.get_state_path())
-    }
-    pub fn get_state_tokens_path(&self) -> String {
-        format!("{}/tokens", self.get_state_path())
-    }
-
-    pub fn get_backup_path(&self) -> String {
-        format!("{}/{}", self.get_system_path(), self.backup.path)
-    }
-
-    pub fn get_runtime_path(&self) -> String {
-        format!("{}/{}", self.get_system_path(), self.runtime.path)
-    }
-
-    pub fn get_streams_path(&self) -> String {
-        format!("{}/{}", self.get_system_path(), self.stream.path)
-    }
-
-    pub fn get_stream_path(&self, stream_id: usize) -> String {
-        format!("{}/{}", self.get_streams_path(), stream_id)
-    }
-
-    pub fn get_topics_path(&self, stream_id: usize) -> String {
-        format!("{}/{}", self.get_stream_path(stream_id), self.topic.path)
-    }
-
-    pub fn get_topic_path(&self, stream_id: usize, topic_id: usize) -> String {
-        format!("{}/{}", self.get_topics_path(stream_id), topic_id)
-    }
-
-    pub fn get_partitions_path(&self, stream_id: usize, topic_id: usize) -> String {
-        format!(
-            "{}/{}",
-            self.get_topic_path(stream_id, topic_id),
-            self.partition.path
-        )
-    }
-
-    pub fn get_partition_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/{}",
-            self.get_partitions_path(stream_id, topic_id),
-            partition_id
-        )
-    }
-
-    pub fn get_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/offsets",
-            self.get_partition_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    pub fn get_consumer_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/consumers",
-            self.get_offsets_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    pub fn get_consumer_group_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/groups",
-            self.get_offsets_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    pub fn get_segment_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        start_offset: u64,
-    ) -> String {
-        format!(
-            "{}/{:0>20}",
-            self.get_partition_path(stream_id, topic_id, partition_id),
-            start_offset
-        )
-    }
-
-    pub fn get_messages_file_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        start_offset: u64,
-    ) -> String {
-        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
-        format!("{path}.{LOG_EXTENSION}")
-    }
-
-    pub fn get_index_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        start_offset: u64,
-    ) -> String {
-        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
-        format!("{path}.{INDEX_EXTENSION}")
-    }
-
-    pub fn resolve_max_topic_size(
-        &self,
-        max_topic_size: MaxTopicSize,
-    ) -> Result<MaxTopicSize, IggyError> {
-        match max_topic_size {
-            MaxTopicSize::ServerDefault => Ok(self.topic.max_size),
-            _ => {
-                if max_topic_size.as_bytes_u64() < self.segment.size.as_bytes_u64() {
-                    Err(IggyError::InvalidTopicSize(
-                        max_topic_size,
-                        self.segment.size,
-                    ))
-                } else {
-                    Ok(max_topic_size)
-                }
-            }
-        }
-    }
-
-    pub fn resolve_message_expiry(&self, message_expiry: IggyExpiry) -> IggyExpiry {
-        match message_expiry {
-            IggyExpiry::ServerDefault => self.topic.message_expiry,
-            _ => message_expiry,
-        }
-    }
-}
-
-impl<S: ConfigEnvMappings> SystemPaths for SystemConfig<S> {
-    fn get_system_path(&self) -> String {
-        SystemConfig::get_system_path(self)
-    }
-
-    fn get_state_path(&self) -> String {
-        SystemConfig::get_state_path(self)
-    }
-
-    fn get_state_messages_file_path(&self) -> String {
-        SystemConfig::get_state_messages_file_path(self)
-    }
-
-    fn get_streams_path(&self) -> String {
-        SystemConfig::get_streams_path(self)
-    }
-
-    fn get_runtime_path(&self) -> String {
-        SystemConfig::get_runtime_path(self)
-    }
+    pub retired_kek_fingerprints: Vec<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use figment::Figment;
+    use figment::providers::{Format, Toml};
 
     #[test]
     fn encryption_key_is_never_serialized() {
@@ -391,11 +103,57 @@ mod tests {
         let config = EncryptionConfig {
             enabled: true,
             key: "encryption-key-MUST-NOT-be-persisted".to_owned(),
+            previous_keys: vec!["previous-key-MUST-NOT-be-persisted".to_owned()],
+            retired_kek_fingerprints: Vec::new(),
         };
         let serialized = serde_json::to_string(&config).expect("serialize encryption config");
         assert!(
             !serialized.contains("MUST-NOT-be-persisted"),
             "encryption key leaked into serialized config: {serialized}"
         );
+        let debugged = format!("{config:?}");
+        assert!(
+            !debugged.contains("MUST-NOT-be-persisted"),
+            "encryption key leaked into debug output: {debugged}"
+        );
+    }
+
+    #[test]
+    fn given_bare_previous_key_string_when_extracting_should_read_one_key_without_echoing_it() {
+        let previous_key = "previous-key-MUST-NOT-be-logged";
+        let extracted = Figment::from(Toml::string(&format!(
+            "enabled = true\nprevious_keys = \"{previous_key}\""
+        )))
+        .extract::<EncryptionConfig>();
+
+        match extracted {
+            Ok(config) => assert_eq!(config.previous_keys, vec![previous_key.to_owned()]),
+            Err(error) => panic!(
+                "bare previous key string was refused, echoed: {}",
+                error.to_string().contains(previous_key)
+            ),
+        }
+    }
+
+    #[test]
+    fn given_retired_kek_fingerprints_when_extracting_should_read_one_or_many_and_serialize_them() {
+        let fingerprint = "39e4f0f95c3693c7";
+        for value in [format!("\"{fingerprint}\""), format!("[\"{fingerprint}\"]")] {
+            let config = Figment::from(Toml::string(&format!(
+                "enabled = true\nretired_kek_fingerprints = {value}"
+            )))
+            .extract::<EncryptionConfig>()
+            .expect("extracts");
+            assert_eq!(
+                config.retired_kek_fingerprints,
+                vec![fingerprint.to_owned()]
+            );
+            let serialized = serde_json::to_string(&config).expect("serialize encryption config");
+            assert!(serialized.contains(fingerprint), "{serialized}");
+        }
+        let defaulted = Figment::from(Toml::string("enabled = true"))
+            .extract::<EncryptionConfig>()
+            .expect("extracts");
+        assert!(defaulted.retired_kek_fingerprints.is_empty());
     }
 }

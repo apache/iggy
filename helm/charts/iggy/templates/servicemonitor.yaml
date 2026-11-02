@@ -31,6 +31,10 @@ spec:
   endpoints:
   - path: {{ .Values.server.serviceMonitor.path }}
     port: http
+  {{- with .Values.server.serviceMonitor.authorization }}
+    authorization:
+      {{- toYaml . | nindent 6 }}
+  {{- end }}
   namespaceSelector:
     matchNames:
     - {{ .Release.Namespace }}

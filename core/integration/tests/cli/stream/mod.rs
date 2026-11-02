@@ -20,5 +20,4 @@ mod test_stream_delete_command;
 mod test_stream_get_command;
 mod test_stream_help_command;
 mod test_stream_list_command;
-mod test_stream_purge_command;
 mod test_stream_update_command;

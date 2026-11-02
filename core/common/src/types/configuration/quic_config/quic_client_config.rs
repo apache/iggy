@@ -16,9 +16,10 @@
 // under the License.
 
 use crate::{
-    AutoLogin, ConnectionString, ConnectionStringOptions, IggyDuration,
-    QuicClientReconnectionConfig, QuicConnectionStringOptions,
+    AutoLogin, ConnectionString, ConnectionStringOptions, NonZeroIggyDuration,
+    PendingOperationsConfig, QuicClientReconnectionConfig, QuicConnectionStringOptions,
 };
+use iggy_binary_protocol::MAX_RECORD_REPLY_SIZE;
 use std::str::FromStr;
 
 /// Configuration for the QUIC client.
@@ -32,6 +33,8 @@ pub struct QuicClientConfig {
     pub server_name: String,
     /// Whether to automatically login user after establishing connection.
     pub auto_login: AutoLogin,
+    /// Shared limits across this client's mutation lanes.
+    pub pending_operations: PendingOperationsConfig,
     // Whether to automatically reconnect when disconnected.
     pub reconnection: QuicClientReconnectionConfig,
     /// The size of the response buffer.
@@ -53,7 +56,7 @@ pub struct QuicClientConfig {
     /// Whether to validate the server certificate.
     pub validate_certificate: bool,
     /// Interval of heartbeats sent by the client
-    pub heartbeat_interval: IggyDuration,
+    pub heartbeat_interval: NonZeroIggyDuration,
 }
 
 impl Default for QuicClientConfig {
@@ -63,9 +66,10 @@ impl Default for QuicClientConfig {
             server_address: "127.0.0.1:8080".to_string(),
             server_name: "localhost".to_string(),
             auto_login: AutoLogin::Disabled,
-            heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
+            pending_operations: PendingOperationsConfig::default(),
+            heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
             reconnection: QuicClientReconnectionConfig::default(),
-            response_buffer_size: 1000 * 1000 * 10,
+            response_buffer_size: MAX_RECORD_REPLY_SIZE as u64,
             max_concurrent_bidi_streams: 10000,
             datagram_send_buffer_size: 100_000,
             initial_mtu: 1200,
@@ -85,6 +89,7 @@ impl From<ConnectionString<QuicConnectionStringOptions>> for QuicClientConfig {
             server_address: connection_string.server_address().into(),
             server_name: "localhost".to_string(),
             auto_login: connection_string.auto_login().to_owned(),
+            pending_operations: connection_string.options().pending_operations(),
             reconnection: connection_string.options().reconnection().to_owned(),
             response_buffer_size: connection_string.options().response_buffer_size(),
             max_concurrent_bidi_streams: connection_string.options().max_concurrent_bidi_streams(),

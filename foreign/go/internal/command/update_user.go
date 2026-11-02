@@ -17,71 +17,52 @@
 
 package command
 
-import "github.com/apache/iggy/foreign/go/contracts"
+import (
+	"github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
+)
 
+// UpdateUser patches a user through the generic UpdateResource command.
 type UpdateUser struct {
-	UserID   iggcon.Identifier  `json:"-"`
-	Username *string            `json:"username"`
-	Status   *iggcon.UserStatus `json:"userStatus"`
+	UserID   iggcon.Identifier
+	Username *string
+	Status   *iggcon.UserStatus
+	Reset    []iggcon.UserOptionKey
+	RawReset []string
+	Options  []iggcon.HeaderEntry
 }
 
 func (u *UpdateUser) Code() Code {
-	return UpdateUserCode
+	return UpdateResourceCode
 }
 
 func (u *UpdateUser) MarshalBinary() ([]byte, error) {
-	userIdBytes, err := u.UserID.MarshalBinary()
-	if err != nil {
-		return nil, err
+	var typed []iggcon.HeaderEntry
+	if u.Username != nil {
+		typed = append(typed, textOption(string(iggcon.UserOptionUsername), *u.Username))
 	}
-	length := len(userIdBytes)
-
-	if u.Username == nil {
-		u.Username = new(string)
-	}
-
-	username := *u.Username
-
-	if len(username) != 0 {
-		length += 2 + len(username)
-	}
-
 	if u.Status != nil {
-		length += 2
-	}
-
-	bytes := make([]byte, length+1)
-	position := 0
-
-	copy(bytes[position:position+len(userIdBytes)], userIdBytes)
-	position += len(userIdBytes)
-
-	if len(username) != 0 {
-		bytes[position] = 1
-		position++
-		bytes[position] = byte(len(username))
-		position++
-		copy(bytes[position:position+len(username)], username)
-		position += len(username)
-	} else {
-		bytes[position] = 0
-		position++
-	}
-
-	if u.Status != nil {
-		bytes[position] = 1
-		position++
-		statusByte := byte(0)
-		switch *u.Status {
-		case iggcon.Active:
-			statusByte = 1
-		case iggcon.Inactive:
-			statusByte = 2
+		status, err := userStatusName(*u.Status)
+		if err != nil {
+			return nil, err
 		}
-		bytes[position] = statusByte
-	} else {
-		bytes[position] = 0
+		typed = append(typed, stringOption(string(iggcon.UserOptionStatus), status))
 	}
+	reset := make([]string, 0, len(u.Reset))
+	for _, key := range u.Reset {
+		reset = append(reset, string(key))
+	}
+	return encodeUpdateResource(iggcon.OptionsScopeUser, []iggcon.Identifier{u.UserID}, typed, u.Options, reset, u.RawReset)
+}
 
-	return bytes, nil
+// userStatusName is the status as the catalog spells it in an update.
+func userStatusName(status iggcon.UserStatus) (string, error) {
+	switch status {
+	case iggcon.Active:
+		return "active", nil
+	case iggcon.Inactive:
+		return "inactive", nil
+	default:
+		return "", ierror.ErrInvalidUserStatus
+	}
 }

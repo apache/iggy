@@ -22,4 +22,4 @@ namespace Apache.Iggy.Contracts.Auth;
 /// </summary>
 /// <param name="UserId">The unique identifier (numeric) of the user</param>
 /// <param name="AccessToken">The optional tokens, used only by HTTP transport</param>
-public record AuthResponse(int UserId, TokenInfo? AccessToken);
+public record AuthResponse(uint UserId, TokenInfo? AccessToken);

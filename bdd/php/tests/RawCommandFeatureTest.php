@@ -19,6 +19,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/SharedFeatureParser.php';
+require_once __DIR__ . '/TestEnvironment.php';
 
 use Iggy\Client as IggyClient;
 use Iggy\Exception\IggyException;
@@ -52,21 +53,35 @@ final class RawCommandFeatureTest extends TestCase
     private function runStep(string $step): void
     {
         if ($step === 'I have a running Iggy server') {
-            $this->client = new IggyClient(server_host() . ':' . server_port());
+            $this->client = new IggyClient(TestEnvironment::serverAddress());
             $this->client->connect();
             $this->client->ping();
             return;
         }
         if ($step === 'I am authenticated as the root user') {
             $this->requireClient()->loginUser(
-                env_or_default('IGGY_USERNAME', 'iggy'),
-                env_or_default('IGGY_PASSWORD', 'iggy'),
+                TestEnvironment::rootUsername(),
+                TestEnvironment::rootPassword(),
             );
             return;
         }
         if (preg_match('/^I send a raw command with code (\d+) and an empty payload$/', $step, $matches) === 1) {
             try {
                 $this->lastResponse = $this->requireClient()->sendBinaryRequest((int) $matches[1], '');
+                $this->lastError = null;
+            } catch (Throwable $error) {
+                $this->lastResponse = null;
+                $this->lastError = $error;
+            }
+            return;
+        }
+        if (preg_match('/^I send a raw command with code (\d+) and an empty payload to replica (\d+)$/', $step, $matches) === 1) {
+            try {
+                $this->lastResponse = $this->requireClient()->sendBinaryRequestToReplica(
+                    (int) $matches[1],
+                    '',
+                    (int) $matches[2],
+                );
                 $this->lastError = null;
             } catch (Throwable $error) {
                 $this->lastResponse = null;
@@ -88,6 +103,12 @@ final class RawCommandFeatureTest extends TestCase
             assert_same(null, $this->lastResponse);
             assert_instance_of(IggyException::class, $this->lastError);
             assert_true(str_contains(strtolower((string) $this->lastError?->getMessage()), 'invalid command'));
+            return;
+        }
+        if ($step === 'the raw command should fail with an invalid identifier error') {
+            assert_same(null, $this->lastResponse);
+            assert_instance_of(IggyException::class, $this->lastError);
+            assert_true(str_contains(strtolower((string) $this->lastError?->getMessage()), 'invalid identifier'));
             return;
         }
 

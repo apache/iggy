@@ -28,6 +28,16 @@ use tracing::{debug, error, info};
 #[async_trait]
 impl Sink for IcebergSink {
     async fn open(&mut self) -> Result<(), Error> {
+        if self.config.dynamic_routing && self.config.dynamic_route_field.trim().is_empty() {
+            return Err(Error::InvalidConfigValue(
+                "dynamic_route_field must not be empty in dynamic routing mode".to_string(),
+            ));
+        }
+        if !self.config.dynamic_routing && self.config.tables.is_empty() {
+            return Err(Error::InvalidConfigValue(
+                "tables must not be empty in static routing mode".to_string(),
+            ));
+        }
         match (
             &self.config.store_access_key_id,
             &self.config.store_secret_access_key,

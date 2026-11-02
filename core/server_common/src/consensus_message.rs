@@ -16,20 +16,34 @@
 // under the License.
 
 use crate::iobuf::{Frozen, Owned};
+use crate::sharding::METADATA_GROUP;
+use aligned_vec::{AVec, ConstAlign};
+use futures::channel::oneshot;
 use iggy_binary_protocol::{
-    Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, GenericHeader,
-    Operation, PrepareHeader, PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader,
-    RequestHeader, RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
-    RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
-    StateChunkHeader, StateTransferTargetHeader,
+    Command, CommitHeader, CommitReplyHeader, ConsensusError, ConsensusHeader,
+    ConsumerSessionHeartbeatHeader, DoViewChangeHeader, ForwardCompletionHeader,
+    ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
+    ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
+    PrepareOkHeader, PrepareProgressHeader, PrimaryRebalanceHeader, RepairPrepareHeader,
+    RepairRangeReplyHeader, RequestHeader, RequestPreparesHeader, RequestStartViewHeader,
+    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader, SegmentDeleteHeader,
+    StartViewChangeHeader, StartViewHeader, StateChunkHeader, StateTransferTargetHeader,
+    frame_checksum_bytes, prepare_identity_checksum_bytes,
 };
 use smallvec::SmallVec;
+use std::sync::{Arc, Mutex};
 use std::{
     marker::PhantomData,
     mem::{offset_of, size_of},
 };
 
 pub const MESSAGE_ALIGN: usize = 4096;
+
+/// Fragment list behind a [`ResponseBacking`]. Inline for the single-buffer
+/// frame every reply but a poll is, so the per-connection mailboxes and the
+/// inter-shard reply lane stay one word wider than a bare [`Frozen`]; a
+/// vectored poll reply spills its fragment table to the heap once.
+pub type ResponseFragments = SmallVec<[Frozen<MESSAGE_ALIGN>; 1]>;
 
 pub trait MessageBacking<H>
 where
@@ -69,13 +83,97 @@ pub struct RequestBacking {
     owned: Owned<MESSAGE_ALIGN>,
 }
 
+/// An outbound frame as a list of buffers written back to back: the wire bytes
+/// are the concatenation of `fragments`. Never empty; the first fragment holds
+/// the whole frame header.
 #[derive(Debug, Clone)]
 pub struct ResponseBacking {
-    fragments: SmallVec<[Frozen<MESSAGE_ALIGN>; 4]>,
+    fragments: ResponseFragments,
+    write_receipt: Option<WriteReceipt>,
+}
+
+/// Completed by the transport only after the whole frame is written and flushed.
+/// Dropping every copy without completion cancels the observer.
+#[derive(Debug, Clone)]
+pub struct WriteReceipt(Arc<Mutex<Option<oneshot::Sender<()>>>>);
+
+impl WriteReceipt {
+    pub fn complete(self) {
+        if let Some(sender) = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = sender.send(());
+        }
+    }
 }
 
 impl RequestBackingKind for RequestBacking {}
 impl ResponseBackingKind for ResponseBacking {}
+
+impl ResponseBacking {
+    pub fn track_write(&mut self) -> oneshot::Receiver<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.write_receipt = Some(WriteReceipt(Arc::new(Mutex::new(Some(sender)))));
+        receiver
+    }
+
+    pub fn take_write_receipt(&mut self) -> Option<WriteReceipt> {
+        self.write_receipt.take()
+    }
+
+    /// The fragment carrying the frame header.
+    #[must_use]
+    pub fn first(&self) -> &Frozen<MESSAGE_ALIGN> {
+        self.fragments
+            .first()
+            .expect("response backing is never empty")
+    }
+
+    #[must_use]
+    pub fn fragments(&self) -> &[Frozen<MESSAGE_ALIGN>] {
+        &self.fragments
+    }
+
+    #[must_use]
+    pub fn into_fragments(self) -> ResponseFragments {
+        self.fragments
+    }
+
+    #[must_use]
+    pub fn total_len(&self) -> usize {
+        self.fragments.iter().map(Frozen::len).sum()
+    }
+
+    /// The frame as one buffer: the single fragment as is, or the fragments
+    /// copied back to back. For writers whose record layer needs a contiguous
+    /// payload (WebSocket frames, in-process reply decoding).
+    #[must_use]
+    pub fn into_contiguous(self) -> Frozen<MESSAGE_ALIGN> {
+        match self.fragments.as_slice() {
+            [single] => single.clone(),
+            fragments => {
+                let mut joined: AVec<u8, ConstAlign<MESSAGE_ALIGN>> =
+                    AVec::with_capacity(MESSAGE_ALIGN, self.total_len());
+                for fragment in fragments {
+                    joined.extend_from_slice(fragment);
+                }
+                Owned::from(joined).into()
+            }
+        }
+    }
+}
+
+impl From<Frozen<MESSAGE_ALIGN>> for ResponseBacking {
+    fn from(frozen: Frozen<MESSAGE_ALIGN>) -> Self {
+        Self {
+            fragments: smallvec::smallvec![frozen],
+            write_receipt: None,
+        }
+    }
+}
 
 impl RequestBacking {
     fn into_owned(self) -> Owned<MESSAGE_ALIGN> {
@@ -225,7 +323,7 @@ where
         if self.total_len() < size_of::<T>() {
             return Err(ConsensusError::InvalidCommand {
                 expected: T::COMMAND,
-                found: Command2::Reserved,
+                found: Command::Reserved,
             });
         }
 
@@ -239,7 +337,7 @@ where
 
         let bytes = <B as MessageBacking<T>>::header_storage(&self.backing);
         let typed = bytemuck::checked::try_from_bytes::<T>(&bytes[..size_of::<T>()])
-            .map_err(|_| ConsensusError::InvalidBitPattern)?;
+            .map_err(|_| classify_failed_cast::<T>(bytes))?;
         // Before `validate`: a header that did not survive the link intact cannot
         // have any of its fields believed, and `validate` reads them.
         typed.verify_frame()?;
@@ -264,7 +362,7 @@ where
         if self.total_len() < size_of::<T>() {
             return Err(ConsensusError::InvalidCommand {
                 expected: T::COMMAND,
-                found: Command2::Reserved,
+                found: Command::Reserved,
             });
         }
 
@@ -278,7 +376,7 @@ where
 
         let bytes = <B as MessageBacking<T>>::header_storage(&self.backing);
         let typed = bytemuck::checked::try_from_bytes::<T>(&bytes[..size_of::<T>()])
-            .map_err(|_| ConsensusError::InvalidBitPattern)?;
+            .map_err(|_| classify_failed_cast::<T>(bytes))?;
         // Before `validate`: a header that did not survive the link intact cannot
         // have any of its fields believed, and `validate` reads them.
         typed.verify_frame()?;
@@ -335,6 +433,24 @@ where
         <RequestBacking as MutableBacking<H>>::as_slice(&self.backing)
     }
 
+    /// The frame body: the bytes after the header, up to the header's `size`.
+    /// Empty for a header-only frame.
+    ///
+    /// Borrowed from the backing buffer rather than copied out of it. A
+    /// `WireDecode` parse takes `&[u8]` and keeps only the fields it decodes, so
+    /// copying the body first buys nothing and costs a memcpy per frame on paths
+    /// that run per replicated op (`metadata::stm`'s apply, `metadata::stm::authz`).
+    ///
+    /// # Panics
+    /// If `size` does not span the header or overruns the buffer.
+    /// [`TryFrom<Owned>`](Message::try_from) rejects both, so every received frame
+    /// satisfies this; a buffer from [`Message::new`] must have its header stamped
+    /// first.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.as_slice()[size_of::<H>()..self.header().size() as usize]
+    }
+
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         <RequestBacking as MutableBacking<H>>::as_mut_slice(&mut self.backing)
     }
@@ -362,6 +478,13 @@ where
         self.backing.into_frozen()
     }
 
+    /// Allocation charge after freezing this frame into a retained journal entry.
+    /// Returns `None` if its allocation layout cannot be represented.
+    #[must_use]
+    pub fn retained_allocation_size(&self) -> Option<usize> {
+        Frozen::<MESSAGE_ALIGN>::allocation_size(self.backing.owned.backing_capacity())
+    }
+
     /// # Panics
     ///
     /// Panics if `H` and `T` have different sizes, or if the rewritten header
@@ -383,11 +506,11 @@ where
 
 impl Message<RequestHeader> {
     /// Retype the client-wire request into the server-internal
-    /// [`RoutedRequestHeader`] shape in place, with `group` starting unset.
+    /// [`RoutedRequestHeader`] shape in place, with server routing fields unset.
     ///
     /// The two layouts share every field offset (const-asserted where they
-    /// are declared) and `group` claims the client header's reserved tail,
-    /// so the promotion zeroes those eight bytes instead of rebuilding the
+    /// are declared) and routing fields claim the client header's reserved tail,
+    /// so the promotion zeroes those bytes instead of rebuilding the
     /// whole 256-byte header. This is the only sanctioned crossing between
     /// the two layouts: transmute-based reads across them would alias
     /// `group` with reserved bytes a client may have sent nonzero.
@@ -400,8 +523,9 @@ impl Message<RequestHeader> {
     #[must_use]
     pub fn into_routed(self) -> Message<RoutedRequestHeader> {
         let group_offset = offset_of!(RoutedRequestHeader, group);
+        let metadata_offset = offset_of!(RoutedRequestHeader, metadata_watermark);
         let mut owned = self.into_owned();
-        owned.as_mut_slice()[group_offset..group_offset + size_of::<u64>()].fill(0);
+        owned.as_mut_slice()[metadata_offset..group_offset + size_of::<u64>()].fill(0);
         Message::try_from(owned).expect("retyped request message must stay valid")
     }
 }
@@ -451,12 +575,12 @@ where
         if bytes.len() < size_of::<H>() {
             return Err(ConsensusError::InvalidCommand {
                 expected: H::COMMAND,
-                found: Command2::Reserved,
+                found: Command::Reserved,
             });
         }
 
         let header = bytemuck::checked::try_from_bytes::<H>(&bytes[..size_of::<H>()])
-            .map_err(|_| ConsensusError::InvalidBitPattern)?;
+            .map_err(|_| classify_failed_cast::<H>(bytes))?;
         header.validate()?;
 
         // `size` is the whole-frame length and must at least span the header, or
@@ -466,14 +590,14 @@ where
         if (header.size() as usize) < size_of::<H>() {
             return Err(ConsensusError::InvalidCommand {
                 expected: H::COMMAND,
-                found: Command2::Reserved,
+                found: Command::Reserved,
             });
         }
 
         if bytes.len() < header.size() as usize {
             return Err(ConsensusError::InvalidCommand {
                 expected: H::COMMAND,
-                found: Command2::Reserved,
+                found: Command::Reserved,
             });
         }
 
@@ -481,29 +605,29 @@ where
     }
 }
 
-impl<H> TryFrom<SmallVec<[Frozen<MESSAGE_ALIGN>; 4]>> for Message<H, ResponseBacking>
+impl<H> TryFrom<ResponseFragments> for Message<H, ResponseBacking>
 where
     H: ConsensusHeader,
 {
     type Error = ConsensusError;
 
-    fn try_from(fragments: SmallVec<[Frozen<MESSAGE_ALIGN>; 4]>) -> Result<Self, Self::Error> {
+    fn try_from(fragments: ResponseFragments) -> Result<Self, Self::Error> {
         let Some(first) = fragments.first() else {
             return Err(ConsensusError::InvalidCommand {
                 expected: H::COMMAND,
-                found: Command2::Reserved,
+                found: Command::Reserved,
             });
         };
 
         if first.len() < size_of::<H>() {
             return Err(ConsensusError::InvalidCommand {
                 expected: H::COMMAND,
-                found: Command2::Reserved,
+                found: Command::Reserved,
             });
         }
 
         let header = bytemuck::checked::try_from_bytes::<H>(&first.as_slice()[..size_of::<H>()])
-            .map_err(|_| ConsensusError::InvalidBitPattern)?;
+            .map_err(|_| classify_failed_cast::<H>(first.as_slice()))?;
         header.validate()?;
 
         // See `TryFrom<Owned>`: `size` must at least span the header so a
@@ -511,7 +635,7 @@ where
         if (header.size() as usize) < size_of::<H>() {
             return Err(ConsensusError::InvalidCommand {
                 expected: H::COMMAND,
-                found: Command2::Reserved,
+                found: Command::Reserved,
             });
         }
 
@@ -519,11 +643,16 @@ where
         if total_len < header.size() as usize {
             return Err(ConsensusError::InvalidCommand {
                 expected: H::COMMAND,
-                found: Command2::Reserved,
+                found: Command::Reserved,
             });
         }
 
-        Ok(unsafe { Self::from_backing_unchecked(ResponseBacking { fragments }) })
+        Ok(unsafe {
+            Self::from_backing_unchecked(ResponseBacking {
+                fragments,
+                write_receipt: None,
+            })
+        })
     }
 }
 
@@ -536,6 +665,8 @@ pub enum MessageBag {
     DoViewChange(Message<DoViewChangeHeader>),
     StartView(Message<StartViewHeader>),
     Commit(Message<CommitHeader>),
+    CommitReply(Message<CommitReplyHeader>),
+    PrepareProgress(Message<PrepareProgressHeader>),
     RequestStartView(Message<RequestStartViewHeader>),
     RequestPrepares(Message<RequestPreparesHeader>),
     /// A journaled prepare re-sent verbatim for repair (command byte
@@ -552,11 +683,245 @@ pub enum MessageBag {
     RequestStateChunk(Message<RequestStateChunkHeader>),
     /// Artifact bytes ride the body (`size` spans header + payload).
     StateChunk(Message<StateChunkHeader>),
+    /// A backup relays a login it authenticated locally to the primary, which
+    /// owns the `Register` proposal.
+    ForwardRegister(Message<ForwardRegisterHeader>),
+    /// The primary's verdict, routed back to the parked login by nonce.
+    ForwardRegisterResult(Message<ForwardRegisterResultHeader>),
+    /// A backup asks the primary to commit a session teardown.
+    ForwardLogout(Message<ForwardLogoutHeader>),
+    /// The primary's verdict, routed back to the parked logout by nonce.
+    ForwardLogoutResult(Message<ForwardLogoutResultHeader>),
+    /// A backup reports session liveness to the metadata primary without a reply.
+    ConsumerSessionHeartbeat(Message<ConsumerSessionHeartbeatHeader>),
+    /// Readiness exchanges pass through shard 0 before reaching a partition owner.
+    PrimaryRebalance(Message<PrimaryRebalanceHeader>),
+    SegmentDelete(Message<SegmentDeleteHeader>),
+    /// A backup relays a partition completion to the metadata primary without a reply.
+    ForwardCompletion(Message<ForwardCompletionHeader>),
 }
 
 impl MessageBag {
+    /// Whether [`Self::routing`] sends frames of `command` to the metadata
+    /// group, whatever group their header names.
+    ///
+    /// Any shard can send these frames, so the replica bus cannot pick their
+    /// link from the sending shard. It sends them over the link of the shard
+    /// range that holds the metadata group. The match names every command,
+    /// so a new command must be classified here before it compiles.
     #[must_use]
-    pub fn command(&self) -> Command2 {
+    pub const fn routes_to_metadata(command: Command) -> bool {
+        match command {
+            Command::ForwardRegister
+            | Command::ForwardRegisterResult
+            | Command::ForwardLogout
+            | Command::ForwardLogoutResult
+            | Command::ConsumerSessionHeartbeat
+            | Command::SessionRetirementProgress
+            | Command::ForwardCompletion
+            | Command::PrimaryRebalance
+            | Command::SegmentDelete => true,
+            Command::Reserved
+            | Command::Ping
+            | Command::Pong
+            | Command::PingClient
+            | Command::PongClient
+            | Command::Request
+            | Command::Prepare
+            | Command::PrepareOk
+            | Command::Reply
+            | Command::Commit
+            | Command::CommitReply
+            | Command::PrepareProgress
+            | Command::StartViewChange
+            | Command::DoViewChange
+            | Command::StartView
+            | Command::Eviction
+            | Command::ReplicaHello
+            | Command::ReplicaChallenge
+            | Command::ReplicaFinish
+            | Command::RequestStartView
+            | Command::RequestPrepares
+            | Command::RepairPrepare
+            | Command::RepairDone
+            | Command::RangeEvicted
+            | Command::RequestStateTransfer
+            | Command::StateTransferTarget
+            | Command::RequestStateChunk
+            | Command::StateChunk => false,
+        }
+    }
+
+    /// `(operation, group)`: everything the shard router needs to pick a
+    /// target, read off the already-typed header without consuming the bag.
+    ///
+    /// `group` is a plain field on every consensus header rather than a
+    /// [`ConsensusHeader`] method, which is why this is a match and not a trait
+    /// call. `RepairPrepare` reads through its wrapped prepare.
+    ///
+    /// One `header()` per arm, bound to a local: each call runs a checked bytemuck
+    /// cast over the 256-byte header, and this is the per-frame routing path.
+    #[must_use]
+    pub fn routing(&self) -> (Operation, u64) {
+        match self {
+            Self::Request(message) => {
+                let header = message.header();
+                (header.operation, header.group)
+            }
+            Self::Prepare(message) => {
+                let header = message.header();
+                (header.operation, header.group)
+            }
+            Self::PrepareOk(message) => {
+                let header = message.header();
+                (header.operation, header.group)
+            }
+            Self::RepairPrepare(message) => {
+                let header = &message.header().0;
+                (header.operation, header.group)
+            }
+            Self::StartViewChange(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::DoViewChange(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::StartView(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::Commit(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::CommitReply(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::PrepareProgress(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::RequestStartView(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::RequestPrepares(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::RepairRangeReply(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::RequestStateTransfer(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::StateTransferTarget(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::RequestStateChunk(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            Self::StateChunk(message) => {
+                let header = message.header();
+                (header.operation(), header.group)
+            }
+            // Register forwarding is a metadata-plane errand, and the metadata
+            // consensus group lives on shard 0 on every node; the headers carry
+            // no group field because there is nothing else they could address.
+            Self::ForwardRegister(message) => (message.header().operation(), METADATA_GROUP),
+            Self::ForwardRegisterResult(message) => (message.header().operation(), METADATA_GROUP),
+            Self::ForwardLogout(message) => (message.header().operation(), METADATA_GROUP),
+            Self::ConsumerSessionHeartbeat(message) => {
+                (message.header().operation(), METADATA_GROUP)
+            }
+            Self::ForwardLogoutResult(message) => (message.header().operation(), METADATA_GROUP),
+            Self::ForwardCompletion(message) => (message.header().operation(), METADATA_GROUP),
+            Self::PrimaryRebalance(message) => (message.header().operation(), METADATA_GROUP),
+            Self::SegmentDelete(message) => (message.header().operation(), METADATA_GROUP),
+        }
+    }
+
+    /// The replica a partition-group frame names as its sender: a member index
+    /// of that group. `None` for client requests and metadata-only frames.
+    #[must_use]
+    pub fn partition_source_replica(&self) -> Option<u8> {
+        let generic = match self {
+            Self::Prepare(message) => message.as_generic(),
+            Self::PrepareOk(message) => message.as_generic(),
+            Self::StartViewChange(message) => message.as_generic(),
+            Self::DoViewChange(message) => message.as_generic(),
+            Self::StartView(message) => message.as_generic(),
+            Self::Commit(message) => message.as_generic(),
+            Self::CommitReply(message) => message.as_generic(),
+            Self::PrepareProgress(message) => message.as_generic(),
+            Self::RequestStartView(message) => message.as_generic(),
+            Self::RequestPrepares(message) => message.as_generic(),
+            Self::RepairRangeReply(message) => message.as_generic(),
+            Self::RequestStateTransfer(message) => message.as_generic(),
+            Self::StateTransferTarget(message) => message.as_generic(),
+            Self::RequestStateChunk(message) => message.as_generic(),
+            Self::StateChunk(message) => message.as_generic(),
+            Self::Request(_)
+            | Self::RepairPrepare(_)
+            | Self::ForwardRegister(_)
+            | Self::ForwardRegisterResult(_)
+            | Self::ForwardLogout(_)
+            | Self::ConsumerSessionHeartbeat(_)
+            | Self::ForwardLogoutResult(_)
+            | Self::ForwardCompletion(_)
+            | Self::PrimaryRebalance(_)
+            | Self::SegmentDelete(_) => return None,
+        };
+        let (_, group) = self.routing();
+        (group != METADATA_GROUP).then(|| generic.header().replica)
+    }
+
+    /// Discard the classification and hand back the underlying frame.
+    ///
+    /// Type-erasure only: the backing bytes are untouched, so a later
+    /// [`MessageBag::try_from`] reclassifies to the same variant. Callers that
+    /// need the frame in a generic container (the parked-frame buffer) use this;
+    /// the dispatch path keeps the bag so it never re-parses.
+    #[must_use]
+    pub fn into_generic(self) -> Message<GenericHeader> {
+        match self {
+            Self::Request(message) => message.into_generic(),
+            Self::Prepare(message) => message.into_generic(),
+            Self::PrepareOk(message) => message.into_generic(),
+            Self::StartViewChange(message) => message.into_generic(),
+            Self::DoViewChange(message) => message.into_generic(),
+            Self::StartView(message) => message.into_generic(),
+            Self::Commit(message) => message.into_generic(),
+            Self::CommitReply(message) => message.into_generic(),
+            Self::PrepareProgress(message) => message.into_generic(),
+            Self::RequestStartView(message) => message.into_generic(),
+            Self::RequestPrepares(message) => message.into_generic(),
+            Self::RepairPrepare(message) => message.into_generic(),
+            Self::RepairRangeReply(message) => message.into_generic(),
+            Self::RequestStateTransfer(message) => message.into_generic(),
+            Self::StateTransferTarget(message) => message.into_generic(),
+            Self::RequestStateChunk(message) => message.into_generic(),
+            Self::StateChunk(message) => message.into_generic(),
+            Self::ForwardRegister(message) => message.into_generic(),
+            Self::ForwardRegisterResult(message) => message.into_generic(),
+            Self::ForwardLogout(message) => message.into_generic(),
+            Self::ConsumerSessionHeartbeat(message) => message.into_generic(),
+            Self::ForwardLogoutResult(message) => message.into_generic(),
+            Self::ForwardCompletion(message) => message.into_generic(),
+            Self::PrimaryRebalance(message) => message.into_generic(),
+            Self::SegmentDelete(message) => message.into_generic(),
+        }
+    }
+
+    #[must_use]
+    pub fn command(&self) -> Command {
         match self {
             Self::Request(message) => message.header().command,
             Self::Prepare(message) => message.header().command,
@@ -565,6 +930,8 @@ impl MessageBag {
             Self::DoViewChange(message) => message.header().command,
             Self::StartView(message) => message.header().command,
             Self::Commit(message) => message.header().command,
+            Self::CommitReply(message) => message.header().command,
+            Self::PrepareProgress(message) => message.header().command,
             Self::RequestStartView(message) => message.header().command,
             Self::RequestPrepares(message) => message.header().command,
             Self::RepairPrepare(message) => message.header().command(),
@@ -573,6 +940,14 @@ impl MessageBag {
             Self::StateTransferTarget(message) => message.header().command,
             Self::RequestStateChunk(message) => message.header().command,
             Self::StateChunk(message) => message.header().command,
+            Self::ForwardRegister(message) => message.header().command,
+            Self::ForwardRegisterResult(message) => message.header().command,
+            Self::ForwardLogout(message) => message.header().command,
+            Self::ConsumerSessionHeartbeat(message) => message.header().command,
+            Self::ForwardLogoutResult(message) => message.header().command,
+            Self::ForwardCompletion(message) => message.header().command,
+            Self::PrimaryRebalance(message) => message.header().command,
+            Self::SegmentDelete(message) => message.header().command,
         }
     }
 
@@ -586,6 +961,8 @@ impl MessageBag {
             Self::DoViewChange(message) => message.header().size(),
             Self::StartView(message) => message.header().size(),
             Self::Commit(message) => message.header().size(),
+            Self::CommitReply(message) => message.header().size(),
+            Self::PrepareProgress(message) => message.header().size(),
             Self::RequestStartView(message) => message.header().size(),
             Self::RequestPrepares(message) => message.header().size(),
             Self::RepairPrepare(message) => message.header().size(),
@@ -594,6 +971,14 @@ impl MessageBag {
             Self::StateTransferTarget(message) => message.header().size(),
             Self::RequestStateChunk(message) => message.header().size(),
             Self::StateChunk(message) => message.header().size(),
+            Self::ForwardRegister(message) => message.header().size(),
+            Self::ForwardRegisterResult(message) => message.header().size(),
+            Self::ForwardLogout(message) => message.header().size(),
+            Self::ConsumerSessionHeartbeat(message) => message.header().size(),
+            Self::ForwardLogoutResult(message) => message.header().size(),
+            Self::ForwardCompletion(message) => message.header().size(),
+            Self::PrimaryRebalance(message) => message.header().size(),
+            Self::SegmentDelete(message) => message.header().size(),
         }
     }
 
@@ -607,6 +992,8 @@ impl MessageBag {
             Self::DoViewChange(message) => message.header().operation(),
             Self::StartView(message) => message.header().operation(),
             Self::Commit(message) => message.header().operation(),
+            Self::CommitReply(message) => message.header().operation(),
+            Self::PrepareProgress(message) => message.header().operation(),
             Self::RequestStartView(message) => message.header().operation(),
             Self::RequestPrepares(message) => message.header().operation(),
             Self::RepairPrepare(message) => message.header().operation(),
@@ -615,8 +1002,80 @@ impl MessageBag {
             Self::StateTransferTarget(message) => message.header().operation(),
             Self::RequestStateChunk(message) => message.header().operation(),
             Self::StateChunk(message) => message.header().operation(),
+            Self::ForwardRegister(message) => message.header().operation(),
+            Self::ForwardRegisterResult(message) => message.header().operation(),
+            Self::ForwardLogout(message) => message.header().operation(),
+            Self::ConsumerSessionHeartbeat(message) => message.header().operation(),
+            Self::ForwardLogoutResult(message) => message.header().operation(),
+            Self::ForwardCompletion(message) => message.header().operation(),
+            Self::PrimaryRebalance(message) => message.header().operation(),
+            Self::SegmentDelete(message) => message.header().operation(),
         }
     }
+}
+
+/// Why `H`'s header bytes failed bytemuck's checked cast.
+///
+/// An operation discriminant this build does not define means the sender runs
+/// another release: a newer one adds operations, and an older one can still
+/// send a retired one. The frame is wire-valid and the releases must be
+/// aligned, a different operator action from the corrupted-header case.
+/// bytemuck reports both as one error, so the operation byte is probed here to
+/// separate them.
+fn classify_failed_cast<H>(bytes: &[u8]) -> ConsensusError
+where
+    H: ConsensusHeader,
+{
+    if let Some(offset) = H::OPERATION_OFFSET
+        && let Some(&code) = bytes.get(offset)
+        && !Operation::is_known_code(code)
+        && operation_byte_is_trustworthy::<H>(bytes)
+    {
+        return ConsensusError::UnsupportedOperation { operation: code };
+    }
+    ConsensusError::InvalidBitPattern
+}
+
+/// Whether the operation byte may be read as the sender's release rather than
+/// as damage.
+///
+/// This classification runs before `verify_frame`, so the byte is still
+/// unverified: a flipped bit landing in an undefined discriminant would
+/// otherwise be reported as version skew, and for a `PrepareOk` --
+/// which echoes an operation this primary minted itself -- corruption is the
+/// likelier cause anyway. Sealed headers verify the frame checksum; the
+/// Prepare family verifies the identity checksum, which covers the operation
+/// byte, recomputed over the raw bytes because the unknown discriminant blocks
+/// the typed view.
+///
+/// A `Request` has neither (its `checksum` crosses the client boundary
+/// unsealed), so its byte is taken at face value and the error text claims
+/// only *likely* skew.
+fn operation_byte_is_trustworthy<H>(bytes: &[u8]) -> bool
+where
+    H: ConsensusHeader,
+{
+    if !H::FRAME_SEALED && !H::IDENTITY_CHECKSUMMED {
+        return true;
+    }
+    let Some(header) = bytes
+        .get(..HEADER_SIZE)
+        .and_then(|slice| <&[u8; HEADER_SIZE]>::try_from(slice).ok())
+    else {
+        return false;
+    };
+    let Some(stored) = header
+        .get(..size_of::<u128>())
+        .and_then(|slice| <[u8; size_of::<u128>()]>::try_from(slice).ok())
+    else {
+        return false;
+    };
+    let expected = if H::FRAME_SEALED {
+        frame_checksum_bytes(header)
+    } else {
+        prepare_identity_checksum_bytes(header)
+    };
+    u128::from_le_bytes(stored) == expected
 }
 
 impl<T> TryFrom<Message<T>> for MessageBag
@@ -633,54 +1092,82 @@ where
         let command = value.as_generic().header().command;
 
         match command {
-            Command2::Prepare => Ok(Self::Prepare(value.try_into_typed::<PrepareHeader>()?)),
-            Command2::Request => Ok(Self::Request(
+            Command::Prepare => Ok(Self::Prepare(value.try_into_typed::<PrepareHeader>()?)),
+            Command::Request => Ok(Self::Request(
                 value.try_into_typed::<RoutedRequestHeader>()?,
             )),
-            Command2::PrepareOk => Ok(Self::PrepareOk(value.try_into_typed::<PrepareOkHeader>()?)),
-            Command2::StartViewChange => Ok(Self::StartViewChange(
+            Command::PrepareOk => Ok(Self::PrepareOk(value.try_into_typed::<PrepareOkHeader>()?)),
+            Command::StartViewChange => Ok(Self::StartViewChange(
                 value.try_into_typed::<StartViewChangeHeader>()?,
             )),
-            Command2::DoViewChange => Ok(Self::DoViewChange(
+            Command::DoViewChange => Ok(Self::DoViewChange(
                 value.try_into_typed::<DoViewChangeHeader>()?,
             )),
-            Command2::StartView => Ok(Self::StartView(value.try_into_typed::<StartViewHeader>()?)),
-            Command2::Commit => Ok(Self::Commit(value.try_into_typed::<CommitHeader>()?)),
-            Command2::RequestStartView => Ok(Self::RequestStartView(
+            Command::StartView => Ok(Self::StartView(value.try_into_typed::<StartViewHeader>()?)),
+            Command::Commit => Ok(Self::Commit(value.try_into_typed::<CommitHeader>()?)),
+            Command::CommitReply => Ok(Self::CommitReply(
+                value.try_into_typed::<CommitReplyHeader>()?,
+            )),
+            Command::PrepareProgress => Ok(Self::PrepareProgress(
+                value.try_into_typed::<PrepareProgressHeader>()?,
+            )),
+            Command::RequestStartView => Ok(Self::RequestStartView(
                 value.try_into_typed::<RequestStartViewHeader>()?,
             )),
-            Command2::RequestPrepares => Ok(Self::RequestPrepares(
+            Command::RequestPrepares => Ok(Self::RequestPrepares(
                 value.try_into_typed::<RequestPreparesHeader>()?,
             )),
-            // A repaired prepare is a stored PrepareHeader frame whose command
-            // byte was rewritten; typed validation would reject the byte, so
-            // parse through the generic backing and trust the prepare-shaped
-            // layout the way the journal that produced it did.
-            Command2::RepairPrepare => Ok(Self::RepairPrepare(
+            // Keep the repair command through routing so it reaches repair
+            // ingest instead of the live-prepare view fence.
+            Command::RepairPrepare => Ok(Self::RepairPrepare(
                 value.try_into_typed::<RepairPrepareHeader>()?,
             )),
-            Command2::RepairDone | Command2::RangeEvicted => Ok(Self::RepairRangeReply(
+            Command::RepairDone | Command::RangeEvicted => Ok(Self::RepairRangeReply(
                 value.try_into_typed::<RepairRangeReplyHeader>()?,
             )),
-            Command2::RequestStateTransfer => Ok(Self::RequestStateTransfer(
+            Command::RequestStateTransfer => Ok(Self::RequestStateTransfer(
                 value.try_into_typed::<RequestStateTransferHeader>()?,
             )),
-            Command2::StateTransferTarget => Ok(Self::StateTransferTarget(
+            Command::StateTransferTarget => Ok(Self::StateTransferTarget(
                 value.try_into_typed::<StateTransferTargetHeader>()?,
             )),
-            Command2::RequestStateChunk => Ok(Self::RequestStateChunk(
+            Command::RequestStateChunk => Ok(Self::RequestStateChunk(
                 value.try_into_typed::<RequestStateChunkHeader>()?,
             )),
-            Command2::StateChunk => Ok(Self::StateChunk(
+            Command::StateChunk => Ok(Self::StateChunk(
                 value.try_into_typed::<StateChunkHeader>()?,
+            )),
+            Command::ForwardRegister => Ok(Self::ForwardRegister(
+                value.try_into_typed::<ForwardRegisterHeader>()?,
+            )),
+            Command::ForwardRegisterResult => Ok(Self::ForwardRegisterResult(
+                value.try_into_typed::<ForwardRegisterResultHeader>()?,
+            )),
+            Command::ForwardLogout => Ok(Self::ForwardLogout(
+                value.try_into_typed::<ForwardLogoutHeader>()?,
+            )),
+            Command::ForwardLogoutResult => Ok(Self::ForwardLogoutResult(
+                value.try_into_typed::<ForwardLogoutResultHeader>()?,
+            )),
+            Command::ConsumerSessionHeartbeat | Command::SessionRetirementProgress => {
+                Ok(Self::ConsumerSessionHeartbeat(
+                    value.try_into_typed::<ConsumerSessionHeartbeatHeader>()?,
+                ))
+            }
+            Command::ForwardCompletion => Ok(Self::ForwardCompletion(
+                value.try_into_typed::<ForwardCompletionHeader>()?,
+            )),
+            Command::SegmentDelete => Ok(Self::SegmentDelete(
+                value.try_into_typed::<SegmentDeleteHeader>()?,
+            )),
+            Command::PrimaryRebalance => Ok(Self::PrimaryRebalance(
+                value.try_into_typed::<PrimaryRebalanceHeader>()?,
             )),
             // Reply / Eviction are server-to-client frames; they do not
             // appear on the inbound dispatch path.
-            Command2::Reply | Command2::Eviction => {
-                Err(ConsensusError::ClientBoundCommand(command))
-            }
+            Command::Reply | Command::Eviction => Err(ConsensusError::ClientBoundCommand(command)),
             other => Err(ConsensusError::InvalidCommand {
-                expected: Command2::Reserved,
+                expected: Command::Reserved,
                 found: other,
             }),
         }
@@ -690,10 +1177,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sharding::IggyNamespace;
     use iggy_binary_protocol::{
-        HEADER_SIZE, Operation, ReplyHeader, RequestHeader, frame_checksum_bytes,
+        ForwardLogoutHeader, ForwardLogoutOutcome, ForwardLogoutResultHeader, HEADER_SIZE,
+        Operation, PrimaryRebalanceKind, ReplyHeader, RequestHeader, frame_checksum_bytes,
     };
     use smallvec::smallvec;
+    use std::mem::offset_of;
 
     // Field offsets via `offset_of!`: a field reorder fails to compile here
     // rather than silently corrupting test bytes.
@@ -704,11 +1194,11 @@ mod tests {
     const REQUEST_SESSION_OFF: usize = std::mem::offset_of!(RoutedRequestHeader, session);
     const REQUEST_REQUEST_OFF: usize = std::mem::offset_of!(RoutedRequestHeader, request);
 
-    fn header_bytes(command: Command2, size: u32) -> Owned<MESSAGE_ALIGN> {
+    fn header_bytes(command: Command, size: u32) -> Owned<MESSAGE_ALIGN> {
         header_bytes_sized(command, size, 256)
     }
 
-    fn header_bytes_sized(command: Command2, size: u32, buffer_len: usize) -> Owned<MESSAGE_ALIGN> {
+    fn header_bytes_sized(command: Command, size: u32, buffer_len: usize) -> Owned<MESSAGE_ALIGN> {
         let mut o = Owned::<MESSAGE_ALIGN>::zeroed(buffer_len);
         {
             let buf = o.as_mut_slice();
@@ -747,10 +1237,148 @@ mod tests {
         {
             let buf = owned.as_mut_slice();
             buf[SIZE_OFF..SIZE_OFF + 4].copy_from_slice(&(DVC_SIZE as u32).to_le_bytes());
-            buf[COMMAND_OFF] = Command2::DoViewChange as u8;
+            buf[COMMAND_OFF] = Command::DoViewChange as u8;
             seal_header_bytes(buf);
         }
         owned
+    }
+
+    /// An operation byte from a newer release, on a frame whose seal proves the
+    /// byte arrived as the sender wrote it.
+    fn sealed_prepare_ok_with_operation(operation: u8) -> Owned<MESSAGE_ALIGN> {
+        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE);
+        {
+            let buf = owned.as_mut_slice();
+            buf[SIZE_OFF..SIZE_OFF + 4].copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+            buf[COMMAND_OFF] = Command::PrepareOk as u8;
+            buf[offset_of!(PrepareOkHeader, operation)] = operation;
+            seal_header_bytes(buf);
+        }
+        owned
+    }
+
+    const OPERATION_FROM_A_NEWER_RELEASE: u8 = 0xEE;
+
+    #[test]
+    fn given_a_sealed_frame_when_its_operation_is_unknown_should_report_version_skew() {
+        let owned = sealed_prepare_ok_with_operation(OPERATION_FROM_A_NEWER_RELEASE);
+
+        assert!(matches!(
+            classify_failed_cast::<PrepareOkHeader>(owned.as_slice()),
+            ConsensusError::UnsupportedOperation {
+                operation: OPERATION_FROM_A_NEWER_RELEASE
+            }
+        ));
+    }
+
+    // The classification runs before `verify_frame`, so on a sealed header the
+    // operation byte is unverified. A flipped bit landing in an undefined
+    // discriminant must not be reported as "the sender runs a newer release":
+    // that sends an operator upgrading a node over a corrupt link, and a
+    // `PrepareOk` echoes an operation this primary minted itself, so corruption
+    // is the likelier cause to begin with.
+    #[test]
+    fn given_a_corrupt_sealed_frame_when_its_operation_is_unknown_should_not_claim_version_skew() {
+        let mut owned = sealed_prepare_ok_with_operation(0);
+        // Flip the operation byte AFTER sealing, the way damage in flight does.
+        owned.as_mut_slice()[offset_of!(PrepareOkHeader, operation)] =
+            OPERATION_FROM_A_NEWER_RELEASE;
+
+        assert!(matches!(
+            classify_failed_cast::<PrepareOkHeader>(owned.as_slice()),
+            ConsensusError::InvalidBitPattern
+        ));
+    }
+
+    /// A Prepare frame stamped the way a real sender stamps it: `checksum`
+    /// carries the prepare identity, which covers the operation byte.
+    fn identity_stamped_prepare(command: Command, operation: u8) -> Owned<MESSAGE_ALIGN> {
+        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE);
+        {
+            let buf = owned.as_mut_slice();
+            buf[SIZE_OFF..SIZE_OFF + 4].copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+            buf[COMMAND_OFF] = command as u8;
+            buf[offset_of!(PrepareHeader, operation)] = operation;
+            let header: &[u8; HEADER_SIZE] =
+                buf[..HEADER_SIZE].try_into().expect("frame is a header");
+            let identity = prepare_identity_checksum_bytes(header);
+            buf[..size_of::<u128>()].copy_from_slice(&identity.to_le_bytes());
+        }
+        owned
+    }
+
+    // A prepare's `checksum` carries its identity, which covers the operation
+    // byte, so an intact identity authenticates the unknown byte as the
+    // sender's release rather than damage.
+    #[test]
+    fn given_an_identity_stamped_prepare_when_its_operation_is_unknown_should_report_version_skew()
+    {
+        let owned = identity_stamped_prepare(Command::Prepare, OPERATION_FROM_A_NEWER_RELEASE);
+
+        const { assert!(!PrepareHeader::FRAME_SEALED) };
+        assert!(matches!(
+            classify_failed_cast::<PrepareHeader>(owned.as_slice()),
+            ConsensusError::UnsupportedOperation {
+                operation: OPERATION_FROM_A_NEWER_RELEASE
+            }
+        ));
+    }
+
+    // The identity was computed over a DIFFERENT operation byte, so the flip
+    // happened after stamping: damage, not a release.
+    #[test]
+    fn given_a_corrupt_prepare_when_its_operation_is_unknown_should_not_claim_version_skew() {
+        let mut owned = identity_stamped_prepare(Command::Prepare, 0);
+        owned.as_mut_slice()[offset_of!(PrepareHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
+
+        assert!(matches!(
+            classify_failed_cast::<PrepareHeader>(owned.as_slice()),
+            ConsensusError::InvalidBitPattern
+        ));
+    }
+
+    // A client `Request` has neither a frame seal nor a prepare identity, so
+    // its operation byte is taken at face value; the error text claims only
+    // likely skew for exactly this reason.
+    #[test]
+    fn given_a_client_request_when_its_operation_is_unknown_should_report_version_skew() {
+        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE);
+        {
+            let buf = owned.as_mut_slice();
+            buf[SIZE_OFF..SIZE_OFF + 4].copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+            buf[COMMAND_OFF] = Command::Request as u8;
+            buf[offset_of!(RequestHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
+        }
+
+        const { assert!(!RequestHeader::FRAME_SEALED && !RequestHeader::IDENTITY_CHECKSUMMED) };
+        assert!(matches!(
+            classify_failed_cast::<RequestHeader>(owned.as_slice()),
+            ConsensusError::UnsupportedOperation {
+                operation: OPERATION_FROM_A_NEWER_RELEASE
+            }
+        ));
+    }
+
+    // Transparent over `PrepareHeader`, so a repaired prepare from a newer
+    // release must reach the same fence instead of reading as corruption.
+    #[test]
+    fn given_a_repaired_prepare_when_its_operation_is_unknown_should_report_version_skew() {
+        assert_eq!(
+            RepairPrepareHeader::OPERATION_OFFSET,
+            PrepareHeader::OPERATION_OFFSET,
+            "the newtype carries the same operation field"
+        );
+        const { assert!(RepairPrepareHeader::IDENTITY_CHECKSUMMED) };
+
+        let owned =
+            identity_stamped_prepare(Command::RepairPrepare, OPERATION_FROM_A_NEWER_RELEASE);
+
+        assert!(matches!(
+            classify_failed_cast::<RepairPrepareHeader>(owned.as_slice()),
+            ConsensusError::UnsupportedOperation {
+                operation: OPERATION_FROM_A_NEWER_RELEASE
+            }
+        ));
     }
 
     #[test]
@@ -792,14 +1420,14 @@ mod tests {
     #[test]
     fn probe_and_repair_commands_round_trip_into_bag() {
         for command in [
-            Command2::RequestStartView,
-            Command2::RequestPrepares,
-            Command2::RepairPrepare,
-            Command2::RepairDone,
-            Command2::RangeEvicted,
+            Command::RequestStartView,
+            Command::RequestPrepares,
+            Command::RepairPrepare,
+            Command::RepairDone,
+            Command::RangeEvicted,
         ] {
             let mut owned = header_bytes(command, 256);
-            if command == Command2::RequestPrepares {
+            if command == Command::RequestPrepares {
                 // validate() demands a non-empty 1-based range.
                 const FROM_OP_OFF: usize =
                     std::mem::offset_of!(iggy_binary_protocol::RequestPreparesHeader, from_op);
@@ -817,17 +1445,202 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{command:?} failed bag parse: {e}"));
             let routed = matches!(
                 (&bag, command),
-                (MessageBag::RequestStartView(_), Command2::RequestStartView)
-                    | (MessageBag::RequestPrepares(_), Command2::RequestPrepares)
-                    | (MessageBag::RepairPrepare(_), Command2::RepairPrepare)
+                (MessageBag::RequestStartView(_), Command::RequestStartView)
+                    | (MessageBag::RequestPrepares(_), Command::RequestPrepares)
+                    | (MessageBag::RepairPrepare(_), Command::RepairPrepare)
                     | (
                         MessageBag::RepairRangeReply(_),
-                        Command2::RepairDone | Command2::RangeEvicted
+                        Command::RepairDone | Command::RangeEvicted
                     )
             );
             assert!(routed, "{command:?} parsed into the wrong bag variant");
             assert_eq!(bag.command(), command, "original command byte must survive");
         }
+    }
+
+    #[test]
+    fn forward_logout_commands_round_trip_into_bag() {
+        let forward = Message::<ForwardLogoutHeader>::new(HEADER_SIZE).transmute_header(
+            |_, header: &mut ForwardLogoutHeader| {
+                header.command = Command::ForwardLogout;
+                header.size = HEADER_SIZE as u32;
+                header.client = 7;
+                header.nonce = 8;
+                header.session = 9;
+                header.request = 10;
+                header.seal();
+            },
+        );
+        let result = Message::<ForwardLogoutResultHeader>::new(HEADER_SIZE).transmute_header(
+            |_, header: &mut ForwardLogoutResultHeader| {
+                header.command = Command::ForwardLogoutResult;
+                header.size = HEADER_SIZE as u32;
+                header.client = 7;
+                header.nonce = 8;
+                header.commit = 11;
+                header.outcome = ForwardLogoutOutcome::Ok;
+                header.seal();
+            },
+        );
+
+        let forward = MessageBag::try_from(forward.into_generic()).expect("parse ForwardLogout");
+        let result =
+            MessageBag::try_from(result.into_generic()).expect("parse ForwardLogoutResult");
+        assert!(matches!(forward, MessageBag::ForwardLogout(_)));
+        assert!(matches!(result, MessageBag::ForwardLogoutResult(_)));
+        assert_eq!(forward.command(), Command::ForwardLogout);
+        assert_eq!(result.command(), Command::ForwardLogoutResult);
+        assert_eq!(forward.operation(), Operation::Reserved);
+        assert_eq!(result.size(), HEADER_SIZE as u32);
+        for bag in [forward, result] {
+            assert!(MessageBag::routes_to_metadata(bag.command()));
+            assert_eq!(bag.routing().1, METADATA_GROUP);
+        }
+    }
+
+    #[test]
+    fn given_a_group_frame_when_classified_should_not_route_to_metadata_by_command() {
+        let bag = dispatch(Command::Prepare, HEADER_SIZE as u32).expect("dispatch Prepare");
+        assert!(!MessageBag::routes_to_metadata(bag.command()));
+        assert_ne!(bag.routing().1, METADATA_GROUP);
+    }
+
+    #[test]
+    fn given_heartbeat_replies_when_classifying_links_should_preserve_their_group() {
+        for group in [METADATA_GROUP, IggyNamespace::new(1, 1, 0).inner()] {
+            let reply = Message::<CommitReplyHeader>::new(HEADER_SIZE).transmute_header(
+                |_, header: &mut CommitReplyHeader| {
+                    header.command = Command::CommitReply;
+                    header.size = u32::try_from(HEADER_SIZE).unwrap();
+                    header.group = group;
+                    header.timestamp_monotonic = 1;
+                    header.seal();
+                },
+            );
+            let bag = MessageBag::try_from(reply.into_generic()).unwrap();
+            assert!(!MessageBag::routes_to_metadata(bag.command()));
+            assert_eq!(bag.routing().1, group);
+        }
+    }
+
+    fn primary_rebalance_frame(kind: PrimaryRebalanceKind) -> Message<PrimaryRebalanceHeader> {
+        Message::<PrimaryRebalanceHeader>::new(HEADER_SIZE).transmute_header(
+            |_, header: &mut PrimaryRebalanceHeader| {
+                header.command = Command::PrimaryRebalance;
+                header.size = HEADER_SIZE as u32;
+                header.cluster = 7;
+                header.view = 11;
+                header.replica = 2;
+                header.nonce = 13;
+                header.kind = kind;
+                header.quorum_age_ns = PrimaryRebalanceHeader::NO_QUORUM_EVIDENCE;
+                if matches!(
+                    kind,
+                    PrimaryRebalanceKind::PartitionProbe
+                        | PrimaryRebalanceKind::PartitionReply
+                        | PrimaryRebalanceKind::SourceProbe
+                        | PrimaryRebalanceKind::SourceReply
+                        | PrimaryRebalanceKind::PrimaryTransfer
+                ) {
+                    header.namespace = 17;
+                    header.created_revision = 19;
+                    header.commit = 23;
+                    header.partition_view = 5;
+                }
+                header.ready = u8::from(matches!(
+                    kind,
+                    PrimaryRebalanceKind::MetadataReply
+                        | PrimaryRebalanceKind::PartitionReply
+                        | PrimaryRebalanceKind::SourceReply
+                ));
+                header.target = u8::from(kind == PrimaryRebalanceKind::PrimaryTransfer);
+                header.seal();
+            },
+        )
+    }
+
+    #[test]
+    fn given_rebalance_phases_when_dispatched_should_route_through_metadata_with_identity_intact() {
+        for kind in [
+            PrimaryRebalanceKind::MetadataProbe,
+            PrimaryRebalanceKind::MetadataReply,
+            PrimaryRebalanceKind::PartitionProbe,
+            PrimaryRebalanceKind::PartitionReply,
+            PrimaryRebalanceKind::SourceProbe,
+            PrimaryRebalanceKind::SourceReply,
+            PrimaryRebalanceKind::PrimaryTransfer,
+        ] {
+            let frame = primary_rebalance_frame(kind);
+            let expected = *frame.header();
+            let bag = MessageBag::try_from(frame.into_generic()).unwrap();
+            assert!(matches!(bag, MessageBag::PrimaryRebalance(_)));
+            assert_eq!(bag.routing(), (Operation::Reserved, METADATA_GROUP));
+            assert!(MessageBag::routes_to_metadata(bag.command()));
+            assert_eq!(bag.command(), Command::PrimaryRebalance);
+            assert_eq!(bag.operation(), Operation::Reserved);
+            assert_eq!(bag.size(), HEADER_SIZE as u32);
+            let decoded = bag
+                .into_generic()
+                .try_into_typed::<PrimaryRebalanceHeader>()
+                .unwrap();
+            assert_eq!(*decoded.header(), expected);
+            assert!(decoded.body().is_empty());
+        }
+    }
+
+    #[test]
+    fn given_invalid_rebalance_fields_when_dispatched_should_reject_before_routing() {
+        for (offset, value, bit_pattern) in [
+            (offset_of!(PrimaryRebalanceHeader, kind), u8::MAX, true),
+            (offset_of!(PrimaryRebalanceHeader, reserved_frame), 1, false),
+            (offset_of!(PrimaryRebalanceHeader, reserved), 1, false),
+            (offset_of!(PrimaryRebalanceHeader, checksum_body), 1, false),
+            (offset_of!(PrimaryRebalanceHeader, release), 1, false),
+            (offset_of!(PrimaryRebalanceHeader, nonce), 0, false),
+            (offset_of!(PrimaryRebalanceHeader, ready), 1, false),
+            (offset_of!(PrimaryRebalanceHeader, namespace), 1, false),
+        ] {
+            let mut owned =
+                primary_rebalance_frame(PrimaryRebalanceKind::MetadataProbe).into_owned();
+            owned.as_mut_slice()[offset] = value;
+            seal_header_bytes(owned.as_mut_slice());
+            let generic = Message::<GenericHeader>::try_from(owned).unwrap();
+            let error = MessageBag::try_from(generic).unwrap_err();
+            if bit_pattern {
+                assert!(matches!(error, ConsensusError::InvalidBitPattern));
+            } else {
+                assert!(
+                    matches!(error, ConsensusError::InvalidField(_)),
+                    "{offset}: {error}"
+                );
+            }
+        }
+
+        let mut owned = primary_rebalance_frame(PrimaryRebalanceKind::PartitionReply).into_owned();
+        owned.as_mut_slice()[offset_of!(PrimaryRebalanceHeader, nonce)] ^= 1;
+        let generic = Message::<GenericHeader>::try_from(owned).unwrap();
+        assert!(matches!(
+            MessageBag::try_from(generic),
+            Err(ConsensusError::FrameChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn given_a_rebalance_frame_when_it_advertises_a_body_should_reject_before_routing() {
+        let valid = primary_rebalance_frame(PrimaryRebalanceKind::PartitionProbe);
+        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE + 1);
+        owned.as_mut_slice()[..HEADER_SIZE].copy_from_slice(valid.as_slice());
+        owned.as_mut_slice()[SIZE_OFF..SIZE_OFF + size_of::<u32>()]
+            .copy_from_slice(&((HEADER_SIZE + 1) as u32).to_le_bytes());
+        seal_header_bytes(owned.as_mut_slice());
+        let generic = Message::<GenericHeader>::try_from(owned).unwrap();
+        assert!(matches!(
+            MessageBag::try_from(generic),
+            Err(ConsensusError::InvalidSize {
+                expected: 256,
+                found: 257
+            })
+        ));
     }
 
     // Construction via Message::new (zeroed)
@@ -850,7 +1663,7 @@ mod tests {
     #[test]
     fn try_from_owned_invalid_bit_pattern_returns_err() {
         let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(256);
-        owned.as_mut_slice()[COMMAND_OFF] = 99; // outside Command2's discriminant range
+        owned.as_mut_slice()[COMMAND_OFF] = 99; // outside Command's discriminant range
         let result = Message::<RoutedRequestHeader>::try_from(owned);
         assert!(matches!(result, Err(ConsensusError::InvalidBitPattern)));
     }
@@ -864,7 +1677,7 @@ mod tests {
         // "buffer shorter than `size_of::<H>`" case currently surface as
         // the same `InvalidCommand` variant; promoting them to distinct
         // `ConsensusError` variants is a separate hardening pass.)
-        let owned = header_bytes(Command2::Request, 999);
+        let owned = header_bytes(Command::Request, 999);
         // header_bytes already produces a 256-byte buffer; size=999 > 256,
         // so try_from rejects via `bytes.len() < header.size()`.
         let result = Message::<RoutedRequestHeader>::try_from(owned);
@@ -878,7 +1691,7 @@ mod tests {
         // buffer-length check passes). Guards the `[size_of::<H>()..size]`
         // underflow at every downstream call site.
         let owned = header_bytes(
-            Command2::Request,
+            Command::Request,
             size_of::<RoutedRequestHeader>() as u32 - 1,
         );
         let result = Message::<RoutedRequestHeader>::try_from(owned);
@@ -889,11 +1702,35 @@ mod tests {
 
     #[test]
     fn as_generic_view_reads_command_byte() {
-        let owned = header_bytes(Command2::Request, 256);
+        let owned = header_bytes(Command::Request, 256);
         let typed = Message::<RoutedRequestHeader>::try_from(owned).expect("valid");
         let generic = typed.as_generic();
-        assert_eq!(generic.header().command, Command2::Request);
+        assert_eq!(generic.header().command, Command::Request);
         assert_eq!(generic.total_len(), 256);
+    }
+
+    // body(): the slice every wire decode reads from
+
+    #[test]
+    fn body_is_the_bytes_between_the_header_and_the_frame_size() {
+        // A 512-byte allocation holding a 260-byte frame: the accessor follows the
+        // header's `size`, never the buffer that happens to hold it.
+        const BODY: [u8; 4] = [1, 2, 3, 4];
+        let frame_size = size_of::<GenericHeader>() + BODY.len();
+        let mut owned = header_bytes_sized(Command::Prepare, frame_size as u32, 512);
+        owned.as_mut_slice()[size_of::<GenericHeader>()..frame_size].copy_from_slice(&BODY);
+
+        let message = Message::<GenericHeader>::try_from(owned).expect("valid generic");
+        assert_eq!(message.body(), BODY);
+    }
+
+    #[test]
+    fn body_is_empty_for_a_header_only_frame() {
+        // Header-only commands go through the same accessor, so `size` equal to the
+        // header must yield an empty slice rather than an inverted-range panic.
+        let owned = header_bytes_sized(Command::Prepare, size_of::<GenericHeader>() as u32, 512);
+        let message = Message::<GenericHeader>::try_from(owned).expect("valid generic");
+        assert!(message.body().is_empty());
     }
 
     // try_as_typed: validation gates the unsafe ptr-cast reborrow
@@ -902,14 +1739,14 @@ mod tests {
     fn try_as_typed_command_mismatch_returns_err_without_unsafe_cast() {
         // bytes are a valid Prepare; asking for RoutedRequestHeader must fail
         // *before* the unsafe ptr-cast inside try_as_typed.
-        let owned = header_bytes(Command2::Prepare, 256);
+        let owned = header_bytes(Command::Prepare, 256);
         let generic = Message::<GenericHeader>::try_from(owned).expect("valid");
         let result = generic.try_as_typed::<RoutedRequestHeader>();
         assert!(matches!(
             result,
             Err(ConsensusError::InvalidCommand {
-                expected: Command2::Request,
-                found: Command2::Prepare,
+                expected: Command::Request,
+                found: Command::Prepare,
             })
         ));
     }
@@ -918,7 +1755,7 @@ mod tests {
     fn try_as_typed_invalid_validation_returns_err() {
         // `RequestHeader::validate` rejects operation=Register with non-zero
         // session; the routed shape shares the same field rules.
-        let mut owned = header_bytes(Command2::Request, 256);
+        let mut owned = header_bytes(Command::Request, 256);
         {
             let buf = owned.as_mut_slice();
             buf[REQUEST_OPERATION_OFF] = Operation::Register as u8;
@@ -933,21 +1770,21 @@ mod tests {
 
     #[test]
     fn try_into_typed_command_mismatch_returns_err() {
-        let owned = header_bytes(Command2::Prepare, 256);
+        let owned = header_bytes(Command::Prepare, 256);
         let generic = Message::<GenericHeader>::try_from(owned).expect("valid");
         let result = generic.try_into_typed::<RoutedRequestHeader>();
         assert!(matches!(
             result,
             Err(ConsensusError::InvalidCommand {
-                expected: Command2::Request,
-                found: Command2::Prepare,
+                expected: Command::Request,
+                found: Command::Prepare,
             })
         ));
     }
 
     // MessageBag dispatch: 7 unsafe `from_backing_unchecked` arms
 
-    fn dispatch(command: Command2, size: u32) -> Result<MessageBag, ConsensusError> {
+    fn dispatch(command: Command, size: u32) -> Result<MessageBag, ConsensusError> {
         let owned = header_bytes(command, size);
         let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
         MessageBag::try_from(generic)
@@ -955,8 +1792,8 @@ mod tests {
 
     #[test]
     fn messagebag_dispatch_unsupported_command_returns_err() {
-        // Ping is a valid Command2 bit pattern but is not a MessageBag variant.
-        let owned = header_bytes(Command2::Ping, 256);
+        // Ping is a valid Command bit pattern but is not a MessageBag variant.
+        let owned = header_bytes(Command::Ping, 256);
         let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
         let result = MessageBag::try_from(generic);
         assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
@@ -965,13 +1802,14 @@ mod tests {
     #[test]
     fn messagebag_command_method_round_trips() {
         for cmd in [
-            Command2::Request,
-            Command2::Prepare,
-            Command2::PrepareOk,
-            Command2::StartViewChange,
-            Command2::DoViewChange,
-            Command2::StartView,
-            Command2::Commit,
+            Command::Request,
+            Command::Prepare,
+            Command::PrepareOk,
+            Command::StartViewChange,
+            Command::DoViewChange,
+            Command::StartView,
+            Command::Commit,
+            Command::CommitReply,
         ] {
             let bag = dispatch(cmd, 256).expect("dispatch");
             assert_eq!(bag.command(), cmd, "round-trip for {cmd:?}");
@@ -989,7 +1827,7 @@ mod tests {
         // `size` floor, reaching typed dispatch. A size below the header size is
         // now rejected earlier by the floor (see
         // `try_from_owned_size_below_header_size_returns_err`).
-        let owned = header_bytes_sized(Command2::Commit, 300, 512);
+        let owned = header_bytes_sized(Command::Commit, 300, 512);
         let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
         let result = MessageBag::try_from(generic);
         assert!(matches!(
@@ -1001,7 +1839,7 @@ mod tests {
     #[test]
     fn client_wire_decode_of_request_with_invalid_register_session_returns_err() {
         // `RequestHeader::validate` rejects Register with non-zero session.
-        let mut owned = header_bytes(Command2::Request, 256);
+        let mut owned = header_bytes(Command::Request, 256);
         {
             let buf = owned.as_mut_slice();
             buf[REQUEST_OPERATION_OFF] = Operation::Register as u8;
@@ -1038,7 +1876,7 @@ mod tests {
         ];
 
         for (operation, session, request, must_pass) in cases {
-            let mut owned = header_bytes(Command2::Request, 256);
+            let mut owned = header_bytes(Command::Request, 256);
             {
                 let buf = owned.as_mut_slice();
                 buf[REQUEST_OPERATION_OFF] = operation as u8;
@@ -1060,7 +1898,7 @@ mod tests {
     // it, so ingress must reject it before it can reach the preflight.
     #[test]
     fn ingress_validation_rejects_zero_client() {
-        let mut owned = header_bytes(Command2::Request, 256);
+        let mut owned = header_bytes(Command::Request, 256);
         {
             let buf = owned.as_mut_slice();
             buf[REQUEST_OPERATION_OFF] = Operation::CreateStream as u8;
@@ -1079,7 +1917,7 @@ mod tests {
 
     #[test]
     fn request_message_deep_copy_independent() {
-        let owned = header_bytes(Command2::Request, 256);
+        let owned = header_bytes(Command::Request, 256);
         let mut msg = Message::<RoutedRequestHeader>::try_from(owned).expect("valid");
         let copy = msg.deep_copy();
         // Mutate the original's bytes; the deep copy must be untouched.
@@ -1092,26 +1930,26 @@ mod tests {
 
     #[test]
     fn transmute_header_request_to_prepare() {
-        let owned = header_bytes(Command2::Request, 256);
+        let owned = header_bytes(Command::Request, 256);
         let msg = Message::<RoutedRequestHeader>::try_from(owned).expect("valid");
         let prepared: Message<PrepareHeader> =
             msg.transmute_header::<PrepareHeader>(|_old, new| {
-                new.command = Command2::Prepare;
+                new.command = Command::Prepare;
                 new.size = 256;
             });
-        assert_eq!(prepared.header().command, Command2::Prepare);
+        assert_eq!(prepared.header().command, Command::Prepare);
     }
 
     // into_routed: in-place client-wire -> routed retype
 
     // Promotion must carry the data-bearing reserved prefix verbatim (the
     // non-replicated op code lives in `reserved[0..4]`) and unset only the
-    // `group` tail, whatever junk the client sent in those eight bytes.
+    // routing fields, whatever bytes the client sent in that tail.
     #[test]
-    fn into_routed_keeps_reserved_prefix_and_unsets_group() {
+    fn into_routed_keeps_client_context_and_clears_routing_fields() {
         const RESERVED_OFF: usize = std::mem::offset_of!(RequestHeader, reserved);
 
-        let mut owned = header_bytes(Command2::Request, 256);
+        let mut owned = header_bytes(Command::Request, 256);
         {
             let buf = owned.as_mut_slice();
             for (index, byte) in buf[RESERVED_OFF..RESERVED_OFF + 60].iter_mut().enumerate() {
@@ -1125,12 +1963,22 @@ mod tests {
         let header = routed.header();
         assert_eq!(
             header.reserved[..],
-            client_header.reserved[..52],
+            client_header.reserved[..header.reserved.len()],
             "the reserved prefix carries data and must survive promotion"
         );
         assert_eq!(
             header.group, 0,
             "the client-sent reserved tail must not leak into `group`"
+        );
+        assert_eq!(header.metadata_watermark, 0);
+        assert_eq!(
+            header.partition_incarnation,
+            client_header.partition_incarnation
+        );
+        assert_eq!(header.owner_generation, client_header.owner_generation);
+        assert_eq!(
+            header.minimum_metadata_op,
+            client_header.minimum_metadata_op
         );
         assert_eq!(header.client, client_header.client);
         assert_eq!(header.operation, client_header.operation);
@@ -1139,14 +1987,14 @@ mod tests {
         assert_eq!(header.user_id, client_header.user_id);
     }
 
-    // A peer-wire `Command2::Request` decodes as `RoutedRequestHeader`, so its
+    // A peer-wire `Command::Request` decodes as `RoutedRequestHeader`, so its
     // validate must enforce the client-boundary field rules: a forged
     // `client = 0` frame would otherwise reach the client table's hard assert
     // and abort the metadata primary, and a `Reserved` operation would replay
     // that client's cached register reply.
     #[test]
     fn messagebag_dispatch_rejects_request_with_zero_client() {
-        let mut owned = header_bytes(Command2::Request, 256);
+        let mut owned = header_bytes(Command::Request, 256);
         owned.as_mut_slice()[REQUEST_CLIENT_OFF..REQUEST_CLIENT_OFF + 16]
             .copy_from_slice(&0u128.to_le_bytes());
         let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
@@ -1158,7 +2006,7 @@ mod tests {
 
     #[test]
     fn messagebag_dispatch_rejects_request_with_reserved_operation() {
-        let mut owned = header_bytes(Command2::Request, 256);
+        let mut owned = header_bytes(Command::Request, 256);
         owned.as_mut_slice()[REQUEST_OPERATION_OFF] = Operation::Reserved as u8;
         let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
         assert!(matches!(
@@ -1171,17 +2019,17 @@ mod tests {
 
     #[test]
     fn response_backing_single_fragment_roundtrip() {
-        let owned = header_bytes(Command2::Reply, 256);
+        let owned = header_bytes(Command::Reply, 256);
         let frozen: Frozen<MESSAGE_ALIGN> = owned.into();
-        let fragments: smallvec::SmallVec<[Frozen<MESSAGE_ALIGN>; 4]> = smallvec![frozen];
+        let fragments: ResponseFragments = smallvec![frozen];
         let msg = Message::<ReplyHeader, ResponseBacking>::try_from(fragments).expect("valid");
-        assert_eq!(msg.header().command, Command2::Reply);
+        assert_eq!(msg.header().command, Command::Reply);
         assert_eq!(msg.fragments().len(), 1);
     }
 
     #[test]
     fn response_backing_empty_fragments_returns_err() {
-        let fragments: smallvec::SmallVec<[Frozen<MESSAGE_ALIGN>; 4]> = smallvec![];
+        let fragments: ResponseFragments = smallvec![];
         let result = Message::<ReplyHeader, ResponseBacking>::try_from(fragments);
         assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
     }
@@ -1190,7 +2038,7 @@ mod tests {
     fn response_backing_first_fragment_too_short_returns_err() {
         let owned = Owned::<MESSAGE_ALIGN>::zeroed(100);
         let frozen: Frozen<MESSAGE_ALIGN> = owned.into();
-        let fragments: smallvec::SmallVec<[Frozen<MESSAGE_ALIGN>; 4]> = smallvec![frozen];
+        let fragments: ResponseFragments = smallvec![frozen];
         let result = Message::<ReplyHeader, ResponseBacking>::try_from(fragments);
         assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
     }
@@ -1199,9 +2047,9 @@ mod tests {
     fn response_backing_size_below_header_size_returns_err() {
         // First fragment is full-size, but its `size` field claims less than
         // the header; the floor must reject before any consumer slices a body.
-        let owned = header_bytes(Command2::Reply, size_of::<ReplyHeader>() as u32 - 1);
+        let owned = header_bytes(Command::Reply, size_of::<ReplyHeader>() as u32 - 1);
         let frozen: Frozen<MESSAGE_ALIGN> = owned.into();
-        let fragments: smallvec::SmallVec<[Frozen<MESSAGE_ALIGN>; 4]> = smallvec![frozen];
+        let fragments: ResponseFragments = smallvec![frozen];
         let result = Message::<ReplyHeader, ResponseBacking>::try_from(fragments);
         assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
     }

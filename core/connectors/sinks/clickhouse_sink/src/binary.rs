@@ -294,6 +294,11 @@ pub(crate) fn serialize_value(
         // ── Decimal ──────────────────────────────────────────────────────────
         ChType::Decimal(precision, scale) => {
             let int_val = coerce_decimal(value, *precision, *scale)?;
+            let precision_limit = 10i128.pow(u32::from(*precision));
+            if int_val <= -precision_limit || int_val >= precision_limit {
+                error!("Decimal value out of range for precision {precision}");
+                return Err(Error::InvalidRecord);
+            }
             if *precision <= 9 {
                 buf.extend_from_slice(
                     &i32::try_from(int_val)
@@ -486,7 +491,7 @@ fn coerce_i64(value: &OwnedValue) -> Result<i64, Error> {
         }),
         OwnedValue::Static(simd_json::StaticNode::F64(f)) => {
             let n = *f as i64;
-            if n as f64 != *f {
+            if !f.is_finite() || *f < i64::MIN as f64 || *f >= i64::MAX as f64 || n as f64 != *f {
                 error!("Float {f} is not a finite whole number within i64 range");
                 return Err(Error::InvalidRecord);
             }
@@ -512,7 +517,7 @@ fn coerce_u64(value: &OwnedValue) -> Result<u64, Error> {
         }),
         OwnedValue::Static(simd_json::StaticNode::F64(f)) => {
             let n = *f as u64;
-            if n as f64 != *f {
+            if !f.is_finite() || *f < 0.0 || *f >= u64::MAX as f64 || n as f64 != *f {
                 error!("Float {f} is not a finite whole number within u64 range");
                 return Err(Error::InvalidRecord);
             }
@@ -579,7 +584,12 @@ fn coerce_decimal(value: &OwnedValue, precision: u8, scale: u8) -> Result<i128, 
                      to preserve full precision."
                 );
             }
-            Ok((f * 10f64.powi(i32::from(scale))).round() as i128)
+            let scaled = (f * 10f64.powi(i32::from(scale))).round();
+            if !scaled.is_finite() || scaled < i128::MIN as f64 || scaled >= i128::MAX as f64 {
+                error!("Decimal overflow for Decimal({precision}, {scale})");
+                return Err(Error::InvalidRecord);
+            }
+            Ok(scaled as i128)
         }
         other => {
             error!("Cannot coerce {other:?} to Decimal({precision}, {scale})");
@@ -608,6 +618,15 @@ fn parse_decimal_str(s: &str, scale: u8) -> Result<i128, ()> {
         None => (s, ""),
     };
 
+    if (int_str.is_empty() && frac_str.is_empty())
+        || !int_str
+            .bytes()
+            .chain(frac_str.bytes())
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return Err(());
+    }
+
     let int_val: i128 = if int_str.is_empty() {
         0
     } else {
@@ -618,25 +637,24 @@ fn parse_decimal_str(s: &str, scale: u8) -> Result<i128, ()> {
     let mut result = int_val.checked_mul(10i128.pow(scale)).ok_or(())?;
 
     if !frac_str.is_empty() {
-        // Cap at 38 digits: Decimal128(38) is the widest ClickHouse type, and
-        // 10^38 < i128::MAX, so no intermediate value overflows.
-        let frac_str = if frac_str.len() > 38 {
-            &frac_str[..38]
+        // Parse only retained digits so long fractions cannot overflow before rounding.
+        let retained_digits = frac_str.len().min(scale as usize);
+        let frac_val: i128 = if retained_digits == 0 {
+            0
         } else {
-            frac_str
+            frac_str[..retained_digits].parse().map_err(|_| ())?
         };
-        let frac_len = frac_str.len() as u32;
-        let frac_val: i128 = frac_str.parse().map_err(|_| ())?;
-        let frac_scaled = if frac_len <= scale {
-            frac_val
-                .checked_mul(10i128.pow(scale - frac_len))
-                .ok_or(())?
-        } else {
-            // More digits than scale: round half-up.
-            let divisor = 10i128.pow(frac_len - scale);
-            (frac_val + divisor / 2) / divisor
-        };
+        let frac_scaled = frac_val
+            .checked_mul(10i128.pow(scale - retained_digits as u32))
+            .ok_or(())?;
         result = result.checked_add(frac_scaled).ok_or(())?;
+        if frac_str
+            .as_bytes()
+            .get(scale as usize)
+            .is_some_and(|digit| *digit >= b'5')
+        {
+            result = result.checked_add(1).ok_or(())?;
+        }
     }
 
     Ok(if negative { -result } else { result })
@@ -704,7 +722,12 @@ fn coerce_to_unix_seconds_f64(value: &OwnedValue) -> Result<f64, Error> {
 
 /// Returns Unix seconds as i64 (truncates fractional seconds).
 fn coerce_to_unix_seconds(value: &OwnedValue) -> Result<i64, Error> {
-    Ok(coerce_to_unix_seconds_f64(value)? as i64)
+    let seconds = coerce_to_unix_seconds_f64(value)?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        error!("DateTime requires finite, non-negative Unix seconds");
+        return Err(Error::InvalidRecord);
+    }
+    Ok(seconds as i64)
 }
 
 /// Parse "YYYY-MM-DDThh:mm:ss[.frac][Z|±hh:mm]" into Unix seconds (f64).
@@ -790,7 +813,12 @@ fn strip_timezone(s: &str) -> (&str, i64) {
                     match (it.next(), it.next()) {
                         (Some(h_s), Some(m_s)) => {
                             if let (Ok(h), Ok(m)) = (h_s.parse::<i64>(), m_s.parse::<i64>()) {
-                                Some(sign * (h * 3600 + m * 60))
+                                match (h.checked_mul(3600), m.checked_mul(60)) {
+                                    (Some(hours), Some(minutes)) => hours
+                                        .checked_add(minutes)
+                                        .and_then(|seconds| seconds.checked_mul(sign)),
+                                    _ => None,
+                                }
                             } else {
                                 None
                             }
@@ -874,6 +902,171 @@ mod tests {
     }
 
     // ── primitives ───────────────────────────────────────────────────────────
+    #[test]
+    fn decimal_serialization_enforces_declared_precision_after_scaling() {
+        for precision in [1, 9, 10, 18, 19, 38] {
+            let limit = 10i128.pow(u32::from(precision));
+            for scale in [0, precision] {
+                for sign in [1, -1] {
+                    let boundary = if scale == 0 {
+                        (sign * (limit - 1)).to_string()
+                    } else {
+                        format!(
+                            "{}0.{}",
+                            if sign < 0 { "-" } else { "" },
+                            "9".repeat(precision as usize)
+                        )
+                    };
+                    let mut buffer = Vec::new();
+                    serialize_value(
+                        &json_str(&boundary),
+                        &ChType::Decimal(precision, scale),
+                        &mut buffer,
+                    )
+                    .expect("The last value within precision must serialize");
+                    let expected = (sign * (limit - 1)).to_le_bytes();
+                    let width = if precision <= 9 {
+                        4
+                    } else if precision <= 18 {
+                        8
+                    } else {
+                        16
+                    };
+                    assert_eq!(
+                        buffer,
+                        expected[..width],
+                        "Decimal({precision}, {scale}): {boundary}"
+                    );
+
+                    let overflow = if scale == 0 {
+                        (sign * limit).to_string()
+                    } else {
+                        sign.to_string()
+                    };
+                    let rounded_overflow =
+                        format!("{boundary}{}", if scale == 0 { ".5" } else { "5" });
+                    for value in [json_str(&overflow), json_str(&rounded_overflow)] {
+                        let mut buffer = Vec::new();
+                        assert!(
+                            serialize_value(
+                                &value,
+                                &ChType::Decimal(precision, scale),
+                                &mut buffer
+                            )
+                            .is_err(),
+                            "Decimal({precision}, {scale}) must reject {value}"
+                        );
+                        assert!(buffer.is_empty());
+                    }
+                }
+            }
+        }
+        for value in [
+            json_i64(10_000_000),
+            json_u64(10_000_000),
+            json_f64(10_000_000.0),
+        ] {
+            assert!(
+                serialize_value(&value, &ChType::Decimal(9, 2), &mut Vec::new()).is_err(),
+                "{value}"
+            );
+        }
+        assert!(
+            serialize_value(
+                &json_str(&i128::MIN.to_string()),
+                &ChType::Decimal(38, 0),
+                &mut Vec::new()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn datetime_rejects_non_finite_and_pre_epoch_values() {
+        for value in [
+            json_f64(f64::NAN),
+            json_f64(f64::INFINITY),
+            json_f64(f64::NEG_INFINITY),
+            json_f64(-0.5),
+            json_str("1969-12-31T23:59:59.5Z"),
+        ] {
+            let mut buffer = Vec::new();
+            assert!(
+                serialize_value(&value, &ChType::DateTime, &mut buffer).is_err(),
+                "{value}"
+            );
+            assert!(buffer.is_empty());
+        }
+        for seconds in [0.0, 0.5, u32::MAX as f64 + 0.5] {
+            let mut buffer = Vec::new();
+            serialize_value(&json_f64(seconds), &ChType::DateTime, &mut buffer).unwrap();
+            assert_eq!(buffer, (seconds as u32).to_le_bytes());
+        }
+        let mut buffer = Vec::new();
+        serialize_value(&json_f64(-0.5), &ChType::DateTime64(3), &mut buffer).unwrap();
+        assert_eq!(buffer, (-500i64).to_le_bytes());
+    }
+
+    #[test]
+    fn given_boundary_floats_when_serializing_numbers_should_preserve_values() {
+        for (column_type, value, expected) in [
+            (
+                ChType::Int64,
+                i64::MIN as f64,
+                i64::MIN.to_le_bytes().to_vec(),
+            ),
+            (
+                ChType::UInt64,
+                (1u64 << 63) as f64,
+                (1u64 << 63).to_le_bytes().to_vec(),
+            ),
+        ] {
+            let mut buffer = Vec::new();
+            serialize_value(&json_f64(value), &column_type, &mut buffer).unwrap();
+            assert_eq!(buffer, expected, "value: {value}");
+        }
+    }
+
+    #[test]
+    fn given_overflowing_float_when_serializing_integer_should_reject() {
+        let mut accepted_values = Vec::new();
+        for (column_type, value) in [
+            (ChType::Int64, i64::MAX as f64),
+            (ChType::UInt64, u64::MAX as f64),
+        ] {
+            let mut row = simd_json::owned::Object::new();
+            row.insert("value".into(), json_f64(value));
+            let result = serialize_row(
+                &OwnedValue::Object(Box::new(row)),
+                &[col("value", column_type, false)],
+                &mut Vec::new(),
+            );
+            if !matches!(result, Err(Error::InvalidRecord)) {
+                accepted_values.push(value);
+            }
+        }
+        assert!(accepted_values.is_empty(), "accepted: {accepted_values:?}");
+    }
+
+    #[test]
+    fn given_overflowing_float_when_serializing_decimal_should_reject() {
+        for value in [
+            i128::MIN as f64,
+            i128::MAX as f64,
+            f64::MAX,
+            -f64::MAX,
+            f64::NAN,
+        ] {
+            let mut buffer = Vec::new();
+            let result = serialize_value(&json_f64(value), &ChType::Decimal(38, 0), &mut buffer);
+            assert!(
+                matches!(result, Err(Error::InvalidRecord)),
+                "value: {value}"
+            );
+            assert!(buffer.is_empty());
+        }
+    }
+
     #[test]
     fn serialize_int32_little_endian() {
         let mut buf = vec![];
@@ -1308,6 +1501,19 @@ mod tests {
     }
 
     #[test]
+    fn given_overflowing_timezone_when_serializing_datetime_should_reject() {
+        for offset in [format!("{}:00", i64::MAX), format!("00:{}", i64::MAX)] {
+            let value = format!("1970-01-01T00:00:00+{offset}");
+            let result =
+                serialize_value(&json_str(&value), &ChType::DateTime64(3), &mut Vec::new());
+            assert!(
+                matches!(result, Err(Error::InvalidRecord)),
+                "value: {value}"
+            );
+        }
+    }
+
+    #[test]
     fn serialize_datetime_from_iso8601_utc_string() {
         let mut buf = vec![];
         // "1970-01-02T00:00:00Z" = 86400 seconds
@@ -1370,6 +1576,31 @@ mod tests {
     }
 
     // ── decimal ──────────────────────────────────────────────────────────────
+    #[test]
+    fn given_multibyte_decimal_when_serializing_should_return_error() {
+        let value = format!("0.{}é", "1".repeat(37));
+        let result = serialize_value(&json_str(&value), &ChType::Decimal(38, 2), &mut Vec::new());
+        assert!(matches!(result, Err(Error::InvalidRecord)));
+    }
+
+    #[test]
+    fn given_malformed_decimal_when_serializing_should_reject() {
+        let mut accepted_values = Vec::new();
+        for value in [
+            ".".into(),
+            "--1".into(),
+            "1.-2".into(),
+            format!("0.{}x", "1".repeat(38)),
+        ] {
+            let result =
+                serialize_value(&json_str(&value), &ChType::Decimal(38, 2), &mut Vec::new());
+            if !matches!(result, Err(Error::InvalidRecord)) {
+                accepted_values.push(value);
+            }
+        }
+        assert!(accepted_values.is_empty(), "accepted: {accepted_values:?}");
+    }
+
     #[test]
     fn serialize_decimal32_scale2() {
         let mut buf = vec![];

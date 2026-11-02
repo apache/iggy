@@ -20,15 +20,25 @@ use crate::server::scenarios::{
     consumer_group_duplicate_name_create_scenario, consumer_group_join_scenario,
     consumer_group_new_messages_after_restart_scenario, consumer_group_offset_cleanup_scenario,
     consumer_group_with_multiple_clients_polling_messages_scenario,
-    consumer_group_with_single_client_polling_messages_scenario,
+    consumer_group_with_single_client_polling_messages_scenario, external_group_offsets_scenario,
 };
 use integration::iggy_harness;
 
 // Consumer group scenarios do not support HTTP (stateful operations).
 
+// Harness clients never ping on their own: the SDK pinger is spawned by
+// `IggyClient::connect`, which the harness builder does not call. With
+// heartbeat checks on, the server logs out a group member that stays silent
+// too long, and the failure surfaces as a missing member or a reassigned
+// partition instead of anything about the scenario under test.
+
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    server(
+        heartbeat.enabled = true,
+        heartbeat.interval = "60s",
+        consumer_group.rebalancing_timeout = "1s"
+    )
 )]
 async fn join(harness: &TestHarness) {
     consumer_group_join_scenario::run(harness).await;
@@ -36,7 +46,7 @@ async fn join(harness: &TestHarness) {
 
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    server(heartbeat.enabled = true, heartbeat.interval = "60s")
 )]
 async fn single_client(harness: &TestHarness) {
     consumer_group_with_single_client_polling_messages_scenario::run(harness).await;
@@ -44,7 +54,11 @@ async fn single_client(harness: &TestHarness) {
 
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    server(
+        heartbeat.enabled = true,
+        heartbeat.interval = "60s",
+        consumer_group.rebalancing_timeout = "1s"
+    )
 )]
 async fn multiple_clients(harness: &TestHarness) {
     consumer_group_with_multiple_clients_polling_messages_scenario::run(harness).await;
@@ -52,7 +66,7 @@ async fn multiple_clients(harness: &TestHarness) {
 
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    server(heartbeat.enabled = true, heartbeat.interval = "60s")
 )]
 async fn auto_commit_reconnection(harness: &TestHarness) {
     consumer_group_auto_commit_reconnection_scenario::run(harness).await;
@@ -60,7 +74,7 @@ async fn auto_commit_reconnection(harness: &TestHarness) {
 
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    server(heartbeat.enabled = true, heartbeat.interval = "60s")
 )]
 async fn new_messages_after_restart(harness: &TestHarness) {
     consumer_group_new_messages_after_restart_scenario::run(harness).await;
@@ -68,7 +82,7 @@ async fn new_messages_after_restart(harness: &TestHarness) {
 
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    server(heartbeat.enabled = true, heartbeat.interval = "60s")
 )]
 async fn offset_cleanup(harness: &TestHarness) {
     consumer_group_offset_cleanup_scenario::run(harness).await;
@@ -76,7 +90,15 @@ async fn offset_cleanup(harness: &TestHarness) {
 
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    server(heartbeat.enabled = true, heartbeat.interval = "60s")
+)]
+async fn external_group_offsets(harness: &TestHarness) {
+    external_group_offsets_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(heartbeat.enabled = true, heartbeat.interval = "60s")
 )]
 async fn duplicate_name_create_preserves_live_group(harness: &TestHarness) {
     consumer_group_duplicate_name_create_scenario::run(harness).await;

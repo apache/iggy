@@ -23,14 +23,16 @@ namespace Apache.Iggy.Configuration;
 public sealed class ReconnectionSettings
 {
     /// <summary>
-    ///     Enable automatic reconnection when connection is lost
+    ///     Enable automatic reconnection when connection is lost. Enabled by default.
     /// </summary>
-    public bool Enabled { get; set; } = false;
+    public bool Enabled { get; set; } = true;
 
     /// <summary>
-    ///     Maximum number of reconnection attempts (0 = infinite)
+    ///     Maximum number of reconnection attempts (0 = infinite). Default is 0. The limit covers one reconnect
+    ///     burst of a replica link: while the client is signed in, each heartbeat restarts a link that used it up,
+    ///     with a fresh budget.
     /// </summary>
-    public int MaxRetries { get; set; } = 3;
+    public int MaxRetries { get; set; }
 
     /// <summary>
     ///     Initial delay before first reconnection attempt

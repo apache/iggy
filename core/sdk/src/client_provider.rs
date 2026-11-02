@@ -19,8 +19,8 @@ use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::clients::client::IggyClient;
 use crate::http::http_client::HttpClient;
 use crate::prelude::{
-    ClientError, HttpClientConfig, IggyDuration, QuicClientConfig, QuicClientReconnectionConfig,
-    TcpClientConfig, TcpClientReconnectionConfig, WebSocketClient,
+    ClientError, HttpClientConfig, IggyDuration, IggyError, NonZeroIggyDuration, QuicClientConfig,
+    QuicClientReconnectionConfig, TcpClientConfig, TcpClientReconnectionConfig, WebSocketClient,
 };
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
@@ -89,19 +89,23 @@ impl ClientProviderConfig {
         match config.transport {
             TransportProtocol::Quic => {
                 config.quic = Some(Arc::new(QuicClientConfig {
+                    pending_operations: Default::default(),
                     client_address: args.quic_client_address,
                     server_address: args.quic_server_address,
                     server_name: args.quic_server_name,
-                    heartbeat_interval: IggyDuration::from_str(&args.quic_heartbeat_interval)
-                        .unwrap(),
+                    heartbeat_interval: NonZeroIggyDuration::from_str(
+                        &args.quic_heartbeat_interval,
+                    )
+                    .map_err(|_| IggyError::InvalidConfiguration)?,
                     reconnection: QuicClientReconnectionConfig {
                         enabled: args.quic_reconnection_enabled,
                         max_retries: args.quic_reconnection_max_retries,
-                        interval: IggyDuration::from_str(&args.quic_reconnection_interval).unwrap(),
+                        interval: NonZeroIggyDuration::from_str(&args.quic_reconnection_interval)
+                            .map_err(|_| IggyError::InvalidConfiguration)?,
                         reestablish_after: IggyDuration::from_str(
                             &args.quic_reconnection_reestablish_after,
                         )
-                        .unwrap(),
+                        .map_err(|_| IggyError::InvalidConfiguration)?,
                     },
                     auto_login: if auto_login {
                         AutoLogin::Enabled(Credentials::UsernamePassword(
@@ -126,27 +130,29 @@ impl ClientProviderConfig {
                 config.http = Some(Arc::new(HttpClientConfig {
                     api_url: args.http_api_url,
                     retries: args.http_retries,
-                    jwt: None,
+                    ..Default::default()
                 }));
             }
             TransportProtocol::Tcp => {
                 config.tcp = Some(Arc::new(TcpClientConfig {
+                    pending_operations: Default::default(),
                     server_address: args.tcp_server_address,
                     tls_enabled: args.tcp_tls_enabled,
                     tls_domain: args.tcp_tls_domain,
                     tls_ca_file: args.tcp_tls_ca_file,
                     tls_validate_certificate: true,
                     nodelay: args.tcp_nodelay,
-                    heartbeat_interval: IggyDuration::from_str(&args.tcp_heartbeat_interval)
-                        .unwrap(),
+                    heartbeat_interval: NonZeroIggyDuration::from_str(&args.tcp_heartbeat_interval)
+                        .map_err(|_| IggyError::InvalidConfiguration)?,
                     reconnection: TcpClientReconnectionConfig {
                         enabled: args.tcp_reconnection_enabled,
                         max_retries: args.tcp_reconnection_max_retries,
-                        interval: IggyDuration::from_str(&args.tcp_reconnection_interval).unwrap(),
+                        interval: NonZeroIggyDuration::from_str(&args.tcp_reconnection_interval)
+                            .map_err(|_| IggyError::InvalidConfiguration)?,
                         reestablish_after: IggyDuration::from_str(
                             &args.tcp_reconnection_reestablish_after,
                         )
-                        .unwrap(),
+                        .map_err(|_| IggyError::InvalidConfiguration)?,
                     },
                     auto_login: if auto_login {
                         AutoLogin::Enabled(Credentials::UsernamePassword(
@@ -160,18 +166,23 @@ impl ClientProviderConfig {
             }
             TransportProtocol::WebSocket => {
                 config.websocket = Some(Arc::new(WebSocketClientConfig {
+                    pending_operations: Default::default(),
                     server_address: args.websocket_server_address,
-                    heartbeat_interval: IggyDuration::from_str(&args.websocket_heartbeat_interval)
-                        .unwrap(),
+                    heartbeat_interval: NonZeroIggyDuration::from_str(
+                        &args.websocket_heartbeat_interval,
+                    )
+                    .map_err(|_| IggyError::InvalidConfiguration)?,
                     reconnection: WebSocketClientReconnectionConfig {
                         enabled: args.websocket_reconnection_enabled,
                         max_retries: args.websocket_reconnection_max_retries,
-                        interval: IggyDuration::from_str(&args.websocket_reconnection_interval)
-                            .unwrap(),
+                        interval: NonZeroIggyDuration::from_str(
+                            &args.websocket_reconnection_interval,
+                        )
+                        .map_err(|_| IggyError::InvalidConfiguration)?,
                         reestablish_after: IggyDuration::from_str(
                             &args.websocket_reconnection_reestablish_after,
                         )
-                        .unwrap(),
+                        .map_err(|_| IggyError::InvalidConfiguration)?,
                     },
                     auto_login: if auto_login {
                         AutoLogin::Enabled(Credentials::UsernamePassword(

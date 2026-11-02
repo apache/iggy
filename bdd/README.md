@@ -38,6 +38,7 @@ bdd/
 ├── docker-compose.yml          # Base: SDK test clients (always included)
 ├── docker-compose.server.yml   # Single iggy-server test setup
 ├── docker-compose.cluster.yml  # Leader + follower test setup
+├── docker-compose.no-quorum.yml # Cluster node that never reaches quorum
 ├── docker-compose.coverage.yml # Coverage collection overlay
 ├── Dockerfile                  # Debug build of Iggy server
 └── README.md
@@ -50,7 +51,7 @@ bdd/
 ```bash
 # Usage: ../scripts/run-bdd-tests.sh [--coverage] <sdk> [feature]
 #   sdk:     rust | python | php | go | go-race | node | csharp | java | all | clean  (default: all)
-#   feature: basic_messaging | leader_redirection | all  (default: all)
+#   feature: basic_messaging | leader_redirection | raw_command | session_contract | stream_crud | all  (default: all)
 
 # Run all features for all SDKs
 ../scripts/run-bdd-tests.sh all
@@ -84,7 +85,7 @@ bdd/
 
 ### How it Works
 
-1. **Server Containers**: `docker-compose.server.yml` runs a single Iggy server; `docker-compose.cluster.yml` adds a leader + follower pair for cluster scenarios
+1. **Server Containers**: `docker-compose.server.yml` runs a single Iggy server; `docker-compose.cluster.yml` adds a leader + follower pair for cluster scenarios. `docker-compose.no-quorum.yml` adds a cluster node whose only peer never starts, so it refuses every sign-in until the caller's deadline
 2. **SDK Containers**: Each SDK has its own container with the appropriate runtime and dependencies
 3. **Shared Features**: All SDKs test against the same `.feature` files for consistency
 4. **Health Checks**: Containers wait for the server to be healthy before running tests

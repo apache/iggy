@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy::prelude::{IggyClient, StreamClient, TopicClient};
+use iggy::prelude::StreamCreateOptions;
+use iggy::prelude::UserCreateOptions;
+use iggy::prelude::{IggyClient, StreamClient, TopicClient, TopicCreateOptions};
 use iggy_common::{
-    CompressionAlgorithm, Consumer, Identifier, IggyExpiry, IggyMessage, MaxTopicSize,
-    Partitioning, PersonalAccessTokenExpiry, UserStatus,
+    Consumer, Durability, Identifier, IggyExpiry, IggyMessage, MaxTopicSize, Partitioning,
+    PersonalAccessTokenExpiry, UserStatus,
 };
 use iggy_common::{
     ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PersonalAccessTokenClient, UserClient,
@@ -44,22 +46,27 @@ pub mod names {
 
 /// Creates a single stream named "test".
 pub async fn stream_only(client: &IggyClient) -> Result<(), SeedError> {
-    client.create_stream("test").await?;
+    client
+        .create_stream("test", &StreamCreateOptions::default())
+        .await?;
     Ok(())
 }
 
 /// Creates a stream with a topic.
 pub async fn stream_with_topic(client: &IggyClient) -> Result<(), SeedError> {
-    client.create_stream("test_stream").await?;
+    client
+        .create_stream("test_stream", &StreamCreateOptions::default())
+        .await?;
     client
         .create_topic(
             &"test_stream".try_into()?,
             "test_topic",
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::Unlimited,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                max_topic_size: Some(MaxTopicSize::Unlimited),
+                ..TopicCreateOptions::default()
+            },
         )
         .await?;
     Ok(())
@@ -69,17 +76,20 @@ pub async fn stream_with_topic(client: &IggyClient) -> Result<(), SeedError> {
 pub async fn connector_stream(client: &IggyClient) -> Result<(), SeedError> {
     let stream_id: Identifier = names::STREAM.try_into()?;
 
-    client.create_stream(names::STREAM).await?;
+    client
+        .create_stream(names::STREAM, &StreamCreateOptions::default())
+        .await?;
 
     client
         .create_topic(
             &stream_id,
             names::TOPIC,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::ServerDefault,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                durability: Durability::Persisted,
+                messages_required_to_save: Some(1),
+                ..TopicCreateOptions::default()
+            },
         )
         .await?;
 
@@ -92,17 +102,20 @@ pub async fn connector_stream(client: &IggyClient) -> Result<(), SeedError> {
 pub async fn connector_multi_topic_stream(client: &IggyClient) -> Result<(), SeedError> {
     let stream_id: Identifier = names::STREAM.try_into()?;
 
-    client.create_stream(names::STREAM).await?;
+    client
+        .create_stream(names::STREAM, &StreamCreateOptions::default())
+        .await?;
 
     client
         .create_topic(
             &stream_id,
             names::TOPIC,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::ServerDefault,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                durability: Durability::Persisted,
+                messages_required_to_save: Some(1),
+                ..TopicCreateOptions::default()
+            },
         )
         .await?;
 
@@ -110,11 +123,12 @@ pub async fn connector_multi_topic_stream(client: &IggyClient) -> Result<(), See
         .create_topic(
             &stream_id,
             names::TOPIC_2,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::ServerDefault,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                durability: Durability::Persisted,
+                messages_required_to_save: Some(1),
+                ..TopicCreateOptions::default()
+            },
         )
         .await?;
 
@@ -126,17 +140,18 @@ pub async fn mcp_standard(client: &IggyClient) -> Result<(), SeedError> {
     let stream_id: Identifier = names::STREAM.try_into()?;
     let topic_id: Identifier = names::TOPIC.try_into()?;
 
-    client.create_stream(names::STREAM).await?;
+    client
+        .create_stream(names::STREAM, &StreamCreateOptions::default())
+        .await?;
 
     client
         .create_topic(
             &stream_id,
             names::TOPIC,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::ServerDefault,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                ..TopicCreateOptions::default()
+            },
         )
         .await?;
 
@@ -165,7 +180,13 @@ pub async fn mcp_standard(client: &IggyClient) -> Result<(), SeedError> {
         .await?;
 
     client
-        .create_user(names::USER, names::USER_PASSWORD, UserStatus::Active, None)
+        .create_user(
+            names::USER,
+            names::USER_PASSWORD,
+            UserStatus::Active,
+            None,
+            &UserCreateOptions::default(),
+        )
         .await?;
 
     client

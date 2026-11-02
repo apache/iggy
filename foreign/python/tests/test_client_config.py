@@ -33,13 +33,19 @@ import pytest
 
 from apache_iggy import (
     AutoCommit,
-    AutoCommitAfter,
-    AutoCommitWhen,
     AutoLogin,
+    CommitAfter,
+    CommitEvery,
+    CommitPolicy,
     IggyClient,
     IggyExpiry,
+    PendingOperationsConfig,
+    PollOptions,
+    QuicConfig,
     TcpConfig,
     TcpReconnectionConfig,
+    TopicOptions,
+    WebSocketConfig,
 )
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
@@ -143,22 +149,23 @@ class TestTcpReconnectionConfig:
 
         assert reconnection.reestablish_after == timedelta(0)
 
-    def test_zero_interval_is_allowed_with_bounded_retries(self):
-        """Test that a zero interval is legal as a bounded fast-retry policy."""
-        reconnection = TcpReconnectionConfig(interval=timedelta(0), max_retries=5)
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},
+            {"max_retries": 5},
+            {"enabled": False},
+        ],
+        ids=["unlimited_retries", "bounded_retries", "reconnection_disabled"],
+    )
+    def test_zero_interval_is_rejected(self, kwargs: dict):
+        """Test that a zero interval fails whatever the retry policy is.
 
-        assert reconnection.interval == timedelta(0)
-
-    def test_zero_interval_is_allowed_when_reconnection_is_disabled(self):
-        """Test that a zero interval is legal when nothing ever reads it."""
-        reconnection = TcpReconnectionConfig(enabled=False, interval=timedelta(0))
-
-        assert reconnection.interval == timedelta(0)
-
-    def test_zero_interval_with_unlimited_retries_is_rejected(self):
-        """Test that the combination that reconnects in a continuous loop fails."""
+        The interval is a delay between attempts, so zero reconnects in a
+        continuous loop.
+        """
         with pytest.raises(ValueError, match="zero"):
-            TcpReconnectionConfig(interval=timedelta(0))
+            TcpReconnectionConfig(interval=timedelta(0), **kwargs)
 
     def test_very_long_interval_round_trips(self):
         """Test that an interval beyond 68 years survives the i32 boundary."""
@@ -256,8 +263,8 @@ class TestTcpConfig:
         ["", "127.0.0.1", "127.0.0.1:not-a-port", "127.0.0.1:70000", "::1:8090"],
     )
     def test_invalid_server_address_is_rejected(self, invalid_address: str):
-        """Test that a malformed address fails at construction, not at connect."""
-        with pytest.raises(ValueError):
+        """Test that a malformed address fails at construction, naming itself."""
+        with pytest.raises(ValueError, match="server_address"):
             TcpConfig(server_address=invalid_address)
 
     def test_negative_heartbeat_interval_is_rejected(self):
@@ -307,8 +314,9 @@ class TestClientConstruction:
             client.create_topic(
                 stream="stream",
                 name="topic",
-                partitions_count=1,
-                message_expiry=IggyExpiry.ExpireDuration(timedelta(seconds=-1)),
+                options=TopicOptions(
+                    message_expiry=IggyExpiry.ExpireDuration(timedelta(seconds=-1))
+                ),
             )
 
     @pytest.mark.parametrize(
@@ -316,32 +324,17 @@ class TestClientConstruction:
         [
             {"polling_retry_interval": timedelta(0)},
             {"init_retries": 3, "init_retry_interval": timedelta(0)},
-            {"auto_commit": AutoCommit.Interval(timedelta(0))},
-            {
-                "auto_commit": AutoCommit.IntervalOrWhen(
-                    timedelta(0), AutoCommitWhen.PollingMessages()
-                )
-            },
-            {
-                "auto_commit": AutoCommit.IntervalOrAfter(
-                    timedelta(0), AutoCommitAfter.ConsumingEachMessage()
-                )
-            },
         ],
         ids=[
             "polling_retry_interval",
             "init_retry_interval",
-            "auto_commit_interval",
-            "auto_commit_interval_or_when",
-            "auto_commit_interval_or_after",
         ],
     )
     def test_zero_consumer_interval_is_rejected(self, interval_kwargs: dict):
-        """Test that a zero consumer interval fails at the call.
+        """Test that a zero retry interval fails at the call.
 
-        Zero spins the retry loop, floods the server with offset stores, or
-        panics inside the runtime timer, and none of those name the argument
-        that caused it.
+        Zero spins the retry loop or panics inside the runtime timer, and
+        neither names the argument that caused it.
         """
         client = IggyClient()
 
@@ -353,23 +346,64 @@ class TestClientConstruction:
                 **interval_kwargs,
             )
 
-    def test_zero_poll_interval_is_allowed(self):
-        """Test that a zero poll interval passes validation.
+    def test_arguments_after_topic_are_keyword_only(self):
+        """Test that a positional argument after topic fails.
 
-        Zero there means "do not wait before polling" and is short-circuited
-        before the sleep, unlike the retry intervals. Reaching the awaitable is
-        what proves it: building one without a running loop is the next failure,
-        and a rejected value would have raised ValueError first.
+        The removed partition_id was the fourth argument. A positional None
+        written for it would otherwise pass as polling_strategy.
         """
         client = IggyClient()
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(TypeError, match="positional arguments"):
             client.consumer_group(
-                name="group",
-                stream="stream",
-                topic="topic",
-                poll_interval=timedelta(0),
+                "group",
+                "stream",
+                "topic",
+                # pyrefly: ignore  # bad-argument-count
+                None,
             )
+
+
+@pytest.mark.unit
+class TestCommitPolicy:
+    """Test when reads store their offsets."""
+
+    def test_default_options_store_nothing(self):
+        """Test that the default commit policy leaves every store to the caller."""
+        assert PollOptions().commit == CommitPolicy.Manual()
+
+    def test_auto_commit_default_stores_every_10000_messages_or_5_seconds(self):
+        """Test the default of an automatic commit and that options keep it."""
+        auto = AutoCommit.default()
+        options = PollOptions(commit=CommitPolicy.Auto(auto))
+
+        assert auto == AutoCommit(
+            interval=timedelta(seconds=5),
+            every=CommitEvery.Messages(10_000),
+            after=CommitAfter.Processing,
+        )
+        assert options.commit == CommitPolicy.Auto(auto)
+        assert repr(options.commit) == repr(CommitPolicy.Auto(auto))
+        assert (
+            "CommitPolicy.Auto(AutoCommit(interval=datetime.timedelta(seconds=5)"
+            in (repr(options))
+        )
+
+    @pytest.mark.parametrize(
+        ("interval", "every", "message"),
+        [
+            (timedelta(0), None, "zero"),
+            (None, CommitEvery.Messages(0), "above zero"),
+            (None, None, "'interval' or an 'every'"),
+        ],
+        ids=["zero_interval", "zero_messages", "neither"],
+    )
+    def test_auto_commit_that_never_stores_is_rejected(
+        self, interval: timedelta | None, every: CommitEvery | None, message: str
+    ):
+        """Test that an automatic commit storing only on close fails at once."""
+        with pytest.raises(ValueError, match=message):
+            AutoCommit(interval=interval, every=every)
 
 
 @pytest.mark.integration
@@ -457,3 +491,29 @@ class TestAutoLoginAgainstServer:
 
         with pytest.raises(RuntimeError):
             await client.connect()
+
+
+@pytest.mark.unit
+class TestPendingOperationsConfig:
+    @pytest.mark.parametrize("config_type", [TcpConfig, QuicConfig, WebSocketConfig])
+    def test_shared_limits_round_trip(self, config_type):
+        defaults = config_type().pending_operations
+        assert defaults.max_operations == 256
+        assert defaults.max_bytes == 64 * 1024 * 1024
+        limits = PendingOperationsConfig(max_operations=3, max_bytes=4096)
+        config = config_type(pending_operations=limits)
+        assert config.pending_operations.max_operations == 3
+        assert config.pending_operations.max_bytes == 4096
+        assert repr(limits) in repr(config)
+        with pytest.raises(AttributeError):
+            # pyrefly: ignore  # read-only
+            limits.max_operations = 4
+
+    @pytest.mark.parametrize("field", ["max_operations", "max_bytes"])
+    @pytest.mark.parametrize(
+        "value,exception",
+        [(0, ValueError), (-1, OverflowError), (2**128, OverflowError)],
+    )
+    def test_invalid_limits_are_rejected(self, field, value, exception):
+        with pytest.raises(exception):
+            PendingOperationsConfig(**{field: value})

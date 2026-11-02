@@ -16,16 +16,20 @@
 // under the License.
 
 //! Shared HTTP transport plumbing for the server REST suites (`http_vsr`,
-//! `http_rbac`): one authenticated `reqwest` session with the login-retry gate
-//! and the generic verb helpers. Each suite keeps its own request shapes and
-//! assertions as extension methods on [`HttpClient`], so the wire-contract and
-//! listener-behavior separation between the suites stays intact.
+//! `http_rbac`): one authenticated `reqwest` session with the login-retry gate,
+//! the generic verb helpers, and the cluster-shaped helpers the multi-node
+//! suites share (which node is the leader, which is a follower, and the retry
+//! a follower needs before it can resolve the primary). Each suite keeps its
+//! own request shapes and assertions as extension methods on [`HttpClient`], so
+//! the wire-contract and listener-behavior separation between the suites stays
+//! intact.
 
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 use iggy::prelude::*;
 use integration::harness::TestHarness;
-use reqwest::Response;
+use reqwest::{Response, StatusCode};
 use serde_json::{Value, json};
 use tokio::time::sleep;
 
@@ -35,6 +39,8 @@ use tokio::time::sleep;
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
 pub const LOGIN_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+const APPLIED_OP_HEADER: &str = "iggy-applied-op";
 
 /// One authenticated HTTP session against the test server's shard-0 listener: a
 /// `reqwest` client, the listener base URL, and the bearer to send. The bearer
@@ -156,7 +162,8 @@ impl HttpClient {
             .expect("get request")
     }
 
-    /// Unauthenticated GET (no bearer) for the public `/ping` probe.
+    /// Unauthenticated GET (no bearer): the public `/ping` probe and 401
+    /// assertions on protected routes.
     pub async fn get_anonymous(&self, path: &str) -> Response {
         self.client
             .get(self.url(path))
@@ -193,6 +200,78 @@ impl HttpClient {
             .await
             .expect("delete request")
     }
+
+    /// The unauthenticated `POST /users/refresh-token` route: the current token
+    /// travels in the JSON body, sent with no bearer header.
+    pub async fn refresh(&self, token: &str) -> Response {
+        self.client
+            .post(self.url("/users/refresh-token"))
+            .json(&json!({ "token": token }))
+            .send()
+            .await
+            .expect("refresh-token request")
+    }
+}
+
+/// `http://host:port` of a harness node's HTTP listener.
+pub fn node_url(harness: &TestHarness, node: usize) -> String {
+    let addr = harness.node(node).http_addr().expect("node http address");
+    format!("http://{addr}")
+}
+
+/// Harness indexes of the node the roster marks `Leader` and of one it marks
+/// `Follower`. The harness emits the roster in node order, so a roster
+/// position is a harness index. Every node reads `Follower` until shard 0
+/// publishes its first view, so the roster is polled within the shared
+/// warmup budget until it marks a leader.
+pub async fn leader_and_follower(harness: &TestHarness) -> (usize, usize) {
+    let client = harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect to node 0");
+    let deadline = Instant::now() + LOGIN_TIMEOUT;
+    loop {
+        let metadata = client
+            .get_cluster_metadata()
+            .await
+            .expect("get cluster metadata");
+        let position =
+            |role: ClusterNodeRole| metadata.nodes.iter().position(|node| node.role == role);
+        if let (Some(leader), Some(follower)) = (
+            position(ClusterNodeRole::Leader),
+            position(ClusterNodeRole::Follower),
+        ) {
+            return (leader, follower);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the roster did not mark a leader within {LOGIN_TIMEOUT:?}, got {metadata}"
+        );
+        sleep(LOGIN_RETRY_INTERVAL).await;
+    }
+}
+
+/// Repeat `request` while the follower answers 503, which it does until it
+/// can resolve the primary from its own view; bounded by the shared warmup
+/// budget, as cluster_metadata_vsr does. A 503 is the retry-safe class: the
+/// request provably never entered a pipeline.
+pub async fn until_primary_resolved<F, Fut>(request: F) -> Response
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Response>,
+{
+    let deadline = Instant::now() + LOGIN_TIMEOUT;
+    loop {
+        let response = request().await;
+        if response.status() != StatusCode::SERVICE_UNAVAILABLE {
+            return response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "follower did not resolve the primary within {LOGIN_TIMEOUT:?}"
+        );
+        sleep(LOGIN_RETRY_INTERVAL).await;
+    }
 }
 
 /// Extract the JWT from a successful login response.
@@ -202,4 +281,19 @@ pub async fn access_token(response: Response) -> String {
         .access_token
         .expect("login must return an access token")
         .token
+}
+
+/// The serving node's applied metadata op, as stamped on every authenticated
+/// success. A response without it is a contract violation, not an absence: the
+/// relay records this value as the caller's read-your-writes floor, so a
+/// missing header would silently reopen the stale read it exists to close.
+pub fn applied_op(response: &Response) -> u64 {
+    response
+        .headers()
+        .get(APPLIED_OP_HEADER)
+        .expect("every authenticated success carries iggy-applied-op")
+        .to_str()
+        .expect("iggy-applied-op must be ASCII")
+        .parse()
+        .expect("iggy-applied-op must be an op number")
 }

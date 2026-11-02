@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import type { CommandResponse } from '../../client/client.type.js';
 import type { Id } from '../identifier.utils.js';
@@ -32,7 +31,7 @@ export type GetOffset = {
   topicId: Id,
   /** Consumer identifier (single or group) */
   consumer: Consumer,
-  /** Partition ID. VSR requires the explicit partition returned by polling. */
+  /** Partition ID. A missing partition reads partition zero. */
   partitionId: number | null
 };
 

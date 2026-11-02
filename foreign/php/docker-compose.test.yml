@@ -31,10 +31,13 @@ services:
     environment:
       - IGGY_HTTP_ADDRESS=0.0.0.0:3000
       - IGGY_TCP_ADDRESS=0.0.0.0:8090
+      - IGGY_NODE_ADVERTISED_ADDRESS=iggy-server
       - IGGY_QUIC_ADDRESS=0.0.0.0:8080
       - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8092
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
+      - IGGY_ENCRYPTION_ENABLED=true
+      - IGGY_ENCRYPTION_KEY=/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=
     networks:
       - php-test-network
     ports:
@@ -61,10 +64,11 @@ services:
     networks:
       - php-test-network
     environment:
-      - IGGY_HOST=iggy-server
-      - IGGY_PORT=8090
-      - IGGY_USERNAME=iggy
-      - IGGY_PASSWORD=iggy
+      - IGGY_TCP_ADDRESS=iggy-server:8090
+      - IGGY_ROOT_USERNAME=iggy
+      - IGGY_ROOT_PASSWORD=iggy
+      - IGGY_ENCRYPTION_ENABLED=true
+      - IGGY_ENCRYPTION_KEY=/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=
     volumes:
       - ./test-results:/workspace/foreign/php/test-results
 

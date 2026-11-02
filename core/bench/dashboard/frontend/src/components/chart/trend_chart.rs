@@ -102,10 +102,12 @@ pub fn trend_chart(props: &TrendChartProps) -> Html {
                     // Render new chart
                     match create_chart(&config, data, &plot_type) {
                         Ok(new_e) => echarts.set(Some(new_e)),
-                        Err(e) => log!(format!("Error rendering chart: {}", e)),
+                        Err(e) => {
+                            log!(format!("Error rendering chart: {}", e));
+                        }
                     }
                 } else {
-                    log!(format!("No data to render chart"));
+                    log!("No data to render chart");
                 }
 
                 || ()

@@ -174,11 +174,11 @@ function validate(pkgs) {
 
 function render(pkgs) {
   const out = [];
-  out.push('Apache Iggy (incubating) - Third-Party License Manifest (Node)');
+  out.push('Apache Iggy - Third-Party License Manifest (Node)');
   out.push('================================================================');
   out.push('');
   out.push('The following npm production dependencies are bundled into this');
-  out.push('Apache Iggy (incubating) convenience binary artifact. Packages are');
+  out.push('Apache Iggy convenience binary artifact. Packages are');
   out.push('grouped by license; the canonical license text appears once per');
   out.push('group as required by the Apache Software Foundation release policy.');
   out.push('');

@@ -32,11 +32,32 @@
 //! mixed pair is dropped, so no view change reaches a quorum. Nothing enforces this,
 //! because there is nothing left to enforce it with; this note is the declaration.
 //!
-//! `Prepare`, `Request`, `Reply`, and `Eviction` are unaffected. Prepares keep
-//! `checksum` as their view-independent identity, and the three client-facing
-//! headers are sealed on neither side, so SDKs are untouched.
+//! The forwarding commands at discriminants 26 through 29 are same-release
+//! replica messages. A build whose command bit-pattern predates them drops the
+//! frames as unparsable and never sends a result, so backup-dialed session
+//! operations wait for their forward timeout in a mixed fleet. These commands are
+//! another reason the release cannot be rolled node by node.
+//!
+//! Consumer-session heartbeats (command 30) also require a coordinated upgrade.
+//! Older replicas reject this command and close the replica connection each time
+//! a new backup reports its sessions.
+//! Older replicas cannot report live sessions to a new primary, which would
+//! expire their consumer-group memberships after the configured timeout.
+//!
+//! Session retirement progress (31), forwarding completion (32), and the
+//! partition incarnation fields in control headers also require matching
+//! replicas. The incarnation occupies bytes older builds treated as reserved;
+//! a mixed cluster cannot safely identify the partition history of a frame.
+//!
+//! Frame sealing does not change `Prepare`, `Request`, `Reply`, or `Eviction`.
+//! Prepares keep `checksum` as their view-independent identity, and the three
+//! client-facing headers are sealed on neither side. Separate client protocol
+//! changes, including partition routes and replica IDs in cluster metadata,
+//! require a coordinated SDK upgrade as well.
 
-use super::{Command2, ConsensusError, Operation};
+use super::{Command, ConsensusError, Operation};
+use crate::WireIdentifier;
+use crate::requests::partitions::InstallConsumerGroupOwnerRequest;
 use bytemuck::{CheckedBitPattern, NoUninit};
 use std::mem::offset_of;
 
@@ -95,13 +116,28 @@ pub fn frame_checksum_bytes(header: &[u8; HEADER_SIZE]) -> u128 {
 /// strict allocators (Miri, jemalloc, arenas). Use
 /// `aligned_vec::AVec<u8, ConstAlign<16>>` for explicit alignment.
 pub trait ConsensusHeader: Sized + CheckedBitPattern + NoUninit {
-    const COMMAND: Command2;
+    const COMMAND: Command;
+    /// Whether `checksum` carries the prepare identity, which covers the
+    /// operation byte: an unknown operation on such a frame can be
+    /// authenticated from the raw bytes even though the typed view refuses to
+    /// cast. False wherever `checksum` seals the frame or crosses the client
+    /// boundary.
+    const IDENTITY_CHECKSUMMED: bool = false;
+
+    /// Byte offset of this header's `operation` field, `None` when it carries
+    /// none.
+    ///
+    /// The typed decode reads the raw byte here after a failed checked cast,
+    /// so an operation a newer release added is reported as version skew
+    /// rather than corruption. An offset rather than a getter because the cast
+    /// has already failed by then, so no typed view of the header exists.
+    const OPERATION_OFFSET: Option<usize> = None;
 
     /// Whether a frame carrying `command` may be typed as this header.
     /// Defaults to an exact match; a header that serves several commands
     /// with one layout (e.g. `RepairDone` / `RangeEvicted`) widens it.
     #[must_use]
-    fn accepts(command: Command2) -> bool {
+    fn accepts(command: Command) -> bool {
         command == Self::COMMAND
     }
 
@@ -129,7 +165,7 @@ pub trait ConsensusHeader: Sized + CheckedBitPattern + NoUninit {
     /// Returns `ConsensusError` if the header fields are inconsistent.
     fn validate(&self) -> Result<(), ConsensusError>;
     fn operation(&self) -> Operation;
-    fn command(&self) -> Command2;
+    fn command(&self) -> Command;
     fn size(&self) -> u32;
 
     /// The `checksum` field, whatever this header spends it on.
@@ -199,7 +235,7 @@ pub struct GenericHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
     pub reserved_command: [u8; RESERVED_COMMAND_LEN],
@@ -221,7 +257,7 @@ const _: () = {
 };
 
 impl ConsensusHeader for GenericHeader {
-    const COMMAND: Command2 = Command2::Reserved;
+    const COMMAND: Command = Command::Reserved;
     const FRAME_SEALED: bool = false;
 
     fn checksum(&self) -> u128 {
@@ -234,7 +270,7 @@ impl ConsensusHeader for GenericHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn validate(&self) -> Result<(), ConsensusError> {
@@ -257,42 +293,56 @@ pub struct RequestHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
     pub client: u128,
-    /// Integrity stamp over the request payload, used by the client table to
-    /// catch a `request` number reused for a different operation: a retry that
-    /// disagrees with the stamp of the cached reply is refused rather than
-    /// answered with the wrong reply. Zero means unstamped, which disables the
-    /// comparison; the wire currently sends zero.
+    /// Random identifier for a logical metadata or session request. The client
+    /// keeps it across retries and reconnect resends. Partition and
+    /// non-replicated operations leave it zero. The server seals the prepared
+    /// body separately with `checksum_body`.
     pub request_checksum: u128,
     pub timestamp: u64,
     pub request: u64,
     pub operation: Operation,
     pub operation_padding: [u8; 7],
-    /// Session fence epoch: the commit op of the latest committed `Register`
-    /// for this `client`. Handed to the client by that register's reply and
-    /// echoed on every subsequent request.
+    /// Session fence epoch: the commit op of the `Register` that created this
+    /// client's logical session, returned by its reply and echoed on subsequent
+    /// requests.
     ///
-    /// Every bind commits a `Register`, so each rebind of the same `client`
-    /// carries a strictly higher value, and a request stamped with an older one
-    /// is a zombie from before that rebind and gets fenced. Being a log
-    /// position rather than a counter is what makes it non-regressing: it
-    /// cannot restart low after the server drops an entry and the client
-    /// registers again.
+    /// `BindSession` and matching registration retries preserve this epoch.
+    /// A new registration after retirement establishes a new epoch, fencing
+    /// requests from the old session. Using the log position keeps the epoch
+    /// monotonic when a registry slot is reused.
     ///
-    /// Zero on `Register` itself (the client has no epoch to echo yet) and on
-    /// sessionless ops; header validation enforces both.
+    /// Header validation requires zero on `Register` itself. `NonReplicated`
+    /// operations also permit zero before a client has registered.
     pub session: u64,
-    /// Acting user id, stamped by the metadata primary at admission for every
-    /// gated client op so the in-apply RBAC gate resolves the same identity on
-    /// every replica; on `Register` it carries the freshly authenticated user.
-    /// The submitter's wire value is never trusted. Zero for `Logout`,
-    /// partition-plane, and server-internal ops.
+    /// Acting user id, stamped by the server for metadata and partition ops
+    /// so every replica uses the authenticated identity for RBAC and dedup.
+    /// On `Register` it carries the freshly authenticated user.
+    /// The submitter's wire value is never trusted.
     pub user_id: u32,
-    pub reserved: [u8; 60],
+    /// Little-endian command code in `reserved[0..4]` for `NonReplicated`.
+    pub reserved: [u8; 4],
+    /// Captured with the request and retained across retries and route refreshes.
+    /// A poll reply carries its served context in the body
+    /// (`PollMessagesResponseHeader::context`). Clients set the three context
+    /// fields with [`PartitionContext::stamp`](crate::PartitionContext::stamp),
+    /// and [`PartitionContext`](crate::PartitionContext) documents each value.
+    pub partition_incarnation: u64,
+    /// Consumer-group owner generation captured with the request. Zero for a
+    /// request without a group: a plain-consumer poll or offset write that
+    /// carries a nonzero value is refused with `ConsumerGroupPartitionNotOwned`.
+    /// On a group poll or group offset write, zero means that no owner was
+    /// captured: the server binds the request to the caller's installed owner,
+    /// or refuses it, and a poll reply names the bound owner in its body
+    /// context.
+    pub owner_generation: u64,
+    /// Minimum committed metadata operation needed to interpret this request.
+    pub minimum_metadata_op: u64,
+    pub reserved_tail: [u8; 32],
 }
 const _: () = {
     assert!(size_of::<RequestHeader>() == HEADER_SIZE);
@@ -303,7 +353,10 @@ const _: () = {
     assert!(
         offset_of!(RequestHeader, user_id) == offset_of!(RequestHeader, session) + size_of::<u64>()
     );
-    assert!(offset_of!(RequestHeader, reserved) + size_of::<[u8; 60]>() == HEADER_SIZE);
+    assert!(offset_of!(RequestHeader, partition_incarnation) == 200);
+    assert!(offset_of!(RequestHeader, owner_generation) == 208);
+    assert!(offset_of!(RequestHeader, minimum_metadata_op) == 216);
+    assert!(offset_of!(RequestHeader, reserved_tail) + size_of::<[u8; 32]>() == HEADER_SIZE);
 };
 
 /// A [`RequestHeader`] AFTER the receiving node resolved its target.
@@ -315,9 +368,8 @@ const _: () = {
 /// (it is derived: plane from `operation`, partition group from the body),
 /// so this is where the derivation result lives for the internal hop.
 ///
-/// Layout: identical to [`RequestHeader`] with `group` claiming the LAST
-/// eight reserved bytes (the tail, bytes 248..256); the leading 52 reserved
-/// bytes keep their client-wire meaning, so promotion is a same-size copy.
+/// Layout: identical to [`RequestHeader`] with server routing fields claiming
+/// bytes 240..256; captured incarnation and ownership retain their client-wire offsets.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct RoutedRequestHeader {
@@ -327,7 +379,7 @@ pub struct RoutedRequestHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -339,10 +391,16 @@ pub struct RoutedRequestHeader {
     pub operation_padding: [u8; 7],
     pub session: u64,
     pub user_id: u32,
-    /// Same offset and meaning as the leading 52 bytes of
-    /// `RequestHeader::reserved` -- this region CARRIES DATA (the
-    /// non-replicated op code range), so `group` must not displace it.
-    pub reserved: [u8; 52],
+    /// Little-endian command code in `reserved[0..4]` for `NonReplicated`.
+    pub reserved: [u8; 4],
+    /// Captured with the request and retained across retries and route refreshes.
+    pub partition_incarnation: u64,
+    pub owner_generation: u64,
+    /// Minimum committed metadata operation needed to interpret this request.
+    pub minimum_metadata_op: u64,
+    pub reserved_tail: [u8; 16],
+    /// Server-observed metadata frontier at partition admission.
+    pub metadata_watermark: u64,
     /// The resolved consensus group id (see `binary_protocol::namespace`),
     /// claiming the TAIL of the client header's reserved area.
     pub group: u64,
@@ -356,6 +414,18 @@ const _: () = {
     assert!(offset_of!(RoutedRequestHeader, session) == offset_of!(RequestHeader, session));
     assert!(offset_of!(RoutedRequestHeader, user_id) == offset_of!(RequestHeader, user_id));
     assert!(offset_of!(RoutedRequestHeader, reserved) == offset_of!(RequestHeader, reserved));
+    assert!(
+        offset_of!(RoutedRequestHeader, partition_incarnation)
+            == offset_of!(RequestHeader, partition_incarnation)
+    );
+    assert!(
+        offset_of!(RoutedRequestHeader, owner_generation)
+            == offset_of!(RequestHeader, owner_generation)
+    );
+    assert!(
+        offset_of!(RoutedRequestHeader, minimum_metadata_op)
+            == offset_of!(RequestHeader, minimum_metadata_op)
+    );
     assert!(offset_of!(RoutedRequestHeader, group) + size_of::<u64>() == HEADER_SIZE);
 };
 
@@ -368,7 +438,7 @@ impl Default for RoutedRequestHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: Command2::Reserved,
+            command: Command::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             client: 0,
@@ -379,7 +449,12 @@ impl Default for RoutedRequestHeader {
             operation_padding: [0; 7],
             session: 0,
             user_id: 0,
-            reserved: [0; 52],
+            reserved: [0; 4],
+            partition_incarnation: 0,
+            owner_generation: 0,
+            minimum_metadata_op: 0,
+            reserved_tail: [0; 16],
+            metadata_watermark: 0,
             group: 0,
         }
     }
@@ -394,7 +469,7 @@ impl Default for RequestHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: Command2::Reserved,
+            command: Command::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             client: 0,
@@ -405,7 +480,11 @@ impl Default for RequestHeader {
             operation_padding: [0; 7],
             session: 0,
             user_id: 0,
-            reserved: [0; 60],
+            reserved: [0; 4],
+            partition_incarnation: 0,
+            owner_generation: 0,
+            minimum_metadata_op: 0,
+            reserved_tail: [0; 32],
         }
     }
 }
@@ -471,7 +550,8 @@ fn validate_request_fields(
 }
 
 impl ConsensusHeader for RoutedRequestHeader {
-    const COMMAND: Command2 = Command2::Request;
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
+    const COMMAND: Command = Command::Request;
     /// The client-wire [`RequestHeader`] this is promoted from is unsealed, and the
     /// promotion copies `checksum` verbatim, so there is nothing here to verify.
     const FRAME_SEALED: bool = false;
@@ -486,7 +566,7 @@ impl ConsensusHeader for RoutedRequestHeader {
     fn operation(&self) -> Operation {
         self.operation
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -494,9 +574,9 @@ impl ConsensusHeader for RoutedRequestHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::Request {
+        if self.command != Command::Request {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::Request,
+                expected: Command::Request,
                 found: self.command,
             });
         }
@@ -505,7 +585,8 @@ impl ConsensusHeader for RoutedRequestHeader {
 }
 
 impl ConsensusHeader for RequestHeader {
-    const COMMAND: Command2 = Command2::Request;
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
+    const COMMAND: Command = Command::Request;
     const FRAME_SEALED: bool = false;
 
     fn checksum(&self) -> u128 {
@@ -518,7 +599,7 @@ impl ConsensusHeader for RequestHeader {
     fn operation(&self) -> Operation {
         self.operation
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -526,9 +607,9 @@ impl ConsensusHeader for RequestHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::Request {
+        if self.command != Command::Request {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::Request,
+                expected: Command::Request,
                 found: self.command,
             });
         }
@@ -548,12 +629,13 @@ pub struct ReplyHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
-    /// Echoed from the request this reply answers; the client table stores it
-    /// alongside the cached reply. See `RequestHeader::request_checksum`.
+    /// The original request's integrity stamp, preserved with its receipt.
+    /// A replay retains this value even if a retry supplies a different stamp.
+    /// See [`RequestHeader::request_checksum`].
     pub request_checksum: u128,
     pub context: u128,
     pub client: u128,
@@ -567,24 +649,38 @@ pub struct ReplyHeader {
     /// failure decided before commit (e.g. a dispatch-time authorization
     /// denial, or the partition primary rejecting a consumer-offset op).
     ///
-    /// Contract: this is nonzero ONLY on a pre-commit denial, and a deny
-    /// reply always carries an EMPTY body. So this header channel and the
-    /// committed per-sub-op results in the metadata result section are mutually
-    /// exclusive by construction: a reply either commits (status 0, result
-    /// section present) or is denied before commit (status set, no body), and a
-    /// consumer never reconciles the two. Carved from `reserved` exactly like
-    /// `user_id` in `RequestHeader` / `PrepareHeader`; no existing field offset
-    /// moves and `validate` does not inspect it.
+    /// Contract: a nonzero status always carries an EMPTY body. With status
+    /// zero, result-framed operations must still decode the result section:
+    /// it can carry a committed result or a pre-commit transient rejection.
+    /// Neither a zero status nor a result section alone proves commitment.
+    /// Carved from `reserved` like `user_id` in `RequestHeader` / `PrepareHeader`;
+    /// no existing field offset moves and `validate` does not inspect it.
     pub status: u32,
-    pub reserved: [u8; 36],
+    /// Byte 220 is [`Self::COMMITTED_RESULT`] only for a final committed result.
+    /// Replayed successful PAT creation preserves this proof but returns
+    /// `PersonalAccessTokenAlreadyExists` because its secret cannot be recovered.
+    /// Zero and unknown values carry no commitment proof.
+    pub reserved: [u8; 4],
+    /// Echoes the request, and the plain poll reply overwrites it with the
+    /// served incarnation. Clients read the served context from the poll
+    /// reply body (`PollMessagesResponseHeader::context`).
+    pub partition_incarnation: u64,
+    pub reserved_tail: [u8; 24],
 }
 const _: () = {
     assert!(size_of::<ReplyHeader>() == HEADER_SIZE);
+    assert!(offset_of!(ReplyHeader, reserved) == 220);
     assert!(
         offset_of!(ReplyHeader, request_checksum)
             == offset_of!(ReplyHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(ReplyHeader, reserved) + size_of::<[u8; 36]>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ReplyHeader, reserved) + size_of::<[u8; 4]>()
+            == offset_of!(ReplyHeader, partition_incarnation)
+    );
+    assert!(offset_of!(ReplyHeader, partition_incarnation) == 224);
+    assert!(offset_of!(ReplyHeader, reserved_tail) == 232);
+    assert!(offset_of!(ReplyHeader, reserved_tail) + size_of::<[u8; 24]>() == HEADER_SIZE);
 };
 
 impl Default for ReplyHeader {
@@ -596,7 +692,7 @@ impl Default for ReplyHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: Command2::Reserved,
+            command: Command::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             request_checksum: 0,
@@ -609,13 +705,98 @@ impl Default for ReplyHeader {
             operation: Operation::Reserved,
             operation_padding: [0; 7],
             status: 0,
-            reserved: [0; 36],
+            reserved: [0; 4],
+            partition_incarnation: 0,
+            reserved_tail: [0; 24],
         }
     }
 }
 
+impl ReplyHeader {
+    /// Wire marker for a final committed result, stored in `reserved[0]`.
+    pub const COMMITTED_RESULT: u8 = 1;
+
+    /// The reply to a committed prepare.
+    ///
+    /// Fields come from the prepare and fixed protocol values, never from the
+    /// primary's live state, so a cached reply replayed by any replica carries the same
+    /// bytes for `(client, request)`: `view` is the commit-time view and
+    /// `replica` the original primary's id. `commit` is the prepare's `op`, not
+    /// `commit_max`, because it drives the `ClientTable` eviction order and
+    /// must be deterministic across replicas.
+    #[must_use]
+    pub fn from_prepare(prepare_header: &PrepareHeader, size: u32) -> Self {
+        Self {
+            cluster: prepare_header.cluster,
+            size,
+            view: prepare_header.view,
+            release: prepare_header.release,
+            command: Command::Reply,
+            replica: prepare_header.replica,
+            request_checksum: prepare_header.request_checksum,
+            client: prepare_header.client,
+            op: prepare_header.op,
+            commit: prepare_header.op,
+            timestamp: prepare_header.timestamp,
+            request: prepare_header.request,
+            operation: prepare_header.operation,
+            reserved: [Self::COMMITTED_RESULT, 0, 0, 0],
+            partition_incarnation: prepare_header.partition_incarnation,
+            ..Self::default()
+        }
+    }
+
+    /// The base of a reply that answers `request_header` without a prepare
+    /// (rejections, denials, non-replicated reads): `cluster`, `view`,
+    /// `release`, `replica`, `request_checksum`, `timestamp`, `request`,
+    /// `operation` and `partition_incarnation` echo the
+    /// request, `command` is `Reply`, `size` is the
+    /// caller's frame length, and every other field is zero.
+    ///
+    /// `client`, `op`, `commit` and `status` stay zero. Callers stamp two
+    /// deliberately different client identities (the transport client id on
+    /// the dispatch paths, the VSR client id elsewhere), so every site names
+    /// `client` itself instead of inheriting one that is right for only half
+    /// of them.
+    #[must_use]
+    pub fn echoing(request_header: &RoutedRequestHeader, size: u32) -> Self {
+        Self {
+            cluster: request_header.cluster,
+            size,
+            view: request_header.view,
+            release: request_header.release,
+            command: Command::Reply,
+            replica: request_header.replica,
+            request_checksum: request_header.request_checksum,
+            timestamp: request_header.timestamp,
+            request: request_header.request,
+            operation: request_header.operation,
+            partition_incarnation: request_header.partition_incarnation,
+            ..Self::default()
+        }
+    }
+
+    /// Header evidence of a final committed result. The caller must also validate
+    /// the result body and its correlation with the original request.
+    /// PAT creation can replace a committed success with an already-exists error
+    /// when replay cannot recover the original secret.
+    #[must_use]
+    pub fn has_committed_result(&self) -> bool {
+        self.command == Command::Reply
+            && self.status == 0
+            && self.reserved[0] == Self::COMMITTED_RESULT
+    }
+
+    /// Withdraw the committed-result marker and keep every other byte, for a
+    /// reply to a committed prepare whose final result is still pending.
+    pub const fn clear_committed_result(&mut self) {
+        self.reserved[0] = 0;
+    }
+}
+
 impl ConsensusHeader for ReplyHeader {
-    const COMMAND: Command2 = Command2::Reply;
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
+    const COMMAND: Command = Command::Reply;
     const FRAME_SEALED: bool = false;
 
     fn checksum(&self) -> u128 {
@@ -628,7 +809,7 @@ impl ConsensusHeader for ReplyHeader {
     fn operation(&self) -> Operation {
         self.operation
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -636,8 +817,8 @@ impl ConsensusHeader for ReplyHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::Reply {
-            return Err(ConsensusError::ReplyInvalidCommand2);
+        if self.command != Command::Reply {
+            return Err(ConsensusError::ReplyInvalidCommand);
         }
         Ok(())
     }
@@ -707,7 +888,7 @@ pub struct EvictionHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -775,7 +956,7 @@ impl EvictionHeader {
             size: HEADER_SIZE as u32,
             view,
             release: 0,
-            command: Command2::Eviction,
+            command: Command::Eviction,
             replica,
             reserved_frame: [0; 66],
             client,
@@ -806,7 +987,7 @@ impl EvictionHeader {
 }
 
 impl ConsensusHeader for EvictionHeader {
-    const COMMAND: Command2 = Command2::Eviction;
+    const COMMAND: Command = Command::Eviction;
     const FRAME_SEALED: bool = false;
 
     fn checksum(&self) -> u128 {
@@ -820,7 +1001,7 @@ impl ConsensusHeader for EvictionHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -829,9 +1010,9 @@ impl ConsensusHeader for EvictionHeader {
 
     #[allow(clippy::cast_possible_truncation)]
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::Eviction {
+        if self.command != Command::Eviction {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::Eviction,
+                expected: Command::Eviction,
                 found: self.command,
             });
         }
@@ -899,7 +1080,7 @@ pub struct PrepareHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -922,7 +1103,13 @@ pub struct PrepareHeader {
     /// Acting user id, copied verbatim from the admitted `RequestHeader`; see
     /// that field for the stamping contract.
     pub user_id: u32,
-    pub reserved: [u8; 28],
+    /// Immutable capacity nominated by the first committed prepare in this group.
+    pub retry_capacity: u32,
+    pub partition_incarnation: u64,
+    pub reserved: [u8; 8],
+    /// Metadata Register commit identifying the authenticated session.
+    /// Zero is reserved for registration and server-originated operations.
+    pub session: u64,
 }
 const _: () = {
     assert!(size_of::<PrepareHeader>() == HEADER_SIZE);
@@ -933,7 +1120,11 @@ const _: () = {
     assert!(
         offset_of!(PrepareHeader, user_id) == offset_of!(PrepareHeader, group) + size_of::<u64>()
     );
-    assert!(offset_of!(PrepareHeader, reserved) + size_of::<[u8; 28]>() == HEADER_SIZE);
+    assert!(offset_of!(PrepareHeader, retry_capacity) == 228);
+    assert!(offset_of!(PrepareHeader, partition_incarnation) == 232);
+    assert!(offset_of!(PrepareHeader, reserved) == 240);
+    assert!(offset_of!(PrepareHeader, session) == 248);
+    assert!(offset_of!(PrepareHeader, session) + size_of::<u64>() == HEADER_SIZE);
 };
 
 impl Default for PrepareHeader {
@@ -945,7 +1136,7 @@ impl Default for PrepareHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: Command2::Reserved,
+            command: Command::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             client: 0,
@@ -959,13 +1150,18 @@ impl Default for PrepareHeader {
             operation_padding: [0; 7],
             group: 0,
             user_id: 0,
-            reserved: [0; 28],
+            retry_capacity: 0,
+            partition_incarnation: 0,
+            reserved: [0; 8],
+            session: 0,
         }
     }
 }
 
 impl ConsensusHeader for PrepareHeader {
-    const COMMAND: Command2 = Command2::Prepare;
+    const IDENTITY_CHECKSUMMED: bool = true;
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
+    const COMMAND: Command = Command::Prepare;
     const FRAME_SEALED: bool = false;
 
     fn checksum(&self) -> u128 {
@@ -978,7 +1174,7 @@ impl ConsensusHeader for PrepareHeader {
     fn operation(&self) -> Operation {
         self.operation
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -986,9 +1182,9 @@ impl ConsensusHeader for PrepareHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::Prepare {
+        if self.command != Command::Prepare {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::Prepare,
+                expected: Command::Prepare,
                 found: self.command,
             });
         }
@@ -1013,8 +1209,8 @@ impl ConsensusHeader for PrepareHeader {
 
 /// `checksum` of a prepare no producer sealed.
 ///
-/// Written by a build predating the identity seal, or by the partition plane.
-/// Verification skips such entries so an older build's WAL still replays.
+/// Used by in-process producers that do not seal frames. A zero checksum does
+/// not grant storage-format compatibility; boot validates that separately.
 pub const CHECKSUM_UNSEALED: u128 = 0;
 
 /// The frame's body, bounded by `size`. What `checksum_body` covers.
@@ -1029,6 +1225,23 @@ pub fn frame_body(frame: &[u8], size: u32) -> &[u8] {
         return &[];
     }
     &frame[HEADER_SIZE..end]
+}
+
+/// Byte-level twin of [`PrepareHeader::identity_checksum`].
+///
+/// For a frame whose operation byte does not cast: an unknown discriminant
+/// blocks the typed view, but the identity covers the operation byte, so
+/// recomputing it over the raw bytes authenticates that byte before anything
+/// is claimed about it. Must agree with the typed method byte for byte; a unit
+/// test pins the equality.
+#[must_use]
+pub fn prepare_identity_checksum_bytes(header: &[u8; HEADER_SIZE]) -> u128 {
+    let mut covered = *header;
+    let checksum_at = core::mem::offset_of!(PrepareHeader, checksum);
+    covered[checksum_at..checksum_at + size_of::<u128>()].fill(0);
+    let view_at = core::mem::offset_of!(PrepareHeader, view);
+    covered[view_at..view_at + size_of::<u32>()].fill(0);
+    u128::from(twox_hash::XxHash3_64::oneshot(&covered))
 }
 
 impl PrepareHeader {
@@ -1047,6 +1260,14 @@ impl PrepareHeader {
         covered.view = 0;
         u128::from(twox_hash::XxHash3_64::oneshot(bytemuck::bytes_of(&covered)))
     }
+
+    /// Whether a parent chain can be proven down from this header. An unsealed
+    /// header names no identity, and a zero `parent` would link anything below it;
+    /// op 1 is the one prepare whose real parent is zero.
+    #[must_use]
+    pub const fn anchors_chain(&self) -> bool {
+        self.checksum != CHECKSUM_UNSEALED && (self.parent != CHECKSUM_UNSEALED || self.op == 1)
+    }
 }
 
 // RepairPrepareHeader - repair peer -> recovering replica (journal repair)
@@ -1063,7 +1284,13 @@ impl PrepareHeader {
 pub struct RepairPrepareHeader(pub PrepareHeader);
 
 impl ConsensusHeader for RepairPrepareHeader {
-    const COMMAND: Command2 = Command2::RepairPrepare;
+    // Transparent over `PrepareHeader`, so the operation sits at the same
+    // offset and its checksum field carries the same identity. Without these a
+    // repaired prepare carrying a newer release's operation is classified as a
+    // corrupt header instead of version skew.
+    const IDENTITY_CHECKSUMMED: bool = true;
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(PrepareHeader, operation));
+    const COMMAND: Command = Command::RepairPrepare;
     const FRAME_SEALED: bool = false;
 
     fn checksum(&self) -> u128 {
@@ -1076,7 +1303,7 @@ impl ConsensusHeader for RepairPrepareHeader {
     fn operation(&self) -> Operation {
         self.0.operation
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.0.command
     }
     fn size(&self) -> u32 {
@@ -1084,9 +1311,9 @@ impl ConsensusHeader for RepairPrepareHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.0.command != Command2::RepairPrepare {
+        if self.0.command != Command::RepairPrepare {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::RepairPrepare,
+                expected: Command::RepairPrepare,
                 found: self.0.command,
             });
         }
@@ -1121,7 +1348,7 @@ pub struct PrepareOkHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -1154,7 +1381,7 @@ impl Default for PrepareOkHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: Command2::Reserved,
+            command: Command::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             parent: 0,
@@ -1172,9 +1399,10 @@ impl Default for PrepareOkHeader {
 }
 
 impl ConsensusHeader for PrepareOkHeader {
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::PrepareOk;
+    const COMMAND: Command = Command::PrepareOk;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1186,7 +1414,7 @@ impl ConsensusHeader for PrepareOkHeader {
     fn operation(&self) -> Operation {
         self.operation
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1194,9 +1422,9 @@ impl ConsensusHeader for PrepareOkHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::PrepareOk {
+        if self.command != Command::PrepareOk {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::PrepareOk,
+                expected: Command::PrepareOk,
                 found: self.command,
             });
         }
@@ -1216,7 +1444,7 @@ pub struct CommitHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -1225,7 +1453,8 @@ pub struct CommitHeader {
     pub commit: u64,
     pub checkpoint_op: u64,
     pub group: u64,
-    pub reserved: [u8; 80],
+    pub partition_incarnation: u64,
+    pub reserved: [u8; 72],
 }
 const _: () = {
     assert!(size_of::<CommitHeader>() == HEADER_SIZE);
@@ -1233,13 +1462,14 @@ const _: () = {
         offset_of!(CommitHeader, commit_checksum)
             == offset_of!(CommitHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(CommitHeader, reserved) + size_of::<[u8; 80]>() == HEADER_SIZE);
+    assert!(offset_of!(CommitHeader, reserved) + size_of::<[u8; 72]>() == HEADER_SIZE);
+    assert!(offset_of!(CommitHeader, partition_incarnation) == 176);
 };
 
 impl ConsensusHeader for CommitHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::Commit;
+    const COMMAND: Command = Command::Commit;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1251,7 +1481,7 @@ impl ConsensusHeader for CommitHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1259,14 +1489,174 @@ impl ConsensusHeader for CommitHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::Commit {
-            return Err(ConsensusError::CommitInvalidCommand2);
+        if self.command != Command::Commit {
+            return Err(ConsensusError::CommitInvalidCommand);
         }
         if self.size != 256 {
             return Err(ConsensusError::CommitInvalidSize(self.size));
         }
         Ok(())
     }
+}
+
+/// Backup -> primary: echo a heartbeat counter for quorum liveness.
+///
+/// This acknowledges connectivity, not journal or state-machine durability.
+/// Nodes using this message require a coordinated cluster upgrade.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
+pub struct CommitReplyHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+    pub timestamp_monotonic: u64,
+    pub group: u64,
+    pub partition_incarnation: u64,
+    pub reserved: [u8; 104],
+}
+
+const _: () = {
+    assert!(size_of::<CommitReplyHeader>() == HEADER_SIZE);
+    assert!(offset_of!(CommitReplyHeader, timestamp_monotonic) == 128);
+    assert!(offset_of!(CommitReplyHeader, partition_incarnation) == 144);
+    assert!(offset_of!(CommitReplyHeader, reserved) + size_of::<[u8; 104]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for CommitReplyHeader {
+    const FRAME_SEALED: bool = true;
+    const COMMAND: Command = Command::CommitReply;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Self::COMMAND {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Self::COMMAND,
+                found: self.command,
+            });
+        }
+        if usize::try_from(self.size) != Ok(HEADER_SIZE) {
+            return Err(ConsensusError::InvalidField(
+                "commit_reply: invalid size".to_string(),
+            ));
+        }
+        if self.release != 0 {
+            return Err(ConsensusError::InvalidField("release != 0".to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// Correlates a replication checkpoint with the backup's contiguous prefixes.
+///
+/// Probes must stay ordered with prepares on the sender's queue, so a reply
+/// proves that the backup consumed every frame sent before its probe. That FIFO
+/// position, not an op, releases transport credit. Progress never counts toward
+/// a commit quorum.
+/// Replies echo the nonce and observed op. `held_op` is the end of the prefix
+/// that the backup holds with proof in the current view, so the primary finds
+/// replication gaps from it. `received_op <= held_op` is the part of that
+/// prefix that meets the prepare acknowledgment rules, and `ready` certifies it. Probes advertise the primary's applied frontier for retention
+/// fallback.
+/// Nodes using this message require a coordinated cluster upgrade.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
+pub struct PrepareProgressHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+    pub nonce: u64,
+    pub group: u64,
+    pub partition_incarnation: u64,
+    pub observed_op: u64,
+    pub received_op: u64,
+    pub held_op: u64,
+    pub commit_op: u64,
+    pub kind: u8,
+    pub ready: u8,
+    pub reserved: [u8; 70],
+}
+
+const _: () = {
+    assert!(size_of::<PrepareProgressHeader>() == HEADER_SIZE);
+    assert!(offset_of!(PrepareProgressHeader, nonce) == 128);
+    assert!(offset_of!(PrepareProgressHeader, partition_incarnation) == 144);
+    assert!(offset_of!(PrepareProgressHeader, reserved) + size_of::<[u8; 70]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for PrepareProgressHeader {
+    const FRAME_SEALED: bool = true;
+    const COMMAND: Command = Command::PrepareProgress;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Self::COMMAND {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Self::COMMAND,
+                found: self.command,
+            });
+        }
+        if usize::try_from(self.size) != Ok(HEADER_SIZE) {
+            return Err(ConsensusError::InvalidField(
+                "prepare_progress: invalid size".to_string(),
+            ));
+        }
+        if self.release != 0 {
+            return Err(ConsensusError::InvalidField("release != 0".to_string()));
+        }
+        if self.kind > Self::REPLY || self.ready > 1 {
+            return Err(ConsensusError::InvalidField(
+                "prepare_progress: invalid fields".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl PrepareProgressHeader {
+    pub const PROBE: u8 = 0;
+    pub const REPLY: u8 = 1;
 }
 
 // StartViewChangeHeader - failure detection (header-only)
@@ -1281,12 +1671,13 @@ pub struct StartViewChangeHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
     pub group: u64,
-    pub reserved: [u8; 120],
+    pub partition_incarnation: u64,
+    pub reserved: [u8; 112],
 }
 const _: () = {
     assert!(size_of::<StartViewChangeHeader>() == HEADER_SIZE);
@@ -1294,13 +1685,14 @@ const _: () = {
         offset_of!(StartViewChangeHeader, group)
             == offset_of!(StartViewChangeHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(StartViewChangeHeader, reserved) + size_of::<[u8; 120]>() == HEADER_SIZE);
+    assert!(offset_of!(StartViewChangeHeader, reserved) + size_of::<[u8; 112]>() == HEADER_SIZE);
+    assert!(offset_of!(StartViewChangeHeader, partition_incarnation) == 136);
 };
 
 impl ConsensusHeader for StartViewChangeHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::StartViewChange;
+    const COMMAND: Command = Command::StartViewChange;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1312,7 +1704,7 @@ impl ConsensusHeader for StartViewChangeHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1320,9 +1712,9 @@ impl ConsensusHeader for StartViewChangeHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::StartViewChange {
+        if self.command != Command::StartViewChange {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::StartViewChange,
+                expected: Command::StartViewChange,
                 found: self.command,
             });
         }
@@ -1333,9 +1725,9 @@ impl ConsensusHeader for StartViewChangeHeader {
     }
 }
 
-// DoViewChangeHeader - view change vote (header-only)
+// DoViewChangeHeader - view change vote with log suffix
 
-/// Replica -> primary candidate: vote for view change. Header-only.
+/// Replica -> replicas: vote for view change, carrying a log-header suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct DoViewChangeHeader {
@@ -1345,7 +1737,7 @@ pub struct DoViewChangeHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -1356,7 +1748,22 @@ pub struct DoViewChangeHeader {
     pub group: u64,
     /// View when status was last normal (key for log selection).
     pub log_view: u32,
-    pub reserved: [u8; 68],
+    /// Bit 0, [`Self::FLAG_UNTRUSTED_LOG`]: the sender recovered a `replicated`
+    /// log after a restart and has not adopted a settled view since, so ops past
+    /// its head may be ones it acknowledged and lost. Such a log can neither be
+    /// canonical nor nack anything while a quorum of trusted senders reports.
+    ///
+    /// Carved from the head of the former `reserved` region. Zero reads as
+    /// "trusted", which is what a build predating the flag sends, so the
+    /// protection holds once every replica runs a build that sets it.
+    ///
+    /// Every bit is must-understand: `validate` rejects one outside
+    /// [`Self::FLAGS_KNOWN`]. `reserved` is not checked, so a later field carved
+    /// from it must be safe for an older receiver to ignore, or its release must
+    /// forbid mixed versions (see `core/server/README.md`, Upgrading).
+    pub flags: u8,
+    pub reserved: [u8; 59],
+    pub partition_incarnation: u64,
     /// Bit `i` set means the sender proves it never prepared suffix entry `i`, so
     /// that entry never reached a replication quorum through this replica. A new
     /// primary may truncate only once `quorum_nack_prepare` senders nack an entry;
@@ -1386,16 +1793,23 @@ const _: () = {
             == offset_of!(DoViewChangeHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
     // op/commit/group/log_view keep their pre-bitset offsets.
-    assert!(offset_of!(DoViewChangeHeader, reserved) == 156);
+    assert!(offset_of!(DoViewChangeHeader, op) == 128);
+    assert!(offset_of!(DoViewChangeHeader, commit) == 136);
+    assert!(offset_of!(DoViewChangeHeader, group) == 144);
+    assert!(offset_of!(DoViewChangeHeader, log_view) == 152);
+    assert!(offset_of!(DoViewChangeHeader, flags) == 156);
+    assert!(offset_of!(DoViewChangeHeader, reserved) == 157);
     // Both bitsets are last and 16-aligned, so the struct has no padding
     // (`NoUninit` would reject any).
     assert!(offset_of!(DoViewChangeHeader, nack_bitset) % 16 == 0);
     assert!(offset_of!(DoViewChangeHeader, present_bitset) % 16 == 0);
     assert!(
         offset_of!(DoViewChangeHeader, nack_bitset)
-            == offset_of!(DoViewChangeHeader, reserved) + size_of::<[u8; 68]>()
+            == offset_of!(DoViewChangeHeader, partition_incarnation) + size_of::<u64>()
     );
     assert!(offset_of!(DoViewChangeHeader, present_bitset) + size_of::<u128>() == HEADER_SIZE);
+    assert!(offset_of!(DoViewChangeHeader, partition_incarnation) == 216);
+    assert!(offset_of!(DoViewChangeHeader, reserved) + size_of::<[u8; 59]>() == 216);
 };
 
 /// Suffix headers a `DoViewChange` may carry: one bit per entry in each of the two
@@ -1408,7 +1822,7 @@ pub const DVC_HEADERS_MAX: usize = 128;
 impl ConsensusHeader for DoViewChangeHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::DoViewChange;
+    const COMMAND: Command = Command::DoViewChange;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1420,7 +1834,7 @@ impl ConsensusHeader for DoViewChangeHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1428,9 +1842,9 @@ impl ConsensusHeader for DoViewChangeHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::DoViewChange {
+        if self.command != Command::DoViewChange {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::DoViewChange,
+                expected: Command::DoViewChange,
                 found: self.command,
             });
         }
@@ -1449,6 +1863,15 @@ impl ConsensusHeader for DoViewChangeHeader {
                 "commit cannot exceed op".to_string(),
             ));
         }
+        // A bit this build cannot read may carry a claim the merge must honor, and
+        // reading past it could seat an untrusted log as canonical. Dropping the
+        // vote costs only availability.
+        if self.flags & !Self::FLAGS_KNOWN != 0 {
+            return Err(ConsensusError::InvalidField(format!(
+                "do_view_change: unknown flag bits {:#04x}",
+                self.flags & !Self::FLAGS_KNOWN
+            )));
+        }
         let suffix_len = self.suffix_len()?;
         // Bits past the suffix describe entries never sent: unchecked, a peer could
         // smuggle a nack for an op the new primary would then truncate.
@@ -1465,6 +1888,17 @@ impl ConsensusHeader for DoViewChangeHeader {
 }
 
 impl DoViewChangeHeader {
+    /// See [`Self::flags`].
+    pub const FLAG_UNTRUSTED_LOG: u8 = 1;
+    /// Every flag bit this build understands.
+    pub const FLAGS_KNOWN: u8 = Self::FLAG_UNTRUSTED_LOG;
+
+    /// Whether the sender marked its log untrusted. See [`Self::flags`].
+    #[must_use]
+    pub const fn untrusted_log(&self) -> bool {
+        self.flags & Self::FLAG_UNTRUSTED_LOG != 0
+    }
+
     /// Number of `PrepareHeader`s in the body.
     ///
     /// Zero is valid and means "no suffix": a replica with nothing uncommitted
@@ -1507,9 +1941,9 @@ fn suffix_len_of(frame: &str, size: u32) -> Result<usize, ConsensusError> {
     Ok(suffix_len)
 }
 
-// StartViewHeader - new view announcement (header-only)
+// StartViewHeader - new view announcement with log suffix
 
-/// New primary -> all replicas: start new view. Header-only.
+/// New primary -> replicas: start a new view, with an optional log-header suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct StartViewHeader {
@@ -1519,7 +1953,7 @@ pub struct StartViewHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -1528,7 +1962,8 @@ pub struct StartViewHeader {
     /// max(commit) from all DVCs.
     pub commit: u64,
     pub group: u64,
-    pub reserved: [u8; 88],
+    pub partition_incarnation: u64,
+    pub reserved: [u8; 80],
     /// Sender's incarnation, echoed from the `RequestStartView` this answers so a
     /// recovering replica can prove the reply post-dates its restart (see
     /// `RequestStartViewHeader::incarnation`). `0` on an unsolicited `StartView`
@@ -1551,12 +1986,17 @@ const _: () = {
     // `incarnation` is last and 16-aligned, so the struct has no padding.
     assert!(offset_of!(StartViewHeader, incarnation) + size_of::<u128>() == HEADER_SIZE);
     assert!(offset_of!(StartViewHeader, incarnation) % 16 == 0);
+    assert!(offset_of!(StartViewHeader, partition_incarnation) == 152);
+    assert!(
+        offset_of!(StartViewHeader, reserved) + size_of::<[u8; 80]>()
+            == offset_of!(StartViewHeader, incarnation)
+    );
 };
 
 impl ConsensusHeader for StartViewHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::StartView;
+    const COMMAND: Command = Command::StartView;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1568,7 +2008,7 @@ impl ConsensusHeader for StartViewHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1576,9 +2016,9 @@ impl ConsensusHeader for StartViewHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::StartView {
+        if self.command != Command::StartView {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::StartView,
+                expected: Command::StartView,
                 found: self.command,
             });
         }
@@ -1631,12 +2071,13 @@ pub struct RequestStartViewHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
     pub group: u64,
-    pub reserved: [u8; 104],
+    pub partition_incarnation: u64,
+    pub reserved: [u8; 96],
     /// The requester's per-boot incarnation, echoed back in the answering
     /// `StartView` so a reply from a previous incarnation is detectable.
     ///
@@ -1656,12 +2097,17 @@ const _: () = {
     // `incarnation` is last and 16-aligned, so the struct has no padding.
     assert!(offset_of!(RequestStartViewHeader, incarnation) + size_of::<u128>() == HEADER_SIZE);
     assert!(offset_of!(RequestStartViewHeader, incarnation) % 16 == 0);
+    assert!(offset_of!(RequestStartViewHeader, partition_incarnation) == 136);
+    assert!(
+        offset_of!(RequestStartViewHeader, reserved) + size_of::<[u8; 96]>()
+            == offset_of!(RequestStartViewHeader, incarnation)
+    );
 };
 
 impl ConsensusHeader for RequestStartViewHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::RequestStartView;
+    const COMMAND: Command = Command::RequestStartView;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1673,7 +2119,7 @@ impl ConsensusHeader for RequestStartViewHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1681,9 +2127,9 @@ impl ConsensusHeader for RequestStartViewHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::RequestStartView {
+        if self.command != Command::RequestStartView {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::RequestStartView,
+                expected: Command::RequestStartView,
                 found: self.command,
             });
         }
@@ -1713,7 +2159,7 @@ pub struct RequestPreparesHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -1721,7 +2167,8 @@ pub struct RequestPreparesHeader {
     pub from_op: u64,
     pub to_op: u64,
     pub group: u64,
-    pub reserved: [u8; 88],
+    pub partition_incarnation: u64,
+    pub reserved: [u8; 80],
 }
 const _: () = {
     assert!(size_of::<RequestPreparesHeader>() == HEADER_SIZE);
@@ -1729,13 +2176,14 @@ const _: () = {
         offset_of!(RequestPreparesHeader, nonce)
             == offset_of!(RequestPreparesHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(RequestPreparesHeader, reserved) + size_of::<[u8; 88]>() == HEADER_SIZE);
+    assert!(offset_of!(RequestPreparesHeader, reserved) + size_of::<[u8; 80]>() == HEADER_SIZE);
+    assert!(offset_of!(RequestPreparesHeader, partition_incarnation) == 168);
 };
 
 impl ConsensusHeader for RequestPreparesHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::RequestPrepares;
+    const COMMAND: Command = Command::RequestPrepares;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1747,7 +2195,7 @@ impl ConsensusHeader for RequestPreparesHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1755,9 +2203,9 @@ impl ConsensusHeader for RequestPreparesHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::RequestPrepares {
+        if self.command != Command::RequestPrepares {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::RequestPrepares,
+                expected: Command::RequestPrepares,
                 found: self.command,
             });
         }
@@ -1786,7 +2234,7 @@ pub struct RepairRangeReplyHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -1794,7 +2242,8 @@ pub struct RepairRangeReplyHeader {
     /// `RepairDone`: last op served. `RangeEvicted`: oldest retained op.
     pub op: u64,
     pub group: u64,
-    pub reserved: [u8; 96],
+    pub partition_incarnation: u64,
+    pub reserved: [u8; 88],
 }
 const _: () = {
     assert!(size_of::<RepairRangeReplyHeader>() == HEADER_SIZE);
@@ -1802,13 +2251,14 @@ const _: () = {
         offset_of!(RepairRangeReplyHeader, nonce)
             == offset_of!(RepairRangeReplyHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(RepairRangeReplyHeader, reserved) + size_of::<[u8; 96]>() == HEADER_SIZE);
+    assert!(offset_of!(RepairRangeReplyHeader, reserved) + size_of::<[u8; 88]>() == HEADER_SIZE);
+    assert!(offset_of!(RepairRangeReplyHeader, partition_incarnation) == 160);
 };
 
 impl ConsensusHeader for RepairRangeReplyHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::RepairDone;
+    const COMMAND: Command = Command::RepairDone;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1820,13 +2270,13 @@ impl ConsensusHeader for RepairRangeReplyHeader {
     // One layout, two commands: `RepairDone` terminates a stream,
     // `RangeEvicted` prefixes it. Without this widening, `try_into_typed`
     // rejects `RangeEvicted` frames before `validate` ever sees them.
-    fn accepts(command: Command2) -> bool {
-        command == Command2::RepairDone || command == Command2::RangeEvicted
+    fn accepts(command: Command) -> bool {
+        command == Command::RepairDone || command == Command::RangeEvicted
     }
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1834,9 +2284,9 @@ impl ConsensusHeader for RepairRangeReplyHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::RepairDone && self.command != Command2::RangeEvicted {
+        if self.command != Command::RepairDone && self.command != Command::RangeEvicted {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::RepairDone,
+                expected: Command::RepairDone,
                 found: self.command,
             });
         }
@@ -1868,13 +2318,14 @@ pub struct RequestStateTransferHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
     pub nonce: u128,
     pub group: u64,
-    pub reserved: [u8; 104],
+    pub partition_incarnation: u64,
+    pub reserved: [u8; 96],
 }
 const _: () = {
     assert!(size_of::<RequestStateTransferHeader>() == HEADER_SIZE);
@@ -1883,14 +2334,15 @@ const _: () = {
             == offset_of!(RequestStateTransferHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
     assert!(
-        offset_of!(RequestStateTransferHeader, reserved) + size_of::<[u8; 104]>() == HEADER_SIZE
+        offset_of!(RequestStateTransferHeader, reserved) + size_of::<[u8; 96]>() == HEADER_SIZE
     );
+    assert!(offset_of!(RequestStateTransferHeader, partition_incarnation) == 152);
 };
 
 impl ConsensusHeader for RequestStateTransferHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::RequestStateTransfer;
+    const COMMAND: Command = Command::RequestStateTransfer;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1902,7 +2354,7 @@ impl ConsensusHeader for RequestStateTransferHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1911,9 +2363,9 @@ impl ConsensusHeader for RequestStateTransferHeader {
 
     #[allow(clippy::cast_possible_truncation)]
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::RequestStateTransfer {
+        if self.command != Command::RequestStateTransfer {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::RequestStateTransfer,
+                expected: Command::RequestStateTransfer,
                 found: self.command,
             });
         }
@@ -1950,7 +2402,7 @@ pub struct StateTransferTargetHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -1963,12 +2415,9 @@ pub struct StateTransferTargetHeader {
     /// Set on an `available == 0` refusal that means "not right now" rather than
     /// "this node is broken".
     ///
-    /// PARTITION arm only: it is the only side with a consecutive-failure count
-    /// to charge. The requester then re-arms on a flat interval instead of
-    /// charging that count, whose exponential backoff climbs to 1024x the retry
-    /// interval and is reset only by a completed install. A serving primary
-    /// momentarily behind its own frontier is the common case under produce
-    /// load.
+    /// Partition receivers re-arm without charging exponential failure backoff.
+    /// Metadata receivers awaiting a descriptor retain their session and retry
+    /// on the normal interval while the peer's checkpoint writer is busy.
     ///
     /// This and `commit_max` below claim the HEAD of what used to be the
     /// reserved tail, so every pre-existing field keeps its published offset.
@@ -1982,8 +2431,8 @@ pub struct StateTransferTargetHeader {
     pub reserved_alignment: [u8; 6],
     /// Serving replica's `commit_max` when the descriptor was built.
     ///
-    /// Read by the PARTITION receiver only; the metadata arm branches on
-    /// `available` and falls back to journal repair without a refusal.
+    /// Read by the partition receiver only. Metadata receivers use `available`
+    /// and `unavailable_transient` to select transfer retry or journal repair.
     ///
     /// A partition receiver refuses an offer from a replica that knows LESS
     /// than it does:
@@ -1993,7 +2442,8 @@ pub struct StateTransferTargetHeader {
     /// and an empty log is trivially caught up) could hand a data-holding
     /// rejoiner an empty offer that unlinks its chain.
     pub commit_max: u64,
-    pub reserved: [u8; 80],
+    pub partition_incarnation: u64,
+    pub reserved: [u8; 72],
 }
 const _: () = {
     assert!(size_of::<StateTransferTargetHeader>() == HEADER_SIZE);
@@ -2008,13 +2458,14 @@ const _: () = {
     assert!(offset_of!(StateTransferTargetHeader, available) == 160);
     assert!(offset_of!(StateTransferTargetHeader, unavailable_transient) == 161);
     assert!(offset_of!(StateTransferTargetHeader, commit_max) == 168);
-    assert!(offset_of!(StateTransferTargetHeader, reserved) + size_of::<[u8; 80]>() == HEADER_SIZE);
+    assert!(offset_of!(StateTransferTargetHeader, reserved) + size_of::<[u8; 72]>() == HEADER_SIZE);
+    assert!(offset_of!(StateTransferTargetHeader, partition_incarnation) == 176);
 };
 
 impl ConsensusHeader for StateTransferTargetHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::StateTransferTarget;
+    const COMMAND: Command = Command::StateTransferTarget;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -2026,7 +2477,7 @@ impl ConsensusHeader for StateTransferTargetHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -2034,9 +2485,9 @@ impl ConsensusHeader for StateTransferTargetHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::StateTransferTarget {
+        if self.command != Command::StateTransferTarget {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::StateTransferTarget,
+                expected: Command::StateTransferTarget,
                 found: self.command,
             });
         }
@@ -2090,7 +2541,7 @@ pub struct RequestStateChunkHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -2101,7 +2552,8 @@ pub struct RequestStateChunkHeader {
     /// Index into the offered state manifest. Range-checked by the serving
     /// handler against the cached offer (the header cannot know the count).
     pub artifact: u32,
-    pub reserved: [u8; 88],
+    pub partition_incarnation: u64,
+    pub reserved: [u8; 80],
 }
 const _: () = {
     assert!(size_of::<RequestStateChunkHeader>() == HEADER_SIZE);
@@ -2109,13 +2561,14 @@ const _: () = {
         offset_of!(RequestStateChunkHeader, nonce)
             == offset_of!(RequestStateChunkHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(RequestStateChunkHeader, reserved) + size_of::<[u8; 88]>() == HEADER_SIZE);
+    assert!(offset_of!(RequestStateChunkHeader, reserved) + size_of::<[u8; 80]>() == HEADER_SIZE);
+    assert!(offset_of!(RequestStateChunkHeader, partition_incarnation) == 168);
 };
 
 impl ConsensusHeader for RequestStateChunkHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::RequestStateChunk;
+    const COMMAND: Command = Command::RequestStateChunk;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -2127,7 +2580,7 @@ impl ConsensusHeader for RequestStateChunkHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -2136,9 +2589,9 @@ impl ConsensusHeader for RequestStateChunkHeader {
 
     #[allow(clippy::cast_possible_truncation)]
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::RequestStateChunk {
+        if self.command != Command::RequestStateChunk {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::RequestStateChunk,
+                expected: Command::RequestStateChunk,
                 found: self.command,
             });
         }
@@ -2175,7 +2628,7 @@ pub struct StateChunkHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -2185,7 +2638,8 @@ pub struct StateChunkHeader {
     /// Index into the offered state manifest. Range-checked by the receiving
     /// handler against its accepted manifest.
     pub artifact: u32,
-    pub reserved: [u8; 92],
+    pub reserved: [u8; 84],
+    pub partition_incarnation: u64,
 }
 const _: () = {
     assert!(size_of::<StateChunkHeader>() == HEADER_SIZE);
@@ -2193,13 +2647,18 @@ const _: () = {
         offset_of!(StateChunkHeader, nonce)
             == offset_of!(StateChunkHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(StateChunkHeader, reserved) + size_of::<[u8; 92]>() == HEADER_SIZE);
+    assert!(
+        offset_of!(StateChunkHeader, reserved) + size_of::<[u8; 84]>()
+            == offset_of!(StateChunkHeader, partition_incarnation)
+    );
+    assert!(offset_of!(StateChunkHeader, partition_incarnation) == 248);
+    assert!(offset_of!(StateChunkHeader, partition_incarnation) + size_of::<u64>() == HEADER_SIZE);
 };
 
 impl ConsensusHeader for StateChunkHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::StateChunk;
+    const COMMAND: Command = Command::StateChunk;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -2211,7 +2670,7 @@ impl ConsensusHeader for StateChunkHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -2219,9 +2678,9 @@ impl ConsensusHeader for StateChunkHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::StateChunk {
+        if self.command != Command::StateChunk {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::StateChunk,
+                expected: Command::StateChunk,
                 found: self.command,
             });
         }
@@ -2234,15 +2693,637 @@ impl ConsensusHeader for StateChunkHeader {
     }
 }
 
+// ForwardRegisterHeader - backup shard 0 -> primary shard 0
+
+/// A backup relays a login it has already authenticated.
+///
+/// Credential verification runs on the node the client dialed, against the
+/// replicated users table, so neither the client's frame nor its credentials
+/// travel: this header carries the VERIFIED identity and nothing else. The
+/// backup keeps the session bind, the reply build, and the connection.
+///
+/// The trust boundary is the replica interconnect's network placement: by
+/// default the replica port trusts any peer that reaches it (the PSK
+/// handshake and TLS ship disabled and are what upgrade the boundary), and
+/// the seal is an unkeyed integrity check, not a MAC. Trusting `user_id`
+/// here adds no capability the port did not already expose, since that same
+/// peer could inject a `Request` + `Register` directly. Clients cannot
+/// reach this command, because every client frame is typed through
+/// [`RequestHeader`], whose `validate` rejects any command but
+/// [`Command::Request`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct ForwardRegisterHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    /// The login frame's consensus client id, proposed verbatim by the primary.
+    pub client: u128,
+    /// Correlation minted by the backup, echoed verbatim in the result. Unique
+    /// per in-flight forward on the originating node, across its restarts as
+    /// well: an answer that outlives the login it was minted for must not match
+    /// the one holding that nonce next.
+    pub nonce: u128,
+    /// The acting user the backup authenticated. The trust payload: the primary
+    /// proposes the register under this id without re-verifying credentials.
+    pub user_id: u32,
+    pub reserved: [u8; 92],
+}
+const _: () = {
+    assert!(size_of::<ForwardRegisterHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ForwardRegisterHeader, client)
+            == offset_of!(ForwardRegisterHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(ForwardRegisterHeader, nonce) == 144);
+    assert!(offset_of!(ForwardRegisterHeader, user_id) == 160);
+    assert!(offset_of!(ForwardRegisterHeader, reserved) + size_of::<[u8; 92]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for ForwardRegisterHeader {
+    // The seal covers `user_id`, which is the whole reason this frame is
+    // believed: a flipped bit there would commit a register under another user.
+    const FRAME_SEALED: bool = true;
+
+    const COMMAND: Command = Command::ForwardRegister;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command::ForwardRegister {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command::ForwardRegister,
+                found: self.command,
+            });
+        }
+        let expected = HEADER_SIZE + crate::requests::users::login_register::REGISTER_REQUEST_BYTES;
+        if self.size as usize != expected {
+            return Err(ConsensusError::InvalidSize {
+                expected: u32::try_from(expected).expect("fixed register frame fits u32"),
+                found: self.size,
+            });
+        }
+        validate_forward_register_frame(
+            u32::try_from(HEADER_SIZE).expect("fixed header fits u32"),
+            self.client,
+            self.nonce,
+            &self.reserved,
+        )
+    }
+}
+
+// ForwardRegisterResultHeader - primary shard 0 -> backup shard 0
+
+/// The primary's verdict on a [`ForwardRegisterHeader`].
+///
+/// Header-only: the backup owns the client connection and builds the wire
+/// reply itself, so only the committed bind (or the refusal) crosses the
+/// interconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct ForwardRegisterResultHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    /// Echo of [`ForwardRegisterHeader::nonce`]; with `client`, the backup's
+    /// routing key.
+    pub nonce: u128,
+    /// Echo of [`ForwardRegisterHeader::client`]. Half of the routing key, not a
+    /// diagnostic: the backup drops an answer whose client disagrees with the
+    /// login it parked under `nonce`.
+    pub client: u128,
+    /// The committed register's op number, which fences the session. Zero
+    /// unless `outcome` is [`ForwardRegisterOutcome::Ok`].
+    pub epoch: u64,
+    /// The client-table entry's highest committed request number, for a caller
+    /// that must resume numbering. Zero unless `outcome` is
+    /// [`ForwardRegisterOutcome::Ok`].
+    pub watermark: u64,
+    pub reserved: [u8; 79],
+    pub outcome: ForwardRegisterOutcome,
+}
+const _: () = {
+    assert!(size_of::<ForwardRegisterResultHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ForwardRegisterResultHeader, nonce)
+            == offset_of!(ForwardRegisterResultHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(ForwardRegisterResultHeader, client) == 144);
+    assert!(offset_of!(ForwardRegisterResultHeader, epoch) == 160);
+    assert!(offset_of!(ForwardRegisterResultHeader, watermark) == 168);
+    assert!(
+        offset_of!(ForwardRegisterResultHeader, outcome) + size_of::<ForwardRegisterOutcome>()
+            == HEADER_SIZE
+    );
+};
+
+/// Wire verdict on a forwarded register.
+///
+/// Mirrors the server-side submit error one-for-one so the backup can surface
+/// the primary's exact answer. Ownership and authentication refusals are
+/// terminal; other errors are transient and replayable.
+///
+/// **Wire-version pinned**, like [`EvictionReason`]: reordering or reusing a
+/// discriminant silently reinterprets a live cluster's frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, NoUninit, CheckedBitPattern)]
+#[repr(u8)]
+pub enum ForwardRegisterOutcome {
+    /// Committed; `epoch` and `watermark` carry the bind.
+    Ok = 0,
+    NotPrimary = 1,
+    /// Reserved: the register submit parks instead of bouncing when the
+    /// primary is not caught up, so nothing produces this today. Wire-pinned,
+    /// so it must keep its discriminant either way.
+    NotCaughtUp = 2,
+    PipelineFull = 3,
+    InProgress = 4,
+    Canceled = 5,
+    /// Terminal: the presented client id belongs to another user.
+    ClientIdOwnedByAnotherUser = 6,
+    /// Terminal: the verified account was deleted, replaced, or disabled.
+    Unauthenticated = 7,
+}
+
+impl ConsensusHeader for ForwardRegisterResultHeader {
+    const FRAME_SEALED: bool = true;
+
+    const COMMAND: Command = Command::ForwardRegisterResult;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command::ForwardRegisterResult {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command::ForwardRegisterResult,
+                found: self.command,
+            });
+        }
+        validate_forward_register_frame(self.size, self.client, self.nonce, &self.reserved)?;
+        if self.outcome != ForwardRegisterOutcome::Ok && (self.epoch != 0 || self.watermark != 0) {
+            return Err(ConsensusError::InvalidField(
+                "forward register result bind must be zero on failure".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Shared field rules of the two register-forwarding headers.
+///
+/// Reserved bytes are strict-zero rather than ignored: this pair only ever
+/// travels between replicas of one release (see the wire-compatibility note at
+/// the top of this module), so there is no forward-compatibility to preserve
+/// and a nonzero byte can only mean a builder bug or a mangled frame.
+fn validate_forward_register_frame(
+    size: u32,
+    client: u128,
+    nonce: u128,
+    reserved: &[u8],
+) -> Result<(), ConsensusError> {
+    validate_forward_frame(size, client, nonce, reserved)
+}
+
+// ForwardLogoutHeader - backup shard 0 -> primary shard 0
+
+/// A backup asks the metadata primary to tear down a session it owns.
+///
+/// The client-facing Logout request stays on the backup. Only the replicated
+/// session identity and request number cross the replica interconnect, and the
+/// primary's epoch guard makes a delayed forward harmless after a rebind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct ForwardLogoutHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    /// The consensus client id whose table entry should be removed.
+    pub client: u128,
+    /// Correlation minted by the backup and echoed in the result.
+    pub nonce: u128,
+    /// The exact register epoch being logged out.
+    pub session: u64,
+    /// The client's request number, or the server's synthetic disconnect id.
+    pub request: u64,
+    pub reserved: [u8; 80],
+}
+const _: () = {
+    assert!(size_of::<ForwardLogoutHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ForwardLogoutHeader, client)
+            == offset_of!(ForwardLogoutHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(ForwardLogoutHeader, nonce) == 144);
+    assert!(offset_of!(ForwardLogoutHeader, session) == 160);
+    assert!(offset_of!(ForwardLogoutHeader, request) == 168);
+    assert!(offset_of!(ForwardLogoutHeader, reserved) + size_of::<[u8; 80]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for ForwardLogoutHeader {
+    const FRAME_SEALED: bool = true;
+    const COMMAND: Command = Command::ForwardLogout;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+
+    fn command(&self) -> Command {
+        self.command
+    }
+
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command::ForwardLogout {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command::ForwardLogout,
+                found: self.command,
+            });
+        }
+        validate_forward_logout_frame(
+            self.size,
+            self.client,
+            self.nonce,
+            self.session,
+            self.request,
+            &self.reserved,
+        )
+    }
+}
+
+// ForwardLogoutResultHeader - primary shard 0 -> backup shard 0
+
+/// The metadata primary's verdict on a [`ForwardLogoutHeader`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct ForwardLogoutResultHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    /// Echo of [`ForwardLogoutHeader::nonce`].
+    pub nonce: u128,
+    /// Echo of [`ForwardLogoutHeader::client`].
+    pub client: u128,
+    /// Committed Logout op, or the current commit for an idempotent no-op.
+    /// Zero unless `outcome` is [`ForwardLogoutOutcome::Ok`].
+    pub commit: u64,
+    pub reserved: [u8; 87],
+    pub outcome: ForwardLogoutOutcome,
+}
+const _: () = {
+    assert!(size_of::<ForwardLogoutResultHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ForwardLogoutResultHeader, nonce)
+            == offset_of!(ForwardLogoutResultHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(ForwardLogoutResultHeader, client) == 144);
+    assert!(offset_of!(ForwardLogoutResultHeader, commit) == 160);
+    assert!(
+        offset_of!(ForwardLogoutResultHeader, outcome) + size_of::<ForwardLogoutOutcome>()
+            == HEADER_SIZE
+    );
+};
+
+/// Wire verdict on a forwarded logout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, NoUninit, CheckedBitPattern)]
+#[repr(u8)]
+pub enum ForwardLogoutOutcome {
+    Ok = 0,
+    NotPrimary = 1,
+    PipelineFull = 2,
+    InProgress = 3,
+    Canceled = 4,
+    RequestTooOld = 5,
+    OperationMismatch = 6,
+}
+
+impl ConsensusHeader for ForwardLogoutResultHeader {
+    const FRAME_SEALED: bool = true;
+    const COMMAND: Command = Command::ForwardLogoutResult;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+
+    fn command(&self) -> Command {
+        self.command
+    }
+
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command::ForwardLogoutResult {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command::ForwardLogoutResult,
+                found: self.command,
+            });
+        }
+        validate_forward_frame(self.size, self.client, self.nonce, &self.reserved)?;
+        if self.outcome != ForwardLogoutOutcome::Ok && self.commit != 0 {
+            return Err(ConsensusError::InvalidField(
+                "forward logout result commit must be zero on failure".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_forward_logout_frame(
+    size: u32,
+    client: u128,
+    nonce: u128,
+    session: u64,
+    request: u64,
+    reserved: &[u8],
+) -> Result<(), ConsensusError> {
+    validate_forward_frame(size, client, nonce, reserved)?;
+    if session == 0 {
+        return Err(ConsensusError::InvalidField(
+            "forward logout session must be non-zero".to_string(),
+        ));
+    }
+    if request == 0 {
+        return Err(ConsensusError::InvalidField(
+            "forward logout request must be non-zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn validate_forward_frame(
+    size: u32,
+    client: u128,
+    nonce: u128,
+    reserved: &[u8],
+) -> Result<(), ConsensusError> {
+    if size as usize != HEADER_SIZE {
+        return Err(ConsensusError::InvalidSize {
+            expected: HEADER_SIZE as u32,
+            found: size,
+        });
+    }
+    if client == 0 {
+        return Err(ConsensusError::InvalidField(
+            "forward client must be non-zero".to_string(),
+        ));
+    }
+    if nonce == 0 {
+        return Err(ConsensusError::InvalidField(
+            "forward nonce must be non-zero".to_string(),
+        ));
+    }
+    if reserved.iter().any(|&byte| byte != 0) {
+        return Err(ConsensusError::InvalidField(
+            "forward reserved bytes must be zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+// ForwardCompletionHeader - backup shard 0 -> primary shard 0
+
+/// Upper bound on the targets of one `CompleteLifecycle` batch, which keeps
+/// one metadata prepare small. A reporter with more ready targets sends the
+/// rest in its next batch.
+pub const LIFECYCLE_COMPLETIONS_MAX: usize = 1024;
+/// `metadata_op`, `stream_id` and the completion count of a lifecycle batch.
+pub const LIFECYCLE_BATCH_HEADER_SIZE: usize = size_of::<u64>() + 2 * size_of::<u32>();
+/// `topic_id`, `partition_id` and `partition_op` of one lifecycle completion.
+pub const LIFECYCLE_COMPLETION_SIZE: usize = 2 * size_of::<u32>() + size_of::<u64>();
+
+/// A backup relays the body of a partition completion to the metadata primary,
+/// which proposes it as `operation`.
+///
+/// The partition replicas prove a completion, and the primary may hold none of
+/// them, so a backup that holds one relays its evidence. No result frame comes
+/// back: the backup sees the commit through replication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct ForwardCompletionHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    /// The shard that built a lifecycle batch. Zero for a revocation.
+    pub reporter: u16,
+    pub operation: Operation,
+    pub reserved: [u8; 125],
+}
+const _: () = {
+    assert!(size_of::<ForwardCompletionHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ForwardCompletionHeader, reporter)
+            == offset_of!(ForwardCompletionHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(ForwardCompletionHeader, operation) == 130);
+    assert!(offset_of!(ForwardCompletionHeader, reserved) + size_of::<[u8; 125]>() == HEADER_SIZE);
+};
+
+impl ForwardCompletionHeader {
+    /// The relay names the stream and topic by number, then carries the
+    /// partition id, the installation and the partition op.
+    const REVOCATION_BODY_SIZE: usize = 2 * WireIdentifier::NUMERIC_ENCODED_SIZE
+        + size_of::<u32>()
+        + InstallConsumerGroupOwnerRequest::ENCODED_SIZE
+        + size_of::<u64>();
+}
+
+impl ConsensusHeader for ForwardCompletionHeader {
+    const FRAME_SEALED: bool = true;
+    const COMMAND: Command = Command::ForwardCompletion;
+    const OPERATION_OFFSET: Option<usize> = Some(offset_of!(Self, operation));
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+
+    fn operation(&self) -> Operation {
+        self.operation
+    }
+
+    fn command(&self) -> Command {
+        self.command
+    }
+
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command::ForwardCompletion {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command::ForwardCompletion,
+                found: self.command,
+            });
+        }
+        let body_size = (self.size as usize).saturating_sub(HEADER_SIZE);
+        let body_fits = match self.operation {
+            Operation::CompleteLifecycle => body_size
+                .checked_sub(LIFECYCLE_BATCH_HEADER_SIZE)
+                .is_some_and(|completions| {
+                    completions.is_multiple_of(LIFECYCLE_COMPLETION_SIZE)
+                        && (1..=LIFECYCLE_COMPLETIONS_MAX)
+                            .contains(&(completions / LIFECYCLE_COMPLETION_SIZE))
+                }),
+            Operation::CompleteConsumerGroupRevocation => body_size == Self::REVOCATION_BODY_SIZE,
+            _ => {
+                return Err(ConsensusError::InvalidField(
+                    "forward completion operation must be a partition completion".to_string(),
+                ));
+            }
+        };
+        if !body_fits {
+            return Err(ConsensusError::InvalidField(
+                "forward completion body must have the size of its operation".to_string(),
+            ));
+        }
+        if self.operation == Operation::CompleteConsumerGroupRevocation && self.reporter != 0 {
+            return Err(ConsensusError::InvalidField(
+                "a forward revocation names no reporter".to_string(),
+            ));
+        }
+        if self.release != 0 {
+            return Err(ConsensusError::InvalidField(
+                "forward completion release must be zero".to_string(),
+            ));
+        }
+        if self.reserved_frame != [0; 66] || self.reserved != [0; 125] {
+            return Err(ConsensusError::InvalidField(
+                "forward completion reserved bytes must be zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 // Tests
 
 #[cfg(test)]
 mod tests {
+    use std::mem::offset_of;
+
+    // The byte-level twin exists for frames whose operation byte does not
+    // cast; if it ever disagrees with the typed method, a genuine
+    // newer-release prepare would be reported as corruption.
+    #[test]
+    fn byte_level_identity_checksum_matches_the_typed_method() {
+        let mut header = PrepareHeader {
+            command: Command::Prepare,
+            view: 42,
+            op: 7,
+            client: 0xCAFE,
+            operation: Operation::CreateStream,
+            size: u32::try_from(HEADER_SIZE).expect("header size fits in u32"),
+            ..Default::default()
+        };
+        header.checksum = header.identity_checksum();
+
+        let bytes: &[u8; HEADER_SIZE] = bytemuck::bytes_of(&header)
+            .try_into()
+            .expect("a consensus header is HEADER_SIZE bytes");
+        assert_eq!(
+            prepare_identity_checksum_bytes(bytes),
+            header.identity_checksum()
+        );
+    }
+    use super::prepare_identity_checksum_bytes;
     use super::{
-        Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
-        EvictionHeader, EvictionReason, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
-        PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader,
-        RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+        Command, CommitHeader, CommitReplyHeader, ConsensusError, ConsensusHeader,
+        DoViewChangeHeader, EvictionHeader, EvictionReason, ForwardCompletionHeader,
+        ForwardLogoutHeader, ForwardLogoutOutcome, ForwardLogoutResultHeader,
+        ForwardRegisterHeader, ForwardRegisterOutcome, ForwardRegisterResultHeader, GenericHeader,
+        HEADER_SIZE, LIFECYCLE_BATCH_HEADER_SIZE, LIFECYCLE_COMPLETION_SIZE,
+        LIFECYCLE_COMPLETIONS_MAX, Operation, PrepareHeader, PrepareOkHeader,
+        PrepareProgressHeader, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader,
+        RequestHeader, RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
         RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
         StateChunkHeader, StateTransferTargetHeader,
     };
@@ -2306,6 +3387,8 @@ mod tests {
         seals!(
             PrepareOkHeader,
             CommitHeader,
+            CommitReplyHeader,
+            PrepareProgressHeader,
             StartViewChangeHeader,
             DoViewChangeHeader,
             StartViewHeader,
@@ -2316,6 +3399,11 @@ mod tests {
             StateTransferTargetHeader,
             RequestStateChunkHeader,
             StateChunkHeader,
+            ForwardRegisterHeader,
+            ForwardRegisterResultHeader,
+            ForwardLogoutHeader,
+            ForwardLogoutResultHeader,
+            ForwardCompletionHeader,
         );
     }
 
@@ -2341,6 +3429,45 @@ mod tests {
                 "byte {offset} is inside the seal and must be covered"
             );
         }
+    }
+
+    #[test]
+    fn given_a_sealed_partition_control_frame_when_its_incarnation_changes_should_reject() {
+        const INCARNATION: u64 = 0x0123_4567_89AB_CDEF;
+        macro_rules! check_incarnation {
+            ($($header:ty),+ $(,)?) => {$({
+                let mut header = control_header::<$header>();
+                assert_eq!(header.partition_incarnation, 0);
+                header.partition_incarnation = INCARNATION;
+                let offset = offset_of!($header, partition_incarnation);
+                assert_eq!(
+                    &bytemuck::bytes_of(&header)[offset..offset + size_of::<u64>()],
+                    &INCARNATION.to_le_bytes(),
+                );
+                for byte in offset..offset + size_of::<u64>() {
+                    assert!(
+                        matches!(tamper(header, byte), Err(ConsensusError::FrameChecksumMismatch { .. })),
+                        "{} incarnation byte {byte} must be sealed",
+                        stringify!($header),
+                    );
+                }
+            })+};
+        }
+        check_incarnation!(
+            CommitHeader,
+            CommitReplyHeader,
+            PrepareProgressHeader,
+            StartViewChangeHeader,
+            DoViewChangeHeader,
+            StartViewHeader,
+            RequestStartViewHeader,
+            RequestPreparesHeader,
+            RepairRangeReplyHeader,
+            RequestStateTransferHeader,
+            StateTransferTargetHeader,
+            RequestStateChunkHeader,
+            StateChunkHeader,
+        );
     }
 
     #[test]
@@ -2371,11 +3498,68 @@ mod tests {
         }
 
         let prepare = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             checksum: 0xdead_beef,
             ..Default::default()
         };
         assert_eq!(prepare.verify_frame(), Ok(()));
+    }
+
+    const DVC_PARTITION_INCARNATION: u64 = 0x0123_4567_89ab_cdef;
+
+    /// A `DoViewChange` as a sender stamps it, with an empty suffix.
+    fn do_view_change(flags: u8) -> DoViewChangeHeader {
+        let mut header = control_header::<DoViewChangeHeader>();
+        header.view = 7;
+        header.log_view = 5;
+        header.op = 42;
+        header.commit = 40;
+        header.group = 9;
+        header.flags = flags;
+        header.partition_incarnation = DVC_PARTITION_INCARNATION;
+        header.seal();
+        header
+    }
+
+    #[test]
+    fn given_untrusted_flag_when_round_tripped_should_keep_flag_and_field_offsets() {
+        let header = do_view_change(DoViewChangeHeader::FLAG_UNTRUSTED_LOG);
+        let mut frame = AlignedFrame([0u8; HEADER_SIZE]);
+        frame.0.copy_from_slice(bytemuck::bytes_of(&header));
+
+        assert_eq!(frame.0[156], DoViewChangeHeader::FLAG_UNTRUSTED_LOG);
+        assert_eq!(frame.0[128..136], 42u64.to_le_bytes());
+        assert_eq!(frame.0[136..144], 40u64.to_le_bytes());
+        assert_eq!(frame.0[144..152], 9u64.to_le_bytes());
+        assert_eq!(frame.0[152..156], 5u32.to_le_bytes());
+        assert!(frame.0[157..216].iter().all(|&byte| byte == 0));
+        assert_eq!(frame.0[216..224], DVC_PARTITION_INCARNATION.to_le_bytes());
+
+        let decoded = bytemuck::checked::try_from_bytes::<DoViewChangeHeader>(&frame.0)
+            .expect("a stamped header is a valid bit pattern");
+        assert_eq!(*decoded, header);
+        assert!(decoded.untrusted_log());
+        assert_eq!(decoded.verify_frame(), Ok(()));
+        assert_eq!(decoded.validate(), Ok(()));
+    }
+
+    #[test]
+    fn given_zero_flags_when_decoded_should_read_as_trusted() {
+        // What a build predating the flag sends in the same bytes.
+        let header = do_view_change(0);
+        assert!(!header.untrusted_log());
+        assert_eq!(header.validate(), Ok(()));
+    }
+
+    #[test]
+    fn given_unknown_flag_bit_when_validating_should_reject() {
+        for bit in 1..u8::BITS {
+            let header = do_view_change(DoViewChangeHeader::FLAG_UNTRUSTED_LOG | (1 << bit));
+            assert!(
+                matches!(header.validate(), Err(ConsensusError::InvalidField(_))),
+                "flag bit {bit} has no meaning yet and must not be read past"
+            );
+        }
     }
 
     #[test]
@@ -2395,14 +3579,14 @@ mod tests {
     fn generic_header_zero_copy() {
         let buf = aligned_zeroed(256);
         let header: &GenericHeader = bytemuck::checked::try_from_bytes(&buf).unwrap();
-        assert_eq!(header.command, Command2::Reserved);
+        assert_eq!(header.command, Command::Reserved);
         assert_eq!(header.size, 0);
     }
 
     #[test]
     fn request_header_zero_copy() {
         let mut buf = aligned_zeroed(256);
-        buf[60] = Command2::Request as u8;
+        buf[60] = Command::Request as u8;
         // client offset = 60 + 1 (replica) + 66 (reserved_frame) = 128.
         // validate rejects client == 0.
         buf[128] = 1;
@@ -2410,7 +3594,7 @@ mod tests {
         // operation is `Reserved`, which validate rejects.
         buf[std::mem::offset_of!(RequestHeader, operation)] = Operation::Register as u8;
         let header: &RequestHeader = bytemuck::checked::try_from_bytes(&buf).unwrap();
-        assert_eq!(header.command, Command2::Request);
+        assert_eq!(header.command, Command::Request);
         assert!(header.validate().is_ok());
     }
 
@@ -2427,7 +3611,7 @@ mod tests {
     #[test]
     fn request_reserved_operation_rejected() {
         let header = RequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             client: 1,
             operation: Operation::Reserved,
             session: 1,
@@ -2440,7 +3624,7 @@ mod tests {
     #[test]
     fn request_register_nonzero_session_rejected() {
         let header = RequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::Register,
             session: 5,
             request: 0,
@@ -2452,7 +3636,7 @@ mod tests {
     #[test]
     fn request_register_nonzero_request_rejected() {
         let header = RequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::Register,
             session: 0,
             request: 1,
@@ -2464,7 +3648,7 @@ mod tests {
     #[test]
     fn request_non_register_valid() {
         let header = RequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::SendMessages,
             client: 0xCAFE,
             session: 10,
@@ -2477,7 +3661,7 @@ mod tests {
     #[test]
     fn request_non_register_zero_session_rejected() {
         let header = RequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::SendMessages,
             session: 0,
             request: 1,
@@ -2489,7 +3673,7 @@ mod tests {
     #[test]
     fn request_non_register_zero_request_rejected() {
         let header = RequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::SendMessages,
             session: 10,
             request: 0,
@@ -2501,9 +3685,9 @@ mod tests {
     #[test]
     fn reply_header_zero_copy() {
         let mut buf = aligned_zeroed(256);
-        buf[60] = Command2::Reply as u8;
+        buf[60] = Command::Reply as u8;
         let header: &ReplyHeader = bytemuck::checked::try_from_bytes(&buf).unwrap();
-        assert_eq!(header.command, Command2::Reply);
+        assert_eq!(header.command, Command::Reply);
         assert!(header.validate().is_ok());
     }
 
@@ -2515,16 +3699,15 @@ mod tests {
         use std::mem::offset_of;
         assert_eq!(size_of::<ReplyHeader>(), HEADER_SIZE);
         assert_eq!(offset_of!(ReplyHeader, status), 216);
+        assert_eq!(offset_of!(ReplyHeader, reserved), 220);
         assert_eq!(
             offset_of!(ReplyHeader, reserved) + size_of::<[u8; 36]>(),
             HEADER_SIZE
         );
     }
 
-    // `group` claims the TAIL of the client header's reserved area; the
-    // leading 52 reserved bytes carry data (the non-replicated op code lives
-    // in `reserved[0..4]`), so a reshuffle of the carve must trip here rather
-    // than silently move the code range.
+    // Routing must preserve the client prefix, including the command code
+    // in `reserved[0..4]` and the captured partition context.
     #[test]
     fn routed_request_group_claims_reserved_tail() {
         use std::mem::offset_of;
@@ -2550,7 +3733,7 @@ mod tests {
     #[test]
     fn routed_request_zero_client_rejected() {
         let header = RoutedRequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::SendMessages,
             session: 10,
             request: 1,
@@ -2562,7 +3745,7 @@ mod tests {
     #[test]
     fn routed_request_reserved_operation_rejected() {
         let header = RoutedRequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             client: 0xCAFE,
             session: 10,
             request: 1,
@@ -2579,7 +3762,7 @@ mod tests {
     #[test]
     fn routed_request_valid_fields_accepted() {
         let header = RoutedRequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::SendMessages,
             client: 0xCAFE,
             session: 10,
@@ -2595,11 +3778,171 @@ mod tests {
     #[test]
     fn reply_header_nonzero_status_still_validates() {
         let header = ReplyHeader {
-            command: Command2::Reply,
+            command: Command::Reply,
             status: 41,
             ..ReplyHeader::default()
         };
         assert!(header.validate().is_ok());
+    }
+
+    #[test]
+    fn reply_from_prepare_echoes_the_prepare_and_positions_at_its_op() {
+        let prepare = PrepareHeader {
+            checksum: 1,
+            checksum_body: 2,
+            cluster: 3,
+            size: 4,
+            view: 5,
+            release: 6,
+            command: Command::Prepare,
+            replica: 7,
+            reserved_frame: [8; 66],
+            client: 9,
+            parent: 10,
+            request_checksum: 11,
+            op: 12,
+            commit: 13,
+            timestamp: 14,
+            request: 15,
+            operation: Operation::CreateStream,
+            operation_padding: [16; 7],
+            group: 17,
+            user_id: 18,
+            retry_capacity: 31,
+            partition_incarnation: 19,
+            reserved: [23; 8],
+            session: 37,
+        };
+        let reply = ReplyHeader::from_prepare(&prepare, 20);
+        assert_eq!(reply.cluster, 3);
+        assert_eq!(reply.size, 20);
+        assert_eq!(reply.view, 5);
+        assert_eq!(reply.release, 6);
+        assert_eq!(reply.command, Command::Reply);
+        assert_eq!(reply.replica, 7);
+        assert_eq!(reply.request_checksum, 11);
+        assert_eq!(reply.client, 9);
+        assert_eq!(reply.op, 12);
+        assert_eq!(reply.commit, 12, "the prepare's op, not its commit");
+        assert_eq!(reply.timestamp, 14);
+        assert_eq!(reply.request, 15);
+        assert_eq!(reply.operation, Operation::CreateStream);
+        assert_eq!(reply.checksum, 0);
+        assert_eq!(reply.checksum_body, 0);
+        assert_eq!(reply.reserved_frame, [0; 66]);
+        assert_eq!(reply.context, 0);
+        assert_eq!(reply.operation_padding, [0; 7]);
+        assert_eq!(reply.status, 0);
+        assert_eq!(reply.reserved, [ReplyHeader::COMMITTED_RESULT, 0, 0, 0]);
+        assert!(reply.has_committed_result());
+        assert_eq!(reply.reserved_tail, [0; 24]);
+        assert_eq!(reply.partition_incarnation, 19);
+    }
+
+    #[test]
+    fn given_unknown_marker_or_denial_when_reading_reply_should_not_prove_commit() {
+        let mut reply = ReplyHeader::from_prepare(
+            &PrepareHeader::default(),
+            u32::try_from(HEADER_SIZE).unwrap(),
+        );
+        for marker in [0, 2, u8::MAX] {
+            reply.reserved[0] = marker;
+            assert!(!reply.has_committed_result());
+        }
+        reply.reserved[0] = ReplyHeader::COMMITTED_RESULT;
+        reply.status = 1;
+        assert!(!reply.has_committed_result());
+        reply.status = 0;
+        reply.command = Command::Eviction;
+        assert!(!reply.has_committed_result());
+    }
+
+    #[test]
+    fn given_committed_result_when_cleared_should_change_only_the_marker_byte() {
+        let committed = ReplyHeader::from_prepare(
+            &PrepareHeader {
+                cluster: 3,
+                view: 5,
+                release: 6,
+                replica: 7,
+                client: 9,
+                request_checksum: 11,
+                op: 12,
+                timestamp: 14,
+                request: 15,
+                operation: Operation::CreateStream,
+                partition_incarnation: 19,
+                ..PrepareHeader::default()
+            },
+            u32::try_from(HEADER_SIZE).unwrap(),
+        );
+        assert!(committed.has_committed_result());
+        let mut cleared = committed;
+        cleared.clear_committed_result();
+        assert!(!cleared.has_committed_result());
+        let changed: Vec<usize> = bytemuck::bytes_of(&committed)
+            .iter()
+            .zip(bytemuck::bytes_of(&cleared))
+            .enumerate()
+            .filter(|(_, (before, after))| before != after)
+            .map(|(offset, _)| offset)
+            .collect();
+        assert_eq!(changed, [offset_of!(ReplyHeader, reserved)]);
+    }
+
+    #[test]
+    fn reply_echoing_copies_the_frame_and_request_identity_only() {
+        let request = RoutedRequestHeader {
+            checksum: 1,
+            checksum_body: 2,
+            cluster: 3,
+            size: 4,
+            view: 5,
+            release: 6,
+            command: Command::Request,
+            replica: 7,
+            reserved_frame: [8; 66],
+            client: 9,
+            request_checksum: 10,
+            timestamp: 11,
+            request: 12,
+            operation: Operation::CreateTopic,
+            operation_padding: [13; 7],
+            session: 14,
+            user_id: 15,
+            reserved: [16; 4],
+            partition_incarnation: 19,
+            owner_generation: 29,
+            minimum_metadata_op: 31,
+            reserved_tail: [0; 16],
+            metadata_watermark: 17,
+            group: 17,
+        };
+        let reply = ReplyHeader::echoing(&request, 18);
+        assert_eq!(reply.cluster, 3);
+        assert_eq!(reply.size, 18);
+        assert_eq!(reply.view, 5);
+        assert_eq!(reply.release, 6);
+        assert_eq!(reply.command, Command::Reply);
+        assert_eq!(reply.replica, 7);
+        assert_eq!(reply.request_checksum, 10);
+        assert_eq!(reply.timestamp, 11);
+        assert_eq!(reply.request, 12);
+        assert_eq!(reply.operation, Operation::CreateTopic);
+        // Left to the caller: the client identity and the position fields.
+        assert_eq!(reply.client, 0);
+        assert_eq!(reply.op, 0);
+        assert_eq!(reply.commit, 0);
+        assert_eq!(reply.status, 0);
+        assert_eq!(reply.checksum, 0);
+        assert_eq!(reply.checksum_body, 0);
+        assert_eq!(reply.reserved_frame, [0; 66]);
+        assert_eq!(reply.context, 0);
+        assert_eq!(reply.operation_padding, [0; 7]);
+        assert_eq!(reply.reserved, [0; 4]);
+        assert!(!reply.has_committed_result());
+        assert_eq!(reply.reserved_tail, [0; 24]);
+        assert_eq!(reply.partition_incarnation, 19);
     }
 
     // Wire-discriminant pin: any change breaks SDK decoders.
@@ -2682,5 +4025,482 @@ mod tests {
     #[test]
     fn eviction_header_is_256_bytes() {
         assert_eq!(size_of::<EvictionHeader>(), 256);
+    }
+
+    /// A sealed, well-formed `ForwardRegister` ready to be mutated per test.
+    fn forward_register() -> ForwardRegisterHeader {
+        let mut header = ForwardRegisterHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 7,
+            size: u32::try_from(
+                HEADER_SIZE + crate::requests::users::login_register::REGISTER_REQUEST_BYTES,
+            )
+            .expect("Register size fits u32"),
+            view: 3,
+            release: 0,
+            command: Command::ForwardRegister,
+            replica: 2,
+            reserved_frame: [0; 66],
+            client: 0xCAFE,
+            nonce: 0xF00D,
+            user_id: 41,
+            reserved: [0; 92],
+        };
+        header.seal();
+        header
+    }
+
+    /// A sealed, well-formed `ForwardRegisterResult` ready to be mutated.
+    fn forward_register_result(outcome: ForwardRegisterOutcome) -> ForwardRegisterResultHeader {
+        let mut header = ForwardRegisterResultHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 7,
+            size: u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32"),
+            view: 3,
+            release: 0,
+            command: Command::ForwardRegisterResult,
+            replica: 0,
+            reserved_frame: [0; 66],
+            nonce: 0xF00D,
+            client: 0xCAFE,
+            epoch: u64::from(outcome == ForwardRegisterOutcome::Ok) * 91,
+            watermark: u64::from(outcome == ForwardRegisterOutcome::Ok) * 12,
+            reserved: [0; 79],
+            outcome,
+        };
+        header.seal();
+        header
+    }
+
+    #[test]
+    fn forward_register_round_trips_through_generic_bytes() {
+        for (command, bytes) in [
+            (
+                Command::ForwardRegister,
+                bytemuck::bytes_of(&forward_register()).to_vec(),
+            ),
+            (
+                Command::ForwardRegisterResult,
+                bytemuck::bytes_of(&forward_register_result(ForwardRegisterOutcome::Ok)).to_vec(),
+            ),
+            (
+                Command::ForwardRegisterResult,
+                bytemuck::bytes_of(&forward_register_result(
+                    ForwardRegisterOutcome::Unauthenticated,
+                ))
+                .to_vec(),
+            ),
+        ] {
+            // 16-byte alignment: `Vec<u8>` requests align=1 and fails Miri.
+            let mut buf = aligned_zeroed(HEADER_SIZE);
+            buf.copy_from_slice(&bytes);
+            let generic = bytemuck::checked::try_from_bytes::<GenericHeader>(&buf)
+                .expect("a forward-register frame is a valid generic header");
+            assert_eq!(generic.command, command);
+            assert_eq!(
+                generic.size as usize,
+                HEADER_SIZE
+                    + if command == Command::ForwardRegister {
+                        crate::requests::users::login_register::REGISTER_REQUEST_BYTES
+                    } else {
+                        0
+                    }
+            );
+        }
+
+        let buf = {
+            let mut buf = aligned_zeroed(HEADER_SIZE);
+            buf.copy_from_slice(bytemuck::bytes_of(&forward_register()));
+            buf
+        };
+        let typed = bytemuck::checked::try_from_bytes::<ForwardRegisterHeader>(&buf)
+            .expect("round-trips into its own type");
+        assert_eq!(typed.verify_frame(), Ok(()));
+        assert_eq!(typed.validate(), Ok(()));
+        assert_eq!(typed.user_id, 41);
+        assert_eq!(typed.nonce, 0xF00D);
+
+        let buf = {
+            let mut buf = aligned_zeroed(HEADER_SIZE);
+            buf.copy_from_slice(bytemuck::bytes_of(&forward_register_result(
+                ForwardRegisterOutcome::ClientIdOwnedByAnotherUser,
+            )));
+            buf
+        };
+        let typed = bytemuck::checked::try_from_bytes::<ForwardRegisterResultHeader>(&buf)
+            .expect("round-trips into its own type");
+        assert_eq!(typed.verify_frame(), Ok(()));
+        assert_eq!(typed.validate(), Ok(()));
+        assert_eq!(
+            typed.outcome,
+            ForwardRegisterOutcome::ClientIdOwnedByAnotherUser
+        );
+    }
+
+    // The seal is the whole trust story for `user_id`: the primary proposes a
+    // register under it without re-verifying credentials, so a flipped bit
+    // must not reach the proposal.
+    #[test]
+    fn forward_register_tampered_user_id_fails_the_seal() {
+        const USER_ID_OFFSET: usize = std::mem::offset_of!(ForwardRegisterHeader, user_id);
+
+        assert!(matches!(
+            tamper(forward_register(), USER_ID_OFFSET),
+            Err(ConsensusError::FrameChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn forward_register_validate_rejects_malformed_frames() {
+        let mut zero_client = forward_register();
+        zero_client.client = 0;
+        assert!(matches!(
+            zero_client.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+
+        let mut zero_nonce = forward_register();
+        zero_nonce.nonce = 0;
+        assert!(matches!(
+            zero_nonce.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+
+        let mut dirty_reserved = forward_register();
+        dirty_reserved.reserved[0] = 1;
+        assert!(matches!(
+            dirty_reserved.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+
+        let mut wrong_size = forward_register();
+        wrong_size.size = 512;
+        assert!(matches!(
+            wrong_size.validate(),
+            Err(ConsensusError::InvalidSize { .. })
+        ));
+
+        let mut result_zero_nonce = forward_register_result(ForwardRegisterOutcome::Ok);
+        result_zero_nonce.nonce = 0;
+        assert!(matches!(
+            result_zero_nonce.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+
+        let mut failed_with_bind = forward_register_result(ForwardRegisterOutcome::NotPrimary);
+        failed_with_bind.epoch = 91;
+        failed_with_bind.watermark = 12;
+        assert!(matches!(
+            failed_with_bind.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+        failed_with_bind.epoch = 0;
+        failed_with_bind.watermark = 0;
+        assert_eq!(failed_with_bind.validate(), Ok(()));
+    }
+
+    // An unknown outcome is rejected by the bit-pattern check, one layer
+    // before `validate` ever runs.
+    #[test]
+    fn forward_register_result_rejects_unknown_outcome() {
+        const OUTCOME_OFFSET: usize = std::mem::offset_of!(ForwardRegisterResultHeader, outcome);
+
+        let mut buf = aligned_zeroed(HEADER_SIZE);
+        buf.copy_from_slice(bytemuck::bytes_of(&forward_register_result(
+            ForwardRegisterOutcome::Ok,
+        )));
+        buf[OUTCOME_OFFSET] = u8::MAX;
+        assert!(bytemuck::checked::try_from_bytes::<ForwardRegisterResultHeader>(&buf).is_err());
+    }
+
+    // Wire-discriminant pin: reordering reinterprets a live cluster's frames.
+    #[test]
+    fn forward_register_outcome_discriminants_pinned() {
+        assert_eq!(ForwardRegisterOutcome::Ok as u8, 0);
+        assert_eq!(ForwardRegisterOutcome::NotPrimary as u8, 1);
+        assert_eq!(ForwardRegisterOutcome::NotCaughtUp as u8, 2);
+        assert_eq!(ForwardRegisterOutcome::PipelineFull as u8, 3);
+        assert_eq!(ForwardRegisterOutcome::InProgress as u8, 4);
+        assert_eq!(ForwardRegisterOutcome::Canceled as u8, 5);
+        assert_eq!(ForwardRegisterOutcome::ClientIdOwnedByAnotherUser as u8, 6);
+        assert_eq!(ForwardRegisterOutcome::Unauthenticated as u8, 7);
+    }
+
+    fn forward_logout() -> ForwardLogoutHeader {
+        let mut header = ForwardLogoutHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 7,
+            size: u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32"),
+            view: 3,
+            release: 0,
+            command: Command::ForwardLogout,
+            replica: 2,
+            reserved_frame: [0; 66],
+            client: 0xCAFE,
+            nonce: 0xF00D,
+            session: 91,
+            request: 12,
+            reserved: [0; 80],
+        };
+        header.seal();
+        header
+    }
+
+    fn forward_logout_result(outcome: ForwardLogoutOutcome) -> ForwardLogoutResultHeader {
+        let mut header = ForwardLogoutResultHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 7,
+            size: u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32"),
+            view: 3,
+            release: 0,
+            command: Command::ForwardLogoutResult,
+            replica: 0,
+            reserved_frame: [0; 66],
+            nonce: 0xF00D,
+            client: 0xCAFE,
+            commit: if outcome == ForwardLogoutOutcome::Ok {
+                92
+            } else {
+                0
+            },
+            reserved: [0; 87],
+            outcome,
+        };
+        header.seal();
+        header
+    }
+
+    #[test]
+    fn forward_logout_headers_round_trip_and_validate() {
+        let forward = forward_logout();
+        assert_eq!(forward.verify_frame(), Ok(()));
+        assert_eq!(forward.validate(), Ok(()));
+
+        for outcome in [
+            ForwardLogoutOutcome::Ok,
+            ForwardLogoutOutcome::NotPrimary,
+            ForwardLogoutOutcome::PipelineFull,
+            ForwardLogoutOutcome::InProgress,
+            ForwardLogoutOutcome::Canceled,
+        ] {
+            let result = forward_logout_result(outcome);
+            assert_eq!(result.verify_frame(), Ok(()));
+            assert_eq!(result.validate(), Ok(()));
+            let mut bytes = aligned_zeroed(HEADER_SIZE);
+            bytes.copy_from_slice(bytemuck::bytes_of(&result));
+            let generic = bytemuck::checked::try_from_bytes::<GenericHeader>(&bytes)
+                .expect("forward logout result is a valid generic header");
+            assert_eq!(generic.command, Command::ForwardLogoutResult);
+        }
+    }
+
+    #[test]
+    fn forward_logout_validate_rejects_malformed_frames() {
+        let mut header = forward_logout();
+        header.client = 0;
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+        header = forward_logout();
+        header.nonce = 0;
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+        header = forward_logout();
+        header.session = 0;
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+        header = forward_logout();
+        header.request = 0;
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+        header = forward_logout();
+        header.reserved[0] = 1;
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+
+        let mut result = forward_logout_result(ForwardLogoutOutcome::NotPrimary);
+        result.commit = 92;
+        assert!(matches!(
+            result.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+    }
+
+    #[test]
+    fn forward_logout_result_rejects_unknown_outcome() {
+        const OUTCOME_OFFSET: usize = std::mem::offset_of!(ForwardLogoutResultHeader, outcome);
+
+        let mut bytes = aligned_zeroed(HEADER_SIZE);
+        bytes.copy_from_slice(bytemuck::bytes_of(&forward_logout_result(
+            ForwardLogoutOutcome::Ok,
+        )));
+        bytes[OUTCOME_OFFSET] = u8::MAX;
+        assert!(bytemuck::checked::try_from_bytes::<ForwardLogoutResultHeader>(&bytes).is_err());
+    }
+
+    #[test]
+    fn forward_logout_outcome_discriminants_pinned() {
+        assert_eq!(ForwardLogoutOutcome::Ok as u8, 0);
+        assert_eq!(ForwardLogoutOutcome::NotPrimary as u8, 1);
+        assert_eq!(ForwardLogoutOutcome::PipelineFull as u8, 2);
+        assert_eq!(ForwardLogoutOutcome::InProgress as u8, 3);
+        assert_eq!(ForwardLogoutOutcome::Canceled as u8, 4);
+        assert_eq!(ForwardLogoutOutcome::RequestTooOld as u8, 5);
+        assert_eq!(ForwardLogoutOutcome::OperationMismatch as u8, 6);
+    }
+
+    /// A revocation, or else a lifecycle batch of one completion.
+    fn forward_completion(operation: Operation) -> ForwardCompletionHeader {
+        let (body_size, reporter) = if operation == Operation::CompleteConsumerGroupRevocation {
+            (ForwardCompletionHeader::REVOCATION_BODY_SIZE, 0)
+        } else {
+            (LIFECYCLE_BATCH_HEADER_SIZE + LIFECYCLE_COMPLETION_SIZE, 5)
+        };
+        let mut header = ForwardCompletionHeader {
+            checksum: 0,
+            checksum_body: 0xB0D7,
+            cluster: 7,
+            size: u32::try_from(HEADER_SIZE + body_size).expect("the frame size fits u32"),
+            view: 3,
+            release: 0,
+            command: Command::ForwardCompletion,
+            replica: 2,
+            reserved_frame: [0; 66],
+            reporter,
+            operation,
+            reserved: [0; 125],
+        };
+        header.seal();
+        header
+    }
+
+    #[test]
+    fn given_sealed_forward_completion_when_parsed_should_keep_every_field() {
+        for operation in [
+            Operation::CompleteLifecycle,
+            Operation::CompleteConsumerGroupRevocation,
+        ] {
+            let header = forward_completion(operation);
+            let mut bytes = aligned_zeroed(HEADER_SIZE);
+            bytes.copy_from_slice(bytemuck::bytes_of(&header));
+            let generic = bytemuck::checked::try_from_bytes::<GenericHeader>(&bytes)
+                .expect("a forward completion is a valid generic header");
+            assert_eq!(generic.command, Command::ForwardCompletion);
+            let parsed = bytemuck::checked::try_from_bytes::<ForwardCompletionHeader>(&bytes)
+                .expect("a forward completion parses as its own header");
+            assert_eq!(parsed, &header);
+            assert_eq!(parsed.verify_frame(), Ok(()));
+            assert_eq!(parsed.validate(), Ok(()));
+            assert_eq!(parsed.operation(), operation);
+        }
+    }
+
+    #[test]
+    fn given_forward_completion_when_malformed_should_fail_validation() {
+        let mut header = forward_completion(Operation::CompleteLifecycle);
+        header.command = Command::ForwardLogout;
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidCommand { .. })
+        ));
+        for operation in [
+            Operation::Reserved,
+            Operation::RemoveConsumerGroupMember,
+            Operation::TruncatePartition,
+            Operation::DeleteTopic,
+            Operation::InstallConsumerGroupOwner,
+        ] {
+            assert!(
+                matches!(
+                    forward_completion(operation).validate(),
+                    Err(ConsensusError::InvalidField(_))
+                ),
+                "{operation:?} is not a partition completion"
+            );
+        }
+        header = forward_completion(Operation::CompleteLifecycle);
+        header.size = u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32");
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+        header = forward_completion(Operation::CompleteLifecycle);
+        header.reserved[0] = 1;
+        assert!(matches!(
+            header.validate(),
+            Err(ConsensusError::InvalidField(_))
+        ));
+        let lifecycle_body =
+            |completions| LIFECYCLE_BATCH_HEADER_SIZE + completions * LIFECYCLE_COMPLETION_SIZE;
+        let revocation_body = ForwardCompletionHeader::REVOCATION_BODY_SIZE;
+        for (operation, body_size, fits) in [
+            (Operation::CompleteLifecycle, lifecycle_body(1), true),
+            (
+                Operation::CompleteLifecycle,
+                lifecycle_body(LIFECYCLE_COMPLETIONS_MAX),
+                true,
+            ),
+            (Operation::CompleteLifecycle, lifecycle_body(0), false),
+            (Operation::CompleteLifecycle, lifecycle_body(1) + 1, false),
+            (
+                Operation::CompleteLifecycle,
+                lifecycle_body(LIFECYCLE_COMPLETIONS_MAX + 1),
+                false,
+            ),
+            (
+                Operation::CompleteConsumerGroupRevocation,
+                revocation_body,
+                true,
+            ),
+            (
+                Operation::CompleteConsumerGroupRevocation,
+                revocation_body - 1,
+                false,
+            ),
+            (
+                Operation::CompleteConsumerGroupRevocation,
+                revocation_body + 1,
+                false,
+            ),
+        ] {
+            header = forward_completion(operation);
+            header.size = u32::try_from(HEADER_SIZE + body_size).expect("the frame size fits u32");
+            assert_eq!(
+                header.validate().is_ok(),
+                fits,
+                "{operation:?} with a body of {body_size} bytes"
+            );
+        }
+        header = forward_completion(Operation::CompleteConsumerGroupRevocation);
+        header.reporter = 5;
+        assert!(
+            matches!(header.validate(), Err(ConsensusError::InvalidField(_))),
+            "a forward revocation names no reporter"
+        );
+        header = forward_completion(Operation::CompleteLifecycle);
+        header.release = 1;
+        assert!(
+            matches!(header.validate(), Err(ConsensusError::InvalidField(_))),
+            "a forward completion carries no release"
+        );
+        header = forward_completion(Operation::CompleteLifecycle);
+        header.reserved_frame[0] = 1;
+        assert!(
+            matches!(header.validate(), Err(ConsensusError::InvalidField(_))),
+            "the frame prefix reserved bytes must be zero"
+        );
     }
 }

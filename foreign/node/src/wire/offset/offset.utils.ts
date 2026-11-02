@@ -14,11 +14,13 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import type { ValueOf } from '../../type.utils.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { uint8ToBuf } from '../number.utils.js';
+
+/** Offset mutations always request quorum acknowledgement. */
+const ACK_QUORUM = 1;
 
 /**
  * Consumer kind options for offset operations.
@@ -101,9 +103,6 @@ export const serializeGetOffset = (
   partitionId: number | null
 ) => {
 
-  if (consumer.kind === ConsumerKind.Single && partitionId === null)
-    throw new Error('getOffset error: partitionId must be provided for single consumer kind');
-
   const streamIdentifier = serializeIdentifier(streamId);
   const topicIdentifier = serializeIdentifier(topicId);
   const consumerIdentifier = serializeIdentifier(consumer.id);
@@ -145,11 +144,37 @@ export const serializeStoreOffset = (
   partitionId: number | null,
   offset: bigint
 ) => {
-  const b = Buffer.allocUnsafe(8);
+  if (partitionId === null)
+    throw new Error('storeOffset error: partitionId must be provided');
+  const b = Buffer.allocUnsafe(9);
   b.writeBigUInt64LE(offset, 0);
+  b.writeUInt8(ACK_QUORUM, 8);
 
   return Buffer.concat([
     serializeGetOffset(streamId, topicId, consumer, partitionId),
     b
   ]);
 }
+
+/**
+ * Serializes parameters for delete offset operation.
+ *
+ * @param streamId - Stream identifier (ID or name)
+ * @param topicId - Topic identifier (ID or name)
+ * @param consumer - Consumer identifier (single or group)
+ * @param partitionId - Partition ID. VSR requires an explicit partition.
+ * @returns Buffer containing serialized delete offset request
+ */
+export const serializeDeleteOffset = (
+  streamId: Id,
+  topicId: Id,
+  consumer: Consumer,
+  partitionId: number | null
+) => {
+  if (partitionId === null)
+    throw new Error('deleteOffset error: partitionId must be provided');
+  return Buffer.concat([
+    serializeGetOffset(streamId, topicId, consumer, partitionId),
+    uint8ToBuf(ACK_QUORUM)
+  ]);
+};

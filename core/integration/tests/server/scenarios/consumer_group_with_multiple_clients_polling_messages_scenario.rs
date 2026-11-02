@@ -20,12 +20,18 @@ use crate::server::scenarios::{
     create_client, get_consumer_group, join_consumer_group,
 };
 use iggy::prelude::*;
-use integration::harness::{TestHarness, assert_clean_system, create_user, login_user};
+use integration::harness::{
+    GroupPoller, TestHarness, assert_clean_system, create_user, login_user,
+};
 use std::str::{FromStr, from_utf8};
 
 pub async fn run(harness: &TestHarness) {
+    // The metadata leader can change while the consumer clients are polling.
     let system_client = harness
-        .root_client()
+        .client_builder_for(harness.transport().expect("Failed to get test transport"))
+        .expect("Failed to create client builder")
+        .with_reconnecting_root_login()
+        .connect()
         .await
         .expect("Failed to get root client");
     let client1 = create_client(harness).await;
@@ -48,18 +54,21 @@ async fn init_system(
     create_users: bool,
 ) {
     // 1. Create the stream
-    system_client.create_stream(STREAM_NAME).await.unwrap();
+    system_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     // 2. Create the topic
     system_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            PARTITIONS_COUNT,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS_COUNT),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -129,7 +138,7 @@ async fn execute_using_messages_key_key(
 }
 
 async fn poll_messages(client: &IggyClient) -> u32 {
-    let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+    let mut poller = GroupPoller::new(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
     let mut total_read_messages_count = 0;
     let mut last_entity_id: Option<u32> = None;
     const MAX_RETRIES: u32 = 5;
@@ -138,15 +147,13 @@ async fn poll_messages(client: &IggyClient) -> u32 {
     for _ in 1..=PARTITIONS_COUNT * MESSAGES_COUNT {
         let mut retries = 0;
         let polled_messages = loop {
-            let polled = client
-                .poll_messages(
+            let polled = poller
+                .poll(
+                    client,
                     &Identifier::named(STREAM_NAME).unwrap(),
                     &Identifier::named(TOPIC_NAME).unwrap(),
-                    None,
-                    &consumer,
                     &PollingStrategy::next(),
-                    1,
-                    true,
+                    single_committed_message(),
                 )
                 .await
                 .unwrap();
@@ -243,7 +250,7 @@ async fn execute_using_none_key(
 }
 
 async fn validate_message_polling(client: &IggyClient) {
-    let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+    let mut poller = GroupPoller::new(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
     let mut partition_id: Option<u32> = None;
     const MAX_RETRIES: u32 = 5;
     let mut total_retries = 0;
@@ -251,15 +258,13 @@ async fn validate_message_polling(client: &IggyClient) {
     for i in 1..=MESSAGES_COUNT {
         let mut retries = 0;
         let polled_messages = loop {
-            let polled = client
-                .poll_messages(
+            let polled = poller
+                .poll(
+                    client,
                     &Identifier::named(STREAM_NAME).unwrap(),
                     &Identifier::named(TOPIC_NAME).unwrap(),
-                    None,
-                    &consumer,
                     &PollingStrategy::next(),
-                    1,
-                    true,
+                    single_committed_message(),
                 )
                 .await
                 .unwrap();
@@ -306,19 +311,25 @@ async fn validate_message_polling(client: &IggyClient) {
         );
     }
 
-    let polled_messages = client
-        .poll_messages(
+    let polled_messages = poller
+        .poll(
+            client,
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            None,
-            &consumer,
             &PollingStrategy::next(),
-            1,
-            true,
+            single_committed_message(),
         )
         .await
         .unwrap();
     assert!(polled_messages.messages.is_empty())
+}
+
+fn single_committed_message() -> PollOptions {
+    PollOptions {
+        count: 1,
+        commit: CommitPolicy::OnRead,
+        ..PollOptions::default()
+    }
 }
 
 fn parse_partition_id_from_extended_payload(payload: &str) -> u32 {

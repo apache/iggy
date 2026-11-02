@@ -30,11 +30,17 @@ use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use iggy::prelude::{
-    DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyByteSize, IggyDuration, IggyExpiry,
-    TransportProtocol,
+    DEFAULT_POLL_MAX_BYTES, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyByteSize,
+    IggyDuration, IggyError, IggyExpiry, PollOptions, TransportProtocol,
 };
+use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE};
+use iggy_binary_protocol::requests::messages::{
+    MAX_DEFERRED_POLL_WAIT_US, MIN_DEFERRED_POLL_MAX_BYTES,
+};
+use iggy_binary_protocol::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
 use std::num::NonZeroU32;
 use std::str::FromStr;
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -52,6 +58,19 @@ pub struct IggyBenchArgs {
     #[arg(long, short = 'P', value_parser = BenchmarkNumericParameter::from_str, default_value_t = BenchmarkNumericParameter::Value(DEFAULT_MESSAGES_PER_BATCH.get()))]
     pub messages_per_batch: BenchmarkNumericParameter,
 
+    /// Maximum deliberate wait for the readiness minimum.
+    #[arg(long, default_value_t = IggyDuration::ONE_SECOND)]
+    pub max_wait: IggyDuration,
+
+    /// Readiness minimum, independent of the maximum messages per batch.
+    #[arg(long, default_value_t = 1)]
+    pub min_count: u32,
+
+    /// Maximum encoded poll reply bytes, including response and batch headers.
+    /// Defaults to 1 MiB, or to one full batch when that is larger.
+    #[arg(long)]
+    pub max_bytes: Option<u32>,
+
     /// Number of message batches per actor (producer / consumer / producing consumer).
     /// This argument is mutually exclusive with `total_messages_size`.
     #[arg(long, short = 'b', group = "data_to_process")]
@@ -67,8 +86,10 @@ pub struct IggyBenchArgs {
     #[arg(long, short = 'r', verbatim_doc_comment)]
     pub rate_limit: Option<IggyByteSize>,
 
-    /// Warmup time in human readable format, e.g. "1s", "2m", "3h"
-    #[arg(long, short = 'w', default_value_t = IggyDuration::from_str(DEFAULT_WARMUP_TIME).unwrap())]
+    /// Warmup time in human readable format, e.g. "1s", "2m", "3h".
+    /// After the warmup, consumer-only runs read the topic again from offset zero,
+    /// including consumer group members.
+    #[arg(long, short = 'w', verbatim_doc_comment, default_value_t = IggyDuration::from_str(DEFAULT_WARMUP_TIME).unwrap())]
     pub warmup_time: IggyDuration,
 
     /// Sampling time for metrics collection. It is also used as bucket size for time series calculations.
@@ -100,9 +121,82 @@ pub struct IggyBenchArgs {
     /// consumers start with fresh data and accurate latency measurements.
     #[arg(long, default_value_t = false)]
     pub reuse_streams: bool,
+
+    /// Message completion policy for newly created benchmark topics.
+    #[arg(long, default_value_t = iggy::prelude::Durability::Replicated)]
+    pub durability: iggy::prelude::Durability,
+
+    /// Offset completion policy, independent of message durability.
+    #[arg(long, default_value_t = iggy::prelude::Durability::Replicated)]
+    pub consumer_offset_durability: iggy::prelude::Durability,
+
+    /// Topic journal flush threshold in messages (server default: 1024).
+    /// Topic option at creation, so it has no effect with `--reuse-streams`.
+    #[arg(long)]
+    pub messages_required_to_save: Option<NonZeroU32>,
 }
 
 impl IggyBenchArgs {
+    /// Each actor sets its own `count` and `commit`. The `count` here is the smallest
+    /// batch, which `--min-count` must fit.
+    pub fn poll_options(&self) -> PollOptions {
+        PollOptions {
+            count: self.messages_per_batch.min(),
+            max_wait: self.max_wait,
+            min_count: self.min_count,
+            max_bytes: self
+                .max_bytes
+                .unwrap_or_else(|| self.batch_reply_bytes().max(DEFAULT_POLL_MAX_BYTES)),
+            ..PollOptions::default()
+        }
+    }
+
+    /// Reply bytes of the largest batch of the largest messages. A poll that starts inside a
+    /// stored batch reads one more stored batch than the batches it covers.
+    fn batch_reply_bytes(&self) -> u32 {
+        let messages = u64::from(self.messages_per_batch.max());
+        let stored_batches = messages.div_ceil(u64::from(self.messages_per_batch.min())) + 1;
+        let bytes = POLL_RESPONSE_HEADER_SIZE as u64
+            + stored_batches * BATCH_HEADER_SIZE as u64
+            + messages * (BATCH_MESSAGE_HEADER_SIZE as u64 + u64::from(self.message_size.max()));
+        u32::try_from(bytes).unwrap_or(u32::MAX)
+    }
+
+    fn poll_options_error(&self, error: &IggyError) -> String {
+        let duration = |micros| IggyDuration::from(Duration::from_micros(micros));
+        match error {
+            IggyError::InvalidMessagesCount => format!(
+                "--min-count {} must be in 1..={}, the smallest --messages-per-batch",
+                self.min_count,
+                self.messages_per_batch.min()
+            ),
+            IggyError::InvalidCommand => format!(
+                "--max-wait {} must be at most {}",
+                self.max_wait,
+                duration(MAX_DEFERRED_POLL_WAIT_US)
+            ),
+            IggyError::InvalidSizeBytes => format!(
+                "--max-bytes {} must be at least {MIN_DEFERRED_POLL_MAX_BYTES}",
+                self.poll_options().max_bytes
+            ),
+            error => error.to_string(),
+        }
+    }
+
+    /// Producer-only kinds never poll, so their names leave out the poll options.
+    const fn polls(&self) -> bool {
+        !matches!(
+            self.benchmark_kind,
+            BenchmarkKindCommand::PinnedProducer(_) | BenchmarkKindCommand::BalancedProducer(_)
+        )
+    }
+
+    /// The request timeout that the SDK derives from `--max-wait`. Result names keep it, so
+    /// they stay comparable with older results.
+    fn request_timeout(&self) -> IggyDuration {
+        self.poll_options().request_timeout()
+    }
+
     pub fn transport_command(&self) -> &BenchmarkTransportCommand {
         self.benchmark_kind.transport_command()
     }
@@ -123,6 +217,19 @@ impl IggyBenchArgs {
     }
 
     pub fn validate(&mut self) {
+        if let Err(error) = self.poll_options().validate() {
+            Self::command()
+                .error(ErrorKind::ValueValidation, self.poll_options_error(&error))
+                .exit();
+        }
+        if let Some(max_bytes) = self.max_bytes
+            && max_bytes < self.batch_reply_bytes()
+        {
+            println!(
+                "Warning: --max-bytes {max_bytes} holds less than one batch ({} B), so polls return partial batches.",
+                self.batch_reply_bytes()
+            );
+        }
         if self.output_dir().is_none()
             && (self.gitref().is_some()
                 || self.identifier().is_some()
@@ -148,7 +255,7 @@ impl IggyBenchArgs {
                 Self::command()
                     .error(
                         ErrorKind::ArgumentConflict,
-                        "--total-messages-size must be at least 2x greater than --message-size",
+                        "--total-data must be at least twice --message-size",
                     )
                     .exit();
             }
@@ -327,6 +434,18 @@ impl IggyBenchArgs {
         self.reuse_streams
     }
 
+    pub const fn durability(&self) -> iggy::prelude::Durability {
+        self.durability
+    }
+
+    pub const fn consumer_offset_durability(&self) -> iggy::prelude::Durability {
+        self.consumer_offset_durability
+    }
+
+    pub const fn messages_required_to_save(&self) -> Option<NonZeroU32> {
+        self.messages_required_to_save
+    }
+
     pub fn username(&self) -> &str {
         &self.username
     }
@@ -353,12 +472,7 @@ impl IggyBenchArgs {
             BenchmarkKindCommand::Examples => unreachable!(),
         };
 
-        let transport = match self.transport_command() {
-            BenchmarkTransportCommand::Tcp(_) => "tcp",
-            BenchmarkTransportCommand::Quic(_) => "quic",
-            BenchmarkTransportCommand::Http(_) => "http",
-            BenchmarkTransportCommand::WebSocket(_) => "ws",
-        };
+        let transport = self.transport_command().as_str();
 
         let actors = match &self.benchmark_kind {
             BenchmarkKindCommand::PinnedProducer(_)
@@ -388,6 +502,16 @@ impl IggyBenchArgs {
             data_volume_arg,
             transport.to_string(),
         ];
+
+        if self.polls() {
+            parts.push(format!(
+                "wait{}_min{}_bytes{}_timeout{}",
+                self.max_wait,
+                self.min_count,
+                self.poll_options().max_bytes,
+                self.request_timeout()
+            ));
+        }
 
         if let Some(remark) = &self.remark() {
             parts.push(remark.clone());
@@ -440,10 +564,82 @@ impl IggyBenchArgs {
             self.messages_per_batch(),
         );
 
+        if self.polls() {
+            name = format!(
+                "{name}, wait {}, min {}, max {}B, timeout {}",
+                self.max_wait,
+                self.min_count,
+                self.poll_options().max_bytes,
+                self.request_timeout()
+            );
+        }
+
         if let Some(remark) = &self.remark() {
             name = format!("{name} ({remark})");
         }
 
         name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> IggyBenchArgs {
+        parse_kind("pinned-consumer", arguments)
+    }
+
+    fn parse_kind(kind: &str, arguments: &[&str]) -> IggyBenchArgs {
+        let mut command = vec!["iggy-bench"];
+        command.extend_from_slice(arguments);
+        command.extend_from_slice(&[kind, "tcp"]);
+        IggyBenchArgs::try_parse_from(command).unwrap()
+    }
+
+    fn poll_error(arguments: &[&str]) -> String {
+        let args = parse(arguments);
+        let error = args.poll_options().validate().unwrap_err();
+        args.poll_options_error(&error)
+    }
+
+    #[test]
+    fn default_max_bytes_should_fit_one_full_batch() {
+        assert_eq!(parse(&[]).poll_options().max_bytes, DEFAULT_POLL_MAX_BYTES);
+
+        let larger = parse(&["-m", "1024"]);
+        let max_bytes = larger.poll_options().max_bytes;
+        assert!(max_bytes > DEFAULT_POLL_MAX_BYTES);
+        assert!(u64::from(max_bytes) >= 1000 * (BATCH_MESSAGE_HEADER_SIZE as u64 + 1024));
+
+        let explicit = parse(&["-m", "1024", "--max-bytes", "4096"]);
+        assert_eq!(explicit.poll_options().max_bytes, 4096);
+    }
+
+    #[test]
+    fn poll_option_errors_should_name_the_flag() {
+        assert!(poll_error(&["-P", "10", "--min-count", "11"]).starts_with("--min-count 11 "));
+        assert_eq!(
+            poll_error(&["--max-wait", "11m"]),
+            "--max-wait 11m must be at most 10m"
+        );
+        assert!(poll_error(&["--max-bytes", "1"]).starts_with("--max-bytes 1 "));
+    }
+
+    #[test]
+    fn producer_only_names_should_leave_out_poll_options() {
+        let producer = parse_kind("pinned-producer", &["-b", "10"]);
+        assert!(!producer.generate_dir_name().contains("_wait"));
+        assert!(!producer.generate_pretty_name().contains("wait"));
+
+        let consumer = parse(&["-b", "10"]);
+        assert!(consumer.generate_dir_name().contains("_wait1s_min1_"));
+        assert!(consumer.generate_dir_name().contains("_timeout11s"));
+        assert!(
+            consumer
+                .generate_pretty_name()
+                .contains(", wait 1s, min 1,")
+        );
+        assert!(consumer.generate_pretty_name().contains(", timeout 11s"));
     }
 }

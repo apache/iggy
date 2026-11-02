@@ -46,23 +46,6 @@ pub(crate) enum MessageAction {
     ///  iggy message poll --offset 0 stream topic 1
     #[clap(verbatim_doc_comment, visible_alias = "p")]
     Poll(PollMessagesArgs),
-    /// Flush messages from given topic ID and given stream ID
-    ///
-    /// Command is used to force a flush of unsaved_buffer to disk
-    /// for specific stream, topic and partition. If fsync is enabled
-    /// then the data is flushed to disk and fsynced, otherwise the
-    /// data is only flushed to disk.
-    ///
-    /// Stream ID can be specified as a stream name or ID
-    /// Topic ID can be specified as a topic name or ID
-    ///
-    /// Examples:
-    ///  iggy message flush 1 2 1
-    ///  iggy message flush stream 2 1
-    ///  iggy message flush 1 topic 1
-    ///  iggy message flush stream topic 1
-    #[clap(verbatim_doc_comment, visible_alias = "f")]
-    Flush(FlushMessagesArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -82,9 +65,9 @@ pub(crate) struct SendMessagesArgs {
     pub(crate) partition_id: Option<u32>,
     /// Messages key which will be used to partition the messages
     ///
-    /// Value of the key will be used by the server to calculate the partition ID
+    /// The key must contain 1 to 255 bytes. Binary clients resolve the partition ID; HTTP resolves it on the server.
     #[clap(verbatim_doc_comment)]
-    #[clap(short, long, group = "partitioning")]
+    #[clap(short, long, value_parser = parse_message_key, group = "partitioning")]
     pub(crate) message_key: Option<String>,
     /// Messages to be sent
     ///
@@ -115,6 +98,10 @@ pub(crate) struct SendMessagesArgs {
     #[clap(verbatim_doc_comment)]
     #[clap(long, value_parser = NonEmptyStringValueParser::new(), group = "input_messages")]
     pub(crate) input_file: Option<String>,
+}
+
+fn parse_message_key(value: &str) -> Result<String, IggyError> {
+    Partitioning::messages_key_str(value).map(|_| value.to_owned())
 }
 
 /// Parse Header Key, Kind and Value from the string separated by a ':'
@@ -263,34 +250,38 @@ pub(crate) struct PollMessagesArgs {
     pub(crate) output_file: Option<String>,
 }
 
-#[derive(Debug, Clone, Args)]
-pub(crate) struct FlushMessagesArgs {
-    /// ID of the stream for which messages will be flushed
-    ///
-    /// Stream ID can be specified as a stream name or ID
-    #[arg(value_parser = clap::value_parser!(Identifier))]
-    pub(crate) stream_id: Identifier,
-    /// ID of the topic for which messages will be flushed
-    ///
-    /// Topic ID can be specified as a topic name or ID
-    #[arg(value_parser = clap::value_parser!(Identifier))]
-    pub(crate) topic_id: Identifier,
-    /// Partition ID for which messages will be flushed
-    #[arg(value_parser = clap::value_parser!(u32).range(0..))]
-    pub(crate) partition_id: u32,
-    /// fsync flushed data to disk
-    ///
-    /// If option is enabled then the data is flushed to disk and fsynced,
-    /// otherwise the data is only flushed to disk. Default is false.
-    #[clap(verbatim_doc_comment)]
-    #[clap(short, long, default_value_t = false)]
-    pub(crate) fsync: bool,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::args::{Command, IggyConsoleArgs};
+    use clap::Parser;
     use std::str::FromStr;
+
+    #[test]
+    fn given_valid_message_key_when_sending_should_preserve_key_bytes() {
+        let max_key_bytes = usize::from(u8::MAX);
+        for key in [
+            "x".to_owned(),
+            "x".repeat(max_key_bytes),
+            format!("{}x", "é".repeat(max_key_bytes / "é".len())),
+        ] {
+            let parsed = IggyConsoleArgs::try_parse_from([
+                "iggy",
+                "message",
+                "send",
+                "--message-key",
+                &key,
+                "stream",
+                "topic",
+                "payload",
+            ])
+            .unwrap();
+            let Some(Command::Message(MessageAction::Send(args))) = parsed.command else {
+                panic!("Expected the message send command");
+            };
+            assert_eq!(args.message_key.as_deref(), Some(key.as_str()));
+        }
+    }
 
     #[test]
     fn parse_key_val_should_parse_string() {

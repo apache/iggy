@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { browser } from '$app/environment';
+import { browser } from '$app/env';
 import { goto } from '$app/navigation';
 import { resolve } from '$app/paths';
-import { authStore } from '$lib/auth/authStore.svelte';
-import { typedRoute } from '$lib/types/appRoutes';
+import { authStore } from '#lib/auth/authStore.svelte.js';
+import { typedRoute } from '#lib/types/appRoutes.js';
 import type { PageLoad } from './$types';
 
 export const load: PageLoad = async () => {
   if (browser && authStore.getAccessToken()) {
-    goto(resolve(typedRoute('/dashboard/overview')));
+    goto(resolve(typedRoute('dashboard/overview')));
   }
 
   return {};

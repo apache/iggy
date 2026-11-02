@@ -31,7 +31,10 @@ pub mod consumer_timestamp_polling_scenario;
 // shard-0 HTTP listener and the create/delete commit through the metadata STM,
 // so the token replicates to every shard a TCP client may land on.
 pub mod cross_protocol_pat_scenario;
+pub mod delete_segments_scenario;
+pub mod delete_stats_rollback_scenario;
 pub mod encryption_scenario;
+pub mod external_group_offsets_scenario;
 pub mod invalid_consumer_offset_scenario;
 pub mod log_rotation_scenario;
 pub mod message_cleanup_scenario;
@@ -39,7 +42,6 @@ pub mod message_headers_scenario;
 pub mod message_size_scenario;
 pub mod offset_scenario;
 pub mod permissions_scenario;
-pub mod purge_delete_scenario;
 pub mod read_during_persistence_scenario;
 pub mod reconnect_after_restart_scenario;
 pub mod restart_offset_skip_scenario;
@@ -54,14 +56,24 @@ pub mod timestamp_scenario;
 pub mod user_scenario;
 pub mod websocket_tls_scenario;
 
+use bytes::Bytes;
 use iggy::prelude::*;
 use integration::harness::{TestHarness, delete_user};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 const PARTITION_ID: u32 = 0;
-const POLL_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);
-const POLL_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+// One pair for every wait in these scenarios, because they all wait out the
+// same thing: the partition plane applies committed ops asynchronously on the
+// owning shard (a send folds into the shared stats and into the servable log at
+// commit-apply; a delete zeroes them when the reconciler drives the wipe),
+// so a read racing that window sees a pre-apply value. Retry until the
+// expectation holds, then make the terminal assertion for a real mismatch.
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);
+const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+// The server cap of one poll reply (`sharding.deferred_poll_max_read_bytes`).
+// A poll that must return more than the 1 MiB default in one reply asks for it.
+const POLL_REPLY_MAX_BYTES: u32 = 16 * 1024 * 1024;
 const STREAM_NAME: &str = "test-stream";
 const TOPIC_NAME: &str = "test-topic";
 const PARTITIONS_COUNT: u32 = 3;
@@ -72,8 +84,127 @@ const USERNAME_3: &str = "user3";
 const CONSUMER_KIND: ConsumerKind = ConsumerKind::Consumer;
 const MESSAGES_COUNT: u32 = 1337;
 
-/// Poll until the partition serves `expected_count` messages or
-/// [`POLL_CONVERGENCE_TIMEOUT`] expires, returning the last poll result.
+const MESSAGE_PAYLOAD_SIZE_BYTES: u64 = 57;
+// The server accounts the actual on-disk batch framing: one 256-byte
+// `SendMessages` command header per append pass plus a 48-byte per-message
+// header (`server_common::send_messages::COMMAND_HEADER_SIZE` and
+// `iggy_binary_protocol::batch::BATCH_MESSAGE_HEADER_SIZE`).
+const NG_BATCH_HEADER_SIZE: u64 = 256;
+const NG_MESSAGE_HEADER_SIZE: u64 = 48;
+
+/// What the server counts for one append pass of `messages_count` messages
+/// built by [`create_messages`].
+const fn batch_size(messages_count: u64) -> u64 {
+    NG_BATCH_HEADER_SIZE + (NG_MESSAGE_HEADER_SIZE + MESSAGE_PAYLOAD_SIZE_BYTES) * messages_count
+}
+
+/// One append pass worth of messages, sized so [`batch_size`] predicts what the
+/// server will report for them.
+fn create_messages(messages_count: u64) -> Vec<IggyMessage> {
+    (0..messages_count)
+        .map(|offset| {
+            let payload = Bytes::from(vec![0xD; MESSAGE_PAYLOAD_SIZE_BYTES as usize]);
+            IggyMessage::builder()
+                .id(u128::from(offset) + 1)
+                .payload(payload)
+                .build()
+                .expect("Failed to create message")
+        })
+        .collect()
+}
+
+/// Fetch the stream until its totals match or [`CONVERGENCE_TIMEOUT`]
+/// expires, then assert on the last read.
+async fn validate_stream(
+    client: &IggyClient,
+    stream_name: &str,
+    expected_size: u64,
+    expected_messages_count: u64,
+) {
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    let stream = loop {
+        let stream = client
+            .get_stream(&Identifier::named(stream_name).unwrap())
+            .await
+            .unwrap()
+            .expect("Failed to get stream");
+        if (stream.size == expected_size && stream.messages_count == expected_messages_count)
+            || Instant::now() >= deadline
+        {
+            break stream;
+        }
+        sleep(RETRY_INTERVAL).await;
+    };
+    assert_eq!(stream.size, expected_size, "stream size mismatch");
+    assert_eq!(
+        stream.messages_count, expected_messages_count,
+        "stream messages_count mismatch"
+    );
+}
+
+/// Topic-level counterpart of [`validate_stream`].
+async fn validate_topic(
+    client: &IggyClient,
+    stream_name: &str,
+    topic_name: &str,
+    expected_size: u64,
+    expected_messages_count: u64,
+) {
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    let topic = loop {
+        let topic = client
+            .get_topic(
+                &Identifier::named(stream_name).unwrap(),
+                &Identifier::named(topic_name).unwrap(),
+            )
+            .await
+            .unwrap()
+            .expect("Failed to get topic");
+        if (topic.size == expected_size && topic.messages_count == expected_messages_count)
+            || Instant::now() >= deadline
+        {
+            break topic;
+        }
+        sleep(RETRY_INTERVAL).await;
+    };
+    assert_eq!(topic.size, expected_size, "topic size mismatch");
+    assert_eq!(
+        topic.messages_count, expected_messages_count,
+        "topic messages_count mismatch"
+    );
+}
+
+/// Server-wide counterpart of [`validate_stream`], reading `[stats]` rather
+/// than one entity.
+async fn validate_system_stats(
+    client: &IggyClient,
+    expected_size: u64,
+    expected_messages_count: u64,
+) {
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    let stats = loop {
+        let stats = client.get_stats().await.unwrap();
+        if (stats.messages_count == expected_messages_count
+            && stats.messages_size_bytes.as_bytes_u64() == expected_size)
+            || Instant::now() >= deadline
+        {
+            break stats;
+        }
+        sleep(RETRY_INTERVAL).await;
+    };
+    assert_eq!(
+        stats.messages_count, expected_messages_count,
+        "system stats messages_count mismatch"
+    );
+    assert_eq!(
+        stats.messages_size_bytes.as_bytes_u64(),
+        expected_size,
+        "system stats messages_size_bytes mismatch"
+    );
+}
+
+/// Poll from `strategy` until the partition serves `expected_count` messages
+/// or [`CONVERGENCE_TIMEOUT`] expires, returning every message read.
 ///
 /// `send_messages` acks at consensus commit while the owning shard applies
 /// the batch asynchronously (see the materialisation race note at the top
@@ -81,32 +212,43 @@ const MESSAGES_COUNT: u32 = 1337;
 /// send burst can observe fewer messages than were acked. Retrying absorbs
 /// that convergence window without weakening the caller's assertion: real
 /// message loss still returns short and fails it once the deadline expires.
+/// One reply holds at most `max_bytes`, so a large read takes several polls.
 async fn poll_until_expected_count(
     client: &IggyClient,
     stream_name: &str,
     topic_name: &str,
     strategy: &PollingStrategy,
     expected_count: u32,
-) -> PolledMessages {
-    let deadline = Instant::now() + POLL_CONVERGENCE_TIMEOUT;
-    loop {
+) -> Vec<IggyMessage> {
+    let stream = Identifier::named(stream_name).unwrap();
+    let topic = Identifier::named(topic_name).unwrap();
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    let mut messages = Vec::with_capacity(expected_count as usize);
+    let mut next = *strategy;
+    while messages.len() < expected_count as usize && Instant::now() < deadline {
         let polled = client
             .poll_messages(
-                &Identifier::named(stream_name).unwrap(),
-                &Identifier::named(topic_name).unwrap(),
-                Some(PARTITION_ID),
+                &stream,
+                &topic,
+                PARTITION_ID,
                 &Consumer::default(),
-                strategy,
-                expected_count,
-                false,
+                &next,
+                PollOptions {
+                    count: expected_count - messages.len() as u32,
+                    max_bytes: POLL_REPLY_MAX_BYTES,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
-        if polled.messages.len() as u32 == expected_count || Instant::now() >= deadline {
-            return polled;
+        if polled.messages.is_empty() {
+            sleep(RETRY_INTERVAL).await;
+            continue;
         }
-        sleep(POLL_RETRY_INTERVAL).await;
+        next = polled.continuation();
+        messages.extend(polled.messages);
     }
+    messages
 }
 
 async fn create_client(harness: &TestHarness) -> IggyClient {
@@ -137,6 +279,17 @@ async fn join_consumer_group(client: &IggyClient) {
         )
         .await
         .unwrap();
+
+    let members_count = get_consumer_group(client).await.members_count;
+    integration::harness::wait_for_consumer_group_assignment(
+        client,
+        &Identifier::named(STREAM_NAME).unwrap(),
+        &Identifier::named(TOPIC_NAME).unwrap(),
+        &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
+        members_count,
+        CONVERGENCE_TIMEOUT,
+    )
+    .await;
 }
 
 async fn leave_consumer_group(client: &IggyClient) {

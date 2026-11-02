@@ -28,8 +28,8 @@ use common::{
     header_only, install_dialed_replicas_locally, install_replicas_locally, loopback,
     self_signed_replica_tls_ctx, set_replica_ctx, set_replica_ctx_with_tls,
 };
-use iggy_binary_protocol::Command2;
-use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
+use iggy_binary_protocol::Command;
+use message_bus::connector::start as start_connector;
 use message_bus::replica::auth::ReplicaAuth;
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus};
@@ -89,27 +89,27 @@ async fn two_replicas_exchange_prepare_and_ack_over_tls() {
         0,
         vec![(1, addr1)],
         dial_delegate_0,
-        DEFAULT_RECONNECT_PERIOD,
+        bus0.config().reconnect_period,
     )
     .await;
 
     wait_until(|| bus0.replicas().contains(1), Duration::from_secs(2)).await;
 
-    let prepare = header_only(Command2::Prepare, CLUSTER, 0);
+    let prepare = header_only(Command::Prepare, CLUSTER, 0);
     bus0.send_to_replica(1, prepare.into_frozen())
         .await
         .expect("send prepare");
 
     let cmd = expect_recv(&rx1, Duration::from_secs(2)).await;
-    assert_eq!(cmd, Command2::Prepare as u8);
+    assert_eq!(cmd, Command::Prepare as u8);
 
-    let ack = header_only(Command2::PrepareOk, CLUSTER, 1);
+    let ack = header_only(Command::PrepareOk, CLUSTER, 1);
     bus1.send_to_replica(0, ack.into_frozen())
         .await
         .expect("send ack");
 
     let cmd = expect_recv(&rx0, Duration::from_secs(2)).await;
-    assert_eq!(cmd, Command2::PrepareOk as u8);
+    assert_eq!(cmd, Command::PrepareOk as u8);
 
     bus0.shutdown(Duration::from_secs(2)).await;
     bus1.shutdown(Duration::from_secs(2)).await;
@@ -143,7 +143,7 @@ async fn tls_dialer_against_plaintext_acceptor_never_installs() {
         0,
         vec![(1, addr1)],
         dial_delegate_0,
-        DEFAULT_RECONNECT_PERIOD,
+        bus0.config().reconnect_period,
     )
     .await;
 
@@ -196,7 +196,7 @@ async fn plaintext_dialer_against_tls_acceptor_never_installs() {
         0,
         vec![(1, addr1)],
         dial_delegate_0,
-        DEFAULT_RECONNECT_PERIOD,
+        bus0.config().reconnect_period,
     )
     .await;
 

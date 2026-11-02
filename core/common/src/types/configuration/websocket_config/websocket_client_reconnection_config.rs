@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::IggyDuration;
+use crate::{IggyDuration, NonZeroIggyDuration};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
@@ -23,18 +23,24 @@ use std::str::FromStr;
 /// WebSocket client reconnection configuration.
 /// It consists of the following fields:
 /// - `enabled`: whether to enable reconnection.
-/// - `max_retries`: the maximum number of retries. If None, will retry infinitely.
-/// - `interval`: the interval between retries.
-/// - `reestablish_after`: the time to wait before attempting to reestablish connection.
+/// - `max_retries`: the retries of one reconnect burst. If None, will retry infinitely.
+/// - `interval`: the full-jitter exponential backoff base, capped at 10 seconds.
+/// - `reestablish_after`: the stable connection duration that resets the retry count and backoff.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WebSocketClientReconnectionConfig {
     /// Whether to enable reconnection.
     pub enabled: bool,
-    /// The maximum number of retries. If None, will retry infinitely.
+    /// Retry passes after the initial bootstrap pass, and consecutive background
+    /// dial attempts per replica. `None` permits unlimited retries; `Some(0)`
+    /// permits only the initial bootstrap pass. The limit covers one reconnect
+    /// burst: while the client is signed in, each `IggyClient` heartbeat
+    /// restarts the replica links that used it up, with a fresh budget. A
+    /// transport client without `IggyClient` has no heartbeat, so only
+    /// `connect()` restarts them.
     pub max_retries: Option<u32>,
-    /// The interval between retries.
-    pub interval: IggyDuration,
-    /// The time to wait before attempting to reestablish connection.
+    /// Full-jitter exponential backoff base, capped at 10 seconds.
+    pub interval: NonZeroIggyDuration,
+    /// Stable connection duration that resets the retry count and backoff.
     pub reestablish_after: IggyDuration,
 }
 
@@ -43,7 +49,7 @@ impl Default for WebSocketClientReconnectionConfig {
         WebSocketClientReconnectionConfig {
             enabled: true,
             max_retries: None,
-            interval: IggyDuration::from_str("1s").unwrap(),
+            interval: NonZeroIggyDuration::from_str("1s").unwrap(),
             reestablish_after: IggyDuration::from_str("5s").unwrap(),
         }
     }

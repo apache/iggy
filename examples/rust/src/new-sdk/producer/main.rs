@@ -58,7 +58,6 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
         .partitioning(partitioning)
         .create_topic_if_not_exists(
             args.partitions_count,
-            None,
             IggyExpiry::ServerDefault,
             MaxTopicSize::ServerDefault,
         )

@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { Client, Consumer, PollingStrategy } from 'apache-iggy';
 import { log, initSystem, cleanup, BATCHES_LIMIT, MESSAGES_PER_BATCH } from '../utils';
@@ -103,7 +102,7 @@ async function consumeMessages(
     interval
   );
 
-  let offset = 0;
+  let offset = 0n;
   let consumedBatches = 0;
 
   while (consumedBatches < BATCHES_LIMIT) {
@@ -114,22 +113,19 @@ async function consumeMessages(
         topicId: topic.id,
         consumer: Consumer.Single,
         partitionId: topic.partitions[0].id,
-        pollingStrategy: PollingStrategy.Offset(BigInt(offset)),
+        pollingStrategy: PollingStrategy.Offset(offset),
         count: MESSAGES_PER_BATCH,
         autocommit: false,
       });
 
       if (!polledMessages || polledMessages.messages.length === 0) {
         log('No messages available.');
-        consumedBatches++;
-        await new Promise(resolve => setTimeout(resolve, interval));
         continue;
       }
 
-      offset += polledMessages.messages.length;
-
       for (const message of polledMessages.messages) {
         handleMessage(message);
+        offset = message.headers.offset + 1n;
       }
       log('Consumed %d message(s).', polledMessages.messages.length);
     } catch (error) {

@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 /**
  * VSR consensus header layout, ported from
@@ -23,6 +22,9 @@
  * by byte offset, mirroring the Rust SDK, which avoids struct casts because
  * the headers lead with unaligned u128 fields.
  */
+
+import { COMMAND_CODE } from '../command.code.js';
+import { Operation } from './operation.js';
 
 /** Size of every consensus header, both directions. */
 export const HEADER_SIZE = 256;
@@ -40,20 +42,36 @@ export const REQUEST_OFFSET = {
   size: 48,
   command: 60,
   client: 128,
+  requestChecksum: 144,
   timestamp: 160,
   request: 168,
   operation: 176,
   session: 184,
-  reserved: 196
+  reserved: 196,
+  partitionIncarnation: 200,
+  ownerGeneration: 208,
+  minimumMetadataOp: 216
 } as const;
 
 /** `ReplyHeader` field offsets the client reads. */
 export const REPLY_OFFSET = {
   size: 48,
   command: 60,
+  requestChecksum: 128,
+  client: 160,
+  op: 176,
+  commit: 184,
+  request: 200,
   operation: 208,
-  status: 216
+  status: 216,
+  reserved: 220,
+  partitionIncarnation: 224
 } as const;
+
+export const COMMITTED_RESULT_MARKER = 1;
+export const hasCommittedResult = (header: Buffer): boolean =>
+  peekCommand(header) === Command.Reply && readStatus(header) === 0 &&
+  header[REPLY_OFFSET.reserved] === COMMITTED_RESULT_MARKER;
 
 /** `EvictionHeader` field offsets the client reads. */
 export const EVICTION_OFFSET = {
@@ -64,8 +82,8 @@ export const EVICTION_OFFSET = {
   reason: 255
 } as const;
 
-/** `Command2` frame discriminants a client encounters. */
-export const Command2 = {
+/** `Command` frame discriminants a client encounters. */
+export const Command = {
   Request: 5,
   Reply: 8,
   Eviction: 13
@@ -94,8 +112,29 @@ export const EvictionReason = {
   MalformedLogin: 15
 } as const;
 
+export const PARTITION_CONTEXT_SIZE = 24;
+
+export type PartitionContext = {
+  readonly incarnation: bigint,
+  readonly ownerGeneration: bigint,
+  readonly metadataOp: bigint
+};
+
+export const EMPTY_PARTITION_CONTEXT: PartitionContext = Object.freeze({
+  incarnation: 0n,
+  ownerGeneration: 0n,
+  metadataOp: 0n
+});
+
+export const deserializePartitionContext = (data: Buffer, offset = 0): PartitionContext => ({
+  incarnation: data.readBigUInt64LE(offset),
+  ownerGeneration: data.readBigUInt64LE(offset + 8),
+  metadataOp: data.readBigUInt64LE(offset + 16)
+});
+
 /** Fields the client writes into a request header. */
 export type RequestHeaderFields = {
+  context?: PartitionContext,
   /** Header + body total, bytes. */
   size: number,
   /** Ephemeral client identifier (u128). */
@@ -111,25 +150,51 @@ export type RequestHeaderFields = {
 };
 
 const U64_MASK = 0xFFFFFFFFFFFFFFFFn;
+/** The requests that park on the server until their wait ends. */
+const DEFERRED_CODES = new Set<number>([
+  COMMAND_CODE.PollMessagesDeferred, COMMAND_CODE.FetchMessages
+]);
 
-/**
- * Encodes a 256-byte request header. Only the six fields the server reads
- * are written; the checksums stay zero, matching the Rust SDK's contract
- * with the VSR server.
- */
+/** Encodes one request identity and its captured partition context. */
 export const encodeRequestHeader = (fields: RequestHeaderFields): Buffer => {
   const header = Buffer.alloc(HEADER_SIZE);
   header.writeUInt32LE(fields.size, REQUEST_OFFSET.size);
-  header.writeUInt8(Command2.Request, REQUEST_OFFSET.command);
+  header.writeUInt8(Command.Request, REQUEST_OFFSET.command);
   // u128 client id: two little-endian u64 halves, low half first.
   header.writeBigUInt64LE(fields.client & U64_MASK, REQUEST_OFFSET.client);
   header.writeBigUInt64LE(fields.client >> 64n, REQUEST_OFFSET.client + 8);
   header.writeBigUInt64LE(fields.request, REQUEST_OFFSET.request);
   header.writeUInt8(fields.operation, REQUEST_OFFSET.operation);
   header.writeBigUInt64LE(fields.session, REQUEST_OFFSET.session);
+  const context = fields.context ?? EMPTY_PARTITION_CONTEXT;
+  header.writeBigUInt64LE(context.incarnation, REQUEST_OFFSET.partitionIncarnation);
+  header.writeBigUInt64LE(context.ownerGeneration, REQUEST_OFFSET.ownerGeneration);
+  header.writeBigUInt64LE(context.metadataOp, REQUEST_OFFSET.minimumMetadataOp);
   if (fields.nonReplicatedCode !== undefined)
     header.writeUInt32LE(fields.nonReplicatedCode, REQUEST_OFFSET.reserved);
   return header;
+};
+
+/**
+ * The header-only frame that cancels a deferred poll (106) or a fetch (109)
+ * parked on the server. It names the client, session
+ * and request id of `request`, as `RequestHeader::deferred_cancellation` in
+ * `core/binary_protocol/src/consensus/request.rs` does. Other requests do not
+ * park, so they have none.
+ */
+export const deferredCancellation = (request: Buffer): Buffer | undefined => {
+  if (request.readUInt8(REQUEST_OFFSET.operation) !== Operation.NonReplicated ||
+      !DEFERRED_CODES.has(request.readUInt32LE(REQUEST_OFFSET.reserved)))
+    return undefined;
+  return encodeRequestHeader({
+    size: HEADER_SIZE,
+    client: request.readBigUInt64LE(REQUEST_OFFSET.client) |
+      (request.readBigUInt64LE(REQUEST_OFFSET.client + 8) << 64n),
+    request: request.readBigUInt64LE(REQUEST_OFFSET.request),
+    operation: Operation.NonReplicated,
+    session: request.readBigUInt64LE(REQUEST_OFFSET.session),
+    nonReplicatedCode: COMMAND_CODE.CancelDeferredRequest
+  });
 };
 
 /**
@@ -143,7 +208,7 @@ export const peekCommand = (header: Buffer): number =>
 export const readSize = (header: Buffer): number =>
   header.readUInt32LE(REPLY_OFFSET.size);
 
-/** Reads the pre-commit denial status; 0 means the reply committed. */
+/** Reads the pre-commit denial status; zero alone does not prove commit. */
 export const readStatus = (header: Buffer): number =>
   header.readUInt32LE(REPLY_OFFSET.status);
 

@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::args::{
-    common::IggyBenchArgs, defaults::DEFAULT_NUMBER_OF_PRODUCERS, props::BenchmarkKindProps,
+    common::IggyBenchArgs, defaults::DEFAULT_NUMBER_OF_CONSUMERS, props::BenchmarkKindProps,
     transport::BenchmarkTransportCommand,
 };
 use clap::{CommandFactory, Parser, error::ErrorKind};
@@ -34,7 +34,7 @@ pub struct PinnedConsumerArgs {
     pub streams: Option<NonZeroU32>,
 
     /// Number of consumers
-    #[arg(long, short = 'c', default_value_t = DEFAULT_NUMBER_OF_PRODUCERS)]
+    #[arg(long, short = 'c', default_value_t = DEFAULT_NUMBER_OF_CONSUMERS)]
     pub consumers: NonZeroU32,
 }
 
@@ -74,7 +74,7 @@ impl BenchmarkKindProps for PinnedConsumerArgs {
         if streams > consumers {
             cmd.error(
                 ErrorKind::ArgumentConflict,
-                format!("For pinned consumer, number of streams ({streams}) must be equal to the number of consumers ({consumers}).",
+                format!("For pinned consumer, number of streams ({streams}) must be less than or equal to the number of consumers ({consumers}).",
             ))
             .exit();
         }

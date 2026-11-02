@@ -26,7 +26,7 @@ import org.apache.iggy.exception.IggyServerException;
  * Byte offsets and readers for the 256-byte consensus headers, mirroring the
  * {@code #[repr(C)]} layouts in
  * {@code core/binary_protocol/src/consensus/header.rs}. All fields are
- * little-endian; the checksum fields stay zero by protocol contract.
+ * little-endian.
  */
 public final class VsrHeaders {
 
@@ -41,22 +41,33 @@ public final class VsrHeaders {
     // so every field past the operation sits eight bytes earlier than it did
     // while the header still carried one.
     static final int REQUEST_CLIENT_OFFSET = 128;
+    static final int REQUEST_CHECKSUM_OFFSET = 144;
     static final int REQUEST_ID_OFFSET = 168;
     static final int REQUEST_OPERATION_OFFSET = 176;
     static final int REQUEST_SESSION_OFFSET = 184;
     static final int REQUEST_RESERVED_CODE_OFFSET = 196;
+    static final int REQUEST_INCARNATION_OFFSET = 200;
+    static final int REQUEST_OWNER_GENERATION_OFFSET = 208;
+    static final int REQUEST_METADATA_OP_OFFSET = 216;
 
     // ReplyHeader
+    static final int REPLY_CHECKSUM_OFFSET = 128;
+    static final int REPLY_CLIENT_OFFSET = 160;
+    static final int REPLY_OP_OFFSET = 176;
+    static final int REPLY_COMMIT_OFFSET = 184;
     static final int REPLY_REQUEST_OFFSET = 200;
     static final int REPLY_OPERATION_OFFSET = 208;
     static final int REPLY_STATUS_OFFSET = 216;
+    static final int REPLY_COMMITTED_RESULT_OFFSET = 220;
+    static final int REPLY_INCARNATION_OFFSET = 224;
+    static final int COMMITTED_RESULT = 1;
 
     // EvictionHeader
     static final int EVICTION_PROTOCOL_VERSION_OFFSET = 144;
     static final int EVICTION_PROTOCOL_VERSION_MIN_OFFSET = 148;
     static final int EVICTION_REASON_OFFSET = 255;
 
-    // Command2 discriminants
+    // Command discriminants
     static final int COMMAND_REQUEST = 5;
     static final int COMMAND_REPLY = 8;
     static final int COMMAND_EVICTION = 13;
@@ -111,7 +122,7 @@ public final class VsrHeaders {
         return frame.getUnsignedByte(frame.readerIndex() + REQUEST_OPERATION_OFFSET);
     }
 
-    static long readRequestId(ByteBuf frame) {
+    public static long readRequestId(ByteBuf frame) {
         return frame.getLongLE(frame.readerIndex() + REQUEST_ID_OFFSET);
     }
 

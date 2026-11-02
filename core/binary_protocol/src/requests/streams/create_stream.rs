@@ -18,42 +18,71 @@
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode};
 use crate::primitives::identifier::WireName;
+use crate::primitives::options::WireOptions;
 use bytes::BytesMut;
 
-/// `CreateStream` request. Wire format: `[name_len:1][name:N]`
+/// `CreateStream` request.
+///
+/// Wire format: `[name_len:1][name:N][options TLV to end]`
+///
+/// The options block runs to the end of the payload; its validator requires
+/// exact consumption, so no length prefix is needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateStreamRequest {
     pub name: WireName,
+    pub options: WireOptions,
 }
 
 impl WireEncode for CreateStreamRequest {
     fn encoded_size(&self) -> usize {
-        self.name.encoded_size()
+        self.name.encoded_size() + self.options.encoded_size()
     }
 
     fn encode(&self, buf: &mut BytesMut) {
         self.name.encode(buf);
+        self.options.encode(buf);
     }
 }
 
 impl WireDecode for CreateStreamRequest {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let (name, consumed) = WireName::decode(buf)?;
-        Ok((Self { name }, consumed))
+        let options = WireOptions::from_slice(&buf[consumed..])?;
+        Ok((Self { name, options }, buf.len()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::user_headers::encode_user_headers;
+
+    fn sample_options() -> WireOptions {
+        let mut buf = BytesMut::new();
+        encode_user_headers(&[(2, b"future_key", 2, b"value")], &mut buf);
+        WireOptions::from_bytes(buf.freeze()).unwrap()
+    }
 
     #[test]
     fn roundtrip() {
         let req = CreateStreamRequest {
             name: WireName::new("test-stream").unwrap(),
+            options: WireOptions::empty(),
         };
         let bytes = req.to_bytes();
         assert_eq!(bytes.len(), 1 + 11);
+        let (decoded, consumed) = CreateStreamRequest::decode(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn roundtrip_with_options() {
+        let req = CreateStreamRequest {
+            name: WireName::new("test-stream").unwrap(),
+            options: sample_options(),
+        };
+        let bytes = req.to_bytes();
         let (decoded, consumed) = CreateStreamRequest::decode(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, req);
@@ -66,23 +95,28 @@ mod tests {
     }
 
     #[test]
-    fn truncated_returns_error() {
+    fn truncated_options_return_error() {
         let req = CreateStreamRequest {
             name: WireName::new("test").unwrap(),
+            options: sample_options(),
         };
         let bytes = req.to_bytes();
-        for i in 0..bytes.len() {
+        let name_end = 1 + 4;
+        for i in name_end + 1..bytes.len() {
             assert!(
                 CreateStreamRequest::decode(&bytes[..i]).is_err(),
                 "expected error for truncation at byte {i}"
             );
         }
+        let (decoded, _) = CreateStreamRequest::decode(&bytes[..name_end]).unwrap();
+        assert!(decoded.options.is_empty());
     }
 
     #[test]
     fn wire_compat_byte_layout() {
         let req = CreateStreamRequest {
             name: WireName::new("test").unwrap(),
+            options: WireOptions::empty(),
         };
         let bytes = req.to_bytes();
         assert_eq!(&bytes[..], &[4, b't', b'e', b's', b't']);

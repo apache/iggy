@@ -37,18 +37,23 @@ pub async fn run(harness: &TestHarness) {
 
 async fn init_system(client: &IggyClient) {
     // 1. Create the stream
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     // 2. Create the topic
     client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy::prelude::Durability::Persisted,
+                consumer_offset_durability: iggy::prelude::Durability::Persisted,
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -134,14 +139,16 @@ async fn create_auto_commit_consumer(client: &IggyClient) -> IggyConsumer {
     let mut consumer = client
         .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
-        .batch_length(10)
-        .poll_interval(IggyDuration::from_str("100ms").expect("Invalid duration"))
+        .poll_options(PollOptions {
+            count: 10,
+            commit: CommitPolicy::Auto(AutoCommit {
+                interval: Some(NonZeroIggyDuration::from_str("1s").unwrap()),
+                every: Some(CommitEvery::Message),
+                after: CommitAfter::Delivery,
+            }),
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .polling_strategy(PollingStrategy::next())
-        .auto_join_consumer_group()
-        .auto_commit(AutoCommit::IntervalOrAfter(
-            IggyDuration::from_str("1s").unwrap(),
-            AutoCommitAfter::ConsumingEachMessage,
-        ))
         .build();
 
     consumer.init().await.unwrap();

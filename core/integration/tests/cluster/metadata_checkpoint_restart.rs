@@ -284,7 +284,7 @@ async fn given_installed_snapshot_when_node_restarts_again_should_transfer_again
 /// The prepare WAL has `SLOT_COUNT = 1024` slots and the coordinator checkpoints at
 /// `<= CHECKPOINT_MARGIN` (64) remaining, so after ~960 uncheckpointed ops. 1024
 /// stream creates clears that with room for a WAL suffix above the checkpoint, and
-/// stays under the 4096 stream namespace cap.
+/// stays under `MAX_STREAMS`.
 const STREAMS: u32 = 1024;
 
 const RECOVER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -343,14 +343,14 @@ async fn wait_for_stream(harness: &TestHarness, stream: &str) -> IggyClient {
 // bulk creation is fast and the WAL is fully committed with no uncommitted suffix to
 // reconcile, exercising checkpoint and snapshot-fold recovery in isolation without an
 // election in the mix.
-#[iggy_harness(cluster_nodes = 1, server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(cluster_nodes = 1, server(sharding.cpu_allocation = "0..1"))]
 async fn given_checkpointed_metadata_when_solo_replica_restarts_should_recover_from_snapshot_and_wal(
     harness: &mut TestHarness,
 ) {
     let client = connect(harness).await;
     for index in 0..STREAMS {
         client
-            .create_stream(&stream_name(index))
+            .create_stream(&stream_name(index), &StreamCreateOptions::default())
             .await
             .unwrap_or_else(|e| panic!("create stream {index}: {e}"));
     }

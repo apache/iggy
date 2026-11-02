@@ -52,7 +52,7 @@ impl WireDecode for ConsumerGroupMemberResponse {
         let id = read_u32_le(buf, 0)?;
         let partitions_count = read_u32_le(buf, 4)?;
         let remaining = buf.len().saturating_sub(8);
-        let mut partitions = Vec::with_capacity(crate::codec::capped_capacity(
+        let mut partitions = Vec::with_capacity(crate::codec::bounded_capacity(
             partitions_count as usize,
             remaining,
             4,

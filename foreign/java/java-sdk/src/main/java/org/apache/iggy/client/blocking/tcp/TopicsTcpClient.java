@@ -22,12 +22,13 @@ package org.apache.iggy.client.blocking.tcp;
 import org.apache.iggy.client.blocking.TopicsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
-import org.apache.iggy.topic.CompressionAlgorithm;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
+import org.apache.iggy.topic.TopicUpdate;
 
-import java.math.BigInteger;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 final class TopicsTcpClient implements TopicsClient {
@@ -50,28 +51,13 @@ final class TopicsTcpClient implements TopicsClient {
 
     @Override
     public TopicDetails createTopic(
-            StreamId streamId,
-            Long partitionsCount,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
-            String name) {
-        return FutureUtil.resolve(delegate.createTopic(
-                streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, replicationFactor, name));
+            StreamId streamId, String name, long partitionsCount, Map<String, HeaderValue> options) {
+        return FutureUtil.resolve(delegate.createTopic(streamId, name, partitionsCount, options));
     }
 
     @Override
-    public void updateTopic(
-            StreamId streamId,
-            TopicId topicId,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
-            String name) {
-        FutureUtil.resolve(delegate.updateTopic(
-                streamId, topicId, compressionAlgorithm, messageExpiry, maxTopicSize, replicationFactor, name));
+    public void updateTopic(StreamId streamId, TopicId topicId, TopicUpdate update) {
+        FutureUtil.resolve(delegate.updateTopic(streamId, topicId, update));
     }
 
     @Override

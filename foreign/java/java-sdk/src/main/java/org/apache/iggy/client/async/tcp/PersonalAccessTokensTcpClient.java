@@ -44,6 +44,14 @@ import java.util.function.Supplier;
 public class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient {
     private static final Logger log = LoggerFactory.getLogger(PersonalAccessTokensTcpClient.class);
 
+    /**
+     * Token name bounds the server enforces, in UTF-8 bytes. Checked here so a bad name fails
+     * before the round trip instead of as an opaque server error.
+     */
+    private static final int MIN_NAME_LENGTH = 3;
+
+    private static final int MAX_NAME_LENGTH = 30;
+
     private final Supplier<AsyncTcpConnection> connectionSupplier;
     private final LoginRoutingHook routingHook;
 
@@ -63,14 +71,13 @@ public class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient
     @Override
     public CompletableFuture<RawPersonalAccessToken> createPersonalAccessToken(String name, BigInteger expiry) {
         var payload = Unpooled.buffer();
-        payload.writeBytes(BytesSerializer.toBytes(name));
+        payload.writeBytes(BytesSerializer.toBytes(name, "name", MIN_NAME_LENGTH, MAX_NAME_LENGTH));
         payload.writeBytes(BytesSerializer.toBytesAsU64(expiry));
 
         log.debug("Creating personal access token: {}", name);
 
-        return connection()
-                .send(CommandCode.PersonalAccessToken.CREATE.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.PersonalAccessToken.CREATE.getValue(), payload), response -> {
                     try {
                         return BytesDeserializer.readRawPersonalAccessToken(response);
                     } finally {
@@ -85,9 +92,8 @@ public class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient
 
         log.debug("Getting all personal access tokens");
 
-        return connection()
-                .send(CommandCode.PersonalAccessToken.GET_ALL.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.PersonalAccessToken.GET_ALL.getValue(), payload), response -> {
                     try {
                         List<PersonalAccessTokenInfo> tokens = new ArrayList<>();
                         while (response.isReadable()) {
@@ -102,30 +108,25 @@ public class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient
 
     @Override
     public CompletableFuture<Void> deletePersonalAccessToken(String name) {
-        var payload = BytesSerializer.toBytes(name);
+        var payload = BytesSerializer.toBytes(name, "name", MIN_NAME_LENGTH, MAX_NAME_LENGTH);
 
         log.debug("Deleting personal access token: {}", name);
 
-        return connection()
-                .send(CommandCode.PersonalAccessToken.DELETE.getValue(), payload)
-                .thenAccept(response -> {
-                    response.release();
-                });
+        return connection().sendAndRelease(CommandCode.PersonalAccessToken.DELETE, payload);
     }
 
     @Override
     public CompletableFuture<IdentityInfo> loginWithPersonalAccessToken(String token) {
-        return routingHook.loginOnLeader(() -> loginWithoutRedirect(token));
+        return routingHook.loginOnLeader(deadline -> loginWithoutRedirect(token, deadline));
     }
 
-    private CompletableFuture<IdentityInfo> loginWithoutRedirect(String token) {
-        var payload = BytesSerializer.toBytes(token);
+    private CompletableFuture<IdentityInfo> loginWithoutRedirect(String token, long deadline) {
+        var payload = BytesSerializer.toBytes(token, "token");
 
         log.debug("Logging in with personal access token");
 
-        return connection()
-                .send(CommandCode.PersonalAccessToken.LOGIN.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.PersonalAccessToken.LOGIN.getValue(), payload, deadline), response -> {
                     try {
                         var userId = response.readUnsignedIntLE();
                         return new IdentityInfo(userId, Optional.empty());

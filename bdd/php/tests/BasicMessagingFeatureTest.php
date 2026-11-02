@@ -19,9 +19,12 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/SharedFeatureParser.php';
+require_once __DIR__ . '/TestEnvironment.php';
 
 use Iggy\Client as IggyClient;
+use Iggy\CommitPolicy;
 use Iggy\PollingStrategy;
+use Iggy\PollOptions;
 use Iggy\SendMessage;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
@@ -30,6 +33,8 @@ use PHPUnit\Framework\TestCase;
 
 final class BasicMessagingFeatureTest extends TestCase
 {
+    private const CONSUMER_ID = 1;
+
     private ?IggyClient $client = null;
     private ?int $lastStreamId = null;
     private ?string $lastStreamName = null;
@@ -71,7 +76,7 @@ final class BasicMessagingFeatureTest extends TestCase
     private function runStep(string $step): void
     {
         if ($step === 'I have a running Iggy server') {
-            $this->client = new IggyClient(server_host() . ':' . server_port());
+            $this->client = new IggyClient(TestEnvironment::serverAddress());
             $this->client->connect();
             $this->client->ping();
 
@@ -79,7 +84,7 @@ final class BasicMessagingFeatureTest extends TestCase
         }
 
         if ($step === 'I am authenticated as the root user') {
-            $this->requireClient()->loginUser(env_or_default('IGGY_USERNAME', 'iggy'), env_or_default('IGGY_PASSWORD', 'iggy'));
+            $this->requireClient()->loginUser(TestEnvironment::rootUsername(), TestEnvironment::rootPassword());
 
             return;
         }
@@ -178,10 +183,10 @@ final class BasicMessagingFeatureTest extends TestCase
                 (int) $matches[1],
                 (int) $matches[2],
                 (int) $matches[3],
+                self::CONSUMER_ID,
                 PollingStrategy::offset((int) $matches[4]),
-                $this->requireSentMessageCount(),
-                true,
-            );
+                new PollOptions(count: $this->requireSentMessageCount(), commit: CommitPolicy::onRead()),
+            )->messages;
 
             return;
         }

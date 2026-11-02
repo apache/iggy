@@ -15,10 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use argon2::{
-    Argon2,
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
-};
+use argon2::{Argon2, PasswordHasher, PasswordVerifier, password_hash};
 use rand::{RngExt, distr::Alphanumeric};
 use std::ops::Range;
 
@@ -31,7 +28,7 @@ use std::ops::Range;
 /// simulator's deterministic hashing is the additive [`hash_with_fixed_salt`].
 #[must_use]
 pub fn hash_password(password: &str) -> String {
-    hash_with_salt(password, &SaltString::generate(&mut OsRng))
+    hash_with_salt(password, &password_hash::generate_salt())
 }
 
 /// SIMULATOR / TEST ONLY. Argon2-hash with a fixed salt so the hash is a pure
@@ -45,13 +42,12 @@ pub fn hash_password(password: &str) -> String {
 pub fn hash_with_fixed_salt(password: &str) -> String {
     // Fixed 16-byte salt; the value is irrelevant beyond being constant.
     const SIMULATOR_SALT: [u8; 16] = *b"iggy-sim-salt-16";
-    let salt = SaltString::encode_b64(&SIMULATOR_SALT).expect("fixed sim salt encodes");
-    hash_with_salt(password, &salt)
+    hash_with_salt(password, &SIMULATOR_SALT)
 }
 
-fn hash_with_salt(password: &str, salt: &SaltString) -> String {
+fn hash_with_salt(password: &str, salt: &[u8]) -> String {
     Argon2::default()
-        .hash_password(password.as_bytes(), salt)
+        .hash_password_with_salt(password.as_bytes(), salt)
         .expect("Password hashing failed")
         .to_string()
 }
@@ -62,11 +58,8 @@ fn hash_with_salt(password: &str, salt: &SaltString) -> String {
 /// not take down the pump on every login. Not a timing oracle: the password
 /// input cannot influence whether the stored hash parses.
 pub fn verify_password(password: &str, hash: &str) -> bool {
-    let Ok(hash) = PasswordHash::new(hash) else {
-        return false;
-    };
     Argon2::default()
-        .verify_password(password.as_bytes(), &hash)
+        .verify_password(password.as_bytes(), hash)
         .is_ok()
 }
 

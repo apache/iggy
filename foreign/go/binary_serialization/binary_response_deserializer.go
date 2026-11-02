@@ -18,14 +18,17 @@
 package binaryserialization
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/apache/iggy/foreign/go/internal/batch"
 	"github.com/klauspost/compress/s2"
 )
 
@@ -57,8 +60,12 @@ func DeserializeStream(payload []byte) (*iggcon.StreamDetails, error) {
 	if err != nil {
 		return nil, err
 	}
-	topics := make([]iggcon.Topic, 0)
-	for pos < len(payload) {
+	// Count-driven: a topic element carries variable-length options blocks,
+	// so "consume until the buffer ends" no longer delimits it. The declared
+	// count is an unvalidated wire u32, so the allocation hint is capped by
+	// what the remaining body could possibly hold.
+	topics := make([]iggcon.Topic, 0, boundedCapacity(stream.TopicsCount, len(payload)-pos, topicMinimumSize))
+	for i := uint32(0); i < stream.TopicsCount; i++ {
 		topic, readBytes, err := DeserializeToTopic(payload, pos)
 		if err != nil {
 			return nil, err
@@ -110,32 +117,71 @@ func DeserializeToStream(payload []byte, position int) (iggcon.Stream, int, erro
 	messagesCount := binary.LittleEndian.Uint64(payload[position+24 : position+32])
 	nameLength := int(payload[position+32])
 
-	totalSize := streamFixedSize + nameLength
-	if remaining < totalSize {
+	if remaining < streamFixedSize+nameLength {
 		return iggcon.Stream{}, 0, fmt.Errorf(
 			"not enough data to read stream name: need %d bytes, got %d",
-			totalSize, remaining)
+			streamFixedSize+nameLength, remaining)
 	}
 
 	name := string(payload[position+33 : position+33+nameLength])
 
+	readBytes := streamFixedSize + nameLength
+	options, optionsSize, err := deserializeOptions(payload, position+readBytes)
+	if err != nil {
+		return iggcon.Stream{}, 0, fmt.Errorf("failed to read stream options: %w", err)
+	}
+	readBytes += optionsSize
+	derivedOptions, derivedSize, err := deserializeOptions(payload, position+readBytes)
+	if err != nil {
+		return iggcon.Stream{}, 0, fmt.Errorf("failed to read stream derived options: %w", err)
+	}
+	readBytes += derivedSize
+
 	return iggcon.Stream{
-		Id:            id,
-		TopicsCount:   topicsCount,
-		Name:          name,
-		SizeBytes:     sizeBytes,
-		MessagesCount: messagesCount,
-		CreatedAt:     createdAt,
-	}, totalSize, nil
+		Id:             id,
+		TopicsCount:    topicsCount,
+		Name:           name,
+		SizeBytes:      sizeBytes,
+		MessagesCount:  messagesCount,
+		CreatedAt:      createdAt,
+		Options:        options,
+		DerivedOptions: derivedOptions,
+	}, readBytes, nil
 }
 
-// pollBatchHeaderLength covers [partition_id u32][current_offset u64][count u32].
-const pollBatchHeaderLength = 16
+// deserializeOptions reads a u32-length-prefixed options TLV block at
+// position and returns the decoded options with the total bytes consumed
+// (prefix included). A zero-length block decodes to a nil map.
+func deserializeOptions(payload []byte, position int) (map[string]iggcon.HeaderValue, int, error) {
+	block, consumed, err := readLengthPrefixed(payload, position, "options block")
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(block) == 0 {
+		return nil, consumed, nil
+	}
 
-// DeserializeFetchMessagesResponse decodes a poll reply. A truncated body is
-// a decode error rather than a shorter batch: silently dropping the tail
-// would let a consumer that commits CurrentOffset skip messages it never saw.
-// The returned messages alias the reply buffer; a retained message pins it.
+	entries, err := iggcon.DeserializeHeaders(block)
+	if err != nil {
+		return nil, 0, err
+	}
+	options := make(map[string]iggcon.HeaderValue, len(entries))
+	for _, entry := range entries {
+		options[string(entry.Key.Value)] = entry.Value
+	}
+	return options, consumed, nil
+}
+
+// pollPrefixLength includes partition, offset, count and the captured context.
+const pollPrefixLength = 16 + iggcon.PartitionContextSize
+
+// DeserializeFetchMessagesResponse decodes a poll reply: the 40-byte prefix
+// followed by batch records ([256-byte batch header][frames]) walked by their
+// batch length, with each frame's deltas resolved to absolute values. A
+// truncated body is a decode error rather than a shorter batch: silently
+// dropping the tail would let a consumer that commits CurrentOffset skip
+// messages it never saw. Uncompressed payloads and user headers alias the
+// reply buffer; retaining those slices pins it. S2 payloads are copied.
 func DeserializeFetchMessagesResponse(payload []byte, compression iggcon.IggyMessageCompression) (*iggcon.PolledMessage, error) {
 	if len(payload) == 0 {
 		return &iggcon.PolledMessage{
@@ -146,85 +192,293 @@ func DeserializeFetchMessagesResponse(payload []byte, compression iggcon.IggyMes
 	}
 
 	length := len(payload)
-	if length < pollBatchHeaderLength {
-		return nil, fmt.Errorf("poll response: %d bytes is short of the batch header", length)
+	if length < pollPrefixLength {
+		return nil, fmt.Errorf("poll response: %d bytes is short of the reply prefix", length)
 	}
 	partitionId := binary.LittleEndian.Uint32(payload[0:4])
 	currentOffset := binary.LittleEndian.Uint64(payload[4:12])
 	messagesCount := binary.LittleEndian.Uint32(payload[12:16])
-	position := pollBatchHeaderLength
-
-	// The declared count is server-controlled; the allocation hint is capped
-	// by what the body could possibly hold.
-	maxMessages := (length - pollBatchHeaderLength) / iggcon.MessageHeaderSize
-	if int(messagesCount) < maxMessages {
-		maxMessages = int(messagesCount)
+	var partitionContext iggcon.PartitionContext
+	if err := partitionContext.UnmarshalBinary(payload[16:pollPrefixLength]); err != nil {
+		return nil, err
 	}
-	messages := make([]iggcon.IggyMessage, 0, maxMessages)
-	for position < length {
-		if position+iggcon.MessageHeaderSize > length {
-			return nil, fmt.Errorf("poll response: truncated message header at byte %d", position)
-		}
-		header, err := iggcon.MessageHeaderFromBytes(payload[position : position+iggcon.MessageHeaderSize])
-		if err != nil {
-			return nil, err
-		}
-		position += iggcon.MessageHeaderSize
-		if uint64(header.PayloadLength) > uint64(length-position) {
-			return nil, fmt.Errorf(
-				"poll response: message payload of %d bytes overruns the body", header.PayloadLength)
-		}
-		payloadSlice := payload[position : position+int(header.PayloadLength)]
-		position += int(header.PayloadLength)
-
-		if uint64(header.UserHeaderLength) > uint64(length-position) {
-			return nil, fmt.Errorf(
-				"poll response: user headers of %d bytes overrun the body", header.UserHeaderLength)
-		}
-		var userHeaders []byte
-		if header.UserHeaderLength > 0 {
-			userHeaders = payload[position : position+int(header.UserHeaderLength)]
-		}
-		position += int(header.UserHeaderLength)
-
-		switch compression {
-		case iggcon.MESSAGE_COMPRESSION_S2, iggcon.MESSAGE_COMPRESSION_S2_BETTER, iggcon.MESSAGE_COMPRESSION_S2_BEST:
-			if length < 32 {
-				break
-			}
-			payloadSlice, err = s2.Decode(nil, payloadSlice)
-			if err != nil {
-				return nil, fmt.Errorf("failed to decode s2 payload: %w", err)
-			}
-		}
-
-		messages = append(messages, iggcon.IggyMessage{
-			Header:      *header,
-			Payload:     payloadSlice,
-			UserHeaders: userHeaders,
-		})
-	}
-	if uint32(len(messages)) != messagesCount {
-		return nil, fmt.Errorf(
-			"poll response: %d decoded messages do not match the declared %d",
-			len(messages), messagesCount)
+	messages, err := decodeRecords("poll response", payload[pollPrefixLength:], messagesCount, compression)
+	if err != nil {
+		return nil, err
 	}
 
-	// !TODO: Add message offset ordering
 	return &iggcon.PolledMessage{
 		PartitionId:   partitionId,
 		CurrentOffset: currentOffset,
 		Messages:      messages,
 		MessageCount:  messagesCount,
+		Context:       partitionContext,
 	}, nil
 }
 
-func DeserializeTopics(payload []byte) ([]iggcon.Topic, error) {
-	topics := make([]iggcon.Topic, 0)
-	length := len(payload)
-	position := 0
+// The fields of a section header of a fetch reply, by offset: partition id,
+// status, current offset, message count, partition context, next offset and
+// records length.
+const (
+	sectionStatusAt        = 4
+	sectionCurrentOffsetAt = 8
+	sectionMessageCountAt  = 16
+	sectionContextAt       = 20
+	sectionNextOffsetAt    = sectionContextAt + iggcon.PartitionContextSize
+	sectionRecordsLengthAt = sectionNextOffsetAt + 8
+	fetchSectionHeaderSize = sectionRecordsLengthAt + 4
+	fetchSectionsCountSize = 4
+)
 
+// DeserializeFetchSections decodes a fetch reply,
+// [sections_count u32][section header x n][records of each section], into
+// its sections in reply order. The records of each section stay encoded and
+// alias payload, and each section keeps compression for their decode. A
+// refused section carries a nonzero status and no records, and the records
+// of all sections fill the body exactly.
+func DeserializeFetchSections(payload []byte, compression iggcon.IggyMessageCompression) ([]iggcon.FetchMessagesSection, error) {
+	if len(payload) < fetchSectionsCountSize {
+		return nil, fmt.Errorf("fetch response: %d bytes is short of the section count", len(payload))
+	}
+	count := binary.LittleEndian.Uint32(payload)
+	if count > iggcon.MaxPartitionsPerRequest {
+		return nil, fmt.Errorf("fetch response: %d sections exceed %d", count, iggcon.MaxPartitionsPerRequest)
+	}
+	records := fetchSectionsCountSize + int(count)*fetchSectionHeaderSize
+	if len(payload) < records {
+		return nil, fmt.Errorf("fetch response: %d section headers do not fit %d bytes", count, len(payload))
+	}
+	sections := make([]iggcon.FetchMessagesSection, 0, count)
+	for header := payload[fetchSectionsCountSize:records]; len(header) > 0; header = header[fetchSectionHeaderSize:] {
+		section := iggcon.FetchMessagesSection{
+			PartitionId:   binary.LittleEndian.Uint32(header),
+			CurrentOffset: binary.LittleEndian.Uint64(header[sectionCurrentOffsetAt:]),
+			MessageCount:  binary.LittleEndian.Uint32(header[sectionMessageCountAt:]),
+			NextOffset:    binary.LittleEndian.Uint64(header[sectionNextOffsetAt:]),
+			Compression:   compression,
+		}
+		if err := section.Context.UnmarshalBinary(header[sectionContextAt:sectionNextOffsetAt]); err != nil {
+			return nil, err
+		}
+		length := binary.LittleEndian.Uint32(header[sectionRecordsLengthAt:])
+		if status := binary.LittleEndian.Uint32(header[sectionStatusAt:]); status != 0 {
+			if length != 0 {
+				return nil, fmt.Errorf("fetch response: refused partition %d carries %d record bytes", section.PartitionId, length)
+			}
+			section.Err = ierror.FromCode(ierror.Code(status))
+		}
+		if uint64(length) > uint64(len(payload)-records) {
+			return nil, fmt.Errorf("fetch response: %d record bytes of partition %d overrun the body", length, section.PartitionId)
+		}
+		section.Records = payload[records : records+int(length)]
+		records += int(length)
+		sections = append(sections, section)
+	}
+	if records != len(payload) {
+		return nil, fmt.Errorf("fetch response: %d bytes follow the last section", len(payload)-records)
+	}
+	return sections, nil
+}
+
+// DeserializeSectionMessages decodes the records of a served fetch section
+// as DeserializeFetchMessagesResponse decodes a poll reply, with the
+// compression of the section and the same aliasing. A refused section
+// returns its Err.
+func DeserializeSectionMessages(section iggcon.FetchMessagesSection) (*iggcon.PolledMessage, error) {
+	if section.Err != nil {
+		return nil, section.Err
+	}
+	messages, err := decodeRecords("fetch section", section.Records, section.MessageCount, section.Compression)
+	if err != nil {
+		return nil, err
+	}
+	return &iggcon.PolledMessage{
+		PartitionId:   section.PartitionId,
+		CurrentOffset: section.CurrentOffset,
+		Messages:      messages,
+		MessageCount:  section.MessageCount,
+		Context:       section.Context,
+	}, nil
+}
+
+// decodeRecords decodes the batch records of the reply named reply, which
+// declares messagesCount messages.
+func decodeRecords(reply string, records []byte, messagesCount uint32, compression iggcon.IggyMessageCompression) ([]iggcon.IggyMessage, error) {
+	length := len(records)
+	// The declared count is server-controlled; the allocation hint is capped
+	// by what the body could possibly hold.
+	maxMessages := length / batch.MessageHeaderSize
+	if int(messagesCount) < maxMessages {
+		maxMessages = int(messagesCount)
+	}
+	messages := make([]iggcon.IggyMessage, 0, maxMessages)
+	position := 0
 	for position < length {
+		record, err := batch.DecodeHeader(records[position:])
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", reply, err)
+		}
+		if record.BatchLength > uint64(length-position) {
+			return nil, fmt.Errorf(
+				"%s: batch record of %d bytes overruns the body", reply, record.BatchLength)
+		}
+		recordEnd := position + int(record.BatchLength)
+		cursor := position + batch.HeaderSize
+		for cursor < recordEnd {
+			frame, err := batch.DecodeMessageHeader(records[cursor:recordEnd])
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", reply, err)
+			}
+			payloadStart := cursor + batch.MessageHeaderSize
+			payloadEnd := payloadStart + int(frame.PayloadLength)
+			userHeadersEnd := payloadEnd + int(frame.UserHeadersLength)
+			if userHeadersEnd > recordEnd {
+				return nil, fmt.Errorf(
+					"%s: message of %d payload and %d user-header bytes overruns the batch record",
+					reply, frame.PayloadLength, frame.UserHeadersLength)
+			}
+			payloadSlice := records[payloadStart:payloadEnd]
+			var userHeaders []byte
+			if frame.UserHeadersLength > 0 {
+				userHeaders = records[payloadEnd:userHeadersEnd]
+			}
+			cursor = userHeadersEnd
+
+			switch compression {
+			case iggcon.MESSAGE_COMPRESSION_S2, iggcon.MESSAGE_COMPRESSION_S2_BETTER, iggcon.MESSAGE_COMPRESSION_S2_BEST:
+				payloadSlice, err = s2.Decode(nil, payloadSlice)
+				if err != nil {
+					return nil, fmt.Errorf("failed to decode s2 payload: %w", err)
+				}
+			}
+
+			messages = append(messages, iggcon.IggyMessage{
+				Header: iggcon.MessageHeader{
+					Checksum: frame.Checksum,
+					Id:       iggcon.MessageID(frame.Id),
+					// A record may be a server-sliced view of a larger stored
+					// batch: BaseOffset stays put and the first frame's delta
+					// positions it, so the sum is the absolute offset either way.
+					Offset: record.BaseOffset + uint64(frame.OffsetDelta),
+					// Broker append time is stamped once per batch; the
+					// per-message delta applies to OriginTimestamp only.
+					Timestamp:        record.BaseTimestamp,
+					OriginTimestamp:  record.OriginTimestamp + uint64(frame.TimestampDelta),
+					UserHeaderLength: frame.UserHeadersLength,
+					PayloadLength:    frame.PayloadLength,
+				},
+				Payload:     payloadSlice,
+				UserHeaders: userHeaders,
+			})
+		}
+		position = recordEnd
+	}
+	if uint32(len(messages)) != messagesCount {
+		return nil, fmt.Errorf(
+			"%s: %d decoded messages do not match the declared %d",
+			reply, len(messages), messagesCount)
+	}
+	return messages, nil
+}
+
+// optionSpecMinimumSize is the smallest catalog entry: a one-character name
+// (a length byte plus at least one byte), kind and flags bytes, and empty
+// length-prefixed default and description.
+const optionSpecMinimumSize = 2 + 1 + 1 + 4 + 4
+
+// Option flag bits of a DescribeOptions entry. Higher bits are ignored.
+const (
+	optionFlagUpdatable  = 1 << 0
+	optionFlagResettable = 1 << 1
+	optionFlagSecret     = 1 << 2
+	optionFlagReadOnly   = 1 << 3
+	optionFlagCritical   = 1 << 4
+)
+
+// DeserializeOptionSpecs reads a DescribeOptions response.
+//
+// Wire format: [count:u32][ [key_len:u8][key][kind:u8][flags:u8]
+// [default_len:u32][default][description_len:u32][description] ]*
+func DeserializeOptionSpecs(payload []byte) ([]iggcon.OptionSpec, error) {
+	if len(payload) < 4 {
+		return nil, fmt.Errorf(
+			"not enough data to read option count: need 4 bytes, got %d", len(payload))
+	}
+	count := binary.LittleEndian.Uint32(payload[0:4])
+	position := 4
+
+	specs := make([]iggcon.OptionSpec, 0,
+		boundedCapacity(count, len(payload)-position, optionSpecMinimumSize))
+	for i := uint32(0); i < count; i++ {
+		if len(payload)-position < 1 {
+			return nil, fmt.Errorf("truncated option key length at offset %d", position)
+		}
+		keyLength := int(payload[position])
+		position++
+		if len(payload)-position < keyLength+2 {
+			return nil, fmt.Errorf("truncated option key at offset %d", position)
+		}
+		key := string(payload[position : position+keyLength])
+		position += keyLength
+
+		kind := payload[position]
+		flags := payload[position+1]
+		position += 2
+
+		defaultValue, read, err := readLengthPrefixed(payload, position, "option default value")
+		if err != nil {
+			return nil, err
+		}
+		position += read
+
+		description, read, err := readLengthPrefixed(payload, position, "option description")
+		if err != nil {
+			return nil, err
+		}
+		position += read
+
+		specs = append(specs, iggcon.OptionSpec{
+			Key:          key,
+			DefaultValue: iggcon.HeaderValue{Kind: iggcon.HeaderKind(kind), Value: defaultValue},
+			Updatable:    flags&optionFlagUpdatable != 0,
+			Resettable:   flags&optionFlagResettable != 0,
+			Secret:       flags&optionFlagSecret != 0,
+			ReadOnly:     flags&optionFlagReadOnly != 0,
+			Critical:     flags&optionFlagCritical != 0,
+			Description:  string(description),
+		})
+	}
+
+	return specs, nil
+}
+
+func readLengthPrefixed(payload []byte, position int, field string) ([]byte, int, error) {
+	if len(payload)-position < 4 {
+		return nil, 0, fmt.Errorf("truncated length prefix for %s at offset %d", field, position)
+	}
+	length := int(binary.LittleEndian.Uint32(payload[position : position+4]))
+	position += 4
+	// Where int is 32 bits a wire length above MaxInt32 converts to a negative
+	// one, which clears the remaining-bytes check and reaches the slice below
+	// with high < low.
+	if length < 0 || len(payload)-position < length {
+		return nil, 0, fmt.Errorf("truncated %s at offset %d", field, position)
+	}
+	return payload[position : position+length], 4 + length, nil
+}
+
+func DeserializeTopics(payload []byte) ([]iggcon.Topic, error) {
+	if len(payload) < 4 {
+		return nil, fmt.Errorf(
+			"not enough data to read topics count: need 4 bytes, got %d", len(payload))
+	}
+	topicsCount := binary.LittleEndian.Uint32(payload[0:4])
+	position := 4
+
+	// The declared count is server-controlled; the allocation hint is capped
+	// by what the body could possibly hold.
+	topics := make([]iggcon.Topic, 0, boundedCapacity(topicsCount, len(payload)-position, topicMinimumSize))
+	for i := uint32(0); i < topicsCount; i++ {
 		topic, readBytes, err := DeserializeToTopic(payload, position)
 		if err != nil {
 			return nil, err
@@ -242,11 +496,15 @@ func DeserializeTopic(payload []byte) (*iggcon.TopicDetails, error) {
 		return &iggcon.TopicDetails{}, err
 	}
 
-	partitions := make([]iggcon.PartitionContract, 0)
-	length := len(payload)
-
-	for position < length {
-		partition, readBytes := DeserializePartition(payload, position)
+	// The header's count delimits the entries, so a body short of it is
+	// refused rather than read as fewer partitions.
+	partitions := make([]iggcon.PartitionContract, 0,
+		boundedCapacity(topic.PartitionsCount, len(payload)-position, partitionMinimumSize))
+	for i := uint32(0); i < topic.PartitionsCount; i++ {
+		partition, readBytes, err := DeserializePartition(payload, position)
+		if err != nil {
+			return nil, err
+		}
 		partitions = append(partitions, partition)
 		position += readBytes
 	}
@@ -256,44 +514,168 @@ func DeserializeTopic(payload []byte) (*iggcon.TopicDetails, error) {
 	}, nil
 }
 
+// topicFixedSize covers the fields before the name:
+// id + created_at + partitions_count + size_bytes + messages_count + name_len.
+// Message expiry, compression and the size cap live in the options blocks.
+const topicFixedSize = 4 + 8 + 4 + 8 + 8 + 1 // 33 bytes
+
+// topicMinimumSize is the smallest possible topic element: fixed fields, a
+// one-character name (the server rejects an empty one), and the two u32
+// options-length prefixes (explicit and derived), both zero.
+const topicMinimumSize = topicFixedSize + 1 + 4 + 4
+
+// boundedCapacity caps a wire-declared element count by what the remaining
+// bytes could possibly hold.
+//
+// The count is an unvalidated u32: at max it asks for a multi-hundred-gigabyte
+// reservation, and a Go allocation failure cannot be recovered from.
+func boundedCapacity(declared uint32, remaining int, minItemSize int) int {
+	if remaining <= 0 || minItemSize <= 0 {
+		return 0
+	}
+	capacity := remaining / minItemSize
+	if uint64(declared) < uint64(capacity) {
+		return int(declared)
+	}
+	return capacity
+}
+
 func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error) {
+	remaining := len(payload) - position
+	if remaining < topicFixedSize {
+		return iggcon.Topic{}, 0, fmt.Errorf(
+			"not enough data to read topic header: need %d bytes, got %d",
+			topicFixedSize, remaining)
+	}
+
 	topic := iggcon.Topic{}
 	topic.Id = binary.LittleEndian.Uint32(payload[position : position+4])
 	topic.CreatedAt = binary.LittleEndian.Uint64(payload[position+4 : position+12])
 	topic.PartitionsCount = binary.LittleEndian.Uint32(payload[position+12 : position+16])
-	topic.MessageExpiry = iggcon.Duration(binary.LittleEndian.Uint64(payload[position+16 : position+24]))
-	topic.CompressionAlgorithm = payload[position+24]
-	topic.MaxTopicSize = binary.LittleEndian.Uint64(payload[position+25 : position+33])
-	topic.ReplicationFactor = payload[position+33]
-	topic.Size = binary.LittleEndian.Uint64(payload[position+34 : position+42])
-	topic.MessagesCount = binary.LittleEndian.Uint64(payload[position+42 : position+50])
+	topic.Size = binary.LittleEndian.Uint64(payload[position+16 : position+24])
+	topic.MessagesCount = binary.LittleEndian.Uint64(payload[position+24 : position+32])
 
-	nameLength := int(payload[position+50])
-	topic.Name = string(payload[position+51 : position+51+nameLength])
+	nameLength := int(payload[position+32])
+	if remaining < topicFixedSize+nameLength {
+		return iggcon.Topic{}, 0, fmt.Errorf(
+			"not enough data to read topic name: need %d bytes, got %d",
+			topicFixedSize+nameLength, remaining)
+	}
+	topic.Name = string(payload[position+33 : position+33+nameLength])
 
-	readBytes := 4 + 8 + 4 + 8 + 8 + 8 + 8 + 1 + 1 + 1 + nameLength
+	readBytes := topicFixedSize + nameLength
+	options, optionsSize, err := deserializeOptions(payload, position+readBytes)
+	if err != nil {
+		return iggcon.Topic{}, 0, fmt.Errorf("failed to read topic options: %w", err)
+	}
+	topic.Options = options
+	readBytes += optionsSize
+
+	derivedOptions, derivedSize, err := deserializeOptions(payload, position+readBytes)
+	if err != nil {
+		return iggcon.Topic{}, 0, fmt.Errorf("failed to read topic derived options: %w", err)
+	}
+	topic.DerivedOptions = derivedOptions
+	readBytes += derivedSize
+
+	topic.MessageExpiry = iggcon.Duration(topicUint64Option(topic, iggcon.TopicOptionMessageExpiry, uint64(iggcon.IggyExpiryNeverExpire)))
+	topic.MaxTopicSize = topicUint64Option(topic, iggcon.TopicOptionMaxTopicSize, math.MaxUint64)
+	topic.CompressionAlgorithm = uint8(iggcon.CompressionAlgorithmNone)
+	if value, ok := topicOption(topic, iggcon.TopicOptionCompressionAlgorithm); ok && value.Kind == iggcon.String {
+		if algorithm, known := compressionAlgorithms[string(value.Value)]; known {
+			topic.CompressionAlgorithm = uint8(algorithm)
+		}
+	}
+
 	return topic, readBytes, nil
 }
 
-func DeserializePartition(payload []byte, position int) (iggcon.PartitionContract, int) {
+// compressionAlgorithms maps the catalog spelling of compression_algorithm to
+// its code.
+var compressionAlgorithms = map[string]iggcon.CompressionAlgorithm{
+	"none": iggcon.CompressionAlgorithmNone,
+	"gzip": iggcon.CompressionAlgorithmGzip,
+}
+
+// topicOption looks a key up in both blocks: a key is explicit or derived,
+// never both.
+func topicOption(topic iggcon.Topic, key iggcon.TopicOptionKey) (iggcon.HeaderValue, bool) {
+	if value, ok := topic.Options[string(key)]; ok {
+		return value, true
+	}
+	value, ok := topic.DerivedOptions[string(key)]
+	return value, ok
+}
+
+// topicUint64Option reads a Uint64 option, or the catalog default when the
+// server reported none.
+func topicUint64Option(topic iggcon.Topic, key iggcon.TopicOptionKey, fallback uint64) uint64 {
+	value, ok := topicOption(topic, key)
+	if !ok || value.Kind != iggcon.Uint64 || len(value.Value) != 8 {
+		return fallback
+	}
+	return binary.LittleEndian.Uint64(value.Value)
+}
+
+// partitionCountersSize covers id + created_at + segments_count +
+// current_offset + size_bytes + messages_count + context.
+const partitionCountersSize = 4 + 8 + 4 + 8 + 8 + 8 + iggcon.PartitionContextSize // 64 bytes
+
+// partitionMinimumSize is a partition whose members and in-sync node lists
+// are both empty: the counters and one u8 count per list.
+const partitionMinimumSize = partitionCountersSize + 1 + 1 // 66 bytes
+
+func DeserializePartition(payload []byte, position int) (iggcon.PartitionContract, int, error) {
+	if position < 0 || position > len(payload) || len(payload)-position < partitionMinimumSize {
+		return iggcon.PartitionContract{}, 0, fmt.Errorf("truncated partition response")
+	}
+	var partitionContext iggcon.PartitionContext
+	if err := partitionContext.UnmarshalBinary(payload[position+40 : position+partitionCountersSize]); err != nil {
+		return iggcon.PartitionContract{}, 0, err
+	}
 	id := binary.LittleEndian.Uint32(payload[position : position+4])
 	createdAt := binary.LittleEndian.Uint64(payload[position+4 : position+12])
 	segmentsCount := binary.LittleEndian.Uint32(payload[position+12 : position+16])
 	currentOffset := binary.LittleEndian.Uint64(payload[position+16 : position+24])
 	sizeBytes := binary.LittleEndian.Uint64(payload[position+24 : position+32])
 	messagesCount := binary.LittleEndian.Uint64(payload[position+32 : position+40])
-	readBytes := 4 + 4 + 8 + 8 + 8 + 8
+	members, membersEnd, err := deserializeNodeIds(payload, position+partitionCountersSize, "partition members")
+	if err != nil {
+		return iggcon.PartitionContract{}, 0, err
+	}
+	inSyncMembers, end, err := deserializeNodeIds(payload, membersEnd, "partition in-sync members")
+	if err != nil {
+		return iggcon.PartitionContract{}, 0, err
+	}
 
 	partition := iggcon.PartitionContract{
+		Context:       partitionContext,
 		Id:            id,
 		CreatedAt:     createdAt,
 		SegmentsCount: segmentsCount,
 		CurrentOffset: currentOffset,
 		SizeBytes:     sizeBytes,
 		MessagesCount: messagesCount,
+		Members:       members,
+		InSyncMembers: inSyncMembers,
 	}
 
-	return partition, readBytes
+	return partition, end - position, nil
+}
+
+// deserializeNodeIds reads a u8 count followed by that many u8 node ids and
+// returns the position past the list.
+func deserializeNodeIds(payload []byte, position int, field string) ([]uint8, int, error) {
+	if position >= len(payload) {
+		return nil, 0, fmt.Errorf("truncated %s count at offset %d", field, position)
+	}
+	count := int(payload[position])
+	start := position + 1
+	if len(payload)-start < count {
+		return nil, 0, fmt.Errorf("truncated %s at offset %d: need %d bytes, got %d",
+			field, start, count, len(payload)-start)
+	}
+	return bytes.Clone(payload[start : start+count]), start + count, nil
 }
 
 func DeserializeConsumerGroups(payload []byte) []iggcon.ConsumerGroup {
@@ -391,10 +773,12 @@ func DeserializeUser(payload []byte) (*iggcon.UserInfoDetails, error) {
 	}
 	hasPermissions := payload[position]
 	userInfo := iggcon.UserInfo{
-		Id:        response.Id,
-		CreatedAt: response.CreatedAt,
-		Username:  response.Username,
-		Status:    response.Status,
+		Id:             response.Id,
+		CreatedAt:      response.CreatedAt,
+		Username:       response.Username,
+		Status:         response.Status,
+		Options:        response.Options,
+		DerivedOptions: response.DerivedOptions,
 	}
 	if hasPermissions == 1 {
 		permissionLength := binary.LittleEndian.Uint32(payload[position+1 : position+5])
@@ -521,12 +905,24 @@ func deserializeToUser(payload []byte, position int) (*iggcon.UserInfo, int, err
 	username := string(payload[position+14 : position+14+int(usernameLength)])
 
 	readBytes := 4 + 8 + 1 + 1 + int(usernameLength)
+	options, optionsSize, err := deserializeOptions(payload, position+readBytes)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to read user options: %w", err)
+	}
+	readBytes += optionsSize
+	derivedOptions, derivedSize, err := deserializeOptions(payload, position+readBytes)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to read user derived options: %w", err)
+	}
+	readBytes += derivedSize
 
 	return &iggcon.UserInfo{
-		Id:        id,
-		CreatedAt: createdAt,
-		Status:    userStatus,
-		Username:  username,
+		Id:             id,
+		CreatedAt:      createdAt,
+		Status:         userStatus,
+		Username:       username,
+		Options:        options,
+		DerivedOptions: derivedOptions,
 	}, readBytes, nil
 }
 
@@ -612,7 +1008,7 @@ func DeserializeAccessToken(payload []byte) (*iggcon.RawPersonalAccessToken, err
 
 func DeserializeAccessTokens(payload []byte) ([]iggcon.PersonalAccessTokenInfo, error) {
 	if len(payload) == 0 {
-		return []iggcon.PersonalAccessTokenInfo{}, ierror.ErrEmptyMessagePayload
+		return []iggcon.PersonalAccessTokenInfo{}, nil
 	}
 
 	var result []iggcon.PersonalAccessTokenInfo
@@ -635,9 +1031,10 @@ func deserializeToPersonalAccessTokenResponse(payload []byte, position int) (igg
 	var expiry *time.Time
 
 	if len(expiryBytes) >= 8 {
-		unixMicroSeconds := binary.LittleEndian.Uint64(expiryBytes)
-		expiryTime := time.Unix(0, int64(unixMicroSeconds))
-		expiry = &expiryTime
+		if unixMicroSeconds := binary.LittleEndian.Uint64(expiryBytes); unixMicroSeconds != 0 {
+			expiryTime := time.UnixMicro(int64(unixMicroSeconds))
+			expiry = &expiryTime
+		}
 	}
 
 	readBytes := 1 + nameLength + 8
@@ -700,19 +1097,25 @@ func DeserializeConsumerGroupAssignment(payload []byte) (*iggcon.ConsumerGroupAs
 		return nil, fmt.Errorf("group assignment: %d bytes is short of the header", len(payload))
 	}
 
-	count := binary.LittleEndian.Uint32(payload[8:12])
-	body := payload[assignmentHeaderLength:]
-	if uint64(len(body)) != uint64(count)*4 {
-		return nil, fmt.Errorf(
-			"group assignment: %d partitions do not fill %d body bytes", count, len(body))
-	}
-
-	partitions := make([]uint32, 0, count)
-	for offset := 0; offset < len(body); offset += 4 {
-		partitions = append(partitions, binary.LittleEndian.Uint32(body[offset:offset+4]))
+	partitions, err := partitionIds("group assignment",
+		binary.LittleEndian.Uint32(payload[8:12]), payload[assignmentHeaderLength:])
+	if err != nil {
+		return nil, err
 	}
 	return &iggcon.ConsumerGroupAssignment{
 		Generation: binary.LittleEndian.Uint64(payload[0:8]),
 		Partitions: partitions,
 	}, nil
+}
+
+// partitionIds decodes the count partition ids that fill body.
+func partitionIds(reply string, count uint32, body []byte) ([]uint32, error) {
+	if uint64(len(body)) != uint64(count)*4 {
+		return nil, fmt.Errorf("%s: %d partitions do not fill %d body bytes", reply, count, len(body))
+	}
+	partitions := make([]uint32, 0, count)
+	for offset := 0; offset < len(body); offset += 4 {
+		partitions = append(partitions, binary.LittleEndian.Uint32(body[offset:offset+4]))
+	}
+	return partitions, nil
 }

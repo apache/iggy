@@ -19,10 +19,14 @@
 
 package org.apache.iggy.client.blocking.http;
 
+import org.apache.iggy.cluster.ClusterNode;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.PolledMessages;
+import org.apache.iggy.partition.Partition;
+import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.system.CacheMetricsKey;
 import org.apache.iggy.system.Stats;
+import org.apache.iggy.topic.TopicDetails;
 import org.assertj.core.data.Offset;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -34,10 +38,28 @@ import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ObjectMapperTest {
 
     private final ObjectMapper objectMapper = ObjectMapperFactory.getInstance();
+
+    @Test
+    void shouldRequireAnExplicitReplicaIdInClusterJson() {
+        String node = """
+                {"name":"node","ip":"127.0.0.1","endpoints":{"tcp":8090,"quic":8080,"http":3000,"websocket":8092},
+                 "role":"leader","status":"healthy"%s}
+                """;
+        for (String missing : new String[] {"", ",\"replica_id\":null"}) {
+            assertThatThrownBy(() -> objectMapper.readValue(node.formatted(missing), ClusterNode.class))
+                    .isInstanceOf(tools.jackson.core.JacksonException.class)
+                    .hasMessageContaining("replica_id");
+        }
+        for (int replica : new int[] {0, 7, 255}) {
+            var decoded = objectMapper.readValue(node.formatted(",\"replica_id\":" + replica), ClusterNode.class);
+            assertThat(decoded.replicaId()).isEqualTo(replica);
+        }
+    }
 
     @Nested
     class Deserialization {
@@ -80,7 +102,9 @@ class ObjectMapperTest {
                           },
                           "threads_count": 13,
                           "free_disk_space": "150073704 KiB",
-                          "total_disk_space": "959392552 KiB"
+                          "total_disk_space": "959392552 KiB",
+                          "open_files_count": 1234,
+                          "open_files_limit": 1048576
                         }
                         """;
 
@@ -106,6 +130,8 @@ class ObjectMapperTest {
                 assertThat(stats.threadsCount()).isEqualTo(13L);
                 assertThat(stats.freeDiskSpace()).isEqualTo("150073704 KiB");
                 assertThat(stats.totalDiskSpace()).isEqualTo("959392552 KiB");
+                assertThat(stats.openFilesCount()).isEqualTo(BigInteger.valueOf(1234));
+                assertThat(stats.openFilesLimit()).isEqualTo(BigInteger.valueOf(1_048_576));
             }
 
             @Test
@@ -155,6 +181,51 @@ class ObjectMapperTest {
                 assertThat(stats.freeDiskSpace()).isEqualTo("250000000000");
                 assertThat(stats.totalDiskSpace()).isEqualTo("500000000000");
             }
+
+            @Test
+            void shouldReadOpenFilesFieldsAsZeroWhenServerOmitsThem() {
+                // given
+                String json = """
+                        {
+                          "process_id": 1234,
+                          "cpu_usage": 12.5,
+                          "total_cpu_usage": 50.0,
+                          "memory_usage": "1000000",
+                          "total_memory": "8000000",
+                          "available_memory": "7000000",
+                          "run_time": 3600,
+                          "start_time": 1000000,
+                          "read_bytes": "500",
+                          "written_bytes": "600",
+                          "messages_size_bytes": "1000",
+                          "streams_count": 5,
+                          "topics_count": 10,
+                          "partitions_count": 20,
+                          "segments_count": 100,
+                          "messages_count": 5000,
+                          "clients_count": 3,
+                          "consumer_groups_count": 2,
+                          "hostname": "localhost",
+                          "os_name": "Linux",
+                          "os_version": "5.4.0",
+                          "kernel_version": "5.4.0-1",
+                          "iggy_server_version": "0.6.1",
+                          "iggy_server_semver": 601000,
+                          "cache_metrics": {},
+                          "threads_count": 8,
+                          "free_disk_space": "250000000000",
+                          "total_disk_space": "500000000000"
+                        }
+                        """;
+
+                // when
+                var stats = objectMapper.readValue(json, Stats.class);
+
+                // then
+                assertThat(stats.totalDiskSpace()).isEqualTo("500000000000");
+                assertThat(stats.openFilesCount()).isEqualTo(BigInteger.ZERO);
+                assertThat(stats.openFilesLimit()).isEqualTo(BigInteger.ZERO);
+            }
         }
 
         @Nested
@@ -169,6 +240,11 @@ class ObjectMapperTest {
                           "partition_id": 1,
                           "current_offset": 10,
                           "count": 1,
+                          "context": {
+                            "incarnation": 17,
+                            "owner_generation": 9,
+                            "metadata_op": 52
+                          },
                           "messages": [
                             {
                               "header": {
@@ -205,6 +281,11 @@ class ObjectMapperTest {
                           "partition_id": 1,
                           "current_offset": 10,
                           "count": 1,
+                          "context": {
+                            "incarnation": 17,
+                            "owner_generation": 9,
+                            "metadata_op": 52
+                          },
                           "messages": [
                             {
                               "header": {
@@ -298,6 +379,11 @@ class ObjectMapperTest {
                           "partition_id": 1,
                           "current_offset": 0,
                           "count": 1,
+                          "context": {
+                            "incarnation": 17,
+                            "owner_generation": 9,
+                            "metadata_op": 52
+                          },
                           "messages": [
                             {
                               "header": {
@@ -318,10 +404,65 @@ class ObjectMapperTest {
                         """.formatted(base64Payload);
             }
         }
+
+        @Nested
+        @DisplayName("TopicDetails")
+        class TopicDetailsDeserialization {
+
+            @Test
+            void shouldReadPartitionMembersAndInSyncMembers() {
+                String json = """
+                        {"id": 2, "created_at": 0, "name": "topic", "size": "0 B", "messages_count": 0,
+                         "partitions_count": 1, "options": {},
+                         "partitions": [
+                           {"id": 1, "created_at": 0, "segments_count": 1, "current_offset": 0, "size": "0 B",
+                            "messages_count": 0,
+                            "context": {"incarnation": 23, "owner_generation": 0, "metadata_op": 101},
+                            "members": [0, 1, 2], "in_sync_members": [0]}
+                         ]}
+                        """;
+
+                var partition = objectMapper
+                        .readValue(json, TopicDetails.class)
+                        .partitions()
+                        .get(0);
+
+                assertThat(partition.members()).containsExactly(0, 1, 2);
+                assertThat(partition.inSyncMembers()).containsExactly(0);
+            }
+
+            @Test
+            void shouldReadAbsentNodeListsAsEmpty() {
+                String json = """
+                        {"id": 1, "created_at": 0, "segments_count": 1, "current_offset": 0, "size": "0 B",
+                         "messages_count": 0,
+                         "context": {"incarnation": 23, "owner_generation": 0, "metadata_op": 101}}
+                        """;
+
+                var partition = objectMapper.readValue(json, Partition.class);
+
+                assertThat(partition.members()).isEmpty();
+                assertThat(partition.inSyncMembers()).isEmpty();
+            }
+        }
     }
 
     @Nested
     class Serialization {
+
+        @Test
+        void shouldSerializeAPolledContextInTheShapeTheServerStores() {
+            // given
+            var context = new PartitionContext(BigInteger.valueOf(17), BigInteger.valueOf(9), BigInteger.valueOf(52));
+
+            // when
+            String json = objectMapper.writeValueAsString(context);
+
+            // then
+            assertThat(objectMapper.readTree(json)).isEqualTo(objectMapper.readTree("""
+                    {"incarnation": 17, "owner_generation": 9, "metadata_op": 52}
+                    """));
+        }
 
         @Nested
         @DisplayName("Payload")

@@ -17,56 +17,175 @@
 
 use super::COMPONENT;
 use super::cluster::ClusterConfig;
+use super::external_auth::ExternalAuthConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
+use super::node::NodeConfig;
 use super::partition::PartitionConfig;
 use super::quic::QuicConfig;
+use super::sharding::ShardingConfig;
 use super::tcp::TcpConfig;
 use super::websocket::WebSocketConfig;
 use crate::ConfigurationError;
 use crate::common::http::HttpConfig;
-use crate::common::system::SystemConfig;
-use configs::{ConfigEnv, ConfigEnvMappings, ConfigProvider, FileConfigProvider, TypedEnvProvider};
+use crate::common::system::{EncryptionConfig, LoggingConfig, RuntimeConfig};
+use configs::{
+    ConfigEnv, ConfigEnvMappings, ConfigProvider, FileConfigProvider, RelocatedKey,
+    RelocatedTarget, TypedEnvProvider,
+};
 use err_trail::ErrContext;
 use figment::providers::{Format, Toml};
 use figment::value::Dict;
 use figment::{Metadata, Profile, Provider};
 use iggy_common::Validatable;
 use serde::{Deserialize, Serialize};
-use server_common::sharding::{MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
+use server_common::bootstrap::SystemPaths;
 use std::env;
-use std::sync::Arc;
 
 pub use crate::common::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MemoryPoolConfig,
-    MessageSaverConfig, MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig,
-    PersonalAccessTokenConfig, TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
-    TelemetryTransport,
+    MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig,
+    TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig, TelemetryTransport,
 };
+
+/// Vars used by sibling binaries (iggy CLI) or test/CI-only. These suppress
+/// unknown-name warnings but are not advertised by the server.
+const SERVER_SCAN_ONLY_ENV_VARS: &[&str] = &[
+    "IGGY_TEST_VERBOSE",
+    "IGGY_TEST_CLUSTER_NODES",
+    "IGGY_TEST_CLEANUP_DISABLED",
+    "IGGY_CI_BUILD",
+    "IGGY_HOME",
+    "IGGY_USERNAME",
+    "IGGY_PASSWORD",
+    "IGGY_TOKEN",
+];
+
+/// Non-config env vars supported by the server and advertised to operators.
+const SERVER_RUNTIME_ENV_VARS: &[&str] = &[
+    "IGGY_CONFIG_PATH",
+    "IGGY_ENV_PATH",
+    crate::configs_impl::DISPLAY_CONFIG_ENV,
+    "IGGY_ROOT_USERNAME",
+    "IGGY_ROOT_PASSWORD",
+    "IGGY_SHARD_RUNTIME_CAPACITY",
+    "IGGY_SHARD_EVENT_INTERVAL",
+];
+
+/// Non-config vars advertised by `iggy-server --list-config-env-vars`.
+pub fn server_runtime_env_vars() -> impl Iterator<Item = &'static str> {
+    SERVER_RUNTIME_ENV_VARS.iter().copied()
+}
+
+/// All non-config vars accepted by the server's unknown-name scan.
+pub fn server_process_env_vars() -> impl Iterator<Item = &'static str> {
+    SERVER_RUNTIME_ENV_VARS
+        .iter()
+        .chain(SERVER_SCAN_ONLY_ENV_VARS)
+        .copied()
+}
+
+pub(crate) const SERVER_ALLOWED_ENV_PREFIXES: &[&str] =
+    &["IGGY_CONNECTORS_", "IGGY_KAFKA_", "IGGY_MCP_", "IGGY_TEST_"];
 
 const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
 
-/// [`SystemConfig`] bound to this crate's own
-/// [`super::sharding::ShardingConfig`]. `core/server` names this alias
-/// wherever it refers to the system config.
-pub type ServerSystemConfig = SystemConfig<super::sharding::ShardingConfig>;
+/// Server config keys that became per-topic options, or went away with the
+/// feature they configured.
+///
+/// The provider refuses to boot while any of them is still set, in the config
+/// file or in the environment. See [`RelocatedKey`] for why a warning is not
+/// enough. The partition knobs matter most: they are create-only options now,
+/// so a topic that boots without one can never be given it afterwards.
+const RELOCATED_CONFIG_KEYS: &[RelocatedKey] = &[
+    // Refuse obsolete layout overrides instead of silently reading another directory.
+    RelocatedKey {
+        path: "partition.path",
+        replacement: RelocatedTarget::Removed,
+    },
+    RelocatedKey {
+        path: "system.path",
+        replacement: RelocatedTarget::MovedTo("path"),
+    },
+    RelocatedKey {
+        path: "system.runtime",
+        replacement: RelocatedTarget::MovedTo("runtime"),
+    },
+    RelocatedKey {
+        path: "system.logging",
+        replacement: RelocatedTarget::MovedTo("logging"),
+    },
+    RelocatedKey {
+        path: "system.encryption",
+        replacement: RelocatedTarget::MovedTo("encryption"),
+    },
+    RelocatedKey {
+        path: "system.partition",
+        replacement: RelocatedTarget::MovedTo("partition"),
+    },
+    RelocatedKey {
+        path: "system.sharding",
+        replacement: RelocatedTarget::MovedTo("sharding"),
+    },
+    RelocatedKey {
+        path: "system.memory_pool",
+        replacement: RelocatedTarget::MovedTo("memory_pool"),
+    },
+    RelocatedKey {
+        path: "stream",
+        replacement: RelocatedTarget::Removed,
+    },
+    RelocatedKey {
+        path: "topic",
+        replacement: RelocatedTarget::Removed,
+    },
+    // Reject the removed table and every former environment mapping beneath it.
+    RelocatedKey {
+        path: "system",
+        replacement: RelocatedTarget::Removed,
+    },
+    RelocatedKey {
+        path: "partition.consumer_offset_enforce_fsync",
+        replacement: RelocatedTarget::TopicOption("consumer_offset_durability"),
+    },
+    // The whole table, not just its leaves. Caps are compile-time constants
+    // enforced at admission, so a per-node value could only diverge from them.
+    RelocatedKey {
+        path: "extra",
+        replacement: RelocatedTarget::Removed,
+    },
+    // Refusing the old key keeps an operator's timeout from changing without
+    // notice.
+    RelocatedKey {
+        path: "consumer_group.session_timeout",
+        replacement: RelocatedTarget::Superseded(
+            "the session timeout is now 1.2 x heartbeat.interval",
+        ),
+    },
+];
 
 /// Top-level on-disk config schema for the `iggy-server` binary.
 ///
-/// Composes the shared section types from [`crate::common`] with the
+/// Composes the shared section types from `crate::common` with the
 /// transport, cluster, metadata and [`MessageBusConfig`] sections owned
-/// by [`super`].
+/// by `super`.
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 #[config_env(prefix = "IGGY_", name = "iggy-server-config")]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub consumer_group: ConsumerGroupConfig,
     pub data_maintenance: DataMaintenanceConfig,
     #[serde(default)]
-    pub extra: ExtraConfig,
-    pub message_saver: MessageSaverConfig,
+    pub node: NodeConfig,
+    #[serde(default)]
     pub personal_access_token: PersonalAccessTokenConfig,
     pub heartbeat: HeartbeatConfig,
-    pub system: Arc<ServerSystemConfig>,
+    pub path: String,
+    pub runtime: RuntimeConfig,
+    pub logging: LoggingConfig,
+    pub encryption: EncryptionConfig,
+    pub memory_pool: MemoryPoolConfig,
+    pub sharding: ShardingConfig,
     pub quic: QuicConfig,
     pub tcp: TcpConfig,
     pub http: HttpConfig,
@@ -76,31 +195,62 @@ pub struct ServerConfig {
     pub metadata: MetadataConfig,
     pub partition: PartitionConfig,
     pub message_bus: MessageBusConfig,
+    #[serde(default)]
+    pub external_auth: ExternalAuthConfig,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Clone, ConfigEnv)]
-pub struct ExtraConfig {
-    pub namespace: NamespaceConfig,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
-pub struct NamespaceConfig {
-    pub max_streams: usize,
-    pub max_topics: usize,
-    pub max_partitions: usize,
-}
-
-impl Default for NamespaceConfig {
-    fn default() -> Self {
-        Self {
-            max_streams: MAX_STREAMS,
-            max_topics: MAX_TOPICS,
-            max_partitions: MAX_PARTITIONS,
-        }
-    }
+/// One client-facing listener, as the client-facing address derivation and
+/// boot validation see it: the config key naming its bind address, that
+/// address as written, and whether the listener is switched on.
+pub struct ClientListener<'a> {
+    pub key: &'static str,
+    pub address: &'a str,
+    pub enabled: bool,
 }
 
 impl ServerConfig {
+    /// The client-facing listeners, in the order the derived client-facing
+    /// address prefers them. TCP leads: it is the binary protocol every SDK
+    /// speaks, so it is the listener an address derived for clients should
+    /// describe whenever it is running.
+    #[must_use]
+    pub fn client_listeners(&self) -> [ClientListener<'_>; 4] {
+        [
+            ClientListener {
+                key: "tcp.address",
+                address: &self.tcp.address,
+                enabled: self.tcp.enabled,
+            },
+            ClientListener {
+                key: "websocket.address",
+                address: &self.websocket.address,
+                enabled: self.websocket.enabled,
+            },
+            ClientListener {
+                key: "quic.address",
+                address: &self.quic.address,
+                enabled: self.quic.enabled,
+            },
+            ClientListener {
+                key: "http.address",
+                address: &self.http.address,
+                enabled: self.http.enabled,
+            },
+        ]
+    }
+
+    /// The listener whose bind address cluster metadata derives this node's
+    /// client-facing address from when `node.advertised_address` is unset:
+    /// the first enabled one. `None` when every client-facing listener is
+    /// off, which leaves no address for a client to dial and nothing to
+    /// publish.
+    #[must_use]
+    pub fn derived_address_listener(&self) -> Option<ClientListener<'_>> {
+        self.client_listeners()
+            .into_iter()
+            .find(|listener| listener.enabled)
+    }
+
     /// Load server configuration from file and environment variables.
     ///
     /// The path comes from `IGGY_CONFIG_PATH` or defaults to
@@ -139,6 +289,14 @@ impl ServerConfig {
             true,
             Some(default_config),
         )
+        .with_relocated_keys(ServerConfig::ENV_PREFIX, RELOCATED_CONFIG_KEYS)
+        .with_known_env_names(
+            Self::all_env_var_names()
+                .into_iter()
+                .chain(server_process_env_vars())
+                .collect(),
+        )
+        .with_allowed_env_prefixes(SERVER_ALLOWED_ENV_PREFIXES)
     }
 
     /// All recognised env var names for [`ServerConfig`].
@@ -159,7 +317,10 @@ pub struct ServerConfigEnvProvider {
 impl Default for ServerConfigEnvProvider {
     fn default() -> Self {
         Self {
-            provider: TypedEnvProvider::from_config(ServerConfig::ENV_PREFIX),
+            // `ServerConfig::config_provider` checks every `IGGY_` name before
+            // this provider runs.
+            provider: TypedEnvProvider::from_config(ServerConfig::ENV_PREFIX)
+                .without_unknown_env_var_check(),
         }
     }
 }
@@ -175,6 +336,86 @@ impl Provider for ServerConfigEnvProvider {
                 "Cannot deserialize environment variables for server config: {e}"
             ))
         })
+    }
+}
+
+impl ServerConfig {
+    pub fn get_system_path(&self) -> String {
+        self.path.to_string()
+    }
+
+    pub fn get_state_path(&self) -> String {
+        format!("{}/state", self.get_system_path())
+    }
+
+    pub fn get_state_messages_file_path(&self) -> String {
+        format!("{}/log", self.get_state_path())
+    }
+
+    pub fn get_state_info_path(&self) -> String {
+        format!("{}/info", self.get_state_path())
+    }
+    pub fn get_state_tokens_path(&self) -> String {
+        format!("{}/tokens", self.get_state_path())
+    }
+
+    pub fn get_runtime_path(&self) -> String {
+        format!("{}/{}", self.get_system_path(), self.runtime.path)
+    }
+
+    pub fn get_streams_path(&self) -> String {
+        format!("{}/streams", self.get_system_path())
+    }
+
+    pub fn get_stream_path(&self, stream_id: usize) -> String {
+        format!("{}/{}", self.get_streams_path(), stream_id)
+    }
+
+    pub fn get_topics_path(&self, stream_id: usize) -> String {
+        format!("{}/topics", self.get_stream_path(stream_id))
+    }
+
+    pub fn get_topic_path(&self, stream_id: usize, topic_id: usize) -> String {
+        format!("{}/{}", self.get_topics_path(stream_id), topic_id)
+    }
+
+    pub fn get_partitions_path(&self, stream_id: usize, topic_id: usize) -> String {
+        format!("{}/partitions", self.get_topic_path(stream_id, topic_id))
+    }
+
+    pub fn get_partition_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/{}",
+            self.get_partitions_path(stream_id, topic_id),
+            partition_id
+        )
+    }
+}
+
+impl SystemPaths for ServerConfig {
+    fn get_system_path(&self) -> String {
+        ServerConfig::get_system_path(self)
+    }
+
+    fn get_state_path(&self) -> String {
+        ServerConfig::get_state_path(self)
+    }
+
+    fn get_state_messages_file_path(&self) -> String {
+        ServerConfig::get_state_messages_file_path(self)
+    }
+
+    fn get_streams_path(&self) -> String {
+        ServerConfig::get_streams_path(self)
+    }
+
+    fn get_runtime_path(&self) -> String {
+        ServerConfig::get_runtime_path(self)
     }
 }
 
@@ -198,7 +439,47 @@ mod tests {
 
         // Spot-check: defaults match the runtime crate's invariants.
         assert_eq!(cfg.message_bus.max_batch, 256);
-        assert_eq!(cfg.message_bus.peer_queue_capacity, 256);
+        assert_eq!(cfg.message_bus.peer_queue_capacity, 4096);
+        assert_eq!(cfg.message_bus.connections_max, None);
+        assert_eq!(ServerConfig::default().message_bus.connections_max, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_zero_connections_max_env_var_when_loading_should_disable_the_cap() {
+        const NAME: &str = "IGGY_MESSAGE_BUS_CONNECTIONS_MAX";
+        assert!(ServerConfig::all_env_var_names().contains(&NAME));
+        // SAFETY: `serial_test::serial` keeps other tests off the environment.
+        unsafe { env::set_var(NAME, "0") };
+
+        let cfg: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract();
+
+        // SAFETY: paired with the set above.
+        unsafe { env::remove_var(NAME) };
+        let cfg = cfg.expect("config with the env override deserializes");
+        assert_eq!(cfg.message_bus.connections_max, Some(0));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_change_log_capacity_env_var_when_loading_should_override_the_default() {
+        const NAME: &str = "IGGY_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY";
+        assert!(ServerConfig::all_env_var_names().contains(&NAME));
+        // SAFETY: `serial_test::serial` keeps other tests off the environment.
+        unsafe { env::set_var(NAME, "4096") };
+
+        let cfg: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract();
+
+        // SAFETY: paired with the set above.
+        unsafe { env::remove_var(NAME) };
+        let cfg = cfg.expect("config with the env override deserializes");
+        assert_eq!(cfg.metadata.change_log_activity_capacity, 4096);
     }
 
     #[test]
@@ -213,11 +494,77 @@ mod tests {
     }
 
     #[test]
+    fn data_root_uses_fixed_stream_topic_and_partition_directories() {
+        let config = ServerConfig {
+            path: "/var/lib/iggy".to_owned(),
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            config.get_partition_path(1, 2, 3),
+            "/var/lib/iggy/streams/1/topics/2/partitions/3"
+        );
+        assert!(!ServerConfig::all_env_var_names().contains(&"IGGY_PARTITION_PATH"));
+    }
+
+    #[test]
     fn all_env_var_names_include_message_bus_section() {
         let names = ServerConfig::all_env_var_names();
         assert!(
             names.iter().any(|n| n.starts_with("IGGY_MESSAGE_BUS_")),
             "expected at least one IGGY_MESSAGE_BUS_* env var, got: {names:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_provider_accepts_server_process_env_vars() {
+        for name in server_process_env_vars() {
+            // SAFETY: the race is process-wide, not per key: `set_var` is unsound
+            // against any concurrent environment access. `serial_test::serial` on
+            // this test is what prevents that.
+            unsafe { env::set_var(name, "1") };
+        }
+
+        let data = ServerConfigEnvProvider::default().data();
+
+        for name in server_process_env_vars() {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
+        }
+
+        // The provider holds no scan of its own, so the typed provider's
+        // debug_assert! stays quiet. A panic above is one failure this test
+        // guards, and one of these names reaching the map is the other.
+        let data = data.expect("the server env provider must accept every process variable");
+        let profile = data.get(&Profile::default()).expect("no default profile");
+        assert!(
+            profile.is_empty(),
+            "none of these variables is a config value, so none of them may reach the map: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn server_process_env_vars_include_every_scan_only_name() {
+        let process_names = server_process_env_vars().collect::<std::collections::HashSet<_>>();
+        for name in [
+            "IGGY_TEST_VERBOSE",
+            "IGGY_TEST_CLUSTER_NODES",
+            "IGGY_TEST_CLEANUP_DISABLED",
+            "IGGY_CI_BUILD",
+            "IGGY_HOME",
+            "IGGY_USERNAME",
+            "IGGY_PASSWORD",
+        ] {
+            assert!(
+                process_names.contains(name),
+                "missing scan-only name {name}"
+            );
+        }
+        assert!(
+            SERVER_RUNTIME_ENV_VARS
+                .iter()
+                .all(|name| !SERVER_SCAN_ONLY_ENV_VARS.contains(name)),
+            "advertised and scan-only env vars must stay disjoint"
         );
     }
 }

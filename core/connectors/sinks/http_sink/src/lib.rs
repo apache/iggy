@@ -22,7 +22,7 @@ use bytes::Bytes;
 use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
-    convert::owned_value_to_serde_json, sink_connector,
+    convert::owned_value_into_serde_json, sink_connector,
 };
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{
@@ -150,7 +150,7 @@ struct EncodedHeader {
     iggy_header_encoding: &'static str,
 }
 
-/// Configuration for the HTTP sink connector, deserialized from [plugin_config] in config.toml.
+/// Configuration for the HTTP sink connector, deserialized from `[plugin_config]` in config.toml.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HttpSinkConfig {
     /// Target URL for HTTP requests (required).
@@ -372,29 +372,19 @@ impl HttpSink {
     }
 
     /// Convert a `Payload` to a JSON value for metadata wrapping.
-    /// Non-JSON payloads are base64-encoded with a `iggy_payload_encoding` marker.
+    /// Text payloads, and proto text that is not JSON, are sent as strings; binary
+    /// payloads are base64-encoded with a `iggy_payload_encoding` marker.
     ///
     /// Note: All current `Payload` variants produce infallible conversions.
     /// The `Result` return type exists as a safety net for future variants.
     fn payload_to_json(&self, payload: Payload) -> Result<serde_json::Value, Error> {
+        let payload = payload.into_json_document();
         match payload {
-            Payload::Json(value) => {
-                // Direct structural conversion (not serialization roundtrip).
-                // Follows the Elasticsearch sink pattern. NaN/Infinity f64 → null.
-                Ok(owned_value_to_serde_json(&value))
-            }
-            Payload::Text(text) => Ok(serde_json::Value::String(text)),
+            Payload::Json(value) => Ok(owned_value_into_serde_json(value)),
+            Payload::Text(text) | Payload::Proto(text) => Ok(serde_json::Value::String(text)),
             Payload::Raw(bytes) | Payload::FlatBuffer(bytes) => {
                 let encoded = EncodedPayload {
                     data: general_purpose::STANDARD.encode(&bytes),
-                    iggy_payload_encoding: ENCODING_BASE64,
-                };
-                serde_json::to_value(encoded)
-                    .map_err(|e| Error::Serialization(format!("EncodedPayload: {}", e)))
-            }
-            Payload::Proto(proto_str) => {
-                let encoded = EncodedPayload {
-                    data: general_purpose::STANDARD.encode(proto_str.as_bytes()),
                     iggy_payload_encoding: ENCODING_BASE64,
                 };
                 serde_json::to_value(encoded)
@@ -1194,8 +1184,10 @@ impl Sink for HttpSink {
     ///
     /// **Runtime note**: The FFI boundary in `sdk/src/sink.rs` maps `consume()`'s `Result` to
     /// `i32` (0=ok, 1=err), but the runtime's `process_messages()` in `runtime/src/sink.rs`
-    /// discards that return code. All retry logic lives inside this method — returning `Err`
-    /// does not trigger a runtime-level retry.
+    /// logs and counts a nonzero code, records no processed messages for the run that
+    /// returned it, and continues polling. A batch that mixes payload variants is split
+    /// into one `consume()` call per run, so the other runs of that poll still count as
+    /// processed. Returning `Err` does not trigger a runtime retry.
     async fn consume(
         &self,
         topic_metadata: &TopicMetadata,
@@ -1235,10 +1227,7 @@ impl Sink for HttpSink {
         };
 
         if let Err(ref e) = result {
-            error!(
-                "HTTP sink ID: {} — consume() returning error (runtime ignores FFI status code): {}",
-                self.id, e
-            );
+            error!("HTTP sink ID: {} - consume() failed: {}", self.id, e);
         }
 
         result
@@ -1555,16 +1544,21 @@ mod tests {
     }
 
     #[test]
-    fn given_proto_payload_should_base64_encode_string_bytes() {
+    fn given_proto_payload_holding_json_should_send_the_document() {
+        let sink = given_sink_with_defaults();
+        let result = sink
+            .payload_to_json(Payload::Proto(r#"{"id":1,"name":"row-1"}"#.to_string()))
+            .unwrap();
+        assert_eq!(result, serde_json::json!({"id": 1, "name": "row-1"}));
+    }
+
+    #[test]
+    fn given_proto_text_that_is_not_json_should_send_it_as_a_string() {
         let sink = given_sink_with_defaults();
         let result = sink
             .payload_to_json(Payload::Proto("proto_data".to_string()))
             .unwrap();
-        assert_eq!(result[FIELD_PAYLOAD_ENCODING], "base64");
-        assert_eq!(
-            result[FIELD_DATA],
-            general_purpose::STANDARD.encode(b"proto_data")
-        );
+        assert_eq!(result, serde_json::Value::String("proto_data".to_string()));
     }
 
     #[test]
@@ -1706,56 +1700,6 @@ mod tests {
             envelope[FIELD_METADATA].get(FIELD_HEADERS).is_none(),
             "Expected no iggy_headers when message has no headers"
         );
-    }
-
-    #[test]
-    fn given_null_value_should_convert_to_null() {
-        let v = simd_json::OwnedValue::Static(simd_json::StaticNode::Null);
-        assert_eq!(owned_value_to_serde_json(&v), serde_json::Value::Null);
-    }
-
-    #[test]
-    fn given_bool_value_should_convert_correctly() {
-        let v = simd_json::OwnedValue::Static(simd_json::StaticNode::Bool(true));
-        assert_eq!(owned_value_to_serde_json(&v), serde_json::Value::Bool(true));
-    }
-
-    #[test]
-    fn given_integer_values_should_convert_correctly() {
-        let i64_val = simd_json::OwnedValue::Static(simd_json::StaticNode::I64(-42));
-        assert_eq!(owned_value_to_serde_json(&i64_val), serde_json::json!(-42));
-
-        let u64_val = simd_json::OwnedValue::Static(simd_json::StaticNode::U64(42));
-        assert_eq!(owned_value_to_serde_json(&u64_val), serde_json::json!(42));
-    }
-
-    #[test]
-    fn given_f64_value_should_convert_correctly() {
-        let v = simd_json::OwnedValue::Static(simd_json::StaticNode::F64(3.54));
-        let result = owned_value_to_serde_json(&v);
-        assert_eq!(result.as_f64().unwrap(), 3.54);
-    }
-
-    #[test]
-    fn given_nan_f64_should_convert_to_null() {
-        let v = simd_json::OwnedValue::Static(simd_json::StaticNode::F64(f64::NAN));
-        assert_eq!(owned_value_to_serde_json(&v), serde_json::Value::Null);
-    }
-
-    #[test]
-    fn given_infinity_f64_should_convert_to_null() {
-        let v = simd_json::OwnedValue::Static(simd_json::StaticNode::F64(f64::INFINITY));
-        assert_eq!(owned_value_to_serde_json(&v), serde_json::Value::Null);
-    }
-
-    #[test]
-    fn given_nested_object_should_convert_recursively() {
-        let v = simd_json_from_str(r#"{"nested":{"key":"val"},"arr":[1,2]}"#);
-
-        let result = owned_value_to_serde_json(&v);
-        assert_eq!(result["nested"]["key"], "val");
-        assert_eq!(result["arr"][0], 1);
-        assert_eq!(result["arr"][1], 2);
     }
 
     #[test]

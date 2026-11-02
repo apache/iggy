@@ -21,8 +21,8 @@ use crate::configs::connectors::{ConfigFormat, ConnectorsConfigProvider, SourceC
 use crate::context::RuntimeContext;
 use crate::error::RuntimeError;
 use crate::metrics::Metrics;
+use crate::plugin_instance::PluginInstanceGuard;
 use crate::source;
-use crate::state::{StateProvider, StateStorage};
 use dashmap::DashMap;
 use dlopen2::wrapper::Container;
 use iggy::prelude::IggyClient;
@@ -35,6 +35,13 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReport {
+    Ignored,
+    AlreadyError,
+    NewError,
+}
 
 #[derive(Debug)]
 pub struct SourceManager {
@@ -83,30 +90,59 @@ impl SourceManager {
         metrics: Option<&Arc<Metrics>>,
     ) {
         if let Some(source) = self.sources.get(key) {
+            source.lock().await.apply_status(status, metrics);
+        }
+    }
+
+    pub async fn set_error(&self, key: &str, error_message: &str, metrics: Option<&Arc<Metrics>>) {
+        if let Some(source) = self.sources.get(key) {
+            source.lock().await.record_error(error_message, metrics);
+        }
+    }
+
+    pub async fn report_unexpected_stop(
+        &self,
+        key: &str,
+        error_message: &str,
+        metrics: &Arc<Metrics>,
+    ) -> StopReport {
+        let Some(source) = self.sources.get(key).map(|entry| entry.value().clone()) else {
+            return StopReport::Ignored;
+        };
+        let mut source = source.lock().await;
+        if matches!(
+            source.info.status,
+            ConnectorStatus::Stopping | ConnectorStatus::Stopped
+        ) {
+            return StopReport::Ignored;
+        }
+        let already_error = source.info.status == ConnectorStatus::Error;
+        source.record_error(error_message, Some(metrics));
+        if already_error {
+            StopReport::AlreadyError
+        } else {
+            StopReport::NewError
+        }
+    }
+
+    pub async fn recover_from_error(&self, key: &str, metrics: Option<&Arc<Metrics>>) {
+        if let Some(source) = self.sources.get(key) {
             let mut source = source.lock().await;
-            let old_status = source.info.status;
-            source.info.status = status;
-            if matches!(status, ConnectorStatus::Running | ConnectorStatus::Stopped) {
-                source.info.last_error = None;
-            }
-            if let Some(metrics) = metrics {
-                if old_status != ConnectorStatus::Running && status == ConnectorStatus::Running {
-                    metrics.increment_sources_running();
-                } else if old_status == ConnectorStatus::Running
-                    && status != ConnectorStatus::Running
-                {
-                    metrics.decrement_sources_running();
-                }
+            if source.info.status == ConnectorStatus::Error {
+                source.apply_status(ConnectorStatus::Running, metrics);
             }
         }
     }
 
-    pub async fn set_error(&self, key: &str, error_message: &str) {
-        if let Some(source) = self.sources.get(key) {
-            let mut source = source.lock().await;
-            source.info.status = ConnectorStatus::Error;
-            source.info.last_error = Some(ConnectorError::new(error_message));
-        }
+    pub async fn is_stopping_or_stopped(&self, key: &str) -> bool {
+        let Some(source) = self.sources.get(key).map(|entry| entry.value().clone()) else {
+            return true;
+        };
+        let source = source.lock().await;
+        matches!(
+            source.info.status,
+            ConnectorStatus::Stopping | ConnectorStatus::Stopped
+        )
     }
 
     pub async fn stop_connector_with_guard(
@@ -138,6 +174,9 @@ impl SourceManager {
             .map(|e| e.value().clone())
             .ok_or_else(|| RuntimeError::SourceNotFound(key.to_string()))?;
 
+        self.update_status(key, ConnectorStatus::Stopping, Some(metrics))
+            .await;
+
         let (task_handles, plugin_id, container) = {
             let mut details = details.lock().await;
             (
@@ -147,8 +186,8 @@ impl SourceManager {
             )
         };
 
-        // Order: close FFI (stops callbacks) -> drop sender (unblocks
-        // recv_async) -> await tasks. Reversing risks an abort mid-save.
+        // The result callback can race with close, so the forwarding loop
+        // treats callback failures during Stopping as expected shutdown.
         if let Some(container) = &container {
             info!("Closing source connector with ID: {plugin_id} for plugin: {key}");
             (container.iggy_source_close)(plugin_id);
@@ -172,12 +211,8 @@ impl SourceManager {
 
         {
             let mut details = details.lock().await;
-            let old_status = details.info.status;
             details.info.status = ConnectorStatus::Stopped;
             details.info.last_error = None;
-            if old_status == ConnectorStatus::Running {
-                metrics.decrement_sources_running();
-            }
         }
 
         Ok(())
@@ -189,7 +224,6 @@ impl SourceManager {
         config: &SourceConfig,
         iggy_client: &IggyClient,
         metrics: &Arc<Metrics>,
-        state_path: &str,
         context: &Arc<RuntimeContext>,
     ) -> Result<(), RuntimeError> {
         let details = self
@@ -207,45 +241,88 @@ impl SourceManager {
 
         let plugin_id = PLUGIN_ID.fetch_add(1, Ordering::SeqCst);
 
-        let state_storage = source::get_state_storage(state_path, key);
-        let state = match &state_storage {
-            StateStorage::File(file) => file.load().await?,
-        };
+        let state_storage = context.state_factory.storage_for(key)?;
+        let state = state_storage
+            .load()
+            .await
+            .map_err(|load_error| match load_error {
+                iggy_connector_sdk::Error::TransientState(_)
+                | iggy_connector_sdk::Error::PermanentState(_)
+                | iggy_connector_sdk::Error::StateLatched => RuntimeError::StateLoadFailed {
+                    connector_key: key.to_string(),
+                    source: load_error,
+                },
+                other => RuntimeError::ConnectorSdkError(other),
+            })?;
+        // An exactly-once source keeps its producer around the plugin's bytes.
+        let stored = crate::exactly_once::StoredState::split(state)
+            .map_err(RuntimeError::ConnectorSdkError)?;
 
         source::init_source(
             &container,
             &config.plugin_config.clone().unwrap_or_default(),
             plugin_id,
-            state,
+            stored.plugin_state(),
         )?;
         info!("Source connector with ID: {plugin_id} for plugin: {key} initialized successfully.");
+        // Armed from here until the id is recorded below. `PluginInstanceGuard`
+        // carries why that window strands the instance.
+        let instance_guard = PluginInstanceGuard::for_source(container.clone(), plugin_id, key);
 
-        let (producer, encoder, transforms) =
-            source::setup_source_producer(key, config, iggy_client).await?;
+        let (producer, transforms) =
+            match source::setup_source_producer(key, config, iggy_client, stored).await {
+                Ok(parts) => parts,
+                Err(error) => {
+                    // Awaited rather than left to `drop`, so this error reaches
+                    // the caller after teardown. `drop` stays the net for a
+                    // cancellation and for a `?` added here later.
+                    instance_guard.close().await;
+                    return Err(error);
+                }
+            };
 
-        let callback = container.iggy_source_handle;
-        let handler_tasks = source::spawn_source_handler(
-            plugin_id,
-            key,
-            config.verbose,
-            config.benchmark,
-            producer,
-            encoder,
-            transforms,
-            state_storage,
-            callback,
-            context.clone(),
-        );
+        let handle_callback = container.iggy_source_handle_v2;
+        let register_stop_callback = container.iggy_source_register_stop_callback;
+        let batch_result_callback = container.iggy_source_batch_result;
 
+        // The lock is taken before the spawn so nothing can await between
+        // registering the tasks and recording the id that reaches them. A
+        // cancellation in that gap left the `SOURCE_SENDERS` entry and both
+        // spawned tasks behind with no id naming them, and the forwarding loop
+        // then ran for the life of the process. The guard closes the plugin
+        // instance on that path but cannot reach either of those.
+        //
+        // The forwarding loop's own first act is to take this lock, so it waits
+        // for this block to end rather than racing it.
         {
             let mut details = details.lock().await;
+            // Nothing between these three statements may await. The spawn used
+            // to be passed in as a closure so the compiler refused one; inlined
+            // here that is a rule rather than a check, so keep it: an await
+            // between the spawn and the id strands the `SOURCE_SENDERS` entry
+            // and both tasks with nothing naming them.
+            details.handler_tasks = source::spawn_source_handler(
+                plugin_id,
+                key,
+                config.verbose,
+                config.benchmark,
+                producer,
+                transforms,
+                state_storage,
+                handle_callback,
+                register_stop_callback,
+                batch_result_callback,
+                context.clone(),
+            );
             details.info.id = plugin_id;
-            details.info.status = ConnectorStatus::Running;
-            details.info.last_error = None;
             details.config = config.clone();
-            details.handler_tasks = handler_tasks;
-            metrics.increment_sources_running();
+            // In the same hold as the id record, not after it. Released first,
+            // this transition raced the forwarding loop's own report and could
+            // overwrite an `Error` the loop had already set.
+            details.apply_status(ConnectorStatus::Running, Some(metrics));
         }
+        // `details.info.id` now names this instance, so a later stop reaches it.
+        instance_guard.disarm();
 
         Ok(())
     }
@@ -256,7 +333,6 @@ impl SourceManager {
         config_provider: &dyn ConnectorsConfigProvider,
         iggy_client: &IggyClient,
         metrics: &Arc<Metrics>,
-        state_path: &str,
         context: &Arc<RuntimeContext>,
     ) -> Result<(), RuntimeError> {
         let guard = {
@@ -282,7 +358,7 @@ impl SourceManager {
             .map_err(|e| RuntimeError::InvalidConfiguration(e.to_string()))?
             .ok_or_else(|| RuntimeError::SourceNotFound(key.to_string()))?;
 
-        self.start_connector(key, &config, iggy_client, metrics, state_path, context)
+        self.start_connector(key, &config, iggy_client, metrics, context)
             .await?;
         info!("Source connector: {key} restarted successfully.");
         Ok(())
@@ -308,6 +384,43 @@ pub struct SourceDetails {
     pub handler_tasks: Vec<JoinHandle<()>>,
     pub container: Option<Arc<Container<SourceApi>>>,
     pub restart_guard: Arc<Mutex<()>>,
+}
+
+impl SourceDetails {
+    fn record_error(&mut self, message: &str, metrics: Option<&Arc<Metrics>>) {
+        // Update the gauge before storing the error; `apply_status` clears old
+        // error text only when entering Running or Stopped.
+        self.apply_status(ConnectorStatus::Error, metrics);
+        self.info.last_error = Some(ConnectorError::new(message));
+    }
+
+    /// Applies a status transition and the gauge move that belongs with it.
+    ///
+    /// On `&mut self` rather than behind a key, so it can run inside a lock the
+    /// caller already holds. `update_status` takes the lock and delegates;
+    /// `start_connector` calls it in the same hold as the id record.
+    ///
+    /// That matters: applied after releasing that lock, the initial `Running`
+    /// could land after the forwarding loop had already reported `Running` and
+    /// then failed its first batch, overwriting `Error`, clearing `last_error`,
+    /// and counting the instance a second time.
+    fn apply_status(&mut self, status: ConnectorStatus, metrics: Option<&Arc<Metrics>>) {
+        let old_status = self.info.status;
+        self.info.status = status;
+        if matches!(status, ConnectorStatus::Running | ConnectorStatus::Stopped) {
+            self.info.last_error = None;
+        }
+        let Some(metrics) = metrics else {
+            return;
+        };
+        // Only a real crossing of `Running` moves the gauge, so repeated
+        // reports of a status the connector already holds cost nothing.
+        if old_status != ConnectorStatus::Running && status == ConnectorStatus::Running {
+            metrics.increment_sources_running();
+        } else if old_status == ConnectorStatus::Running && status != ConnectorStatus::Running {
+            metrics.decrement_sources_running();
+        }
+    }
 }
 
 impl fmt::Debug for SourceDetails {
@@ -446,6 +559,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_poll_task_exits_when_running_should_report_error_and_decrement_gauge() {
+        let metrics = Arc::new(Metrics::init());
+        let mut details = create_test_source_details("pg", 1);
+        details.info.status = ConnectorStatus::Stopped;
+        let manager = SourceManager::new(vec![details]);
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+
+        assert_eq!(
+            manager
+                .report_unexpected_stop("pg", "polling stopped", &metrics)
+                .await,
+            StopReport::NewError
+        );
+        let source = manager.get("pg").await.expect("source exists");
+        let source = source.lock().await;
+        assert_eq!(source.info.status, ConnectorStatus::Error);
+        assert_eq!(metrics.get_sources_running(), 0);
+        assert!(source.info.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn given_batch_error_before_stop_should_not_count_a_second_error() {
+        let metrics = Arc::new(Metrics::init());
+        let mut details = create_test_source_details("pg", 1);
+        details.info.status = ConnectorStatus::Stopped;
+        let manager = SourceManager::new(vec![details]);
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+        manager
+            .set_error("pg", "batch rejected", Some(&metrics))
+            .await;
+
+        assert_eq!(
+            manager
+                .report_unexpected_stop("pg", "NACK limit reached", &metrics)
+                .await,
+            StopReport::AlreadyError
+        );
+        assert_eq!(metrics.get_sources_running(), 0);
+        let source = manager.get("pg").await.expect("source exists");
+        let source = source.lock().await;
+        assert_eq!(source.info.status, ConnectorStatus::Error);
+        assert!(source.info.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn given_user_shutdown_when_poll_task_exits_should_not_report_error() {
+        let metrics = Arc::new(Metrics::init());
+        let mut details = create_test_source_details("pg", 1);
+        details.info.status = ConnectorStatus::Stopped;
+        let manager = SourceManager::new(vec![details]);
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+        manager
+            .update_status("pg", ConnectorStatus::Stopping, Some(&metrics))
+            .await;
+
+        assert_eq!(
+            manager
+                .report_unexpected_stop("pg", "polling stopped", &metrics)
+                .await,
+            StopReport::Ignored
+        );
+        let source = manager.get("pg").await.expect("source exists");
+        let source = source.lock().await;
+        assert_eq!(source.info.status, ConnectorStatus::Stopping);
+        assert!(source.info.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_not_double_count_when_an_error_falls_between_two_running_reports() {
+        // The interleaving that double counts: the forwarding loop reports
+        // `Running`, fails its first batch, and a second `Running` report lands
+        // afterwards. That second report crosses into `Running` again, so it
+        // increments a gauge the error never gave back, and the instance is
+        // counted twice.
+        //
+        // What the consecutive-`Running` test cannot see: there the second
+        // report finds the status already `Running`, so no crossing happens and
+        // no arithmetic is exercised. The error in the middle is the whole point.
+        let metrics = Arc::new(Metrics::init());
+        let mut details = create_test_source_details("pg", 1);
+        details.info.status = ConnectorStatus::Stopped;
+        let manager = SourceManager::new(vec![details]);
+
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+        manager
+            .set_error("pg", "first batch failed", Some(&metrics))
+            .await;
+        assert_eq!(
+            metrics.get_sources_running(),
+            0,
+            "an instance that has failed is not running, and the gauge has to say so \
+             or nothing later can correct it"
+        );
+
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+
+        assert_eq!(
+            metrics.get_sources_running(),
+            1,
+            "one instance, however many times its status crossed Running"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_keep_the_error_message_when_the_status_becomes_error() {
+        // `set_error` routes through a transition that clears `last_error` for
+        // some statuses, so its observable contract is worth pinning: the
+        // status ends `Error` and the message survives.
+        //
+        // Worth knowing what this does NOT pin. The message is assigned after
+        // the transition, so widening the clear to include `Error` leaves this
+        // green; checked, and the mutant survives. The ordering is the
+        // mechanism, and no unit test can see an ordering inside one lock hold.
+        let metrics = Arc::new(Metrics::init());
+        let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
+
+        manager
+            .set_error("pg", "producer setup failed", Some(&metrics))
+            .await;
+
+        let source = manager.get("pg").await.expect("source must exist");
+        let source = source.lock().await;
+        assert_eq!(source.info.status, ConnectorStatus::Error);
+        assert_eq!(
+            source
+                .info
+                .last_error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("producer setup failed"),
+            "the transition must not clear the message set right after it"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_increment_metrics_once_when_running_is_reported_twice() {
+        // Both a start and the forwarding loop report `Running` for the same
+        // instance, so the gauge has to count instances rather than reports.
+        let metrics = Arc::new(Metrics::init());
+        let mut details = create_test_source_details("pg", 1);
+        details.info.status = ConnectorStatus::Stopped;
+        let manager = SourceManager::new(vec![details]);
+
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+
+        assert_eq!(
+            metrics.get_sources_running(),
+            1,
+            "a second report of a status the connector already has must not move the gauge"
+        );
+    }
+
+    #[tokio::test]
     async fn should_decrement_metrics_when_leaving_running() {
         let metrics = Arc::new(Metrics::init());
         let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
@@ -461,7 +742,7 @@ mod tests {
     #[tokio::test]
     async fn should_clear_error_when_status_becomes_running() {
         let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
-        manager.set_error("pg", "some error").await;
+        manager.set_error("pg", "some error", None).await;
 
         manager
             .update_status("pg", ConnectorStatus::Running, None)
@@ -476,12 +757,38 @@ mod tests {
     async fn should_set_error_status_and_message() {
         let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
 
-        manager.set_error("pg", "connection failed").await;
+        manager.set_error("pg", "connection failed", None).await;
 
         let source = manager.get("pg").await.unwrap();
         let details = source.lock().await;
         assert_eq!(details.info.status, ConnectorStatus::Error);
         assert!(details.info.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn recover_from_error_should_not_overwrite_stopping_status() {
+        let mut details = create_test_source_details("pg", 1);
+        details.info.status = ConnectorStatus::Stopping;
+        let manager = SourceManager::new(vec![details]);
+
+        manager.recover_from_error("pg", None).await;
+
+        let source = manager.get("pg").await.unwrap();
+        let details = source.lock().await;
+        assert_eq!(details.info.status, ConnectorStatus::Stopping);
+    }
+
+    #[tokio::test]
+    async fn recover_from_error_should_restore_running_status_and_clear_error() {
+        let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
+        manager.set_error("pg", "connection failed", None).await;
+
+        manager.recover_from_error("pg", None).await;
+
+        let source = manager.get("pg").await.unwrap();
+        let details = source.lock().await;
+        assert_eq!(details.info.status, ConnectorStatus::Running);
+        assert!(details.info.last_error.is_none());
     }
 
     #[tokio::test]
@@ -539,7 +846,7 @@ mod tests {
     #[tokio::test]
     async fn should_clear_error_when_status_becomes_stopped() {
         let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
-        manager.set_error("pg", "some error").await;
+        manager.set_error("pg", "some error", None).await;
 
         manager
             .update_status("pg", ConnectorStatus::Stopped, None)
@@ -591,6 +898,46 @@ mod tests {
     async fn set_error_should_be_noop_for_unknown_key() {
         let manager = SourceManager::new(vec![]);
 
-        manager.set_error("nonexistent", "some error").await;
+        manager.set_error("nonexistent", "some error", None).await;
+    }
+
+    #[tokio::test]
+    async fn given_running_connector_when_error_repeats_should_decrement_once() {
+        const FAILED_KEY: &str = "failed";
+        let metrics = Arc::new(Metrics::init());
+        let manager = SourceManager::new(vec![
+            create_test_source_details(FAILED_KEY, 1),
+            create_test_source_details("healthy", 2),
+        ]);
+        metrics.increment_sources_running();
+        metrics.increment_sources_running();
+
+        manager
+            .set_error(FAILED_KEY, "first error", Some(&metrics))
+            .await;
+        assert_eq!(
+            metrics.get_sources_running(),
+            1,
+            "the healthy connector remains running"
+        );
+
+        manager
+            .set_error(FAILED_KEY, "repeated error", Some(&metrics))
+            .await;
+        assert_eq!(
+            metrics.get_sources_running(),
+            1,
+            "repeated errors must not decrement twice"
+        );
+
+        manager
+            .stop_connector(FAILED_KEY, &metrics)
+            .await
+            .expect("failed connector should stop");
+        assert_eq!(
+            metrics.get_sources_running(),
+            1,
+            "stopping an errored connector must not decrement again"
+        );
     }
 }

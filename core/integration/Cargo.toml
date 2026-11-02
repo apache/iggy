@@ -28,17 +28,19 @@ publish = false
 [package.metadata.cargo-machete]
 ignored = ["cfg_aliases", "rust-s3"]
 
-# Some tests are failing in CI due to lack of IPv6 interfaces
-# inside the docker containers. This is a temporary workaround (hopefully).
 [features]
-ci-qemu = []
 default = ["login-session"]
 login-session = ["dep:zbus-secret-service-keyring-store"]
 
 [dependencies]
+apache-avro = { workspace = true }
+arrow = { workspace = true }
 assert_cmd = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+# Derives the HTTP relay proof key the way a cluster node does, so a test can
+# pose as a node relaying a partition request.
+blake3 = { workspace = true }
 bon = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
@@ -54,6 +56,7 @@ dtor = { workspace = true }
 figment = { workspace = true }
 futures = { workspace = true }
 harness_derive = { workspace = true }
+hex = { workspace = true }
 humantime = { workspace = true }
 iggy = { workspace = true }
 iggy-cli = { workspace = true }
@@ -61,33 +64,44 @@ iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 # Path-dep only so the Doris integration test can reuse the connector's pure
 # `build_label` function — keeping the test and production label format in lock-step.
-iggy_connector_doris_sink = { path = "../connectors/sinks/doris_sink" }
+# The only connector crate `integration` can depend on. Every plugin exports the
+# same no_mangle `iggy_sink_*` symbols, so a second one fails the test binary
+# link with duplicate symbols. Scoping a plugin's tests into a CI run needs no
+# dependency.
+iggy_connector_doris_sink = { workspace = true }
 iggy_connector_sdk = { workspace = true, features = ["api"] }
 # Locates and decodes the on-disk superblock slot files in the recovery test
 # (`SLOT_FILE_NAMES`, `decode_slots`).
 journal = { workspace = true }
 jsonwebtoken = { workspace = true }
 keyring-core = { workspace = true }
+lapin = { workspace = true }
 lazy_static = { workspace = true }
 libc = { workspace = true }
 mongodb = { workspace = true }
+parquet = { workspace = true }
+pgwire = { workspace = true }
 predicates = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
 reqwest = { workspace = true, features = ["http2", "json"] }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }
+ring = { workspace = true }
 rmcp = { workspace = true, features = [
     "client",
     "reqwest",
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
 ] }
+rumqttc-v4 = { workspace = true }
+rumqttc-v5 = { workspace = true }
 rust-s3 = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
+sqlparser = { workspace = true }
 sqlx = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
@@ -95,6 +109,7 @@ test-case = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-postgres = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -109,3 +124,6 @@ zbus-secret-service-keyring-store = { workspace = true, optional = true }
 
 [build-dependencies]
 cfg_aliases = { workspace = true }
+
+[lints]
+workspace = true

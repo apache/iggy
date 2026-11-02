@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use super::{Transform, TransformType};
 use crate::decoders::avro::{AvroConfig, AvroStreamDecoder};
 use crate::encoders::avro::{AvroEncoderConfig, AvroStreamEncoder};
-use crate::{DecodedMessage, Error, Payload, Schema, TopicMetadata};
+use crate::{DecodedMessage, Error, Payload, Schema, TopicMetadata, convert::apply_field_mappings};
 use crate::{StreamDecoder, StreamEncoder};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,36 +68,14 @@ impl AvroConvert {
         Self::new(AvroConvertConfig::default())
     }
 
-    fn apply_field_mappings(
+    fn apply_field_transformations(
         &self,
         payload: Payload,
         field_mappings: &HashMap<String, String>,
-    ) -> Result<Payload, Error> {
-        match payload {
-            Payload::Json(json_value) => {
-                if let simd_json::OwnedValue::Object(mut map) = json_value {
-                    let mut new_entries = Vec::new();
-
-                    for (key, value) in map.iter() {
-                        if let Some(new_key) = field_mappings.get(key) {
-                            new_entries.push((new_key.clone(), value.clone()));
-                        } else {
-                            new_entries.push((key.clone(), value.clone()));
-                        }
-                    }
-
-                    map.clear();
-                    for (key, value) in new_entries {
-                        map.insert(key, value);
-                    }
-
-                    Ok(Payload::Json(simd_json::OwnedValue::Object(map)))
-                } else {
-                    Ok(Payload::Json(json_value))
-                }
-            }
-            other => Ok(other),
-        }
+    ) -> Payload {
+        apply_field_mappings(payload, |key| {
+            field_mappings.get(&key).cloned().unwrap_or(key)
+        })
     }
 }
 
@@ -112,7 +90,7 @@ impl Transform for AvroConvert {
         mut message: DecodedMessage,
     ) -> Result<Option<DecodedMessage>, Error> {
         if let Some(field_mappings) = &self.config.field_mappings {
-            message.payload = self.apply_field_mappings(message.payload, field_mappings)?;
+            message.payload = self.apply_field_transformations(message.payload, field_mappings);
         }
 
         message.payload = match (&self.config.source_format, &self.config.target_format) {
@@ -120,7 +98,7 @@ impl Transform for AvroConvert {
                 let encoder_config = AvroEncoderConfig {
                     schema_path: self.config.schema_path.clone(),
                     schema_json: self.config.schema_json.clone(),
-                    field_mappings: self.config.field_mappings.clone(),
+                    field_mappings: None,
                 };
                 let encoder = AvroStreamEncoder::new(encoder_config);
                 let encoded_bytes = encoder.encode(message.payload)?;
@@ -184,6 +162,10 @@ impl Default for AvroConvert {
 
 #[cfg(test)]
 mod tests {
+    use apache_avro::{
+        Schema as AvroSchema, reader::datum::GenericDatumReader, types::Value as AvroValue,
+    };
+
     use super::*;
     use crate::TopicMetadata;
 
@@ -226,7 +208,53 @@ mod tests {
             ("name".to_string(), AvroValue::String("Alice".to_string())),
             ("age".to_string(), AvroValue::Int(30)),
         ]);
-        apache_avro::to_avro_datum(&schema, record).unwrap()
+        apache_avro::writer::datum::GenericDatumWriter::builder(&schema)
+            .build()
+            .unwrap()
+            .write_value_to_vec(record)
+            .unwrap()
+    }
+
+    #[test]
+    fn given_chained_field_names_when_encoding_should_apply_each_mapping_once() {
+        let schema_json = create_test_schema_json();
+        let schema = AvroSchema::parse_str(&schema_json).expect("parse User schema");
+        let converter = AvroConvert::new(AvroConvertConfig {
+            source_format: Schema::Json,
+            target_format: Schema::Avro,
+            schema_json: Some(schema_json),
+            field_mappings: Some(HashMap::from([
+                ("old_name".to_string(), "name".to_string()),
+                ("name".to_string(), "archived_name".to_string()),
+            ])),
+            ..AvroConvertConfig::default()
+        });
+        let message = create_test_message(Payload::Json(simd_json::json!({
+            "old_name": "Alice",
+            "age": 30,
+        })));
+        let transformed = converter
+            .transform(&create_test_metadata(), message)
+            .expect("encode with one field rename")
+            .expect("preserve message");
+        let Payload::Avro(data) = transformed.payload else {
+            panic!("expected Avro datum");
+        };
+        let reader = GenericDatumReader::builder(&schema)
+            .build()
+            .expect("create Avro reader");
+        let mut bytes = data.as_slice();
+        let decoded = reader
+            .read_value(&mut bytes)
+            .expect("decode transformed datum");
+        assert_eq!(
+            decoded,
+            AvroValue::Record(vec![
+                ("name".to_string(), AvroValue::String("Alice".to_string())),
+                ("age".to_string(), AvroValue::Int(30)),
+            ])
+        );
+        assert!(bytes.is_empty());
     }
 
     #[test]

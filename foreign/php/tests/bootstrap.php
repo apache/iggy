@@ -22,6 +22,8 @@ use Iggy\Client as IggyClient;
 use Iggy\ReceiveMessage;
 use PHPUnit\Framework\Assert;
 
+const READ_UNTIL_POLL_MICROS = 10_000;
+
 function assert_true(bool $condition, string $message = 'expected condition to be true'): void
 {
     Assert::assertTrue($condition, $message);
@@ -84,14 +86,19 @@ function env_or_default(string $name, string $default): string
     return $value === false || $value === '' ? $default : $value;
 }
 
+function server_address(): string
+{
+    return env_or_default('IGGY_TCP_ADDRESS', '127.0.0.1:8090');
+}
+
 function server_host(): string
 {
-    return env_or_default('IGGY_HOST', '127.0.0.1');
+    return explode(':', server_address(), 2)[0];
 }
 
 function server_port(): int
 {
-    return (int) env_or_default('IGGY_PORT', '8090');
+    return (int) (explode(':', server_address(), 2)[1] ?? '8090');
 }
 
 function wait_for_server(string $host, int $port, int $timeoutSeconds = 30): void
@@ -116,9 +123,9 @@ function wait_for_server(string $host, int $port, int $timeoutSeconds = 30): voi
 
 function new_client(): IggyClient
 {
-    $client = new IggyClient(server_host() . ':' . server_port());
+    $client = new IggyClient(server_address());
     $client->connect();
-    $client->loginUser(env_or_default('IGGY_USERNAME', 'iggy'), env_or_default('IGGY_PASSWORD', 'iggy'));
+    $client->loginUser(env_or_default('IGGY_ROOT_USERNAME', 'iggy'), env_or_default('IGGY_ROOT_PASSWORD', 'iggy'));
 
     return $client;
 }
@@ -127,11 +134,47 @@ function new_connection_string_client(): IggyClient
 {
     $host = server_host();
     $port = server_port();
-    $username = rawurlencode(env_or_default('IGGY_USERNAME', 'iggy'));
-    $password = rawurlencode(env_or_default('IGGY_PASSWORD', 'iggy'));
+    $username = rawurlencode(env_or_default('IGGY_ROOT_USERNAME', 'iggy'));
+    $password = rawurlencode(env_or_default('IGGY_ROOT_PASSWORD', 'iggy'));
 
     $client = IggyClient::fromConnectionString("iggy+tcp://{$username}:{$password}@{$host}:{$port}");
     $client->connect();
+
+    return $client;
+}
+
+/**
+ * Logged-in client for one transport, as root unless credentials are given. QUIC, HTTP and
+ * WebSocket addresses default to the server's default ports on the TCP host.
+ */
+function new_transport_client(string $transport, ?string $username = null, ?string $password = null): IggyClient
+{
+    $username ??= env_or_default('IGGY_ROOT_USERNAME', 'iggy');
+    $password ??= env_or_default('IGGY_ROOT_PASSWORD', 'iggy');
+    if ($transport === 'tcp') {
+        $client = new IggyClient(server_address());
+        $client->connect();
+        $client->loginUser($username, $password);
+
+        return $client;
+    }
+
+    $schemes = ['quic' => 'iggy+quic', 'http' => 'iggy+http', 'websocket' => 'iggy+ws'];
+    $addresses = [
+        'quic' => env_or_default('IGGY_QUIC_ADDRESS', server_host() . ':8080'),
+        'http' => env_or_default('IGGY_HTTP_ADDRESS', server_host() . ':3000'),
+        'websocket' => env_or_default('IGGY_WEBSOCKET_ADDRESS', server_host() . ':8092'),
+    ];
+    $encodedUsername = rawurlencode($username);
+    $encodedPassword = rawurlencode($password);
+
+    $client = IggyClient::fromConnectionString(
+        "{$schemes[$transport]}://{$encodedUsername}:{$encodedPassword}@{$addresses[$transport]}",
+    );
+    $client->connect();
+    if ($transport === 'http') {
+        $client->loginUser($username, $password);
+    }
 
     return $client;
 }
@@ -167,6 +210,48 @@ function cleanup_stream_with_topics(object $client, string|int $stream, array $t
     cleanup_stream($client, $stream);
 }
 
+/**
+ * The SDK has no user management, so tests create a user through the raw CreateUser command
+ * (33): active and without permissions.
+ */
+function create_user_without_permissions(IggyClient $client, string $username, string $password): void
+{
+    $client->sendBinaryRequest(
+        33,
+        chr(strlen($username)) . $username . chr(strlen($password)) . $password . chr(1) . chr(0),
+    );
+}
+
+/** Deletes a user by name through the raw DeleteUser command (34). */
+function delete_user_by_name(IggyClient $client, string $username): void
+{
+    $client->sendBinaryRequest(34, chr(2) . chr(strlen($username)) . $username);
+}
+
+/**
+ * Stream id to name, from the raw GetStreams answer (201): per stream its id, created_at,
+ * topics_count, size, messages_count, name and the two length-prefixed option blocks.
+ */
+function stream_list(IggyClient $client): array
+{
+    $payload = $client->sendBinaryRequest(201, '');
+    $streams = [];
+    $position = 0;
+    while ($position < strlen($payload)) {
+        $id = unpack('V', $payload, $position)[1];
+        $position += 4 + 8 + 4 + 8 + 8;
+        $nameLength = ord($payload[$position]);
+        $streams[$id] = substr($payload, $position + 1, $nameLength);
+        $position += 1 + $nameLength;
+        for ($block = 0; $block < 2; $block++) {
+            $position += 4 + unpack('V', $payload, $position)[1];
+        }
+    }
+    ksort($streams);
+
+    return $streams;
+}
+
 function collect_payloads(array $messages): array
 {
     return array_map(static fn (ReceiveMessage $message): string => $message->payload(), $messages);
@@ -182,8 +267,27 @@ function micros(int $seconds): int
     return $seconds * 1_000_000;
 }
 
+/**
+ * Calls $read until it returns $expected or the timeout ends, and returns the last value read.
+ */
+function read_until(callable $read, mixed $expected, float $timeoutSeconds): mixed
+{
+    $deadline = microtime(true) + $timeoutSeconds;
+
+    while (true) {
+        $value = $read();
+        if ($value === $expected || microtime(true) >= $deadline) {
+            return $value;
+        }
+
+        usleep(READ_UNTIL_POLL_MICROS);
+    }
+}
+
 if (!extension_loaded('iggy-php')) {
     Assert::fail('The iggy-php extension is not loaded.');
 }
 
-wait_for_server(server_host(), server_port());
+if (getenv('IGGY_SKIP_SERVER_WAIT') !== '1') {
+    wait_for_server(server_host(), server_port());
+}

@@ -16,36 +16,18 @@
 // under the License.
 
 use super::COMPONENT;
-use super::server::{
-    DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig, TelemetryConfig,
-};
+use super::server::{DataMaintenanceConfig, MessagesMaintenanceConfig, TelemetryConfig};
 use super::server::{MemoryPoolConfig, PersonalAccessTokenConfig};
-use super::system::SegmentConfig;
-use super::system::{CompressionConfig, LoggingConfig, PartitionConfig};
+use super::system::{EncryptionConfig, LoggingConfig};
 use crate::ConfigurationError;
 use cpu_allocation::{CpuAllocation, allowed_cpus};
 use err_trail::ErrContext;
-use iggy_common::CompressionAlgorithm;
-use iggy_common::Validatable;
+use iggy_common::{ServerKeyContext, Validatable};
+use server_common::log::LogFilter;
 use std::thread::available_parallelism;
-use tracing::warn;
 
 /// 1 GiB max segment size.
 pub const SEGMENT_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
-
-impl Validatable<ConfigurationError> for CompressionConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        let compression_alg = &self.default_algorithm;
-        if *compression_alg != CompressionAlgorithm::None {
-            // TODO(numinex): Change this message once server side compression is fully developed.
-            warn!(
-                "Server started with server-side compression enabled, using algorithm: {compression_alg}, this feature is not implemented yet!"
-            );
-        }
-
-        Ok(())
-    }
-}
 
 impl Validatable<ConfigurationError> for TelemetryConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
@@ -72,48 +54,24 @@ impl Validatable<ConfigurationError> for TelemetryConfig {
     }
 }
 
-impl Validatable<ConfigurationError> for PartitionConfig {
+impl Validatable<ConfigurationError> for EncryptionConfig {
+    /// A supplied key must be 32 bytes of base64, and `enabled` needs one.
+    /// The key values are never printed.
     fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.messages_required_to_save == 0 {
-            eprintln!("Configured system.partition.messages_required_to_save cannot be 0");
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for SegmentConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.size > SEGMENT_MAX_SIZE_BYTES {
-            eprintln!(
-                "Configured system.segment.size {} B is greater than maximum {} B",
-                self.size.as_bytes_u64(),
-                SEGMENT_MAX_SIZE_BYTES
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        if !self.size.as_bytes_u64().is_multiple_of(512) {
-            eprintln!(
-                "Configured system.segment.size {} B is not a multiple of 512 B",
-                self.size.as_bytes_u64()
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for MessageSaverConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.enabled && self.interval.is_zero() {
-            eprintln!("message_saver.interval cannot be zero when message_saver is enabled");
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        Ok(())
+        ServerKeyContext::from_config(&self.key, &self.previous_keys, self.enabled)
+            .and_then(|context| {
+                context.with_retired_kek_fingerprints(&self.retired_kek_fingerprints)
+            })
+            .map(|_| ())
+            .map_err(|_| {
+                eprintln!(
+                    "encryption.key must be 32 bytes of standard base64, set when encryption is \
+                     enabled, encryption.previous_keys may hold at most two other such keys, and \
+                     encryption.retired_kek_fingerprints needs a key and holds 16 lowercase hex \
+                     characters per entry, none naming a configured key"
+                );
+                ConfigurationError::InvalidConfigurationValue
+            })
     }
 }
 
@@ -157,14 +115,17 @@ impl Validatable<ConfigurationError> for PersonalAccessTokenConfig {
 
 impl Validatable<ConfigurationError> for LoggingConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.level.is_empty() {
-            eprintln!("system.logging.level is supposed be configured");
+        if let Err(error) = self.level.parse::<LogFilter>() {
+            eprintln!(
+                "Configured logging.level {:?} is invalid: {error}",
+                self.level
+            );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        if self.retention.as_secs() < 1 {
+        if !self.retention.is_zero() && self.retention.as_secs() < 1 {
             eprintln!(
-                "Configured system.logging.retention {} is less than minimum 1 second",
+                "Configured logging.retention {} is less than minimum 1 second, use 0 to turn off deletion by age",
                 self.retention
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -172,8 +133,17 @@ impl Validatable<ConfigurationError> for LoggingConfig {
 
         if self.rotation_check_interval.as_secs() < 1 {
             eprintln!(
-                "Configured system.logging.rotation_check_interval {} is less than minimum 1 second",
+                "Configured logging.rotation_check_interval {} is less than minimum 1 second",
                 self.rotation_check_interval
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        if !self.sysinfo_print_interval.is_zero() && self.sysinfo_print_interval.as_secs() < 1 {
+            eprintln!(
+                "Configured logging.sysinfo_print_interval {} is less than minimum 1 second, \
+                 use \"0 s\" to disable it",
+                self.sysinfo_print_interval
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -183,7 +153,7 @@ impl Validatable<ConfigurationError> for LoggingConfig {
             && self.max_file_size.as_bytes_u64() > self.max_total_size.as_bytes_u64()
         {
             eprintln!(
-                "Configured system.logging.max_total_size {} is less than system.logging.max_file_size {}",
+                "Configured logging.max_total_size {} is less than logging.max_file_size {}",
                 self.max_total_size, self.max_file_size
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -196,9 +166,7 @@ impl Validatable<ConfigurationError> for LoggingConfig {
 impl Validatable<ConfigurationError> for MemoryPoolConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
         if self.enabled && self.size == 0 {
-            eprintln!(
-                "Configured system.memory_pool.enabled is true and system.memory_pool.size is 0"
-            );
+            eprintln!("Configured memory_pool.enabled is true and memory_pool.size is 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
@@ -208,7 +176,7 @@ impl Validatable<ConfigurationError> for MemoryPoolConfig {
 
         if self.enabled && self.size < MIN_POOL_SIZE {
             eprintln!(
-                "Configured system.memory_pool.size {} B ({} MiB) is less than minimum {} B, ({} MiB)",
+                "Configured memory_pool.size {} B ({} MiB) is less than minimum {} B, ({} MiB)",
                 self.size.as_bytes_u64(),
                 self.size.as_bytes_u64() / (1024 * 1024),
                 MIN_POOL_SIZE,
@@ -219,7 +187,7 @@ impl Validatable<ConfigurationError> for MemoryPoolConfig {
 
         if self.enabled && !self.size.as_bytes_u64().is_multiple_of(DEFAULT_PAGE_SIZE) {
             eprintln!(
-                "Configured system.memory_pool.size {} B is not a multiple of default page size {} B",
+                "Configured memory_pool.size {} B is not a multiple of default page size {} B",
                 self.size.as_bytes_u64(),
                 DEFAULT_PAGE_SIZE
             );
@@ -228,7 +196,7 @@ impl Validatable<ConfigurationError> for MemoryPoolConfig {
 
         if self.enabled && self.bucket_capacity < MIN_BUCKET_CAPACITY {
             eprintln!(
-                "Configured system.memory_pool.buffers {} is less than minimum {}",
+                "Configured memory_pool.buffers {} is less than minimum {}",
                 self.bucket_capacity, MIN_BUCKET_CAPACITY
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -236,7 +204,7 @@ impl Validatable<ConfigurationError> for MemoryPoolConfig {
 
         if self.enabled && !self.bucket_capacity.is_power_of_two() {
             eprintln!(
-                "Configured system.memory_pool.buffers {} is not a power of 2",
+                "Configured memory_pool.buffers {} is not a power of 2",
                 self.bucket_capacity
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -353,5 +321,182 @@ mod cpu_allocation_tests {
 
         let available = available_parallelism().unwrap().get();
         assert!(validate_cpu_allocation(&CpuAllocation::Range(0, available + 1), false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::*;
+    use iggy_common::{IggyByteSize, IggyDuration};
+    use std::time::Duration;
+
+    #[test]
+    fn given_print_interval_samples_when_validating_should_accept_zero_or_at_least_one_second() {
+        let one_second = Duration::from_secs(1);
+        let samples = [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_micros(1),
+            Duration::from_millis(1),
+            Duration::from_millis(500),
+            Duration::from_nanos(999_999_999),
+            one_second,
+            Duration::from_nanos(1_000_000_001),
+            Duration::from_secs(10),
+        ];
+        for interval in samples {
+            let accepted = with_sysinfo_print_interval(interval).validate().is_ok();
+            assert_eq!(
+                accepted,
+                interval.is_zero() || interval >= one_second,
+                "sysinfo_print_interval {interval:?}"
+            );
+        }
+    }
+
+    fn with_sysinfo_print_interval(interval: Duration) -> LoggingConfig {
+        LoggingConfig {
+            sysinfo_print_interval: IggyDuration::new(interval),
+            ..LoggingConfig::default()
+        }
+    }
+
+    #[test]
+    fn level_that_is_not_a_level_is_rejected() {
+        let config = LoggingConfig {
+            level: "inof".to_owned(),
+            ..LoggingConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn zero_retention_is_accepted() {
+        let config = LoggingConfig {
+            retention: IggyDuration::new(Duration::ZERO),
+            ..LoggingConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn sub_second_retention_and_check_interval_are_rejected() {
+        let half_second = IggyDuration::new(Duration::from_millis(500));
+        let retention = LoggingConfig {
+            retention: half_second,
+            ..LoggingConfig::default()
+        };
+        let check_interval = LoggingConfig {
+            rotation_check_interval: half_second,
+            ..LoggingConfig::default()
+        };
+        assert!(retention.validate().is_err());
+        assert!(check_interval.validate().is_err());
+    }
+
+    #[test]
+    fn max_total_size_below_max_file_size_is_rejected_unless_unlimited() {
+        let below = LoggingConfig {
+            max_file_size: IggyByteSize::from(100),
+            max_total_size: IggyByteSize::from(50),
+            ..LoggingConfig::default()
+        };
+        let unlimited = LoggingConfig {
+            max_total_size: IggyByteSize::from(0),
+            ..below.clone()
+        };
+        assert!(below.validate().is_err());
+        assert!(unlimited.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
+    const OTHER_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+    const THIRD_KEY: &str = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
+
+    #[test]
+    fn given_encryption_config_when_validating_should_require_valid_key_only_when_supplied_or_enabled()
+     {
+        for (enabled, key, valid) in [
+            (false, "", true),
+            (false, KEY, true),
+            (true, KEY, true),
+            (true, "", false),
+            (false, "c2hvcnQ=", false),
+            (true, "not base64", false),
+        ] {
+            assert_eq!(
+                config(enabled, key, &[]).validate().is_ok(),
+                valid,
+                "enabled={enabled}, key length {}",
+                key.len()
+            );
+        }
+    }
+
+    #[test]
+    fn given_previous_keys_when_validating_should_require_valid_current_key_and_at_most_two() {
+        for (key, previous, valid) in [
+            (KEY, vec![], true),
+            (KEY, vec![OTHER_KEY], true),
+            (KEY, vec![OTHER_KEY, THIRD_KEY], true),
+            (KEY, vec![OTHER_KEY, THIRD_KEY, "AAAA"], false),
+            (KEY, vec![KEY], false),
+            (KEY, vec![OTHER_KEY, OTHER_KEY], false),
+            (KEY, vec!["c2hvcnQ="], false),
+            ("", vec![OTHER_KEY], false),
+        ] {
+            assert_eq!(
+                config(true, key, &previous).validate().is_ok(),
+                valid,
+                "{} previous keys",
+                previous.len()
+            );
+        }
+    }
+
+    #[test]
+    fn given_retired_kek_fingerprints_when_validating_should_require_a_key_and_unconfigured_hex() {
+        let configured = ServerKeyContext::from_config(KEY, &[], true)
+            .expect("valid key")
+            .kek_fingerprint()
+            .expect("a fingerprint");
+        let unconfigured = ServerKeyContext::from_config(THIRD_KEY, &[], true)
+            .expect("valid key")
+            .kek_fingerprint()
+            .expect("a fingerprint");
+        for (key, previous, retired, valid) in [
+            (KEY, vec![], vec![unconfigured.clone()], true),
+            (KEY, vec![], vec![], true),
+            ("", vec![], vec![], true),
+            ("", vec![], vec![unconfigured.clone()], false),
+            (KEY, vec![], vec![configured], false),
+            (KEY, vec![THIRD_KEY], vec![unconfigured.clone()], false),
+            (KEY, vec![], vec![unconfigured.to_uppercase()], false),
+            (KEY, vec![], vec![unconfigured[..15].to_owned()], false),
+            (
+                KEY,
+                vec![],
+                vec![unconfigured.clone(), unconfigured.clone()],
+                false,
+            ),
+        ] {
+            let mut config = config(!key.is_empty(), key, &previous);
+            config.retired_kek_fingerprints = retired.clone();
+            assert_eq!(config.validate().is_ok(), valid, "{retired:?}");
+        }
+    }
+
+    fn config(enabled: bool, key: &str, previous_keys: &[&str]) -> EncryptionConfig {
+        EncryptionConfig {
+            enabled,
+            key: key.to_owned(),
+            previous_keys: previous_keys.iter().map(|key| (*key).to_owned()).collect(),
+            retired_kek_fingerprints: Vec::new(),
+        }
     }
 }

@@ -14,10 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 export { Client, SimpleClient, SingleClient } from './client.js'
 export * from './client.config.js';
+export { ConnectionClosedError } from './client.connection.js';
+export { parseConnectionString } from './client.connection-string.js';
 export * from './client.utils.js';
 export * from './client.socket.js';
 export * from './client.type.js';

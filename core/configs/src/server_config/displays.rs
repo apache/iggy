@@ -22,27 +22,33 @@
 //! [`ServerConfig`] formatter and the [`MessageBusConfig`] section
 //! formatter.
 
+use super::external_auth::ExternalAuthConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::partition::PartitionConfig;
-use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
-use super::server::{ExtraConfig, NamespaceConfig, ServerConfig};
-use super::tcp::{TcpConfig, TcpSocketConfig, TcpTlsConfig};
+use super::quic::{QuicCertificateConfig, QuicConfig};
+use super::server::ServerConfig;
+use super::tcp::{TcpConfig, TcpTlsConfig};
 use std::fmt::{Display, Formatter};
 
 impl Display for ServerConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ consumer_group: {}, data_maintenance: {}, extra: {}, message_saver: {}, \
-             heartbeat: {}, system: {}, quic: {}, tcp: {}, http: {}, telemetry: {}, \
-             metadata: {}, message_bus: {}, partition: {} }}",
+            "{{ consumer_group: {}, data_maintenance: {}, \
+             heartbeat: {}, path: {}, runtime: {{ path: {} }}, logging: {}, \
+             encryption: {}, memory_pool: {:?}, sharding: {:?}, \
+             quic: {}, tcp: {}, http: {}, telemetry: {}, \
+             metadata: {}, message_bus: {}, partition: {}, external_auth: {} }}",
             self.consumer_group,
             self.data_maintenance,
-            self.extra,
-            self.message_saver,
             self.heartbeat,
-            self.system,
+            self.path,
+            self.runtime.path,
+            self.logging,
+            self.encryption,
+            self.memory_pool,
+            self.sharding,
             self.quic,
             self.tcp,
             self.http,
@@ -50,6 +56,7 @@ impl Display for ServerConfig {
             self.metadata,
             self.message_bus,
             self.partition,
+            self.external_auth,
         )
     }
 }
@@ -58,10 +65,17 @@ impl Display for PartitionConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ prepare_queue_depth: {}, evicted_ring_capacity: {}, \
-             evicted_ring_bytes_max: {}, transfer_served_cache_bytes_max: {}, \
-             transfer_artifact_bytes_max: {} }}",
+            "{{ wal_bytes_max: {}, wal_group_commit_delay_micros: {}, validate_checksum: {}, prepare_queue_depth: {}, dedup_clients_max: {}, consumer_offsets_max: {}, \
+             offset_reservation_lease: {}, \
+             evicted_ring_capacity: {}, evicted_ring_bytes_max: {}, \
+             transfer_served_cache_bytes_max: {}, transfer_artifact_bytes_max: {} }}",
+            self.wal_bytes_max,
+            self.wal_group_commit_delay_micros,
+            self.validate_checksum,
             self.prepare_queue_depth,
+            self.dedup_clients_max,
+            self.consumer_offsets_max,
+            self.offset_reservation_lease,
             self.evicted_ring_capacity,
             self.evicted_ring_bytes_max,
             self.transfer_served_cache_bytes_max,
@@ -74,8 +88,13 @@ impl Display for MetadataConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ prepare_queue_depth: {}, journal_slots: {}, clients_table_max: {} }}",
-            self.prepare_queue_depth, self.journal_slots, self.clients_table_max,
+            "{{ prepare_queue_depth: {}, journal_slots: {}, clients_table_max: {}, partitions_max: {}, change_log_resource_capacity: {}, change_log_activity_capacity: {} }}",
+            self.prepare_queue_depth,
+            self.journal_slots,
+            self.clients_table_max,
+            self.partitions_max,
+            self.change_log_resource_capacity,
+            self.change_log_activity_capacity,
         )
     }
 }
@@ -84,32 +103,25 @@ impl Display for MessageBusConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ max_batch: {}, max_message_size: {}, peer_queue_capacity: {}, \
-             reconnect_period: {}, close_peer_timeout: {}, close_grace: {}, \
-             handshake_grace: {} }}",
+            "{{ max_batch: {}, max_message_size: {}, replica_read_buffer_size: {}, \
+             peer_queue_capacity: {}, client_queue_capacity: {}, client_write_stall_timeout: {}, \
+             client_request_queue_bytes_max: {}, reconnect_period: {}, close_peer_timeout: {}, \
+             close_grace: {}, handshake_grace: {}, connections_max: {} }}",
             self.max_batch,
             self.max_message_size,
+            self.replica_read_buffer_size,
             self.peer_queue_capacity,
+            self.client_queue_capacity,
+            self.client_write_stall_timeout,
+            self.client_request_queue_bytes_max,
             self.reconnect_period,
             self.close_peer_timeout,
             self.close_grace,
             self.handshake_grace,
-        )
-    }
-}
-
-impl Display for ExtraConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ namespace: {} }}", self.namespace)
-    }
-}
-
-impl Display for NamespaceConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ max_streams: {}, max_topics: {}, max_partitions: {} }}",
-            self.max_streams, self.max_topics, self.max_partitions
+            self.connections_max.map_or_else(
+                || "half of RLIMIT_NOFILE".to_owned(),
+                |connections_max| connections_max.to_string()
+            ),
         )
     }
 }
@@ -118,8 +130,8 @@ impl Display for TcpConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, address: {}, ipv6: {}, tls: {}, socket: {}, socket_migration: {} }}",
-            self.enabled, self.address, self.ipv6, self.tls, self.socket, self.socket_migration
+            "{{ enabled: {}, address: {}, tls: {} }}",
+            self.enabled, self.address, self.tls
         )
     }
 }
@@ -134,33 +146,18 @@ impl Display for TcpTlsConfig {
     }
 }
 
-impl Display for TcpSocketConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ override_defaults: {}, recv_buffer_size: {}, send_buffer_size: {}, keepalive: {}, nodelay: {}, linger: {} }}",
-            self.override_defaults,
-            self.recv_buffer_size,
-            self.send_buffer_size,
-            self.keepalive,
-            self.nodelay,
-            self.linger,
-        )
-    }
-}
-
 impl Display for QuicConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, address: {}, max_concurrent_bidi_streams: {}, datagram_send_buffer_size: {}, initial_mtu: {}, send_window: {}, receive_window: {}, keep_alive_interval: {}, max_idle_timeout: {}, certificate: {} }}",
+            "{{ enabled: {}, address: {}, max_concurrent_bidi_streams: {}, initial_mtu: {}, send_window: {}, receive_window: {}, stream_receive_window: {}, keep_alive_interval: {}, max_idle_timeout: {}, certificate: {} }}",
             self.enabled,
             self.address,
             self.max_concurrent_bidi_streams,
-            self.datagram_send_buffer_size,
             self.initial_mtu,
             self.send_window,
             self.receive_window,
+            self.stream_receive_window,
             self.keep_alive_interval,
             self.max_idle_timeout,
             self.certificate
@@ -178,12 +175,12 @@ impl Display for QuicCertificateConfig {
     }
 }
 
-impl Display for QuicSocketConfig {
+impl Display for ExternalAuthConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ override_defaults: {}, recv_buffer_size: {}, send_buffer_size: {}, keepalive: {} }}",
-            self.override_defaults, self.recv_buffer_size, self.send_buffer_size, self.keepalive
+            "{{ enabled: {}, url: [redacted], timeout: {}, max_concurrent_callouts: {} }}",
+            self.enabled, self.timeout, self.max_concurrent_callouts,
         )
     }
 }

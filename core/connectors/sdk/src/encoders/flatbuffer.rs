@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Error, Payload, Schema, StreamEncoder};
+use crate::{Error, Payload, Schema, StreamEncoder, convert::apply_field_mappings};
 use base64::Engine;
 use flatbuffers::FlatBufferBuilder;
 use serde::{Deserialize, Serialize};
@@ -63,35 +63,11 @@ impl FlatBufferStreamEncoder {
         Ok(())
     }
 
-    fn apply_field_transformations(&self, payload: Payload) -> Result<Payload, Error> {
+    fn apply_field_transformations(&self, payload: Payload) -> Payload {
         if let Some(mappings) = &self.config.field_mappings {
-            match payload {
-                Payload::Json(json_value) => {
-                    if let simd_json::OwnedValue::Object(mut map) = json_value {
-                        let mut new_entries = Vec::new();
-
-                        for (key, value) in map.iter() {
-                            if let Some(new_key) = mappings.get(key) {
-                                new_entries.push((new_key.clone(), value.clone()));
-                            } else {
-                                new_entries.push((key.clone(), value.clone()));
-                            }
-                        }
-
-                        map.clear();
-                        for (key, value) in new_entries {
-                            map.insert(key, value);
-                        }
-
-                        Ok(Payload::Json(simd_json::OwnedValue::Object(map)))
-                    } else {
-                        Ok(Payload::Json(json_value))
-                    }
-                }
-                other => Ok(other),
-            }
+            apply_field_mappings(payload, |key| mappings.get(&key).cloned().unwrap_or(key))
         } else {
-            Ok(payload)
+            payload
         }
     }
 
@@ -229,7 +205,7 @@ impl StreamEncoder for FlatBufferStreamEncoder {
     }
 
     fn encode(&self, payload: Payload) -> Result<Vec<u8>, Error> {
-        let transformed_payload = self.apply_field_transformations(payload)?;
+        let transformed_payload = self.apply_field_transformations(payload);
 
         match transformed_payload {
             Payload::Json(json_value) => self.encode_json_to_flatbuffer(json_value),
@@ -327,6 +303,20 @@ mod tests {
         assert!(result.is_ok());
         let encoded_data = result.unwrap();
         assert!(!encoded_data.is_empty());
+
+        // No `.fbs` schema to decode typed fields, but keys are plain UTF-8 strings inline, so the rename is checkable byte-wise.
+        assert!(contains_bytes(&encoded_data, b"new_field"));
+        assert!(!contains_bytes(&encoded_data, b"old_field"));
+        assert!(contains_bytes(&encoded_data, b"unchanged_field"));
+        // Confirms the renamed key kept its value rather than being dropped.
+        assert!(contains_bytes(&encoded_data, b"should_be_renamed"));
+        assert!(contains_bytes(&encoded_data, b"stays_same"));
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
     }
 
     #[test]

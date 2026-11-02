@@ -23,6 +23,10 @@ import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
+// ackQuorum is the AckLevel the offset commands send: the server replies only
+// once the write is committed.
+const ackQuorum byte = 1
+
 type StoreConsumerOffsetRequest struct {
 	StreamId    iggcon.Identifier `json:"streamId"`
 	TopicId     iggcon.Identifier `json:"topicId"`
@@ -54,8 +58,8 @@ func (s *StoreConsumerOffsetRequest) MarshalBinary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// consumer + stream_id + topic_id + hasPartition(1) + partition(4) + offset(8)
-	bytes := make([]byte, len(consumerBytes)+len(streamIdBytes)+len(topicIdBytes)+13)
+	// consumer + stream_id + topic_id + hasPartition(1) + partition(4) + offset(8) + ack(1)
+	bytes := make([]byte, len(consumerBytes)+len(streamIdBytes)+len(topicIdBytes)+14)
 	position := 0
 	copy(bytes[position:], consumerBytes)
 	position += len(consumerBytes)
@@ -66,6 +70,7 @@ func (s *StoreConsumerOffsetRequest) MarshalBinary() ([]byte, error) {
 	bytes[position] = hasPartition
 	binary.LittleEndian.PutUint32(bytes[position+1:position+5], partition)
 	binary.LittleEndian.PutUint64(bytes[position+5:position+13], s.Offset)
+	bytes[position+13] = ackQuorum
 	return bytes, nil
 }
 
@@ -143,8 +148,8 @@ func (d *DeleteConsumerOffset) MarshalBinary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// consumer + stream_id + topic_id + hasPartition(1) + partition(4)
-	bytes := make([]byte, len(consumerBytes)+len(streamIdBytes)+len(topicIdBytes)+5)
+	// consumer + stream_id + topic_id + hasPartition(1) + partition(4) + ack(1)
+	bytes := make([]byte, len(consumerBytes)+len(streamIdBytes)+len(topicIdBytes)+6)
 	position := 0
 	copy(bytes[position:], consumerBytes)
 	position += len(consumerBytes)
@@ -154,5 +159,6 @@ func (d *DeleteConsumerOffset) MarshalBinary() ([]byte, error) {
 	position += len(topicIdBytes)
 	bytes[position] = hasPartition
 	binary.LittleEndian.PutUint32(bytes[position+1:position+5], partition)
+	bytes[position+5] = ackQuorum
 	return bytes, nil
 }

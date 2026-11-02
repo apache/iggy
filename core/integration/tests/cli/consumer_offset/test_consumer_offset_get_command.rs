@@ -94,7 +94,7 @@ impl IggyCmdTestCase for TestConsumerOffsetGetCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         // Create stream and capture its actual ID
         let stream = client
-            .create_stream(&self.stream_name)
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
             .await
             .expect("Failed to create stream");
         self.actual_stream_id = Some(stream.id);
@@ -104,11 +104,11 @@ impl IggyCmdTestCase for TestConsumerOffsetGetCmd {
             .create_topic(
                 &stream.id.try_into().unwrap(),
                 &self.topic_name,
-                1,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await
             .expect("Failed to create topic");
@@ -277,11 +277,12 @@ Arguments:
 
 Options:
   -k, --kind <KIND>
-          Consumer kind: "consumer" for regular consumer, "consumer_group" for consumer group
+          Consumer kind: "consumer" for regular consumer, "consumer-group" for consumer group, "external-group" for a group managed outside Iggy
 
           Possible values:
           - consumer:       `Consumer` represents a regular consumer
           - consumer-group: `ConsumerGroup` represents a consumer group
+          - external-group: `ExternalGroup` holds the offsets of a group managed outside Iggy, such as a Kafka group
 {CLAP_INDENT}
           [default: consumer]
 
@@ -313,7 +314,8 @@ Arguments:
   <PARTITION_ID>  Partitions ID for which consumer offset is retrieved
 
 Options:
-  -k, --kind <KIND>  Consumer kind: "consumer" for regular consumer, "consumer_group" for consumer group [default: consumer] [possible values: consumer, consumer-group]
+  -k, --kind <KIND>  Consumer kind: "consumer" for regular consumer, "consumer-group" for consumer group, "external-group" for a group managed outside Iggy [default: consumer] [possible values:
+                     consumer, consumer-group, external-group]
   -h, --help         Print help (see more with '--help')
 "#,
             ),

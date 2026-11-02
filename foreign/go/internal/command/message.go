@@ -19,18 +19,16 @@ package command
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"time"
 
 	"github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/internal/batch"
 	"github.com/klauspost/compress/s2"
-)
-
-const (
-	partitionPresenceSize = 1
-	partitionFieldSize    = 4
-	partitionStrategySize = partitionPresenceSize + partitionFieldSize + 1
-	offsetSize            = 12
-	commitFlagSize        = 1
-	indexSize             = 16
+	"github.com/zeebo/xxh3"
 )
 
 type SendMessages struct {
@@ -46,18 +44,24 @@ func (s *SendMessages) Code() Code {
 	return SendMessagesCode
 }
 
-// zeroIndex is the blank per-message index entry reserved ahead of the
-// message section and filled in as messages are appended.
-var zeroIndex [indexSize]byte
+// zeroBatchHeader is the blank batch header reserved ahead of the message
+// frames and backpatched once every frame checksum is known.
+var zeroBatchHeader [batch.HeaderSize]byte
 
 func (s *SendMessages) MarshalBinary() ([]byte, error) {
 	return s.AppendBinary(nil)
 }
 
 // AppendBinary encodes the batch straight into b: [metadata_length u32]
-// [stream id][topic id][partitioning][messages_count u32], the per-message
-// index section, then each message as header, payload, user headers.
+// [stream id][topic id][partitioning][messages_count u32], then one canonical
+// batch record: a 256-byte batch header followed by one frame per message.
 func (s *SendMessages) AppendBinary(b []byte) ([]byte, error) {
+	// The server rejects an empty batch at admission. Refuse it before the
+	// wire, matching every other SDK encoder.
+	if len(s.Messages) == 0 {
+		return b, errors.New("cannot encode an empty message batch")
+	}
+
 	s.compressPayloads()
 
 	metadataStart := len(b)
@@ -76,30 +80,62 @@ func (s *SendMessages) AppendBinary(b []byte) ([]byte, error) {
 	metadataLength := len(b) - metadataStart - 4
 	binary.LittleEndian.PutUint32(b[metadataStart:], uint32(metadataLength))
 
-	indexesStart := len(b)
-	for range s.Messages {
-		b = append(b, zeroIndex[:]...)
+	var originTimestamp uint64
+	for i := range s.Messages {
+		if i == 0 || s.Messages[i].Header.OriginTimestamp < originTimestamp {
+			originTimestamp = s.Messages[i].Header.OriginTimestamp
+		}
 	}
 
-	msgSize := uint32(0)
+	headerStart := len(b)
+	b = append(b, zeroBatchHeader[:]...)
+
+	blobStart := len(b)
+	frameChecksums := make([]byte, 0, len(s.Messages)*8)
 	for i := range s.Messages {
 		message := &s.Messages[i]
+		// The id sits under the frame checksum, so it must exist before the
+		// frame is hashed; the server never mints ids.
+		if message.Header.Id == (iggcon.MessageID{}) {
+			binary.LittleEndian.PutUint64(message.Header.Id[0:8], rand.Uint64())
+			binary.LittleEndian.PutUint64(message.Header.Id[8:16], rand.Uint64())
+		}
 		// The header lengths and the appended slices must agree, or every
 		// message boundary after a mismatch mis-frames; deriving both from
 		// the same slice makes the disagreement impossible.
 		message.Header.PayloadLength = uint32(len(message.Payload))
 		message.Header.UserHeaderLength = uint32(len(message.UserHeaders))
-		if b, err = message.Header.AppendBinary(b); err != nil {
-			return b, err
+		timestampDelta := message.Header.OriginTimestamp - originTimestamp
+		if timestampDelta > math.MaxUint32 {
+			return b, fmt.Errorf(
+				"message origin timestamp %d runs more than %d microseconds past the batch's earliest %d",
+				message.Header.OriginTimestamp, uint64(math.MaxUint32), originTimestamp)
 		}
+
+		frameStart := len(b)
+		b = binary.LittleEndian.AppendUint64(b, 0)
+		b = append(b, message.Header.Id[:]...)
+		b = binary.LittleEndian.AppendUint32(b, uint32(i))
+		b = binary.LittleEndian.AppendUint32(b, uint32(timestampDelta))
+		b = binary.LittleEndian.AppendUint32(b, message.Header.UserHeaderLength)
+		b = binary.LittleEndian.AppendUint32(b, message.Header.PayloadLength)
+		b = binary.LittleEndian.AppendUint64(b, 0)
 		b = append(b, message.Payload...)
 		b = append(b, message.UserHeaders...)
 
-		msgSize += iggcon.MessageHeaderSize +
-			message.Header.PayloadLength + message.Header.UserHeaderLength
-		binary.LittleEndian.PutUint32(b[indexesStart+i*indexSize+4:], msgSize)
+		checksum := xxh3.Hash(b[frameStart+8:])
+		binary.LittleEndian.PutUint64(b[frameStart:], checksum)
+		message.Header.Checksum = checksum
+		frameChecksums = binary.LittleEndian.AppendUint64(frameChecksums, checksum)
 	}
 
+	batchHeader := batch.Header{
+		OriginTimestamp: originTimestamp,
+		BatchLength:     uint64(batch.HeaderSize + len(b) - blobStart),
+		MessageCount:    uint32(len(s.Messages)),
+	}
+	batchHeader.BatchChecksum = batchHeader.Checksum(frameChecksums)
+	batchHeader.EncodeInto(b[headerStart:blobStart])
 	return b, nil
 }
 
@@ -141,22 +177,21 @@ type PollMessages struct {
 	Strategy    iggcon.PollingStrategy `json:"pollingStrategy"`
 	Count       uint32                 `json:"count"`
 	AutoCommit  bool                   `json:"autoCommit"`
+	// Deferred makes the poll a deferred poll, which the server holds until
+	// its limits are met.
+	Deferred *iggcon.DeferredPollOptions `json:"deferred"`
 }
 
 func (m *PollMessages) Code() Code {
+	if m.Deferred != nil {
+		return PollMessagesDeferredCode
+	}
 	return PollMessagesCode
 }
 
 func (m *PollMessages) AppendBinary(b []byte) ([]byte, error) {
-	b = append(b, byte(m.Consumer.Kind))
-	var err error
-	if b, err = m.Consumer.Id.AppendBinary(b); err != nil {
-		return nil, err
-	}
-	if b, err = m.StreamId.AppendBinary(b); err != nil {
-		return nil, err
-	}
-	if b, err = m.TopicId.AppendBinary(b); err != nil {
+	b, err := appendPollTarget(b, m.Consumer, m.StreamId, m.TopicId)
+	if err != nil {
 		return nil, err
 	}
 	if m.PartitionId != nil {
@@ -173,9 +208,98 @@ func (m *PollMessages) AppendBinary(b []byte) ([]byte, error) {
 	} else {
 		b = append(b, 0)
 	}
+	if m.Deferred != nil {
+		b = binary.LittleEndian.AppendUint64(b, Micros(m.Deferred.MaxWait))
+		b = binary.LittleEndian.AppendUint32(b, m.Deferred.MinCount)
+		b = binary.LittleEndian.AppendUint32(b, m.Deferred.MaxBytes)
+		b = binary.LittleEndian.AppendUint64(b, Micros(m.Deferred.RequestTimeout))
+	}
 	return b, nil
 }
 
 func (m *PollMessages) MarshalBinary() ([]byte, error) {
 	return m.AppendBinary(nil)
+}
+
+// FetchMessages reads the targets of one primary in one deferred request.
+// Each target carries its own cap and partition fence, so the request header
+// carries no partition context.
+type FetchMessages struct {
+	StreamId   iggcon.Identifier
+	TopicId    iggcon.Identifier
+	Consumer   iggcon.Consumer
+	Targets    []FetchTarget
+	Count      uint32
+	AutoCommit bool
+	Options    iggcon.DeferredPollOptions
+}
+
+// FetchTarget is a fetch target with its cap, the most record bytes that its
+// section holds. Its fence is Strategy.Context, zero without one.
+type FetchTarget struct {
+	iggcon.FetchMessagesTarget
+	MaxBytes uint32
+}
+
+func (m *FetchMessages) Code() Code {
+	return FetchMessagesCode
+}
+
+func (m *FetchMessages) AppendBinary(b []byte) ([]byte, error) {
+	b, err := appendPollTarget(b, m.Consumer, m.StreamId, m.TopicId)
+	if err != nil {
+		return nil, err
+	}
+	b = binary.LittleEndian.AppendUint64(b, Micros(m.Options.MaxWait))
+	b = binary.LittleEndian.AppendUint64(b, Micros(m.Options.RequestTimeout))
+	b = binary.LittleEndian.AppendUint32(b, m.Options.MinCount)
+	b = binary.LittleEndian.AppendUint32(b, m.Count)
+	b = binary.LittleEndian.AppendUint32(b, m.Options.MaxBytes)
+	if m.AutoCommit {
+		b = append(b, 1)
+	} else {
+		b = append(b, 0)
+	}
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(m.Targets)))
+	for _, target := range m.Targets {
+		var fence iggcon.PartitionContext
+		if target.Strategy.Context != nil {
+			fence = *target.Strategy.Context
+		}
+		b = binary.LittleEndian.AppendUint32(b, target.PartitionId)
+		b = append(b, byte(target.Strategy.Kind))
+		b = binary.LittleEndian.AppendUint64(b, target.Strategy.Value)
+		b = binary.LittleEndian.AppendUint32(b, target.MaxBytes)
+		b = binary.LittleEndian.AppendUint64(b, fence.Incarnation)
+		b = binary.LittleEndian.AppendUint64(b, fence.OwnerGeneration)
+	}
+	return b, nil
+}
+
+func (m *FetchMessages) MarshalBinary() ([]byte, error) {
+	return m.AppendBinary(nil)
+}
+
+// appendPollTarget writes the consumer, the stream and the topic that start a
+// poll and a fetch.
+func appendPollTarget(b []byte, consumer iggcon.Consumer, streamId, topicId iggcon.Identifier) ([]byte, error) {
+	b = append(b, byte(consumer.Kind))
+	var err error
+	if b, err = consumer.Id.AppendBinary(b); err != nil {
+		return nil, err
+	}
+	if b, err = streamId.AppendBinary(b); err != nil {
+		return nil, err
+	}
+	if b, err = topicId.AppendBinary(b); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// Micros is a duration of deferred poll options as the wire carries it. The
+// options are validated before they are encoded, so the duration is never
+// negative.
+func Micros(duration time.Duration) uint64 {
+	return uint64(duration / time.Microsecond)
 }

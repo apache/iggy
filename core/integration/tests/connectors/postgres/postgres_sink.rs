@@ -17,20 +17,152 @@
 
 use super::TEST_MESSAGE_COUNT;
 use crate::connectors::fixtures::{
-    PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
+    POSTGRES_LARGE_BATCH_SIZE, PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture,
+    PostgresSinkJsonFixture, PostgresSinkLargeBatchFixture,
 };
 use crate::connectors::{TestMessage, create_test_messages};
 use bytes::Bytes;
-use iggy::prelude::{IggyMessage, Partitioning};
+use iggy::prelude::{IggyClient, IggyMessage, Partitioning};
 use iggy_common::Identifier;
 use iggy_common::MessageClient;
+use iggy_connector_sdk::api::ConnectorRuntimeStats;
 use integration::harness::seeds;
 use integration::iggy_harness;
+use std::time::Duration;
+use tokio::time::{sleep, timeout};
 
 const SINK_TABLE: &str = "iggy_messages";
+const DEFAULT_INSERT_PARAMETERS: usize = 9;
+const MAX_DEFAULT_INSERT_ROWS: usize = u16::MAX as usize / DEFAULT_INSERT_PARAMETERS;
+const STATS_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const STATS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 type SinkRow = (i64, String, String, Vec<u8>);
 type SinkJsonRow = (i64, serde_json::Value);
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/postgres/sink.toml")),
+    seed = large_postgres_batch
+)]
+async fn oversized_callback_stores_all_rows(fixture: PostgresSinkLargeBatchFixture) {
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    let rows: Vec<SinkJsonRow> = fixture
+        .fetch_rows_as(
+            &pool,
+            "SELECT iggy_offset, payload FROM iggy_messages ORDER BY iggy_offset",
+            POSTGRES_LARGE_BATCH_SIZE,
+        )
+        .await
+        .expect("Every row must survive bind-limit chunking");
+    assert_eq!(rows.len(), POSTGRES_LARGE_BATCH_SIZE);
+    for (sequence, (offset, payload)) in rows.into_iter().enumerate() {
+        assert_eq!(offset, sequence as i64);
+        assert_eq!(payload, serde_json::json!({"sequence": sequence}));
+    }
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/postgres/sink.toml")),
+    seed = large_postgres_batch_with_invalid_record
+)]
+async fn failed_chunk_reports_runtime_error_and_preserves_later_chunks(
+    harness: &TestHarness,
+    fixture: PostgresSinkLargeBatchFixture,
+) {
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    let expected_rows = POSTGRES_LARGE_BATCH_SIZE - MAX_DEFAULT_INSERT_ROWS;
+    let rows: Vec<SinkJsonRow> = fixture
+        .fetch_rows_as(
+            &pool,
+            "SELECT iggy_offset, payload FROM iggy_messages ORDER BY iggy_offset",
+            expected_rows,
+        )
+        .await
+        .expect("The chunk after the rejected chunk must still be inserted");
+    assert_eq!(rows.len(), expected_rows);
+    for (position, (offset, payload)) in rows.into_iter().enumerate() {
+        let sequence = MAX_DEFAULT_INSERT_ROWS + position;
+        assert_eq!(offset, sequence as i64);
+        assert_eq!(payload, serde_json::json!({"sequence": sequence}));
+    }
+
+    let runtime = harness.connectors_runtime().expect("connectors runtime");
+    let stats_url = format!("{}/stats", runtime.http_url());
+    let http_client = reqwest::Client::new();
+    let stats = timeout(STATS_WAIT_TIMEOUT, async {
+        loop {
+            let snapshot: ConnectorRuntimeStats = http_client
+                .get(&stats_url)
+                .send()
+                .await
+                .expect("stats request")
+                .error_for_status()
+                .expect("stats status")
+                .json()
+                .await
+                .expect("stats response");
+            let sink = snapshot
+                .connectors
+                .into_iter()
+                .find(|sink| sink.key == "postgres")
+                .expect("PostgreSQL sink must be reported");
+            if sink.errors > 0 {
+                break sink;
+            }
+            sleep(STATS_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("The failed chunk must reach runtime error statistics");
+    assert_eq!(stats.errors, 1);
+    assert_eq!(
+        stats.messages_consumed,
+        Some(POSTGRES_LARGE_BATCH_SIZE as u64)
+    );
+    assert_eq!(stats.messages_processed, Some(0));
+}
+
+async fn large_postgres_batch(client: &IggyClient) -> Result<(), seeds::SeedError> {
+    seed_large_postgres_batch(client, false).await
+}
+
+async fn large_postgres_batch_with_invalid_record(
+    client: &IggyClient,
+) -> Result<(), seeds::SeedError> {
+    seed_large_postgres_batch(client, true).await
+}
+
+async fn seed_large_postgres_batch(
+    client: &IggyClient,
+    invalid_first_record: bool,
+) -> Result<(), seeds::SeedError> {
+    seeds::connector_stream(client).await?;
+    let stream_id: Identifier = seeds::names::STREAM.try_into()?;
+    let topic_id: Identifier = seeds::names::TOPIC.try_into()?;
+    let mut messages = Vec::with_capacity(POSTGRES_LARGE_BATCH_SIZE);
+    for sequence in 0..POSTGRES_LARGE_BATCH_SIZE {
+        let payload = if invalid_first_record && sequence == 0 {
+            b"invalid JSON".to_vec()
+        } else {
+            serde_json::to_vec(&serde_json::json!({"sequence": sequence}))?
+        };
+        messages.push(
+            IggyMessage::builder()
+                .id(sequence as u128 + 1)
+                .payload(Bytes::from(payload))
+                .build()?,
+        );
+    }
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await?;
+    Ok(())
+}
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/postgres/sink.toml")),

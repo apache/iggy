@@ -33,8 +33,8 @@
 //!
 //! - **Leaf types** (primitives, String, known value types): generate direct mappings
 //! - **Nested types** (structs with `ConfigEnv` derive): include their mappings recursively
-//! - **Vec<T>**: expands to indexed mappings (e.g., `FIELD_0_NAME`, `FIELD_1_NAME`, ...)
-//! - **Arc<T>**, **Box<T>**, **Option<T>**: transparently unwrapped
+//! - **`Vec<T>`**: expands to indexed mappings (e.g., `FIELD_0_NAME`, `FIELD_1_NAME`, ...)
+//! - **`Arc<T>`**, **`Box<T>`**, **`Option<T>`**: transparently unwrapped
 
 mod config_env;
 

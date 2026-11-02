@@ -1,6 +1,6 @@
 # Security Policy
 
-Apache Iggy (Incubating) follows the [Apache Software Foundation security process](https://www.apache.org/security/).
+Apache Iggy follows the [Apache Software Foundation security process](https://www.apache.org/security/).
 Please read this before reporting anything you believe is a security issue.
 
 ## Reporting a Vulnerability
@@ -12,7 +12,7 @@ puts users at risk.
 Send reports to **[security@apache.org](mailto:security@apache.org)**.
 
 Iggy does not currently have its own project security list, so `security@apache.org` is the correct
-address. The ASF Security Team will forward your report to the Iggy PPMC's private list and confirm to
+address. The ASF Security Team will forward your report to the Iggy PMC's private list and confirm to
 you that they have done so.
 
 When reporting, please:
@@ -25,7 +25,7 @@ When reporting, please:
 
 ## What Happens Next
 
-1. The ASF Security Team acknowledges receipt and forwards the report to the Iggy PPMC.
+1. The ASF Security Team acknowledges receipt and forwards the report to the Iggy PMC.
 2. We acknowledge the report and investigate. We will tell you whether we accept or reject it, and why.
 3. If accepted, a CVE ID is allocated. The ASF Security Team is the CNA for all Apache projects and is
    the only body that can assign CVE IDs to Apache software.

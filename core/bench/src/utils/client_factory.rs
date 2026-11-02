@@ -20,7 +20,7 @@ use crate::args::transport::BenchmarkTransportCommand;
 use async_trait::async_trait;
 use iggy::http::http_client::HttpClient;
 use iggy::prelude::{
-    Client, ClientWrapper, HttpClientConfig, IdentityInfo, IggyClient, QuicClientConfig, TcpClient,
+    Client, ClientWrapper, HttpClientConfig, IggyClient, IggyError, QuicClientConfig, TcpClient,
     TcpClientConfig, TransportProtocol, UserClient, WebSocketClientConfig,
 };
 use iggy::quic::quic_client::QuicClient;
@@ -34,10 +34,18 @@ pub trait ClientFactory: Sync + Send {
     fn server_addr(&self) -> String;
     fn username(&self) -> &str;
     fn password(&self) -> &str;
-}
 
-pub async fn authenticate(client: &IggyClient, username: &str, password: &str) -> IdentityInfo {
-    client.login_user(username, password).await.unwrap()
+    /// Connects and logs in, the way an SDK user would.
+    ///
+    /// `IggyClient::connect` spawns the heartbeat task, which also refreshes
+    /// consumer-group assignments. The returned client owns that task, so
+    /// dropping it aborts both for the rest of the run.
+    async fn create_authenticated_client(&self) -> Result<IggyClient, IggyError> {
+        let client = IggyClient::create(self.create_client().await, None, None);
+        client.connect().await?;
+        client.login_user(self.username(), self.password()).await?;
+        Ok(client)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -106,20 +114,18 @@ impl ClientFactory for TcpClientFactory {
             )
         });
         Client::connect(&client).await.unwrap_or_else(|e| {
-            if self.tls_enabled {
-                panic!(
-                    "Failed to connect to iggy-server at {} with TLS enabled, error: {:?}\n\
+            assert!(
+                !self.tls_enabled,
+                "Failed to connect to iggy-server at {} with TLS enabled, error: {:?}\n\
                     Hint: Make sure the server is started with TLS enabled and self-signed certificate:\n\
                     IGGY_TCP_TLS_ENABLED=true IGGY_TCP_TLS_SELF_SIGNED=true\n
                     or start iggy-bench with relevant tcp tls arguments: --tls --tls-domain <domain> --tls-ca-file <ca_file>\n",
-                    self.server_addr, e
-                )
-            } else {
-                panic!(
-                    "Failed to connect to iggy-server at {}, error: {:?}",
-                    self.server_addr, e
-                )
-            }
+                self.server_addr, e
+            );
+            panic!(
+                "Failed to connect to iggy-server at {}, error: {:?}",
+                self.server_addr, e
+            )
         });
         ClientWrapper::Tcp(client)
     }

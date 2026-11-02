@@ -17,12 +17,10 @@
 
 //! InfluxDB V3 source — SQL queries, JSONL responses, Bearer auth.
 //!
-//! V3 uses strict `> cursor` semantics. DataFusion/Parquet does not guarantee
-//! stable ordering for rows that share the same timestamp, so the V2 skip-N
-//! approach is not safe here. If a full batch is returned and all rows share
-//! the same timestamp, the cursor cannot advance — the effective batch size is
-//! doubled each poll up to `stuck_batch_cap_factor × batch_size`. If the cap
-//! is reached, the circuit breaker is tripped.
+//! V3 uses strict `> cursor` semantics and requires stable timestamp/tiebreaker
+//! ordering. A full tied batch retains the cursor, advances OFFSET and doubles
+//! the query size up to its cap. Reaching the cap records a circuit-breaker
+//! failure; mixed full batches defer their final timestamp group.
 
 use crate::common::{
     DEFAULT_V3_CURSOR_FIELD, PayloadFormat, Row, RowContext, V3SourceConfig, V3State,
@@ -334,15 +332,12 @@ pub(crate) struct RowProcessingResult {
 ///
 /// - Any row whose cursor field value fails [`normalize_v3_timestamp`] (not a valid RFC 3339
 ///   timestamp even after appending `"Z"`) is an immediate error.
-/// - If the batch is non-empty but *no* row contains the cursor field, an error is
-///   returned — the cursor cannot advance and the connector would re-deliver the same
-///   rows indefinitely. Individual rows that merely lack the cursor field (while at
-///   least one other row has it) still produce messages without error.
+/// - Any row with a missing or non-string cursor field is an immediate error.
 ///
 /// ## Message identity
 ///
-/// A single random UUID is generated per call; per-message IDs are derived by
-/// adding the message's position to that base, keeping PRNG work O(1) per batch.
+/// IDs add the result position to timestamp nanoseconds. Distinct rows can
+/// collide across batches; these values are not unique database-row keys.
 ///
 /// ## Parameters
 ///
@@ -389,8 +384,8 @@ pub(crate) fn process_rows(
                 ))
             })?;
         let (cv_owned, cv_dt) = normalize_v3_timestamp(raw_cv)?;
-        // Stable ID using i128 arithmetic to avoid the i64 nanosecond overflow
-        // that occurs for timestamps outside ~1678-2262 CE.
+        // i128 avoids the i64 nanosecond range limit; adding the result position
+        // still permits collisions across timestamps or query boundaries.
         let nanos_i128 =
             cv_dt.timestamp() as i128 * 1_000_000_000 + cv_dt.timestamp_subsec_nanos() as i128;
         let this_row_id = (nanos_i128 as u128).wrapping_add(db_pos);
@@ -533,7 +528,6 @@ pub(crate) async fn poll(
     if cap_factor > 0
         && full_batch
         && !all_same_timestamp
-        && result.rows_at_max_cursor > 1
         && let Some(penultimate) = result.penultimate_cursor
     {
         let safe_count = result.safe_message_count;
@@ -622,11 +616,10 @@ pub(crate) async fn poll(
             None => {
                 warn!(
                     "InfluxDB V3 source — stuck-timestamp cap reached at batch size {effective_batch}; \
-                     tripping circuit breaker to prevent an infinite loop"
+                     recording a circuit-breaker failure"
                 );
-                // Reset effective_batch_size to base so the next poll after the
-                // circuit-breaker cool-down restarts from the configured batch size
-                // rather than re-entering at cap and immediately re-tripping.
+                // Restart the next query at the base size instead of returning
+                // immediately to the cap. The caller applies the failure threshold.
                 // Do NOT update last_timestamp_row_offset on the trip path — no
                 // messages were emitted, so the offset tiebreaker is unchanged.
                 Ok(PollResult {
@@ -709,15 +702,14 @@ pub(crate) async fn poll(
         // order (the typical time-series pattern). If out-of-order or backdated
         // writes are possible in your workload, a concurrent writer could insert
         // rows at stuck_cursor AFTER this empty-batch poll, and those rows would
-        // be silently skipped because the cursor advances past them here. In that
-        // case, use stuck_batch_cap_factor = 0 to disable stuck detection and
-        // accept potential re-delivery instead.
+        // be silently skipped because the cursor advances past them here.
+        // Disabling stuck detection does not make backdated writes visible.
         _ if state.last_timestamp_row_offset > 0 && state.stuck_cursor.is_some() => {
             warn!(
                 "Advancing cursor past stuck_cursor={:?} on empty follow-up batch. \
                  Any backdated writes at this timestamp inserted after this poll \
-                 will be silently skipped. Set stuck_batch_cap_factor=0 to disable \
-                 stuck detection if your workload has out-of-order ingestion.",
+                 will be skipped. Disabling stuck detection does not recover \
+                 backdated writes.",
                 state.stuck_cursor.as_deref()
             );
             state.stuck_cursor.clone()
@@ -1249,10 +1241,10 @@ mod tests {
 #[cfg(test)]
 mod http_tests {
     use super::*;
-    use axum::Router;
     use axum::extract::Request;
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::post;
+    use axum::{Json, Router};
     use secrecy::SecretString;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1584,6 +1576,78 @@ mod http_tests {
             result.new_state.last_timestamp.as_deref(),
             Some("2024-01-01T00:00:00Z")
         );
+    }
+
+    #[tokio::test]
+    async fn poll_preserves_unseen_ties_after_single_maximum_row() {
+        const FIRST: &str = "2026-01-01T00:00:00Z";
+        const SECOND: &str = "2026-01-01T00:00:01Z";
+        const POLL_LIMIT: usize = 4;
+        let app = Router::new().route(
+            "/api/v3/query_sql",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                let query = body["q"].as_str().unwrap();
+                let cursor = query
+                    .split_once("time > '")
+                    .unwrap()
+                    .1
+                    .split('\'')
+                    .next()
+                    .unwrap();
+                let tokens: Vec<_> = query.split_whitespace().collect();
+                let limit = tokens[tokens.iter().position(|token| *token == "LIMIT").unwrap() + 1]
+                    .parse::<usize>()
+                    .unwrap();
+                let offset = tokens
+                    [tokens.iter().position(|token| *token == "OFFSET").unwrap() + 1]
+                    .parse::<usize>()
+                    .unwrap();
+                [(FIRST, 0), (SECOND, 1), (SECOND, 2)]
+                    .into_iter()
+                    .filter(|(timestamp, _)| *timestamp > cursor)
+                    .skip(offset)
+                    .take(limit)
+                    .map(|(timestamp, value)| {
+                        json!({"time": timestamp, "value": value}).to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }),
+        );
+        let base = start_server(app).await;
+        let config = V3SourceConfig {
+            batch_size: Some(2),
+            query: "SELECT * FROM t WHERE time > '$cursor' ORDER BY time, value LIMIT $limit OFFSET $offset".to_string(),
+            ..make_config(&base)
+        };
+        let client = make_client();
+        let mut state = V3State::default();
+        let mut values = Vec::new();
+        for _ in 0..POLL_LIMIT {
+            let result = poll(
+                &client,
+                &config,
+                "Bearer tok",
+                &state,
+                PayloadFormat::Json,
+                true,
+            )
+            .await
+            .unwrap();
+            for message in result.messages {
+                let payload: serde_json::Value = serde_json::from_slice(&message.payload).unwrap();
+                values.push(payload["value"].as_u64().unwrap());
+            }
+            state = result.new_state;
+        }
+        assert_eq!(
+            values,
+            vec![0, 1, 2],
+            "a batch boundary must not skip unseen rows at its maximum timestamp"
+        );
+        assert_eq!(state.processed_rows, 3);
+        assert_eq!(state.last_timestamp.as_deref(), Some(SECOND));
+        assert_eq!(state.last_timestamp_row_offset, 0);
     }
 
     #[tokio::test]

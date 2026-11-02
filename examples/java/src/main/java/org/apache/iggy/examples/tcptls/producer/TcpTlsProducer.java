@@ -25,17 +25,13 @@ import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.stream.StreamDetails;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.TopicDetails;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-
-import static java.util.Optional.empty;
 
 /**
  * TCP/TLS Producer Example
@@ -43,13 +39,15 @@ import static java.util.Optional.empty;
  * <p>Demonstrates producing messages over a TLS-encrypted TCP connection
  * using custom certificates from core/certs/.
  *
- * <p>Prerequisites: Start the Iggy server with TLS enabled:
+ * <p>Start a disposable server from the repository root with no root credential overrides:
  * <pre>
  *   IGGY_TCP_TLS_ENABLED=true \
  *   IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
  *   IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
- *   cargo r --bin iggy-server
+ *   cargo run --bin iggy-server -- --fresh --with-default-root-credentials
  * </pre>
+ * <p>The fresh flag clears local replica data. Run the client from examples/java
+ * so its development CA certificate path resolves.
  */
 public final class TcpTlsProducer {
 
@@ -138,15 +136,7 @@ public final class TcpTlsProducer {
             log.warn("Topic already exists and will not be created again.");
             return;
         }
-        client.topics()
-                .createTopic(
-                        STREAM_ID,
-                        1L,
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        empty(),
-                        TOPIC_NAME);
+        client.topics().createTopic(STREAM_ID, TOPIC_NAME, 1L);
         log.info("Topic {} was created.", TOPIC_NAME);
     }
 }

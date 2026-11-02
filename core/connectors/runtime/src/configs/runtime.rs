@@ -24,11 +24,14 @@ use figment::value::Dict;
 use figment::{Metadata, Profile, Provider};
 use iggy_common::IggyDuration;
 use iggy_common::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
+use reqwest::Url;
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
+use std::time::Duration;
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct TelemetryConfig {
@@ -345,11 +348,245 @@ impl Default for ConnectorsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct StateConfig {
     pub path: String,
+    #[serde(default)]
+    #[config_env(leaf)]
+    pub storage: StateStorageKind,
+    #[serde(default)]
+    pub http: HttpStateConfig,
 }
 
 impl Display for StateConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ path: {} }}", self.path)
+        write!(
+            f,
+            "{{ path: {}, storage: {}, http: {} }}",
+            self.path, self.storage, self.http
+        )
+    }
+}
+
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Deserialize,
+    Serialize,
+    strum::Display,
+    strum::EnumString,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+pub enum StateStorageKind {
+    #[default]
+    File,
+    Http,
+}
+
+#[serde_as]
+#[derive(Clone, Serialize, Deserialize, ConfigEnv)]
+#[serde(default)]
+pub struct HttpStateConfig {
+    #[config_env(secret)]
+    pub url: String,
+    #[config_env(leaf)]
+    pub load_method: HttpStateMethod,
+    #[serde(default = "default_state_save_method")]
+    #[config_env(leaf)]
+    pub save_method: HttpStateMethod,
+    #[config_env(leaf)]
+    #[serde_as(as = "DisplayFromStr")]
+    pub timeout: IggyDuration,
+    #[config_env(skip)]
+    #[serde(serialize_with = "serialize_redacted_secret_map")]
+    pub request_headers: HashMap<String, SecretString>,
+    pub retry: RetryConfig,
+}
+
+impl Default for HttpStateConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            load_method: HttpStateMethod::Get,
+            save_method: HttpStateMethod::Put,
+            timeout: IggyDuration::new_from_secs(5),
+            request_headers: HashMap::new(),
+            retry: default_state_retry(),
+        }
+    }
+}
+
+impl Display for HttpStateConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ url: {:?}, load_method: {}, save_method: {}, timeout: {}, request_headers: {:?}, retry: {} }}",
+            state_url_label(&self.url),
+            self.load_method,
+            self.save_method,
+            self.timeout,
+            self.request_headers.keys(),
+            self.retry
+        )
+    }
+}
+
+impl std::fmt::Debug for HttpStateConfig {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpStateConfig")
+            .field("url", &state_url_label(&self.url))
+            .field("load_method", &self.load_method)
+            .field("save_method", &self.save_method)
+            .field("timeout", &self.timeout)
+            .field("request_headers", &self.request_headers.keys())
+            .field("retry", &self.retry)
+            .finish()
+    }
+}
+
+fn state_url_label(value: &str) -> String {
+    let Ok(mut url) = Url::parse(value) else {
+        return "<invalid URL>".to_string();
+    };
+    if !url.username().is_empty() {
+        let _ = url.set_username("redacted");
+    }
+    if url.password().is_some() {
+        let _ = url.set_password(Some("redacted"));
+    }
+    if url.query().is_some() {
+        url.set_query(Some("redacted"));
+    }
+    url.to_string()
+}
+
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Deserialize,
+    Serialize,
+    strum::Display,
+    strum::EnumString,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "UPPERCASE", ascii_case_insensitive)]
+pub enum HttpStateMethod {
+    #[default]
+    Get,
+    Put,
+    Post,
+    Patch,
+}
+
+fn default_state_save_method() -> HttpStateMethod {
+    HttpStateMethod::Put
+}
+
+fn default_state_retry() -> RetryConfig {
+    RetryConfig {
+        enabled: true,
+        max_attempts: 4,
+        initial_backoff: IggyDuration::new(Duration::from_millis(200)),
+        max_backoff: IggyDuration::new_from_secs(2),
+        backoff_multiplier: 2,
+    }
+}
+
+fn serialize_redacted_secret_map<S: serde::Serializer>(
+    headers: &HashMap<String, SecretString>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(headers.keys().map(|name| (name, "[REDACTED]")))
+}
+
+#[cfg(test)]
+mod state_config_tests {
+    use super::*;
+
+    #[test]
+    fn given_legacy_path_only_state_section_when_parsed_should_default_to_file_storage() {
+        let parsed: StateConfig = toml::from_str(r#"path = "local_state""#).expect("parse state");
+        assert_eq!(parsed.path, "local_state");
+        assert_eq!(parsed.storage, StateStorageKind::File);
+        assert!(parsed.http.url.is_empty());
+        assert_eq!(parsed.http.load_method, HttpStateMethod::Get);
+        assert_eq!(parsed.http.save_method, HttpStateMethod::Put);
+        assert_eq!(parsed.http.timeout.get_duration(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn given_http_state_section_when_parsed_should_populate_backend_config() {
+        let toml = r#"
+            path = "local_state"
+            storage = "http"
+
+            [http]
+            url = "http://127.0.0.1:8080/connectors/state"
+            load_method = "post"
+            save_method = "patch"
+            timeout = "10s"
+
+            [http.request_headers]
+            authorization = "Bearer token"
+
+            [http.retry]
+            enabled = true
+            max_attempts = 7
+            initial_backoff = "100ms"
+            max_backoff = "1s"
+            backoff_multiplier = 3
+        "#;
+        let parsed: StateConfig = toml::from_str(toml).expect("parse state");
+        assert_eq!(parsed.storage, StateStorageKind::Http);
+        assert_eq!(parsed.http.url, "http://127.0.0.1:8080/connectors/state");
+        assert_eq!(parsed.http.load_method, HttpStateMethod::Post);
+        assert_eq!(parsed.http.save_method, HttpStateMethod::Patch);
+        assert_eq!(parsed.http.timeout.get_duration(), Duration::from_secs(10));
+        assert!(parsed.http.request_headers.contains_key("authorization"));
+        assert_eq!(parsed.http.retry.max_attempts, 7);
+        assert_eq!(parsed.http.retry.backoff_multiplier, 3);
+    }
+
+    #[test]
+    fn given_unknown_storage_kind_when_parsed_should_fail() {
+        let result = toml::from_str::<StateConfig>(
+            r#"
+            path = "local_state"
+            storage = "s3"
+        "#,
+        );
+        assert!(result.is_err(), "unknown storage kinds must fail boot");
+    }
+
+    #[test]
+    fn given_state_config_when_displayed_should_not_render_header_values() {
+        let mut config = StateConfig::default();
+        config.http.url = "https://user:password@example.com/state?token=query-secret".to_string();
+        config
+            .http
+            .request_headers
+            .insert("authorization".to_string(), "Bearer top-secret".into());
+        let display_output = config.to_string();
+        let debug_output = format!("{config:?}");
+        let serialized_output = toml::to_string(&config).expect("serialize state config");
+        assert!(!display_output.contains("top-secret"), "{display_output}");
+        assert!(!debug_output.contains("top-secret"), "{debug_output}");
+        assert!(!display_output.contains("password"), "{display_output}");
+        assert!(!debug_output.contains("password"), "{debug_output}");
+        assert!(!display_output.contains("query-secret"), "{display_output}");
+        assert!(!debug_output.contains("query-secret"), "{debug_output}");
+        assert!(
+            !serialized_output.contains("top-secret"),
+            "{serialized_output}"
+        );
+        assert!(serialized_output.contains("[REDACTED]"));
     }
 }
 
@@ -408,6 +645,8 @@ impl Default for StateConfig {
     fn default() -> Self {
         Self {
             path: "local_state".to_owned(),
+            storage: StateStorageKind::default(),
+            http: HttpStateConfig::default(),
         }
     }
 }

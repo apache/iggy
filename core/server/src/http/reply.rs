@@ -20,7 +20,7 @@
 //! login error mappings the write and auth paths render through.
 
 use iggy_binary_protocol::consensus::{
-    Command2, EvictionHeader, HEADER_SIZE, result_code, result_section_len,
+    Command, EvictionHeader, HEADER_SIZE, result_code, result_section_len,
 };
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
 use iggy_binary_protocol::responses::messages::SendMessagesResponse;
@@ -33,12 +33,13 @@ use iggy_common::{
     ConsumerGroupDetails, IggyError, StreamDetails, TopicDetails, UserInfoDetails,
     eviction_reason_to_error,
 };
-use message_bus::BusMessage;
-use server_common::Message;
+use metadata::MetadataSubmitError;
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use tracing::warn;
 
+use crate::dispatch::login_error::LoginRegisterError;
 use crate::http::error::{PartitionWriteError, WriteError};
-use crate::login_register::LoginRegisterError;
+use crate::reply_frame::reply_body;
 
 /// Discriminate a partition write reply. Partition replies carry no result
 /// section - a denial is empty-bodied and a committed body, where there is one,
@@ -53,6 +54,12 @@ use crate::login_register::LoginRegisterError;
 /// number) is always >= 1, so a 0 there is an ack with nothing committed
 /// behind it and must not grade as success.
 ///
+/// `TransientNotCommitted` is the exception to that map: the relay that lost
+/// the write's verdict answers it, and it licenses only a replay of the same
+/// request id. HTTP mints a new id per request, so a resend is a new request
+/// that cannot replay this one: the write may still commit and grades as the
+/// unknown-outcome [`PartitionWriteError::Timeout`].
+///
 /// Grading only, and it hands the graded header back: the committed body is
 /// read separately (see [`send_confirmations`]) because it is
 /// operation-specific - consumer-offset writes commit empty, a produce commits
@@ -60,15 +67,18 @@ use crate::login_register::LoginRegisterError;
 /// keeps that a single parse whose failure mode is already decided here, rather
 /// than a second one whose fallback would have to invent a body.
 pub(in crate::http) fn classify_partition_reply(
-    reply: &BusMessage,
+    reply: &Frozen<MESSAGE_ALIGN>,
 ) -> Result<ReplyHeader, PartitionWriteError> {
     let header = reply
         .as_slice()
         .get(..HEADER_SIZE)
         .and_then(|bytes| bytemuck::checked::try_from_bytes::<ReplyHeader>(bytes).ok())
         .ok_or(PartitionWriteError::Rejected(IggyError::InvalidCommand))?;
-    if header.command != Command2::Reply {
+    if header.command != Command::Reply {
         return Err(PartitionWriteError::Rejected(IggyError::InvalidCommand));
+    }
+    if header.status == IggyError::TransientNotCommitted.as_code() {
+        return Err(PartitionWriteError::Timeout(header.operation));
     }
     if header.status != 0 {
         return Err(PartitionWriteError::Rejected(IggyError::from_code(
@@ -93,7 +103,7 @@ pub(in crate::http) fn classify_partition_reply(
 /// `header` is the one [`classify_partition_reply`] graded, so this reads the
 /// body without re-deriving its extent.
 pub(in crate::http) fn send_confirmations(
-    reply: &BusMessage,
+    reply: &Frozen<MESSAGE_ALIGN>,
     header: &ReplyHeader,
 ) -> Option<SendMessagesResponse> {
     let body = partition_reply_body(reply, header);
@@ -115,7 +125,7 @@ pub(in crate::http) fn send_confirmations(
 /// A partition reply's body past the header, bounded by the header's `size`
 /// rather than by the buffer length: `size` is the frame's authoritative
 /// extent, and the typed decoders reject trailing bytes.
-fn partition_reply_body<'a>(reply: &'a BusMessage, header: &ReplyHeader) -> &'a [u8] {
+fn partition_reply_body<'a>(reply: &'a Frozen<MESSAGE_ALIGN>, header: &ReplyHeader) -> &'a [u8] {
     reply
         .as_slice()
         .get(HEADER_SIZE..header.size as usize)
@@ -145,33 +155,6 @@ pub(in crate::http) fn committed_payload(
         Some(code) => Err(WriteError::Rejected(IggyError::from_code(code))),
         None => Err(WriteError::Rejected(IggyError::InvalidCommand)),
     }
-}
-
-/// The transient variant of a reply-shaped pre-consensus rejection frame
-/// (`[count=1][index=0][code]`, see `build_result_rejection_reply`), or `None`
-/// for a committed outcome. Either transient means the op did not commit, so
-/// the write path must replay the same request id rather than grade it as a
-/// committed result or advance the session gate. The two codes are kept
-/// distinct because they exhaust differently: `TransientNotAccepted` never
-/// entered the pipeline and is safe to re-issue anywhere, while
-/// `TransientNotCommitted` may still commit and only a same-session same-id
-/// replay is safe.
-pub(in crate::http) fn transient_code(reply: &Message<GenericHeader>) -> Option<IggyError> {
-    match result_code(reply_body(reply)) {
-        Some(code) if code == IggyError::TransientNotCommitted.as_code() => {
-            Some(IggyError::TransientNotCommitted)
-        }
-        Some(code) if code == IggyError::TransientNotAccepted.as_code() => {
-            Some(IggyError::TransientNotAccepted)
-        }
-        _ => None,
-    }
-}
-
-/// The reply body past the generic header, bounded by the header's `size`.
-fn reply_body(reply: &Message<GenericHeader>) -> &[u8] {
-    let size = reply.header().size as usize;
-    reply.as_slice().get(HEADER_SIZE..size).unwrap_or_default()
 }
 
 /// Decode the `GetStreamResponse` payload of a committed create-stream reply into
@@ -253,9 +236,13 @@ pub(in crate::http) fn eviction_error(reply: &Message<GenericHeader>) -> IggyErr
 /// `#[non_exhaustive]` enum.
 pub(in crate::http) const fn login_error_to_iggy(error: &LoginRegisterError) -> IggyError {
     match error {
-        LoginRegisterError::InvalidCredentials => IggyError::InvalidCredentials,
+        LoginRegisterError::InvalidCredentials | LoginRegisterError::UserNotFound => {
+            IggyError::InvalidCredentials
+        }
         LoginRegisterError::InvalidToken => IggyError::InvalidPersonalAccessToken,
         LoginRegisterError::UserInactive => IggyError::UserInactive,
+        LoginRegisterError::Transient(MetadataSubmitError::NotCaughtUp)
+        | LoginRegisterError::ExternalAuthUnavailable => IggyError::TransientNotAccepted,
         _ => IggyError::Unauthenticated,
     }
 }
@@ -270,12 +257,23 @@ mod tests {
     use iggy_binary_protocol::WireEncode;
     use iggy_binary_protocol::responses::messages::SendMessagesConfirmationResponse;
 
-    use crate::responses::{
-        NonReplicatedResponse, build_deny_reply, build_empty_reply, build_reply_from_bytes,
-        build_reply_with_body,
+    use crate::reply_frame::{
+        build_deny_reply, build_empty_reply, build_reply_from_bytes, build_reply_with_body,
+        transient_code,
     };
+    use crate::responses::NonReplicatedResponse;
 
     use crate::http::wire::build_request_message;
+
+    #[test]
+    fn given_uninitialized_root_when_mapping_login_failure_should_return_a_retryable_error() {
+        assert!(matches!(
+            login_error_to_iggy(&LoginRegisterError::Transient(
+                MetadataSubmitError::NotCaughtUp
+            )),
+            IggyError::TransientNotAccepted
+        ));
+    }
 
     // The dispatch-time deny frame: an empty body plus `ReplyHeader.status` set
     // to the rule's error code, the request-level channel the SDK peeks before
@@ -296,7 +294,7 @@ mod tests {
             "status carries the deny code"
         );
         assert_ne!(status, 0, "a deny status is nonzero so the SDK peek fires");
-        assert_eq!(reply.header().command, Command2::Reply);
+        assert_eq!(reply.header().command, Command::Reply);
         // Echoes the request so the SDK routes it back to the waiting slot.
         assert_eq!(reply.header().request, request.header().request);
         assert_eq!(reply.header().operation, request.header().operation);
@@ -338,7 +336,7 @@ mod tests {
 
         // The consensus plane's committed-reply builder (plane_helpers path).
         let prepare = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             operation: Operation::SendMessages,
             client: 42,
             op: 1,
@@ -362,14 +360,14 @@ mod tests {
         );
     }
 
-    fn frozen(reply: Message<iggy_binary_protocol::ReplyHeader>) -> BusMessage {
+    fn frozen(reply: Message<iggy_binary_protocol::ReplyHeader>) -> Frozen<MESSAGE_ALIGN> {
         reply.into_generic().into_frozen()
     }
 
     #[test]
     fn committed_partition_reply_classifies_as_success() {
         let prepare = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             operation: Operation::SendMessages,
             client: 42,
             op: 1,
@@ -381,12 +379,12 @@ mod tests {
     }
 
     /// The 204 path of the offset write routes: a committed
-    /// `StoreConsumerOffset2` reply (op >= 1) classifies as success.
+    /// `StoreConsumerOffset` reply (op >= 1) classifies as success.
     #[test]
     fn committed_offset_write_reply_classifies_as_success() {
         let prepare = PrepareHeader {
-            command: Command2::Prepare,
-            operation: Operation::StoreConsumerOffset2,
+            command: Command::Prepare,
+            operation: Operation::StoreConsumerOffset,
             client: 42,
             op: 3,
             request: 2,
@@ -451,6 +449,14 @@ mod tests {
             transient_code(&not_accepted),
             Some(IggyError::TransientNotAccepted)
         );
+
+        let not_primary = consensus::build_result_rejection_reply(
+            request.header(),
+            9,
+            IggyError::NotPrimary.as_code(),
+        )
+        .into_generic();
+        assert_eq!(transient_code(&not_primary), Some(IggyError::NotPrimary));
     }
 
     /// Genuine committed outcomes must advance the gate, so neither a success
@@ -486,9 +492,9 @@ mod tests {
         ));
     }
 
-    fn send_reply(body: &Bytes) -> BusMessage {
+    fn send_reply(body: &Bytes) -> Frozen<MESSAGE_ALIGN> {
         let prepare = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             operation: Operation::SendMessages,
             client: 42,
             op: 1,
@@ -554,7 +560,7 @@ mod tests {
     /// mapped `IggyError`, not as the generic op-0 not-found.
     #[test]
     fn status_bearing_deny_reply_classifies_as_typed_rejection() {
-        let request = build_request_message(Operation::DeleteConsumerOffset2, 42, 7, 1, &[]);
+        let request = build_request_message(Operation::DeleteConsumerOffset, 42, 7, 1, &[]);
         let mut deny = build_empty_reply(request.header(), 42, 0, 9);
         let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
             &mut deny.as_mut_slice()[..HEADER_SIZE],

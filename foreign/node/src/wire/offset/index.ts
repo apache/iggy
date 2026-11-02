@@ -14,8 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 export * from './get-offset.command.js';
 export * from './store-offset.command.js';
+export * from './position.command.js';
 export { Consumer } from './offset.utils.js';

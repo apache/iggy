@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 export * from './consumer-stream.js';
+export * from './partition-reader.js';
+export * from './iggy-consumer.js';

@@ -15,18 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_common::IggyDuration;
+
 use super::http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig};
 use super::server::{
-    ConsumerGroupConfig, HeartbeatConfig, MemoryPoolConfig, MessageSaverConfig,
-    MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig,
-    TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
+    ConsumerGroupConfig, HeartbeatConfig, MemoryPoolConfig, MessagesMaintenanceConfig,
+    PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig, TelemetryConfig,
+    TelemetryLogsConfig, TelemetryTracesConfig,
 };
-use super::system::{
-    BackupConfig, CompatibilityConfig, CompressionConfig, EncryptionConfig, LoggingConfig,
-    MessageDeduplicationConfig, PartitionConfig, RecoveryConfig, RuntimeConfig, SegmentConfig,
-    StateConfig, StreamConfig, SystemConfig, TopicConfig,
-};
-use configs::ConfigEnvMappings;
+use super::system::{EncryptionConfig, LoggingConfig, RuntimeConfig};
 
 static_toml::static_toml! {
     // static_toml resolves relative to CARGO_MANIFEST_DIR (core/configs/).
@@ -150,16 +147,6 @@ impl Default for HttpTlsConfig {
     }
 }
 
-impl Default for MessageSaverConfig {
-    fn default() -> MessageSaverConfig {
-        MessageSaverConfig {
-            enabled: SERVER_CONFIG.message_saver.enabled,
-            enforce_fsync: SERVER_CONFIG.message_saver.enforce_fsync,
-            interval: SERVER_CONFIG.message_saver.interval.parse().unwrap(),
-        }
-    }
-}
-
 impl Default for PersonalAccessTokenConfig {
     fn default() -> PersonalAccessTokenConfig {
         PersonalAccessTokenConfig {
@@ -183,51 +170,6 @@ impl Default for PersonalAccessTokenCleanerConfig {
     }
 }
 
-impl<S: ConfigEnvMappings + Default> Default for SystemConfig<S> {
-    fn default() -> Self {
-        Self {
-            path: SERVER_CONFIG.system.path.parse().unwrap(),
-            backup: BackupConfig::default(),
-            runtime: RuntimeConfig::default(),
-            logging: LoggingConfig::default(),
-            stream: StreamConfig::default(),
-            encryption: EncryptionConfig::default(),
-            topic: TopicConfig::default(),
-            partition: PartitionConfig::default(),
-            segment: SegmentConfig::default(),
-            state: StateConfig::default(),
-            compression: CompressionConfig::default(),
-            message_deduplication: MessageDeduplicationConfig::default(),
-            recovery: RecoveryConfig::default(),
-            memory_pool: MemoryPoolConfig::default(),
-            sharding: S::default(),
-        }
-    }
-}
-
-impl Default for BackupConfig {
-    fn default() -> BackupConfig {
-        BackupConfig {
-            path: SERVER_CONFIG.system.backup.path.parse().unwrap(),
-            compatibility: CompatibilityConfig::default(),
-        }
-    }
-}
-
-impl Default for CompatibilityConfig {
-    fn default() -> Self {
-        CompatibilityConfig {
-            path: SERVER_CONFIG
-                .system
-                .backup
-                .compatibility
-                .path
-                .parse()
-                .unwrap(),
-        }
-    }
-}
-
 impl Default for HeartbeatConfig {
     fn default() -> HeartbeatConfig {
         HeartbeatConfig {
@@ -240,14 +182,14 @@ impl Default for HeartbeatConfig {
 impl Default for ConsumerGroupConfig {
     fn default() -> ConsumerGroupConfig {
         ConsumerGroupConfig {
+            heartbeat_interval: SERVER_CONFIG
+                .consumer_group
+                .heartbeat_interval
+                .parse()
+                .unwrap(),
             rebalancing_timeout: SERVER_CONFIG
                 .consumer_group
                 .rebalancing_timeout
-                .parse()
-                .unwrap(),
-            rebalancing_check_interval: SERVER_CONFIG
-                .consumer_group
-                .rebalancing_check_interval
                 .parse()
                 .unwrap(),
         }
@@ -257,21 +199,7 @@ impl Default for ConsumerGroupConfig {
 impl Default for RuntimeConfig {
     fn default() -> RuntimeConfig {
         RuntimeConfig {
-            path: SERVER_CONFIG.system.runtime.path.parse().unwrap(),
-        }
-    }
-}
-
-impl Default for CompressionConfig {
-    fn default() -> Self {
-        CompressionConfig {
-            allow_override: SERVER_CONFIG.system.compression.allow_override,
-            default_algorithm: SERVER_CONFIG
-                .system
-                .compression
-                .default_algorithm
-                .parse()
-                .unwrap(),
+            path: SERVER_CONFIG.runtime.path.parse().unwrap(),
         }
     }
 }
@@ -279,114 +207,37 @@ impl Default for CompressionConfig {
 impl Default for LoggingConfig {
     fn default() -> LoggingConfig {
         LoggingConfig {
-            path: SERVER_CONFIG.system.logging.path.parse().unwrap(),
-            level: SERVER_CONFIG.system.logging.level.parse().unwrap(),
-            file_enabled: SERVER_CONFIG.system.logging.file_enabled,
-            max_file_size: SERVER_CONFIG.system.logging.max_file_size.parse().unwrap(),
-            max_total_size: SERVER_CONFIG.system.logging.max_total_size.parse().unwrap(),
+            path: SERVER_CONFIG.logging.path.parse().unwrap(),
+            level: SERVER_CONFIG.logging.level.parse().unwrap(),
+            file_enabled: SERVER_CONFIG.logging.file_enabled,
+            max_file_size: SERVER_CONFIG.logging.max_file_size.parse().unwrap(),
+            max_total_size: SERVER_CONFIG.logging.max_total_size.parse().unwrap(),
             rotation_check_interval: SERVER_CONFIG
-                .system
                 .logging
                 .rotation_check_interval
                 .parse()
                 .unwrap(),
-            retention: SERVER_CONFIG.system.logging.retention.parse().unwrap(),
-            sysinfo_print_interval: SERVER_CONFIG
-                .system
-                .logging
-                .sysinfo_print_interval
-                .parse()
-                .unwrap(),
+            retention: SERVER_CONFIG.logging.retention.parse().unwrap(),
+            sysinfo_print_interval: default_sysinfo_print_interval(),
         }
     }
+}
+
+pub(crate) fn default_sysinfo_print_interval() -> IggyDuration {
+    SERVER_CONFIG
+        .logging
+        .sysinfo_print_interval
+        .parse()
+        .unwrap()
 }
 
 impl Default for EncryptionConfig {
     fn default() -> EncryptionConfig {
         EncryptionConfig {
-            enabled: SERVER_CONFIG.system.encryption.enabled,
-            key: SERVER_CONFIG.system.encryption.key.parse().unwrap(),
-        }
-    }
-}
-
-impl Default for StreamConfig {
-    fn default() -> StreamConfig {
-        StreamConfig {
-            path: SERVER_CONFIG.system.stream.path.parse().unwrap(),
-        }
-    }
-}
-
-impl Default for TopicConfig {
-    fn default() -> TopicConfig {
-        TopicConfig {
-            path: SERVER_CONFIG.system.topic.path.parse().unwrap(),
-            max_size: SERVER_CONFIG.system.topic.max_size.parse().unwrap(),
-            message_expiry: SERVER_CONFIG.system.topic.message_expiry.parse().unwrap(),
-        }
-    }
-}
-
-impl Default for PartitionConfig {
-    fn default() -> PartitionConfig {
-        PartitionConfig {
-            path: SERVER_CONFIG.system.partition.path.parse().unwrap(),
-            size_of_messages_required_to_save: SERVER_CONFIG
-                .system
-                .partition
-                .size_of_messages_required_to_save
-                .parse()
-                .unwrap(),
-            messages_required_to_save: SERVER_CONFIG.system.partition.messages_required_to_save
-                as u32,
-            enforce_fsync: SERVER_CONFIG.system.partition.enforce_fsync,
-            validate_checksum: SERVER_CONFIG.system.partition.validate_checksum,
-        }
-    }
-}
-
-impl Default for SegmentConfig {
-    fn default() -> SegmentConfig {
-        SegmentConfig {
-            size: SERVER_CONFIG.system.segment.size.parse().unwrap(),
-            preallocate: SERVER_CONFIG.system.segment.preallocate,
-            cache_indexes: SERVER_CONFIG.system.segment.cache_indexes.parse().unwrap(),
-            archive_expired: SERVER_CONFIG.system.segment.archive_expired,
-        }
-    }
-}
-
-impl Default for StateConfig {
-    fn default() -> StateConfig {
-        StateConfig {
-            enforce_fsync: SERVER_CONFIG.system.state.enforce_fsync,
-            max_file_operation_retries: SERVER_CONFIG.system.state.max_file_operation_retries
-                as u32,
-            retry_delay: SERVER_CONFIG.system.state.retry_delay.parse().unwrap(),
-        }
-    }
-}
-
-impl Default for MessageDeduplicationConfig {
-    fn default() -> MessageDeduplicationConfig {
-        MessageDeduplicationConfig {
-            enabled: SERVER_CONFIG.system.message_deduplication.enabled,
-            max_entries: SERVER_CONFIG.system.message_deduplication.max_entries as u64,
-            expiry: SERVER_CONFIG
-                .system
-                .message_deduplication
-                .expiry
-                .parse()
-                .unwrap(),
-        }
-    }
-}
-
-impl Default for RecoveryConfig {
-    fn default() -> RecoveryConfig {
-        RecoveryConfig {
-            recreate_missing_state: SERVER_CONFIG.system.recovery.recreate_missing_state,
+            enabled: SERVER_CONFIG.encryption.enabled,
+            key: SERVER_CONFIG.encryption.key.parse().unwrap(),
+            previous_keys: Vec::new(),
+            retired_kek_fingerprints: Vec::new(),
         }
     }
 }
@@ -394,9 +245,9 @@ impl Default for RecoveryConfig {
 impl Default for MemoryPoolConfig {
     fn default() -> MemoryPoolConfig {
         Self {
-            enabled: SERVER_CONFIG.system.memory_pool.enabled,
-            size: SERVER_CONFIG.system.memory_pool.size.parse().unwrap(),
-            bucket_capacity: SERVER_CONFIG.system.memory_pool.bucket_capacity as u32,
+            enabled: SERVER_CONFIG.memory_pool.enabled,
+            size: SERVER_CONFIG.memory_pool.size.parse().unwrap(),
+            bucket_capacity: SERVER_CONFIG.memory_pool.bucket_capacity as u32,
         }
     }
 }

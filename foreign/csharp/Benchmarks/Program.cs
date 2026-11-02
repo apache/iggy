@@ -18,6 +18,7 @@
 using Apache.Iggy;
 using Apache.Iggy.Benchmarks;
 using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.IggyClient;
@@ -44,16 +45,6 @@ for (var i = 0; i < producerCount; i++)
         BaseAddress = "127.0.0.1:8090",
         Protocol = Protocol.Tcp,
         LoggerFactory = loggerFactory,
-#if OS_LINUX
-        ReceiveBufferSize = Int32.MaxValue,
-        SendBufferSize = Int32.MaxValue,
-#elif OS_WINDOWS
-        ReceiveBufferSize = int.MaxValue,
-        SendBufferSize = int.MaxValue,
-#elif OS_MAC
-        ReceiveBufferSize = 7280 * 1024,
-        SendBufferSize = 7280 * 1024,
-#endif
     });
 
     await bus.LoginUserAsync("iggy", "iggy");
@@ -68,11 +59,8 @@ try
 
         await clients[0].CreateTopicAsync(Identifier.Numeric(startingStreamId + i),
             $"Test bench topic_{i}",
-            compressionAlgorithm: CompressionAlgorithm.None,
-            messageExpiry: TimeSpan.Zero,
-            maxTopicSize: 2_000_000_000,
-            replicationFactor: 3,
-            partitionsCount: 1);
+            partitionsCount: 1,
+            options: new TopicOptions { MaxTopicSize = 2_000_000_000 });
     }
 }
 catch

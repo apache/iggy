@@ -1,0 +1,516 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Identifier resolution against the replicated streams STM.
+//!
+//! Resolve partition-addressed requests to the owning `IggyNamespace` through
+//! the STM's stream / topic resolvers, naming the level that missed with the
+//! legacy typed not-found errors. Also home of the consumer-group
+//! ownership fence the offset ops run before resolving, which stops a stale
+//! group member from writing an offset for a partition it no longer owns.
+
+use crate::shell::{ShellBus, ShellShard};
+use consensus::MetadataHandle;
+use iggy_binary_protocol::PrepareHeader;
+use iggy_binary_protocol::batch::BATCH_PRODUCER_OFFSET;
+use iggy_binary_protocol::primitives::consumer::WireConsumer;
+use iggy_binary_protocol::requests::consumer_offsets::{
+    DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
+};
+use iggy_binary_protocol::requests::messages::SendMessagesHeader;
+use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
+use iggy_binary_protocol::{
+    KIND_CONSUMER_GROUP, KIND_EXTERNAL_GROUP, Operation, WireDecode, WireIdentifier,
+    WirePartitioning,
+};
+use iggy_common::{Identifier, IggyError};
+use journal::superblock::SuperblockStore;
+use journal::{Journal, JournalHandle};
+use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::stream::Streams;
+use server_common::Message;
+use server_common::sharding::IggyNamespace;
+use shard::{PartitionRead, PartitionReadReply};
+use std::rc::Rc;
+
+pub fn resolve_offset_group_id(
+    streams: &Streams,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+    group: &WireIdentifier,
+) -> Result<u64, IggyError> {
+    streams
+        .resolve_consumer_group_id(stream_id, topic_id, group)
+        .ok_or_else(|| {
+            if streams
+                .topic_partitions_count(stream_id, topic_id)
+                .is_some()
+            {
+                missing_consumer_group_error(group, topic_id)
+            } else {
+                IggyError::ResourceNotFound(String::new())
+            }
+        })
+}
+
+/// Fence a consumer-group offset op then resolve its target partition
+/// namespace. Shared by the four `Store`/`Delete` consumer-offset arms and by
+/// the consumer-routing read.
+pub fn fence_and_resolve_offset_namespace<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    consumer: &WireConsumer,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+    partition_id: Option<u32>,
+    client_id: u128,
+) -> Result<IggyNamespace, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    fence_group_offset(
+        shard,
+        consumer,
+        stream_id,
+        topic_id,
+        partition_id,
+        client_id,
+    )?;
+    resolve_partition_namespace(shard, stream_id, topic_id, partition_id)
+}
+
+pub fn resolve_partition_request_namespace<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    operation: Operation,
+    body: &[u8],
+    client_id: u128,
+) -> Result<u64, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let namespace = match operation {
+        Operation::SendMessages => {
+            if body.len() < 4 {
+                return Err(IggyError::InvalidCommand);
+            }
+            let metadata_length = u32::from_le_bytes(
+                body[..4]
+                    .try_into()
+                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
+            ) as usize;
+            if body.len() < 4 + metadata_length {
+                return Err(IggyError::InvalidCommand);
+            }
+            let header = SendMessagesHeader::decode_from(&body[4..4 + metadata_length])
+                .map_err(|_| IggyError::InvalidCommand)?;
+            // A producer counts its sequence per partition, so its batch must
+            // name one. Refused before `Balanced` moves its cursor.
+            if !matches!(header.partitioning, WirePartitioning::PartitionId(_))
+                && body
+                    .get(4 + metadata_length + BATCH_PRODUCER_OFFSET)
+                    .is_some_and(|&flags| flags != 0)
+            {
+                return Err(IggyError::ProducerPartitionRequired);
+            }
+            resolve_send_messages_namespace(shard, &header)?
+        }
+        Operation::StoreConsumerOffset => {
+            let request = StoreConsumerOffsetRequest::decode_from(body)
+                .map_err(|_| IggyError::InvalidCommand)?;
+            fence_and_resolve_offset_namespace(
+                shard,
+                &request.consumer,
+                &request.stream_id,
+                &request.topic_id,
+                request.partition_id,
+                client_id,
+            )?
+        }
+        Operation::DeleteConsumerOffset => {
+            let request = DeleteConsumerOffsetRequest::decode_from(body)
+                .map_err(|_| IggyError::InvalidCommand)?;
+            fence_and_resolve_offset_namespace(
+                shard,
+                &request.consumer,
+                &request.stream_id,
+                &request.topic_id,
+                request.partition_id,
+                client_id,
+            )?
+        }
+        Operation::DeleteSegments => {
+            let request =
+                DeleteSegmentsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+            resolve_partition_namespace(
+                shard,
+                &request.stream_id,
+                &request.topic_id,
+                Some(request.partition_id),
+            )?
+        }
+        _ => return Err(IggyError::FeatureUnavailable),
+    };
+    Ok(namespace.inner())
+}
+
+/// Whether this node stores `namespace`: true for one every node stores, and
+/// for one this node has not seen committed yet.
+pub fn stores_partition<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+) -> bool
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let node = shard.replica_topology().self_replica_id;
+    shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .members_for_namespace(namespace)
+        .is_none_or(|members| members.is_none_or(|members| members.member(node).is_some()))
+}
+
+/// The primary of `namespace`'s group. A node storing the partition answers
+/// from its own replica; any other node answers with the view the group's
+/// primary last reported, or the committed initial view before any report.
+#[allow(clippy::future_not_send)]
+pub async fn partition_primary<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+) -> Option<PartitionReadReply>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let topology = shard.replica_topology();
+    let route = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .partition_route_inputs(namespace);
+    let stored = route.as_ref().is_none_or(|(members, _, _)| {
+        members.is_none_or(|members| members.member(topology.self_replica_id).is_some())
+    });
+    if stored {
+        return shard
+            .partition_read(namespace, PartitionRead::Primary)
+            .await;
+    }
+    let (members, created_view, reported) = route?;
+    // A stale view costs one NotPrimary hop; no view leaves the route empty.
+    let view = reported.unwrap_or(created_view);
+    let primary = metadata::stm::stream::primary_of(members, view, topology.replica_count)?;
+    Some(PartitionReadReply::Primary { view, primary })
+}
+
+pub fn resolve_partition_namespace<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+    partition_id: Option<u32>,
+) -> Result<IggyNamespace, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
+    let streams = shard.plane.metadata().mux_stm.streams();
+    if let Some(namespace) = streams.namespace_from_partition(stream_id, topic_id, partition_id) {
+        return Ok(namespace);
+    }
+    // Name the level that missed - partition, topic, or stream - with the
+    // legacy typed not-found, so a client can tell an addressing typo from an
+    // empty partition. Callers that shape their own reply (empty poll, group
+    // gather) treat every variant the same, so the split is reply-visible only
+    // where a caller denies typed.
+    if streams.topic_partition_ids(stream_id, topic_id).is_some() {
+        return Err(IggyError::PartitionNotFound(
+            partition_id as usize,
+            Identifier::try_from(topic_id).unwrap_or_default(),
+            Identifier::try_from(stream_id).unwrap_or_default(),
+        ));
+    }
+    Err(streams.read(|inner| {
+        let Some(resolved_stream) = inner.resolve_stream_id(stream_id) else {
+            return stream_not_found(stream_id);
+        };
+        if inner.resolve_topic_id(resolved_stream, topic_id).is_none() {
+            return topic_not_found(stream_id, topic_id);
+        }
+        // Unreachable while `topic_partition_ids` misses only on stream/topic;
+        // kept as the safe generic rejection should that invariant drift.
+        IggyError::InvalidIdentifier
+    }))
+}
+
+/// Reject a request whose parent stream/topic is absent with the legacy typed
+/// error naming the level that missed. For a consumer-group read, a missing
+/// group itself stays the shared not-found reply (empty over TCP, 404 over HTTP).
+pub fn ensure_topic_exists<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    shard.plane.metadata().mux_stm.streams().read(|streams| {
+        let resolved_stream = streams
+            .resolve_stream_id(stream_id)
+            .ok_or_else(|| stream_not_found(stream_id))?;
+        streams
+            .resolve_topic_id(resolved_stream, topic_id)
+            .ok_or_else(|| topic_not_found(stream_id, topic_id))?;
+        Ok(())
+    })
+}
+
+/// Fence a consumer-group offset commit/delete: a group consumer may only
+/// touch the offset of a partition it currently owns. `Ok` for individual
+/// consumers (no fence) and for owned group partitions; `Err` otherwise so a
+/// stale client re-syncs instead of corrupting the shared group offset. An
+/// external group has no members here, so it needs only an existing group.
+fn fence_group_offset<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    consumer: &WireConsumer,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+    partition_id: Option<u32>,
+    client_id: u128,
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let streams = shard.plane.metadata().mux_stm.streams();
+    match consumer.kind {
+        KIND_CONSUMER_GROUP => {}
+        KIND_EXTERNAL_GROUP => {
+            partition_id.ok_or(IggyError::InvalidIdentifier)?;
+            resolve_offset_group_id(streams, stream_id, topic_id, &consumer.id)?;
+            return Ok(());
+        }
+        _ => return Ok(()),
+    }
+    let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
+    let Some(_) = streams
+        // Commit fence: allow a pending-revoked partition (the source commits it
+        // to drain the cooperative handoff), so `require_pollable = false`.
+        .consumer_group_fence(
+            stream_id,
+            topic_id,
+            &consumer.id,
+            client_id,
+            partition_id,
+            false,
+        )
+    else {
+        resolve_offset_group_id(streams, stream_id, topic_id, &consumer.id)?;
+        return Err(IggyError::ConsumerGroupPartitionNotOwned(
+            client_id,
+            partition_id,
+        ));
+    };
+    Ok(())
+}
+
+fn missing_consumer_group_error(group: &WireIdentifier, topic: &WireIdentifier) -> IggyError {
+    let topic = Identifier::try_from(topic).unwrap_or_default();
+    match group {
+        WireIdentifier::Numeric(_) => IggyError::ConsumerGroupIdNotFound(
+            Identifier::try_from(group).unwrap_or_default(),
+            topic,
+        ),
+        WireIdentifier::String(name) => {
+            IggyError::ConsumerGroupNameNotFound(name.as_str().to_owned(), topic)
+        }
+    }
+}
+
+fn resolve_send_messages_namespace<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    header: &SendMessagesHeader,
+) -> Result<IggyNamespace, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let streams = shard.plane.metadata().mux_stm.streams();
+    let partition_id = match &header.partitioning {
+        WirePartitioning::PartitionId(partition_id) => Some(*partition_id),
+        WirePartitioning::Balanced => {
+            streams.next_balanced_partition(&header.stream_id, &header.topic_id)
+        }
+        WirePartitioning::MessagesKey(key) => {
+            streams.partition_by_messages_key(&header.stream_id, &header.topic_id, key)
+        }
+    };
+    let Some(partition_id) = partition_id else {
+        ensure_topic_exists(shard, &header.stream_id, &header.topic_id)?;
+        // The topic exists but has no partition to pick.
+        return Err(IggyError::InvalidIdentifier);
+    };
+    resolve_partition_namespace(
+        shard,
+        &header.stream_id,
+        &header.topic_id,
+        Some(partition_id),
+    )
+}
+
+/// Typed miss for a read's parent stream, matching the legacy servers' error
+/// shape. The identifier only feeds the error message; a wire form with no
+/// domain equivalent (numeric 0 is a live slab id here but not a legacy id)
+/// falls back to the default identifier.
+fn stream_not_found(stream_id: &WireIdentifier) -> IggyError {
+    IggyError::StreamIdNotFound(Identifier::try_from(stream_id).unwrap_or_default())
+}
+
+/// Typed miss for a read's parent topic; see [`stream_not_found`]. The variant's
+/// display order is (topic, stream).
+fn topic_not_found(stream_id: &WireIdentifier, topic_id: &WireIdentifier) -> IggyError {
+    IggyError::TopicIdNotFound(
+        Identifier::try_from(topic_id).unwrap_or_default(),
+        Identifier::try_from(stream_id).unwrap_or_default(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::test_support::{
+        SpyBus, create_consumer_group, create_one_partition, test_shard,
+    };
+
+    /// A group offset write from a client that owns no partition of the group
+    /// is fenced, and the refusal names that client.
+    #[test]
+    fn given_non_member_when_fencing_group_offset_should_name_the_full_client_id() {
+        // Wider than u64, so a refusal that truncated it would name another client.
+        const CLIENT_ID: u128 = (1 << 64) + 41;
+        const GROUP_ID: u32 = 0;
+        const PARTITION_ID: u32 = 0;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        create_consumer_group(&shard);
+
+        let refusal = fence_and_resolve_offset_namespace(
+            &shard,
+            &WireConsumer::consumer_group(WireIdentifier::numeric(GROUP_ID)),
+            &WireIdentifier::numeric(0),
+            &WireIdentifier::numeric(0),
+            Some(PARTITION_ID),
+            CLIENT_ID,
+        )
+        .err();
+
+        assert!(
+            matches!(
+                refusal,
+                Some(IggyError::ConsumerGroupPartitionNotOwned(
+                    CLIENT_ID,
+                    PARTITION_ID
+                ))
+            ),
+            "{refusal:?}"
+        );
+    }
+
+    #[compio::test]
+    async fn given_no_report_from_a_partition_this_node_does_not_store_when_routing_should_name_its_initial_primary()
+     {
+        const CREATED_VIEW: u32 = 1;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 3, 1));
+        let namespace = IggyNamespace::new(0, 0, 0);
+        shard.plane.metadata().mux_stm.streams().seed_namespace_on(
+            namespace,
+            1,
+            CREATED_VIEW,
+            iggy_common::Durability::Persisted,
+            &[1, 2],
+        );
+
+        let route = partition_primary(&shard, namespace).await;
+
+        assert!(
+            matches!(
+                route,
+                Some(PartitionReadReply::Primary {
+                    view: CREATED_VIEW,
+                    primary: 2,
+                })
+            ),
+            "{route:?}"
+        );
+    }
+
+    /// The payload only feeds the error message, so a wire id with no domain
+    /// form reports the default identifier instead of failing the lookup.
+    #[test]
+    fn given_wire_id_without_domain_form_when_reporting_a_miss_should_name_the_default_identifier()
+    {
+        let zero = WireIdentifier::Numeric(0);
+
+        // `IggyError` equality compares codes only, so match the payload.
+        assert!(matches!(
+            stream_not_found(&zero),
+            IggyError::StreamIdNotFound(stream) if stream == Identifier::default()
+        ));
+        assert!(matches!(
+            topic_not_found(&zero, &zero),
+            IggyError::TopicIdNotFound(topic, stream)
+                if topic == Identifier::default() && stream == Identifier::default()
+        ));
+        assert!(matches!(
+            missing_consumer_group_error(&zero, &zero),
+            IggyError::ConsumerGroupIdNotFound(group, topic)
+                if group == Identifier::default() && topic == Identifier::default()
+        ));
+    }
+}

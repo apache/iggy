@@ -97,3 +97,291 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
   {{- end }}
 {{- end }}
+
+{{/*
+Validate the cluster roster and fail the render with an actionable message.
+Every check here is one the server would otherwise only reject at boot, after
+the pod is already scheduled.
+*/}}
+{{- define "iggy.validateCluster" -}}
+  {{- $cluster := .Values.server.cluster }}
+  {{- if not $cluster.nodes }}
+    {{- fail "server.cluster.enabled is true but server.cluster.nodes is empty. Every node runs the identical roster; see the Cluster Mode section of the chart README." }}
+  {{- end }}
+  {{- if and $cluster.requireHostNetwork (not .Values.server.hostNetwork) }}
+    {{- fail "server.cluster.enabled is true but server.hostNetwork is false. The replica listener binds the roster ip verbatim, which is not an address a pod owns on the cluster network, so the pod dies at boot with CannotBindToSocket. Set server.hostNetwork to true, or server.cluster.requireHostNetwork to false if the roster ip really is one this pod owns." }}
+  {{- end }}
+  {{- $count := len $cluster.nodes }}
+  {{- $seen := dict }}
+  {{- range $cluster.nodes }}
+    {{- if not .name }}
+      {{- fail "every server.cluster.nodes entry needs a name" }}
+    {{- end }}
+    {{- if not .ip }}
+      {{- fail (printf "server.cluster.nodes entry %q has no ip. The replica listener binds this address verbatim, so it must be a literal IP the pod owns." .name) }}
+    {{- end }}
+    {{- $ip := toString .ip }}
+    {{- if not (regexMatch "^[0-9a-fA-F.:]+$" $ip) }}
+      {{- fail (printf "server.cluster.nodes entry %q has ip %q, which the server parses as an IP address and rejects. Use server.cluster.nodes[*].advertisedAddress for the hostname clients dial." .name $ip) }}
+    {{- end }}
+    {{- if or (eq $ip "0.0.0.0") (eq $ip "::") }}
+      {{- fail (printf "server.cluster.nodes entry %q has the wildcard ip %q. Every peer dials this address verbatim, so it has to name one interface." .name $ip) }}
+    {{- end }}
+    {{- if kindIs "invalid" .replicaId }}
+      {{- fail (printf "server.cluster.nodes entry %q has no replicaId" .name) }}
+    {{- end }}
+    {{- $id := int .replicaId }}
+    {{- if or (lt $id 0) (ge $id $count) }}
+      {{- fail (printf "server.cluster.nodes entry %q has replicaId %d, which is outside 0..%d for a %d-node roster" .name $id (sub $count 1) $count) }}
+    {{- end }}
+    {{- if hasKey $seen (printf "%d" $id) }}
+      {{- fail (printf "server.cluster.nodes has two entries with replicaId %d; ids must be unique" $id) }}
+    {{- end }}
+    {{- $_ := set $seen (printf "%d" $id) .name }}
+    {{- if not (and .ports .ports.tcpReplica) }}
+      {{- fail (printf "server.cluster.nodes entry %q has no ports.tcpReplica. In cluster mode the server takes every listener port from the roster and refuses to start without it." .name) }}
+    {{- end }}
+  {{- end }}
+  {{- if not (hasKey $seen (printf "%d" (int $cluster.selfReplicaId))) }}
+    {{- fail (printf "server.cluster.selfReplicaId is %d but no server.cluster.nodes entry declares that replicaId. Each release picks its own identity out of the shared roster." (int $cluster.selfReplicaId)) }}
+  {{- end }}
+{{- end }}
+
+{{/*
+The ports this release's server binds, as a JSON object. In cluster mode the
+server takes every listener port from its own roster entry and never falls back
+to the top-level ones, so a node whose entry names other ports has to reach the
+container ports, the probes and the Service targets as well. `server.ports`
+supplies the per-field default there and the whole answer outside cluster mode.
+`tcpReplica` has no top-level default because the roster owns it: it is
+mandatory on every entry and there is no replica listener outside cluster mode.
+*/}}
+{{- define "iggy.serverPorts" -}}
+  {{- $ports := .Values.server.ports }}
+  {{- $resolved := dict "http" $ports.http "quic" $ports.quic "tcp" $ports.tcp "websocket" $ports.websocket }}
+  {{- if .Values.server.cluster.enabled }}
+    {{- $selfReplicaId := int .Values.server.cluster.selfReplicaId }}
+    {{- range .Values.server.cluster.nodes }}
+      {{- if eq (int .replicaId) $selfReplicaId }}
+        {{- range $name, $port := (default (dict) .ports) }}
+          {{- if $port }}
+            {{- $_ := set $resolved $name $port }}
+          {{- end }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+  {{- $resolved | toJson }}
+{{- end }}
+
+{{/*
+Render the roster as IGGY_CLUSTER_* environment variables. The server accepts
+the whole cluster config this way, so the chart needs no config file mount.
+*/}}
+{{- define "iggy.clusterEnv" -}}
+  {{- $ports := .Values.server.ports }}
+- name: IGGY_CLUSTER_ENABLED
+  value: "true"
+- name: IGGY_CLUSTER_NAME
+  value: {{ .Values.server.cluster.name | quote }}
+  {{- range .Values.server.cluster.nodes }}
+    {{- $id := int .replicaId }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_NAME
+  value: {{ .name | quote }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_IP
+  value: {{ .ip | quote }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_REPLICA_ID
+  value: {{ $id | quote }}
+    {{- if .advertisedAddress }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_ADVERTISED_ADDRESS
+  value: {{ .advertisedAddress | quote }}
+    {{- end }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_PORTS_TCP
+  value: {{ (default $ports.tcp (and .ports .ports.tcp)) | quote }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_PORTS_QUIC
+  value: {{ (default $ports.quic (and .ports .ports.quic)) | quote }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_PORTS_HTTP
+  value: {{ (default $ports.http (and .ports .ports.http)) | quote }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_PORTS_WEBSOCKET
+  value: {{ (default $ports.websocket (and .ports .ports.websocket)) | quote }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_PORTS_TCP_REPLICA
+  value: {{ .ports.tcpReplica | quote }}
+  {{- end }}
+{{- end }}
+
+{{/*
+Name of the Secret holding the cluster-wide secrets the chart generates from
+inline values. Each of encryption, JWT and replica auth may instead point at a
+Secret the operator made, which is the path a multi-node cluster wants: the
+values have to be byte-identical on every node, so they belong in one object
+every release references rather than in each release's values.
+*/}}
+{{- define "iggy.secretName" -}}
+  {{- printf "%s-secrets" (include "iggy.fullname" .) }}
+{{- end }}
+
+{{/*
+True when any secret has to be generated by the chart, i.e. an inline value is
+set for a feature that is switched on and no existing Secret was named for it.
+*/}}
+{{- define "iggy.createsSecret" -}}
+  {{- $server := .Values.server }}
+  {{- $create := false }}
+  {{- if and $server.encryption.key (not $server.encryption.existingSecret.name) }}
+    {{- $create = true }}
+  {{- end }}
+  {{- if and (or $server.jwt.encodingSecret $server.jwt.decodingSecret) (not $server.jwt.existingSecret.name) }}
+    {{- $create = true }}
+  {{- end }}
+  {{- if and $server.cluster.auth.enabled (not $server.cluster.auth.existingSecret.name) }}
+    {{- $create = true }}
+  {{- end }}
+  {{- if $create }}true{{ end }}
+{{- end }}
+
+{{/*
+Validate the secret configuration. The server enforces all of this at boot, so
+catching it during render only saves a scheduling round trip, but a cluster
+whose PSK differs between nodes fails as a handshake rejection rather than as
+anything that names the cause.
+*/}}
+{{- define "iggy.validateSecrets" -}}
+  {{- $server := .Values.server }}
+  {{- $root := $server.users.root }}
+  {{- if and (not $root.createSecret) (not $root.existingSecret.name) (not (has "--with-default-root-credentials" $server.extraArgs)) }}
+    {{- $rootEnv := list }}
+    {{- range $server.env }}
+      {{- if has .name (list "IGGY_ROOT_USERNAME" "IGGY_ROOT_PASSWORD") }}
+        {{- $rootEnv = append $rootEnv .name }}
+      {{- end }}
+    {{- end }}
+    {{- if lt (len (uniq $rootEnv)) 2 }}
+      {{- fail "server.users.root has neither createSecret nor existingSecret.name, so the container receives no IGGY_ROOT_USERNAME or IGGY_ROOT_PASSWORD. The chart requires both for initial root creation. Point existingSecret.name at a Secret holding them, set createSecret with a username and password, or for a throwaway development install add --with-default-root-credentials to server.extraArgs." }}
+    {{- end }}
+  {{- end }}
+  {{- if and $server.encryption.enabled (not $server.encryption.key) (not $server.encryption.existingSecret.name) }}
+    {{- fail "server.encryption.enabled is true but no key was given. Set server.encryption.key to a base64-encoded 32-byte key, or point server.encryption.existingSecret.name at a Secret holding one." }}
+  {{- end }}
+  {{- if and $server.encryption.key (not $server.encryption.existingSecret.name) }}
+    {{- if ne (len (b64dec $server.encryption.key)) 32 }}
+      {{- fail (printf "server.encryption.key decodes to %d bytes. AES-256-GCM takes a base64-encoded 32-byte key, and the server refuses the config on anything else, enabled or not." (len (b64dec $server.encryption.key))) }}
+    {{- end }}
+  {{- end }}
+  {{- if and $server.encryption.previousKeys (not $server.encryption.existingSecret.name) }}
+    {{- $previousKeys := $server.encryption.previousKeys }}
+    {{- if not $server.encryption.key }}
+      {{- fail "server.encryption.previousKeys is set without server.encryption.key. A rotation needs the new key in key and the retiring ones in previousKeys." }}
+    {{- end }}
+    {{- if gt (len $previousKeys) 2 }}
+      {{- fail (printf "server.encryption.previousKeys holds %d keys. The server accepts at most two." (len $previousKeys)) }}
+    {{- end }}
+    {{- if ne (len (uniq $previousKeys)) (len $previousKeys) }}
+      {{- fail "server.encryption.previousKeys lists the same key twice, which the server rejects." }}
+    {{- end }}
+    {{- range $previousKeys }}
+      {{- if ne (len (b64dec .)) 32 }}
+        {{- fail (printf "A server.encryption.previousKeys entry decodes to %d bytes. Each must be a base64-encoded 32-byte key." (len (b64dec .))) }}
+      {{- end }}
+      {{- if eq . $server.encryption.key }}
+        {{- fail "server.encryption.previousKeys repeats server.encryption.key, which the server rejects. Leave previousKeys empty outside a rotation." }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+  {{- if $server.cluster.auth.enabled }}
+    {{- if not $server.cluster.enabled }}
+      {{- fail "server.cluster.auth.enabled is true but server.cluster.enabled is false. Replica authentication only applies to the consensus port, which exists in cluster mode." }}
+    {{- end }}
+    {{- if and (not $server.cluster.auth.sharedSecret) (not $server.cluster.auth.existingSecret.name) }}
+      {{- fail "server.cluster.auth.enabled is true but no shared secret was given. Set server.cluster.auth.sharedSecret, or point server.cluster.auth.existingSecret.name at a Secret holding one. Every node needs the byte-identical value." }}
+    {{- end }}
+    {{- if and $server.cluster.auth.sharedSecret (lt (len $server.cluster.auth.sharedSecret) 32) }}
+      {{- fail (printf "server.cluster.auth.sharedSecret is %d bytes; the server requires at least 32 bytes of CSPRNG output." (len $server.cluster.auth.sharedSecret)) }}
+    {{- end }}
+    {{- if $server.cluster.auth.previousSharedSecret }}
+      {{- if lt (len $server.cluster.auth.previousSharedSecret) 32 }}
+        {{- fail (printf "server.cluster.auth.previousSharedSecret is %d bytes; the server requires at least 32 bytes of CSPRNG output." (len $server.cluster.auth.previousSharedSecret)) }}
+      {{- end }}
+      {{- if eq $server.cluster.auth.previousSharedSecret $server.cluster.auth.sharedSecret }}
+        {{- fail "server.cluster.auth.previousSharedSecret equals server.cluster.auth.sharedSecret, which the server rejects as a no-op rotation window. Leave it empty outside a rotation." }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+
+{{/*
+Environment entries for the secret-backed settings, each sourced from whichever
+Secret owns it.
+*/}}
+{{- define "iggy.secretEnv" -}}
+  {{- $server := .Values.server }}
+  {{- $generated := include "iggy.secretName" . }}
+  {{- if or $server.encryption.enabled $server.encryption.key $server.encryption.existingSecret.name }}
+    {{- $configVersion := $server.encryption.configVersion | default "auto" }}
+    {{- if eq $configVersion "auto" }}
+      {{- $imageTag := $server.image.tag | default .Chart.AppVersion }}
+      {{- if and (regexMatch "^v?[0-9]+\\.[0-9]+\\.[0-9]+([+-].*)?$" $imageTag) (semverCompare "<=0.9.0-edge.7" $imageTag) }}
+        {{- $configVersion = "legacy" }}
+      {{- else }}
+        {{- fail "Cannot determine the encryption config layout for this server image. Set server.encryption.configVersion to flat for builds using [encryption], or legacy for builds using [system.encryption]." }}
+      {{- end }}
+    {{- end }}
+    {{- $prefix := "IGGY_ENCRYPTION" }}
+    {{- if eq $configVersion "legacy" }}
+      {{- $prefix = "IGGY_SYSTEM_ENCRYPTION" }}
+    {{- else if ne $configVersion "flat" }}
+      {{- fail "server.encryption.configVersion must be auto, legacy, or flat." }}
+    {{- end }}
+- name: {{ $prefix }}_ENABLED
+  value: {{ $server.encryption.enabled | quote }}
+- name: {{ $prefix }}_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ default $generated $server.encryption.existingSecret.name }}
+      key: {{ ternary $server.encryption.existingSecret.key "encryptionKey" (ne $server.encryption.existingSecret.name "") }}
+    {{- if and $server.encryption.previousKeys (not $server.encryption.existingSecret.name) }}
+      {{- if eq $configVersion "legacy" }}
+        {{- fail "server.encryption.previousKeys needs a server build using [encryption]. The legacy [system.encryption] layout has no key rotation. Set server.encryption.configVersion to flat for such a build." }}
+      {{- end }}
+    {{- end }}
+    {{- if and (eq $configVersion "flat") (or $server.encryption.previousKeys $server.encryption.existingSecret.name) }}
+- name: IGGY_ENCRYPTION_PREVIOUS_KEYS
+  valueFrom:
+    secretKeyRef:
+      name: {{ default $generated $server.encryption.existingSecret.name }}
+      key: {{ ternary $server.encryption.existingSecret.previousKeysKey "encryptionPreviousKeys" (ne $server.encryption.existingSecret.name "") }}
+      optional: true
+    {{- end }}
+  {{- end }}
+  {{- if or $server.jwt.existingSecret.name $server.jwt.encodingSecret }}
+- name: IGGY_HTTP_JWT_ENCODING_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ default $generated $server.jwt.existingSecret.name }}
+      key: {{ ternary $server.jwt.existingSecret.encodingSecretKey "jwtEncodingSecret" (ne $server.jwt.existingSecret.name "") }}
+  {{- end }}
+  {{- if or $server.jwt.existingSecret.name $server.jwt.decodingSecret }}
+- name: IGGY_HTTP_JWT_DECODING_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ default $generated $server.jwt.existingSecret.name }}
+      key: {{ ternary $server.jwt.existingSecret.decodingSecretKey "jwtDecodingSecret" (ne $server.jwt.existingSecret.name "") }}
+      optional: true
+  {{- end }}
+  {{- if $server.cluster.auth.enabled }}
+- name: IGGY_CLUSTER_AUTH_ENABLED
+  value: "true"
+- name: IGGY_CLUSTER_AUTH_SHARED_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ default $generated $server.cluster.auth.existingSecret.name }}
+      key: {{ ternary $server.cluster.auth.existingSecret.sharedSecretKey "clusterSharedSecret" (ne $server.cluster.auth.existingSecret.name "") }}
+    {{- if or $server.cluster.auth.previousSharedSecret $server.cluster.auth.existingSecret.name }}
+- name: IGGY_CLUSTER_AUTH_PREVIOUS_SHARED_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ default $generated $server.cluster.auth.existingSecret.name }}
+      key: {{ ternary $server.cluster.auth.existingSecret.previousSharedSecretKey "clusterPreviousSharedSecret" (ne $server.cluster.auth.existingSecret.name "") }}
+      optional: true
+    {{- end }}
+  {{- end }}
+{{- end }}

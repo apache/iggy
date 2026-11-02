@@ -66,6 +66,20 @@ public sealed class ConsumerGroupClientStateTests
     }
 
     [Fact]
+    public void AssignedPartitions_KeepAssignmentOrderAndFollowTheLatestAssignment()
+    {
+        var state = new ConsumerGroupClientState();
+        Assert.Empty(state.AssignedPartitions(Key));
+
+        state.SetAssignment(Key, 1, [2, 0, 1]);
+        state.NextGroupPartition(Key);
+        Assert.Equal<uint[]>([2, 0, 1], [.. state.AssignedPartitions(Key)]);
+
+        state.SetAssignment(Key, 2, [4]);
+        Assert.Equal<uint[]>([4], [.. state.AssignedPartitions(Key)]);
+    }
+
+    [Fact]
     public void NextGroupPartition_WithoutAssignmentIsNull()
     {
         var state = new ConsumerGroupClientState();
@@ -95,11 +109,23 @@ public sealed class ConsumerGroupClientStateTests
         state.SetAssignment(Key, 1, []);
 
         Assert.False(state.HasAssignment(Key));
+        Assert.Null(state.NextGroupPartition(Key));
         Assert.True(state.IsRegistered(Key));
 
         state.DeregisterGroup(Key);
 
         Assert.False(state.IsRegistered(Key));
+    }
+
+    [Fact]
+    public void HasAssignment_ExpiresAfterTheRefreshInterval()
+    {
+        var state = new ConsumerGroupClientState();
+        state.SetAssignment(Key, 1, [0]);
+        var now = Environment.TickCount64;
+
+        Assert.True(state.HasAssignment(Key, now));
+        Assert.False(state.HasAssignment(Key, now + ConsumerGroupClientState.AssignmentRefreshMs));
     }
 
     [Fact]

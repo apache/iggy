@@ -434,7 +434,7 @@ mod miri_tests {
     #[cfg(not(miri))]
     mod split_to {
         use super::*;
-        use crate::memory_pool::{MemoryPool, MemoryPoolConfigOther};
+        use crate::memory_pool::{MemoryPool, MemoryPoolSettings};
         use iggy_common::IggyByteSize;
         use serial_test::serial;
         use std::str::FromStr;
@@ -444,7 +444,7 @@ mod miri_tests {
 
         fn init_pool_for_split_to_tests() {
             MIRI_POOL_INIT.call_once(|| {
-                let config = MemoryPoolConfigOther {
+                let config = MemoryPoolSettings {
                     enabled: true,
                     size: IggyByteSize::from_str("64MiB").unwrap(),
                     bucket_capacity: 16,

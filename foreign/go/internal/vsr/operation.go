@@ -36,22 +36,24 @@ const (
 	OperationRemoveConsumerGroupMember       Operation = 66
 	OperationCompleteConsumerGroupRevocation Operation = 67
 	OperationTruncatePartition               Operation = 68
+	OperationFinalizeSession                 Operation = 70
+	OperationCompleteLifecycle               Operation = 71
+	OperationUpdateStreamResolved            Operation = 72
+	OperationUpdateTopicResolved             Operation = 73
+	OperationUpdateUserResolved              Operation = 74
+	OperationRewrapStreamKeys                Operation = 75
 
+	// 129, 133 and 142 were the per-resource updates. Never reuse them.
 	OperationCreateStream              Operation = 128
-	OperationUpdateStream              Operation = 129
 	OperationDeleteStream              Operation = 130
-	OperationPurgeStream               Operation = 131
 	OperationCreateTopic               Operation = 132
-	OperationUpdateTopic               Operation = 133
 	OperationDeleteTopic               Operation = 134
-	OperationPurgeTopic                Operation = 135
 	OperationCreatePartitions          Operation = 136
 	OperationDeletePartitions          Operation = 137
 	OperationDeleteSegments            Operation = 138
 	OperationCreateConsumerGroup       Operation = 139
 	OperationDeleteConsumerGroup       Operation = 140
 	OperationCreateUser                Operation = 141
-	OperationUpdateUser                Operation = 142
 	OperationDeleteUser                Operation = 143
 	OperationChangePassword            Operation = 144
 	OperationUpdatePermissions         Operation = 145
@@ -59,19 +61,21 @@ const (
 	OperationDeletePersonalAccessToken Operation = 147
 	OperationJoinConsumerGroup         Operation = 148
 	OperationLeaveConsumerGroup        Operation = 149
+	OperationUpdateResource            Operation = 150
 
-	OperationSendMessages          Operation = 160
-	OperationStoreConsumerOffset   Operation = 161
-	OperationDeleteConsumerOffset  Operation = 162
-	OperationStoreConsumerOffset2  Operation = 164
-	OperationDeleteConsumerOffset2 Operation = 165
+	OperationSendMessages               Operation = 160
+	OperationStoreConsumerOffset        Operation = 161
+	OperationDeleteConsumerOffset       Operation = 162
+	OperationRetireSession              Operation = 166
+	OperationInstallConsumerGroupOwner  Operation = 167
+	OperationTransitionPartitionHistory Operation = 168
+	OperationRetireConsumerGroupOwners  Operation = 169
 )
 
 // Band boundaries. The internal band is never client-sent.
 const (
-	internalBandStart  = OperationCreateTopicWithAssignments
-	metadataBandStart  = OperationCreateStream
-	partitionBandStart = OperationSendMessages
+	internalBandStart = OperationCreateTopicWithAssignments
+	metadataBandStart = OperationCreateStream
 )
 
 // allOperations lists every declared discriminant in wire order. It backs both
@@ -86,21 +90,22 @@ var allOperations = []Operation{
 	OperationRemoveConsumerGroupMember,
 	OperationCompleteConsumerGroupRevocation,
 	OperationTruncatePartition,
+	OperationFinalizeSession,
+	OperationCompleteLifecycle,
+	OperationUpdateStreamResolved,
+	OperationUpdateTopicResolved,
+	OperationUpdateUserResolved,
+	OperationRewrapStreamKeys,
 	OperationCreateStream,
-	OperationUpdateStream,
 	OperationDeleteStream,
-	OperationPurgeStream,
 	OperationCreateTopic,
-	OperationUpdateTopic,
 	OperationDeleteTopic,
-	OperationPurgeTopic,
 	OperationCreatePartitions,
 	OperationDeletePartitions,
 	OperationDeleteSegments,
 	OperationCreateConsumerGroup,
 	OperationDeleteConsumerGroup,
 	OperationCreateUser,
-	OperationUpdateUser,
 	OperationDeleteUser,
 	OperationChangePassword,
 	OperationUpdatePermissions,
@@ -108,11 +113,14 @@ var allOperations = []Operation{
 	OperationDeletePersonalAccessToken,
 	OperationJoinConsumerGroup,
 	OperationLeaveConsumerGroup,
+	OperationUpdateResource,
 	OperationSendMessages,
 	OperationStoreConsumerOffset,
 	OperationDeleteConsumerOffset,
-	OperationStoreConsumerOffset2,
-	OperationDeleteConsumerOffset2,
+	OperationRetireSession,
+	OperationInstallConsumerGroupOwner,
+	OperationTransitionPartitionHistory,
+	OperationRetireConsumerGroupOwners,
 }
 
 var knownOperations = newOperationSet(allOperations)
@@ -122,33 +130,27 @@ var knownOperations = newOperationSet(allOperations)
 // header field, leaving the server authoritative for commands this SDK build
 // does not know.
 var replicatedOperation = map[uint32]Operation{
-	uint32(command.CreateUserCode):            OperationCreateUser,
-	uint32(command.DeleteUserCode):            OperationDeleteUser,
-	uint32(command.UpdateUserCode):            OperationUpdateUser,
-	uint32(command.UpdatePermissionsCode):     OperationUpdatePermissions,
-	uint32(command.ChangePasswordCode):        OperationChangePassword,
-	uint32(command.CreateAccessTokenCode):     OperationCreatePersonalAccessToken,
-	uint32(command.DeleteAccessTokenCode):     OperationDeletePersonalAccessToken,
-	uint32(command.SendMessagesCode):          OperationSendMessages,
-	uint32(command.StoreOffsetCode):           OperationStoreConsumerOffset,
-	uint32(command.DeleteConsumerOffsetCode):  OperationDeleteConsumerOffset,
-	uint32(command.StoreOffset2Code):          OperationStoreConsumerOffset2,
-	uint32(command.DeleteConsumerOffset2Code): OperationDeleteConsumerOffset2,
-	uint32(command.CreateStreamCode):          OperationCreateStream,
-	uint32(command.DeleteStreamCode):          OperationDeleteStream,
-	uint32(command.UpdateStreamCode):          OperationUpdateStream,
-	uint32(command.PurgeStreamCode):           OperationPurgeStream,
-	uint32(command.CreateTopicCode):           OperationCreateTopic,
-	uint32(command.DeleteTopicCode):           OperationDeleteTopic,
-	uint32(command.UpdateTopicCode):           OperationUpdateTopic,
-	uint32(command.PurgeTopicCode):            OperationPurgeTopic,
-	uint32(command.CreatePartitionsCode):      OperationCreatePartitions,
-	uint32(command.DeletePartitionsCode):      OperationDeletePartitions,
-	uint32(command.DeleteSegmentsCode):        OperationDeleteSegments,
-	uint32(command.CreateGroupCode):           OperationCreateConsumerGroup,
-	uint32(command.DeleteGroupCode):           OperationDeleteConsumerGroup,
-	uint32(command.JoinGroupCode):             OperationJoinConsumerGroup,
-	uint32(command.LeaveGroupCode):            OperationLeaveConsumerGroup,
+	uint32(command.CreateUserCode):           OperationCreateUser,
+	uint32(command.DeleteUserCode):           OperationDeleteUser,
+	uint32(command.UpdatePermissionsCode):    OperationUpdatePermissions,
+	uint32(command.ChangePasswordCode):       OperationChangePassword,
+	uint32(command.CreateAccessTokenCode):    OperationCreatePersonalAccessToken,
+	uint32(command.DeleteAccessTokenCode):    OperationDeletePersonalAccessToken,
+	uint32(command.SendMessagesCode):         OperationSendMessages,
+	uint32(command.StoreOffsetCode):          OperationStoreConsumerOffset,
+	uint32(command.DeleteConsumerOffsetCode): OperationDeleteConsumerOffset,
+	uint32(command.CreateStreamCode):         OperationCreateStream,
+	uint32(command.DeleteStreamCode):         OperationDeleteStream,
+	uint32(command.CreateTopicCode):          OperationCreateTopic,
+	uint32(command.DeleteTopicCode):          OperationDeleteTopic,
+	uint32(command.CreatePartitionsCode):     OperationCreatePartitions,
+	uint32(command.DeletePartitionsCode):     OperationDeletePartitions,
+	uint32(command.DeleteSegmentsCode):       OperationDeleteSegments,
+	uint32(command.CreateGroupCode):          OperationCreateConsumerGroup,
+	uint32(command.DeleteGroupCode):          OperationDeleteConsumerGroup,
+	uint32(command.JoinGroupCode):            OperationJoinConsumerGroup,
+	uint32(command.LeaveGroupCode):           OperationLeaveConsumerGroup,
+	uint32(command.UpdateResourceCode):       OperationUpdateResource,
 }
 
 func newOperationSet(operations []Operation) map[Operation]struct{} {
@@ -195,7 +197,7 @@ func IsKnownOperation(operation Operation) bool {
 // IsInternal reports whether the operation belongs to the replica-internal
 // band, which a client never sends.
 func IsInternal(operation Operation) bool {
-	return operation >= internalBandStart && operation < metadataBandStart
+	return operation == OperationRetireSession || operation == OperationInstallConsumerGroupOwner || operation == OperationTransitionPartitionHistory || operation == OperationRetireConsumerGroupOwners || operation >= internalBandStart && operation < metadataBandStart
 }
 
 // IsMetadata reports whether the operation replicates through the metadata
@@ -204,18 +206,12 @@ func IsInternal(operation Operation) bool {
 // truncation server-side.
 func IsMetadata(operation Operation) bool {
 	if IsInternal(operation) {
-		return true
+		return operation < OperationSendMessages
 	}
 	if operation == OperationDeleteSegments {
 		return false
 	}
-	return operation >= metadataBandStart && operation <= OperationLeaveConsumerGroup
-}
-
-// IsPartition reports whether the operation is routed to the shard owning a
-// partition.
-func IsPartition(operation Operation) bool {
-	return operation >= partitionBandStart
+	return operation >= metadataBandStart && operation <= OperationUpdateResource
 }
 
 // IsResultFramed reports whether the reply body leads with a committed result
@@ -227,8 +223,7 @@ func IsResultFramed(operation Operation) bool {
 		return true
 	}
 	switch operation {
-	case OperationStoreConsumerOffset, OperationStoreConsumerOffset2,
-		OperationDeleteConsumerOffset, OperationDeleteConsumerOffset2:
+	case OperationStoreConsumerOffset, OperationDeleteConsumerOffset:
 		return true
 	default:
 		return false

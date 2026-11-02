@@ -19,7 +19,7 @@
 //! (fabricated user). No permissions payload, so every outcome is `Effect::None`.
 
 use iggy_binary_protocol::RoutedRequestHeader;
-use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use server_common::Message;
 
 use crate::client::SimClient;
@@ -39,7 +39,7 @@ pub const OUTCOMES: &[Outcome] = &[Outcome::Ok, Outcome::UserNotFound];
 pub fn sample(
     shadow: &mut Shadow,
     outcome: Outcome,
-    prng: &mut Xoshiro256Plus,
+    prng: &mut Xoshiro256PlusPlus,
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
@@ -47,8 +47,9 @@ pub fn sample(
         Outcome::UserNotFound => Some(Input {
             user: shadow.fabricate_absent_name("user"),
         }),
-        // Not a targeted outcome (absent from `OUTCOMES`); never sampled.
-        Outcome::CannotChangePermissions => None,
+        // Not targeted outcomes (absent from `OUTCOMES`); never sampled. The
+        // sim client sends no permissions payload, so no grant names a target.
+        Outcome::CannotChangePermissions | Outcome::StreamNotFound | Outcome::TopicNotFound => None,
     }
 }
 

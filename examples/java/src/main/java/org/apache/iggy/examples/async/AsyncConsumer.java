@@ -24,6 +24,7 @@ import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
@@ -31,12 +32,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -44,7 +48,7 @@ import java.util.concurrent.atomic.AtomicReference;
  *
  * <p>Demonstrates advanced async message consumption patterns including:
  * <ul>
- *   <li>Non-blocking continuous polling</li>
+ *   <li>Deferred polling: the server holds each poll until data is ready</li>
  *   <li>Backpressure management (don't poll faster than you can process)</li>
  *   <li>Error recovery with exponential backoff</li>
  *   <li>Offloading CPU-intensive work from Netty threads</li>
@@ -86,9 +90,12 @@ public final class AsyncConsumer {
 
     // Polling configuration
     private static final int POLL_BATCH_SIZE = 100;
-    private static final int POLL_INTERVAL_MS = 1000;
     private static final int BATCHES_LIMIT = 5; // Exit after receiving this many batches
-    private static final int MAX_EMPTY_POLLS = 5; // Exit if no messages after consecutive empty polls
+    // The server holds each poll for the readiness wait, so the client never
+    // sleeps between polls. Idle time is measured directly instead of counting
+    // empty polls, whose meaning changes with the wait.
+    private static final Duration IDLE_LIMIT = Duration.ofSeconds(5);
+    private static final DeferredPollOptions POLL_OPTIONS = DeferredPollOptions.defaults();
 
     // Error recovery configuration
     private static final int MAX_RETRY_ATTEMPTS = 5;
@@ -178,7 +185,7 @@ public final class AsyncConsumer {
         log.info("Starting async polling loop (limit: {} batches)...", BATCHES_LIMIT);
 
         AtomicInteger totalReceived = new AtomicInteger(0);
-        AtomicInteger emptyPolls = new AtomicInteger(0);
+        AtomicLong lastProgressNanos = new AtomicLong(System.nanoTime());
         AtomicInteger consumedBatches = new AtomicInteger(0);
         AtomicReference<BigInteger> offset = new AtomicReference<>(BigInteger.ZERO);
 
@@ -188,15 +195,16 @@ public final class AsyncConsumer {
         // until we've finished processing the current batch.
 
         CompletableFuture<Void> pollingLoop = new CompletableFuture<>();
-        pollBatch(client, processingPool, totalReceived, emptyPolls, consumedBatches, offset, 0, pollingLoop);
+        pollBatch(client, processingPool, totalReceived, lastProgressNanos, consumedBatches, offset, 0, pollingLoop);
         return pollingLoop;
     }
 
+    @SuppressWarnings("checkstyle:ParameterNumber")
     private static void pollBatch(
             AsyncIggyTcpClient client,
             ExecutorService processingPool,
             AtomicInteger totalReceived,
-            AtomicInteger emptyPolls,
+            AtomicLong lastProgressNanos,
             AtomicInteger consumedBatches,
             AtomicReference<BigInteger> offset,
             int retryAttempt,
@@ -215,14 +223,15 @@ public final class AsyncConsumer {
         Consumer consumer = Consumer.of(CONSUMER_ID);
 
         client.messages()
-                .pollMessages(
+                .pollMessagesDeferred(
                         streamId,
                         topicId,
                         Optional.of(PARTITION_ID),
                         consumer,
                         PollingStrategy.offset(offset.get()),
                         (long) POLL_BATCH_SIZE,
-                        false)
+                        false,
+                        POLL_OPTIONS)
                 .thenComposeAsync(
                         polled -> {
                             // OFFLOAD TO PROCESSING POOL:
@@ -232,37 +241,39 @@ public final class AsyncConsumer {
                             int messageCount = polled.messages().size();
 
                             if (messageCount > 0) {
-                                // Update offset for next poll
-                                offset.updateAndGet(current -> current.add(BigInteger.valueOf(messageCount)));
-                                consumedBatches.incrementAndGet();
-
                                 return processMessages(polled, totalReceived, processingPool)
-                                        .thenRun(() -> emptyPolls.set(0));
-                            } else {
-                                int empty = emptyPolls.incrementAndGet();
-                                if (empty >= MAX_EMPTY_POLLS) {
-                                    log.info("No more messages after {} empty polls, finishing.", MAX_EMPTY_POLLS);
-                                    running = false;
-                                    return CompletableFuture.completedFuture(null);
-                                }
-                                log.info("Caught up - no new messages. Waiting...");
-                                // Sleep without blocking Netty threads
-                                return CompletableFuture.runAsync(
-                                        () -> {
-                                            try {
-                                                Thread.sleep(POLL_INTERVAL_MS);
-                                            } catch (InterruptedException e) {
-                                                Thread.currentThread().interrupt();
-                                            }
-                                        },
-                                        processingPool);
+                                        .thenRun(() -> {
+                                            offset.set(polled.messages()
+                                                    .get(messageCount - 1)
+                                                    .header()
+                                                    .offset()
+                                                    .add(BigInteger.ONE));
+                                            consumedBatches.incrementAndGet();
+                                            lastProgressNanos.set(System.nanoTime());
+                                        });
                             }
+                            // An empty reply means the server waited and the topic
+                            // stayed quiet, so the next poll goes out immediately.
+                            if (System.nanoTime() - lastProgressNanos.get() >= IDLE_LIMIT.toNanos()) {
+                                log.info("No new messages for {}, finishing.", IDLE_LIMIT);
+                                running = false;
+                            } else {
+                                log.info("Caught up - no new messages.");
+                            }
+                            return CompletableFuture.completedFuture(null);
                         },
                         processingPool)
                 .thenRun(() -> {
                     // SUCCESS: Reset retry counter and schedule next poll
                     pollBatch(
-                            client, processingPool, totalReceived, emptyPolls, consumedBatches, offset, 0, loopFuture);
+                            client,
+                            processingPool,
+                            totalReceived,
+                            lastProgressNanos,
+                            consumedBatches,
+                            offset,
+                            0,
+                            loopFuture);
                 })
                 .exceptionally(e -> {
                     // ERROR RECOVERY WITH EXPONENTIAL BACKOFF:
@@ -289,7 +300,7 @@ public final class AsyncConsumer {
                                             client,
                                             processingPool,
                                             totalReceived,
-                                            emptyPolls,
+                                            lastProgressNanos,
                                             consumedBatches,
                                             offset,
                                             retryAttempt + 1,
@@ -312,7 +323,7 @@ public final class AsyncConsumer {
                     int messageCount = polled.messages().size();
 
                     for (Message message : polled.messages()) {
-                        String payload = new String(message.payload());
+                        String payload = new String(message.payload(), StandardCharsets.UTF_8);
 
                         // Simulate message processing (in real app: parse, validate, store, etc.)
                         // This could be CPU-intensive or involve blocking I/O (database, HTTP calls)

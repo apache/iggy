@@ -16,6 +16,7 @@
 // under the License.
 
 using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Kinds;
 using Microsoft.Extensions.Logging;
@@ -50,7 +51,7 @@ public class IggyConsumerConfig
     public bool CreateIggyClient { get; set; }
 
     /// <summary>
-    ///     The protocol to use for communication (TCP, QUIC, HTTP)
+    ///     The protocol to use for communication (TCP or HTTP)
     /// </summary>
     public Protocol Protocol { get; set; }
 
@@ -70,14 +71,24 @@ public class IggyConsumerConfig
     public string Password { get; set; } = string.Empty;
 
     /// <summary>
-    ///     The size of the receive buffer in bytes. Default is 4096.
+    ///     Personal access token used instead of <see cref="Login" /> and <see cref="Password" /> when creating
+    ///     the client. Takes precedence over them when set.
     /// </summary>
-    public int ReceiveBufferSize { get; set; } = 4096;
+    public string PersonalAccessToken { get; set; } = string.Empty;
 
     /// <summary>
-    ///     The size of the send buffer in bytes. Default is 4096.
+    ///     The size of the receive buffer in bytes. When null, the size is not set on the socket, so the
+    ///     operating system default is used. On Linux, this keeps TCP auto-tuning enabled. The initial size
+    ///     is the middle value in <c>/proc/sys/net/ipv4/tcp_rmem</c>.
     /// </summary>
-    public int SendBufferSize { get; set; } = 4096;
+    public int? ReceiveBufferSize { get; set; } = null;
+
+    /// <summary>
+    ///     The size of the send buffer in bytes. When null, the size is not set on the socket, so the
+    ///     operating system default is used. On Linux, this keeps TCP auto-tuning enabled. The initial size
+    ///     is the middle value in <c>/proc/sys/net/ipv4/tcp_wmem</c>.
+    /// </summary>
+    public int? SendBufferSize { get; set; } = null;
 
     /// <summary>
     ///     The identifier of the stream to consume from
@@ -90,10 +101,10 @@ public class IggyConsumerConfig
     public Identifier TopicId { get; set; }
 
     /// <summary>
-    ///     Optional partition ID to consume from. If null, consumes from all partitions.
-    ///     Note: This is ignored when using consumer groups.
+    ///     The partitions of a standalone consumer. A consumer group reads the assignment of its member and refuses
+    ///     partitions here.
     /// </summary>
-    public uint? PartitionId { get; set; }
+    public IReadOnlyList<uint> Partitions { get; set; } = [];
 
     /// <summary>
     ///     The consumer configuration (single consumer or consumer group)
@@ -103,22 +114,7 @@ public class IggyConsumerConfig
     /// <summary>
     ///     The polling strategy defining from where to start consuming messages
     /// </summary>
-    public PollingStrategy PollingStrategy { get; set; }
-
-    /// <summary>
-    ///     The maximum number of messages to fetch in a single poll. Default is 100.
-    /// </summary>
-    public uint BatchSize { get; set; } = 100;
-
-    /// <summary>
-    ///     Whether to enable automatic offset committing
-    /// </summary>
-    public bool AutoCommit { get; set; }
-
-    /// <summary>
-    ///     The auto-commit mode determining when offsets are stored
-    /// </summary>
-    public AutoCommitMode AutoCommitMode { get; set; }
+    public PollingStrategy PollingStrategy { get; set; } = PollingStrategy.Next();
 
     /// <summary>
     ///     The name of the consumer group (used when consumer ID is numeric)
@@ -131,14 +127,12 @@ public class IggyConsumerConfig
     public bool CreateConsumerGroupIfNotExists { get; set; } = true;
 
     /// <summary>
-    ///     Whether to automatically join the consumer group. Default is true.
+    ///     The limits of each read and the commit policy. By default a read waits up to 5 seconds for messages,
+    ///     returns up to 1000 messages and 1 MiB, and nothing is stored: commit
+    ///     <see cref="ReceivedMessage.Checkpoint" /> with <see cref="IggyConsumer.CommitAsync" />, or choose
+    ///     <see cref="CommitPolicy.OnRead" /> or <see cref="CommitPolicy.Auto" />.
     /// </summary>
-    public bool JoinConsumerGroup { get; set; } = true;
-
-    /// <summary>
-    ///     The interval in milliseconds between message polls. Default is 100ms.
-    /// </summary>
-    public int PollingIntervalMs { get; set; } = 100;
+    public PollOptions PollOptions { get; set; } = new() { MaxWait = TimeSpan.FromSeconds(5) };
 
     /// <summary>
     ///     Optional logger factory for creating loggers
@@ -148,7 +142,14 @@ public class IggyConsumerConfig
     /// <summary>
     ///     Gets or sets the reconnection settings to control the behavior of the iggy client
     ///     in case of a disconnect or network failure.
-    ///     This property is optional and can be null. If null, reconnection will be disabled.
+    ///     This property is optional and can be null. If null, the default <see cref="Configuration.ReconnectionSettings" />
+    ///     apply.
     /// </summary>
     public ReconnectionSettings? ReconnectionSettings { get; set; }
+
+    /// <summary>
+    ///     Interval between the pings the created client sends to keep an idle session alive.
+    ///     See <see cref="IggyClientConfigurator.HeartbeatInterval" />.
+    /// </summary>
+    public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(5);
 }

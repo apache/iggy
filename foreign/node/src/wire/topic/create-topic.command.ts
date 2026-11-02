@@ -14,19 +14,72 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import type { CommandResponse } from '../../client/client.type.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
+import { dedupeOptions, serializeOptions, sortOptions, type OptionEntry } from '../options.utils.js';
+import { HeaderValue } from '../message/header.utils.js';
 import {
-  isValidCompressionAlgorithm, CompressionAlgorithm,
+  isValidCompressionAlgorithm, CompressionAlgorithm, Durability, PartitionResizePolicy,
+  compressionAlgorithmName,
   deserializeTopic,
   type Topic,
   type CompressionAlgorithm as CompressionAlgorithmT
 } from './topic.utils.js';
 
+
+/**
+ * Settings a topic takes at create. Only the message expiry and the size cap
+ * can change later, through `updateTopic`.
+ */
+export type TopicOptions = {
+  /** Compression algorithm label (None or Gzip), stored and reported only */
+  compressionAlgorithm?: CompressionAlgorithmT,
+  /**
+   * Message expiry time in microseconds. `0n` is not "unlimited": it omits the
+   * key so the server resolves its own default, reported back as a derived
+   * option on `getTopic`.
+   */
+  messageExpiry?: bigint,
+  /**
+   * Maximum topic size in bytes. `0n` is not "unlimited": it omits the key so
+   * the server resolves its own default, reported back as a derived option on
+   * `getTopic`.
+   */
+  maxTopicSize?: bigint,
+  /** Segment size in bytes: 512-byte multiple between 1 MiB and 1 GiB */
+  segmentSize?: bigint,
+  /** Message completion policy. Defaults to replicated, independently of offsets. */
+  durability?: Durability,
+  consumerOffsetDurability?: Durability,
+  /** Whether partitions can be added or deleted later. The server default is mutable. */
+  partitionResizePolicy?: PartitionResizePolicy,
+  /** Message count that triggers a save (must be non-zero) */
+  messagesRequiredToSave?: number,
+  /** Accumulated message bytes that trigger a save */
+  sizeOfMessagesRequiredToSave?: bigint,
+  /** Preallocate segment files when the topic is created */
+  preallocateSegments?: boolean,
+  /**
+   * Number of nodes that store each partition of the topic: 1 to 32 and at most
+   * the cluster's node count. Omitted, the server's `[cluster]
+   * default_replication_factor` applies: every node unless an operator set a
+   * number. A write commits on a quorum of those nodes, so 2 keeps two copies
+   * but stops taking writes while either node is down, like Kafka with
+   * `min.insync.replicas=2`. A value out of range is refused with error 2018,
+   * invalid replication factor.
+   */
+  replicationFactor?: number,
+  /**
+   * Option keys with no field of their own, for a key the server catalog gained
+   * after this build shipped. A field above wins on collision, since the block
+   * must not carry a key twice. Call `describeOptions` for the keys a server
+   * accepts.
+   */
+  options?: OptionEntry[]
+};
 
 /**
  * Parameters for the create topic command.
@@ -37,20 +90,14 @@ export type CreateTopic = {
   /** Topic name (1-255 bytes) */
   name: string,
   /** Number of partitions to create */
-  partitionCount: number,
-  /** Compression algorithm (None or Gzip) */
-  compressionAlgorithm: CompressionAlgorithmT,
-  /** Message expiry time in microseconds (0 = unlimited) */
-  messageExpiry?: bigint,
-  /** Maximum topic size in bytes (0 = unlimited) */
-  maxTopicSize?: bigint,
-  /** Replication factor (1-255) */
-  replicationFactor?: number
-};
+  partitionCount: number
+} & TopicOptions;
 
 /**
  * Create topic command definition.
  * Creates a new topic within a stream.
+ * Layout: `[stream_id][partitions_count:u32_le][name_len:u8][name]`
+ * followed by the options TLV block running to the end of the payload.
  */
 export const CREATE_TOPIC = {
   code: COMMAND_CODE.CreateTopic,
@@ -62,32 +109,99 @@ export const CREATE_TOPIC = {
     compressionAlgorithm = CompressionAlgorithm.None,
     messageExpiry = 0n,
     maxTopicSize = 0n,
-    replicationFactor = 1
+    segmentSize,
+    durability = Durability.Replicated,
+    consumerOffsetDurability = Durability.Replicated,
+    partitionResizePolicy,
+    messagesRequiredToSave,
+    sizeOfMessagesRequiredToSave,
+    preallocateSegments,
+    replicationFactor,
+    options: extraOptions = []
   }: CreateTopic
   ) => {
     // Topic ID is now auto-assigned by the server, not sent in the protocol
     const streamIdentifier = serializeIdentifier(streamId);
     const bName = Buffer.from(name)
 
-    if (replicationFactor < 1 || replicationFactor > 255)
-      throw new Error('Topic replication factor should be between 1 and 255');
     if (bName.length < 1 || bName.length > 255)
       throw new Error('Topic name should be between 1 and 255 bytes');
     if(!isValidCompressionAlgorithm(compressionAlgorithm))
       throw new Error(`createTopic: invalid compressionAlgorithm (${compressionAlgorithm})`);
 
-    const b = Buffer.allocUnsafe(4 + 1 + 8 + 8 + 1 + 1);
+    // partitions_count rides the command's own fixed field, never the
+    // options block: the server rejects it as an unsupported option key.
+    // Server-default sentinels (expiry 0, size 0, compression none) and
+    // unset optionals are omitted so the server resolves them from its own
+    // config and reports them back as derived options.
+    // Caller keys first so a typed field below overwrites one of them.
+    const options: OptionEntry[] = [...extraOptions];
+    if (compressionAlgorithm !== CompressionAlgorithm.None)
+      options.push({
+        key: 'compression_algorithm',
+        value: HeaderValue.String(compressionAlgorithmName(compressionAlgorithm))
+      });
+    if (messageExpiry !== 0n)
+      options.push({
+        key: 'message_expiry', value: HeaderValue.Uint64(messageExpiry)
+      });
+    if (maxTopicSize !== 0n)
+      options.push({
+        key: 'max_topic_size', value: HeaderValue.Uint64(maxTopicSize)
+      });
+    if (segmentSize !== undefined)
+      options.push({
+        key: 'segment_size', value: HeaderValue.Uint64(segmentSize)
+      });
+    for (const [key, policy] of [
+      ['durability', durability],
+      ['consumer_offset_durability', consumerOffsetDurability]
+    ] as const) {
+      if (policy !== Durability.Replicated && policy !== Durability.Persisted)
+        throw new Error(`Invalid ${key}: ${policy}`);
+      const expected = HeaderValue.String(policy);
+      for (const entry of extraOptions) {
+        if (entry.key === key && (entry.value.kind !== expected.kind || entry.value.value !== expected.value))
+          throw new Error(`Conflicting ${key}`);
+      }
+      options.push({ key, value: expected });
+    }
+    if (partitionResizePolicy !== undefined) {
+      if (!Object.values<string>(PartitionResizePolicy).includes(partitionResizePolicy))
+        throw new Error(`Invalid partition_resize_policy: ${partitionResizePolicy}`);
+      options.push({
+        key: 'partition_resize_policy', value: HeaderValue.String(partitionResizePolicy)
+      });
+    }
+    if (messagesRequiredToSave !== undefined)
+      options.push({
+        key: 'messages_required_to_save',
+        value: HeaderValue.Uint32(messagesRequiredToSave)
+      });
+    if (sizeOfMessagesRequiredToSave !== undefined)
+      options.push({
+        key: 'size_of_messages_required_to_save',
+        value: HeaderValue.Uint64(sizeOfMessagesRequiredToSave)
+      });
+    if (preallocateSegments !== undefined)
+      options.push({
+        key: 'preallocate_segments',
+        value: HeaderValue.Bool(preallocateSegments)
+      });
+    if (replicationFactor !== undefined)
+      options.push({
+        key: 'replication_factor',
+        value: HeaderValue.Uint32(replicationFactor)
+      });
+    const b = Buffer.allocUnsafe(4 + 1);
     b.writeUInt32LE(partitionCount, 0);
-    b.writeUInt8(compressionAlgorithm, 4);
-    b.writeBigUInt64LE(messageExpiry, 5); // 0 is unlimited
-    b.writeBigUInt64LE(maxTopicSize, 13); // optional, 0 is null
-    b.writeUInt8(replicationFactor, 21); // must be > 0
-    b.writeUInt8(bName.length, 22);
+    b.writeUInt8(bName.length, 4);
 
     return Buffer.concat([
       streamIdentifier,
       b,
       bName,
+      serializeOptions(sortOptions(dedupeOptions(options))),
     ]);
   },
 

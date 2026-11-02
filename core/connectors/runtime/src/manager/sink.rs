@@ -21,13 +21,16 @@ use crate::configs::connectors::{ConfigFormat, ConnectorsConfigProvider, SinkCon
 use crate::context::RuntimeContext;
 use crate::error::RuntimeError;
 use crate::metrics::Metrics;
+use crate::plugin_instance::PluginInstanceGuard;
 use crate::sink;
 use dashmap::DashMap;
 use dlopen2::wrapper::Container;
-use iggy::prelude::IggyClient;
+use futures::future::join_all;
+use iggy_common::{BINARY_OPERATION_TIMEOUT, IggyDuration, PollOptions};
 use iggy_connector_sdk::api::{ConnectorError, ConnectorStatus};
 use std::collections::HashMap;
 use std::fmt;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -100,9 +103,14 @@ impl SinkManager {
         }
     }
 
-    pub async fn set_error(&self, key: &str, error_message: &str) {
+    pub async fn set_error(&self, key: &str, error_message: &str, metrics: Option<&Arc<Metrics>>) {
         if let Some(sink) = self.sinks.get(key) {
             let mut sink = sink.lock().await;
+            if sink.info.status == ConnectorStatus::Running
+                && let Some(metrics) = metrics
+            {
+                metrics.decrement_sinks_running();
+            }
             sink.info.status = ConnectorStatus::Error;
             sink.info.last_error = Some(ConnectorError::new(error_message));
         }
@@ -137,13 +145,14 @@ impl SinkManager {
             .map(|e| e.value().clone())
             .ok_or_else(|| RuntimeError::SinkNotFound(key.to_string()))?;
 
-        let (shutdown_tx, task_handles, plugin_id, container) = {
+        let (shutdown_tx, task_handles, plugin_id, container, budget) = {
             let mut details = details.lock().await;
             (
                 details.shutdown_tx.take(),
                 std::mem::take(&mut details.task_handles),
                 details.info.id,
                 details.container.clone(),
+                close_budget(&details.config),
             )
         };
 
@@ -151,9 +160,8 @@ impl SinkManager {
             let _ = tx.send(());
         }
 
-        for handle in task_handles {
-            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-        }
+        // The consumers close at the same time, so one budget covers them all.
+        let _ = tokio::time::timeout(budget, join_all(task_handles)).await;
 
         if let Some(container) = &container {
             info!("Closing sink connector with ID: {plugin_id} for plugin: {key}");
@@ -178,7 +186,6 @@ impl SinkManager {
         &self,
         key: &str,
         config: &SinkConfig,
-        iggy_client: &IggyClient,
         metrics: &Arc<Metrics>,
         context: &Arc<RuntimeContext>,
     ) -> Result<(), RuntimeError> {
@@ -197,29 +204,48 @@ impl SinkManager {
 
         let plugin_id = PLUGIN_ID.fetch_add(1, Ordering::SeqCst);
 
-        sink::init_sink(
+        // Connected before the plugin starts, so a refused connection leaves no
+        // plugin instance behind.
+        let client = context.iggy_clients.connect_sink_client().await?;
+        if let Err(error) = sink::init_sink(
             &container,
             &config.plugin_config.clone().unwrap_or_default(),
             plugin_id,
-        )?;
+        ) {
+            sink::release_sink_client(client, plugin_id).await;
+            return Err(error);
+        }
         info!("Sink connector with ID: {plugin_id} for plugin: {key} initialized successfully.");
+        // Armed from here until the id is recorded below. `PluginInstanceGuard`
+        // carries why that window strands the instance.
+        let instance_guard = PluginInstanceGuard::for_sink(container.clone(), plugin_id, key);
 
-        let consumers = sink::setup_sink_consumers(key, config, iggy_client).await?;
+        let consumers = match sink::setup_sink_consumers(key, config, &client).await {
+            Ok(consumers) => consumers,
+            Err(error) => {
+                sink::release_sink_client(client, plugin_id).await;
+                instance_guard.close().await;
+                return Err(error);
+            }
+        };
 
         let callback = container.iggy_sink_consume;
-        let (shutdown_tx, task_handles) = sink::spawn_consume_tasks(
-            plugin_id,
-            key,
-            consumers,
-            callback,
-            config.verbose,
-            config.benchmark,
-            metrics,
-            context.clone(),
-        );
-
+        // Locked before the spawn, so no await sits between starting the tasks
+        // and recording the id: a cancellation there would leave the tasks
+        // consuming into an instance the guard has just closed.
         {
             let mut details = details.lock().await;
+            let (shutdown_tx, task_handles) = sink::spawn_consume_tasks(
+                plugin_id,
+                key,
+                consumers,
+                client,
+                callback,
+                config.verbose,
+                config.benchmark,
+                metrics,
+                context.clone(),
+            );
             details.info.id = plugin_id;
             details.info.status = ConnectorStatus::Running;
             details.info.last_error = None;
@@ -228,6 +254,8 @@ impl SinkManager {
             details.task_handles = task_handles;
             metrics.increment_sinks_running();
         }
+        // `details.info.id` now names this instance, so a later stop reaches it.
+        instance_guard.disarm();
 
         Ok(())
     }
@@ -236,7 +264,6 @@ impl SinkManager {
         &self,
         key: &str,
         config_provider: &dyn ConnectorsConfigProvider,
-        iggy_client: &IggyClient,
         metrics: &Arc<Metrics>,
         context: &Arc<RuntimeContext>,
     ) -> Result<(), RuntimeError> {
@@ -263,8 +290,7 @@ impl SinkManager {
             .map_err(|e| RuntimeError::InvalidConfiguration(e.to_string()))?
             .ok_or_else(|| RuntimeError::SinkNotFound(key.to_string()))?;
 
-        self.start_connector(key, &config, iggy_client, metrics, context)
-            .await?;
+        self.start_connector(key, &config, metrics, context).await?;
         info!("Sink connector: {key} restarted successfully.");
         Ok(())
     }
@@ -302,10 +328,32 @@ impl fmt::Debug for SinkDetails {
     }
 }
 
+/// The longest that the consumers of `config` take to close: a committing read, which the close
+/// cancels but a server that stopped answering ends only at its deadline, then the rewind of the
+/// offsets and the leave of the group, each within one operation timeout. A stream without
+/// `max_wait` waits one second.
+fn close_budget(config: &SinkConfig) -> Duration {
+    let read = config
+        .streams
+        .iter()
+        .map(|stream| {
+            stream
+                .max_wait
+                .as_deref()
+                .and_then(|max_wait| IggyDuration::from_str(max_wait).ok())
+                .unwrap_or(IggyDuration::ONE_SECOND)
+        })
+        .map(|max_wait| PollOptions::wait(max_wait).request_timeout().get_duration())
+        .max()
+        .unwrap_or_default();
+    read.saturating_add(BINARY_OPERATION_TIMEOUT.saturating_mul(2))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::configs::connectors::SinkConfig;
+    use crate::configs::connectors::{SinkConfig, StreamConsumerConfig};
+    use std::sync::atomic::AtomicBool;
 
     fn create_test_sink_info(key: &str, id: u32) -> SinkInfo {
         SinkInfo {
@@ -444,7 +492,7 @@ mod tests {
     #[tokio::test]
     async fn should_clear_error_when_status_becomes_running() {
         let manager = SinkManager::new(vec![create_test_sink_details("es", 1)]);
-        manager.set_error("es", "some error").await;
+        manager.set_error("es", "some error", None).await;
 
         manager
             .update_status("es", ConnectorStatus::Running, None)
@@ -459,7 +507,7 @@ mod tests {
     async fn should_set_error_status_and_message() {
         let manager = SinkManager::new(vec![create_test_sink_details("es", 1)]);
 
-        manager.set_error("es", "connection failed").await;
+        manager.set_error("es", "connection failed", None).await;
 
         let sink = manager.get("es").await.unwrap();
         let details = sink.lock().await;
@@ -501,6 +549,39 @@ mod tests {
         assert!(details.task_handles.is_empty());
     }
 
+    /// A consumer close can wait for a committing read and then store its offset and leave its
+    /// group, which takes longer than a fixed few seconds.
+    #[tokio::test]
+    async fn given_a_consumer_close_longer_than_a_few_seconds_when_stopping_should_wait_for_it() {
+        const CLOSE: Duration = Duration::from_secs(6);
+        let metrics = Arc::new(Metrics::init());
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(());
+        let closed = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn({
+            let closed = Arc::clone(&closed);
+            async move {
+                let _ = shutdown_rx.changed().await;
+                tokio::time::sleep(CLOSE).await;
+                closed.store(true, Ordering::SeqCst);
+            }
+        });
+        let mut details = create_test_sink_details("es", 1);
+        details.config.streams = vec![StreamConsumerConfig {
+            max_wait: Some("10s".to_owned()),
+            ..Default::default()
+        }];
+        details.shutdown_tx = Some(shutdown_tx);
+        details.task_handles = vec![handle];
+        let manager = SinkManager::new(vec![details]);
+
+        manager.stop_connector("es", &metrics).await.unwrap();
+
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "the stop waits for the close of its consumer"
+        );
+    }
+
     #[tokio::test]
     async fn stop_should_work_without_container() {
         let metrics = Arc::new(Metrics::init());
@@ -527,7 +608,7 @@ mod tests {
     #[tokio::test]
     async fn should_clear_error_when_status_becomes_stopped() {
         let manager = SinkManager::new(vec![create_test_sink_details("es", 1)]);
-        manager.set_error("es", "some error").await;
+        manager.set_error("es", "some error", None).await;
 
         manager
             .update_status("es", ConnectorStatus::Stopped, None)
@@ -579,6 +660,46 @@ mod tests {
     async fn set_error_should_be_noop_for_unknown_key() {
         let manager = SinkManager::new(vec![]);
 
-        manager.set_error("nonexistent", "some error").await;
+        manager.set_error("nonexistent", "some error", None).await;
+    }
+
+    #[tokio::test]
+    async fn given_running_connector_when_error_repeats_should_decrement_once() {
+        const FAILED_KEY: &str = "failed";
+        let metrics = Arc::new(Metrics::init());
+        let manager = SinkManager::new(vec![
+            create_test_sink_details(FAILED_KEY, 1),
+            create_test_sink_details("healthy", 2),
+        ]);
+        metrics.increment_sinks_running();
+        metrics.increment_sinks_running();
+
+        manager
+            .set_error(FAILED_KEY, "first error", Some(&metrics))
+            .await;
+        assert_eq!(
+            metrics.get_sinks_running(),
+            1,
+            "the healthy connector remains running"
+        );
+
+        manager
+            .set_error(FAILED_KEY, "repeated error", Some(&metrics))
+            .await;
+        assert_eq!(
+            metrics.get_sinks_running(),
+            1,
+            "repeated errors must not decrement twice"
+        );
+
+        manager
+            .stop_connector(FAILED_KEY, &metrics)
+            .await
+            .expect("failed connector should stop");
+        assert_eq!(
+            metrics.get_sinks_running(),
+            1,
+            "stopping an errored connector must not decrement again"
+        );
     }
 }

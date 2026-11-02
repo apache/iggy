@@ -40,9 +40,11 @@
 
 use super::COMPONENT;
 use crate::ConfigurationError;
+use crate::common::validators::SEGMENT_MAX_SIZE_BYTES;
 use configs::ConfigEnv;
 use iggy_common::{IggyByteSize, Validatable};
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU32;
 
 /// Mirrors `consensus::PIPELINE_PREPARE_QUEUE_MAX`.
 pub const DEFAULT_PARTITION_PREPARE_QUEUE_DEPTH: usize = 32;
@@ -61,41 +63,155 @@ pub const DEFAULT_PARTITION_PREPARE_QUEUE_DEPTH: usize = 32;
 /// batches) still holds and is looser, so the wire is what decides.
 pub const MAX_PARTITION_PREPARE_QUEUE_DEPTH: usize = 127;
 
+/// Most one segment can overshoot its size cap: rotation checks the cap AFTER
+/// appending, so a sealed segment runs up to one maximum batch past the
+/// per-topic `segment_size`, whose own ceiling is the compile-time
+/// [`SEGMENT_MAX_SIZE_BYTES`]. Tracks the shipped
+/// `message_bus.max_message_size`, which is what actually bounds an appendable
+/// batch.
+///
+/// Mirrors `shard::SEGMENT_SIZE_OVERSHOOT_BYTES`, which the serving side uses as
+/// the floor of its admission divisor.
+pub const SEGMENT_SIZE_OVERSHOOT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Distinct max-size segments the served-payload budget is sized to hold at
+/// once, and so the concurrent state transfers a shard admits.
+///
+/// Mirrors `shard::CONCURRENT_SERVED_SEGMENTS`.
+pub const CONCURRENT_SERVED_SEGMENTS: u64 = 2;
+
 /// Mirrors the free const `shard::PARTITION_ARTIFACT_LEN_DEFAULT` (segment
 /// ceiling plus the one whole batch a segment may close past it).
-pub const DEFAULT_TRANSFER_ARTIFACT_BYTES_MAX: u64 = 1024 * 1024 * 1024 + 64 * 1024 * 1024;
+pub const DEFAULT_TRANSFER_ARTIFACT_BYTES_MAX: u64 =
+    SEGMENT_MAX_SIZE_BYTES + SEGMENT_SIZE_OVERSHOOT_BYTES;
 
 /// Mirrors the free const `shard::SERVED_SEGMENT_CACHE_BYTES_DEFAULT`: room for
-/// two concurrently served segments at the size a SEALED one actually reaches,
-/// which is the artifact ceiling above, not the configured segment target. Sized
-/// off the target instead, two admitted pulls would not both fit and would evict
-/// each other on every chunk.
-pub const DEFAULT_TRANSFER_SERVED_CACHE_BYTES_MAX: u64 = 2 * DEFAULT_TRANSFER_ARTIFACT_BYTES_MAX;
+/// [`CONCURRENT_SERVED_SEGMENTS`] served segments at the size a SEALED one
+/// actually reaches, which is the artifact ceiling above, not the configured
+/// segment target. Sized off the target instead, two admitted pulls would not
+/// both fit and would evict each other on every chunk.
+pub const DEFAULT_TRANSFER_SERVED_CACHE_BYTES_MAX: u64 =
+    CONCURRENT_SERVED_SEGMENTS * DEFAULT_TRANSFER_ARTIFACT_BYTES_MAX;
 
 /// Upper bound on the two state-transfer byte knobs. A typo guard, not a sizing
 /// endorsement: both are PER SHARD, so a slipped digit multiplies by the core
 /// count.
 pub const MAX_TRANSFER_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
+/// Upper bound on `offset_reservation_lease`: a typo guard, so a slipped digit
+/// cannot reach the arithmetic in the append fence.
+pub const MAX_OFFSET_RESERVATION_LEASE: u32 = 16 * 1024 * 1024;
+
+/// Mirrors `partitions::DEFAULT_OFFSET_RESERVATION_LEASE`; pinned against drift
+/// by `default_offset_reservation_lease_matches_partitions_constant` in the
+/// server crate, which can see both.
+pub const DEFAULT_OFFSET_RESERVATION_LEASE: u32 = 64 * 1024;
+
+/// Serde fallback for a `[partition]` table that omits
+/// `offset_reservation_lease`.
+fn default_offset_reservation_lease() -> NonZeroU32 {
+    NonZeroU32::new(DEFAULT_OFFSET_RESERVATION_LEASE)
+        .expect("DEFAULT_OFFSET_RESERVATION_LEASE is a nonzero literal")
+}
+
 /// Mirrors `partitions::EVICTED_RING_CAPACITY`.
-pub const DEFAULT_EVICTED_RING_CAPACITY: usize = 4096;
+pub const DEFAULT_EVICTED_RING_CAPACITY: usize = 65536;
 
 /// Upper bound on `evicted_ring_capacity`. The ring exists per multi-replica
-/// partition and each retained entry pins a full committed batch, so
-/// worst-case pinned memory scales with the partition count; a typo guard,
-/// not a sizing endorsement.
+/// partition, and each retained entry pins a full committed batch until the
+/// byte cap releases it to its segment, so worst-case pinned memory scales
+/// with the partition count. A typo guard, not a sizing endorsement.
 pub const MAX_EVICTED_RING_CAPACITY: usize = 65536;
 
 /// Mirrors `partitions::EVICTED_RING_BYTES_MAX`.
-pub const DEFAULT_EVICTED_RING_BYTES_MAX: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_EVICTED_RING_BYTES_MAX: u64 = 64 * 1024 * 1024;
 
 /// Upper bound on `evicted_ring_bytes_max`, per partition. Whichever ring cap
 /// trips first evicts; this byte ceiling is the second typo guard.
 pub const MAX_EVICTED_RING_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Shipped default for [`PartitionConfig::dedup_clients_max`]; pinned against
+/// the runtime constant by a bootstrap assert.
+pub const PARTITION_DEDUP_CLIENTS_DEFAULT: usize = 4096;
+
+/// Ceiling for [`PartitionConfig::dedup_clients_max`]. A per-group budget, so
+/// the ceiling bounds worst-case memory at roughly `partitions * this * 146
+/// bytes`: a 112-byte slot entry plus its index-map slot.
+pub const PARTITION_DEDUP_CLIENTS_CEILING: usize = 1 << 16;
+
+/// Shipped per-kind consumer-offset cardinality limit for one partition.
+///
+/// Mirrors `partitions::DEFAULT_CONSUMER_OFFSETS_MAX`. The server crate pins
+/// the duplicated literals because configs must not depend on partitions.
+pub const PARTITION_CONSUMER_OFFSETS_DEFAULT: usize = 4096;
+
+/// Configuration typo guard for the per-kind consumer-offset limit.
+///
+/// The runtime state-transfer decoder accepts `1 << 20` entries per section.
+/// Keeping the configurable ceiling at one quarter leaves room for recovered
+/// over-limit state while the shipped default remains much smaller.
+pub const PARTITION_CONSUMER_OFFSETS_CEILING: usize = 1 << 18;
+
+fn default_consumer_offsets_max() -> usize {
+    PARTITION_CONSUMER_OFFSETS_DEFAULT
+}
+
+pub const DEFAULT_PARTITION_WAL_BYTES_MAX: u64 = 256 * 1024 * 1024;
+pub const MIN_PARTITION_WAL_BYTES_MAX: u64 = 2 * (64 * 1024 * 1024 + 4096);
+pub const MAX_PARTITION_WAL_BYTES_MAX: u64 = 4 * 1024 * 1024 * 1024;
+
+fn default_wal_bytes_max() -> IggyByteSize {
+    IggyByteSize::from(DEFAULT_PARTITION_WAL_BYTES_MAX)
+}
+
+fn default_repair_memory_bytes_max() -> IggyByteSize {
+    const DEFAULT_REPAIR_MEMORY_BYTES_MAX: u64 = 1024 * 1024 * 1024;
+    IggyByteSize::from(DEFAULT_REPAIR_MEMORY_BYTES_MAX)
+}
+
+/// Ceiling on the group-commit delay. A longer wait costs more than the
+/// barrier it is meant to amortize.
+pub const MAX_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS: u64 = 10_000;
+
+fn default_wal_group_commit_delay_micros() -> u64 {
+    0
+}
+
 /// Capacity tunables for the per-partition consensus plane.
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct PartitionConfig {
+    /// Active WAL and pending prepare budget per persisted partition.
+    /// Temporary generation rewrites may require additional disk space.
+    ///
+    /// It also bounds the memory of a backup that repairs an unproven log from
+    /// the head down: that repair holds up to this many bytes of batches per
+    /// partition, subject to the shared `repair_memory_bytes_max` cap.
+    #[serde(default = "default_wal_bytes_max")]
+    #[config_env(leaf)]
+    pub wal_bytes_max: IggyByteSize,
+    /// Node-wide allocation cap for unproven repair walks and snapshot repair tails.
+    /// Exhausted walks fall back to state transfer; exhausted tails require a fresh snapshot.
+    /// Normal prepare queues and state-transfer buffers have separate limits.
+    #[serde(default = "default_repair_memory_bytes_max")]
+    #[config_env(leaf)]
+    pub repair_memory_bytes_max: IggyByteSize,
+    /// Bounded wait, in microseconds, for more prepares before a persisted
+    /// partition's WAL writer starts its durability barrier. Zero disables it.
+    ///
+    /// Spends up to this much acknowledgment latency to cut device writes: one
+    /// barrier and one frontier write then cover a whole group of prepares
+    /// instead of a single one. Durability is unchanged. The same barrier runs
+    /// over the same bytes, later, and the quorum gate is untouched.
+    ///
+    /// Skipped while prepares arrive further apart than the delay, so an idle
+    /// partition never waits. Earns nothing until the barrier completes faster
+    /// than prepares arrive, which is where the writer stops grouping by
+    /// itself. Start near the measured barrier duration.
+    #[serde(default = "default_wal_group_commit_delay_micros")]
+    #[config_env(leaf)]
+    pub wal_group_commit_delay_micros: u64,
+    #[serde(default = "default_validate_checksum")]
+    pub validate_checksum: bool,
     /// Depth of a partition's prepare queue: how many uncommitted produce /
     /// consumer-offset ops may be in flight at once for that partition.
     /// Submits beyond it are rejected with the transient prepare-queue-full
@@ -103,18 +219,59 @@ pub struct PartitionConfig {
     /// pinned request-buffer memory by the partition count.
     pub prepare_queue_depth: usize,
 
+    /// Initial capacity for session-qualified retry protection in each partition
+    /// group. Live and unretired sessions occupy slots. A full table refuses new
+    /// writers with `TransientNotAccepted`; existing protection is never evicted.
+    /// Ended sessions release slots only after ordered retirement. The first
+    /// committed operation fixes this limit, so changing configuration does not
+    /// resize an existing group after restart or transfer. Must be > 0 and
+    /// <= [`PARTITION_DEDUP_CLIENTS_CEILING`].
+    ///
+    /// Unlike `[metadata] clients_table_max`, this budget is PER GROUP, so the
+    /// worst case scales with partition count: size it to the producers a
+    /// single partition actually sees, not the node's client total.
+    pub dedup_clients_max: usize,
+
+    /// Distinct durable consumer-offset keys admitted per kind by one
+    /// partition primary. Existing keys remain writable at the limit.
+    #[serde(default = "default_consumer_offsets_max")]
+    pub consumer_offsets_max: usize,
+
+    /// Offsets claimed in the superblock ahead of the mint counter before an
+    /// append, so a crash-restarted replica resumes above what it confirmed.
+    /// One superblock write per block: lowering it raises the fsync rate,
+    /// raising it wastes at most one block per crash. Must be <=
+    /// [`MAX_OFFSET_RESERVATION_LEASE`].
+    ///
+    /// SINGLE-REPLICA groups only: a replicated group acks once a quorum has
+    /// journaled the batch, claims nothing, and ignores this.
+    ///
+    /// `NonZeroU32` rather than a `u32` with a floor check: a zero lease claims
+    /// nothing and would write the superblock before every append, and the type
+    /// is what stops the partition-side setter from having to silently coerce it
+    /// to one, a coercion that hid wiring errors the validator could not see.
+    ///
+    /// The serde fallback is for the providers that do NOT merge the embedded
+    /// defaults: the file provider does, so a partial `[partition]` table only
+    /// fails through direct deserialization or an alternate provider.
+    #[serde(default = "default_offset_reservation_lease")]
+    #[config_env(leaf)]
+    pub offset_reservation_lease: NonZeroU32,
+
     /// Entries the evicted ring retains per multi-replica partition for
     /// journal repair after a peer rejoins. Larger widens the window a
     /// restarting peer can be served from the ring before falling back to
     /// bulk sync, at the cost of pinned memory per partition. Must be > 0 and
     /// <= [`MAX_EVICTED_RING_CAPACITY`]. Single-replica partitions retain
-    /// nothing regardless.
+    /// nothing regardless. The entries whose batches went back to their
+    /// segments have their own cap of 16384.
     pub evicted_ring_capacity: usize,
 
     /// Byte ceiling for the evicted ring per partition; whichever ring cap
     /// (this or [`Self::evicted_ring_capacity`]) trips first evicts. Bounds
     /// the ring memory a burst of large batches can pin. Must be > 0 and <=
-    /// [`MAX_EVICTED_RING_BYTES`].
+    /// [`MAX_EVICTED_RING_BYTES`]. The headers of the batches that went back to
+    /// their segments do not count here.
     #[config_env(leaf)]
     pub evicted_ring_bytes_max: IggyByteSize,
 
@@ -142,6 +299,28 @@ pub struct PartitionConfig {
 
 impl Validatable<ConfigurationError> for PartitionConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
+        let repair_bytes = self.repair_memory_bytes_max.as_bytes_u64();
+        if repair_bytes == 0 || usize::try_from(repair_bytes).is_err() {
+            eprintln!("{COMPONENT} partition.repair_memory_bytes_max must fit in usize and be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        let wal_bytes = self.wal_bytes_max.as_bytes_u64();
+        if !(MIN_PARTITION_WAL_BYTES_MAX..=MAX_PARTITION_WAL_BYTES_MAX).contains(&wal_bytes)
+            || !wal_bytes.is_multiple_of(4096)
+        {
+            eprintln!(
+                "{COMPONENT} partition.wal_bytes_max must be a 4 KiB multiple between {MIN_PARTITION_WAL_BYTES_MAX} and {MAX_PARTITION_WAL_BYTES_MAX} bytes"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        if self.wal_group_commit_delay_micros > MAX_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS {
+            eprintln!(
+                "{COMPONENT} partition.wal_group_commit_delay_micros must not exceed {MAX_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS}"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         if self.prepare_queue_depth == 0 {
             eprintln!("{COMPONENT} partition.prepare_queue_depth must be > 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -157,6 +336,32 @@ impl Validatable<ConfigurationError> for PartitionConfig {
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
+        if self.dedup_clients_max == 0 || self.dedup_clients_max > PARTITION_DEDUP_CLIENTS_CEILING {
+            eprintln!(
+                "{COMPONENT} partition.dedup_clients_max ({}) must be > 0 and <= \
+                 {PARTITION_DEDUP_CLIENTS_CEILING}",
+                self.dedup_clients_max
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.consumer_offsets_max == 0
+            || self.consumer_offsets_max > PARTITION_CONSUMER_OFFSETS_CEILING
+        {
+            eprintln!(
+                "{COMPONENT} partition.consumer_offsets_max ({}) must be > 0 and <= \
+                 {PARTITION_CONSUMER_OFFSETS_CEILING}",
+                self.consumer_offsets_max
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.offset_reservation_lease.get() > MAX_OFFSET_RESERVATION_LEASE {
+            eprintln!(
+                "{COMPONENT} partition.offset_reservation_lease ({}) exceeds the maximum \
+                 ({MAX_OFFSET_RESERVATION_LEASE})",
+                self.offset_reservation_lease
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         if self.evicted_ring_capacity == 0 {
             eprintln!("{COMPONENT} partition.evicted_ring_capacity must be > 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -169,7 +374,7 @@ impl Validatable<ConfigurationError> for PartitionConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
         // The FLOOR on `transfer_artifact_bytes_max` cannot live here (it needs
-        // `system.segment.size` and the bus cap); it is enforced in the
+        // the topic's `segment_size` and the bus cap); it is enforced in the
         // `ServerConfig` validator, which is what turns that misconfiguration
         // into a boot error instead of a silent per-partition rejoin livelock.
         let served_cache = self.transfer_served_cache_bytes_max.as_bytes_u64();
@@ -203,9 +408,72 @@ impl Validatable<ConfigurationError> for PartitionConfig {
     }
 }
 
+const fn default_validate_checksum() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wal_capacity_requires_aligned_bounds_and_defaults_when_omitted() {
+        for bytes in [
+            0,
+            MIN_PARTITION_WAL_BYTES_MAX - 4096,
+            MIN_PARTITION_WAL_BYTES_MAX + 1,
+            MAX_PARTITION_WAL_BYTES_MAX + 4096,
+        ] {
+            let config = PartitionConfig {
+                wal_bytes_max: IggyByteSize::from(bytes),
+                ..PartitionConfig::default()
+            };
+            assert!(config.validate().is_err(), "accepted WAL capacity {bytes}");
+        }
+        for bytes in [
+            MIN_PARTITION_WAL_BYTES_MAX,
+            DEFAULT_PARTITION_WAL_BYTES_MAX,
+            MAX_PARTITION_WAL_BYTES_MAX,
+        ] {
+            let config = PartitionConfig {
+                wal_bytes_max: IggyByteSize::from(bytes),
+                ..PartitionConfig::default()
+            };
+            assert!(config.validate().is_ok());
+        }
+        let config: PartitionConfig = serde_json::from_str(&partial_table(None)).unwrap();
+        assert_eq!(
+            config.wal_bytes_max.as_bytes_u64(),
+            DEFAULT_PARTITION_WAL_BYTES_MAX
+        );
+    }
+
+    #[test]
+    fn given_a_repair_memory_limit_when_loading_config_should_preserve_overrides_and_reject_zero() {
+        const CUSTOM_BYTES: u64 = 8 * 1024 * 1024;
+        let omitted: PartitionConfig = serde_json::from_str(&partial_table(None)).unwrap();
+        assert_eq!(
+            omitted.repair_memory_bytes_max,
+            PartitionConfig::default().repair_memory_bytes_max,
+            "older configuration files use the shipped node-wide limit"
+        );
+        let mut config = PartitionConfig {
+            repair_memory_bytes_max: IggyByteSize::from(CUSTOM_BYTES),
+            ..PartitionConfig::default()
+        };
+        assert!(config.validate().is_ok());
+        let restored: PartitionConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            restored.repair_memory_bytes_max.as_bytes_u64(),
+            CUSTOM_BYTES
+        );
+        config.repair_memory_bytes_max = IggyByteSize::from(0_u64);
+        assert!(
+            config.validate().is_err(),
+            "a zero repair budget must fail validation"
+        );
+    }
 
     #[test]
     fn default_impl_validates() {
@@ -234,6 +502,57 @@ mod tests {
     }
 
     #[test]
+    fn shipped_dedup_default_matches_the_runtime_constant() {
+        assert_eq!(
+            PartitionConfig::default().dedup_clients_max,
+            PARTITION_DEDUP_CLIENTS_DEFAULT,
+            "config.toml dedup_clients_max drifted from the runtime default"
+        );
+    }
+
+    #[test]
+    fn shipped_consumer_offsets_default_matches_constant() {
+        assert_eq!(
+            PartitionConfig::default().consumer_offsets_max,
+            PARTITION_CONSUMER_OFFSETS_DEFAULT
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_consumer_offsets_max() {
+        for value in [0, PARTITION_CONSUMER_OFFSETS_CEILING + 1] {
+            let config = PartitionConfig {
+                consumer_offsets_max: value,
+                ..PartitionConfig::default()
+            };
+            assert!(config.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn accepts_consumer_offsets_max_at_ceiling() {
+        let config = PartitionConfig {
+            consumer_offsets_max: PARTITION_CONSUMER_OFFSETS_CEILING,
+            ..PartitionConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_out_of_range_dedup_clients_max() {
+        for value in [0, PARTITION_DEDUP_CLIENTS_CEILING + 1] {
+            let config = PartitionConfig {
+                dedup_clients_max: value,
+                ..PartitionConfig::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "dedup_clients_max {value} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_zero_prepare_queue_depth() {
         let config = PartitionConfig {
             prepare_queue_depth: 0,
@@ -255,6 +574,73 @@ mod tests {
     fn accepts_prepare_queue_depth_at_ceiling() {
         let config = PartitionConfig {
             prepare_queue_depth: MAX_PARTITION_PREPARE_QUEUE_DEPTH,
+            ..PartitionConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    fn lease(value: u32) -> NonZeroU32 {
+        NonZeroU32::new(value).expect("a nonzero test lease")
+    }
+
+    /// A `[partition]` table as an alternate provider hands it over: every other
+    /// field present, the lease optional.
+    fn partial_table(lease: Option<u32>) -> String {
+        let entry = lease.map_or_else(String::new, |lease| {
+            format!(r#""offset_reservation_lease": {lease},"#)
+        });
+        format!(
+            r#"{{"prepare_queue_depth": 32, {entry}
+               "dedup_clients_max": 4096,
+               "evicted_ring_capacity": 4096,
+               "evicted_ring_bytes_max": "16 MiB",
+               "transfer_served_cache_bytes_max": "64 MiB",
+               "transfer_artifact_bytes_max": "64 MiB"}}"#
+        )
+    }
+
+    /// The floor is the type's, so a zero cannot be constructed to validate --
+    /// it is refused at deserialization instead.
+    #[test]
+    fn rejects_zero_offset_reservation_lease_at_deserialization() {
+        let error = serde_json::from_str::<PartitionConfig>(&partial_table(Some(0)))
+            .expect_err("a zero lease reserves nothing and must not deserialize");
+        assert!(
+            error.to_string().contains("nonzero"),
+            "the refusal must name the constraint, got {error}"
+        );
+    }
+
+    /// The providers that do not merge the embedded defaults hand over a partial
+    /// table, which must still deserialize.
+    #[test]
+    fn given_a_table_without_the_lease_when_deserialized_should_fall_back_to_the_default() {
+        let config = serde_json::from_str::<PartitionConfig>(&partial_table(None))
+            .expect("a table omitting the lease must deserialize");
+        assert_eq!(
+            config.offset_reservation_lease.get(),
+            DEFAULT_OFFSET_RESERVATION_LEASE
+        );
+        assert_eq!(
+            config.consumer_offsets_max,
+            PARTITION_CONSUMER_OFFSETS_DEFAULT
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_offset_reservation_lease_above_ceiling() {
+        let config = PartitionConfig {
+            offset_reservation_lease: lease(MAX_OFFSET_RESERVATION_LEASE + 1),
+            ..PartitionConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_offset_reservation_lease_at_ceiling() {
+        let config = PartitionConfig {
+            offset_reservation_lease: lease(MAX_OFFSET_RESERVATION_LEASE),
             ..PartitionConfig::default()
         };
         assert!(config.validate().is_ok());

@@ -18,6 +18,7 @@
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_str, read_u8, read_u32_le};
 use crate::primitives::identifier::WireName;
+use crate::primitives::options::WireOptions;
 use crate::primitives::permissions::WirePermissions;
 use bytes::{BufMut, BytesMut};
 use std::borrow::Cow;
@@ -26,13 +27,18 @@ use std::borrow::Cow;
 ///
 /// Wire format:
 /// `[username_len:u8][username:N][password_len:u8][password:N][status:u8]
-///  [has_permissions:u8][permissions_len:u32_le?][permissions:M?]`
+///  [has_permissions:u8][permissions_len:u32_le?][permissions:M?]
+///  [options TLV to end]`
+///
+/// The options block runs to the end of the payload; its validator requires
+/// exact consumption, so no length prefix is needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateUserRequest {
     pub username: WireName,
     pub password: String,
     pub status: u8,
     pub permissions: Option<WirePermissions>,
+    pub options: WireOptions,
 }
 
 impl WireEncode for CreateUserRequest {
@@ -46,6 +52,7 @@ impl WireEncode for CreateUserRequest {
                 .permissions
                 .as_ref()
                 .map_or(0, |p| 4 + p.encoded_size())
+            + self.options.encoded_size()
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -67,6 +74,7 @@ impl WireEncode for CreateUserRequest {
         } else {
             buf.put_u8(0);
         }
+        self.options.encode(buf);
     }
 }
 
@@ -100,14 +108,17 @@ impl WireDecode for CreateUserRequest {
             None
         };
 
+        let options = WireOptions::from_slice(&buf[pos..])?;
+
         Ok((
             Self {
                 username,
                 password,
                 status,
                 permissions,
+                options,
             },
-            pos,
+            buf.len(),
         ))
     }
 }
@@ -135,6 +146,13 @@ mod tests {
         }
     }
 
+    fn sample_options() -> WireOptions {
+        use crate::primitives::user_headers::encode_user_headers;
+        let mut buf = BytesMut::new();
+        encode_user_headers(&[(2, b"future_key", 2, b"value")], &mut buf);
+        WireOptions::from_bytes(buf.freeze()).unwrap()
+    }
+
     #[test]
     fn roundtrip_without_permissions() {
         let req = CreateUserRequest {
@@ -142,6 +160,7 @@ mod tests {
             password: "secret123".to_string(),
             status: 1,
             permissions: None,
+            options: WireOptions::empty(),
         };
         let bytes = req.to_bytes();
         let (decoded, consumed) = CreateUserRequest::decode(&bytes).unwrap();
@@ -156,6 +175,22 @@ mod tests {
             password: "p@ssw0rd".to_string(),
             status: 2,
             permissions: Some(sample_permissions()),
+            options: WireOptions::empty(),
+        };
+        let bytes = req.to_bytes();
+        let (decoded, consumed) = CreateUserRequest::decode(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn roundtrip_with_permissions_and_options() {
+        let req = CreateUserRequest {
+            username: WireName::new("admin").unwrap(),
+            password: "p@ssw0rd".to_string(),
+            status: 2,
+            permissions: Some(sample_permissions()),
+            options: sample_options(),
         };
         let bytes = req.to_bytes();
         let (decoded, consumed) = CreateUserRequest::decode(&bytes).unwrap();
@@ -170,6 +205,7 @@ mod tests {
             password: "pw".to_string(),
             status: 0,
             permissions: Some(sample_permissions()),
+            options: sample_options(),
         };
         assert_eq!(req.encoded_size(), req.to_bytes().len());
     }
@@ -181,6 +217,7 @@ mod tests {
             password: "pass".to_string(),
             status: 1,
             permissions: None,
+            options: WireOptions::empty(),
         };
         let bytes = req.to_bytes();
         for i in 0..bytes.len() {
@@ -192,16 +229,38 @@ mod tests {
     }
 
     #[test]
+    fn truncated_options_return_error() {
+        let req = CreateUserRequest {
+            username: WireName::new("user").unwrap(),
+            password: "pass".to_string(),
+            status: 1,
+            permissions: None,
+            options: sample_options(),
+        };
+        let bytes = req.to_bytes();
+        let fixed_end = bytes.len() - req.options.encoded_size();
+        for i in fixed_end + 1..bytes.len() {
+            assert!(
+                CreateUserRequest::decode(&bytes[..i]).is_err(),
+                "expected error for truncation at byte {i}"
+            );
+        }
+        let (decoded, _) = CreateUserRequest::decode(&bytes[..fixed_end]).unwrap();
+        assert!(decoded.options.is_empty());
+    }
+
+    #[test]
     fn none_permissions_wire_layout() {
         let req = CreateUserRequest {
             username: WireName::new("u").unwrap(),
             password: "p".to_string(),
             status: 0,
             permissions: None,
+            options: WireOptions::empty(),
         };
         let bytes = req.to_bytes();
         // username: [1, b'u'] + password: [1, b'p'] + status: [0]
-        // + has_perm: [0]
+        // + has_perm: [0]; empty options add zero bytes
         let expected: &[u8] = &[1, b'u', 1, b'p', 0, 0];
         assert_eq!(&bytes[..], expected);
     }

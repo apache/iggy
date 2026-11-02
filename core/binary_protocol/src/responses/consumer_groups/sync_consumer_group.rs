@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::WireError;
-use crate::codec::{WireDecode, WireEncode, capped_capacity, read_u32_le, read_u64_le};
+use crate::codec::{WireDecode, WireEncode, bounded_capacity, read_u32_le, read_u64_le};
 use bytes::{BufMut, BytesMut};
 
 /// `SyncConsumerGroup` response.
@@ -53,7 +53,7 @@ impl WireDecode for SyncConsumerGroupResponse {
         let partitions_count = read_u32_le(buf, 8)?;
         let remaining = buf.len().saturating_sub(12);
         let mut partitions =
-            Vec::with_capacity(capped_capacity(partitions_count as usize, remaining, 4));
+            Vec::with_capacity(bounded_capacity(partitions_count as usize, remaining, 4));
         let mut offset = 12;
         for _ in 0..partitions_count {
             partitions.push(read_u32_le(buf, offset)?);

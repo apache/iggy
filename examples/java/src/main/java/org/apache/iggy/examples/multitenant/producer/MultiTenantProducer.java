@@ -20,12 +20,12 @@
 package org.apache.iggy.examples.multitenant.producer;
 
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
+import org.apache.iggy.exception.IggyAuthorizationException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.stream.StreamDetails;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.TopicDetails;
 import org.apache.iggy.user.GlobalPermissions;
 import org.apache.iggy.user.Permissions;
@@ -36,7 +36,6 @@ import org.apache.iggy.user.UserStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -253,15 +252,7 @@ public final class MultiTenantProducer {
             return;
         }
 
-        client.topics()
-                .createTopic(
-                        streamId,
-                        (long) partitionsCount,
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        Optional.empty(),
-                        topicId.getName());
+        client.topics().createTopic(streamId, topicId.getName(), (long) partitionsCount);
         log.info("Created topic {} for stream {}", topicId.getName(), streamId.getName());
     }
 
@@ -287,7 +278,7 @@ public final class MultiTenantProducer {
     private static Optional<StreamDetails> tryGetStream(IggyTcpClient client, StreamId streamId) {
         try {
             return client.streams().getStream(streamId);
-        } catch (Exception e) {
+        } catch (IggyAuthorizationException e) {
             log.debug("Unable to get stream {}: {}", streamId.getName(), e.getMessage());
             return Optional.empty();
         }

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Utils;
 
 namespace Apache.Iggy.Vsr;
@@ -35,22 +36,26 @@ internal enum VsrOperation : byte
     RemoveConsumerGroupMember = 66,
     CompleteConsumerGroupRevocation = 67,
     TruncatePartition = 68,
+    FinalizeSession = 70,
+    CompleteLifecycle = 71,
+    UpdateStreamResolved = 72,
+    UpdateTopicResolved = 73,
+    UpdateUserResolved = 74,
+    RewrapStreamKeys = 75,
 
     CreateStream = 128,
-    UpdateStream = 129,
+    // 129 was UpdateStream. Never reuse it.
     DeleteStream = 130,
-    PurgeStream = 131,
     CreateTopic = 132,
-    UpdateTopic = 133,
+    // 133 was UpdateTopic. Never reuse it.
     DeleteTopic = 134,
-    PurgeTopic = 135,
     CreatePartitions = 136,
     DeletePartitions = 137,
     DeleteSegments = 138,
     CreateConsumerGroup = 139,
     DeleteConsumerGroup = 140,
     CreateUser = 141,
-    UpdateUser = 142,
+    // 142 was UpdateUser. Never reuse it.
     DeleteUser = 143,
     ChangePassword = 144,
     UpdatePermissions = 145,
@@ -58,24 +63,25 @@ internal enum VsrOperation : byte
     DeletePersonalAccessToken = 147,
     JoinConsumerGroup = 148,
     LeaveConsumerGroup = 149,
+    UpdateResource = 150,
 
     SendMessages = 160,
     StoreConsumerOffset = 161,
     DeleteConsumerOffset = 162,
-    StoreConsumerOffset2 = 164,
-    DeleteConsumerOffset2 = 165
+    RetireSession = 166,
+    InstallConsumerGroupOwner = 167,
+    TransitionPartitionHistory = 168,
+    RetireConsumerGroupOwners = 169
 }
 
 internal static class VsrOperations
 {
     private const byte InternalStart = (byte)VsrOperation.CreateTopicWithAssignments;
     private const byte MetadataStart = (byte)VsrOperation.CreateStream;
-    private const byte PartitionStart = (byte)VsrOperation.SendMessages;
 
     /// <summary>
     ///     Non-replicated codes this build knows to leave no server-side state behind, so re-sending one after a
-    ///     lost connection is indistinguishable from sending it once. Flushing an unsaved buffer is included: it
-    ///     is idempotent by construction, a second flush writes nothing new.
+    ///     lost connection is indistinguishable from sending it once.
     /// </summary>
     private static readonly HashSet<int> NonReplicatedReadCodes =
     [
@@ -83,13 +89,13 @@ internal static class VsrOperations
         CommandCodes.GET_STATS_CODE,
         CommandCodes.GET_SNAPSHOT_CODE,
         CommandCodes.GET_CLUSTER_METADATA_CODE,
+        CommandCodes.GET_METADATA_CHANGES_CODE,
         CommandCodes.GET_ME_CODE,
         CommandCodes.GET_CLIENT_CODE,
         CommandCodes.GET_CLIENTS_CODE,
         CommandCodes.GET_USER_CODE,
         CommandCodes.GET_USERS_CODE,
         CommandCodes.GET_PERSONAL_ACCESS_TOKENS_CODE,
-        CommandCodes.FLUSH_UNSAVED_BUFFER_CODE,
         CommandCodes.GET_CONSUMER_OFFSET_CODE,
         CommandCodes.GET_STREAM_CODE,
         CommandCodes.GET_STREAMS_CODE,
@@ -97,7 +103,8 @@ internal static class VsrOperations
         CommandCodes.GET_TOPICS_CODE,
         CommandCodes.GET_CONSUMER_GROUP_CODE,
         CommandCodes.GET_CONSUMER_GROUPS_CODE,
-        CommandCodes.SYNC_CONSUMER_GROUP_CODE
+        CommandCodes.SYNC_CONSUMER_GROUP_CODE,
+        CommandCodes.GET_PARTITION_ROUTE_CODE,
     ];
 
     /// <summary>
@@ -120,7 +127,6 @@ internal static class VsrOperations
             CommandCodes.LOGOUT_USER_CODE => VsrOperation.Logout,
             CommandCodes.CREATE_USER_CODE => VsrOperation.CreateUser,
             CommandCodes.DELETE_USER_CODE => VsrOperation.DeleteUser,
-            CommandCodes.UPDATE_USER_CODE => VsrOperation.UpdateUser,
             CommandCodes.UPDATE_PERMISSIONS_CODE => VsrOperation.UpdatePermissions,
             CommandCodes.CHANGE_PASSWORD_CODE => VsrOperation.ChangePassword,
             CommandCodes.CREATE_PERSONAL_ACCESS_TOKEN_CODE => VsrOperation.CreatePersonalAccessToken,
@@ -128,16 +134,11 @@ internal static class VsrOperations
             CommandCodes.SEND_MESSAGES_CODE => VsrOperation.SendMessages,
             CommandCodes.STORE_CONSUMER_OFFSET_CODE => VsrOperation.StoreConsumerOffset,
             CommandCodes.DELETE_CONSUMER_OFFSET_CODE => VsrOperation.DeleteConsumerOffset,
-            CommandCodes.STORE_CONSUMER_OFFSET_2_CODE => VsrOperation.StoreConsumerOffset2,
-            CommandCodes.DELETE_CONSUMER_OFFSET_2_CODE => VsrOperation.DeleteConsumerOffset2,
             CommandCodes.CREATE_STREAM_CODE => VsrOperation.CreateStream,
             CommandCodes.DELETE_STREAM_CODE => VsrOperation.DeleteStream,
-            CommandCodes.UPDATE_STREAM_CODE => VsrOperation.UpdateStream,
-            CommandCodes.PURGE_STREAM_CODE => VsrOperation.PurgeStream,
             CommandCodes.CREATE_TOPIC_CODE => VsrOperation.CreateTopic,
             CommandCodes.DELETE_TOPIC_CODE => VsrOperation.DeleteTopic,
-            CommandCodes.UPDATE_TOPIC_CODE => VsrOperation.UpdateTopic,
-            CommandCodes.PURGE_TOPIC_CODE => VsrOperation.PurgeTopic,
+            CommandCodes.UPDATE_RESOURCE_CODE => VsrOperation.UpdateResource,
             CommandCodes.CREATE_PARTITIONS_CODE => VsrOperation.CreatePartitions,
             CommandCodes.DELETE_PARTITIONS_CODE => VsrOperation.DeletePartitions,
             CommandCodes.DELETE_SEGMENTS_CODE => VsrOperation.DeleteSegments,
@@ -153,28 +154,9 @@ internal static class VsrOperations
     ///     Whether losing the connection mid-request leaves nothing for the server to deduplicate, so the request
     ///     can be re-issued on a fresh session by the reconnect path instead of failing the caller.
     /// </summary>
-    internal static bool IsReplaySafeRead(int code, bool isLoginRegister, ReadOnlySpan<byte> body)
+    internal static bool IsReplaySafeRead(int code, ReadOnlySpan<byte> body)
     {
-        // A register lost mid-flight is replayable: the retry re-arms the session under a fresh client id, so
-        // it cannot be mistaken for the first one. At worst the server keeps an entry nobody binds, which it
-        // ages out. Reporting an unknown outcome here instead would deny the caller the retry that is in fact
-        // the only correct response.
-        if (isLoginRegister)
-        {
-            return true;
-        }
-
         var operation = ForCode(code);
-
-        // A consumer offset write carries an absolute offset and the server applies it as an unconditional
-        // overwrite, on a plane that keeps no client table to dedup against, so a replay lands on the same
-        // value. Denying the retry here reports an unknown outcome for a blip on an offset commit, which
-        // takes down the consume loop over a write that was safe to repeat.
-        if (operation is VsrOperation.StoreConsumerOffset or VsrOperation.StoreConsumerOffset2
-            or VsrOperation.DeleteConsumerOffset or VsrOperation.DeleteConsumerOffset2)
-        {
-            return true;
-        }
 
         if (operation != VsrOperation.NonReplicated)
         {
@@ -182,10 +164,17 @@ internal static class VsrOperations
         }
 
         // A poll that auto-commits moves the consumer offset server-side, so a reply lost after the commit
-        // would make the replay start past a batch the caller never saw. auto_commit is the last body byte.
-        if (code == CommandCodes.POLL_MESSAGES_CODE)
+        // would make the replay start past a batch the caller never saw. auto_commit is the last byte of a
+        // PollMessages body, which a deferred poll extends.
+        if (code is CommandCodes.POLL_MESSAGES_CODE or CommandCodes.POLL_MESSAGES_DEFERRED_CODE)
         {
-            return body.Length > 0 && body[^1] == 0;
+            var tail = code == CommandCodes.POLL_MESSAGES_DEFERRED_CODE ? TcpContracts.DEFERRED_POLL_TAIL_SIZE : 0;
+            return body.Length > tail && body[^(tail + 1)] == 0;
+        }
+
+        if (code == CommandCodes.FETCH_MESSAGES_CODE)
+        {
+            return !TcpContracts.FetchAutoCommits(body);
         }
 
         // Everything else non-replicated is replay-safe only if this build knows it to be a read. An unmapped
@@ -196,26 +185,35 @@ internal static class VsrOperations
 
     /// <summary>
     ///     Whether the byte is a declared discriminant. Replies carry a server-controlled operation byte, so
-    ///     an undeclared value is rejected rather than classified by range.
+    ///     an undeclared value, a retired one included, is rejected rather than classified by range.
     /// </summary>
     internal static bool IsKnown(byte value)
     {
-        return (VsrOperation)value switch
+        return Enum.IsDefined((VsrOperation)value);
+    }
+
+    /// <summary>
+    ///     The operation a request carried before prepare rewrote it, mirroring <c>Operation::request_operation</c>.
+    ///     A committed reply names the rewritten operation, so a reply correlates with its request through this.
+    /// </summary>
+    internal static VsrOperation RequestOperation(this VsrOperation operation)
+    {
+        return operation switch
         {
-            VsrOperation.Reserved or VsrOperation.Register or VsrOperation.NonReplicated or VsrOperation.Logout =>
-                true,
-            >= VsrOperation.CreateTopicWithAssignments and <= VsrOperation.TruncatePartition => true,
-            >= VsrOperation.CreateStream and <= VsrOperation.LeaveConsumerGroup => true,
-            VsrOperation.SendMessages or VsrOperation.StoreConsumerOffset or VsrOperation.DeleteConsumerOffset
-                or VsrOperation.StoreConsumerOffset2 or VsrOperation.DeleteConsumerOffset2 => true,
-            _ => false
+            VsrOperation.CreateTopicWithAssignments => VsrOperation.CreateTopic,
+            VsrOperation.CreatePartitionsWithAssignments => VsrOperation.CreatePartitions,
+            VsrOperation.UpdateStreamResolved or VsrOperation.UpdateTopicResolved or VsrOperation.UpdateUserResolved =>
+                VsrOperation.UpdateResource,
+            VsrOperation.TruncatePartition => VsrOperation.DeleteSegments,
+            _ => operation
         };
     }
 
     /// <summary>Replica / journal only; never emitted by a client.</summary>
     internal static bool IsInternal(this VsrOperation operation)
     {
-        return (byte)operation >= InternalStart && (byte)operation < MetadataStart;
+        return ((byte)operation >= InternalStart && (byte)operation < MetadataStart)
+            || operation is VsrOperation.RetireSession or VsrOperation.InstallConsumerGroupOwner or VsrOperation.TransitionPartitionHistory or VsrOperation.RetireConsumerGroupOwners;
     }
 
     /// <summary>
@@ -227,37 +225,24 @@ internal static class VsrOperations
     /// </summary>
     internal static bool IsMetadata(this VsrOperation operation)
     {
-        return operation.IsInternal() || operation is VsrOperation.CreateStream
-            or VsrOperation.UpdateStream
+        return (operation.IsInternal() && (byte)operation < (byte)VsrOperation.SendMessages)
+            || operation is VsrOperation.CreateStream
             or VsrOperation.DeleteStream
-            or VsrOperation.PurgeStream
             or VsrOperation.CreateTopic
-            or VsrOperation.UpdateTopic
             or VsrOperation.DeleteTopic
-            or VsrOperation.PurgeTopic
             or VsrOperation.CreatePartitions
             or VsrOperation.DeletePartitions
             or VsrOperation.CreateConsumerGroup
             or VsrOperation.DeleteConsumerGroup
             or VsrOperation.CreateUser
-            or VsrOperation.UpdateUser
             or VsrOperation.DeleteUser
             or VsrOperation.ChangePassword
             or VsrOperation.UpdatePermissions
             or VsrOperation.CreatePersonalAccessToken
             or VsrOperation.DeletePersonalAccessToken
             or VsrOperation.JoinConsumerGroup
-            or VsrOperation.LeaveConsumerGroup;
-    }
-
-    /// <summary>
-    ///     Data-plane operations routed by namespace to the shard owning the partition.
-    ///     <see cref="VsrOperation.DeleteSegments" /> is deliberately neither metadata nor partition: the
-    ///     server resolves it to an internal <c>TruncatePartition</c>, yet it still carries a packed namespace.
-    /// </summary>
-    internal static bool IsPartition(this VsrOperation operation)
-    {
-        return (byte)operation >= PartitionStart;
+            or VsrOperation.LeaveConsumerGroup
+            or VsrOperation.UpdateResource;
     }
 
     /// <summary>
@@ -268,8 +253,6 @@ internal static class VsrOperations
     internal static bool IsResultFramed(this VsrOperation operation)
     {
         return operation.IsMetadata() || operation is VsrOperation.StoreConsumerOffset
-            or VsrOperation.StoreConsumerOffset2
-            or VsrOperation.DeleteConsumerOffset
-            or VsrOperation.DeleteConsumerOffset2;
+            or VsrOperation.DeleteConsumerOffset;
     }
 }

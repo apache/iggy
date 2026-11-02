@@ -15,37 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Diagnostics.CodeAnalysis;
-using Apache.Iggy.Enums;
+using System.Text.Json.Serialization;
 
 namespace Apache.Iggy.Contracts.Http;
 
-internal sealed class CreateTopicRequest
-{
-    public required string Name { get; set; }
-    public CompressionAlgorithm CompressionAlgorithm { get; set; } = CompressionAlgorithm.None;
-    public ulong MessageExpiry { get; set; }
-    public uint PartitionsCount { get; set; } = 1;
-    public byte? ReplicationFactor { get; set; } = 1;
-    public ulong MaxTopicSize { get; set; }
-
-    public CreateTopicRequest()
-    {
-    }
-
-    [SetsRequiredMembers]
-    public CreateTopicRequest(string name,
-        CompressionAlgorithm compressionAlgorithm,
-        ulong messageExpiry,
-        uint partitionsCount,
-        byte? replicationFactor,
-        ulong maxTopicSize)
-    {
-        Name = name;
-        CompressionAlgorithm = compressionAlgorithm;
-        MessageExpiry = messageExpiry;
-        PartitionsCount = partitionsCount;
-        ReplicationFactor = replicationFactor;
-        MaxTopicSize = maxTopicSize;
-    }
-}
+/// <summary>
+///     A topic create over REST. Every setting, compression, expiry and size cap included, rides
+///     <paramref name="Options" /> as <see cref="OptionInputs" /> renders it.
+/// </summary>
+internal sealed record CreateTopicRequest(
+    string Name,
+    uint PartitionsCount,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    Dictionary<string, object>? Options);

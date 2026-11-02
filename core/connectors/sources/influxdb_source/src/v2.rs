@@ -63,8 +63,8 @@ const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 /// The limit is inflated by `already_seen` (rows at the current cursor
 /// timestamp that were delivered in a previous batch) so that re-fetching
 /// with `>= cursor` returns enough rows to skip them and still fill a full
-/// batch. Inflation is capped at `MAX_SKIP_INFLATION_FACTOR × batch_size`
-/// to prevent excessively large queries when the cursor is stuck.
+/// batch. The additional skip allowance is capped at
+/// `MAX_SKIP_INFLATION_FACTOR * batch_size`, limiting the total to eleven batches.
 fn render_query(config: &V2SourceConfig, cursor: &str, already_seen: u64) -> Result<String, Error> {
     validate_cursor(cursor)?;
     let batch = config.batch_size.unwrap_or(500).max(1) as u64;
@@ -765,8 +765,8 @@ pub(crate) struct RowProcessingResult {
 ///
 /// ## Message identity
 ///
-/// A single random UUID is generated per call; per-message IDs are derived by
-/// adding the message's position to that base, keeping PRNG work O(1) per batch.
+/// IDs add the result position to timestamp nanoseconds, with a random batch
+/// base for missing/out-of-range timestamps. Distinct rows can collide across batches.
 ///
 /// ## Parameters
 ///
@@ -793,8 +793,7 @@ pub(crate) fn process_rows(
     let mut max_cursor_parsed: Option<DateTime<Utc>> = None;
     let mut rows_at_max_cursor = 0u64;
     let mut skipped = 0u64;
-    // Generate the base UUID once per poll; derive per-message IDs by addition.
-    // This is O(1) PRNG calls per batch instead of O(n), measurable at batch ≥ 100.
+    // Fallback base for rows without a timestamp representable as nanoseconds.
     let id_base = Uuid::new_v4().as_u128();
     // Parse once outside the loop to normalise RFC 3339 variants (Z vs +00:00)
     // so skip logic compares instants, not strings.
@@ -839,9 +838,8 @@ pub(crate) fn process_rows(
             }
         }
 
-        // Stable ID: cursor timestamp nanoseconds + DB-absolute row position.
-        // Position = already_seen + emitted so far; encodes the row's global slot
-        // in the result set so IDs are stable across re-polls with changing already_seen.
+        // The position distinguishes ties within a result, but this sum is not
+        // a unique row key across timestamps or changing query boundaries.
         let global_pos = already_seen as u128 + messages.len() as u128;
         let msg_id = cv_dt
             .and_then(|dt| dt.timestamp_nanos_opt())

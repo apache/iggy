@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 // Re-export all examples for easy importing
 export * from './getting-started/producer.js';

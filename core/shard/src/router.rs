@@ -23,87 +23,56 @@ use crate::{IggyShard, LifecycleFrame, Receiver, RestorableMetadataStm, ShardFra
 use consensus::{MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use futures::FutureExt;
-use iggy_binary_protocol::{ConsensusHeader, GenericHeader, Operation, PrepareHeader};
+use futures::future::poll_fn;
+use iggy_binary_protocol::{Command, ConsensusError, GenericHeader, Operation, PrepareHeader};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
-use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
+use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn, ReplicaLinkId};
+use partitions::{FatalCommit, PartitionIncarnation};
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, MessageBag};
+use std::collections::VecDeque;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Poll;
 
 /// How often the shard pump drives `VsrConsensus::tick`.
 ///
 /// Heartbeats, prepare retransmit, and view-change timeouts only advance
-/// when the tick runs ("call this periodically, e.g. every 10ms"). Public
-/// so the simulator can advance its virtual clock in whole tick intervals.
-pub const CONSENSUS_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+/// when the tick runs. Re-exported from `consensus` so the drive cadence and
+/// the tick counts it feeds share one unit; public so the simulator can
+/// advance its virtual clock in whole tick intervals.
+pub use consensus::TICK_INTERVAL as CONSENSUS_TICK_INTERVAL;
 
-/// Decompose a [`MessageBag`] into the routing-relevant tuple
-/// `(operation, namespace, generic_message)`.
-///
-/// Single source of truth used by every dispatch entry point so the
-/// operation / namespace extraction never drifts between call sites.
-fn extract_routing(bag: MessageBag) -> (Operation, u64, Message<GenericHeader>) {
-    match bag {
-        MessageBag::Request(r) => {
-            let h = *r.header();
-            (h.operation, h.group, r.into_generic())
+pub const COOPERATIVE_EVENT_BUDGET: usize = 64;
+
+#[derive(Default)]
+pub struct LoopbackRound {
+    pub(super) entries: VecDeque<(Option<PartitionIncarnation>, Message<GenericHeader>)>,
+    pub(super) scratch: Vec<Message<GenericHeader>>,
+}
+
+impl<B: MessageBus, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB> {
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn cooperate(&self) {
+        let serviced = self.cooperative_events.get() + 1;
+        if serviced < COOPERATIVE_EVENT_BUDGET {
+            self.cooperative_events.set(serviced);
+            return;
         }
-        MessageBag::Prepare(p) => {
-            let h = *p.header();
-            (h.operation, h.group, p.into_generic())
-        }
-        MessageBag::PrepareOk(p) => {
-            let h = *p.header();
-            (h.operation, h.group, p.into_generic())
-        }
-        MessageBag::StartViewChange(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::DoViewChange(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::StartView(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::Commit(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::RequestStartView(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::RequestPrepares(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::RepairPrepare(m) => {
-            let h = *m.header();
-            (h.0.operation, h.0.group, m.into_generic())
-        }
-        MessageBag::RepairRangeReply(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::RequestStateTransfer(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::StateTransferTarget(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::RequestStateChunk(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::StateChunk(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
+        self.cooperative_events.set(0);
+        let mut yielded = false;
+        poll_fn(|context| {
+            if yielded {
+                Poll::Ready(())
+            } else {
+                yielded = true;
+                context.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })
+        .await;
     }
 }
 
@@ -122,40 +91,61 @@ where
     /// Network-receive entry point. Classifies the raw
     /// `Message<GenericHeader>` and routes it to the owning shard via
     /// `route_typed`.
-    //
-    // TODO(hubcio): perf - this `MessageBag::try_from` is run twice per
-    // consensus frame: once here to extract (operation, namespace) for
-    // routing, and a second time on the receiving shard inside `on_message`
-    // (lib.rs ~560) to dispatch to the correct on_* handler. The second
-    // parse re-runs `bytemuck::checked::try_from_bytes` + per-header
-    // `validate()` on bytes already validated upstream. Measured ~50 ns/
-    // frame; at 1M ops/sec/shard ~ 50 ms/sec/shard of pure re-validation.
-    //
-    // Fix: thread the classified bag through `ShardFrame::Consensus` (carry
-    // `MessageBag` instead of `Message<GenericHeader>`) so the inbox path
-    // matches directly with no second parse. Consensus variant grows from
-    // ~24 B to ~32 B, but `ShardFrame` total stays at 160 B (LifecycleFrame
-    // drives the union size).
+    ///
+    /// The only classify a frame gets: the bag rides
+    /// [`ShardFrame::Consensus`] to the owning shard, whose pump matches it
+    /// directly. Reading routing off it and then handing the bytes on generic
+    /// made every frame pay `bytemuck::checked::try_from_bytes` plus the
+    /// header's `validate()` twice.
     pub fn dispatch(&self, message: Message<GenericHeader>) {
+        let command = message.header().command;
         let bag = match MessageBag::try_from(message) {
             Ok(bag) => bag,
+            Err(ConsensusError::UnsupportedOperation { operation }) => {
+                // For a replication frame this is terminal for its consensus
+                // group, not a per-frame hiccup: the op is never journaled,
+                // never acked, and every later prepare dies on the resulting
+                // gap while quorum hides the outage. Repair wraps the same
+                // typed header, so it cannot rescue this node either -- only
+                // aligning the releases can. A routed request, by contrast, is dropped
+                // before journaling and stalls nothing; the consequence in the
+                // log follows the frame. Nothing fences the sending peer, so
+                // the log and the counter are the whole signal an operator
+                // gets.
+                self.metrics.record_frame_drop(
+                    frame_drop_variant::CONSENSUS,
+                    frame_drop_reason::UNSUPPORTED_OPERATION,
+                );
+                let consequence = match command {
+                    Command::Prepare | Command::RepairPrepare | Command::PrepareOk => {
+                        "this node cannot journal or ack it, so its consensus group stops \
+                         making progress until the releases are aligned"
+                    }
+                    _ => "the frame is dropped before journaling, with no reply to the sender",
+                };
+                tracing::error!(
+                    shard = self.id,
+                    operation = format_args!("{operation:#04x}"),
+                    command = ?command,
+                    build_release = %iggy_binary_protocol::ProtocolVersion(
+                        iggy_binary_protocol::IGGY_PROTOCOL_VERSION
+                    ),
+                    "frame carries an operation this build does not know; the sender likely \
+                     runs another release. {consequence}"
+                );
+                return;
+            }
             Err(e) => {
-                // TODO(hubcio): this drop is the whole story for a consensus
-                // frame carrying an Operation this build does not know: no
-                // metric, no peer error, no eviction. An old node in a mixed
-                // cluster silently gap-stops the group here (never journals
-                // the op, never PrepareOks, every later prepare dies on the
-                // gap check) while quorum hides it, and repair wraps the same
-                // typed header so it cannot rescue. Rolling upgrades across
-                // consensus-op additions need a version fence (release_min /
-                // release_max bounds on the replica plane) before this arm is
-                // safe to hit.
+                self.metrics.record_frame_drop(
+                    frame_drop_variant::CONSENSUS,
+                    frame_drop_reason::UNPARSABLE,
+                );
                 tracing::warn!(shard = self.id, error = %e, "dropping unparsable consensus frame");
                 return;
             }
         };
-        let (operation, namespace, generic) = extract_routing(bag);
-        self.route_typed(operation, namespace, generic);
+        let (operation, namespace) = bag.routing();
+        self.route_typed(operation, namespace, bag);
     }
 
     /// Invoke the client-request handler directly, exactly as the client-fd
@@ -167,7 +157,7 @@ where
     /// build excludes the `simulator` feature and this method.
     #[cfg(any(test, feature = "simulator"))]
     pub fn deliver_client_request(&self, client_id: u128, message: Message<GenericHeader>) {
-        (self.on_client_request)(client_id, message);
+        self.host.on_client_request(client_id, message);
     }
 
     /// Route a consensus-control message (`StartViewChange`, `DoViewChange`,
@@ -176,7 +166,7 @@ where
     /// group is deterministic across the cluster.
     pub(crate) fn route_consensus_control(
         &self,
-        message: Message<GenericHeader>,
+        message: MessageBag,
         namespace_u64: u64,
         operation: Operation,
     ) {
@@ -198,12 +188,7 @@ where
     ///    - `METADATA_GROUP` -> shard 0.
     ///    - packable `IggyNamespace::inner()` -> the shard owning that
     ///      partition's consensus group.
-    fn route_typed(
-        &self,
-        operation: Operation,
-        namespace_u64: u64,
-        generic: Message<GenericHeader>,
-    ) {
+    fn route_typed(&self, operation: Operation, namespace_u64: u64, generic: MessageBag) {
         if operation.is_metadata() {
             self.try_send_to_target(0, generic, operation);
             return;
@@ -254,17 +239,15 @@ where
     /// records the drop in `frame_drops_total`, under `variant=partition` for a
     /// partition-plane operation and `variant=consensus` otherwise -- the two
     /// have different recovery stories, so folding them into one label hides
-    /// which one is bleeding. VSR retransmit recovers consensus drops. A
+    /// which one is bleeding. VSR retransmit recovers consensus drops, except
+    /// the four register/logout forwarding frames, which no retransmit covers: a
+    /// dropped forward or its result surfaces as the origin's forward timeout
+    /// plus the SDK's session-operation replay. A
     /// `target` past the end of `senders` (a stored `u16` from `shard_for`, not
     /// a trusted index) is dropped with `reason=unroutable` rather than
     /// panicking. Metadata frames always pass `target = 0` here, since
     /// `is_metadata` operations are owned by shard 0.
-    fn try_send_to_target(
-        &self,
-        target: u16,
-        message: Message<GenericHeader>,
-        operation: Operation,
-    ) {
+    fn try_send_to_target(&self, target: u16, message: MessageBag, operation: Operation) {
         let variant = if operation.is_partition() {
             frame_drop_variant::PARTITION
         } else {
@@ -309,21 +292,63 @@ where
     /// Drain this shard's inbox and process each frame locally until the
     /// `stop` signal fires or the inbox disconnects, then drain any frames
     /// still queued so in-flight requests still get a response.
+    ///
+    /// Returns the commit fault that ended the pump, if one did. A fault
+    /// skips that queued drain: the frames in it are requests for a shard
+    /// holding a divergent partition, and answering them means re-entering
+    /// the commit path that just failed. The final flush still runs, so
+    /// every partition that CAN still reach disk does.
+    ///
+    /// `shutdown_flag` is the cross-thread server shutdown signal. The pump
+    /// flips it as soon as a commit fault is resolved, BEFORE the final
+    /// flush: the flush writes to the device whose failure raised the fault,
+    /// so it can stall indefinitely, and only the flag arms the watchdog and
+    /// the bounded pump drain that turn a stalled flush into a timed-out
+    /// non-zero exit instead of a process that reports healthy forever.
     #[allow(clippy::future_not_send)]
-    pub async fn run_message_pump(&self, stop: Receiver<()>)
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the owner select loop and its shutdown sequence together"
+    )]
+    pub async fn run_message_pump(
+        &self,
+        stop: Receiver<()>,
+        shutdown_flag: Arc<AtomicBool>,
+    ) -> Option<FatalCommit>
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
+        SB: 'static,
     {
+        let _completion_pump = self.poll_completions.pump_guard();
+        let _deferred_pump = self.deferred_polls.pump_guard(self.id, &self.senders);
+        self.plane.partitions().set_io_notifier(
+            self.partition_io.notifier(),
+            self.partition_io.limits.bytes_max(),
+        );
+        if let Some(consensus) = self.plane.metadata().consensus.as_ref() {
+            consensus.set_loopback_notifier(Some(self.plane.partitions().loopback_wake_notifier()));
+        }
+        if let Some(sender) = self.senders.get(self.id as usize).cloned() {
+            let metrics = self.metrics.clone();
+            self.plane
+                .partitions()
+                .set_persistence_notifier(Rc::new(move |completion| {
+                    let frame = LifecycleFrame::PartitionPersistenceCompleted(completion);
+                    if let Err(error) = sender.try_send(ShardFrame::lifecycle(frame)) {
+                        metrics.record_frame_drop(
+                            frame_drop_variant::PARTITION_PERSISTENCE_COMPLETED,
+                            crate::coordinator::classify_try_send_err(&error),
+                        );
+                    }
+                }));
+        }
         // Reused across every pump iteration; pre-size to skip the
         // first-drain reallocation.
-        let mut loopback_buf = Vec::with_capacity(64);
+        let mut loopback_buf = LoopbackRound::default();
         let mut namespace_scratch: Vec<IggyNamespace> = Vec::with_capacity(64);
         // Consensus timer driver, folded into the pump: running the tick as a
         // select! arm (not a sibling task) serializes it with frame processing,
@@ -339,39 +364,70 @@ where
         // simulator (see `MessageBus::sleep`).
         let rearm_tick = || self.bus.sleep(CONSENSUS_TICK_INTERVAL).fuse();
         let mut consensus_tick = std::pin::pin!(rearm_tick());
+        // Keep the receive registered: recreating it repeats Crossfire's initial
+        // backoff on every pump turn while the shutdown channel is empty.
+        let mut stop_signal = std::pin::pin!(stop.recv().fuse());
+        let mut fatal: Option<FatalCommit> = None;
+        let deadline_timer = |deadline: Option<u64>| {
+            async move {
+                if let Some(deadline) = deadline {
+                    self.bus
+                        .sleep(std::time::Duration::from_micros(
+                            deadline.saturating_sub(self.bus.monotonic_micros()),
+                        ))
+                        .await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }
+            .fuse()
+        };
+        let mut armed_deadline = None;
+        let mut deferred_deadline = std::pin::pin!(deadline_timer(None));
         loop {
+            self.service_deferred_polls().await;
+            // Here and not at the end of the turn: an idle owner would hold
+            // the pushes of this turn until its next event or tick.
+            self.flush_readiness_pushes();
+            let next_deadline = self.deferred_polls.earliest_deadline();
+            if next_deadline != armed_deadline {
+                armed_deadline = next_deadline;
+                deferred_deadline.set(deadline_timer(next_deadline));
+            }
             // `select_biased!`, not `select!`: the unbiased macro draws its
             // arm order from a process-random thread-local PRNG, which the
             // deterministic simulator cannot seed. The listed order is the
-            // intended priority anyway: stop, then tick, then frames.
+            // intended priority anyway: stop, then tick, redispatch, then
+            // newly received frames.
             futures::select_biased! {
-                _ = stop.recv().fuse() => break,
+                _ = stop_signal.as_mut() => break,
                 () = consensus_tick.as_mut() => {
-                    // Sharing the pump task is what keeps `tick_partitions`
-                    // borrow-safe, but it bounds the tick's worst-case delay to
-                    // one frame body's longest `.await` (replication append +
-                    // commit_journal fsync/rotate + reply).
+                    // Sharing the pump task keeps `tick_partitions` borrows
+                    // safe, but a tick can wait for a main frame's processing
+                    // (replication, journal fsync or rotation, and reply), plus
+                    // one reply and one poll completion, including its loopback.
                     // TODO(hubcio): if a load test shows tick starvation,
                     // make `tick_partitions` borrow-free so the tick can be
                     // decoupled from the pump again without reintroducing the
                     // partition-ref-across-`.await` UB this fold closed.
                     self.tick_metadata().await;
-                    self.tick_partitions().await;
+                    if let Some(fault) = self.tick_partitions(&mut namespace_scratch).await {
+                        fatal = Some(fault);
+                        break;
+                    }
                     // Runs here, not inside `tick_metadata`: that early-returns
                     // on shards without metadata consensus, and partition-plane
                     // offers live on every shard that hosts a serving group --
                     // parked behind the shard-0 gate they would never expire.
                     self.expire_idle_state_transfer_offers();
-                    // While a cooperative revocation is pending, wake the
-                    // reconciler each tick so the handoff completes within ~one
-                    // tick of the partition draining, not the periodic pass.
-                    if self
-                        .plane
-                        .metadata()
-                        .mux_stm
-                        .streams()
-                        .has_pending_revocations()
-                    {
+                    self.serve_parked_partition_transfer_requests().await;
+                    // A drain completes without an event, so a pending
+                    // revocation wakes the reconciler each tick. A published
+                    // fence wakes it once, and retries of an unpublished one
+                    // stay on its periodic pass.
+                    let fence_published = self.plane.partitions().take_fence_published();
+                    let streams = self.plane.metadata().mux_stm.streams();
+                    if fence_published || streams.has_pending_revocations() {
                         self.dispatch_metadata_commit_tick();
                     }
                     // A dropped `ReconcileApply` marker (full inbox at
@@ -379,38 +435,374 @@ where
                     // a quiet shard until the next inbound frame's tail
                     // drain; parked partition frames then never re-dispatch.
                     self.apply_reconcile_ops();
+                    self.tick_deferred_polls();
+                    self.sweep_readiness_watches();
                     consensus_tick.set(rearm_tick());
+                    self.process_loopback(&mut loopback_buf).await;
+                }
+                () = deferred_deadline.as_mut() => {
+                    armed_deadline = None;
+                    deferred_deadline.set(deadline_timer(None));
+                }
+                frame = poll_fn(|_| {
+                    self.pop_redispatched_frame().map_or(Poll::Pending, Poll::Ready)
+                }).fuse() => {
+                    // One frame per select iteration. Ranking this arm above
+                    // the inbox preserves park order without making a full
+                    // queue stall ticks and commit broadcasts for other groups.
+                    self.dispatch_redispatched_frame(frame).await;
+                    self.cooperate().await;
+                    // A request handled by a solo primary self-acks here. If
+                    // loopback waited for another inbox frame, the request
+                    // would remain uncommitted indefinitely on a quiet shard.
+                    self.process_loopback(&mut loopback_buf).await;
+                    self.apply_reconcile_ops();
+                    // Same guaranteed reply-lane service as the inbox arm: this
+                    // arm outranks both lanes, so a deep drain would otherwise
+                    // starve forwarded client replies for its whole duration.
+                    if let Ok(reply) = self.reply_inbox.try_recv()
+                        && self.accept_frame_for_self(&reply)
+                    {
+                        self.process_frame(reply).await;
+                    }
+                    self.process_one_poll_completion(&mut loopback_buf).await;
                 }
                 frame = self.inbox.recv().fuse() => {
                     match frame {
                         Ok(frame) => {
                             if self.accept_frame_for_self(&frame) {
                                 self.process_frame(frame).await;
-                                self.process_loopback(&mut loopback_buf, &mut namespace_scratch).await;
+                                self.process_loopback(&mut loopback_buf).await;
                                 // Tail drain catches reconcile ops whose marker was dropped.
+                                // Anything it stages is served by the arm above
+                                // on the next pass, before this arm can run again.
                                 self.apply_reconcile_ops();
                             }
+                            // Guaranteed reply-lane service: `select_biased!`
+                            // polls the main lane first, so a saturated main
+                            // lane would otherwise starve the reply arm below
+                            // indefinitely. Taking at most ONE reply per main
+                            // frame makes the worst case a deterministic 1:1
+                            // interleave - replies keep flowing under a
+                            // consensus storm, and consensus keeps flowing
+                            // under a reply flood.
+                            if let Ok(reply) = self.reply_inbox.try_recv()
+                                && self.accept_frame_for_self(&reply)
+                            {
+                                self.process_frame(reply).await;
+                            }
+                            self.process_one_poll_completion(&mut loopback_buf).await;
                         }
                         Err(_) => break,
                     }
                 }
+                frame = self.reply_inbox.recv().fuse() => {
+                    // Reached only while the main lane is quiet (biased order):
+                    // serve forwarded client replies without waiting for the
+                    // next main frame or tick.
+                    match frame {
+                        Ok(frame) => {
+                            if self.accept_frame_for_self(&frame) {
+                                self.process_frame(frame).await;
+                            }
+                            self.process_one_poll_completion(&mut loopback_buf).await;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                completion = self.partition_io.recv().fuse() => {
+                    self.accept_partition_io_completion(completion);
+                    self.cooperate().await;
+                }
+                completion = self.poll_completions.recv().fuse() => {
+                    match completion {
+                        Ok(completion) => {
+                            self.on_poll_completed(*completion).await;
+                            self.cooperate().await;
+                            self.process_loopback(&mut loopback_buf).await;
+                            self.apply_reconcile_ops();
+                        }
+                        Err(_) => break,
+                    }
+                }
+                () = poll_fn(|context| self.deferred_polls.poll_ready(context)).fuse() => {}
+                () = poll_fn(|context| {
+                    self.plane.partitions().register_loopback_waker(context.waker());
+                    self.partition_io.register_waker(context.waker());
+                    self.served_reads.register_waker(context.waker());
+                    if self.has_pending_loopback(&loopback_buf)
+                        || self.partition_io.has_ready()
+                        || self.served_reads.has_landed()
+                    {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }).fuse() => {
+                    self.process_loopback(&mut loopback_buf).await;
+                    self.apply_reconcile_ops();
+                }
             }
+            self.service_partition_io().await;
+            // After every event, as partition I/O, so a busy inbox cannot
+            // starve the serves that wait for a disk read.
+            self.serve_landed_read().await;
         }
 
-        // Drain remaining frames so in-flight requests get a response.
-        while let Ok(frame) = self.inbox.try_recv() {
-            if self.accept_frame_for_self(&frame) {
-                self.process_frame(frame).await;
-                self.process_loopback(&mut loopback_buf, &mut namespace_scratch)
-                    .await;
-                self.apply_reconcile_ops();
-            }
+        self.poll_completions.close();
+        self.deferred_polls.close(self.id, &self.senders);
+
+        // A stop can win the select immediately after a frame fenced a
+        // partition, before the next tick observes it. Preserve that fault so
+        // shutdown cannot turn a durability failure into a clean pump exit.
+        if fatal.is_none() {
+            fatal = self.first_partition_commit_fault();
+        }
+
+        // Drain remaining frames so in-flight requests get a response, and
+        // the reply lane so already-forwarded replies still reach their
+        // clients before the bus tears down. Skipped on a commit fault: a
+        // queued Ack or Commit frame for the fenced partition would re-enter
+        // the commit path that just failed, and `advance_commit_min` asserts
+        // on the gap the fault left. Those requests go unanswered and their
+        // clients time out, which is what a node stopping on a durability
+        // fault owes them.
+        self.shutting_down.set(true);
+        if fatal.is_none() {
+            fatal = self
+                .drain_queued_frames_for_shutdown(&mut loopback_buf)
+                .await;
+        }
+
+        if fatal.is_some() {
+            // Flipped BEFORE the final flush, not after the pump returns: the
+            // flush writes to the device whose failure raised the fault and
+            // can stall there indefinitely, and the flag is what arms the
+            // watchdog and the bounded pump drain. Siblings give up at most
+            // the flush window of extra serving.
+            shutdown_flag.store(true, Ordering::Relaxed);
         }
 
         // Final flush: committed messages still resident in the in-memory
         // journal must reach segment storage before the process exits, or a
-        // graceful restart recovers consumer offsets ahead of the data.
-        self.flush_partitions().await;
+        // graceful restart recovers consumer offsets ahead of the data. On a
+        // fault, healthy partitions still flush. A fenced partition skips the
+        // flush, leaving any resident committed data unpersisted at shutdown.
+        self.flush_partitions(&mut loopback_buf).await;
+        self.partition_io.close();
+
+        // A failed flush fences its partition: the data it could not write is
+        // cluster-committed and now lives only in this process's memory, so a
+        // clean exit here would report a durability loss as a good shutdown.
+        if fatal.is_none() {
+            fatal = self.first_partition_commit_fault();
+        }
+
+        fatal
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn flush_partitions(&self, loopback: &mut LoopbackRound)
+    where
+        B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+        SB: 'static,
+    {
+        self.shutting_down.set(true);
+        let partitions = self.plane.partitions();
+        let namespaces: Vec<_> = partitions.namespaces().copied().collect();
+        for namespace in &namespaces {
+            if let Some(partition) = partitions.get_io_owner(namespace) {
+                partition.begin_shutdown_io();
+            }
+        }
+        let rearm = || self.bus.sleep(CONSENSUS_TICK_INTERVAL).fuse();
+        let mut tick = std::pin::pin!(rearm());
+        let mut namespace_scratch = Vec::with_capacity(namespaces.len());
+        let mut inbox = std::pin::pin!(self.inbox.recv().fuse());
+        let mut replies = std::pin::pin!(self.reply_inbox.recv().fuse());
+        loop {
+            self.process_one_poll_completion(loopback).await;
+            self.service_partition_io().await;
+            self.process_loopback(loopback).await;
+            let finished = !self.partition_io.has_ready()
+                && self.partition_io.outstanding() == 0
+                && namespaces.iter().all(|namespace| {
+                    partitions
+                        .get_io_owner(namespace)
+                        .is_none_or(|partition| partition.shutdown_io_complete())
+                });
+            if finished {
+                break;
+            }
+            futures::select_biased! {
+                () = tick.as_mut() => {
+                    for namespace in &namespaces {
+                        if let Some(partition) = partitions.get_io_owner(namespace) {
+                            partition.drive_persistence().await;
+                            if partition.needs_io_retry() {
+                                self.partition_io.retry(*namespace, partition.incarnation());
+                            }
+                        }
+                    }
+                    self.tick_metadata().await;
+                    let _ = self.tick_partitions(&mut namespace_scratch).await;
+                    tick.set(rearm());
+                }
+                completion = self.partition_io.recv().fuse() => {
+                    self.accept_partition_io_completion(completion);
+                    self.cooperate().await;
+                }
+                frame = inbox.as_mut() => {
+                    if let Ok(frame) = frame {
+                        if self.accept_frame_for_self(&frame) {
+                            self.process_frame(frame).await;
+                        }
+                        inbox.set(self.inbox.recv().fuse());
+                    }
+                }
+                frame = replies.as_mut() => {
+                    if let Ok(frame) = frame {
+                        if self.accept_frame_for_self(&frame) {
+                            self.process_frame(frame).await;
+                        }
+                        replies.set(self.reply_inbox.recv().fuse());
+                    }
+                }
+                () = poll_fn(|context| {
+                    self.partition_io.register_waker(context.waker());
+                    if self.partition_io.has_ready() || self.has_pending_loopback(loopback) {
+                        Poll::Ready(())
+                    } else { Poll::Pending }
+                }).fuse() => {}
+            }
+        }
+    }
+
+    /// A busy ordinary lane yields one completion per frame. Keeping this
+    /// service bounded lets ordinary work progress under a completion flood.
+    #[allow(clippy::future_not_send)]
+    async fn process_one_poll_completion(&self, loopback_buf: &mut LoopbackRound)
+    where
+        B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
+        if let Ok(completion) = self.poll_completions.try_recv() {
+            self.on_poll_completed(*completion).await;
+            self.cooperate().await;
+            self.process_loopback(loopback_buf).await;
+            self.apply_reconcile_ops();
+        }
+    }
+
+    /// Process queued work after the select loop has stopped. Redispatch keeps
+    /// its live-pump rank over the inbox, and every delivered frame gets its
+    /// loopback before another frame can run.
+    #[allow(clippy::future_not_send)]
+    async fn drain_queued_frames_for_shutdown(
+        &self,
+        loopback_buf: &mut LoopbackRound,
+    ) -> Option<FatalCommit>
+    where
+        B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
+        loop {
+            while let Some(frame) = self.pop_redispatched_frame() {
+                self.dispatch_redispatched_frame(frame).await;
+                self.cooperate().await;
+                self.process_loopback(loopback_buf).await;
+                self.apply_reconcile_ops();
+                if let Some(fault) = self.first_partition_commit_fault() {
+                    return Some(fault);
+                }
+                self.process_one_poll_completion(loopback_buf).await;
+                if let Some(fault) = self.first_partition_commit_fault() {
+                    return Some(fault);
+                }
+            }
+            let Ok(frame) = self.inbox.try_recv() else {
+                if let Ok(completion) = self.poll_completions.try_recv() {
+                    self.on_poll_completed(*completion).await;
+                    self.cooperate().await;
+                    self.process_loopback(loopback_buf).await;
+                    self.apply_reconcile_ops();
+                    if let Some(fault) = self.first_partition_commit_fault() {
+                        return Some(fault);
+                    }
+                    // Completion processing can stage ordinary work. Return
+                    // to the main drain before accepting another completion.
+                    continue;
+                }
+                if self.has_pending_loopback(loopback_buf) {
+                    self.process_loopback(loopback_buf).await;
+                    self.apply_reconcile_ops();
+                    if let Some(fault) = self.first_partition_commit_fault() {
+                        return Some(fault);
+                    }
+                    continue;
+                }
+                break;
+            };
+            if self.accept_frame_for_self(&frame) {
+                self.process_frame(frame).await;
+                self.process_loopback(loopback_buf).await;
+                self.apply_reconcile_ops();
+                if let Some(fault) = self.first_partition_commit_fault() {
+                    return Some(fault);
+                }
+            }
+            self.process_one_poll_completion(loopback_buf).await;
+            if let Some(fault) = self.first_partition_commit_fault() {
+                return Some(fault);
+            }
+        }
+
+        // Retired, not delivered: the pump is going away, so a staged frame has
+        // no later arm to reach the plane through. This runs before the reply
+        // lane drain, which is what carries client denies out.
+        self.retire_redispatched_frames();
+        while let Ok(frame) = self.reply_inbox.try_recv() {
+            if self.accept_frame_for_self(&frame) {
+                self.process_frame(frame).await;
+                if let Some(fault) = self.first_partition_commit_fault() {
+                    return Some(fault);
+                }
+            }
+        }
+        None
+    }
+
+    /// First partition commit fault currently fenced on this shard.
+    ///
+    /// The regular path observes faults in `tick_partitions`. This scan covers
+    /// the pump-exit edges where a stop signal wins before that tick, or a
+    /// queued frame fails while the pump is draining during shutdown.
+    fn first_partition_commit_fault(&self) -> Option<FatalCommit> {
+        let partitions = self.plane.partitions();
+        partitions.namespaces().find_map(|namespace| {
+            partitions
+                .get_io_owner(namespace)
+                .and_then(|partition| partition.fatal().cloned())
+        })
+    }
+
+    /// `first_partition_commit_fault` for the simulator's lost-wakeup
+    /// tripwire: a fenced pump and a missed wake both leave frames undrained, and
+    /// only the second is a channel bug. Test/simulator only, like `inbox_len`.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fenced_partition_fault(&self) -> Option<FatalCommit> {
+        self.first_partition_commit_fault()
     }
 
     /// Sanity check at pump entry: every Consensus frame routed through
@@ -451,11 +843,8 @@ where
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
         match frame {
@@ -464,62 +853,89 @@ where
             }
             ShardFrame::Lifecycle(payload) => self.process_lifecycle(payload).await,
         }
+        self.cooperate().await;
     }
 
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
     async fn process_lifecycle(&self, payload: LifecycleFrame)
     where
         B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
     {
         match payload {
-            LifecycleFrame::ReplicaInboundSetup { fd, slot } => {
+            LifecycleFrame::ReplicaInboundSetup {
+                fd,
+                slot,
+                link,
+                deadline,
+            } => {
                 tracing::info!(
                     shard = self.id,
                     slot,
+                    replica_id = link.replica,
+                    link = link.link,
+                    epoch = link.epoch,
                     raw_fd = fd.as_raw_fd(),
-                    "installing blind-delegated inbound replica fd"
+                    "installing delegated inbound replica link fd"
                 );
                 let on_done =
-                    self.replica_handshake_done_fn(ReplicaHandshakeOutcome::ReleaseSlot(slot));
-                self.bus
-                    .install_replica_inbound_fd(fd, self.on_replica_message.clone(), on_done);
-            }
-            LifecycleFrame::ReplicaOutboundSetup { fd, replica_id } => {
-                tracing::info!(
-                    shard = self.id,
-                    replica_id,
-                    raw_fd = fd.as_raw_fd(),
-                    "installing delegated outbound replica fd"
-                );
-                let on_done =
-                    self.replica_handshake_done_fn(ReplicaHandshakeOutcome::ClearDial(replica_id));
-                self.bus.install_replica_outbound_fd(
+                    self.replica_handshake_done_fn(ReplicaHandshakeOutcome::Inbound { slot, link });
+                self.bus.install_replica_inbound_fd(
                     fd,
-                    replica_id,
+                    link,
+                    deadline,
                     self.on_replica_message.clone(),
                     on_done,
                 );
             }
-            LifecycleFrame::ReplicaInboundHandshakeDone { slot } => {
-                // Only shard 0 tracks in-flight handshake slots; a
-                // non-zero owning shard's ack closure addresses senders[0]
-                // (shard 0 itself releases inline, no frame).
+            LifecycleFrame::ReplicaOutboundSetup { fd, link } => {
+                tracing::info!(
+                    shard = self.id,
+                    replica_id = link.replica,
+                    link = link.link,
+                    epoch = link.epoch,
+                    raw_fd = fd.as_raw_fd(),
+                    "installing delegated outbound replica link fd"
+                );
+                let on_done =
+                    self.replica_handshake_done_fn(ReplicaHandshakeOutcome::Outbound(link));
+                self.bus.install_replica_outbound_fd(
+                    fd,
+                    link,
+                    self.on_replica_message.clone(),
+                    on_done,
+                );
+            }
+            LifecycleFrame::ReplicaInboundHandshakeDone { slot, link } => {
+                // Only shard 0 tracks in-flight handshake slots and
+                // bundles; a non-zero owning shard's ack closure addresses
+                // senders[0] (shard 0 itself acks inline, no frame).
                 debug_assert_eq!(
                     self.id, 0,
                     "ReplicaInboundHandshakeDone routed to shard {}",
                     self.id
                 );
-                self.bus.release_replica_handshake_slot(slot);
+                self.bus.replica_inbound_handshake_done(slot, link);
             }
-            LifecycleFrame::ReplicaOutboundHandshakeDone { replica_id } => {
+            LifecycleFrame::ReplicaOutboundHandshakeDone { link } => {
                 debug_assert_eq!(
                     self.id, 0,
                     "ReplicaOutboundHandshakeDone routed to shard {}",
                     self.id
                 );
-                self.bus.clear_replica_dial_pending(replica_id);
+                self.bus.replica_outbound_handshake_done(link);
             }
-            LifecycleFrame::ClientConnectionSetup { fd, meta } => {
+            LifecycleFrame::ReplicaLinkClosed { link } => {
+                debug_assert_eq!(self.id, 0, "ReplicaLinkClosed routed to shard {}", self.id);
+                self.bus.replica_link_closed(link);
+            }
+            LifecycleFrame::ReplicaLinkClose { link } => {
+                self.bus.close_replica_link(link);
+            }
+            LifecycleFrame::ClientConnectionSetup { fd, meta, permit } => {
                 tracing::info!(
                     shard = self.id,
                     client_id = meta.client_id,
@@ -527,9 +943,9 @@ where
                     "installing delegated client fd"
                 );
                 self.bus
-                    .install_client_fd(fd, meta, self.on_client_request.clone());
+                    .install_client_fd(fd, meta, permit, self.on_client_request.clone());
             }
-            LifecycleFrame::ClientWsConnectionSetup { fd, meta } => {
+            LifecycleFrame::ClientWsConnectionSetup { fd, meta, permit } => {
                 tracing::info!(
                     shard = self.id,
                     client_id = meta.client_id,
@@ -537,7 +953,47 @@ where
                     "installing delegated WS client fd (pre-upgrade)"
                 );
                 self.bus
-                    .install_client_ws_fd(fd, meta, self.on_client_request.clone());
+                    .install_client_ws_fd(fd, meta, permit, self.on_client_request.clone());
+            }
+            LifecycleFrame::ClientTcpTlsConnectionSetup {
+                fd,
+                meta,
+                config,
+                permit,
+            } => {
+                tracing::info!(
+                    shard = self.id,
+                    client_id = meta.client_id,
+                    raw_fd = fd.as_raw_fd(),
+                    "installing delegated TCP-TLS client fd (pre-handshake)"
+                );
+                self.bus.install_client_tcp_tls_fd(
+                    fd,
+                    meta,
+                    config,
+                    permit,
+                    self.on_client_request.clone(),
+                );
+            }
+            LifecycleFrame::ClientWssConnectionSetup {
+                fd,
+                meta,
+                config,
+                permit,
+            } => {
+                tracing::info!(
+                    shard = self.id,
+                    client_id = meta.client_id,
+                    raw_fd = fd.as_raw_fd(),
+                    "installing delegated WSS client fd (pre-handshake)"
+                );
+                self.bus.install_client_wss_fd(
+                    fd,
+                    meta,
+                    config,
+                    permit,
+                    self.on_client_request.clone(),
+                );
             }
             LifecycleFrame::ForwardReplicaSend { replica_id, msg } => {
                 if let Err(e) = self.bus.send_to_replica(replica_id, msg).await {
@@ -551,20 +1007,17 @@ where
             }
             LifecycleFrame::ForwardClientSend { client_id, msg } => {
                 if let Err(e) = self.bus.send_to_client(client_id, msg).await {
-                    // Terminal per `SendError` docs: the client never
-                    // receives the reply and request / response semantics
-                    // break above the bus. Bump the receiver-side counter
-                    // (sender side already bumps in `builder.rs`) and raise
-                    // to `warn!` so it surfaces in default operator logs.
+                    // The production bus refuses every frame sent by id, so
+                    // this is the expected outcome there, not a fault.
                     self.metrics.record_frame_drop(
                         frame_drop_variant::FORWARD_CLIENT_SEND,
                         frame_drop_reason::DELIVERY_FAILED,
                     );
-                    tracing::warn!(
+                    tracing::debug!(
                         shard = self.id,
                         client_id,
                         error = ?e,
-                        "forward-client-send delivery failed"
+                        "staged client deny has no route by client id"
                     );
                 }
             }
@@ -578,27 +1031,53 @@ where
                     self.id, 0,
                     "MetadataSubmit must only be processed on shard 0"
                 );
-                (self.on_metadata_submit)(submit);
+                self.host.on_metadata_submit(submit);
             }
             LifecycleFrame::ListClients { reply } => {
                 // Every shard handles this (not shard-0-only): each replies
                 // with the clients whose connections it homes. The handler
                 // (wired by the server) reads this shard's `SessionManager`
-                // and pushes the list over `reply`.
-                (self.on_list_clients)(reply);
+                // and pushes the answer over `reply`.
+                self.host.on_list_clients(reply);
             }
             LifecycleFrame::PartitionRead {
                 namespace,
                 read,
                 reply,
             } => {
-                // Addressed to the shard owning `namespace` (the sender
-                // resolved it via the shards table). The handler (wired by
-                // the server) runs the read against this shard's partitions
-                // plane and pushes the result over `reply`; a dropped
-                // sender means the read is skipped and the gather side
-                // times out.
-                (self.on_partition_read)(namespace, read, reply);
+                self.on_partition_read(namespace, read, reply).await;
+            }
+            LifecycleFrame::ReadinessWait { wait, reply, watch } => {
+                self.admit_readiness_wait(*wait, &reply, watch);
+            }
+            LifecycleFrame::ReadinessCancel { waiter } => {
+                self.cancel_readiness_wait(waiter);
+            }
+            LifecycleFrame::ReadinessUpdate { from, states } => {
+                self.apply_readiness_update(from, states);
+            }
+            LifecycleFrame::ReadinessUnwatch { from, watches } => {
+                self.unwatch_readiness(from, watches);
+            }
+            LifecycleFrame::ReadinessInterest {
+                from,
+                watches,
+                parked,
+            } => {
+                self.set_readiness_interest(from, watches, parked);
+            }
+            LifecycleFrame::PartitionSubmit {
+                request,
+                reply,
+                attachment,
+            } => {
+                // Addressed to the shard owning the request's namespace (the
+                // sender resolved it via the shards table, same fallback as
+                // `route_typed`). Every refusal answers on `reply`, so the
+                // awaiting shard never waits out its budget on a decision
+                // already made.
+                self.dispatch_partition_submit(request, reply, None, attachment)
+                    .await;
             }
             LifecycleFrame::MetadataCommitTick => {
                 // Reconciler may not yet be wired (e.g. mid-bootstrap, or
@@ -617,6 +1096,31 @@ where
                     );
                 }
             }
+            LifecycleFrame::PartitionPlacementViews(reports, statuses) => {
+                if self.id == 0 {
+                    self.plane.metadata().observe_partition_views(&reports);
+                    self.partition_status_outbox
+                        .record(&statuses, self.bus.monotonic_now());
+                    self.record_partition_statuses(&statuses);
+                } else {
+                    self.metrics.record_frame_drop(
+                        frame_drop_variant::PARTITION_PLACEMENT_VIEWS,
+                        frame_drop_reason::MISROUTED,
+                    );
+                }
+            }
+            LifecycleFrame::PrimaryRebalance(frame) => {
+                self.on_local_rebalance(*frame).await;
+            }
+            LifecycleFrame::PartitionPersistenceCompleted(completion) => {
+                let namespace = IggyNamespace::from_raw(completion.group);
+                let partitions = self.plane.partitions();
+                if let Some(partition) = partitions.get_mut_by_ns(&namespace) {
+                    partition
+                        .on_persistence_completed(completion, partitions.config())
+                        .await;
+                }
+            }
             LifecycleFrame::ReconcileApply => {
                 self.apply_reconcile_ops();
             }
@@ -630,10 +1134,10 @@ where
                 // task already resolved the retention decision off-pump, so
                 // this only mutates, serialized with reads on the same loop.
                 if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
-                    let (segments, messages) = partition
+                    let removal = partition
                         .clean_expired_segments(now, message_expiry, max_bytes)
                         .await;
-                    if segments > 0 {
+                    if removal.segments > 0 {
                         // Any unlink invalidates what this shard is SERVING:
                         // the offer names files that are gone and the payload
                         // cache can answer from RAM without touching disk, so a
@@ -645,10 +1149,24 @@ where
                         tracing::debug!(
                             shard = self.id,
                             namespace_raw = namespace.inner(),
-                            segments,
-                            messages,
+                            segments = removal.segments,
+                            messages = removal.messages,
                             "segment cleaner removed sealed segments"
                         );
+                    }
+                    if removal.budget_spent {
+                        // The pass stopped on its per-frame budget with more to
+                        // remove. Leaving the rest to the next interval tick
+                        // caps reclaim at one budget per interval, which a
+                        // producer outruns forever on small segments. Re-stage
+                        // as a frame rather than looping, so the pump keeps
+                        // interleaving consensus ticks between passes. This
+                        // terminates: a pass re-arms only when MORE than a full
+                        // budget was removable and it retires exactly the
+                        // budget, so the backlog strictly shrinks; a pass held
+                        // by the consumer barrier stops at or below the budget
+                        // and does not re-arm at all.
+                        self.request_clean_partition(namespace, now, message_expiry, max_bytes);
                     }
                 }
             }
@@ -660,9 +1178,8 @@ where
                 // committed offset is identical on every replica, so the local
                 // deletion converges; idempotent if already trimmed past it.
                 if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
-                    let (segments, messages) =
-                        partition.remove_sealed_segments_up_to(up_to_offset).await;
-                    if segments > 0 {
+                    let removal = partition.remove_sealed_segments_up_to(up_to_offset).await;
+                    if removal.segments > 0 {
                         // See the cleaner arm: a truncate commits on the
                         // METADATA plane, so this partition's commit_op never
                         // moves and the cached offer stays a hit over unlinked
@@ -671,109 +1188,11 @@ where
                         tracing::debug!(
                             shard = self.id,
                             namespace_raw = namespace.inner(),
-                            segments,
-                            messages,
+                            segments = removal.segments,
+                            messages = removal.messages,
                             up_to_offset,
                             "truncate-partition removed sealed segments"
                         );
-                    }
-                }
-            }
-            LifecycleFrame::PurgePartition {
-                namespace,
-                generation,
-            } => {
-                // Pump-side enforcement of a committed `PurgeTopic`: reset the
-                // partition to empty at offset 0 and clear consumer offsets.
-                // Idempotent per generation -- skip if already applied so a
-                // redundant reconcile pass does not wipe messages sent since.
-                let config = self.plane.partitions().config().clone();
-                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace)
-                    && partition.applied_purge_generation() < generation
-                {
-                    match partition.purge(&config, generation).await {
-                        Ok(()) => {
-                            // The purge unlinked the very bytes this shard is
-                            // serving: the cached offer still advertises the
-                            // pre-purge manifest and the payload cache can
-                            // answer chunk requests for it without touching
-                            // disk, so a puller would install purged data. Both
-                            // are keyed on pre-purge content, so neither can
-                            // notice on its own.
-                            self.drop_partition_transfer_state(namespace, partition);
-                            tracing::debug!(
-                                shard = self.id,
-                                namespace_raw = namespace.inner(),
-                                generation,
-                                "purge-partition reset partition to empty"
-                            );
-                        }
-                        Err(partitions::PurgeError::FrontierNotRecorded) => {
-                            // NOT fenced: nothing was mutated, so the chain is
-                            // whole and `applied_purge_generation` is unmoved,
-                            // which means the reconciler's `committed > applied`
-                            // gate still sees this purge as outstanding.
-                            // Fencing here would quarantine live data, and the
-                            // fence's own frontier write would first stamp the
-                            // pre-purge counter the purge was about to reset.
-                            //
-                            // NOT woken: staging a purge counts as work in the
-                            // pass, which keeps the fast-skip disarmed, so the
-                            // ordinary periodic pass re-issues until one lands
-                            // and stops once `applied` catches `committed`. An
-                            // eager wake here closes a loop with no pacing in
-                            // it at all -- pass, stage, defer, wake -- and on a
-                            // disk that refuses instantly that is a full O(N)
-                            // reconcile scan and a real `atomic_replace`
-                            // attempt per turn, holding the partition write
-                            // lock each time.
-                            tracing::warn!(
-                                shard = self.id,
-                                namespace_raw = namespace.inner(),
-                                generation,
-                                "purge-partition deferred: could not record the frontier reset; \
-                                 the reconciler re-issues it while the generation stays unapplied"
-                            );
-                        }
-                        Err(error @ partitions::PurgeError::GenerationNotRecorded(_)) => {
-                            // NOT fenced: the wipe ran and a fresh chain is
-                            // planted, so the partition is serviceable; only
-                            // the durable generation record failed, which
-                            // leaves `applied_purge_generation` unmoved and
-                            // the reconciler re-issuing the (now cheap) purge.
-                            // Same pacing argument as the frontier deferral
-                            // above; the caches already describe wiped bytes.
-                            self.drop_partition_transfer_state(namespace, partition);
-                            tracing::warn!(
-                                shard = self.id,
-                                namespace_raw = namespace.inner(),
-                                generation,
-                                %error,
-                                "purge-partition deferred: reset applied but the generation \
-                                 record failed; the reconciler re-issues it"
-                            );
-                        }
-                        Err(error @ partitions::PurgeError::Unserviceable(_)) => {
-                            // Past the drain, so this group has no serviceable
-                            // chain and the next append panics on
-                            // `active_segment()`. Fence it for rebuild, exactly
-                            // as a failed state-transfer convergence does. The
-                            // counters were already reset to 0 before the
-                            // fallible plant, so the fence's advancing write
-                            // records the post-purge frontier.
-                            tracing::error!(
-                                shard = self.id,
-                                namespace_raw = namespace.inner(),
-                                generation,
-                                %error,
-                                "purge-partition failed to reset partition; fencing it for rebuild"
-                            );
-                            // Fenced, but the caches still describe the
-                            // pre-purge bytes until the rebuild lands.
-                            self.drop_partition_transfer_state(namespace, partition);
-                            self.fence_partition_for_rebuild(namespace, partition, None)
-                                .await;
-                        }
                     }
                 }
             }
@@ -782,11 +1201,12 @@ where
 
     /// Build the one-shot ack a delegated replica handshake fires when it
     /// finishes, releasing the in-flight cap slot (inbound) or clearing
-    /// the pending-dial entry (outbound). When this shard IS shard 0 the
-    /// closure releases inline on the local bus (infallible, no frame in
-    /// flight); otherwise it `try_send`s the outcome frame to shard 0,
-    /// where a full or disconnected inbox is log-only: shard 0's
-    /// deadline expiry covers the lost ack.
+    /// the pending-dial entry (outbound) and refreshing the bundle of the
+    /// peer. When this shard IS shard 0 the closure acks inline on the
+    /// local bus (infallible, no frame in flight); otherwise it
+    /// `try_send`s the outcome frame to shard 0, where a full or
+    /// disconnected inbox is log-only: shard 0's deadline expiry and
+    /// reconnect sweep cover the lost ack.
     fn replica_handshake_done_fn(
         &self,
         outcome: ReplicaHandshakeOutcome,
@@ -794,11 +1214,11 @@ where
         if self.id == 0 {
             let bus = self.bus.clone();
             return Box::new(move || match outcome {
-                ReplicaHandshakeOutcome::ReleaseSlot(slot) => {
-                    bus.release_replica_handshake_slot(slot);
+                ReplicaHandshakeOutcome::Inbound { slot, link } => {
+                    bus.replica_inbound_handshake_done(slot, link);
                 }
-                ReplicaHandshakeOutcome::ClearDial(replica_id) => {
-                    bus.clear_replica_dial_pending(replica_id);
+                ReplicaHandshakeOutcome::Outbound(link) => {
+                    bus.replica_outbound_handshake_done(link);
                 }
             });
         }
@@ -807,11 +1227,11 @@ where
         let shard = self.id;
         Box::new(move || {
             let frame = match outcome {
-                ReplicaHandshakeOutcome::ReleaseSlot(slot) => {
-                    LifecycleFrame::ReplicaInboundHandshakeDone { slot }
+                ReplicaHandshakeOutcome::Inbound { slot, link } => {
+                    LifecycleFrame::ReplicaInboundHandshakeDone { slot, link }
                 }
-                ReplicaHandshakeOutcome::ClearDial(replica_id) => {
-                    LifecycleFrame::ReplicaOutboundHandshakeDone { replica_id }
+                ReplicaHandshakeOutcome::Outbound(link) => {
+                    LifecycleFrame::ReplicaOutboundHandshakeDone { link }
                 }
             };
             if let Err(e) = to_shard_zero.try_send(ShardFrame::lifecycle(frame)) {
@@ -830,10 +1250,266 @@ where
 
 /// Outcome a delegated replica handshake reports back to shard 0:
 /// release the in-flight cap slot (inbound) or clear the pending-dial
-/// entry (outbound). Becomes a [`LifecycleFrame`] only on the
-/// cross-shard send leg; shard 0 applies it inline.
+/// entry (outbound), then refresh the bundle of the peer. Becomes a
+/// [`LifecycleFrame`] only on the cross-shard send leg; shard 0 applies
+/// it inline.
 #[derive(Clone, Copy)]
 enum ReplicaHandshakeOutcome {
-    ReleaseSlot(u64),
-    ClearDial(u8),
+    Inbound { slot: u64, link: ReplicaLinkId },
+    Outbound(ReplicaLinkId),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::partition_placement_tests::owner;
+    use crate::{build_deny_reply_from_request_header, shard_channel};
+    use iggy_binary_protocol::RoutedRequestHeader;
+    use iggy_binary_protocol::{
+        Command, ConsensusError, GenericHeader, HEADER_SIZE, PrepareHeader,
+        prepare_identity_checksum_bytes,
+    };
+    use iggy_common::IggyError;
+    use server_common::iobuf::Owned;
+    use server_common::{MESSAGE_ALIGN, Message, MessageBag};
+    use std::mem::offset_of;
+
+    /// An `Operation` discriminant this build does not know, arriving on an
+    /// otherwise wire-valid consensus frame (correct command, size, checksum:
+    /// exactly what a newer release sends after an op addition), must decode to
+    /// its own error rather than the `InvalidBitPattern` that random memory
+    /// corruption produces.
+    ///
+    /// The two need different operator actions: version skew is fixed by
+    /// upgrading this node, and until it is, the frame's consensus group makes
+    /// no progress (the op is never journaled, never acked, and every later
+    /// prepare dies on the gap). `dispatch` splits its drop arms on this
+    /// distinction; the accounting half is pinned in the server crate by
+    /// `given_an_unknown_operation_when_dispatched_should_account_an_upgrade_fence_drop`.
+    #[test]
+    fn given_an_unknown_operation_when_a_consensus_frame_decodes_should_surface_an_upgrade_fence_signal()
+     {
+        // Far past every defined Operation discriminant (the highest is 162,
+        // `DeleteConsumerOffset`).
+        const OPERATION_FROM_A_NEWER_RELEASE: u8 = 0xEE;
+
+        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE);
+        {
+            let frame = owned.as_mut_slice();
+            let size_offset = offset_of!(PrepareHeader, size);
+            let frame_size = u32::try_from(HEADER_SIZE).expect("header size fits in u32");
+            frame[size_offset..size_offset + 4].copy_from_slice(&frame_size.to_le_bytes());
+            frame[offset_of!(PrepareHeader, command)] = Command::Prepare as u8;
+            let client_offset = offset_of!(PrepareHeader, client);
+            frame[client_offset..client_offset + 16].copy_from_slice(&0xCAFE_u128.to_le_bytes());
+            frame[offset_of!(PrepareHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
+            // A prepare's `checksum` carries the identity checksum, computed
+            // over the operation byte among others; stamping it the way a real
+            // sender does leaves the unknown byte as the frame's only anomaly
+            // and is what lets the classifier trust that byte.
+            let header: &[u8; HEADER_SIZE] = frame[..HEADER_SIZE]
+                .try_into()
+                .expect("frame spans a full header");
+            let identity = prepare_identity_checksum_bytes(header);
+            frame[..size_of::<u128>()].copy_from_slice(&identity.to_le_bytes());
+        }
+
+        // The generic view carries no operation field, so the receive path
+        // accepts the frame; the unknown byte is first seen by the typed
+        // decode inside `MessageBag::try_from`, which is what `dispatch` runs.
+        let message = Message::<GenericHeader>::try_from(owned)
+            .expect("a sealed Prepare frame is wire-valid in the generic view");
+
+        let Err(error) = MessageBag::try_from(message) else {
+            panic!("an operation this build does not know must not decode into a bag");
+        };
+
+        assert!(
+            matches!(
+                error,
+                ConsensusError::UnsupportedOperation {
+                    operation: OPERATION_FROM_A_NEWER_RELEASE
+                }
+            ),
+            "unknown operation {OPERATION_FROM_A_NEWER_RELEASE:#x} is silently dropped: the \
+             typed decode collapses a wire-valid frame from a newer release into the same \
+             InvalidBitPattern as corruption, and dispatch drops both with only a warn log, \
+             no operator signal and no upgrade fence, so an old node in a mixed cluster \
+             gap-stops its consensus group while quorum hides it; got {error:?}"
+        );
+    }
+    #[compio::test]
+    async fn given_no_reply_owner_when_forwarded_client_send_arrives_should_not_fire_http_slot() {
+        const CLIENT: u128 = 41;
+        const REQUEST: u64 = 7;
+        let (shard, _) = owner(0);
+        shard.bus.clients().insert_in_process(CLIENT).unwrap();
+        let (_slot, mut reply) = shard
+            .bus
+            .clients()
+            .install_reply_slot(CLIENT, REQUEST)
+            .unwrap();
+        let header = RoutedRequestHeader {
+            client: CLIENT,
+            request: REQUEST,
+            ..Default::default()
+        };
+        let message = build_deny_reply_from_request_header(
+            &header,
+            IggyError::TransientNotAccepted.as_code(),
+        );
+        shard
+            .process_frame(ShardFrame::lifecycle(LifecycleFrame::ForwardClientSend {
+                client_id: CLIENT,
+                msg: message.into_generic().into_frozen().into(),
+            }))
+            .await;
+        assert!(
+            matches!(reply.try_recv(), Ok(None)),
+            "an originless forwarded reply must not fill an HTTP slot"
+        );
+    }
+
+    #[compio::test]
+    async fn given_no_reply_owner_when_shard_denies_tombstoned_partition_should_not_fire_http_slot()
+    {
+        const CLIENT: u128 = 42;
+        const REQUEST: u64 = 8;
+        let (shard, _) = owner(0);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        shard.plane.partitions().tombstone(namespace);
+        shard.bus.clients().insert_in_process(CLIENT).unwrap();
+        let (_slot, mut reply) = shard
+            .bus
+            .clients()
+            .install_reply_slot(CLIENT, REQUEST)
+            .unwrap();
+        let request = Message::<RoutedRequestHeader>::new(size_of::<RoutedRequestHeader>())
+            .transmute_header(|_, header: &mut RoutedRequestHeader| {
+                header.command = Command::Request;
+                header.operation = Operation::SendMessages;
+                header.client = CLIENT;
+                header.session = 1;
+                header.request = REQUEST;
+                header.group = namespace.inner();
+                header.size = u32::try_from(size_of::<RoutedRequestHeader>()).unwrap();
+            });
+        shard.on_message(MessageBag::Request(request)).await;
+        assert!(
+            matches!(reply.try_recv(), Ok(None)),
+            "a tombstone denial without its owner must not fill an HTTP slot"
+        );
+    }
+
+    #[compio::test]
+    async fn given_no_reply_owner_when_shard_denies_unroutable_request_should_not_fire_http_slot() {
+        const CLIENT: u128 = 43;
+        const REQUEST: u64 = 9;
+        let (shard, _) = owner(0);
+        shard.bus.clients().insert_in_process(CLIENT).unwrap();
+        let (_slot, mut reply) = shard
+            .bus
+            .clients()
+            .install_reply_slot(CLIENT, REQUEST)
+            .unwrap();
+        let request = Message::<RoutedRequestHeader>::new(size_of::<RoutedRequestHeader>())
+            .transmute_header(|_, header: &mut RoutedRequestHeader| {
+                header.command = Command::Request;
+                header.operation = Operation::NonReplicated;
+                header.client = CLIENT;
+                header.request = REQUEST;
+                header.size = u32::try_from(size_of::<RoutedRequestHeader>()).unwrap();
+            });
+        shard.on_message(MessageBag::Request(request)).await;
+        assert!(
+            matches!(reply.try_recv(), Ok(None)),
+            "an unroutable denial without its owner must not fill an HTTP slot"
+        );
+    }
+
+    #[compio::test]
+    async fn given_carried_reply_when_partition_is_tombstoned_or_park_buffer_full_should_answer_owner()
+     {
+        const CLIENT: u128 = 45;
+        const REQUEST: u64 = 11;
+        for tombstoned in [false, true] {
+            let (shard, _) = owner(0);
+            let namespace = IggyNamespace::new(0, 0, 0);
+            shard.bus.clients().insert_in_process(CLIENT).unwrap();
+            let (_slot, mut unrelated) = shard
+                .bus
+                .clients()
+                .install_reply_slot(CLIENT, REQUEST)
+                .unwrap();
+            let request = Message::<RoutedRequestHeader>::new(size_of::<RoutedRequestHeader>())
+                .transmute_header(|_, header: &mut RoutedRequestHeader| {
+                    header.command = Command::Request;
+                    header.operation = Operation::SendMessages;
+                    header.client = CLIENT;
+                    header.session = 1;
+                    header.request = REQUEST;
+                    header.group = namespace.inner();
+                    header.size = u32::try_from(size_of::<RoutedRequestHeader>()).unwrap();
+                });
+            if tombstoned {
+                shard.plane.partitions().tombstone(namespace);
+            } else {
+                for _ in 0..crate::MAX_PARKED_PER_NAMESPACE {
+                    shard.on_message(MessageBag::Request(request.clone())).await;
+                }
+                assert_eq!(
+                    shard.parked_frame_count(namespace),
+                    crate::MAX_PARKED_PER_NAMESPACE
+                );
+            }
+            let (reply, receiver) = crate::channel(1);
+            shard
+                .process_frame(ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
+                    request,
+                    reply,
+                    attachment: None,
+                }))
+                .await;
+            let response = receiver
+                .try_recv()
+                .expect("the carried receiver is answered immediately")
+                .expect("a concrete denial")
+                .try_into_typed::<iggy_binary_protocol::ReplyHeader>()
+                .unwrap();
+            assert_eq!(
+                response.header().status,
+                IggyError::TransientNotAccepted.as_code()
+            );
+            assert!(
+                matches!(unrelated.try_recv(), Ok(None)),
+                "the same client/request pair does not confer slot ownership"
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn given_no_reply_owner_when_shard_stages_deny_should_not_fire_http_slot() {
+        const CLIENT: u128 = 44;
+        const REQUEST: u64 = 10;
+        let (mut shard, _) = owner(0);
+        let (sender, _inbox, replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        shard.bus.clients().insert_in_process(CLIENT).unwrap();
+        let (_slot, mut reply) = shard
+            .bus
+            .clients()
+            .install_reply_slot(CLIENT, REQUEST)
+            .unwrap();
+        let header = RoutedRequestHeader {
+            client: CLIENT,
+            request: REQUEST,
+            ..Default::default()
+        };
+        assert!(shard.stage_transient_deny(&header));
+        shard.process_frame(replies.recv().await.unwrap()).await;
+        assert!(
+            matches!(reply.try_recv(), Ok(None)),
+            "a staged denial without its owner must not fill an HTTP slot"
+        );
+    }
 }

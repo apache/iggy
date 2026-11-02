@@ -18,9 +18,10 @@
 namespace Apache.Iggy.Exceptions;
 
 /// <summary>
-///     The request produced no server verdict after transmission began, so the server may already have committed
-///     it. Replaying it on a fresh consensus session would bypass server-side deduplication, so the SDK refuses to
-///     retry and surfaces this instead: the caller decides whether re-issuing the operation is safe.
+///     The server did not confirm whether it committed the request, either because no verdict arrived after
+///     transmission began or because the request aged out of its deduplication window. Replaying it on a fresh
+///     consensus session would bypass server-side deduplication, so the SDK refuses to retry: the caller decides
+///     whether re-issuing the operation is safe.
 /// </summary>
 /// <remarks>
 ///     Deliberately derived from <see cref="Exception" /> rather than <see cref="IOException" /> or
@@ -28,6 +29,10 @@ namespace Apache.Iggy.Exceptions;
 ///     and either retried or swallowed, which are the two responses this type exists to prevent. The triggering
 ///     exception is preserved as <see cref="Exception.InnerException" />.
 /// </remarks>
-public sealed class VsrRequestOutcomeUnknownException(Exception innerException)
-    : Exception("The VSR request outcome is unknown because no server verdict arrived after transmission began.",
-        innerException);
+public class VsrRequestOutcomeUnknownException(Exception innerException, ulong? operationId = null)
+    : Exception("The VSR request outcome is unknown because the server did not confirm whether it committed the request.",
+        innerException)
+{
+    /// <summary>The local operation to resolve or abandon. An uncertain committing poll or fetch can only be abandoned.</summary>
+    public ulong? OperationId { get; } = operationId;
+}

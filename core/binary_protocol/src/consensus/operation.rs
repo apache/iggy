@@ -31,7 +31,7 @@ pub enum Operation {
     /// consensus pipeline (prepare/replicate/commit) as normal operations
     /// but skips state machine dispatch at commit time, the metadata
     /// plane calls `commit_register` directly, which mints the session's
-    /// fence epoch (1 at first register, +1 per rebind).
+    /// fence epoch from the committed Register log position.
     Register = 1,
 
     /// Non-replicated client request carried in VSR framing. The concrete
@@ -62,16 +62,30 @@ pub enum Operation {
     /// and submits this through metadata consensus, so every replica applies
     /// the same offset deterministically. No client wire code.
     TruncatePartition = 68,
+    FinalizeSession = 70,
+    CompleteLifecycle = 71,
+    /// Prepare-resolved `UpdateResource` on a stream: column changes extracted,
+    /// resets resolved to their defaults. Claimed by the streams state machine.
+    UpdateStreamResolved = 72,
+    /// Prepare-resolved `UpdateResource` on a topic.
+    UpdateTopicResolved = 73,
+    /// Prepare-resolved `UpdateResource` on a user. Claimed by the users state
+    /// machine.
+    UpdateUserResolved = 74,
+    /// Server-originated: replace encrypted streams' wrap sets during a
+    /// key-encryption key rotation. Proposed by the metadata primary, no
+    /// client wire code.
+    RewrapStreamKeys = 75,
 
     // Metadata operations (shard 0)
     CreateStream = 128,
-    UpdateStream = 129,
+    // 129 was UpdateStream. Never reuse it.
     DeleteStream = 130,
-    PurgeStream = 131,
+    // 131 was PurgeStream. Never reuse it.
     CreateTopic = 132,
-    UpdateTopic = 133,
+    // 133 was UpdateTopic. Never reuse it.
     DeleteTopic = 134,
-    PurgeTopic = 135,
+    // 135 was PurgeTopic. Never reuse it.
     CreatePartitions = 136,
     DeletePartitions = 137,
     // Client op handled specially: the dispatch layer resolves the requested
@@ -82,7 +96,7 @@ pub enum Operation {
     CreateConsumerGroup = 139,
     DeleteConsumerGroup = 140,
     CreateUser = 141,
-    UpdateUser = 142,
+    // 142 was UpdateUser. Never reuse it.
     DeleteUser = 143,
     ChangePassword = 144,
     UpdatePermissions = 145,
@@ -90,51 +104,100 @@ pub enum Operation {
     DeletePersonalAccessToken = 147,
     JoinConsumerGroup = 148,
     LeaveConsumerGroup = 149,
+    /// Generic option patch for a stream, topic or user. Prepare rewrites it to
+    /// the resolved operation of the target's scope.
+    UpdateResource = 150,
 
     // Partition operations (routed by namespace)
     SendMessages = 160,
     StoreConsumerOffset = 161,
     DeleteConsumerOffset = 162,
-    StoreConsumerOffset2 = 164,
-    DeleteConsumerOffset2 = 165,
+    // 163 is reserved; 164 and 165 are retired offset operations.
+    RetireSession = 166,
+    InstallConsumerGroupOwner = 167,
+    TransitionPartitionHistory = 168,
+    RetireConsumerGroupOwners = 169,
 }
 
 impl Operation {
+    /// Whether `code` is a discriminant this build defines.
+    ///
+    /// Decoders need this to tell an operation another release defines from a
+    /// corrupted header byte: bytemuck's checked cast rejects both with one
+    /// undifferentiated error, and only the former is fixed by aligning the
+    /// releases. A newer release adds operations, and an older one can still
+    /// send a retired one.
+    #[must_use]
+    pub fn is_known_code(code: u8) -> bool {
+        bytemuck::checked::try_cast::<u8, Self>(code).is_ok()
+    }
+
     pub const INTERNAL_START: u8 = Self::CreateTopicWithAssignments as u8;
     pub const METADATA_START: u8 = Self::CreateStream as u8;
     pub const PARTITION_START: u8 = Self::SendMessages as u8;
+
+    /// Preparation rewrites some client opcodes. Retry identity must survive
+    /// that projection, including when only the committed reply remains.
+    #[must_use]
+    pub const fn request_operation(&self) -> Self {
+        match self {
+            Self::CreateTopicWithAssignments => Self::CreateTopic,
+            Self::CreatePartitionsWithAssignments => Self::CreatePartitions,
+            Self::UpdateStreamResolved | Self::UpdateTopicResolved | Self::UpdateUserResolved => {
+                Self::UpdateResource
+            }
+            Self::TruncatePartition => Self::DeleteSegments,
+            operation => *operation,
+        }
+    }
 
     /// Internal-only operations reserved for replica / journal use.
     #[must_use]
     #[inline]
     pub const fn is_internal(&self) -> bool {
-        (*self as u8) >= Self::INTERNAL_START && (*self as u8) < Self::METADATA_START
+        // The SDK protocol checks parse this list, so it names every operation.
+        ((*self as u8) >= Self::INTERNAL_START && (*self as u8) < Self::METADATA_START)
+            || matches!(
+                self,
+                Self::RetireSession
+                    | Self::InstallConsumerGroupOwner
+                    | Self::TransitionPartitionHistory
+                    | Self::RetireConsumerGroupOwners
+            )
+    }
+
+    /// Partition fences that metadata orders. Each one changes consumer-group
+    /// ownership or the partition history, so it applies alone.
+    #[must_use]
+    #[inline]
+    pub const fn is_partition_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Self::InstallConsumerGroupOwner
+                | Self::TransitionPartitionHistory
+                | Self::RetireConsumerGroupOwners
+        )
     }
 
     /// Metadata / control-plane operations handled by shard 0.
     #[must_use]
     #[inline]
     pub const fn is_metadata(&self) -> bool {
-        if self.is_internal() {
+        if self.is_internal() && !self.is_partition() {
             return true;
         }
 
         matches!(
             self,
             Self::CreateStream
-                | Self::UpdateStream
                 | Self::DeleteStream
-                | Self::PurgeStream
                 | Self::CreateTopic
-                | Self::UpdateTopic
                 | Self::DeleteTopic
-                | Self::PurgeTopic
                 | Self::CreatePartitions
                 | Self::DeletePartitions
                 | Self::CreateConsumerGroup
                 | Self::DeleteConsumerGroup
                 | Self::CreateUser
-                | Self::UpdateUser
                 | Self::DeleteUser
                 | Self::ChangePassword
                 | Self::UpdatePermissions
@@ -142,6 +205,7 @@ impl Operation {
                 | Self::DeletePersonalAccessToken
                 | Self::JoinConsumerGroup
                 | Self::LeaveConsumerGroup
+                | Self::UpdateResource
         )
     }
 
@@ -169,14 +233,7 @@ impl Operation {
     /// the SDK, the one place that sees Register replies.
     #[must_use]
     pub const fn is_result_framed(&self) -> bool {
-        self.is_metadata()
-            || matches!(
-                self,
-                Self::StoreConsumerOffset
-                    | Self::StoreConsumerOffset2
-                    | Self::DeleteConsumerOffset
-                    | Self::DeleteConsumerOffset2
-            )
+        self.is_metadata() || matches!(self, Self::StoreConsumerOffset | Self::DeleteConsumerOffset)
     }
 
     /// Data-plane operations routed to the shard owning the partition.
@@ -201,6 +258,14 @@ impl Operation {
         self.is_metadata() || matches!(self, Self::Register | Self::Logout)
     }
 
+    /// Whether a consensus plane claims this operation. Anything else the plane
+    /// chain drops in its `()` terminator, so entry paths must refuse it first.
+    #[must_use]
+    #[inline]
+    pub const fn is_plane_routable(&self) -> bool {
+        self.is_metadata_plane() || self.is_partition()
+    }
+
     /// Operations clients are allowed to send directly.
     #[must_use]
     #[inline]
@@ -220,24 +285,29 @@ impl Operation {
             | Self::NonReplicated
             | Self::CreateTopicWithAssignments
             | Self::CreatePartitionsWithAssignments
+            | Self::UpdateStreamResolved
+            | Self::UpdateTopicResolved
+            | Self::UpdateUserResolved
+            | Self::RewrapStreamKeys
             | Self::RemoveConsumerGroupMember
             | Self::CompleteConsumerGroupRevocation
-            | Self::TruncatePartition => None,
+            | Self::TruncatePartition
+            | Self::FinalizeSession
+            | Self::CompleteLifecycle
+            | Self::RetireSession
+            | Self::InstallConsumerGroupOwner
+            | Self::TransitionPartitionHistory
+            | Self::RetireConsumerGroupOwners => None,
             Self::CreateStream
-            | Self::UpdateStream
             | Self::DeleteStream
-            | Self::PurgeStream
             | Self::CreateTopic
-            | Self::UpdateTopic
             | Self::DeleteTopic
-            | Self::PurgeTopic
             | Self::CreatePartitions
             | Self::DeletePartitions
             | Self::DeleteSegments
             | Self::CreateConsumerGroup
             | Self::DeleteConsumerGroup
             | Self::CreateUser
-            | Self::UpdateUser
             | Self::DeleteUser
             | Self::ChangePassword
             | Self::UpdatePermissions
@@ -245,11 +315,10 @@ impl Operation {
             | Self::DeletePersonalAccessToken
             | Self::JoinConsumerGroup
             | Self::LeaveConsumerGroup
+            | Self::UpdateResource
             | Self::SendMessages
             | Self::StoreConsumerOffset
-            | Self::DeleteConsumerOffset
-            | Self::StoreConsumerOffset2
-            | Self::DeleteConsumerOffset2 => match crate::dispatch::lookup_by_operation(*self) {
+            | Self::DeleteConsumerOffset => match crate::dispatch::lookup_by_operation(*self) {
                 Some(meta) => Some(meta.code),
                 None => None,
             },
@@ -276,20 +345,15 @@ mod tests {
     fn command_code_roundtrip() {
         let ops = [
             Operation::CreateStream,
-            Operation::UpdateStream,
             Operation::DeleteStream,
-            Operation::PurgeStream,
             Operation::CreateTopic,
-            Operation::UpdateTopic,
             Operation::DeleteTopic,
-            Operation::PurgeTopic,
             Operation::CreatePartitions,
             Operation::DeletePartitions,
             Operation::DeleteSegments,
             Operation::CreateConsumerGroup,
             Operation::DeleteConsumerGroup,
             Operation::CreateUser,
-            Operation::UpdateUser,
             Operation::DeleteUser,
             Operation::ChangePassword,
             Operation::UpdatePermissions,
@@ -297,11 +361,10 @@ mod tests {
             Operation::DeletePersonalAccessToken,
             Operation::JoinConsumerGroup,
             Operation::LeaveConsumerGroup,
+            Operation::UpdateResource,
             Operation::SendMessages,
             Operation::StoreConsumerOffset,
             Operation::DeleteConsumerOffset,
-            Operation::StoreConsumerOffset2,
-            Operation::DeleteConsumerOffset2,
         ];
         for op in ops {
             let code = op
@@ -367,8 +430,90 @@ mod tests {
         assert!(Operation::TruncatePartition.is_internal());
         assert!(Operation::TruncatePartition.is_metadata());
         assert!(!Operation::TruncatePartition.is_client_allowed());
+        assert!(Operation::StoreConsumerOffset.is_partition());
         assert!(Operation::DeleteConsumerOffset.is_partition());
-        assert!(Operation::StoreConsumerOffset2.is_partition());
-        assert!(Operation::DeleteConsumerOffset2.is_partition());
+    }
+
+    /// Every operation belongs to exactly one plane, or to the short list
+    /// answered before the chain. Walks `is_known_code` so a new variant fails
+    /// here rather than on the first frame carrying it.
+    #[test]
+    fn unroutable_operations_are_listed() {
+        // Answered earlier: `Reserved` by `validate_request_fields`,
+        // `NonReplicated` by the reads router, `DeleteSegments` by resolution to
+        // `TruncatePartition` (`server::dispatch::classify`).
+        const UNROUTABLE: [Operation; 3] = [
+            Operation::Reserved,
+            Operation::NonReplicated,
+            Operation::DeleteSegments,
+        ];
+
+        for code in 0..=u8::MAX {
+            if !Operation::is_known_code(code) {
+                continue;
+            }
+            let operation: Operation = bytemuck::checked::cast(code);
+            assert!(
+                !(operation.is_metadata_plane() && operation.is_partition()),
+                "{operation:?} is claimed by both planes; the chain takes the first"
+            );
+            assert_eq!(
+                operation.is_plane_routable(),
+                !UNROUTABLE.contains(&operation),
+                "{operation:?}: is_plane_routable={} disagrees with the unroutable list",
+                operation.is_plane_routable(),
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_codes_remain_unknown() {
+        const RESERVED_CODES: [u8; 5] = [131, 135, 163, 164, 165];
+
+        for code in RESERVED_CODES {
+            assert!(
+                !Operation::is_known_code(code),
+                "reserved operation code {code} must not be reused"
+            );
+        }
+    }
+
+    #[test]
+    fn given_rewrap_operation_when_classifying_should_be_internal_metadata_and_not_client_allowed()
+    {
+        let rewrap = Operation::RewrapStreamKeys;
+        assert_eq!(rewrap as u8, 75);
+        assert!(rewrap.is_internal());
+        assert!(rewrap.is_metadata());
+        assert!(rewrap.is_metadata_plane());
+        assert!(!rewrap.is_client_allowed());
+        assert_eq!(rewrap.to_command_code(), None);
+        assert_eq!(rewrap.request_operation(), rewrap);
+        assert!(!Operation::is_known_code(69));
+    }
+
+    #[test]
+    fn given_resolved_update_operations_when_classifying_should_be_internal_metadata() {
+        for resolved in [
+            Operation::UpdateStreamResolved,
+            Operation::UpdateTopicResolved,
+            Operation::UpdateUserResolved,
+        ] {
+            assert!(resolved.is_internal(), "{resolved:?}");
+            assert!(resolved.is_metadata(), "{resolved:?}");
+            assert!(resolved.is_result_framed(), "{resolved:?}");
+            assert!(!resolved.is_client_allowed(), "{resolved:?}");
+            assert_eq!(resolved.to_command_code(), None);
+            assert_eq!(resolved.request_operation(), Operation::UpdateResource);
+        }
+        assert!(Operation::UpdateResource.is_metadata());
+        assert!(Operation::UpdateResource.is_client_allowed());
+        assert_eq!(Operation::UpdateResource as u8, 150);
+        for retired in [129u8, 133, 142] {
+            assert!(
+                !Operation::is_known_code(retired),
+                "{retired} must stay retired"
+            );
+        }
     }
 }

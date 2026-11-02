@@ -1,32 +1,31 @@
 <!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
 
-    Licensed to the Apache Software Foundation (ASF) under one
-    or more contributor license agreements.  See the NOTICE file
-    distributed with this work for additional information
-    regarding copyright ownership.  The ASF licenses this file
-    to you under the Apache License, Version 2.0 (the
-    "License"); you may not use this file except in compliance
-    with the License.  You may obtain a copy of the License at
+  http://www.apache.org/licenses/LICENSE-2.0
 
-      http://www.apache.org/licenses/LICENSE-2.0
-
-    Unless required by applicable law or agreed to in writing,
-    software distributed under the License is distributed on an
-    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-    KIND, either express or implied.  See the License for the
-    specific language governing permissions and limitations
-    under the License.
-
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
 -->
+
 <script lang="ts">
-  import type { CloseModalFn } from '$lib/types/utilTypes';
+  import type { CloseModalFn } from '#lib/types/utilTypes.js';
   import { z } from 'zod';
   import Input from '../Input.svelte';
   import ModalBase from './ModalBase.svelte';
-  import { numberSizes } from '$lib/utils/constants/numberSizes';
+  import { numberSizes } from '#lib/utils/constants/numberSizes.js';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
   import { zod4 } from 'sveltekit-superforms/adapters';
-  import { fetchRouteApi } from '$lib/api/fetchRouteApi';
+  import { fetchRouteApi } from '#lib/api/fetchRouteApi.js';
   import { page } from '$app/state';
   import { showToast } from '../AppToasts.svelte';
   import Button from '../Button.svelte';

@@ -27,3 +27,6 @@ bench-report = { workspace = true }
 human-repr = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 uuid = { workspace = true, features = ["serde"] }
+
+[lints]
+workspace = true

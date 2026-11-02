@@ -197,7 +197,6 @@ async fn sink_configs_list_returns_all_versions(
     assert_eq!(topics[0].as_str().unwrap(), "test_topic");
     assert_eq!(stream["schema"].as_str().unwrap(), "json");
     assert!(stream["batch_length"].as_u64().is_some());
-    assert!(stream["poll_interval"].as_str().is_some());
     assert!(stream["consumer_group"].as_str().is_some());
 
     assert!(v0["plugin_config_format"].is_null());

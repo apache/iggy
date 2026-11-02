@@ -14,15 +14,18 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { reverseRecord } from '../type.utils.js';
 
 export const COMMAND_CODE = {
   Ping: 1,
   GetStats: 10,
-  GetSnapshot: 11,                    // @TODO GET_SNAPSHOT_FILE_CODE: u32 = 11
+  GetSnapshot: 11,
   GetClusterMetadata: 12,
+  DescribeOptions: 13,
+  BindSession: 15,
+  UpdateResource: 16,
+  GetMetadataChanges: 17,
   GetMe: 20,
   GetClient: 21,
   GetClients: 22,
@@ -30,7 +33,7 @@ export const COMMAND_CODE = {
   GetUsers: 32,
   CreateUser: 33,
   DeleteUser: 34,
-  UpdateUser: 35,
+  // 35 is retired and must never be reused.
   UpdatePermissions: 36,
   ChangePassword: 37,
   LoginUser: 38,
@@ -43,24 +46,25 @@ export const COMMAND_CODE = {
   LoginRegisterWithAccessToken: 45,
   PollMessages: 100,
   SendMessages: 101,
-  FlushUnsavedBuffers: 102,
+  // 103 and 104 are retired and must never be reused.
+  GetPartitionRoute: 105,
+  PollMessagesDeferred: 106,
+  CancelDeferredRequest: 108,
+  FetchMessages: 109,
   GetOffset: 120,
   StoreOffset: 121,
   DeleteConsumerOffset: 122,
-  StoreOffset2: 123,
-  DeleteConsumerOffset2: 124,
+  // 123 and 124 are retired and must never be reused.
   GetStream: 200,
   GetStreams: 201,
   CreateStream: 202,
   DeleteStream: 203,
-  UpdateStream: 204,
-  PurgeStream: 205,
+  // 204 is retired and must never be reused.
   GetTopic: 300,
   GetTopics: 301,
   CreateTopic: 302,
   DeleteTopic: 303,
-  UpdateTopic: 304,
-  PurgeTopic: 305,
+  // 304 is retired and must never be reused.
   CreatePartitions: 402,
   DeletePartitions: 403,
   DeleteSegments: 503,

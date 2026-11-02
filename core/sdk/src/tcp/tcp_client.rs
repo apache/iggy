@@ -15,228 +15,38 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
-use crate::prelude::Client;
-use crate::prelude::TcpClientConfig;
-use crate::session::ConsensusSession;
-use crate::tcp::tcp_connection_stream::TcpConnectionStream;
-use crate::tcp::tcp_connection_stream_kind::ConnectionStreamKind;
-use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
-use async_broadcast::{Receiver, Sender, broadcast};
-use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
-use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
-use iggy_common::VsrSessionControl as _;
+use crate::binary::impl_binary_client;
+use crate::driver::OperationDriver;
+use crate::links::{Dialer, ReconnectPolicy, ReplicaLinks};
+use crate::session_owner::SessionOwner;
 use iggy_common::{
-    AutoLogin, ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
-    IggyDuration, IggyError, IggyTimestamp, TcpConnectionStringOptions, TransportProtocol,
+    AutoLogin, ConnectionString, ConnectionStringUtils, IggyError, NonZeroIggyDuration,
+    TcpClientConfig, TcpConnectionStringOptions, TransportProtocol,
 };
-use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
-use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
-use secrecy::ExposeSecret;
-use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use tokio::time::sleep;
-use tokio_rustls::{TlsConnector, TlsStream};
-use tracing::{error, info, trace, warn};
 
-const NAME: &str = "Iggy";
-/// Upper bound for awaiting a reply on the lockstep VSR connection. Far
-/// beyond any healthy round-trip; only trips when the server loses the
-/// reply entirely (e.g. stalled replication quorum), which would otherwise
-/// hold the stream lock forever and wedge the client.
-const RESPONSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Backoff before replaying a request the server answered with an explicit
-/// `TransientNotCommitted` frame (not-caught-up / in-flight / pipeline-full /
-/// view-change cancel). The reply arrives promptly, so a short pause keeps the
-/// replay from spinning while the primary catches up. Bounded by
-/// `RESPONSE_READ_TIMEOUT`.
-const NOT_READY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
-
-/// How long a request replays `TransientNotCommitted` on the SAME connection
-/// before the client re-checks cluster leadership. A node that stopped being
-/// primary (view change while the connection stayed up) answers transient
-/// forever, so replaying alone never recovers; periodically consult the
-/// roster and fail over to the leader. Bounded by `RESPONSE_READ_TIMEOUT`
-/// overall.
-const TRANSIENT_FAILOVER_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// TCP client for interacting with the Iggy API.
-/// It requires a valid server address.
+/// TCP client whose replica links share one session and operation driver.
 #[derive(Debug)]
 pub struct TcpClient {
-    pub(crate) stream: Arc<Mutex<Option<ConnectionStreamKind>>>,
     pub(crate) config: Arc<TcpClientConfig>,
-    pub(crate) state: Mutex<ClientState>,
-    client_address: Mutex<Option<SocketAddr>>,
-    events: (Sender<DiagnosticEvent>, Receiver<DiagnosticEvent>),
-    pub(crate) connected_at: Mutex<Option<IggyTimestamp>>,
-    leader_redirection_state: Mutex<LeaderRedirectionState>,
-    pub(crate) current_server_address: Mutex<String>,
-    // `std::sync::Mutex` (not `tokio::sync::Mutex`): the critical section
-    // is `encode_request_header`, which is pure CPU and never awaits. The
-    // tokio variant would pay a waker alloc + internal semaphore on
-    // contention with zero correctness benefit.
-    consensus_session: Arc<StdMutex<ConsensusSession>>,
-    skip_auto_login_once: Mutex<bool>,
-    consumer_group_state: Arc<iggy_common::ConsumerGroupClientState>,
+    pub(crate) driver: OperationDriver,
 }
 
 impl Default for TcpClient {
     fn default() -> Self {
-        TcpClient::create(Arc::new(TcpClientConfig::default())).unwrap()
+        Self::create(Arc::new(TcpClientConfig::default())).unwrap()
     }
 }
 
-#[async_trait]
-impl Client for TcpClient {
-    async fn connect(&self) -> Result<(), IggyError> {
-        TcpClient::connect(self).await
-    }
-
-    async fn disconnect(&self) -> Result<(), IggyError> {
-        TcpClient::disconnect(self).await
-    }
-
-    async fn shutdown(&self) -> Result<(), IggyError> {
-        TcpClient::shutdown(self).await
-    }
-
-    async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
-        self.events.1.clone()
-    }
-}
-
-#[async_trait]
-#[async_trait]
-impl BinaryTransport for TcpClient {
-    async fn get_state(&self) -> ClientState {
-        *self.state.lock().await
-    }
-
-    async fn set_state(&self, state: ClientState) {
-        *self.state.lock().await = state;
-    }
-
-    async fn publish_event(&self, event: DiagnosticEvent) {
-        if let Err(error) = self.events.0.broadcast(event).await {
-            error!("Failed to send a TCP diagnostic event: {error}");
-        }
-    }
-
-    async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        let result = self.send_raw(code, payload.clone()).await;
-        if result.is_ok() {
-            return result;
-        }
-
-        let error = result.unwrap_err();
-        if !matches!(
-            error,
-            IggyError::Disconnected
-                | IggyError::EmptyResponse
-                | IggyError::Unauthenticated
-                | IggyError::StaleClient
-                | IggyError::NotConnected
-                | IggyError::CannotEstablishConnection
-                | IggyError::TcpError
-        ) {
-            return Err(error);
-        }
-
-        if !self.config.reconnection.enabled {
-            return Err(IggyError::Disconnected);
-        }
-
-        if matches!(self.config.auto_login, AutoLogin::Disabled) && !is_login_register_code(code) {
-            // Without auto-login a reconnect cannot re-establish the session,
-            // so non-login requests fail fast. Login/register itself is the
-            // exception: the server stays deliberately silent on transient
-            // register failures (the server `surface_login_failure`) and
-            // relies on the client timing out and replaying the request.
-            return Err(error);
-        }
-
-        self.disconnect().await?;
-
-        let skip_auto_login = is_login_register_code(code);
-        if skip_auto_login {
-            *self.skip_auto_login_once.lock().await = true;
-        }
-
-        {
-            let client_address = self.get_client_address_value().await;
-            let server_address = self.current_server_address.lock().await.clone();
-            info!(
-                "Reconnecting to the server: {} by client: {client_address}...",
-                server_address
-            );
-        }
-
-        let reconnect = self.connect().await;
-        if skip_auto_login && reconnect.is_err() {
-            *self.skip_auto_login_once.lock().await = false;
-        }
-        reconnect?;
-        self.send_raw(code, payload).await
-    }
-
-    fn get_heartbeat_interval(&self) -> IggyDuration {
-        self.config.heartbeat_interval
-    }
-
-    fn consumer_group_state(&self) -> Arc<iggy_common::ConsumerGroupClientState> {
-        Arc::clone(&self.consumer_group_state)
-    }
-}
-
-impl iggy_common::VsrSessionSealed for TcpClient {}
-
-#[async_trait::async_trait]
-impl iggy_common::VsrSessionControl for TcpClient {
-    async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError> {
-        if session == 0 {
-            return Err(IggyError::InvalidSession(session));
-        }
-
-        let mut consensus_session = self
-            .consensus_session
-            .lock()
-            .expect("consensus session mutex poisoned");
-        if consensus_session.is_bound() {
-            return Err(IggyError::AlreadyAuthenticated);
-        }
-
-        consensus_session.bind(session);
-        Ok(())
-    }
-
-    async fn reset_vsr_session(&self) -> Result<(), IggyError> {
-        *self
-            .consensus_session
-            .lock()
-            .expect("consensus session mutex poisoned") = ConsensusSession::new();
-        Ok(())
-    }
-
-    fn sdk_version(&self) -> &'static str {
-        crate::SDK_VERSION
-    }
-}
-
-impl BinaryClient for TcpClient {}
+impl_binary_client!(TcpClient);
 
 impl TcpClient {
-    /// Create a new TCP client for the provided server address.
+    /// Creates a TCP client for the endpoint, credentials and heartbeat interval.
     pub fn new(
         server_address: &str,
         auto_sign_in: AutoLogin,
-        heartbeat_interval: IggyDuration,
+        heartbeat_interval: NonZeroIggyDuration,
     ) -> Result<Self, IggyError> {
         Self::create(Arc::new(TcpClientConfig {
             heartbeat_interval,
@@ -246,12 +56,12 @@ impl TcpClient {
         }))
     }
 
-    /// Create a new TCP client for the provided server address using TLS.
+    /// Creates a TLS client that validates the endpoint against the supplied domain.
     pub fn new_tls(
         server_address: &str,
         domain: &str,
         auto_sign_in: AutoLogin,
-        heartbeat_interval: IggyDuration,
+        heartbeat_interval: NonZeroIggyDuration,
     ) -> Result<Self, IggyError> {
         Self::create(Arc::new(TcpClientConfig {
             heartbeat_interval,
@@ -263,7 +73,7 @@ impl TcpClient {
         }))
     }
 
-    /// Create a new TCP client from the provided connection string.
+    /// Creates a TCP client from an Iggy connection string.
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         if ConnectionStringUtils::parse_protocol(connection_string)? != TransportProtocol::Tcp {
             return Err(IggyError::InvalidConnectionString);
@@ -274,600 +84,1331 @@ impl TcpClient {
         ))
     }
 
-    /// Create a new TCP client based on the provided configuration.
+    /// Creates the client without spawning tasks or opening sockets.
     pub fn create(config: Arc<TcpClientConfig>) -> Result<Self, IggyError> {
-        let server_address = config.server_address.clone();
+        let session = Arc::new(SessionOwner::with_pending_operations(
+            config.auto_login.clone(),
+            config.pending_operations,
+        ));
+        let links = ReplicaLinks::new(
+            Dialer::Tcp(Arc::clone(&config)),
+            config.server_address.clone(),
+            ReconnectPolicy::from(&config.reconnection),
+            session,
+        );
         Ok(Self {
             config,
-            client_address: Mutex::new(None),
-            stream: Arc::new(Mutex::new(None)),
-            state: Mutex::new(ClientState::Disconnected),
-            events: broadcast(1000),
-            connected_at: Mutex::new(None),
-            leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
-            current_server_address: Mutex::new(server_address),
-            consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
-            skip_auto_login_once: Mutex::new(false),
-            consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
+            driver: OperationDriver::new(links),
         })
     }
 
-    async fn connect(&self) -> Result<(), IggyError> {
-        loop {
-            match self.get_state().await {
-                ClientState::Shutdown => {
-                    trace!("Cannot connect. Client is shutdown.");
-                    return Err(IggyError::ClientShutdown);
-                }
-                ClientState::Connected
-                | ClientState::Authenticating
-                | ClientState::Authenticated => {
-                    let client_address = self.get_client_address_value().await;
-                    trace!("Client: {client_address} is already connected.");
-                    return Ok(());
-                }
-                ClientState::Connecting => {
-                    trace!("Client is already connecting.");
-                    return Ok(());
-                }
-                _ => {}
-            }
-
-            self.set_state(ClientState::Connecting).await;
-            if let Some(connected_at) = self.connected_at.lock().await.as_ref() {
-                let now = IggyTimestamp::now();
-                let elapsed = now.as_micros() - connected_at.as_micros();
-                let interval = self.config.reconnection.reestablish_after.as_micros();
-                trace!(
-                    "Elapsed time since last connection: {}",
-                    IggyDuration::from(elapsed)
-                );
-                if elapsed < interval {
-                    let remaining = IggyDuration::from(interval - elapsed);
-                    info!("Trying to connect to the server in: {remaining}",);
-                    sleep(remaining.get_duration()).await;
-                }
-            }
-
-            let tls_enabled = self.config.tls_enabled;
-            let mut retry_count = 0;
-            let connection_stream: ConnectionStreamKind;
-            let remote_address;
-            let client_address;
-            loop {
-                let server_address = self.current_server_address.lock().await.clone();
-                info!(
-                    "{NAME} client is connecting to server: {}...",
-                    server_address
-                );
-
-                let connection = TcpStream::connect(&server_address).await;
-                if let Err(err) = &connection {
-                    error!(
-                        "Failed to connect to server: {}. Error: {}",
-                        server_address, err
-                    );
-                    if !self.config.reconnection.enabled {
-                        warn!("Automatic reconnection is disabled.");
-                        return Err(IggyError::CannotEstablishConnection);
-                    }
-
-                    let unlimited_retries = self.config.reconnection.max_retries.is_none();
-                    let max_retries = self.config.reconnection.max_retries.unwrap_or_default();
-                    let max_retries_str =
-                        if let Some(max_retries) = self.config.reconnection.max_retries {
-                            max_retries.to_string()
-                        } else {
-                            "unlimited".to_string()
-                        };
-
-                    let interval_str = self.config.reconnection.interval.as_human_time_string();
-                    if unlimited_retries || retry_count < max_retries {
-                        retry_count += 1;
-                        info!(
-                            "Retrying to connect to server ({retry_count}/{max_retries_str}): {} in: {interval_str}",
-                            server_address,
-                        );
-                        sleep(self.config.reconnection.interval.get_duration()).await;
-                        continue;
-                    }
-
-                    self.set_state(ClientState::Disconnected).await;
-                    self.publish_event(DiagnosticEvent::Disconnected).await;
-                    return Err(IggyError::CannotEstablishConnection);
-                }
-
-                let stream = connection.map_err(|error| {
-                    error!("Failed to establish TCP connection to the server: {error}",);
-                    IggyError::CannotEstablishConnection
-                })?;
-                client_address = stream.local_addr().map_err(|error| {
-                    error!("Failed to get the local address of the client: {error}",);
-                    IggyError::CannotEstablishConnection
-                })?;
-                remote_address = stream.peer_addr().map_err(|error| {
-                    error!("Failed to get the remote address of the server: {error}",);
-                    IggyError::CannotEstablishConnection
-                })?;
-                self.client_address.lock().await.replace(client_address);
-
-                if let Err(e) = stream.set_nodelay(self.config.nodelay) {
-                    error!("Failed to set the nodelay option on the client: {e}, continuing...",);
-                }
-
-                if !tls_enabled {
-                    connection_stream =
-                        ConnectionStreamKind::Tcp(TcpConnectionStream::new(client_address, stream));
-                    break;
-                }
-
-                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-                let config = if self.config.tls_validate_certificate {
-                    let mut root_cert_store = rustls::RootCertStore::empty();
-                    if let Some(certificate_path) = &self.config.tls_ca_file {
-                        for cert in
-                            CertificateDer::pem_file_iter(certificate_path).map_err(|error| {
-                                error!("Failed to read the CA file: {certificate_path}. {error}",);
-                                IggyError::InvalidTlsCertificatePath
-                            })?
-                        {
-                            let certificate = cert.map_err(|error| {
-                            error!(
-                                "Failed to read a certificate from the CA file: {certificate_path}. {error}",
-                            );
-                            IggyError::InvalidTlsCertificate
-                        })?;
-                            root_cert_store.add(certificate).map_err(|error| {
-                            error!(
-                                "Failed to add a certificate to the root certificate store. {error}",
-                            );
-                            IggyError::InvalidTlsCertificate
-                        })?;
-                        }
-                    } else {
-                        root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                    }
-
-                    rustls::ClientConfig::builder()
-                        .with_root_certificates(root_cert_store)
-                        .with_no_client_auth()
-                } else {
-                    use crate::tcp::tcp_tls_verifier::NoServerVerification;
-                    rustls::ClientConfig::builder()
-                        .dangerous()
-                        .with_custom_certificate_verifier(Arc::new(NoServerVerification))
-                        .with_no_client_auth()
-                };
-                let connector = TlsConnector::from(Arc::new(config));
-                let tls_domain = if self.config.tls_domain.is_empty() {
-                    // Extract hostname/IP from server_address when tls_domain is not specified
-                    server_address
-                        .split(':')
-                        .next()
-                        .unwrap_or(&server_address)
-                        .to_string()
-                } else {
-                    self.config.tls_domain.to_owned()
-                };
-                let domain = ServerName::try_from(tls_domain).map_err(|error| {
-                    error!("Failed to create a server name from the domain. {error}",);
-                    IggyError::InvalidTlsDomain
-                })?;
-                let stream = connector.connect(domain, stream).await.map_err(|error| {
-                    error!("Failed to establish a TLS connection to the server: {error}",);
-                    IggyError::CannotEstablishConnection
-                })?;
-                connection_stream = ConnectionStreamKind::TcpTls(TcpTlsConnectionStream::new(
-                    client_address,
-                    TlsStream::Client(stream),
-                ));
-                break;
-            }
-
-            let now = IggyTimestamp::now();
-            info!(
-                "{NAME} client: {client_address} has connected to server: {remote_address} at: {now}",
-            );
-            self.stream.lock().await.replace(connection_stream);
-            self.set_state(ClientState::Connected).await;
-            self.connected_at.lock().await.replace(now);
-            self.publish_event(DiagnosticEvent::Connected).await;
-            let skip_auto_login = {
-                let mut guard = self.skip_auto_login_once.lock().await;
-                std::mem::take(&mut *guard)
-            };
-
-            // Handle auto-login
-            let should_redirect = match &self.config.auto_login {
-                AutoLogin::Disabled => {
-                    info!("Automatic sign-in is disabled.");
-                    // Leadership still matters without auto-login: the caller
-                    // signs in manually, and a login against a non-leader
-                    // replays for its whole read timeout. `GetClusterMetadata`
-                    // is sessionless and pre-auth, so the check works on the
-                    // unauthenticated connection.
-                    self.handle_leader_redirection().await?
-                }
-                AutoLogin::Enabled(credentials) => {
-                    if skip_auto_login {
-                        info!("Skipping automatic sign-in for a retried login/register request.");
-                        false
-                    } else if self.handle_leader_redirection().await? {
-                        // Check leadership BEFORE signing in: register/login are
-                        // consensus ops a backup answers with
-                        // `TransientNotCommitted`, so signing in against a
-                        // non-leader replays for the whole read timeout instead
-                        // of failing over. `GetClusterMetadata` is sessionless
-                        // and pre-auth, so it works on the unauthenticated
-                        // connection.
-                        true
-                    } else {
-                        info!("{NAME} client: {client_address} is signing in...");
-                        self.set_state(ClientState::Authenticating).await;
-                        match credentials {
-                            Credentials::UsernamePassword(username, password) => {
-                                self.login_user(username, password.expose_secret()).await?;
-                                info!(
-                                    "{NAME} client: {client_address} has signed in with the user credentials, username: {username}",
-                                );
-                            }
-                            Credentials::PersonalAccessToken(token) => {
-                                self.login_with_personal_access_token(token.expose_secret())
-                                    .await?;
-                                info!(
-                                    "{NAME} client: {client_address} has signed in with a personal access token.",
-                                );
-                            }
-                        }
-
-                        self.handle_leader_redirection().await?
-                    }
-                }
-            };
-
-            if should_redirect {
-                continue;
-            }
-
-            return Ok(());
-        }
-    }
-
-    /// Checks cluster metadata and handles leader redirection if needed.
-    /// Returns true if redirection occurred and reconnection is needed.
-    pub(crate) async fn handle_leader_redirection(&self) -> Result<bool, IggyError> {
-        let current_address = self.current_server_address.lock().await.clone();
-        let leader_address = check_and_redirect_to_leader(
-            self,
-            &current_address,
-            iggy_common::TransportProtocol::Tcp,
-        )
-        .await?;
-
-        if let Some(new_leader_address) = leader_address {
-            let mut redirection_state = self.leader_redirection_state.lock().await;
-            if !redirection_state.can_redirect() {
-                warn!("Maximum leader redirections reached, continuing with current connection");
-                return Ok(false);
-            }
-
-            info!(
-                "Current node is not leader, redirecting to leader at: {}",
-                new_leader_address
-            );
-            redirection_state.increment_redirect(new_leader_address.clone());
-            drop(redirection_state);
-
-            // Clear connected_at to avoid reestablish_after delay during redirection
-            self.connected_at.lock().await.take();
-            self.disconnect().await?;
-
-            *self.current_server_address.lock().await = new_leader_address;
-            Ok(true)
-        } else {
-            self.leader_redirection_state.lock().await.reset();
-            Ok(false)
-        }
-    }
-
-    async fn disconnect(&self) -> Result<(), IggyError> {
-        if self.get_state().await == ClientState::Disconnected {
-            return Ok(());
-        }
-
-        let client_address = self.get_client_address_value().await;
-        info!("{NAME} client: {client_address} is disconnecting from server...");
-        self.set_state(ClientState::Disconnected).await;
-        self.stream.lock().await.take();
-        self.reset_vsr_session().await?;
-        self.publish_event(DiagnosticEvent::Disconnected).await;
-        let now = IggyTimestamp::now();
-        info!("{NAME} client: {client_address} has disconnected from server at: {now}.");
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> Result<(), IggyError> {
-        if self.get_state().await == ClientState::Shutdown {
-            return Ok(());
-        }
-
-        let client_address = self.get_client_address_value().await;
-        info!("Shutting down the {NAME} TCP client: {client_address}");
-        let stream = self.stream.lock().await.take();
-        if let Some(mut stream) = stream {
-            stream.shutdown().await?;
-        }
-        self.reset_vsr_session().await?;
-        self.set_state(ClientState::Shutdown).await;
-        self.publish_event(DiagnosticEvent::Shutdown).await;
-        info!("{NAME} TCP client: {client_address} has been shutdown.");
-        Ok(())
-    }
-
-    async fn send_raw(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        match self.get_state().await {
-            ClientState::Shutdown => {
-                trace!("Cannot send data. Client is shutdown.");
-                return Err(IggyError::ClientShutdown);
-            }
-            ClientState::Disconnected => {
-                trace!("Cannot send data. Client is not connected.");
-                return Err(IggyError::NotConnected);
-            }
-            ClientState::Connecting => {
-                trace!("Cannot send data. Client is still connecting.");
-                return Err(IggyError::NotConnected);
-            }
-            _ => {}
-        }
-
-        // One overall deadline bounds the request across transient replays
-        // AND leader failovers, matching the previous single-connection
-        // budget. Login/register replays stay on this connection for the
-        // whole budget: the connect flow owns leader redirection for the
-        // sign-in handshake, and reconnecting from underneath it would
-        // recurse.
-        let overall_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
-        let mut preencoded = None;
-        loop {
-            let transient_deadline = if is_login_register_code(code) {
-                overall_deadline
-            } else {
-                overall_deadline
-                    .min(tokio::time::Instant::now() + TRANSIENT_FAILOVER_CHECK_INTERVAL)
-            };
-            let (header, result) = self
-                .send_raw_vsr_attempt(
-                    code,
-                    payload.clone(),
-                    preencoded,
-                    transient_deadline,
-                    overall_deadline,
-                )
-                .await;
-            match result {
-                Err(IggyError::TransientNotAccepted)
-                    if tokio::time::Instant::now() < overall_deadline
-                        && !is_login_register_code(code) =>
-                {
-                    // The server explicitly did NOT admit the request, so
-                    // re-issuing it -- same id on this session, or a fresh
-                    // id under a new session after a failover -- cannot
-                    // double-apply. Keep the encoded id for same-session
-                    // replays; a redirect re-registers, so the id is
-                    // re-encoded under the new session.
-                    // (`TransientNotCommitted` never reaches this branch:
-                    // its outcome is unknown, so the attempt loop replays
-                    // it same-session for the whole budget and then the
-                    // error propagates to the caller.)
-                    preencoded = header;
-                    if let Ok(true) = self.handle_leader_redirection().await {
-                        self.connect().await?;
-                        preencoded = None;
-                    }
-                }
-                Err(IggyError::Disconnected) => {
-                    // Reply stream state is unknown (timed out or torn
-                    // mid-frame); a late reply would desync framing for the
-                    // next request, so drop the connection and let callers
-                    // reconnect.
-                    self.stream.lock().await.take();
-                    self.set_state(ClientState::Disconnected).await;
-                    return Err(IggyError::Disconnected);
-                }
-                other => return other,
-            }
-        }
-    }
-
-    /// One send attempt on the current connection: encode the header (or reuse
-    /// `preencoded` so a same-session replay keeps its request id for the
-    /// server's dedup), write the frame, and replay on `TransientNotCommitted`
-    /// until `transient_deadline`. Reads are bounded by `read_deadline` -- the
-    /// full request budget -- so a short transient window cannot tear down a
-    /// connection that is merely slow to reply. Returns the header used so the
-    /// caller can replay the same id on a later attempt.
-    async fn send_raw_vsr_attempt(
-        &self,
-        code: u32,
-        payload: Bytes,
-        preencoded: Option<iggy_binary_protocol::consensus::RequestHeader>,
-        transient_deadline: tokio::time::Instant,
-        read_deadline: tokio::time::Instant,
-    ) -> (
-        Option<iggy_binary_protocol::consensus::RequestHeader>,
-        Result<Bytes, IggyError>,
-    ) {
-        let stream = self.stream.clone();
-        let consensus_session = self.consensus_session.clone();
-        // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
-        let joined = tokio::spawn(async move {
-            let mut stream = stream.lock().await;
-            let Some(stream) = stream.as_mut() else {
-                error!("Cannot send data. Client is not connected.");
-                return (None, Err(IggyError::NotConnected));
-            };
-            // Encode the request header ONCE per session: `next_request_id`
-            // advances here, so a transient replay must reuse the same id for
-            // the server's dedup. The connection is lockstep (one request in
-            // flight per client), so a complete reply leaves the stream at a
-            // clean frame boundary -- a `TransientNotCommitted` answer (the
-            // server could not commit yet: not-caught-up / in-flight /
-            // pipeline-full / view-change cancel) lets us resend the SAME
-            // request on the SAME connection with no reconnect and the session
-            // intact.
-            let request_header = match preencoded {
-                Some(header) => header,
-                None => {
-                    let encoded = {
-                        let mut consensus_session = consensus_session
-                            .lock()
-                            .expect("consensus session mutex poisoned");
-                        crate::vsr::encode_request_header(&mut consensus_session, code, &payload)
-                    };
-                    match encoded {
-                        Ok((header, request_size)) => {
-                            trace!(
-                                "Sending a TCP VSR request of size {request_size} with code: {code}"
-                            );
-                            header
-                        }
-                        Err(error) => return (None, Err(error)),
-                    }
-                }
-            };
-            let header_bytes = bytemuck::bytes_of(&request_header);
-            let outcome = async {
-                loop {
-                    stream.write(header_bytes).await?;
-                    if !payload.is_empty() {
-                        stream.write(&payload).await?;
-                    }
-                    stream.flush().await?;
-                    trace!("Sent a TCP request with code: {code}, waiting for a response...");
-
-                    let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
-                    // `stream.read` delegates to `read_exact`; on success it
-                    // always returns the requested length, so no short-read
-                    // guard is needed here.
-                    //
-                    // Deadline guards against server-side reply loss (e.g. a
-                    // stalled replication quorum that never commits the op):
-                    // the connection is lockstep, so an unanswered read would
-                    // hold the stream lock forever and wedge every later
-                    // request on this client. On expiry drop the stream --
-                    // a late reply would desync framing for the next request.
-                    //
-                    // One deadline spans BOTH the header and body reads: a
-                    // reply that delivers a header then stalls must not get a
-                    // fresh full timeout for the body.
-                    let header_read =
-                        tokio::time::timeout_at(read_deadline, stream.read(&mut response_header))
-                            .await;
-                    let Ok(header_read) = header_read else {
-                        error!(
-                            "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for VSR response header for TCP request with code: {code}",
-                        );
-                        return Err(IggyError::Disconnected);
-                    };
-                    header_read.map_err(|error| {
-                        error!(
-                            "Failed to read VSR response header for TCP request with code: {code}: {error}",
-                        );
-                        IggyError::Disconnected
-                    })?;
-
-                    let response_size = crate::vsr::response_size(&response_header)?;
-                    let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
-                    let body = if body_size > 0 {
-                        let mut body = BytesMut::with_capacity(body_size);
-                        let body_read = tokio::time::timeout_at(
-                            read_deadline,
-                            stream.read_buf(&mut body, body_size),
-                        )
-                        .await;
-                        let Ok(body_read) = body_read else {
-                            error!(
-                                "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for VSR response body for TCP request with code: {code}",
-                            );
-                            return Err(IggyError::Disconnected);
-                        };
-                        body_read.map_err(|error| {
-                            error!(
-                                "Failed to read VSR response body for TCP request with code: {code}: {error}",
-                            );
-                            IggyError::Disconnected
-                        })?;
-                        body.freeze()
-                    } else {
-                        Bytes::new()
-                    };
-
-                    match crate::vsr::decode_response_split(&response_header, body) {
-                        // `TransientNotCommitted`: the op's outcome is unknown
-                        // (e.g. a view change canceled it in flight) -- ONLY a
-                        // same-session replay of the same request id is safe
-                        // (the client-table serves it from cache if it did
-                        // commit). Replay on this connection for the whole
-                        // request budget; never hand it to the failover path,
-                        // which re-issues under a fresh session and could
-                        // double-apply a committed write.
-                        Err(IggyError::TransientNotCommitted)
-                            if tokio::time::Instant::now() < read_deadline =>
-                        {
-                            let remaining = read_deadline
-                                .saturating_duration_since(tokio::time::Instant::now());
-                            tokio::time::sleep(NOT_READY_RETRY_INTERVAL.min(remaining)).await;
-                        }
-                        // `TransientNotAccepted`: the server never admitted the
-                        // request, so it is re-issuable anywhere. Replay here
-                        // briefly, then hand it back to the caller for a
-                        // leader recheck / failover.
-                        Err(IggyError::TransientNotAccepted)
-                            if tokio::time::Instant::now() < transient_deadline =>
-                        {
-                            let remaining = transient_deadline
-                                .saturating_duration_since(tokio::time::Instant::now());
-                            tokio::time::sleep(NOT_READY_RETRY_INTERVAL.min(remaining)).await;
-                        }
-                        other => return other,
-                    }
-                }
-            }
-            .await;
-            (Some(request_header), outcome)
-        })
-        .await;
-        match joined {
-            Ok(result) => result,
-            Err(e) => {
-                error!("Task execution failed during TCP request: {}", e);
-                (None, Err(IggyError::TcpError))
-            }
-        }
-    }
-
-    async fn get_client_address_value(&self) -> String {
-        let client_address = self.client_address.lock().await;
-        if let Some(client_address) = &*client_address {
-            client_address.to_string()
-        } else {
-            "unknown".to_string()
+    #[cfg(test)]
+    pub(crate) fn from_links(links: ReplicaLinks) -> Self {
+        Self {
+            config: Arc::new(TcpClientConfig::default()),
+            driver: OperationDriver::new(links),
         }
     }
 }
 
-const fn is_login_register_code(code: u32) -> bool {
-    matches!(code, LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE)
-}
-
-/// Unit tests for TcpClient.
-/// Currently only tests for "from_connection_string()" are implemented.
-/// TODO: Add complete unit tests for TcpClient.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::links::OPERATION_TIMEOUT;
+    use crate::links::fake_cluster::{
+        Answer, FakeCluster, TEST_BUDGET, endpoint, eventually, links, policy, topic_body,
+    };
+    use bytes::Bytes;
+    use iggy_binary_protocol::codes::{
+        BIND_SESSION_CODE, CHANGE_PASSWORD_CODE, GET_CLUSTER_METADATA_CODE, GET_STREAMS_CODE,
+        GET_TOPIC_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGOUT_USER_CODE,
+        PING_CODE, POLL_MESSAGES_DEFERRED_CODE, SEND_MESSAGES_CODE, UPDATE_RESOURCE_CODE,
+    };
+    use iggy_binary_protocol::consensus::EvictionReason;
+    use iggy_binary_protocol::requests::users::{
+        ChangePasswordRequest, LoginRegisterRequest, LoginRegisterWithPatRequest,
+    };
+    use iggy_binary_protocol::responses::messages::{
+        PartitionRouteResponse, PollMessagesResponseHeader,
+    };
+    use iggy_binary_protocol::{WireDecode, WireEncode, WireIdentifier};
+    use iggy_common::{
+        BinaryTransport, Client, ClientState, CommitPolicy, Consumer, Credentials, Identifier,
+        IggyDuration, IggyMessage, MessageClient, Partitioning, PersonalAccessTokenClient,
+        PollOptions, PollingStrategy, SystemClient, TcpClientReconnectionConfig, TopicClient,
+        TopicUpdateOptions, UserClient, UserUpdateOptions, with_binary_deadline,
+    };
+    use secrecy::{ExposeSecret, SecretString};
+    use std::time::Duration;
+    use tokio::time::{Instant, sleep, timeout};
+
+    const USERNAME: &str = "iggy";
+    const PASSWORD: &str = "iggy";
+    const WRONG_PASSWORD: &str = "wrong";
+    const NEW_USERNAME: &str = "renamed";
+    const NEW_PASSWORD: &str = "rotated";
+    const COMMIT: u64 = 20;
+    const SIGN_IN_DEADLINE: Duration = Duration::from_secs(1);
+
+    fn manual_client(cluster: &Arc<FakeCluster>) -> TcpClient {
+        let session = Arc::new(SessionOwner::new(AutoLogin::Disabled));
+        TcpClient::from_links(ReplicaLinks::new(
+            cluster.dialer(),
+            endpoint(0),
+            policy(),
+            session,
+        ))
+    }
+
+    async fn signed_in_client(cluster: &Arc<FakeCluster>) -> TcpClient {
+        let client = manual_client(cluster);
+        client.login_user(USERNAME, PASSWORD).await.unwrap();
+        client
+    }
+
+    /// Ends the next call of `code` with an unknown outcome, and answers its
+    /// replay with `replay`.
+    fn end_uncertain(cluster: &FakeCluster, code: u32, replay: Answer) {
+        cluster.script(
+            &endpoint(0),
+            code,
+            [
+                Answer::Refuse(IggyError::TransientNotCommitted),
+                Answer::Refuse(IggyError::RequestTooOld),
+                replay,
+            ],
+        );
+    }
+
+    /// The outcome of `call`, after a resolve proved it if the call ended
+    /// uncertain.
+    async fn proved(client: &TcpClient, call: Result<(), IggyError>) -> Result<(), IggyError> {
+        match call {
+            Err(IggyError::OperationUncertain(op)) => {
+                client
+                    .resolve_operation(op, (Instant::now() + OPERATION_TIMEOUT).into_std())
+                    .await
+            }
+            outcome => outcome,
+        }
+    }
+
+    /// Ends the session on the server, so the client signs in again, and
+    /// returns that sign-in.
+    async fn sign_in_again(cluster: &FakeCluster) -> LoginRegisterRequest {
+        let sign_ins = cluster.count(LOGIN_REGISTER_CODE);
+        *cluster.session.lock().unwrap() = None;
+        cluster.drop_connections(&endpoint(0));
+        eventually("the client signs in again", || {
+            cluster.count(LOGIN_REGISTER_CODE) > sign_ins
+        })
+        .await;
+        let sign_ins = cluster.received(LOGIN_REGISTER_CODE);
+        LoginRegisterRequest::decode_from(&sign_ins.last().unwrap().body).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_held_automatic_register_when_explicit_policy_supersedes_should_use_caller_credentials()
+     {
+        let cluster = FakeCluster::new(1);
+        cluster
+            .held_registers
+            .lock()
+            .unwrap()
+            .insert(USERNAME.to_owned());
+        let client = TcpClient::from_links(links(&cluster, &endpoint(0), policy()));
+        let (automatic, explicit) = tokio::join!(timeout(TEST_BUDGET, client.connect()), async {
+            eventually("automatic Register is held", || {
+                cluster.count(LOGIN_REGISTER_CODE) == 1
+            })
+            .await;
+            timeout(TEST_BUDGET, client.login_user("other", "password")).await
+        });
+        assert_eq!(
+            automatic.expect("the automatic sweep must yield to the explicit attempt"),
+            Err(IggyError::Unauthenticated)
+        );
+        assert!(
+            explicit
+                .expect("explicit login must supersede the held automatic attempt")
+                .is_ok()
+        );
+        let registers = cluster.received(LOGIN_REGISTER_CODE);
+        assert_eq!(registers.len(), 2);
+        assert_eq!(
+            LoginRegisterRequest::decode_from(&registers[1].body)
+                .unwrap()
+                .username
+                .as_str(),
+            "other"
+        );
+        assert!(
+            matches!(client.driver.session().sign_in_credentials(), Some(Credentials::UsernamePassword(username, _)) if username == "other")
+        );
+    }
+
+    async fn given_a_failed_explicit_policy_attempt_when_connecting_should_require_another_explicit_sign_in(
+        token: bool,
+        silent: bool,
+    ) {
+        let cluster = FakeCluster::new(1);
+        let code = LOGIN_REGISTER_CODE;
+        let refusal = if token {
+            IggyError::InvalidPersonalAccessToken
+        } else {
+            IggyError::InvalidCredentials
+        };
+        cluster.script(
+            &endpoint(0),
+            code,
+            [if silent {
+                Answer::Silence
+            } else {
+                Answer::Refuse(refusal.clone())
+            }],
+        );
+        let client = TcpClient::from_links(links(&cluster, &endpoint(0), policy()));
+        let result = with_binary_deadline(Instant::now() + TEST_BUDGET, async {
+            if token {
+                client
+                    .login_with_personal_access_token("refused-token")
+                    .await
+            } else {
+                client.login_user("other", "password").await
+            }
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "token={token}, silent={silent}: {result:?}"
+        );
+        assert!(
+            client.driver.session().sign_in_credentials().is_none(),
+            "failed explicit attempt restored configured credentials"
+        );
+        assert!(!client.driver.session().epoch().bound);
+        let registers =
+            cluster.count(LOGIN_REGISTER_CODE) + cluster.count(LOGIN_REGISTER_WITH_PAT_CODE);
+        client.disconnect().await.unwrap();
+        client.connect().await.unwrap();
+        assert_eq!(
+            cluster.count(LOGIN_REGISTER_CODE) + cluster.count(LOGIN_REGISTER_WITH_PAT_CODE),
+            registers
+        );
+        assert_eq!(
+            client
+                .send_raw_with_response(GET_STREAMS_CODE, Bytes::new())
+                .await,
+            Err(IggyError::Unauthenticated)
+        );
+        assert_eq!(cluster.count(GET_STREAMS_CODE), 0);
+        assert!(client.login_user("recovered", "password").await.is_ok());
+        assert!(client.driver.session().epoch().bound);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_failed_explicit_policy_attempt_when_connecting_should_require_another_explicit_sign_in_password_refused()
+     {
+        given_a_failed_explicit_policy_attempt_when_connecting_should_require_another_explicit_sign_in(false, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_failed_explicit_policy_attempt_when_connecting_should_require_another_explicit_sign_in_password_timeout()
+     {
+        given_a_failed_explicit_policy_attempt_when_connecting_should_require_another_explicit_sign_in(false, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_failed_explicit_policy_attempt_when_connecting_should_require_another_explicit_sign_in_token_refused()
+     {
+        given_a_failed_explicit_policy_attempt_when_connecting_should_require_another_explicit_sign_in(true, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_failed_explicit_policy_attempt_when_connecting_should_require_another_explicit_sign_in_token_timeout()
+     {
+        given_a_failed_explicit_policy_attempt_when_connecting_should_require_another_explicit_sign_in(true, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_register_success_when_external_deadline_cancels_explicit_policy_should_discard_the_session()
+     {
+        let cluster = FakeCluster::new(1);
+        cluster.hold(GET_CLUSTER_METADATA_CODE);
+        let client = TcpClient::from_links(links(&cluster, &endpoint(0), policy()));
+        let result = timeout(SIGN_IN_DEADLINE, client.login_user("other", "password")).await;
+        assert!(
+            result.is_err(),
+            "the external deadline must cancel the pending public login"
+        );
+        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+        assert!(!client.driver.session().epoch().bound);
+        assert!(client.driver.session().sign_in_credentials().is_none());
+        cluster.release(GET_CLUSTER_METADATA_CODE);
+        client.connect().await.unwrap();
+        assert_eq!(cluster.count(BIND_SESSION_CODE), 0);
+        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+        assert_eq!(client.get_state().await, ClientState::Connected);
+        assert!(client.login_user("recovered", "password").await.is_ok());
+    }
+
+    async fn given_register_success_when_explicit_policy_is_cancelled_should_discard_only_its_session(
+        superseded: bool,
+    ) {
+        let cluster = FakeCluster::new(1);
+        cluster.hold(GET_CLUSTER_METADATA_CODE);
+        let client = TcpClient::from_links(links(&cluster, &endpoint(0), policy()));
+        let mut first = Box::pin(client.login_user("first", "password"));
+        tokio::select! {
+            result = &mut first => panic!("login completed before held roster: {result:?}"),
+            () = eventually("Register bound before roster", || cluster.count(GET_CLUSTER_METADATA_CODE) == 1) => {},
+        }
+        assert!(client.driver.session().epoch().bound);
+        cluster.release(GET_CLUSTER_METADATA_CODE);
+        if superseded {
+            client.login_user("second", "password").await.unwrap();
+        }
+        drop(first);
+        assert_eq!(client.driver.session().epoch().bound, superseded);
+        if superseded {
+            assert_eq!(client.get_state().await, ClientState::Authenticated);
+            assert!(
+                matches!(client.driver.session().sign_in_credentials(), Some(Credentials::UsernamePassword(username, _)) if username == "second")
+            );
+        } else {
+            assert!(client.driver.session().sign_in_credentials().is_none());
+            client.connect().await.unwrap();
+            assert_eq!(cluster.count(BIND_SESSION_CODE), 0);
+            assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_register_success_when_explicit_policy_is_cancelled_should_discard_only_its_session_own()
+     {
+        given_register_success_when_explicit_policy_is_cancelled_should_discard_only_its_session(
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_register_success_when_explicit_policy_is_cancelled_should_discard_only_its_session_superseded()
+     {
+        given_register_success_when_explicit_policy_is_cancelled_should_discard_only_its_session(
+            true,
+        )
+        .await;
+    }
+
+    async fn automatic_register_after_password_update(refused: bool) {
+        let cluster = FakeCluster::new(2);
+        let client = TcpClient::from_links(links(&cluster, &endpoint(0), policy()));
+        client.connect().await.unwrap();
+        eventually("both replicas are connected", || {
+            client.driver.links().ready_replicas().len() == 2
+        })
+        .await;
+        cluster.hold(CHANGE_PASSWORD_CODE);
+        cluster.hold(LOGIN_REGISTER_CODE);
+        if refused {
+            cluster.script(
+                &endpoint(1),
+                LOGIN_REGISTER_CODE,
+                [Answer::Refuse(IggyError::InvalidCredentials)],
+            );
+        }
+        let user = Identifier::named(USERNAME).unwrap();
+        let (changed, ()) = tokio::join!(
+            client.change_password(&user, PASSWORD, NEW_PASSWORD),
+            async {
+                eventually("password change reached the server", || {
+                    cluster.count(CHANGE_PASSWORD_CODE) == 1
+                })
+                .await;
+                *cluster.session.lock().unwrap() = None;
+                cluster.drop_connections(&endpoint(1));
+                eventually("recovery Register used the old password", || {
+                    cluster.count(LOGIN_REGISTER_CODE) == 2
+                })
+                .await;
+                cluster.release(CHANGE_PASSWORD_CODE);
+            }
+        );
+        changed.unwrap();
+        let lineage = client.driver.session().epoch().lineage;
+        cluster.release(LOGIN_REGISTER_CODE);
+        eventually("updated credentials recover the same owner", || {
+            client.driver.session().epoch().bound
+        })
+        .await;
+        assert_eq!(client.driver.session().epoch().lineage, lineage);
+        let registers = cluster.received(LOGIN_REGISTER_CODE);
+        assert_eq!(registers.len(), if refused { 3 } else { 2 });
+        let old = LoginRegisterRequest::decode_from(&registers[1].body).unwrap();
+        assert_eq!(old.password.expose_secret(), PASSWORD);
+        if refused {
+            let retried = LoginRegisterRequest::decode_from(&registers[2].body).unwrap();
+            assert_eq!(retried.password.expose_secret(), NEW_PASSWORD);
+            assert_eq!(old.username, retried.username);
+            assert_eq!(registers[1].header.client, registers[2].header.client);
+        } else {
+            *cluster.session.lock().unwrap() = None;
+            cluster.drop_connections(&endpoint(1));
+            eventually("the next recovery registers", || {
+                cluster.count(LOGIN_REGISTER_CODE) == 3 && client.driver.session().epoch().bound
+            })
+            .await;
+            let registers = cluster.received(LOGIN_REGISTER_CODE);
+            let next = LoginRegisterRequest::decode_from(&registers[2].body).unwrap();
+            assert_eq!(next.password.expose_secret(), NEW_PASSWORD);
+            assert_eq!(next.username, old.username);
+            assert_eq!(client.driver.session().epoch().lineage, lineage);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_committed_password_update_when_automatic_old_credentials_are_refused_should_retry_the_same_owner()
+     {
+        automatic_register_after_password_update(true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_committed_password_update_when_automatic_old_credentials_succeed_should_preserve_the_new_password()
+     {
+        automatic_register_after_password_update(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_late_public_logout_when_another_sign_in_succeeds_should_keep_its_session() {
+        let cluster = FakeCluster::new(1);
+        let client = TcpClient::from_links(links(&cluster, &endpoint(0), policy()));
+        client.connect().await.unwrap();
+        cluster.hold(LOGOUT_USER_CODE);
+        let (logged_out, ()) = tokio::join!(client.logout_user(), async {
+            eventually("the first Logout reaches the server", || {
+                cluster.count(LOGOUT_USER_CODE) == 1
+            })
+            .await;
+            let (signed_in, ()) =
+                tokio::join!(client.login_user(NEW_USERNAME, NEW_PASSWORD), async {
+                    eventually("the preparatory Logout reaches the server", || {
+                        cluster.count(LOGOUT_USER_CODE) == 2
+                    })
+                    .await;
+                    cluster.release_latest(LOGOUT_USER_CODE);
+                });
+            signed_in.unwrap();
+            cluster.release(LOGOUT_USER_CODE);
+        });
+        assert_eq!(logged_out, Ok(()));
+        assert!(client.driver.session().epoch().bound);
+        assert_eq!(client.get_state().await, ClientState::Authenticated);
+        let Credentials::UsernamePassword(username, password) =
+            client.driver.session().sign_in_credentials().unwrap()
+        else {
+            panic!("expected the caller's password credentials");
+        };
+        assert_eq!(username, NEW_USERNAME);
+        assert_eq!(password.expose_secret(), NEW_PASSWORD);
+        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_roster_deadline_when_explicit_policy_finishes_should_preserve_best_effort_success()
+     {
+        let cluster = FakeCluster::new(1);
+        cluster.hold(GET_CLUSTER_METADATA_CODE);
+        let client = manual_client(&cluster);
+        with_binary_deadline(
+            Instant::now() + SIGN_IN_DEADLINE,
+            client.login_user("other", "password"),
+        )
+        .await
+        .unwrap();
+        assert!(client.driver.session().epoch().bound);
+        assert_eq!(client.get_state().await, ClientState::Authenticated);
+        assert!(
+            matches!(client.driver.session().sign_in_credentials(), Some(Credentials::UsernamePassword(username, _)) if username == "other")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_roster_error_when_explicit_policy_finishes_should_preserve_best_effort_success()
+     {
+        let cluster = FakeCluster::new(1);
+        cluster.script(
+            &endpoint(0),
+            GET_CLUSTER_METADATA_CODE,
+            [Answer::Refuse(IggyError::Unauthorized)],
+        );
+        let client = manual_client(&cluster);
+        client.login_user("other", "password").await.unwrap();
+        assert!(client.driver.session().epoch().bound);
+        assert_eq!(client.get_state().await, ClientState::Authenticated);
+        assert!(
+            matches!(client.driver.session().sign_in_credentials(), Some(Credentials::UsernamePassword(username, _)) if username == "other")
+        );
+    }
+
+    async fn given_logout_or_refusal_when_explicit_policy_has_no_sign_in_owed_should_fail_raw_calls_at_once(
+        refused: bool,
+    ) {
+        let cluster = FakeCluster::new(1);
+        let client = TcpClient::from_links(links(&cluster, &endpoint(0), policy()));
+        if refused {
+            *cluster.reject_credentials.lock().unwrap() = true;
+            assert_eq!(client.connect().await, Err(IggyError::InvalidCredentials));
+        } else {
+            client.connect().await.unwrap();
+            client.logout_user().await.unwrap();
+        }
+        let started = Instant::now();
+        assert_eq!(
+            client
+                .send_raw_with_response(GET_STREAMS_CODE, Bytes::new())
+                .await,
+            Err(IggyError::Unauthenticated)
+        );
+        assert_eq!(Instant::now(), started);
+        assert_eq!(cluster.count(GET_STREAMS_CODE), 0);
+        *cluster.reject_credentials.lock().unwrap() = false;
+        client.disconnect().await.unwrap();
+        client.connect().await.unwrap();
+        assert_eq!(
+            cluster.count(LOGIN_REGISTER_CODE),
+            if refused { 1 } else { 2 }
+        );
+        assert_eq!(client.driver.session().epoch().bound, !refused);
+        if refused {
+            assert_eq!(client.get_state().await, ClientState::Connected);
+            client.login_user(NEW_USERNAME, NEW_PASSWORD).await.unwrap();
+            assert!(client.driver.session().epoch().bound);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_logout_or_refusal_when_explicit_policy_has_no_sign_in_owed_should_fail_raw_calls_at_once_logout()
+     {
+        given_logout_or_refusal_when_explicit_policy_has_no_sign_in_owed_should_fail_raw_calls_at_once(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_logout_or_refusal_when_explicit_policy_has_no_sign_in_owed_should_fail_raw_calls_at_once_refusal()
+     {
+        given_logout_or_refusal_when_explicit_policy_has_no_sign_in_owed_should_fail_raw_calls_at_once(true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_sent_progress_poll_when_signing_in_should_keep_its_lineage_uncertain() {
+        for (commit, strategy) in [
+            (CommitPolicy::OnRead, PollingStrategy::offset(0)),
+            (CommitPolicy::Manual, PollingStrategy::next()),
+        ] {
+            for answer in [
+                Answer::Body(
+                    PollMessagesResponseHeader {
+                        partition_id: 0,
+                        current_offset: 0,
+                        messages_count: 0,
+                        context: Default::default(),
+                    }
+                    .to_bytes()
+                    .to_vec(),
+                ),
+                Answer::Refuse(IggyError::TransientNotCommitted),
+            ] {
+                let cluster = FakeCluster::new(1);
+                let client = Arc::new(signed_in_client(&cluster).await);
+                *cluster.route.lock().unwrap() = Some(PartitionRouteResponse {
+                    incarnation: 7,
+                    metadata_op: 11,
+                    view: 0,
+                    partitions_count: 1,
+                    primary_replica: 0,
+                });
+                cluster.script(&endpoint(0), POLL_MESSAGES_DEFERRED_CODE, [answer]);
+                cluster.hold(POLL_MESSAGES_DEFERRED_CODE);
+                let pending = tokio::spawn({
+                    let client = Arc::clone(&client);
+                    async move {
+                        let id = Identifier::numeric(1).unwrap();
+                        let options = PollOptions {
+                            count: 1,
+                            commit,
+                            ..PollOptions::default()
+                        };
+                        client
+                            .poll_messages(
+                                &id,
+                                &id,
+                                0,
+                                &Consumer::new(id.clone()),
+                                &strategy,
+                                options,
+                            )
+                            .await
+                    }
+                });
+                eventually("the progress poll arrives", || {
+                    cluster.count(POLL_MESSAGES_DEFERRED_CODE) == 1
+                })
+                .await;
+                client.login_user(USERNAME, PASSWORD).await.unwrap();
+                cluster.release(POLL_MESSAGES_DEFERRED_CODE);
+
+                let error = pending.await.unwrap().unwrap_err();
+                if commit == CommitPolicy::OnRead {
+                    let operation = cluster.received(POLL_MESSAGES_DEFERRED_CODE)[0]
+                        .header
+                        .request;
+                    assert_eq!(error, IggyError::FetchProgressUncertain(operation));
+                } else {
+                    assert_eq!(error, IggyError::TransientNotCommitted);
+                }
+                assert_eq!(cluster.count(POLL_MESSAGES_DEFERRED_CODE), 1);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_partition_lookup_when_signing_in_should_end_the_send_lineage() {
+        for partitioning in [
+            Partitioning::balanced(),
+            Partitioning::messages_key_str("key").unwrap(),
+        ] {
+            let cluster = FakeCluster::new(1);
+            let client = Arc::new(signed_in_client(&cluster).await);
+            *cluster.route.lock().unwrap() = Some(PartitionRouteResponse {
+                incarnation: 7,
+                metadata_op: 11,
+                view: 0,
+                partitions_count: 1,
+                primary_replica: 0,
+            });
+            cluster.script(&endpoint(0), GET_TOPIC_CODE, [Answer::Body(topic_body(1))]);
+            cluster.hold(GET_TOPIC_CODE);
+            let pending = tokio::spawn({
+                let client = Arc::clone(&client);
+                async move {
+                    let id = Identifier::numeric(1).unwrap();
+                    let mut messages = vec![
+                        IggyMessage::builder()
+                            .payload("old".into())
+                            .build()
+                            .unwrap(),
+                    ];
+                    client
+                        .send_messages(&id, &id, &partitioning, &mut messages)
+                        .await
+                }
+            });
+            eventually("the partition lookup arrives", || {
+                cluster.count(GET_TOPIC_CODE) == 1
+            })
+            .await;
+            client.login_user(USERNAME, PASSWORD).await.unwrap();
+            cluster.release(GET_TOPIC_CODE);
+
+            assert_eq!(
+                pending.await.unwrap().unwrap_err(),
+                IggyError::Unauthenticated
+            );
+            assert_eq!(cluster.count(SEND_MESSAGES_CODE), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_no_connection_when_explicitly_signing_in_should_bootstrap_before_register() {
+        for token in [false, true] {
+            let cluster = FakeCluster::new(1);
+            let client = manual_client(&cluster);
+            let identity = if token {
+                client.login_with_personal_access_token("test-token").await
+            } else {
+                client.login_user("iggy", "iggy").await
+            };
+            assert!(identity.is_ok(), "token={token}: {identity:?}");
+            assert_eq!(client.get_state().await, ClientState::Authenticated);
+            assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+            client.disconnect().await.unwrap();
+            assert_eq!(client.ping().await.unwrap_err(), IggyError::NotConnected);
+            assert_eq!(cluster.count(PING_CODE), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_invalid_token_when_relogging_should_preserve_the_live_session() {
+        let cluster = FakeCluster::new(1);
+        let client = manual_client(&cluster);
+        client.login_user("iggy", "iggy").await.unwrap();
+        let identity = client.driver.session().identity();
+
+        assert_eq!(
+            client
+                .login_with_personal_access_token("")
+                .await
+                .unwrap_err(),
+            IggyError::InvalidFormat
+        );
+        assert_eq!(client.driver.session().identity(), identity);
+        assert_eq!(client.get_state().await, ClientState::Authenticated);
+        assert_eq!(cluster.count(LOGOUT_USER_CODE), 0);
+        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_invalid_username_or_password_when_relogging_should_preserve_the_live_session()
+    {
+        for (username, password, invalid) in [
+            ("", PASSWORD, IggyError::InvalidUsername),
+            (USERNAME, "", IggyError::InvalidPassword),
+        ] {
+            let cluster = FakeCluster::new(1);
+            let client = signed_in_client(&cluster).await;
+            let identity = client.driver.session().identity();
+
+            assert_eq!(
+                client.login_user(username, password).await.unwrap_err(),
+                invalid
+            );
+            assert_eq!(client.driver.session().identity(), identity);
+            assert_eq!(client.get_state().await, ClientState::Authenticated);
+            assert_eq!(cluster.count(LOGOUT_USER_CODE), 0);
+            assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_automatic_sign_in_when_explicitly_signing_in_should_use_explicit_credentials() {
+        let cluster = FakeCluster::new(1);
+        let client = TcpClient::from_links(links(&cluster, &endpoint(0), policy()));
+        client.connect().await.unwrap();
+        client.login_user("other", "password").await.unwrap();
+        let requests = cluster.received(LOGIN_REGISTER_CODE);
+        assert_eq!(requests.len(), 2);
+        let automatic = LoginRegisterRequest::decode_from(&requests[0].body).unwrap();
+        let explicit = LoginRegisterRequest::decode_from(&requests[1].body).unwrap();
+        assert_eq!(automatic.username.as_str(), "iggy");
+        assert_eq!(explicit.username.as_str(), "other");
+        assert_eq!(cluster.count(LOGOUT_USER_CODE), 1);
+        assert_eq!(client.get_state().await, ClientState::Authenticated);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_configured_credentials_when_explicitly_signing_in_should_skip_auto_login() {
+        for configured_token in [false, true] {
+            for explicit_token in [false, true] {
+                let cluster = FakeCluster::new(1);
+                let credentials = if configured_token {
+                    Credentials::PersonalAccessToken(SecretString::from("wrong-token"))
+                } else {
+                    Credentials::UsernamePassword(
+                        "configured".to_owned(),
+                        SecretString::from("wrong"),
+                    )
+                };
+                let session = Arc::new(SessionOwner::new(AutoLogin::Enabled(credentials)));
+                let client = TcpClient::from_links(ReplicaLinks::new(
+                    cluster.dialer(),
+                    endpoint(0),
+                    policy(),
+                    session,
+                ));
+                let identity = if explicit_token {
+                    client.login_with_personal_access_token("valid-token").await
+                } else {
+                    client.login_user("explicit", "password").await
+                };
+                assert!(
+                    identity.is_ok(),
+                    "configured_token={configured_token}, explicit_token={explicit_token}: {identity:?}"
+                );
+                let requests = cluster.received(LOGIN_REGISTER_CODE);
+                assert_eq!(
+                    requests.len(),
+                    1,
+                    "only explicit credentials reach the server"
+                );
+                if explicit_token {
+                    let request =
+                        LoginRegisterWithPatRequest::decode_from(&requests[0].body).unwrap();
+                    assert_eq!(request.token.expose_secret(), "valid-token");
+                } else {
+                    let request = LoginRegisterRequest::decode_from(&requests[0].body).unwrap();
+                    assert_eq!(request.username.as_str(), "explicit");
+                }
+                assert_eq!(cluster.count(LOGOUT_USER_CODE), 0);
+                assert_eq!(client.get_state().await, ClientState::Authenticated);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_invalid_auto_login_when_explicitly_signing_in_should_ignore_its_failure() {
+        for token in [false, true] {
+            let cluster = FakeCluster::new(1);
+            let credentials = if token {
+                Credentials::PersonalAccessToken(SecretString::from(""))
+            } else {
+                Credentials::UsernamePassword("iggy".to_owned(), SecretString::from(""))
+            };
+            let client = || {
+                TcpClient::from_links(ReplicaLinks::new(
+                    cluster.dialer(),
+                    endpoint(0),
+                    policy(),
+                    Arc::new(SessionOwner::new(AutoLogin::Enabled(credentials.clone()))),
+                ))
+            };
+            let automatic = client();
+            let error = automatic.connect().await.unwrap_err();
+            assert_eq!(
+                error,
+                if token {
+                    IggyError::InvalidFormat
+                } else {
+                    IggyError::InvalidPassword
+                }
+            );
+            automatic.disconnect().await.unwrap();
+            assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 0);
+
+            let explicit = client();
+            if token {
+                explicit
+                    .login_with_personal_access_token("valid-token")
+                    .await
+                    .unwrap();
+            } else {
+                explicit.login_user("iggy", "iggy").await.unwrap();
+            }
+            assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+            assert_eq!(explicit.get_state().await, ClientState::Authenticated);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_concurrent_connect_when_signing_in_should_use_explicit_credentials() {
+        for rejection in [
+            None,
+            Some(EvictionReason::InvalidCredentials),
+            Some(EvictionReason::InvalidToken),
+        ] {
+            let cluster = FakeCluster::new(1);
+            if let Some(reason) = rejection {
+                cluster.script(&endpoint(0), LOGIN_REGISTER_CODE, [Answer::Evict(reason)]);
+            }
+            cluster.hold(LOGIN_REGISTER_CODE);
+            let client = TcpClient::from_links(links(&cluster, &endpoint(0), policy()));
+            let (automatic, explicit) = tokio::join!(client.connect(), async {
+                eventually("automatic Register reaches the server", || {
+                    cluster.count(LOGIN_REGISTER_CODE) == 1
+                })
+                .await;
+                cluster.release(LOGIN_REGISTER_CODE);
+                client.login_user("other", "password").await
+            });
+            assert!(automatic.is_err());
+            assert!(explicit.is_ok(), "rejection={rejection:?}: {explicit:?}");
+            let requests = cluster.received(LOGIN_REGISTER_CODE);
+            assert_eq!(requests.len(), 2);
+            let request = LoginRegisterRequest::decode_from(&requests[1].body).unwrap();
+            assert_eq!(request.username.as_str(), "other");
+            assert_eq!(cluster.count(LOGOUT_USER_CODE), 0);
+            assert_eq!(client.get_state().await, ClientState::Authenticated);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_lost_link_with_a_bound_session_when_signing_in_should_release_old_identity() {
+        for expired in [false, true] {
+            let cluster = FakeCluster::new(1);
+            let client = manual_client(&cluster);
+            client.login_user("iggy", "iggy").await.unwrap();
+            // A transport loss preserves the session; public Disconnect resets it.
+            client.driver.links().disconnect();
+            if expired {
+                *cluster.session.lock().unwrap() = None;
+            }
+            client.login_user("other", "password").await.unwrap();
+            assert_eq!(client.get_state().await, ClientState::Authenticated);
+            let requests = cluster.received(LOGIN_REGISTER_CODE);
+            assert_eq!(requests.len(), 2);
+            let request = LoginRegisterRequest::decode_from(&requests[1].body).unwrap();
+            assert_eq!(request.username.as_str(), "other");
+            assert_eq!(cluster.count(BIND_SESSION_CODE), 1);
+            assert_eq!(cluster.count(LOGOUT_USER_CODE), usize::from(!expired));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_stop_during_connect_when_explicit_login_waits_should_not_redial() {
+        for shutdown in [false, true] {
+            let cluster = FakeCluster::new(1);
+            cluster.script(&endpoint(0), LOGIN_REGISTER_CODE, [Answer::Silence]);
+            let client = TcpClient::from_links(links(&cluster, &endpoint(0), policy()));
+            let (automatic, explicit, ()) = tokio::join!(
+                client.connect(),
+                async {
+                    eventually("automatic Register reaches the server", || {
+                        cluster.count(LOGIN_REGISTER_CODE) == 1
+                    })
+                    .await;
+                    client.login_user("other", "password").await
+                },
+                async {
+                    eventually("explicit attempt owns the caller lineage", || {
+                        client.driver.session().epoch().lineage > 0
+                    })
+                    .await;
+                    if shutdown {
+                        client.shutdown().await.unwrap();
+                    } else {
+                        client.disconnect().await.unwrap();
+                    }
+                }
+            );
+            assert!(automatic.is_err());
+            assert!(explicit.is_err());
+            assert_eq!(
+                client.get_state().await,
+                if shutdown {
+                    ClientState::Shutdown
+                } else {
+                    ClientState::Disconnected
+                }
+            );
+            assert!(!client.driver.session().epoch().bound);
+            assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+            assert_eq!(cluster.dials_to(&endpoint(0)).len(), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_rejected_credentials_when_signing_in_again_should_reconnect_without_retaining() {
+        for (replicas, previously_authenticated) in [(1, false), (2, true), (1, true)] {
+            let cluster = FakeCluster::new(replicas);
+            let client = manual_client(&cluster);
+            client.connect().await.unwrap();
+            if previously_authenticated {
+                client.login_user("iggy", "iggy").await.unwrap();
+                eventually("all replica links are ready", || {
+                    client.driver.links().ready_replicas().len() == usize::from(replicas)
+                })
+                .await;
+            }
+            let previous_identity = client.driver.session().identity();
+            cluster.script(
+                &endpoint(0),
+                LOGIN_REGISTER_CODE,
+                [Answer::Evict(EvictionReason::InvalidCredentials)],
+            );
+            assert_eq!(
+                client.login_user("iggy", "wrong").await.unwrap_err(),
+                IggyError::InvalidCredentials
+            );
+            assert!(!client.driver.session().epoch().bound);
+            assert!(client.driver.session().sign_in_credentials().is_none());
+            client.login_user("other", "password").await.unwrap();
+            assert_eq!(client.get_state().await, ClientState::Authenticated);
+            assert_ne!(client.driver.session().identity(), previous_identity);
+            let requests = cluster.received(LOGIN_REGISTER_CODE);
+            assert_eq!(requests.len(), 2 + usize::from(previously_authenticated));
+            let request =
+                LoginRegisterRequest::decode_from(&requests.last().unwrap().body).unwrap();
+            assert_eq!(request.username.as_str(), "other");
+            assert_eq!(
+                cluster.count(LOGOUT_USER_CODE),
+                usize::from(previously_authenticated)
+            );
+            assert_eq!(cluster.dials_to(&endpoint(0)).len(), 2);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_silent_endpoint_when_login_deadline_passes_should_never_send_register() {
+        let cluster = FakeCluster::new(1);
+        cluster.silent.lock().unwrap().insert(endpoint(0));
+        let client = manual_client(&cluster);
+        let deadline = Instant::now() + Duration::from_millis(10);
+        let result = with_binary_deadline(deadline, client.login_user("iggy", "iggy")).await;
+        assert_eq!(result.unwrap_err(), IggyError::TransientNotAccepted);
+        assert_eq!(Instant::now(), deadline);
+        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 0);
+        assert!(!client.driver.session().epoch().bound);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_unanswered_register_when_login_deadline_passes_should_return_58() {
+        let cluster = FakeCluster::new(1);
+        cluster.script(&endpoint(0), LOGIN_REGISTER_CODE, [Answer::Silence]);
+        let client = manual_client(&cluster);
+        let deadline = Instant::now() + Duration::from_millis(10);
+        let result = with_binary_deadline(deadline, client.login_user("iggy", "iggy")).await;
+        assert_eq!(result.unwrap_err(), IggyError::TransientNotAccepted);
+        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+        assert!(!client.driver.session().epoch().bound);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_stop_during_explicit_login_when_reply_is_pending_should_not_restore_session() {
+        for shutdown in [false, true] {
+            let cluster = FakeCluster::new(1);
+            cluster.script(&endpoint(0), LOGIN_REGISTER_CODE, [Answer::Silence]);
+            let client = manual_client(&cluster);
+            let (result, ()) = tokio::join!(client.login_user("iggy", "iggy"), async {
+                eventually("register reaches the server", || {
+                    cluster.count(LOGIN_REGISTER_CODE) == 1
+                })
+                .await;
+                if shutdown {
+                    client.shutdown().await.unwrap();
+                } else {
+                    client.disconnect().await.unwrap();
+                }
+            });
+            assert!(result.is_err());
+            assert_eq!(
+                client.get_state().await,
+                if shutdown {
+                    ClientState::Shutdown
+                } else {
+                    ClientState::Disconnected
+                }
+            );
+            assert!(!client.driver.session().epoch().bound);
+            assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_committed_password_change_when_signing_in_again_should_send_the_new_password()
+    {
+        for (raw, resolved) in [(false, false), (true, false), (false, true), (true, true)] {
+            let cluster = FakeCluster::new(1);
+            let client = signed_in_client(&cluster).await;
+            if resolved {
+                end_uncertain(&cluster, CHANGE_PASSWORD_CODE, Answer::Commit(COMMIT));
+            }
+
+            let changed = if raw {
+                let request = ChangePasswordRequest {
+                    user_id: WireIdentifier::named(USERNAME).unwrap(),
+                    current_password: PASSWORD.to_owned(),
+                    new_password: NEW_PASSWORD.to_owned(),
+                };
+                client
+                    .send_raw_with_response(CHANGE_PASSWORD_CODE, request.to_bytes())
+                    .await
+                    .map(drop)
+            } else {
+                let user = Identifier::named(USERNAME).unwrap();
+                client.change_password(&user, PASSWORD, NEW_PASSWORD).await
+            };
+            proved(&client, changed).await.unwrap();
+            let sign_in = sign_in_again(&cluster).await;
+
+            let case = format!("raw={raw}, resolved={resolved}");
+            let attempts = if resolved { 3 } else { 1 };
+            assert_eq!(cluster.count(CHANGE_PASSWORD_CODE), attempts, "{case}");
+            assert_eq!(sign_in.password.expose_secret(), NEW_PASSWORD, "{case}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_generic_user_rename_when_reconnecting_should_use_updated_username() {
+        for resolved in [false, true] {
+            let cluster = FakeCluster::new(1);
+            let client = signed_in_client(&cluster).await;
+            if resolved {
+                end_uncertain(&cluster, UPDATE_RESOURCE_CODE, Answer::Commit(COMMIT));
+            }
+
+            let renamed = client
+                .update_user(
+                    &Identifier::named(USERNAME).unwrap(),
+                    &UserUpdateOptions {
+                        username: Some(NEW_USERNAME.to_owned()),
+                        ..UserUpdateOptions::default()
+                    },
+                )
+                .await;
+            proved(&client, renamed).await.unwrap();
+            let sign_in = sign_in_again(&cluster).await;
+
+            let case = format!("resolved={resolved}");
+            let attempts = if resolved { 3 } else { 1 };
+            assert_eq!(cluster.count(UPDATE_RESOURCE_CODE), attempts, "{case}");
+            assert_eq!(sign_in.username.as_str(), NEW_USERNAME, "{case}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_rejected_rename_or_topic_rename_when_reconnecting_should_keep_the_username() {
+        let cluster = FakeCluster::new(1);
+        let client = signed_in_client(&cluster).await;
+        cluster.script(
+            &endpoint(0),
+            UPDATE_RESOURCE_CODE,
+            [Answer::CommitRejected(COMMIT, IggyError::UserAlreadyExists)],
+        );
+        let rejected = client
+            .update_user(
+                &Identifier::named(USERNAME).unwrap(),
+                &UserUpdateOptions {
+                    username: Some(NEW_USERNAME.to_owned()),
+                    ..UserUpdateOptions::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            proved(&client, rejected).await,
+            Err(IggyError::UserAlreadyExists)
+        );
+        client
+            .update_topic(
+                &Identifier::numeric(1).unwrap(),
+                &Identifier::numeric(1).unwrap(),
+                &TopicUpdateOptions {
+                    name: Some(NEW_USERNAME.to_owned()),
+                    ..TopicUpdateOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let sign_in = sign_in_again(&cluster).await;
+
+        assert_eq!(sign_in.username.as_str(), USERNAME);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_committed_rejection_of_a_password_change_when_signing_in_again_should_send_the_old_password()
+     {
+        for resolved in [false, true] {
+            let cluster = FakeCluster::new(1);
+            let client = signed_in_client(&cluster).await;
+            let rejected = Answer::CommitRejected(COMMIT, IggyError::InvalidCredentials);
+            if resolved {
+                end_uncertain(&cluster, CHANGE_PASSWORD_CODE, rejected);
+            } else {
+                cluster.script(&endpoint(0), CHANGE_PASSWORD_CODE, [rejected]);
+            }
+
+            let changed = client
+                .change_password(
+                    &Identifier::named(USERNAME).unwrap(),
+                    WRONG_PASSWORD,
+                    NEW_PASSWORD,
+                )
+                .await;
+
+            assert_eq!(
+                proved(&client, changed).await,
+                Err(IggyError::InvalidCredentials),
+                "resolved={resolved}"
+            );
+            let sign_in = sign_in_again(&cluster).await;
+            assert_eq!(
+                sign_in.password.expose_secret(),
+                PASSWORD,
+                "resolved={resolved}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_explicit_disconnect_when_keepalive_ticks_should_not_reconnect() {
+        let cluster = FakeCluster::new(1);
+        let client = TcpClient::from_links(links(&cluster, &endpoint(0), policy()));
+        client.connect().await.unwrap();
+
+        client.disconnect().await.unwrap();
+
+        assert!(!client.keepalive().await.unwrap());
+        assert_eq!(client.get_state().await, ClientState::Disconnected);
+        assert_eq!(cluster.dials_to(&endpoint(0)).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_logout_when_keepalive_ticks_should_not_sign_in_again() {
+        let cluster = FakeCluster::new(1);
+        let client = TcpClient::from_links(links(&cluster, &endpoint(0), policy()));
+        client.connect().await.unwrap();
+        client.logout_user().await.unwrap();
+
+        // Every link stops, as after an outage longer than the retry budget.
+        client.driver.links().disconnect();
+
+        assert!(!client.keepalive().await.unwrap());
+        assert_eq!(client.get_state().await, ClientState::Disconnected);
+        assert!(!client.driver.session().epoch().bound);
+        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_rejected_explicit_sign_in_after_the_session_was_lost_when_keepalive_ticks_should_not_sign_in_again()
+     {
+        for owed in [true, false] {
+            let cluster = FakeCluster::new(1);
+            let limited = ReconnectPolicy::from(&TcpClientReconnectionConfig {
+                max_retries: Some(1),
+                ..TcpClientReconnectionConfig::default()
+            });
+            let client = TcpClient::from_links(links(&cluster, &endpoint(0), limited));
+            client.connect().await.unwrap();
+            *cluster.session.lock().unwrap() = None;
+            if owed {
+                // The slot finds the session gone and owes the sign-in, which
+                // loses its link until the slot runs out of retries.
+                cluster
+                    .hang_up_on_register
+                    .lock()
+                    .unwrap()
+                    .insert(endpoint(0));
+                cluster.drop_connections(&endpoint(0));
+                eventually("the slot stops", || {
+                    client.driver.links().state() == ClientState::Disconnected
+                })
+                .await;
+                cluster.hang_up_on_register.lock().unwrap().clear();
+            } else {
+                // The explicit sign-in is the first to find the session gone.
+                client.driver.links().disconnect();
+            }
+            assert_eq!(client.driver.session().epoch().sign_in_owed, owed);
+            *cluster.reject_credentials.lock().unwrap() = true;
+            assert_eq!(
+                client.login_user("other", "password").await.unwrap_err(),
+                IggyError::InvalidCredentials
+            );
+            *cluster.reject_credentials.lock().unwrap() = false;
+            let registers = cluster.count(LOGIN_REGISTER_CODE);
+            cluster.drop_connections(&endpoint(0));
+            eventually("the client is disconnected", || {
+                client.driver.links().state() == ClientState::Disconnected
+            })
+            .await;
+
+            let pinged = client.keepalive().await.unwrap();
+            sleep(TEST_BUDGET).await;
+
+            let signed_in_as: Vec<String> = cluster.received(LOGIN_REGISTER_CODE)[registers..]
+                .iter()
+                .map(|request| {
+                    let request = LoginRegisterRequest::decode_from(&request.body).unwrap();
+                    request.username.as_str().to_owned()
+                })
+                .collect();
+            assert!(
+                signed_in_as.is_empty(),
+                "owed={owed}: signed in again as {signed_in_as:?}"
+            );
+            assert!(!pinged, "owed={owed}");
+            assert_eq!(
+                client.get_state().await,
+                ClientState::Disconnected,
+                "owed={owed}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_late_automatic_sign_in_when_signing_in_as_another_user_should_keep_that_user()
+    {
+        for replicas in [1, 2] {
+            let cluster = FakeCluster::new(replicas);
+            let client = TcpClient::from_links(links(&cluster, &endpoint(0), policy()));
+            client.connect().await.unwrap();
+            eventually("every slot is ready", || {
+                client.driver.links().ready_replicas().len() == usize::from(replicas)
+            })
+            .await;
+            // The last slot finds the session gone and signs in again as the
+            // last user. The server registers it, but the reply waits. With
+            // two replicas, that slot is not on the link of the explicit
+            // Register, so the explicit reply can come first.
+            cluster
+                .held_registers
+                .lock()
+                .unwrap()
+                .insert("iggy".to_owned());
+            *cluster.session.lock().unwrap() = None;
+            cluster.drop_connections(&endpoint(replicas - 1));
+            eventually("the slot signs in again", || {
+                cluster.count(LOGIN_REGISTER_CODE) == 2
+            })
+            .await;
+            assert!(
+                client.driver.session().epoch().sign_in_owed,
+                "replicas={replicas}"
+            );
+            let registers = cluster.count(LOGIN_REGISTER_CODE);
+
+            let signed_in = client.login_user("other", "password").await;
+            assert!(signed_in.is_ok(), "replicas={replicas}: {signed_in:?}");
+            cluster.held_registers.lock().unwrap().clear();
+            sleep(TEST_BUDGET).await;
+
+            let requests = cluster.received(LOGIN_REGISTER_CODE);
+            let signed_in_as: Vec<String> = requests[registers..]
+                .iter()
+                .map(|request| {
+                    let request = LoginRegisterRequest::decode_from(&request.body).unwrap();
+                    request.username.as_str().to_owned()
+                })
+                .collect();
+            assert_eq!(signed_in_as, ["other"], "replicas={replicas}");
+            let (owed, explicit) = (&requests[registers - 1], &requests[registers]);
+            assert_ne!(
+                explicit.header.client, owed.header.client,
+                "replicas={replicas}"
+            );
+            assert_eq!(
+                client.get_state().await,
+                ClientState::Authenticated,
+                "replicas={replicas}"
+            );
+            let registered = cluster.session.lock().unwrap().unwrap();
+            assert_eq!(
+                client
+                    .driver
+                    .session()
+                    .identity()
+                    .map(|identity| identity.session),
+                Ok(registered),
+                "replicas={replicas}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_fail_with_a_zero_heartbeat_interval() {
+        let value = "iggy+tcp://user:secret@127.0.0.1:1234?heartbeat_interval=none";
+
+        let error = TcpClient::from_connection_string(value).err();
+
+        assert!(matches!(error, Some(IggyError::InvalidConnectionString)));
+    }
+
+    #[test]
+    fn should_succeed_with_a_zero_reestablish_after() {
+        let value = "iggy+tcp://user:secret@127.0.0.1:1234?reestablish_after=0";
+
+        let client = TcpClient::from_connection_string(value).unwrap();
+
+        assert!(client.config.reconnection.reestablish_after.is_zero());
+    }
+
+    #[test]
+    fn should_fail_with_a_zero_reconnection_interval() {
+        let value = "iggy+tcp://user:secret@127.0.0.1:1234?reconnection_interval=0";
+
+        let error = TcpClient::from_connection_string(value).err();
+
+        assert!(matches!(error, Some(IggyError::InvalidConnectionString)));
+    }
 
     #[test]
     fn should_fail_with_empty_connection_string() {
@@ -1027,14 +1568,14 @@ mod tests {
         assert!(tcp_client_config.tls_ca_file.is_none());
         assert_eq!(
             tcp_client_config.heartbeat_interval,
-            IggyDuration::from_str("5s").unwrap()
+            NonZeroIggyDuration::from_str("5s").unwrap()
         );
 
         assert!(tcp_client_config.reconnection.enabled);
         assert!(tcp_client_config.reconnection.max_retries.is_none());
         assert_eq!(
             tcp_client_config.reconnection.interval,
-            IggyDuration::from_str("1s").unwrap()
+            NonZeroIggyDuration::from_str("1s").unwrap()
         );
         assert_eq!(
             tcp_client_config.reconnection.reestablish_after,
@@ -1076,7 +1617,7 @@ mod tests {
         assert!(tcp_client_config.tls_ca_file.is_none());
         assert_eq!(
             tcp_client_config.heartbeat_interval,
-            IggyDuration::from_str(heartbeat_interval).unwrap()
+            NonZeroIggyDuration::from_str(heartbeat_interval).unwrap()
         );
 
         assert!(tcp_client_config.reconnection.enabled);
@@ -1086,7 +1627,7 @@ mod tests {
         );
         assert_eq!(
             tcp_client_config.reconnection.interval,
-            IggyDuration::from_str("1s").unwrap()
+            NonZeroIggyDuration::from_str("1s").unwrap()
         );
         assert_eq!(
             tcp_client_config.reconnection.reestablish_after,
@@ -1122,14 +1663,14 @@ mod tests {
         assert!(tcp_client_config.tls_ca_file.is_none());
         assert_eq!(
             tcp_client_config.heartbeat_interval,
-            IggyDuration::from_str("5s").unwrap()
+            NonZeroIggyDuration::from_str("5s").unwrap()
         );
 
         assert!(tcp_client_config.reconnection.enabled);
         assert!(tcp_client_config.reconnection.max_retries.is_none());
         assert_eq!(
             tcp_client_config.reconnection.interval,
-            IggyDuration::from_str("1s").unwrap()
+            NonZeroIggyDuration::from_str("1s").unwrap()
         );
         assert_eq!(
             tcp_client_config.reconnection.reestablish_after,

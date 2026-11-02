@@ -25,7 +25,8 @@
 //! - the SDK-hidden success codes (produce 201, reads 200, mutations 204, and
 //!   the server-assigned id in a 200 create-stream body);
 //! - HTTP-only route shapes: the `/users/me` self alias, the caller-scoped
-//!   name-sorted PAT-list array, auth-only cluster metadata, and the public ping;
+//!   name-sorted PAT-list array, auth-only cluster metadata and metrics scrape,
+//!   and the public ping;
 //! - the change-password status/body shape: a wrong current password renders a
 //!   typed 400 `InvalidCredentials` and a missing target a 404 `ResourceNotFound`,
 //!   both bodies the SDK hides. Change-password commits over every transport, so
@@ -35,12 +36,13 @@
 
 use crate::server::http_client::HttpClient;
 use iggy::prelude::*;
-use iggy_common::IggyMessagesBatch;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::create_topic::CreateTopic;
+use iggy_common::{IggyMessagesBatch, OptionInputMap};
 use integration::iggy_harness;
 use reqwest::{Response, StatusCode};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 // Partition ids are 0-based (CreateTopic assigns them from 0).
 const PARTITION_ID: u32 = 0;
@@ -48,6 +50,7 @@ const PARTITION_ID: u32 = 0;
 const CONSUMER_ID: u32 = 1;
 
 // `IggyError` discriminants (== the numeric `id` in the JSON error body).
+const UNAUTHENTICATED_ID: u64 = 40;
 const UNAUTHORIZED_ID: u64 = 41;
 const INVALID_CREDENTIALS_ID: u64 = 42;
 const CANNOT_DELETE_USER_ID: u64 = 48;
@@ -55,6 +58,7 @@ const CANNOT_CHANGE_PERMISSIONS_ID: u64 = 49;
 // The apply's `ChangePasswordResult::UserNotFound` maps to `ResourceNotFound`.
 const RESOURCE_NOT_FOUND_ID: u64 = 20;
 // Snake-case `IggyError` names (== the `code` string in the JSON error body).
+const UNAUTHENTICATED_CODE: &str = "unauthenticated";
 const UNAUTHORIZED_CODE: &str = "unauthorized";
 const INVALID_CREDENTIALS_CODE: &str = "invalid_credentials";
 const CANNOT_DELETE_USER_CODE: &str = "cannot_delete_user";
@@ -90,7 +94,11 @@ impl ClientExt for HttpClient {
         let response = self
             .post_json(
                 "/streams",
-                &serde_json::to_value(CreateStream { name: name.into() }).unwrap(),
+                &serde_json::to_value(CreateStream {
+                    name: name.into(),
+                    options: OptionInputMap::default(),
+                })
+                .unwrap(),
             )
             .await;
         assert!(
@@ -108,11 +116,8 @@ impl ClientExt for HttpClient {
         let command = CreateTopic {
             stream_id: Identifier::default(),
             partitions_count: partitions,
-            compression_algorithm: CompressionAlgorithm::None,
-            message_expiry: IggyExpiry::NeverExpire,
-            max_topic_size: MaxTopicSize::ServerDefault,
-            replication_factor: None,
             name: topic.to_string(),
+            options: OptionInputMap::default(),
         };
         let response = self
             .post_json(
@@ -174,6 +179,7 @@ impl ClientExt for HttpClient {
             topic_id: Identifier::default(),
             partitioning: Partitioning::partition_id(partition_id),
             batch: IggyMessagesBatch::from(&messages),
+            context: None,
         };
         self.client
             .post(self.url(&format!("/streams/{stream}/topics/{topic}/messages")))
@@ -241,6 +247,13 @@ async fn pat_names(response: Response) -> Vec<String> {
                 .to_owned()
         })
         .collect()
+}
+
+/// The server-assigned id from a `POST /users` response, asserting 200 first.
+async fn created_user_id(response: Response) -> u64 {
+    assert_eq!(response.status(), StatusCode::OK, "create user");
+    let details: Value = response.json().await.expect("created user JSON");
+    details["id"].as_u64().expect("created user id")
 }
 
 // === Denials carry the exact HTTP status + typed JSON error body ============
@@ -327,6 +340,271 @@ async fn given_http_requests_when_denied_should_carry_typed_status_and_body(harn
     .await;
 }
 
+#[iggy_harness]
+async fn given_unexpired_jwts_when_user_revoked_should_reject_reads_and_writes(
+    harness: &TestHarness,
+) {
+    let root = HttpClient::login_root(harness).await;
+    let permissions = Permissions {
+        global: GlobalPermissions {
+            manage_streams: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let created = root
+        .create_user(
+            "revoked-http-user",
+            "revoked-http-password",
+            serde_json::to_value(permissions).unwrap(),
+        )
+        .await;
+    assert_eq!(created.status(), StatusCode::OK, "create active user");
+    let details: Value = created.json().await.expect("created user JSON");
+    let user_id = details["id"].as_u64().expect("created user id");
+    let user_path = format!("/users/{user_id}");
+    let established = root
+        .login("revoked-http-user", "revoked-http-password")
+        .await;
+    let unused_for_writes = root
+        .login("revoked-http-user", "revoked-http-password")
+        .await;
+    assert_ne!(established.token, unused_for_writes.token);
+
+    assert_eq!(
+        established
+            .post_json("/streams", &json!({ "name": "before-revocation" }))
+            .await
+            .status(),
+        StatusCode::OK,
+        "active user must establish a write session"
+    );
+    for credential in [&established, &unused_for_writes] {
+        assert_eq!(
+            credential.get("/streams").await.status(),
+            StatusCode::OK,
+            "both JWTs must authorize reads before revocation"
+        );
+    }
+
+    for revoked_state in ["inactive", "deleted"] {
+        let revoked = if revoked_state == "inactive" {
+            root.put_json(&user_path, &json!({ "status": "inactive" }))
+                .await
+        } else {
+            root.delete(&user_path).await
+        };
+        assert_eq!(
+            revoked.status(),
+            StatusCode::NO_CONTENT,
+            "mark user {revoked_state}"
+        );
+        for (kind, credential) in [
+            ("established", &established),
+            ("unused-for-writes", &unused_for_writes),
+        ] {
+            let context = format!("{kind} JWT for {revoked_state} user");
+            let read = credential.get("/streams").await;
+            let write = credential
+                .post_json(
+                    "/streams",
+                    &json!({ "name": format!("rejected-{revoked_state}-{kind}") }),
+                )
+                .await;
+            for (operation, response) in [("read", read), ("write", write)] {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{context}: {operation} must be rejected"
+                );
+                assert_error_body(
+                    response,
+                    UNAUTHENTICATED_ID,
+                    UNAUTHENTICATED_CODE,
+                    &format!("{context}: {operation}"),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+/// A delete frees the user's id for the next create. A token issued to the
+/// deleted account must not refresh while the id is free, and must not
+/// authenticate or refresh as the account that takes the id.
+#[iggy_harness]
+async fn given_deleted_users_jwt_when_new_user_takes_its_id_should_reject_reads_writes_and_refresh(
+    harness: &TestHarness,
+) {
+    let root = HttpClient::login_root(harness).await;
+    let former_id = created_user_id(
+        root.create_user("former-user", "former-password", no_permissions())
+            .await,
+    )
+    .await;
+    let former = root.login("former-user", "former-password").await;
+
+    assert_eq!(
+        root.delete(&format!("/users/{former_id}")).await.status(),
+        StatusCode::NO_CONTENT,
+        "delete the former user"
+    );
+    let refresh_while_free = root.refresh(&former.token).await;
+    assert_eq!(
+        refresh_while_free.status(),
+        StatusCode::UNAUTHORIZED,
+        "a deleted user's JWT must not refresh while its id is free"
+    );
+
+    // The successor may read and create streams, so a stale token that
+    // authenticated as the successor would get a success status below.
+    let permissions = Permissions {
+        global: GlobalPermissions {
+            manage_streams: true,
+            read_streams: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let successor_id = created_user_id(
+        root.create_user(
+            "successor-user",
+            "successor-password",
+            serde_json::to_value(permissions).unwrap(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        successor_id, former_id,
+        "the successor must take the freed id"
+    );
+    let successor = root.login("successor-user", "successor-password").await;
+    assert_eq!(
+        successor.get("/streams").await.status(),
+        StatusCode::OK,
+        "the successor's own JWT must authenticate"
+    );
+
+    let read = former.get("/streams").await;
+    let write = former
+        .post_json("/streams", &json!({ "name": "stale-token-stream" }))
+        .await;
+    let refresh = root.refresh(&former.token).await;
+    for (operation, response) in [("read", read), ("write", write), ("refresh", refresh)] {
+        let context = format!("deleted user's JWT after its id is reused: {operation}");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{context} must be rejected"
+        );
+        assert_error_body(response, UNAUTHENTICATED_ID, UNAUTHENTICATED_CODE, &context).await;
+    }
+}
+
+/// A raw personal access token sent as the bearer fails the JWT decode and
+/// resolves through the PAT index instead. Its reads and writes must act as its
+/// owner, and it must stop authenticating once the owner is deleted.
+#[iggy_harness]
+async fn given_raw_pat_bearer_when_reading_and_writing_should_act_as_its_owner(
+    harness: &TestHarness,
+) {
+    let root = HttpClient::login_root(harness).await;
+    let stream_id = root.create_stream("pat-stream").await;
+    root.create_topic("pat-stream", "pat-topic", 1).await;
+    // One stream grant and no global permission: a request that ran as root, or
+    // as a user without this grant, would get another status below.
+    let permissions = Permissions {
+        streams: Some(BTreeMap::from([(
+            stream_id as usize,
+            StreamPermissions {
+                send_messages: true,
+                ..Default::default()
+            },
+        )])),
+        ..Default::default()
+    };
+    let owner_id = created_user_id(
+        root.create_user(
+            "pat-owner",
+            "pat-owner-password",
+            serde_json::to_value(permissions).unwrap(),
+        )
+        .await,
+    )
+    .await;
+    let owner = root.login("pat-owner", "pat-owner-password").await;
+    let created = owner
+        .post_json(
+            "/personal-access-tokens",
+            &json!({ "name": "pat-bearer", "expiry": 0 }),
+        )
+        .await;
+    assert_eq!(created.status(), StatusCode::OK, "create the owner's PAT");
+    let raw: Value = created.json().await.expect("raw PAT JSON");
+    let pat = owner.with_token(raw["token"].as_str().expect("raw PAT").to_owned());
+
+    let me = pat.get("/users/me").await;
+    assert_eq!(me.status(), StatusCode::OK, "a PAT read must authenticate");
+    let me: Value = me.json().await.expect("users/me JSON");
+    assert_eq!(
+        (me["id"].as_u64(), me["username"].as_str()),
+        (Some(owner_id), Some("pat-owner")),
+        "a PAT read must act as its owner"
+    );
+    assert_eq!(
+        pat.produce(
+            "pat-stream",
+            "pat-topic",
+            PARTITION_ID,
+            vec![text_message(1, "pat-msg")],
+        )
+        .await
+        .status(),
+        StatusCode::CREATED,
+        "a PAT write must carry its owner's grant"
+    );
+    let ungranted = pat
+        .post_json("/streams", &json!({ "name": "pat-owner-stream" }))
+        .await;
+    assert_eq!(
+        ungranted.status(),
+        StatusCode::FORBIDDEN,
+        "a PAT write must not act beyond its owner's grants"
+    );
+    assert_error_body(
+        ungranted,
+        UNAUTHORIZED_ID,
+        UNAUTHORIZED_CODE,
+        "PAT write without a grant",
+    )
+    .await;
+
+    assert_eq!(
+        root.delete(&format!("/users/{owner_id}")).await.status(),
+        StatusCode::NO_CONTENT,
+        "delete the owner"
+    );
+    let read = pat.get("/users/me").await;
+    let write = pat
+        .produce(
+            "pat-stream",
+            "pat-topic",
+            PARTITION_ID,
+            vec![text_message(2, "pat-msg")],
+        )
+        .await;
+    for (operation, response) in [("read", read), ("write", write)] {
+        let context = format!("deleted owner's PAT: {operation}");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{context} must be rejected"
+        );
+        assert_error_body(response, UNAUTHENTICATED_ID, UNAUTHENTICATED_CODE, &context).await;
+    }
+}
+
 // === Authorized requests carry the SDK-hidden success status codes ==========
 
 /// Root exercises the happy path; the SDK hides these exact status codes behind
@@ -403,6 +681,25 @@ async fn given_http_only_routes_when_requested_should_return_expected_shapes(
         alice.get_anonymous("/ping").await.status(),
         StatusCode::OK,
         "ping is public"
+    );
+
+    // The metrics scrape is auth-only like cluster metadata: anonymous is 401,
+    // an ungranted caller reads the exposition.
+    assert_eq!(
+        alice.get_anonymous("/metrics").await.status(),
+        StatusCode::UNAUTHORIZED,
+        "metrics scrape without a bearer must be 401"
+    );
+    let metrics = alice.get("/metrics").await;
+    assert_eq!(
+        metrics.status(),
+        StatusCode::OK,
+        "metrics scrape is auth-only, never RBAC-gated"
+    );
+    let exposition = metrics.text().await.expect("metrics exposition body");
+    assert!(
+        exposition.contains("# TYPE streams "),
+        "metrics exposition must carry the parity metric set:\n{exposition}"
     );
 
     // PAT listing is a JSON array of the caller's own tokens, name-sorted
@@ -489,7 +786,7 @@ async fn given_own_password_when_current_wrong_should_reject_and_correct_should_
 /// Admin-initiated change (target != caller): the current password is checked
 /// against the TARGET's stored hash, so a wrong one is 400 `InvalidCredentials`;
 /// a target that does not resolve is left to the replicated apply, which
-/// answers 404 `UserNotFound` (the plaintext is still stripped + hashed first).
+/// answers 404 `UserNotFound` (both plaintext passwords are stripped first).
 #[iggy_harness]
 async fn given_admin_change_password_when_target_current_wrong_or_missing_should_reject(
     harness: &TestHarness,

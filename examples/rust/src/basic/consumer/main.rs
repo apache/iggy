@@ -40,6 +40,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let client = client_provider::get_raw_client(client_provider_config, false).await?;
     let client = IggyClient::new(client);
     client.connect().await?;
+    if args.transport == TransportProtocol::Http.as_str() {
+        client.login_user(&args.username, &args.password).await?;
+    }
     system::init_by_consumer(&args, &client).await;
     system::consume_messages(&args, &client, &handle_message).await
 }

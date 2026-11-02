@@ -21,7 +21,10 @@
 // The layout is a port of core/binary_protocol/src/consensus/header.rs.
 package vsr
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+)
 
 // HeaderSize is the length of every consensus frame header, both directions.
 // A frame is this header followed by size-HeaderSize body bytes.
@@ -43,21 +46,31 @@ const (
 	requestOffsetSize      = 48
 	requestOffsetCommand   = 60
 	requestOffsetClient    = 128
+	requestOffsetChecksum  = 144
 	requestOffsetTimestamp = 160
 	requestOffsetRequest   = 168
 	requestOffsetOperation = 176
 	requestOffsetSession   = 184
 	requestOffsetReserved  = 196
+	requestOffsetContext   = 200
 )
 
 // Reply header field offsets the client reads.
 const (
-	replyOffsetSize      = 48
-	replyOffsetCommand   = 60
-	replyOffsetRequest   = 200
-	replyOffsetOperation = 208
-	replyOffsetStatus    = 216
+	replyOffsetSize        = 48
+	replyOffsetCommand     = 60
+	replyOffsetCommit      = 184
+	replyOffsetRequest     = 200
+	replyOffsetOperation   = 208
+	replyOffsetStatus      = 216
+	replyOffsetResult      = 220
+	replyOffsetClient      = 160
+	replyOffsetOp          = 176
+	replyOffsetIncarnation = 224
+	replyOffsetChecksum    = 128
 )
+
+const committedResult = 1
 
 // Eviction header field offsets the client reads.
 const (
@@ -116,7 +129,8 @@ func (c ClientID) IsZero() bool {
 }
 
 // RequestFields are the header fields a client fills in. The rest of the 256
-// bytes stay zero, including both checksums, which the server does not read.
+// bytes stay zero. StampRequestHeader additionally stamps the body integrity
+// checksum for metadata deduplication; partition receipts retain a zero stamp.
 type RequestFields struct {
 	// Size is the header plus body total.
 	Size uint32
@@ -160,8 +174,7 @@ func ReadSize(header *[HeaderSize]byte) uint32 {
 	return binary.LittleEndian.Uint32(header[replyOffsetSize:])
 }
 
-// ReadStatus reads the pre-commit denial status. Zero means the reply
-// committed and the body is meaningful.
+// ReadStatus reads the pre-commit denial status. Zero alone proves no commitment.
 func ReadStatus(header *[HeaderSize]byte) uint32 {
 	return binary.LittleEndian.Uint32(header[replyOffsetStatus:])
 }
@@ -177,6 +190,19 @@ func ReadReplyOperation(header *[HeaderSize]byte) Operation {
 // in flight.
 func ReadReplyRequestID(header *[HeaderSize]byte) uint64 {
 	return binary.LittleEndian.Uint64(header[replyOffsetRequest:])
+}
+
+// MetadataCommit excludes partition replies, whose commit indexes belong to
+// different consensus groups and cannot fence a metadata read.
+func MetadataCommit(header *[HeaderSize]byte) uint64 {
+	operation := ReadReplyOperation(header)
+	if PeekCommand(header) != FrameReply || !IsKnownOperation(operation) {
+		return 0
+	}
+	if operation == OperationNonReplicated || operation >= OperationSendMessages {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(header[replyOffsetCommit:])
 }
 
 // StampedRequestID reads the request id back out of a stamped request frame.
@@ -202,4 +228,11 @@ func ReadEviction(header *[HeaderSize]byte) Eviction {
 		ServerProtocolVersion:    binary.LittleEndian.Uint32(header[evictionOffsetServerProtocolVersion:]),
 		ServerProtocolVersionMin: binary.LittleEndian.Uint32(header[evictionOffsetServerProtocolVersionMin:]),
 	}
+}
+
+// StampPartitionContext preserves the captured incarnation through request retries.
+func StampPartitionContext(dst *[HeaderSize]byte, captured iggcon.PartitionContext) {
+	binary.LittleEndian.PutUint64(dst[requestOffsetContext:], captured.Incarnation)
+	binary.LittleEndian.PutUint64(dst[requestOffsetContext+8:], captured.OwnerGeneration)
+	binary.LittleEndian.PutUint64(dst[requestOffsetContext+16:], captured.MetadataOp)
 }

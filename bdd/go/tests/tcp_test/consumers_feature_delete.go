@@ -87,7 +87,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER GROUP:", func() {
 			client := createAuthorizedConnection()
 			err := client.DeleteConsumerGroup(
 				context.Background(),
-				randomU32Identifier(),
+				nonExistingStreamIdentifier(client),
 				randomU32Identifier(),
 				randomU32Identifier(),
 			)

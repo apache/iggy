@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { Client } from '../client/client.js';
 import { getIggyAddress } from '../tcp.sm.utils.js';

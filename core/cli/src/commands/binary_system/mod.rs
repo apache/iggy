@@ -18,6 +18,8 @@
 pub mod login;
 pub mod logout;
 pub mod me;
+pub mod metadata_changes;
+pub mod options;
 pub mod ping;
 pub mod session;
 pub mod session_status;

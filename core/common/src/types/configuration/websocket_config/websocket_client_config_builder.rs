@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{AutoLogin, IggyDuration, IggyError, WebSocketClientConfig, validate_server_address};
+use crate::{
+    AutoLogin, IggyDuration, IggyError, NonZeroIggyDuration, PendingOperationsConfig,
+    WebSocketClientConfig, validate_server_address,
+};
 
 /// Builder for the WebSocket client configuration.
 /// Allows configuring the WebSocket client with custom settings or using defaults:
@@ -40,6 +43,12 @@ impl WebSocketClientConfigBuilder {
         self
     }
 
+    /// Sets client-wide active and retained mutation limits.
+    pub fn with_pending_operations(mut self, pending_operations: PendingOperationsConfig) -> Self {
+        self.config.pending_operations = pending_operations;
+        self
+    }
+
     /// Sets the auto sign in during connection.
     pub fn with_auto_sign_in(mut self, auto_sign_in: AutoLogin) -> Self {
         self.config.auto_login = auto_sign_in;
@@ -57,20 +66,20 @@ impl WebSocketClientConfigBuilder {
         self
     }
 
-    /// Sets the interval between retries when connecting to the server.
-    pub fn with_reconnection_interval(mut self, interval: IggyDuration) -> Self {
+    /// Sets the full-jitter exponential backoff base, capped at 10 seconds.
+    pub fn with_reconnection_interval(mut self, interval: NonZeroIggyDuration) -> Self {
         self.config.reconnection.interval = interval;
         self
     }
 
-    /// Sets the time to wait before attempting to reestablish connection.
+    /// Sets the stable connection duration that resets the retry count and backoff.
     pub fn with_reestablish_after(mut self, reestablish_after: IggyDuration) -> Self {
         self.config.reconnection.reestablish_after = reestablish_after;
         self
     }
 
     /// Sets the heartbeat interval.
-    pub fn with_heartbeat_interval(mut self, heartbeat_interval: IggyDuration) -> Self {
+    pub fn with_heartbeat_interval(mut self, heartbeat_interval: NonZeroIggyDuration) -> Self {
         self.config.heartbeat_interval = heartbeat_interval;
         self
     }

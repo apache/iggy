@@ -15,68 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use bytes::Bytes;
 use iggy::prelude::*;
 use integration::bench_utils::run_bench_and_wait_for_finish;
 use integration::harness::{TestHarness, TestServerConfig};
 use serial_test::parallel;
-use std::{collections::HashMap, str::FromStr};
-use test_case::test_matrix;
-
-fn cache_open_segment() -> &'static str {
-    "open_segment"
-}
-
-fn cache_all() -> &'static str {
-    "all"
-}
-
-fn cache_none() -> &'static str {
-    "none"
-}
-
-fn build_server_config(cache_setting: &str) -> TestServerConfig {
-    let mut extra_envs = HashMap::new();
-    extra_envs.insert(
-        "IGGY_SYSTEM_SEGMENT_CACHE_INDEXES".to_string(),
-        cache_setting.to_string(),
-    );
-    // The server flushes on the journal thresholds (no flush primitive), so
-    // force every committed batch straight to disk: the restart asserts
-    // below need everything durable, and the explicit flush calls are
-    // cfg'd out under vsr (`flush_unsaved_buffer` answers
-    // FeatureUnavailable there and is slated for removal). Legacy keeps its
-    // shipped buffered defaults; the flush loops below are its barrier.
-    extra_envs.insert(
-        "IGGY_SYSTEM_PARTITION_MESSAGES_REQUIRED_TO_SAVE".to_string(),
-        "1".to_string(),
-    );
-    extra_envs.insert(
-        "IGGY_SYSTEM_PARTITION_ENFORCE_FSYNC".to_string(),
-        "true".to_string(),
-    );
-    TestServerConfig::builder().extra_envs(extra_envs).build()
-}
+use std::str::FromStr;
 
 // TODO(numminex) - Move the message generation method from benchmark run to a special method.
 //
-// The durability barrier is the eager-flush envs in `build_server_config`
-// (`flush_unsaved_buffer` answers FeatureUnavailable on VSR, so there is no
-// explicit flush loop), and `iggy-bench` must be freshly built: the harness
-// spawns the prebuilt binary, and a stale one never completes a frame
-// against the server, tripping the bench timeout in
-// `run_bench_and_wait_for_finish`.
-#[test_matrix(
-    [cache_all(), cache_open_segment(), cache_none()]
-)]
+// The durability barrier is the graceful restart itself: shutdown force-flushes
+// the committed journal. The eager-flush knobs that used to stand in for it are
+// topic creation options now, and the topics here are created by `iggy-bench`,
+// which exposes no flag for them.
+//
+// `iggy-bench` must be freshly built: the harness spawns the prebuilt binary,
+// and a stale one never completes a frame against the server, tripping the
+// bench timeout in `run_bench_and_wait_for_finish`.
 #[tokio::test]
 #[parallel]
-async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) {
+async fn should_fill_data_and_verify_after_restart() {
     // Restart scenarios run single-node: restarting a node in a multi-node
     // cluster trips a known partitions-plane view-change stall, tracked
     // separately.
     let mut harness = TestHarness::builder()
         .cluster_nodes(1)
-        .server(build_server_config(cache_setting))
+        .server(TestServerConfig::default())
         .build()
         .unwrap();
 
@@ -126,6 +90,9 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     let expected_messages_count = stats.messages_count;
     let expected_clients_count = stats.clients_count;
     let expected_consumer_groups_count = stats.consumer_groups_count;
+
+    // Keep this handle from reconnecting alongside the replacement after restart.
+    client.disconnect().await.unwrap();
 
     // Restart server
     harness.restart_server().await.unwrap();
@@ -206,10 +173,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
         "pinned-consumer",
         IggyByteSize::from(amount_of_data_to_process.as_bytes_u64() * 2),
     );
-    drop(client_after_restart);
-
-    // Connect and login to server
-    let client = harness.tcp_root_client().await.unwrap();
+    let client = client_after_restart;
 
     // Save stats from the second server (should have double the data)
     let stats = client.get_stats().await.unwrap();
@@ -313,9 +277,18 @@ async fn should_handle_resource_deletion_and_restart() {
     let client = harness.tcp_root_client().await.unwrap();
 
     // Create 3 streams
-    let stream_0 = client.create_stream("stream-0").await.unwrap();
-    let stream_1 = client.create_stream("stream-1").await.unwrap();
-    let stream_2 = client.create_stream("stream-2").await.unwrap();
+    let stream_0 = client
+        .create_stream("stream-0", &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream_1 = client
+        .create_stream("stream-1", &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream_2 = client
+        .create_stream("stream-2", &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     assert_eq!(stream_0.id, 0);
     assert_eq!(stream_1.id, 1);
@@ -331,17 +304,35 @@ async fn should_handle_resource_deletion_and_restart() {
                 .create_topic(
                     &stream_ident,
                     &format!("topic-{}", topic_idx),
-                    3,
-                    CompressionAlgorithm::None,
-                    None,
-                    IggyExpiry::NeverExpire,
-                    MaxTopicSize::Unlimited,
+                    &TopicCreateOptions {
+                        partitions_count: Some(3),
+                        message_expiry: Some(IggyExpiry::NeverExpire),
+                        max_topic_size: Some(MaxTopicSize::Unlimited),
+                        ..TopicCreateOptions::default()
+                    },
                 )
                 .await
                 .unwrap();
             assert_eq!(topic.id, topic_idx);
 
             let topic_ident = Identifier::numeric(topic_idx).unwrap();
+
+            // One pass per partition. Without messages every delete below
+            // removes an empty scope, and the stats assertions across the
+            // restart would hold whether or not a delete rolls its bytes out
+            // of the parent totals.
+            for partition_id in 0..3u32 {
+                let mut messages = deletion_test_messages();
+                client
+                    .send_messages(
+                        &stream_ident,
+                        &topic_ident,
+                        &Partitioning::partition_id(partition_id),
+                        &mut messages,
+                    )
+                    .await
+                    .unwrap();
+            }
 
             // Create 3 consumer groups per topic
             for cg_idx in 0..3 {
@@ -390,7 +381,10 @@ async fn should_handle_resource_deletion_and_restart() {
     // was used instead of vacant_key() to predict the assigned ID.
     // After deletion: streams are [0, 2], len=2, but vacant_key=1
     // Bug: code used len (2) to create directory, but metadata assigned ID 1
-    let stream_reused = client.create_stream("stream-reused").await.unwrap();
+    let stream_reused = client
+        .create_stream("stream-reused", &StreamCreateOptions::default())
+        .await
+        .unwrap();
     assert_eq!(
         stream_reused.id, 1,
         "New stream should reuse deleted ID 1, got {}",
@@ -411,11 +405,12 @@ async fn should_handle_resource_deletion_and_restart() {
         .create_topic(
             &stream_0_ident,
             "topic-reused",
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::Unlimited,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                max_topic_size: Some(MaxTopicSize::Unlimited),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -435,12 +430,32 @@ async fn should_handle_resource_deletion_and_restart() {
         stream_ids
     );
 
+    // Deletes roll their bytes out of the parent totals at commit time; a
+    // restart rebuilds those totals from disk instead. The two have to agree,
+    // or one of the paths still counts data the other already removed.
+    let stats_before_restart = client.get_stats().await.unwrap();
+
     drop(client);
 
     // Restart server
     harness.restart_server().await.unwrap();
 
     let client = harness.tcp_root_client().await.unwrap();
+
+    let stats_after_restart = client.get_stats().await.unwrap();
+    assert!(
+        stats_before_restart.messages_count > 0,
+        "the deletes above must leave messages behind, or the comparison is vacuous"
+    );
+    assert_eq!(
+        stats_before_restart.messages_count, stats_after_restart.messages_count,
+        "messages_count must survive the restart unchanged after the deletes"
+    );
+    assert_eq!(
+        stats_before_restart.messages_size_bytes.as_bytes_u64(),
+        stats_after_restart.messages_size_bytes.as_bytes_u64(),
+        "messages_size_bytes must survive the restart unchanged after the deletes"
+    );
 
     // Verify streams after restart - should have 3 streams: 0, 1 (reused), 2
     let streams = client.get_streams().await.unwrap();
@@ -554,4 +569,18 @@ async fn should_handle_resource_deletion_and_restart() {
             cg_ids
         );
     }
+}
+
+/// Payload for `should_handle_resource_deletion_and_restart`: small, fixed and
+/// non-empty, so a scope that gets deleted has bytes worth rolling back.
+fn deletion_test_messages() -> Vec<IggyMessage> {
+    (0..8u128)
+        .map(|offset| {
+            IggyMessage::builder()
+                .id(offset + 1)
+                .payload(Bytes::from_static(b"deletion-stats-payload"))
+                .build()
+                .expect("Failed to build message")
+        })
+        .collect()
 }

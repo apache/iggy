@@ -15,12 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-baseDir = "."
-headerPath = "ASF_LICENSE.txt"
-strictCheck = true
-useDefaultMapping = true
+[header]
+path = "ASF_LICENSE.txt"
 keywords = ["Licensed to the Apache Software Foundation"]
 
+[files]
+root = "."
 excludes = [
     "**/target/**",
     "**/node_modules/**",
@@ -37,15 +37,17 @@ excludes = [
     "**/local_data*/**",
     "**/performance_results*/**",
     "**/*.lock",
+    "**/pylock.toml",
     "**/*.txt",
     "**/*.tpl",
     "**/LICENSE",
     "LICENSE",
     "NOTICE",
-    "DISCLAIMER",
     "**/NOTICE",
     "**/.gitignore",
+    "**/.gitattributes",
     "**/.dockerignore",
+    "**/Dockerfile.dockerignore",
     "**/.helmignore",
     "**/.prettierignore",
     "**/.editorconfig",
@@ -78,9 +80,19 @@ excludes = [
     "**/META-INF/services/**",
     ".github/config/hawkeye.version",
     "**/.python-version",
+    "**/Package.resolved",
+    "**/.swift-format",
+    # SwiftPM requires `// swift-tools-version` as the very first line, which the
+    # header parser reads as part of the header. The header is still present.
+    "**/Package.swift",
+    "**/.build/**",
+    "**/gradle/wrapper/**",
+    "**/.clang-tidy",
+    # cargo-php regenerates this file with an extra separator after the header.
+    "foreign/php/iggy-php.stubs.php",
 ]
 
-[mapping.DOUBLESLASH_STYLE]
+[[rules]]
 extensions = [
     "cs",
     "go",
@@ -88,10 +100,13 @@ extensions = [
     "php",
     "rs",
     "js",
+    "swift",
     "ts",
 ]
+style_out = "doubleslash"
+styles_in = ["doubleslash", "slashstar", "javadoc"]
 
-[mapping.SCRIPT_STYLE]
+[[rules]]
 filenames = [
     "Dockerfile",
     "Dockerfile.test",
@@ -113,8 +128,9 @@ extensions = [
     "yaml",
     "yml",
 ]
+style_out = "script"
 
-[mapping.SLASHSTAR_STYLE]
+[[rules]]
 extensions = [
     "css",
     "fbs",
@@ -128,8 +144,9 @@ extensions = [
     "h",
     "hpp",
 ]
+style_out = "slashstar"
 
-[mapping.XML_STYLE]
+[[rules]]
 filenames = [
     "phpunit.xml.dist",
 ]
@@ -140,7 +157,8 @@ extensions = [
     "svelte",
     "xml",
 ]
+style_out = "xml"
 
 [git]
 ignore = "auto"
-attrs = "disable"
+file_attrs = "disable"

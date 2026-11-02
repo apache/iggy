@@ -21,33 +21,42 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::future::{Future, poll_fn};
 use std::net::IpAddr;
+use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::{Poll, Waker};
 
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::Response;
-use configs::server::ServerSystemConfig;
-use consensus::{MetadataHandle, VsrConsensus};
+use configs::server::ServerConfig;
+use consensus::{Consensus, MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
-use iggy_common::{ClusterMetadata, IggyTimestamp};
+use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
+use iggy_common::{ClusterMetadata, IggyError, IggyTimestamp, UserStatus};
 use message_bus::InstanceToken;
 use metadata::MetadataSubmitError;
+use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::user::User;
 use send_wrapper::SendWrapper;
 use tokio::sync::Mutex;
 use tracing::warn;
 
-use crate::bootstrap::ServerShard;
 use crate::cluster_meta::ClusterRoster;
-use crate::dispatch::submit_register_on_owner;
+use crate::consumer_group::lease::{ConsumerGroupLiveness, SessionActivity};
+use crate::dispatch::session_ops::{submit_logout_on_owner, submit_register_on_owner};
+use crate::http::admission::RelayTargets;
 use crate::http::error::{AuthError, ReadError, primary_redirect_location};
-use crate::http::forward::ForwardState;
-use crate::http::jwt::JwtManager;
+use crate::http::relay_proof::RelayKey;
+
+use crate::http::jwt::{JwtManager, TrustedIssuer};
 use crate::http::metrics::HttpMetrics;
 use crate::http::session::{
     BarrierEntry, FIRST_REQUEST_ID, FRESH_ENTRY_WATERMARK, HttpSession, RegistrationBarrier,
     forget_if_same, live_entry, sweep_expired,
 };
+use crate::shell::ServerShard;
 
 /// Response header carrying the current VSR view number. Stamped by
 /// `insert_view_header` on success and redirect responses only (never on
@@ -57,11 +66,228 @@ use crate::http::session::{
 /// follower's possibly-stale one.
 pub(in crate::http) const VIEW_HEADER: HeaderName = HeaderName::from_static("iggy-view");
 
+/// Response header carrying the SERVING node's applied metadata op, stamped by
+/// [`insert_view_header`] on the same responses as [`VIEW_HEADER`].
+///
+/// Load-bearing, not diagnostic: a follower that RELAYS a control-plane write
+/// to the primary never runs the local write path, so nothing would record
+/// what that caller was told committed, and its next unqualified GET - which
+/// stays local - could answer from before its own write. The relay reads this
+/// header off the primary's response and records it as the caller's floor (see
+/// `http::forward`). Filled if absent, so a relayed response keeps the serving
+/// node's number rather than the relaying follower's lower one.
+///
+/// The op is a floor, not the caller's exact commit: the primary applies a
+/// metadata op before it replies, so its applied frontier at reply time is at
+/// or above the op the caller now holds. Above means waiting for a few of
+/// someone else's committed ops too, which is stronger than read-your-writes
+/// and never weaker.
+pub(in crate::http) const APPLIED_OP_HEADER: HeaderName =
+    HeaderName::from_static("iggy-applied-op");
+
+/// Response header attesting what durability a produce response proves:
+/// The completed topic policy after an awaited quorum commit. If namespace
+/// replacement prevents attesting its incarnation, report the proven quorum
+/// guarantee. `none` means `?ack=none` dispatch acceptance.
+pub(in crate::http) const DURABILITY_HEADER: HeaderName =
+    HeaderName::from_static("iggy-durability");
+
+struct RegisteredSessionGuard {
+    shard: Rc<ServerShard>,
+    identity: Option<(u128, u64)>,
+}
+
+impl Drop for RegisteredSessionGuard {
+    fn drop(&mut self) {
+        if let Some((client_id, epoch)) = self.identity {
+            discard_registration(Rc::clone(&self.shard), client_id, epoch);
+        }
+    }
+}
+
+fn discard_registration(shard: Rc<ServerShard>, client_id: u128, epoch: u64) {
+    compio::runtime::spawn(async move {
+        if let Err(error) = submit_logout_on_owner(
+            &shard,
+            client_id,
+            epoch,
+            consensus::client_table::EXPIRED_SESSION_REQUEST_ID,
+        )
+        .await
+        {
+            warn!(
+                ?error,
+                client_id, epoch, "server HTTP: orphan registration awaits lease expiry"
+            );
+        }
+    })
+    .detach();
+}
+
+/// Per-user read-your-writes floors: the highest metadata op each user has
+/// been told committed BY THIS NODE.
+///
+/// Keyed by user id, and held outside the session table, both deliberately. A
+/// session entry is dropped outright when its VSR slot dies
+/// ([`HttpInner::forget_session`]) or when the expiry sweep runs, and
+/// `POST /users/refresh-token` answers with a fresh `jti` that registers no
+/// session at all: a floor living in the session entry, or keyed by the
+/// credential, reads `0` again in all three cases while the caller's bearer
+/// stays valid - the stale read this exists to prevent, for exactly the
+/// callers still holding a committed reply. Keying by user also bounds the
+/// table by the user count instead of by every token ever minted.
+///
+/// One user's floor is shared by its credentials, which is stronger than
+/// read-your-writes and never weaker: the extra ops a second credential waits
+/// for are the same user's.
+#[derive(Debug, Default)]
+pub(in crate::http) struct MetadataWatermarks(RefCell<HashMap<u32, u64>>);
+
+impl MetadataWatermarks {
+    /// Highest metadata op `user_id` was told committed here, or `0` when it
+    /// was told none - no write of its ever ran on this node, so there is
+    /// nothing to read back.
+    ///
+    /// Deliberately not expiry-filtered: the number is a consistency floor,
+    /// not a capability, and the request that consults it has already
+    /// re-verified the bearer.
+    ///
+    /// Confines the `RefCell` borrow to this call, so it can never span the
+    /// read gate's `.await`.
+    pub(in crate::http) fn get(&self, user_id: u32) -> u64 {
+        self.0.borrow().get(&user_id).copied().unwrap_or(0)
+    }
+
+    /// Raise `user_id`'s floor to `commit`. Monotone, so a reply that lands
+    /// out of order (concurrent requests on one credential are legal) cannot
+    /// lower it.
+    ///
+    /// Only COMMITTED metadata replies belong here; see
+    /// [`crate::dispatch::submit::committed_reply_commit`] for what that
+    /// excludes and why.
+    pub(in crate::http) fn record(&self, user_id: u32, commit: u64) {
+        let mut floors = self.0.borrow_mut();
+        let floor = floors.entry(user_id).or_insert(0);
+        *floor = (*floor).max(commit);
+    }
+}
+
 /// Axum router state: shard-0's [`HttpInner`] behind an `Rc`, `!Send` yet
 /// bridged into axum's `Send + Sync` requirement by `SendWrapper`. Sound
 /// because the listener and every handler run on shard 0's compio thread - the
 /// same thread that builds this state. Never touch it off that thread.
 pub(in crate::http) type HttpState = SendWrapper<Rc<HttpInner>>;
+
+/// Per-node forwarding context hung off `HttpInner`: the outbound client
+/// (pinned-cert TLS when the listener serves HTTPS), the scheme it dials, the
+/// request-body buffer bound, the key that proves a relay comes from a node,
+/// the budget of the relays this node sends, and the separate budget of the
+/// relays it serves as their hop target. A relayed deferred poll holds its
+/// slots for its whole wait, so it takes them from a second pair of budgets.
+/// Built by `http::forward::build_forward_state`; lives here so the state hub
+/// never imports the forwarding middleware.
+pub(in crate::http) struct ForwardState {
+    /// Derived from the cluster-wide bearer key material, so `None` when none
+    /// exists (no configured JWT secret, no cluster PSK). Then forwarding is
+    /// off and every relay field is refused.
+    pub(in crate::http) relay_key: Option<RelayKey>,
+    pub(in crate::http) client: cyper::Client,
+    /// Also read by the 307 redirect builder: the primary is assumed to serve
+    /// the same scheme as this node (uniform cluster HTTP config).
+    pub(in crate::http) scheme: &'static str,
+    pub(in crate::http) body_limit: usize,
+    pub(in crate::http) in_flight: Rc<Cell<u32>>,
+    pub(in crate::http) deferred_in_flight: Rc<Cell<u32>>,
+    pub(in crate::http) relay_targets: RelayTargets,
+    pub(in crate::http) deferred_relay_targets: RelayTargets,
+    pub(in crate::http) floor_reads: FloorReads,
+}
+
+/// This node's metadata floor reads, single flight. A read already sent can
+/// miss an op acknowledged after it left, so it serves only the waiters that
+/// came before it was sent. The waiters that come while it is in flight share
+/// the next read, which the first of them sends once it ends.
+#[derive(Default)]
+pub(in crate::http) struct FloorReads {
+    /// Reads sent so far, which also numbers each read.
+    sent: Cell<u64>,
+    in_flight: Cell<bool>,
+    /// The number and outcome of the newest read that ended.
+    ended: Cell<Option<(u64, ControlFlow<Option<u64>>)>>,
+    /// Waiters parked until the read in flight ends.
+    parked: RefCell<Vec<Waker>>,
+}
+
+impl FloorReads {
+    /// The outcome of a read sent after this call. A waiter shares the read in
+    /// flight only when it was sent after the waiter came, and otherwise sends
+    /// the next one with `read` unless another waiter sent it first.
+    pub(in crate::http) async fn read<F>(
+        &self,
+        read: impl FnOnce() -> F,
+    ) -> ControlFlow<Option<u64>>
+    where
+        F: Future<Output = ControlFlow<Option<u64>>>,
+    {
+        let sent_before = self.sent.get();
+        loop {
+            if let Some((number, outcome)) = self.ended.get()
+                && number > sent_before
+            {
+                return outcome;
+            }
+            if !self.in_flight.get() {
+                break;
+            }
+            self.park().await;
+        }
+        let number = self.sent.get() + 1;
+        self.sent.set(number);
+        self.in_flight.set(true);
+        let sending = SentFloorRead { reads: self };
+        let outcome = read().await;
+        self.ended.set(Some((number, outcome)));
+        drop(sending);
+        outcome
+    }
+
+    async fn park(&self) {
+        let mut parked = false;
+        poll_fn(|context| {
+            if parked {
+                return Poll::Ready(());
+            }
+            parked = true;
+            self.parked.borrow_mut().push(context.waker().clone());
+            Poll::Pending
+        })
+        .await;
+    }
+}
+
+/// The read in flight. Its drop ends it, also when its waiter is dropped
+/// mid-read, and wakes the parked waiters so one of them sends the next read.
+struct SentFloorRead<'a> {
+    reads: &'a FloorReads,
+}
+
+impl Drop for SentFloorRead<'_> {
+    fn drop(&mut self) {
+        self.reads.in_flight.set(false);
+        for waker in self.reads.parked.take() {
+            waker.wake();
+        }
+    }
+}
+
+impl ForwardState {
+    /// Without cluster-wide bearer key material a forwarded bearer would 401
+    /// on the primary, so the middleware passes through and followers answer
+    /// with the transient 503 instead.
+    pub(in crate::http) const fn active(&self) -> bool {
+        self.relay_key.is_some()
+    }
+}
 
 /// Shared shard-0 HTTP state.
 ///
@@ -69,12 +295,13 @@ pub(in crate::http) type HttpState = SendWrapper<Rc<HttpInner>>;
 /// session table so every handler and the [`Authenticated`] extractor reach
 /// them through one axum `State`.
 pub(in crate::http) struct HttpInner {
+    pub(crate) session_liveness: Rc<RefCell<ConsumerGroupLiveness>>,
     pub(in crate::http) shard: Rc<ServerShard>,
     pub(in crate::http) jwt: JwtManager,
     /// Read-only server config for the snapshot collector (log directory +
     /// runtime config paths); the shard does not expose config on the read
     /// path.
-    pub(in crate::http) system_config: Arc<ServerSystemConfig>,
+    pub(in crate::http) server_config: Arc<ServerConfig>,
     /// Per-credential VSR sessions keyed by JWT `jti` / PAT hash. `RefCell` is
     /// sound here - shard 0 is single-threaded and the `SendWrapper` state
     /// bridge tolerates the `!Sync` interior - but the guard must never be held
@@ -83,16 +310,12 @@ pub(in crate::http) struct HttpInner {
     /// Per-key registration barrier: prevents a thundering herd of first
     /// requests for one credential from each running its own `Register`.
     pub(in crate::http) registrations: RegistrationBarrier,
-    pub(in crate::http) roster: ClusterRoster,
+    pub(in crate::http) roster: Rc<ClusterRoster>,
     /// Cap on live per-credential sessions: half the configured `[metadata]
     /// clients_table_max`, so HTTP sessions cannot crowd the TCP/QUIC/WS virtual
     /// clients out of the shared VSR client table. Read by `resolve_session`
     /// when admitting a fresh session.
     pub(in crate::http) max_http_sessions: usize,
-    /// Configured `[personal_access_token] max_tokens_per_user`, enforced
-    /// pre-consensus by the PAT rewrite inside the write submit (the cap is
-    /// config-derived, so it must never branch inside the replicated apply).
-    pub(in crate::http) max_tokens_per_user: u32,
     /// Awaited partition writes currently in flight across all sessions, gated
     /// by [`MAX_IN_FLIGHT_WRITES_GLOBAL`]. Only [`InFlightWriteGuard`] touches
     /// it, so every admission is paired with exactly one release.
@@ -103,6 +326,10 @@ pub(in crate::http) struct HttpInner {
     /// Legacy-parity metric registry served by the scrape route; the router's
     /// counting layer holds a clone of its request counter.
     pub(in crate::http) metrics: HttpMetrics,
+    /// Per-user read-your-writes floors the read gate holds reads against.
+    /// Behind `Rc` because the write path records from a detached task that
+    /// outlives its handler by design (see `submit_committed`).
+    pub(in crate::http) metadata_watermarks: Rc<MetadataWatermarks>,
 }
 
 impl HttpInner {
@@ -119,6 +346,18 @@ impl HttpInner {
             .consensus
             .as_ref()
             .is_some_and(VsrConsensus::is_primary)
+    }
+
+    /// True when this node is both in normal status and the primary. Used
+    /// by the ext-auth gate to block callouts during view changes, matching
+    /// the binary transport path in `session_ops::is_metadata_primary`.
+    pub(in crate::http) fn is_normal_primary(&self) -> bool {
+        self.shard
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .is_some_and(|c| c.is_normal() && c.is_primary())
     }
 
     /// Grade a linearizable read that reached a follower: redirect (307) to the
@@ -162,19 +401,43 @@ impl HttpInner {
     /// this one is parked (single-threaded `RefCell` + cooperative scheduling).
     pub(in crate::http) async fn resolve_session(
         &self,
-        key: String,
+        key: &str,
         user_id: u32,
+        user_created_at: IggyTimestamp,
         expiry: u64,
     ) -> Result<Rc<HttpSession>, AuthError> {
         loop {
+            self.ensure_active_user(user_id, Some(user_created_at))?;
             let now = IggyTimestamp::now().to_secs();
-            if let Some(session) = self.live_session(&key, now) {
+            if let Some(session) = self.live_session(key, now) {
+                return Ok(session);
+            }
+            {
+                let metadata = self.shard.plane.metadata();
+                let mut registry = metadata.client_table.borrow_mut();
+                for session in self
+                    .sessions
+                    .borrow()
+                    .values()
+                    .filter(|session| session.expiry > now)
+                {
+                    session.reattach(&mut registry);
+                }
+            }
+            if let Some(session) = self.live_session(key, now) {
                 return Ok(session);
             }
 
             // Miss. Serialize registration per credential so a herd of
             // concurrent first-requests runs one `Register`, not N.
-            match self.registrations.enter(&key) {
+            let (available_slots, torn) = {
+                let mut table = self.sessions.borrow_mut();
+                let torn = sweep_expired(&mut table, now);
+                (self.max_http_sessions.saturating_sub(table.len()), torn)
+            };
+            self.teardown_reply_targets(torn);
+            match self.registrations.enter(key, available_slots) {
+                BarrierEntry::Full => return Err(AuthError::SessionUnavailable),
                 BarrierEntry::Wait(waiter) => {
                     // Another first-request is registering this credential.
                     // Park until it finishes (its guard wakes us on drop),
@@ -182,51 +445,102 @@ impl HttpInner {
                     let _ = waiter.await;
                 }
                 BarrierEntry::Lead(_guard) => {
-                    // Sole registrant for this key: mint + Register with no
-                    // borrow held (an async VSR commit). The guard wakes any
-                    // waiters when this scope ends, cancellation drop included.
-                    let fresh = self.register_session(key.clone(), user_id, expiry).await?;
-                    // Resample after the await: the pre-await stamp is stale for
-                    // the expiry sweep and cap check below.
-                    let now = IggyTimestamp::now().to_secs();
-                    let (admitted, torn) = {
-                        let mut table = self.sessions.borrow_mut();
-                        let torn = sweep_expired(&mut table, now);
-                        if table.len() >= self.max_http_sessions {
-                            // Still full after dropping expired entries: too many
-                            // genuinely live sessions. Refuse rather than evict a
-                            // live one (its `fresh` client id is orphaned on the
-                            // peers until they evict it - a rare at-cap cost).
-                            (None, torn)
-                        } else {
-                            table.insert(key.clone(), Rc::clone(&fresh));
-                            (Some(fresh), torn)
-                        }
-                    };
-                    self.teardown_reply_targets(torn);
-                    return admitted.ok_or(AuthError::SessionUnavailable);
+                    // The guard reserves local capacity across Register and
+                    // releases it on failure or cancellation, waking waiters.
+                    let fresh = self
+                        .register_session(key.to_owned(), user_id, user_created_at, expiry)
+                        .await?;
+                    self.sessions
+                        .borrow_mut()
+                        .insert(key.to_owned(), Rc::clone(&fresh));
+                    return Ok(fresh);
                 }
             }
         }
     }
 
+    /// `created_at` of the active user at `user_id`. Refused when the id is
+    /// free, the user is not active, or `expected` is another account's stamp:
+    /// a delete frees the id for the next create, so a credential pins the
+    /// account it was issued to and every later check compares the stamp.
+    pub(in crate::http) fn ensure_active_user(
+        &self,
+        user_id: u32,
+        expected: Option<IggyTimestamp>,
+    ) -> Result<IggyTimestamp, IggyError> {
+        self.shard
+            .plane
+            .metadata()
+            .mux_stm
+            .users()
+            .read(|users| {
+                users
+                    .items
+                    .get(user_id as usize)
+                    .filter(|user| user.status == UserStatus::Active)
+                    .map(|user| user.created_at)
+            })
+            // A token carries micros, so compare at that precision.
+            .filter(|created_at| {
+                expected.is_none_or(|expected| expected.as_micros() == created_at.as_micros())
+            })
+            .ok_or(IggyError::Unauthenticated)
+    }
+
+    /// `(id, created_at)` of the account a trusted issuer's tokens act as: the
+    /// user named by the issuer, looked up per request. See
+    /// [`trusted_issuer_account`].
+    pub(in crate::http) fn trusted_issuer_user(
+        &self,
+        issuer: &TrustedIssuer,
+    ) -> Result<(u32, IggyTimestamp), IggyError> {
+        self.shard
+            .plane
+            .metadata()
+            .mux_stm
+            .users()
+            .read(|users| trusted_issuer_account(users.user_by_name(&issuer.config.username)))
+            .ok_or_else(|| {
+                issuer.warn_invalid_account();
+                IggyError::Unauthenticated
+            })
+    }
+
+    /// Highest metadata op `user_id` was told committed here; see
+    /// [`MetadataWatermarks`] for why the floor is per user and lives outside
+    /// the session table.
+    pub(in crate::http) fn metadata_watermark(&self, user_id: u32) -> u64 {
+        self.metadata_watermarks.get(user_id)
+    }
+
+    /// Whether this node holds a live session for `key`, which
+    /// [`Self::resolve_session`] returns without a `Register`.
+    pub(in crate::http) fn has_live_session(&self, key: &str) -> bool {
+        self.live_session(key, IggyTimestamp::now().to_secs())
+            .is_some()
+    }
+
     /// Clone the live (non-expired) entry for `key`, if present. Confines the
     /// shared `RefCell` borrow to this call so it can never span an `.await`.
     fn live_session(&self, key: &str, now_secs: u64) -> Option<Rc<HttpSession>> {
-        live_entry(&self.sessions.borrow(), key, now_secs)
+        let session = live_entry(&self.sessions.borrow(), key, now_secs)?;
+        session.activity.touch();
+        Some(session)
     }
 
     /// Mint a shard-0 client id and run the VSR `Register` for a fresh session,
     /// retrying on a fresh id if the minted one turns out to be taken.
     ///
-    /// The minter is a per-process counter reseeded from the client table at
-    /// boot, so a fresh mint normally lands on a free id. Two situations break
-    /// that, and neither is predictable from here: a promoted primary mints
-    /// from a counter with no relationship to the ids its predecessor
-    /// committed, and in a cluster every node counts independently. Landing on
-    /// an occupied entry is therefore reactive to detect and cheap to fix --
-    /// mint again. Bounded, because a run of collisions means the counter is
-    /// wrong rather than unlucky, and looping would hide that.
+    /// The minter puts this boot's nonce above a per-process counter, so a fresh
+    /// mint lands on an id that no other node and no earlier boot minted. That
+    /// holds only while no cluster node runs server 0.9.0: it seeds its counter
+    /// from the low 112 bits of live ids, nonce included, so it can mint the ids
+    /// this node mints next. A fresh mint can still land on an occupied entry
+    /// if a binary-transport client chose that id for itself (the TCP login
+    /// path takes `client` off the wire), or if two boots drew the same nonce.
+    /// That is cheap to detect and to fix: mint again. Bounded, because a run
+    /// of collisions means the minter is wrong rather than unlucky, and looping
+    /// would hide that.
     ///
     /// The two collision signals are asymmetric. A different owner is refused
     /// terminally by the register ownership gate. The SAME user is not refused
@@ -239,15 +553,16 @@ impl HttpInner {
         &self,
         key: String,
         user_id: u32,
+        user_created_at: IggyTimestamp,
         expiry: u64,
     ) -> Result<Rc<HttpSession>, AuthError> {
-        /// Enough to ride out a promotion-era counter overlap; beyond this the
-        /// minter is misconfigured and the 503 is the honest answer.
+        /// A collision is rare enough that this many in a row means the minter
+        /// is broken, and the 503 is the honest answer.
         const MINT_ATTEMPTS: u8 = 3;
 
         for attempt in 1..=MINT_ATTEMPTS {
             match self
-                .register_session_once(key.clone(), user_id, expiry)
+                .register_session_once(key.clone(), user_id, user_created_at, expiry)
                 .await
             {
                 Ok(session) => return Ok(session),
@@ -271,37 +586,18 @@ impl HttpInner {
         &self,
         key: String,
         user_id: u32,
+        user_created_at: IggyTimestamp,
         expiry: u64,
     ) -> Result<Rc<HttpSession>, AuthError> {
         let coordinator = self
             .shard
             .coordinator()
             .ok_or(AuthError::SessionUnavailable)?;
-        // Refold the client table into the minter if this is the first mint of
-        // the current view. Cheap and skipped within a view, and it is what
-        // stops a PROMOTED primary from minting against ids its predecessor
-        // committed from an unrelated counter -- the table is replicated, the
-        // counter is per process. Boot does the same call (`bootstrap`); this
-        // one covers every later view.
-        {
-            let metadata = self.shard.plane.metadata();
-            if let Some(consensus) = metadata.consensus.as_ref() {
-                coordinator.seed_client_sequence(
-                    consensus.view(),
-                    metadata.client_table.borrow().client_ids(),
-                );
-            }
-        }
         // Reuse the TCP accept path's minter: it draws from the same shard-0
         // `client_seq`, so an HTTP session id can never collide with a TCP
         // virtual client's and the shard-0 tag (top 16 bits == 0) is preserved.
         let client_id = coordinator.mint_shard_zero_client_id();
-        // The minter seeds at 1, so 0 is only reachable after a 2^112 wrap.
-        // Guard anyway: `submit_register_in_process` asserts `client_id != 0`,
-        // and an assert on this request path would be a panic.
-        if client_id == 0 {
-            return Err(AuthError::SessionUnavailable);
-        }
+        self.metrics.session_registers.inc();
         // Shared Register entry point; on shard 0 (always, for HTTP) it runs
         // `submit_register_in_process` directly on the metadata owner.
         //
@@ -315,10 +611,20 @@ impl HttpInner {
         let (result_slot, committed) = oneshot::channel();
         let shard = Rc::clone(&self.shard);
         compio::runtime::spawn(async move {
-            let result = submit_register_on_owner(&shard, client_id, user_id).await;
-            // A failed send means the handler died mid-await; the Register
-            // itself has already committed, which is what matters.
-            let _ = result_slot.send(result);
+            let registration = RegisterRequest {
+                user_created_at: user_created_at.as_micros(),
+                bind_verifier: consensus::client_table::bind_verifier(
+                    client_id,
+                    user_id,
+                    &rand::random(),
+                ),
+            };
+            let result = submit_register_on_owner(&shard, client_id, user_id, registration).await;
+            if let Err(Ok(bound)) = result_slot.send(result)
+                && bound.watermark == FRESH_ENTRY_WATERMARK
+            {
+                discard_registration(shard, client_id, bound.epoch);
+            }
         })
         .detach();
         let bound = committed
@@ -326,31 +632,7 @@ impl HttpInner {
             .map_err(|_| AuthError::SessionUnavailable)?
             .map_err(|error| {
                 warn!(?error, "server HTTP: VSR Register submit failed");
-                match error {
-                    // The Register never entered the pipeline, so re-issuing
-                    // it anywhere is safe; the transient-not-accepted body
-                    // tells a forwarding peer to retry against the current
-                    // primary. `Canceled` / `InProgress` mean a prepare may
-                    // still commit cluster-wide, so they stay the plain
-                    // unavailable 503.
-                    MetadataSubmitError::NotPrimary
-                    | MetadataSubmitError::NotCaughtUp
-                    | MetadataSubmitError::PipelineFull => AuthError::SessionNotAccepted,
-                    // Terminal, and the only variant here that is: retrying
-                    // anywhere cannot make the id free. Kept off the 503 path
-                    // so the caller's HTTP stack does not auto-retry forever.
-                    MetadataSubmitError::ClientIdOwnedByAnotherUser => {
-                        AuthError::SessionIdOwnedByAnotherUser
-                    }
-                    // `InProgress` / `Canceled` mean a prepare may still
-                    // commit cluster-wide, so the outcome is unknown rather
-                    // than terminal. A future variant lands here too: 503 is
-                    // the safe default, since it never asserts a refusal the
-                    // server did not make.
-                    MetadataSubmitError::InProgress | MetadataSubmitError::Canceled | _ => {
-                        AuthError::SessionUnavailable
-                    }
-                }
+                register_submit_auth_error(&error)
             })?;
         // A fresh mint must land on a fresh entry, so a watermark it did not
         // write means the id was already registered to this same user (see
@@ -365,14 +647,54 @@ impl HttpInner {
             );
             return Err(AuthError::SessionIdTaken);
         }
+        // A handler canceled during catch-up must not orphan a committed slot.
+        let mut registration = RegisteredSessionGuard {
+            shard: Rc::clone(&self.shard),
+            identity: Some((client_id, bound.epoch)),
+        };
+        // `bound.epoch` also floors the read gate: a HEALTHY BACKUP forwards the
+        // register to the primary (see `submit_register_local_or_forward`), so
+        // this node can hand back an epoch its own commit walk has not
+        // reached, and the caller's first read would otherwise be served from
+        // state older than the register it is holding.
+        self.metadata_watermarks.record(user_id, bound.epoch);
+        let metadata = self.shard.plane.metadata();
+        let frontier = metadata.applied_frontier();
+        shard::bus_timeout(
+            &self.shard.bus,
+            frontier.read_budget(),
+            frontier.reached(bound.epoch),
+        )
+        .await
+        .ok_or(AuthError::SessionUnavailable)?;
+        // Register and catch-up may yield to a user revocation.
+        self.ensure_active_user(user_id, Some(user_created_at))?;
+        let attachment = metadata
+            .client_table
+            .borrow_mut()
+            .attach_session(client_id, bound.epoch, user_id)
+            .ok_or(AuthError::SessionUnavailable)?;
+        let activity = Rc::new(SessionActivity::new(
+            iggy_binary_protocol::ConsumerSession {
+                client_id,
+                session: bound.epoch,
+            },
+        ));
+        self.session_liveness
+            .borrow_mut()
+            .observe_local_session(&activity);
+        registration.identity = None;
         Ok(Rc::new(HttpSession {
+            attachment: RefCell::new(attachment),
+            activity,
             key,
             client_id,
             session: bound.epoch,
             user_id,
             expiry,
             gate: Mutex::new(FIRST_REQUEST_ID),
-            data_request: Cell::new(FIRST_REQUEST_ID),
+            data_gate: Mutex::new(FIRST_REQUEST_ID),
+            partition_gates: RefCell::default(),
             registry_token: Cell::new(None),
             in_flight_writes: Cell::new(0),
         }))
@@ -423,6 +745,27 @@ impl HttpInner {
     }
 }
 
+const fn register_submit_auth_error(error: &MetadataSubmitError) -> AuthError {
+    match error {
+        // These outcomes prove the Register never entered a pipeline, so a
+        // forwarding peer may safely retry against a re-resolved primary.
+        MetadataSubmitError::NotPrimary
+        | MetadataSubmitError::NotCaughtUp
+        | MetadataSubmitError::PipelineFull
+        | MetadataSubmitError::PrimaryUnreachable => AuthError::SessionNotAccepted,
+        MetadataSubmitError::ClientIdOwnedByAnotherUser => AuthError::SessionIdOwnedByAnotherUser,
+        MetadataSubmitError::Unauthenticated => {
+            AuthError::Unauthenticated(IggyError::Unauthenticated)
+        }
+        // The proposal may still commit. Unknown future outcomes fail closed
+        // into the same client-only retry class.
+        MetadataSubmitError::InProgress
+        | MetadataSubmitError::Canceled
+        | MetadataSubmitError::ForwardTimedOut
+        | _ => AuthError::SessionUnavailable,
+    }
+}
+
 /// Set the [`VIEW_HEADER`] to the current VSR view on a successful or redirect
 /// `response`. Omits the header on error responses and when this node has no
 /// live consensus: a missing header is unambiguous, whereas a fabricated view
@@ -441,5 +784,145 @@ pub(in crate::http) fn insert_view_header(state: &HttpInner, mut response: Respo
             .entry(VIEW_HEADER)
             .or_insert(HeaderValue::from(consensus.view()));
     }
+    // Same fill-if-absent rule, and for the same reason: the relay needs the
+    // op the SERVING node had applied, not this one's (see
+    // [`APPLIED_OP_HEADER`]).
     response
+        .headers_mut()
+        .entry(APPLIED_OP_HEADER)
+        .or_insert(HeaderValue::from(
+            state.shard.plane.metadata().applied_frontier().get(),
+        ));
+    response
+}
+
+/// `(id, created_at)` of `user` when a trusted issuer may act as it: active and
+/// not root. A deleted user's id goes to the next user created, so the issuer
+/// is matched by username, and an external issuer never holds root.
+fn trusted_issuer_account(user: Option<&User>) -> Option<(u32, IggyTimestamp)> {
+    crate::external_auth::validate_provisioned_account(user)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MetadataWatermarks, register_submit_auth_error, trusted_issuer_account};
+    use crate::http::error::AuthError;
+    use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+    use iggy_common::{HeaderKey, HeaderValue, OptionKey, OptionValue};
+    use iggy_common::{IggyTimestamp, UserStatus};
+    use metadata::MetadataSubmitError;
+    use metadata::stm::user::User;
+
+    /// The floor is what the read gate waits for, so nothing may lower it: two
+    /// concurrent requests by one user can have their committed replies land
+    /// out of order, and the later-but-lower reply must not undo the
+    /// earlier-but-higher one.
+    #[test]
+    fn given_out_of_order_replies_when_recording_should_keep_the_floor_monotone() {
+        const USER: u32 = 3;
+
+        let watermarks = MetadataWatermarks::default();
+        assert_eq!(
+            watermarks.get(USER),
+            0,
+            "a user this node never wrote for was promised nothing"
+        );
+
+        watermarks.record(USER, 50);
+        watermarks.record(USER, 7);
+        assert_eq!(
+            watermarks.get(USER),
+            50,
+            "a lower commit must not lower the floor"
+        );
+    }
+
+    /// One user's floor is not another's: a busy writer must not park an
+    /// unrelated user's reads behind ops it never issued.
+    #[test]
+    fn given_two_users_when_one_writes_should_leave_the_other_floor_alone() {
+        let watermarks = MetadataWatermarks::default();
+        watermarks.record(1, 50);
+        assert_eq!(watermarks.get(2), 0);
+    }
+
+    #[test]
+    fn register_submit_errors_preserve_known_and_unknown_outcomes() {
+        for error in [
+            MetadataSubmitError::NotPrimary,
+            MetadataSubmitError::NotCaughtUp,
+            MetadataSubmitError::PipelineFull,
+            MetadataSubmitError::PrimaryUnreachable,
+        ] {
+            assert!(matches!(
+                register_submit_auth_error(&error),
+                AuthError::SessionNotAccepted
+            ));
+        }
+        assert!(matches!(
+            register_submit_auth_error(&MetadataSubmitError::ClientIdOwnedByAnotherUser),
+            AuthError::SessionIdOwnedByAnotherUser
+        ));
+        for error in [
+            MetadataSubmitError::InProgress,
+            MetadataSubmitError::Canceled,
+            MetadataSubmitError::ForwardTimedOut,
+        ] {
+            assert!(matches!(
+                register_submit_auth_error(&error),
+                AuthError::SessionUnavailable
+            ));
+        }
+    }
+
+    #[test]
+    fn given_root_inactive_or_unknown_user_when_trusted_issuer_maps_onto_it_should_refuse() {
+        let root = user(DEFAULT_ROOT_USER_ID, UserStatus::Active);
+        let inactive = user(1, UserStatus::Inactive);
+        assert_eq!(
+            trusted_issuer_account(Some(&root)),
+            None,
+            "an external issuer must never act as root"
+        );
+        assert_eq!(trusted_issuer_account(Some(&inactive)), None);
+        assert_eq!(trusted_issuer_account(None), None);
+    }
+
+    #[test]
+    fn given_active_user_when_trusted_issuer_maps_onto_it_should_resolve_its_account() {
+        let active = user(1, UserStatus::Active);
+        assert_eq!(
+            trusted_issuer_account(Some(&active)),
+            Some((1, active.created_at))
+        );
+    }
+
+    #[test]
+    fn given_user_with_critical_options_when_trusted_issuer_maps_onto_it_should_refuse() {
+        let mut with_critical = user(2, UserStatus::Active);
+        // An unrecognized key listed in the critical-keys marker triggers
+        // check_critical_options to reject the user.
+        with_critical.options.insert(
+            HeaderKey::try_from("future_secret").unwrap(),
+            OptionValue::explicit(HeaderValue::try_from("opaque").unwrap()),
+        );
+        with_critical.options.insert(
+            HeaderKey::from(OptionKey::CriticalKeys),
+            OptionValue::derived(HeaderValue::try_from("future_secret").unwrap()),
+        );
+        assert_eq!(
+            trusted_issuer_account(Some(&with_critical)),
+            None,
+            "a user with unrecognized critical options must be rejected"
+        );
+    }
+
+    fn user(id: u32, status: UserStatus) -> User {
+        User {
+            id,
+            status,
+            created_at: IggyTimestamp::from(1_700_000_000_000_000),
+            ..User::default()
+        }
+    }
 }

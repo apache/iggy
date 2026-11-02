@@ -19,20 +19,23 @@ package tcp_test
 
 import (
 	"context"
+	"errors"
 	"math/rand"
-	"os"
 	"strings"
 	"time"
 
+	"github.com/apache/iggy/bdd/go/tests/env"
 	"github.com/apache/iggy/foreign/go/client"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 
 	"github.com/apache/iggy/foreign/go/client/tcp"
 )
 
 func createAuthorizedConnection() iggcon.Client {
 	cli := createClient()
-	_, err := cli.LoginUser(context.Background(), "iggy", "iggy")
+	username, password := env.RootCredentials()
+	_, err := cli.LoginUser(context.Background(), username, password)
 	if err != nil {
 		panic(err)
 	}
@@ -40,13 +43,9 @@ func createAuthorizedConnection() iggcon.Client {
 }
 
 func createClient() iggcon.Client {
-	addr := os.Getenv("IGGY_TCP_ADDRESS")
-	if addr == "" {
-		addr = "127.0.0.1:8090"
-	}
 	cli, err := client.NewIggyClient(
 		client.WithTcp(
-			tcp.WithServerAddress(addr),
+			tcp.WithServerAddress(env.ServerAddress()),
 		),
 	)
 	if err != nil {
@@ -77,6 +76,20 @@ func createRandomUInt32() uint32 {
 func randomU32Identifier() iggcon.Identifier {
 	id, _ := iggcon.NewIdentifier(createRandomUInt32())
 	return id
+}
+
+// nonExistingStreamIdentifier returns an id that no stream holds. Earlier
+// suites leave streams on the shared server, so a random id can resolve and
+// turn a stream-not-found answer into a topic-not-found one.
+func nonExistingStreamIdentifier(cli iggcon.Client) iggcon.Identifier {
+	const attempts = 64
+	for range attempts {
+		id := randomU32Identifier()
+		if _, err := cli.GetStream(context.Background(), id); errors.Is(err, ierror.ErrStreamIdNotFound) {
+			return id
+		}
+	}
+	panic("no free stream id found")
 }
 
 func createRandomString(length int) string {

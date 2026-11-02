@@ -19,28 +19,28 @@
 declare(strict_types=1);
 
 use Iggy\Client;
+use Iggy\CommitPolicy;
 use Iggy\PollingStrategy;
+use Iggy\PollOptions;
 use Iggy\SendMessage;
 
-function iggy_connection_string(): string
+const CONSUMER_ID = 1;
+
+function iggy_client(): Client
 {
     $configured = getenv('IGGY_CONNECTION_STRING');
     if ($configured !== false && $configured !== '') {
-        return $configured;
+        $client = Client::fromConnectionString($configured);
+        $client->connect();
+
+        return $client;
     }
 
     $host = getenv('IGGY_HOST') ?: '127.0.0.1';
     $port = getenv('IGGY_PORT') ?: '8090';
-    $username = rawurlencode(getenv('IGGY_USERNAME') ?: 'iggy');
-    $password = rawurlencode(getenv('IGGY_PASSWORD') ?: 'iggy');
-
-    return "iggy+tcp://{$username}:{$password}@{$host}:{$port}";
-}
-
-function iggy_client(): Client
-{
-    $client = Client::fromConnectionString(iggy_connection_string());
+    $client = new Client("{$host}:{$port}");
     $client->connect();
+    $client->loginUser(getenv('IGGY_USERNAME') ?: 'iggy', getenv('IGGY_PASSWORD') ?: 'iggy');
 
     return $client;
 }
@@ -68,7 +68,14 @@ function send_payloads(Client $client, string $stream, string $topic, array $pay
 
 function print_polled_messages(Client $client, string $stream, string $topic, int $count): void
 {
-    $messages = $client->pollMessages($stream, $topic, 0, PollingStrategy::first(), $count, true);
+    $messages = $client->pollMessages(
+        $stream,
+        $topic,
+        0,
+        CONSUMER_ID,
+        PollingStrategy::first(),
+        new PollOptions(count: $count, commit: CommitPolicy::onRead()),
+    )->messages;
 
     if (count($messages) < $count) {
         throw new RuntimeException("Expected {$count} messages, received " . count($messages));

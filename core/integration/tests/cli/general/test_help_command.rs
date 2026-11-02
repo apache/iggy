@@ -38,8 +38,10 @@ Commands:
   segment          segments operations [alias: seg]
   ping             ping iggy server
   me               get current client info
+  options          list the option catalog of a resource scope
   stats            get iggy server statistics
   snapshot         collect iggy server troubleshooting data
+  metadata         metadata change log operations [alias: md]
   pat              personal access token operations
   user             user operations [alias: u]
   client           client operations [alias: c]
@@ -92,7 +94,7 @@ Options:
       --tcp-reconnection-max-retries <TCP_RECONNECTION_MAX_RETRIES>
           The optional number of max reconnect retries for the TCP transport
 {CLAP_INDENT}
-          [default: 3]
+          [default: 10]
 
       --tcp-reconnection-interval <TCP_RECONNECTION_INTERVAL>
           The optional reconnect interval for the TCP transport
@@ -125,7 +127,7 @@ Options:
       --quic-reconnection-max-retries <QUIC_RECONNECTION_MAX_RETRIES>
           The optional number of max reconnect retries for the QUIC transport
 {CLAP_INDENT}
-          [default: 3]
+          [default: 10]
 
       --quic-reconnection-interval <QUIC_RECONNECTION_INTERVAL>
           The optional reconnect interval for the QUIC transport
@@ -150,12 +152,12 @@ Options:
       --quic-send-window <QUIC_SEND_WINDOW>
           The optional send window for QUIC
 {CLAP_INDENT}
-          [default: 100000]
+          [default: 1000000]
 
       --quic-receive-window <QUIC_RECEIVE_WINDOW>
           The optional receive window for QUIC
 {CLAP_INDENT}
-          [default: 100000]
+          [default: 1000000]
 
       --quic-response-buffer-size <QUIC_RESPONSE_BUFFER_SIZE>
           The optional response buffer size for QUIC
@@ -170,7 +172,7 @@ Options:
       --quic-max-idle-timeout <QUIC_MAX_IDLE_TIMEOUT>
           The optional maximum idle timeout for QUIC
 {CLAP_INDENT}
-          [default: 10000]
+          [default: 100000]
 
       --quic-validate-certificate
           Flag to enable certificate validation for QUIC
@@ -183,7 +185,7 @@ Options:
       --websocket-reconnection-max-retries <WEBSOCKET_RECONNECTION_MAX_RETRIES>
           The optional number of max reconnect retries for the WebSocket transport
 {CLAP_INDENT}
-          [default: 3]
+          [default: 10]
 
       --websocket-reconnection-interval <WEBSOCKET_RECONNECTION_INTERVAL>
           The optional reconnect interval for the WebSocket transport
@@ -191,23 +193,34 @@ Options:
           [default: "1s"]
 
   -q, --quiet
-          Quiet mode (disabled stdout printing)
+          Suppress logging output (command-specific output may remain)
 
   -d, --debug <DEBUG>
           Debug mode (verbose printing to given file)
 
   -u, --username <USERNAME>
           Iggy server username
+{CLAP_INDENT}
+          When no credential flags are supplied, set both IGGY_USERNAME and
+          IGGY_PASSWORD. This environment pair does not fill omitted flags.
 
   -p, --password <PASSWORD>
           Iggy server password
 {CLAP_INDENT}
-          An optional parameter to specify the password for authentication.
-          If not provided, user will be prompted interactively to enter the
-          password securely.
+          With --username and no --password, read the password from the terminal
+          or stdin. IGGY_PASSWORD does not supply a password for --username.
+{CLAP_INDENT}
+          When no credential flags are supplied, set both IGGY_USERNAME and
+          IGGY_PASSWORD. This environment pair does not fill omitted flags.
 
   -t, --token <TOKEN>
           Iggy server personal access token
+{CLAP_INDENT}
+          Can also be provided with the IGGY_TOKEN environment variable.
+          An empty IGGY_TOKEN is treated as unset.
+          Command line credentials take precedence over the environment
+          variables, and IGGY_TOKEN takes precedence over the IGGY_USERNAME and
+          IGGY_PASSWORD pair.
 
   -n, --token-name <TOKEN_NAME>
           Iggy server personal access token name

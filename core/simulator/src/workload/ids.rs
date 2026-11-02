@@ -22,7 +22,7 @@
 //! need pseudo-uuid ids without reshaping this module.
 
 use rand::RngExt;
-use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use rand_xoshiro::rand_core::SeedableRng;
 
 #[derive(Debug, Clone, Copy)]
@@ -47,7 +47,7 @@ impl IdPermutation {
                     u32::try_from(data).is_ok(),
                     "Random id permutation needs index <= u32::MAX, got {data}"
                 );
-                let mut prng = Xoshiro256Plus::seed_from_u64(seed.wrapping_add(data));
+                let mut prng = Xoshiro256PlusPlus::seed_from_u64(seed.wrapping_add(data));
                 let lo32: u32 = prng.random();
                 ((data & 0xFFFF_FFFF) << 32) | u64::from(lo32)
             }

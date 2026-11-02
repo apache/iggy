@@ -251,16 +251,23 @@ pub fn read_bytes(buf: &[u8], offset: usize, len: usize) -> Result<&[u8], WireEr
         })
 }
 
-/// Cap a pre-allocation hint so a bogus wire count cannot cause OOM.
-/// The actual count is validated by the decode loop - this only limits
-/// the upfront allocation.
-#[inline]
+/// Capacity to preallocate for `count` elements that still have to be decoded
+/// out of `remaining` bytes, each at least `min_element_size` bytes on the
+/// wire.
+///
+/// A count read off the wire is chosen by the peer, and `Vec::with_capacity`
+/// reserves for it before a single element has been bounds-checked. A hostile
+/// or corrupt frame claiming `u32::MAX` elements therefore aborts the process
+/// on allocation failure instead of returning a decode error. The bytes left
+/// to decode are the honest ceiling on how many elements can exist.
+///
+/// A zero `min_element_size` is treated as one byte rather than passing the
+/// wire count through: an element that occupies no bytes cannot exist, and
+/// trusting the count is the exact hole this function was written to close.
 #[must_use]
-pub fn capped_capacity(count: usize, remaining: usize, min_item_size: usize) -> usize {
-    if min_item_size == 0 {
-        return count;
-    }
-    count.min(remaining / min_item_size)
+#[inline]
+pub fn bounded_capacity(count: usize, remaining: usize, min_element_size: usize) -> usize {
+    count.min(remaining / min_element_size.max(1))
 }
 
 #[cfg(test)]
@@ -268,17 +275,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capped_capacity_limits_allocation() {
-        assert_eq!(capped_capacity(1_000_000, 100, 10), 10);
-        assert_eq!(capped_capacity(5, 100, 10), 5);
-        assert_eq!(capped_capacity(10, 100, 10), 10);
-        assert_eq!(capped_capacity(11, 100, 10), 10);
-        assert_eq!(capped_capacity(0, 100, 10), 0);
-        assert_eq!(capped_capacity(100, 0, 10), 0);
+    fn bounded_capacity_limits_allocation() {
+        assert_eq!(bounded_capacity(1_000_000, 100, 10), 10);
+        assert_eq!(bounded_capacity(5, 100, 10), 5);
+        assert_eq!(bounded_capacity(10, 100, 10), 10);
+        assert_eq!(bounded_capacity(11, 100, 10), 10);
+        assert_eq!(bounded_capacity(0, 100, 10), 0);
+        assert_eq!(bounded_capacity(100, 0, 10), 0);
     }
 
     #[test]
-    fn capped_capacity_zero_item_size_returns_count() {
-        assert_eq!(capped_capacity(1_000_000, 100, 0), 1_000_000);
+    fn bounded_capacity_zero_element_size_still_bounds_by_the_buffer() {
+        assert_eq!(bounded_capacity(1_000_000, 100, 0), 100);
     }
 }

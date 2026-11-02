@@ -25,7 +25,7 @@ import (
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
-func (c *IggyTcpClient) CreatePersonalAccessToken(ctx context.Context, name string, expiry uint32) (*iggcon.RawPersonalAccessToken, error) {
+func (c *IggyTcpClient) CreatePersonalAccessToken(ctx context.Context, name string, expiry iggcon.Duration) (*iggcon.RawPersonalAccessToken, error) {
 	buffer, err := c.do(ctx, &command.CreatePersonalAccessToken{
 		Name:   name,
 		Expiry: expiry,

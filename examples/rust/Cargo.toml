@@ -134,3 +134,6 @@ path = "src/tcp-tls/producer/main.rs"
 [[example]]
 name = "tcp-tls-consumer"
 path = "src/tcp-tls/consumer/main.rs"
+
+[lints]
+workspace = true

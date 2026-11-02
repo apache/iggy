@@ -21,24 +21,46 @@ use thiserror::Error;
 pub enum RuntimeError {
     #[error("Invalid configuration: {0}")]
     InvalidConfiguration(String),
+    #[error(
+        "Invalid connector key {0:?}: expected at most {max_length} bytes of ASCII letters, digits, '-', '_' or '.', starting with a letter or digit",
+        max_length = crate::configs::connectors::ConnectorKey::MAX_LENGTH
+    )]
+    InvalidConnectorKey(String),
+    #[error(
+        "Sink stream {0:?} sets poll_interval, which is no longer supported. Set max_wait and min_count to batch messages"
+    )]
+    UnsupportedPollInterval(String),
     #[error("Failed to serialize topic metadata")]
     FailedToSerializeTopicMetadata,
     #[error("Failed to serialize messages metadata")]
     FailedToSerializeMessagesMetadata,
     #[error("Failed to serialize raw messages")]
     FailedToSerializeRawMessages,
-    #[error("Connector SDK error")]
+    #[error(transparent)]
     ConnectorSdkError(#[from] iggy_connector_sdk::Error),
-    #[error("Iggy client error")]
-    IggyClient(#[from] iggy::prelude::ClientError),
-    #[error("Iggy error")]
+    /// A classified state-store failure while loading an enabled source's
+    /// state. Process-level: treating it as "no state" would silently rewind
+    /// the source, and parking the source as a failed plugin would hide a
+    /// store outage that a restart could clear.
+    #[error("Failed to load state for source connector '{connector_key}': {source}")]
+    StateLoadFailed {
+        connector_key: String,
+        source: iggy_connector_sdk::Error,
+    },
+    /// Passed through as-is. An `IggyError` that originated on the server
+    /// loses its fields on the wire (apache/iggy#3735): the client reads
+    /// only the status code and fills the rest with defaults, so ids in the
+    /// message can be zero placeholders and not real ids. This is not
+    /// specific to this variant. It applies wherever a server-originated
+    /// `IggyError` is wrapped or stringified, such as
+    /// `iggy::prelude::ClientError::SdkError` or a message built by a
+    /// connector plugin.
+    #[error(transparent)]
     IggyError(#[from] iggy::prelude::IggyError),
     #[error("Missing Iggy credentials")]
     MissingIggyCredentials,
     #[error("Missing TLS certificate file")]
     MissingTlsCertificateFile,
-    #[error("JSON error")]
-    JsonError(#[from] serde_json::Error),
     #[error("Sink not found with key: {0}")]
     SinkNotFound(String),
     #[error("Sink config not found with key: {0}, version: {1}")]
@@ -51,6 +73,10 @@ pub enum RuntimeError {
     CannotConvertConfiguration,
     #[error("IO operation failed with error: {0:?}")]
     IoError(#[from] std::io::Error),
+    #[error("Failed to list configuration environment variables")]
+    ListConfigEnvVars(#[source] std::io::Error),
+    #[error("Failed to create Tokio runtime")]
+    RuntimeCreation(#[source] std::io::Error),
     #[error("HTTP request failed: {0}")]
     HttpRequestFailed(String),
     #[error("Token file not found: {0}")]
@@ -70,11 +96,48 @@ impl RuntimeError {
             RuntimeError::SourceConfigNotFound(_, _) => "source_config_not_found",
             RuntimeError::MissingIggyCredentials => "invalid_configuration",
             RuntimeError::InvalidConfiguration(_) => "invalid_configuration",
+            RuntimeError::InvalidConnectorKey(_) => "invalid_connector_key",
+            RuntimeError::UnsupportedPollInterval(_) => "invalid_configuration",
             RuntimeError::HttpRequestFailed(_) => "http_request_failed",
+            RuntimeError::StateLoadFailed { .. } => "state_load_failed",
             RuntimeError::TokenFileNotFound(_) => "invalid_configuration",
             RuntimeError::TokenFileReadError(_, _) => "invalid_configuration",
             RuntimeError::TokenFileEmpty(_) => "invalid_configuration",
             _ => "error",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy::prelude::IggyError;
+
+    #[test]
+    fn given_iggy_error_when_displayed_should_include_inner_message() {
+        let inner = IggyError::StreamNameNotFound("orders".to_owned());
+        let expected = inner.to_string();
+
+        let error = RuntimeError::from(inner);
+
+        assert_eq!(
+            error.to_string(),
+            expected,
+            "RuntimeError should carry the IggyError message"
+        );
+    }
+
+    #[test]
+    fn given_connector_sdk_error_when_displayed_should_include_inner_message() {
+        let inner = iggy_connector_sdk::Error::InitError("bad credentials".to_owned());
+        let expected = inner.to_string();
+
+        let error = RuntimeError::from(inner);
+
+        assert_eq!(
+            error.to_string(),
+            expected,
+            "RuntimeError should carry the SDK error message"
+        );
     }
 }

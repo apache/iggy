@@ -30,7 +30,11 @@ pub struct Permissions {
     /// Global permissions are applied to all streams.
     pub global: GlobalPermissions,
 
-    /// Stream permissions are applied to a specific stream.
+    /// Stream permissions are applied to a specific stream, keyed by stream ID.
+    ///
+    /// The server refuses a grant on a stream or topic that does not exist, and
+    /// a delete of a stream or topic removes every grant on it. A new stream or
+    /// topic can reuse a deleted ID, so a grant must not outlive its target.
     pub streams: Option<BTreeMap<usize, StreamPermissions>>,
 }
 
@@ -219,7 +223,7 @@ impl From<GlobalPermissions> for Table {
     fn from(value: GlobalPermissions) -> Self {
         let mut table = Self::new();
 
-        table.load_preset(ASCII_NO_BORDERS);
+        table.load_style(ASCII_NO_BORDERS);
         table.set_header(vec!["Permission", "Value"]);
         table.add_row(vec![
             "Manage Servers",
@@ -264,7 +268,7 @@ impl From<&TopicPermissions> for Table {
     fn from(value: &TopicPermissions) -> Self {
         let mut table = Self::new();
 
-        table.load_preset(ASCII_NO_BORDERS);
+        table.load_style(ASCII_NO_BORDERS);
         table.set_header(vec!["Permission", "Value"]);
         table.add_row(vec![
             "Manage Topic",
@@ -288,7 +292,7 @@ impl From<&StreamPermissions> for Table {
     fn from(value: &StreamPermissions) -> Self {
         let mut table = Self::new();
 
-        table.load_preset(ASCII_NO_BORDERS);
+        table.load_style(ASCII_NO_BORDERS);
         table.set_header(vec!["Permission", "Value"]);
         table.add_row(vec![
             "Manage Stream",

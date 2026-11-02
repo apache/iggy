@@ -21,11 +21,21 @@ use iggy_common::Client;
 
 pub static PRINT_TARGET: &str = "iggy::cli::output";
 
+/// Diagnostics that must not land on [`PRINT_TARGET`]: that channel is the
+/// command's result, and callers pipe it. Routed to stderr instead, so a
+/// degraded-but-working run (no keyring, for one) stays visible without
+/// corrupting parseable output.
+pub static DIAGNOSTIC_TARGET: &str = "iggy::cli::diagnostic";
+
 #[async_trait]
 pub trait CliCommand {
     fn explain(&self) -> String;
     fn use_tracing(&self) -> bool {
         true
+    }
+    /// Whether stdout carries only the command's data, so the banner goes to stderr.
+    fn stdout_is_data(&self) -> bool {
+        false
     }
     fn login_required(&self) -> bool {
         true

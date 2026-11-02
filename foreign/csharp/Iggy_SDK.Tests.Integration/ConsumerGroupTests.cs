@@ -21,6 +21,7 @@ using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
+using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 
 namespace Apache.Iggy.Tests.Integrations;
@@ -54,7 +55,6 @@ public class ConsumerGroupTests
             Identifier.String(streamName), Identifier.String(TopicName), GroupName);
 
         consumerGroup.ShouldNotBeNull();
-        consumerGroup.Id.ShouldBeGreaterThanOrEqualTo(0u);
         consumerGroup.PartitionsCount.ShouldBe(PartitionsCount);
         consumerGroup.MembersCount.ShouldBe(0u);
         consumerGroup.Name.ShouldBe(GroupName);
@@ -129,8 +129,8 @@ public class ConsumerGroupTests
         // Verify via GetMe that the client is now a member of the consumer group
         var me = await client.GetMeAsync();
         me.ShouldNotBeNull();
-        me.ConsumerGroupsCount.ShouldBe(1);
-        me.ConsumerGroups.ShouldContain(x => x.GroupId == (int)cg!.Id);
+        me.ConsumerGroupsCount.ShouldBe(1u);
+        me.ConsumerGroups.ShouldContain(x => x.GroupId == cg!.Id);
     }
 
     [Test]
@@ -165,8 +165,8 @@ public class ConsumerGroupTests
         // Verify via GetMe that the client is no longer a member of the consumer group
         var me = await client.GetMeAsync();
         me.ShouldNotBeNull();
-        me.ConsumerGroupsCount.ShouldBe(0);
-        me.ConsumerGroups.ShouldNotContain(x => x.GroupId == (int)cg.Id);
+        me.ConsumerGroupsCount.ShouldBe(0u);
+        me.ConsumerGroups.ShouldNotContain(x => x.GroupId == cg.Id);
     }
 
     [Test]
@@ -200,9 +200,8 @@ public class ConsumerGroupTests
                 Identifier.String(TopicName), Identifier.Numeric(cg!.Id));
         }
 
-        var response = await client.GetConsumerGroupByIdAsync(Identifier.String(streamName),
-            Identifier.String(TopicName),
-            Identifier.Numeric(cg!.Id));
+        var response = await client.WaitForConsumerGroupAssignmentAsync(Identifier.String(streamName),
+            Identifier.String(TopicName), Identifier.Numeric(cg!.Id), 2);
 
         response.ShouldNotBeNull();
         response.Id.ShouldBe(cg.Id);

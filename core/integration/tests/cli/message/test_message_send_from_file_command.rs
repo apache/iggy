@@ -95,7 +95,7 @@ impl IggyCmdTestCase for TestMessageSendFromFileCmd<'_> {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         // Create stream and capture its actual ID
         let stream = client
-            .create_stream(&self.stream_name)
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
             .await
             .expect("Failed to create stream");
         self.actual_stream_id = Some(stream.id);
@@ -105,11 +105,11 @@ impl IggyCmdTestCase for TestMessageSendFromFileCmd<'_> {
             .create_topic(
                 &stream.id.try_into().unwrap(),
                 &self.topic_name,
-                1,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await
             .expect("Failed to create topic");
@@ -211,11 +211,14 @@ impl IggyCmdTestCase for TestMessageSendFromFileCmd<'_> {
                 .poll_messages(
                     &stream_id.try_into().unwrap(),
                     &topic_id.try_into().unwrap(),
-                    Some(0),
+                    0,
                     &Consumer::new(Identifier::default()),
                     &PollingStrategy::offset(0),
-                    self.message_count as u32 * 2,
-                    true,
+                    PollOptions {
+                        count: self.message_count as u32 * 2,
+                        commit: CommitPolicy::OnRead,
+                        ..PollOptions::default()
+                    },
                 )
                 .await;
             assert!(messages.is_ok());

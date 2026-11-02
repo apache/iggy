@@ -15,12 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Partially vsr-gated inside the module: the remaining gates cover
-// `flush_unsaved_buffer`, which the server answers `FeatureUnavailable` and
-// which the eager-flush server envs replace under vsr. The bench-fill test
-// itself runs under vsr since PARTITION-plane state transfer landed, but the
-// harness spawns `iggy-bench` off disk with no cargo build-graph edge, so the
-// binary must be freshly built or a stale build hangs on login.
+// The bench-fill test runs under vsr since PARTITION-plane state transfer
+// landed, but the harness spawns `iggy-bench` off disk with no cargo
+// build-graph edge, so the binary must be freshly built or a stale build
+// hangs on login.
 mod verify_after_server_restart;
 mod verify_user_login_after_restart;
 
@@ -39,3 +37,8 @@ mod verify_cluster_replica_data_identical;
 // Auto-commit offset replication is inherently a multi-node (VSR) property: the
 // backup only holds the offset if the poll's auto-commit rode consensus.
 mod verify_auto_commit_offset_replicates;
+
+// On-disk format compatibility across a binary swap. `#[ignore]`d: it needs a
+// baseline `iggy-server` built from the merge base, which only
+// `scripts/ci/storage-compat.sh` provides.
+mod storage_compat;

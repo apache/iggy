@@ -19,9 +19,11 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
+import io.netty.channel.IoEventLoopGroup;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientBuilder;
 import org.apache.iggy.config.RetryPolicy;
+import org.apache.iggy.config.TcpConnectionString;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 
 import java.io.File;
@@ -126,13 +128,44 @@ public final class IggyTcpClientBuilder {
     }
 
     /**
-     * Sets the retry policy.
+     * Sets the retry policy for the redials after a connection loss, see
+     * {@link AsyncIggyTcpClientBuilder#retryPolicy(RetryPolicy)}.
      *
      * @param retryPolicy the retry policy to use
      * @return this builder
      */
     public IggyTcpClientBuilder retryPolicy(RetryPolicy retryPolicy) {
         asyncBuilder.retryPolicy(retryPolicy);
+        return this;
+    }
+
+    /**
+     * Sets the number of event loop threads in the group that the client creates for itself.
+     *
+     * <p>The client drives a single channel, so the default of 1 is enough. If
+     * {@link #eventLoopGroup(IoEventLoopGroup)} is set, the client ignores this value.
+     *
+     * @param ioThreads the event loop thread count, at least 1
+     * @return this builder
+     */
+    public IggyTcpClientBuilder ioThreads(int ioThreads) {
+        asyncBuilder.ioThreads(ioThreads);
+        return this;
+    }
+
+    /**
+     * Sets a caller-owned event loop group shared across clients.
+     *
+     * <p>The client registers its channel on the group and never shuts the group down.
+     * After every client on the group is closed, the caller shuts the group down. The group
+     * must drive NIO channels.
+     *
+     * @param eventLoopGroup the group to register the client's channel on
+     * @return this builder
+     * @throws org.apache.iggy.exception.IggyInvalidArgumentException if the group is null
+     */
+    public IggyTcpClientBuilder eventLoopGroup(IoEventLoopGroup eventLoopGroup) {
+        asyncBuilder.eventLoopGroup(eventLoopGroup);
         return this;
     }
 
@@ -176,6 +209,36 @@ public final class IggyTcpClientBuilder {
      */
     public IggyTcpClientBuilder tlsCertificate(String tlsCertificatePath) {
         asyncBuilder.tlsCertificate(tlsCertificatePath);
+        return this;
+    }
+
+    /**
+     * Bounds active and retained mutations; admission waits within each call's deadline. The count also bounds
+     * the proved replay outcomes that the client keeps for later resolves.
+     */
+    public IggyTcpClientBuilder pendingOperations(int count, long bytes) {
+        asyncBuilder.pendingOperations(count, bytes);
+        return this;
+    }
+
+    /**
+     * Sets the host, port, credentials and TLS options from a connection string.
+     *
+     * <p>The format is {@code iggy://<username>:<password>@<host>:<port>?<options>}, with
+     * {@code tls=true|false} and {@code tls_ca_file=<path>} as the supported options.
+     * Settings that are not in the connection string keep their current values, so a string
+     * without {@code tls} leaves an earlier {@link #enableTls()} in place.
+     *
+     * @param connectionString the connection string, for example {@code iggy://iggy:iggy@localhost:8090?tls=true}
+     * @return this builder
+     * @throws org.apache.iggy.exception.IggyInvalidArgumentException if the connection string is invalid
+     * @see TcpConnectionString
+     */
+    public IggyTcpClientBuilder fromConnectionString(String connectionString) {
+        TcpConnectionString parsed = TcpConnectionString.parse(connectionString);
+        asyncBuilder.fromConnectionString(connectionString);
+        this.username = parsed.username();
+        this.password = parsed.password();
         return this;
     }
 

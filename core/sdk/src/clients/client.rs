@@ -21,9 +21,11 @@ use crate::clients::client_builder::IggyClientBuilder;
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
 use crate::prelude::EncryptorKind;
+use crate::prelude::Identifier;
 use crate::prelude::IggyConsumerBuilder;
 use crate::prelude::IggyError;
 use crate::prelude::IggyProducerBuilder;
+use crate::prelude::ReaderBuilder;
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use crate::websocket::websocket_client::WebSocketClient;
@@ -39,10 +41,11 @@ use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{BinaryTransport, Client, HttpMethod, SystemClient};
 use iggy_common::{ConnectionStringUtils, DiagnosticEvent, Partitioner, TransportProtocol};
 use std::fmt::Debug;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 use tokio::spawn;
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::time::{sleep_until, timeout_at};
 use tracing::log::warn;
 use tracing::{debug, error, info};
 
@@ -56,16 +59,205 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
     LOGIN_REGISTER_WITH_PAT_CODE,
 ];
 
-/// The main client struct which implements all the `Client` traits and wraps the underlying low-level client for the specific transport.
+/// A high-level, transport-agnostic client for an Iggy server.
 ///
-/// It also provides the additional builders for the standalone consumer, consumer group, and producer.
+/// `IggyClient` wraps a transport-specific low-level **client** ([`ClientWrapper`]) and
+/// **provides access to the full server API**.
+/// Iggy comes with four options for client-server communication: TCP, QUIC, WebSocket and HTTP.
+/// The `IggyClient` is configured with one of these transport modes, hence abstracting
+/// transport specific implementations away.
+///
+/// The [`ClientWrapper`] lives behind an [`IggyRwLock`] so that the connection
+/// can be shared safely. You create a single client and use it from many tasks
+/// at once (e.g. producers, consumers). Every operation takes a shared read
+/// guard.
+///
+/// A [`Partitioner`] and a client-side [`EncryptorKind`] are optional, and both
+/// default to disabled. The [`Partitioner`] computes on the client-side the target
+/// partition for messages published without an explicit partition. Hence, you can
+/// configure routing to partitions within a topic yourself dependent on the stream,
+/// topic, and/ or message contents.
+///
+/// The [`EncryptorKind`] encrypts each message payload before it leaves the client and decrypts it on
+/// the way back, keeping payloads opaque to the server. Attach either through
+/// [`create()`].
+///
+/// # What you can do
+///
+/// Configure a connection with an Iggy server and interact with it.
+/// The `IggyClient` provides various methods to setup the connection using connection strings,
+/// builder patterns or an already existing [`ClientWrapper`].
+/// You can spawn [`IggyConsumer`]s and [`IggyProducer`]s that share that connection.
+///
+/// The full server API is split into domain-specific traits.
+/// `IggyClient` implements [`Client`], the supertrait, which pulls every domain-specific trait.
+/// Bring the one you need into scope to call its methods.
+/// `use iggy::prelude::*` brings all of them in at once.
+///
+/// - [`SystemClient`]: ping, server statistics, snapshots, and connected-client info.
+/// - [`UserClient`]: create, inspect, update, and delete users and their permissions.
+/// - [`PersonalAccessTokenClient`]: create, list, and delete personal access tokens, log in with one.
+/// - [`StreamClient`]: create, get, update, and delete streams.
+/// - [`TopicClient`]: create, get, update, and delete topics within a stream.
+/// - [`PartitionClient`]: add and remove partitions on a topic.
+/// - [`SegmentClient`]: delete closed segments from a partition.
+/// - [`ConsumerGroupClient`]: create, get, delete, and join or leave consumer groups.
+/// - [`ConsumerOffsetClient`]: store, read, and delete consumer offsets.
+/// - [`MessageClient`]: send and poll messages.
+///
+/// Additionally, you can bypass invoking methods from these traits and directly talk to the server with [`send_binary_request`] and [`send_http_request`] for http.
+/// Both trade typed API's safety for low-level control. You need to know the server codes and the wire format.
+///
+/// On TCP, QUIC and WebSocket, each read with [`CommitPolicy::OnRead`] holds one slot of a
+/// pool with the [`PendingOperationsConfig`] limits (256 operations and 64 MiB by default) for the
+/// whole call, also while the server waits for messages, and after an unknown outcome until
+/// [`abandon_operation`]. When the pool is full, the read returns
+/// [`IggyError::TransientNotAccepted`] at its deadline.
+///
+/// # Usage
+///
+/// The typical lifecycle of an `IggyClient` is construct, [`connect()`], use, and finally shutdown.
+///
+/// 1. Construct a client from a connection string ([`from_connection_string()`]),
+///    from the [`builder()`], or by wrapping an existing transport client with
+///    [`new()`] / [`create()`].
+/// 2. Call [`connect()`] to establish the transport-level connection. If the transport was
+///    configured with auto-login, this also authenticates. Otherwise call
+///    [`login_user()`] afterwards. For HTTP always call [`login_user()`] instead of [`connect()`].
+/// 3. Spawn [`IggyConsumer`]s and [`IggyProducer`]s to write to, and consume messages
+///    from, the server.
+/// 4. To shut everything down, call [`IggyConsumer::shutdown()`] on each consumer to store their
+///    final offset and leave consumer groups. Then, call [`IggyProducer::shutdown()`] on each
+///    [`IggyProducer`] so that _background_ producers flush the latest state. Finally,
+///    call [`shutdown()`] on the [`IggyClient`] which closes the connection.
+///    Use [`disconnect()`] rather than [`shutdown()`] to close the connection but keep the client usable, as a
+///    client that has been shut down cannot reconnect. The disconnect holds until the next
+///    [`connect()`]: requests fail and nothing reconnects in the background, even with `auto-login`.
+///    Explicit disconnect clears the remembered sign-in. Configured auto-login still authenticates
+///    on the next connection; otherwise call [`connect()`] and [`login_user()`] again before
+///    issuing requests.
+///
+/// A [`connect()`] and a [`disconnect()`] that race on different tasks end in no defined
+/// order. A caller that needs a defined end state makes both calls from one task.
+///
+/// # Examples
+///
+/// Build a client from a connection string, connect, publish through a
+/// background batching producer, consume with a standalone consumer, and shut down cleanly.
+///
+/// ```no_run
+/// use iggy::prelude::*;
+/// use futures_util::StreamExt;
+/// use std::str::FromStr;
+///
+/// # async fn run() -> Result<(), IggyError> {
+/// // Auto-logs in from the credentials in the string and retries forever on disconnect.
+/// let client = IggyClient::builder_from_connection_string(
+///     "iggy+tcp://user:secret@localhost:8090\
+///      ?reconnection_retries=unlimited&reconnection_interval=1s&heartbeat_interval=5s&nodelay=true",
+/// )?
+/// .build()?;
+/// client.connect().await?;
+///
+/// // A background producer batches messages and creates a topic.
+/// let producer = client
+///     .producer("stream_name", "topic_name")?
+///     .topic_durability(iggy::prelude::Durability::Persisted)
+///     .background(
+///         BackgroundConfig::builder()
+///             .batch_length(1000)
+///             .linger_time(IggyDuration::ONE_SECOND)
+///             .build(),
+///     )
+///     .partitioning(Partitioning::balanced())
+///     .create_topic_if_not_exists(
+///         3,
+///         IggyExpiry::ServerDefault,
+///         MaxTopicSize::ServerDefault,
+///     )
+///     .build();
+/// producer.init().await?;
+/// producer
+///     .send(vec![IggyMessage::from_str("our-first-message")?])
+///     .await?;
+///
+/// // A consumer of one partition, whose offset the server stores
+/// // when it reads a batch (not when the batch is consumed!).
+/// let mut consumer = client
+///     .consumer("consumer_name", "stream_name", "topic_name")?
+///     .partitions([1])
+///     .poll_options(PollOptions {
+///         commit: CommitPolicy::OnRead,
+///         ..PollOptions::wait(IggyDuration::ONE_SECOND)
+///     })
+///     .polling_strategy(PollingStrategy::next())
+///     .build();
+/// consumer.init().await?;
+///
+/// while let Some(message) = consumer.next().await {
+///     let message = message?;
+///     // Handle `message.message.payload` here however required
+///     break;
+/// }
+///
+/// // Finish commit before stopping (comp. method docs).
+/// consumer.shutdown().await?;
+/// // Finish flush before stopping (comp. method docs).
+/// producer.shutdown().await;
+///
+/// client.shutdown().await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`IggyConsumer`]: crate::prelude::IggyConsumer
+/// [`IggyProducer`]: crate::prelude::IggyProducer
+/// [`IggyConsumer::shutdown()`]: crate::prelude::IggyConsumer::shutdown
+/// [`IggyProducer::shutdown()`]: crate::prelude::IggyProducer::shutdown
+/// [`new()`]: IggyClient::new
+/// [`create()`]: IggyClient::create
+/// [`send_binary_request`]: IggyClient::send_binary_request
+/// [`send_http_request`]: IggyClient::send_http_request
+/// [`shutdown()`]: IggyClient::shutdown
+/// [`login_user()`]: crate::prelude::UserClient::login_user
+/// [`connect()`]: IggyClient::connect
+/// [`disconnect()`]: IggyClient::disconnect
+/// [`producer()`]: IggyClient::producer
+/// [`consumer()`]: IggyClient::consumer
+/// [`builder()`]: IggyClient::builder
+/// [`from_connection_string()`]: IggyClient::from_connection_string
+/// [`consumer_group()`]: IggyClient::consumer_group
+/// [`Client`]: crate::prelude::Client
+/// [`SystemClient`]: crate::prelude::SystemClient
+/// [`UserClient`]: crate::prelude::UserClient
+/// [`PersonalAccessTokenClient`]: crate::prelude::PersonalAccessTokenClient
+/// [`StreamClient`]: crate::prelude::StreamClient
+/// [`TopicClient`]: crate::prelude::TopicClient
+/// [`PartitionClient`]: crate::prelude::PartitionClient
+/// [`SegmentClient`]: crate::prelude::SegmentClient
+/// [`MessageClient`]: crate::prelude::MessageClient
+/// [`ConsumerOffsetClient`]: crate::prelude::ConsumerOffsetClient
+/// [`ConsumerGroupClient`]: crate::prelude::ConsumerGroupClient
+/// [`ClusterClient`]: crate::prelude::ClusterClient
+/// [`CommitPolicy::OnRead`]: crate::prelude::CommitPolicy::OnRead
+/// [`PendingOperationsConfig`]: crate::prelude::PendingOperationsConfig
+/// [`abandon_operation`]: crate::prelude::Client::abandon_operation
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct IggyClient {
     pub(crate) client: IggyRwLock<ClientWrapper>,
     partitioner: Option<Arc<dyn Partitioner>>,
     pub(crate) encryptor: Option<Arc<EncryptorKind>>,
-    heartbeat_handle: Mutex<Option<JoinHandle<()>>>,
+    heartbeat: Mutex<Heartbeat>,
+}
+
+/// The heartbeat task, and whether an explicit `disconnect()` stopped it.
+/// Only `connect()` clears the stop. A racing `disconnect()` prevents the
+/// completed connection attempt from starting another heartbeat.
+#[derive(Debug, Default)]
+struct Heartbeat {
+    handle: Option<JoinHandle<()>>,
+    stopped: bool,
 }
 
 impl Default for IggyClient {
@@ -75,30 +267,249 @@ impl Default for IggyClient {
 }
 
 impl IggyClient {
-    /// Creates a new `IggyClientBuilder`.
+    /// Returns an empty [`IggyClientBuilder`].
+    ///
+    /// The returned builder is not ready to be [`IggyClientBuilder::build()`].
+    /// It sill needs to configure a mode of transport.
     pub fn builder() -> IggyClientBuilder {
         IggyClientBuilder::new()
     }
 
-    /// Creates a new `IggyClientBuilder` from the provided connection string.
+    /// Creates an [`IggyClientBuilder`] with the transport preconfigured from a
+    /// connection string.
+    ///
+    /// The transport is selected from the scheme:
+    /// - `iggy://` defaults to TCP.
+    /// - `iggy+tcp://` for TCP.
+    /// - `iggy+quic://` for QUIC.
+    /// - `iggy+http://` for HTTP.
+    /// - `iggy+ws://` for WebSocket.
+    ///
+    /// Protected requests require authentication. The credential field is required
+    /// by the parser; HTTP callers must still log in explicitly. Binary transports
+    /// apply these credentials during `connect()`.
+    /// - user + password: `<user>:<password>@<host>:<port>` or
+    ///   `<user>:<password>@[<ipv6>]:<port>`
+    /// - personal access token: `<personal_access_token>@<host>:<port>` or
+    ///   `<personal_access_token>@[<ipv6>]:<port>`
+    ///
+    /// Optional `?key=value&key=value` queries carry transport specific
+    /// configuration. The query is parsed per transport, so the accepted keys differ
+    /// by scheme. An unknown key is rejected.
+    /// If no queries are provided optional configurations are automatically set to their default values.
+    ///
+    /// # Examples
+    ///
+    /// Each example lists configuration options per transport mode and shows
+    /// one concrete example.
+    ///
+    /// If the value of an option is
+    /// - a duration pass a `humantime` string such as `5s`, `500ms`, or `1h 1m 1s`.
+    ///   These are cast into an [`IggyDuration`]/[`NonZeroIggyDuration`].
+    ///   For [`IggyDuration`], `unlimited`, `none`, `disabled`, and `0` parse to zero.
+    /// - a retry count use either the literal `unlimited` or a number such as `5`.
+    /// - a bool use the literal `true` or `false`.
+    /// - bytes and millisecond options provide a number such as `1024`.
+    ///
+    /// ## TCP
+    ///
+    /// The same options apply for `iggy://` and `iggy+tcp://`.
+    ///
+    /// - `tls`: bool. Enable/disable TLS. Default: `false`.
+    /// - `tls_domain`: string. Server name to validate the certificate against. Default: unset.
+    /// - `tls_ca_file`: filesystem path. PEM roots replacing the built-in roots. Default: unset.
+    /// - `reconnection_retries`: "unlimited" or u32. Retry passes after the initial endpoint pass. Default: `unlimited`.
+    /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Full-jitter exponential backoff base, capped at 10 seconds. Default: `1s`.
+    /// - `reestablish_after`: [`IggyDuration`]. Stable connection duration that resets the retry count and backoff. Default: `5s`.
+    /// - `max_pending_operations`: positive usize. Active and retained mutations per session. Default: `256`.
+    /// - `max_pending_operation_bytes`: positive usize. Frozen mutation headers and bodies. Default: `67108864` (64 MiB).
+    /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
+    /// - `nodelay`: `bool`. Disable Nagle's algorithm (`TCP_NODELAY`). Default: `false`.
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    ///
+    /// # fn run() -> Result<(), IggyError> {
+    /// let client = IggyClient::builder_from_connection_string(
+    ///     "iggy+tcp://user:secret@localhost:8090\
+    ///      ?tls=true&tls_domain=localhost&tls_ca_file=/etc/iggy/ca.pem\
+    ///      &reconnection_retries=unlimited&reconnection_interval=1s&reestablish_after=5s\
+    ///      &heartbeat_interval=5s&nodelay=true",
+    /// )?
+    /// .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## QUIC
+    ///
+    /// - `validate_certificate`: bool. Verify the server certificate. Default: `false`.
+    /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
+    /// - `reconnection_max_retries`: "unlimited" or u32. Retry passes after the initial endpoint pass. Default: `unlimited`.
+    /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Full-jitter exponential backoff base, capped at 10 seconds. Default: `1s`.
+    /// - `reconnection_reestablish_after`: [`IggyDuration`]. Stable connection duration that resets the retry count and backoff. Default: `5s`.
+    /// - `max_pending_operations`: positive usize. Active and retained mutations per session. Default: `256`.
+    /// - `max_pending_operation_bytes`: positive usize. Frozen mutation headers and bodies. Default: `67108864` (64 MiB).
+    /// - `response_buffer_size`: u64. Number of bytes in the response receive buffer, at least the largest read reply of one record. Default: `64156564`.
+    /// - `max_concurrent_bidi_streams`: u64. Number of concurrent bidirectional streams. Default: `10000`.
+    /// - `datagram_send_buffer_size`: u64. Number of bytes in the datagram send buffer. Default: `100000`.
+    /// - `initial_mtu`: u16. Initial MTU estimate (in bytes). Default: `1200`.
+    /// - `send_window`: u64. Number of bytes of the flow-control send window. Default: `100000`.
+    /// - `receive_window`: u64. Number of bytes of the flow-control receive window. Default: `100000`.
+    /// - `keep_alive_interval`: u64. QUIC keep-alive period in milliseconds; zero disables it. Default: `5000`.
+    /// - `max_idle_timeout`: u64. Idle timeout in milliseconds; zero leaves Quinn's 30-second default. Default: `10000`.
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    ///
+    /// # fn run() -> Result<(), IggyError> {
+    /// let client = IggyClient::builder_from_connection_string(
+    ///     "iggy+quic://user:secret@localhost:8080\
+    ///      ?validate_certificate=true&heartbeat_interval=5s\
+    ///      &reconnection_max_retries=unlimited&reconnection_interval=1s&reconnection_reestablish_after=5s\
+    ///      &response_buffer_size=64156564&max_concurrent_bidi_streams=10000\
+    ///      &datagram_send_buffer_size=100000&initial_mtu=1200\
+    ///      &send_window=100000&receive_window=100000\
+    ///      &keep_alive_interval=5000&max_idle_timeout=10000",
+    /// )?
+    /// .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## HTTP
+    ///
+    /// A REST transport. Iggy uses the `reqwest` crate to manage the HTTP client.
+    /// Hence, transport specific configuration is abstracted away.
+    ///
+    /// Configurable options are:
+    /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
+    /// - `retries`: u32. Number of retries when sending a request. Default: `3`.
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    ///
+    /// # async fn run() -> Result<(), IggyError> {
+    /// let client = IggyClient::builder_from_connection_string(
+    ///     "iggy+http://user:password@127.0.0.1:3000?heartbeat_interval=5s&retries=3",
+    /// )?
+    /// .build()?;
+    /// client.login_user("user", "password").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## WebSocket
+    ///
+    /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
+    /// - `reconnection_retries`: "unlimited" or u32. Retry passes after the initial endpoint pass. Default: `unlimited`.
+    /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Full-jitter exponential backoff base, capped at 10 seconds. Default: `1s`.
+    /// - `reestablish_after`: [`IggyDuration`]. Stable connection duration that resets the retry count and backoff. Default: `5s`.
+    /// - `max_pending_operations`: positive usize. Active and retained mutations per session. Default: `256`.
+    /// - `max_pending_operation_bytes`: positive usize. Frozen mutation headers and bodies. Default: `67108864` (64 MiB).
+    /// - `read_buffer_size`: usize. Size of the read buffer in bytes. Default: `131072`.
+    /// - `write_buffer_size`: usize. Size of the write buffer in bytes. Default: `131072`.
+    /// - `max_write_buffer_size`: usize. Must exceed `write_buffer_size`. Default: `usize::MAX`.
+    /// - `max_message_size`: usize. Maximum accepted message size in bytes. Default: `67108864`.
+    /// - `max_frame_size`: usize. Maximum accepted frame size in bytes. Default: `16777216`.
+    /// - `accept_unmasked_frames`: bool. Has no effect on client connections. Default: `false`.
+    /// - `tls`: `bool`. Enable/disable TLS. Default: `false`.
+    /// - `tls_domain`: string. Server name to validate the certificate against. Default: unset.
+    /// - `tls_ca_file`: filesystem path. PEM roots replacing the built-in roots. Default: unset.
+    /// - `tls_validate_certificate`: bool. Whether to verify the server certificate. Default: `false`.
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    ///
+    /// # fn run() -> Result<(), IggyError> {
+    /// let client = IggyClient::builder_from_connection_string(
+    ///     "iggy+ws://user:secret@localhost:8092\
+    ///      ?heartbeat_interval=5s&reconnection_retries=unlimited&reconnection_interval=1s&reestablish_after=5s\
+    ///      &read_buffer_size=131072&write_buffer_size=131072\
+    ///      &max_message_size=67108864&max_frame_size=16777216&accept_unmasked_frames=false\
+    ///      &tls=true&tls_domain=localhost&tls_ca_file=/etc/iggy/ca.pem&tls_validate_certificate=true",
+    /// )?
+    /// .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IggyError::InvalidConnectionString`] if the connection string is malformed.
+    ///
+    /// [`IggyDuration`]: crate::prelude::IggyDuration
+    /// [`NonZeroIggyDuration`]: crate::prelude::NonZeroIggyDuration
     pub fn builder_from_connection_string(
         connection_string: &str,
     ) -> Result<IggyClientBuilder, IggyError> {
         IggyClientBuilder::from_connection_string(connection_string)
     }
 
-    /// Creates a new `IggyClient` with the provided client implementation for the specific transport.
+    /// Creates a new `IggyClient` from an already-constructed transport client.
+    ///
+    /// Use this when you built the transport client yourself
+    /// and want the full high-level `IggyClient` surface on top of it. To start
+    /// from a connection string instead, prefer
+    /// [`from_connection_string`](IggyClient::from_connection_string) or
+    /// [`builder_from_connection_string`](IggyClient::builder_from_connection_string).
+    /// To also attach a [`Partitioner`] or client-side [`EncryptorKind`], use
+    /// [`create`].
+    ///
+    /// # Examples
+    ///
+    /// Build a [`TcpClient`] from a config, wrap it in a [`ClientWrapper`], and
+    /// hand it to `IggyClient` for the full server API.
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    /// use std::sync::Arc;
+    ///
+    /// # fn run() -> Result<(), IggyError> {
+    /// let config = TcpClientConfigBuilder::new()
+    ///     .with_server_address("127.0.0.1:8090".to_owned())
+    ///     .build()?;
+    /// let tcp_client = TcpClient::create(Arc::new(config))?;
+    ///
+    /// let client = IggyClient::new(ClientWrapper::Tcp(tcp_client));
+    /// # let _ = client;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`create`]: IggyClient::create
+    /// [`Partitioner`]: crate::prelude::Partitioner
+    /// [`EncryptorKind`]: crate::prelude::EncryptorKind
+    /// [`TcpClient`]: crate::prelude::TcpClient
+    /// [`ClientWrapper`]: crate::prelude::ClientWrapper
     pub fn new(client: ClientWrapper) -> Self {
         let client = IggyRwLock::new(client);
         IggyClient {
             client,
             partitioner: None,
             encryptor: None,
-            heartbeat_handle: Mutex::new(None),
+            heartbeat: Mutex::default(),
         }
     }
 
-    /// Creates a new `IggyClient` from the provided connection string.
+    /// Creates a new `IggyClient` directly from a connection string.
+    ///
+    /// This is a shortcut for [`builder_from_connection_string`] followed by
+    /// [`build`](IggyClientBuilder::build) when no partitioner or encryptor is
+    /// needed.
+    ///
+    /// Refer to [`builder_from_connection_string`] for concise examples on how
+    /// to use a connection string.
+    /// To also attach a [`Partitioner`] or client-side [`EncryptorKind`], use
+    /// [`create`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IggyError::InvalidConnectionString`] if the connection string is
+    /// malformed.
+    ///
+    /// [`builder_from_connection_string`]: IggyClient::builder_from_connection_string
+    /// [`create`]: IggyClient::create
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         match ConnectionStringUtils::parse_protocol(connection_string)? {
             TransportProtocol::Tcp => Ok(IggyClient::new(ClientWrapper::Tcp(
@@ -116,7 +527,62 @@ impl IggyClient {
         }
     }
 
-    /// Creates a new `IggyClient` with the provided client implementation for the specific transport and the optional implementations for the `partitioner` and `encryptor`.
+    /// Creates a new `IggyClient` from a transport client, with an optional
+    /// [`Partitioner`] and client-side [`EncryptorKind`].
+    ///
+    /// The partitioner picks the target partition for messages published without
+    /// an explicit partition assigned to them. Note, that setting a [`Partitioner`] overrides a producer's
+    /// [`Partitioning`](crate::prelude::Partitioning) the partition id is
+    /// computed client-side and the partitioning strategy is forced to [`PartitioningKind::PartitionId`] using the computed ID.
+    /// The encryptor encrypts payloads before they leave the client. Pass [`None`] for either to
+    /// disable it, just as [`new`](IggyClient::new) does for both.
+    ///
+    /// # Examples
+    ///
+    /// Wrap a [`TcpClient`] together with a custom [`Partitioner`] and an
+    /// AES-256-GCM payload [`EncryptorKind`].
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    /// use std::sync::Arc;
+    ///
+    /// // Routes every message to partition 1.
+    /// #[derive(Debug)]
+    /// struct FixedPartitioner;
+    ///
+    /// impl Partitioner for FixedPartitioner {
+    ///     fn calculate_partition_id(
+    ///         &self,
+    ///         _stream_id: &Identifier,
+    ///         _topic_id: &Identifier,
+    ///         _messages: &[IggyMessage],
+    ///     ) -> Result<u32, IggyError> {
+    ///         Ok(1)
+    ///     }
+    /// }
+    ///
+    /// # fn run() -> Result<(), IggyError> {
+    /// let tcp_client =
+    ///     TcpClient::from_connection_string("iggy+tcp://user:secret@localhost:8090")?;
+    ///
+    /// let partitioner: Arc<dyn Partitioner> = Arc::new(FixedPartitioner);
+    /// let encryptor = Arc::new(EncryptorKind::Aes256Gcm(Aes256GcmEncryptor::new(&[0u8; 32])?));
+    ///
+    /// let client = IggyClient::create(
+    ///     ClientWrapper::Tcp(tcp_client),
+    ///     Some(partitioner),
+    ///     Some(encryptor),
+    /// );
+    /// # let _ = client;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`Partitioner`]: crate::prelude::Partitioner
+    /// [`PartitioningKind::PartitionId`]: iggy_common::PartitioningKind::PartitionId
+    /// [`EncryptorKind`]: crate::prelude::EncryptorKind
+    /// [`TcpClient`]: crate::prelude::TcpClient
+    /// [`ClientWrapper`]: crate::prelude::ClientWrapper
     pub fn create(
         client: ClientWrapper,
         partitioner: Option<Arc<dyn Partitioner>>,
@@ -134,36 +600,155 @@ impl IggyClient {
             client,
             partitioner,
             encryptor,
-            heartbeat_handle: Mutex::new(None),
+            heartbeat: Mutex::default(),
         }
     }
 
-    /// Returns the underlying client implementation for the specific transport.
+    /// Returns a handle to the underlying transport client.
+    ///
+    /// The returned [`ClientWrapper`] is behind an [`IggyRwLock`].
+    /// Thus, the returned type shares ownership with this `IggyClient`, meaning
+    /// changes made through either are visible to both.
+    ///
+    /// # Examples
+    ///
+    /// Take the shared handle, acquire a read guard, and reach the underlying
+    /// transport directly, here to ping the server over the raw connection.
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    /// use crate::iggy::prelude::locking::IggyRwLockFn;
+    ///
+    /// # async fn run(client: IggyClient) -> Result<(), IggyError> {
+    /// let handle = client.client();
+    /// handle.read().await.ping().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn client(&self) -> IggyRwLock<ClientWrapper> {
         self.client.clone()
     }
 
-    /// Returns the builder for the standalone consumer.
+    /// Returns an [`IggyConsumerBuilder`] to build a standalone consumer.
+    ///
+    /// Copies the client and the encryptor registered with the [`IggyClient`]
+    /// into a [`IggyConsumerBuilder`] and returns it.
+    /// Sets the consumer to [`ConsumerKind::Consumer`], i.e. a single consumer,
+    /// with the provided name.
+    /// Registers a consumer for `stream` and `topic`. It reads the partitions of
+    /// [`IggyConsumerBuilder::partitions`], which a standalone consumer requires.
+    ///
+    /// To get builder for a load-balanced consumer group, use
+    /// [`consumer_group`](IggyClient::consumer_group) instead.
+    ///
+    /// Refer to the [`IggyConsumer`] type and the [`IggyConsumerBuilder`]
+    /// for details on how a consumer can be configured.
+    ///
+    /// # Examples
+    ///
+    /// Connect a client, build a consumer of partitions 0 and 1, and configure
+    /// it to store the processed positions every 10,000 messages or 5 s.
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    ///
+    /// # async fn run() -> Result<(), IggyError> {
+    /// let client = IggyClient::from_connection_string(
+    ///     "iggy+tcp://user:secret@localhost:8090",
+    /// )?;
+    /// client.connect().await?;
+    ///
+    /// let consumer = client
+    ///     .consumer("consumer_name", "stream_name", "topic_name")? // returns IggyConsumerBuilder from IggyClient
+    ///     .partitions([0, 1])
+    ///     .poll_options(PollOptions {
+    ///         commit: CommitPolicy::Auto(AutoCommit::default()),
+    ///         ..PollOptions::wait(IggyDuration::ONE_SECOND)
+    ///     })
+    ///     .polling_strategy(PollingStrategy::next())
+    ///     .build(); // returns IggyConsumer from IggyConsumerBuilder
+    /// # let _ = consumer;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IggyError::InvalidIdentifier`] if `name`, `stream`, or `topic`
+    /// is not a valid identifier.
+    ///
+    /// [`ConsumerKind::Consumer`]: crate::prelude::ConsumerKind::Consumer
+    /// [`IggyConsumer`]: crate::prelude::IggyConsumer
     pub fn consumer(
         &self,
         name: &str,
         stream: &str,
         topic: &str,
-        partition: u32,
     ) -> Result<IggyConsumerBuilder, IggyError> {
         Ok(IggyConsumerBuilder::new(
             self.client.clone(),
             name.to_owned(),
             Consumer::new(name.try_into()?),
-            stream.try_into()?,
-            topic.try_into()?,
-            Some(partition),
+            Identifier::named(stream)?,
+            Identifier::named(topic)?,
             self.encryptor.clone(),
-            None,
         ))
     }
 
-    /// Returns the builder for the consumer group.
+    /// Returns an [`IggyConsumerBuilder`] for a member of a consumer group.
+    ///
+    /// Copies the client and the encryptor registered with the [`IggyClient`]
+    /// into a [`IggyConsumerBuilder`] and returns it.
+    /// Sets the consumer to [`ConsumerKind::ConsumerGroup`], i.e. a member of a
+    /// load-balanced group. The provided name identifies the group.
+    /// Registers the member for every partition of `topic` in `stream`. The
+    /// group then balances those partitions across its members, so each message is
+    /// delivered to exactly one member. When consumers leave or join a group,
+    /// rebalancing (re-assigning consumers to partitions) might deliver messages again
+    /// in cases where they were polled, but the read did not commit yet.
+    /// Since the new consumer starts reading from the last commit, messages are delivered
+    /// at-least-once.
+    ///
+    /// For a consumer of chosen partitions, use
+    /// [`consumer`](IggyClient::consumer) instead.
+    ///
+    /// Refer to the [`IggyConsumer`] type and the [`IggyConsumerBuilder`]
+    /// for details on how a consumer can be configured.
+    ///
+    /// # Examples
+    ///
+    /// Connect a client, build a member of a consumer group, and configure it to
+    /// let the server store the offset of each batch that it reads.
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    ///
+    /// # async fn run() -> Result<(), IggyError> {
+    /// let client = IggyClient::from_connection_string(
+    ///     "iggy+tcp://user:secret@localhost:8090",
+    /// )?;
+    /// client.connect().await?;
+    ///
+    /// let consumer = client
+    ///     .consumer_group("group_name", "stream_name", "topic_name")? // returns IggyConsumerBuilder from IggyClient
+    ///     .poll_options(PollOptions {
+    ///         commit: CommitPolicy::OnRead,
+    ///         ..PollOptions::wait(IggyDuration::ONE_SECOND)
+    ///     })
+    ///     .polling_strategy(PollingStrategy::next())
+    ///     .build(); // returns IggyConsumer from IggyConsumerBuilder
+    /// # let _ = consumer;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IggyError::InvalidIdentifier`] if `name`, `stream`, or `topic`
+    /// is not a valid identifier.
+    ///
+    /// [`ConsumerKind::ConsumerGroup`]: crate::prelude::ConsumerKind::ConsumerGroup
+    /// [`IggyConsumer`]: crate::prelude::IggyConsumer
     pub fn consumer_group(
         &self,
         name: &str,
@@ -173,57 +758,364 @@ impl IggyClient {
         Ok(IggyConsumerBuilder::new(
             self.client.clone(),
             name.to_owned(),
-            Consumer::group(name.try_into()?),
-            stream.try_into()?,
-            topic.try_into()?,
-            None,
+            Consumer::group(Identifier::named(name)?),
+            Identifier::named(stream)?,
+            Identifier::named(topic)?,
             self.encryptor.clone(),
-            None,
         ))
     }
 
-    /// Returns the builder for the producer.
+    /// Returns a [`ReaderBuilder`] for a [`PartitionReader`] of `topic` in `stream`, which reads
+    /// as `consumer` and decodes with the encryptor of the client.
+    ///
+    /// A standalone [`Consumer`] reads the partitions of [`ReaderBuilder::partitions`]. A
+    /// consumer group reads the assignment of its member.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    ///
+    /// # async fn run() -> Result<(), IggyError> {
+    /// let client = IggyClient::from_connection_string(
+    ///     "iggy+tcp://user:secret@localhost:8090",
+    /// )?;
+    /// client.connect().await?;
+    ///
+    /// let (stream, topic) = (Identifier::named("orders")?, Identifier::named("events")?);
+    /// let mut reader = client
+    ///     .reader(&stream, &topic, &Consumer::new(Identifier::named("audit")?))
+    ///     .partitions(0..8)
+    ///     .build()
+    ///     .await?;
+    /// let batch = reader.next().await?;
+    /// if let Some(checkpoint) = batch.checkpoint() {
+    ///     reader.commit(checkpoint).await?;
+    /// }
+    /// reader.close().await
+    /// # }
+    /// ```
+    ///
+    /// [`PartitionReader`]: crate::prelude::PartitionReader
+    pub fn reader(
+        &self,
+        stream: &Identifier,
+        topic: &Identifier,
+        consumer: &Consumer,
+    ) -> ReaderBuilder {
+        ReaderBuilder::new(
+            self.client.clone(),
+            stream.clone(),
+            topic.clone(),
+            consumer.clone(),
+            self.encryptor.clone(),
+        )
+    }
+
+    /// Returns an [`IggyProducerBuilder`].
+    ///
+    /// Copies the client and the encryptor registered with the [`IggyClient`]
+    /// into a [`IggyProducerBuilder`] and returns it.
+    ///
+    /// Binds a producer to the provided stream and topic.
+    /// Refer to the [`IggyProducer`] type and the [`IggyProducerBuilder`]
+    /// for details on how a producer can be configured.
+    ///
+    /// # Examples
+    ///
+    /// Connect a client, build a producer that creates the topic if it is
+    /// missing, then publish a message.
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    /// use std::str::FromStr;
+    ///
+    /// # async fn run() -> Result<(), IggyError> {
+    /// let client = IggyClient::from_connection_string(
+    ///     "iggy+tcp://user:secret@localhost:8090",
+    /// )?;
+    /// client.connect().await?;
+    ///
+    /// let producer = client
+    ///     .producer("stream_name", "topic_name")?
+    ///     .topic_durability(iggy::prelude::Durability::Persisted)
+    ///     .partitioning(Partitioning::balanced())
+    ///     .create_topic_if_not_exists(
+    ///         3,
+    ///         IggyExpiry::ServerDefault,
+    ///         MaxTopicSize::ServerDefault,
+    ///     )
+    ///     .build(); // returns IggyProducer from IggyProducerBuilder
+    /// producer.init().await?;
+    /// producer
+    ///     .send(vec![IggyMessage::from_str("our-first-message")?])
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IggyError::InvalidIdentifier`] if `stream` or `topic` is not a
+    /// valid identifier.
+    ///
+    /// [`IggyProducer`]: crate::prelude::IggyProducer
     pub fn producer(&self, stream: &str, topic: &str) -> Result<IggyProducerBuilder, IggyError> {
         Ok(IggyProducerBuilder::new(
             self.client.clone(),
-            stream.try_into()?,
+            Identifier::named(stream)?,
             stream.to_owned(),
-            topic.try_into()?,
+            Identifier::named(topic)?,
             topic.to_owned(),
             self.encryptor.clone(),
-            None,
+            self.partitioner.clone(),
         ))
     }
 
-    /// Returns the current connection information including the transport protocol and server address.
-    /// This is useful for verifying which server the client is connected to, especially after
-    /// leader redirection in a clustered environment.
+    /// Returns the current [`ConnectionInfo`].
+    ///
+    /// The transport protocol and the server address the client is connected to.
+    ///
+    /// # Examples
+    ///
+    /// Connect a client and print the transport protocol and server address it
+    /// is connected to.
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    ///
+    /// # async fn run() -> Result<(), IggyError> {
+    /// let client = IggyClient::from_connection_string(
+    ///     "iggy+tcp://user:secret@localhost:8090",
+    /// )?;
+    /// client.connect().await?;
+    ///
+    /// let info = client.get_connection_info().await;
+    /// println!("connected to {} over {}", info.server_address, info.protocol);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn get_connection_info(&self) -> ConnectionInfo {
         self.client.read().await.get_connection_info().await
     }
 
-    /// Send a raw binary command (`code` + serialized `payload`), returning the
-    /// raw response. Binary transports only (HTTP yields `FeatureUnavailable`).
+    /// Sends a raw binary command (`code` plus serialized `payload`) and returns
+    /// the raw response payload.
     ///
-    /// Login and logout codes are rejected with `InvalidCommand`. Use the
-    /// `login_user` / `logout_user` methods so SDK session state stays correct.
+    /// Use this method for commands the typed API does not cover, for
+    /// example a command you added to a forked server.
     ///
-    /// Custom codes are forwarded to the server, which is the authority on
-    /// whether it implements them.
+    /// `code` selects the command. Available codes are defined in
+    /// [`iggy_binary_protocol::codes`]
+    ///
+    /// `payload` is the command body already serialized in the Iggy wire format,
+    /// and the returned [`Bytes`] is the raw response body in that same format,
+    /// which you need to decode yourself. The wire frame that carries both (length, code,
+    /// status) is documented at the [`iggy_binary_protocol`]. You pass
+    /// and receive only the payload, the transport configured with the client frames it.
+    ///
+    /// Only the binary transports (TCP, QUIC, WebSocket) have a raw binary path.
+    /// The HTTP counterpart is
+    /// [`send_http_request`](IggyClient::send_http_request).
+    ///
+    /// Partition commands carry the partition context the typed API would send.
+    /// `SendMessages` with an explicit partition id captures one from
+    /// `GetPartitionRoute` and caches it. `PollMessages`, `StoreConsumerOffset` and
+    /// `DeleteConsumerOffset` are routed like their typed calls and take the
+    /// context their route reports, so after another client deleted and
+    /// recreated the partition, one call can fail with
+    /// [`IggyError::HistoryUnavailable`]
+    /// ([`IggyError::ConsumerGroupPartitionNotOwned`] for a consumer group).
+    /// The failed route is dropped and the next call routes again. See
+    /// [`BinaryTransport::send_raw_with_response`].
+    ///
+    /// # Examples
+    ///
+    /// Ping the server over the raw binary path. `PING_CODE` takes an empty
+    /// payload and the server replies with an empty payload.
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    /// use iggy_binary_protocol::codes::PING_CODE;
+    /// use bytes::Bytes;
+    ///
+    /// # async fn run() -> Result<(), IggyError> {
+    /// let client = IggyClient::from_connection_string(
+    ///     "iggy+tcp://user:secret@localhost:8090",
+    /// )?;
+    /// client.connect().await?;
+    ///
+    /// let response = client.send_binary_request(PING_CODE, Bytes::new()).await?;
+    /// assert!(response.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    /// [`IggyError::InvalidCommand`] if `code` is one of the session-control
+    /// codes (login, logout, and register). Use the typed `login_user` /
+    /// `logout_user` methods so the SDK's session state stays correct.
+    /// The same error, before anything is sent, if the payload of a partition
+    /// command does not decode.
+    /// [`IggyError::FeatureUnavailable`] on the HTTP transport, which has no
+    /// binary path, and before anything is sent for `SendMessages` with
+    /// `Balanced` or `MessagesKey` partitioning. Use
+    /// [`send_messages`](crate::prelude::MessageClient::send_messages) or an
+    /// explicit partition id.
+    ///
+    /// [`iggy_binary_protocol`]: iggy_binary_protocol
+    /// [`iggy_binary_protocol::codes`]: iggy_binary_protocol::codes
     pub async fn send_binary_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
         if SESSION_CONTROL_CODES.contains(&code) {
             return Err(IggyError::InvalidCommand);
         }
-        match &*self.client.read().await {
+        super::with_client!(self, client => match &*client {
             ClientWrapper::Tcp(client) => client.send_raw_with_response(code, payload).await,
             ClientWrapper::Quic(client) => client.send_raw_with_response(code, payload).await,
             ClientWrapper::WebSocket(client) => client.send_raw_with_response(code, payload).await,
             ClientWrapper::Http(_) | ClientWrapper::Iggy(_) => Err(IggyError::FeatureUnavailable),
-        }
+        })
     }
 
-    /// Invoke an arbitrary HTTP endpoint and return the raw response body. HTTP
-    /// transport only; binary transports yield `FeatureUnavailable`.
+    /// Sends a raw binary request with a caller-supplied deadline.
+    ///
+    /// The deadline covers client-lock acquisition, routing, admission and retries.
+    /// An earlier enclosing operation deadline still applies. Routing, cancellation
+    /// and error handling follow [`Self::send_binary_request`].
+    pub async fn send_binary_request_with_deadline(
+        &self,
+        code: u32,
+        payload: Bytes,
+        deadline: Instant,
+    ) -> Result<Bytes, IggyError> {
+        iggy_common::with_binary_deadline(deadline.into(), self.send_binary_request(code, payload))
+            .await
+    }
+
+    /// Sends a raw request to the replica `replica_id` and returns its raw
+    /// reply body.
+    ///
+    /// [`send_binary_request`](IggyClient::send_binary_request) lets the client
+    /// pick the replica, the metadata primary for any command it does not
+    /// route by partition. This function sends to the replica the caller names,
+    /// for example to read the stats each node keeps for itself. Replica ids
+    /// are the ones [`get_cluster_metadata`](crate::prelude::ClusterClient::get_cluster_metadata)
+    /// returns. The request carries the session's metadata watermark, so the
+    /// replica answers once it applied the metadata the session saw. The reply
+    /// is that replica's own, a refusal such as [`IggyError::NotPrimary`]
+    /// included: nothing is retried on another replica. A replica that is
+    /// reconnecting is waited for within the operation deadline.
+    ///
+    /// # Examples
+    ///
+    /// Read the stats of replica 1.
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    /// use iggy_binary_protocol::codes::GET_STATS_CODE;
+    /// use bytes::Bytes;
+    ///
+    /// # async fn run() -> Result<(), IggyError> {
+    /// let client = IggyClient::from_connection_string(
+    ///     "iggy+tcp://user:secret@localhost:8090",
+    /// )?;
+    /// client.connect().await?;
+    ///
+    /// let stats = client
+    ///     .send_binary_request_to_replica(GET_STATS_CODE, Bytes::new(), 1)
+    ///     .await?;
+    /// # let _ = stats;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    /// [`IggyError::InvalidCommand`] before anything is sent if `code` is a
+    /// session-control code, a replicated command, a poll, a fetch, a
+    /// deferred-request cancel, or a consumer-offset read. Writes and partition reads reach their primary through the typed
+    /// API and [`send_binary_request`](IggyClient::send_binary_request).
+    /// [`IggyError::InvalidIdentifier`] if the roster does not name
+    /// `replica_id`, or names it without an endpoint for this transport.
+    /// [`IggyError::TransientNotAccepted`] if the replica stays unreachable
+    /// until the deadline. [`IggyError::TransientNotCommitted`] if a link was
+    /// lost after the request was written and no later attempt got a reply,
+    /// because the replica may have run it. [`IggyError::FeatureUnavailable`]
+    /// on the HTTP transport, which has no binary path.
+    pub async fn send_binary_request_to_replica(
+        &self,
+        code: u32,
+        payload: Bytes,
+        replica_id: u8,
+    ) -> Result<Bytes, IggyError> {
+        if SESSION_CONTROL_CODES.contains(&code) {
+            return Err(IggyError::InvalidCommand);
+        }
+        super::with_client!(self, client => match &*client {
+            ClientWrapper::Tcp(client) => client.send_raw_to_replica(code, payload, replica_id).await,
+            ClientWrapper::Quic(client) => client.send_raw_to_replica(code, payload, replica_id).await,
+            ClientWrapper::WebSocket(client) => {
+                client.send_raw_to_replica(code, payload, replica_id).await
+            }
+            ClientWrapper::Http(_) | ClientWrapper::Iggy(_) => Err(IggyError::FeatureUnavailable),
+        })
+    }
+
+    /// Sends a raw binary request to a named replica with a caller-supplied deadline.
+    ///
+    /// The deadline covers client-lock acquisition, connection setup and the reply.
+    /// An earlier enclosing operation deadline still applies. The command restrictions
+    /// and error handling follow [`Self::send_binary_request_to_replica`].
+    pub async fn send_binary_request_to_replica_with_deadline(
+        &self,
+        code: u32,
+        payload: Bytes,
+        replica_id: u8,
+        deadline: Instant,
+    ) -> Result<Bytes, IggyError> {
+        iggy_common::with_binary_deadline(
+            deadline.into(),
+            self.send_binary_request_to_replica(code, payload, replica_id),
+        )
+        .await
+    }
+
+    /// Invokes a HTTP endpoint and returns the raw response body.
+    ///
+    /// This is the HTTP counterpart to
+    /// [`send_binary_request`](IggyClient::send_binary_request).
+    ///
+    /// `method` is the HTTP verb and `path` is joined onto the
+    /// client's configured API URL, e.g. `/streams`.
+    /// `body` (if needed) is sent as-is as the request body. The client
+    /// attaches its bearer token. The returned [`Bytes`] is the raw response body
+    /// for a response, which you decode yourself.
+    ///
+    /// # Examples
+    ///
+    /// Fetch the server's stats over the raw HTTP path with a `GET` and no body.
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    ///
+    /// # async fn run() -> Result<(), IggyError> {
+    /// let client = IggyClient::from_connection_string(
+    ///     "iggy+http://user:secret@localhost:3000",
+    /// )?;
+    /// client.login_user("user", "password").await?;
+    ///
+    /// let response = client
+    ///     .send_http_request(HttpMethod::Get, "/stats", None)
+    ///     .await?;
+    /// // `response` is the raw JSON body, decode it however required.
+    /// # let _ = response;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`IggyError::FeatureUnavailable`] on the TCP, QUIC, and WebSocket
+    /// transports, which have no HTTP path.
     pub async fn send_http_request(
         &self,
         method: HttpMethod,
@@ -242,66 +1134,104 @@ impl IggyClient {
 
 impl Drop for IggyClient {
     fn drop(&mut self) {
-        let heartbeat_handle = self
-            .heartbeat_handle
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        if let Some(handle) = heartbeat_handle {
+        if let Some(handle) = self.stop_heartbeat() {
             handle.abort();
         }
+    }
+}
+
+impl IggyClient {
+    async fn start_heartbeat(&self) {
+        let heartbeat_interval = self.client.read().await.heartbeat_interval().await;
+        let mut heartbeat = self.heartbeat();
+        if heartbeat.stopped
+            || heartbeat
+                .handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished())
+        {
+            return;
+        }
+
+        drop(heartbeat.handle.take());
+        let client = self.client.clone();
+        heartbeat.handle = Some(spawn(async move {
+            loop {
+                debug!("Sending the heartbeat...");
+                let keepalive = client.read().await.keepalive().await;
+                let next_tick = tokio::time::Instant::now() + heartbeat_interval.get_duration();
+                match keepalive {
+                    Err(error) => {
+                        error!("There was an error when sending a heartbeat. {error}");
+                        if error == IggyError::ClientShutdown {
+                            warn!("The client has been shut down - stopping the heartbeat.");
+                            return;
+                        }
+                    }
+                    Ok(true) => {
+                        debug!("Heartbeat was sent successfully.");
+                        // Picks up a widened assignment without waiting for an ownership-fence rejection.
+                        // All groups share the time until the next tick, so syncs that the
+                        // coordinator leaves unanswered never delay the keepalive, which
+                        // restarts the stopped links.
+                        let refresh = async {
+                            client
+                                .read()
+                                .await
+                                .refresh_consumer_group_assignments()
+                                .await;
+                        };
+                        if timeout_at(next_tick, refresh).await.is_err() {
+                            warn!(
+                                "The consumer group assignments were not refreshed before the next heartbeat."
+                            );
+                        }
+                    }
+                    Ok(false) => {}
+                }
+                sleep_until(next_tick).await
+            }
+        }));
+    }
+
+    /// Marks the heartbeat stopped and takes its task, under one lock, so a
+    /// `start_heartbeat` that runs later finds the mark.
+    fn stop_heartbeat(&self) -> Option<JoinHandle<()>> {
+        let mut heartbeat = self.heartbeat();
+        heartbeat.stopped = true;
+        heartbeat.handle.take()
+    }
+
+    fn heartbeat(&self) -> MutexGuard<'_, Heartbeat> {
+        self.heartbeat
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 }
 
 #[async_trait]
 impl Client for IggyClient {
     async fn connect(&self) -> Result<(), IggyError> {
-        let heartbeat_interval;
-        {
-            let client = self.client.read().await;
-            client.connect().await?;
-            heartbeat_interval = client.heartbeat_interval().await;
-        }
-
-        let mut heartbeat_handle = self
-            .heartbeat_handle
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if heartbeat_handle
-            .as_ref()
-            .is_some_and(|handle| !handle.is_finished())
-        {
-            return Ok(());
-        }
-
-        drop(heartbeat_handle.take());
-        let client = self.client.clone();
-        *heartbeat_handle = Some(spawn(async move {
-            loop {
-                debug!("Sending the heartbeat...");
-                if let Err(error) = client.read().await.ping().await {
-                    error!("There was an error when sending a heartbeat. {error}");
-                    if error == IggyError::ClientShutdown {
-                        warn!("The client has been shut down - stopping the heartbeat.");
-                        return;
-                    }
-                } else {
-                    debug!("Heartbeat was sent successfully.");
-                    // Picks up a widened assignment (e.g. partition-count
-                    // change) without waiting for an ownership-fence rejection.
-                    client
-                        .read()
-                        .await
-                        .refresh_consumer_group_assignments()
-                        .await;
-                }
-                sleep(heartbeat_interval.get_duration()).await
-            }
-        }));
+        self.heartbeat().stopped = false;
+        self.client.read().await.connect().await?;
+        self.start_heartbeat().await;
         Ok(())
     }
 
+    /// Stops the binary client's heartbeat. An explicit login can reconnect,
+    /// but only [`connect`](Client::connect) restarts the heartbeat.
     async fn disconnect(&self) -> Result<(), IggyError> {
+        // HTTP keeps no connection, so its disconnect changes nothing and the
+        // heartbeat keeps running.
+        let is_http = matches!(&*self.client.read().await, ClientWrapper::Http(_));
+        // A heartbeat ping on a disconnected client only logs errors, and on
+        // QUIC a redial it starts during the disconnect blocks the call. The
+        // aborted task is awaited, so a reconnect it owned is over before the
+        // transport tears down. Only `connect` starts the heartbeat again.
+        if !is_http && let Some(handle) = self.stop_heartbeat() {
+            handle.abort();
+            let _ = handle.await;
+        }
         self.client.read().await.disconnect().await
     }
 
@@ -312,11 +1242,345 @@ impl Client for IggyClient {
     async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
         self.client.read().await.subscribe_events().await
     }
+
+    async fn resolve_operation(&self, op: u64, deadline: Instant) -> Result<(), IggyError> {
+        iggy_common::with_binary_deadline(deadline.into(), async {
+            let client = tokio::time::timeout_at(
+                iggy_common::binary_operation_deadline(),
+                self.client.read(),
+            )
+            .await
+            .map_err(|_| IggyError::OperationUncertain(op))?;
+            client.resolve_operation(op, deadline).await
+        })
+        .await
+    }
+
+    async fn abandon_operation(&self, op: u64) -> Result<(), IggyError> {
+        super::with_client!(self, client => client.abandon_operation(op).await)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::links::fake_cluster::{
+        Answer, FakeCluster, connected, connected_with, endpoint, eventually,
+    };
+    use crate::links::test_support::LOCALHOST;
+    use crate::links::{OPERATION_TIMEOUT, ReconnectPolicy};
+    use iggy_binary_protocol::codes::{
+        CREATE_STREAM_CODE, GET_STATS_CODE, PING_CODE, SYNC_CONSUMER_GROUP_CODE,
+    };
+    use iggy_common::{
+        StreamClient, StreamCreateOptions, TcpClientConfig, TcpClientReconnectionConfig,
+    };
+    use std::iter::repeat_n;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::time::sleep;
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_raw_request_with_a_long_deadline_when_the_reply_is_late_should_return_it() {
+        const CUSTOM_CODE: u32 = u32::MAX;
+        for replica in [None, Some(1)] {
+            let cluster = FakeCluster::new(2);
+            let client = IggyClient::new(ClientWrapper::Tcp(TcpClient::from_links(
+                connected(&cluster, 1).await,
+            )));
+            let destination = replica.unwrap_or(0);
+            let payload = Bytes::from_static(b"request");
+            let response = Bytes::from_static(b"response");
+            cluster.script(
+                &endpoint(destination),
+                CUSTOM_CODE,
+                [Answer::Body(response.to_vec())],
+            );
+            cluster.hold(CUSTOM_CODE);
+            let started = tokio::time::Instant::now();
+            let deadline = started + Duration::from_secs(60);
+            let request = async {
+                match replica {
+                    None => {
+                        client
+                            .send_binary_request_with_deadline(
+                                CUSTOM_CODE,
+                                payload.clone(),
+                                deadline.into_std(),
+                            )
+                            .await
+                    }
+                    Some(replica) => {
+                        client
+                            .send_binary_request_to_replica_with_deadline(
+                                CUSTOM_CODE,
+                                payload.clone(),
+                                replica,
+                                deadline.into_std(),
+                            )
+                            .await
+                    }
+                }
+            };
+            let (result, ()) = tokio::join!(request, async {
+                eventually("the raw request reaches its destination", || {
+                    cluster.count(CUSTOM_CODE) == 1
+                })
+                .await;
+                sleep(Duration::from_secs(45)).await;
+                cluster.release(CUSTOM_CODE);
+            });
+            assert_eq!(result, Ok(response));
+            assert!(tokio::time::Instant::now() - started > OPERATION_TIMEOUT);
+            let received = cluster.received(CUSTOM_CODE);
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].endpoint, endpoint(destination));
+            assert_eq!(received[0].body, payload);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_raw_request_deadline_when_the_wrapper_is_locked_should_expire_without_sending()
+    {
+        for replica in [None, Some(1)] {
+            let cluster = FakeCluster::new(2);
+            let client = IggyClient::new(ClientWrapper::Tcp(TcpClient::from_links(
+                connected(&cluster, 1).await,
+            )));
+            let guard = client.client.write().await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let result = match replica {
+                None => {
+                    client
+                        .send_binary_request_with_deadline(
+                            GET_STATS_CODE,
+                            Bytes::new(),
+                            deadline.into_std(),
+                        )
+                        .await
+                }
+                Some(replica) => {
+                    client
+                        .send_binary_request_to_replica_with_deadline(
+                            GET_STATS_CODE,
+                            Bytes::new(),
+                            replica,
+                            deadline.into_std(),
+                        )
+                        .await
+                }
+            };
+            assert_eq!(result, Err(IggyError::TransientNotAccepted));
+            assert_eq!(tokio::time::Instant::now(), deadline);
+            assert_eq!(cluster.count(GET_STATS_CODE), 0);
+            drop(guard);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_enclosing_deadline_when_a_raw_request_asks_for_longer_should_keep_the_earlier_budget()
+     {
+        for replica in [None, Some(1)] {
+            let cluster = FakeCluster::new(2);
+            let client = IggyClient::new(ClientWrapper::Tcp(TcpClient::from_links(
+                connected(&cluster, 1).await,
+            )));
+            let started = tokio::time::Instant::now();
+            let outer = started + Duration::from_secs(5);
+            let requested = started + Duration::from_secs(60);
+            let result = iggy_common::with_binary_deadline(outer, async {
+                match replica {
+                    None => {
+                        client
+                            .send_binary_request_with_deadline(
+                                GET_STATS_CODE,
+                                Bytes::new(),
+                                requested.into_std(),
+                            )
+                            .await
+                    }
+                    Some(replica) => {
+                        client
+                            .send_binary_request_to_replica_with_deadline(
+                                GET_STATS_CODE,
+                                Bytes::new(),
+                                replica,
+                                requested.into_std(),
+                            )
+                            .await
+                    }
+                }
+            })
+            .await;
+            assert_eq!(result, Err(IggyError::TransientNotCommitted));
+            assert_eq!(tokio::time::Instant::now(), outer);
+            assert_eq!(cluster.count(GET_STATS_CODE), 1);
+            assert!(iggy_common::binary_operation_deadline() > outer);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_expired_raw_request_deadline_when_called_should_send_nothing() {
+        for replica in [None, Some(1)] {
+            let cluster = FakeCluster::new(2);
+            let client = IggyClient::new(ClientWrapper::Tcp(TcpClient::from_links(
+                connected(&cluster, 1).await,
+            )));
+            let deadline = (tokio::time::Instant::now() - Duration::from_secs(1)).into_std();
+            let result = match replica {
+                None => {
+                    client
+                        .send_binary_request_with_deadline(GET_STATS_CODE, Bytes::new(), deadline)
+                        .await
+                }
+                Some(replica) => {
+                    client
+                        .send_binary_request_to_replica_with_deadline(
+                            GET_STATS_CODE,
+                            Bytes::new(),
+                            replica,
+                            deadline,
+                        )
+                        .await
+                }
+            };
+            assert_eq!(result, Err(IggyError::TransientNotAccepted));
+            assert_eq!(cluster.count(GET_STATS_CODE), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_unsupported_raw_request_when_refused_should_keep_standard_requests_working() {
+        const CUSTOM_CODE: u32 = u32::MAX;
+        for replica in [None, Some(1)] {
+            let cluster = FakeCluster::new(2);
+            let client = IggyClient::new(ClientWrapper::Tcp(TcpClient::from_links(
+                connected(&cluster, 1).await,
+            )));
+            cluster.script(
+                &endpoint(replica.unwrap_or(0)),
+                CUSTOM_CODE,
+                [Answer::Refuse(IggyError::InvalidCommand)],
+            );
+            let deadline = (tokio::time::Instant::now() + Duration::from_secs(60)).into_std();
+            let result = match replica {
+                None => {
+                    client
+                        .send_binary_request_with_deadline(CUSTOM_CODE, Bytes::new(), deadline)
+                        .await
+                }
+                Some(replica) => {
+                    client
+                        .send_binary_request_to_replica_with_deadline(
+                            CUSTOM_CODE,
+                            Bytes::new(),
+                            replica,
+                            deadline,
+                        )
+                        .await
+                }
+            };
+            assert_eq!(result, Err(IggyError::InvalidCommand));
+            assert_eq!(cluster.count(CUSTOM_CODE), 1);
+            assert_eq!(client.ping().await, Ok(()));
+            assert_eq!(cluster.count(PING_CODE), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_nested_client_locks_when_reading_should_share_one_deadline() {
+        let cluster = FakeCluster::new(1);
+        let inner = IggyClient::new(ClientWrapper::Tcp(TcpClient::from_links(
+            connected(&cluster, 1).await,
+        )));
+        let inner_lock = inner.client.clone();
+        let outer = IggyClient::new(ClientWrapper::Iggy(inner));
+        let outer_lock = outer.client.clone();
+        let inner_guard = inner_lock.write().await;
+        let outer_guard = outer_lock.write().await;
+        let lock_wait = Duration::from_secs(20);
+        let start = tokio::time::Instant::now();
+
+        let ((result, finished), ()) = tokio::join!(
+            async { (outer.get_stats().await, tokio::time::Instant::now()) },
+            async {
+                sleep(lock_wait).await;
+                drop(outer_guard);
+                sleep(lock_wait).await;
+                drop(inner_guard);
+            }
+        );
+
+        assert!(matches!(result, Err(IggyError::TransientNotAccepted)));
+        assert_eq!(finished - start, OPERATION_TIMEOUT);
+        assert_eq!(cluster.count(GET_STATS_CODE), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_wrapper_lock_wait_when_a_mutation_times_out_should_preserve_its_operation() {
+        let cluster = FakeCluster::new(1);
+        let client = IggyClient::new(ClientWrapper::Tcp(TcpClient::from_links(
+            connected(&cluster, 1).await,
+        )));
+        cluster.script(&endpoint(0), CREATE_STREAM_CODE, [Answer::Silence]);
+        let client_lock = client.client.clone();
+        let guard = client_lock.write().await;
+        let start = tokio::time::Instant::now();
+        let options = StreamCreateOptions::default();
+        let (result, ()) = tokio::join!(client.create_stream("stream", &options), async {
+            sleep(Duration::from_secs(20)).await;
+            drop(guard);
+        });
+
+        let Err(IggyError::OperationUncertain(op)) = result else {
+            panic!("a sent mutation must return its retained operation identity");
+        };
+        assert_eq!(tokio::time::Instant::now() - start, OPERATION_TIMEOUT);
+        assert_eq!(cluster.count(CREATE_STREAM_CODE), 1);
+        assert!(client_lock.read().await.retains_operation(op).await);
+
+        let guard = client_lock.write().await;
+        let resolve_budget = Duration::from_secs(5);
+        let result = client
+            .resolve_operation(
+                op,
+                (tokio::time::Instant::now() + resolve_budget).into_std(),
+            )
+            .await;
+        assert_eq!(result, Err(IggyError::OperationUncertain(op)));
+        drop(guard);
+        assert!(client_lock.read().await.retains_operation(op).await);
+        client.abandon_operation(op).await.unwrap();
+    }
+
+    #[test]
+    fn should_construct_http_clients_from_fully_qualified_and_unicode_hostnames() {
+        for hostname in ["iggy.example.com.", "例子.example"] {
+            let connection_string = format!("iggy+http://user:secret@{hostname}:3000");
+            let client = IggyClient::from_connection_string(&connection_string);
+            assert!(
+                client.is_ok(),
+                "Failed to construct HTTP client for {hostname}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn should_construct_clients_from_ipv6_connection_strings() {
+        for authority in ["user:secret@[::1]", "iggypat-1234567890abcdef@[::1]"] {
+            for (scheme, port) in [
+                ("iggy", 8090),
+                ("iggy+tcp", 8090),
+                ("iggy+quic", 8080),
+                ("iggy+http", 3000),
+                ("iggy+ws", 8092),
+            ] {
+                let connection_string = format!("{scheme}://{authority}:{port}");
+                let client = IggyClient::from_connection_string(&connection_string);
+                assert!(client.is_ok(), "Failed to construct {scheme} client");
+            }
+        }
+    }
 
     #[test]
     fn should_fail_with_empty_connection_string() {
@@ -522,5 +1786,86 @@ mod tests {
                 "code {code} must be rejected before reaching the transport"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn should_start_no_heartbeat_after_disconnect_until_connect() {
+        let listener = TcpListener::bind(LOCALHOST).await.unwrap();
+        let tcp = TcpClient::create(Arc::new(TcpClientConfig {
+            server_address: listener.local_addr().unwrap().to_string(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let client = IggyClient::new(ClientWrapper::Tcp(tcp));
+        client.disconnect().await.unwrap();
+
+        // A redirect reconnect that finished just before the disconnect starts
+        // the heartbeat after it.
+        client.start_heartbeat().await;
+        let runs_after_disconnect = heartbeat_runs(&client);
+        client.connect().await.unwrap();
+        let runs_after_connect = heartbeat_runs(&client);
+
+        assert!(
+            !runs_after_disconnect && runs_after_connect,
+            "heartbeat after disconnect() {runs_after_disconnect}, \
+             after connect() {runs_after_connect}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_coordinator_that_never_answers_syncs_when_the_heartbeat_refreshes_three_groups_should_restart_links_every_tick()
+     {
+        const GROUPS: u32 = 3;
+        const TICKS: u32 = 4;
+        let cluster = FakeCluster::new(2);
+        let stopped = endpoint(1);
+        cluster.down.lock().unwrap().insert(stopped.clone());
+        cluster.script(
+            &endpoint(0),
+            SYNC_CONSUMER_GROUP_CODE,
+            repeat_n(Answer::Silence, (GROUPS * TICKS) as usize),
+        );
+        let no_retry = TcpClientReconnectionConfig {
+            max_retries: Some(0),
+            ..TcpClientReconnectionConfig::default()
+        };
+        let links = connected_with(&cluster, 1, ReconnectPolicy::from(&no_retry)).await;
+        eventually("the link to replica 1 gives up", || {
+            !cluster.dials_to(&stopped).is_empty()
+        })
+        .await;
+        let first_dials = cluster.dials_to(&stopped).len();
+        let tcp = TcpClient::from_links(links);
+        let stream = Identifier::numeric(1).unwrap();
+        let topic = Identifier::numeric(1).unwrap();
+        for group in 1..=GROUPS {
+            let group = Identifier::numeric(group).unwrap();
+            tcp.consumer_group_state().register_group(
+                group.to_string(),
+                stream.clone(),
+                topic.clone(),
+                group,
+            );
+        }
+        let client = IggyClient::new(ClientWrapper::Tcp(tcp));
+        let interval = TcpClientConfig::default().heartbeat_interval.get_duration();
+
+        client.start_heartbeat().await;
+        sleep(interval * TICKS).await;
+
+        let restarts = cluster.dials_to(&stopped).len() - first_dials;
+        assert!(
+            restarts >= TICKS as usize,
+            "{restarts} link restarts in {TICKS} heartbeat ticks"
+        );
+    }
+
+    fn heartbeat_runs(client: &IggyClient) -> bool {
+        client
+            .heartbeat()
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
     }
 }

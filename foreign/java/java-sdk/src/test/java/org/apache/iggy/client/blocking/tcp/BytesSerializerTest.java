@@ -20,16 +20,15 @@
 package org.apache.iggy.client.blocking.tcp;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
-import org.apache.iggy.message.BytesMessageId;
 import org.apache.iggy.message.HeaderKey;
+import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.message.HeaderValue;
-import org.apache.iggy.message.Message;
-import org.apache.iggy.message.MessageHeader;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.serde.BytesSerializer;
@@ -39,6 +38,8 @@ import org.apache.iggy.user.StreamPermissions;
 import org.apache.iggy.user.TopicPermissions;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
@@ -171,7 +172,7 @@ class BytesSerializerTest {
             String input = "test";
 
             // when
-            ByteBuf result = BytesSerializer.toBytes(input);
+            ByteBuf result = BytesSerializer.toBytes(input, "name");
 
             // then
             assertThat(result.readByte()).isEqualTo((byte) 4); // length
@@ -181,16 +182,15 @@ class BytesSerializerTest {
         }
 
         @Test
-        void shouldSerializeEmptyString() {
+        void shouldRejectEmptyString() {
             // given
             String input = "";
 
-            // when
-            ByteBuf result = BytesSerializer.toBytes(input);
-
-            // then
-            assertThat(result.readByte()).isEqualTo((byte) 0); // length = 0
-            assertThat(result.readableBytes()).isEqualTo(0);
+            // when / then
+            assertThatThrownBy(() -> BytesSerializer.toBytes(input, "name"))
+                    .isInstanceOf(IggyInvalidArgumentException.class)
+                    .hasMessageContaining("name")
+                    .hasMessageContaining("0 bytes");
         }
 
         @Test
@@ -199,7 +199,7 @@ class BytesSerializerTest {
             String input = "Hello世界";
 
             // when
-            ByteBuf result = BytesSerializer.toBytes(input);
+            ByteBuf result = BytesSerializer.toBytes(input, "name");
 
             // then
             byte[] expectedBytes = input.getBytes(StandardCharsets.UTF_8);
@@ -207,6 +207,55 @@ class BytesSerializerTest {
             byte[] stringBytes = new byte[expectedBytes.length];
             result.readBytes(stringBytes);
             assertThat(stringBytes).isEqualTo(expectedBytes);
+        }
+
+        @Test
+        void shouldSerializeStringOfExactly255EncodedBytes() {
+            // given
+            String input = "世".repeat(85);
+
+            // when
+            ByteBuf result = BytesSerializer.toBytes(input, "name");
+
+            // then
+            assertThat(result.readUnsignedByte()).isEqualTo((short) 255);
+            assertThat(result.readableBytes()).isEqualTo(255);
+        }
+
+        @Test
+        void shouldRejectStringLongerThan255EncodedBytesEvenIfUnder255Chars() {
+            // given
+            String input = "あ".repeat(86);
+            assertThat(input.length()).isLessThan(255);
+
+            // when / then
+            assertThatThrownBy(() -> BytesSerializer.toBytes(input, "name"))
+                    .isInstanceOf(IggyInvalidArgumentException.class)
+                    .hasMessageContaining("258");
+        }
+
+        @Test
+        void shouldNameTheRejectedField() {
+            assertThatThrownBy(() -> BytesSerializer.toBytes("", "username"))
+                    .isInstanceOf(IggyInvalidArgumentException.class)
+                    .hasMessageContaining("Invalid username length");
+        }
+
+        @Test
+        void shouldApplyCallerBoundsToEncodedLength() {
+            // given: three chars, six bytes
+            String input = "ééé";
+
+            // when / then
+            assertThat(BytesSerializer.toBytes(input, "password", 3, 6).readUnsignedByte())
+                    .isEqualTo((short) 6);
+            assertThatThrownBy(() -> BytesSerializer.toBytes(input, "password", 3, 5))
+                    .isInstanceOf(IggyInvalidArgumentException.class)
+                    .hasMessageContaining("password")
+                    .hasMessageContaining("between 3 and 5");
+            assertThatThrownBy(() -> BytesSerializer.toBytes("ab", "password", 3, 5))
+                    .isInstanceOf(IggyInvalidArgumentException.class)
+                    .hasMessageContaining("2 bytes");
         }
     }
 
@@ -240,7 +289,45 @@ class BytesSerializerTest {
             assertThat(result.readByte()).isEqualTo((byte) 11); // length = "test-stream".length()
             byte[] nameBytes = new byte[11];
             result.readBytes(nameBytes);
-            assertThat(new String(nameBytes)).isEqualTo("test-stream");
+            assertThat(new String(nameBytes, StandardCharsets.UTF_8)).isEqualTo("test-stream");
+        }
+
+        @Test
+        void shouldSerializeUtf8StringIdentifierWithByteLength() {
+            // given
+            String name = "strumień-世界";
+            byte[] expectedBytes = name.getBytes(StandardCharsets.UTF_8);
+            var identifier = StreamId.of(name);
+
+            // when
+            ByteBuf result = BytesSerializer.toBytes(identifier);
+
+            // then
+            assertThat(expectedBytes.length).isGreaterThan(name.length());
+            assertThat(result.readableBytes()).isEqualTo(identifier.getSize());
+            assertThat(result.readByte()).isEqualTo((byte) 2); // kind = 2 (string)
+            assertThat(result.readByte()).isEqualTo((byte) expectedBytes.length);
+            byte[] nameBytes = new byte[expectedBytes.length];
+            result.readBytes(nameBytes);
+            assertThat(nameBytes).isEqualTo(expectedBytes);
+            assertThat(result.readableBytes()).isEqualTo(0);
+        }
+
+        @ParameterizedTest
+        @CsvSource({
+            "café,       02 05 63 61 66 C3 A9",
+            "naïve-café, 02 0C 6E 61 C3 AF 76 65 2D 63 61 66 C3 A9",
+            "日本語,     02 09 E6 97 A5 E6 9C AC E8 AA 9E",
+        })
+        void shouldMatchExpectedWireLayoutForNonAsciiNames(String name, String expectedHex) {
+            // given
+            var identifier = StreamId.of(name);
+
+            // when
+            ByteBuf result = BytesSerializer.toBytes(identifier);
+
+            // then
+            assertThat(ByteBufUtil.hexDump(result).toUpperCase()).isEqualTo(expectedHex.replace(" ", ""));
         }
     }
 
@@ -489,104 +576,30 @@ class BytesSerializerTest {
             // then - verify buffer contains data for both headers
             assertThat(result.readableBytes()).isEqualTo(28);
         }
-    }
-
-    @Nested
-    class MessageSerialization {
 
         @Test
-        void shouldSerializeMessageWithoutUserHeaders() {
+        void shouldNameTheKeyWhenAKeyIsTooLong() {
             // given
-            var messageId = new BytesMessageId(new byte[16]);
-            var header = new MessageHeader(
-                    BigInteger.valueOf(123), // checksum
-                    messageId,
-                    BigInteger.valueOf(0), // offset
-                    BigInteger.valueOf(1000), // timestamp
-                    BigInteger.valueOf(1000), // originTimestamp
-                    0L, // userHeadersLength
-                    5L, // payloadLength
-                    BigInteger.ZERO // reserved
-                    );
-            byte[] payload = "hello".getBytes();
-            var message = new Message(header, payload, new HashMap<>());
+            String name = "k".repeat(256);
+            Map<HeaderKey, HeaderValue> headers = new HashMap<>();
+            headers.put(new HeaderKey(HeaderKind.String, name.getBytes()), HeaderValue.fromRaw("v".getBytes()));
 
-            // when
-            ByteBuf result = BytesSerializer.toBytes(message);
-
-            // then
-            assertThat(result.readableBytes()).isEqualTo(MessageHeader.SIZE + 5); // header + payload, no user headers
+            // when / then
+            assertThatThrownBy(() -> BytesSerializer.toBytes(headers))
+                    .isInstanceOf(IggyInvalidArgumentException.class)
+                    .hasMessage("Invalid header key '" + name + "' length: 256 bytes, must be between 1 and 255");
         }
 
         @Test
-        void shouldSerializeMessageWithUserHeaders() {
+        void shouldNameTheKeyWhenAValueIsEmpty() {
             // given
-            var messageId = new BytesMessageId(new byte[16]);
-            Map<HeaderKey, HeaderValue> userHeaders = new HashMap<>();
-            userHeaders.put(HeaderKey.fromString("key"), HeaderValue.fromRaw("val".getBytes()));
+            Map<HeaderKey, HeaderValue> headers = new HashMap<>();
+            headers.put(HeaderKey.fromString("k1"), new HeaderValue(HeaderKind.Raw, new byte[0]));
 
-            // Calculate user headers size
-            ByteBuf headersBuf = BytesSerializer.toBytes(userHeaders);
-            int userHeadersLength = headersBuf.readableBytes();
-
-            var header = new MessageHeader(
-                    BigInteger.ZERO,
-                    messageId,
-                    BigInteger.ZERO,
-                    BigInteger.valueOf(1000),
-                    BigInteger.valueOf(1000),
-                    (long) userHeadersLength,
-                    3L, // "abc".length()
-                    BigInteger.ZERO // reserved
-                    );
-            byte[] payload = "abc".getBytes();
-            var message = new Message(header, payload, userHeaders);
-
-            // when
-            ByteBuf result = BytesSerializer.toBytes(message);
-
-            // then
-            assertThat(result.readableBytes()).isEqualTo(MessageHeader.SIZE + 3 + userHeadersLength);
-        }
-    }
-
-    @Nested
-    class MessageHeaderSerialization {
-
-        @Test
-        void shouldSerializeMessageHeader() {
-            // given
-            var messageId = new BytesMessageId(new byte[16]);
-            var header = new MessageHeader(
-                    BigInteger.valueOf(999), // checksum
-                    messageId,
-                    BigInteger.valueOf(42), // offset
-                    BigInteger.valueOf(2000), // timestamp
-                    BigInteger.valueOf(1999), // originTimestamp
-                    10L, // userHeadersLength
-                    100L, // payloadLength
-                    BigInteger.ZERO // reserved
-                    );
-
-            // when
-            ByteBuf result = BytesSerializer.toBytes(header);
-
-            // then
-            assertThat(result.readableBytes()).isEqualTo(MessageHeader.SIZE);
-            // Read checksum (8 bytes)
-            result.skipBytes(8);
-            // Read message ID (16 bytes)
-            result.skipBytes(16);
-            // Read offset (8 bytes)
-            result.skipBytes(8);
-            // Read timestamp (8 bytes)
-            result.skipBytes(8);
-            // Read origin timestamp (8 bytes)
-            result.skipBytes(8);
-            // Read user headers length (4 bytes)
-            assertThat(result.readIntLE()).isEqualTo(10);
-            // Read payload length (4 bytes)
-            assertThat(result.readIntLE()).isEqualTo(100);
+            // when / then
+            assertThatThrownBy(() -> BytesSerializer.toBytes(headers))
+                    .isInstanceOf(IggyInvalidArgumentException.class)
+                    .hasMessage("Invalid header value for key 'k1' length: 0 bytes, must be between 1 and 255");
         }
     }
 

@@ -14,10 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { toDate } from '../serialize.utils.js';
 import { deserializePermissions, type UserPermissions } from './permissions.utils.js';
+import { deserializePrefixedOptions, type ParsedOptions } from '../options.utils.js';
 
 /**
  * Basic user information without permissions.
@@ -30,7 +30,11 @@ export type BaseUser = {
   /** User status (Active/Inactive) */
   status: string,
   /** Username */
-  userName: string
+  userName: string,
+  /** Options the client explicitly sent at create */
+  options: ParsedOptions,
+  /** Options the server filled */
+  derivedOptions: ParsedOptions
 };
 
 /**
@@ -88,14 +92,18 @@ export const deserializeBaseUser = (p: Buffer, pos = 0): BaseUserDeserialized =>
   const status = statusString(p.readUInt8(pos + 12));
   const userNameLength = p.readUInt8(pos + 13);
   const userName = p.subarray(pos + 14, pos + 14 + userNameLength).toString();
+  const explicit = deserializePrefixedOptions(p, pos + 14 + userNameLength);
+  const derived = deserializePrefixedOptions(p, pos + 14 + userNameLength + explicit.bytesRead);
 
   return {
-    bytesRead: 14 + userNameLength,
+    bytesRead: 14 + userNameLength + explicit.bytesRead + derived.bytesRead,
     data: {
       id,
       createdAt,
       status,
       userName,
+      options: explicit.options,
+      derivedOptions: derived.options,
     }
   }
 };

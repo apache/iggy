@@ -19,8 +19,9 @@ use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::clients::client::IggyClient;
 use crate::http::http_client::HttpClient;
 use crate::prelude::{
-    AutoLogin, EncryptorKind, HttpClientConfigBuilder, IggyDuration, IggyError, Partitioner,
-    QuicClientConfigBuilder, TcpClientConfigBuilder, WebSocketClientConfigBuilder,
+    AutoLogin, EncryptorKind, HttpClientConfigBuilder, IggyDuration, IggyError,
+    NonZeroIggyDuration, Partitioner, PendingOperationsConfig, QuicClientConfigBuilder,
+    TcpClientConfigBuilder, WebSocketClientConfigBuilder,
 };
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
@@ -159,6 +160,12 @@ impl TcpClientBuilder {
         self
     }
 
+    /// Sets the shared capacity for active and retained mutation frames.
+    pub fn with_pending_operations(mut self, pending_operations: PendingOperationsConfig) -> Self {
+        self.config = self.config.with_pending_operations(pending_operations);
+        self
+    }
+
     /// Sets the auto sign in during connection.
     pub fn with_auto_sign_in(mut self, auto_sign_in: AutoLogin) -> Self {
         self.config = self.config.with_auto_sign_in(auto_sign_in);
@@ -174,7 +181,10 @@ impl TcpClientBuilder {
     }
 
     /// Sets the interval between retries when connecting to the server.
-    pub fn with_reconnection_interval(mut self, reconnection_interval: IggyDuration) -> Self {
+    pub fn with_reconnection_interval(
+        mut self,
+        reconnection_interval: NonZeroIggyDuration,
+    ) -> Self {
         self.config = self
             .config
             .with_reconnection_interval(reconnection_interval);
@@ -243,6 +253,12 @@ impl QuicClientBuilder {
         self
     }
 
+    /// Sets the shared capacity for active and retained mutation frames.
+    pub fn with_pending_operations(mut self, pending_operations: PendingOperationsConfig) -> Self {
+        self.config = self.config.with_pending_operations(pending_operations);
+        self
+    }
+
     /// Sets the auto sign in during connection.
     pub fn with_auto_sign_in(mut self, auto_sign_in: AutoLogin) -> Self {
         self.config = self.config.with_auto_sign_in(auto_sign_in);
@@ -258,7 +274,10 @@ impl QuicClientBuilder {
     }
 
     /// Sets the interval between retries when connecting to the server.
-    pub fn with_reconnection_interval(mut self, reconnection_interval: IggyDuration) -> Self {
+    pub fn with_reconnection_interval(
+        mut self,
+        reconnection_interval: NonZeroIggyDuration,
+    ) -> Self {
         self.config = self
             .config
             .with_reconnection_interval(reconnection_interval);
@@ -336,6 +355,12 @@ impl WebSocketClientBuilder {
         self
     }
 
+    /// Sets the shared capacity for active and retained mutation frames.
+    pub fn with_pending_operations(mut self, pending_operations: PendingOperationsConfig) -> Self {
+        self.config = self.config.with_pending_operations(pending_operations);
+        self
+    }
+
     /// Sets the auto sign in during connection.
     pub fn with_auto_sign_in(mut self, auto_sign_in: AutoLogin) -> Self {
         self.config = self.config.with_auto_sign_in(auto_sign_in);
@@ -351,7 +376,10 @@ impl WebSocketClientBuilder {
     }
 
     /// Sets the interval between retries when connecting to the server.
-    pub fn with_reconnection_interval(mut self, reconnection_interval: IggyDuration) -> Self {
+    pub fn with_reconnection_interval(
+        mut self,
+        reconnection_interval: NonZeroIggyDuration,
+    ) -> Self {
         self.config = self
             .config
             .with_reconnection_interval(reconnection_interval);

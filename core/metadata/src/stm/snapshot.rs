@@ -15,18 +15,98 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::IGGY_PROTOCOL_VERSION;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
 
+use crate::change_log::{ChangeLogSnapshot, RingSnapshot};
 use crate::stm::stream::StreamsSnapshot;
 use crate::stm::user::UsersSnapshot;
 
+/// The snapshot format version written by this build.
+///
+/// Each version identifies a serialized shape and its invariants. Bump it when
+/// fields change, including nested fields: `MessagePack` encodes structs
+/// positionally, so a layout change can reinterpret bytes without an error.
+///
+/// [`MetadataSnapshot::decode`] accepts versions from
+/// [`MIN_READABLE_SNAPSHOT_FORMAT_VERSION`] through this version. Older accepted
+/// formats rely on defaulted trailing fields; incompatible versions outside
+/// that range are refused before payload deserialization.
+///
+/// Version 2: `status` sits at reply-header offset 216 (version 1 carried a
+/// `namespace` word before it), which the client table's cached replies embed as raw
+/// wire bytes msgpack cannot introspect.
+///
+/// Version 3: `TopicSnapshot` dropped `replication_factor` from the middle of the
+/// struct and gained `options`. Both changes land in the same element count, so a
+/// version 2 file decoded under this shape does not fail cleanly: msgpack reads the
+/// old `replication_factor` byte as `message_expiry` and walks every later field one
+/// position out of place. The bump is what turns that into
+/// `UnsupportedFormatVersion` instead of an opaque deserializer error, or worse a
+/// silent misread.
+///
+/// Version 5: `PartitionSnapshot` gained `created_view` as a trailing, defaulted
+/// field.
+///
+/// Version 7: session protection no longer stores a payload fingerprint.
+///
+/// Version 8: streams persist the revision of their partition incarnations.
+///
+/// Version 10: `PartitionSnapshot` dropped `purge_generation`.
+///
+/// Version 11: streams also persist pending lifecycle intents, and each
+/// `TopicSnapshot` the op of its last consumer group catalog change.
+///
+/// Version 12: pending consumer group owner generations equal their metadata
+/// operation, replacing independently incremented generations.
+///
+/// Version 13: `TopicSnapshot` dropped its typed expiry, compression and size
+/// fields, which the options map already holds, and `StreamSnapshot` gained
+/// `created_op`, the identity of a stream incarnation.
+///
+/// Version 14: `TopicSnapshot` gained `created_op`, the identity of a topic
+/// incarnation, and the snapshot carries the metadata change log.
+///
+/// Version 15: `PartitionSnapshot` gained `members` and `retirement_debt_op`,
+/// and each pending lifecycle target `retired_members`, as trailing, defaulted
+/// fields.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 15;
+
+/// Oldest format version [`MetadataSnapshot::decode`] still reads.
+///
+/// Session protection is mandatory and its nested layout changed in version
+/// 14, so older snapshots cannot prove the current retry contract and are
+/// refused. Version 14 reads with every partition on every node and no
+/// retirement debt.
+pub const MIN_READABLE_SNAPSHOT_FORMAT_VERSION: u32 = 14;
+
+/// The release that wrote a snapshot: the packed `iggy_binary_protocol` semver of
+/// this build. [`iggy_binary_protocol::ProtocolVersion`] documents the packing and
+/// renders it as `major.minor.patch`.
+///
+/// Provenance, never a gate. The format version says whether the bytes are
+/// readable; this says which build produced them, which matters most for a snapshot
+/// that arrived over state transfer from a machine whose build this node otherwise
+/// has no record of.
+///
+/// A build constant, identical on every replica, so two replicas holding identical
+/// state still serialize identically (see [`MetadataSnapshot`]).
+pub const SNAPSHOT_WRITER_RELEASE: u32 = IGGY_PROTOCOL_VERSION;
+
+const _: () = assert!(SNAPSHOT_WRITER_RELEASE > 0);
+
 #[derive(Debug)]
 pub enum SnapshotError {
+    InvalidState(&'static str),
     /// Serialization failed.
     Serialize(rmp_serde::encode::Error),
     /// Deserialization failed.
     Deserialize(rmp_serde::decode::Error),
+    /// The embedded client table contains invalid sessions or retry receipts.
+    ClientTable(consensus::client_table::ClientTableDecodeError),
+    /// Committed retry protection is absent from the snapshot.
+    MissingClientTable,
     /// I/O error during snapshot persist/load.
     Io(std::io::Error),
     /// I/O error during a specific stage of snapshot persistence.
@@ -39,12 +119,28 @@ pub enum SnapshotError {
     /// The snapshot's integrity trailer does not match its payload: a torn or
     /// bit-rotted checkpoint. Refuse to restore from it rather than feed corrupt state
     /// into the state machine.
-    ChecksumMismatch { expected: u128, actual: u128 },
+    ChecksumMismatch {
+        expected: u128,
+        actual: u128,
+    },
+    /// Snapshot integrity framing is absent or damaged.
+    InvalidTrailer,
     /// Snapshot file is too short to contain a valid checksum.
-    Truncated { size: u64 },
+    Truncated {
+        size: u64,
+    },
+    /// The snapshot was written in a format version this build does not read: a
+    /// different build wrote it, on this disk or on a state-transfer peer. Refuse it
+    /// rather than let msgpack read one field's bytes as another's. The version is
+    /// peeked ahead of the rest of the payload, so this fires even when nothing past
+    /// it is recognizable.
+    UnsupportedFormatVersion {
+        found: u32,
+        expected: u32,
+    },
     /// A state-transfer descriptor's frontiers contradict its artifacts: a
     /// `commit_op` below the snapshot the same offer ships, or a client-table
-    /// frontier above that commit point. Both are impossible from a
+    /// frontier outside the snapshot-to-commit range. Both are impossible from a
     /// caught-up-primary offer, so the install is refused and the receiver falls
     /// back to journal repair rather than moving its frontiers off a bad
     /// manifest.
@@ -53,10 +149,13 @@ pub enum SnapshotError {
         commit_op: u64,
         table_frontier: u64,
     },
-    /// The snapshot was written under a different format version. Refuse it
-    /// rather than reinterpret embedded raw bytes (the client table's cached
-    /// replies are wire `ReplyHeader` frames) under the wrong layout.
-    UnsupportedVersion { found: u32, supported: u32 },
+    /// A state transfer moved the history certificate off the WAL suffix above
+    /// `snapshot_seq` and could not make that binding durable. The suffix stays: a
+    /// restart after removing it would find the recorded binding gone and certify
+    /// no view.
+    HistoryBindingNotDurable {
+        snapshot_seq: u64,
+    },
 }
 
 /// Stage at which snapshot persistence failed.
@@ -79,8 +178,11 @@ pub enum PersistStage {
 impl fmt::Display for SnapshotError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidState(reason) => write!(f, "invalid snapshot state: {reason}"),
             Self::Serialize(e) => write!(f, "snapshot serialization failed: {e}"),
             Self::Deserialize(e) => write!(f, "snapshot deserialization failed: {e}"),
+            Self::ClientTable(e) => write!(f, "snapshot client table is invalid: {e}"),
+            Self::MissingClientTable => write!(f, "snapshot client table is missing"),
             Self::Io(e) => write!(f, "snapshot I/O error: {e}"),
             Self::Persist { stage, source } => {
                 write!(f, "snapshot persist failed at {stage:?} stage: {source}")
@@ -91,10 +193,18 @@ impl fmt::Display for SnapshotError {
                     "snapshot checksum mismatch: expected {expected:#034x}, actual {actual:#034x}"
                 )
             }
+            Self::InvalidTrailer => write!(f, "snapshot integrity trailer is absent or damaged"),
             Self::Truncated { size } => {
                 write!(
                     f,
                     "snapshot file truncated: {size} bytes (too short for checksum)"
+                )
+            }
+            Self::UnsupportedFormatVersion { found, expected } => {
+                write!(
+                    f,
+                    "snapshot format version {found} is incompatible with this build, which \
+                     reads version {expected}"
                 )
             }
             Self::IncoherentManifest {
@@ -108,11 +218,11 @@ impl fmt::Display for SnapshotError {
                      commit_op {commit_op}, table frontier {table_frontier}"
                 )
             }
-            Self::UnsupportedVersion { found, supported } => {
+            Self::HistoryBindingNotDurable { snapshot_seq } => {
                 write!(
                     f,
-                    "unsupported metadata snapshot version {found}; this build reads only \
-                     version {supported}"
+                    "state transfer to op {snapshot_seq} could not persist its history \
+                     binding; the WAL suffix above it was kept"
                 )
             }
         }
@@ -124,11 +234,16 @@ impl std::error::Error for SnapshotError {
         match self {
             Self::Serialize(e) => Some(e),
             Self::Deserialize(e) => Some(e),
+            Self::ClientTable(e) => Some(e),
             Self::Io(e) | Self::Persist { source: e, .. } => Some(e),
-            Self::ChecksumMismatch { .. }
+            Self::InvalidState(..)
+            | Self::ChecksumMismatch { .. }
+            | Self::MissingClientTable
+            | Self::InvalidTrailer
             | Self::Truncated { .. }
+            | Self::UnsupportedFormatVersion { .. }
             | Self::IncoherentManifest { .. }
-            | Self::UnsupportedVersion { .. } => None,
+            | Self::HistoryBindingNotDurable { .. } => None,
         }
     }
 }
@@ -150,17 +265,15 @@ impl From<std::io::Error> for SnapshotError {
 /// replicas with identical state must serialize identically. Regression guards:
 /// `stream::tests::populated_streams_snapshot_reencode_is_byte_stable` and
 /// `impls::metadata::tests::populated_snapshot_reencode_and_checksum_are_stable`.
-/// Current [`MetadataSnapshot::version`]. Bump whenever the serialized form
-/// changes meaning without changing shape -- in particular the client table's
-/// cached replies, which are embedded as raw `ReplyHeader` wire bytes msgpack
-/// cannot introspect. Version 2: `status` sits at reply-header offset 216
-/// (version 1 carried a `namespace` word before it).
-pub const METADATA_SNAPSHOT_VERSION: u32 = 2;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataSnapshot {
-    /// Snapshot format version; [`MetadataSnapshot::decode`] refuses any other
-    /// value (see [`METADATA_SNAPSHOT_VERSION`]).
+    /// The version of the snapshot format in use, reserved for breaking changes.
+    /// See [`SNAPSHOT_FORMAT_VERSION`]; [`Self::decode`] reads back to
+    /// [`MIN_READABLE_SNAPSHOT_FORMAT_VERSION`] and refuses anything else.
+    ///
+    /// First field deliberately: msgpack encodes the struct positionally, so this is
+    /// the one element [`peek_format_version`] can pull out before it knows the rest
+    /// of the layout.
     pub version: u32,
     /// Timestamp when the snapshot was created (microseconds since epoch).
     pub created_at: u64,
@@ -173,10 +286,15 @@ pub struct MetadataSnapshot {
     pub streams: Option<StreamsSnapshot>,
     /// Client-table state (sessions + at-most-once dedup replies) at the checkpoint
     /// op. Not a state machine, but folded in so a restart that drained the WAL
-    /// prefix still recovers pre-checkpoint sessions. `#[serde(default)]` so a
-    /// snapshot predating this field decodes as `None`.
-    #[serde(default)]
+    /// prefix still recovers pre-checkpoint sessions.
     pub client_table: Option<consensus::ClientTableSnapshot>,
+    /// The change log at the checkpoint op. Not a state machine either, it
+    /// is folded in so a restart or a transfer keeps the history readers
+    /// resume from.
+    pub change_log: ChangeLogSnapshot,
+    /// The release that wrote this snapshot, as a packed `iggy_binary_protocol`
+    /// semver. Provenance only, never a gate. See [`SNAPSHOT_WRITER_RELEASE`].
+    pub writer_release: u32,
 }
 
 impl Default for MetadataSnapshot {
@@ -190,7 +308,7 @@ impl MetadataSnapshot {
     #[must_use]
     pub const fn new(sequence_number: u64) -> Self {
         Self {
-            version: METADATA_SNAPSHOT_VERSION,
+            version: SNAPSHOT_FORMAT_VERSION,
             // Deterministic placeholder. The real creation time is stamped by
             // `Snapshot::create` from the consensus-injected clock (see
             // `VsrConsensus::clock_realtime_micros`) so a replayed simulator
@@ -201,6 +319,23 @@ impl MetadataSnapshot {
             users: None,
             streams: None,
             client_table: None,
+            change_log: ChangeLogSnapshot {
+                log_id: None,
+                last_record_op: 0,
+                resource: RingSnapshot {
+                    evicted_through_op: 0,
+                    evicted_through_ordinal: 0,
+                    evicted_through_timestamp: 0,
+                    entries: Vec::new(),
+                },
+                activity: RingSnapshot {
+                    evicted_through_op: 0,
+                    evicted_through_ordinal: 0,
+                    evicted_through_timestamp: 0,
+                    entries: Vec::new(),
+                },
+            },
+            writer_release: SNAPSHOT_WRITER_RELEASE,
         }
     }
 
@@ -212,22 +347,59 @@ impl MetadataSnapshot {
         rmp_serde::to_vec(self).map_err(SnapshotError::Serialize)
     }
 
-    /// Decode a snapshot from msgpack bytes.
+    /// Decode a snapshot from msgpack bytes, refusing a format version this build
+    /// does not read.
+    ///
+    /// The version is checked before the payload is deserialized, so a snapshot
+    /// whose layout past that field is unknown is refused by version rather than by
+    /// whichever later field happened to misparse.
     ///
     /// # Errors
-    /// Returns `SnapshotError::Deserialize` if msgpack deserialization fails,
-    /// or `SnapshotError::UnsupportedVersion` if the snapshot was written
-    /// under a different format version.
+    /// [`SnapshotError::UnsupportedFormatVersion`] when the stamped version is
+    /// outside [`MIN_READABLE_SNAPSHOT_FORMAT_VERSION`]..=[`SNAPSHOT_FORMAT_VERSION`],
+    /// or [`SnapshotError::Deserialize`] if `MessagePack` deserialization fails.
     pub fn decode(bytes: &[u8]) -> Result<Self, SnapshotError> {
-        let snapshot: Self = rmp_serde::from_slice(bytes).map_err(SnapshotError::Deserialize)?;
-        if snapshot.version != METADATA_SNAPSHOT_VERSION {
-            return Err(SnapshotError::UnsupportedVersion {
-                found: snapshot.version,
-                supported: METADATA_SNAPSHOT_VERSION,
+        // Bytes carrying no readable version are not a snapshot at all, so they fall
+        // through to the deserializer, whose error names what actually went wrong.
+        if let Some(version) = peek_format_version(bytes)
+            && !(MIN_READABLE_SNAPSHOT_FORMAT_VERSION..=SNAPSHOT_FORMAT_VERSION).contains(&version)
+        {
+            return Err(SnapshotError::UnsupportedFormatVersion {
+                found: version,
+                expected: SNAPSHOT_FORMAT_VERSION,
             });
         }
+        let snapshot: Self = rmp_serde::from_slice(bytes).map_err(SnapshotError::Deserialize)?;
+        snapshot.validate()?;
         Ok(snapshot)
     }
+
+    pub(crate) fn validate(&self) -> Result<(), SnapshotError> {
+        if let Some(streams) = &self.streams {
+            streams.validate_ownership_history(self.sequence_number)?;
+            streams.validate_partition_members()?;
+        }
+        self.change_log.validate(self.sequence_number)
+    }
+}
+
+/// The format version stamped in encoded snapshot bytes, read without decoding the
+/// rest of them.
+///
+/// `None` for anything that is not a msgpack array whose first element is an
+/// unsigned integer, which covers every input that is not a snapshot.
+///
+/// Reading the version on its own is what keeps the check working across a layout
+/// change: deserializing the whole struct first would let some later field fail and
+/// report a msgpack error naming no version, which is the difference between "this
+/// file came from a newer build" and "this file is corrupt". `journal::superblock`
+/// reads its own version field the same way, ahead of the length and checksum it
+/// cannot yet trust.
+#[must_use]
+pub fn peek_format_version(encoded: &[u8]) -> Option<u32> {
+    let mut cursor = encoded;
+    rmp::decode::read_array_len(&mut cursor).ok()?;
+    rmp::decode::read_int(&mut cursor).ok()
 }
 
 /// Trait for metadata snapshot implementations.
@@ -394,6 +566,7 @@ macro_rules! impl_fill_restore {
             ) -> Result<Self, $crate::stm::snapshot::SnapshotError> {
                 use serde::de::Error as _;
                 use $crate::stm::snapshot::{SnapshotError, Snapshotable};
+                snapshot.validate()?;
                 let snap = snapshot.$field.clone().ok_or_else(|| {
                     SnapshotError::Deserialize(rmp_serde::decode::Error::custom(format_args!(
                         "Snapshot Restore Error: {}",
@@ -414,6 +587,7 @@ macro_rules! impl_fill_restore {
                 use serde::de::Error as _;
                 use $crate::stm::snapshot::SnapshotError;
                 paste::paste! {
+                    snapshot.validate()?;
                     let snap = snapshot.$field.clone().ok_or_else(|| {
                         SnapshotError::Deserialize(rmp_serde::decode::Error::custom(
                             format_args!("Snapshot Restore Error: {}", stringify!($field)),
@@ -435,6 +609,7 @@ macro_rules! impl_fill_restore {
             ) -> Result<(), $crate::stm::snapshot::SnapshotError> {
                 use serde::de::Error as _;
                 use $crate::stm::snapshot::SnapshotError;
+                snapshot.validate()?;
                 if snapshot.$field.is_none() {
                     return Err(SnapshotError::Deserialize(
                         rmp_serde::decode::Error::custom(format_args!(
@@ -452,8 +627,13 @@ macro_rules! impl_fill_restore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stm::stream::{PartitionSnapshot, StatsSnapshot, StreamSnapshot, TopicSnapshot};
-    use iggy_common::{CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize};
+    use crate::stm::stream::{
+        PartitionSnapshot, StatsSnapshot, StreamSnapshot, StreamsSnapshot, TopicSnapshot,
+    };
+    use crate::stm::user::UserSnapshot;
+    use iggy_common::{
+        HeaderKey, HeaderValue, IggyTimestamp, OptionKey, OptionValue, ResourceOptions,
+    };
 
     #[test]
     fn test_metadata_snapshot_roundtrip() {
@@ -463,28 +643,370 @@ mod tests {
         let decoded = MetadataSnapshot::decode(&encoded).unwrap();
 
         assert_eq!(decoded.sequence_number, 42);
+        assert_eq!(decoded.version, SNAPSHOT_FORMAT_VERSION);
+        assert_eq!(decoded.writer_release, SNAPSHOT_WRITER_RELEASE);
         assert!(decoded.users.is_none());
         assert!(decoded.streams.is_none());
         assert!(decoded.client_table.is_none());
     }
 
-    // The client table's cached replies are embedded as raw `ReplyHeader`
-    // wire bytes msgpack cannot introspect, so a snapshot from a different
-    // format version must be refused, never reinterpreted under the current
-    // header layout.
     #[test]
-    fn decode_refuses_a_snapshot_from_another_format_version() {
-        let mut snapshot = MetadataSnapshot::new(42);
-        snapshot.version = METADATA_SNAPSHOT_VERSION - 1;
+    fn encoded_shape_is_pinned_to_the_format_version() {
+        // The gate is only as good as the discipline that bumps it, and nothing else
+        // fails when a field is appended and the bump is forgotten. msgpack encodes
+        // positionally, so the element count is the shape's fingerprint: pinning it
+        // turns "shape changed, version did not" into a failing test rather than an
+        // operator's boot reading one field's bytes as another's. Changing either
+        // number is the reminder to change the other.
+        const FIELD_COUNT: u32 = 8;
+        const PINNED_VERSION: u32 = 15;
 
+        let encoded = MetadataSnapshot::new(0).encode().unwrap();
+        let mut cursor = encoded.as_slice();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut cursor).unwrap(),
+            FIELD_COUNT,
+            "MetadataSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
+        assert_eq!(
+            SNAPSHOT_FORMAT_VERSION, PINNED_VERSION,
+            "SNAPSHOT_FORMAT_VERSION moved; confirm the shape or invariants changed with it"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn nested_snapshot_shapes_are_pinned_too() {
+        // The top-level count above is blind to everything under it, which is how
+        // `TopicSnapshot` once swapped a removed field for an added one and kept
+        // the same element count: a version 2 file then decoded field-by-field
+        // one position out of place instead of failing. The types the STM
+        // actually grows need their own pins.
+        const TOPIC_FIELD_COUNT: u32 = 10;
+        const STREAM_FIELD_COUNT: u32 = 7;
+        const STREAMS_FIELD_COUNT: u32 = 4;
+        const USER_FIELD_COUNT: u32 = 7;
+        // Version 4 appended `fences`; it is defaulted on read, which is what
+        // keeps version 3 readable, so a further append here needs the same
+        // treatment or a bump.
+        const CLIENT_TABLE_FIELD_COUNT: u32 = 2;
+        // Version 5 appended `created_view` the same way. Version 10 dropped
+        // `purge_generation` from the middle, which no default can cover.
+        // `members` and `retirement_debt_op` are appended with defaults.
+        const PARTITION_FIELD_COUNT: u32 = 8;
+
+        let client_table = consensus::ClientTableSnapshot {
+            slots: Vec::new(),
+            capacity: 4,
+        };
+        let mut cursor = rmp_serde::to_vec(&client_table).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut cursor.as_slice()).unwrap(),
+            CLIENT_TABLE_FIELD_COUNT,
+            "ClientTableSnapshot's field count changed; default the new field or bump the version"
+        );
+        cursor.clear();
+
+        let topic = TopicSnapshot {
+            id: 0,
+            name: String::new(),
+            created_at: IggyTimestamp::default(),
+            stats: StatsSnapshot {
+                size_bytes: 0,
+                messages_count: 0,
+                segments_count: 0,
+            },
+            partitions: Vec::new(),
+            consumer_groups: Vec::new(),
+            next_consumer_group_id: 0,
+            options: ResourceOptions::new(),
+            consumer_group_catalog_op: 0,
+            created_op: 0,
+        };
+        let encoded = rmp_serde::to_vec(&topic).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            TOPIC_FIELD_COUNT,
+            "TopicSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
+
+        let partition = PartitionSnapshot {
+            id: 0,
+            consensus_group_id: 0,
+            created_at: IggyTimestamp::default(),
+            created_revision: 0,
+            deleted_up_to_offset: 0,
+            created_view: 0,
+            members: Vec::new(),
+            retirement_debt_op: 0,
+        };
+        let encoded = rmp_serde::to_vec(&partition).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            PARTITION_FIELD_COUNT,
+            "PartitionSnapshot's field count changed; default the new field or bump the version"
+        );
+
+        let stream = StreamSnapshot {
+            id: 0,
+            name: String::new(),
+            created_at: IggyTimestamp::default(),
+            stats: StatsSnapshot {
+                size_bytes: 0,
+                messages_count: 0,
+                segments_count: 0,
+            },
+            topics: Vec::new(),
+            options: ResourceOptions::new(),
+            created_op: 0,
+        };
+        let encoded = rmp_serde::to_vec(&stream).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            STREAM_FIELD_COUNT,
+            "StreamSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
+
+        let streams = StreamsSnapshot {
+            items: vec![(0, stream)],
+            revision: 1,
+            namespace_revision: 1,
+            lifecycle_intents: std::collections::BTreeMap::default(),
+        };
+        let encoded = rmp_serde::to_vec(&streams).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            STREAMS_FIELD_COUNT,
+            "StreamsSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
+
+        let user = crate::stm::user::UserSnapshot {
+            id: 0,
+            username: String::new(),
+            password_hash: String::new(),
+            status: iggy_common::UserStatus::Active,
+            created_at: IggyTimestamp::default(),
+            permissions: None,
+            options: ResourceOptions::new(),
+        };
+        let encoded = rmp_serde::to_vec(&user).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            USER_FIELD_COUNT,
+            "UserSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
+    }
+
+    #[test]
+    fn a_build_decodes_what_it_writes() {
+        // Exact-equality versioning makes this the one thing that could go wrong
+        // silently: a stamp the writer picks and the reader rejects would refuse every
+        // node its own snapshot on the next boot.
+        let encoded = MetadataSnapshot::new(5).encode().unwrap();
+        MetadataSnapshot::decode(&encoded).expect("a build must read its own snapshot");
+    }
+
+    #[test]
+    fn release_stamp_is_a_build_constant() {
+        // Two replicas holding identical state must serialize identically, which a
+        // per-node or per-write release stamp would break.
+        assert_eq!(
+            MetadataSnapshot::new(1).encode().unwrap(),
+            MetadataSnapshot::new(1).encode().unwrap()
+        );
+    }
+
+    #[test]
+    fn encoded_snapshot_leads_with_the_version_element() {
+        // `peek_format_version` rests on this shape: a msgpack array (`rmp_serde`'s
+        // compact struct encoding) whose first element is `version`. Switching to
+        // `to_vec_named` would encode a map instead and silently blind the peek, so
+        // pin it here.
+        let encoded = MetadataSnapshot::new(3).encode().unwrap();
+        assert_eq!(
+            encoded[0] & 0xf0,
+            0x90,
+            "snapshot must encode as a msgpack fixarray"
+        );
+        assert_eq!(
+            peek_format_version(&encoded),
+            Some(SNAPSHOT_FORMAT_VERSION),
+            "the first array element must be the format version"
+        );
+    }
+
+    #[test]
+    fn peek_format_version_ignores_bytes_that_are_not_a_snapshot() {
+        assert_eq!(peek_format_version(&[]), None);
+        // A msgpack string, not an array.
+        assert_eq!(peek_format_version(&[0xa1, b'x']), None);
+        // An array whose first element is not an unsigned integer.
+        assert_eq!(peek_format_version(&[0x91, 0xc0]), None);
+    }
+
+    #[test]
+    fn given_change_log_above_the_snapshot_when_decoding_should_refuse_it() {
+        let mut snapshot = MetadataSnapshot::new(9);
+        snapshot.change_log.log_id = Some(1);
+        snapshot.change_log.last_record_op = 10;
+        let encoded = snapshot.encode().unwrap();
+
+        assert!(matches!(
+            MetadataSnapshot::decode(&encoded),
+            Err(SnapshotError::InvalidState(_))
+        ));
+        snapshot.change_log.last_record_op = 9;
+        let decoded = MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
+        assert_eq!(decoded.change_log, snapshot.change_log);
+    }
+
+    #[test]
+    fn decode_refuses_snapshots_without_durable_session_protection() {
+        for version in 0..MIN_READABLE_SNAPSHOT_FORMAT_VERSION {
+            let mut snapshot = MetadataSnapshot::new(9);
+            snapshot.version = version;
+            let bytes = snapshot.encode().unwrap();
+            assert!(matches!(MetadataSnapshot::decode(&bytes),
+                Err(SnapshotError::UnsupportedFormatVersion { found, .. }) if found == version));
+        }
+    }
+
+    #[test]
+    fn given_independent_owner_generation_format_when_decoding_should_refuse_before_restore() {
+        const INDEPENDENT_OWNER_GENERATION_FORMAT: u32 = 11;
+        let mut snapshot = MetadataSnapshot::new(9);
+        snapshot.version = INDEPENDENT_OWNER_GENERATION_FORMAT;
         let encoded = snapshot.encode().unwrap();
         assert!(matches!(
             MetadataSnapshot::decode(&encoded),
-            Err(SnapshotError::UnsupportedVersion {
-                found,
-                supported: METADATA_SNAPSHOT_VERSION,
-            }) if found == METADATA_SNAPSHOT_VERSION - 1
+            Err(SnapshotError::UnsupportedFormatVersion { found, expected })
+                if found == INDEPENDENT_OWNER_GENERATION_FORMAT && expected == SNAPSHOT_FORMAT_VERSION
         ));
+    }
+
+    #[test]
+    fn given_format_fourteen_partition_when_decoding_should_default_members_and_debt() {
+        #[derive(Serialize)]
+        struct FormatFourteenPartition {
+            id: usize,
+            consensus_group_id: u64,
+            created_at: IggyTimestamp,
+            created_revision: u64,
+            deleted_up_to_offset: u64,
+            created_view: u32,
+        }
+        let mut snapshot = MetadataSnapshot::new(9);
+        snapshot.version = MIN_READABLE_SNAPSHOT_FORMAT_VERSION;
+        assert!(MetadataSnapshot::decode(&snapshot.encode().unwrap()).is_ok());
+
+        let encoded = rmp_serde::to_vec(&FormatFourteenPartition {
+            id: 2,
+            consensus_group_id: 3,
+            created_at: IggyTimestamp::from(4),
+            created_revision: 5,
+            deleted_up_to_offset: 6,
+            created_view: 7,
+        })
+        .unwrap();
+        let decoded: PartitionSnapshot = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!((decoded.id, decoded.created_view), (2, 7));
+        assert!(decoded.members.is_empty(), "stored on every node");
+        assert_eq!(decoded.retirement_debt_op, 0);
+    }
+
+    #[test]
+    fn given_format_fourteen_snapshot_when_restoring_should_preserve_options_and_created_op() {
+        const PREVIOUS_FORMAT: u32 = 13;
+        let mut options = ResourceOptions::new();
+        options.insert(
+            HeaderKey::from(OptionKey::MessageExpiry),
+            OptionValue::explicit(HeaderValue::from(60_000_000u64)),
+        );
+        options.insert(
+            HeaderKey::from(OptionKey::MaxTopicSize),
+            OptionValue::derived(HeaderValue::from(u64::MAX)),
+        );
+        let mut stream = stream_snapshot_fixture(
+            3,
+            "orders",
+            StatsSnapshot {
+                size_bytes: 0,
+                messages_count: 0,
+                segments_count: 0,
+            },
+        );
+        stream.created_op = 41;
+        stream.options = options.clone();
+        let mut snapshot = MetadataSnapshot::new(50);
+        snapshot.streams = Some(StreamsSnapshot {
+            lifecycle_intents: std::collections::BTreeMap::default(),
+            revision: 0,
+            namespace_revision: 0,
+            items: vec![(3, stream)],
+        });
+
+        let decoded = MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
+        let (_, restored) = &decoded.streams.as_ref().unwrap().items[0];
+        assert_eq!(restored.created_op, 41);
+        assert_eq!(restored.options, options);
+
+        snapshot.version = PREVIOUS_FORMAT;
+        assert!(matches!(
+            MetadataSnapshot::decode(&snapshot.encode().unwrap()),
+            Err(SnapshotError::UnsupportedFormatVersion { found, .. }) if found == PREVIOUS_FORMAT
+        ));
+    }
+
+    #[test]
+    fn decode_refuses_any_other_format_version() {
+        // Newer and older alike: there is no accepted window, so both directions are
+        // the same refusal. Version 0 is what a zeroed or absent stamp reads as.
+        for forged in [SNAPSHOT_FORMAT_VERSION + 1, 0] {
+            let mut snapshot = MetadataSnapshot::new(9);
+            snapshot.version = forged;
+            let encoded = snapshot.encode().unwrap();
+
+            match MetadataSnapshot::decode(&encoded) {
+                Err(SnapshotError::UnsupportedFormatVersion { found, expected }) => {
+                    assert_eq!(found, forged);
+                    assert_eq!(expected, SNAPSHOT_FORMAT_VERSION);
+                }
+                other => panic!("expected an unsupported-version refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn decode_refuses_a_shape_change_by_version_not_by_msgpack() {
+        // The reason the version is peeked instead of read off the decoded struct: a
+        // future build's layout need not decode at all under this one, and the refusal
+        // must still name the version rather than whichever field happened to
+        // misparse. Emulated by appending an element, which is what a field append
+        // looks like on the wire.
+        let mut snapshot = MetadataSnapshot::new(4);
+        snapshot.version = SNAPSHOT_FORMAT_VERSION + 1;
+        let current = snapshot.encode().unwrap();
+        assert_eq!(current[0] & 0xf0, 0x90, "expected a msgpack fixarray");
+        let mut future = vec![0x90 | ((current[0] & 0x0f) + 1)];
+        future.extend_from_slice(&current[1..]);
+        future.push(0xc0);
+
+        match MetadataSnapshot::decode(&future) {
+            Err(SnapshotError::UnsupportedFormatVersion { found, .. }) => {
+                assert_eq!(found, SNAPSHOT_FORMAT_VERSION + 1);
+            }
+            other => panic!("expected an unsupported-version refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_reports_deserialization_when_no_version_is_readable() {
+        // Bytes carrying no version field are corruption, not a version skew, and the
+        // msgpack error names that far better than a fabricated version would.
+        match MetadataSnapshot::decode(&[0xa3, b'n', b'o', b'!']) {
+            Err(SnapshotError::Deserialize(_)) => {}
+            other => panic!("expected a deserialization error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -493,7 +1015,9 @@ mod tests {
 
         let mut snapshot = MetadataSnapshot::new(100);
         snapshot.streams = Some(StreamsSnapshot {
+            lifecycle_intents: std::collections::BTreeMap::default(),
             revision: 0,
+            namespace_revision: 0,
             items: vec![(
                 0,
                 StreamSnapshot {
@@ -511,10 +1035,6 @@ mod tests {
                             id: 0,
                             name: "topic".to_string(),
                             created_at: ts,
-                            replication_factor: 1,
-                            message_expiry: IggyExpiry::default(),
-                            compression_algorithm: CompressionAlgorithm::default(),
-                            max_topic_size: MaxTopicSize::default(),
                             stats: StatsSnapshot {
                                 size_bytes: 256,
                                 messages_count: 12,
@@ -526,15 +1046,22 @@ mod tests {
                                 created_at: ts,
                                 created_revision: 0,
                                 deleted_up_to_offset: 0,
-                                purge_generation: 0,
+                                created_view: 0,
+                                members: vec![2, 0, 1],
+                                retirement_debt_op: 9,
                             }],
                             consumer_groups: Vec::new(),
                             // Nonzero and distinct from every id above so the
                             // roundtrip assert below proves the field survives
                             // instead of matching a default.
                             next_consumer_group_id: 5,
+                            options: ResourceOptions::default(),
+                            consumer_group_catalog_op: 7,
+                            created_op: 8,
                         },
                     )],
+                    options: ResourceOptions::default(),
+                    created_op: 9,
                 },
             )],
         });
@@ -559,43 +1086,48 @@ mod tests {
         let (_, topic) = &stream.topics[0];
         assert_eq!(topic.partitions.len(), 1);
         assert_eq!(topic.partitions[0].consensus_group_id, 33);
+        assert_eq!(topic.partitions[0].retirement_debt_op, 9);
         // Never-reuse counter: `#[serde(default)]` would silently restore 0 if
         // the field were dropped from the wire format, so pin its survival.
         assert_eq!(topic.next_consumer_group_id, 5);
+        assert_eq!(topic.consumer_group_catalog_op, 7);
+        assert_eq!(topic.created_op, 8);
+    }
+
+    fn user_snapshot_fixture(id: u32, username: &str, password_hash: &str) -> UserSnapshot {
+        use iggy_common::UserStatus;
+        UserSnapshot {
+            id,
+            username: username.to_string(),
+            password_hash: password_hash.to_string(),
+            status: UserStatus::Active,
+            created_at: IggyTimestamp::from(1_694_968_446_131_680_u64),
+            permissions: None,
+            options: ResourceOptions::default(),
+        }
+    }
+
+    fn stream_snapshot_fixture(id: usize, name: &str, stats: StatsSnapshot) -> StreamSnapshot {
+        StreamSnapshot {
+            id,
+            name: name.to_string(),
+            created_at: IggyTimestamp::from(1_694_968_446_131_680_u64),
+            stats,
+            topics: vec![],
+            options: ResourceOptions::default(),
+            created_op: 0,
+        }
     }
 
     #[test]
     fn roundtrip_with_slab_gaps() {
         use crate::stm::stream::StreamsSnapshot;
-        use crate::stm::user::{PermissionerSnapshot, UserSnapshot, UsersSnapshot};
-        use iggy_common::UserStatus;
-
-        let ts = IggyTimestamp::from(1_694_968_446_131_680_u64);
+        use crate::stm::user::{PermissionerSnapshot, UsersSnapshot};
 
         let users_snap = UsersSnapshot {
             items: vec![
-                (
-                    0,
-                    UserSnapshot {
-                        id: 0,
-                        username: "alice".to_string(),
-                        password_hash: "hash_a".to_string(),
-                        status: UserStatus::Active,
-                        created_at: ts,
-                        permissions: None,
-                    },
-                ),
-                (
-                    2,
-                    UserSnapshot {
-                        id: 2,
-                        username: "charlie".to_string(),
-                        password_hash: "hash_c".to_string(),
-                        status: UserStatus::Active,
-                        created_at: ts,
-                        permissions: None,
-                    },
-                ),
+                (0, user_snapshot_fixture(0, "alice", "hash_a")),
+                (2, user_snapshot_fixture(2, "charlie", "hash_c")),
             ],
             personal_access_tokens: vec![],
             permissioner: PermissionerSnapshot {
@@ -609,35 +1141,33 @@ mod tests {
         };
 
         let streams_snap = StreamsSnapshot {
+            lifecycle_intents: std::collections::BTreeMap::default(),
             revision: 0,
+            namespace_revision: 0,
             items: vec![
                 (
                     0,
-                    StreamSnapshot {
-                        id: 0,
-                        name: "stream-0".to_string(),
-                        created_at: ts,
-                        stats: StatsSnapshot {
+                    stream_snapshot_fixture(
+                        0,
+                        "stream-0",
+                        StatsSnapshot {
                             size_bytes: 100,
                             messages_count: 10,
                             segments_count: 1,
                         },
-                        topics: vec![],
-                    },
+                    ),
                 ),
                 (
                     3,
-                    StreamSnapshot {
-                        id: 3,
-                        name: "stream-3".to_string(),
-                        created_at: ts,
-                        stats: StatsSnapshot {
+                    stream_snapshot_fixture(
+                        3,
+                        "stream-3",
+                        StatsSnapshot {
                             size_bytes: 200,
                             messages_count: 20,
                             segments_count: 2,
                         },
-                        topics: vec![],
-                    },
+                    ),
                 ),
             ],
         };

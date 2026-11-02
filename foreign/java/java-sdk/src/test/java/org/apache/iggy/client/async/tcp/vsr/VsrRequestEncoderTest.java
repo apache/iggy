@@ -23,9 +23,13 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.exception.IggyNotConnectedException;
+import org.apache.iggy.partition.PartitionContext;
+import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.Test;
 
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -41,6 +45,16 @@ class VsrRequestEncoderTest {
     private final ConsensusSession session = new ConsensusSession();
     private final VsrRequestEncoder encoder = new VsrRequestEncoder(session);
     private final ByteBufAllocator alloc = ByteBufAllocator.DEFAULT;
+
+    @Test
+    void shouldKeepGeneratedClientIdsOutsideServerRangeAfterReset() {
+        int samples = 64;
+        for (int sample = 0; sample < samples; sample++) {
+            assertThat(session.clientIdHigh()).isNotNegative();
+            assertThat(session.clientIdLow() | session.clientIdHigh()).isNotZero();
+            session.reset();
+        }
+    }
 
     @Test
     void shouldBuildRegisterFrameForLogin() {
@@ -82,7 +96,7 @@ class VsrRequestEncoderTest {
     }
 
     @Test
-    void shouldKeepPreAuthClusterMetadataSessionlessWithoutAdvancingRequestId() {
+    void shouldKeepPreAuthClusterMetadataSessionlessWithAUniqueRequestId() {
         ByteBuf frame = encoder.encode(alloc, GET_CLUSTER_METADATA_CODE, Unpooled.EMPTY_BUFFER);
         try {
             assertThat(frame.getUnsignedByte(VsrHeaders.REQUEST_OPERATION_OFFSET))
@@ -90,7 +104,7 @@ class VsrRequestEncoderTest {
             assertThat(frame.getIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET)).isEqualTo(GET_CLUSTER_METADATA_CODE);
             assertThat(frame.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(1);
             assertThat(frame.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isZero();
-            assertThat(session.currentRequestId()).isEqualTo(1);
+            assertThat(session.currentRequestId()).isEqualTo(2);
         } finally {
             frame.release();
         }
@@ -110,6 +124,20 @@ class VsrRequestEncoderTest {
         ByteBuf first = encoder.encode(alloc, CREATE_STREAM_CODE, Unpooled.EMPTY_BUFFER);
         ByteBuf second = encoder.encode(alloc, CREATE_STREAM_CODE, Unpooled.EMPTY_BUFFER);
         try {
+            byte[] firstIdentifier = new byte[16];
+            byte[] secondIdentifier = new byte[16];
+            first.getBytes(VsrHeaders.REQUEST_CHECKSUM_OFFSET, firstIdentifier);
+            second.getBytes(VsrHeaders.REQUEST_CHECKSUM_OFFSET, secondIdentifier);
+            assertThat(firstIdentifier).isNotEqualTo(new byte[16]);
+            assertThat(firstIdentifier).isNotEqualTo(secondIdentifier);
+            ByteBuf retry = first.retainedDuplicate();
+            try {
+                byte[] retryIdentifier = new byte[16];
+                retry.getBytes(VsrHeaders.REQUEST_CHECKSUM_OFFSET, retryIdentifier);
+                assertThat(retryIdentifier).isEqualTo(firstIdentifier);
+            } finally {
+                retry.release();
+            }
             assertThat(first.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(1);
             assertThat(second.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(2);
             assertThat(second.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(42);
@@ -120,9 +148,10 @@ class VsrRequestEncoderTest {
     }
 
     @Test
-    void shouldCorrelatePartitionOpsWithoutAdvancingTheDedupRequestId() {
-        // Partition ops replicate in their own group with no client-table dedup, so
-        // they take a correlation id and leave the dedup counter where it was.
+    void shouldConsumeTheDedupRequestIdForPartitionOps() {
+        // Dedup identity requires each send to carry a distinct number, so
+        // partition ops advance the dedup counter exactly like metadata ops
+        // and the two planes interleave on one sequence.
         session.beginRegister();
         session.bind(42);
 
@@ -132,13 +161,16 @@ class VsrRequestEncoderTest {
         ByteBuf second = encoder.encode(alloc, SEND_MESSAGES_CODE, secondPayload);
         firstPayload.release();
         secondPayload.release();
+        ByteBuf metadata = encoder.encode(alloc, CREATE_STREAM_CODE, Unpooled.EMPTY_BUFFER);
         try {
             assertThat(first.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(1);
             assertThat(second.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(2);
-            assertThat(session.currentRequestId()).isEqualTo(1);
+            assertThat(metadata.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(3);
+            assertThat(session.currentRequestId()).isEqualTo(4);
         } finally {
             first.release();
             second.release();
+            metadata.release();
         }
     }
 
@@ -165,21 +197,143 @@ class VsrRequestEncoderTest {
     }
 
     @Test
-    void shouldReArmWithFreshClientIdOnSecondLogin() {
+    void shouldStampPartitionContextAtTheRequestHeaderOffsets() {
+        session.beginRegister();
+        session.bind(42);
+        PartitionContext context =
+                new PartitionContext(BigInteger.valueOf(17), BigInteger.valueOf(9), BigInteger.valueOf(52));
+
+        ByteBuf payload = sendMessagesPayload(2, 3, 4);
+        ByteBuf frame = encoder.encode(alloc, SEND_MESSAGES_CODE, payload, context);
+        payload.release();
+        try {
+            // Literal offsets pin the Rust RequestHeader layout, so a wrong VsrHeaders constant fails here.
+            assertThat(frame.getLongLE(200)).isEqualTo(17);
+            assertThat(frame.getLongLE(208)).isEqualTo(9);
+            assertThat(frame.getLongLE(216)).isEqualTo(52);
+            byte[] reservedTail = new byte[32];
+            frame.getBytes(224, reservedTail);
+            assertThat(reservedTail).isEqualTo(new byte[32]);
+        } finally {
+            frame.release();
+        }
+    }
+
+    @Test
+    void shouldKeepFetchHeaderContextZeroAfterObservingMetadata() {
+        session.bind(42);
+        session.observeMetadata(52);
+        PartitionContext context =
+                new PartitionContext(BigInteger.valueOf(17), BigInteger.valueOf(9), BigInteger.valueOf(49));
+
+        for (PartitionContext supplied : List.of(PartitionContext.EMPTY, context)) {
+            ByteBuf frame = encoder.encode(
+                    alloc, CommandCode.Messages.FETCH_MESSAGES.getValue(), Unpooled.EMPTY_BUFFER, supplied);
+            try {
+                assertThat(frame.getLongLE(VsrHeaders.REQUEST_INCARNATION_OFFSET))
+                        .isZero();
+                assertThat(frame.getLongLE(VsrHeaders.REQUEST_OWNER_GENERATION_OFFSET))
+                        .isZero();
+                assertThat(frame.getLongLE(VsrHeaders.REQUEST_METADATA_OP_OFFSET))
+                        .isZero();
+                assertThat(frame.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(42);
+            } finally {
+                frame.release();
+            }
+        }
+    }
+
+    @Test
+    void shouldKeepMetadataFencesForDeferredPollsAndMetadataReads() {
+        session.bind(42);
+        session.observeMetadata(52);
+        PartitionContext context =
+                new PartitionContext(BigInteger.valueOf(17), BigInteger.valueOf(9), BigInteger.valueOf(49));
+        ByteBuf fencedPoll =
+                encoder.encode(alloc, CommandCode.Messages.POLL_DEFERRED.getValue(), Unpooled.EMPTY_BUFFER, context);
+        ByteBuf poll = encoder.encode(alloc, CommandCode.Messages.POLL_DEFERRED.getValue(), Unpooled.EMPTY_BUFFER);
+        ByteBuf metadata = encoder.encode(alloc, GET_CLUSTER_METADATA_CODE, Unpooled.EMPTY_BUFFER);
+        try {
+            assertThat(fencedPoll.getLongLE(VsrHeaders.REQUEST_INCARNATION_OFFSET))
+                    .isEqualTo(17);
+            assertThat(fencedPoll.getLongLE(VsrHeaders.REQUEST_OWNER_GENERATION_OFFSET))
+                    .isEqualTo(9);
+            assertThat(fencedPoll.getLongLE(VsrHeaders.REQUEST_METADATA_OP_OFFSET))
+                    .isEqualTo(49);
+            assertThat(poll.getLongLE(VsrHeaders.REQUEST_METADATA_OP_OFFSET)).isEqualTo(52);
+            assertThat(metadata.getLongLE(VsrHeaders.REQUEST_METADATA_OP_OFFSET))
+                    .isEqualTo(52);
+            assertThat(metadata.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(42);
+        } finally {
+            fencedPoll.release();
+            poll.release();
+            metadata.release();
+        }
+    }
+
+    @Test
+    void shouldRetainClientIdAndSecretWhenRegistrationIsRepeated() {
         ByteBuf firstLogin = loginUserPayload();
         encoder.encode(alloc, LOGIN_USER_CODE, firstLogin).release();
         firstLogin.release();
         long firstLow = session.clientIdLow();
         long firstHigh = session.clientIdHigh();
+        byte[] firstSecret = session.bindSecret();
         session.bind(7);
+        long firstGeneration = session.generation();
 
         ByteBuf secondLogin = loginUserPayload();
         encoder.encode(alloc, LOGIN_USER_CODE, secondLogin).release();
         secondLogin.release();
 
-        assertThat(session.isBound()).isFalse();
-        assertThat(session.clientIdLow() != firstLow || session.clientIdHigh() != firstHigh)
-                .isTrue();
+        assertThat(session.isBound()).isTrue();
+        assertThat(session.clientIdLow()).isEqualTo(firstLow);
+        assertThat(session.clientIdHigh()).isEqualTo(firstHigh);
+        assertThat(session.bindSecret()).isEqualTo(firstSecret);
+        assertThat(session.generation()).isEqualTo(firstGeneration);
+    }
+
+    @Test
+    void shouldKeepUnsignedSharedEpochInEncodedRequest() {
+        ConsensusSession parent = new ConsensusSession();
+        parent.bind(Long.MIN_VALUE);
+        byte[] secret = parent.bindSecret();
+        session.bindShared(parent, parent.clientIdLow(), parent.clientIdHigh(), Long.MIN_VALUE, secret);
+        ByteBuf frame = encoder.encode(alloc, PING_CODE, Unpooled.EMPTY_BUFFER);
+        try {
+            assertThat(frame.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(Long.MIN_VALUE);
+            assertThat(session.bindSecret(parent.clientIdLow(), parent.clientIdHigh(), Long.MIN_VALUE))
+                    .isEqualTo(secret);
+        } finally {
+            frame.release();
+        }
+    }
+
+    @Test
+    void shouldShareOneCounterAcrossCoordinatorReadsBindsAndPrimaryWrites() {
+        session.bind(7);
+        ConsensusSession shared = new ConsensusSession();
+        shared.bindShared(session, session.clientIdLow(), session.clientIdHigh(), 7, session.bindSecret());
+        VsrRequestEncoder primary = new VsrRequestEncoder(shared);
+        ByteBuf read = encoder.encode(alloc, GET_CLUSTER_METADATA_CODE, Unpooled.EMPTY_BUFFER);
+        ByteBuf bind = primary.encode(alloc, 20, Unpooled.EMPTY_BUFFER);
+        ByteBuf payload = sendMessagesPayload(2, 3, 4);
+        ByteBuf write = primary.encode(alloc, SEND_MESSAGES_CODE, payload);
+        ByteBuf nextRead = encoder.encode(alloc, PING_CODE, Unpooled.EMPTY_BUFFER);
+        try {
+            assertThat(read.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(1);
+            assertThat(bind.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(2);
+            assertThat(write.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(3);
+            assertThat(nextRead.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(4);
+            assertThat(write.getLongLE(VsrHeaders.REQUEST_CLIENT_OFFSET)).isEqualTo(session.clientIdLow());
+            assertThat(write.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(7);
+        } finally {
+            read.release();
+            bind.release();
+            write.release();
+            nextRead.release();
+            payload.release();
+        }
     }
 
     private static ByteBuf loginUserPayload() {

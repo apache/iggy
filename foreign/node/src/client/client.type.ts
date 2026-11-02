@@ -14,23 +14,26 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import type { Readable } from 'stream';
-import { type TcpSocketConnectOpts } from 'node:net';
+import { type TcpNetConnectOpts } from 'node:net';
 import { type ConnectionOptions } from 'node:tls';
+import type { PartitionContext } from '../wire/vsr/header.js';
+import type { Id } from '../wire/identifier.utils.js';
 
 /**
  * TCP socket connection options.
- * Alias for Node.js TcpSocketConnectOpts.
+ * Alias for Node.js TcpNetConnectOpts, what net.createConnection accepts.
  */
-export type TcpOption = TcpSocketConnectOpts;
+export type TcpOption = TcpNetConnectOpts;
 
 /**
  * TLS socket connection options.
- * Combines port number with Node.js TLS ConnectionOptions.
+ * Combines port number with Node.js TLS ConnectionOptions and the
+ * net.connect options tls.connect forwards at runtime. `caFile` is an SDK
+ * extension: a CA certificate path read when the TLS socket is created.
  */
-export type TlsOption = { port: number } & ConnectionOptions;
+export type TlsOption = { port: number } & ConnectionOptions & Partial<TcpNetConnectOpts> & { caFile?: string };
 
 /**
  * Response from a command sent to the Iggy server.
@@ -41,14 +44,49 @@ export type CommandResponse = {
   /** Length of the response data in bytes */
   length: number,
   /** Response payload data */
-  data: Buffer
+  data: Buffer,
+  /** Local recovery metadata for uncertain sections. The wire bytes stay unchanged. */
+  fetchProgress?: { operationId: bigint, partitions: ReadonlySet<number> }
 };
 
 export type SendCommandOptions = {
+  /** Cancels this call without closing its shared replica link. */
+  signal?: AbortSignal,
   /** Whether the response uses the standard command response decoder */
   handleResponse?: boolean,
-  /** Whether to append rather than prepend the command to the queue */
-  last?: boolean
+  /** @deprecated Multiplexed calls ignore this queue-order hint. */
+  last?: boolean,
+  /** @deprecated The shared session owner manages replica routing. */
+  followsLeaderMoves?: boolean,
+  /**
+   * When the whole request gives up, as an epoch timestamp in milliseconds.
+   * Includes admission, discovery, link waits and retries. Defaults to 30 seconds.
+   */
+  deadline?: number,
+  /**
+   * Partition context of a poll, an offset store or delete, or a send to an
+   * explicit partition, taken from an earlier reply. It replaces the context
+   * the client would capture, stays on every retry, and is never refreshed
+   * after a history refusal (87): work from one partition incarnation must
+   * not land in another.
+   */
+  context?: PartitionContext,
+  /**
+   * Sends the command to the replica with this id instead of the replica the
+   * client picks, for example to read the stats that replica keeps for itself.
+   * Replica ids are the ones the cluster metadata returns. Only non-replicated
+   * commands other than a poll, a consumer-offset read or session control are
+   * accepted, others fail with status 3 before anything is sent. An id the roster does not name fails with status 6. The
+   * replica's reply is returned as it is, a `NotPrimary` (89) refusal
+   * included, and nothing is retried on another replica.
+   */
+  replica?: number,
+  /**
+   * The `RawClient.lineage` that a call of several commands started with. A
+   * command of an older lineage fails with status 40 and sends nothing, so no
+   * part of the call runs under a session the caller opened after it started.
+   */
+  lineage?: number
 };
 
 /**
@@ -64,11 +102,37 @@ export type RawClient = {
   ) => Promise<CommandResponse>,
   /** Whether the client has been authenticated */
   isAuthenticated: boolean
-  /** Authenticates the client with the server */
+  /** Raised by each sign-in and logout of the caller. */
+  readonly lineage?: number
+  /** Uses caller credentials. Any failed attempt withdraws automatic sign-in. */
   authenticate: (c: ClientCredentials) => Promise<boolean>
+  /** Typed login delegates validation to the session owner when supported. */
+  _authWithPassword?: (c: PasswordCredentials) => Promise<{ userId: number }>
+  _authWithToken?: (c: TokenCredentials) => Promise<{ userId: number }>
+  /**
+   * Resolves the original frozen operation. Never sends it under a fresh identity.
+   * The client keeps the proved outcomes of its last `maxPendingOperations`
+   * replays, also across a session reset, so a later resolve of the same
+   * operation returns the same outcome without a request.
+   * `OperationNotRetainedError` means that a session reset or an abandon came
+   * before a replay proved the outcome, or that the proved outcome aged out.
+   */
+  resolveOperation?: (operationId: bigint, options?: SendCommandOptions) => Promise<void>,
+  /**
+   * Releases a retained lane without asserting that the operation did not commit.
+   * A replay that is already running keeps the lane until it ends, and the
+   * client keeps the outcome that it proves.
+   */
+  abandonOperation?: (operationId: bigint) => void,
+  /**
+   * Groups partitions of a topic by their primary, from the cached routes,
+   * so a partition reader can keep one fetch in flight per group.
+   */
+  readinessGroups?: (streamId: Id, topicId: Id, partitions: number[], options?: SendCommandOptions) =>
+    Promise<number[][]>,
   /** Destroys the client connection */
   destroy: () => void,
-  /** Holds a pooled client across multiple command submissions */
+  /** Tracks one facade operation across multiple command submissions. */
   hold?: () => () => void,
   /** Registers an event listener */
   on: (ev: string, cb: (e?: unknown) => void) => void
@@ -80,7 +144,7 @@ export type RawClient = {
 
 /**
  * Function type that provides a RawClient instance.
- * Used for dependency injection and connection pooling.
+ * Used for dependency injection.
  */
 export type ClientProvider = () => Promise<RawClient>;
 
@@ -101,9 +165,17 @@ export type TransportType = typeof Transports[number];
 export type ReconnectOption = {
   /** Whether automatic reconnection is enabled */
   enabled: boolean,
-  /** Interval between reconnection attempts in milliseconds */
+  /**
+   * Initial reconnect delay in milliseconds. Each replica uses exponential
+   * backoff capped at 10 seconds with jitter.
+   */
   interval: number,
-  /** Maximum number of reconnection attempts */
+  /**
+   * Maximum retries per replica after the first attempt. Bootstrap retries
+   * sweep the configured seed and remembered endpoints. The budget limits one
+   * reconnect burst: while the client stays signed in, each heartbeat restarts
+   * a replica link that used its budget, with a fresh budget.
+   */
   maxRetries: number
 }
 
@@ -137,14 +209,20 @@ export type PasswordCredentials = {
 export type ClientCredentials = TokenCredentials | PasswordCredentials;
 
 /**
- * Connection pool size configuration.
+ * Legacy logical-client count. Replica links are managed independently.
  */
 export type PoolSizeOption = {
-  /** Minimum number of connections in the pool */
+  /** Minimum logical clients. Normalized to one */
   min?: number,
-  /** Maximum number of connections in the pool */
+  /** Maximum logical clients. Only one is supported */
   max?: number
 }
+
+/**
+ * Client configuration or a connection string such as
+ * `iggy://username:password@host:port`.
+ */
+export type ClientConfigOrString = ClientConfig | string;
 
 /**
  * Complete client configuration for connecting to the Iggy server.
@@ -156,12 +234,19 @@ export type ClientConfig = {
   options: TransportOption,
   /** Authentication credentials */
   credentials: ClientCredentials,
-  /** Connection pool size configuration */
+  /** Legacy logical-client count. Does not limit replica links. */
   poolSize?: PoolSizeOption,
   /** Automatic reconnection configuration */
   reconnect?: ReconnectOption,
-  /** Interval for sending heartbeat pings in milliseconds */
+  /**
+   * Interval for sending heartbeat pings, in milliseconds. Each heartbeat also
+   * restarts replica links that used their reconnect budget. 0 disables both.
+   */
   heartbeatInterval?: number,
   /** Maximum accepted response frame size in bytes */
-  maxResponseFrameSize?: number
+  maxResponseFrameSize?: number,
+  /** Maximum active plus retained mutations across this client. Default: 256. */
+  maxPendingOperations?: number,
+  /** Frozen mutation headers and bodies, including retained and writer-owned bytes. Default: 64 MiB. */
+  maxPendingOperationBytes?: number
 }

@@ -22,10 +22,11 @@
 //! 4. Task A calls active_indexes().unwrap() - panics because indexes are None
 //!
 //! This test uses:
-//! - Very small segment size (512B) to trigger frequent rotations
+//! - The smallest segment size a topic may declare (1 MiB), with a payload
+//!   sized so the burst still rolls a few hundred segments (see
+//!   `PAYLOAD_FILLER_LEN`)
 //! - 8 concurrent producers (2 per protocol: TCP, HTTP, QUIC, WebSocket)
 //! - All producers write to the same partition for maximum lock contention
-//! - Short message_saver interval to add more concurrent persist operations
 
 use iggy::prelude::*;
 use iggy_common::TransportProtocol;
@@ -42,7 +43,20 @@ const PRODUCERS_PER_PROTOCOL: usize = 2;
 const PARTITION_ID: u32 = 0;
 const TEST_DURATION_SECS: u64 = 10;
 const MESSAGES_PER_BATCH: usize = 5;
-const MAX_ALLOWED_MEMORY_BYTES: u64 = 200 * 1024 * 1024;
+const SEGMENT_SIZE: u64 = 1024 * 1024;
+/// Filler appended to each payload. A topic segment cannot go below 1 MiB, so
+/// rotation frequency has to come from message volume instead. Measured over
+/// the 10-second burst: no filler writes ~28 MiB and rolls ~27 segments, while
+/// this rolls ~240 at the same server memory footprint. The old 512 B cap
+/// rolled one per batch (~50k), which no legal segment size can reproduce.
+const PAYLOAD_FILLER_LEN: usize = 2 * 1024;
+/// Final server RSS. Measured from 207 MiB at start, the burst ends near
+/// 282 MiB after ~240 segments when this test runs alone, and near 314 MiB
+/// after 83 segments inside a loaded parallel suite. Growth tracks neither
+/// segments nor bytes, and the heap levels off during the burst. The cap
+/// leaves room for that variance and still catches unbounded cache growth,
+/// such as the earlier 760 MB class.
+const MAX_ALLOWED_MEMORY_BYTES: u64 = 350 * 1024 * 1024;
 
 /// Runs the segment rotation race condition test with multiple protocols.
 /// Uses all available transports from the harness (TCP, HTTP, QUIC, WebSocket).
@@ -170,17 +184,22 @@ async fn create_client_for_transport(
 }
 
 async fn init_system(client: &IggyClient, total_producers: usize) {
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                segment_size: Some(IggyByteSize::from(SEGMENT_SIZE)),
+                messages_required_to_save: Some(32),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -205,7 +224,13 @@ async fn run_producer(
         let mut messages = Vec::with_capacity(MESSAGES_PER_BATCH);
 
         for i in 0..MESSAGES_PER_BATCH {
-            let payload = format!("p{}:b{}:m{}", producer_id, batch_num, i);
+            let payload = format!(
+                "p{}:b{}:m{}{}",
+                producer_id,
+                batch_num,
+                i,
+                "x".repeat(PAYLOAD_FILLER_LEN)
+            );
             let message = IggyMessage::builder()
                 .payload(payload.into_bytes().into())
                 .build()

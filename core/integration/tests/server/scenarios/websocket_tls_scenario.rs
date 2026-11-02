@@ -21,7 +21,10 @@ use integration::harness::assert_clean_system;
 
 pub async fn run(client: &IggyClient) {
     let stream_name = "test-websocket-tls-stream";
-    client.create_stream(stream_name).await.unwrap();
+    client
+        .create_stream(stream_name, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     let stream = client
         .get_stream(&Identifier::named(stream_name).unwrap())
@@ -35,11 +38,11 @@ pub async fn run(client: &IggyClient) {
         .create_topic(
             &Identifier::named(stream_name).unwrap(),
             topic_name,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -66,11 +69,14 @@ pub async fn run(client: &IggyClient) {
         .poll_messages(
             &Identifier::named(stream_name).unwrap(),
             &Identifier::named(topic_name).unwrap(),
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            true,
+            PollOptions {
+                count: 1,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();

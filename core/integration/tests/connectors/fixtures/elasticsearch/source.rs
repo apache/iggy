@@ -101,8 +101,6 @@ impl TestFixture for ElasticsearchSourceFixture {
         let http_client = create_http_client();
         let index = format!("{TEST_INDEX_PREFIX}_{}", Uuid::new_v4().simple());
 
-        // Container startup already waits for /_cluster/health to return 200
-        // via HttpWaitStrategy, so no additional health check is needed.
         Ok(Self {
             container,
             http_client,

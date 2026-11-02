@@ -33,13 +33,12 @@ runs:
     - name: Setup Node.js
       uses: actions/setup-node@v6
       with:
-        node-version: "23"
+        node-version: "24"
         registry-url: "https://registry.npmjs.org"
-        cache: "npm"
-        cache-dependency-path: foreign/node/package-lock.json
+        package-manager-cache: false
 
-    - name: Pin npm to 11 to match Dependabot lockfile format
-      run: npm install -g npm@11
+    - name: Install OIDC-compatible npm
+      run: npm install -g npm@12.0.1
       shell: bash
 
     - name: Install dependencies
@@ -109,6 +108,15 @@ runs:
             console.error('❌ Missing required fields:', missing.join(', '));
             process.exit(1);
           }
+          if (pkg.name !== 'apache-iggy') {
+            console.error('❌ package.json name must be apache-iggy, got:', pkg.name);
+            process.exit(1);
+          }
+          const repositoryUrl = typeof pkg.repository === 'string' ? pkg.repository : pkg.repository?.url;
+          if (repositoryUrl !== 'git+https://github.com/apache/iggy.git') {
+            console.error('❌ package.json repository must point to github.com/apache/iggy, got:', repositoryUrl);
+            process.exit(1);
+          }
           console.log('✅ All required fields present');
           console.log('');
           console.log('Package info:');
@@ -128,8 +136,6 @@ runs:
       shell: bash
 
     - name: Publish to npm
-      env:
-        NODE_AUTH_TOKEN: ${{ env.NPM_TOKEN }}
       run: |
         cd foreign/node
 
@@ -170,18 +176,11 @@ runs:
           echo "Or add to package.json:"
           echo '  "apache-iggy": "^${{ inputs.version }}"'
         else
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "❌ NPM_TOKEN is not set"
-            exit 1
-          fi
-
           echo "📦 Publishing to npm registry..."
           echo "Version: $VERSION (dist-tag: $DIST_TAG)"
           echo ""
 
-          # Publish with provenance for supply chain security. --tag keeps
-          # prereleases off `latest` (npm's default tag for any version).
-          npm publish --provenance --access public --tag "$DIST_TAG"
+          npm publish --access public --tag "$DIST_TAG"
 
           if [ $? -eq 0 ]; then
             echo ""

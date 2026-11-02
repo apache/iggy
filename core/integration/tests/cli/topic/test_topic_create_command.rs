@@ -27,6 +27,7 @@ use iggy::prelude::CompressionAlgorithm;
 use iggy::prelude::IggyByteSize;
 use iggy::prelude::IggyExpiry;
 use iggy::prelude::MaxTopicSize;
+use iggy::prelude::StreamCreateOptions;
 use predicates::str::diff;
 use serial_test::parallel;
 use std::str::FromStr;
@@ -40,7 +41,6 @@ struct TestTopicCreateCmd {
     compression_algorithm: CompressionAlgorithm,
     message_expiry: Option<Vec<String>>,
     max_topic_size: MaxTopicSize,
-    replication_factor: u8,
     using_identifier: TestStreamId,
 }
 
@@ -54,7 +54,6 @@ impl TestTopicCreateCmd {
         compression_algorithm: CompressionAlgorithm,
         message_expiry: Option<Vec<String>>,
         max_topic_size: MaxTopicSize,
-        replication_factor: u8,
         using_identifier: TestStreamId,
     ) -> Self {
         Self {
@@ -65,7 +64,6 @@ impl TestTopicCreateCmd {
             compression_algorithm,
             message_expiry,
             max_topic_size,
-            replication_factor,
             using_identifier,
         }
     }
@@ -92,7 +90,9 @@ impl TestTopicCreateCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestTopicCreateCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name).await;
+        let stream = client
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
     }
 
@@ -120,13 +120,12 @@ impl IggyCmdTestCase for TestTopicCreateCmd {
 
         let max_topic_size = self.max_topic_size.to_string();
 
-        let replication_factor = self.replication_factor;
-
         let message = format!(
-            "Executing create topic with name: {topic_name}, message expiry: {message_expiry}, compression algorithm: {compression_algorithm}, \
-            max topic size: {max_topic_size}, replication factor: {replication_factor} in stream with ID: {stream_id}\n\
+            "Executing create topic with name: {topic_name}, message expiry: {message_expiry}, \
+            compression algorithm: {compression_algorithm}, max topic size: {max_topic_size} \
+            in stream with ID: {stream_id}\n\
             Topic with name: {topic_name}, partitions count: {partitions_count}, compression algorithm: {compression_algorithm}, message expiry: {message_expiry}, \
-            max topic size: {max_topic_size}, replication factor: {replication_factor} created in stream with ID: {stream_id}\n",
+            max topic size: {max_topic_size} created in stream with ID: {stream_id}\n",
         );
 
         command_state.success().stdout(diff(message));
@@ -154,7 +153,7 @@ impl IggyCmdTestCase for TestTopicCreateCmd {
                 .parse::<HumanDuration>()
                 .unwrap();
             assert_eq!(
-                topic_details.message_expiry,
+                topic_details.resolved_options().message_expiry,
                 IggyExpiry::ExpireDuration(duration.into())
             );
         }
@@ -189,7 +188,6 @@ pub async fn should_be_successful() {
             Default::default(),
             None,
             MaxTopicSize::ServerDefault,
-            1,
             TestStreamId::Named,
         ))
         .await;
@@ -202,7 +200,6 @@ pub async fn should_be_successful() {
             Default::default(),
             None,
             MaxTopicSize::ServerDefault,
-            1,
             TestStreamId::Named,
         ))
         .await;
@@ -215,7 +212,6 @@ pub async fn should_be_successful() {
             Default::default(),
             Some(vec![String::from("3days"), String::from("5s")]),
             MaxTopicSize::Unlimited,
-            1,
             TestStreamId::Named,
         ))
         .await;
@@ -233,7 +229,6 @@ pub async fn should_be_successful() {
                 String::from("1s"),
             ]),
             MaxTopicSize::Custom(IggyByteSize::from_str("2GiB").unwrap()),
-            1,
             TestStreamId::Named,
         ))
         .await;
@@ -251,7 +246,7 @@ pub async fn should_help_match() {
                 r#"Create topic with given name, number of partitions, compression algorithm and expiry time for given stream ID
 
 Stream ID can be specified as a stream name or ID
-If topic ID is not provided then the server will automatically assign it
+The server assigns the topic ID. The legacy --topic-id flag is ignored.
 
 Examples
  iggy topic create 1 sensor1 2 gzip 15days
@@ -274,31 +269,51 @@ Arguments:
           Number of partitions inside the topic
 
   <COMPRESSION_ALGORITHM>
-          Compression algorithm for the topic, set to "none" for no compression
+          Compression metadata (none or gzip). Payload compression is not implemented
 
   [MESSAGE_EXPIRY]...
           Message expiry time in human-readable format like "unlimited" or "15days 2min 2s"
 {CLAP_INDENT}
-          "server_default" or skipping parameter makes CLI to use server default (from current server config) expiry time
+          Skipping this parameter or using "server_default" creates a topic with no message expiry.
 {CLAP_INDENT}
           [default: server_default]
 
 Options:
   -t, --topic-id <TOPIC_ID>
-          Topic ID to create
+          Legacy topic ID flag (ignored)
 
   -m, --max-topic-size <MAX_TOPIC_SIZE>
           Max topic size in human-readable format like "unlimited" or "15GB"
 {CLAP_INDENT}
-          "server_default" or skipping parameter makes CLI to use server default (from current server config) max topic size
-          Can't be lower than segment size in the config.
+          Skipping this parameter or using "server_default" creates a topic with unlimited size.
+          A finite size cannot be lower than the topic segment size.
 {CLAP_INDENT}
           [default: server_default]
 
-  -r, --replication-factor <REPLICATION_FACTOR>
-          Replication factor for the topic
+      --durability <DURABILITY>
+          Message completion policy: replicated or persisted. Both policies store messages on disk
+
+          Possible values:
+          - replicated: Quorum commit without an additional stable-storage barrier
+          - persisted:  Quorum commit backed by recoverable stable-storage copies
 {CLAP_INDENT}
-          [default: 1]
+          [default: replicated]
+
+      --consumer-offset-durability <CONSUMER_OFFSET_DURABILITY>
+          Offset completion policy: replicated or persisted. Independent of message durability
+
+          Possible values:
+          - replicated: Quorum commit without an additional stable-storage barrier
+          - persisted:  Quorum commit backed by recoverable stable-storage copies
+{CLAP_INDENT}
+          [default: replicated]
+
+      --set <KEY=VALUE>
+          Additional topic option as key=value, repeatable
+{CLAP_INDENT}
+          Values are sent as strings and parsed server-side through each option's
+          own FromStr (e.g. --set segment_size=128MiB). The server rejects keys it
+          does not support; run "iggy options topic" to list the ones it accepts.
 
   -h, --help
           Print help (see a summary with '-h')
@@ -324,14 +339,18 @@ Arguments:
   <STREAM_ID>              Stream ID to create topic
   <NAME>                   Name of the topic
   <PARTITIONS_COUNT>       Number of partitions inside the topic
-  <COMPRESSION_ALGORITHM>  Compression algorithm for the topic, set to "none" for no compression
+  <COMPRESSION_ALGORITHM>  Compression metadata (none or gzip). Payload compression is not implemented
   [MESSAGE_EXPIRY]...      Message expiry time in human-readable format like "unlimited" or "15days 2min 2s" [default: server_default]
 
 Options:
-  -t, --topic-id <TOPIC_ID>                      Topic ID to create
-  -m, --max-topic-size <MAX_TOPIC_SIZE>          Max topic size in human-readable format like "unlimited" or "15GB" [default: server_default]
-  -r, --replication-factor <REPLICATION_FACTOR>  Replication factor for the topic [default: 1]
-  -h, --help                                     Print help (see more with '--help')
+  -t, --topic-id <TOPIC_ID>                                      Legacy topic ID flag (ignored)
+  -m, --max-topic-size <MAX_TOPIC_SIZE>                          Max topic size in human-readable format like "unlimited" or "15GB" [default: server_default]
+      --durability <DURABILITY>                                  Message completion policy: replicated or persisted. Both policies store messages on disk [default: replicated] [possible values:
+                                                                 replicated, persisted]
+      --consumer-offset-durability <CONSUMER_OFFSET_DURABILITY>  Offset completion policy: replicated or persisted. Independent of message durability [default: replicated] [possible values:
+                                                                 replicated, persisted]
+      --set <KEY=VALUE>                                          Additional topic option as key=value, repeatable
+  -h, --help                                                     Print help (see more with '--help')
 "#,
             ),
         ))

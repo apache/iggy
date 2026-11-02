@@ -19,7 +19,12 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import io.netty.channel.IoEventLoopGroup;
+import io.netty.channel.MultiThreadIoEventLoopGroup;
+import io.netty.channel.local.LocalIoHandler;
+import io.netty.channel.nio.NioIoHandler;
 import org.apache.iggy.client.BaseIntegrationTest;
+import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyAuthenticationException;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
@@ -222,6 +227,19 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
+    /** A read returns a first message larger than its byte limit, so every link reads a reply of the largest one. */
+    @Test
+    void shouldRejectMaximumVsrFrameSizeBelowAReplyOfTheLargestMessage() {
+        AsyncIggyTcpClientBuilder builder =
+                AsyncIggyTcpClient.builder().maxVsrFrameSize(AsyncIggyTcpClientBuilder.MIN_MAX_VSR_FRAME_SIZE - 1);
+
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+        client = AsyncIggyTcpClient.builder()
+                .maxVsrFrameSize(AsyncIggyTcpClientBuilder.MIN_MAX_VSR_FRAME_SIZE)
+                .build();
+        assertThat(client).isNotNull();
+    }
+
     @Test
     void shouldRejectNonPositiveMaximumVsrFrameSize() {
         assertThatThrownBy(() -> AsyncIggyTcpClient.builder().maxVsrFrameSize(0).build())
@@ -239,6 +257,14 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
     }
 
     @Test
+    void shouldDefaultPendingOperationLimitsToTheSessionDefaults() {
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder();
+
+        assertThat(builder.maxPendingOperations()).isEqualTo(ConsensusSession.DEFAULT_MAX_PENDING_OPERATIONS);
+        assertThat(builder.maxPendingOperationBytes()).isEqualTo(ConsensusSession.DEFAULT_MAX_PENDING_OPERATION_BYTES);
+    }
+
+    @Test
     void shouldRejectNonPositiveHeartbeatInterval() {
         assertThatThrownBy(() -> AsyncIggyTcpClient.builder()
                         .heartbeatInterval(Duration.ZERO)
@@ -248,6 +274,96 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                         .heartbeatInterval(Duration.ofMillis(-1))
                         .build())
                 .isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldRejectNonPositiveIoThreads() {
+        assertThatThrownBy(() -> AsyncIggyTcpClient.builder().ioThreads(0).build())
+                .isInstanceOf(IggyInvalidArgumentException.class);
+        assertThatThrownBy(() -> AsyncIggyTcpClient.builder().ioThreads(-1).build())
+                .isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldIgnoreIoThreadsWhenAnEventLoopGroupIsSupplied() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        try {
+            AsyncIggyTcpClient.builder().ioThreads(0).eventLoopGroup(group).build();
+        } finally {
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldRejectNullEventLoopGroup() {
+        assertThatThrownBy(() -> AsyncIggyTcpClient.builder().eventLoopGroup(null))
+                .isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldRejectAnEventLoopGroupThatCannotDriveNioChannels() throws Exception {
+        IoEventLoopGroup localGroup = new MultiThreadIoEventLoopGroup(1, LocalIoHandler.newFactory());
+        try {
+            assertThatThrownBy(() -> AsyncIggyTcpClient.builder()
+                            .eventLoopGroup(localGroup)
+                            .build())
+                    .isInstanceOf(IggyInvalidArgumentException.class)
+                    .hasMessageContaining("NIO");
+        } finally {
+            localGroup.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldRejectAShutDownEventLoopGroup() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+
+        assertThatThrownBy(
+                        () -> AsyncIggyTcpClient.builder().eventLoopGroup(group).build())
+                .isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldShareOneEventLoopGroupAcrossClients() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        AsyncIggyTcpClient other = null;
+        try {
+            client = AsyncIggyTcpClient.builder()
+                    .host(serverHost())
+                    .port(serverTcpPort())
+                    .eventLoopGroup(group)
+                    .build();
+            other = AsyncIggyTcpClient.builder()
+                    .host(serverHost())
+                    .port(serverTcpPort())
+                    .eventLoopGroup(group)
+                    .build();
+            client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            other.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            client.users().login(TEST_USERNAME, TEST_PASSWORD).get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            other.users().login(TEST_USERNAME, TEST_PASSWORD).get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            assertThat(client.streams().getStreams().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                    .isNotNull();
+            assertThat(other.streams().getStreams().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                    .isNotNull();
+
+            client.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            client = null;
+
+            assertThat(group.isShuttingDown())
+                    .as("closing a client must not take the shared group down")
+                    .isFalse();
+            assertThat(other.streams().getStreams().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                    .as("the other client keeps working on the shared group")
+                    .isNotNull();
+        } finally {
+            if (other != null) {
+                other.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            assertThat(group.isShuttingDown()).isFalse();
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
     }
 
     @Test
@@ -588,6 +704,18 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         assertThat(client.personalAccessTokens()).isNotNull();
         assertThat(client.partitions()).isNotNull();
         assertThat(client.consumerOffsets()).isNotNull();
+    }
+
+    @Test
+    void testBuildAndLoginFromConnectionString() throws Exception {
+        // buildAndLogin completes only after the login with the credentials from the connection string succeeds
+        client = AsyncIggyTcpClient.builder()
+                .fromConnectionString(
+                        "iggy://" + TEST_USERNAME + ":" + TEST_PASSWORD + "@" + serverHost() + ":" + serverTcpPort())
+                .buildAndLogin()
+                .get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+        assertThat(client.users()).isNotNull();
     }
 
     @Test

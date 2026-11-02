@@ -14,10 +14,21 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
+import { deserializePartitionContext, PARTITION_CONTEXT_SIZE, type PartitionContext } from '../vsr/header.js';
 import { toDate } from '../serialize.utils.js';
 import type { ValueOf } from '../../type.utils.js';
+import { deserializePrefixedOptions, type ParsedOptions } from '../options.utils.js';
+import { deserializeError } from '../error.utils.js';
+
+/** Default of `message_expiry` and `max_topic_size`: never expire, no cap. */
+const UNLIMITED = 0xffff_ffff_ffff_ffffn;
+
+/** Partition id, counters and context, before the two node lists. */
+const PARTITION_COUNTERS_SIZE = 40 + PARTITION_CONTEXT_SIZE;
+
+/** Smallest partition entry: the counters and two empty node lists. */
+const PARTITION_MIN_SIZE = PARTITION_COUNTERS_SIZE + 2;
 
 /**
  * Basic topic information without partition details.
@@ -31,24 +42,28 @@ export type BaseTopic = {
   createdAt: Date,
   /** Number of partitions */
   partitionsCount: number,
-  /** Compression algorithm used */
+  /** Compression algorithm label, read from the options */
   compressionAlgorithm: number,
-  /** Message expiry time in microseconds (0 = unlimited) */
+  /** Message expiry in microseconds, read from the options (u64 max = never expire) */
   messageExpiry: bigint,
-  /** Maximum topic size in bytes (0 = unlimited) */
+  /** Maximum topic size in bytes, read from the options (u64 max = unlimited) */
   maxTopicSize: bigint,
-  /** Replication factor */
-  replicationFactor: number
   /** Total size of the topic in bytes */
   sizeBytes: bigint,
   /** Total number of messages in the topic */
   messagesCount: bigint,
+  /** Options the client explicitly sent at create */
+  options: ParsedOptions,
+  /** Options resolved from server defaults at create */
+  derivedOptions: ParsedOptions,
 };
 
 /**
  * Partition information within a topic.
  */
 export type Partition = {
+  /** Partition incarnation, owner generation and metadata op the reply carries */
+  context: PartitionContext,
   /** Partition ID */
   id: number,
   /** Partition creation timestamp */
@@ -60,7 +75,14 @@ export type Partition = {
   /** Total size of the partition in bytes */
   sizeBytes: bigint,
   /** Total number of messages in the partition */
-  messagesCount: bigint
+  messagesCount: bigint,
+  /** Node ids that store the partition, in member order */
+  members: number[],
+  /**
+   * Node ids among `members` that the partition's primary last reported in
+   * sync and that are up. Empty until the primary first reports.
+   */
+  inSyncMembers: number[]
 };
 
 /** Topic with partition details */
@@ -113,28 +135,52 @@ export const isValidCompressionAlgorithm = (ca: number): ca is CompressionAlgori
   Object.values(CompressionAlgorithm).includes(ca);
 
 /**
- * Deserializes a base topic from a buffer.
+ * Maps a compression algorithm code to its wire option name.
+ *
+ * @param ca - Compression algorithm code
+ * @returns Option value string ('none' or 'gzip')
+ */
+export const compressionAlgorithmName = (ca: CompressionAlgorithm): string =>
+  ca === CompressionAlgorithm.Gzip ? 'gzip' : 'none';
+
+/**
+ * Deserializes a topic header from a buffer.
+ * Layout: 33 fixed bytes, name, then two length-prefixed options blocks
+ * (client-explicit and server-derived) holding every setting.
  *
  * @param p - Buffer containing serialized topic data
  * @param pos - Starting position in the buffer
  * @returns Object with bytes read and deserialized topic data
  */
 export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized => {
+  const start = pos;
   const id = p.readUInt32LE(pos);
   const createdAt = toDate(p.readBigUint64LE(pos + 4));
   const partitionsCount = p.readUInt32LE(pos + 12);
-  const messageExpiry = p.readBigUInt64LE(pos + 16);
-  const compressionAlgorithm = p.readUInt8(pos + 24);
-  const maxTopicSize = p.readBigUInt64LE(pos + 25);
-  const replicationFactor = p.readUInt8(pos + 33);
-  const sizeBytes = p.readBigUInt64LE(pos + 34);
-  const messagesCount = p.readBigUInt64LE(pos + 42);
+  const sizeBytes = p.readBigUInt64LE(pos + 16);
+  const messagesCount = p.readBigUInt64LE(pos + 24);
 
-  const nameLength = p.readUInt8(pos + 50);
-  const name = p.subarray(pos + 51, pos + 51 + nameLength).toString();
+  const nameLength = p.readUInt8(pos + 32);
+  const name = p.subarray(pos + 33, pos + 33 + nameLength).toString();
+  pos += 33 + nameLength;
+
+  const explicit = deserializePrefixedOptions(p, pos);
+  pos += explicit.bytesRead;
+  const derived = deserializePrefixedOptions(p, pos);
+  pos += derived.bytesRead;
+
+  const setting = (key: string) => explicit.options[key] ?? derived.options[key];
+  const limit = (key: string) => {
+    const value = setting(key);
+    return typeof value === 'bigint' ? value : UNLIMITED;
+  };
+  const compressionAlgorithm = setting('compression_algorithm') === 'gzip'
+    ? CompressionAlgorithm.Gzip : CompressionAlgorithm.None;
+  const messageExpiry = limit('message_expiry');
+  const maxTopicSize = limit('max_topic_size');
 
   return {
-    bytesRead: 4 + 8 + 4 + 1 + 8 + 8 + 1 + 8 + 8 + 1 + nameLength,
+    bytesRead: pos - start,
     data: {
       id,
       name,
@@ -142,10 +188,11 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
       partitionsCount,
       compressionAlgorithm,
       maxTopicSize,
-      replicationFactor,
       messageExpiry,
       messagesCount,
       sizeBytes,
+      options: explicit.options,
+      derivedOptions: derived.options,
     }
   }
 };
@@ -153,28 +200,67 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
 
 /**
  * Deserializes a partition from a buffer.
+ * Layout: `[id:u32][created_at:u64][segments_count:u32][current_offset:u64]
+ * [size_bytes:u64][messages_count:u64][context:24]` then two node lists,
+ * members and in-sync members, each a `u8` count followed by that many `u8`
+ * node ids. The entry is 66 bytes plus one per listed node.
  *
  * @param p - Buffer containing serialized partition data
  * @param pos - Starting position in the buffer
  * @returns Object with bytes read and deserialized partition data
+ * @throws DeserializeError if the buffer ends inside the entry
  */
 export const deserializePartition = (p: Buffer, pos = 0): PartitionSerialized => {
+  if (p.length - pos < PARTITION_MIN_SIZE)
+    deserializeError('partition', pos, p.length, PARTITION_MIN_SIZE);
+
+  const start = pos;
+  const id = p.readUInt32LE(pos);
+  const createdAt = toDate(p.readBigUint64LE(pos + 4));
+  const segmentsCount = p.readUInt32LE(pos + 12);
+  const currentOffset = p.readBigUint64LE(pos + 16);
+  const sizeBytes = p.readBigUint64LE(pos + 24);
+  const messagesCount = p.readBigUint64LE(pos + 32);
+  const context = deserializePartitionContext(p, pos + 40);
+  pos += PARTITION_COUNTERS_SIZE;
+
+  const members = deserializeNodeIds(p, pos, 'partition members');
+  pos += 1 + members.length;
+  const inSyncMembers = deserializeNodeIds(p, pos, 'partition in-sync members');
+  pos += 1 + inSyncMembers.length;
+
   return {
-    bytesRead: 4 + 8 + 4 + 8 + 8 + 8,
+    bytesRead: pos - start,
     data: {
-      id: p.readUInt32LE(pos),
-      createdAt: toDate(p.readBigUint64LE(pos + 4)),
-      segmentsCount: p.readUInt32LE(pos + 12),
-      currentOffset: p.readBigUint64LE(pos + 16),
-      sizeBytes: p.readBigUint64LE(pos + 24),
-      messagesCount: p.readBigUint64LE(pos + 32),
+      id,
+      createdAt,
+      segmentsCount,
+      currentOffset,
+      sizeBytes,
+      messagesCount,
+      context,
+      members,
+      inSyncMembers,
     }
   }
+};
+
+/** Reads a `[count:u8][ids:count x u8]` node list at `pos`. */
+const deserializeNodeIds = (p: Buffer, pos: number, name: string): number[] => {
+  if (p.length - pos < 1)
+    deserializeError(name, pos, p.length, 1);
+  const count = p.readUInt8(pos);
+  if (p.length - pos - 1 < count)
+    deserializeError(name, pos, p.length, 1 + count, { count });
+  return Array.from(p.subarray(pos + 1, pos + 1 + count));
 };
 
 
 /**
  * Deserializes a topic with partitions from a buffer.
+ * Partition elements are count-driven from the topic's partitionsCount:
+ * the header's variable-length options blocks make greedy consumption
+ * ambiguous.
  *
  * @param p - Buffer containing serialized topic data
  * @param pos - Starting position in the buffer
@@ -189,8 +275,7 @@ export const deserializeTopic = (p: Buffer, pos = 0): TopicSerialized => {
   const { bytesRead, data } = deserializeBaseTopic(p, pos);
   pos += bytesRead;
   const partitions = [];
-  const end = p.length;
-  while (pos < end) {
+  for (let i = 0; i < data.partitionsCount; i++) {
     const { bytesRead, data } = deserializePartition(p, pos);
     partitions.push(data);
     pos += bytesRead;
@@ -200,19 +285,36 @@ export const deserializeTopic = (p: Buffer, pos = 0): TopicSerialized => {
 
 
 /**
- * Deserializes multiple topics from a buffer.
+ * Deserializes a GetTopics response: `[topics_count:u32_le]` prefix followed
+ * by count-driven topic headers (no partition details).
  *
  * @param p - Buffer containing serialized topics data
  * @param pos - Starting position in the buffer
  * @returns Array of deserialized topics
  */
 export const deserializeTopics = (p: Buffer, pos = 0): Topic[] => {
+  const topicsCount = p.readUInt32LE(pos);
+  pos += 4;
   const topics = [];
-  const len = p.length;
-  while (pos < len) {
-    const { bytesRead, data } = deserializeTopic(p, pos);
-    topics.push(data);
+  for (let i = 0; i < topicsCount; i++) {
+    const { bytesRead, data } = deserializeBaseTopic(p, pos);
+    topics.push({ ...data, partitions: [] });
     pos += bytesRead;
   }
   return topics;
 };
+
+export const Durability = {
+  Replicated: 'replicated',
+  Persisted: 'persisted'
+} as const;
+
+export type Durability = typeof Durability[keyof typeof Durability];
+
+/** Whether a topic may add and delete partitions after create. */
+export const PartitionResizePolicy = {
+  Mutable: 'mutable',
+  Fixed: 'fixed'
+} as const;
+
+export type PartitionResizePolicy = typeof PartitionResizePolicy[keyof typeof PartitionResizePolicy];

@@ -22,7 +22,7 @@ package org.apache.iggy.client.async.tcp;
 import org.apache.iggy.user.IdentityInfo;
 
 import java.util.concurrent.CompletableFuture;
-import java.util.function.Supplier;
+import java.util.function.LongFunction;
 
 /**
  * Routes a login to the cluster leader before executing its Register
@@ -31,7 +31,7 @@ import java.util.function.Supplier;
 @FunctionalInterface
 interface LoginRoutingHook {
 
-    LoginRoutingHook NONE = loginAttempt -> loginAttempt.get();
+    LoginRoutingHook NONE = loginAttempt -> loginAttempt.apply(0);
 
     /**
      * Discovers and selects the current leader, then executes the supplied
@@ -40,5 +40,13 @@ interface LoginRoutingHook {
      * @param loginAttempt sends Register against the active connection
      * @return the identity returned by the successful Register response
      */
-    CompletableFuture<IdentityInfo> loginOnLeader(Supplier<CompletableFuture<IdentityInfo>> loginAttempt);
+    CompletableFuture<IdentityInfo> loginOnLeader(LongFunction<CompletableFuture<IdentityInfo>> loginAttempt);
+
+    /**
+     * Captures cleanup for the current login owner. A delayed sign-out completion must not discard a
+     * newer explicit sign-in.
+     */
+    default Runnable logoutCompletion() {
+        return () -> {};
+    }
 }

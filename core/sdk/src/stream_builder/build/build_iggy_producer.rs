@@ -47,22 +47,18 @@ pub(crate) async fn build_iggy_producer(
     let stream = config.stream_name();
     let topic = config.topic_name();
     let topic_partitions_count = config.topic_partitions_count();
-    let topic_replication_factor = config.topic_replication_factor();
     let batch_length = config.batch_length();
     let linger_time = config.linger_time();
     let partitioning = config.partitioning().to_owned();
-    let send_retries = config.send_retries_count();
-    let send_retries_interval = config.send_retries_interval();
 
     trace!("Build iggy producer");
     let mut builder = client
         .producer(stream, topic)?
+        .topic_durability(config.topic_durability())
         .partitioning(partitioning)
         .create_stream_if_not_exists()
-        .send_retries(send_retries, send_retries_interval)
         .create_topic_if_not_exists(
             topic_partitions_count,
-            topic_replication_factor,
             IggyExpiry::ServerDefault,
             MaxTopicSize::ServerDefault,
         )

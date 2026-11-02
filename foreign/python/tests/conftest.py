@@ -22,20 +22,28 @@ This module provides pytest fixtures for setting up test environments
 and connecting to Iggy servers in various configurations.
 """
 
-# TODO(slbotbm): Create text fixture for clean up after
-# delete_stream() has been implemented.
-
 import asyncio
 import os
 import secrets
 import string
+from collections.abc import AsyncGenerator
 from pathlib import Path
 
 import pytest
 
-from apache_iggy import IggyClient
+from apache_iggy import IggyClient, PendingOperationError
 
-from .utils import get_server_config, wait_for_ping, wait_for_server
+from .utils import (
+    get_http_server_config,
+    get_quic_server_config,
+    get_server_config,
+    get_websocket_server_config,
+    wait_for_ping,
+    wait_for_server,
+)
+
+# A request and its retained replay can each spend 30 seconds.
+STREAM_CLEANUP_TIMEOUT_SECONDS = 60
 
 
 @pytest.fixture(scope="session")
@@ -68,6 +76,32 @@ async def iggy_client() -> IggyClient:
     # Authenticate
     await client.login_user("iggy", "iggy")
 
+    return client
+
+
+@pytest.fixture(params=["tcp", "quic", "http", "websocket"])
+async def transport_client(request: pytest.FixtureRequest) -> IggyClient:
+    """
+    Return a client logged in as root over each transport the SDK exposes.
+
+    Every transport is reached through its connection string, so a test that
+    takes this fixture runs once per transport against the same server.
+    """
+    scheme, (host, port), query = {
+        "tcp": ("tcp", get_server_config(), ""),
+        "quic": ("quic", get_quic_server_config(), "?reconnection_max_retries=0"),
+        "http": ("http", get_http_server_config(), ""),
+        "websocket": ("ws", get_websocket_server_config(), ""),
+    }[request.param]
+    # QUIC listens on UDP, which a TCP probe cannot reach.
+    if scheme != "quic":
+        wait_for_server(host, port)
+    client = IggyClient.from_connection_string(
+        f"iggy+{scheme}://iggy:iggy@{host}:{port}{query}"
+    )
+    await client.connect()
+    await wait_for_ping(client)
+    await client.login_user("iggy", "iggy")
     return client
 
 
@@ -106,6 +140,53 @@ def unique_name():
         return f"{prefix}{suffix}"
 
     return make_name
+
+
+@pytest.fixture(scope="function", autouse=True)
+async def cleanup_streams(
+    request: pytest.FixtureRequest,
+) -> AsyncGenerator[None, None]:
+    """Delete streams created by the current test."""
+    if "iggy_client" not in request.fixturenames:
+        yield
+        return
+
+    client: IggyClient = request.getfixturevalue("iggy_client")
+    existing_streams = {
+        (stream.id, stream.created_at) for stream in await client.get_streams()
+    }
+
+    yield
+
+    for stream in await client.get_streams():
+        if (stream.id, stream.created_at) not in existing_streams:
+            try:
+                async with asyncio.timeout(STREAM_CLEANUP_TIMEOUT_SECONDS):
+                    while True:
+                        try:
+                            await client.delete_stream(stream.id)
+                            break
+                        except PendingOperationError as error:
+                            if error.kind not in ("uncertain", "lane_blocked"):
+                                raise
+                            await client.resolve_operation(error.operation_id)
+                            if error.kind == "uncertain":
+                                break
+                            if await client.get_stream(stream.id) is None:
+                                break
+
+                    if await client.get_stream(stream.id) is not None:
+                        raise RuntimeError(
+                            f"Stream {stream.id} still exists after deletion"
+                        )
+            except (RuntimeError, TimeoutError) as error:
+                reason = (
+                    f"Cleanup failed for stream {stream.id} ({stream.name!r}): "
+                    f"{error!r}"
+                )
+                error.add_note(reason)
+                request.session.shouldstop = reason
+                raise
 
 
 @pytest.fixture(scope="session", autouse=True)

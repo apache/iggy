@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
+using Apache.Iggy.Exceptions;
+using Apache.Iggy.Vsr;
 
 namespace Apache.Iggy.Kinds;
 
@@ -37,6 +40,55 @@ public readonly struct PollingStrategy
     ///     For First, Last, and Next: this value is 0.
     /// </summary>
     public required ulong Value { get; init; }
+
+    /// <summary>
+    ///     The partition incarnation and owner the poll has to be served under, stamped into the request header.
+    ///     The server refuses the poll with status 87 when the partition was deleted and recreated since, and with
+    ///     status 5009 when it moved to another member of the consumer group. Null takes the context the
+    ///     partition's route reports.
+    /// </summary>
+    public PartitionContext? Context { get; init; }
+
+    /// <summary>
+    ///     The partition of a continuation, which a read of another partition refuses. Null for a strategy that
+    ///     fits every partition.
+    /// </summary>
+    internal uint? PartitionId { get; init; }
+
+    /// <summary>
+    ///     Pins the poll to a context, such as <see cref="PolledMessages.Context" /> of an earlier poll, so it never
+    ///     reads a newer incarnation of the partition.
+    /// </summary>
+    /// <param name="context">The context the poll has to be served under.</param>
+    /// <returns>This strategy with the context set.</returns>
+    public PollingStrategy WithContext(PartitionContext context)
+    {
+        return this with { Context = context };
+    }
+
+    /// <summary>A continuation of <paramref name="partitionId" /> under <paramref name="context" />.</summary>
+    internal static PollingStrategy Continuation(uint partitionId, MessagePolling kind, ulong value,
+        PartitionContext context)
+    {
+        return new PollingStrategy
+        {
+            Kind = kind,
+            Value = value,
+            Context = context,
+            PartitionId = partitionId
+        };
+    }
+
+    /// <summary>Refuses a continuation of another partition than <paramref name="partitionId" />.</summary>
+    /// <exception cref="IggyInvalidStatusCodeException">Status 3 (InvalidCommand) for a continuation of another partition.</exception>
+    internal void ValidatePartition(uint partitionId)
+    {
+        if (PartitionId is { } bound && bound != partitionId)
+        {
+            throw VsrError.Exception(VsrError.INVALID_COMMAND,
+                $"A continuation of partition {bound} cannot read partition {partitionId}.");
+        }
+    }
 
     /// <summary>
     ///     Creates a polling strategy that starts from a specific message offset.

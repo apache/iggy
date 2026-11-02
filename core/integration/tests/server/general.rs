@@ -16,18 +16,15 @@
 // under the License.
 
 use crate::server::scenarios::{
-    authentication_scenario, consumer_timestamp_polling_scenario, invalid_consumer_offset_scenario,
-    message_headers_scenario, permissions_scenario, snapshot_scenario,
-    stream_size_validation_scenario, system_scenario, user_scenario,
+    authentication_scenario, consumer_timestamp_polling_scenario, delete_stats_rollback_scenario,
+    invalid_consumer_offset_scenario, message_headers_scenario, permissions_scenario,
+    snapshot_scenario, stream_size_validation_scenario, system_scenario, user_scenario,
 };
 use integration::iggy_harness;
 
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        segment.size = "1MiB",
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -36,11 +33,13 @@ async fn authentication(harness: &TestHarness) {
     authentication_scenario::run(harness).await;
 }
 
+// Placement spreads partition primaries over the nodes. The node the HTTP
+// client calls relays a request for another node's partition only when every
+// node verifies its bearer.
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
+        config_path = "tests/server/shared_jwt_secrets.toml",
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -52,8 +51,6 @@ async fn system(harness: &TestHarness) {
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -62,11 +59,11 @@ async fn user(harness: &TestHarness) {
     user_scenario::run(harness).await;
 }
 
+// Same HTTP relay requirement as `system`.
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
+        config_path = "tests/server/shared_jwt_secrets.toml",
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -78,8 +75,6 @@ async fn permissions(harness: &TestHarness) {
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -91,8 +86,6 @@ async fn message_headers(harness: &TestHarness) {
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -101,11 +94,17 @@ async fn stream_size_validation(harness: &TestHarness) {
     stream_size_validation_scenario::run(harness).await;
 }
 
+// One transport: the scenario asserts server-side rollback arithmetic, and
+// every call it makes (`get_stream`, `get_topic`, `get_stats`) is already
+// exercised on all four transports by the scenarios above.
+#[iggy_harness(test_client_transport = [Tcp])]
+async fn delete_stats_rollback(harness: &TestHarness) {
+    delete_stats_rollback_scenario::run(harness).await;
+}
+
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -117,8 +116,6 @@ async fn consumer_timestamp_polling(harness: &TestHarness) {
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -134,8 +131,6 @@ async fn snapshot(harness: &TestHarness) {
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )

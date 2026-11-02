@@ -20,10 +20,15 @@ package tests_test
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
+	"os"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -58,8 +63,8 @@ func TestE2E_SendAndPollRoundTrip(t *testing.T) {
 	}
 
 	partitionId := uint32(0)
-	polled, err := connected.PollMessages(ctx, streamId, topicId,
-		iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), 12, false, &partitionId)
+	polled, err := connected.PollMessages(ctx, streamId, topicId, partitionId,
+		iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), countOptions(12, false))
 	require.NoError(t, err)
 	assert.Len(t, polled.Messages, 12)
 	assert.Equal(t, uint32(0), polled.PartitionId)
@@ -149,6 +154,7 @@ func TestE2E_ConsumerGroupFlow(t *testing.T) {
 	groupId, err := iggcon.NewIdentifier(group.Id)
 	require.NoError(t, err)
 	require.NoError(t, connected.JoinConsumerGroup(ctx, streamId, topicId, groupId))
+	waitForGroupAssignment(t, connected, streamId, topicId, groupId)
 
 	assignment, err := connected.SyncConsumerGroup(ctx, streamId, topicId, groupId)
 	require.NoError(t, err)
@@ -161,14 +167,13 @@ func TestE2E_ConsumerGroupFlow(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// A group poll without an explicit partition round-robins the partitions
-	// the member owns, so polling once per partition covers every one of them.
+	// The member polls each partition that it owns, and the server stores what it reads.
 	polledPartitions := make(map[uint32]bool)
-	for range len(assignment.Partitions) {
-		polled, err := connected.PollMessages(ctx, streamId, topicId,
-			iggcon.NewGroupConsumer(groupId), iggcon.NextPollingStrategy(), 2, true, nil)
+	for _, partitionId := range assignment.Partitions {
+		polled, err := connected.PollMessages(ctx, streamId, topicId, partitionId,
+			iggcon.NewGroupConsumer(groupId), iggcon.NextPollingStrategy(), countOptions(2, true))
 		require.NoError(t, err)
-		require.NotEqual(t, iggcon.NoAssignedPartition, polled.PartitionId)
+		require.Len(t, polled.Messages, 2)
 		polledPartitions[polled.PartitionId] = true
 	}
 	assert.Len(t, polledPartitions, len(assignment.Partitions),
@@ -178,7 +183,123 @@ func TestE2E_ConsumerGroupFlow(t *testing.T) {
 	require.NoError(t, connected.DeleteConsumerGroup(ctx, streamId, topicId, groupId))
 }
 
-func TestE2E_RawRequestsDoNotGapMetadataRequestIDs(t *testing.T) {
+// The shared cluster fixture seeds these partitions before moving only metadata
+// leadership. Creating a fresh topic here would put both primaries together.
+func TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership(t *testing.T) {
+	streamName := os.Getenv("IGGY_POLL_ROUTING_STREAM")
+	if streamName == "" {
+		t.Skip("set IGGY_POLL_ROUTING_STREAM and IGGY_POLL_ROUTING_TOPIC to a split-primary topic with eight messages per partition")
+	}
+	messagesPerPartition := 8
+	if value := os.Getenv("IGGY_POLL_ROUTING_MESSAGES_PER_PARTITION"); value != "" {
+		var err error
+		messagesPerPartition, err = strconv.Atoi(value)
+		require.NoError(t, err, "IGGY_POLL_ROUTING_MESSAGES_PER_PARTITION must be a positive integer")
+		require.Positive(t, messagesPerPartition, "IGGY_POLL_ROUTING_MESSAGES_PER_PARTITION must be a positive integer")
+	}
+	stream, err := iggcon.NewIdentifier(streamName)
+	require.NoError(t, err)
+	topic, err := iggcon.NewIdentifier(os.Getenv("IGGY_POLL_ROUTING_TOPIC"))
+	require.NoError(t, err)
+	connected := connect(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	details, err := connected.GetTopic(ctx, stream, topic)
+	require.NoError(t, err)
+	group, err := connected.CreateConsumerGroup(ctx, stream, topic, fmt.Sprintf("go-primary-%d", time.Now().UnixNano()))
+	require.NoError(t, err)
+	groupID, err := iggcon.NewIdentifier(group.Id)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = connected.DeleteConsumerGroup(context.Background(), stream, topic, groupID) })
+	require.NoError(t, connected.JoinConsumerGroup(ctx, stream, topic, groupID))
+	waitForGroupAssignment(t, connected, stream, topic, groupID)
+	consumer := iggcon.NewGroupConsumer(groupID)
+	primaryAddress := requireSplitPrimaries(t, ctx, connected, stream, topic)
+	coordinator := connected.GetConnectionInfo().ServerAddress
+	beforeClient, err := connected.GetMe(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint32(1), beforeClient.ConsumerGroupsCount)
+	counts := make(map[uint32]int)
+	for index := range int(details.PartitionsCount) * messagesPerPartition {
+		partition := uint32(index) % details.PartitionsCount
+		polled, err := connected.PollMessages(ctx, stream, topic, partition, consumer, iggcon.NextPollingStrategy(), countOptions(1, true))
+		require.NoError(t, err)
+		require.Len(t, polled.Messages, 1)
+		counts[polled.PartitionId]++
+	}
+	for partition := range details.PartitionsCount {
+		assert.Equal(t, messagesPerPartition, counts[partition])
+		require.Eventually(t, func() bool {
+			offset, err := connected.GetConsumerOffset(ctx, consumer, stream, topic, &partition)
+			return err == nil && offset != nil && offset.StoredOffset == uint64(messagesPerPartition-1)
+		}, 5*time.Second, 50*time.Millisecond,
+			"partition %d auto-commit must replicate to the coordinator's backup", partition)
+		polled, err := connected.PollMessages(ctx, stream, topic, partition, consumer, iggcon.NextPollingStrategy(), countOptions(1, true))
+		require.NoError(t, err)
+		assert.Empty(t, polled.Messages, "the group auto-commit advanced on the primary")
+		polled, err = connected.PollMessages(ctx, stream, topic, partition, iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), countOptions(1, true))
+		require.NoError(t, err)
+		require.Len(t, polled.Messages, 1)
+	}
+	afterClient, err := connected.GetMe(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, beforeClient.ID, afterClient.ID)
+	assert.Equal(t, beforeClient.ConsumerGroupsCount, afterClient.ConsumerGroupsCount)
+	assert.Equal(t, coordinator, connected.GetConnectionInfo().ServerAddress)
+	t.Logf("coordinator=%s primary=%s messages=%d client=%d groups=%d", coordinator,
+		primaryAddress, int(details.PartitionsCount)*messagesPerPartition, afterClient.ID, afterClient.ConsumerGroupsCount)
+}
+
+// A manual group commit on the same split-primary fixture. The Rust SDK routes
+// it to the partition primary over the consumer-session data connection and
+// keeps its coordinator membership; the Go client must do the same rather than
+// move its session to the primary, which registers a new client identity that
+// is not a member and gets the commit refused.
+func TestE2E_SplitPrimaryManualCommitPreservesMembership(t *testing.T) {
+	streamName := os.Getenv("IGGY_POLL_ROUTING_STREAM")
+	if streamName == "" {
+		t.Skip("set IGGY_POLL_ROUTING_STREAM and IGGY_POLL_ROUTING_TOPIC to a split-primary topic")
+	}
+	stream, err := iggcon.NewIdentifier(streamName)
+	require.NoError(t, err)
+	topic, err := iggcon.NewIdentifier(os.Getenv("IGGY_POLL_ROUTING_TOPIC"))
+	require.NoError(t, err)
+	connected := connect(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	group, err := connected.CreateConsumerGroup(ctx, stream, topic, fmt.Sprintf("go-commit-%d", time.Now().UnixNano()))
+	require.NoError(t, err)
+	groupID, err := iggcon.NewIdentifier(group.Id)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = connected.DeleteConsumerGroup(context.Background(), stream, topic, groupID) })
+	require.NoError(t, connected.JoinConsumerGroup(ctx, stream, topic, groupID))
+	waitForGroupAssignment(t, connected, stream, topic, groupID)
+	consumer := iggcon.NewGroupConsumer(groupID)
+	requireSplitPrimaries(t, ctx, connected, stream, topic)
+	coordinator := connected.GetConnectionInfo().ServerAddress
+	beforeClient, err := connected.GetMe(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint32(1), beforeClient.ConsumerGroupsCount)
+
+	partition := uint32(0)
+	for offset := range uint64(2) {
+		err := connected.StoreConsumerOffset(ctx, consumer, stream, topic, offset, &partition)
+		require.NoError(t, err, "manual group commit of offset %d must reach the partition primary as a member (session %s -> %s)",
+			offset, coordinator, connected.GetConnectionInfo().ServerAddress)
+		assert.Equal(t, coordinator, connected.GetConnectionInfo().ServerAddress,
+			"the commit must not move the coordinator session")
+	}
+	require.Eventually(t, func() bool {
+		stored, err := connected.GetConsumerOffset(ctx, consumer, stream, topic, &partition)
+		return err == nil && stored != nil && stored.StoredOffset == 1
+	}, 5*time.Second, 50*time.Millisecond, "the manual group commit must replicate to the coordinator's backup")
+	afterClient, err := connected.GetMe(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, beforeClient.ID, afterClient.ID, "the commit registered a new client identity")
+	assert.Equal(t, beforeClient.ConsumerGroupsCount, afterClient.ConsumerGroupsCount, "the commit dropped the group membership")
+}
+
+func TestE2E_MetadataRequestsAcceptCounterGapsFromRawRequests(t *testing.T) {
 	connected := connect(t)
 	ctx := context.Background()
 
@@ -195,6 +316,27 @@ func TestE2E_RawRequestsDoNotGapMetadataRequestIDs(t *testing.T) {
 	require.NotNil(t, topic)
 }
 
+// GetMe is self-scoped: the reply must describe this connection and this user,
+// so the user id is checked against the one the sign-in returned rather than
+// against a constant.
+func TestE2E_GetMeDescribesTheCallingClient(t *testing.T) {
+	connected := newClient(t)
+	ctx := context.Background()
+
+	identity, err := connected.LoginUser(ctx, rootUsername, rootPassword)
+	require.NoError(t, err)
+
+	me, err := connected.GetMe(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, me)
+	assert.Positive(t, me.ID)
+	assert.Equal(t, identity.UserId, me.UserID)
+	// The literal pins the wire value: MapClientInfo writes string(iggcon.Tcp)
+	// for transport byte 1, so comparing against the constant would pass for
+	// any value of it.
+	assert.Equal(t, "tcp", me.Transport)
+}
+
 func TestE2E_RejectsSessionControlCodesOnTheRawPath(t *testing.T) {
 	connected := connect(t)
 
@@ -202,7 +344,7 @@ func TestE2E_RejectsSessionControlCodesOnTheRawPath(t *testing.T) {
 	assert.Error(t, err, "a login must go through LoginUser, not the raw path")
 }
 
-func TestE2E_ConsumerOffsetsV2OverTheRawPath(t *testing.T) {
+func TestE2E_ConsumerOffsetAckLevelsOverTheRawPath(t *testing.T) {
 	connected := connect(t)
 	ctx := context.Background()
 	streamId, topicId := scratchTopic(t, connected, 1)
@@ -220,11 +362,11 @@ func TestE2E_ConsumerOffsetsV2OverTheRawPath(t *testing.T) {
 			offset = 4
 		}
 
-		store := consumerOffsetV2Payload(t, consumer, streamId, topicId, partitionId)
+		store := consumerOffsetPayload(t, consumer, streamId, topicId, partitionId)
 		store = binary.LittleEndian.AppendUint64(store, offset)
 		store = append(store, ack)
 
-		_, err := connected.SendBinaryRequest(ctx, storeConsumerOffset2Code, store)
+		_, err := connected.SendBinaryRequest(ctx, storeConsumerOffsetCode, store)
 		require.NoError(t, err, "ack level %d", ack)
 
 		stored, err := connected.GetConsumerOffset(ctx, consumer, streamId, topicId, &partitionId)
@@ -233,9 +375,9 @@ func TestE2E_ConsumerOffsetsV2OverTheRawPath(t *testing.T) {
 		assert.Equal(t, offset, stored.StoredOffset, "ack level %d", ack)
 	}
 
-	remove := consumerOffsetV2Payload(t, consumer, streamId, topicId, partitionId)
+	remove := consumerOffsetPayload(t, consumer, streamId, topicId, partitionId)
 	remove = append(remove, ackQuorum)
-	_, err = connected.SendBinaryRequest(ctx, deleteConsumerOffset2Code, remove)
+	_, err = connected.SendBinaryRequest(ctx, deleteConsumerOffsetCode, remove)
 	require.NoError(t, err)
 }
 
@@ -259,15 +401,21 @@ func TestE2E_AutoLoginSignsInOnConnect(t *testing.T) {
 	assert.NotNil(t, streams)
 }
 
-func TestE2E_PingWorksBeforeSigningIn(t *testing.T) {
+func TestE2E_OnlyPingWorksBeforeSigningIn(t *testing.T) {
 	connected := newClient(t)
 
 	require.NoError(t, connected.Ping(context.Background()))
 
+	// Ping is the only command the server answers on an unbound connection.
+	// The cluster roster is auth-gated so that an unauthenticated reader cannot
+	// enumerate the private network topology.
 	metadata, err := connected.GetClusterMetadata(context.Background())
-	require.NoError(t, err, "cluster metadata is readable before the sign-in")
-	require.NotNil(t, metadata)
-	assert.NotEmpty(t, metadata.Nodes)
+	require.ErrorIs(t, err, ierror.ErrUnauthenticated)
+	assert.Nil(t, metadata, "no roster leaks to an unauthenticated reader")
+
+	me, err := connected.GetMe(context.Background())
+	require.ErrorIs(t, err, ierror.ErrUnauthenticated)
+	assert.Nil(t, me, "the caller's own client info is not served before sign-in")
 }
 
 func TestE2E_LogoutEndsTheSession(t *testing.T) {
@@ -301,8 +449,160 @@ func TestE2E_TLSRoundTrip(t *testing.T) {
 	require.NotEmpty(t, response.Confirmations)
 
 	partitionId := uint32(0)
-	polled, err := connected.PollMessages(ctx, streamId, topicId,
-		iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), 3, false, &partitionId)
+	polled, err := connected.PollMessages(ctx, streamId, topicId, partitionId,
+		iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), countOptions(3, false))
 	require.NoError(t, err)
 	assert.Len(t, polled.Messages, 3)
+}
+
+func TestE2E_TopicOptionsRoundTripAndCatalog(t *testing.T) {
+	connected := connect(t)
+	ctx := context.Background()
+
+	specs, err := connected.DescribeOptions(ctx, iggcon.OptionsScopeTopic)
+	require.NoError(t, err)
+	byKey := map[string]iggcon.OptionSpec{}
+	for _, spec := range specs {
+		byKey[spec.Key] = spec
+	}
+	require.Contains(t, byKey, "durability", "the catalog lists the keys create accepts")
+	require.Contains(t, byKey, "segment_size")
+	assert.NotEmpty(t, byKey["segment_size"].Description)
+	assert.Equal(t, iggcon.Uint64, byKey["segment_size"].DefaultValue.Kind)
+
+	// Every scope has a catalog, and each entry says what an update may do.
+	streamSpecs, err := connected.DescribeOptions(ctx, iggcon.OptionsScopeStream)
+	require.NoError(t, err)
+	streamByKey := map[string]iggcon.OptionSpec{}
+	for _, spec := range streamSpecs {
+		streamByKey[spec.Key] = spec
+	}
+	require.Contains(t, streamByKey, "encryption_key")
+	assert.True(t, streamByKey["encryption_key"].Secret)
+	assert.False(t, streamByKey["encryption_key"].Updatable)
+	assert.True(t, streamByKey["name"].Updatable)
+	assert.True(t, byKey["message_expiry"].Resettable)
+	assert.False(t, byKey["compression_algorithm"].Updatable)
+
+	name := fmt.Sprintf("go-e2e-options-%d", time.Now().UnixNano())
+	stream, err := connected.CreateStream(ctx, name, nil)
+	require.NoError(t, err)
+	streamId, err := iggcon.NewIdentifier(stream.Id)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = connected.DeleteStream(context.Background(), streamId) })
+
+	// A key with no field of its own rides the raw options.
+	created, err := connected.CreateTopic(ctx, streamId, name, &iggcon.TopicOptions{Raw: []iggcon.HeaderEntry{{
+		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("durability")},
+		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("persisted")},
+	}}})
+	require.NoError(t, err)
+
+	topicId, err := iggcon.NewIdentifier(created.Id)
+	require.NoError(t, err)
+	topic, err := connected.GetTopic(ctx, streamId, topicId)
+	require.NoError(t, err)
+
+	durability, ok := topic.Options["durability"]
+	require.True(t, ok, "an explicitly set key is reported as explicit, got %v", topic.Options)
+	// Create admission re-encodes the block from its own parse, so the stored
+	// value carries the key's canonical kind whatever kind the client sent it
+	// as: durability is a canonical String token.
+	assert.Equal(t, iggcon.String, durability.Kind)
+	assert.Equal(t, []byte("persisted"), durability.Value)
+	// Keys the client left alone are resolved by admission and reported apart.
+	require.Contains(t, topic.DerivedOptions, "max_topic_size")
+	assert.NotContains(t, topic.DerivedOptions, "durability")
+
+	// A key outside the catalog is refused by name.
+	_, err = connected.CreateTopic(ctx, streamId, name+"-bad", &iggcon.TopicOptions{Raw: []iggcon.HeaderEntry{{
+		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("not_a_real_option")},
+		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("1")},
+	}}})
+	require.Error(t, err)
+}
+
+func TestE2E_TypedTopicOptionsMatchTheCatalog(t *testing.T) {
+	connected := connect(t)
+	ctx := context.Background()
+
+	// Values inside the bounds the catalog reports: a 512-byte multiple segment
+	// size at the floor, a non-zero message threshold, preallocation off so
+	// nothing is reserved on disk, and one replica, which fits any cluster.
+	typed := []iggcon.HeaderEntry{
+		iggcon.SegmentSizeOption(1024 * 1024),
+		iggcon.DurabilityOption(iggcon.DurabilityPersisted),
+		iggcon.MessagesRequiredToSaveOption(7),
+		iggcon.SizeOfMessagesRequiredToSaveOption(4096),
+		iggcon.PreallocateSegmentsOption(false),
+		iggcon.ReplicationFactorOption(1),
+	}
+
+	specs, err := connected.DescribeOptions(ctx, iggcon.OptionsScopeTopic)
+	require.NoError(t, err)
+	catalog := map[string]iggcon.OptionSpec{}
+	for _, spec := range specs {
+		catalog[spec.Key] = spec
+	}
+	for _, entry := range typed {
+		key := string(entry.Key.Value)
+		spec, found := catalog[key]
+		require.True(t, found, "%q is not a catalog key", key)
+		assert.Equal(t, spec.DefaultValue.Kind, entry.Value.Kind,
+			"%q must be sent in the kind the catalog gives it", key)
+	}
+
+	name := fmt.Sprintf("go-e2e-typed-options-%d", time.Now().UnixNano())
+	stream, err := connected.CreateStream(ctx, name, nil)
+	require.NoError(t, err)
+	streamId, err := iggcon.NewIdentifier(stream.Id)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = connected.DeleteStream(context.Background(), streamId) })
+
+	created, err := connected.CreateTopic(ctx, streamId, name, &iggcon.TopicOptions{Raw: typed})
+	require.NoError(t, err)
+
+	topicId, err := iggcon.NewIdentifier(created.Id)
+	require.NoError(t, err)
+	topic, err := connected.GetTopic(ctx, streamId, topicId)
+	require.NoError(t, err)
+
+	for _, entry := range typed {
+		key := string(entry.Key.Value)
+		stored, found := topic.Options[key]
+		require.True(t, found, "%q was set explicitly, got %v", key, topic.Options)
+		// Admission re-encodes the block in each key's canonical kind, which is
+		// the kind the constructor already sent, so the bytes survive unchanged.
+		assert.Equal(t, entry.Value.Kind, stored.Kind, key)
+		assert.Equal(t, entry.Value.Value, stored.Value, key)
+		assert.NotContains(t, topic.DerivedOptions, key)
+	}
+
+	// A flush threshold of zero messages can never trip, so it is refused.
+	_, err = connected.CreateTopic(ctx, streamId, name+"-zero-flush", &iggcon.TopicOptions{
+		Raw: []iggcon.HeaderEntry{iggcon.MessagesRequiredToSaveOption(0)},
+	})
+	require.Error(t, err)
+
+	// A partition needs at least one replica.
+	_, err = connected.CreateTopic(ctx, streamId, name+"-zero-replicas", &iggcon.TopicOptions{
+		Raw: []iggcon.HeaderEntry{iggcon.ReplicationFactorOption(0)},
+	})
+	require.ErrorIs(t, err, ierror.ErrInvalidReplicationFactor)
+
+	// A segment size off the 512-byte grid is refused, but zero is not: it
+	// leaves the key derived.
+	_, err = connected.CreateTopic(ctx, streamId, name+"-odd-segment", &iggcon.TopicOptions{
+		Raw: []iggcon.HeaderEntry{iggcon.SegmentSizeOption(1024*1024 + 1)},
+	})
+	require.Error(t, err)
+
+	zeroSegment := iggcon.SegmentSizeOption(0)
+	derived, err := connected.CreateTopic(ctx, streamId, name+"-zero-segment", &iggcon.TopicOptions{
+		Raw: []iggcon.HeaderEntry{zeroSegment},
+	})
+	require.NoError(t, err)
+	segmentSizeKey := string(zeroSegment.Key.Value)
+	assert.NotContains(t, derived.Options, segmentSizeKey)
+	assert.Contains(t, derived.DerivedOptions, segmentSizeKey)
 }

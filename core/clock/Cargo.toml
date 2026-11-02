@@ -29,3 +29,6 @@ iggy_common = { workspace = true }
 enum_glob_use = "deny"
 pedantic = "deny"
 nursery = "warn"
+
+[lints.rust]
+warnings = "deny"

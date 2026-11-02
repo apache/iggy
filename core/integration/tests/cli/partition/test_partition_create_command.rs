@@ -23,7 +23,8 @@ use async_trait::async_trait;
 use iggy::prelude::Client;
 use iggy::prelude::CompressionAlgorithm;
 use iggy::prelude::IggyExpiry;
-use iggy::prelude::MaxTopicSize;
+use iggy::prelude::StreamCreateOptions;
+use iggy::prelude::TopicCreateOptions;
 use predicates::str::diff;
 use serial_test::parallel;
 
@@ -83,7 +84,9 @@ impl TestPartitionCreateCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestPartitionCreateCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name).await;
+        let stream = client
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
         self.actual_stream_id = Some(stream.unwrap().id);
 
@@ -91,11 +94,14 @@ impl IggyCmdTestCase for TestPartitionCreateCmd {
             .create_topic(
                 &self.actual_stream_id.unwrap().try_into().unwrap(),
                 &self.topic_name,
-                self.partitions_count,
-                self.compression_algorithm,
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(self.partitions_count),
+                    compression_algorithm: (self.compression_algorithm
+                        != CompressionAlgorithm::default())
+                    .then_some(self.compression_algorithm),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await;
         assert!(topic.is_ok());

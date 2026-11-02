@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
+use super::{API_KEY, POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::connectors::fixtures::{PostgresOps, PostgresSinkFixture};
 use crate::connectors::{TestMessage, create_test_messages};
 use bytes::Bytes;
@@ -29,7 +29,6 @@ use reqwest::Client;
 use std::time::Duration;
 use tokio::time::sleep;
 
-const API_KEY: &str = "test-api-key";
 const SINK_TABLE: &str = "iggy_messages";
 const SINK_KEY: &str = "postgres";
 

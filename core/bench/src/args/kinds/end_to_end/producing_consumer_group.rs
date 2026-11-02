@@ -113,7 +113,7 @@ impl BenchmarkKindProps for EndToEndProducingConsumerGroupArgs {
             cmd.error(
                 ErrorKind::ArgumentConflict,
                 format!(
-                    "For producing consumer group benchmark, consumer groups number ({cg_number}) must be less than the number of streams ({streams})"
+                    "For producing consumer group benchmark, consumer groups number ({cg_number}) must be greater than or equal to the number of streams ({streams})"
                 ),
             )
             .exit();

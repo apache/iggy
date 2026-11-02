@@ -21,13 +21,13 @@
 //! `iggy-durability` header, the body-size cap, and cross-request isolation
 //! of concurrent produces on one login session.
 
-use crate::server::http_client::HttpClient;
+use crate::server::http_client::{HttpClient, applied_op, leader_and_follower, node_url};
 use futures::future::join_all;
 use iggy::prelude::*;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
-use iggy_common::{ConsumerOffsetInfo, IggyMessagesBatch};
+use iggy_common::{ConsumerOffsetInfo, IggyMessagesBatch, OptionInputMap, OptionInputValue};
 use integration::iggy_harness;
 use reqwest::{Response, StatusCode};
 use serde_json::json;
@@ -45,7 +45,8 @@ const PARTITION_ID: u32 = 0;
 const CONSUMER_ID: u32 = 1;
 
 const DURABILITY_HEADER: &str = "iggy-durability";
-const DURABILITY_REPLICATED_MEMORY: &str = "replicated-memory";
+const DURABILITY_REPLICATED: &str = "replicated";
+const DURABILITY_PERSISTED: &str = "persisted";
 const DURABILITY_NONE: &str = "none";
 
 /// `?ack=none` answers before the commit; poll until visible, never unbounded.
@@ -56,7 +57,8 @@ const ASYNC_COMMIT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 /// exercises the listener's produce / poll / consumer-offset behavior, so its
 /// helpers decode `PolledMessages` and drive multi-partition produces.
 trait HttpSessionExt {
-    async fn create_stream_and_topic(&self, stream: &str, topic: &str, partitions: u32);
+    /// Returns the applied op of the topic create.
+    async fn create_stream_and_topic(&self, stream: &str, topic: &str, partitions: u32) -> u64;
     async fn produce(
         &self,
         stream: &str,
@@ -72,6 +74,15 @@ trait HttpSessionExt {
         messages: Vec<IggyMessage>,
         query: &str,
     ) -> Response;
+    async fn produce_in_context(
+        &self,
+        stream: &str,
+        topic: &str,
+        partition_id: u32,
+        messages: Vec<IggyMessage>,
+        query: &str,
+        context: Option<PartitionContext>,
+    ) -> Response;
     async fn poll(
         &self,
         stream: &str,
@@ -80,17 +91,26 @@ trait HttpSessionExt {
         offset: u64,
         count: u32,
     ) -> PolledMessages;
+    async fn try_poll(
+        &self,
+        stream: &str,
+        topic: &str,
+        partition_id: u32,
+        offset: u64,
+        count: u32,
+    ) -> Option<PolledMessages>;
     async fn create_user(&self, username: &str, password: &str);
 }
 
 impl HttpSessionExt for HttpClient {
-    async fn create_stream_and_topic(&self, stream: &str, topic: &str, partitions: u32) {
+    async fn create_stream_and_topic(&self, stream: &str, topic: &str, partitions: u32) -> u64 {
         let response = self
             .client
             .post(self.url("/streams"))
             .bearer_auth(&self.token)
             .json(&CreateStream {
                 name: stream.to_string(),
+                options: OptionInputMap::default(),
             })
             .send()
             .await
@@ -104,11 +124,17 @@ impl HttpSessionExt for HttpClient {
         let command = CreateTopic {
             stream_id: Identifier::default(),
             partitions_count: partitions,
-            compression_algorithm: CompressionAlgorithm::None,
-            message_expiry: IggyExpiry::NeverExpire,
-            max_topic_size: MaxTopicSize::ServerDefault,
-            replication_factor: None,
             name: topic.to_string(),
+            options: OptionInputMap(BTreeMap::from([
+                (
+                    "durability".to_string(),
+                    OptionInputValue::String(Durability::Persisted.to_string().into()),
+                ),
+                (
+                    "consumer_offset_durability".to_string(),
+                    OptionInputValue::String(Durability::Persisted.to_string().into()),
+                ),
+            ])),
         };
         let response = self
             .client
@@ -118,11 +144,14 @@ impl HttpSessionExt for HttpClient {
             .send()
             .await
             .expect("create topic request");
-        assert!(
-            response.status().is_success(),
-            "create topic failed: {}",
-            response.status()
-        );
+        // Body included on failure: a 500 from a serialization fault names
+        // itself only there, and status alone sent this down a long detour.
+        let status = response.status();
+        if status.is_success() {
+            return applied_op(&response);
+        }
+        let body = response.text().await.unwrap_or_default();
+        panic!("create topic failed: {status} body={body}");
     }
 
     async fn produce(
@@ -144,12 +173,26 @@ impl HttpSessionExt for HttpClient {
         messages: Vec<IggyMessage>,
         query: &str,
     ) -> Response {
+        self.produce_in_context(stream, topic, partition_id, messages, query, None)
+            .await
+    }
+
+    async fn produce_in_context(
+        &self,
+        stream: &str,
+        topic: &str,
+        partition_id: u32,
+        messages: Vec<IggyMessage>,
+        query: &str,
+        context: Option<PartitionContext>,
+    ) -> Response {
         let body = SendMessages {
             metadata_length: 0,
             stream_id: Identifier::default(),
             topic_id: Identifier::default(),
             partitioning: Partitioning::partition_id(partition_id),
             batch: IggyMessagesBatch::from(&messages),
+            context,
         };
         self.client
             .post(self.url(&format!("/streams/{stream}/topics/{topic}/messages{query}")))
@@ -168,6 +211,26 @@ impl HttpSessionExt for HttpClient {
         offset: u64,
         count: u32,
     ) -> PolledMessages {
+        self.try_poll(stream, topic, partition_id, offset, count)
+            .await
+            .expect("poll must answer 200")
+    }
+
+    /// Poll without demanding that the topic already be visible.
+    ///
+    /// `None` means 404: a create commits on the metadata primary and then
+    /// propagates, so a poll that lands on a shard which has not caught up yet
+    /// answers 404 rather than an empty batch. Callers already looping for
+    /// eventual visibility want to keep waiting on that, so only a
+    /// non-OK-non-404 status is a hard failure.
+    async fn try_poll(
+        &self,
+        stream: &str,
+        topic: &str,
+        partition_id: u32,
+        offset: u64,
+        count: u32,
+    ) -> Option<PolledMessages> {
         let path = format!(
             "/streams/{stream}/topics/{topic}/messages\
              ?consumer_id={CONSUMER_ID}&partition_id={partition_id}\
@@ -180,8 +243,11 @@ impl HttpSessionExt for HttpClient {
             .send()
             .await
             .expect("poll request");
+        if response.status() == StatusCode::NOT_FOUND {
+            return None;
+        }
         assert_eq!(response.status(), StatusCode::OK, "poll must answer 200");
-        response.json().await.expect("decode PolledMessages")
+        Some(response.json().await.expect("decode PolledMessages"))
     }
 
     /// Create an ungranted user (no permissions -> the permissioner holds no
@@ -226,6 +292,63 @@ fn text_message(id: u128, payload: String) -> IggyMessage {
         .expect("message build")
 }
 
+#[iggy_harness(cluster_nodes = 1, server(metadata.clients_table_max = "4"))]
+async fn given_full_http_capacity_when_registration_is_refused_should_allow_tcp_registration(
+    harness: &TestHarness,
+) {
+    const HTTP_CAPACITY: usize = 2;
+    const TCP_HEADROOM: usize = 2;
+    const REFUSED_REQUESTS: usize = 4;
+    let mut admitted = Vec::new();
+    for index in 0..HTTP_CAPACITY {
+        let http = HttpClient::login_root(harness).await;
+        assert_eq!(
+            http.post_json(
+                "/streams",
+                &json!({ "name": format!("capacity-admitted-{index}") })
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        admitted.push(http);
+    }
+    let refused = HttpClient::login_root(harness).await;
+    for attempt in 0..REFUSED_REQUESTS {
+        assert_eq!(
+            refused
+                .post_json("/streams", &json!({ "name": "capacity-refused" }))
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HTTP request {attempt} must be refused before Register"
+        );
+    }
+    let mut tcp_clients = Vec::new();
+    for _ in 0..TCP_HEADROOM {
+        tcp_clients.push(
+            harness
+                .tcp_root_client()
+                .await
+                .expect("refused HTTP credentials must not consume TCP capacity"),
+        );
+    }
+    for tcp in tcp_clients {
+        tcp.ping().await.unwrap();
+    }
+    for (index, http) in admitted.into_iter().enumerate() {
+        assert_eq!(
+            http.post_json(
+                "/streams",
+                &json!({ "name": format!("capacity-reused-{index}") })
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+    }
+}
+
 #[iggy_harness]
 async fn given_http_session_when_producing_and_polling_should_round_trip(harness: &TestHarness) {
     let http = HttpClient::login_root(harness).await;
@@ -259,7 +382,7 @@ async fn given_http_session_when_producing_and_polling_should_round_trip(harness
         StatusCode::CREATED,
         "produce must commit"
     );
-    assert_eq!(durability(&response), DURABILITY_REPLICATED_MEMORY);
+    assert_eq!(durability(&response), DURABILITY_PERSISTED);
 
     let polled = http
         .poll("http-stream", "http-topic", PARTITION_ID, 0, 10)
@@ -284,10 +407,51 @@ async fn given_http_session_when_producing_and_polling_should_round_trip(harness
     );
 }
 
+/// A fresh partition that only plain consumers read keeps a zero metadata
+/// frontier. The served context must still cover the topic create: below it,
+/// a later poll on a node that has not applied the create passes the frontier
+/// check and drops its position on `HistoryUnavailable`.
+#[iggy_harness]
+async fn given_fresh_topic_when_polling_over_http_should_serve_a_context_at_or_above_the_topic_create(
+    harness: &TestHarness,
+) {
+    const STREAM: &str = "http-context-stream";
+    const TOPIC: &str = "http-context-topic";
+    let http = HttpClient::login_root(harness).await;
+    let topic_create_op = http.create_stream_and_topic(STREAM, TOPIC, 1).await;
+    let response = http
+        .produce(
+            STREAM,
+            TOPIC,
+            PARTITION_ID,
+            vec![text_message(1, "served-context".to_string())],
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "produce must commit"
+    );
+
+    let polled = http.poll(STREAM, TOPIC, PARTITION_ID, 0, 10).await;
+    assert_eq!(polled.messages.len(), 1, "the sent message must come back");
+    assert!(
+        polled.context().metadata_op >= topic_create_op,
+        "the served context {:?} must cover the topic create at op {topic_create_op}",
+        polled.context()
+    );
+}
+
 const CONCURRENT_PRODUCES: usize = 16;
 const CONCURRENT_PARTITIONS: u32 = 4;
 
-#[iggy_harness]
+/// Placement spreads partition primaries over the nodes. The node the HTTP
+/// client calls relays a produce to another node's partition only when every
+/// node verifies its bearer.
+#[iggy_harness(server(
+    http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+    http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+))]
 async fn given_one_session_when_producing_concurrently_should_not_cross_talk(
     harness: &TestHarness,
 ) {
@@ -315,8 +479,8 @@ async fn given_one_session_when_producing_concurrently_should_not_cross_talk(
             "concurrent produce {i} must commit"
         );
         assert_eq!(
-            durability, DURABILITY_REPLICATED_MEMORY,
-            "concurrent produce {i} must attest a replicated commit"
+            durability, DURABILITY_PERSISTED,
+            "concurrent produce {i} must attest a persisted commit"
         );
     }
 
@@ -380,6 +544,7 @@ async fn given_consumer_offset_when_stored_and_deleted_should_round_trip(harness
 
     let offsets_path = "/streams/http-offsets/topics/offsets/consumer-offsets";
     let store = StoreConsumerOffset {
+        context: None,
         consumer: Consumer::new(Identifier::numeric(CONSUMER_ID).expect("consumer id")),
         partition_id: Some(PARTITION_ID),
         offset: 1,
@@ -496,6 +661,7 @@ async fn given_missing_consumer_offset_when_deleting_should_reject_404_fast(harn
         "produce must commit"
     );
     let store = StoreConsumerOffset {
+        context: None,
         consumer: Consumer::new(Identifier::numeric(CONSUMER_ID).expect("consumer id")),
         partition_id: Some(PARTITION_ID),
         offset: 0,
@@ -525,6 +691,46 @@ async fn given_missing_consumer_offset_when_deleting_should_reject_404_fast(harn
         StatusCode::NO_CONTENT,
         "existing offset delete must commit"
     );
+}
+
+#[iggy_harness]
+async fn given_purge_paths_when_deleting_should_answer_404_and_keep_messages(
+    harness: &TestHarness,
+) {
+    let http = HttpClient::login_root(harness).await;
+    http.create_stream_and_topic("http-purge-paths", "kept", 1)
+        .await;
+    let messages = vec![text_message(1, "kept".to_string())];
+    let response = http
+        .produce("http-purge-paths", "kept", PARTITION_ID, messages)
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "produce must commit"
+    );
+
+    for path in [
+        "/streams/http-purge-paths/purge",
+        "/streams/http-purge-paths/topics/kept/purge",
+    ] {
+        let response = http.delete(path).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{path} must match no route"
+        );
+        let body = response.text().await.expect("read 404 body");
+        assert!(
+            body.is_empty(),
+            "{path} must match no route, not a handler 404: {body}"
+        );
+    }
+
+    let polled = http
+        .poll("http-purge-paths", "kept", PARTITION_ID, 0, 10)
+        .await;
+    assert_eq!(polled.messages.len(), 1, "the topic must keep its message");
 }
 
 /// A store of an out-of-range consumer offset is denied by the partition
@@ -564,6 +770,7 @@ async fn given_out_of_range_consumer_offset_when_storing_should_reject_400_fast(
     // Offset 5 runs past the committed tail (offset 1), so it is out of range.
     let offsets_path = "/streams/http-store-range/topics/offsets/consumer-offsets";
     let store = StoreConsumerOffset {
+        context: None,
         consumer: Consumer::new(Identifier::numeric(CONSUMER_ID).expect("consumer id")),
         partition_id: Some(PARTITION_ID),
         offset: 5,
@@ -649,17 +856,170 @@ async fn given_oversized_body_when_producing_should_reject_413(harness: &TestHar
 
 #[iggy_harness]
 async fn given_ack_none_when_producing_should_return_202_and_commit(harness: &TestHarness) {
+    const BURST_SIZE: u32 = 8;
     let http = HttpClient::login_root(harness).await;
     http.create_stream_and_topic("http-ack-none", "fire", 1)
         .await;
 
-    let message = text_message(1, "fire-and-forget".to_string());
+    for index in 0..BURST_SIZE {
+        let message = text_message(u128::from(index) + 1, format!("fire-and-forget-{index}"));
+        let response = http
+            .produce_with_query(
+                "http-ack-none",
+                "fire",
+                PARTITION_ID,
+                vec![message],
+                "?ack=none",
+            )
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "ack=none must answer before the commit"
+        );
+        assert_eq!(durability(&response), DURABILITY_NONE);
+    }
+
+    // The commit still happens, just asynchronously: poll bounded until the
+    // message becomes visible. A 404 counts as not-yet-visible for the same
+    // reason an empty batch does -- nothing here waited for the create to
+    // reach the shard that serves the poll.
+    let deadline = Instant::now() + ASYNC_COMMIT_TIMEOUT;
+    loop {
+        if let Some(polled) = http
+            .try_poll("http-ack-none", "fire", PARTITION_ID, 0, 10)
+            .await
+            && polled.messages.len() == BURST_SIZE as usize
+        {
+            for (index, message) in polled.messages.iter().enumerate() {
+                assert_eq!(
+                    message.payload,
+                    bytes::Bytes::from(format!("fire-and-forget-{index}")),
+                    "every ack=none write in the burst must round trip in order"
+                );
+            }
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ack=none produce did not become pollable within {ASYNC_COMMIT_TIMEOUT:?}"
+        );
+        sleep(ASYNC_COMMIT_RETRY_INTERVAL).await;
+    }
+}
+
+/// A refusal before the partition must reach an `?ack=none` caller: the batch
+/// was never admitted, so a 202 would report a write that cannot commit. The
+/// route carries a metadata op this node has not applied, as a route learned
+/// from a node further ahead does.
+#[iggy_harness(cluster_nodes = 1)]
+async fn given_ack_none_when_denied_before_the_partition_should_answer_the_deny(
+    harness: &TestHarness,
+) {
+    /// Far past any op this test commits.
+    const UNAPPLIED_METADATA_OPS: u64 = 1_000_000;
+    const STREAM: &str = "http-ack-none-deny";
+    const TOPIC: &str = "deny";
+    let http = HttpClient::login_root(harness).await;
+    http.create_stream_and_topic(STREAM, TOPIC, 1).await;
+    let response = http
+        .produce(
+            STREAM,
+            TOPIC,
+            PARTITION_ID,
+            vec![text_message(1, "admitted".to_string())],
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "produce must commit"
+    );
+    let mut context = http.poll(STREAM, TOPIC, PARTITION_ID, 0, 1).await.context();
+    context.metadata_op += UNAPPLIED_METADATA_OPS;
+
+    let response = http
+        .produce_in_context(
+            STREAM,
+            TOPIC,
+            PARTITION_ID,
+            vec![text_message(2, "denied".to_string())],
+            "?ack=none",
+            Some(context),
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ack=none must answer a refusal before the partition, not 202"
+    );
+    let body: serde_json::Value = response.json().await.expect("decode the error body");
+    assert_eq!(body["id"], IggyError::TransientNotAccepted.as_code());
+}
+
+/// The FIRST send to a partition that has never minted an offset, on both
+/// produce routes, against the only cluster shape where the offset reservation
+/// runs at all.
+///
+/// `cluster_nodes = 1` is load-bearing, not a speed-up: `request_mint_ceiling`
+/// returns `None` above one replica, so this suite's three-node default leaves
+/// the whole reservation path as dead code and proves nothing here.
+///
+/// What it guards is the BOUNCE REMOVAL. A first send used to be answered
+/// `TransientNotAccepted` so the shard tick would claim the block off the
+/// request pump, and neither HTTP route can carry a retryable refusal back to
+/// the caller: the acked route has no transient replay loop, and `?ack=none`
+/// never reads a reply at all, so that bounce answered 202 and dropped the
+/// message.
+///
+/// It is NOT sensitive to where the claim is taken. With the bounce gone the
+/// inline fence at the mint writes the same block on the first send, so both
+/// routes still commit with the create-time claim deleted;
+/// `given_a_fresh_solo_partition_when_building_should_record_its_first_claim`
+/// in `core/server/src/partition_helpers.rs` reads the durable record and is
+/// the test that fails without it.
+///
+/// Both partitions are produced to exactly once, so a per-partition regression
+/// cannot hide behind a second send.
+#[iggy_harness(cluster_nodes = 1)]
+async fn given_a_solo_topic_when_producing_its_first_http_messages_should_commit_them(
+    harness: &TestHarness,
+) {
+    const ACKED_PARTITION: u32 = 0;
+    const UNACKED_PARTITION: u32 = 1;
+
+    let http = HttpClient::login_root(harness).await;
+    http.create_stream_and_topic("http-first-send", "first", 2)
+        .await;
+
+    let response = http
+        .produce(
+            "http-first-send",
+            "first",
+            ACKED_PARTITION,
+            vec![text_message(1, "first-acked".to_string())],
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "the first acked send to a never-minted partition must commit, not be refused"
+    );
+    let polled = http
+        .poll("http-first-send", "first", ACKED_PARTITION, 0, 10)
+        .await;
+    assert_eq!(polled.messages.len(), 1, "the first acked send is durable");
+    assert_eq!(
+        polled.messages[0].payload,
+        bytes::Bytes::from("first-acked")
+    );
+
     let response = http
         .produce_with_query(
-            "http-ack-none",
-            "fire",
-            PARTITION_ID,
-            vec![message],
+            "http-first-send",
+            "first",
+            UNACKED_PARTITION,
+            vec![text_message(2, "first-unacked".to_string())],
             "?ack=none",
         )
         .await;
@@ -668,27 +1028,28 @@ async fn given_ack_none_when_producing_should_return_202_and_commit(harness: &Te
         StatusCode::ACCEPTED,
         "ack=none must answer before the commit"
     );
-    assert_eq!(durability(&response), DURABILITY_NONE);
 
-    // The commit still happens, just asynchronously: poll bounded until the
-    // message becomes visible.
+    // 202 says nothing about the commit, which is the whole hazard: a refusal
+    // on this route is answered the same way and leaves no trace. Only the poll
+    // proves the message survived.
     let deadline = Instant::now() + ASYNC_COMMIT_TIMEOUT;
     loop {
-        let polled = http
-            .poll("http-ack-none", "fire", PARTITION_ID, 0, 10)
-            .await;
-        if !polled.messages.is_empty() {
+        if let Some(polled) = http
+            .try_poll("http-first-send", "first", UNACKED_PARTITION, 0, 10)
+            .await
+            && !polled.messages.is_empty()
+        {
             assert_eq!(polled.messages.len(), 1, "exactly one message was produced");
             assert_eq!(
                 polled.messages[0].payload,
-                bytes::Bytes::from("fire-and-forget"),
-                "ack=none payload must round trip"
+                bytes::Bytes::from("first-unacked"),
+                "the first ack=none send to a never-minted partition must not be dropped"
             );
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "ack=none produce did not become pollable within {ASYNC_COMMIT_TIMEOUT:?}"
+            "the first ack=none send never became pollable within {ASYNC_COMMIT_TIMEOUT:?}"
         );
         sleep(ASYNC_COMMIT_RETRY_INTERVAL).await;
     }
@@ -754,23 +1115,6 @@ async fn given_ungranted_user_when_reading_or_producing_should_be_forbidden(harn
         StatusCode::OK,
         "cluster metadata is auth-only, never RBAC-gated"
     );
-}
-
-/// The unauthenticated `POST /users/refresh-token` route: the current token
-/// travels in the JSON body, sent with no bearer header.
-trait RefreshExt {
-    async fn refresh(&self, token: &str) -> Response;
-}
-
-impl RefreshExt for HttpClient {
-    async fn refresh(&self, token: &str) -> Response {
-        self.client
-            .post(self.url("/users/refresh-token"))
-            .json(&json!({ "token": token }))
-            .send()
-            .await
-            .expect("refresh-token request")
-    }
 }
 
 #[iggy_harness]
@@ -851,4 +1195,348 @@ async fn given_garbage_or_empty_token_when_refreshing_should_reject_401(harness:
             "refresh with an invalid token ({token:?}) must be 401"
         );
     }
+}
+
+/// Placement spreads partition primaries over the nodes. The node the HTTP
+/// client calls relays a produce to another node's partition only when every
+/// node verifies its bearer.
+#[iggy_harness(server(
+    http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+    http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+))]
+async fn given_independent_durability_policies_when_producing_should_attest_message_policy(
+    harness: &TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    client
+        .create_stream("durability-http", &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream = Identifier::named("durability-http").unwrap();
+    let http = HttpClient::login_root(harness).await;
+    for (index, (message_policy, offset_policy)) in [
+        (Durability::Replicated, Durability::Replicated),
+        (Durability::Replicated, Durability::Persisted),
+        (Durability::Persisted, Durability::Replicated),
+        (Durability::Persisted, Durability::Persisted),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let topic = format!("policy-{index}");
+        let created = http
+            .client
+            .post(http.url("/streams/durability-http/topics"))
+            .bearer_auth(&http.token)
+            .json(&CreateTopic {
+                name: topic.clone(),
+                options: OptionInputMap(BTreeMap::from([
+                    (
+                        "durability".to_string(),
+                        OptionInputValue::String(message_policy.to_string().into()),
+                    ),
+                    (
+                        "consumer_offset_durability".to_string(),
+                        OptionInputValue::String(offset_policy.to_string().into()),
+                    ),
+                ])),
+                ..CreateTopic::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            created.status().is_success(),
+            "{}",
+            created.text().await.unwrap()
+        );
+        let details = client
+            .get_topic(&stream, &Identifier::named(&topic).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let policies = iggy_common::TopicRuntimeOptions::from_resource_options(&details.options);
+        assert_eq!(policies.durability, message_policy);
+        assert_eq!(policies.consumer_offset_durability, offset_policy);
+        let queries = ["", "?ack=replicated", "?ack=none"];
+        for query in queries {
+            let message = IggyMessage::builder()
+                .payload("policy".into())
+                .build()
+                .unwrap();
+            let response = http
+                .produce_with_query(
+                    "durability-http",
+                    &topic,
+                    PARTITION_ID,
+                    vec![message],
+                    query,
+                )
+                .await;
+            if query == "?ack=none" {
+                assert_eq!(response.status(), StatusCode::ACCEPTED);
+                assert_eq!(durability(&response), DURABILITY_NONE);
+            } else {
+                assert_eq!(response.status(), StatusCode::CREATED);
+                assert_eq!(
+                    durability(&response),
+                    if message_policy.is_persisted() {
+                        DURABILITY_PERSISTED
+                    } else {
+                        DURABILITY_REPLICATED
+                    }
+                );
+            }
+        }
+        let deadline = Instant::now() + ASYNC_COMMIT_TIMEOUT;
+        loop {
+            if let Some(polled) = http
+                .try_poll(
+                    "durability-http",
+                    &topic,
+                    PARTITION_ID,
+                    0,
+                    queries.len() as u32,
+                )
+                .await
+                && polled.messages.len() == queries.len()
+            {
+                assert!(
+                    polled
+                        .messages
+                        .iter()
+                        .all(|message| message.payload == "policy")
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "writes with {message_policy}/{offset_policy} did not become pollable"
+            );
+            sleep(ASYNC_COMMIT_RETRY_INTERVAL).await;
+        }
+    }
+}
+
+#[iggy_harness]
+async fn given_one_http_durability_option_when_creating_should_derive_the_other_as_replicated(
+    harness: &TestHarness,
+) {
+    let http = HttpClient::login_root(harness).await;
+    http.create_stream_and_topic("http-policy-defaults", "initial", 1)
+        .await;
+    for key in ["durability", "consumer_offset_durability"] {
+        let response = http
+            .client
+            .post(http.url("/streams/http-policy-defaults/topics"))
+            .bearer_auth(&http.token)
+            .json(&CreateTopic {
+                name: key.to_string(),
+                options: OptionInputMap(BTreeMap::from([(
+                    key.to_string(),
+                    OptionInputValue::String("persisted".to_string().into()),
+                )])),
+                ..CreateTopic::default()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let topic: serde_json::Value = response.json().await.unwrap();
+        for policy in ["durability", "consumer_offset_durability"] {
+            assert_eq!(
+                topic["options"][policy]["value"],
+                if policy == key {
+                    "persisted"
+                } else {
+                    "replicated"
+                }
+            );
+            assert_eq!(topic["options"][policy]["explicit"], policy == key);
+        }
+    }
+}
+
+#[iggy_harness]
+async fn given_http_sdk_when_sending_should_expose_the_advertised_durability(
+    harness: &TestHarness,
+) {
+    let address = harness.server().http_addr().unwrap();
+    let client = iggy::http::http_client::HttpClient::new(&format!("http://{address}")).unwrap();
+    client.login_user("iggy", "iggy").await.unwrap();
+    client
+        .create_stream("sdk-durability", &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream = Identifier::named("sdk-durability").unwrap();
+    client
+        .create_topic(
+            &stream,
+            "persisted",
+            &TopicCreateOptions {
+                durability: Durability::Persisted,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut messages = vec![
+        IggyMessage::builder()
+            .payload(bytes::Bytes::from_static(b"durable"))
+            .build()
+            .unwrap(),
+    ];
+    let (response, durability) = client
+        .send_messages_with_durability(
+            &stream,
+            &Identifier::named("persisted").unwrap(),
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+    assert_eq!(durability, Some(Durability::Persisted));
+    assert_eq!(response.confirmations.len(), 1);
+}
+
+/// Without cluster-wide bearer key material, forwarding is off and a follower
+/// cannot relay a control-plane write. Its consensus answers `NotPrimary`, and
+/// replaying on a backup cannot reach the primary, so the follower refuses with
+/// 58 at once instead of replaying until the transient budget ends.
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
+async fn given_forwarding_off_when_a_follower_takes_a_write_should_refuse_at_once(
+    harness: &TestHarness,
+) {
+    /// Far below the 30 s transient replay budget of the submit path.
+    const REFUSAL_BUDGET: Duration = Duration::from_secs(5);
+    let (_, follower) = leader_and_follower(harness).await;
+    let http = HttpClient::login_root_no_redirect(node_url(harness, follower)).await;
+    let started = Instant::now();
+    let response = http
+        .post_json("/streams", &json!({ "name": "follower-write" }))
+        .await;
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json().await.expect("decode the error body");
+    assert_eq!(body["id"], IggyError::TransientNotAccepted.as_code());
+    assert!(
+        elapsed < REFUSAL_BUDGET,
+        "a follower refused after {elapsed:?}, the replay budget is not for backups"
+    );
+}
+
+/// A PUT body the update shape refuses answers the Iggy error JSON with
+/// `InvalidCommand`, the category the binary decoder gives the same patch,
+/// naming in `field` the member the shape refuses. A `null` member leaves its
+/// key unchanged.
+#[iggy_harness]
+async fn given_malformed_update_body_when_putting_should_reject_invalid_command(
+    harness: &TestHarness,
+) {
+    let http = HttpClient::login_root(harness).await;
+    http.create_stream_and_topic("http-put-shape", "shape", 1)
+        .await;
+    let path = "/streams/http-put-shape/topics/shape";
+    let stream_path = "/streams/http-put-shape";
+    let cases = [
+        (path, r#"{"name":"first","name":"second"}"#, Some("name")),
+        (
+            path,
+            r#"{"message_expiry":{"value":"1 day"}}"#,
+            Some("message_expiry"),
+        ),
+        (path, r#"["name"]"#, None),
+        (path, r#"{"reset":"message_expiry"}"#, Some("reset")),
+        (
+            path,
+            r#"{"message_expiry":"1 day","reset":["message_expiry"]}"#,
+            None,
+        ),
+        (path, r#"{}"#, None),
+        (
+            stream_path,
+            r#"{"name":"renamed","options":{}}"#,
+            Some("options"),
+        ),
+    ];
+    for (path, body, field) in cases {
+        let response = http
+            .client
+            .put(http.url(path))
+            .bearer_auth(&http.token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .expect("put request");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let error: serde_json::Value = response.json().await.expect("decode the error body");
+        assert_eq!(error["id"], IggyError::InvalidCommand.as_code(), "{body}");
+        assert_eq!(
+            error["code"],
+            IggyError::InvalidCommand.as_string(),
+            "{body}"
+        );
+        assert_eq!(error["field"], json!(field), "{body}");
+    }
+
+    let before: serde_json::Value = http.get(path).await.json().await.expect("topic json");
+    let response = http
+        .put_json(
+            path,
+            &json!({ "name": "shape-renamed", "message_expiry": null }),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let after: serde_json::Value = http
+        .get("/streams/http-put-shape/topics/shape-renamed")
+        .await
+        .json()
+        .await
+        .expect("topic json");
+    assert_eq!(after["options"], before["options"]);
+}
+
+/// An option placed beside `options` in a POST create body is refused, not
+/// dropped, so a stream never commits without the key its client sent. The
+/// error names the misplaced member in `field`.
+#[iggy_harness]
+async fn given_option_beside_options_when_creating_should_reject_invalid_command(
+    harness: &TestHarness,
+) {
+    let http = HttpClient::login_root(harness).await;
+    http.create_stream_and_topic("http-misplaced", "kept", 1)
+        .await;
+    let cases = [
+        (
+            "/streams",
+            json!({
+                "name": "misplaced-key",
+                "encryption_key": "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
+            }),
+            "encryption_key",
+        ),
+        (
+            "/streams/http-misplaced/topics",
+            json!({ "name": "misplaced-expiry", "partitions_count": 1, "message_expiry": "7 days" }),
+            "message_expiry",
+        ),
+    ];
+    for (path, body, field) in cases {
+        let response = http.post_json(path, &body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let error: serde_json::Value = response.json().await.expect("decode the error body");
+        assert_eq!(error["id"], IggyError::InvalidCommand.as_code(), "{body}");
+        assert_eq!(error["field"], field, "{body}");
+    }
+    assert_eq!(
+        http.get("/streams/misplaced-key").await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        http.get("/streams/http-misplaced/topics/misplaced-expiry")
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
 }

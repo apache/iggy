@@ -18,79 +18,63 @@
 package tcp
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
-	"github.com/avast/retry-go/v5"
 )
 
 type Option func(config *Options)
+type Options struct{ config config }
 
-type Options struct {
-	config config
-}
-
-func GetDefaultOptions() Options {
-	return Options{
-		config: defaultTcpClientConfig(),
-	}
-}
+func GetDefaultOptions() Options { return Options{config: defaultTcpClientConfig()} }
 
 type IggyTcpClient struct {
-	conn net.Conn
-	// reader buffers reads off conn, so a reply costs one syscall instead of
-	// one for the header and one for the body; guarded by c.mtx.
-	reader *bufio.Reader
-	mtx    sync.Mutex
-	// registerMtx single-flights the sign-in transaction: BeginRegister and
-	// Bind live in different c.mtx critical sections, and two interleaved
-	// sign-ins would commit one Register whose session is never bound.
-	registerMtx sync.Mutex
-	// closed unblocks a replay wait when Close is called, which cannot go
-	// through c.mtx because the replay loop holds it.
-	closed                 chan struct{}
-	closeOnce              sync.Once
-	config                 config
-	logger                 *slog.Logger
-	MessageCompression     iggcon.IggyMessageCompression
-	leaderRedirectionState iggcon.LeaderRedirectionState
-	clientAddress          string
-	currentServerAddress   string
-	knownServerAddresses   []string
-	connectedAt            time.Time
-	transportState         iggcon.TransportState
-	sessionState           iggcon.SessionState
-	// session carries the consensus client identity and request watermark;
-	// guarded by c.mtx.
-	session *vsr.Session
-	// skipAutoLoginOnce suppresses the next automatic sign-in so a replayed
-	// login is not preempted by one the reconnect issues; guarded by c.mtx.
-	skipAutoLoginOnce bool
-	// loggedOut records an explicit sign-out, so a reconnect's automatic
-	// sign-in does not silently reverse it; guarded by c.mtx.
-	loggedOut bool
-	// groups caches the consumer-group assignments this client polls with.
-	groups groupAssignmentCache
-	// topics caches what a send needs to resolve a partition locally.
-	topics topicCache
-	// respHeader is the reused reply-header read buffer; guarded by c.mtx.
-	respHeader [vsr.HeaderSize]byte
+	mtx                sync.Mutex
+	connectMu          sync.Mutex
+	connectionAttempt  *connectAttempt
+	recovery           context.Context
+	recoveryCancel     context.CancelFunc
+	registerGate       chan struct{}
+	closed             chan struct{}
+	closeOnce          sync.Once
+	config             config
+	logger             *slog.Logger
+	MessageCompression iggcon.IggyMessageCompression
+	session            *vsr.Session
+	sessionFence       uint64
+	sessionUserID      uint32
+	loggedOut          bool
+	autoLoginBlocked   bool
+	rememberedLogin    AutoLogin
+	epoch              atomic.Pointer[signInEpoch]
+	metadataWatermark  atomic.Uint64
+	operations         *operationRegistry
+	links              *replicaLinks
+	polls              pollRouter
+	groups             groupAssignmentCache
+	topics             topicCache
+	// deferred holds one slot for each deferred poll and fetch
+	// in flight.
+	deferred chan struct{}
+	// commits counts the fetches with auto-commit that may be in flight, and
+	// Close waits for them. Each Add happens under mtx before the close of
+	// closed, or not at all.
+	commits sync.WaitGroup
 }
 
 type config struct {
@@ -104,7 +88,10 @@ type config struct {
 	// reconnection indicates whether to automatically reconnect when disconnected
 	reconnection tcpClientReconnectionConfig
 	// noDelay disable Nagle's algorithm for the TCP connection
-	noDelay bool
+	noDelay              bool
+	maxPendingOperations int
+	maxPendingBytes      int
+	heartbeatInterval    time.Duration
 }
 
 func defaultTcpClientConfig() config {
@@ -114,9 +101,11 @@ func defaultTcpClientConfig() config {
 		tls:           defaultTLSConfig(),
 		autoLogin:     AutoLogin{},
 		reconnection:  defaultTcpClientReconnectionConfig(),
-		// The lockstep request model stalls a multi-segment frame behind
-		// Nagle's algorithm, so coalescing is off by default.
-		noDelay: true,
+		// Small control frames must not wait for delayed acknowledgments.
+		noDelay:              true,
+		maxPendingOperations: DefaultMaxPendingOperations,
+		maxPendingBytes:      DefaultMaxPendingOperationBytes,
+		heartbeatInterval:    5 * time.Second,
 	}
 }
 
@@ -185,17 +174,24 @@ func NewPersonalAccessTokenCredentials(token string) Credentials {
 	}
 }
 
-// WithServerAddress Sets the server address for the TCP client.
+// WithServerAddress Sets the server address for the TCP client. The link to
+// the node of a one-node cluster always dials this address.
 func WithServerAddress(address string) Option {
 	return func(opts *Options) {
 		opts.config.serverAddress = address
 	}
 }
 
-// WithAutoLogin signs the client in with the given credentials on every
-// connection, including the ones a reconnect establishes. Without it a
-// reconnect cannot restore the session, so a request that hits a dropped
-// connection fails instead of replaying.
+// WithAutoLogin supplies credentials for the initial session. Replacement
+// links bind the existing identity. A terminal session recovery signs in with
+// these credentials until the caller signs in with LoginUser or
+// LoginWithPersonalAccessToken, and as that sign-in after it. After
+// LogoutUser, only such a sign-in by the caller or a Connect after Disconnect
+// signs in again. Disconnect forgets the sign-in of the caller, so the next
+// Connect signs in with these credentials. A failed explicit sign-in or a
+// credential refusal blocks automatic sign-in until another explicit attempt.
+// A committed password change or rename updates stored credentials, also
+// when it is sent raw or proved by ResolveOperation.
 func WithAutoLogin(credentials Credentials) Option {
 	return func(opts *Options) {
 		opts.config.autoLogin = NewAutoLogin(credentials)
@@ -239,17 +235,28 @@ func WithTLSValidateCertificate(validate bool) TLSOption {
 	}
 }
 
-// WithNoDelay controls TCP_NODELAY. It defaults to true because the lockstep
-// request model stalls behind Nagle's algorithm; pass false to re-enable
-// segment coalescing for bandwidth-bound workloads.
+// WithNoDelay controls TCP_NODELAY; it defaults to true.
 func WithNoDelay(noDelay bool) Option {
 	return func(opts *Options) {
 		opts.config.noDelay = noDelay
 	}
 }
 
-// NewIggyTcpClient creates a new Iggy TCP client with the given options.
-// warning: don't use this function directly, use iggycli.NewIggyClient with iggycli.WithTcp instead.
+// WithPendingOperations bounds active and retained mutation frames, including headers.
+// The same limits independently bound committing-fetch recovery IDs and target keys.
+func WithPendingOperations(maxOperations, maxBytes int) Option {
+	return func(opts *Options) {
+		opts.config.maxPendingOperations = maxOperations
+		opts.config.maxPendingBytes = maxBytes
+	}
+}
+
+// WithHeartbeatInterval controls managed activity on every ready replica link.
+// A nonpositive interval disables the task.
+func WithHeartbeatInterval(interval time.Duration) Option {
+	return func(opts *Options) { opts.config.heartbeatInterval = interval }
+}
+
 func NewIggyTcpClient(logger *slog.Logger, options ...Option) *IggyTcpClient {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
@@ -260,41 +267,54 @@ func NewIggyTcpClient(logger *slog.Logger, options ...Option) *IggyTcpClient {
 			opt(&opts)
 		}
 	}
-
-	return &IggyTcpClient{
-		config:                 opts.config,
-		logger:                 logger,
-		clientAddress:          "",
-		conn:                   nil,
-		transportState:         iggcon.TransportStateDisconnected,
-		sessionState:           iggcon.SessionStateUnauthenticated,
-		connectedAt:            time.Time{},
-		leaderRedirectionState: iggcon.LeaderRedirectionState{},
-		currentServerAddress:   opts.config.serverAddress,
-		session:                vsr.NewSession(),
-		closed:                 make(chan struct{}),
-	}
+	client := &IggyTcpClient{config: opts.config, logger: logger, session: vsr.NewSession(), sessionFence: 1, registerGate: make(chan struct{}, 1), closed: make(chan struct{}), deferred: make(chan struct{}, maxDeferredRequests)}
+	client.operations = newOperationRegistry(opts.config.maxPendingOperations, opts.config.maxPendingBytes)
+	client.links = newReplicaLinks(client)
+	client.epoch.Store(newSignInEpoch())
+	return client
 }
 
 const (
-	MaxStringLength   = 255
-	MaxPartitionCount = 1000
+	MaxStringLength           = 255
+	MaxPartitionCount         = 1000
+	responseReadTimeout       = 30 * time.Second
+	replayInterval            = 50 * time.Millisecond
+	lifecycleRetryMaxInterval = time.Second
+	failoverDialTimeout       = 2 * time.Second
+	// maxDeferredRequests bounds the deferred polls and fetches that the client
+	// parks at once. The server parks at most as many for one session on one shard.
+	maxDeferredRequests = 64
 )
 
-// Timings of the lockstep consensus exchange, matching the Rust SDK.
-const (
-	// responseReadTimeout bounds one request across every replay and failover.
-	// It is far beyond any healthy round trip and only trips when the server
-	// loses the reply, which would otherwise hold the connection forever.
-	responseReadTimeout = 30 * time.Second
-	// replayInterval paces the resend of a transiently rejected request.
-	replayInterval = 50 * time.Millisecond
-	// failoverCheckInterval is how long a request that was never admitted
-	// replays on the same connection before the client re-checks leadership.
-	// A node that stopped being primary answers transient forever, so
-	// replaying alone never recovers.
-	failoverCheckInterval = 2 * time.Second
-)
+// operationScope marks the context of a call. Its value is the sign-in epoch
+// that the call started in, which every request inside the call keeps.
+type operationScope struct{}
+
+func (c *IggyTcpClient) operationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx.Value(operationScope{}) != nil {
+		return ctx, func() {}
+	}
+	timed, cancel := context.WithTimeout(ctx, responseReadTimeout)
+	return context.WithValue(timed, operationScope{}, c.epoch.Load()), cancel
+}
+
+// deferredContext bounds a deferred poll or a fetch by its
+// own request timeout instead of the default operation budget.
+func (c *IggyTcpClient) deferredContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	timed, cancel := context.WithTimeout(ctx, timeout)
+	if ctx.Value(operationScope{}) != nil {
+		return timed, cancel
+	}
+	return context.WithValue(timed, operationScope{}, c.epoch.Load()), cancel
+}
+
+// callEpoch is the sign-in epoch that the call of ctx started in.
+func (c *IggyTcpClient) callEpoch(ctx context.Context) *signInEpoch {
+	if epoch, ok := ctx.Value(operationScope{}).(*signInEpoch); ok {
+		return epoch
+	}
+	return c.epoch.Load()
+}
 
 // requestBufPool reuses wire-payload buffers across RPCs. A fresh buffer
 // already holds the header plus room for a small payload, so a metadata
@@ -322,85 +342,112 @@ func releaseRequestBuf(bp *[]byte) {
 	requestBufPool.Put(bp)
 }
 
-func (c *IggyTcpClient) read(expectedSize int) (int, []byte, error) {
-	buffer := make([]byte, expectedSize)
-	n, err := c.readInto(buffer)
-	if err != nil {
-		return n, buffer[:n], err
-	}
-	return n, buffer, nil
-}
-
-// readInto reads exactly len(buf) bytes from the connection into buf, through
-// the buffered reader when the connect flow installed one.
-func (c *IggyTcpClient) readInto(buf []byte) (int, error) {
-	if c.reader != nil {
-		return io.ReadFull(c.reader, buf)
-	}
-	var totalRead int
-	expected := len(buf)
-	for totalRead < expected {
-		n, err := c.conn.Read(buf[totalRead:])
-		if err != nil {
-			return totalRead, err
-		}
-		if n == 0 {
-			return totalRead, io.ErrNoProgress
-		}
-		totalRead += n
-	}
-	return totalRead, nil
-}
-
-func (c *IggyTcpClient) write(payload []byte) (int, error) {
-	var totalWritten int
-	for totalWritten < len(payload) {
-		n, err := c.conn.Write(payload[totalWritten:])
-		if err != nil {
-			return totalWritten, err
-		}
-		if n == 0 {
-			return totalWritten, io.ErrNoProgress
-		}
-		totalWritten += n
-	}
-
-	return totalWritten, nil
-}
-
 // do sends the command and returns the response body. Commands implementing
 // the appender interface encode directly into a pooled buffer.
 func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, error) {
+	return c.doCaptured(ctx, cmd, nil, nil)
+}
+
+// doCaptured is do for a partition command that carries captured, a context
+// the caller holds, instead of the context its route names, and for a command
+// sent to the replica the caller chose.
+func (c *IggyTcpClient) doCaptured(ctx context.Context, cmd command.Command, captured *iggcon.PartitionContext, replica *uint8) ([]byte, error) {
+	if ctx == nil {
+		return nil, ierror.ErrNilContext
+	}
+	ctx, cancel := c.operationContext(ctx)
+	defer cancel()
 	bp := acquireRequestBuf()
 	defer releaseRequestBuf(bp)
-
 	frame, err := appendCommandFrame(*bp, cmd)
 	if frame != nil {
-		// Keep the grown buffer even when the encode failed, so the pool gets
-		// it back at its new capacity.
 		*bp = frame
 	}
 	if err != nil {
 		return nil, err
 	}
-
-	return c.exchange(ctx, uint32(cmd.Code()), frame)
+	if isPartitionCommand(cmd.Code()) {
+		query, err := partitionQuery(cmd.Code(), frame[vsr.HeaderSize:])
+		if err != nil {
+			return nil, err
+		}
+		if poll, ok := cmd.(*command.PollMessages); ok && poll.Strategy.Context != nil {
+			captured = poll.Strategy.Context
+		}
+		if cmd.Code() == command.FetchMessagesCode {
+			// Each target of a fetch carries its own fence.
+			captured = &iggcon.PartitionContext{}
+		}
+		return c.drive(ctx, cmd.Code(), query, frame, captured, nil)
+	}
+	return c.drive(ctx, cmd.Code(), nil, frame, nil, replica)
 }
 
+// rawRequest carries a SendBinaryRequest through do, so a raw partition
+// command captures and keeps its context exactly as a typed one does.
+type rawRequest struct {
+	code    command.Code
+	payload []byte
+}
+
+func (r rawRequest) Code() command.Code { return r.code }
+
+func (r rawRequest) MarshalBinary() ([]byte, error) { return r.payload, nil }
+
+func (r rawRequest) AppendBinary(b []byte) ([]byte, error) { return append(b, r.payload...), nil }
+
 // SendBinaryRequest sends a command code and payload and returns the raw response body.
-// Session-control codes return ierror.ErrInvalidCommand without writing to the connection.
+// Session-control codes and deferred-request cancels return ierror.ErrInvalidCommand
+// without writing to the connection. Message sends, polls and consumer offset writes are
+// stamped with the partition context their typed methods would capture, and keep it
+// across retries. A send must name an explicit partition id: a balanced or
+// key-partitioned send returns ierror.ErrFeatureUnavailable without writing, so use
+// SendMessages for those. Deferred polls and fetches take the paths
+// of a deferred poll and a fetch, and limits that the
+// server refuses fail before anything is sent. A fetch preserves its target caps
+// and nonzero fences, resolving zero incarnations before progress admission.
 func (c *IggyTcpClient) SendBinaryRequest(ctx context.Context, code uint32, payload []byte) ([]byte, error) {
-	if isSessionControlCode(code) {
+	if isSessionControlCode(code) || code == uint32(command.CancelDeferredRequestCode) {
 		return nil, ierror.ErrInvalidCommand
 	}
+	if ctx == nil {
+		return nil, ierror.ErrNilContext
+	}
+	switch command.Code(code) {
+	case command.FetchMessagesCode:
+		fetch, err := parseFetch(payload)
+		if err != nil {
+			return nil, err
+		}
+		ctx, cancel := c.deferredContext(ctx, fetch.options.RequestTimeout)
+		defer cancel()
+		reply, _, err := c.fetchMessages(ctx, fetch)
+		return reply, err
+	case command.PollMessagesDeferredCode:
+		options, err := rawDeferredPollOptions(payload)
+		if err != nil {
+			return nil, err
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = c.deferredContext(ctx, options.RequestTimeout)
+		defer cancel()
+	}
+	return c.do(ctx, rawRequest{code: command.Code(code), payload: payload})
+}
 
-	bp := acquireRequestBuf()
-	defer releaseRequestBuf(bp)
-
-	frame := append(reserveHeader(*bp), payload...)
-	*bp = frame
-
-	return c.exchange(ctx, code, frame)
+// SendBinaryRequestToReplica sends a command code and payload to the replica with id
+// replicaID and returns that replica's raw response body. Session-control codes,
+// replicated commands, polls, fetches, deferred-request cancels and
+// consumer offset reads return ierror.ErrInvalidCommand without writing to the
+// connection. A replica the roster does not name, after one roster read, returns
+// ierror.ErrInvalidIdentifier. The replica's own refusal, such as ierror.ErrNotPrimary,
+// is returned as it is.
+func (c *IggyTcpClient) SendBinaryRequestToReplica(ctx context.Context, code uint32, payload []byte, replicaID uint8) ([]byte, error) {
+	if _, replicated := vsr.ReplicatedOperation(code); replicated || isSessionControlCode(code) || isPartitionRead(command.Code(code)) ||
+		code == uint32(command.CancelDeferredRequestCode) {
+		return nil, ierror.ErrInvalidCommand
+	}
+	return c.doCaptured(ctx, rawRequest{code: command.Code(code), payload: payload}, nil, &replicaID)
 }
 
 // reserveHeader returns buf truncated to exactly the header prologue, growing
@@ -409,6 +456,18 @@ func (c *IggyTcpClient) SendBinaryRequest(ctx context.Context, code uint32, payl
 // write four extra cache lines per request.
 func reserveHeader(buf []byte) []byte {
 	return slices.Grow(buf[:0], vsr.HeaderSize)[:vsr.HeaderSize]
+}
+
+// isPartitionRead reports whether code reads a partition through its primary and
+// incarnation, which a request to a chosen replica does not carry.
+func isPartitionRead(code command.Code) bool {
+	switch code {
+	case command.PollMessagesCode, command.PollMessagesDeferredCode, command.FetchMessagesCode,
+		command.GetOffsetCode:
+		return true
+	default:
+		return false
+	}
 }
 
 func isSessionControlCode(code uint32) bool {
@@ -422,12 +481,6 @@ func isSessionControlCode(code uint32) bool {
 	default:
 		return false
 	}
-}
-
-// isRegisterCode reports whether the code carries the sign-in handshake.
-func isRegisterCode(code uint32) bool {
-	return code == uint32(command.LoginRegisterCode) ||
-		code == uint32(command.LoginRegisterWithPATCode)
 }
 
 // appendCommandFrame reserves the request prologue in buf and appends the
@@ -447,382 +500,179 @@ func appendCommandFrame(buf []byte, cmd command.Command) ([]byte, error) {
 	return append(buf, body...), nil
 }
 
-// connectScoped marks the context of a request the connect flow itself
-// issues. exchange must not reconnect such a request: Connect is already on
-// the stack, and re-entering it has no depth bound.
-type connectScoped struct{}
-
-// localPreconditionError marks a request that failed before its frame was
-// written. The connection is healthy, so exchange must not tear it down and
-// re-dial over what is purely local state.
-type localPreconditionError struct{ err error }
-
-func (e *localPreconditionError) Error() string { return e.err.Error() }
-func (e *localPreconditionError) Unwrap() error { return e.err }
-
-// exchange runs one request to completion, reconnecting and replaying it when
-// the failure is one a fresh connection recovers from.
-func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame []byte) ([]byte, error) {
-	response, err := c.sendFrame(ctx, code, frame)
-	if err == nil || !isReconnectable(err) {
-		return response, err
+func (c *IggyTcpClient) Connect(ctx context.Context) error {
+	err := c.connect(ctx)
+	var refusal *signInRefusal
+	if errors.As(err, &refusal) {
+		return refusal.err
 	}
-	var precondition *localPreconditionError
-	if errors.As(err, &precondition) {
-		return nil, err
-	}
-	if ctx.Value(connectScoped{}) != nil {
-		return nil, err
-	}
-	if !c.config.reconnection.enabled {
-		c.logger.Warn("Automatic reconnection is disabled.")
-		return nil, err
-	}
-
-	// Without auto-login a reconnect cannot restore the session, so anything
-	// but a sign-in fails here instead of replaying unauthenticated. The
-	// sign-in itself is the exception: the server stays silent on a transient
-	// register failure and expects the client to replay it.
-	login := isRegisterCode(code)
-	if !c.config.autoLogin.enabled && !login {
-		return nil, err
-	}
-	c.mtx.Lock()
-	loggedOut := c.loggedOut
-	c.mtx.Unlock()
-	if loggedOut && !login {
-		// An explicit sign-out stays signed out: the reconnect's automatic
-		// sign-in would silently reverse it.
-		return nil, err
-	}
-	if !canReplay(code, err) {
-		c.logger.Warn("Not replaying a replicated request with an unknown outcome.",
-			slog.Int("code", int(code)), slog.Any("error", err))
-		return nil, err
-	}
-
-	if disconnectErr := c.disconnect(); disconnectErr != nil {
-		return nil, disconnectErr
-	}
-	if login {
-		c.mtx.Lock()
-		c.skipAutoLoginOnce = true
-		c.mtx.Unlock()
-	}
-
-	c.logger.Info("Reconnecting to the server...",
-		slog.String("server_address", c.currentServerAddress),
-		slog.Any("error", err))
-
-	if reconnectErr := c.Connect(ctx); reconnectErr != nil {
-		if login {
-			c.mtx.Lock()
-			c.skipAutoLoginOnce = false
-			c.mtx.Unlock()
-		}
-		return nil, reconnectErr
-	}
-	return c.sendFrame(ctx, code, frame)
+	return err
 }
 
-// canReplay reports whether re-issuing the request over a fresh connection
-// cannot double-apply it. A reconnect registers a new client identity, so the
-// server cannot deduplicate the replay against the original request. A
-// sign-in is a deliberate exception the server expects, a non-replicated
-// request is never deduplicated in the first place, and two failures leave a
-// replicated request provably unapplied: one that struck before the frame was
-// written, and a session refusal the server answered instead of applying.
-// What remains is a replicated request whose reply was lost in transit, and
-// its unknown outcome makes the replay unsafe.
-func canReplay(code uint32, err error) bool {
-	if isRegisterCode(code) {
-		return true
-	}
-	if _, replicated := vsr.ReplicatedOperation(code); !replicated {
-		return true
-	}
-	neverApplied := []error{
-		ierror.ErrNotConnected,
-		ierror.ErrCannotEstablishConnection,
-		ierror.ErrUnauthenticated,
-		ierror.ErrStaleClient,
-	}
-	for _, target := range neverApplied {
-		if errors.Is(err, target) {
-			return true
-		}
-	}
-	return false
-}
-
-// isReconnectable reports whether a fresh connection can recover the failure.
-func isReconnectable(err error) bool {
-	reconnectable := []error{
-		ierror.ErrDisconnected,
-		ierror.ErrEmptyResponse,
-		ierror.ErrUnauthenticated,
-		ierror.ErrStaleClient,
-		ierror.ErrNotConnected,
-		ierror.ErrCannotEstablishConnection,
-		ierror.ErrTcpError,
-	}
-	for _, target := range reconnectable {
-		if errors.Is(err, target) {
-			return true
-		}
-	}
-	return false
-}
-
-// sendFrame runs the request against the current connection. One deadline
-// bounds it across every same-connection replay and every leader failover.
-func (c *IggyTcpClient) sendFrame(ctx context.Context, code uint32, frame []byte) ([]byte, error) {
+// connect is Connect, except that a refused sign-in stays a signInRefusal, so
+// the recovery and the calls that wait for the attempt can tell it apart.
+func (c *IggyTcpClient) connect(ctx context.Context) error {
 	if ctx == nil {
-		return nil, ierror.ErrNilContext
+		return ierror.ErrNilContext
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	if c.config.maxPendingOperations <= 0 || c.config.maxPendingBytes <= 0 {
+		return ierror.ErrInvalidConfiguration
 	}
-
-	deadline := time.Now().Add(responseReadTimeout)
-	stamped := false
-	for {
-		// A sign-in owns the whole budget on this connection. The connect flow
-		// already pointed it at the leader, and failing over from under the
-		// handshake would recurse back into it.
-		transientDeadline := deadline
-		if !isRegisterCode(code) {
-			if failover := time.Now().Add(failoverCheckInterval); failover.Before(deadline) {
-				transientDeadline = failover
-			}
-		}
-
-		response, attemptStamped, err := c.attempt(
-			ctx, code, frame, stamped, transientDeadline, deadline)
-		stamped = attemptStamped
-
-		switch {
-		case err == nil:
-			return response, nil
-		case errors.Is(err, ierror.ErrTransientNotAccepted) &&
-			!isRegisterCode(code) && time.Now().Before(deadline):
-			// The server never admitted the request, so re-issuing it cannot
-			// double-apply. A same-connection replay keeps the stamped request
-			// id; a redirect registers again, so the frame is stamped afresh.
-			redirect, redirectErr := c.HandleLeaderRedirection(ctx)
-			if redirectErr != nil {
-				return nil, redirectErr
-			}
-			if redirect {
-				if connectErr := c.Connect(ctx); connectErr != nil {
-					return nil, connectErr
-				}
-				stamped = false
-			}
-		default:
-			return nil, err
+	epoch := c.callEpoch(ctx)
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(epoch.ctx, cancel)
+	defer cancel()
+	defer stop()
+	ctx = context.WithValue(ctx, operationScope{}, epoch)
+	c.connectMu.Lock()
+	if attempt := c.connectionAttempt; attempt != nil {
+		c.connectMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-attempt.done:
+			return attempt.err
 		}
 	}
+	attempt := &connectAttempt{done: make(chan struct{})}
+	c.connectionAttempt = attempt
+	c.connectMu.Unlock()
+	link, err := c.links.connect(ctx)
+	if err == nil {
+		c.links.mu.Lock()
+		lifetime := c.links.ctx
+		c.links.mu.Unlock()
+		if lifetime == nil {
+			err = ierror.ErrNotConnected
+		} else {
+			sessionCtx, endSignIn := signInContext(ctx, epoch)
+			stop := context.AfterFunc(lifetime, endSignIn)
+			err = c.establishSession(sessionCtx, link)
+			stop()
+			endSignIn()
+		}
+	}
+	var refusal *signInRefusal
+	if ended := epoch.err(); ended != nil && !errors.As(err, &refusal) {
+		err = ended
+	}
+	c.connectMu.Lock()
+	attempt.link, attempt.err = link, err
+	c.connectionAttempt = nil
+	close(attempt.done)
+	c.connectMu.Unlock()
+	return err
 }
 
-// attempt stamps the frame if it is not stamped yet and exchanges it once,
-// replaying in place while the server answers transiently.
-func (c *IggyTcpClient) attempt(
-	ctx context.Context,
-	code uint32,
-	frame []byte,
-	stamped bool,
-	transientDeadline, readDeadline time.Time,
-) ([]byte, bool, error) {
+func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
+	return &iggcon.ConnectionInfo{Protocol: iggcon.Tcp, ServerAddress: c.links.address()}
+}
+
+// GetNoDelay reports whether TCP_NODELAY is set on new connections, which
+// tests and callers can use to observe the parsed nodelay option before a
+// connection exists to read it off.
+func (c *IggyTcpClient) GetNoDelay() bool {
+	// The client configuration does not change after construction, so this
+	// reads the field directly, like the dial path does.
+	return c.config.noDelay
+}
+
+// GetHeartbeatInterval reports the pacing of the managed heartbeat task on
+// ready replica links, which tests and callers can use to observe the
+// parsed heartbeat_interval option before a connection exists.
+func (c *IggyTcpClient) GetHeartbeatInterval() time.Duration {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
+	return c.config.heartbeatInterval
+}
 
-	switch c.transportState {
-	case iggcon.TransportStateShutdown:
-		c.logger.Debug("Cannot send data. Client is shutdown.")
-		return nil, stamped, ierror.ErrClientShutdown
-	case iggcon.TransportStateDisconnected:
-		c.logger.Debug("Cannot send data. Client is not connected.")
-		return nil, stamped, ierror.ErrNotConnected
-	case iggcon.TransportStateConnecting:
-		c.logger.Debug("Cannot send data. Client is still connecting.")
-		return nil, stamped, ierror.ErrNotConnected
+// ResolveOperation replays the retained bytes under their original identity.
+// A committed business rejection is returned unchanged and releases the lane.
+// For an operation that is no longer retained, it returns what a replay proved.
+// An unknown committing fetch returns FetchProgressUncertain without I/O, and its
+// recovery ID is local ownership, not a replayable server receipt.
+func (c *IggyTcpClient) ResolveOperation(ctx context.Context, operationID uint64) error {
+	if ctx == nil {
+		return ierror.ErrNilContext
 	}
-	if c.conn == nil {
-		return nil, stamped, ierror.ErrNotConnected
+	ctx, cancel := c.operationContext(ctx)
+	defer cancel()
+	ticket, err := c.operations.resume(ctx, operationID)
+	if errors.Is(err, ierror.ErrOperationNotRetained) {
+		return c.operations.recordedOutcome(operationID)
 	}
-
-	if !stamped {
-		// Stamp once per session: the header consumes a request id, and a
-		// replay must carry the same one for the server to deduplicate it.
-		// A stamp failure is local and pre-write, so it is marked as such:
-		// the connection is healthy and must not be torn down for it.
-		if err := vsr.StampRequestHeader(c.session, code, frame); err != nil {
-			return nil, false, &localPreconditionError{err}
-		}
-		stamped = true
-	}
-
-	conn := c.conn
-	var deadlineMu sync.Mutex
-	cleared := false
-	if ctx.Done() != nil {
-		stop := context.AfterFunc(ctx, func() {
-			deadlineMu.Lock()
-			defer deadlineMu.Unlock()
-			if !cleared {
-				// A deadline in the past unblocks any read or write in
-				// progress. This uses the snapshotted conn, not c.conn, so a
-				// reconnect cannot receive the deadline of a cancelled call.
-				_ = conn.SetDeadline(time.Now())
-			}
-		})
-		defer stop()
-	}
-
-	deadlineMu.Lock()
-	_ = conn.SetDeadline(readDeadline)
-	deadlineMu.Unlock()
-
-	response, err := c.exchangeLocked(ctx, code, frame, transientDeadline, readDeadline)
-
-	deadlineMu.Lock()
-	cleared = true
-	_ = conn.SetDeadline(time.Time{})
-	deadlineMu.Unlock()
-
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, stamped, ctxErr
-		}
+		return err
 	}
-	return response, stamped, err
+	_, err = c.driveRetained(ctx, ticket)
+	return err
 }
 
-// exchangeLocked writes the frame and reads its reply, resending the identical
-// bytes while the server answers with a transient rejection.
-func (c *IggyTcpClient) exchangeLocked(
-	ctx context.Context,
-	code uint32,
-	frame []byte,
-	transientDeadline, readDeadline time.Time,
-) ([]byte, error) {
-	for {
-		c.logger.Debug("Sending a TCP request",
-			slog.Int("frame_length", len(frame)), slog.Int("code", int(code)))
-		if _, err := c.write(frame); err != nil {
-			// Normalized like the read failures below, so callers can match
-			// a dropped connection with one sentinel in both directions.
-			c.logger.Error("Failed to write the request frame",
-				slog.Int("code", int(code)), slog.Any("error", err))
-			c.invalidateConnLocked()
-			return nil, ierror.ErrDisconnected
-		}
-
-		body, err := c.readReplyLocked(code)
-		if err != nil {
-			return nil, err
-		}
-		if vsr.PeekCommand(&c.respHeader) == vsr.FrameReply {
-			// A reply must answer the request in flight. An unexpected echo
-			// means the stream is delivering some other request's answer, and
-			// every later reply would pair off by one.
-			expected := vsr.StampedRequestID(frame)
-			if echoed := vsr.ReadReplyRequestID(&c.respHeader); echoed != expected {
-				c.logger.Error("The reply answers a different request",
-					slog.Uint64("expected_request", expected),
-					slog.Uint64("echoed_request", echoed))
-				c.invalidateConnLocked()
-				return nil, ierror.ErrDisconnected
-			}
-		}
-
-		response, err := vsr.DecodeReply(&c.respHeader, body)
-		switch {
-		case errors.Is(err, ierror.ErrTransientNotCommitted) && time.Now().Before(readDeadline):
-			// The outcome is unknown, so only a replay of the same request id
-			// on this session is safe. On the metadata plane the client table
-			// answers a committed request from its reply cache; the partition
-			// plane keeps no client table, so its replay is at-least-once.
-			if waitErr := c.waitBeforeReplay(ctx, readDeadline); waitErr != nil {
-				return nil, waitErr
-			}
-		case errors.Is(err, ierror.ErrTransientNotAccepted) && time.Now().Before(transientDeadline):
-			if waitErr := c.waitBeforeReplay(ctx, transientDeadline); waitErr != nil {
-				return nil, waitErr
-			}
-		default:
-			if err != nil {
-				c.handleReplyFailureLocked(err)
-				return nil, err
-			}
-			return response, nil
-		}
+// AbandonOperation releases local recovery ownership without proving non-execution.
+// A running ResolveOperation keeps the lane and the outcome that it proves.
+func (c *IggyTcpClient) AbandonOperation(ctx context.Context, operationID uint64) error {
+	if ctx == nil {
+		return ierror.ErrNilContext
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return c.operations.abandon(operationID)
 }
 
-// readReplyLocked reads the fixed header and then exactly the body bytes it
-// declares. A read that cannot complete leaves the stream at an unknown frame
-// boundary, so the connection is dropped rather than reused.
-func (c *IggyTcpClient) readReplyLocked(code uint32) ([]byte, error) {
-	if _, err := c.readInto(c.respHeader[:]); err != nil {
-		c.logger.Error("Failed to read the reply header",
-			slog.Int("code", int(code)), slog.Any("error", err))
-		c.invalidateConnLocked()
-		return nil, ierror.ErrDisconnected
-	}
-
-	size := vsr.ReadSize(&c.respHeader)
-	if size < vsr.HeaderSize || size > vsr.MaxFrameSize {
-		c.logger.Error("The reply declares an invalid frame size",
-			slog.Int("code", int(code)), slog.Int("size", int(size)))
-		c.invalidateConnLocked()
-		return nil, ierror.ErrInvalidCommand
-	}
-
-	bodyLength := int(size) - vsr.HeaderSize
-	if bodyLength == 0 {
-		return nil, nil
-	}
-
-	_, body, err := c.read(bodyLength)
-	if err != nil {
-		c.logger.Error("Failed to read the reply body",
-			slog.Int("code", int(code)), slog.Any("error", err))
-		c.invalidateConnLocked()
-		return nil, ierror.ErrDisconnected
-	}
-	return body, nil
-}
-
-// handleReplyFailureLocked reacts to a failed reply. An eviction is
-// session-terminal, so the local session is dropped and the next sign-in
-// registers a fresh client identity.
-func (c *IggyTcpClient) handleReplyFailureLocked(err error) {
-	var eviction *vsr.EvictionError
-	if !errors.As(err, &eviction) {
-		return
-	}
-	c.logger.Warn("The server evicted the session",
-		slog.Int("reason", int(eviction.Reason)),
-		slog.Any("error", eviction.Unwrap()))
-	c.invalidateConnLocked()
-}
-
-// waitBeforeReplay pauses before resending a transiently rejected request,
-// never past the deadline, the caller's cancellation, or a client shutdown.
-// The shutdown channel matters because this wait runs with c.mtx held, which
-// is the lock Close needs; without it Close would block for the rest of the
-// request budget.
-func (c *IggyTcpClient) waitBeforeReplay(ctx context.Context, deadline time.Time) error {
-	interval := replayInterval
-	if remaining := time.Until(deadline); remaining < interval {
-		interval = remaining
-	}
-	if interval <= 0 {
+func (c *IggyTcpClient) Disconnect() error {
+	epoch := c.resetSession(false)
+	c.mtx.Lock()
+	if c.epoch.Load() != epoch {
+		c.mtx.Unlock()
 		return nil
 	}
+	// Registration publication is fenced by the reset. Forget credentials
+	// before waiting, so completion cannot erase a later explicit sign-in.
+	c.rememberedLogin = AutoLogin{}
+	c.loggedOut = c.autoLoginBlocked
+	stopped := c.links.detach()
+	c.mtx.Unlock()
+	stopped(true)
+	c.connectMu.Lock()
+	attempt := c.connectionAttempt
+	c.connectMu.Unlock()
+	if attempt != nil {
+		<-attempt.done
+	}
+	return nil
+}
 
+// Close ends the client. A fetch with auto-commit is never cancelled,
+// because a cancel after its read drops what it stored, so Close waits for
+// the reply of each one in flight before it closes the links.
+func (c *IggyTcpClient) Close() error {
+	c.mtx.Lock()
+	c.closeOnce.Do(func() { close(c.closed) })
+	c.mtx.Unlock()
+	c.commits.Wait()
+	return errors.Join(c.Disconnect(), c.operations.unresolvedFetch())
+}
+
+// startCommit counts a fetch with auto-commit before it may send. It fails
+// once Close started, so Close waits only for the fetches that it lets
+// through.
+func (c *IggyTcpClient) startCommit() bool {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	select {
+	case <-c.closed:
+		return false
+	default:
+		c.commits.Add(1)
+		return true
+	}
+}
+
+func (c *IggyTcpClient) pause(ctx context.Context, interval time.Duration) error {
+	if interval <= 0 {
+		return ctx.Err()
+	}
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 	select {
@@ -835,247 +685,60 @@ func (c *IggyTcpClient) waitBeforeReplay(ctx context.Context, deadline time.Time
 	}
 }
 
-// invalidateConnLocked closes the connection and marks it as disconnected
-func (c *IggyTcpClient) invalidateConnLocked() {
-	_ = c.closeConnLocked()
-	c.transportState = iggcon.TransportStateDisconnected
-	c.sessionState = iggcon.SessionStateUnauthenticated
-	c.session.Reset()
-	c.groups.clear()
-	c.topics.clearCounts()
+func isTLSConfigFault(err error) bool {
+	var certificateError *tls.CertificateVerificationError
+	return errors.Is(err, ierror.ErrInvalidTlsCertificatePath) || errors.Is(err, ierror.ErrInvalidTlsCertificate) || errors.Is(err, ierror.ErrInvalidTlsDomain) || errors.As(err, &certificateError)
 }
 
-// closeConnLocked closes and drops the current connection.
-func (c *IggyTcpClient) closeConnLocked() error {
-	if c.conn == nil {
-		return nil
-	}
-	err := c.conn.Close()
-	c.conn = nil
-	c.reader = nil
-	return err
-}
+func (c *IggyTcpClient) dialCandidate(ctx context.Context, address string) (net.Conn, error) {
+	c.logger.Info("Iggy client is connecting to server...", slog.String("server_address", address))
+	ctx, cancel := context.WithTimeout(ctx, failoverDialTimeout)
+	defer cancel()
 
-func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
-	return &iggcon.ConnectionInfo{
-		Protocol:      iggcon.Tcp,
-		ServerAddress: c.currentServerAddress,
-	}
-}
-
-// Connect establishes the TCP connection to the server.
-func (c *IggyTcpClient) Connect(ctx context.Context) error {
-	c.mtx.Lock()
-	switch c.transportState {
-	case iggcon.TransportStateShutdown:
-		c.mtx.Unlock()
-		c.logger.Debug("Cannot connect. Client is shutdown.")
-		return ierror.ErrClientShutdown
-	case iggcon.TransportStateConnected:
-		clientAddress := c.clientAddress
-		c.mtx.Unlock()
-		c.logger.Debug("Client is already connected.", slog.String("client_address", clientAddress))
-		return nil
-	case iggcon.TransportStateConnecting:
-		c.mtx.Unlock()
-		c.logger.Debug("Client is already connecting.")
-		return nil
-	default:
-		c.transportState = iggcon.TransportStateConnecting
-	}
-	connectedAt := c.connectedAt
-	c.mtx.Unlock()
-
-	// handle reestablish interval
-	if !connectedAt.IsZero() {
-		now := time.Now()
-		elapsed := now.Sub(connectedAt)
-		reestablishAfter := c.config.reconnection.reestablishAfter
-
-		c.logger.Debug("Elapsed time since last connection", slog.Duration("elapsed", elapsed))
-		if elapsed < reestablishAfter {
-			remaining := reestablishAfter - elapsed
-			c.logger.Info("Trying to connect to the server", slog.Duration("remaining", remaining))
-			time.Sleep(remaining)
+	var tlsConfiguration *tls.Config
+	if c.config.tlsEnabled {
+		var err error
+		tlsConfiguration, err = c.createTLSConfig(address)
+		if err != nil {
+			return nil, err
 		}
 	}
-	attempts := uint(1)
-	interval := time.Duration(0)
-	if c.config.reconnection.enabled {
-		attempts = uint(c.config.reconnection.maxRetries)
-		interval = c.config.reconnection.interval
-	}
-
-	candidates := c.connectionCandidates()
-	var conn net.Conn
-	var candidateIndex int
-	if err := retry.New(
-		retry.Context(ctx),
-		retry.Attempts(attempts),
-		retry.Delay(interval),
-		retry.DelayType(retry.FixedDelay),
-		retry.OnRetry(func(n uint, err error) {
-			c.logger.Info("Retrying to connect to server...", slog.Int("retry_count", int(n+1)), slog.Int("max_retries", int(attempts)), slog.Any("error", err))
-		}),
-	).Do(
-		func() error {
-			address := candidates[candidateIndex%len(candidates)]
-			candidateIndex++
-			c.logger.Info("Iggy client is connecting to server...", slog.String("server_address", address))
-			connection, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
-			if err != nil {
-				c.logger.Error("Failed to establish TCP connection to the server", slog.Any("error", err))
-				return ierror.ErrCannotEstablishConnection
-			}
-
-			tc := connection.(*net.TCPConn)
-			if err := tc.SetNoDelay(c.config.noDelay); err != nil {
-				c.logger.Error("Failed to set the nodelay option on the client, continuing...", slog.Any("error", err))
-			}
-
-			c.mtx.Lock()
-			c.clientAddress = tc.LocalAddr().String()
-			c.currentServerAddress = address
-			c.mtx.Unlock()
-
-			if !c.config.tlsEnabled {
-				conn = connection
-				return nil
-			}
-
-			// TLS logic
-			tlsConfig, err := c.createTLSConfig()
-			if err != nil {
-				_ = connection.Close()
-				return err
-			}
-
-			tlsConn := tls.Client(connection, tlsConfig)
-			if err := tlsConn.HandshakeContext(ctx); err != nil {
-				c.logger.Error("Failed to establish a TLS connection to the server", slog.Any("error", err))
-				_ = connection.Close()
-				return fmt.Errorf("TLS handshake failed: %w", err)
-			}
-
-			conn = tlsConn
-			return nil
-		}); err != nil {
-		c.mtx.Lock()
-		c.transportState = iggcon.TransportStateDisconnected
-		c.mtx.Unlock()
-		if !c.config.reconnection.enabled {
-			c.logger.Warn("Automatic reconnection is disabled.")
-		}
-		// TODO publish event disconnected
-		return err
-	}
-
-	c.mtx.Lock()
-	c.conn = conn
-	c.reader = bufio.NewReaderSize(conn, 64*1024)
-	c.transportState = iggcon.TransportStateConnected
-	c.connectedAt = time.Now()
-	// The server fence does not survive the old socket, so the new connection
-	// starts from a fresh client identity.
-	c.session.Reset()
-	skipAutoLogin := c.skipAutoLoginOnce
-	c.skipAutoLoginOnce = false
-	c.logger.Info("Iggy client has connected to the Iggy server", slog.String("client_address", c.clientAddress), slog.String("server_address", c.currentServerAddress))
-	c.mtx.Unlock()
-
-	if err := c.establishSession(ctx, skipAutoLogin); err != nil {
-		_ = c.disconnect()
-		return err
-	}
-	return nil
-}
-
-func (c *IggyTcpClient) connectionCandidates() []string {
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
-
-	addresses := make([]string, 0, 2+len(c.knownServerAddresses))
-	seen := make(map[string]struct{}, cap(addresses))
-	for _, address := range append(
-		[]string{c.currentServerAddress, c.config.serverAddress},
-		c.knownServerAddresses...,
-	) {
-		if address == "" {
-			continue
-		}
-		if _, ok := seen[address]; ok {
-			continue
-		}
-		seen[address] = struct{}{}
-		addresses = append(addresses, address)
-	}
-	return addresses
-}
-
-// establishSession points the connection at the leader and signs in when
-// auto-login is configured.
-//
-// Leadership is settled before the sign-in, and it is settled even when
-// auto-login is off: register is a consensus operation that a backup answers
-// transiently, so signing in against a follower replays for the whole request
-// budget instead of failing over. Cluster metadata is sessionless and works on
-// the unauthenticated connection.
-func (c *IggyTcpClient) establishSession(ctx context.Context, skipAutoLogin bool) error {
-	// The metadata request runs while Connect is on the stack. Reconnecting
-	// it would re-enter Connect and recurse without a bound, so its failure
-	// unwinds to this Connect instead. The sign-in below keeps the reconnect
-	// path: its replay is the documented recovery for a transient register
-	// failure, and the replayed sign-in suppresses the automatic one, so the
-	// depth is bounded at one nested Connect.
-	redirect, err := c.HandleLeaderRedirection(context.WithValue(ctx, connectScoped{}, struct{}{}))
+	connection, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
 	if err != nil {
-		return err
+		c.logger.Error("Failed to establish TCP connection to the server", slog.Any("error", err))
+		return nil, ierror.ErrCannotEstablishConnection
 	}
-	if redirect {
-		if skipAutoLogin {
-			// The suppression belongs to the sign-in replay, not to this
-			// connection attempt. Connect already consumed the flag, so it is
-			// re-armed for the post-redirect Connect; otherwise that nested
-			// Connect signs in automatically and the replayed login then
-			// commits a second Register.
-			c.mtx.Lock()
-			c.skipAutoLoginOnce = true
-			c.mtx.Unlock()
+
+	tc := connection.(*net.TCPConn)
+	if err := tc.SetNoDelay(c.config.noDelay); err != nil {
+		c.logger.Error("Failed to set the nodelay option on the client, continuing...", slog.Any("error", err))
+	}
+
+	established := connection
+	if c.config.tlsEnabled {
+
+		tlsConn := tls.Client(connection, tlsConfiguration)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			c.logger.Error("Failed to establish a TLS connection to the server", slog.Any("error", err))
+			_ = connection.Close()
+			return nil, fmt.Errorf("TLS handshake failed: %w", err)
 		}
-		return c.Connect(ctx)
+		established = tlsConn
 	}
 
-	if !c.config.autoLogin.enabled {
-		c.logger.Info("Automatic sign-in is disabled.")
-		return nil
-	}
-	if skipAutoLogin {
-		c.logger.Info("Skipping the automatic sign-in for a replayed login.")
-		return nil
-	}
-
-	credentials := c.config.autoLogin.credentials
-	if credentials.personalAccessToken != "" {
-		_, err = c.LoginWithPersonalAccessToken(ctx, credentials.personalAccessToken)
-		return err
-	}
-	_, err = c.LoginUser(ctx, credentials.username, credentials.password)
-	return err
+	return established, nil
 }
 
-func (c *IggyTcpClient) createTLSConfig() (*tls.Config, error) {
+func (c *IggyTcpClient) createTLSConfig(address string) (*tls.Config, error) {
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: !c.config.tls.tlsValidateCertificate,
 	}
 
-	// Set server name for SNI
 	serverName := c.config.tls.tlsDomain
 	if serverName == "" {
-		host, _, err := net.SplitHostPort(c.currentServerAddress)
+		host, _, err := net.SplitHostPort(address)
 		if err != nil {
-			host = c.currentServerAddress
+			host = address
 		}
 		serverName = host
 	}
@@ -1086,7 +749,6 @@ func (c *IggyTcpClient) createTLSConfig() (*tls.Config, error) {
 	}
 	tlsConfig.ServerName = serverName
 
-	// Load CA certificate if provided
 	if c.config.tls.tlsCAFile != "" {
 		caCert, err := os.ReadFile(c.config.tls.tlsCAFile)
 		if err != nil {
@@ -1107,60 +769,4 @@ func (c *IggyTcpClient) createTLSConfig() (*tls.Config, error) {
 	}
 
 	return tlsConfig, nil
-}
-
-func (c *IggyTcpClient) disconnect() error {
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
-
-	if c.transportState == iggcon.TransportStateDisconnected || c.transportState == iggcon.TransportStateShutdown {
-		return nil
-	}
-
-	c.logger.Info("Iggy client is disconnecting from server...", slog.String("client_address", c.clientAddress))
-	c.transportState = iggcon.TransportStateDisconnected
-	c.sessionState = iggcon.SessionStateUnauthenticated
-	c.session.Reset()
-	c.groups.clear()
-	c.topics.clearCounts()
-
-	err := c.closeConnLocked()
-
-	c.logger.Info("Iggy client has disconnected from server.", slog.String("client_address", c.clientAddress))
-	// TODO event pushing logic
-	return err
-}
-
-func (c *IggyTcpClient) shutdown() error {
-	// Unblock any in-flight replay wait before taking the lock it holds,
-	// otherwise this call queues behind the rest of that request's budget.
-	c.closeOnce.Do(func() {
-		if c.closed != nil {
-			close(c.closed)
-		}
-	})
-
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
-
-	if c.transportState == iggcon.TransportStateShutdown {
-		return nil
-	}
-
-	c.logger.Info("Shutting down the Iggy TCP client...", slog.String("client_address", c.clientAddress))
-
-	err := c.closeConnLocked()
-
-	c.transportState = iggcon.TransportStateShutdown
-	c.sessionState = iggcon.SessionStateUnauthenticated
-	c.session.Reset()
-	c.groups.clear()
-	c.topics.clearCounts()
-	c.logger.Info("Iggy TCP client has been shutdown.", slog.String("client_address", c.clientAddress))
-	// TODO push shutdown event
-	return err
-}
-
-func (c *IggyTcpClient) Close() error {
-	return c.shutdown()
 }

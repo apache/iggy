@@ -39,24 +39,28 @@
 //! - **Batch ordering**: each transport drains the per-peer
 //!   `BusReceiver` in FIFO order, but the dispatch shape differs:
 //!     * **TCP (vectored batch)** assembles up to `max_batch` frames
-//!       into one `write_vectored_all` call. The kernel may short-write
-//!       the iovec set (so `writev` is not atomic), but FIFO order
-//!       across the batch is preserved and any short or failed write
-//!       tears the connection down rather than retrying on a
+//!       (every fragment of each [`BusMessage`](crate::BusMessage), chunked at `IOV_MAX`
+//!       iovecs) into `write_vectored_all` calls. The kernel may
+//!       short-write the iovec set (so `writev` is not atomic), but FIFO
+//!       order across the batch is preserved and any short or failed
+//!       write tears the connection down rather than retrying on a
 //!       half-written batch.
 //!     * **TCP-TLS, WS, WSS (drain-and-flush)** drain the same
 //!       `max_batch` window into a `Vec<BusMessage>` and then write
 //!       each frame through the per-record API (`AsyncWriteExt::write_all`
-//!       for TLS, `WebSocketStream::send` for WS / WSS) followed by ONE
-//!       trailing `flush()` per batch. This avoids per-frame TCP/TLS
+//!       per fragment for TLS, `WebSocketStream::send` for WS / WSS, which
+//!       joins a multi-fragment frame into one payload first) followed by
+//!       ONE trailing `flush()` per batch. This avoids per-frame TCP/TLS
 //!       record overhead while staying inside the per-record API
 //!       constraints of those transports.
-//!     * **QUIC (per-frame)** uses one bidirectional stream per peer
-//!       and writes each `BusMessage` with a separate
+//!     * **QUIC (per-frame)** answers each request on its own
+//!       bidirectional stream, and serves the streams of a peer at once.
+//!       It writes each `BusMessage` fragment with a separate
 //!       `SendStream::write_all` call; quinn coalesces at the datagram
 //!       layer.
 //!
-//!   In all four cases, any write failure tears the connection down.
+//!   On TCP, TCP-TLS and WS / WSS, any write failure tears the connection
+//!   down. On QUIC, it ends only the stream of that request.
 //! - **Zero-copy `Frozen` ownership**: outbound frames are handed to
 //!   the kernel without intermediate copies on plaintext TCP. WS / QUIC
 //!   / TLS planes pay structural copies in their record layers; see the
@@ -70,7 +74,7 @@
 //! - fd-delegation (`F_DUPFD_CLOEXEC`) stays TCP-only and lives outside
 //!   this trait (see [`crate::fd_transfer`]). Other transports terminate
 //!   on shard 0 and forward `Frozen<MESSAGE_ALIGN>` over the inter-shard
-//!   crossfire channel via [`crate::ReplicaForwardFn`] / [`crate::ClientForwardFn`].
+//!   crossfire channel via [`crate::ReplicaForwardFn`].
 //!
 //! Per-transport impls live in
 //! `transports/{tcp,tcp_tls,ws,wss,quic}.rs`.
@@ -127,7 +131,7 @@ pub struct ActorContext {
     /// message to the bus's per-plane handler (`MessageHandler` /
     /// `RequestHandler`).
     pub in_tx: Sender<Message<GenericHeader>>,
-    /// Outbound channel: the bus's `send_to_*` path pushes `Frozen`
+    /// Outbound channel: the bus's `send_to_*` path pushes [`BusMessage`](crate::BusMessage)
     /// frames into the matching `Sender`; the transport drains here.
     pub rx: BusReceiver,
     /// Cooperative cancellation. Fires on bus shutdown OR on

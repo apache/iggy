@@ -24,7 +24,6 @@ pub fn footer() -> Html {
             <div class="footer-inner">
                 <div class="footer-brand">
                     <span class="footer-brand-name">{"Apache Iggy"}</span>
-                    <span class="footer-brand-tag">{"Incubating"}</span>
                 </div>
                 <nav class="footer-links">
                     <a href="https://iggy.apache.org" target="_blank" rel="noopener noreferrer">

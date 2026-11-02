@@ -15,22 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::helpers::env::{follower_address, leader_address, server_address};
 use iggy::prelude::*;
-use std::env;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
-/// Resolves server address based on role and port, checking environment variables first
+/// Resolves the server address for a role and port from the environment
 pub fn resolve_server_address(role: &str, port: u16) -> String {
     match (role.to_lowercase().as_str(), port) {
-        ("leader", 8091) => {
-            env::var("IGGY_TCP_ADDRESS_LEADER").unwrap_or_else(|_| "iggy-leader:8091".to_string())
-        }
-        ("follower", 8092) => env::var("IGGY_TCP_ADDRESS_FOLLOWER")
-            .unwrap_or_else(|_| "iggy-follower:8092".to_string()),
-        ("single", 8090) | (_, 8090) => {
-            env::var("IGGY_TCP_ADDRESS").unwrap_or_else(|_| "iggy-server:8090".to_string())
-        }
-        _ => format!("iggy-server:{}", port),
+        ("leader", 8091) => leader_address(),
+        ("follower", 8092) => follower_address(),
+        (_, 8090) => server_address(),
+        _ => panic!("no address mapping for role '{role}' on port {port}"),
     }
 }
 
@@ -47,6 +43,24 @@ pub async fn create_and_connect_client(addr: &str) -> IggyClient {
         .expect("Client should connect");
 
     IggyClient::create(ClientWrapper::Tcp(client), None, None)
+}
+
+/// Whether two `host:port` spellings name the same endpoint.
+///
+/// A client that never redirected still holds the address it was given (a
+/// host name, in the BDD compose network), while a redirected one holds the
+/// address the roster published (an IP). Both name the same node, so they
+/// are compared once resolved, like the Go and Java suites do.
+pub fn is_same_endpoint(left: &str, right: &str) -> Result<bool, String> {
+    let resolve = |address: &str| -> Result<Vec<SocketAddr>, String> {
+        address
+            .to_socket_addrs()
+            .map(Iterator::collect)
+            .map_err(|error| format!("Failed to resolve server address {address}: {error}"))
+    };
+    let left = resolve(left)?;
+    let right = resolve(right)?;
+    Ok(left.iter().any(|candidate| right.contains(candidate)))
 }
 
 /// Verifies that a client is connected to the expected port

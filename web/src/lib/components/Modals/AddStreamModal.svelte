@@ -1,33 +1,38 @@
 <!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
 
-    Licensed to the Apache Software Foundation (ASF) under one
-    or more contributor license agreements.  See the NOTICE file
-    distributed with this work for additional information
-    regarding copyright ownership.  The ASF licenses this file
-    to you under the Apache License, Version 2.0 (the
-    "License"); you may not use this file except in compliance
-    with the License.  You may obtain a copy of the License at
+  http://www.apache.org/licenses/LICENSE-2.0
 
-      http://www.apache.org/licenses/LICENSE-2.0
-
-    Unless required by applicable law or agreed to in writing,
-    software distributed under the License is distributed on an
-    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-    KIND, either express or implied.  See the License for the
-    specific language governing permissions and limitations
-    under the License.
-
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
 -->
+
 <script lang="ts">
-  import type { CloseModalFn } from '$lib/types/utilTypes';
+  import type { CloseModalFn } from '#lib/types/utilTypes.js';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
   import { zod4 } from 'sveltekit-superforms/adapters';
   import { z } from 'zod';
   import Button from '../Button.svelte';
   import Input from '../Input.svelte';
+  import PasswordInput from '../PasswordInput.svelte';
   import ModalBase from './ModalBase.svelte';
   import { showToast } from '../AppToasts.svelte';
-  import { fetchRouteApi } from '$lib/api/fetchRouteApi';
+  import { fetchRouteApi } from '#lib/api/fetchRouteApi.js';
+  import {
+    INVALID_STREAM_KEY_MESSAGE,
+    isStreamEncryptionKey,
+    streamCreate
+  } from '#lib/api/resourceOptions.js';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
 
   interface Props {
@@ -35,6 +40,10 @@
   }
 
   let { closeModal }: Props = $props();
+
+  // Kept out of the superform so the key never enters a store.
+  let encryptionKey = $state('');
+  let encryptionKeyError = $state('');
 
   const schema = z.object({
     name: z
@@ -51,12 +60,19 @@
     async onUpdate({ form }) {
       if (!form.valid) return;
 
+      encryptionKeyError = '';
+      if (encryptionKey !== '' && !isStreamEncryptionKey(encryptionKey)) {
+        encryptionKeyError = INVALID_STREAM_KEY_MESSAGE;
+        return;
+      }
+
+      const body = streamCreate(form.data.name, encryptionKey);
+      encryptionKey = '';
+
       const { data, ok } = await fetchRouteApi({
         method: 'POST',
         path: '/streams',
-        body: {
-          name: form.data.name
-        }
+        body
       });
 
       if (!ok) {
@@ -102,8 +118,22 @@
 </script>
 
 <ModalBase {closeModal} title="Add new stream">
-  <form method="POST" class="flex flex-col h-[300px] gap-4" use:enhance>
+  <form method="POST" class="flex flex-col h-[400px] gap-4" use:enhance>
     <Input name="name" label="Name" bind:value={$form.name} errorMessage={$errors.name?.[0]} />
+
+    <div class="flex flex-col gap-2">
+      <PasswordInput
+        label="Encryption key (optional)"
+        name="streamEncryptionKey"
+        autocomplete="new-password"
+        spellcheck="false"
+        bind:value={encryptionKey}
+        errorMessage={encryptionKeyError}
+      />
+      <span class="text-xs text-shade-d200 dark:text-shade-l700 ml-1">
+        Standard base64 of 32 random bytes. The server must have an encryption key configured.
+      </span>
+    </div>
 
     <div class="flex justify-end gap-3 mt-auto w-full">
       <Button type="button" variant="text" class="w-2/5" onclick={() => closeModal()}>Cancel</Button

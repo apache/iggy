@@ -21,6 +21,7 @@ import (
 	"context"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
@@ -97,7 +98,18 @@ func TestCheckAndRedirectToLeader_NeverRedirectsASingleNodeCluster(t *testing.T)
 	assert.Equal(t, []string{"10.0.0.1:8090"}, addresses)
 }
 
+// shrinkLeaderlessBudget makes the leaderless poll converge fast in tests.
+func shrinkLeaderlessBudget(t *testing.T, budget, interval time.Duration) {
+	t.Helper()
+	previousBudget, previousInterval := leaderlessWaitBudget, leaderlessPollInterval
+	leaderlessWaitBudget, leaderlessPollInterval = budget, interval
+	t.Cleanup(func() {
+		leaderlessWaitBudget, leaderlessPollInterval = previousBudget, previousInterval
+	})
+}
+
 func TestCheckAndRedirectToLeader_StaysPutWhenNoHealthyLeaderExists(t *testing.T) {
+	shrinkLeaderlessBudget(t, 0, time.Millisecond)
 	client := &metadataClient{metadata: &iggcon.ClusterMetadata{
 		Nodes: []iggcon.ClusterNode{
 			clusterNode("10.0.0.1", 8090, iggcon.RoleLeader, iggcon.Unreachable),
@@ -110,6 +122,38 @@ func TestCheckAndRedirectToLeader_StaysPutWhenNoHealthyLeaderExists(t *testing.T
 	assert.Empty(t, leader, "an unhealthy leader is not a redirect target")
 	assert.Equal(t, []string{"10.0.0.2:8090"}, addresses,
 		"only healthy nodes are reconnect candidates")
+}
+
+// electingClient answers a leaderless roster until the election settles.
+type electingClient struct {
+	iggcon.Client
+	reads    int
+	settleAt int
+}
+
+func (c *electingClient) GetClusterMetadata(context.Context) (*iggcon.ClusterMetadata, error) {
+	c.reads++
+	role := iggcon.RoleFollower
+	if c.reads >= c.settleAt {
+		role = iggcon.RoleLeader
+	}
+	return &iggcon.ClusterMetadata{
+		Nodes: []iggcon.ClusterNode{
+			clusterNode("10.0.0.1", 8090, role, iggcon.Healthy),
+			clusterNode("10.0.0.2", 8090, iggcon.RoleFollower, iggcon.Healthy),
+		},
+	}, nil
+}
+
+func TestCheckAndRedirectToLeader_PollsThroughALeaderlessElection(t *testing.T) {
+	shrinkLeaderlessBudget(t, time.Second, time.Millisecond)
+	client := &electingClient{settleAt: 3}
+
+	leader, _, err := checkRedirect(t, client, "10.0.0.2:8090")
+	require.NoError(t, err)
+	assert.Equal(t, "10.0.0.1:8090", leader,
+		"the poll rides through the election instead of settling leaderless")
+	assert.Equal(t, 3, client.reads)
 }
 
 func TestCheckAndRedirectToLeader_SwallowsAMetadataFailure(t *testing.T) {

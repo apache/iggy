@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::POLL_REPLY_MAX_BYTES;
 use futures::StreamExt;
 use iggy::prelude::*;
 use iggy_common::TransportProtocol;
@@ -25,21 +26,40 @@ use tokio::time::{Duration, sleep, timeout};
 const STREAM_NAME: &str = "test-reconnect-stream";
 const TOPIC_NAME: &str = "test-reconnect-topic";
 
+/// The restart specs below need every committed batch on disk before the
+/// server goes down: there is no flush primitive, so the topic carries the
+/// eager-flush thresholds that used to be `[partition]` config.
+fn eager_flush_options() -> TopicCreateOptions {
+    TopicCreateOptions {
+        partitions_count: Some(1),
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        durability: iggy_common::Durability::Persisted,
+        messages_required_to_save: Some(1),
+        ..TopicCreateOptions::default()
+    }
+}
+
 pub async fn run_producer(harness: &mut TestHarness) {
     let client = create_client(harness);
     Client::connect(&client).await.expect("Failed to connect");
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            &eager_flush_options(),
+        )
+        .await
+        .unwrap();
 
     let producer = client
         .producer(STREAM_NAME, TOPIC_NAME)
         .expect("Failed to create producer builder")
         .create_stream_if_not_exists()
-        .create_topic_if_not_exists(
-            1,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
-        )
-        .send_retries(Some(10), Some(IggyDuration::from_str("2s").unwrap()))
+        .create_topic_if_not_exists(1, IggyExpiry::NeverExpire, MaxTopicSize::ServerDefault)
         .build();
 
     producer
@@ -60,7 +80,9 @@ pub async fn run_producer(harness: &mut TestHarness) {
 
     let send_handle = tokio::spawn(async move {
         let msg = IggyMessage::from_str("after-restart").unwrap();
-        producer.send(vec![msg]).await
+        producer.send(vec![msg]).await?;
+        let later = IggyMessage::from_str("after-resume").unwrap();
+        producer.send(vec![later]).await
     });
 
     sleep(Duration::from_secs(1)).await;
@@ -84,19 +106,30 @@ pub async fn run_producer(harness: &mut TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            10,
-            false,
+            PollOptions {
+                count: 10,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("Failed to poll messages after restart");
 
-    assert!(
-        !polled.messages.is_empty(),
-        "Expected at least one message after server restart"
+    assert_eq!(
+        polled.messages.len(),
+        3,
+        "reconnect must preserve the original send and reopen the producer gate"
     );
+    for (message, expected) in
+        polled
+            .messages
+            .iter()
+            .zip(["before-restart", "after-restart", "after-resume"])
+    {
+        assert_eq!(message.payload.as_ref(), expected.as_bytes());
+    }
 }
 
 pub async fn run_consumer(harness: &mut TestHarness) {
@@ -106,18 +139,19 @@ pub async fn run_consumer(harness: &mut TestHarness) {
         .expect("Failed to create setup client");
 
     setup_client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("Failed to create stream");
     setup_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            Default::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy_common::Durability::Persisted,
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("Failed to create topic");
@@ -129,12 +163,15 @@ pub async fn run_consumer(harness: &mut TestHarness) {
     Client::connect(&client).await.expect("Failed to connect");
 
     let mut consumer = client
-        .consumer("test-consumer", STREAM_NAME, TOPIC_NAME, 0)
+        .consumer("test-consumer", STREAM_NAME, TOPIC_NAME)
         .expect("Failed to create consumer builder")
+        .partitions([0])
         .polling_strategy(PollingStrategy::next())
-        .batch_length(10)
-        .poll_interval(IggyDuration::from_str("100ms").unwrap())
-        .polling_retry_interval(IggyDuration::from_str("500ms").unwrap())
+        .poll_options(PollOptions {
+            count: 10,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
+        .polling_retry_interval(NonZeroIggyDuration::from_str("500ms").unwrap())
         .build();
 
     consumer
@@ -233,7 +270,7 @@ async fn consume_messages_validated(
     let mut payloads = Vec::with_capacity(expected as usize);
     let deadline = tokio::time::Instant::now() + max_wait;
     while (payloads.len() as u32) < expected && tokio::time::Instant::now() < deadline {
-        let poll_result: Option<Result<ReceivedMessage, IggyError>> =
+        let poll_result: Option<Result<ReceivedMessage, ReadError>> =
             tokio::time::timeout(Duration::from_millis(500), consumer.next())
                 .await
                 .ok()
@@ -262,16 +299,15 @@ pub async fn run_single_message_offset_zero_restart(harness: &mut TestHarness) {
         .await
         .expect("Failed to create client");
 
-    client.create_stream(STREAM).await.unwrap();
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &Identifier::named(STREAM).unwrap(),
             TOPIC,
-            1,
-            Default::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &eager_flush_options(),
         )
         .await
         .unwrap();
@@ -294,11 +330,14 @@ pub async fn run_single_message_offset_zero_restart(harness: &mut TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM).unwrap(),
             &Identifier::named(TOPIC).unwrap(),
-            Some(0),
+            0,
             &consumer,
             &PollingStrategy::next(),
-            10,
-            true,
+            PollOptions {
+                count: 10,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -340,11 +379,14 @@ pub async fn run_single_message_offset_zero_restart(harness: &mut TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM).unwrap(),
             &Identifier::named(TOPIC).unwrap(),
-            Some(0),
+            0,
             &consumer,
             &PollingStrategy::next(),
-            10,
-            true,
+            PollOptions {
+                count: 10,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -381,18 +423,17 @@ pub async fn run_consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
         .await
         .expect("Failed to create client");
 
-    let stream = client.create_stream(STREAM).await.unwrap();
+    let stream = client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id;
 
     let topic = client
         .create_topic(
             &Identifier::named(STREAM).unwrap(),
             TOPIC,
-            1,
-            Default::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &eager_flush_options(),
         )
         .await
         .unwrap();
@@ -418,11 +459,14 @@ pub async fn run_consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM).unwrap(),
             &Identifier::named(TOPIC).unwrap(),
-            Some(0),
+            0,
             &consumer,
             &PollingStrategy::next(),
-            100,
-            true,
+            PollOptions {
+                count: 100,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -485,11 +529,14 @@ pub async fn run_consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM).unwrap(),
             &Identifier::named(TOPIC).unwrap(),
-            Some(0),
+            0,
             &consumer,
             &PollingStrategy::next(),
-            100,
-            true,
+            PollOptions {
+                count: 100,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -512,8 +559,8 @@ pub async fn run_consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
 /// settled primary survives to answer the rejoin probes. The replicas must
 /// give up probing (`ViewChangeReason::ViewProbeUnanswered`), elect among
 /// their recovered logs, and serve the durable data across the outage. The
-/// caller's server config must flush eagerly (`messages_required_to_save=1`
-/// + fsync): with every journal dying at once, only flushed bytes survive.
+/// topic flushes eagerly (see [`eager_flush_options`]): with every journal
+/// dying at once, only flushed bytes survive.
 pub async fn run_full_cluster_restart(harness: &mut TestHarness) {
     let setup_client = harness
         .root_client()
@@ -521,18 +568,14 @@ pub async fn run_full_cluster_restart(harness: &mut TestHarness) {
         .expect("Failed to create setup client");
 
     setup_client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("Failed to create stream");
     setup_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            Default::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &eager_flush_options(),
         )
         .await
         .expect("Failed to create topic");
@@ -585,11 +628,16 @@ async fn poll_from_zero_until(
             .poll_messages(
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                expected * 2,
-                false,
+                PollOptions {
+                    count: expected * 2,
+                    // Each message is its own batch, so the default byte limit
+                    // holds only a few thousand of them.
+                    max_bytes: POLL_REPLY_MAX_BYTES,
+                    ..PollOptions::default()
+                },
             )
             .await;
         if let Ok(polled) = &polled
@@ -610,7 +658,7 @@ async fn poll_from_zero_until(
 }
 
 /// Rejoin with a window larger than the peers' evicted ring
-/// (`EVICTED_RING_CAPACITY` = 4096 entries): the serving peer answers
+/// (explicitly configured to 4096 entries by the fixture): the serving peer answers
 /// `RangeEvicted` for the front of the range and the commit floor must
 /// settle at its retention point, with the rejoiner's recovered segments
 /// standing in below it. This is the only scenario that exercises
@@ -621,33 +669,22 @@ async fn poll_from_zero_until(
 pub async fn run_ring_overflow_rejoin(harness: &mut TestHarness) {
     const RING_OVERFLOW_OPS: u32 = 4300;
     const POST_RESTART_OPS: u32 = 50;
-    // The point of this scenario is overflowing the peers' evicted ring so
-    // RangeEvicted and the commit floor engage. The harness runs the server on
-    // the shipped default ring capacity; if that default ever reaches this op
-    // count the overflow stops happening and the test silently passes without
-    // covering the floor path. Fail loud instead.
-    const _: () = assert!(
-        RING_OVERFLOW_OPS as usize > configs::partition::DEFAULT_EVICTED_RING_CAPACITY,
-        "RING_OVERFLOW_OPS must exceed the default evicted ring capacity, or this scenario no longer exercises RangeEvicted",
-    );
+    // The fixture pins a smaller ring so production capacity increases do not
+    // turn this into a throughput benchmark or stop exercising RangeEvicted.
 
     let setup_client = harness
         .root_client()
         .await
         .expect("Failed to create setup client");
     setup_client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("Failed to create stream");
     setup_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            Default::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &eager_flush_options(),
         )
         .await
         .expect("Failed to create topic");

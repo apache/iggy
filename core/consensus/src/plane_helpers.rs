@@ -16,11 +16,12 @@
 // under the License.
 
 use crate::{
-    Consensus, IgnoreReason, Pipeline, PipelineEntry, PlaneKind, PrepareOkOutcome, Sequencer,
-    Status, VsrConsensus,
+    Consensus, DvcHeaderKind, IgnoreReason, MergedLog, Pipeline, PipelineEntry, PlaneKind,
+    PrepareOkOutcome, ReplicationSend, Sequencer, Status, VsrConsensus, dvc_header_kind,
 };
+use iggy_binary_protocol::consensus::{REJECTION_SECTION_LEN, write_rejection_section};
 use iggy_binary_protocol::{
-    CHECKSUM_UNSEALED, Command2, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
+    CHECKSUM_UNSEALED, Command, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
     ReplyHeader, RoutedRequestHeader, frame_body,
 };
 use message_bus::{MessageBus, SendError};
@@ -30,25 +31,24 @@ use server_common::{
 };
 use std::{error::Error, fmt, mem::size_of, ops::AsyncFnOnce};
 
-/// Failure to route or forward a prepare through the replication chain.
+/// Failure to enqueue a prepare for replication.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum ChainReplicationError {
+pub enum PrepareReplicationError {
     MalformedPrepare,
-    UnexpectedCommand { command: Command2 },
+    UnexpectedCommand { command: Command },
     CommittedPrepare { op: u64, commit_min: u64 },
-    SelfRoute { replica: u8 },
     Transport(SendError),
 }
 
-impl ChainReplicationError {
+impl PrepareReplicationError {
     #[must_use]
     pub const fn is_transport(&self) -> bool {
         matches!(self, Self::Transport(_))
     }
 }
 
-impl fmt::Display for ChainReplicationError {
+impl fmt::Display for PrepareReplicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MalformedPrepare => formatter.write_str("malformed prepare frame"),
@@ -59,18 +59,12 @@ impl fmt::Display for ChainReplicationError {
                 formatter,
                 "prepare op {op} is not above committed op {commit_min}"
             ),
-            Self::SelfRoute { replica } => {
-                write!(
-                    formatter,
-                    "replication chain routes replica {replica} to itself"
-                )
-            }
             Self::Transport(error) => error.fmt(formatter),
         }
     }
 }
 
-impl Error for ChainReplicationError {
+impl Error for PrepareReplicationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Transport(error) => Some(error),
@@ -79,7 +73,7 @@ impl Error for ChainReplicationError {
     }
 }
 
-impl From<SendError> for ChainReplicationError {
+impl From<SendError> for PrepareReplicationError {
     fn from(error: SendError) -> Self {
         Self::Transport(error)
     }
@@ -129,118 +123,122 @@ where
     header.op <= consensus.commit_min()
 }
 
-/// Shared chain-replication forwarding to the next replica.
-///
-/// Borrows the message, makes a deep copy for the wire, and lets the caller
-/// retain ownership for journal append.
+/// Enqueue one shared wire copy for every backup. Backups never forward it.
 ///
 /// # Errors
 ///
-/// Returns an error if the prepare cannot be routed or the bus cannot deliver
-/// it to the next replica.
-/// Callers decide error policy (VSR retransmits from WAL via prepare timeout).
+/// Returns the first enqueue error after attempting every backup. The bus
+/// bounds each peer's queue; a full queue must not skip another peer.
 #[allow(clippy::future_not_send)]
-pub async fn replicate_to_next_in_chain<B, P>(
+pub async fn replicate_prepare<B, P>(
     consensus: &VsrConsensus<B, P>,
     message: &Message<PrepareHeader>,
-) -> Result<(), ChainReplicationError>
+) -> Result<(), PrepareReplicationError>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    let Some(next) = replication_target(consensus, message.header())? else {
+    if !primary_sends_prepare(consensus, message.header())? {
         return Ok(());
-    };
+    }
     let frozen = message.deep_copy().into_generic().into_frozen();
-    consensus
-        .message_bus()
-        .send_to_replica(next, frozen)
-        .await
-        .map_err(Into::into)
+    enqueue_prepare_for_backups(consensus, frozen).await
 }
 
-/// Forward an already validated frozen prepare to the next replica without
-/// copying its payload.
+/// Enqueue a frozen prepare for every backup without copying its payload.
 ///
 /// # Errors
 ///
-/// Returns an error if the frame is malformed, cannot be routed, or the bus
-/// cannot deliver it to the next replica.
+/// Returns an error for a malformed frame, or the first enqueue error after
+/// attempting every backup.
 #[allow(clippy::future_not_send)]
-pub async fn replicate_frozen_to_next_in_chain<B, P>(
+pub async fn replicate_frozen_prepare<B, P>(
     consensus: &VsrConsensus<B, P>,
     message: Frozen<MESSAGE_ALIGN>,
-) -> Result<(), ChainReplicationError>
+) -> Result<(), PrepareReplicationError>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     let header = frozen_prepare_header(&message)?;
-    let Some(next) = replication_target(consensus, &header)? else {
+    if !primary_sends_prepare(consensus, &header)? {
         return Ok(());
-    };
-    consensus
-        .message_bus()
-        .send_to_replica(next, message)
-        .await
-        .map_err(Into::into)
-}
-
-fn frozen_prepare_header(
-    message: &Frozen<MESSAGE_ALIGN>,
-) -> Result<PrepareHeader, ChainReplicationError> {
-    let header_bytes = message
-        .as_slice()
-        .get(..size_of::<PrepareHeader>())
-        .ok_or(ChainReplicationError::MalformedPrepare)?;
-    let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
-        .copied()
-        .map_err(|_| ChainReplicationError::MalformedPrepare)?;
-    header
-        .validate()
-        .map_err(|_| ChainReplicationError::MalformedPrepare)?;
-    let frame_size =
-        usize::try_from(header.size).map_err(|_| ChainReplicationError::MalformedPrepare)?;
-    if !(size_of::<PrepareHeader>()..=message.len()).contains(&frame_size) {
-        return Err(ChainReplicationError::MalformedPrepare);
     }
-    Ok(header)
+    enqueue_prepare_for_backups(consensus, message).await
 }
 
-fn replication_target<B, P>(
+#[allow(clippy::future_not_send)]
+async fn enqueue_prepare_for_backups<B, P>(
     consensus: &VsrConsensus<B, P>,
-    header: &PrepareHeader,
-) -> Result<Option<u8>, ChainReplicationError>
+    message: Frozen<MESSAGE_ALIGN>,
+) -> Result<(), PrepareReplicationError>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    if header.command != Command2::Prepare {
-        return Err(ChainReplicationError::UnexpectedCommand {
+    let op = frozen_prepare_header(&message)?.op;
+    let mut first_error = None;
+    for replica in 0..consensus.replica_count() {
+        if replica == consensus.replica() {
+            continue;
+        }
+        if let Err(error) = consensus
+            .send_replicated_prepare(replica, op, message.clone(), ReplicationSend::Live)
+            .await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), |error| Err(error.into()))
+}
+
+fn frozen_prepare_header(
+    message: &Frozen<MESSAGE_ALIGN>,
+) -> Result<PrepareHeader, PrepareReplicationError> {
+    let header_bytes = message
+        .as_slice()
+        .get(..size_of::<PrepareHeader>())
+        .ok_or(PrepareReplicationError::MalformedPrepare)?;
+    let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
+        .copied()
+        .map_err(|_| PrepareReplicationError::MalformedPrepare)?;
+    header
+        .validate()
+        .map_err(|_| PrepareReplicationError::MalformedPrepare)?;
+    let frame_size =
+        usize::try_from(header.size).map_err(|_| PrepareReplicationError::MalformedPrepare)?;
+    if !(size_of::<PrepareHeader>()..=message.len()).contains(&frame_size) {
+        return Err(PrepareReplicationError::MalformedPrepare);
+    }
+    Ok(header)
+}
+
+fn primary_sends_prepare<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    header: &PrepareHeader,
+) -> Result<bool, PrepareReplicationError>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    if header.command != Command::Prepare {
+        return Err(PrepareReplicationError::UnexpectedCommand {
             command: header.command,
         });
     }
     let commit_min = consensus.commit_min();
     if header.op <= commit_min {
-        return Err(ChainReplicationError::CommittedPrepare {
+        return Err(PrepareReplicationError::CommittedPrepare {
             op: header.op,
             commit_min,
         });
     }
 
-    let next = (consensus.replica() + 1) % consensus.replica_count();
-    let primary = consensus.primary_index(header.view);
-
-    if next == primary {
-        return Ok(None);
-    }
-
-    if next == consensus.replica() {
-        return Err(ChainReplicationError::SelfRoute {
-            replica: consensus.replica(),
-        });
-    }
-    Ok(Some(next))
+    Ok(consensus.is_acting_primary()
+        && !consensus.has_observed_newer_view()
+        && !consensus.is_transferring()
+        && header.view == consensus.view())
 }
 
 /// Re-stamp a stored prepare with the current view before retransmission.
@@ -307,7 +305,7 @@ pub fn verify_prepare_integrity(header: &PrepareHeader, frame: &[u8]) -> Result<
 /// status, or the message's view differs from the replica's.
 ///
 /// # Panics
-/// If `header.command` is not `Command2::Prepare`.
+/// If `header.command` is not `Command::Prepare`.
 pub fn replicate_preflight<B, P>(
     consensus: &VsrConsensus<B, P>,
     header: &PrepareHeader,
@@ -316,7 +314,7 @@ where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    assert_eq!(header.command, Command2::Prepare);
+    assert_eq!(header.command, Command::Prepare);
 
     if consensus.is_transferring() {
         return Err(IgnoreReason::StateTransfer);
@@ -336,12 +334,8 @@ where
         return Err(IgnoreReason::NewerView);
     }
 
-    // Deposed-primary prepares can still be in flight after a view change:
-    // replicate_to_next_in_chain stops the ring at primary_index(header.view),
-    // not the current view's primary, so a stale prepare reaches the new
-    // primary and would hit its sequencer invariants. Uncommitted old-view
-    // ops are decided by the view change, never by late delivery. Message
-    // repair, once it lands, fetches prepares via its own path, not here.
+    // Late fanout from a deposed primary must not decide uncommitted old-view
+    // ops. View change and message repair recover them through their own paths.
     if header.view < consensus.view() {
         return Err(IgnoreReason::OlderView);
     }
@@ -368,6 +362,21 @@ pub fn seal_prepare_checksum(mut message: Message<PrepareHeader>) -> Message<Pre
         .expect("a prepare header round-trips its own bit pattern");
     header.checksum = checksum;
     message
+}
+
+#[must_use]
+/// # Panics
+/// If capacity exceeds `u32`; configuration and recovery validate a tighter bound.
+pub fn seal_prepare_capacity(
+    message: Message<PrepareHeader>,
+    capacity: usize,
+) -> Message<PrepareHeader> {
+    let capacity = u32::try_from(capacity).expect("configured retry capacity fits u32");
+    let message = message.transmute_header(|old, new| {
+        *new = old;
+        new.retry_capacity = capacity;
+    });
+    seal_prepare_checksum(message)
 }
 
 /// Shared preflight checks for `on_ack`.
@@ -415,15 +424,15 @@ where
         return false;
     }
 
-    let pipeline = consensus.pipeline().borrow();
     let mut new_commit = consensus.commit_max();
-    while let Some(entry) = pipeline.entry_by_op(new_commit + 1) {
-        if !entry.ok_quorum_received {
-            break;
+    consensus.with_pipeline(|pipeline| {
+        while let Some(entry) = pipeline.entry_by_op(new_commit + 1) {
+            if !entry.ok_quorum_received {
+                break;
+            }
+            new_commit += 1;
         }
-        new_commit += 1;
-    }
-    drop(pipeline);
+    });
 
     if new_commit > consensus.commit_max() {
         consensus.advance_commit_max(new_commit);
@@ -433,56 +442,95 @@ where
     false
 }
 
-/// Drain and return committable prepares from the pipeline head.
+/// Whether a repair session may still run.
 ///
-/// Entries are drained only from the head and only while their op is covered
-/// by the current commit frontier.
+/// `Normal` is the ordinary case. The exception is a primary-elect that parked a
+/// merged log: its repair runs in `ViewChange` by design, because the log it is
+/// repairing toward is one nobody has started yet. Reading `is_normal` alone at an
+/// ingest site drops the frame AND the session, so the coverage scan re-arms every
+/// tick and nothing it fetches can ever land.
 ///
-/// # Panics
-/// If `head()` returns `Some` but `pop()` returns `None` (unreachable).
-pub fn drain_committable_prefix<B, P>(consensus: &VsrConsensus<B, P>) -> Vec<PipelineEntry>
+/// Every site that fences a repair session on status must use this, so the arming
+/// side and the ingest side cannot drift apart.
+pub fn repair_session_live<B, P>(consensus: &VsrConsensus<B, P>) -> bool
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    let commit = consensus.commit_max();
-    let mut drained = Vec::new();
-    let mut pipeline = consensus.pipeline().borrow_mut();
-
-    while let Some(head_op) = pipeline.head().map(|entry| entry.header.op) {
-        if head_op > commit {
-            break;
-        }
-
-        let entry = pipeline
-            .pop()
-            .expect("drain_committable_prefix: head exists");
-        drained.push(entry);
-    }
-
-    drained
+    consensus.is_normal() || consensus.is_primary_elect()
 }
 
-/// Header of the pipeline head, iff its op is covered by the commit frontier.
+/// Header of the pipeline head, iff its op is the next one this replica owes its
+/// state machine and is covered by the commit frontier.
 ///
-/// Peek-only counterpart of [`drain_committable_prefix`] for commit paths that
-/// must survive their driving future being canceled between "committable" and
+/// Commit paths must survive their driving future being canceled between "committable" and
 /// "applied" (see `IggyMetadata::on_ack`): the caller peeks here, performs its
-/// awaits with the entry still in the pipeline, then — in a sync region —
+/// awaits with the entry still in the pipeline, then synchronously
 /// revalidates that the head is still this exact entry before popping and
 /// applying it. A driver dropped at an await strands nothing; a sibling driver
 /// that committed the op first fails the caller's revalidation and re-peeks.
+///
+/// A head that is not `commit_min + 1` is held and reported, because applying it
+/// would violate sequential advancement. Holding is safe: a shard pump's panic is
+/// swallowed by `compio::runtime::spawn`, while `tick_metadata` re-arms repair on
+/// the level.
 pub fn peek_committable_head<B, P>(consensus: &VsrConsensus<B, P>) -> Option<PrepareHeader>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     let commit = consensus.commit_max();
-    let pipeline = consensus.pipeline().borrow();
-    pipeline
-        .head()
-        .map(|entry| entry.header)
-        .filter(|header| header.op <= commit)
+    let commit_min = consensus.commit_min();
+    let head = consensus
+        .pipeline_head_header()
+        .filter(|header| header.op <= commit)?;
+    if head.op != commit_min + 1 {
+        report_uncommittable_head(consensus.replica(), head.op, commit_min, commit, 0);
+        return None;
+    }
+    Some(head)
+}
+
+/// Log a held pipeline head, with the remedy for the arm it is in.
+///
+/// `debug`, not `warn`, matching `tick_partitions` / `tick_metadata`: a hold is the
+/// steady state for a whole rejoin, so `warn` is one line per group per tick. A
+/// hold that never clears is caught by a simulator invariant, not by this line.
+pub fn report_uncommittable_head(
+    replica: u8,
+    head_op: u64,
+    commit_min: u64,
+    commit_max: u64,
+    drained: usize,
+) {
+    if head_op > commit_min {
+        tracing::debug!(
+            replica,
+            head_op,
+            expected_op = commit_min + 1,
+            commit_min,
+            commit_max,
+            drained,
+            "committable head sits above a hole in the committed prefix; holding the commit \
+             walk until the ops below it are journaled"
+        );
+    } else {
+        // Reported, not called a defect: a commit-floor jump reaches this state
+        // legitimately. `IggyMetadata`'s state-transfer install and
+        // `IggyPartition::complete_repair` both raise `commit_min` past a live
+        // pipeline via `set_commit_floor` without the `clear_pipeline` the
+        // partition transfer path pairs with it. Nothing pops a head below the
+        // floor, so it holds until a view change clears the pipeline.
+        tracing::warn!(
+            replica,
+            head_op,
+            commit_min,
+            commit_max,
+            drained,
+            "committable head sits at or below the applied commit point; nothing can pop \
+             or answer this entry until a view change clears the pipeline"
+        );
+    }
 }
 
 /// Build reply for a committed prepare.
@@ -526,53 +574,27 @@ where
 {
     let header_size = std::mem::size_of::<ReplyHeader>();
     let total_size = header_size + body_len;
-    let mut buffer = bytes::BytesMut::zeroed(total_size);
+    let mut buffer = Owned::<4096>::zeroed(total_size);
 
-    let header = ReplyHeader {
-        checksum: 0,
-        checksum_body: 0,
-        cluster: prepare_header.cluster,
-        size: total_size as u32,
-        // Commit-time view
-        view: prepare_header.view,
-        release: prepare_header.release,
-        command: Command2::Reply,
-        // Original primary's id
-        replica: prepare_header.replica,
-        reserved_frame: [0; 66],
-        request_checksum: prepare_header.request_checksum,
-        context: 0,
-        client: prepare_header.client,
-        op: prepare_header.op,
-        // Prepare's op (not commit_max): drives ClientTable eviction order;
-        // must be deterministic across replicas.
-        commit: prepare_header.op,
-        timestamp: prepare_header.timestamp,
-        request: prepare_header.request,
-        operation: prepare_header.operation,
-        ..Default::default()
-    };
-    // `BytesMut` makes no alignment guarantee, so never cast into it.
-    buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+    let header = ReplyHeader::from_prepare(prepare_header, total_size as u32);
+    let bytes = buffer.as_mut_slice();
+    bytes[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 
-    fill(&mut buffer[header_size..]);
+    fill(&mut bytes[header_size..]);
 
-    // TODO: drop this copy once replies stop round-tripping through `Bytes`
-    // and the binary protocol uses `Owned` end-to-end.
-    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
-        .expect("reply buffer must contain a valid reply message")
+    Message::try_from(buffer).expect("reply buffer must contain a valid reply message")
 }
 
 /// Builds a `Reply` carrying only a single-entry result section, no payload:
 /// the generic `[count=1][index=0][result=code]` rejection frame.
 ///
-/// Two families of `code` ride this frame. `TransientNotCommitted` marks a
-/// request that could not be committed *right now* (not-caught-up / in-flight
-/// / pipeline-full / view-change cancel); the SDK decodes it and replays the
-/// same `request_id` immediately instead of waiting out its response
-/// read-timeout. Any other code is a TERMINAL rejection (e.g. a committed
-/// metadata rejection like `UserAlreadyExists`) that the SDK surfaces as the
-/// typed error.
+/// `TransientNotCommitted` marks a request that could not be committed right
+/// now (not-caught-up / in-flight / pipeline-full / view-change cancel).
+/// Other codes describe pre-consensus rejections. Neither proves the final
+/// result of an earlier uncertain attempt with the same request identity, so
+/// the header carries no commit marker. A caller that refuses a replay of a
+/// request that committed swaps in the committed reply's header instead, as
+/// the metadata plane does for a replayed `CreatePersonalAccessToken`.
 ///
 /// Stamped from the request header (no prepare exists for a rejected op).
 /// `commit` is the primary's current commit position and is informational
@@ -588,41 +610,24 @@ pub fn build_result_rejection_reply(
     commit: u64,
     code: u32,
 ) -> Message<ReplyHeader> {
-    // `[count: u32][index: u32][result: u32]`, the single-entry rejection shape
-    // of `ApplyReply::write_reply_body` (mirrored here to avoid a metadata dep).
-    const RESULT_BODY_LEN: usize = 12;
     let header_size = std::mem::size_of::<ReplyHeader>();
-    let total_size = header_size + RESULT_BODY_LEN;
-    let mut buffer = bytes::BytesMut::zeroed(total_size);
+    let total_size = header_size + REJECTION_SECTION_LEN;
+    let mut buffer = Owned::<4096>::zeroed(total_size);
 
     let header = ReplyHeader {
-        cluster: request_header.cluster,
-        size: total_size as u32,
-        view: request_header.view,
-        release: request_header.release,
-        command: Command2::Reply,
-        replica: request_header.replica,
-        request_checksum: request_header.request_checksum,
         client: request_header.client,
         // Position-typed like the sibling builders (`build_reply_from_request`
         // stamps `op: commit` too); inert on this path -- rejections are never
         // cached -- but keeps the wire field convention for frame inspection.
         op: commit,
         commit,
-        timestamp: request_header.timestamp,
-        request: request_header.request,
-        operation: request_header.operation,
-        ..Default::default()
+        ..ReplyHeader::echoing(request_header, total_size as u32)
     };
-    buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+    let bytes = buffer.as_mut_slice();
+    bytes[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+    write_rejection_section(&mut bytes[header_size..], code);
 
-    let body = &mut buffer[header_size..];
-    body[0..4].copy_from_slice(&1u32.to_le_bytes());
-    body[4..8].copy_from_slice(&0u32.to_le_bytes());
-    body[8..12].copy_from_slice(&code.to_le_bytes());
-
-    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
-        .expect("transient reply buffer must contain a valid reply message")
+    Message::try_from(buffer).expect("transient reply buffer must contain a valid reply message")
 }
 
 /// Reply for fast paths that skip the VSR pipeline (e.g. `AckLevel::NoAck`).
@@ -644,7 +649,7 @@ where
 {
     let header_size = std::mem::size_of::<ReplyHeader>();
     let total_size = header_size + body.len();
-    let mut buffer = bytes::BytesMut::zeroed(total_size);
+    let mut buffer = Owned::<4096>::zeroed(total_size);
 
     let commit = consensus.commit_max();
     let header = ReplyHeader {
@@ -654,7 +659,7 @@ where
         size: total_size as u32,
         view: consensus.view(),
         release: 0,
-        command: Command2::Reply,
+        command: Command::Reply,
         replica: consensus.replica(),
         reserved_frame: [0; 66],
         request_checksum: request_header.request_checksum,
@@ -667,14 +672,14 @@ where
         operation: request_header.operation,
         ..Default::default()
     };
-    buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+    let bytes = buffer.as_mut_slice();
+    bytes[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 
     if !body.is_empty() {
-        buffer[header_size..].copy_from_slice(&body);
+        bytes[header_size..].copy_from_slice(&body);
     }
 
-    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
-        .expect("reply buffer must contain a valid reply message")
+    Message::try_from(buffer).expect("reply buffer must contain a valid reply message")
 }
 
 /// Reply that denies a request on the primary before it enters the VSR
@@ -726,27 +731,16 @@ pub fn build_deny_reply_from_request_header(
     status: u32,
 ) -> Message<ReplyHeader> {
     let header_size = std::mem::size_of::<ReplyHeader>();
-    let mut buffer = bytes::BytesMut::zeroed(header_size);
+    let mut buffer = Owned::<4096>::zeroed(header_size);
 
     let header = ReplyHeader {
-        cluster: request_header.cluster,
-        size: header_size as u32,
-        view: request_header.view,
-        release: request_header.release,
-        command: Command2::Reply,
-        replica: request_header.replica,
-        request_checksum: request_header.request_checksum,
         client: request_header.client,
         status,
-        timestamp: request_header.timestamp,
-        request: request_header.request,
-        operation: request_header.operation,
-        ..Default::default()
+        ..ReplyHeader::echoing(request_header, header_size as u32)
     };
-    buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+    buffer.as_mut_slice()[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 
-    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
-        .expect("deny reply buffer must contain a valid reply message")
+    Message::try_from(buffer).expect("deny reply buffer must contain a valid reply message")
 }
 
 /// Verify hash chain would not break if we add this header.
@@ -767,31 +761,66 @@ pub fn panic_if_hash_chain_would_break_in_same_view(
     }
 }
 
-// TODO: Figure out how to make this check the journal if it contains the prepare.
+/// Resolve a repair's contiguous head and the checksum of the entry sitting at it.
+///
+/// A view change can put the sequencer above holes that repair later backfills.
+/// Such a lower entry changes durable coverage, but not the head the next prepare
+/// must parent: taking its checksum would rewind the chain while leaving the
+/// sequencer ahead of it. `None` until the journal holds the entry at the head.
+pub fn repaired_frontier_update(
+    previous_frontier: u64,
+    mut header_at: impl FnMut(u64) -> Option<PrepareHeader>,
+) -> Option<(u64, u128)> {
+    let mut frontier = previous_frontier;
+    // Re-anchored on the head the journal can prove, not only on an advance:
+    // `handle_start_view` moves the sequencer to the announced head without
+    // touching the checksum, so the frame that finally delivers that head is
+    // the only chance to make the pair agree again.
+    let mut checksum = header_at(frontier).map(|header| header.checksum);
+    while let Some(header) = header_at(frontier + 1) {
+        frontier += 1;
+        checksum = Some(header.checksum);
+    }
+    checksum.map(|checksum| (frontier, checksum))
+}
+
+/// Ack a prepare back to its primary once the owning plane vouches for it.
+///
+/// `is_persisted` is the caller's journal-containment verdict for `header`:
+/// consensus is sans-io and cannot consult the journal itself, so the plane
+/// that owns the journal must vouch that this exact prepare is durable before
+/// the ack leaves. `false` withholds the ack; the primary's retransmit
+/// re-drives it once a later persist succeeds. Returns `true` only after the
+/// acknowledgment is queued for delivery.
+///
 /// # Panics
-/// - If `header.command` is not `Command2::Prepare`.
+/// - If `header.command` is not `Command::Prepare`.
 /// - If `header.view > consensus.view()`.
 #[allow(clippy::cast_possible_truncation, clippy::future_not_send)]
 pub async fn send_prepare_ok<B, P>(
     consensus: &VsrConsensus<B, P>,
     header: &PrepareHeader,
-    is_persisted: Option<bool>,
-) where
+    is_persisted: bool,
+) -> bool
+where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    assert_eq!(header.command, Command2::Prepare);
+    assert_eq!(header.command, Command::Prepare);
 
     if consensus.status() != Status::Normal {
-        return;
+        return false;
     }
 
-    if consensus.is_transferring() {
-        return;
+    if consensus.is_transferring()
+        || consensus.view_log_unproven()
+        || !consensus.history_certified()
+    {
+        return false;
     }
 
-    if is_persisted == Some(false) {
-        return;
+    if !is_persisted {
+        return false;
     }
 
     assert!(
@@ -802,11 +831,11 @@ pub async fn send_prepare_ok<B, P>(
     );
 
     if header.op > consensus.sequencer().current_sequence() {
-        return;
+        return false;
     }
 
     let prepare_ok_header = PrepareOkHeader {
-        command: Command2::PrepareOk,
+        command: Command::PrepareOk,
         cluster: consensus.cluster(),
         replica: consensus.replica(),
         view: consensus.view(),
@@ -833,18 +862,247 @@ pub async fn send_prepare_ok<B, P>(
 
     consensus
         .send_or_loopback(primary, message.into_generic())
-        .await;
+        .await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewLogProof {
+    Proven,
+    /// Fetch `op`; retained entries above `unproven_through` match the view.
+    Missing {
+        op: u64,
+        unproven_through: u64,
+    },
+    /// This replica holds an entry at every op in `first..=last`, and each differs
+    /// from the view; retained entries above `last` match it.
+    Divergent {
+        first: u64,
+        last: u64,
+    },
+}
+
+/// Prove held entries against the view's hash chain. Canonical headers can
+/// bridge missing bodies; a gap with no header leaves its lower prefix unknown.
+///
+/// A canonical header off the chain is no header, so its op is such a gap. It is
+/// no divergence: nothing is held there to remove, and the next proof would name
+/// the same op again.
+///
+/// A divergence spans every contiguous held entry the chain still proves wrong,
+/// so the caller removes it with one rewrite instead of one per op.
+#[must_use]
+pub fn view_log_proof(
+    commit_floor: u64,
+    canonical: &[PrepareHeader],
+    op_head: u64,
+    header_at: impl Fn(u64) -> Option<PrepareHeader>,
+) -> ViewLogProof {
+    let proven = locally_proven_commit(commit_floor, &header_at);
+    if op_head <= proven {
+        return ViewLogProof::Proven;
+    }
+    let Some(head) = canonical
+        .first()
+        .filter(|head| head.op == op_head && dvc_header_kind(head) != DvcHeaderKind::Blank)
+    else {
+        // No canonical checksum to test a resident head against, so fetch one.
+        return ViewLogProof::Missing {
+            op: op_head,
+            unproven_through: op_head,
+        };
+    };
+    let mut expected = head.checksum;
+    let mut missing = None;
+    for op in (proven + 1..=op_head).rev() {
+        let header = if let Some(local) = header_at(op) {
+            local
+        } else if let Some(header) = canonical_header_at(canonical, op)
+            .filter(|header| header.checksum != CHECKSUM_UNSEALED && header.checksum == expected)
+        {
+            // The lowest missing body, not the highest: the repair window opens at
+            // it and runs up to the head, so one round fetches every bridged body.
+            missing = Some(op);
+            *header
+        } else {
+            return ViewLogProof::Missing {
+                op,
+                unproven_through: op,
+            };
+        };
+        if header.checksum == CHECKSUM_UNSEALED || header.checksum != expected {
+            return ViewLogProof::Divergent {
+                first: divergent_run_first(op, expected, proven, canonical, &header_at),
+                last: op,
+            };
+        }
+        expected = header.parent;
+    }
+    missing.map_or(ViewLogProof::Proven, |op| ViewLogProof::Missing {
+        op,
+        unproven_through: 0,
+    })
+}
+
+fn canonical_header_at(canonical: &[PrepareHeader], op: u64) -> Option<&PrepareHeader> {
+    canonical
+        .iter()
+        .find(|header| header.op == op && dvc_header_kind(header) != DvcHeaderKind::Blank)
+}
+
+/// Lowest op of the divergent run ending at `last`, where the view expects `expected`.
+///
+/// A held entry below joins the run when it differs from the parent that the
+/// view's header one op up names, the same test the walk applies. The run ends
+/// where that header is missing or off the chain, so an entry past an unknown op
+/// stays.
+fn divergent_run_first(
+    last: u64,
+    mut expected: u128,
+    proven: u64,
+    canonical: &[PrepareHeader],
+    header_at: &impl Fn(u64) -> Option<PrepareHeader>,
+) -> u64 {
+    let mut first = last;
+    while first - 1 > proven {
+        let Some(named) = canonical_header_at(canonical, first)
+            .filter(|named| named.checksum != CHECKSUM_UNSEALED && named.checksum == expected)
+        else {
+            break;
+        };
+        expected = named.parent;
+        if header_at(first - 1)
+            .is_none_or(|local| local.checksum != CHECKSUM_UNSEALED && local.checksum == expected)
+        {
+            break;
+        }
+        first -= 1;
+    }
+    first
+}
+
+fn locally_proven_commit(
+    commit_floor: u64,
+    header_at: &impl Fn(u64) -> Option<PrepareHeader>,
+) -> u64 {
+    let mut proven = commit_floor;
+    let mut op = commit_floor;
+    let mut parent = None;
+    while let Some(next_op) = op.checked_add(1) {
+        let Some(local) = header_at(next_op) else {
+            break;
+        };
+        if local.checksum == CHECKSUM_UNSEALED
+            || parent.is_some_and(|checksum| local.parent != checksum)
+        {
+            break;
+        }
+        proven = proven.max(local.commit.min(op));
+        parent = Some(local.checksum);
+        op = next_op;
+    }
+    proven
+}
+
+/// What a replica's own log says about a repaired prepare before it journals it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairEvidence {
+    /// The view's log names this prepare.
+    Proven,
+    /// Nothing held names the prepare or rules it out.
+    Unproven,
+    /// The view's log names another prepare at or next to this op, or the frame
+    /// does not chain to a held neighbor.
+    Contradicted,
+}
+
+/// Classify a repaired prepare against the headers this replica already trusts.
+///
+/// A repair body carries no sender, so a stale peer's abandoned prepare at a
+/// committed op passes every integrity check. Only this replica's own log can
+/// vouch for it: `pending` is the adopted view's log, whose suffix and committed
+/// headers it names, and `held_at(op)` returns the journaled header at `op` with
+/// whether the view-log proof covers it.
+///
+/// Three things prove a prepare. A vouched header at its op with its checksum. A
+/// vouched header one op up whose `parent` is its checksum. A `view` stamp at or
+/// above this replica's view: only that view's primary stamps or restamps it, and
+/// that primary's log holds every op committed in an earlier view, so a prepare an
+/// earlier view abandoned never carries it.
+///
+/// A vouched neighbor that does not chain contradicts. A held unvouched neighbor
+/// that does not chain contradicts only an unproven prepare: one of the two comes
+/// from another branch, and journaling it would splice the branches. An unsealed
+/// checksum on either side of a chain link is no evidence.
+#[must_use]
+pub fn repaired_prepare_evidence(
+    header: &PrepareHeader,
+    view: u32,
+    pending: Option<&MergedLog>,
+    held_at: impl Fn(u64) -> Option<(PrepareHeader, bool)>,
+) -> RepairEvidence {
+    let entry_at = |op: u64| {
+        pending
+            .and_then(|pending| {
+                canonical_header_at(&pending.headers, op)
+                    .or_else(|| canonical_header_at(&pending.committed_elsewhere, op))
+            })
+            .map(|named| (*named, true))
+            .or_else(|| held_at(op))
+    };
+    if let Some((named, true)) = entry_at(header.op) {
+        return if named.checksum == header.checksum {
+            RepairEvidence::Proven
+        } else {
+            RepairEvidence::Contradicted
+        };
+    }
+    let links = |child: &PrepareHeader, parent: &PrepareHeader| {
+        (child.checksum != CHECKSUM_UNSEALED && parent.checksum != CHECKSUM_UNSEALED)
+            .then_some(child.parent == parent.checksum)
+    };
+    let mut proven = header.view >= view;
+    let mut splices = false;
+    let below = header
+        .op
+        .checked_sub(1)
+        .filter(|op| *op > 0)
+        .and_then(entry_at);
+    let above = header.op.checked_add(1).and_then(entry_at);
+    for (link, vouched) in [
+        below.map(|(below, vouched)| (links(header, &below), vouched)),
+        above.map(|(above, vouched)| (links(&above, header), vouched)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match link {
+            Some(false) if vouched => return RepairEvidence::Contradicted,
+            Some(false) => splices = true,
+            _ => {}
+        }
+    }
+    proven |= above.is_some_and(|(above, vouched)| vouched && links(&above, header) == Some(true));
+    if proven {
+        RepairEvidence::Proven
+    } else if splices {
+        RepairEvidence::Contradicted
+    } else {
+        RepairEvidence::Unproven
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Consensus, LocalPipeline, VsrAction};
+    use crate::{Consensus, ConsensusClock, LocalPipeline, ReplicaSet, VsrAction};
     use aligned_vec::{AVec, ConstAlign};
     use iggy_binary_protocol::{ConsensusHeader, Operation, StartViewChangeHeader};
     use iggy_common::calculate_checksum;
-    use message_bus::SendError;
+    use message_bus::{BusMessage, SendError};
     use server_common::{MESSAGE_ALIGN, iobuf::Frozen};
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
 
     /// `PrepareHeader`'s alignment, which every suffix body has to satisfy.
     const BODY_ALIGN: usize = align_of::<PrepareHeader>();
@@ -861,7 +1119,7 @@ mod tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
             Ok(())
         }
@@ -876,7 +1134,6 @@ mod tests {
 
         fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -884,7 +1141,7 @@ mod tests {
         Message::<PrepareHeader>::new(std::mem::size_of::<PrepareHeader>()).transmute_header(
             |_, new| {
                 *new = PrepareHeader {
-                    command: Command2::Prepare,
+                    command: Command::Prepare,
                     size: std::mem::size_of::<PrepareHeader>() as u32,
                     op,
                     parent,
@@ -906,7 +1163,7 @@ mod tests {
             Message::<PrepareHeader>::new(std::mem::size_of::<PrepareHeader>()).transmute_header(
                 |_, new| {
                     *new = PrepareHeader {
-                        command: Command2::Prepare,
+                        command: Command::Prepare,
                         size: std::mem::size_of::<PrepareHeader>() as u32,
                         op: 1,
                         view,
@@ -958,7 +1215,7 @@ mod tests {
         let svc =
             Message::<StartViewChangeHeader>::new(std::mem::size_of::<StartViewChangeHeader>())
                 .transmute_header(|_, new: &mut StartViewChangeHeader| {
-                    new.command = Command2::StartViewChange;
+                    new.command = Command::StartViewChange;
                     new.size = std::mem::size_of::<StartViewChangeHeader>() as u32;
                     new.view = 1;
                     new.replica = 0;
@@ -998,7 +1255,7 @@ mod tests {
         let svc =
             Message::<StartViewChangeHeader>::new(std::mem::size_of::<StartViewChangeHeader>())
                 .transmute_header(|_, new: &mut StartViewChangeHeader| {
-                    new.command = Command2::StartViewChange;
+                    new.command = Command::StartViewChange;
                     new.size = std::mem::size_of::<StartViewChangeHeader>() as u32;
                     new.view = 1;
                     new.replica = 0;
@@ -1028,14 +1285,16 @@ mod tests {
             size: std::mem::size_of::<DoViewChangeHeader>() as u32,
             view: 1,
             release: 0,
-            command: Command2::DoViewChange,
+            command: Command::DoViewChange,
             replica: 1,
             reserved_frame: [0; 66],
             op: dvc_op,
             commit,
             group: 0,
             log_view: 0,
-            reserved: [0; 68],
+            flags: 0,
+            reserved: [0; 59],
+            partition_incarnation: 0,
             nack_bitset: 0,
             present_bitset: 0,
         };
@@ -1052,7 +1311,7 @@ mod tests {
         // moved with it, one op would carry different checksums per receiving view
         // and the merge would read them as competing prepares nacking each other.
         let base = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             operation: iggy_binary_protocol::Operation::CreateStream,
             op: 9,
             view: 4,
@@ -1123,13 +1382,167 @@ mod tests {
     }
 
     #[test]
+    fn given_restamped_lower_op_when_rebuilding_pipeline_should_keep_the_chain() {
+        // A backup that missed op 9 journals the copy the view-3 primary
+        // retransmits, restamped to view 3, while op 10 keeps the view-0 stamp it
+        // arrived with. Promoted later, it rebuilds its pipeline from these headers.
+        let retransmitted = restamp_prepare_view(prepare_message(9, 7, 11).into_frozen(), 3)
+            .expect("valid prepare");
+        let lower = *bytemuck::checked::try_from_bytes::<PrepareHeader>(
+            &retransmitted[..size_of::<PrepareHeader>()],
+        )
+        .expect("restamped prepare header");
+        let upper = *prepare_message(10, lower.checksum, 13).header();
+        assert!(upper.view < lower.view);
+
+        let mut pipeline = LocalPipeline::new();
+        pipeline.push(PipelineEntry::new(lower));
+        pipeline.push(PipelineEntry::new(upper));
+
+        assert_eq!(pipeline.prepare_count(), 2);
+        assert!(pipeline.message_by_op_and_checksum(10, 13).is_some());
+    }
+
+    #[test]
     fn given_truncated_buffer_when_reading_frozen_prepare_should_reject() {
         let malformed: Frozen<MESSAGE_ALIGN> = Owned::<MESSAGE_ALIGN>::copy_from_slice(&[0]).into();
 
         assert!(matches!(
             frozen_prepare_header(&malformed),
-            Err(ChainReplicationError::MalformedPrepare)
+            Err(PrepareReplicationError::MalformedPrepare)
         ));
+    }
+
+    #[test]
+    fn given_a_primary_when_replicating_should_enqueue_every_backup_independently() {
+        for count in [3, 5] {
+            for primary in 0..count {
+                for frozen in [false, true] {
+                    let mut consensus = VsrConsensus::new(
+                        1,
+                        primary,
+                        count,
+                        0,
+                        SpyBus::new(),
+                        LocalPipeline::new(),
+                    );
+                    consensus.set_view(u32::from(primary));
+                    consensus.set_log_view(u32::from(primary));
+                    consensus.init();
+                    let message = prepare_message(1, 0, 42).transmute_header(
+                        |old, header: &mut PrepareHeader| {
+                            *header = old;
+                            header.view = u32::from(primary);
+                        },
+                    );
+                    let result = if frozen {
+                        futures::executor::block_on(replicate_frozen_prepare(
+                            &consensus,
+                            message.deep_copy().into_frozen(),
+                        ))
+                    } else {
+                        futures::executor::block_on(replicate_prepare(&consensus, &message))
+                    };
+                    result.unwrap();
+                    let sent = consensus.message_bus().sent.borrow();
+                    let expected: Vec<_> = (0..count).filter(|peer| *peer != primary).collect();
+                    assert_eq!(
+                        sent.iter().map(|(peer, _)| *peer).collect::<Vec<_>>(),
+                        expected
+                    );
+                    for (_, copy) in sent.iter() {
+                        assert_eq!(copy.as_slice(), message.as_slice());
+                        assert!(
+                            copy.shares_allocation(&sent[0].1),
+                            "fanout shares one wire allocation"
+                        );
+                    }
+                    assert_eq!(consensus.commit_max(), 0, "enqueueing is not an ack");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn given_one_full_replica_queue_when_replicating_should_still_enqueue_the_healthy_backup() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, SpyBus::new(), LocalPipeline::new());
+        consensus.init();
+        consensus
+            .message_bus()
+            .failures
+            .borrow_mut()
+            .insert(1, SendError::Backpressure);
+        let result = futures::executor::block_on(replicate_frozen_prepare(
+            &consensus,
+            prepare_message(1, 0, 42).into_frozen(),
+        ));
+        assert!(
+            result.is_err(),
+            "the failed enqueue remains visible for retransmission"
+        );
+        assert_eq!(*consensus.message_bus().attempts.borrow(), [1, 2]);
+        assert_eq!(consensus.message_bus().sent.borrow()[0].0, 2);
+    }
+
+    #[test]
+    fn given_a_backup_or_singleton_when_replicating_should_enqueue_nothing() {
+        for count in [1, 3, 5] {
+            for view in 0..count {
+                for replica in 0..count {
+                    if count > 1 && replica == view {
+                        continue;
+                    }
+                    let consensus = VsrConsensus::new(
+                        1,
+                        replica,
+                        count,
+                        0,
+                        SpyBus::new(),
+                        LocalPipeline::new(),
+                    );
+                    consensus.init();
+                    let prepare = prepare_message(1, 0, 42).transmute_header(
+                        |old, header: &mut PrepareHeader| {
+                            *header = old;
+                            header.view = u32::from(view);
+                        },
+                    );
+                    futures::executor::block_on(replicate_frozen_prepare(
+                        &consensus,
+                        prepare.into_frozen(),
+                    ))
+                    .unwrap();
+                    assert!(consensus.message_bus().attempts.borrow().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn given_an_enqueue_error_when_replicating_should_attempt_every_other_backup() {
+        for error in [
+            SendError::ReplicaNotConnected(1),
+            SendError::ConnectionClosed,
+            SendError::Backpressure,
+            SendError::ReplicaRouteMissing(1),
+            SendError::ReplicaForwardFailed(1),
+            SendError::BusShuttingDown,
+        ] {
+            let consensus = VsrConsensus::new(1, 0, 3, 0, SpyBus::new(), LocalPipeline::new());
+            consensus.init();
+            consensus
+                .message_bus()
+                .failures
+                .borrow_mut()
+                .insert(1, error);
+            let result = futures::executor::block_on(replicate_frozen_prepare(
+                &consensus,
+                prepare_message(1, 0, 42).into_frozen(),
+            ));
+            assert!(result.is_err());
+            assert_eq!(*consensus.message_bus().attempts.borrow(), [1, 2]);
+            assert_eq!(consensus.message_bus().sent.borrow()[0].0, 2);
+        }
     }
 
     #[test]
@@ -1139,8 +1552,8 @@ mod tests {
         let prepare = prepare_message(0, 0, 0);
 
         assert!(matches!(
-            replication_target(&consensus, prepare.header()),
-            Err(ChainReplicationError::CommittedPrepare {
+            primary_sends_prepare(&consensus, prepare.header()),
+            Err(PrepareReplicationError::CommittedPrepare {
                 op: 0,
                 commit_min: 0
             })
@@ -1152,7 +1565,7 @@ mod tests {
         // The distinction the merge depends on: two prepares at one op number are
         // told apart, so a canonical header is distinguishable from a stale one.
         let first = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             operation: iggy_binary_protocol::Operation::CreateStream,
             op: 5,
             client: 1,
@@ -1197,6 +1610,37 @@ mod tests {
     }
 
     #[test]
+    fn loopback_notifier_registers_existing_work_and_only_notifies_new_edges() {
+        let consensus = Rc::new(VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new()));
+        consensus.init();
+        let message =
+            || Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>()).into_generic();
+        consensus.push_loopback(message());
+        let notifications = Rc::new(Cell::new(0));
+        let observed = Rc::clone(&notifications);
+        let owner = Rc::downgrade(&consensus);
+        consensus.set_loopback_notifier(Some(crate::LoopbackNotifier::new(move || {
+            assert!(
+                owner.upgrade().unwrap().has_loopback(),
+                "notification releases the queue borrow"
+            );
+            observed.set(observed.get() + 1);
+        })));
+        assert_eq!(notifications.get(), 1);
+        consensus.push_loopback(message());
+        assert_eq!(notifications.get(), 1);
+        let mut messages = Vec::new();
+        consensus.drain_loopback_into(&mut messages);
+        assert_eq!(messages.len(), 2);
+        consensus.push_loopback(message());
+        assert_eq!(notifications.get(), 2);
+        consensus.set_loopback_notifier(None);
+        consensus.drain_loopback_into(&mut messages);
+        consensus.push_loopback(message());
+        assert_eq!(notifications.get(), 2, "retired owners do not notify");
+    }
+
+    #[test]
     fn loopback_cleared_on_view_change_reset() {
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
         consensus.init();
@@ -1215,7 +1659,7 @@ mod tests {
         consensus.init();
 
         let prepare_header = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             cluster: 1,
             view: 0,
             op: 0,
@@ -1223,18 +1667,18 @@ mod tests {
             ..Default::default()
         };
 
-        futures::executor::block_on(send_prepare_ok(&consensus, &prepare_header, Some(true)));
+        futures::executor::block_on(send_prepare_ok(&consensus, &prepare_header, true));
 
         let mut buf = Vec::new();
         consensus.drain_loopback_into(&mut buf);
         assert_eq!(buf.len(), 1);
-        assert_eq!(buf[0].header().command, Command2::PrepareOk);
+        assert_eq!(buf[0].header().command, Command::PrepareOk);
 
         let typed: Message<PrepareOkHeader> = buf
             .remove(0)
             .try_into_typed()
             .expect("loopback message must be PrepareOk");
-        assert_eq!(typed.header().command, Command2::PrepareOk);
+        assert_eq!(typed.header().command, Command::PrepareOk);
     }
 
     /// A sender's suffix and matching body bytes for a replica that holds every op
@@ -1283,16 +1727,55 @@ mod tests {
                 .expect("synthetic DVC frame fits u32"),
             view,
             release: 0,
-            command: Command2::DoViewChange,
+            command: Command::DoViewChange,
             replica,
             reserved_frame: [0; 66],
             op,
             commit,
             group: 0,
             log_view,
-            reserved: [0; 68],
+            flags: 0,
+            reserved: [0; 59],
+            partition_incarnation: 0,
             nack_bitset: 0,
             present_bitset: present,
+        };
+        (header, body)
+    }
+
+    /// A DVC carrying `op` and `commit` only. Abstention: counts toward the
+    /// view-change quorum, says nothing about any op.
+    fn dvc_numbers_only(
+        replica: u8,
+        view: u32,
+        log_view: u32,
+        op: u64,
+        commit: u64,
+    ) -> (iggy_binary_protocol::DoViewChangeHeader, Body) {
+        use iggy_binary_protocol::DoViewChangeHeader;
+
+        let headers: Vec<PrepareHeader> = Vec::new();
+        let body = encode_body(&headers);
+        let header = DoViewChangeHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: u32::try_from(std::mem::size_of::<DoViewChangeHeader>() + body.len())
+                .expect("synthetic DVC frame fits u32"),
+            view,
+            release: 0,
+            command: Command::DoViewChange,
+            replica,
+            reserved_frame: [0; 66],
+            op,
+            commit,
+            group: 0,
+            log_view,
+            flags: 0,
+            reserved: [0; 59],
+            partition_incarnation: 0,
+            nack_bitset: 0,
+            present_bitset: 0,
         };
         (header, body)
     }
@@ -1311,7 +1794,8 @@ mod tests {
         let mut ascending = Vec::new();
         for op in low.max(1)..=high {
             let mut header = PrepareHeader {
-                command: Command2::Prepare,
+                command: Command::Prepare,
+                cluster: 1,
                 operation: iggy_binary_protocol::Operation::CreateStream,
                 op,
                 view,
@@ -1341,11 +1825,12 @@ mod tests {
             .expect("header fits u32"),
             view,
             release: 0,
-            command: Command2::StartViewChange,
+            command: Command::StartViewChange,
             replica,
             reserved_frame: [0; 66],
             group: 0,
-            reserved: [0; 120],
+            partition_incarnation: 0,
+            reserved: [0; 112],
         }
     }
 
@@ -1358,6 +1843,116 @@ mod tests {
     ) {
         let headers = suffix_headers(commit, op, log_view);
         consensus.set_local_dvc_suffix(crate::dvc_merge::suffix_all_present(headers));
+    }
+
+    /// The replica that prepared the head is gone for good, one survivor holds its
+    /// header without the body and the other never had it. Both survivors are
+    /// outside the ack set, so the op is truncated and the view starts. Counting the
+    /// header-only sender as neither copy nor nack instead waits for the crashed
+    /// replica forever.
+    #[test]
+    fn given_a_crashed_body_holder_when_merging_should_truncate_and_start_the_view() {
+        // View 3 of 3 replicas elects this one.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.restore_commit_state(2, 2);
+        consensus.sequencer().set_sequence(4);
+        // Bit 0 is op 4: its header, never journaled.
+        let local = suffix_headers(2, 4, 0);
+        consensus.set_local_dvc_suffix(crate::view_change_quorum::DvcSuffix::new(local, 0, 0b110));
+
+        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, 3));
+
+        // Replica 1 stops at op 3. Replica 2 held the only body and never reports.
+        let (dvc, body) = dvc_with_suffix(1, 3, 0, 3, 2, None);
+        let _ = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
+
+        let pending = consensus
+            .pending_view_log()
+            .expect("two senders outside op 4's ack set decide it without replica 2");
+        assert_eq!(
+            pending.op_head, 3,
+            "op 4 never committed, so it is truncated"
+        );
+        assert_eq!(pending.commit_max, 2);
+    }
+
+    /// The shard's refresh, gate included: it re-reads the journal only when the
+    /// snapshot no longer describes it (`refresh_metadata_dvc_suffix`).
+    fn refresh_local_suffix_if_stale(
+        consensus: &VsrConsensus<NoopBus, LocalPipeline>,
+        journal: crate::view_change_quorum::DvcSuffix,
+    ) {
+        if consensus.local_dvc_suffix_stale() {
+            consensus.set_local_dvc_suffix(journal);
+        }
+    }
+
+    /// A backup that adopted a `StartView` sits at the announced head with the
+    /// bodies still missing, so repair filling one moves neither the head nor the
+    /// commit point. Tag the snapshot by those two alone and it keeps reading as
+    /// current, which the merge takes as proof this replica never journaled the op.
+    #[test]
+    fn given_a_repaired_body_under_an_unmoved_head_when_tagging_should_read_the_snapshot_stale() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.restore_commit_state(2, 2);
+        consensus.sequencer().set_sequence(4);
+        let headers = suffix_headers(2, 4, 0);
+        consensus
+            .set_local_dvc_suffix(crate::view_change_quorum::DvcSuffix::new(headers, 0, 0b110));
+        assert!(!consensus.local_dvc_suffix_stale());
+
+        consensus.note_journal_mutation();
+
+        assert!(
+            consensus.local_dvc_suffix_stale(),
+            "the head and the commit point did not move, so only the journal counter \
+             can report the body landing"
+        );
+        assert!(
+            consensus.local_dvc_suffix().is_empty(),
+            "a snapshot that no longer describes the log must nack nothing"
+        );
+    }
+
+    /// The same op, carried through the merge: once the refresh is allowed to run,
+    /// this replica offers op 4's body and the peer that never prepared it is one
+    /// nack short of the quorum, so the view starts keeping the op it acked.
+    #[test]
+    fn given_a_repaired_body_under_an_unmoved_head_when_merging_should_keep_the_acked_op() {
+        // View 3 of 3 replicas elects this one.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.restore_commit_state(2, 2);
+        consensus.sequencer().set_sequence(4);
+        // Adopted the view's header for op 4, body still being repaired.
+        let headers = suffix_headers(2, 4, 0);
+        consensus.set_local_dvc_suffix(crate::view_change_quorum::DvcSuffix::new(
+            headers.clone(),
+            0,
+            0b110,
+        ));
+        // Repair journals the body and this replica acks it: a replication quorum
+        // with the primary, so op 4 is committed even though nobody's commit point
+        // has caught up yet.
+        consensus.note_journal_mutation();
+        refresh_local_suffix_if_stale(&consensus, crate::dvc_merge::suffix_all_present(headers));
+
+        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, 3));
+
+        // Replica 1's log stops at op 3, an explicit nack for op 4. Replica 2 is the
+        // crashed primary and never reports.
+        let (dvc, body) = dvc_with_suffix(1, 3, 0, 3, 2, None);
+        let _ = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
+
+        let pending = consensus
+            .pending_view_log()
+            .expect("op 4 is servable from this replica, so the view can start");
+        assert_eq!(
+            pending.op_head, 4,
+            "one nack cannot discard an op this replica journaled and acked"
+        );
     }
 
     #[test]
@@ -1377,14 +1972,18 @@ mod tests {
         let local = suffix_headers(2, 4, 0);
         consensus.set_local_dvc_suffix(crate::view_change_quorum::DvcSuffix::new(local, 0, 0b110));
 
-        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, 5));
-
-        // Two peers report, reaching the quorum of 3. All three hold op 4's header,
-        // none can serve its body, and two replicas have yet to report.
+        // Two peers abstain, reaching the quorum of 3 and leaving op 4 one nack short.
+        // The first brings this replica into view 5, which it announces, before f
+        // StartViewChanges arrive, so it sends no DoViewChange of its own.
         for replica in [1u8, 2] {
-            let (dvc, body) = dvc_with_suffix(replica, 5, 0, 4, 2, Some(4));
+            let (dvc, body) = dvc_numbers_only(replica, 5, 0, 4, 2);
             let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
-            assert!(actions.is_empty());
+            assert!(
+                actions
+                    .iter()
+                    .all(|action| matches!(action, VsrAction::SendStartViewChange { view: 5, .. })),
+                "{actions:?}"
+            );
         }
         assert!(
             consensus.pending_view_log().is_none(),
@@ -1406,7 +2005,7 @@ mod tests {
     fn given_a_sealed_prepare_when_verifying_integrity_should_accept() {
         let message = Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(
             |_, header: &mut PrepareHeader| {
-                header.command = Command2::Prepare;
+                header.command = Command::Prepare;
                 header.op = 7;
                 header.size = u32::try_from(size_of::<PrepareHeader>()).expect("header fits u32");
             },
@@ -1421,7 +2020,7 @@ mod tests {
         // corrupted in transit is journaled and then re-served to peers from the WAL.
         let message = Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(
             |_, header: &mut PrepareHeader| {
-                header.command = Command2::Prepare;
+                header.command = Command::Prepare;
                 header.op = 7;
                 header.size = u32::try_from(size_of::<PrepareHeader>()).expect("header fits u32");
             },
@@ -1439,7 +2038,7 @@ mod tests {
         // The partition plane leaves `checksum` at `CHECKSUM_UNSEALED` and carries a
         // verified `batch_checksum` over the same bytes instead.
         let header = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             op: 7,
             ..Default::default()
         };
@@ -1462,7 +2061,7 @@ mod tests {
         let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
             &mut bytes[..size_of::<PrepareHeader>()],
         );
-        header.command = Command2::Prepare;
+        header.command = Command::Prepare;
         header.op = 7;
         header.size = u32::try_from(size).expect("fits u32");
         header.checksum_body = u128::from(calculate_checksum(body));
@@ -1548,6 +2147,130 @@ mod tests {
     }
 
     #[test]
+    fn given_a_started_view_when_its_head_is_unapplied_should_report_the_view_start_unapplied() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        assert!(
+            consensus.applied_view_start(),
+            "a replica that started no view has nothing to apply"
+        );
+        consensus.restore_commit_state(2, 2);
+        consensus.sequencer().set_sequence(3);
+        install_local_suffix(&consensus, 3, 2, 0);
+        let _ = consensus.handle_start_view_change(PlaneKind::Partitions, &svc_header(1, 3));
+        let (dvc, body) = dvc_with_full_suffix(2, 3, 0, 3, 2);
+        let _ = consensus.handle_do_view_change(PlaneKind::Partitions, &dvc, &body);
+        let _ = consensus.start_pending_view(PlaneKind::Partitions);
+        assert_eq!(consensus.status(), Status::Normal);
+        assert_eq!((consensus.commit_min(), consensus.commit_max()), (2, 2));
+        assert!(
+            !consensus.applied_view_start(),
+            "op 3 can be a write that the old view acknowledged, and \
+             commit_min == commit_max does not cover it"
+        );
+
+        consensus.advance_commit_max(3);
+        consensus.advance_commit_min(3);
+        assert!(consensus.applied_view_start());
+    }
+
+    #[test]
+    fn given_parked_view_repair_when_starting_should_rebuild_only_unapplied_ops() {
+        const MERGED_COMMIT: u64 = 2;
+        const HEAD: u64 = 5;
+        const VIEW: u32 = 3;
+
+        for (applied_before, repaired_to, expected_start) in [
+            (2, 3, Some(4)),
+            (2, 5, None),
+            (2, 2, Some(3)),
+            (0, 0, Some(3)),
+        ] {
+            let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+            consensus.init();
+            consensus.restore_commit_state(applied_before, MERGED_COMMIT);
+            consensus.sequencer().set_sequence(HEAD);
+            install_local_suffix(&consensus, HEAD, MERGED_COMMIT, 0);
+            let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, VIEW));
+            let (dvc, body) = dvc_with_full_suffix(2, VIEW, 0, HEAD, MERGED_COMMIT);
+            let _ = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
+            let merged = consensus.pending_view_log().expect("the view is parked");
+            assert_eq!(merged.commit_max, MERGED_COMMIT);
+
+            // Repair may apply a verified prefix after the DVC quorum is frozen.
+            for op in applied_before + 1..=repaired_to {
+                consensus.advance_commit_max(op);
+                consensus.advance_commit_min(op);
+            }
+            assert_eq!(consensus.log_view(), 0);
+            consensus.settle_view_log_proof();
+            let actions = consensus.start_pending_view(PlaneKind::Metadata);
+            let mut rebuilt_from = None;
+            for action in actions {
+                match action {
+                    VsrAction::CommitJournal => {
+                        for op in consensus.commit_min() + 1..=consensus.commit_max() {
+                            consensus.advance_commit_min(op);
+                        }
+                    }
+                    VsrAction::RebuildPipeline { from_op, to_op } => {
+                        rebuilt_from = Some(from_op);
+                        assert_eq!(to_op, HEAD);
+                        consensus.with_pipeline_mut(|pipeline| {
+                            for op in from_op..=to_op {
+                                let header = *merged
+                                    .headers
+                                    .iter()
+                                    .find(|header| header.op == op)
+                                    .expect("the decided history is available");
+                                let mut entry = PipelineEntry::new(header);
+                                entry.add_ack(consensus.replica());
+                                pipeline.push(entry);
+                            }
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                rebuilt_from, expected_start,
+                "repair applied through {repaired_to}"
+            );
+
+            for header in merged
+                .headers
+                .iter()
+                .rev()
+                .filter(|header| header.op > repaired_to.max(MERGED_COMMIT))
+            {
+                let ack = PrepareOkHeader {
+                    command: Command::PrepareOk,
+                    view: VIEW,
+                    replica: 1,
+                    op: header.op,
+                    prepare_checksum: header.checksum,
+                    ..Default::default()
+                };
+                assert!(ack_quorum_reached(&consensus, PlaneKind::Metadata, &ack));
+                let ready = peek_committable_head(&consensus)
+                    .expect("the next op must commit in this view");
+                assert_eq!(ready.checksum, header.checksum);
+                assert_eq!(consensus.pop_committed_prepare().unwrap().header, ready);
+                consensus.advance_commit_min(ready.op);
+            }
+            assert_eq!(consensus.view(), VIEW);
+            assert_eq!(consensus.status(), Status::Normal);
+            assert_eq!(consensus.commit_min(), HEAD);
+            assert!(consensus.pipeline_is_empty());
+            assert!(consensus.applied_view_start());
+            assert_eq!(
+                consensus.last_prepare_checksum(),
+                merged.headers[0].checksum
+            );
+        }
+    }
+
+    #[test]
     fn loopback_cleared_on_complete_view_change_as_primary() {
         // 3 replicas, replica 0 is primary for view 0 (and view 3: 3 % 3 = 0).
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
@@ -1607,9 +2330,10 @@ mod tests {
     ///
     /// A parked merge leaves the replica in `ViewChange` announcing nothing if the
     /// bodies never arrive, which is the intended trade against losing data but has
-    /// to stay recoverable: the status timeout fires, escalates, and drops the parked
-    /// log. Reusing a log merged for a superseded view would leak a truncation
-    /// decided there into a view that never voted for it.
+    /// to stay recoverable: the status timeout votes for the next view, and the
+    /// quorum that joins the vote drops the parked log. Reusing a log merged for a
+    /// superseded view would leak a truncation decided there into a view that never
+    /// voted for it.
     /// A `StartView` from the view's primary, optionally carrying the view's
     /// canonical headers.
     fn start_view_with_suffix(
@@ -1629,18 +2353,19 @@ mod tests {
         let header = StartViewHeader {
             checksum: 0,
             checksum_body: 0,
-            cluster: 0,
+            cluster: 1,
             size: u32::try_from(std::mem::size_of::<StartViewHeader>() + body.len())
                 .expect("synthetic StartView fits u32"),
             view,
             release: 0,
-            command: Command2::StartView,
+            command: Command::StartView,
             replica,
             reserved_frame: [0; 66],
             op,
             commit,
             group: 0,
-            reserved: [0; 88],
+            partition_incarnation: 0,
+            reserved: [0; 80],
             incarnation: 0,
         };
         (header, body)
@@ -1704,7 +2429,7 @@ mod tests {
     #[test]
     fn given_an_unsealed_suffix_when_decoding_should_be_accepted() {
         // The on-disk sentinel: suffixes are read out of the journal, which may hold
-        // pre-seal entries, and partition-plane prepares are unsealed by construction.
+        // pre-seal entries. Both planes seal newly prepared headers.
         let headers: Vec<PrepareHeader> = suffix_headers(2, 4, 1)
             .into_iter()
             .map(|mut header| {
@@ -1749,29 +2474,24 @@ mod tests {
     }
 
     #[test]
-    fn given_start_view_without_suffix_when_adopted_should_trust_the_announced_op() {
-        // Probe answers and stale-view corrections carry numbers only: a backup must
-        // still adopt, and record nothing it could mistake for the view's decision.
+    fn given_start_view_without_suffix_when_adopted_should_keep_proof_pending() {
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
         consensus.init();
-
         let (header, body) = start_view_with_suffix(1, 1, 5, 3, false);
         assert!(body.is_empty());
         let actions = consensus.handle_start_view(PlaneKind::Metadata, &header, &body);
 
-        assert!(
-            !actions.is_empty(),
-            "a numbers-only StartView must still adopt"
-        );
+        assert!(!actions.is_empty());
         assert_eq!(consensus.sequencer().current_sequence(), 5);
-        assert!(
-            consensus.pending_view_log().is_none(),
-            "no suffix means no canonical headers to verify against"
-        );
+        let pending = consensus.pending_view_log().unwrap();
+        assert_eq!(pending.op_head, 5);
+        assert_eq!(pending.headers, [] as [PrepareHeader; 0]);
+        assert!(consensus.view_log_unproven());
     }
 
     #[test]
-    fn given_parked_view_change_when_status_timeout_fires_should_escalate_and_drop_merged_log() {
+    fn given_parked_view_change_when_a_quorum_votes_after_its_status_timeout_should_drop_merged_log()
+     {
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
         consensus.init();
         consensus.restore_commit_state(2, 2);
@@ -1787,26 +2507,24 @@ mod tests {
         assert_eq!(consensus.status(), Status::ViewChange);
         let parked_view = consensus.view();
 
-        // `VIEW_CHANGE_STATUS_TICKS` is 500; tick past it. Escalation shows as the
-        // view advancing, since the 50-tick SVC retransmit also emits a send.
-        let mut escalated = false;
-        for _ in 0..600 {
-            let _ = consensus.tick(PlaneKind::Metadata);
-            if consensus.view() > parked_view {
-                escalated = true;
-                break;
-            }
-        }
+        // The status timeout votes for the next view and keeps the parked merge,
+        // which can still start the view once repair covers it.
+        let next_view = parked_view + 1;
+        let voted = (0..crate::TimeoutManager::VIEW_CHANGE_STATUS_TICKS)
+            .flat_map(|_| consensus.tick(PlaneKind::Metadata))
+            .any(|action| {
+                matches!(action, VsrAction::SendStartViewChange { view, .. } if view == next_view)
+            });
+        assert!(
+            voted,
+            "a parked view change must still vote on the status timeout"
+        );
+        assert_eq!(consensus.view(), parked_view);
+        assert!(consensus.pending_view_log().is_some());
 
-        assert!(
-            escalated,
-            "a parked view change must still escalate on the status timeout"
-        );
-        assert!(
-            consensus.view() > parked_view,
-            "escalation must advance the view past {parked_view}, got {}",
-            consensus.view()
-        );
+        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, next_view));
+
+        assert_eq!(consensus.view(), next_view);
         assert!(
             consensus.pending_view_log().is_none(),
             "the superseded merged log must be dropped, not carried into the next view"
@@ -1862,7 +2580,7 @@ mod tests {
         consensus.init();
 
         let prepare_header = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             cluster: 1,
             view: 0,
             op: 0,
@@ -1870,7 +2588,7 @@ mod tests {
             ..Default::default()
         };
 
-        futures::executor::block_on(send_prepare_ok(&consensus, &prepare_header, Some(true)));
+        futures::executor::block_on(send_prepare_ok(&consensus, &prepare_header, true));
 
         let mut buf = Vec::new();
         consensus.drain_loopback_into(&mut buf);
@@ -1888,14 +2606,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn send_prepare_ok_reports_transport_failure_and_can_be_retried() {
+        let consensus = VsrConsensus::new(1, 1, 3, 0, SpyBus::new(), LocalPipeline::new());
+        consensus.init();
+        let header = PrepareHeader {
+            command: Command::Prepare,
+            cluster: 1,
+            checksum: 42,
+            ..Default::default()
+        };
+        consensus.message_bus().reject_sends.set(true);
+        assert!(!futures::executor::block_on(send_prepare_ok(
+            &consensus, &header, true,
+        )));
+        assert!(consensus.message_bus().sent.borrow().is_empty());
+
+        consensus.message_bus().reject_sends.set(false);
+        assert!(futures::executor::block_on(send_prepare_ok(
+            &consensus, &header, true,
+        )));
+        assert_eq!(consensus.message_bus().sent.borrow().len(), 1);
+    }
+
     struct SpyBus {
         sent: std::cell::RefCell<Vec<(u8, Frozen<MESSAGE_ALIGN>)>>,
+        reject_sends: std::cell::Cell<bool>,
+        failures: std::cell::RefCell<BTreeMap<u8, SendError>>,
+        attempts: std::cell::RefCell<Vec<u8>>,
     }
 
     impl SpyBus {
         fn new() -> Self {
             Self {
                 sent: std::cell::RefCell::new(Vec::new()),
+                reject_sends: std::cell::Cell::new(false),
+                failures: std::cell::RefCell::new(BTreeMap::new()),
+                attempts: std::cell::RefCell::new(Vec::new()),
             }
         }
     }
@@ -1907,7 +2654,7 @@ mod tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
             Ok(())
         }
@@ -1916,13 +2663,19 @@ mod tests {
             replica: u8,
             data: Frozen<MESSAGE_ALIGN>,
         ) -> Result<(), SendError> {
+            self.attempts.borrow_mut().push(replica);
+            if self.reject_sends.get() {
+                return Err(SendError::ReplicaNotConnected(replica));
+            }
+            if let Some(error) = self.failures.borrow_mut().remove(&replica) {
+                return Err(error);
+            }
             self.sent.borrow_mut().push((replica, data));
             Ok(())
         }
 
         fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
     }
 
     #[test]
@@ -1956,26 +2709,168 @@ mod tests {
         assert_eq!(sent[0].0, 1);
     }
 
+    const SUBSET_MEMBERS: [u8; 3] = [4, 1, 3];
+
+    fn subset_consensus(self_node: u8) -> VsrConsensus<SpyBus> {
+        let consensus = VsrConsensus::with_members(
+            1,
+            self_node,
+            ReplicaSet::new(&SUBSET_MEMBERS).expect("valid members"),
+            0,
+            SpyBus::new(),
+            LocalPipeline::new(),
+            ConsensusClock::system(),
+        );
+        consensus.init();
+        consensus
+    }
+
+    #[test]
+    fn given_subset_group_when_sending_to_members_should_address_their_nodes() {
+        let consensus = subset_consensus(1);
+        let message = || {
+            Message::<PrepareOkHeader>::new(std::mem::size_of::<PrepareOkHeader>()).into_generic()
+        };
+
+        assert!(futures::executor::block_on(
+            consensus.send_or_loopback(0, message())
+        ));
+        assert!(futures::executor::block_on(
+            consensus.send_or_loopback(2, message())
+        ));
+        assert!(futures::executor::block_on(
+            consensus.send_or_loopback(1, message())
+        ));
+        assert!(matches!(
+            futures::executor::block_on(consensus.send_to_member(3, message().into_frozen())),
+            Err(SendError::ReplicaNotConnected(3))
+        ));
+
+        let mut looped = Vec::new();
+        consensus.drain_loopback_into(&mut looped);
+        assert_eq!(looped.len(), 1, "member 1 is this node");
+        assert_eq!(*consensus.message_bus().attempts.borrow(), [4, 3]);
+    }
+
+    #[test]
+    fn given_no_link_to_a_member_when_sending_should_count_it_out_of_sync() {
+        let consensus = subset_consensus(4);
+        let send = |consensus: &VsrConsensus<SpyBus>| {
+            futures::executor::block_on(
+                consensus.send_to_member(
+                    1,
+                    Message::<PrepareOkHeader>::new(std::mem::size_of::<PrepareOkHeader>())
+                        .into_generic()
+                        .into_frozen(),
+                ),
+            )
+        };
+        assert_eq!(consensus.in_sync_members(crate::MEMBER_LAG_MAX), Some(3));
+
+        consensus.message_bus().reject_sends.set(true);
+        assert!(send(&consensus).is_err());
+        assert_eq!(consensus.in_sync_members(crate::MEMBER_LAG_MAX), Some(2));
+
+        consensus.message_bus().reject_sends.set(false);
+        send(&consensus).expect("the link is back");
+        assert_eq!(consensus.in_sync_members(crate::MEMBER_LAG_MAX), Some(3));
+    }
+
+    #[test]
+    fn given_subset_group_when_replicating_should_send_to_each_member_node() {
+        let consensus = subset_consensus(4);
+        futures::executor::block_on(replicate_frozen_prepare(
+            &consensus,
+            prepare_message(1, 0, 42).into_frozen(),
+        ))
+        .expect("both backups are connected");
+        assert_eq!(*consensus.message_bus().attempts.borrow(), [1, 3]);
+
+        let consensus = subset_consensus(4);
+        consensus
+            .message_bus()
+            .failures
+            .borrow_mut()
+            .insert(1, SendError::ReplicaNotConnected(1));
+        let result = futures::executor::block_on(replicate_frozen_prepare(
+            &consensus,
+            prepare_message(1, 0, 42).into_frozen(),
+        ));
+        assert!(result.is_err(), "the unreachable backup stays visible");
+        assert_eq!(
+            *consensus.message_bus().attempts.borrow(),
+            [1, 3],
+            "node 3 still gets its copy"
+        );
+    }
+
+    /// `advance_commit_min` is strictly sequential, so draining op 7 with 6 never
+    /// applied panics the shard pump. The commit gate must hold instead.
+    #[test]
+    fn given_a_hole_below_the_head_when_committing_should_hold_the_head() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.restore_commit_state(5, 5);
+
+        // Op 6 never arrived; 7 and 8 did, and the cluster committed through 8.
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(7, 0, 70));
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(8, 70, 80));
+        consensus.advance_commit_max(8);
+
+        assert!(
+            peek_committable_head(&consensus).is_none(),
+            "the head is covered by the frontier but op 6 is not applied"
+        );
+        assert_eq!(
+            consensus.pipeline_head_header().map(|header| header.op),
+            Some(7),
+            "holding must not consume the entry"
+        );
+    }
+
+    /// The shape the journal-walk caps prevent. The gate must still refuse it:
+    /// re-applying an applied op panics `advance_commit_min`.
+    #[test]
+    fn given_an_applied_head_when_committing_should_refuse_it() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.restore_commit_state(4, 4);
+
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(5, 0, 50));
+        consensus.advance_commit_max(6);
+        // The journal walk got there first and applied 5 and 6 out of the WAL.
+        consensus.advance_commit_min(5);
+        consensus.advance_commit_min(6);
+
+        assert!(
+            peek_committable_head(&consensus).is_none(),
+            "op 5 is already applied; re-applying it panics advance_commit_min"
+        );
+        assert_eq!(consensus.pipeline_head_header().unwrap().op, 5);
+    }
+
     #[test]
     fn drains_only_up_to_commit_frontier_even_without_quorum_flags() {
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
         consensus.init();
+        // Pipeline opens at op 5, so the state machine must already be through 4.
+        consensus.restore_commit_state(4, 4);
 
         consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(5, 0, 50));
         consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(6, 50, 60));
         consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(7, 60, 70));
 
         consensus.advance_commit_max(6);
-        let drained = drain_committable_prefix(&consensus);
-        let drained_ops: Vec<_> = drained.into_iter().map(|entry| entry.header.op).collect();
+        let mut drained_ops = Vec::new();
+        while let Some(header) = peek_committable_head(&consensus) {
+            assert_eq!(consensus.pop_committed_prepare().unwrap().header, header);
+            consensus.advance_commit_min(header.op);
+            drained_ops.push(header.op);
+        }
 
         assert_eq!(drained_ops, vec![5, 6]);
         assert_eq!(
-            consensus
-                .pipeline()
-                .borrow()
-                .head()
-                .map(|entry| entry.header.op),
+            consensus.pipeline_head_header().map(|header| header.op),
             Some(7)
         );
     }
@@ -1991,8 +2886,8 @@ mod tests {
         consensus.advance_commit_max(4);
 
         let request = RoutedRequestHeader {
-            command: Command2::Request,
-            operation: Operation::DeleteConsumerOffset2,
+            command: Command::Request,
+            operation: Operation::DeleteConsumerOffset,
             client: 42,
             request: 7,
             ..Default::default()
@@ -2001,18 +2896,403 @@ mod tests {
         let reply = build_deny_reply_from_request(&consensus, &request, status);
 
         let header = reply.header();
-        assert_eq!(header.command, Command2::Reply);
+        assert_eq!(header.command, Command::Reply);
         assert_eq!(header.status, status);
         assert_eq!(header.op, 0, "a deny commits nothing");
         assert_eq!(header.commit, 4);
         assert_eq!(header.client, 42);
         assert_eq!(header.request, 7);
-        assert_eq!(header.operation, Operation::DeleteConsumerOffset2);
+        assert_eq!(header.operation, Operation::DeleteConsumerOffset);
         assert_eq!(
             header.size as usize,
             std::mem::size_of::<ReplyHeader>(),
             "deny reply body must be empty"
         );
         assert!(header.validate().is_ok());
+    }
+
+    fn header_with_checksum(op: u64, checksum: u128) -> PrepareHeader {
+        PrepareHeader {
+            command: Command::Prepare,
+            op,
+            checksum,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn given_lower_backfill_when_resolving_repaired_frontier_should_not_rewind() {
+        let headers = BTreeMap::from([
+            (169, header_with_checksum(169, 1690)),
+            (170, header_with_checksum(170, 1700)),
+            (171, header_with_checksum(171, 1710)),
+        ]);
+
+        let update = repaired_frontier_update(171, |op| headers.get(&op).copied());
+
+        // Not a rewind: the frontier does not move, and the checksum re-anchors
+        // on the entry the sequencer already points at rather than on the
+        // backfill that just arrived below it.
+        assert_eq!(update, Some((171, 1710)));
+    }
+
+    #[test]
+    fn given_gap_closure_when_resolving_repaired_frontier_should_use_new_head_checksum() {
+        let headers = BTreeMap::from([
+            (170, header_with_checksum(170, 1700)),
+            (171, header_with_checksum(171, 1710)),
+            (172, header_with_checksum(172, 1720)),
+        ]);
+
+        let update = repaired_frontier_update(169, |op| headers.get(&op).copied());
+
+        assert_eq!(update, Some((172, 1720)));
+    }
+
+    #[test]
+    fn given_view_suffix_when_proving_local_history_should_distinguish_gaps_from_divergence() {
+        let local: Vec<_> = (3..=6)
+            .map(|op| PrepareHeader {
+                op,
+                parent: u128::from(op - 1),
+                commit: 2,
+                checksum: u128::from(op),
+                ..Default::default()
+            })
+            .collect();
+        let canonical = [*local.last().unwrap()];
+        let proof = |floor, entries: &[PrepareHeader], canonical: &[PrepareHeader]| {
+            let held: BTreeMap<_, _> = entries.iter().map(|header| (header.op, *header)).collect();
+            view_log_proof(floor, canonical, 6, |op| held.get(&op).copied())
+        };
+        assert_eq!(proof(2, &local, &canonical), ViewLogProof::Proven);
+        let mut gap = local.clone();
+        gap.remove(2);
+        assert_eq!(
+            proof(2, &gap, &canonical),
+            ViewLogProof::Missing {
+                op: 5,
+                unproven_through: 5
+            }
+        );
+        let bridged = [local[3], local[2]];
+        assert_eq!(
+            proof(2, &gap, &bridged),
+            ViewLogProof::Missing {
+                op: 5,
+                unproven_through: 0,
+            },
+            "a canonical header proves the prefix even while its body is missing"
+        );
+        let mut off_chain = bridged;
+        off_chain[1].checksum += 10;
+        assert_eq!(
+            proof(2, &gap, &off_chain),
+            ViewLogProof::Missing {
+                op: 5,
+                unproven_through: 5
+            },
+            "a canonical header off the chain is no header, and nothing is held to remove"
+        );
+        gap[1].checksum += 10;
+        assert_eq!(
+            proof(2, &gap, &bridged),
+            ViewLogProof::Divergent { first: 4, last: 4 }
+        );
+        assert_eq!(
+            proof(2, &gap, &canonical),
+            ViewLogProof::Missing {
+                op: 5,
+                unproven_through: 5
+            },
+            "a gap cannot prove the held prefix divergent"
+        );
+        gap.insert(2, local[2]);
+        assert_eq!(
+            proof(2, &gap, &canonical),
+            ViewLogProof::Divergent { first: 4, last: 4 }
+        );
+        assert_eq!(
+            proof(2, &local, &[]),
+            ViewLogProof::Missing {
+                op: 6,
+                unproven_through: 6
+            }
+        );
+        assert_eq!(proof(6, &local, &[]), ViewLogProof::Proven);
+    }
+
+    /// A backup that adopted a view holding only the head body proves the rest
+    /// through canonical headers, and repairs from the reported op up to the head.
+    /// Reporting the highest missing body fetched one body per round trip, each
+    /// open to a stall retry, so a full pipeline took hundreds of ticks to commit.
+    #[test]
+    fn given_bridged_bodies_missing_when_proving_history_should_report_the_lowest() {
+        const FLOOR: u64 = 2;
+        const HEAD: u64 = 6;
+        let canonical: Vec<_> = (FLOOR + 1..=HEAD)
+            .rev()
+            .map(|op| PrepareHeader {
+                op,
+                parent: u128::from(op - 1),
+                checksum: u128::from(op),
+                ..Default::default()
+            })
+            .collect();
+        let head = canonical[0];
+
+        assert_eq!(
+            view_log_proof(FLOOR, &canonical, HEAD, |op| (op == HEAD).then_some(head)),
+            ViewLogProof::Missing {
+                op: FLOOR + 1,
+                unproven_through: 0,
+            },
+            "a repair window opened above the lowest missing body leaves it for another round"
+        );
+    }
+
+    #[test]
+    fn given_a_divergent_run_when_proving_history_should_report_the_whole_proven_run() {
+        const FLOOR: u64 = 2;
+        const FIRST: u64 = FLOOR + 1;
+        const DIVERGENT: u64 = 32;
+        const LAST: u64 = FIRST + DIVERGENT - 1;
+        const HEAD: u64 = LAST + 3;
+        const UNKNOWN: u64 = FIRST + 10;
+        const HOLE: u64 = FIRST + 20;
+        const COMMITTED: u64 = FIRST + 4;
+        const STALE: u128 = 1 << 64;
+        let view = |op: u64| PrepareHeader {
+            op,
+            parent: u128::from(op - 1),
+            checksum: u128::from(op),
+            ..Default::default()
+        };
+        let held: BTreeMap<_, _> = (1..=HEAD)
+            .map(|op| {
+                let mut header = view(op);
+                if (FIRST..=LAST).contains(&op) {
+                    header.checksum += STALE;
+                    if op > FIRST {
+                        header.parent += STALE;
+                    }
+                }
+                (op, header)
+            })
+            .collect();
+        let canonical: Vec<_> = (FLOOR + 1..=HEAD).rev().map(view).collect();
+        let proof = |floor, held: &BTreeMap<u64, PrepareHeader>, canonical: &[PrepareHeader]| {
+            view_log_proof(floor, canonical, HEAD, |op| held.get(&op).copied())
+        };
+
+        assert_eq!(
+            proof(FLOOR, &held, &canonical),
+            ViewLogProof::Divergent {
+                first: FIRST,
+                last: LAST
+            }
+        );
+        let unknown: Vec<_> = canonical
+            .iter()
+            .copied()
+            .filter(|header| header.op != UNKNOWN)
+            .collect();
+        assert_eq!(
+            proof(FLOOR, &held, &unknown),
+            ViewLogProof::Divergent {
+                first: UNKNOWN,
+                last: LAST
+            },
+            "the header above an unknown op still proves it, but nothing below it"
+        );
+        let mut holed = held.clone();
+        holed.remove(&HOLE);
+        assert_eq!(
+            proof(FLOOR, &holed, &canonical),
+            ViewLogProof::Divergent {
+                first: HOLE + 1,
+                last: LAST
+            },
+            "a run never spans a held gap"
+        );
+        assert_eq!(
+            proof(COMMITTED, &held, &canonical),
+            ViewLogProof::Divergent {
+                first: COMMITTED + 1,
+                last: LAST
+            },
+            "a run never reaches the commit floor"
+        );
+    }
+
+    #[test]
+    fn given_blank_view_slots_when_proving_history_should_wait_for_evidence() {
+        const HEAD: u64 = 4;
+        let blank = crate::dvc_blank(HEAD);
+        let local = PrepareHeader {
+            op: HEAD,
+            parent: 3,
+            checksum: 4,
+            ..Default::default()
+        };
+        for held in [None, Some(local)] {
+            assert_eq!(
+                view_log_proof(HEAD - 1, &[blank], HEAD, |_| held),
+                ViewLogProof::Missing {
+                    op: HEAD,
+                    unproven_through: HEAD,
+                },
+                "a blank head cannot prove either a missing or held prepare divergent"
+            );
+        }
+        assert_eq!(
+            view_log_proof(HEAD - 2, &[local, crate::dvc_blank(HEAD - 1)], HEAD, |op| {
+                (op == HEAD).then_some(local)
+            }),
+            ViewLogProof::Missing {
+                op: HEAD - 1,
+                unproven_through: HEAD - 1,
+            },
+            "a blank predecessor cannot bridge a proof gap"
+        );
+    }
+
+    #[test]
+    fn given_commit_stamps_when_proving_history_should_require_a_sealed_contiguous_chain() {
+        const FLOOR: u64 = 2;
+        let headers: Vec<_> = (FLOOR + 1..=6)
+            .map(|op| PrepareHeader {
+                op,
+                parent: u128::from(op - 1),
+                checksum: u128::from(op),
+                commit: op - 1,
+                ..Default::default()
+            })
+            .collect();
+        let proof = |headers: &[PrepareHeader]| {
+            view_log_proof(FLOOR, &[], 5, |op| {
+                headers.iter().find(|header| header.op == op).copied()
+            })
+        };
+        assert_eq!(proof(&headers), ViewLogProof::Proven);
+        for damaged in [0, 1] {
+            let mut broken = headers.clone();
+            if damaged == 0 {
+                broken[1].checksum = CHECKSUM_UNSEALED;
+            } else {
+                broken[1].parent += 1;
+            }
+            assert_eq!(
+                proof(&broken),
+                ViewLogProof::Missing {
+                    op: 5,
+                    unproven_through: 5
+                },
+                "a later commit stamp must not bridge an unsealed or disconnected prefix"
+            );
+        }
+        let mut gap = headers;
+        gap.remove(1);
+        assert_eq!(
+            proof(&gap),
+            ViewLogProof::Missing {
+                op: 5,
+                unproven_through: 5
+            }
+        );
+    }
+
+    #[test]
+    fn given_a_repaired_prepare_when_classifying_should_require_evidence_from_the_view_log() {
+        const VIEW: u32 = 3;
+        const OP: u64 = 5;
+        let entry = |op: u64, branch: u128, view: u32| PrepareHeader {
+            op,
+            parent: u128::from(op - 1) + branch,
+            checksum: u128::from(op) + branch,
+            view,
+            ..Default::default()
+        };
+        let committed = entry(OP, 0, VIEW - 1);
+        let abandoned = entry(OP, 100, VIEW - 2);
+        let pending =
+            |headers: &[PrepareHeader], committed_elsewhere: &[PrepareHeader]| MergedLog {
+                op_head: OP + 1,
+                commit_max: OP + 1,
+                headers: headers.to_vec(),
+                committed_elsewhere: committed_elsewhere.to_vec(),
+            };
+        let classify =
+            |frame: &PrepareHeader, canonical: &[PrepareHeader], held: &[(PrepareHeader, bool)]| {
+                repaired_prepare_evidence(frame, VIEW, Some(&pending(canonical, &[])), |op| {
+                    held.iter().find(|(header, _)| header.op == op).copied()
+                })
+            };
+        let above = entry(OP + 1, 0, VIEW);
+        let below = entry(OP - 1, 0, VIEW - 1);
+
+        assert_eq!(
+            classify(&committed, &[committed], &[]),
+            RepairEvidence::Proven
+        );
+        assert_eq!(
+            classify(&abandoned, &[committed], &[]),
+            RepairEvidence::Contradicted
+        );
+        let committed_elsewhere = pending(&[], &[committed]);
+        for (frame, evidence) in [
+            (committed, RepairEvidence::Proven),
+            (abandoned, RepairEvidence::Contradicted),
+        ] {
+            assert_eq!(
+                repaired_prepare_evidence(&frame, VIEW, Some(&committed_elsewhere), |_| None),
+                evidence
+            );
+        }
+        assert_eq!(classify(&committed, &[above], &[]), RepairEvidence::Proven);
+        assert_eq!(
+            classify(&committed, &[], &[(above, true)]),
+            RepairEvidence::Proven
+        );
+        assert_eq!(
+            classify(&abandoned, &[], &[(above, true)]),
+            RepairEvidence::Contradicted
+        );
+        assert_eq!(
+            classify(&entry(OP, 0, VIEW), &[], &[]),
+            RepairEvidence::Proven,
+            "only this view's primary stamps a prepare with this view"
+        );
+        assert_eq!(
+            classify(&committed, &[], &[(below, true)]),
+            RepairEvidence::Unproven,
+            "a parent link proves continuity, not identity"
+        );
+        assert_eq!(
+            classify(&committed, &[], &[(above, false)]),
+            RepairEvidence::Unproven,
+            "an unproven neighbor cannot vouch"
+        );
+        let stale_below = entry(OP - 1, 100, VIEW - 2);
+        assert_eq!(
+            classify(&committed, &[], &[(stale_below, true)]),
+            RepairEvidence::Contradicted
+        );
+        assert_eq!(
+            classify(&committed, &[], &[(stale_below, false)]),
+            RepairEvidence::Contradicted,
+            "an unproven frame must not splice onto another branch"
+        );
+        assert_eq!(
+            classify(&committed, &[above], &[(stale_below, false)]),
+            RepairEvidence::Proven,
+            "a proven frame outranks an unproven neighbor"
+        );
+        let mut unsealed_below = stale_below;
+        unsealed_below.checksum = CHECKSUM_UNSEALED;
+        assert_eq!(
+            classify(&committed, &[], &[(unsealed_below, true)]),
+            RepairEvidence::Unproven
+        );
     }
 }

@@ -1,26 +1,25 @@
 <!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
 
-    Licensed to the Apache Software Foundation (ASF) under one
-    or more contributor license agreements.  See the NOTICE file
-    distributed with this work for additional information
-    regarding copyright ownership.  The ASF licenses this file
-    to you under the Apache License, Version 2.0 (the
-    "License"); you may not use this file except in compliance
-    with the License.  You may obtain a copy of the License at
+  http://www.apache.org/licenses/LICENSE-2.0
 
-      http://www.apache.org/licenses/LICENSE-2.0
-
-    Unless required by applicable law or agreed to in writing,
-    software distributed under the License is distributed on an
-    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-    KIND, either express or implied.  See the License for the
-    specific language governing permissions and limitations
-    under the License.
-
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
 -->
+
 <script lang="ts">
-  import type { StreamDetails } from '$lib/domain/StreamDetails';
-  import type { CloseModalFn } from '$lib/types/utilTypes';
+  import type { StreamDetails } from '#lib/domain/StreamDetails.js';
+  import type { CloseModalFn } from '#lib/types/utilTypes.js';
   import { z } from 'zod';
   import Button from '../Button.svelte';
   import Icon from '../Icon.svelte';
@@ -28,14 +27,15 @@
   import ModalBase from './ModalBase.svelte';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
   import { zod4 } from 'sveltekit-superforms/adapters';
-  import { fetchRouteApi } from '$lib/api/fetchRouteApi';
+  import { fetchRouteApi } from '#lib/api/fetchRouteApi.js';
+  import { streamUpdate } from '#lib/api/resourceOptions.js';
   import { goto } from '$app/navigation';
   import { showToast } from '../AppToasts.svelte';
   import ModalConfirmation from '../ModalConfirmation.svelte';
-  import { typedRoute } from '$lib/types/appRoutes';
-  import { browser } from '$app/environment';
+  import { typedRoute } from '#lib/types/appRoutes.js';
+  import { browser } from '$app/env';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
-  import { arraySum } from '$lib/utils/arraySum';
+  import { arraySum } from '#lib/utils/arraySum.js';
   import { resolve } from '$app/paths';
 
   interface Props {
@@ -63,12 +63,13 @@
     async onUpdate({ form }) {
       if (!form.valid) return;
 
+      const body = streamUpdate({ current: stream, next: { name: form.data.name } });
+      if (Object.keys(body).length === 0) return closeModal();
+
       const { data, ok } = await fetchRouteApi({
         method: 'PUT',
         path: `/streams/${stream.id}`,
-        body: {
-          name: form.data.name
-        }
+        body
       });
 
       if (!ok) {
@@ -128,7 +129,7 @@
     confirmationOpen = false;
 
     if (result) {
-      const { ok } = await fetchRouteApi({
+      const { data, ok } = await fetchRouteApi({
         method: 'DELETE',
         path: `/streams/${stream.id}`
       });
@@ -136,7 +137,7 @@
       if (ok) {
         closeModal(async () => {
           if (!browser) return;
-          await goto(resolve(typedRoute('/dashboard/streams')));
+          await goto(resolve(typedRoute('dashboard/streams')));
           await customInvalidateAll();
           showToast({
             type: 'success',
@@ -177,9 +178,27 @@
     {/snippet}
   </ModalConfirmation>
 
-  <div class="h-[350px] flex flex-col">
-    <form method="POST" class="flex flex-col h-[300px] gap-4 flex-3 pb-5" use:enhance>
+  <div class="h-[460px] flex flex-col">
+    <form method="POST" class="flex flex-col h-[410px] gap-4 flex-3 pb-5" use:enhance>
       <Input name="name" label="Name" bind:value={$form.name} errorMessage={$errors.name?.[0]} />
+
+      <div class="flex flex-col gap-1 ml-1">
+        <span class="text-sm text-color">Encryption</span>
+        <span class="text-xs text-shade-d200 dark:text-shade-l700">
+          Key source: {stream.encryptionKeySource ?? 'unknown'}
+        </span>
+        {#if stream.encryptionKeyFingerprint}
+          <span class="text-xs text-shade-d200 dark:text-shade-l700">
+            Key fingerprint: <span class="font-mono">{stream.encryptionKeyFingerprint}</span>
+          </span>
+        {/if}
+        {#if stream.encryptionKekFingerprints.length > 0}
+          <span class="text-xs text-shade-d200 dark:text-shade-l700">
+            Server key fingerprints:
+            <span class="font-mono">{stream.encryptionKekFingerprints.join(', ')}</span>
+          </span>
+        {/if}
+      </div>
 
       <div class="flex justify-end gap-3 w-full mt-auto">
         <Button type="button" variant="text" class="w-2/5" onclick={() => closeModal()}

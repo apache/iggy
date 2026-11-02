@@ -208,8 +208,8 @@ public class LeaderRedirectionSteps {
     }
 
     private void authenticateAllClients() {
-        String username = getenvOrDefault("IGGY_ROOT_USERNAME", "iggy");
-        String password = getenvOrDefault("IGGY_ROOT_PASSWORD", "iggy");
+        String username = TestEnvironment.rootUsername();
+        String password = TestEnvironment.rootPassword();
         for (IggyTcpClient client : clients.values()) {
             String initialAddress = client.getConnectionInfo().serverAddress();
             client.users().login(username, password);
@@ -275,8 +275,8 @@ public class LeaderRedirectionSteps {
 
     private static String addressForRole(String role) {
         return switch (role) {
-            case "leader" -> getenvOrDefault("IGGY_TCP_ADDRESS_LEADER", "127.0.0.1:8091");
-            case "follower" -> getenvOrDefault("IGGY_TCP_ADDRESS_FOLLOWER", "127.0.0.1:8092");
+            case "leader" -> TestEnvironment.leaderAddress();
+            case "follower" -> TestEnvironment.followerAddress();
             default -> throw new IllegalArgumentException("Unknown role: " + role);
         };
     }
@@ -291,11 +291,6 @@ public class LeaderRedirectionSteps {
     }
 
     private static String singleServerAddress() {
-        return getenvOrDefault("IGGY_TCP_ADDRESS", "127.0.0.1:8090");
-    }
-
-    private static String getenvOrDefault(String key, String defaultValue) {
-        String value = System.getenv(key);
-        return value == null || value.isBlank() ? defaultValue : value;
+        return TestEnvironment.serverAddress();
     }
 }

@@ -138,7 +138,7 @@ Options:
 {CLAP_INDENT}
           Examples:
           - `--compression bzip2` for higher compression.
-          - `--compression none` to store without compression.
+          - `--compression stored` to store without compression.
 
   -s, --snapshot-types <SNAPSHOT_TYPES>...
           Specify types of snapshots to include.

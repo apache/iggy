@@ -23,7 +23,7 @@ import {
   ResponseFrameDecoder
 } from './client.frame.js';
 import {
-  Command2,
+  Command,
   HEADER_SIZE,
   REPLY_OFFSET
 } from '../wire/vsr/header.js';
@@ -33,7 +33,7 @@ const LIMIT = 1024;
 const vsrFrame = (body: Buffer): Buffer => {
   const frame = Buffer.alloc(HEADER_SIZE + body.length);
   frame.writeUInt32LE(frame.length, REPLY_OFFSET.size);
-  frame.writeUInt8(Command2.Reply, REPLY_OFFSET.command);
+  frame.writeUInt8(Command.Reply, REPLY_OFFSET.command);
   body.copy(frame, HEADER_SIZE);
   return frame;
 };

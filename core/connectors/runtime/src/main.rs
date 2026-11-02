@@ -15,8 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::configs::connectors::{ConnectorsConfigProvider, create_connectors_config_provider};
-use ::configs::ConfigProvider;
+use crate::configs::connectors::{
+    ConnectorKey, ConnectorsConfig, ConnectorsConfigProvider, SinkConfig, SourceConfig,
+    create_connectors_config_provider,
+    local_provider::{BaseConnectorConfig, connector_env_prefix},
+};
+use crate::metrics::ConnectorType;
+use ::configs::{
+    CONNECTORS_CONFIG_PATH_ENV, CONNECTORS_ENV_PATH_ENV, CONNECTORS_RUNTIME_ENV_VARS,
+    ConfigEnvMappings, ConfigProvider, PLUGIN_CONFIG_ENV_SEGMENT, print_env_var_names,
+};
 use clap::Parser;
 use configs::connectors::ConfigFormat;
 use configs::runtime::ConnectorsRuntimeConfig;
@@ -24,15 +32,16 @@ use dlopen2::wrapper::{Container, WrapperApi};
 use dotenvy::dotenv;
 use error::RuntimeError;
 use figlet_rs::FIGlet;
-use iggy::prelude::{Client, IggyConsumer, IggyProducer};
+use iggy::prelude::{Client, IggyClient, IggyConsumer, IggyProducer};
 use iggy_connector_sdk::{
     StreamDecoder, StreamEncoder,
     api::ConnectorStatus,
     sink::ConsumeCallback,
-    source::{HandleCallback, SendCallback},
+    source::{BatchResultCallback, HandleCallback, SendCallback, SourceStoppedCallback},
     transforms::Transform,
 };
 use mimalloc::MiMalloc;
+use source::RegisterStopCallback;
 use state::StateStorage;
 use std::{
     collections::HashMap,
@@ -40,16 +49,19 @@ use std::{
     sync::{Arc, atomic::AtomicU32},
 };
 use system_stats::capture_allowed_cpus;
-use tracing::{error, info};
+use tokio::runtime::Builder;
+use tracing::{error, info, warn};
 
 mod api;
 mod benchmark;
 pub(crate) mod configs;
 pub(crate) mod context;
 pub(crate) mod error;
+mod exactly_once;
 mod log;
 mod manager;
 pub(crate) mod metrics;
+mod plugin_instance;
 mod sink;
 mod source;
 mod state;
@@ -63,8 +75,27 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser, Debug)]
-#[command(author = "Apache Iggy (Incubating)", version)]
-struct Args {}
+#[command(author = "Apache Iggy", version)]
+struct Args {
+    #[arg(
+        long,
+        help = "Print supported configuration environment variables and exit",
+        long_help = r#"Print supported configuration environment variables and exit.
+
+Lists all supported IGGY_* environment variable names and templates,
+sorted and deduplicated. Template syntax:
+- <N> represents vector indices (0-255 for stream fields)
+- <KEY> represents connector keys (uppercased from config).
+  Overrides via <KEY> require the local connectors provider.
+- <FIELD> represents plugin configuration field names, excluding
+  FORMAT (handled separately as a strongly-typed field). It sets one
+  lowercased top-level plugin_config key: A_B becomes a_b, not nested a.b.
+  Nested plugin configuration keys cannot be set via environment variables.
+
+Exits immediately before any startup."#
+    )]
+    list_config_env_vars: bool,
+}
 
 static PLUGIN_ID: AtomicU32 = AtomicU32::new(1);
 const ALLOWED_PLUGIN_EXTENSIONS: [&str; 3] = ["so", "dylib", "dll"];
@@ -80,7 +111,10 @@ pub(crate) struct SourceApi {
         state_len: usize,
         log_callback: iggy_connector_sdk::LogCallback,
     ) -> i32,
-    iggy_source_handle: extern "C" fn(id: u32, callback: SendCallback) -> i32,
+    iggy_source_handle_v2: extern "C" fn(id: u32, callback: SendCallback) -> i32,
+    iggy_source_register_stop_callback:
+        Option<extern "C" fn(id: u32, callback: SourceStoppedCallback) -> i32>,
+    iggy_source_batch_result: extern "C" fn(plugin_id: u32, batch_id: u64, result: u8) -> i32,
     iggy_source_close: extern "C" fn(id: u32) -> i32,
     iggy_source_version: extern "C" fn() -> *const std::ffi::c_char,
 }
@@ -113,13 +147,64 @@ fn print_ascii_art(text: &str) {
     println!("{}", figure.unwrap());
 }
 
-#[tokio::main]
-async fn main() -> Result<(), RuntimeError> {
+fn main() -> Result<(), RuntimeError> {
+    let args = Args::parse();
+    if args.list_config_env_vars {
+        print_config_env_vars().map_err(RuntimeError::ListConfigEnvVars)?;
+        return Ok(());
+    }
     capture_allowed_cpus();
-    Args::parse();
+    Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(RuntimeError::RuntimeCreation)?
+        .block_on(run())
+}
+
+fn print_config_env_vars() -> std::io::Result<()> {
+    let sink_source_templates = [
+        (
+            BaseConnectorConfig::Sink {
+                key: "<KEY>".to_owned(),
+            },
+            SinkConfig::env_templates(),
+        ),
+        (
+            BaseConnectorConfig::Source {
+                key: "<KEY>".to_owned(),
+            },
+            SourceConfig::env_templates(),
+        ),
+    ]
+    .into_iter()
+    .flat_map(|(connector, templates)| {
+        // "<KEY>" stands in for the real, per-connector key `local_provider`
+        // uppercases at runtime - same prefix rule, so the listing can't
+        // drift from the names the runtime actually reads.
+        let connector_type = connector.connector_type().to_uppercase();
+        let key = connector.key().to_uppercase();
+        let prefix = connector_env_prefix(&connector_type, &key);
+        let plugin_config = format!("{prefix}{PLUGIN_CONFIG_ENV_SEGMENT}<FIELD>");
+        templates
+            .iter()
+            .map(move |template| format!("{prefix}{}", template.env_name))
+            .chain(std::iter::once(plugin_config))
+    });
+
+    let names = ConnectorsRuntimeConfig::env_templates()
+        .iter()
+        .map(|t| t.env_name.to_string())
+        .chain(CONNECTORS_RUNTIME_ENV_VARS.iter().map(|s| s.to_string()))
+        .chain(sink_source_templates);
+
+    let mut stdout = std::io::stdout();
+    print_env_var_names(names, &mut stdout)
+}
+
+async fn run() -> Result<(), RuntimeError> {
     print_ascii_art("Iggy Connectors");
 
-    if let Ok(env_path) = std::env::var("IGGY_CONNECTORS_ENV_PATH") {
+    if let Ok(env_path) = std::env::var(CONNECTORS_ENV_PATH_ENV) {
         if dotenvy::from_path(&env_path).is_ok() {
             println!("Loaded environment variables from path: {env_path}");
         }
@@ -131,7 +216,7 @@ async fn main() -> Result<(), RuntimeError> {
     }
 
     let config_path =
-        env::var("IGGY_CONNECTORS_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
+        env::var(CONNECTORS_CONFIG_PATH_ENV).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
     println!("Starting Iggy Connectors Runtime, loading configuration from: {config_path}...");
 
     let config: ConnectorsRuntimeConfig = ConnectorsRuntimeConfig::config_provider(config_path)
@@ -141,9 +226,7 @@ async fn main() -> Result<(), RuntimeError> {
 
     log::init_logging(&config.telemetry, &config.logging, VERSION);
 
-    std::fs::create_dir_all(&config.state.path).expect("Failed to create state directory");
-
-    info!("State will be stored in: {}", config.state.path);
+    let state_factory = state::factory_from_config(&config.state)?;
 
     let iggy_clients = Arc::new(stream::init(config.iggy.clone()).await?);
 
@@ -156,16 +239,17 @@ async fn main() -> Result<(), RuntimeError> {
         connectors_config.sources().len(),
         connectors_config.sinks().len()
     );
+    warn_on_unaddressable_keys(&connectors_config);
     let sources_config = connectors_config.sources();
     let (sources, failed_sources) = source::init(
         sources_config.clone(),
         &iggy_clients.producer,
-        &config.state.path,
+        &state_factory,
     )
     .await?;
 
     let sinks_config = connectors_config.sinks();
-    let (sinks, failed_sinks) = sink::init(sinks_config.clone(), &iggy_clients.consumer).await?;
+    let (sinks, failed_sinks) = sink::init(sinks_config.clone(), &iggy_clients).await?;
 
     let mut sink_wrappers = vec![];
     let mut sink_containers_by_key: HashMap<String, Arc<Container<SinkApi>>> = HashMap::new();
@@ -184,13 +268,17 @@ async fn main() -> Result<(), RuntimeError> {
     let mut source_wrappers = vec![];
     let mut source_containers_by_key: HashMap<String, Arc<Container<SourceApi>>> = HashMap::new();
     for (_path, source) in sources {
-        let container = Arc::new(source.container);
-        let callback = container.iggy_source_handle;
+        let container = source.container;
+        let handle_callback = container.iggy_source_handle_v2;
+        let register_stop_callback = container.iggy_source_register_stop_callback;
+        let batch_result_callback = container.iggy_source_batch_result;
         for plugin in &source.plugins {
             source_containers_by_key.insert(plugin.key.clone(), container.clone());
         }
         source_wrappers.push(SourceConnectorWrapper {
-            callback,
+            handle_callback,
+            register_stop_callback,
+            batch_result_callback,
             plugins: source.plugins,
         });
     }
@@ -205,7 +293,7 @@ async fn main() -> Result<(), RuntimeError> {
         &failed_sources,
         connectors_config_provider,
         iggy_clients.clone(),
-        config.state.path.clone(),
+        state_factory,
     );
     for (key, container) in sink_containers_by_key {
         if let Some(details) = context.sinks.get(&key).await {
@@ -300,9 +388,31 @@ async fn main() -> Result<(), RuntimeError> {
     }
 
     iggy_clients.producer.shutdown().await?;
-    iggy_clients.consumer.shutdown().await?;
     info!("All connectors closed. Runtime shutdown complete.");
     Ok(())
+}
+
+/// Keys loaded from a provider are not held to `ConnectorKey`, so existing
+/// deployments keep starting, but the control API only routes keys that pass
+/// it. Say so at startup instead of letting the operator discover a 400.
+fn warn_on_unaddressable_keys(connectors_config: &ConnectorsConfig) {
+    let keys = connectors_config
+        .sinks()
+        .keys()
+        .map(|key| ("sink", key))
+        .chain(
+            connectors_config
+                .sources()
+                .keys()
+                .map(|key| ("source", key)),
+        );
+    for (connector_type, key) in keys {
+        if let Err(error) = key.parse::<ConnectorKey>() {
+            warn!(
+                "Loaded {connector_type} connector with key {key:?} that the control API cannot address: {error}"
+            );
+        }
+    }
 }
 
 /// Resolves a plugin shared library path from the connector config `path` field.
@@ -327,12 +437,7 @@ pub(crate) fn resolve_plugin_path(path: &str) -> Result<String, RuntimeError> {
     let with_extension = if ALLOWED_PLUGIN_EXTENSIONS.contains(&extension) {
         path.to_string()
     } else {
-        let os_extension = match std::env::consts::OS {
-            "macos" => "dylib",
-            "windows" => "dll",
-            _ => "so",
-        };
-        format!("{path}.{os_extension}")
+        format!("{path}.{}", std::env::consts::DLL_EXTENSION)
     };
 
     let candidate = std::path::Path::new(&with_extension);
@@ -417,6 +522,7 @@ struct SinkConnectorPlugin {
     version: String,
     config_format: Option<ConfigFormat>,
     consumers: Vec<SinkConnectorConsumer>,
+    client: Option<Arc<IggyClient>>,
     error: Option<String>,
     verbose: bool,
     benchmark: bool,
@@ -434,8 +540,30 @@ struct SinkConnectorWrapper {
     plugins: Vec<SinkConnectorPlugin>,
 }
 
+/// Closes a plugin instance whose setup did not finish, reporting a refusal
+/// rather than returning it: every caller is already on a failure path with an
+/// error of its own to surface.
+///
+/// The two sides had this body inline, one word apart. That word is the label
+/// [`ConnectorType`] already defines, so it is taken as the enum rather than a
+/// string nothing constrains.
+pub(crate) fn close_plugin_instance(
+    close: &dyn Fn(u32) -> i32,
+    kind: ConnectorType,
+    plugin_id: u32,
+    key: &str,
+) {
+    let close_result = close(plugin_id);
+    if close_result != 0 {
+        let kind = kind.as_label();
+        warn!(
+            "iggy_{kind}_close returned {close_result} while cleaning up failed {kind} connector with ID: {plugin_id} ({key})"
+        );
+    }
+}
+
 struct SourceConnector {
-    container: Container<SourceApi>,
+    container: Arc<Container<SourceApi>>,
     plugins: Vec<SourceConnectorPlugin>,
 }
 
@@ -457,10 +585,14 @@ struct SourceConnectorPlugin {
 struct SourceConnectorProducer {
     encoder: Arc<dyn StreamEncoder>,
     producer: IggyProducer,
+    /// Set when the source delivers exactly once. See `exactly_once`.
+    exactly_once: Option<exactly_once::ExactlyOnce>,
 }
 
 struct SourceConnectorWrapper {
-    callback: HandleCallback,
+    handle_callback: HandleCallback,
+    register_stop_callback: Option<RegisterStopCallback>,
+    batch_result_callback: BatchResultCallback,
     plugins: Vec<SourceConnectorPlugin>,
 }
 
@@ -503,6 +635,7 @@ impl FailedPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use std::fs;
     use tempfile::TempDir;
 
@@ -520,10 +653,7 @@ mod tests {
     fn path_without_extension_gets_os_suffix() {
         let result = resolve_plugin_path("/tmp/nonexistent_test_plugin");
         let err = result.unwrap_err().to_string();
-        let expected_ext = match std::env::consts::OS {
-            "macos" => "dylib",
-            _ => "so",
-        };
+        let expected_ext = std::env::consts::DLL_EXTENSION;
         assert!(
             err.contains(&format!("nonexistent_test_plugin.{expected_ext}")),
             "Error should mention OS-specific extension, got: {err}"
@@ -559,5 +689,17 @@ mod tests {
         let result = resolve_plugin_path(plugin_path.to_str().unwrap())
             .expect("should resolve existing file");
         assert_eq!(result, plugin_path.to_str().unwrap());
+    }
+
+    #[test]
+    fn list_config_env_help_matches_stream_template_limit() {
+        let template = SinkConfig::env_templates()
+            .iter()
+            .find(|template| template.env_name == "STREAMS_<N>_STREAM")
+            .expect("sink stream template");
+        assert_eq!(template.max_elements, &[256]);
+
+        let help = Args::command().render_long_help().to_string();
+        assert!(help.contains("0-255 for stream fields"));
     }
 }

@@ -1029,17 +1029,6 @@ body.dark .segment.active {
     letter-spacing: -0.01em;
 }
 
-.footer-brand-tag {
-    padding: 1px 6px;
-    background: rgba(255, 145, 3, 0.14);
-    color: #ff9103;
-    border-radius: 4px;
-    font-size: 10px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-}
-
 .footer-links {
     display: inline-flex;
     justify-content: center;

@@ -67,11 +67,11 @@ async fn create_topic(client: &IggyClient, stream: &Identifier, name: &str) {
         .create_topic(
             stream,
             name,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap_or_else(|error| panic!("create_topic {name}: {error}"));
@@ -104,11 +104,13 @@ async fn poll_payloads(
         .poll_messages(
             stream,
             topic,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            16,
-            false,
+            PollOptions {
+                count: 16,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap_or_else(|error| panic!("poll_messages: {error}"))
@@ -139,7 +141,7 @@ fn assert_no_degraded_park_paths(harness: &TestHarness) {
 
 /// Topics are created in a batch first, so several materialisations are in
 /// flight at once when the produces start.
-#[iggy_harness(cluster_nodes = 1, server(system.sharding.cpu_allocation = "2"))]
+#[iggy_harness(cluster_nodes = 1, server(sharding.cpu_allocation = "2"))]
 async fn given_two_shards_when_producing_right_after_create_topic_should_round_trip(
     harness: &TestHarness,
 ) {
@@ -149,7 +151,10 @@ async fn given_two_shards_when_producing_right_after_create_topic_should_round_t
         .await
         .unwrap();
     let stream = Identifier::named(STREAM).unwrap();
-    client.create_stream(STREAM).await.unwrap();
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     for index in 0..TOPICS {
         create_topic(&client, &stream, &topic_name(index)).await;
@@ -183,7 +188,7 @@ async fn given_two_shards_when_producing_right_after_create_topic_should_round_t
 /// fence needs a produce concurrent with the delete from a second connection,
 /// which is a different test. This one catches the steady-state failures: a
 /// rebuild that wedges, or stale segments served under the recycled identity.
-#[iggy_harness(cluster_nodes = 1, server(system.sharding.cpu_allocation = "2"))]
+#[iggy_harness(cluster_nodes = 1, server(sharding.cpu_allocation = "2"))]
 async fn given_two_shards_when_recreating_a_topic_should_serve_only_the_new_incarnation(
     harness: &TestHarness,
 ) {
@@ -193,7 +198,10 @@ async fn given_two_shards_when_recreating_a_topic_should_serve_only_the_new_inca
         .await
         .unwrap();
     let stream = Identifier::named(STREAM).unwrap();
-    client.create_stream(STREAM).await.unwrap();
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     for index in 0..TOPICS {
         let name = topic_name(index);

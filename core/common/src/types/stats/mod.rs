@@ -70,7 +70,7 @@ pub struct Stats {
     pub kernel_version: String,
     /// The version of the Iggy server.
     pub iggy_server_version: String,
-    /// The semantic version of the Iggy server in the numeric format e.g. 1.2.3 -> 100200300 (major * 1000000 + minor * 1000 + patch).
+    /// The semantic version of the Iggy server in the numeric format e.g. 1.2.3 -> 1002003 (major * 1000000 + minor * 1000 + patch).
     pub iggy_server_semver: Option<u32>,
     /// Cache metrics per partition
     #[serde(with = "cache_metrics_serializer")]
@@ -81,6 +81,15 @@ pub struct Stats {
     pub free_disk_space: IggyByteSize,
     /// The total disk space for the data directory.
     pub total_disk_space: IggyByteSize,
+    /// The number of file descriptors the server process holds open, 0 when unknown.
+    /// Where the kernel cannot count them without a scan (Linux before 6.2, macOS),
+    /// the server scans at least every 10 seconds, so the count can be 10 seconds old.
+    #[serde(default)]
+    pub open_files_count: u64,
+    /// The soft limit on open file descriptors (`RLIMIT_NOFILE`) of the server
+    /// process, 0 when unknown.
+    #[serde(default)]
+    pub open_files_limit: u64,
 }
 
 /// Key for identifying a specific partition's cache metrics
@@ -191,6 +200,8 @@ impl Default for Stats {
             threads_count: 0,
             free_disk_space: 0.into(),
             total_disk_space: 0.into(),
+            open_files_count: 0,
+            open_files_limit: 0,
         }
     }
 }

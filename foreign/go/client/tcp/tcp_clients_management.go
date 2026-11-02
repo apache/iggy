@@ -42,3 +42,12 @@ func (c *IggyTcpClient) GetClient(ctx context.Context, clientId uint32) (*iggcon
 
 	return binaryserialization.DeserializeClient(buffer), nil
 }
+
+func (c *IggyTcpClient) GetMe(ctx context.Context) (*iggcon.ClientInfoDetails, error) {
+	buffer, err := c.do(ctx, &command.GetMe{})
+	if err != nil {
+		return nil, err
+	}
+
+	return binaryserialization.DeserializeClient(buffer), nil
+}

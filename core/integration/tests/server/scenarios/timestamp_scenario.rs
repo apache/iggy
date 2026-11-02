@@ -53,7 +53,7 @@ fn all_message_sizes() -> Vec<u64> {
     vec![50, 1000, 20000]
 }
 
-pub async fn run(harness: &TestHarness) {
+pub async fn run(harness: &TestHarness, topic_options: &TopicCreateOptions) {
     let client = harness
         .root_client()
         .await
@@ -61,7 +61,14 @@ pub async fn run(harness: &TestHarness) {
 
     for msg_size in all_message_sizes() {
         for (pattern_name, batch_pattern) in all_batch_patterns() {
-            run_timestamp_test(&client, msg_size, &batch_pattern, pattern_name).await;
+            run_timestamp_test(
+                &client,
+                msg_size,
+                &batch_pattern,
+                pattern_name,
+                topic_options,
+            )
+            .await;
         }
     }
 }
@@ -71,11 +78,12 @@ async fn run_timestamp_test(
     message_size: u64,
     batch_lengths: &[u32],
     pattern_name: &str,
+    topic_options: &TopicCreateOptions,
 ) {
     let stream_name = format!("test-stream-ts-{}-{}", message_size, pattern_name);
     let topic_name = format!("test-topic-ts-{}-{}", message_size, pattern_name);
 
-    init_system(client, &stream_name, &topic_name).await;
+    init_system(client, &stream_name, &topic_name, topic_options).await;
 
     let total_messages_count: u32 = batch_lengths.iter().sum();
 
@@ -133,17 +141,21 @@ async fn run_timestamp_test(
     cleanup(client, &stream_name).await;
 }
 
-async fn init_system(client: &IggyClient, stream_name: &str, topic_name: &str) {
-    client.create_stream(stream_name).await.unwrap();
+async fn init_system(
+    client: &IggyClient,
+    stream_name: &str,
+    topic_name: &str,
+    topic_options: &TopicCreateOptions,
+) {
+    client
+        .create_stream(stream_name, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &Identifier::named(stream_name).unwrap(),
             topic_name,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            topic_options,
         )
         .await
         .unwrap();
@@ -220,7 +232,7 @@ async fn verify_all_messages_from_start_timestamp(
     initial_timestamp: u64,
     total_messages: u32,
 ) {
-    let polled = poll_until_expected_count(
+    let messages = poll_until_expected_count(
         client,
         stream_name,
         topic_name,
@@ -230,11 +242,11 @@ async fn verify_all_messages_from_start_timestamp(
     .await;
 
     assert_eq!(
-        polled.messages.len() as u32,
+        messages.len() as u32,
         total_messages,
         "Expected {} messages from initial timestamp, got {}",
         total_messages,
-        polled.messages.len()
+        messages.len()
     );
 }
 
@@ -251,7 +263,7 @@ async fn verify_messages_from_middle_timestamp(
         let prior_batches_sum: u32 = batch_lengths[..3].iter().sum();
         let remaining_messages = total_messages - prior_batches_sum;
 
-        let polled = poll_until_expected_count(
+        let messages = poll_until_expected_count(
             client,
             stream_name,
             topic_name,
@@ -261,11 +273,11 @@ async fn verify_messages_from_middle_timestamp(
         .await;
 
         assert_eq!(
-            polled.messages.len() as u32,
+            messages.len() as u32,
             remaining_messages,
             "Expected {} messages from middle timestamp, got {}",
             remaining_messages,
-            polled.messages.len()
+            messages.len()
         );
     }
 }
@@ -281,11 +293,13 @@ async fn verify_no_messages_with_future_timestamp(
         .poll_messages(
             &Identifier::named(stream_name).unwrap(),
             &Identifier::named(topic_name).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::timestamp(IggyTimestamp::from(future_timestamp)),
-            10,
-            false,
+            PollOptions {
+                count: 10,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -311,11 +325,13 @@ async fn verify_small_subset_from_start_timestamp(
         .poll_messages(
             &Identifier::named(stream_name).unwrap(),
             &Identifier::named(topic_name).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::timestamp(IggyTimestamp::from(initial_timestamp)),
-            subset_size,
-            false,
+            PollOptions {
+                count: subset_size,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -343,11 +359,13 @@ async fn verify_messages_spanning_batches_by_timestamp(
             .poll_messages(
                 &Identifier::named(stream_name).unwrap(),
                 &Identifier::named(topic_name).unwrap(),
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &Consumer::default(),
                 &PollingStrategy::timestamp(IggyTimestamp::from(span_timestamp)),
-                span_size,
-                false,
+                PollOptions {
+                    count: span_size,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -377,11 +395,13 @@ async fn verify_message_content_by_timestamp(
             .poll_messages(
                 &Identifier::named(stream_name).unwrap(),
                 &Identifier::named(topic_name).unwrap(),
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &Consumer::default(),
                 &PollingStrategy::timestamp(IggyTimestamp::from(span_timestamp)),
-                span_size,
-                false,
+                PollOptions {
+                    count: span_size,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();

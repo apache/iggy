@@ -1,0 +1,132 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+/// Error raised by every SDK operation.
+///
+/// The `code` is what the server answered with, or what the SDK decided
+/// locally (a dropped connection, a rejected argument). Match on it:
+///
+/// ```swift
+/// do {
+///     _ = try await client.getStream("orders")
+/// } catch let error as IggyError where error.code == .streamNameNotFound {
+///     // create it
+/// }
+/// ```
+///
+/// `context` carries whatever extra detail was available where the error was
+/// raised, such as the transport failure message or the protocol window the
+/// server accepts. It never carries credentials, and it takes no part in
+/// equality. Recovery errors also compare their operation and partition IDs.
+public struct IggyError: Error, Sendable, Hashable, CustomStringConvertible {
+    /// The classified code.
+    public let code: IggyErrorCode
+    /// The exact code that arrived on the wire. Equal to `code.rawValue` unless
+    /// the server answered with a code this SDK does not know, in which case
+    /// `code` is ``IggyErrorCode/error`` and this keeps the original value.
+    public let rawCode: UInt32
+    /// Extra detail about the failure, when any was available.
+    public let context: String?
+    /// A client-local recovery handle, never a replayable fetch receipt.
+    public let operationID: UInt128Value?
+    /// The partition whose progress is blocked by `operationID`, when known.
+    public let partitionID: UInt32?
+
+    public init(_ code: IggyErrorCode, context: String? = nil, operationID: UInt128Value? = nil, partitionID: UInt32? = nil) {
+        self.code = code
+        self.rawCode = code.rawValue
+        self.context = context
+        self.operationID = operationID
+        self.partitionID = partitionID
+    }
+
+    /// Maps a code received from the server, keeping unknown codes visible.
+    public init(wireCode: UInt32) {
+        if let code = IggyErrorCode(rawValue: wireCode) {
+            self.code = code
+            self.context = nil
+        } else {
+            self.code = .error
+            self.context = "unknown error code \(wireCode)"
+        }
+        self.rawCode = wireCode
+        self.operationID = nil
+        self.partitionID = nil
+    }
+
+    public var description: String {
+        let identity = operationID.map { " operation=\($0)" } ?? ""
+        let partition = partitionID.map { " partition=\($0)" } ?? ""
+        if let context {
+            return "\(code.name) (\(rawCode))\(identity)\(partition): \(context)"
+        }
+        return "\(code.name) (\(rawCode))\(identity)\(partition)"
+    }
+
+    public static func == (lhs: IggyError, rhs: IggyError) -> Bool {
+        lhs.code == rhs.code && lhs.rawCode == rhs.rawCode && lhs.operationID == rhs.operationID && lhs.partitionID == rhs.partitionID
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(code)
+        hasher.combine(rawCode)
+        hasher.combine(operationID)
+        hasher.combine(partitionID)
+    }
+}
+
+extension IggyError {
+    /// Whether the failure means the connection itself is gone.
+    var isConnectionLoss: Bool {
+        switch code {
+        case .disconnected, .emptyResponse, .notConnected, .cannotEstablishConnection, .tcpError, .staleClient:
+            true
+        default:
+            false
+        }
+    }
+
+    /// Whether a fresh connection and sign-in can recover from this failure.
+    var isReconnectable: Bool {
+        isConnectionLoss || code == .unauthenticated
+    }
+
+    /// Whether the replica found no stream, topic, or partition for the
+    /// request. A replica that has not applied the commit creating one
+    /// answers this too.
+    var isNamespaceMiss: Bool {
+        switch code {
+        case .streamIdNotFound, .streamNameNotFound, .topicIdNotFound, .topicNameNotFound, .partitionNotFound:
+            true
+        default:
+            false
+        }
+    }
+
+    /// Whether a sign-in that failed this way would fail the same way on a
+    /// retry, so the remembered credentials are dropped. The same refusals
+    /// as `rejects_credentials` in the Rust SDK.
+    var isCredentialRejection: Bool {
+        switch code {
+        case .invalidCredentials, .invalidUsername, .invalidPassword, .invalidPersonalAccessToken, .personalAccessTokenExpired, .userInactive,
+            .unauthenticated, .invalidFormat:
+            true
+        default:
+            false
+        }
+    }
+}

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -22,6 +23,16 @@ pub enum IpAddrKind {
     #[default]
     V4,
     V6,
+}
+
+impl IpAddrKind {
+    /// The loopback address of this family, which every harness listener binds.
+    pub fn loopback(self) -> IpAddr {
+        match self {
+            Self::V4 => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Self::V6 => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

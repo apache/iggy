@@ -151,21 +151,21 @@ public class MessageEncryptionTests
 
         Span<byte> span = buffer.AsSpan(0, written);
         var metadataLength = BinaryPrimitives.ReadInt32LittleEndian(span[..4]);
-        var position = 4 + metadataLength + 16 * messages.Length;
+        var position = 4 + metadataLength + 256;
 
-        var firstPayloadLength = BinaryPrimitives.ReadInt32LittleEndian(span[(position + 52)..(position + 56)]);
+        var firstPayloadLength = BinaryPrimitives.ReadInt32LittleEndian(span[(position + 36)..(position + 40)]);
         Assert.Equal(encryptor.GetMaxEncryptedLength("first-payload"u8.Length), firstPayloadLength);
         Assert.Equal("first-payload"u8.ToArray(),
-            encryptor.DecryptToArray(span.Slice(position + 64, firstPayloadLength)));
+            encryptor.DecryptToArray(span.Slice(position + 48, firstPayloadLength)));
 
-        position += 64 + firstPayloadLength;
-        var secondHeadersLength = BinaryPrimitives.ReadInt32LittleEndian(span[(position + 48)..(position + 52)]);
-        var secondPayloadLength = BinaryPrimitives.ReadInt32LittleEndian(span[(position + 52)..(position + 56)]);
+        position += 48 + firstPayloadLength;
+        var secondHeadersLength = BinaryPrimitives.ReadInt32LittleEndian(span[(position + 32)..(position + 36)]);
+        var secondPayloadLength = BinaryPrimitives.ReadInt32LittleEndian(span[(position + 36)..(position + 40)]);
         Assert.Equal("second-payload"u8.ToArray(),
-            encryptor.DecryptToArray(span.Slice(position + 64, secondPayloadLength)));
+            encryptor.DecryptToArray(span.Slice(position + 48, secondPayloadLength)));
 
         var plainHeaders = encryptor.DecryptToArray(
-            span.Slice(position + 64 + secondPayloadLength, secondHeadersLength));
+            span.Slice(position + 48 + secondPayloadLength, secondHeadersLength));
         Assert.Single(BinaryMapper.MapHeaders(plainHeaders));
     }
 }

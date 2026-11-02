@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { deserializeError } from '../error.utils.js';
 
@@ -34,6 +33,7 @@ export type TransportEndpoints = {
 }
 
 export type ClusterNode = {
+  replicaId: number
   name: string
   ip: string
   endpoints: TransportEndpoints
@@ -43,7 +43,7 @@ export type ClusterNode = {
 
 type DeserializedClusterNode = { length: number, data: ClusterNode }
 
-const CLUSTER_NODE_MIN_BUFFER_SIZE = 18; // 4 + 1 + 4 + 1 + 8 (endpoints) + 1 + 1;
+const CLUSTER_NODE_MIN_BUFFER_SIZE = 19;
 
 export const deserializeNode = (b: Buffer, pos = 0): DeserializedClusterNode => {
   if (b.length - pos < CLUSTER_NODE_MIN_BUFFER_SIZE)
@@ -52,6 +52,8 @@ export const deserializeNode = (b: Buffer, pos = 0): DeserializedClusterNode => 
     );
 
   const startPos = pos;
+  const replicaId = b.readUInt8(pos);
+  pos += 1;
 
   // Read name
   const nameLen = b.readUInt32LE(pos);
@@ -102,6 +104,7 @@ export const deserializeNode = (b: Buffer, pos = 0): DeserializedClusterNode => 
   return {
     length: pos - startPos,
     data: {
+      replicaId,
       name,
       ip,
       endpoints,

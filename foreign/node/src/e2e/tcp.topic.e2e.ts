@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -35,8 +34,7 @@ describe('e2e -> topic', async () => {
       name: topicName,
       partitionCount: 0,
       compressionAlgorithm: 1,
-      messageExpiry: 0n,
-      replicationFactor: 1
+      messageExpiry: 0n
     });
     assert.ok(TOPIC);
   });
@@ -67,10 +65,6 @@ describe('e2e -> topic', async () => {
       partitionCount: 19
     });
     assert.ok(dp);
-  });
-
-  it('e2e -> topic::purge', async () => {
-    assert.ok(await c.topic.purge({ streamId: streamName, topicId: topicName }));
   });
 
   it('e2e -> topic::delete', async () => {

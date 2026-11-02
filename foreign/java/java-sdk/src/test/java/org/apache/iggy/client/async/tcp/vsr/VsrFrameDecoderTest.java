@@ -26,6 +26,8 @@ import io.netty.handler.codec.DecoderException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -113,6 +115,80 @@ class VsrFrameDecoderTest {
             } catch (DecoderException ignored) {
                 // Closing a failed decoder can replay its exception.
             }
+        }
+    }
+
+    @Test
+    void shouldApplyEachRequestsLimitIndependentlyOnASharedConnection() {
+        long limitedRequest = 1L;
+        long ordinaryRequest = 2L;
+        int limit = VsrHeaders.HEADER_SIZE + 40;
+        EmbeddedChannel shared = new EmbeddedChannel(new VsrFrameDecoder(
+                VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE,
+                request -> request == limitedRequest ? limit : VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE));
+        try {
+            ByteBuf ordinary = Unpooled.buffer(limit + 1);
+            ordinary.writeZero(limit + 1);
+            ordinary.setIntLE(VsrHeaders.SIZE_OFFSET, limit + 1);
+            ordinary.setLongLE(VsrHeaders.REPLY_REQUEST_OFFSET, ordinaryRequest);
+            assertThat(shared.writeInbound(ordinary)).isTrue();
+            ByteBuf decoded = shared.readInbound();
+            assertThat(decoded.readableBytes()).isEqualTo(limit + 1);
+            decoded.release();
+
+            ByteBuf header = Unpooled.buffer(VsrHeaders.HEADER_SIZE);
+            header.writeZero(VsrHeaders.HEADER_SIZE);
+            header.setIntLE(VsrHeaders.SIZE_OFFSET, limit + 1);
+            header.setLongLE(VsrHeaders.REPLY_REQUEST_OFFSET, limitedRequest);
+            assertThatThrownBy(() -> shared.writeInbound(header)).isInstanceOf(DecoderException.class);
+        } finally {
+            try {
+                shared.finishAndReleaseAll();
+            } catch (DecoderException ignored) {
+                // Closing a failed decoder can replay its exception.
+            }
+        }
+    }
+
+    @Test
+    void shouldFollowALimitTightenedForOneExchange() {
+        int tightened = VsrHeaders.HEADER_SIZE + 16;
+        AtomicInteger limit = new AtomicInteger(VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE);
+        EmbeddedChannel tightenedChannel = new EmbeddedChannel(
+                new VsrFrameDecoder(VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE, request -> limit.get()));
+        try {
+            limit.set(tightened);
+            ByteBuf oversized = Unpooled.buffer(VsrHeaders.HEADER_SIZE);
+            oversized.writeZero(VsrHeaders.HEADER_SIZE);
+            oversized.setIntLE(VsrHeaders.SIZE_OFFSET, tightened + 1);
+
+            assertThatThrownBy(() -> tightenedChannel.writeInbound(oversized)).isInstanceOf(DecoderException.class);
+        } finally {
+            try {
+                tightenedChannel.finishAndReleaseAll();
+            } catch (DecoderException ignored) {
+                // Closing a failed decoder can replay its exception.
+            }
+        }
+    }
+
+    @Test
+    void shouldAcceptAFrameInsideTheTightenedLimitBeforeAccumulatingIt() {
+        int tightened = VsrHeaders.HEADER_SIZE + 16;
+        AtomicInteger limit = new AtomicInteger(tightened);
+        EmbeddedChannel tightenedChannel = new EmbeddedChannel(
+                new VsrFrameDecoder(VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE, request -> limit.get()));
+        try {
+            ByteBuf frame = Unpooled.buffer(tightened);
+            frame.writeZero(tightened);
+            frame.setIntLE(VsrHeaders.SIZE_OFFSET, tightened);
+
+            assertThat(tightenedChannel.writeInbound(frame)).isTrue();
+            ByteBuf decoded = tightenedChannel.readInbound();
+            assertThat(decoded.readableBytes()).isEqualTo(tightened);
+            decoded.release();
+        } finally {
+            tightenedChannel.finishAndReleaseAll();
         }
     }
 }

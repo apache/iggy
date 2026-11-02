@@ -24,6 +24,9 @@ namespace Apache.Iggy.Contracts;
 /// </summary>
 public sealed class PolledMessagesRental : IDisposable
 {
+    /// <summary>Captured incarnation and ownership authority for these offsets.</summary>
+    public PartitionContext Context { get; init; }
+
     private readonly IMemoryOwner<byte> _owner;
     private readonly IMemoryOwner<byte>? _plaintextOwner;
     private int _disposed;
@@ -31,7 +34,7 @@ public sealed class PolledMessagesRental : IDisposable
     /// <summary>
     ///     Partition identifier for the messages.
     /// </summary>
-    public required int PartitionId { get; init; }
+    public required uint PartitionId { get; init; }
 
     /// <summary>
     ///     Current offset for the partition.

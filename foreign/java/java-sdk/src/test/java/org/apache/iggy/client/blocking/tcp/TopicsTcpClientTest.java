@@ -21,11 +21,40 @@ package org.apache.iggy.client.blocking.tcp;
 
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.TopicsClientBaseTest;
+import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.HeaderKind;
+import org.apache.iggy.message.HeaderValue;
+import org.junit.jupiter.api.Test;
+
+import java.util.Map;
+
+import static org.apache.iggy.TestConstants.STREAM_NAME;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class TopicsTcpClientTest extends TopicsClientBaseTest {
 
     @Override
     protected IggyBaseClient getClient() {
         return TcpClientFactory.create(serverHost(), serverTcpPort());
+    }
+
+    @Test
+    void shouldStoreAnOptionInItsCanonicalKind() {
+        // Create admission re-encodes the block from its own parse, so a value
+        // arrives back in the key's catalog kind whatever kind it was sent as.
+        // Only the binary transport carries kinds: REST renders values as strings.
+        var created = topicsClient.createTopic(
+                STREAM_NAME, "canonical-kind-topic", 1L, Map.of("durability", HeaderValue.fromString("persisted")));
+
+        var topic = topicsClient.getTopic(STREAM_NAME, TopicId.of(created.id())).orElseThrow();
+        assertThat(topic.options().get("durability").kind()).isEqualTo(HeaderKind.String);
+    }
+
+    @Test
+    void shouldRejectAnOptionKeyOutsideTheCatalog() {
+        assertThatThrownBy(() -> topicsClient.createTopic(
+                        STREAM_NAME, "bad-options-topic", 1L, Map.of("not_a_real_option", HeaderValue.fromString("1"))))
+                .isInstanceOf(RuntimeException.class);
     }
 }

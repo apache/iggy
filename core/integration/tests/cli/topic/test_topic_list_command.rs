@@ -23,7 +23,8 @@ use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
 use iggy::prelude::IggyExpiry;
-use iggy::prelude::MaxTopicSize;
+use iggy::prelude::StreamCreateOptions;
+use iggy::prelude::TopicCreateOptions;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
 
@@ -67,18 +68,20 @@ impl TestTopicListCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestTopicListCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name).await;
+        let stream = client
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
 
         let topic = client
             .create_topic(
                 &self.stream_name.clone().try_into().unwrap(),
                 &self.topic_name,
-                1,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await;
         assert!(topic.is_ok());

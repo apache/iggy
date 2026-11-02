@@ -17,8 +17,7 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
-use iggy_common::PartitionClient;
-use iggy_common::{Identifier, IggyError};
+use iggy_common::{Identifier, IggyError, PartitionClient};
 
 #[async_trait]
 impl PartitionClient for ClientWrapper {
@@ -28,33 +27,11 @@ impl PartitionClient for ClientWrapper {
         topic_id: &Identifier,
         partitions_count: u32,
     ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .create_partitions(stream_id, topic_id, partitions_count)
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .create_partitions(stream_id, topic_id, partitions_count)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .create_partitions(stream_id, topic_id, partitions_count)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .create_partitions(stream_id, topic_id, partitions_count)
-                    .await
-            }
-            ClientWrapper::WebSocket(client) => {
-                client
-                    .create_partitions(stream_id, topic_id, partitions_count)
-                    .await
-            }
-        }
+        super::dispatch_client!(
+            self,
+            PartitionClient::create_partitions(stream_id, topic_id, partitions_count)
+        )
+        .await
     }
 
     async fn delete_partitions(
@@ -63,32 +40,10 @@ impl PartitionClient for ClientWrapper {
         topic_id: &Identifier,
         partitions_count: u32,
     ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .delete_partitions(stream_id, topic_id, partitions_count)
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .delete_partitions(stream_id, topic_id, partitions_count)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .delete_partitions(stream_id, topic_id, partitions_count)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .delete_partitions(stream_id, topic_id, partitions_count)
-                    .await
-            }
-            ClientWrapper::WebSocket(client) => {
-                client
-                    .delete_partitions(stream_id, topic_id, partitions_count)
-                    .await
-            }
-        }
+        super::dispatch_client!(
+            self,
+            PartitionClient::delete_partitions(stream_id, topic_id, partitions_count)
+        )
+        .await
     }
 }

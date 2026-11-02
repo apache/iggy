@@ -578,6 +578,18 @@ pub(crate) fn py_user_headers_to_rust(
     Ok(rust_headers)
 }
 
+/// Wrap one Rust header value as the `HeaderValue` message headers already use.
+///
+/// The option catalog reports each key's default as a typed value, and options
+/// ride the user-headers codec, so they hand back the same type rather than a
+/// second one that means the same thing.
+pub(crate) fn rust_header_value_to_py<'a>(
+    py: Python<'a>,
+    value: &RustHeaderValue,
+) -> PyResult<Bound<'a, HeaderValue>> {
+    Bound::<HeaderValue>::try_from(RustHeaderValueRef { py, value })
+}
+
 pub(crate) fn rust_user_headers_to_py<'a>(
     py: Python<'a>,
     headers: RustUserHeaders,

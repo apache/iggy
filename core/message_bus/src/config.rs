@@ -33,10 +33,11 @@
 //! [`From<&ServerConfig> for MessageBusConfig`](MessageBusConfig)
 //! folds that section into [`WebSocketConfig`] once at boot.
 //!
-//! Liveness detection is NOT done via TCP keepalive on the bus: SDK
-//! clients manage their own keepalive policy at the application layer,
-//! and replica<->replica liveness is observed by VSR heartbeats rather
-//! than by `SO_KEEPALIVE`.
+//! SDK clients manage their own keepalive policy at the application
+//! layer, so client sockets get no TCP keepalive. VSR heartbeats never
+//! close a replica socket, so replica sockets get keepalive probes, and
+//! on Linux [`MessageBusConfig::replica_user_timeout`] closes a link
+//! whose peer stays silent that long, idle or not.
 //!
 //! Neither plane is authenticated at the bus layer: identity and
 //! credential checks belong to the caller (`core/server`) via
@@ -63,18 +64,16 @@ use std::time::Duration;
 ///
 /// Hardcoded knobs the bus does NOT expose: `max_concurrent_uni_streams = 0`
 /// and the CUBIC congestion controller. Both are architectural
-/// invariants of the SDK-client plane (single bidi stream per peer,
-/// no datagram or unidirectional traffic).
+/// invariants of the SDK-client plane (no datagram or unidirectional
+/// traffic).
 #[derive(Debug, Clone)]
 pub struct QuicTuning {
     /// Maximum number of concurrent bidirectional streams per
-    /// connection. The bus opens exactly one per peer; setting this
-    /// above 1 just preallocates unused quinn-proto state.
+    /// connection. Each SDK command opens a fresh bidi stream, so
+    /// this caps how many commands one client connection may have
+    /// in flight; 1 disables pipelining. Defaults to
+    /// [`QUIC_MAX_CONCURRENT_STREAMS`].
     pub max_concurrent_bidi_streams: u32,
-
-    /// Buffer size handed to quinn's outbound datagram queue, in
-    /// bytes.
-    pub datagram_send_buffer_size: usize,
 
     /// Initial path MTU advertised to the peer, in bytes.
     pub initial_mtu: u16,
@@ -84,6 +83,13 @@ pub struct QuicTuning {
 
     /// Receive-flow control window per connection, in bytes.
     pub receive_window: u32,
+
+    /// Receive-flow control window per stream, in bytes. Never above
+    /// [`Self::receive_window`]. A value strictly below keeps one
+    /// unread stream from pinning the whole connection window. The
+    /// default is equal, because the server reads each stream as soon
+    /// as it opens.
+    pub stream_receive_window: u32,
 
     /// Interval between QUIC keep-alive PINGs. `Duration::ZERO`
     /// disables keep-alive; the connection then relies entirely on
@@ -134,10 +140,23 @@ pub struct MessageBusConfig {
     /// validator; undersize or oversize frames are rejected.
     pub max_message_size: usize,
 
-    /// Bound on the per-peer mpsc queue. The writer task drains; the
+    /// Read-ahead buffer per plaintext replica link, in bytes. Threaded
+    /// into `TcpTransportConn::with_replica_read` by the replica
+    /// installer; zero selects the unbuffered read path. The client
+    /// plane and the TLS-family transports ignore it.
+    pub replica_read_buffer_size: usize,
+
+    /// Bound on each replica peer's mpsc queue. The writer task drains; the
     /// `send_to_*` path enqueues. Too small drops under burst; too
     /// large delays backpressure signalling.
     pub peer_queue_capacity: usize,
+
+    /// Bound on each SDK connection's inbound and outbound queues.
+    pub client_queue_capacity: usize,
+
+    /// How long a reply waits for room in a full client queue before the
+    /// connection is closed.
+    pub client_write_stall_timeout: Duration,
 
     /// Interval between outbound reconnect attempts to peers with
     /// `peer_id > self_id`.
@@ -145,8 +164,8 @@ pub struct MessageBusConfig {
 
     /// Number of peer replicas this node expects in its mesh
     /// (`cluster.nodes.len() - 1`, or 0 with clustering disabled).
-    /// Used only for mesh-formation observability: an info log fires
-    /// when the owner table first holds this many peers.
+    /// Used only for mesh-formation observability: shard 0 logs the mesh
+    /// complete once this many peer bundles are Up.
     pub mesh_expected_peers: usize,
 
     /// Timeout for per-peer close drain (flush writer, tear down
@@ -169,8 +188,16 @@ pub struct MessageBusConfig {
     /// and the QUIC `connecting.await` + first `accept_bi.await` pair.
     /// Threaded into `compio::time::timeout(handshake_grace, ...)` at
     /// each handshake site so a slowloris peer cannot pin per-conn
-    /// channels + registry slot + spawned task indefinitely.
+    /// channels + registry slot + spawned task indefinitely. Also bounds
+    /// the read of a replica link's placement preamble and the time a
+    /// replica bundle may stay incomplete.
     pub handshake_grace: Duration,
+
+    /// `TCP_USER_TIMEOUT` of every replica link, from
+    /// `cluster.heartbeat_timeout`: sent data or keepalive probes that stay
+    /// unacknowledged this long close the link. Linux only; see
+    /// `socket_opts::apply_replica_socket_options`.
+    pub replica_user_timeout: Duration,
 
     /// WebSocket frame-layer tunables (read/write buffer sizes, max
     /// frame size, max message size, accept-unmasked-frames flag).
@@ -209,7 +236,11 @@ impl From<&ServerConfig> for MessageBusConfig {
             max_batch: bus.max_batch,
             max_message_size: usize::try_from(bus.max_message_size.as_bytes_u64())
                 .expect("message_bus.max_message_size fits usize on supported targets"),
+            replica_read_buffer_size: usize::try_from(bus.replica_read_buffer_size.as_bytes_u64())
+                .expect("message_bus.replica_read_buffer_size fits usize on supported targets"),
             peer_queue_capacity: bus.peer_queue_capacity,
+            client_queue_capacity: bus.client_queue_capacity,
+            client_write_stall_timeout: bus.client_write_stall_timeout.get_duration(),
             reconnect_period: bus.reconnect_period.get_duration(),
             mesh_expected_peers: if cfg.cluster.enabled {
                 cfg.cluster.nodes.len().saturating_sub(1)
@@ -219,6 +250,7 @@ impl From<&ServerConfig> for MessageBusConfig {
             close_peer_timeout: bus.close_peer_timeout.get_duration(),
             close_grace: bus.close_grace.get_duration(),
             handshake_grace: bus.handshake_grace.get_duration(),
+            replica_user_timeout: cfg.cluster.heartbeat_timeout.get_duration(),
             ws_config: build_ws_config(&cfg.websocket),
             quic: build_quic_tuning(&cfg.quic),
         }
@@ -239,32 +271,38 @@ fn build_quic_tuning(quic: &configs::quic::QuicConfig) -> QuicTuning {
     QuicTuning {
         max_concurrent_bidi_streams: u32::try_from(quic.max_concurrent_bidi_streams)
             .unwrap_or(u32::MAX),
-        datagram_send_buffer_size: usize::try_from(quic.datagram_send_buffer_size.as_bytes_u64())
-            .unwrap_or(usize::MAX),
         initial_mtu: u16::try_from(quic.initial_mtu.as_bytes_u64()).unwrap_or(u16::MAX),
         send_window: quic.send_window.as_bytes_u64(),
         receive_window: u32::try_from(quic.receive_window.as_bytes_u64()).unwrap_or(u32::MAX),
+        stream_receive_window: u32::try_from(quic.stream_receive_window.as_bytes_u64())
+            .unwrap_or(u32::MAX),
         keep_alive_interval: quic.keep_alive_interval.get_duration(),
         max_idle_timeout: quic.max_idle_timeout.get_duration(),
     }
 }
 
+/// Default stream cap of a client QUIC connection. Equal to the default
+/// `message_bus.client_queue_capacity`, the most requests the server runs
+/// at once for one connection.
+pub const QUIC_MAX_CONCURRENT_STREAMS: u32 = 256;
+
 impl Default for QuicTuning {
     /// Mirrors the `[quic]` defaults in
-    /// `core/server/config.toml`: 64 MiB send/receive windows,
-    /// 30 s idle timeout, 10 s keep-alive, 8 KiB initial MTU, 100 KiB
-    /// datagram send buffer, single bidi stream per peer.
+    /// `core/server/config.toml`: 64 MiB send/receive windows, a per-stream
+    /// window equal to the connection receive window, 30 s idle timeout, 10 s
+    /// keep-alive, 1200 B initial MTU, [`QUIC_MAX_CONCURRENT_STREAMS`]
+    /// in-flight commands per connection.
     ///
     /// Intended for tests and direct callers; production builds
     /// derive the field from [`ServerConfig`] so the values stay in
     /// lock-step with the on-disk schema.
     fn default() -> Self {
         Self {
-            max_concurrent_bidi_streams: 1,
-            datagram_send_buffer_size: 100 * 1024,
-            initial_mtu: 8 * 1024,
+            max_concurrent_bidi_streams: QUIC_MAX_CONCURRENT_STREAMS,
+            initial_mtu: 1200,
             send_window: 64 * 1024 * 1024,
             receive_window: 64 * 1024 * 1024,
+            stream_receive_window: 64 * 1024 * 1024,
             keep_alive_interval: Duration::from_secs(10),
             max_idle_timeout: Duration::from_secs(30),
         }
@@ -335,17 +373,16 @@ mod tests {
             literal.max_concurrent_bidi_streams
         );
         assert_eq!(
-            schema_quic.datagram_send_buffer_size, literal.datagram_send_buffer_size,
-            "schema datagram_send_buffer_size {} bytes vs literal {} bytes",
-            schema_quic.datagram_send_buffer_size, literal.datagram_send_buffer_size
-        );
-        assert_eq!(
             schema_quic.initial_mtu, literal.initial_mtu,
             "schema initial_mtu {} bytes vs literal {} bytes",
             schema_quic.initial_mtu, literal.initial_mtu
         );
         assert_eq!(schema_quic.send_window, literal.send_window);
         assert_eq!(schema_quic.receive_window, literal.receive_window);
+        assert_eq!(
+            schema_quic.stream_receive_window,
+            literal.stream_receive_window
+        );
         assert_eq!(schema_quic.keep_alive_interval, literal.keep_alive_interval);
         assert_eq!(schema_quic.max_idle_timeout, literal.max_idle_timeout);
     }

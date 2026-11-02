@@ -19,6 +19,7 @@ use crate::{DeltaSinkConfig, StorageBackendType};
 use iggy_connector_sdk::Error;
 use secrecy::ExposeSecret;
 use std::collections::HashMap;
+use tracing::info;
 
 pub(crate) fn build_storage_options(
     config: &DeltaSinkConfig,
@@ -27,25 +28,42 @@ pub(crate) fn build_storage_options(
 
     match config.storage_backend_type {
         Some(StorageBackendType::S3) => {
-            let access_key = config.aws_s3_access_key.as_ref().ok_or_else(|| {
-                Error::InitError("S3 backend requires 'aws_s3_access_key'".into())
-            })?;
-            let secret_key = config.aws_s3_secret_key.as_ref().ok_or_else(|| {
-                Error::InitError("S3 backend requires 'aws_s3_secret_key'".into())
-            })?;
-            let region = config
-                .aws_s3_region
-                .as_ref()
-                .ok_or_else(|| Error::InitError("S3 backend requires 'aws_s3_region'".into()))?;
+            match (
+                config.aws_s3_access_key.as_ref(),
+                config.aws_s3_secret_key.as_ref(),
+            ) {
+                (Some(access_key), Some(secret_key)) => {
+                    info!("S3 backend: using static access key/secret key credentials");
+                    opts.insert(
+                        "AWS_ACCESS_KEY_ID".into(),
+                        access_key.expose_secret().to_owned(),
+                    );
+                    opts.insert(
+                        "AWS_SECRET_ACCESS_KEY".into(),
+                        secret_key.expose_secret().to_owned(),
+                    );
+                }
+                (None, None) => {
+                    // Edge case: no key here means this sink relies on the AWS SDK's own
+                    // credential discovery (e.g. IAM role). But if another Delta sink in
+                    // this same process sets a key, opening it writes that key into the
+                    // shared process environment, and this sink's fallback can silently
+                    // read it too.
+                    info!(
+                        "S3 backend: no static keys provided, relying on AWS SDK's default credential chain"
+                    );
+                }
+                _ => {
+                    return Err(Error::InvalidConfigValue(
+                        "aws_s3_access_key and aws_s3_secret_key must be provided together, or both omitted".into(),
+                    ));
+                }
+            }
 
-            opts.insert(
-                "AWS_ACCESS_KEY_ID".into(),
-                access_key.expose_secret().to_owned(),
-            );
-            opts.insert(
-                "AWS_SECRET_ACCESS_KEY".into(),
-                secret_key.expose_secret().to_owned(),
-            );
+            let region = config.aws_s3_region.as_ref().ok_or_else(|| {
+                Error::InvalidConfigValue("S3 backend requires 'aws_s3_region'".into())
+            })?;
+
             opts.insert("AWS_REGION".into(), region.clone());
 
             if let Some(endpoint_url) = config.aws_s3_endpoint_url.as_ref() {
@@ -58,10 +76,12 @@ pub(crate) fn build_storage_options(
         }
         Some(StorageBackendType::Azure) => {
             let account_name = config.azure_storage_account_name.as_ref().ok_or_else(|| {
-                Error::InitError("Azure backend requires 'azure_storage_account_name'".into())
+                Error::InvalidConfigValue(
+                    "Azure backend requires 'azure_storage_account_name'".into(),
+                )
             })?;
             let container_name = config.azure_container_name.as_ref().ok_or_else(|| {
-                Error::InitError("Azure backend requires 'azure_container_name'".into())
+                Error::InvalidConfigValue("Azure backend requires 'azure_container_name'".into())
             })?;
 
             opts.insert("AZURE_STORAGE_ACCOUNT_NAME".into(), account_name.clone());
@@ -84,16 +104,16 @@ pub(crate) fn build_storage_options(
                     );
                 }
                 (Some(_), Some(_)) => {
-                    return Err(Error::InitError("Azure backend requires exactly one of 'azure_storage_account_key' or 'azure_storage_sas_token', but both were provided".into()));
+                    return Err(Error::InvalidConfigValue("Azure backend requires exactly one of 'azure_storage_account_key' or 'azure_storage_sas_token', but both were provided".into()));
                 }
                 (None, None) => {
-                    return Err(Error::InitError("Azure backend requires one of 'azure_storage_account_key' or 'azure_storage_sas_token'".into()));
+                    return Err(Error::InvalidConfigValue("Azure backend requires one of 'azure_storage_account_key' or 'azure_storage_sas_token'".into()));
                 }
             }
         }
         Some(StorageBackendType::Gcs) => {
             let service_account_key = config.gcs_service_account_key.as_ref().ok_or_else(|| {
-                Error::InitError("GCS backend requires 'gcs_service_account_key'".into())
+                Error::InvalidConfigValue("GCS backend requires 'gcs_service_account_key'".into())
             })?;
 
             opts.insert(
@@ -204,6 +224,16 @@ mod tests {
         let mut config = s3_config();
         config.aws_s3_secret_key = None;
         assert!(build_storage_options(&config).is_err());
+    }
+
+    #[test]
+    fn s3_backend_without_access_and_secret_keys_succeeds() {
+        let mut config = s3_config();
+        config.aws_s3_access_key = None;
+        config.aws_s3_secret_key = None;
+        let opts = build_storage_options(&config).unwrap();
+        assert!(!opts.contains_key("AWS_ACCESS_KEY_ID"));
+        assert!(!opts.contains_key("AWS_SECRET_ACCESS_KEY"));
     }
 
     #[test]

@@ -77,7 +77,6 @@ pub const COMMAND_TABLE: &[CommandMeta] = &[
     CommandMeta::non_replicated(GET_USERS_CODE, "user.list"),
     CommandMeta::replicated(CREATE_USER_CODE, "user.create", Operation::CreateUser),
     CommandMeta::replicated(DELETE_USER_CODE, "user.delete", Operation::DeleteUser),
-    CommandMeta::replicated(UPDATE_USER_CODE, "user.update", Operation::UpdateUser),
     CommandMeta::replicated(
         UPDATE_PERMISSIONS_CODE,
         "user.permissions",
@@ -113,7 +112,6 @@ pub const COMMAND_TABLE: &[CommandMeta] = &[
     // Messages
     CommandMeta::non_replicated(POLL_MESSAGES_CODE, "message.poll"),
     CommandMeta::replicated(SEND_MESSAGES_CODE, "message.send", Operation::SendMessages),
-    CommandMeta::non_replicated(FLUSH_UNSAVED_BUFFER_CODE, "message.flush_unsaved_buffer"),
     // Consumer Offsets
     CommandMeta::non_replicated(GET_CONSUMER_OFFSET_CODE, "consumer_offset.get"),
     CommandMeta::replicated(
@@ -126,30 +124,16 @@ pub const COMMAND_TABLE: &[CommandMeta] = &[
         "consumer_offset.delete",
         Operation::DeleteConsumerOffset,
     ),
-    CommandMeta::replicated(
-        STORE_CONSUMER_OFFSET_2_CODE,
-        "consumer_offset.store.v2",
-        Operation::StoreConsumerOffset2,
-    ),
-    CommandMeta::replicated(
-        DELETE_CONSUMER_OFFSET_2_CODE,
-        "consumer_offset.delete.v2",
-        Operation::DeleteConsumerOffset2,
-    ),
     // Streams
     CommandMeta::non_replicated(GET_STREAM_CODE, "stream.get"),
     CommandMeta::non_replicated(GET_STREAMS_CODE, "stream.list"),
     CommandMeta::replicated(CREATE_STREAM_CODE, "stream.create", Operation::CreateStream),
     CommandMeta::replicated(DELETE_STREAM_CODE, "stream.delete", Operation::DeleteStream),
-    CommandMeta::replicated(UPDATE_STREAM_CODE, "stream.update", Operation::UpdateStream),
-    CommandMeta::replicated(PURGE_STREAM_CODE, "stream.purge", Operation::PurgeStream),
     // Topics
     CommandMeta::non_replicated(GET_TOPIC_CODE, "topic.get"),
     CommandMeta::non_replicated(GET_TOPICS_CODE, "topic.list"),
     CommandMeta::replicated(CREATE_TOPIC_CODE, "topic.create", Operation::CreateTopic),
     CommandMeta::replicated(DELETE_TOPIC_CODE, "topic.delete", Operation::DeleteTopic),
-    CommandMeta::replicated(UPDATE_TOPIC_CODE, "topic.update", Operation::UpdateTopic),
-    CommandMeta::replicated(PURGE_TOPIC_CODE, "topic.purge", Operation::PurgeTopic),
     // Partitions
     CommandMeta::replicated(
         CREATE_PARTITIONS_CODE,
@@ -193,15 +177,41 @@ pub const COMMAND_TABLE: &[CommandMeta] = &[
     CommandMeta::non_replicated(SYNC_CONSUMER_GROUP_CODE, "consumer_group.sync"),
     // Login + Register (PAT - Personal Access Token variant)
     CommandMeta::non_replicated(LOGIN_REGISTER_WITH_PAT_CODE, "user.login_register_with_pat"),
+    // Options catalog discovery
+    CommandMeta::non_replicated(DESCRIBE_OPTIONS_CODE, "options.describe"),
+    CommandMeta::non_replicated(BIND_SESSION_CODE, "session.bind"),
+    CommandMeta::non_replicated(GET_PARTITION_ROUTE_CODE, "partition.route"),
+    // Generic option patch for streams, topics and users
+    CommandMeta::replicated(
+        UPDATE_RESOURCE_CODE,
+        "resource.update",
+        Operation::UpdateResource,
+    ),
+    // Change log of committed metadata operations
+    CommandMeta::non_replicated(GET_METADATA_CHANGES_CODE, "metadata.changes"),
+    // Deferred messages
+    CommandMeta::non_replicated(POLL_MESSAGES_DEFERRED_CODE, "message.poll_deferred"),
+    CommandMeta::non_replicated(CANCEL_DEFERRED_REQUEST_CODE, "message.cancel_deferred"),
+    CommandMeta::non_replicated(FETCH_MESSAGES_CODE, "message.fetch"),
 ];
 
 /// Lookup command metadata by command code.
 ///
-/// Uses a `match` (compiled to a jump table / binary search) for O(1) lookup
-/// instead of linear scan. The match maps code -> table index, keeping
-/// `COMMAND_TABLE` as the single source of truth for all metadata.
+/// Uses the `match` of [`command_index`] (compiled to a jump table / binary
+/// search) for O(1) lookup instead of linear scan, keeping `COMMAND_TABLE`
+/// as the single source of truth for all metadata.
 #[must_use]
 pub const fn lookup_command(code: u32) -> Option<&'static CommandMeta> {
+    match command_index(code) {
+        Some(idx) => Some(&COMMAND_TABLE[idx]),
+        None => None,
+    }
+}
+
+/// The index of command `code` in `COMMAND_TABLE`, for per-command arrays in
+/// table order.
+#[must_use]
+pub const fn command_index(code: u32) -> Option<usize> {
     // Indices must match the order of entries in COMMAND_TABLE above.
     let idx = match code {
         PING_CODE => 0,
@@ -215,50 +225,50 @@ pub const fn lookup_command(code: u32) -> Option<&'static CommandMeta> {
         GET_USERS_CODE => 8,
         CREATE_USER_CODE => 9,
         DELETE_USER_CODE => 10,
-        UPDATE_USER_CODE => 11,
-        UPDATE_PERMISSIONS_CODE => 12,
-        CHANGE_PASSWORD_CODE => 13,
-        LOGIN_USER_CODE => 14,
-        LOGOUT_USER_CODE => 15,
-        LOGIN_REGISTER_CODE => 16,
-        GET_PERSONAL_ACCESS_TOKENS_CODE => 17,
-        CREATE_PERSONAL_ACCESS_TOKEN_CODE => 18,
-        DELETE_PERSONAL_ACCESS_TOKEN_CODE => 19,
-        LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE => 20,
-        POLL_MESSAGES_CODE => 21,
-        SEND_MESSAGES_CODE => 22,
-        FLUSH_UNSAVED_BUFFER_CODE => 23,
-        GET_CONSUMER_OFFSET_CODE => 24,
-        STORE_CONSUMER_OFFSET_CODE => 25,
-        DELETE_CONSUMER_OFFSET_CODE => 26,
-        STORE_CONSUMER_OFFSET_2_CODE => 27,
-        DELETE_CONSUMER_OFFSET_2_CODE => 28,
-        GET_STREAM_CODE => 29,
-        GET_STREAMS_CODE => 30,
-        CREATE_STREAM_CODE => 31,
-        DELETE_STREAM_CODE => 32,
-        UPDATE_STREAM_CODE => 33,
-        PURGE_STREAM_CODE => 34,
-        GET_TOPIC_CODE => 35,
-        GET_TOPICS_CODE => 36,
-        CREATE_TOPIC_CODE => 37,
-        DELETE_TOPIC_CODE => 38,
-        UPDATE_TOPIC_CODE => 39,
-        PURGE_TOPIC_CODE => 40,
-        CREATE_PARTITIONS_CODE => 41,
-        DELETE_PARTITIONS_CODE => 42,
-        DELETE_SEGMENTS_CODE => 43,
-        GET_CONSUMER_GROUP_CODE => 44,
-        GET_CONSUMER_GROUPS_CODE => 45,
-        CREATE_CONSUMER_GROUP_CODE => 46,
-        DELETE_CONSUMER_GROUP_CODE => 47,
-        JOIN_CONSUMER_GROUP_CODE => 48,
-        LEAVE_CONSUMER_GROUP_CODE => 49,
-        SYNC_CONSUMER_GROUP_CODE => 50,
-        LOGIN_REGISTER_WITH_PAT_CODE => 51,
+        UPDATE_PERMISSIONS_CODE => 11,
+        CHANGE_PASSWORD_CODE => 12,
+        LOGIN_USER_CODE => 13,
+        LOGOUT_USER_CODE => 14,
+        LOGIN_REGISTER_CODE => 15,
+        GET_PERSONAL_ACCESS_TOKENS_CODE => 16,
+        CREATE_PERSONAL_ACCESS_TOKEN_CODE => 17,
+        DELETE_PERSONAL_ACCESS_TOKEN_CODE => 18,
+        LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE => 19,
+        POLL_MESSAGES_CODE => 20,
+        SEND_MESSAGES_CODE => 21,
+        GET_CONSUMER_OFFSET_CODE => 22,
+        STORE_CONSUMER_OFFSET_CODE => 23,
+        DELETE_CONSUMER_OFFSET_CODE => 24,
+        GET_STREAM_CODE => 25,
+        GET_STREAMS_CODE => 26,
+        CREATE_STREAM_CODE => 27,
+        DELETE_STREAM_CODE => 28,
+        GET_TOPIC_CODE => 29,
+        GET_TOPICS_CODE => 30,
+        CREATE_TOPIC_CODE => 31,
+        DELETE_TOPIC_CODE => 32,
+        CREATE_PARTITIONS_CODE => 33,
+        DELETE_PARTITIONS_CODE => 34,
+        DELETE_SEGMENTS_CODE => 35,
+        GET_CONSUMER_GROUP_CODE => 36,
+        GET_CONSUMER_GROUPS_CODE => 37,
+        CREATE_CONSUMER_GROUP_CODE => 38,
+        DELETE_CONSUMER_GROUP_CODE => 39,
+        JOIN_CONSUMER_GROUP_CODE => 40,
+        LEAVE_CONSUMER_GROUP_CODE => 41,
+        SYNC_CONSUMER_GROUP_CODE => 42,
+        LOGIN_REGISTER_WITH_PAT_CODE => 43,
+        DESCRIBE_OPTIONS_CODE => 44,
+        BIND_SESSION_CODE => 45,
+        GET_PARTITION_ROUTE_CODE => 46,
+        UPDATE_RESOURCE_CODE => 47,
+        GET_METADATA_CHANGES_CODE => 48,
+        POLL_MESSAGES_DEFERRED_CODE => 49,
+        CANCEL_DEFERRED_REQUEST_CODE => 50,
+        FETCH_MESSAGES_CODE => 51,
         _ => return None,
     };
-    Some(&COMMAND_TABLE[idx])
+    Some(idx)
 }
 
 /// Lookup command metadata by VSR operation.
@@ -269,34 +279,32 @@ pub const fn lookup_command(code: u32) -> Option<&'static CommandMeta> {
 pub const fn lookup_by_operation(op: Operation) -> Option<&'static CommandMeta> {
     // Indices must match the order of entries in COMMAND_TABLE above.
     let idx = match op {
-        Operation::CreateStream => 31,
-        Operation::UpdateStream => 33,
-        Operation::DeleteStream => 32,
-        Operation::PurgeStream => 34,
-        Operation::CreateTopic => 37,
-        Operation::UpdateTopic => 39,
-        Operation::DeleteTopic => 38,
-        Operation::PurgeTopic => 40,
-        Operation::CreatePartitions => 41,
-        Operation::DeletePartitions => 42,
-        Operation::DeleteSegments => 43,
-        Operation::CreateConsumerGroup => 46,
-        Operation::DeleteConsumerGroup => 47,
-        Operation::JoinConsumerGroup => 48,
-        Operation::LeaveConsumerGroup => 49,
         Operation::CreateUser => 9,
-        Operation::UpdateUser => 11,
         Operation::DeleteUser => 10,
-        Operation::ChangePassword => 13,
-        Operation::UpdatePermissions => 12,
-        Operation::CreatePersonalAccessToken => 18,
-        Operation::DeletePersonalAccessToken => 19,
-        Operation::SendMessages => 22,
-        Operation::StoreConsumerOffset => 25,
-        Operation::DeleteConsumerOffset => 26,
-        Operation::StoreConsumerOffset2 => 27,
-        Operation::DeleteConsumerOffset2 => 28,
+        Operation::UpdatePermissions => 11,
+        Operation::ChangePassword => 12,
+        Operation::CreatePersonalAccessToken => 17,
+        Operation::DeletePersonalAccessToken => 18,
+        Operation::SendMessages => 21,
+        Operation::StoreConsumerOffset => 23,
+        Operation::DeleteConsumerOffset => 24,
+        Operation::CreateStream => 27,
+        Operation::DeleteStream => 28,
+        Operation::CreateTopic => 31,
+        Operation::DeleteTopic => 32,
+        Operation::CreatePartitions => 33,
+        Operation::DeletePartitions => 34,
+        Operation::DeleteSegments => 35,
+        Operation::CreateConsumerGroup => 38,
+        Operation::DeleteConsumerGroup => 39,
+        Operation::JoinConsumerGroup => 40,
+        Operation::LeaveConsumerGroup => 41,
+        Operation::UpdateResource => 47,
         Operation::CreateTopicWithAssignments
+        | Operation::UpdateStreamResolved
+        | Operation::UpdateTopicResolved
+        | Operation::UpdateUserResolved
+        | Operation::RewrapStreamKeys
         | Operation::CreatePartitionsWithAssignments
         | Operation::RemoveConsumerGroupMember
         | Operation::CompleteConsumerGroupRevocation
@@ -304,7 +312,13 @@ pub const fn lookup_by_operation(op: Operation) -> Option<&'static CommandMeta> 
         | Operation::Reserved
         | Operation::Register
         | Operation::Logout
-        | Operation::NonReplicated => return None,
+        | Operation::NonReplicated
+        | Operation::FinalizeSession
+        | Operation::RetireSession
+        | Operation::CompleteLifecycle
+        | Operation::TransitionPartitionHistory
+        | Operation::InstallConsumerGroupOwner
+        | Operation::RetireConsumerGroupOwners => return None,
     };
     Some(&COMMAND_TABLE[idx])
 }
@@ -312,69 +326,6 @@ pub const fn lookup_by_operation(op: Operation) -> Option<&'static CommandMeta> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn every_code_has_entry() {
-        let all_codes = [
-            PING_CODE,
-            GET_STATS_CODE,
-            GET_SNAPSHOT_FILE_CODE,
-            GET_CLUSTER_METADATA_CODE,
-            GET_ME_CODE,
-            GET_CLIENT_CODE,
-            GET_CLIENTS_CODE,
-            GET_USER_CODE,
-            GET_USERS_CODE,
-            CREATE_USER_CODE,
-            DELETE_USER_CODE,
-            UPDATE_USER_CODE,
-            UPDATE_PERMISSIONS_CODE,
-            CHANGE_PASSWORD_CODE,
-            LOGIN_USER_CODE,
-            LOGOUT_USER_CODE,
-            LOGIN_REGISTER_CODE,
-            LOGIN_REGISTER_WITH_PAT_CODE,
-            GET_PERSONAL_ACCESS_TOKENS_CODE,
-            CREATE_PERSONAL_ACCESS_TOKEN_CODE,
-            DELETE_PERSONAL_ACCESS_TOKEN_CODE,
-            LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
-            POLL_MESSAGES_CODE,
-            SEND_MESSAGES_CODE,
-            FLUSH_UNSAVED_BUFFER_CODE,
-            GET_CONSUMER_OFFSET_CODE,
-            STORE_CONSUMER_OFFSET_CODE,
-            DELETE_CONSUMER_OFFSET_CODE,
-            STORE_CONSUMER_OFFSET_2_CODE,
-            DELETE_CONSUMER_OFFSET_2_CODE,
-            GET_STREAM_CODE,
-            GET_STREAMS_CODE,
-            CREATE_STREAM_CODE,
-            DELETE_STREAM_CODE,
-            UPDATE_STREAM_CODE,
-            PURGE_STREAM_CODE,
-            GET_TOPIC_CODE,
-            GET_TOPICS_CODE,
-            CREATE_TOPIC_CODE,
-            DELETE_TOPIC_CODE,
-            UPDATE_TOPIC_CODE,
-            PURGE_TOPIC_CODE,
-            CREATE_PARTITIONS_CODE,
-            DELETE_PARTITIONS_CODE,
-            DELETE_SEGMENTS_CODE,
-            GET_CONSUMER_GROUP_CODE,
-            GET_CONSUMER_GROUPS_CODE,
-            CREATE_CONSUMER_GROUP_CODE,
-            DELETE_CONSUMER_GROUP_CODE,
-            JOIN_CONSUMER_GROUP_CODE,
-            LEAVE_CONSUMER_GROUP_CODE,
-        ];
-        for code in all_codes {
-            assert!(
-                lookup_command(code).is_some(),
-                "missing dispatch entry for code {code}"
-            );
-        }
-    }
 
     #[test]
     fn no_duplicate_codes_in_table() {
@@ -402,51 +353,6 @@ mod tests {
     }
 
     #[test]
-    fn lookup_by_operation_roundtrips_with_lookup_command() {
-        let replicated_ops = [
-            Operation::CreateStream,
-            Operation::UpdateStream,
-            Operation::DeleteStream,
-            Operation::PurgeStream,
-            Operation::CreateTopic,
-            Operation::UpdateTopic,
-            Operation::DeleteTopic,
-            Operation::PurgeTopic,
-            Operation::CreatePartitions,
-            Operation::DeletePartitions,
-            Operation::DeleteSegments,
-            Operation::CreateConsumerGroup,
-            Operation::DeleteConsumerGroup,
-            Operation::CreateUser,
-            Operation::UpdateUser,
-            Operation::DeleteUser,
-            Operation::ChangePassword,
-            Operation::UpdatePermissions,
-            Operation::CreatePersonalAccessToken,
-            Operation::DeletePersonalAccessToken,
-            Operation::JoinConsumerGroup,
-            Operation::LeaveConsumerGroup,
-            Operation::SendMessages,
-            Operation::StoreConsumerOffset,
-            Operation::DeleteConsumerOffset,
-            Operation::StoreConsumerOffset2,
-            Operation::DeleteConsumerOffset2,
-        ];
-        for op in replicated_ops {
-            let meta = lookup_by_operation(op)
-                .unwrap_or_else(|| panic!("no dispatch entry for operation {op:?}"));
-
-            let by_code = lookup_command(meta.code)
-                .unwrap_or_else(|| panic!("no dispatch entry for code {}", meta.code));
-
-            assert_eq!(
-                meta.code, by_code.code,
-                "lookup_by_operation and lookup disagree for {op:?}"
-            );
-        }
-    }
-
-    #[test]
     fn reserved_operation_returns_none() {
         assert!(lookup_by_operation(Operation::Reserved).is_none());
     }
@@ -466,12 +372,13 @@ mod tests {
         }
     }
 
-    /// Verify that the match indices in `lookup_command` point to entries
+    /// Verify that the match indices in `command_index` point to entries
     /// whose `.code` field actually matches the looked-up code.
     /// Catches table reordering that would silently break the match.
     #[test]
     fn lookup_command_indices_match_table_codes() {
         for (i, entry) in COMMAND_TABLE.iter().enumerate() {
+            assert_eq!(command_index(entry.code), Some(i), "{}", entry.name);
             let looked_up = lookup_command(entry.code)
                 .unwrap_or_else(|| panic!("lookup_command({}) returned None", entry.code));
             assert_eq!(

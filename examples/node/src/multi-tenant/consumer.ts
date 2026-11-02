@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { Client, Consumer, PollingStrategy } from 'apache-iggy';
 import { BATCHES_LIMIT, log, parseArgs } from '../utils';
@@ -25,7 +24,7 @@ interface TenantConsumer {
   streamId: number;
   topicId: number;
   partitionId: number;
-  offset: number;
+  offset: bigint;
   messagesConsumed: number;
 }
 
@@ -50,7 +49,7 @@ async function discoverTenantStreams(client: Client): Promise<TenantConsumer[]> 
               streamId: stream.id,
               topicId: topic.id,
               partitionId: topic.partitions[0].id,
-              offset: 0,
+              offset: 0n,
               messagesConsumed: 0,
             });
             log('Added consumer for tenant %s - stream %d, topic %d', stream.name, stream.id, topic.id);
@@ -86,17 +85,16 @@ async function consumeMessagesFromTenants(
           topicId: consumer.topicId,
           consumer: Consumer.Single,
           partitionId: consumer.partitionId,
-          pollingStrategy: PollingStrategy.Offset(BigInt(consumer.offset)),
+          pollingStrategy: PollingStrategy.Offset(consumer.offset),
           count: MESSAGES_PER_POLL,
           autocommit: false,
         });
 
         if (polledMessages && polledMessages.messages.length > 0) {
-          consumer.offset += polledMessages.messages.length;
-
           for (const message of polledMessages.messages) {
             const payload = new TextDecoder().decode(new Uint8Array(Object.values(message.payload)));
             log('  [Tenant %d] %s', consumer.tenantId, payload);
+            consumer.offset = message.headers.offset + 1n;
             consumer.messagesConsumed++;
           }
           log('Consumed %d message(s) from tenant %d', polledMessages.messages.length, consumer.tenantId);

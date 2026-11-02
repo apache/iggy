@@ -16,10 +16,10 @@
 // under the License.
 
 import { error, type Cookies, redirect } from '@sveltejs/kit';
-import { base } from '$app/paths';
+import { resolve } from '$app/paths';
 import { getJson } from './getJson';
-import { tokens } from '$lib/utils/constants/tokens';
-import { typedRoute } from '$lib/types/appRoutes';
+import { tokens } from '#lib/utils/constants/tokens.js';
+import { typedRoute } from '#lib/types/appRoutes.js';
 
 export const handleFetchErrors = async (
   fetchResult: Response | unknown,
@@ -58,18 +58,16 @@ export const handleFetchErrors = async (
     401: () => {
       console.log(`handleErrorStatus: 401 ${response.url}`);
       removeCookies();
-      redirect(302, `${base}${typedRoute('/auth/sign-in')}`);
+      redirect(302, resolve(typedRoute('auth/sign-in')));
     },
     403: () => {
       console.log(`handleErrorStatus: 403 ${response.url}`);
       removeCookies();
-      redirect(302, `${base}${typedRoute('/auth/sign-in')}`);
+      redirect(302, resolve(typedRoute('auth/sign-in')));
     },
     404: () => {
       console.log(`handleErrorStatus: 404 ${response.url}`);
-      error(404, {
-        message: 'Not Found'
-      });
+      error(404, 'Not Found');
     }
   };
 
@@ -78,7 +76,5 @@ export const handleFetchErrors = async (
 
   console.log(`handleErrorStatus: 500 ${response.url}`);
 
-  error(500, {
-    message: 'handleErrorStatus: Internal server error'
-  });
+  error(500, 'handleErrorStatus: Internal server error');
 };

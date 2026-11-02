@@ -17,83 +17,418 @@
  * under the License.
  */
 
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <map>
+#include <optional>
+#include <set>
 #include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
 #include "iggy.hpp"
 
+static_assert(!std::is_constructible_v<iggy::IggyException, const std::string &, const iggy::ffi::ErrorInfo &>,
+              "Only IggyBlockingClient may turn bridge error details into an IggyException");
+static_assert(std::is_nothrow_copy_constructible_v<iggy::IggyException>,
+              "Copying an exception while it propagates must not throw");
+
+TEST(ConnectionStringTest, ConstructsQuicClient) {
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::from_connection_string("iggy+quic://iggy:iggy@127.0.0.1:8080"); });
+    ASSERT_NE(client, nullptr);
+    iggy::ffi::delete_client(client);
+}
+
 TEST(CompressionAlgorithmTest, ReturnsExpectedValues) {
-    EXPECT_EQ(iggy::CompressionAlgorithm::none().compression_algorithm_value(), "none");
-    EXPECT_EQ(iggy::CompressionAlgorithm::gzip().compression_algorithm_value(), "gzip");
+    EXPECT_EQ(iggy::CompressionAlgorithm::None().Value(), "none");
+    EXPECT_EQ(iggy::CompressionAlgorithm::Gzip().Value(), "gzip");
 }
 
 TEST(SnapshotCompressionTest, ReturnsExpectedValues) {
-    EXPECT_EQ(iggy::SnapshotCompression::stored().snapshot_compression_value(), "stored");
-    EXPECT_EQ(iggy::SnapshotCompression::deflated().snapshot_compression_value(), "deflated");
-    EXPECT_EQ(iggy::SnapshotCompression::bzip2().snapshot_compression_value(), "bzip2");
-    EXPECT_EQ(iggy::SnapshotCompression::zstd().snapshot_compression_value(), "zstd");
-    EXPECT_EQ(iggy::SnapshotCompression::lzma().snapshot_compression_value(), "lzma");
-    EXPECT_EQ(iggy::SnapshotCompression::xz().snapshot_compression_value(), "xz");
+    EXPECT_EQ(iggy::SnapshotCompression::Stored().Value(), "stored");
+    EXPECT_EQ(iggy::SnapshotCompression::Deflated().Value(), "deflated");
+    EXPECT_EQ(iggy::SnapshotCompression::Bzip2().Value(), "bzip2");
+    EXPECT_EQ(iggy::SnapshotCompression::Zstd().Value(), "zstd");
+    EXPECT_EQ(iggy::SnapshotCompression::Lzma().Value(), "lzma");
+    EXPECT_EQ(iggy::SnapshotCompression::Xz().Value(), "xz");
 }
 
 TEST(SystemSnapshotTypeTest, ReturnsExpectedValues) {
-    EXPECT_EQ(iggy::SystemSnapshotType::filesystem_overview().snapshot_type_value(), "filesystem_overview");
-    EXPECT_EQ(iggy::SystemSnapshotType::process_list().snapshot_type_value(), "process_list");
-    EXPECT_EQ(iggy::SystemSnapshotType::resource_usage().snapshot_type_value(), "resource_usage");
-    EXPECT_EQ(iggy::SystemSnapshotType::test().snapshot_type_value(), "test");
-    EXPECT_EQ(iggy::SystemSnapshotType::server_logs().snapshot_type_value(), "server_logs");
-    EXPECT_EQ(iggy::SystemSnapshotType::server_config().snapshot_type_value(), "server_config");
-    EXPECT_EQ(iggy::SystemSnapshotType::all().snapshot_type_value(), "all");
-}
-
-TEST(IdKindTest, ReturnsExpectedValues) {
-    EXPECT_EQ(iggy::IdKind::numeric().id_kind_value(), "numeric");
-    EXPECT_EQ(iggy::IdKind::string().id_kind_value(), "string");
+    EXPECT_EQ(iggy::SystemSnapshotType::FilesystemOverview().SnapshotTypeValue(), "filesystem_overview");
+    EXPECT_EQ(iggy::SystemSnapshotType::ProcessList().SnapshotTypeValue(), "process_list");
+    EXPECT_EQ(iggy::SystemSnapshotType::ResourceUsage().SnapshotTypeValue(), "resource_usage");
+    EXPECT_EQ(iggy::SystemSnapshotType::Test().SnapshotTypeValue(), "test");
+    EXPECT_EQ(iggy::SystemSnapshotType::ServerLogs().SnapshotTypeValue(), "server_logs");
+    EXPECT_EQ(iggy::SystemSnapshotType::ServerConfig().SnapshotTypeValue(), "server_config");
+    EXPECT_EQ(iggy::SystemSnapshotType::All().SnapshotTypeValue(), "all");
 }
 
 TEST(MaxTopicSizeTest, ReturnsExpectedValues) {
-    EXPECT_EQ(iggy::MaxTopicSize::server_default().max_topic_size(), "server_default");
-    EXPECT_EQ(iggy::MaxTopicSize::unlimited().max_topic_size(), "unlimited");
-    EXPECT_EQ(iggy::MaxTopicSize::from_bytes(0).max_topic_size(), "server_default");
-    EXPECT_EQ(iggy::MaxTopicSize::from_bytes(std::numeric_limits<std::uint64_t>::max()).max_topic_size(), "unlimited");
-    EXPECT_EQ(iggy::MaxTopicSize::from_bytes(1024).max_topic_size(), "1024");
+    EXPECT_EQ(iggy::MaxTopicSize::ServerDefault().Value(), "server_default");
+    EXPECT_EQ(iggy::MaxTopicSize::Unlimited().Value(), "unlimited");
+    EXPECT_EQ(iggy::MaxTopicSize::FromBytes(0).Value(), "server_default");
+    EXPECT_EQ(iggy::MaxTopicSize::FromBytes(std::numeric_limits<std::uint64_t>::max()).Value(), "unlimited");
+    EXPECT_EQ(iggy::MaxTopicSize::FromBytes(1024).Value(), "1024");
 }
 
 TEST(PollingStrategyTest, ReturnsExpectedKindAndValue) {
-    const auto offset = iggy::PollingStrategy::offset(7);
-    EXPECT_EQ(offset.polling_strategy_kind(), "offset");
-    EXPECT_EQ(offset.polling_strategy_value(), 7u);
+    const auto offset = iggy::PollingStrategy::Offset(7);
+    EXPECT_EQ(offset.Kind(), "offset");
+    EXPECT_EQ(offset.Value(), 7u);
 
-    const auto timestamp = iggy::PollingStrategy::timestamp(42);
-    EXPECT_EQ(timestamp.polling_strategy_kind(), "timestamp");
-    EXPECT_EQ(timestamp.polling_strategy_value(), 42u);
+    const auto timestamp = iggy::PollingStrategy::Timestamp(42);
+    EXPECT_EQ(timestamp.Kind(), "timestamp");
+    EXPECT_EQ(timestamp.Value(), 42u);
 
-    const auto first = iggy::PollingStrategy::first();
-    EXPECT_EQ(first.polling_strategy_kind(), "first");
-    EXPECT_EQ(first.polling_strategy_value(), 0u);
+    const auto first = iggy::PollingStrategy::First();
+    EXPECT_EQ(first.Kind(), "first");
+    EXPECT_EQ(first.Value(), 0u);
 
-    const auto last = iggy::PollingStrategy::last();
-    EXPECT_EQ(last.polling_strategy_kind(), "last");
-    EXPECT_EQ(last.polling_strategy_value(), 0u);
+    const auto last = iggy::PollingStrategy::Last();
+    EXPECT_EQ(last.Kind(), "last");
+    EXPECT_EQ(last.Value(), 0u);
 
-    const auto next = iggy::PollingStrategy::next();
-    EXPECT_EQ(next.polling_strategy_kind(), "next");
-    EXPECT_EQ(next.polling_strategy_value(), 0u);
+    const auto next = iggy::PollingStrategy::Next();
+    EXPECT_EQ(next.Kind(), "next");
+    EXPECT_EQ(next.Value(), 0u);
+}
+
+TEST(PartitionContextTest, ReturnsConstructedValues) {
+    const iggy::PartitionContext context(3, 5, 7);
+    EXPECT_EQ(context.Incarnation(), 3u);
+    EXPECT_EQ(context.OwnerGeneration(), 5u);
+    EXPECT_EQ(context.MetadataOp(), 7u);
 }
 
 TEST(ExpiryTest, ReturnsExpectedKindAndValue) {
-    const auto server_default = iggy::Expiry::server_default();
-    EXPECT_EQ(server_default.expiry_kind(), "server_default");
-    EXPECT_EQ(server_default.expiry_value(), static_cast<std::uint64_t>(0));
+    const auto server_default = iggy::Expiry::ServerDefault();
+    EXPECT_EQ(server_default.Kind(), "server_default");
+    EXPECT_EQ(server_default.Value(), static_cast<std::uint64_t>(0));
 
-    const auto never_expire = iggy::Expiry::never_expire();
-    EXPECT_EQ(never_expire.expiry_kind(), "never_expire");
-    EXPECT_EQ(never_expire.expiry_value(), std::numeric_limits<std::uint64_t>::max());
+    const auto never_expire = iggy::Expiry::NeverExpire();
+    EXPECT_EQ(never_expire.Kind(), "never_expire");
+    EXPECT_EQ(never_expire.Value(), std::numeric_limits<std::uint64_t>::max());
 
-    const auto duration = iggy::Expiry::duration(15);
-    EXPECT_EQ(duration.expiry_kind(), "duration");
-    EXPECT_EQ(duration.expiry_value(), static_cast<std::uint64_t>(15));
+    const auto duration = iggy::Expiry::Duration(15);
+    EXPECT_EQ(duration.Kind(), "duration");
+    EXPECT_EQ(duration.Value(), static_cast<std::uint64_t>(15));
+    EXPECT_THROW(iggy::Expiry::Duration(0), std::invalid_argument);
+}
+
+TEST(TopicCreateOptionsTest, DefaultHasNoValues) {
+    const iggy::TopicCreateOptions options;
+    EXPECT_FALSE(options.PartitionsCount().has_value());
+    EXPECT_FALSE(options.CompressionAlgorithm().has_value());
+    EXPECT_FALSE(options.MessageExpiry().has_value());
+    EXPECT_FALSE(options.MaxTopicSize().has_value());
+    EXPECT_FALSE(options.SegmentSize().has_value());
+    EXPECT_FALSE(options.Durability().has_value());
+    EXPECT_FALSE(options.ConsumerOffsetDurability().has_value());
+    EXPECT_FALSE(options.MessagesRequiredToSave().has_value());
+    EXPECT_FALSE(options.SizeOfMessagesRequiredToSave().has_value());
+    EXPECT_FALSE(options.PreallocateSegments().has_value());
+    EXPECT_FALSE(options.ReplicationFactor().has_value());
+    EXPECT_TRUE(options.RawEntries().empty());
+}
+
+TEST(TopicCreateOptionsTest, PartitionsCountStoresValue) {
+    iggy::TopicCreateOptions options;
+    options.SetPartitionsCount(3);
+    ASSERT_TRUE(options.PartitionsCount().has_value());
+    EXPECT_EQ(*options.PartitionsCount(), 3u);
+    options.SetPartitionsCount(1000);
+    EXPECT_EQ(*options.PartitionsCount(), 1000u);
+}
+
+TEST(TopicCreateOptionsTest, SegmentSizeStoresValue) {
+    iggy::TopicCreateOptions options;
+    options.SetSegmentSize(0x0102030405060708ULL);
+    ASSERT_TRUE(options.SegmentSize().has_value());
+    EXPECT_EQ(*options.SegmentSize(), 0x0102030405060708ULL);
+}
+
+TEST(TopicCreateOptionsTest, DurabilityStoresPolicy) {
+    iggy::TopicCreateOptions persisted;
+    persisted.SetDurability(iggy::Durability::Persisted);
+    ASSERT_TRUE(persisted.Durability().has_value());
+    EXPECT_EQ(*persisted.Durability(), iggy::Durability::Persisted);
+
+    iggy::TopicCreateOptions replicated;
+    replicated.SetDurability(iggy::Durability::Replicated);
+    ASSERT_TRUE(replicated.Durability().has_value());
+    EXPECT_EQ(*replicated.Durability(), iggy::Durability::Replicated);
+
+    iggy::TopicCreateOptions offset;
+    offset.SetConsumerOffsetDurability(iggy::Durability::Persisted);
+    ASSERT_TRUE(offset.ConsumerOffsetDurability().has_value());
+    EXPECT_EQ(*offset.ConsumerOffsetDurability(), iggy::Durability::Persisted);
+}
+
+TEST(TopicCreateOptionsTest, MessagesRequiredToSaveStoresValue) {
+    iggy::TopicCreateOptions options;
+    options.SetMessagesRequiredToSave(0x01020304U);
+    ASSERT_TRUE(options.MessagesRequiredToSave().has_value());
+    EXPECT_EQ(*options.MessagesRequiredToSave(), 0x01020304U);
+}
+
+TEST(TopicCreateOptionsTest, SizeOfMessagesRequiredToSaveStoresValue) {
+    iggy::TopicCreateOptions options;
+    options.SetSizeOfMessagesRequiredToSave(1024ULL * 1024ULL);
+    ASSERT_TRUE(options.SizeOfMessagesRequiredToSave().has_value());
+    EXPECT_EQ(*options.SizeOfMessagesRequiredToSave(), 1024ULL * 1024ULL);
+}
+
+TEST(TopicCreateOptionsTest, PreallocateSegmentsStoresBool) {
+    iggy::TopicCreateOptions enabled;
+    enabled.SetPreallocateSegments(true);
+    ASSERT_TRUE(enabled.PreallocateSegments().has_value());
+    EXPECT_EQ(*enabled.PreallocateSegments(), true);
+
+    iggy::TopicCreateOptions disabled;
+    disabled.SetPreallocateSegments(false);
+    ASSERT_TRUE(disabled.PreallocateSegments().has_value());
+    EXPECT_EQ(*disabled.PreallocateSegments(), false);
+}
+
+TEST(TopicCreateOptionsTest, ReplicationFactorStoresValue) {
+    iggy::TopicCreateOptions options;
+    options.SetReplicationFactor(3);
+    ASSERT_TRUE(options.ReplicationFactor().has_value());
+    EXPECT_EQ(*options.ReplicationFactor(), 3u);
+}
+
+TEST(TopicCreateOptionsTest, MaximumValuesPreserved) {
+    iggy::TopicCreateOptions options;
+    options.SetSegmentSize(std::numeric_limits<std::uint64_t>::max());
+    ASSERT_TRUE(options.SegmentSize().has_value());
+    EXPECT_EQ(*options.SegmentSize(), std::numeric_limits<std::uint64_t>::max());
+
+    options.SetMessagesRequiredToSave(std::numeric_limits<std::uint32_t>::max());
+    ASSERT_TRUE(options.MessagesRequiredToSave().has_value());
+    EXPECT_EQ(*options.MessagesRequiredToSave(), std::numeric_limits<std::uint32_t>::max());
+
+    options.SetSizeOfMessagesRequiredToSave(std::numeric_limits<std::uint64_t>::max());
+    ASSERT_TRUE(options.SizeOfMessagesRequiredToSave().has_value());
+    EXPECT_EQ(*options.SizeOfMessagesRequiredToSave(), std::numeric_limits<std::uint64_t>::max());
+}
+
+TEST(TopicCreateOptionsTest, ChainingAndOverwrite) {
+    iggy::TopicCreateOptions options;
+    options.SetSegmentSize(1024).SetDurability(iggy::Durability::Persisted).SetMessagesRequiredToSave(512);
+    EXPECT_EQ(*options.SegmentSize(), 1024ULL);
+    EXPECT_EQ(*options.Durability(), iggy::Durability::Persisted);
+    EXPECT_EQ(*options.MessagesRequiredToSave(), 512u);
+    options.SetSegmentSize(2048);
+    EXPECT_EQ(*options.SegmentSize(), 2048ULL);
+}
+
+TEST(TopicCreateOptionsTest, CompressionAlgorithmAndExpiryAndMaxTopicSize) {
+    iggy::TopicCreateOptions options;
+    options.SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+        .SetMessageExpiry(iggy::Expiry::Duration(15))
+        .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024));
+    ASSERT_TRUE(options.CompressionAlgorithm().has_value());
+    EXPECT_EQ(options.CompressionAlgorithm()->Value(), "gzip");
+    ASSERT_TRUE(options.MessageExpiry().has_value());
+    EXPECT_EQ(options.MessageExpiry()->Kind(), "duration");
+    EXPECT_EQ(options.MessageExpiry()->Value(), 15u);
+    ASSERT_TRUE(options.MaxTopicSize().has_value());
+    EXPECT_EQ(options.MaxTopicSize()->Value(), "1024");
+}
+
+TEST(TopicCreateOptionsTest, ServerDefaultSentinelsClearValues) {
+    iggy::TopicCreateOptions options;
+    options.SetMessageExpiry(iggy::Expiry::Duration(15)).SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024));
+    ASSERT_TRUE(options.MessageExpiry().has_value());
+    ASSERT_TRUE(options.MaxTopicSize().has_value());
+
+    options.SetMessageExpiry(iggy::Expiry::ServerDefault()).SetMaxTopicSize(iggy::MaxTopicSize::ServerDefault());
+    EXPECT_FALSE(options.MessageExpiry().has_value());
+    EXPECT_FALSE(options.MaxTopicSize().has_value());
+}
+
+TEST(TopicCreateOptionsTest, RawMapStoresForwardCompatibleKeys) {
+    iggy::TopicCreateOptions options;
+    options.SetRawEntries({{"custom_key", "custom_value"}});
+    EXPECT_EQ(options.RawEntries().count("custom_key"), 1u);
+    EXPECT_EQ(options.RawEntries().at("custom_key"), "custom_value");
+    options.SetRawEntries(std::map<std::string, std::string>{{"a", "1"}, {"b", "2"}});
+    EXPECT_EQ(options.RawEntries().size(), 3u);
+    EXPECT_EQ(options.RawEntries().at("a"), "1");
+}
+
+TEST(TopicCreateOptionsTest, RawMapReplacesDuplicateKeys) {
+    iggy::TopicCreateOptions options;
+    const std::map<std::string, std::string> first_entries{{"message_expiry", "7 days"}};
+    const std::map<std::string, std::string> second_entries{{"message_expiry", "1 day"}};
+
+    options.SetRawEntries(first_entries).SetRawEntries(second_entries);
+
+    EXPECT_EQ(options.RawEntries().at("message_expiry"), "1 day");
+}
+
+TEST(TopicCreateOptionsTest, RawMapReplacesDuplicateKeysWhenMoved) {
+    iggy::TopicCreateOptions options;
+    std::map<std::string, std::string> first_entries{{"message_expiry", "7 days"}};
+    std::map<std::string, std::string> second_entries{{"message_expiry", "1 day"}};
+
+    options.SetRawEntries(std::move(first_entries)).SetRawEntries(std::move(second_entries));
+
+    EXPECT_EQ(options.RawEntries().at("message_expiry"), "1 day");
+}
+
+TEST(TopicUpdateOptionsTest, DefaultHasNoValues) {
+    const iggy::TopicUpdateOptions options;
+    EXPECT_FALSE(options.Name().has_value());
+    EXPECT_FALSE(options.MessageExpiry().has_value());
+    EXPECT_FALSE(options.MaxTopicSize().has_value());
+    EXPECT_TRUE(options.RawEntries().empty());
+    EXPECT_TRUE(options.ResetKeys().empty());
+}
+
+TEST(TopicUpdateOptionsTest, StoresUpdatableFields) {
+    iggy::TopicUpdateOptions options;
+    options.SetName("renamed")
+        .SetMessageExpiry(iggy::Expiry::NeverExpire())
+        .SetMaxTopicSize(iggy::MaxTopicSize::Unlimited());
+    EXPECT_EQ(options.Name(), std::optional<std::string>("renamed"));
+    ASSERT_TRUE(options.MessageExpiry().has_value());
+    EXPECT_EQ(options.MessageExpiry()->Kind(), "never_expire");
+    ASSERT_TRUE(options.MaxTopicSize().has_value());
+    EXPECT_EQ(options.MaxTopicSize()->Value(), "unlimited");
+}
+
+TEST(TopicUpdateOptionsTest, ServerDefaultSentinelsClearValues) {
+    iggy::TopicUpdateOptions options;
+    options.SetMessageExpiry(iggy::Expiry::Duration(15)).SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024));
+    ASSERT_TRUE(options.MessageExpiry().has_value());
+    ASSERT_TRUE(options.MaxTopicSize().has_value());
+
+    options.SetMessageExpiry(iggy::Expiry::ServerDefault()).SetMaxTopicSize(iggy::MaxTopicSize::ServerDefault());
+    EXPECT_FALSE(options.MessageExpiry().has_value());
+    EXPECT_FALSE(options.MaxTopicSize().has_value());
+}
+
+TEST(TopicUpdateOptionsTest, RawMapStoresKeys) {
+    iggy::TopicUpdateOptions options;
+    options.SetRawEntries({{"message_expiry", "7 days"}});
+    EXPECT_EQ(options.RawEntries().count("message_expiry"), 1u);
+    options.SetRawEntries(std::map<std::string, std::string>{{"compression_algorithm", "gzip"}});
+    EXPECT_EQ(options.RawEntries().size(), 2u);
+}
+
+TEST(TopicUpdateOptionsTest, RawMapReplacesDuplicateKeys) {
+    iggy::TopicUpdateOptions options;
+    const std::map<std::string, std::string> first_entries{{"message_expiry", "7 days"}};
+    const std::map<std::string, std::string> second_entries{{"message_expiry", "1 day"}};
+    std::map<std::string, std::string> third_entries{{"message_expiry", "7 days"}};
+    std::map<std::string, std::string> fourth_entries{{"message_expiry", "1 day"}};
+
+    options.SetRawEntries(first_entries).SetRawEntries(second_entries);
+    EXPECT_EQ(options.RawEntries().at("message_expiry"), "1 day");
+
+    options.SetRawEntries(std::move(third_entries)).SetRawEntries(std::move(fourth_entries));
+
+    EXPECT_EQ(options.RawEntries().at("message_expiry"), "1 day");
+}
+
+TEST(TopicUpdateOptionsTest, ResetCollectsTypedKeysOnce) {
+    iggy::TopicUpdateOptions options;
+    options.Reset(iggy::TopicOptionKey::MaxTopicSize)
+        .Reset(iggy::TopicOptionKey::MessageExpiry)
+        .Reset(iggy::TopicOptionKey::MaxTopicSize);
+    EXPECT_EQ(options.ResetKeys(), (std::set<iggy::TopicOptionKey>{iggy::TopicOptionKey::MessageExpiry,
+                                                                   iggy::TopicOptionKey::MaxTopicSize}));
+}
+
+TEST(OptionKeyTest, ReturnsCatalogNames) {
+    EXPECT_EQ(iggy::to_string(iggy::StreamOptionKey::Name), "name");
+    EXPECT_EQ(iggy::to_string(iggy::StreamOptionKey::EncryptionKey), "encryption_key");
+    EXPECT_EQ(iggy::to_string(iggy::StreamOptionKey::EncryptionKekFingerprint), "encryption_kek_fingerprint");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::SizeOfMessagesRequiredToSave), "size_of_messages_required_to_save");
+    EXPECT_EQ(iggy::to_string(iggy::UserOptionKey::Status), "status");
+    EXPECT_EQ(iggy::to_string(iggy::OptionsScope::User), "user");
+    EXPECT_EQ(iggy::to_string(iggy::StreamEncryptionSource::Server), "server");
+}
+
+TEST(StreamCreateOptionsTest, LastKeySetterWins) {
+    iggy::StreamCreateOptions options;
+    EXPECT_FALSE(options.HasEncryptionKey());
+    options.SetEncryptionKey(std::vector<std::uint8_t>(32, 7));
+    EXPECT_TRUE(options.HasEncryptionKey());
+    options.SetEncryptionKeyBase64("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=");
+    EXPECT_TRUE(options.HasEncryptionKey());
+    options.SetRawEntries({{"future_key", "future_value"}});
+    EXPECT_EQ(options.RawEntries().at("future_key"), "future_value");
+}
+
+TEST(StreamUpdateOptionsTest, StoresNameAndReset) {
+    iggy::StreamUpdateOptions options;
+    EXPECT_FALSE(options.Name().has_value());
+    options.SetName("renamed").Reset(iggy::StreamOptionKey::EncryptionKey);
+    EXPECT_EQ(options.Name(), std::optional<std::string>("renamed"));
+    EXPECT_EQ(options.ResetKeys(), (std::set<iggy::StreamOptionKey>{iggy::StreamOptionKey::EncryptionKey}));
+}
+
+TEST(UserUpdateOptionsTest, StoresUsernameStatusAndReset) {
+    iggy::UserUpdateOptions options;
+    EXPECT_FALSE(options.Username().has_value());
+    EXPECT_FALSE(options.Status().has_value());
+    options.SetUsername("renamed").SetStatus(iggy::UserStatus::Inactive).Reset(iggy::UserOptionKey::Status);
+    EXPECT_EQ(options.Username(), std::optional<std::string>("renamed"));
+    EXPECT_EQ(options.Status(), std::optional<iggy::UserStatus>(iggy::UserStatus::Inactive));
+    EXPECT_EQ(options.ResetKeys(), (std::set<iggy::UserOptionKey>{iggy::UserOptionKey::Status}));
+}
+
+TEST(UserCreateOptionsTest, RawMapStoresKeys) {
+    iggy::UserCreateOptions options;
+    EXPECT_TRUE(options.RawEntries().empty());
+    options.SetRawEntries({{"future_key", "future_value"}});
+    EXPECT_EQ(options.RawEntries().at("future_key"), "future_value");
+}
+
+TEST(EncryptionKeyFingerprintTest, AcceptsOnlyThirtyTwoBytes) {
+    const auto fingerprint = iggy::EncryptionKeyFingerprint(std::vector<std::uint8_t>(32, 7));
+    EXPECT_EQ(fingerprint.size(), 16u);
+    EXPECT_EQ(fingerprint, iggy::EncryptionKeyFingerprint(std::vector<std::uint8_t>(32, 7)));
+    for (const std::size_t length : {std::size_t{0}, std::size_t{31}, std::size_t{33}}) {
+        SCOPED_TRACE(length);
+        try {
+            (void)iggy::EncryptionKeyFingerprint(std::vector<std::uint8_t>(length, 7));
+            ADD_FAILURE() << "A key that is not 32 bytes must be refused";
+        } catch (const iggy::IggyException &error) {
+            EXPECT_EQ(error.Kind(), "invalid_encryption_key");
+            EXPECT_EQ(error.Code(), std::optional<std::uint32_t>(70));
+        }
+    }
+}
+
+TEST(StreamUpdateOptionsTest, RawMapStoresKeys) {
+    iggy::StreamUpdateOptions options;
+    EXPECT_TRUE(options.RawEntries().empty());
+    options.SetRawEntries({{"future_key", "future_value"}});
+    EXPECT_EQ(options.RawEntries().count("future_key"), 1u);
+    EXPECT_EQ(options.RawEntries().at("future_key"), "future_value");
+}
+
+TEST(StreamUpdateOptionsTest, RawMapReplacesDuplicateKeys) {
+    iggy::StreamUpdateOptions options;
+    std::map<std::string, std::string> first_entries{{"future_key", "first_value"}};
+    std::map<std::string, std::string> second_entries{{"future_key", "second_value"}};
+    const std::map<std::string, std::string> third_entries{{"future_key", "first_value"}};
+    const std::map<std::string, std::string> fourth_entries{{"future_key", "second_value"}};
+
+    options.SetRawEntries(std::move(first_entries)).SetRawEntries(std::move(second_entries));
+    EXPECT_EQ(options.RawEntries().at("future_key"), "second_value");
+
+    options.SetRawEntries(third_entries).SetRawEntries(fourth_entries);
+
+    EXPECT_EQ(options.RawEntries().at("future_key"), "second_value");
 }
 
 TEST(IggyExceptionTest, StoresMessage) {
@@ -103,4 +438,202 @@ TEST(IggyExceptionTest, StoresMessage) {
     const std::string message = "boom2";
     const iggy::IggyException from_string(message);
     EXPECT_EQ(std::string(from_string.what()), message);
+    EXPECT_FALSE(from_string.Code().has_value());
+    EXPECT_TRUE(from_string.Kind().empty());
+    EXPECT_FALSE(from_string.OperationId().has_value());
+}
+
+TEST(IggyExceptionTest, CopyKeepsKindAfterOriginalIsDestroyed) {
+    auto client = iggy::IggyBlockingClient::Builder().Build();
+    std::optional<iggy::IggyException> original;
+    try {
+        client.ResolveOperation(1);
+    } catch (const iggy::IggyException &error) {
+        original.emplace(error);
+    }
+    ASSERT_TRUE(original.has_value());
+
+    const iggy::IggyException copy = *original;
+    original.reset();
+    EXPECT_EQ(copy.Kind(), "operation_not_retained");
+}
+
+TEST(IggyBlockingClientTest, RecoveryErrorsPreserveFullWidthOperationIds) {
+    auto client                      = iggy::IggyBlockingClient::Builder().Build();
+    const std::uint64_t operations[] = {(std::uint64_t{1} << 53) + 7, std::numeric_limits<std::uint64_t>::max()};
+    for (const auto operation : operations) {
+        for (const bool abandon : {false, true}) {
+            try {
+                if (abandon) {
+                    client.AbandonOperation(operation);
+                } else {
+                    client.ResolveOperation(operation);
+                }
+                FAIL() << "An unknown operation must not resolve or be abandoned";
+            } catch (const iggy::IggyException &error) {
+                EXPECT_EQ(error.Code(), 14008u);
+                EXPECT_EQ(error.Kind(), "operation_not_retained");
+                EXPECT_EQ(error.OperationId(), operation);
+            }
+        }
+    }
+}
+
+TEST(IggyBlockingClientTest, RecoveryTimeoutMustBePositive) {
+    auto client = iggy::IggyBlockingClient::Builder().Build();
+    for (const auto timeout : {std::chrono::microseconds::zero(), std::chrono::microseconds(-1)}) {
+        try {
+            client.ResolveOperation(1, timeout);
+            FAIL() << "A non-positive resolution timeout must be rejected";
+        } catch (const iggy::IggyException &error) {
+            EXPECT_STREQ(error.what(), "Resolution timeout must be positive");
+            EXPECT_FALSE(error.Code().has_value());
+            EXPECT_TRUE(error.Kind().empty());
+            EXPECT_FALSE(error.OperationId().has_value());
+        }
+    }
+}
+
+TEST(IggyBlockingClientBuilderTest, PendingOperationLimitsMustBePositive) {
+    EXPECT_NO_THROW((void)iggy::IggyBlockingClient::Builder().WithPendingOperations(1, 4096).Build());
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithPendingOperations(0, 4096), iggy::IggyException);
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithPendingOperations(1, 0), iggy::IggyException);
+}
+
+TEST(IggyFfiRecoveryTest, PerCallDetailsSurviveExceptionsAndResetOnValidation) {
+    auto *client         = iggy::ffi::new_connection({});
+    const auto operation = std::numeric_limits<std::uint64_t>::max();
+    iggy::ffi::ErrorInfo error_info{};
+    EXPECT_THROW(client->resolve_operation(operation, 1000, error_info), std::exception);
+    EXPECT_EQ(error_info.code, 14008u);
+    EXPECT_EQ(std::string(error_info.kind), "operation_not_retained");
+    EXPECT_TRUE(error_info.has_operation_id);
+    EXPECT_EQ(error_info.operation_id, operation);
+
+    EXPECT_THROW(client->delete_stream({}, error_info), std::exception);
+    EXPECT_EQ(error_info.code, 0u);
+    EXPECT_TRUE(error_info.kind.empty());
+    EXPECT_FALSE(error_info.has_operation_id);
+    EXPECT_EQ(error_info.operation_id, 0u);
+    iggy::ffi::delete_client(client);
+}
+
+TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
+    auto client   = iggy::IggyBlockingClient::Builder().Build();
+    auto moved_to = std::move(client);
+    (void)moved_to;
+
+    const auto stream   = iggy::Identifier::String("stream");
+    const auto topic    = iggy::Identifier::String("topic");
+    const auto group    = iggy::Identifier::String("group");
+    const auto consumer = iggy::Consumer::Single(iggy::Identifier::Numeric(1));
+
+    // Exercising the moved-from guard requires invoking every operation on the valid but empty source object.
+    EXPECT_THROW(client.Connect(), iggy::IggyException);
+    EXPECT_THROW(client.Disconnect(), iggy::IggyException);
+    EXPECT_THROW(client.Shutdown(), iggy::IggyException);
+    EXPECT_THROW(client.Login("iggy", "iggy"), iggy::IggyException);
+    EXPECT_THROW(client.Logout(), iggy::IggyException);
+    EXPECT_THROW((void)client.GetUser(stream), iggy::IggyException);
+    EXPECT_THROW((void)client.GetUsers(), iggy::IggyException);
+    EXPECT_THROW((void)client.CreateUser("user", "secret123", iggy::UserStatus::Active), iggy::IggyException);
+    EXPECT_THROW(client.DeleteUser(stream), iggy::IggyException);
+    EXPECT_THROW(client.UpdateUser(
+                     stream, iggy::UserUpdateOptions().SetUsername("updated-user").SetStatus(iggy::UserStatus::Active)),
+                 iggy::IggyException);
+    EXPECT_THROW(client.CreateStream("stream"), iggy::IggyException);
+    EXPECT_THROW(client.UpdateStream(stream, iggy::StreamUpdateOptions().SetName("updated-stream")),
+                 iggy::IggyException);
+    EXPECT_THROW(client.GetStreams(), iggy::IggyException);
+    EXPECT_THROW(client.GetStream(stream), iggy::IggyException);
+    EXPECT_THROW(client.DeleteStream(stream), iggy::IggyException);
+    EXPECT_THROW(client.CreateTopic(stream, "topic", iggy::TopicCreateOptions().SetPartitionsCount(1)),
+                 iggy::IggyException);
+    EXPECT_THROW(client.UpdateTopic(stream, topic, iggy::TopicUpdateOptions().SetName("updated-topic")),
+                 iggy::IggyException);
+    EXPECT_THROW(client.GetTopics(stream), iggy::IggyException);
+    EXPECT_THROW(client.GetTopic(stream, topic), iggy::IggyException);
+    EXPECT_THROW(client.DeleteTopic(stream, topic), iggy::IggyException);
+    EXPECT_THROW(client.CreatePartitions(stream, topic, 1), iggy::IggyException);
+    EXPECT_THROW(client.DeletePartitions(stream, topic, 1), iggy::IggyException);
+    EXPECT_THROW(client.DeleteSegments(stream, topic, 0, 1), iggy::IggyException);
+    EXPECT_THROW(client.CreateConsumerGroup(stream, topic, "group"), iggy::IggyException);
+    EXPECT_THROW(client.GetConsumerGroup(stream, topic, group), iggy::IggyException);
+    EXPECT_THROW(client.GetConsumerGroups(stream, topic), iggy::IggyException);
+    EXPECT_THROW(client.DeleteConsumerGroup(stream, topic, group), iggy::IggyException);
+    EXPECT_THROW(client.JoinConsumerGroup(stream, topic, group), iggy::IggyException);
+    EXPECT_THROW(client.LeaveConsumerGroup(stream, topic, group), iggy::IggyException);
+    EXPECT_THROW(client.StoreConsumerOffset(consumer, stream, topic, 0, 0), iggy::IggyException);
+    EXPECT_THROW(client.GetConsumerOffset(consumer, stream, topic, 0), iggy::IggyException);
+    EXPECT_THROW(client.DeleteConsumerOffset(consumer, stream, topic, 0), iggy::IggyException);
+    EXPECT_THROW((void)client.DescribeOptions(iggy::OptionsScope::Stream), iggy::IggyException);
+    EXPECT_THROW((void)client.GetStats(), iggy::IggyException);
+    EXPECT_THROW((void)client.GetMe(), iggy::IggyException);
+    EXPECT_THROW((void)client.GetClient(1), iggy::IggyException);
+    EXPECT_THROW((void)client.GetClients(), iggy::IggyException);
+}
+
+TEST(IggyBlockingClientTest, ConsumerOffsetOperationsRejectMaximumPartitionId) {
+    auto client                  = iggy::IggyBlockingClient::Builder().Build();
+    const auto stream            = iggy::Identifier::String("stream");
+    const auto topic             = iggy::Identifier::String("topic");
+    const auto consumer          = iggy::Consumer::Single(iggy::Identifier::Numeric(1));
+    const auto maximum_partition = std::numeric_limits<std::uint32_t>::max();
+    const auto expect_rejection  = [](auto &&operation) {
+        try {
+            operation();
+            FAIL() << "Expected the maximum std::uint32_t partition_id to be rejected";
+        } catch (const iggy::IggyException &error) {
+            EXPECT_STREQ(error.what(), "partition_id cannot be the maximum std::uint32_t value");
+        }
+    };
+
+    expect_rejection([&] { client.StoreConsumerOffset(consumer, stream, topic, maximum_partition, 0); });
+    expect_rejection([&] { (void)client.GetConsumerOffset(consumer, stream, topic, maximum_partition); });
+    expect_rejection([&] { client.DeleteConsumerOffset(consumer, stream, topic, maximum_partition); });
+}
+
+TEST(AutoLoginKindTest, HasStableDiscriminantsAndZeroInitializedDefault) {
+    EXPECT_EQ(static_cast<std::uint8_t>(iggy::ffi::AutoLoginKind::Disabled), 0u);
+    EXPECT_EQ(static_cast<std::uint8_t>(iggy::ffi::AutoLoginKind::UsernamePassword), 1u);
+    EXPECT_EQ(static_cast<std::uint8_t>(iggy::ffi::AutoLoginKind::PersonalAccessToken), 2u);
+
+    const iggy::ffi::IggyClientConfig config{};
+    EXPECT_EQ(config.auto_login_kind, iggy::ffi::AutoLoginKind::Disabled);
+}
+
+TEST(IggyBlockingClientBuilderTest, BuildsWithEachAutoLoginKind) {
+    EXPECT_NO_THROW((void)iggy::IggyBlockingClient::Builder().Build());
+    EXPECT_NO_THROW((void)iggy::IggyBlockingClient::Builder().WithAutoLogin("iggy", "iggy").Build());
+    EXPECT_NO_THROW((void)iggy::IggyBlockingClient::Builder().WithPersonalAccessToken("token").Build());
+}
+
+TEST(IggyBlockingClientBuilderTest, RejectsEmptyServerAddress) {
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithServerAddress(""), iggy::IggyException);
+}
+
+TEST(IggyBlockingClientBuilderTest, RejectsEmptyAutoLoginCredentials) {
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithAutoLogin("", "password"), iggy::IggyException);
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithAutoLogin("username", ""), iggy::IggyException);
+}
+
+TEST(IggyBlockingClientBuilderTest, RejectsEmptyPersonalAccessToken) {
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithPersonalAccessToken(""), iggy::IggyException);
+}
+
+TEST(IggyBlockingClientBuilderTest, RejectsTlsDomainWhenTlsIsDisabled) {
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithTlsDomain("localhost").Build(), iggy::IggyException);
+}
+
+TEST(IggyBlockingClientBuilderTest, RejectsTlsCaFileWhenTlsIsDisabled) {
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithTlsCaFile("ca.pem").Build(), iggy::IggyException);
+}
+
+TEST(IggyBlockingClientBuilderTest, RejectsTlsValidationWhenTlsIsDisabled) {
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithTlsCertificateValidation().Build(), iggy::IggyException);
+}
+
+TEST(IggyBlockingClientBuilderTest, RejectsEmptyTlsSettings) {
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithTlsDomain(""), iggy::IggyException);
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithTlsCaFile(""), iggy::IggyException);
 }

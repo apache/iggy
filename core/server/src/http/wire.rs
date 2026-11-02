@@ -19,11 +19,11 @@
 //! the control-plane [`Message<RoutedRequestHeader>`] builder shared by the write path.
 
 use bytes::{Bytes, BytesMut};
-use iggy_binary_protocol::consensus::{Command2, HEADER_SIZE};
+use iggy_binary_protocol::consensus::{Command, HEADER_SIZE};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
 use iggy_binary_protocol::requests::consumer_offsets::{
-    DeleteConsumerOffset2Request, GetConsumerOffsetRequest, StoreConsumerOffset2Request,
+    DeleteConsumerOffsetRequest, GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::messages::{
     PollMessagesRequest, RawMessage, SendMessagesEncoder,
@@ -34,9 +34,9 @@ use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use iggy_common::wire_conversions::{consumer_to_wire, identifier_to_wire, partitioning_to_wire};
 use iggy_common::{
-    Consumer, Identifier, IggyError, IggyMessageView, PollMessages, PolledMessages,
-    RESYNC_REQUIRED_PARTITION_SENTINEL, SendMessages,
+    Consumer, ConsumerKind, Identifier, IggyError, IggyMessageView, PollMessages, SendMessages,
 };
+use serde::Deserialize;
 use server_common::Message;
 
 /// Encode a validated HTTP `SendMessages` into the `SendMessagesRequest` wire
@@ -58,7 +58,14 @@ pub(in crate::http) fn encode_send_messages(
     let raw_messages: Vec<RawMessage<'_>> = views
         .iter()
         .map(|view| RawMessage {
-            id: view.header().id(),
+            // HTTP producers send no id; the producer side owns minting now
+            // (the id sits under the frame checksum), and for JSON bodies
+            // this handler IS the producer encoder.
+            id: if view.header().id() == 0 {
+                iggy_common::random_id::get_uuid()
+            } else {
+                view.header().id()
+            },
             origin_timestamp: view.header().origin_timestamp(),
             headers: view.user_headers(),
             payload: view.payload(),
@@ -77,20 +84,26 @@ pub(in crate::http) fn encode_send_messages(
         &wire_topic_id,
         &wire_partitioning,
         &raw_messages,
-    );
+    )
+    .map_err(|error| match error {
+        iggy_binary_protocol::WireError::InvalidMessageTimestampDelta(delta) => {
+            IggyError::InvalidMessageTimestampDelta(delta)
+        }
+        _ => IggyError::InvalidCommand,
+    })?;
     Ok(buf.freeze())
 }
 
 /// Map a validated HTTP poll query onto the wire `PollMessagesRequest` the
 /// shared TCP resolver consumes, so both transports resolve one request shape.
-/// The query's consumer kind is structurally always `Consumer`
-/// (`Consumer::kind` is `#[serde(skip)]` - the flattened `kind` param names
-/// the polling strategy), matching the legacy HTTP server.
+/// Rejects `consumer_kind=consumer_group` since HTTP has no persistent connection.
 pub(in crate::http) fn poll_wire_request(
     stream_id: &Identifier,
     topic_id: &Identifier,
     query: &PollMessages,
 ) -> Result<PollMessagesRequest, IggyError> {
+    refuse_consumer_group(query.consumer.kind)?;
+
     Ok(PollMessagesRequest {
         consumer: WireConsumer {
             kind: query.consumer.kind.as_code(),
@@ -106,6 +119,40 @@ pub(in crate::http) fn poll_wire_request(
         count: query.count,
         auto_commit: query.auto_commit,
     })
+}
+
+/// The limits of `GET .../messages/deferred`. An omitted field takes the default of
+/// [`iggy_common::DeferredPollOptions`].
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub(in crate::http) struct DeferredPollQuery {
+    pub wait_us: u64,
+    pub min_count: u32,
+    pub max_bytes: u32,
+    pub request_timeout_us: u64,
+}
+
+impl Default for DeferredPollQuery {
+    fn default() -> Self {
+        let options = iggy_common::DeferredPollOptions::default();
+        Self {
+            wait_us: options.max_wait.as_micros(),
+            min_count: options.min_count,
+            max_bytes: options.max_bytes,
+            request_timeout_us: options.request_timeout.as_micros(),
+        }
+    }
+}
+
+impl From<DeferredPollQuery> for iggy_common::DeferredPollOptions {
+    fn from(query: DeferredPollQuery) -> Self {
+        Self {
+            max_wait: query.wait_us.into(),
+            min_count: query.min_count,
+            max_bytes: query.max_bytes,
+            request_timeout: query.request_timeout_us.into(),
+        }
+    }
 }
 
 /// Map a validated HTTP consumer-offset query onto the wire
@@ -128,18 +175,20 @@ pub(in crate::http) fn consumer_offset_wire_request(
     })
 }
 
-/// Map a validated HTTP store-offset body onto the v2 wire request
-/// (`StoreConsumerOffset2Request`), `ack` pinned to `Quorum` so the route can
-/// await the committed reply. The body's consumer kind is structurally always
-/// `Consumer` (`Consumer::kind` is `#[serde(skip)]`), matching the legacy HTTP
-/// server; `partition_id` passes through as the wire `Option` (flag byte +
-/// u32) for the server-side resolvers to ground.
+/// Map a validated HTTP store-offset body onto the wire request
+/// (`StoreConsumerOffsetRequest`), `ack` pinned to `Quorum` so the route can
+/// await the committed reply. `partition_id` passes through as the wire
+/// `Option` (flag byte + u32) for the server-side resolvers to ground.
+/// Rejects `consumer_kind=consumer_group` since HTTP has no persistent
+/// connection to hold group membership, so the write would always be fenced.
 pub(in crate::http) fn store_offset_wire_request(
     stream_id: &Identifier,
     topic_id: &Identifier,
     command: &StoreConsumerOffset,
-) -> Result<StoreConsumerOffset2Request, IggyError> {
-    Ok(StoreConsumerOffset2Request {
+) -> Result<StoreConsumerOffsetRequest, IggyError> {
+    refuse_consumer_group(command.consumer.kind)?;
+
+    Ok(StoreConsumerOffsetRequest {
         consumer: consumer_to_wire(&command.consumer)?,
         stream_id: identifier_to_wire(stream_id)?,
         topic_id: identifier_to_wire(topic_id)?,
@@ -149,34 +198,25 @@ pub(in crate::http) fn store_offset_wire_request(
     })
 }
 
-/// Map a validated HTTP delete-offset request onto the v2 wire request
-/// (`DeleteConsumerOffset2Request`), `ack` pinned to `Quorum` like
-/// [`store_offset_wire_request`].
+/// Map a validated HTTP delete-offset request onto the wire request
+/// (`DeleteConsumerOffsetRequest`), `ack` pinned to `Quorum` like
+/// [`store_offset_wire_request`]. Rejects `consumer_kind=consumer_group` for
+/// the same reason [`store_offset_wire_request`] does.
 pub(in crate::http) fn delete_offset_wire_request(
     stream_id: &Identifier,
     topic_id: &Identifier,
     consumer: &Consumer,
     partition_id: Option<u32>,
-) -> Result<DeleteConsumerOffset2Request, IggyError> {
-    Ok(DeleteConsumerOffset2Request {
+) -> Result<DeleteConsumerOffsetRequest, IggyError> {
+    refuse_consumer_group(consumer.kind)?;
+
+    Ok(DeleteConsumerOffsetRequest {
         consumer: consumer_to_wire(consumer)?,
         stream_id: identifier_to_wire(stream_id)?,
         topic_id: identifier_to_wire(topic_id)?,
         partition_id,
         ack: AckLevel::Quorum,
     })
-}
-
-/// The empty `PolledMessages` a fenced consumer-group poll answers, carrying
-/// the re-sync sentinel in `partition_id` exactly as the TCP dispatch replies
-/// it, so an SDK re-syncs its assignment instead of reading end-of-partition.
-pub(in crate::http) const fn resync_required_polled_messages() -> PolledMessages {
-    PolledMessages {
-        partition_id: RESYNC_REQUIRED_PARTITION_SENTINEL,
-        current_offset: 0,
-        count: 0,
-        messages: Vec::new(),
-    }
 }
 
 /// Build a `Message<RoutedRequestHeader>` for a control-plane write by filling a zeroed
@@ -197,13 +237,20 @@ pub(in crate::http) fn build_request_message(
         &mut message.as_mut_slice()[..HEADER_SIZE],
     )
     .expect("zeroed bytes form a valid RoutedRequestHeader");
-    header.command = Command2::Request;
+    header.command = Command::Request;
     header.operation = operation;
     header.client = client_id;
     header.session = session_id;
     header.request = request_id;
     header.size = u32::try_from(total).expect("control-plane message size fits u32");
     message
+}
+
+fn refuse_consumer_group(kind: ConsumerKind) -> Result<(), IggyError> {
+    if kind == ConsumerKind::ConsumerGroup {
+        return Err(IggyError::FeatureUnavailable);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -214,34 +261,31 @@ mod tests {
 
     use iggy_binary_protocol::WireDecode;
     use iggy_binary_protocol::WireEncode;
-    use iggy_binary_protocol::WireMessageIterator;
-    use iggy_binary_protocol::message_layout::WIRE_MESSAGE_INDEX_SIZE;
-    use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
     use iggy_common::{
-        Consumer, ConsumerKind, IggyMessage, IggyMessagesBatch, IggyTimestamp, Partitioning,
-        PartitioningKind, PollingKind, PollingStrategy, Validatable,
+        IggyMessagesBatch, IggyTimestamp, Partitioning, PartitioningKind, PolledMessages,
+        PollingKind, PollingStrategy, Validatable,
     };
     use partitions::{Fragment, PollFragments};
     use server_common::MESSAGE_ALIGN;
     use server_common::iobuf::Owned;
-    use server_common::send_messages2::{
-        COMMAND_HEADER_SIZE, IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Header,
-        SendMessages2Owned,
+    use server_common::send_messages::{
+        BatchHeader, COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages,
+        SendMessagesOwned,
     };
 
     use crate::http::error::{Consistency, ConsistencyQuery};
-    use crate::responses::build_polled_messages_body;
+    use crate::reply_frame::build_polled_messages_body;
 
     fn produce_command(partitioning: Partitioning) -> SendMessages {
-        let first = IggyMessage::builder()
+        let first = iggy_common::IggyMessage::builder()
             .id(7)
             .payload(Bytes::from_static(b"first"))
             .build()
             .expect("valid message");
         // Raw pre-encoded user headers, mirroring the HTTP deserializer's
         // base64 branch.
-        let mut second = IggyMessage::builder()
+        let mut second = iggy_common::IggyMessage::builder()
             .id(8)
             .payload(Bytes::from_static(b"second"))
             .build()
@@ -274,7 +318,10 @@ mod tests {
         let metadata_length =
             u32::from_le_bytes(bytes[..4].try_into().expect("length prefix")) as usize;
         let (header, consumed) =
-            SendMessagesHeader::decode(&bytes[4..4 + metadata_length]).expect("valid metadata");
+            iggy_binary_protocol::requests::messages::SendMessagesHeader::decode(
+                &bytes[4..4 + metadata_length],
+            )
+            .expect("valid metadata");
         assert_eq!(consumed, metadata_length);
         assert_eq!(header.stream_id, identifier_to_wire(&stream_id).unwrap());
         assert_eq!(header.topic_id, identifier_to_wire(&topic_id).unwrap());
@@ -284,18 +331,53 @@ mod tests {
         );
         assert_eq!(header.messages_count, 2);
 
-        let data_offset = 4 + metadata_length + 2 * WIRE_MESSAGE_INDEX_SIZE;
-        let views: Vec<_> = WireMessageIterator::new(&bytes[data_offset..], 2)
-            .collect::<Result<Vec<_>, _>>()
-            .expect("valid message frames");
-        assert_eq!(views[0].id(), 7);
-        assert_eq!(views[0].payload(), b"first");
-        assert_eq!(views[0].user_headers(), b"");
-        assert_eq!(views[0].origin_timestamp(), origin_timestamps[0]);
-        assert_eq!(views[1].id(), 8);
-        assert_eq!(views[1].payload(), b"second");
-        assert_eq!(views[1].user_headers(), b"raw-header-bytes");
-        assert_eq!(views[1].origin_timestamp(), origin_timestamps[1]);
+        let batch = iggy_binary_protocol::batch::decode_batch_slice(&bytes[4 + metadata_length..])
+            .expect("valid producer batch");
+        assert_eq!(batch.header.partition_id, 0);
+        assert_eq!(batch.message_count(), 2);
+        let views: Vec<_> = batch.iter().collect();
+        let batch_origin = batch.header.origin_timestamp;
+        assert_eq!(views[0].header.id, 7);
+        assert_eq!(views[0].payload, b"first");
+        assert_eq!(views[0].user_headers, b"");
+        assert_eq!(
+            batch_origin + u64::from(views[0].header.timestamp_delta),
+            origin_timestamps[0]
+        );
+        assert_eq!(views[1].header.id, 8);
+        assert_eq!(views[1].payload, b"second");
+        assert_eq!(views[1].user_headers, b"raw-header-bytes");
+        assert_eq!(
+            batch_origin + u64::from(views[1].header.timestamp_delta),
+            origin_timestamps[1]
+        );
+    }
+
+    #[test]
+    fn encode_send_messages_mints_ids_for_zero_id_messages() {
+        // JSON producers send no id; the frame checksum covers the id field,
+        // so this handler must mint before encoding - the server no longer
+        // assigns ids at admission.
+        let stream_id = Identifier::from_str_value("1").expect("valid stream id");
+        let topic_id = Identifier::from_str_value("orders").expect("valid topic id");
+        let message = iggy_common::IggyMessage::builder()
+            .payload(Bytes::from_static(b"no-id"))
+            .build()
+            .expect("valid message");
+        assert_eq!(message.header.id, 0, "builder default id must be zero");
+        let command = SendMessages {
+            partitioning: Partitioning::partition_id(1),
+            batch: IggyMessagesBatch::from(&vec![message]),
+            ..Default::default()
+        };
+
+        let bytes = encode_send_messages(&stream_id, &topic_id, &command).expect("encodes");
+        let metadata_length =
+            u32::from_le_bytes(bytes[..4].try_into().expect("length prefix")) as usize;
+        let batch = iggy_binary_protocol::batch::decode_batch_slice(&bytes[4 + metadata_length..])
+            .expect("valid producer batch");
+        let views: Vec<_> = batch.iter().collect();
+        assert_ne!(views[0].header.id, 0, "zero id must be minted at encode");
     }
 
     #[test]
@@ -377,6 +459,18 @@ mod tests {
     }
 
     #[test]
+    fn poll_wire_request_rejects_consumer_group_kind() {
+        let stream_id = Identifier::from_str_value("orders").expect("valid stream id");
+        let topic_id = Identifier::from_str_value("1").expect("valid topic id");
+        let query = PollMessages {
+            consumer: Consumer::group(Identifier::numeric(9).expect("valid id")),
+            ..Default::default()
+        };
+        let error = poll_wire_request(&stream_id, &topic_id, &query).expect_err("must reject");
+        assert!(matches!(error, IggyError::FeatureUnavailable));
+    }
+
+    #[test]
     fn consumer_offset_wire_request_defaults_omitted_partition_to_zero() {
         let stream_id = Identifier::numeric(1).expect("valid stream id");
         let topic_id = Identifier::numeric(1).expect("valid topic id");
@@ -390,10 +484,59 @@ mod tests {
     }
 
     #[test]
+    fn consumer_offset_wire_request_maps_consumer_group_kind() {
+        let stream_id = Identifier::numeric(1).expect("valid stream id");
+        let topic_id = Identifier::numeric(1).expect("valid topic id");
+        let query = GetConsumerOffset {
+            consumer: Consumer::group(Identifier::numeric(7).expect("valid id")),
+            partition_id: Some(2),
+        };
+        let wire = consumer_offset_wire_request(&stream_id, &topic_id, &query).expect("maps");
+        assert_eq!(wire.consumer.kind, 2);
+        assert_eq!(wire.partition_id, Some(2));
+    }
+
+    #[test]
+    fn get_consumer_offset_query_parses_consumer_kind_param() {
+        let uri: Uri = "/streams/1/topics/1/consumer-offsets?consumer_id=my-group&consumer_kind=consumer_group&partition_id=0"
+            .parse()
+            .expect("valid uri");
+        let Query(query) = Query::<GetConsumerOffset>::try_from_uri(&uri).expect("parses");
+        assert_eq!(query.consumer.kind, ConsumerKind::ConsumerGroup);
+        assert_eq!(
+            query.consumer.id,
+            Identifier::named("my-group").expect("valid id")
+        );
+    }
+
+    #[test]
+    fn get_consumer_offset_query_defaults_consumer_kind_when_omitted() {
+        let uri: Uri = "/streams/1/topics/1/consumer-offsets?consumer_id=42"
+            .parse()
+            .expect("valid uri");
+        let Query(query) = Query::<GetConsumerOffset>::try_from_uri(&uri).expect("parses");
+        assert_eq!(query.consumer.kind, ConsumerKind::Consumer);
+    }
+
+    #[test]
+    fn store_consumer_offset_json_body_round_trips_consumer_group_kind() {
+        let json = serde_json::json!({
+            "consumer_id": "my-group",
+            "consumer_kind": "consumer_group",
+            "partition_id": 0,
+            "offset": 42,
+        });
+        let command: StoreConsumerOffset =
+            serde_json::from_value(json).expect("valid StoreConsumerOffset body");
+        assert_eq!(command.consumer.kind, ConsumerKind::ConsumerGroup);
+    }
+
+    #[test]
     fn store_offset_wire_request_round_trips_with_quorum_ack() {
         let stream_id = Identifier::numeric(1).expect("valid stream id");
         let topic_id = Identifier::named("orders").expect("valid topic id");
         let command = StoreConsumerOffset {
+            context: None,
             consumer: Consumer::new(Identifier::named("c1").expect("valid id")),
             partition_id: Some(1),
             offset: 42,
@@ -402,7 +545,7 @@ mod tests {
         let bytes = request.to_bytes();
         assert_eq!(*bytes.last().expect("non-empty"), AckLevel::Quorum.as_u8());
         let (decoded, consumed) =
-            StoreConsumerOffset2Request::decode(&bytes).expect("decodes as the server does");
+            StoreConsumerOffsetRequest::decode(&bytes).expect("decodes as the server does");
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, request);
         assert_eq!(decoded.consumer.kind, 1);
@@ -416,6 +559,7 @@ mod tests {
         let stream_id = Identifier::numeric(1).expect("valid stream id");
         let topic_id = Identifier::numeric(2).expect("valid topic id");
         let command = StoreConsumerOffset {
+            context: None,
             consumer: Consumer::new(Identifier::numeric(7).expect("valid id")),
             partition_id: None,
             offset: u64::MAX,
@@ -423,7 +567,7 @@ mod tests {
         let request = store_offset_wire_request(&stream_id, &topic_id, &command).expect("maps");
         let bytes = request.to_bytes();
         let (decoded, consumed) =
-            StoreConsumerOffset2Request::decode(&bytes).expect("decodes as the server does");
+            StoreConsumerOffsetRequest::decode(&bytes).expect("decodes as the server does");
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded.partition_id, None);
         assert_eq!(decoded.offset, u64::MAX);
@@ -445,7 +589,7 @@ mod tests {
             let bytes = request.to_bytes();
             assert_eq!(*bytes.last().expect("non-empty"), AckLevel::Quorum.as_u8());
             let (decoded, consumed) =
-                DeleteConsumerOffset2Request::decode(&bytes).expect("decodes as the server does");
+                DeleteConsumerOffsetRequest::decode(&bytes).expect("decodes as the server does");
             assert_eq!(consumed, bytes.len());
             assert_eq!(decoded, request);
             assert_eq!(decoded.consumer.kind, 1);
@@ -464,10 +608,63 @@ mod tests {
         assert_eq!(query.partition_id, None);
     }
 
-    /// Wrap one stored `SendMessages2` batch (`[256B header][blob]`) as the
+    #[test]
+    fn delete_offset_query_parses_consumer_kind_param() {
+        let uri: Uri = "/x?consumer_kind=consumer_group&partition_id=3"
+            .parse()
+            .expect("valid uri");
+        let Query(query) = Query::<DeleteConsumerOffset>::try_from_uri(&uri).expect("parses");
+        assert_eq!(query.consumer_kind, ConsumerKind::ConsumerGroup);
+        let bare: Uri = "/x".parse().expect("valid uri");
+        let Query(query) = Query::<DeleteConsumerOffset>::try_from_uri(&bare).expect("parses");
+        assert_eq!(query.consumer_kind, ConsumerKind::Consumer);
+    }
+
+    #[test]
+    fn store_offset_wire_request_rejects_consumer_group_kind() {
+        let stream_id = Identifier::numeric(1).expect("valid stream id");
+        let topic_id = Identifier::named("orders").expect("valid topic id");
+        let command = StoreConsumerOffset {
+            context: None,
+            consumer: Consumer::group(Identifier::numeric(9).expect("valid id")),
+            partition_id: Some(1),
+            offset: 42,
+        };
+        let error =
+            store_offset_wire_request(&stream_id, &topic_id, &command).expect_err("must reject");
+        assert!(matches!(error, IggyError::FeatureUnavailable));
+    }
+
+    #[test]
+    fn refuse_consumer_group_rejects_group_kind() {
+        let error = refuse_consumer_group(ConsumerKind::ConsumerGroup).expect_err("must reject");
+        assert!(matches!(error, IggyError::FeatureUnavailable));
+    }
+
+    #[test]
+    fn refuse_consumer_group_passes_non_group_kinds() {
+        assert!(refuse_consumer_group(ConsumerKind::Consumer).is_ok());
+        assert!(refuse_consumer_group(ConsumerKind::ExternalGroup).is_ok());
+    }
+
+    #[test]
+    fn delete_offset_wire_request_rejects_consumer_group_kind() {
+        let stream_id = Identifier::named("stream-1").expect("valid stream id");
+        let topic_id = Identifier::numeric(2).expect("valid topic id");
+        let error = delete_offset_wire_request(
+            &stream_id,
+            &topic_id,
+            &Consumer::group(Identifier::numeric(9).expect("valid id")),
+            Some(1),
+        )
+        .expect_err("must reject");
+        assert!(matches!(error, IggyError::FeatureUnavailable));
+    }
+
+    /// Wrap one stored `SendMessages` batch (`[256B header][blob]`) as the
     /// poll fragment the owning shard replies, the shape
     /// `build_polled_messages_body` consumes.
-    fn fragment_from_stored_batch(header: &SendMessages2Header, blob: &[u8]) -> PollFragments {
+    fn fragment_from_stored_batch(header: &BatchHeader, blob: &[u8]) -> PollFragments {
         let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(COMMAND_HEADER_SIZE + blob.len());
         header.encode_into(buffer.as_mut_slice());
         buffer.as_mut_slice()[COMMAND_HEADER_SIZE..].copy_from_slice(blob);
@@ -477,14 +674,14 @@ mod tests {
     }
 
     /// Round-trip the poll route's encode/decode seam: the store's own batch
-    /// writer (`SendMessages2Owned::from_messages`) is the encoder oracle,
+    /// writer (`SendMessagesOwned::from_messages`) is the encoder oracle,
     /// `build_polled_messages_body` re-encodes to the legacy wire body, and
     /// the SDK's `PolledMessages::from_bytes` must read back every field.
     #[test]
     fn polled_messages_body_decodes_into_common_polled_messages() {
-        let mut messages = IggyMessages2::with_capacity(2);
-        messages.push(IggyMessage2 {
-            header: IggyMessage2Header {
+        let mut messages = IggyMessages::with_capacity(2);
+        messages.push(IggyMessage {
+            header: IggyMessageHeader {
                 id: 7,
                 origin_timestamp: 1_000,
                 ..Default::default()
@@ -492,8 +689,8 @@ mod tests {
             payload: Bytes::from_static(b"first"),
             user_headers: None,
         });
-        messages.push(IggyMessage2 {
-            header: IggyMessage2Header {
+        messages.push(IggyMessage {
+            header: IggyMessageHeader {
                 id: 8,
                 origin_timestamp: 1_050,
                 ..Default::default()
@@ -503,7 +700,7 @@ mod tests {
         });
         let namespace = server_common::sharding::IggyNamespace::new(0, 0, 3);
         let stored =
-            SendMessages2Owned::from_messages(namespace, &messages).expect("encodes stored batch");
+            SendMessagesOwned::from_messages(namespace, &messages).expect("encodes stored batch");
         // The store stamps these on append; `from_messages` leaves them zero.
         let mut header = stored.header;
         header.base_offset = 41;
@@ -512,11 +709,13 @@ mod tests {
         let body = build_polled_messages_body(
             3,
             42,
+            iggy_common::PartitionContext::default(),
             fragment_from_stored_batch(&header, &stored.blob),
             None,
         )
         .expect("re-encodes wire body");
-        let polled = PolledMessages::from_bytes(body).expect("decodes as the SDK does");
+        let polled = PolledMessages::from_bytes(body, &PollingStrategy::offset(41))
+            .expect("decodes as the SDK does");
 
         assert_eq!(polled.partition_id, 3);
         assert_eq!(polled.current_offset, 42);
@@ -536,13 +735,5 @@ mod tests {
             polled.messages[1].user_headers.as_deref(),
             Some(b"raw-header-bytes".as_ref())
         );
-    }
-
-    #[test]
-    fn resync_required_polled_messages_carries_sentinel_partition() {
-        let polled = resync_required_polled_messages();
-        assert_eq!(polled.partition_id, RESYNC_REQUIRED_PARTITION_SENTINEL);
-        assert_eq!(polled.count, 0);
-        assert!(polled.messages.is_empty());
     }
 }

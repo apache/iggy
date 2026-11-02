@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { browser } from '$app/environment';
+import { browser } from '$app/env';
 import { goto } from '$app/navigation';
 import { resolve } from '$app/paths';
-import { clientApi } from '$lib/api/clientApi';
-import { authStore } from '$lib/auth/authStore.svelte';
-import { userDetailsMapper } from '$lib/domain/UserDetails';
-import { typedRoute } from '$lib/types/appRoutes';
+import { clientApi } from '#lib/api/clientApi.js';
+import { authStore } from '#lib/auth/authStore.svelte.js';
+import { userDetailsMapper } from '#lib/domain/UserDetails.js';
+import { typedRoute } from '#lib/types/appRoutes.js';
 import { jwtDecode } from 'jwt-decode';
 import type { LayoutLoad } from './$types';
 
@@ -32,14 +32,14 @@ export const load: LayoutLoad = async () => {
 
   const token = authStore.getAccessToken();
   if (browser && !token) {
-    goto(resolve(typedRoute('/auth/sign-in')));
+    goto(resolve(typedRoute('auth/sign-in')));
     return { user: null };
   }
 
   const getDetailedUser = async () => {
     let userId = authStore.userId;
 
-    if (!userId && token) {
+    if (userId === null && token) {
       try {
         const decoded = jwtDecode(token);
         userId = decoded.sub ? parseInt(decoded.sub, 10) : null;
@@ -48,7 +48,7 @@ export const load: LayoutLoad = async () => {
       }
     }
 
-    if (!userId) return null;
+    if (userId === null) return null;
 
     try {
       const data = await clientApi({ method: 'GET', path: `/users/${userId}` });

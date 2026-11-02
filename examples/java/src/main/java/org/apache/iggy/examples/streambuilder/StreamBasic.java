@@ -28,7 +28,6 @@ import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.stream.StreamDetails;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.TopicDetails;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -104,13 +103,12 @@ public final class StreamBasic {
                         message.header().offset(),
                         polledMessages.partitionId());
 
+                offset = message.header().offset().add(BigInteger.ONE);
                 consumedMessages++;
                 if (consumedMessages == EXPECTED_MESSAGES) {
                     break;
                 }
             }
-
-            offset = offset.add(BigInteger.valueOf(polledMessages.messages().size()));
         }
     }
 
@@ -127,15 +125,7 @@ public final class StreamBasic {
         if (topic.isPresent()) {
             log.info("Topic {} already exists.", TOPIC_NAME);
         } else {
-            client.topics()
-                    .createTopic(
-                            STREAM_ID,
-                            1L,
-                            CompressionAlgorithm.None,
-                            BigInteger.ZERO,
-                            BigInteger.ZERO,
-                            Optional.empty(),
-                            TOPIC_NAME);
+            client.topics().createTopic(STREAM_ID, TOPIC_NAME, 1L);
             log.info("Topic {} was created.", TOPIC_NAME);
         }
     }

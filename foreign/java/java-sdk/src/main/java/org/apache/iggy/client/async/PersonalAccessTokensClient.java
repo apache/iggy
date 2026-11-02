@@ -24,6 +24,7 @@ import org.apache.iggy.personalaccesstoken.RawPersonalAccessToken;
 import org.apache.iggy.user.IdentityInfo;
 
 import java.math.BigInteger;
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
@@ -36,10 +37,23 @@ public interface PersonalAccessTokensClient {
      * Creates a new personal access token asynchronously.
      *
      * @param name The name of the token
-     * @param expiry The expiration time in seconds (0 for no expiration)
+     * @param expiry The token lifetime in microseconds, the wire unit
+     *     (0 for the server default, u64 max for no expiration)
      * @return A CompletableFuture containing the created raw personal access token
      */
     CompletableFuture<RawPersonalAccessToken> createPersonalAccessToken(String name, BigInteger expiry);
+
+    /**
+     * Creates a new personal access token asynchronously, converting the
+     * lifetime to the wire's microsecond unit.
+     *
+     * @param name The name of the token
+     * @param expiry The token lifetime
+     * @return A CompletableFuture containing the created raw personal access token
+     */
+    default CompletableFuture<RawPersonalAccessToken> createPersonalAccessToken(String name, Duration expiry) {
+        return createPersonalAccessToken(name, BigInteger.valueOf(expiry.toNanos() / 1_000));
+    }
 
     /**
      * Gets all personal access tokens asynchronously.

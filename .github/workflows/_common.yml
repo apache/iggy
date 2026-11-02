@@ -18,6 +18,11 @@
 name: _common
 on:
   workflow_call:
+    inputs:
+      validate-third-party-licenses:
+        description: "Whether to validate bundled third-party licenses"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -25,8 +30,9 @@ permissions:
 
 jobs:
   rust-versions:
-    name: Check Rust versions sync
-    runs-on: ubuntu-latest
+    name: Rust versions sync
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -34,8 +40,9 @@ jobs:
         run: ./scripts/ci/sync-rustc-version.sh --check
 
   python-versions:
-    name: Check Python SDK versions sync
-    runs-on: ubuntu-latest
+    name: Python SDK versions sync
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -43,8 +50,9 @@ jobs:
         run: ./scripts/ci/python-sdk-version-sync.sh --check
 
   python-interpreter-versions:
-    name: Check Python interpreter versions sync
-    runs-on: ubuntu-latest
+    name: Python interpreter versions sync
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -52,20 +60,22 @@ jobs:
         run: ./scripts/ci/sync-python-interpreter-version.sh --check
 
   python-lockfiles:
-    name: Check Python lockfiles
-    runs-on: ubuntu-latest
+    name: Python lockfiles
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Check uv.lock files are in sync with pyproject.toml
         run: ./scripts/ci/uv-lock-check.sh --check
 
   version-consistency:
-    name: Check version consistency
-    runs-on: ubuntu-latest
+    name: Version consistency
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -74,7 +84,7 @@ jobs:
           if ! command -v yq >/dev/null 2>&1; then
             YQ_VERSION="v4.47.1"
             YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
-            curl -sSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            curl -fsSL --retry 5 --retry-all-errors -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
             echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
             chmod +x /usr/local/bin/yq
           fi
@@ -82,9 +92,30 @@ jobs:
       - name: Check version consistency
         run: ./scripts/extract-version.sh --check
 
+  edge-image-catalog:
+    name: Edge image catalog
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Setup yq
+        run: |
+          if ! command -v yq >/dev/null 2>&1; then
+            YQ_VERSION="v4.47.1"
+            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+            curl -fsSL --retry 5 --retry-all-errors -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
+            chmod +x /usr/local/bin/yq
+          fi
+
+      - name: Check edge image catalog matches publish.yml
+        run: ./scripts/ci/edge-image-catalog.sh --check
+
   license-headers:
-    name: Check license headers
-    runs-on: ubuntu-latest
+    name: License headers
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -93,7 +124,7 @@ jobs:
         run: echo "version=$(cat .github/config/hawkeye.version)" >> "$GITHUB_OUTPUT"
 
       - name: Install HawkEye
-        uses: taiki-e/install-action@v2.85.3
+        uses: taiki-e/install-action@v2.87.28
         with:
           tool: hawkeye@${{ steps.hawkeye-version.outputs.version }}
 
@@ -102,21 +133,26 @@ jobs:
 
   third-party-licenses:
     name: Validate third-party licenses
-    runs-on: ubuntu-latest
+    if: inputs.validate-third-party-licenses
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: ./.github/actions/utils/validate-third-party-licenses
 
   markdown:
     name: Markdown lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v7.0.0
-        with:
-          node-version: "23"
+      # ubuntu-slim ships Node LTS but no tool cache, so setup-node
+      # would download Node on every run.
+      - name: Show Node.js version
+        run: |
+          node --version
+          npm --version
 
       - name: Install markdownlint-cli
         run: npm install -g markdownlint-cli
@@ -124,9 +160,13 @@ jobs:
       - name: Run markdownlint
         run: ./scripts/ci/markdownlint.sh --check
 
+      - name: Check agent skills
+        run: ./scripts/ci/skills.sh
+
   shellcheck:
     name: Shell scripts lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -141,8 +181,9 @@ jobs:
         run: ./scripts/ci/shellcheck.sh --check
 
   trailing-whitespace:
-    name: Check trailing whitespace
-    runs-on: ubuntu-latest
+    name: Trailing whitespace
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -153,8 +194,9 @@ jobs:
         run: ./scripts/ci/trailing-whitespace.sh --check --ci
 
   trailing-newline:
-    name: Check trailing newline
-    runs-on: ubuntu-latest
+    name: Trailing newline
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -165,8 +207,9 @@ jobs:
         run: ./scripts/ci/trailing-newline.sh --check --ci
 
   toml-format:
-    name: Check TOML formatting
-    runs-on: ubuntu-latest
+    name: TOML formatting
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -175,7 +218,12 @@ jobs:
 
       - name: Install taplo
         run: |
-          curl -fsSL https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-x86_64.gz | gunzip > taplo
+          tarball="$(mktemp)"
+          # Staged to a file because curl --retry cannot rewind a pipe.
+          curl -fsSL --retry 5 --retry-all-errors -o "$tarball" \
+            https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-x86_64.gz
+          gunzip -c "$tarball" > taplo
+          rm -f "$tarball"
           chmod +x taplo
           sudo mv taplo /usr/local/bin/
 
@@ -183,8 +231,9 @@ jobs:
         run: ./scripts/ci/taplo.sh --check --ci
 
   binary-artifacts:
-    name: Check binary artifacts
-    runs-on: ubuntu-latest
+    name: Binary artifacts
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -195,8 +244,8 @@ jobs:
         run: ./scripts/ci/binary-artifacts.sh --check --ci
 
   typos:
-    name: Check typos
-    runs-on: ubuntu-latest
+    name: Typos
+    runs-on: ubuntu-slim
     timeout-minutes: 10
     env:
       FORCE_COLOR: 1
@@ -206,7 +255,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Check typos
-        uses: crate-ci/typos@v1.48.0
+        uses: crate-ci/typos@v1.51.1
 
   summary:
     name: Common checks summary
@@ -217,6 +266,7 @@ jobs:
         python-interpreter-versions,
         python-lockfiles,
         version-consistency,
+        edge-image-catalog,
         license-headers,
         third-party-licenses,
         markdown,
@@ -228,7 +278,8 @@ jobs:
         typos,
       ]
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - name: Summary
         run: |
@@ -287,6 +338,15 @@ jobs:
             echo "| ⏭️ Version Consistency | $VERSION_CONSISTENCY | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+          EDGE_IMAGE_CATALOG="${{ needs.edge-image-catalog.result }}"
+          if [ "$EDGE_IMAGE_CATALOG" = "success" ]; then
+            echo "| ✅ Edge Image Catalog | success | Every Docker image has an :edge catalog row |" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$EDGE_IMAGE_CATALOG" = "failure" ]; then
+            echo "| ❌ Edge Image Catalog | failure | Catalog drifted from publish.yml (see job log) |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| ⏭️ Edge Image Catalog | $EDGE_IMAGE_CATALOG | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
           if [ "$LICENSE_HEADERS" = "success" ]; then
             echo "| ✅ License Headers | success | All files have Apache headers |" >> "$GITHUB_STEP_SUMMARY"
           elif [ "$LICENSE_HEADERS" = "failure" ]; then
@@ -304,9 +364,9 @@ jobs:
           fi
 
           if [ "$MARKDOWN" = "success" ]; then
-            echo "| ✅ Markdown Lint | success | All markdown files are valid |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ✅ Markdown Lint | success | All markdown files and agent skills are valid |" >> "$GITHUB_STEP_SUMMARY"
           elif [ "$MARKDOWN" = "failure" ]; then
-            echo "| ❌ Markdown Lint | failure | Markdown formatting issues found |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ❌ Markdown Lint | failure | Markdown or agent skill issues found |" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "| ⏭️ Markdown Lint | $MARKDOWN | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
           fi

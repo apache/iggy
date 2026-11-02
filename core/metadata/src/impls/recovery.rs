@@ -15,15 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::impls::metadata::IggySnapshot;
-use crate::stm::StateMachine;
-use crate::stm::authz::GatedApply;
-use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, SnapshotError};
-use consensus::{
-    ClientTable, ClientTableDecodeError, VsrState, VsrStateError, build_reply_message,
-    build_reply_message_with,
+use crate::change_log::{
+    ChangeLogCapacities, ChangeLogError, MetadataChangeLog, change_actor, session_closed,
+    session_registered, session_revoked,
 };
+use crate::impls::metadata::IggySnapshot;
+use crate::stm::authz::{GatedApply, reject_stale_session};
+use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, SnapshotError};
+use crate::stm::{ApplyContext, StateMachine};
+use consensus::{
+    ClientTable, ClientTableDecodeError, CommitReply, HistoryRecovery, VsrState, VsrStateError,
+    build_reply_message, build_reply_message_with,
+};
+use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Operation, PrepareHeader};
+use iggy_binary_protocol::requests::system::FinalizeSessionRequest;
+use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
 use iggy_common::IggyError;
 use journal::Journal as _;
 use journal::prepare_journal::{JournalError, PrepareJournal};
@@ -40,7 +47,14 @@ pub enum RecoveryError {
     Snapshot(SnapshotError),
     Journal(JournalError),
     StateMachine(IggyError),
+    /// Replay produced change records the log cannot take, which only a bug
+    /// in record production can cause.
+    ChangeLog(ChangeLogError),
     Io(std::io::Error),
+    DisconnectedSoloJournal {
+        path: PathBuf,
+        op: u64,
+    },
     /// Opening or reading the durable superblock failed. `dir` is the metadata
     /// directory holding [`journal::superblock::SLOT_FILE_NAMES`]: `compio` attaches no
     /// path to its I/O errors, so without this the operator's chain ends in a bare
@@ -52,6 +66,7 @@ pub enum RecoveryError {
     /// A checkpoint client-table slot held bytes that are not a valid reply
     /// message (a corrupt or torn snapshot).
     ClientTableDecode(ClientTableDecodeError),
+    RetryProtection(consensus::ClientTableWireError),
     /// The superblock references a checkpoint newer than the on-disk snapshot, a
     /// lost or reverted snapshot write: recovering from the older snapshot while
     /// trusting the superblock's commit point could skip committed state.
@@ -144,9 +159,15 @@ impl fmt::Display for RecoveryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Snapshot(e) => write!(f, "recovery snapshot error: {e}"),
+            Self::ChangeLog(e) => write!(f, "recovery change log error: {e}"),
             Self::Journal(e) => write!(f, "recovery journal error: {e}"),
             Self::StateMachine(e) => write!(f, "recovery state machine error: {e}"),
             Self::Io(e) => write!(f, "recovery I/O error: {e}"),
+            Self::DisconnectedSoloJournal { path, op } => write!(
+                f,
+                "solo metadata journal {} does not connect at op {op}, refusing boot without changing the WAL",
+                path.display()
+            ),
             Self::Superblock { dir, source } => write!(
                 f,
                 "recovery superblock error in {} ({} / {}): {source}",
@@ -155,6 +176,7 @@ impl fmt::Display for RecoveryError {
                 SLOT_FILE_NAMES[1]
             ),
             Self::ClientTableDecode(e) => write!(f, "recovery client-table decode error: {e}"),
+            Self::RetryProtection(e) => write!(f, "recovery retry protection error: {e}"),
             Self::CheckpointAheadOfSnapshot {
                 dir,
                 checkpoint_op,
@@ -225,13 +247,16 @@ impl std::error::Error for RecoveryError {
             Self::Snapshot(e) => Some(e),
             Self::Journal(e) => Some(e),
             Self::StateMachine(e) => Some(e),
+            Self::ChangeLog(e) => Some(e),
             Self::Io(e) | Self::Superblock { source: e, .. } => Some(e),
             Self::ClientTableDecode(e) => Some(e),
+            Self::RetryProtection(e) => Some(e),
             Self::SuperblockUndecodable { source, .. } => Some(source),
             Self::CheckpointAheadOfSnapshot { .. }
             | Self::CheckpointChecksumMismatch { .. }
             | Self::SuperblockUnreadable { .. }
-            | Self::SuperblockIdentityMismatch { .. } => None,
+            | Self::SuperblockIdentityMismatch { .. }
+            | Self::DisconnectedSoloJournal { .. } => None,
         }
     }
 }
@@ -266,6 +291,12 @@ impl From<std::io::Error> for RecoveryError {
     }
 }
 
+impl From<ChangeLogError> for RecoveryError {
+    fn from(e: ChangeLogError) -> Self {
+        Self::ChangeLog(e)
+    }
+}
+
 /// Result of a successful metadata recovery.
 pub struct RecoveredMetadata<M> {
     pub journal: PrepareJournal,
@@ -288,6 +319,9 @@ pub struct RecoveredMetadata<M> {
     /// post-boot view-change superblock write records the real pairing.
     pub snapshot_checkpoint: (u64, u128),
     pub mux_stm: M,
+    /// Change log restored from the checkpoint and advanced by the replayed
+    /// committed suffix, so it equals the log the node held before it stopped.
+    pub change_log: MetadataChangeLog,
     /// Client table restored from the checkpoint and advanced by the replayed
     /// committed suffix: registers carry their own commit op as the epoch, so
     /// replay reads fences out of the log rather than deriving them from replay
@@ -303,18 +337,60 @@ pub struct RecoveredMetadata<M> {
     /// carries the primary's commit watermark when the prepare was sent, and
     /// journaled does not imply committed.
     pub last_applied_op: Option<u64>,
-    /// Highest op present in the journal, `None` when it is empty. Ops in
-    /// `(last_applied_op, last_journaled_op]` are prepared-but-uncommitted:
-    /// they stay journal-only until the recovered primary re-replicates them
-    /// (or a backup sees the commit point advance past them).
+    /// Highest durable op above the snapshot floor, `None` when none remain.
+    /// Later entries may have committed elsewhere. They stay unapplied until
+    /// the cluster proves the adopted log and repairs any missing prefix.
     pub last_journaled_op: Option<u64>,
     /// First op replay could not connect to its predecessor, `None` when the
     /// replayed range is one unbroken chain.
     ///
-    /// `Some(op)` means entries at and above `op` were truncated and must come back
-    /// from the cluster. `last_journaled_op` stops below it, which keeps the restored
-    /// head, the re-pipeline range, and the recovery barrier honest.
+    /// Entries at and above it remain durable but unapplied until the cluster's
+    /// view-log proof reconciles them. The restored head includes this suffix.
     pub chain_break_op: Option<u64>,
+    /// What the WAL proves about its original prefix. A retained newer suffix is
+    /// only adopted identity until repair proves the complete body log.
+    pub history: HistoryRecovery,
+}
+
+/// The contiguous WAL run that can prove recovery's committed frontier.
+pub struct ReplayPrefix<'a> {
+    pub headers: &'a [PrepareHeader],
+    pub commit_watermark: u64,
+    pub chain_break_op: Option<u64>,
+}
+
+/// Select the contiguous parent-chained suffix above a snapshot from sorted headers.
+#[must_use]
+pub fn replay_prefix(headers: &[PrepareHeader], snapshot_op: u64, solo: bool) -> ReplayPrefix<'_> {
+    let start = headers.partition_point(|header| header.op <= snapshot_op);
+    let suffix = &headers[start..];
+    let mut previous = headers[..start]
+        .last()
+        .filter(|header| snapshot_op != 0 && header.op == snapshot_op);
+    let mut expected = snapshot_op.saturating_add(1).max(1);
+    let mut length = 0;
+    let mut commit_watermark = snapshot_op;
+    let mut chain_break_op = None;
+    for header in suffix {
+        let broken_chain = previous.is_some_and(|previous| {
+            previous.checksum != CHECKSUM_UNSEALED
+                && header.checksum != CHECKSUM_UNSEALED
+                && header.parent != previous.checksum
+        });
+        if header.op != expected || broken_chain {
+            chain_break_op = Some(header.op);
+            break;
+        }
+        commit_watermark = commit_watermark.max(if solo { header.op } else { header.commit });
+        previous = Some(header);
+        expected = header.op.saturating_add(1);
+        length += 1;
+    }
+    ReplayPrefix {
+        headers: &suffix[..length],
+        commit_watermark,
+        chain_break_op,
+    }
 }
 
 /// Recover metadata state from disk.
@@ -332,16 +408,18 @@ pub struct RecoveredMetadata<M> {
 ///
 /// # Errors
 /// Returns `RecoveryError` if snapshot loading, journal opening, or replay fails.
-/// `seed_baseline` reproduces boot-time state that never reaches the WAL
-/// (today: the locally-ensured root user). It runs on the freshly-defaulted
+/// `seed_baseline` reproduces caller-supplied state outside the WAL.
+/// Production root creation is journaled. The callback runs on the freshly-defaulted
 /// state machine BEFORE journal replay and ONLY when no snapshot exists, so
 /// replayed ops land on the same baseline (and the same slab ids) they were
 /// originally applied over. A snapshot already contains that baseline.
 ///
-/// `clients_table_max` sizes the rebuilt client table. It comes from
-/// `[metadata] clients_table_max`: the recovered table replaces the one the
-/// caller built, so reading the compile-time default here would make the knob
-/// inert on every restart.
+/// `clients_table_max` sizes a fresh registry. Recovery preserves the
+/// checkpoint's committed capacity.
+///
+/// `on_replayed_session` receives registration, logout, and user-revocation
+/// effects. For revocation, `client` and `session` identify each affected
+/// session; the operation, op, and timestamp still name the committed user mutation.
 ///
 /// `identity` is what this replica expects its own durable superblock to carry, and
 /// a mismatch refuses boot ([`RecoveryError::SuperblockIdentityMismatch`]). Its
@@ -358,6 +436,7 @@ pub async fn recover<M>(
     journal_slots: usize,
     clients_table_max: usize,
     seed_baseline: impl FnOnce(&M),
+    change_log_capacities: ChangeLogCapacities,
 ) -> Result<RecoveredMetadata<M>, RecoveryError>
 where
     M: StateMachine<Input = Message<PrepareHeader>, Error = IggyError>
@@ -376,6 +455,20 @@ where
         (Some(snapshot), checksum)
     } else {
         (None, 0)
+    };
+
+    // Validate protection before opening storage that may repair a torn WAL.
+    let mut client_table = match snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.snapshot().client_table.clone())
+    {
+        Some(table) => ClientTable::from_snapshot(table)?,
+        None if snapshot.is_none() => ClientTable::new(clients_table_max),
+        None => {
+            return Err(RecoveryError::RetryProtection(
+                consensus::ClientTableWireError::EmptyRing,
+            ));
+        }
     };
 
     // Open the durable superblock and read the last VSR state. Recovery owns this so
@@ -429,6 +522,12 @@ where
     // configured cluster name, so it never sees a foreign disk.
     if let Some(state) = recovered_state.as_ref() {
         verify_identity(state, identity, &metadata_dir)?;
+        state
+            .validate_group(server_common::sharding::METADATA_GROUP, 0)
+            .map_err(|source| RecoveryError::SuperblockUndecodable {
+                dir: metadata_dir.clone(),
+                source,
+            })?;
     }
 
     // Second of the snapshot's two integrity checks, and the one the superblock owns.
@@ -459,10 +558,6 @@ where
         &metadata_dir,
     )?;
 
-    let replay_from = snapshot
-        .as_ref()
-        .map_or(0, |snapshot| snapshot.sequence_number() + 1);
-
     let mux_stm = if let Some(snapshot) = snapshot.as_ref() {
         M::restore_snapshot(snapshot.snapshot())?
     } else {
@@ -470,48 +565,82 @@ where
         seed_baseline(&mux_stm);
         mux_stm
     };
+    // Decode already checked the log against the snapshot's sequence number.
+    let change_log = MetadataChangeLog::new(change_log_capacities);
+    if let Some(snapshot) = snapshot.as_ref() {
+        change_log.restore(
+            snapshot
+                .snapshot()
+                .change_log
+                .restore(change_log_capacities)?,
+        )?;
+    }
 
     let journal_path = metadata_dir.join("journal.wal");
     let watermark = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
     let journal = PrepareJournal::open_with_slots(&journal_path, watermark, journal_slots).await?;
 
+    let history = HistoryRecovery::new(recovered_state.as_ref(), identity.is_solo(), |op| {
+        usize::try_from(op)
+            .ok()
+            .and_then(|slot| journal.header(slot))
+            .map(|header| header.checksum)
+    });
+    let history = recovered_state
+        .as_ref()
+        .and_then(|state| state.adopted_view.as_ref())
+        .map_or(history, |adopted| {
+            history.retain_adopted_suffix(adopted, journal.iter_headers_from(0))
+        });
+    if let HistoryRecovery::Certified {
+        truncate_from: Some(from),
+        ..
+    } = history
+        && journal.last_op().is_some_and(|last| last >= from)
+    {
+        let removed = journal
+            .truncate_from(from)
+            .await
+            .map_err(RecoveryError::Io)?;
+        tracing::warn!(
+            from,
+            removed,
+            "dropped metadata WAL entries journaled for a view this replica never proved"
+        );
+    }
+
     // The scan replays entries no producer sealed rather than rejecting them, so
     // report the count: an operator gets no other signal that these bodies were
-    // replayed on trust. Goes away once every node in the cluster seals.
+    // replayed on trust. Storage-format admission remains a separate prerequisite.
     let unsealed_entries = journal.unsealed_entry_count();
     if unsealed_entries > 0 {
         tracing::warn!(
             unsealed_entries,
             path = %journal_path.display(),
             "metadata WAL holds entries without a body checksum; replayed unverified \
-             (written before body sealing, or replicated from a primary that predates it)"
+             (the writer did not seal the frame)"
         );
     }
 
-    // Intentional fail-fast: a bad entry aborts recovery and the operator
-    // must repair or truncate the WAL before the node can boot again.
-    let headers_to_replay = journal.iter_headers_from(replay_from);
-
-    // Committed watermark: the `commit` field of each journaled prepare is
-    // the primary's commit point when it was sent, so the highest one is the
-    // highest commit this WAL can prove. Ops above it were prepared but not
-    // provably committed; applying them here would fabricate commit knowledge
-    // (a crashed suffix may have been discarded by a view change) and would
-    // hide the suffix from re-replication. A max fold (not `.last()`) so a
-    // future non-monotone stamping change cannot silently under-apply the
-    // committed prefix.
-    let snapshot_floor = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
-    let commit_watermark = if identity.is_solo() {
-        headers_to_replay
-            .iter()
-            .map(|header| header.op)
-            .fold(snapshot_floor, u64::max)
-    } else {
-        headers_to_replay
-            .iter()
-            .map(|header| header.commit)
-            .fold(snapshot_floor, u64::max)
-    };
+    let headers = journal.iter_headers_from(snapshot_op);
+    let prefix = replay_prefix(&headers, snapshot_op, identity.is_solo());
+    let headers_to_replay = prefix.headers;
+    let commit_watermark = prefix.commit_watermark;
+    let chain_break_op = prefix.chain_break_op;
+    if let Some(op) = chain_break_op {
+        if identity.is_solo() {
+            return Err(RecoveryError::DisconnectedSoloJournal {
+                path: journal_path,
+                op,
+            });
+        }
+        tracing::error!(
+            op,
+            snapshot_op,
+            last_contiguous_op = headers_to_replay.last().map(|header| header.op),
+            "metadata WAL does not connect at this op, stopping replay before the suffix"
+        );
+    }
 
     // The superblock's `commit_max` is the highest op this replica knew the cluster had
     // committed when it last wrote. Report a gap against what the WAL can prove, since
@@ -537,59 +666,18 @@ where
         );
     }
 
-    // Restore the client table from the checkpoint's folded copy, then replay the
-    // committed suffix on top, mirroring how the state machine is restored from the
-    // snapshot and advanced by the WAL. This is what lets a session registered below
-    // the snapshot floor come back with its watermark intact.
-    let mut client_table = match snapshot
-        .as_ref()
-        .and_then(|snapshot| snapshot.snapshot().client_table.clone())
-    {
-        // Integrity is verified above, so a decode failure here means genuinely
-        // corrupt bytes: refuse boot with a typed error rather than panicking.
-        Some(table) => ClientTable::from_snapshot(table, clients_table_max)?,
-        None => ClientTable::new(clients_table_max),
-    };
-
     let mut last_applied_op: Option<u64> = None;
-    let mut last_journaled_op: Option<u64> = None;
-    let mut chain_break_op: Option<u64> = None;
-    let mut previous: Option<PrepareHeader> = None;
-    for header in &headers_to_replay {
-        // Stop at the first op that does not connect to the one before it. Applying
-        // across a hole replays effects onto a state machine that never saw the
-        // missing op, and nothing downstream re-checks it.
-        //
-        // The WAL scan does not cover this: it only fires on CONSECUTIVE ops with
-        // both ends sealed, so a gap reaches here. The first replayed op is exempt,
-        // since a snapshot records no checksum for its parent to chain to.
-        if let Some(previous) = previous {
-            let gap = previous.op + 1 != header.op;
-            let broken_chain = previous.checksum != CHECKSUM_UNSEALED
-                && header.checksum != CHECKSUM_UNSEALED
-                && header.parent != previous.checksum;
-            if gap || broken_chain {
-                tracing::error!(
-                    op = header.op,
-                    previous_op = previous.op,
-                    gap,
-                    broken_chain,
-                    "metadata WAL does not connect at this op; stopping replay and dropping the \
-                     suffix for VSR repair"
-                );
-                chain_break_op = Some(header.op);
-                break;
-            }
-        }
-        previous = Some(*header);
-
-        last_journaled_op = Some(header.op);
+    let last_journaled_op = journal.last_op().filter(|op| *op > snapshot_op);
+    for header in headers_to_replay {
         if header.op > commit_watermark {
             continue;
         }
+        client_table
+            .commit_capacity(header.retry_capacity as usize)
+            .map_err(RecoveryError::RetryProtection)?;
 
-        // Register/Logout mutate the client table and skip the state
-        // machine, mirroring the commit paths (`on_ack` / `commit_journal`).
+        // Register/Logout apply their session effects through the callback,
+        // mirroring the commit paths (`on_ack` / `commit_journal`).
         //
         // Epochs come back identical on every replica: they are the register's
         // own commit op, so replay reads them out of the log rather than
@@ -611,17 +699,83 @@ where
         // table, so recovery from one still starts empty. It converges once the
         // node takes its next checkpoint.
         if header.operation == Operation::Register {
+            let prepare = journal.entry_at(header).await?.ok_or_else(|| {
+                RecoveryError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "committed Register is missing from WAL",
+                ))
+            })?;
+            let registration = RegisterRequest::decode_from(prepare.body()).map_err(|_| {
+                RecoveryError::RetryProtection(consensus::ClientTableWireError::InvalidReply)
+            })?;
+            if !mux_stm.is_active_account(header.user_id, registration.user_created_at) {
+                change_log.append(header, Vec::new())?;
+                last_applied_op = Some(header.op);
+                continue;
+            }
+            let inserted = !client_table.contains(header.client);
             let reply = build_reply_message(header, &bytes::Bytes::new());
-            client_table.commit_register(header.client, header.user_id, reply);
+            client_table
+                .commit_register(
+                    header.client,
+                    header.user_id,
+                    registration.bind_verifier,
+                    reply,
+                )
+                .map_err(RecoveryError::RetryProtection)?;
+            let epoch = client_table.get_epoch(header.client).unwrap_or(header.op);
+            let mut changes: Vec<_> = inserted
+                .then(|| session_registered(header, registration.user_created_at, epoch))
+                .into_iter()
+                .collect();
+            changes.extend(mux_stm.refresh_session(
+                header,
+                epoch,
+                change_actor(&ApplyContext::from(header)),
+            ));
+            change_log.append(header, changes)?;
             last_applied_op = Some(header.op);
             continue;
         }
         if header.operation == Operation::Logout {
-            client_table.remove_client(header.client);
-            // TODO: the commit paths also run `remove_consumer_group_member`
-            // here; recovery has no `StreamsFrontend` bound, so replayed
-            // logouts leave stale group members (pre-existing, harmless for
-            // dead connections but a divergence from the live apply).
+            let mut changes = Vec::new();
+            if client_table
+                .commit_logout(
+                    header.client,
+                    header.user_id,
+                    header.session,
+                    build_reply_message(header, &bytes::Bytes::new()),
+                )
+                .map_err(RecoveryError::RetryProtection)?
+            {
+                // The order the commit walk records: the session, then the
+                // memberships it ended.
+                let closed = mux_stm
+                    .user_key(header.user_id)
+                    .map(|user| session_closed(header, user));
+                let actor = closed.as_ref().and_then(|closed| closed.actor_user_id);
+                changes.extend(closed);
+                changes.extend(mux_stm.end_memberships(&[header.client], header, actor));
+            }
+            change_log.append(header, changes)?;
+            last_applied_op = Some(header.op);
+            continue;
+        }
+        if header.operation == Operation::FinalizeSession {
+            let prepare = journal.entry_at(header).await?.ok_or_else(|| {
+                RecoveryError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "committed finalization is missing from WAL",
+                ))
+            })?;
+            let request = FinalizeSessionRequest::decode_from(prepare.body()).map_err(|_| {
+                RecoveryError::RetryProtection(consensus::ClientTableWireError::InvalidReply)
+            })?;
+            if mux_stm.namespace_revision() == request.namespace_revision {
+                client_table.finalize_session(request.identity);
+                mux_stm.record_retirement_debt(&request.debt, header.op);
+            }
+            change_log.append(header, Vec::new())?;
             last_applied_op = Some(header.op);
             continue;
         }
@@ -634,20 +788,42 @@ where
         })?;
         // WAL replay must recompute authorization denials identically to the
         // primary/backup commit paths, so it goes through the same gate.
-        let reply = mux_stm.gated_update(entry)?;
-        // Re-cache the reply exactly like the commit paths: same prepare
-        // header + deterministic apply output = the original bytes. Skipped
-        // when the session is absent (server-originated ops, or the client
-        // was evicted).
-        if client_table.get_epoch(header.client).is_some() {
+        let mut reply = reject_stale_session(header, &client_table)
+            .map_or_else(|| mux_stm.gated_update(entry), Ok)?;
+        if let Some(user) = reply.revoked_user {
+            let mut sessions = client_table.end_user_sessions(user.user_id, header.op);
+            sessions.sort_by_key(|identity| identity.client_id);
+            let actor = change_actor(&ApplyContext::from(header));
+            let client_ids: Vec<u128> =
+                sessions.iter().map(|identity| identity.client_id).collect();
+            reply.changes.extend(sessions.iter().map(|identity| {
+                session_revoked(user, identity.client_id, identity.session, actor)
+            }));
+            reply
+                .changes
+                .extend(mux_stm.end_memberships(&client_ids, header, actor));
+        }
+        // Every client commit must restore its original receipt before admission.
+        if header.client != consensus::client_table::RESERVED_CLIENT_ID
+            && !message_bus::is_auto_commit_client(header.client)
+            && !matches!(
+                header.operation,
+                Operation::CompleteConsumerGroupRevocation | Operation::CompleteLifecycle
+            )
+        {
             let cached = build_reply_message_with(header, reply.reply_body_len(), |dst| {
                 reply.write_reply_body(dst);
             });
-            // Skips (never panics) on a stale-request replay: capacity
-            // eviction is replica-local and unlogged, so a WAL can legitimately
-            // replay a lower request id onto a preserved watermark. Recovery
-            // must boot from such a WAL, not refuse it.
-            let _ = client_table.commit_reply(header.client, cached);
+            if !matches!(
+                client_table.commit_reply(header.client, header.user_id, cached),
+                CommitReply::Cached | CommitReply::SessionEnded { .. }
+            ) {
+                return Err(RecoveryError::RetryProtection(
+                    consensus::ClientTableWireError::InvalidWatermark {
+                        client_id: header.client,
+                    },
+                ));
+            }
         }
         tracing::debug!(
             target: "iggy.metadata.diag",
@@ -656,23 +832,8 @@ where
             user_id = header.user_id,
             "recovery replayed op"
         );
+        change_log.append(header, reply.changes)?;
         last_applied_op = Some(header.op);
-    }
-
-    // `truncate_from`, never `drain`: the removed ops must stay refillable, so the
-    // snapshot watermark stays put. Leaving them resident would make `append` refuse
-    // the slot, failing repair on exactly the ops it exists to fix.
-    if let Some(break_op) = chain_break_op {
-        let removed = journal
-            .truncate_from(break_op)
-            .await
-            .map_err(RecoveryError::Io)?;
-        tracing::warn!(
-            break_op,
-            removed,
-            last_journaled_op,
-            "dropped the disconnected metadata WAL suffix; the cluster re-supplies these ops"
-        );
     }
 
     Ok(RecoveredMetadata {
@@ -682,10 +843,12 @@ where
         recovered_state,
         snapshot_checkpoint: (snapshot_op, snapshot_checksum),
         mux_stm,
+        change_log,
         client_table,
         last_applied_op,
         last_journaled_op,
         chain_break_op,
+        history,
     })
 }
 
@@ -793,11 +956,30 @@ fn verify_checkpoint_pairing(
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use crate::impls::metadata::checkpoint_checksum;
-    use consensus::CLIENTS_TABLE_MAX;
-    use iggy_binary_protocol::consensus::{Command2, Operation};
+    use crate::impls::metadata::{StreamsFrontend, apply_committed_prepare, checkpoint_checksum};
+    use crate::stm::consumer_group::JoinConsumerGroupRequest;
+    use crate::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
+    use crate::stm::snapshot::{SNAPSHOT_FORMAT_VERSION, Snapshotable};
+    use crate::stm::stream::{Streams, StreamsSnapshot};
+    use crate::stm::user::{CreatePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES, Users};
+    use consensus::{CLIENTS_TABLE_MAX, HistoryCertificate};
+    use iggy_binary_protocol::consensus::{Command, Operation};
+    use iggy_binary_protocol::primitives::metadata_changes::WireMetadataChangeKind;
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+    use iggy_binary_protocol::primitives::permissions::{WireGlobalPermissions, WirePermissions};
+    use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+    };
+    use iggy_binary_protocol::requests::users::{
+        CreateUserRequest, DeleteUserRequest, UpdateUserResolvedRequest,
+    };
+    use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions, result_code};
+    use iggy_common::{MetadataChangeClass, UserStatus};
     use journal::Journal;
     use server_common::iobuf::Owned;
+    use std::cell::RefCell;
     use tempfile::tempdir;
 
     use crate::MuxStateMachine;
@@ -832,6 +1014,8 @@ mod tests {
             checkpoint_op,
             checkpoint_checksum,
             offset_frontier: 0,
+            offset_reserved: 0,
+            adopted_view: None,
         }
     }
 
@@ -891,6 +1075,13 @@ mod tests {
         ));
     }
 
+    fn protected_snapshot(op: u64) -> IggySnapshot {
+        let mut snapshot = IggySnapshot::new(op);
+        snapshot.snapshot_mut().client_table =
+            Some(ClientTable::new(CLIENTS_TABLE_MAX).to_snapshot());
+        snapshot
+    }
+
     fn make_prepare(op: u64, body_size: usize) -> Message<PrepareHeader> {
         make_prepare_with_commit(op, op.saturating_sub(1), body_size)
     }
@@ -909,10 +1100,11 @@ mod tests {
             &mut buffer.as_mut_slice()[..HEADER_SIZE],
         );
         header.size = total_size as u32;
-        header.command = Command2::Prepare;
+        header.command = Command::Prepare;
         header.op = op;
         header.commit = commit;
         header.operation = Operation::CreateStream;
+        header.retry_capacity = consensus::CLIENTS_TABLE_MAX as u32;
         header.checksum_body = checksum_body;
         Message::try_from(buffer).unwrap()
     }
@@ -926,8 +1118,19 @@ mod tests {
         user_id: u32,
         request: u64,
     ) -> Message<PrepareHeader> {
-        let total_size = HEADER_SIZE;
+        let registration = RegisterRequest {
+            user_created_at: 1,
+            bind_verifier: [0x5a; 32],
+        }
+        .to_bytes();
+        let body: &[u8] = if operation == Operation::Register {
+            &registration
+        } else {
+            &[]
+        };
+        let total_size = HEADER_SIZE + body.len();
         let mut buffer = Owned::<4096>::zeroed(total_size);
+        buffer.as_mut_slice()[HEADER_SIZE..].copy_from_slice(body);
         let checksum_body = u128::from(iggy_common::calculate_checksum(
             &buffer.as_slice()[HEADER_SIZE..],
         ));
@@ -935,13 +1138,15 @@ mod tests {
             &mut buffer.as_mut_slice()[..HEADER_SIZE],
         );
         header.size = total_size as u32;
-        header.command = Command2::Prepare;
+        header.command = Command::Prepare;
         header.op = op;
         header.commit = op.saturating_sub(1);
         header.operation = operation;
         header.client = client;
         header.user_id = user_id;
         header.request = request;
+        header.session = 1;
+        header.retry_capacity = consensus::CLIENTS_TABLE_MAX as u32;
         header.checksum_body = checksum_body;
         Message::try_from(buffer).unwrap()
     }
@@ -955,6 +1160,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -969,9 +1175,10 @@ mod tests {
         let metadata_dir = dir.path().join("metadata");
         std::fs::create_dir_all(&metadata_dir).unwrap();
 
-        let snapshot = IggySnapshot::new(42);
+        let snapshot = protected_snapshot(42);
         snapshot
             .persist(&metadata_dir.join("snapshot.bin"))
+            .await
             .unwrap();
 
         let recovered = recover::<TestStm>(
@@ -980,6 +1187,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -1015,6 +1223,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -1040,7 +1249,198 @@ mod tests {
     }
 
     #[compio::test]
-    async fn recover_stops_at_a_gap_and_drops_the_disconnected_suffix() {
+    async fn given_a_snapshot_and_disconnected_wal_when_recovering_should_ignore_its_commit_claims()
+    {
+        for contiguous in [0, 2] {
+            let directory = tempdir().unwrap();
+            let metadata_dir = directory.path().join("metadata");
+            std::fs::create_dir_all(&metadata_dir).unwrap();
+            protected_snapshot(100)
+                .persist(&metadata_dir.join("snapshot.bin"))
+                .await
+                .unwrap();
+            {
+                let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 100)
+                    .await
+                    .unwrap();
+                journal
+                    .append(make_prepare_with_commit(100, 100, 32))
+                    .await
+                    .unwrap();
+                for op in 101..101 + contiguous {
+                    journal
+                        .append(make_prepare_with_commit(op, 100, 32))
+                        .await
+                        .unwrap();
+                }
+                for op in 179..=181 {
+                    journal
+                        .append(make_prepare_with_commit(op, op - 1, 32))
+                        .await
+                        .unwrap();
+                }
+            }
+            let recovered = recover::<TestStm>(
+                directory.path(),
+                CLUSTERED,
+                journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |_| {},
+                ChangeLogCapacities::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.chain_break_op, Some(179));
+            assert_eq!(recovered.last_applied_op, None);
+            assert_eq!(recovered.last_journaled_op, Some(181));
+            assert_eq!(recovered.journal.last_op(), Some(181));
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_fork_after_a_snapshot_when_recovering_should_stop_at_the_snapshot_parent() {
+        let directory = tempdir().unwrap();
+        let metadata_dir = directory.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        protected_snapshot(100)
+            .persist(&metadata_dir.join("snapshot.bin"))
+            .await
+            .unwrap();
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 100)
+                .await
+                .unwrap();
+            let fork = make_chained_prepare(101, 101, 0xdead_beef);
+            let child = make_chained_prepare(102, 102, fork.header().checksum);
+            journal.append(fork).await.unwrap();
+            journal
+                .append(make_chained_prepare(100, 100, 0))
+                .await
+                .unwrap();
+            journal.append(child).await.unwrap();
+        }
+        let recovered = recover::<TestStm>(
+            directory.path(),
+            CLUSTERED,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            ChangeLogCapacities::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.chain_break_op, Some(101));
+        assert_eq!(recovered.last_applied_op, None);
+        assert_eq!(recovered.last_journaled_op, Some(102));
+        assert_eq!(recovered.journal.last_op(), Some(102));
+    }
+
+    #[compio::test]
+    async fn given_an_uncommitted_root_and_disconnected_tail_when_recovering_should_not_apply_root()
+    {
+        type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
+        let directory = tempdir().unwrap();
+        let metadata_dir = directory.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let body = CreateUserRequest {
+            username: WireName::new("uncommitted-root").unwrap(),
+            password: "hash".to_owned(),
+            status: UserStatus::Active.as_code(),
+            permissions: None,
+            options: WireOptions::empty(),
+        }
+        .to_bytes();
+        let mut root = make_prepare_with_commit(1, 0, body.len());
+        root.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut root.as_mut_slice()[..HEADER_SIZE],
+        );
+        header.operation = Operation::CreateUser;
+        header.timestamp = 1;
+        header.checksum_body = u128::from(iggy_common::calculate_checksum(&body));
+        header.checksum = header.identity_checksum();
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            journal.append(root).await.unwrap();
+            for op in 179..=181 {
+                journal
+                    .append(make_prepare_with_commit(op, op - 1, 32))
+                    .await
+                    .unwrap();
+            }
+        }
+        let recovered = recover::<UserStm>(
+            directory.path(),
+            CLUSTERED,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            ChangeLogCapacities::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            recovered
+                .mux_stm
+                .users()
+                .read(|users| users.items.is_empty())
+        );
+        assert_eq!(recovered.last_applied_op, None);
+        assert_eq!(recovered.last_journaled_op, Some(181));
+        assert_eq!(recovered.chain_break_op, Some(179));
+        assert_eq!(recovered.journal.last_op(), Some(181));
+    }
+
+    #[compio::test]
+    async fn given_a_disconnected_solo_wal_when_recovering_should_refuse_without_rewriting_it() {
+        for forked in [false, true] {
+            let directory = tempdir().unwrap();
+            let metadata_dir = directory.path().join("metadata");
+            std::fs::create_dir_all(&metadata_dir).unwrap();
+            protected_snapshot(100)
+                .persist(&metadata_dir.join("snapshot.bin"))
+                .await
+                .unwrap();
+            let path = metadata_dir.join("journal.wal");
+            {
+                let journal = PrepareJournal::open(&path, 100).await.unwrap();
+                if forked {
+                    let fork = make_chained_prepare(101, 101, 0xdead_beef);
+                    let child = make_chained_prepare(102, 102, fork.header().checksum);
+                    journal.append(fork).await.unwrap();
+                    journal
+                        .append(make_chained_prepare(100, 100, 0))
+                        .await
+                        .unwrap();
+                    journal.append(child).await.unwrap();
+                } else {
+                    journal
+                        .append(make_prepare_with_commit(100, 100, 32))
+                        .await
+                        .unwrap();
+                    journal
+                        .append(make_prepare_with_commit(179, 178, 32))
+                        .await
+                        .unwrap();
+                }
+                journal.storage_ref().fsync().await.unwrap();
+            }
+            let before = std::fs::read(&path).unwrap();
+            assert!(matches!(
+                recover::<TestStm>(directory.path(), SOLO,
+                    journal::prepare_journal::DEFAULT_SLOT_COUNT, CLIENTS_TABLE_MAX,
+                    |_| {}, ChangeLogCapacities::default()).await,
+                Err(RecoveryError::DisconnectedSoloJournal { op, .. })
+                    if op == if forked { 101 } else { 179 }
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_gap_when_recovering_a_cluster_should_preserve_the_durable_suffix() {
         // Ops 1-3 then 5: op 4 never landed. Replaying 5 over a state machine that
         // never saw 4 diverges silently, and the WAL scan waves this through --
         // its chain check only fires on CONSECUTIVE ops, since a gap is also what
@@ -1072,6 +1472,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -1084,19 +1485,200 @@ mod tests {
         );
         assert_eq!(
             recovered.last_journaled_op,
-            Some(3),
-            "the restored head stops below the break, so nothing re-pipelines it"
+            Some(5),
+            "the restored head must include every durable prepare for the view change"
         );
         assert_eq!(
             recovered.journal.last_op(),
-            Some(3),
-            "the disconnected entry is dropped so repair can journal the cluster's op 5"
+            Some(5),
+            "only a cluster view-log proof may remove a durable prepare"
         );
         assert_eq!(
             recovered.journal.snapshot_op(),
             0,
             "truncating a suffix must leave the watermark, or the ops stop being refillable"
         );
+    }
+
+    #[compio::test]
+    async fn given_repaired_adopted_bodies_when_restarting_should_retain_them_without_recertifying()
+    {
+        const CERTIFIED_VIEW: u32 = 5;
+        const ANNOUNCED_VIEW: u32 = 7;
+        const BINDING: u64 = 2;
+        const COMMITTED: u64 = 4;
+        const ANNOUNCED_HEAD: u64 = 5;
+        for (missing_op, expected_applied, expected_chain_break) in [
+            (None, COMMITTED - 1, None),
+            (Some(BINDING + 1), BINDING - 1, Some(COMMITTED)),
+        ] {
+            let directory = tempdir().unwrap();
+            let metadata_dir = directory.path().join("metadata");
+            std::fs::create_dir_all(&metadata_dir).unwrap();
+            let mut messages = Vec::new();
+            let mut parent = 0;
+            for op in 1..=ANNOUNCED_HEAD {
+                let mut prepare = make_chained_prepare(op, op.saturating_sub(1), parent);
+                let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+                    &mut prepare.as_mut_slice()[..HEADER_SIZE],
+                );
+                header.cluster = CLUSTERED.cluster;
+                header.group = server_common::sharding::METADATA_GROUP;
+                header.view = ANNOUNCED_VIEW;
+                header.timestamp = op;
+                header.checksum = header.identity_checksum();
+                parent = header.checksum;
+                messages.push(prepare);
+            }
+            let certificate = HistoryCertificate::new(
+                CERTIFIED_VIEW,
+                BINDING,
+                messages[BINDING as usize - 1].header().checksum,
+            );
+            let adopted = consensus::AdoptedView {
+                view: ANNOUNCED_VIEW,
+                group: server_common::sharding::METADATA_GROUP,
+                partition_incarnation: 0,
+                op_head: ANNOUNCED_HEAD,
+                commit_max: COMMITTED,
+                headers: messages
+                    .iter()
+                    .rev()
+                    .map(|prepare| *prepare.header())
+                    .collect(),
+            };
+            let state = VsrState {
+                view: ANNOUNCED_VIEW,
+                log_view: ANNOUNCED_VIEW,
+                commit_max: COMMITTED,
+                adopted_view: Some(adopted),
+                ..vsr_state_with_checkpoint(0, 0)
+            }
+            .with_history_certificate(Some(certificate));
+            {
+                let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                    .await
+                    .unwrap();
+                for prepare in &messages[..COMMITTED as usize] {
+                    if Some(prepare.header().op) != missing_op {
+                        journal.append(prepare.clone()).await.unwrap();
+                    }
+                }
+                // A resident tail with a different identity must still be discarded.
+                let mut divergent = messages[ANNOUNCED_HEAD as usize - 1].clone();
+                let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+                    &mut divergent.as_mut_slice()[..HEADER_SIZE],
+                );
+                header.request += 1;
+                header.checksum = header.identity_checksum();
+                journal.append(divergent).await.unwrap();
+                journal.storage_ref().fsync().await.unwrap();
+                let superblock = PingPongSuperblock::open(&metadata_dir).await.unwrap();
+                superblock.write(&state.to_bytes()).await.unwrap();
+            }
+            // The donor is gone. Both boots must recover the last copy of the
+            // committed body, including when an earlier repair is still missing.
+            for _ in 0..2 {
+                let recovered = recover::<TestStm>(
+                    directory.path(),
+                    CLUSTERED,
+                    journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                    CLIENTS_TABLE_MAX,
+                    |_| {},
+                    ChangeLogCapacities::default(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    recovered.journal.last_op(),
+                    Some(COMMITTED),
+                    "gap {missing_op:?}"
+                );
+                let retained = recovered
+                    .journal
+                    .entry(messages[COMMITTED as usize - 1].header())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    retained.as_slice(),
+                    messages[COMMITTED as usize - 1].as_slice()
+                );
+                assert!(recovered.journal.header(ANNOUNCED_HEAD as usize).is_none());
+                // A retained body beyond a gap cannot establish the replay commit point.
+                assert_eq!(recovered.last_applied_op, Some(expected_applied));
+                assert_eq!(recovered.chain_break_op, expected_chain_break);
+                if let Some(missing) = missing_op {
+                    assert!(recovered.journal.header(missing as usize).is_none());
+                }
+                assert_eq!(
+                    recovered
+                        .recovered_state
+                        .as_ref()
+                        .unwrap()
+                        .history_certificate(),
+                    Some(certificate),
+                );
+            }
+        }
+    }
+
+    /// Entries journaled for a view the replica recorded but never proved go before
+    /// replay can apply them or count their commit stamps. While no later view is
+    /// recorded, every entry stays the certified view's.
+    #[compio::test]
+    async fn recover_drops_entries_journaled_for_a_view_it_never_proved() {
+        const CERTIFIED_VIEW: u32 = 5;
+        const ADOPTED_VIEW: u32 = 7;
+        const BINDING: u64 = 2;
+        const HEAD: u64 = 4;
+        for (view, kept) in [(ADOPTED_VIEW, BINDING), (CERTIFIED_VIEW, HEAD)] {
+            let dir = tempdir().unwrap();
+            let metadata_dir = dir.path().join("metadata");
+            std::fs::create_dir_all(&metadata_dir).unwrap();
+            {
+                let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                    .await
+                    .unwrap();
+                let mut parent = 0;
+                let mut binding = None;
+                for op in 1..=HEAD {
+                    let prepare = make_chained_prepare(op, op, parent);
+                    parent = prepare.header().checksum;
+                    if op == BINDING {
+                        binding = Some(HistoryCertificate::new(CERTIFIED_VIEW, op, parent));
+                    }
+                    journal.append(prepare).await.unwrap();
+                }
+                journal.storage_ref().fsync().await.unwrap();
+                let state = VsrState {
+                    view,
+                    log_view: view,
+                    ..vsr_state_with_checkpoint(0, 0)
+                }
+                .with_history_certificate(binding);
+                let superblock = PingPongSuperblock::open(&metadata_dir).await.unwrap();
+                superblock.write(&state.to_bytes()).await.unwrap();
+            }
+
+            let recovered = recover::<TestStm>(
+                dir.path(),
+                CLUSTERED,
+                journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |_| {},
+                ChangeLogCapacities::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.history.log_view(), CERTIFIED_VIEW, "view {view}");
+            assert_eq!(recovered.journal.last_op(), Some(kept), "view {view}");
+            assert_eq!(recovered.last_journaled_op, Some(kept), "view {view}");
+            assert_eq!(
+                recovered.last_applied_op,
+                Some(kept),
+                "view {view}: a commit stamp from a dropped entry applied its predecessors"
+            );
+        }
     }
 
     #[compio::test]
@@ -1131,6 +1713,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            ChangeLogCapacities::default(),
         )
         .await;
 
@@ -1181,6 +1764,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -1196,9 +1780,10 @@ mod tests {
         std::fs::create_dir_all(&metadata_dir).unwrap();
 
         // Snapshot at op 5
-        let snapshot = IggySnapshot::new(5);
+        let snapshot = protected_snapshot(5);
         snapshot
             .persist(&metadata_dir.join("snapshot.bin"))
+            .await
             .unwrap();
 
         // WAL has ops 1-10
@@ -1218,6 +1803,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -1233,76 +1819,59 @@ mod tests {
         );
     }
 
-    // A checkpoint that carries no folded client table still loses the watermark
-    // half of table recovery, and this pins that residual as a fact rather than a
-    // comment: it is the shape of a snapshot written before the fold existed.
-    // Shape: a client registers, commits request 1, a checkpoint lands past that
-    // register, then the client rebinds. Replay starts above the floor, so it
-    // never sees the first register: `commit_register` takes its fresh-entry
-    // branch and the entry comes back with watermark 0, while a peer whose floor
-    // sat lower replayed both registers, took the rebind branch, and kept
-    // watermark 1.
-    //
-    // Consequence, once a client re-presents a recovered id: the same request
-    // that peer answers `Duplicate` is `New` here and gets re-executed. The
-    // fence is unaffected -- epochs are op-derived, so this node still returns
-    // the second register's op.
-    //
-    // The green counterpart, where the checkpoint does carry the table, is
-    // `recover_restores_the_watermark_from_a_folded_checkpoint_table`.
     #[compio::test]
-    async fn recover_loses_the_watermark_when_a_tableless_checkpoint_hides_the_first_register() {
-        const CLIENT: u128 = 0x1337;
-        const USER: u32 = 7;
-        const FLOOR: u64 = 2;
-
+    async fn recovery_refuses_invalid_session_protection_before_repairing_the_wal() {
         let dir = tempdir().unwrap();
         let metadata_dir = dir.path().join("metadata");
         std::fs::create_dir_all(&metadata_dir).unwrap();
-
-        // Ops 1..=2 are below the floor and are never replayed: the client's
-        // first Register and the request that advanced its watermark.
-        IggySnapshot::new(FLOOR)
-            .persist(&metadata_dir.join("snapshot.bin"))
-            .unwrap();
-
+        let wal_path = metadata_dir.join("journal.wal");
         {
-            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+            let journal = PrepareJournal::open(&wal_path, 0).await.unwrap();
+            journal
+                .append(make_client_prepare(3, Operation::Register, 7, 1, 0))
                 .await
                 .unwrap();
-            for entry in [
-                make_client_prepare(1, Operation::Register, CLIENT, USER, 0),
-                make_client_prepare(2, Operation::CreateStream, CLIENT, USER, 1),
-                // The rebind, above the floor, so replay does see this one.
-                make_client_prepare(3, Operation::Register, CLIENT, USER, 0),
-            ] {
-                journal.append(entry).await.unwrap();
-            }
             journal.storage_ref().fsync().await.unwrap();
         }
+        let mut before = std::fs::read(&wal_path).unwrap();
+        before.extend_from_slice(b"torn-prepare-header");
+        std::fs::write(&wal_path, &before).unwrap();
 
-        let recovered = recover::<TestStm>(
-            dir.path(),
-            SOLO,
-            journal::prepare_journal::DEFAULT_SLOT_COUNT,
-            CLIENTS_TABLE_MAX,
-            |_| {},
-        )
-        .await
-        .unwrap();
-
-        let table = &recovered.client_table;
-        assert_eq!(
-            table.get_epoch(CLIENT),
-            Some(3),
-            "the fence is op-derived, so it survives the checkpoint intact"
-        );
-        assert_eq!(
-            table.get_watermark(CLIENT),
-            Some(0),
-            "a tableless checkpoint loses the pre-floor watermark, so request 1 reads \
-             as New here while a lower-floor peer answers it as a duplicate"
-        );
+        let mut malformed = protected_snapshot(2);
+        malformed
+            .snapshot_mut()
+            .client_table
+            .as_mut()
+            .unwrap()
+            .capacity = 0;
+        for snapshot in [IggySnapshot::new(2), malformed] {
+            snapshot
+                .persist(&metadata_dir.join("snapshot.bin"))
+                .await
+                .unwrap();
+            let result = recover::<TestStm>(
+                dir.path(),
+                SOLO,
+                journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |_| {},
+                ChangeLogCapacities::default(),
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(
+                    RecoveryError::RetryProtection(consensus::ClientTableWireError::EmptyRing)
+                        | RecoveryError::ClientTableDecode(
+                            ClientTableDecodeError::SlotOutOfRange { .. }
+                        )
+                )
+            ));
+            assert_eq!(std::fs::read(&wal_path).unwrap(), before);
+            for slot in journal::superblock::SLOT_FILE_NAMES {
+                assert!(!metadata_dir.join(slot).exists());
+            }
+        }
     }
 
     // The fold closes the gap above: same WAL and same floor, but the checkpoint
@@ -1324,21 +1893,26 @@ mod tests {
         // op 1, request 1 committed at op 2.
         let mut at_checkpoint = ClientTable::new(CLIENTS_TABLE_MAX);
         let register = make_client_prepare(1, Operation::Register, CLIENT, USER, 0);
-        at_checkpoint.commit_register(
-            CLIENT,
-            USER,
-            build_reply_message(register.header(), &bytes::Bytes::new()),
-        );
+        at_checkpoint
+            .commit_register(
+                CLIENT,
+                USER,
+                [0x5a; 32],
+                build_reply_message(register.header(), &bytes::Bytes::new()),
+            )
+            .unwrap();
         let app = make_client_prepare(2, Operation::CreateStream, CLIENT, USER, 1);
         at_checkpoint.commit_reply(
             CLIENT,
+            USER,
             build_reply_message(app.header(), &bytes::Bytes::new()),
         );
 
-        let mut snapshot = IggySnapshot::new(FLOOR);
+        let mut snapshot = protected_snapshot(FLOOR);
         snapshot.snapshot_mut().client_table = Some(at_checkpoint.to_snapshot());
         snapshot
             .persist(&metadata_dir.join("snapshot.bin"))
+            .await
             .unwrap();
 
         {
@@ -1362,6 +1936,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -1369,8 +1944,8 @@ mod tests {
         let table = &recovered.client_table;
         assert_eq!(
             table.get_epoch(CLIENT),
-            Some(3),
-            "replay still advances the fence to the rebind's op"
+            Some(1),
+            "a matching registration preserves the original epoch"
         );
         assert_eq!(
             table.get_watermark(CLIENT),
@@ -1382,6 +1957,92 @@ mod tests {
             Some(USER),
             "the folded entry carries the acting user, so no metadata lookup is needed"
         );
+    }
+
+    #[compio::test]
+    async fn given_retirement_evidence_when_replaying_after_namespace_change_should_keep_the_session()
+     {
+        const CLIENT: u128 = 7;
+        const USER: u32 = 0;
+        const SNAPSHOT_OP: u64 = 2;
+        const CURRENT_REVISION: u64 = 2;
+        type SessionStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
+
+        for reported_revision in [CURRENT_REVISION - 1, CURRENT_REVISION] {
+            let dir = tempdir().unwrap();
+            let metadata_dir = dir.path().join("metadata");
+            std::fs::create_dir_all(&metadata_dir).unwrap();
+            let mut table = ClientTable::new(CLIENTS_TABLE_MAX);
+            let register = make_client_prepare(1, Operation::Register, CLIENT, USER, 0);
+            table
+                .commit_register(
+                    CLIENT,
+                    USER,
+                    [0x5a; 32],
+                    build_reply_message(register.header(), &bytes::Bytes::new()),
+                )
+                .unwrap();
+            let logout = make_client_prepare(SNAPSHOT_OP, Operation::Logout, CLIENT, USER, 1);
+            table
+                .commit_logout(
+                    CLIENT,
+                    USER,
+                    1,
+                    build_reply_message(logout.header(), &bytes::Bytes::new()),
+                )
+                .unwrap();
+            let identity = table.ended_sessions().next().unwrap();
+            let mut snapshot = protected_snapshot(SNAPSHOT_OP);
+            snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+            snapshot.snapshot_mut().users = Some(Users::default().to_snapshot());
+            snapshot.snapshot_mut().streams = Some(StreamsSnapshot {
+                lifecycle_intents: std::collections::BTreeMap::default(),
+                items: Vec::new(),
+                revision: CURRENT_REVISION,
+                namespace_revision: CURRENT_REVISION,
+            });
+            snapshot
+                .persist(&metadata_dir.join("snapshot.bin"))
+                .await
+                .unwrap();
+
+            let body = FinalizeSessionRequest {
+                identity,
+                namespace_revision: reported_revision,
+                debt: Vec::new(),
+            }
+            .to_bytes();
+            let mut prepare = make_prepare(SNAPSHOT_OP + 1, body.len());
+            prepare.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
+            let prepare = prepare.transmute_header(|old, header: &mut PrepareHeader| {
+                *header = old;
+                header.operation = Operation::FinalizeSession;
+                header.checksum_body = u128::from(iggy_common::calculate_checksum(&body));
+            });
+            {
+                let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), SNAPSHOT_OP)
+                    .await
+                    .unwrap();
+                journal.append(prepare).await.unwrap();
+                journal.storage_ref().fsync().await.unwrap();
+            }
+            let recovered = recover::<SessionStm>(
+                dir.path(),
+                SOLO,
+                journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |_| {},
+                ChangeLogCapacities::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.last_applied_op, Some(SNAPSHOT_OP + 1));
+            assert_eq!(
+                recovered.client_table.ended_sessions().next(),
+                (reported_revision != CURRENT_REVISION).then_some(identity),
+                "WAL replay must preserve protection when the report covered an older partition set"
+            );
+        }
     }
 
     // The IGGY-137 restart contract: a rebooted node must remember where
@@ -1427,6 +2088,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -1439,21 +2101,23 @@ mod tests {
             Some(1),
             "committed request 1 restored the watermark"
         );
-        match table.check_request(CLIENT, 1, 1, 0) {
+        match table.check_request(CLIENT, 1, 1, Operation::CreateStream) {
             RequestStatus::Duplicate(cached) => {
                 assert_eq!(cached.header().request, 1, "retry replays the cached reply");
             }
             other => panic!("expected Duplicate, got {other:?}"),
         }
         assert!(
-            matches!(table.check_request(CLIENT, 1, 2, 0), RequestStatus::New),
+            matches!(
+                table.check_request(CLIENT, 1, 2, Operation::CreateStream),
+                RequestStatus::New
+            ),
             "the next request id is admitted"
         );
     }
 
-    // A replayed Logout removes the entry, mirroring the commit paths.
     #[compio::test]
-    async fn recover_replays_logout_as_session_removal() {
+    async fn recover_retains_the_logout_result_and_ended_session() {
         const CLIENT: u128 = 0x1337;
         const USER: u32 = 7;
 
@@ -1482,24 +2146,719 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
         assert_eq!(
             recovered.client_table.get_epoch(CLIENT),
             None,
-            "logged-out session must not be resurrected"
+            "an ended session cannot accept another mutation"
+        );
+        assert_eq!(recovered.client_table.count(), 1);
+        assert!(matches!(
+            recovered
+                .client_table
+                .check_request(CLIENT, 1, 1, Operation::Logout),
+            consensus::client_table::RequestStatus::Duplicate(_)
+        ));
+        assert!(matches!(
+            recovered
+                .client_table
+                .check_request(CLIENT, 1, 2, Operation::CreateStream),
+            consensus::client_table::RequestStatus::NoSession
+        ));
+        let sessions = recovered
+            .change_log
+            .read(|log| {
+                log.ring(MetadataChangeClass::Activity)
+                    .entries()
+                    .iter()
+                    .map(|entry| (entry.op, entry.kind))
+                    .collect::<Vec<_>>()
+            })
+            .expect("readable");
+        assert_eq!(
+            sessions,
+            [
+                (1, WireMetadataChangeKind::SessionRegistered),
+                (2, WireMetadataChangeKind::SessionClosed)
+            ],
+            "replay must record the session the logout ended"
         );
         assert_eq!(recovered.last_applied_op, Some(2));
     }
 
-    #[test]
-    fn snapshot_persist_load_roundtrip() {
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_reused_user_id_when_pending_operations_commit_should_reject_the_old_session() {
+        const CLIENT: u128 = 1;
+        const ROOT_CLIENT: u128 = 2;
+        const REPLACEMENT_CLIENT: u128 = 3;
+        const USER: u32 = 1;
+        const ROOT_SESSION: u64 = 1;
+        const SESSION: u64 = 3;
+        const REPLACEMENT_SESSION: u64 = 8;
+        const TOKEN_HASH: [u8; PAT_TOKEN_HASH_BYTES] = [b'a'; PAT_TOKEN_HASH_BYTES];
+        type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
+
+        // Admission rejects reserved IDs, but previously committed sessions must
+        // still replay and fence their pending operations after user deletion.
+        for (client_id, replace_before_token) in [
+            CLIENT,
+            message_bus::server_internal_client_id(0),
+            message_bus::AUTO_COMMIT_CLIENT_ID,
+        ]
+        .into_iter()
+        .flat_map(|client_id| [(client_id, false), (client_id, true)])
+        {
+            let directory = tempdir().unwrap();
+            let metadata_dir = directory.path().join("metadata");
+            std::fs::create_dir_all(&metadata_dir).unwrap();
+            let stm = UserStm::default();
+            stm.users().ensure_root_user("root", "hash");
+            let table = RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX));
+            let mut account = CreateUserRequest {
+                username: WireName::new("original").unwrap(),
+                password: "hash".to_owned(),
+                status: UserStatus::Active.as_code(),
+                permissions: None,
+                options: WireOptions::empty(),
+            };
+            let original = account.to_bytes();
+            account.username = WireName::new("replacement").unwrap();
+            account.permissions = Some(WirePermissions {
+                global: WireGlobalPermissions {
+                    manage_servers: false,
+                    read_servers: false,
+                    manage_users: false,
+                    read_users: false,
+                    manage_streams: true,
+                    read_streams: false,
+                    manage_topics: false,
+                    read_topics: false,
+                    poll_messages: false,
+                    send_messages: false,
+                },
+                streams: Vec::new(),
+            });
+            let token = CreatePersonalAccessTokenRequest {
+                user_id: USER,
+                name: WireName::new("token").unwrap(),
+                expiry: 0,
+                token_hash: TOKEN_HASH,
+            }
+            .to_bytes();
+            let stream = CreateStreamRequest {
+                name: WireName::new("stream").unwrap(),
+                options: WireOptions::empty(),
+            }
+            .to_bytes();
+            let register = |created_at| {
+                RegisterRequest {
+                    user_created_at: created_at,
+                    bind_verifier: [0x5a; 32],
+                }
+                .to_bytes()
+            };
+            let replacement = (
+                Operation::CreateUser,
+                account.to_bytes(),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            );
+            let pending_token = (
+                Operation::CreatePersonalAccessToken,
+                token.clone(),
+                client_id,
+                USER,
+                SESSION,
+            );
+            let (first, second) = if replace_before_token {
+                (replacement, pending_token)
+            } else {
+                (pending_token, replacement)
+            };
+            let operations = [
+                (Operation::Register, register(1), ROOT_CLIENT, 0, 0),
+                (
+                    Operation::CreateUser,
+                    original,
+                    ROOT_CLIENT,
+                    0,
+                    ROOT_SESSION,
+                ),
+                (Operation::Register, register(2), client_id, USER, 0),
+                (
+                    Operation::DeleteUser,
+                    DeleteUserRequest {
+                        user_id: WireIdentifier::numeric(USER),
+                    }
+                    .to_bytes(),
+                    ROOT_CLIENT,
+                    0,
+                    ROOT_SESSION,
+                ),
+                first,
+                second,
+                (
+                    Operation::CreateStream,
+                    stream.clone(),
+                    client_id,
+                    USER,
+                    SESSION,
+                ),
+                (
+                    Operation::Register,
+                    register(if replace_before_token { 5 } else { 6 }),
+                    REPLACEMENT_CLIENT,
+                    USER,
+                    0,
+                ),
+                (
+                    Operation::CreatePersonalAccessToken,
+                    token,
+                    REPLACEMENT_CLIENT,
+                    USER,
+                    REPLACEMENT_SESSION,
+                ),
+                (
+                    Operation::CreateStream,
+                    stream,
+                    REPLACEMENT_CLIENT,
+                    USER,
+                    REPLACEMENT_SESSION,
+                ),
+                (
+                    Operation::CompleteLifecycle,
+                    CompleteLifecycleRequest::new(
+                        ROOT_SESSION,
+                        0,
+                        vec![LifecycleCompletion {
+                            topic_id: 0,
+                            partition_id: 0,
+                            partition_op: 1,
+                        }],
+                    )
+                    .unwrap()
+                    .to_bytes(),
+                    message_bus::server_internal_client_id(server_common::sharding::METADATA_GROUP),
+                    0,
+                    1,
+                ),
+            ];
+            let mut parent = 0;
+            {
+                let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                    .await
+                    .unwrap();
+                for (index, (operation, body, client, user_id, session)) in
+                    operations.into_iter().enumerate()
+                {
+                    let op = u64::try_from(index).unwrap() + 1;
+                    let mut prepare = make_prepare(op, body.len());
+                    prepare.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
+                    let prepare = consensus::seal_prepare_checksum(prepare.transmute_header(
+                        |old, header: &mut PrepareHeader| {
+                            *header = old;
+                            header.operation = operation;
+                            header.client = client;
+                            header.user_id = user_id;
+                            header.session = session;
+                            header.request = if operation == Operation::Register {
+                                0
+                            } else {
+                                op
+                            };
+                            header.timestamp = op;
+                            header.parent = parent;
+                            header.checksum_body =
+                                u128::from(iggy_common::calculate_checksum(&body));
+                        },
+                    ));
+                    parent = prepare.header().checksum;
+                    let reply =
+                        apply_committed_prepare(&stm, &table, true, |_| {}, prepare.clone()).reply;
+                    let status = if operation == Operation::Register {
+                        result_code(reply.body()).unwrap_or(0)
+                    } else {
+                        result_code(reply.body()).unwrap()
+                    };
+                    let stale = client == client_id && operation != Operation::Register;
+                    assert_eq!(
+                        status,
+                        if stale {
+                            IggyError::StaleClient.as_code()
+                        } else {
+                            0
+                        },
+                        "{operation:?} at op {op}, client {client_id}, replace before token: {replace_before_token}"
+                    );
+                    if stale {
+                        assert_eq!(stm.users().read(|users| users.pat_count_of(USER)), 0);
+                        assert!(stm.streams().read(|streams| streams.items.is_empty()));
+                    }
+                    journal.append(prepare).await.unwrap();
+                }
+                journal.storage_ref().fsync().await.unwrap();
+            }
+            let recovered = recover::<UserStm>(
+                directory.path(),
+                SOLO,
+                journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |stm| stm.users().ensure_root_user("root", "hash"),
+                ChangeLogCapacities::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.client_table.encode(), table.borrow().encode());
+            assert_eq!(recovered.client_table.get_epoch(client_id), None);
+            assert_eq!(
+                recovered.client_table.get_epoch(REPLACEMENT_CLIENT),
+                Some(REPLACEMENT_SESSION)
+            );
+            assert_eq!(
+                recovered.mux_stm.users().read(|users| {
+                    let replacement = users.user_by_name("replacement").unwrap();
+                    (replacement.id, users.pat_count_of(USER))
+                }),
+                (USER, 1)
+            );
+            assert_eq!(
+                recovered
+                    .mux_stm
+                    .streams()
+                    .read(|streams| streams.items.len()),
+                1
+            );
+        }
+    }
+
+    /// WAL replay must rebuild the table that live apply built. A request the
+    /// primary admitted before the revocation of its user committed commits
+    /// right behind it as a `StaleClient` no-op, and a checkpoint of that table
+    /// must restart.
+    #[compio::test]
+    async fn given_revoked_user_when_replaying_wal_should_preserve_session_revocation() {
+        const CLIENT: u128 = 0x1337;
+        const ROOT_CLIENT: u128 = CLIENT + 1;
+        const USER: u32 = 1;
+        const ROOT_SESSION: u64 = 1;
+        // The op of the registration that runs before the revocation.
+        const SESSION: u64 = 3;
+        const REVOCATION_OP: u64 = 4;
+        type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
+        for (operation, register_first, replace) in [
+            (Operation::DeleteUser, true, false),
+            (Operation::UpdateUserResolved, true, false),
+            (Operation::DeleteUser, false, false),
+            (Operation::UpdateUserResolved, false, false),
+            (Operation::DeleteUser, false, true),
+        ] {
+            let directory = tempdir().unwrap();
+            let metadata_dir = directory.path().join("metadata");
+            std::fs::create_dir_all(&metadata_dir).unwrap();
+            let register = |user_created_at| {
+                RegisterRequest {
+                    user_created_at,
+                    bind_verifier: [0x5a; 32],
+                }
+                .to_bytes()
+            };
+            let create = CreateUserRequest {
+                username: WireName::new("user").unwrap(),
+                password: "hash".to_owned(),
+                status: UserStatus::Active.as_code(),
+                permissions: None,
+                options: WireOptions::empty(),
+            }
+            .to_bytes();
+            let revocation = if operation == Operation::DeleteUser {
+                DeleteUserRequest {
+                    user_id: WireIdentifier::numeric(USER),
+                }
+                .to_bytes()
+            } else {
+                UpdateUserResolvedRequest {
+                    user_id: WireIdentifier::numeric(USER),
+                    username: None,
+                    status: Some(UserStatus::Inactive.as_code()),
+                    explicit_options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
+                }
+                .to_bytes()
+            };
+            let registration = (Operation::Register, register(2), CLIENT, USER, 0);
+            let mut entries = vec![
+                (Operation::Register, register(1), ROOT_CLIENT, 0, 0),
+                (
+                    Operation::CreateUser,
+                    create.clone(),
+                    ROOT_CLIENT,
+                    0,
+                    ROOT_SESSION,
+                ),
+            ];
+            if register_first {
+                entries.push(registration.clone());
+            }
+            entries.push((operation, revocation, ROOT_CLIENT, 0, ROOT_SESSION));
+            if register_first {
+                let pipelined = CreateStreamRequest {
+                    name: WireName::new("stream").unwrap(),
+                    options: WireOptions::empty(),
+                }
+                .to_bytes();
+                entries.push((Operation::CreateStream, pipelined, CLIENT, USER, SESSION));
+            }
+            if replace {
+                entries.push((Operation::CreateUser, create, ROOT_CLIENT, 0, ROOT_SESSION));
+            }
+            if !register_first {
+                entries.push(registration);
+            }
+            let last_op = entries.len() as u64;
+            let stm = UserStm::default();
+            stm.users().ensure_root_user("root", "hash");
+            let table = RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX));
+            let live_log = MetadataChangeLog::new(ChangeLogCapacities::default());
+            let mut last_reply = None;
+            let mut parent = 0;
+            {
+                let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                    .await
+                    .unwrap();
+                for (index, (operation, body, client, user_id, session)) in
+                    entries.into_iter().enumerate()
+                {
+                    let op = index as u64 + 1;
+                    let mut prepare = make_prepare(op, body.len());
+                    prepare.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
+                    let prepare = consensus::seal_prepare_checksum(prepare.transmute_header(
+                        |old, header: &mut PrepareHeader| {
+                            *header = old;
+                            header.operation = operation;
+                            header.timestamp = op;
+                            header.client = client;
+                            header.user_id = user_id;
+                            header.session = session;
+                            header.request = if operation == Operation::Register {
+                                0
+                            } else {
+                                op
+                            };
+                            header.parent = parent;
+                            header.checksum_body =
+                                u128::from(iggy_common::calculate_checksum(&body));
+                        },
+                    ));
+                    parent = prepare.header().checksum;
+                    let committed =
+                        apply_committed_prepare(&stm, &table, true, |_| {}, prepare.clone());
+                    live_log
+                        .append(prepare.header(), committed.changes)
+                        .expect("live ops append in order");
+                    last_reply = Some(committed.reply);
+                    journal.append(prepare).await.unwrap();
+                }
+                journal.storage_ref().fsync().await.unwrap();
+            }
+            if register_first {
+                assert_eq!(
+                    last_reply.and_then(|reply| result_code(reply.body())),
+                    Some(IggyError::StaleClient.as_code())
+                );
+            }
+            let live = table.borrow().encode();
+            ClientTable::decode(&live).expect("the state transfer form must decode");
+            let recovered = recover::<UserStm>(
+                directory.path(),
+                SOLO,
+                journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |stm| {
+                    stm.users().ensure_root_user("root", "hash");
+                },
+                ChangeLogCapacities::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.last_applied_op, Some(last_op));
+            assert!(
+                recovered.client_table.encode() == live,
+                "{operation:?}: WAL replay must rebuild the live table"
+            );
+            assert_eq!(recovered.client_table.get_epoch(CLIENT), None);
+            assert_eq!(
+                recovered.client_table.get_epoch(ROOT_CLIENT),
+                Some(ROOT_SESSION)
+            );
+            assert_eq!(
+                recovered.change_log.snapshot(),
+                live_log.snapshot(),
+                "{operation:?}: WAL replay must rebuild the live change log"
+            );
+            let ended: Vec<_> = recovered.client_table.ended_sessions().collect();
+            if register_first {
+                assert_eq!(
+                    ended,
+                    vec![iggy_binary_protocol::requests::system::SessionIdentity {
+                        client_id: CLIENT,
+                        session: SESSION,
+                        metadata_watermark: REVOCATION_OP,
+                    }]
+                );
+            } else {
+                assert_eq!(
+                    ended,
+                    [] as [iggy_binary_protocol::requests::system::SessionIdentity; 0]
+                );
+            }
+            drop(recovered);
+
+            let mut checkpoint = <IggySnapshot as Snapshot>::create(&stm, last_op, 0).unwrap();
+            checkpoint.snapshot_mut().client_table = Some(table.borrow().to_snapshot());
+            checkpoint
+                .persist(&metadata_dir.join("snapshot.bin"))
+                .await
+                .unwrap();
+            let restarted = recover::<UserStm>(
+                directory.path(),
+                SOLO,
+                journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |stm| stm.users().ensure_root_user("root", "hash"),
+                ChangeLogCapacities::default(),
+            )
+            .await
+            .expect("restart must accept the checkpointed table");
+            assert_eq!(
+                restarted.client_table.ended_sessions().collect::<Vec<_>>(),
+                ended
+            );
+        }
+    }
+
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_memberships_ended_by_logout_and_revocation_when_replaying_wal_should_rebuild_the_live_change_log()
+     {
+        const ROOT_CLIENT: u128 = 0x10;
+        const CLIENT_A: u128 = 0x11;
+        const CLIENT_B: u128 = 0x12;
+        const USER: u32 = 1;
+        // Epochs are the ops of the registrations below.
+        const ROOT_SESSION: u64 = 1;
+        const SESSION_A: u64 = 6;
+        const SESSION_B: u64 = 7;
+        type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
+        let register = |user_created_at| {
+            RegisterRequest {
+                user_created_at,
+                bind_verifier: [0x5a; 32],
+            }
+            .to_bytes()
+        };
+        let join = |client_id, session| {
+            JoinConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                group_id: WireIdentifier::numeric(0),
+                client_id,
+                session,
+            }
+            .to_bytes()
+        };
+        let entries = [
+            (Operation::Register, register(1), ROOT_CLIENT, 0, 0),
+            (
+                Operation::CreateUser,
+                CreateUserRequest {
+                    username: WireName::new("user").unwrap(),
+                    password: "hash".to_owned(),
+                    status: UserStatus::Active.as_code(),
+                    permissions: None,
+                    options: WireOptions::empty(),
+                }
+                .to_bytes(),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            ),
+            (
+                Operation::CreateStream,
+                CreateStreamRequest {
+                    name: WireName::new("orders").unwrap(),
+                    options: WireOptions::empty(),
+                }
+                .to_bytes(),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            ),
+            (
+                Operation::CreateTopicWithAssignments,
+                CreateTopicWithAssignmentsRequest {
+                    request: CreateTopicRequest {
+                        stream_id: WireIdentifier::numeric(0),
+                        partitions_count: 2,
+                        name: WireName::new("events").unwrap(),
+                        options: WireOptions::empty(),
+                    },
+                    derived_options: WireOptions::empty(),
+                    partitions: (0..2)
+                        .map(|partition_id| CreatedPartitionAssignment {
+                            partition_id,
+                            consensus_group_id: u64::from(partition_id) + 1,
+                            initial_view: 0,
+                            members: Vec::new(),
+                        })
+                        .collect(),
+                }
+                .to_bytes(),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            ),
+            (
+                Operation::CreateConsumerGroup,
+                CreateConsumerGroupRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    name: WireName::new("billing").unwrap(),
+                }
+                .to_bytes(),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            ),
+            // The user was created at op 2, whose timestamp is 2.
+            (Operation::Register, register(2), CLIENT_A, USER, 0),
+            (Operation::Register, register(2), CLIENT_B, USER, 0),
+            (
+                Operation::JoinConsumerGroup,
+                join(CLIENT_A, SESSION_A),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            ),
+            (
+                Operation::JoinConsumerGroup,
+                join(CLIENT_B, SESSION_B),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            ),
+            (
+                Operation::Logout,
+                bytes::Bytes::new(),
+                CLIENT_A,
+                USER,
+                SESSION_A,
+            ),
+            (
+                Operation::DeleteUser,
+                DeleteUserRequest {
+                    user_id: WireIdentifier::numeric(USER),
+                }
+                .to_bytes(),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            ),
+        ];
+        let directory = tempdir().unwrap();
+        let metadata_dir = directory.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let stm = UserStm::default();
+        stm.users().ensure_root_user("root", "hash");
+        let table = RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX));
+        let live_log = MetadataChangeLog::new(ChangeLogCapacities::default());
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            let mut parent = 0;
+            for (index, (operation, body, client, user_id, session)) in
+                entries.into_iter().enumerate()
+            {
+                let op = index as u64 + 1;
+                let mut prepare = make_prepare(op, body.len());
+                prepare.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
+                let prepare = consensus::seal_prepare_checksum(prepare.transmute_header(
+                    |old, header: &mut PrepareHeader| {
+                        *header = old;
+                        header.operation = operation;
+                        header.timestamp = op;
+                        header.client = client;
+                        header.user_id = user_id;
+                        header.session = session;
+                        header.request = if operation == Operation::Register {
+                            0
+                        } else {
+                            op
+                        };
+                        header.parent = parent;
+                        header.checksum_body = u128::from(iggy_common::calculate_checksum(&body));
+                    },
+                ));
+                parent = prepare.header().checksum;
+                let committed =
+                    apply_committed_prepare(&stm, &table, true, |_| {}, prepare.clone());
+                assert_eq!(result_code(committed.reply.body()).unwrap_or(0), 0);
+                live_log
+                    .append(prepare.header(), committed.changes)
+                    .expect("live ops append in order");
+                journal.append(prepare).await.unwrap();
+            }
+            journal.storage_ref().fsync().await.unwrap();
+        }
+
+        let recovered = recover::<UserStm>(
+            directory.path(),
+            SOLO,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |stm| stm.users().ensure_root_user("root", "hash"),
+            ChangeLogCapacities::default(),
+        )
+        .await
+        .unwrap();
+
+        let live = live_log.snapshot();
+        assert_eq!(recovered.change_log.snapshot(), live);
+        let kinds: Vec<_> = live
+            .activity
+            .entries
+            .iter()
+            .map(|entry| (entry.op, entry.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (1, WireMetadataChangeKind::SessionRegistered.as_u8()),
+                (6, WireMetadataChangeKind::SessionRegistered.as_u8()),
+                (7, WireMetadataChangeKind::SessionRegistered.as_u8()),
+                (8, WireMetadataChangeKind::ConsumerGroupMemberJoined.as_u8()),
+                (9, WireMetadataChangeKind::ConsumerGroupMemberJoined.as_u8()),
+                (10, WireMetadataChangeKind::SessionClosed.as_u8()),
+                (10, WireMetadataChangeKind::ConsumerGroupMemberLeft.as_u8()),
+                (11, WireMetadataChangeKind::SessionClosed.as_u8()),
+                (11, WireMetadataChangeKind::ConsumerGroupMemberLeft.as_u8()),
+            ],
+            "the replayed history must hold every session and membership change"
+        );
+    }
+
+    #[compio::test]
+    async fn snapshot_persist_load_roundtrip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("snapshot.bin");
 
-        let snapshot = IggySnapshot::new(99);
-        snapshot.persist(&path).unwrap();
+        let snapshot = protected_snapshot(99);
+        snapshot.persist(&path).await.unwrap();
 
         let (loaded, checksum) = IggySnapshot::load(&path).unwrap();
         assert_eq!(loaded.sequence_number(), 99);
@@ -1520,6 +2879,36 @@ mod tests {
             IggySnapshot::load(&path),
             Err(SnapshotError::ChecksumMismatch { .. })
         ));
+    }
+
+    #[compio::test]
+    async fn snapshot_refuses_absent_truncated_and_damaged_integrity_framing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("snapshot.bin");
+        let snapshot = protected_snapshot(99);
+        let payload = snapshot.encode().unwrap();
+        snapshot.persist(&path).await.unwrap();
+        let sealed = std::fs::read(&path).unwrap();
+        assert_eq!(
+            IggySnapshot::decode(&payload).unwrap().sequence_number(),
+            99
+        );
+        for trailer_len in 0..sealed.len() - payload.len() {
+            std::fs::write(&path, &sealed[..payload.len() + trailer_len]).unwrap();
+            assert!(
+                IggySnapshot::load(&path).is_err(),
+                "accepted {trailer_len} trailer bytes"
+            );
+        }
+        let mut damaged = sealed.clone();
+        damaged[payload.len()] ^= u8::MAX;
+        std::fs::write(&path, damaged).unwrap();
+        assert!(matches!(
+            IggySnapshot::load(&path),
+            Err(SnapshotError::InvalidTrailer)
+        ));
+        std::fs::write(&path, sealed).unwrap();
+        assert_eq!(IggySnapshot::load(&path).unwrap().0.sequence_number(), 99);
     }
 
     #[compio::test]
@@ -1544,6 +2933,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            ChangeLogCapacities::default(),
         )
         .await;
         assert!(matches!(
@@ -1576,6 +2966,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            ChangeLogCapacities::default(),
         )
         .await;
         assert!(matches!(
@@ -1607,6 +2998,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -1659,6 +3051,7 @@ mod tests {
                 journal::prepare_journal::DEFAULT_SLOT_COUNT,
                 CLIENTS_TABLE_MAX,
                 |_| {},
+                ChangeLogCapacities::default(),
             )
             .await;
             match result {
@@ -1672,47 +3065,92 @@ mod tests {
     }
 
     #[compio::test]
-    async fn recover_accepts_snapshot_written_before_a_trailing_default_field() {
-        // Appending a `#[serde(default)]` field is this repo's forward-compatible
-        // snapshot migration, and msgpack encodes structs positionally: a file the
-        // previous build wrote decodes fine (the default fills the missing element)
-        // but re-encodes with one MORE element. A pairing checksum recomputed by
-        // re-encoding the decoded snapshot would therefore diverge on the FIRST boot
-        // of the new build and refuse every checkpointed node, with the WAL prefix
-        // already drained. Hashing the bytes on disk is what makes that upgrade boot.
-        //
-        // Emulated in the direction the migration runs: strip the trailing element off
-        // a current-shape file, which is what the pre-`client_table` build wrote.
+    async fn recover_refuses_a_snapshot_from_another_format_version() {
+        // A snapshot shape is only as trustworthy as the version stamped on it, so a
+        // foreign one refuses boot rather than restoring whatever msgpack happens to
+        // make of the bytes. Everything else about the directory is healthy: the
+        // superblock pairs with the file on disk, so the refusal can only be the
+        // version.
         const CHECKPOINT_OP: u64 = 42;
-        let encoded = IggySnapshot::new(CHECKPOINT_OP).encode().unwrap();
-        assert_eq!(
-            encoded[0] & 0xf0,
-            0x90,
-            "snapshot must encode as a msgpack fixarray for this emulation"
-        );
-        assert_eq!(
-            *encoded.last().unwrap(),
-            0xC0,
-            "the trailing snapshot field must encode as nil here; adjust the emulation \
-             if the last field stops being an Option"
-        );
-        let mut legacy = vec![0x90 | ((encoded[0] & 0x0f) - 1)];
-        legacy.extend_from_slice(&encoded[1..encoded.len() - 1]);
+        let mut snapshot = protected_snapshot(CHECKPOINT_OP);
+        snapshot.snapshot_mut().version = SNAPSHOT_FORMAT_VERSION + 1;
+        let foreign = snapshot.encode().unwrap();
 
-        let decoded = IggySnapshot::decode(&legacy).unwrap();
-        assert_eq!(decoded.sequence_number(), CHECKPOINT_OP);
+        let dir = tempdir().unwrap();
+        let metadata_dir = dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let state = vsr_state_with_checkpoint(CHECKPOINT_OP, checkpoint_checksum(&foreign));
+        IggySnapshot::write_durably(&metadata_dir.join("snapshot.bin"), foreign)
+            .await
+            .unwrap();
+        {
+            let superblock = PingPongSuperblock::open(&metadata_dir).await.unwrap();
+            superblock.write(&state.to_bytes()).await.unwrap();
+        }
+
+        match recover::<TestStm>(
+            dir.path(),
+            CLUSTERED,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            ChangeLogCapacities::default(),
+        )
+        .await
+        {
+            Err(RecoveryError::Snapshot(SnapshotError::UnsupportedFormatVersion {
+                found,
+                expected,
+            })) => {
+                assert_eq!(found, SNAPSHOT_FORMAT_VERSION + 1);
+                assert_eq!(expected, SNAPSHOT_FORMAT_VERSION);
+            }
+            Err(other) => panic!("expected a format-version refusal, got {other}"),
+            Ok(_) => panic!("expected a foreign format version to refuse boot"),
+        }
+    }
+
+    #[compio::test]
+    async fn recover_pairs_the_checkpoint_against_the_bytes_on_disk() {
+        // The pairing checksum is taken over the file's bytes, never over a re-encode
+        // of the decoded snapshot. Re-encoding would tie recovery to
+        // decode-then-encode staying byte-identical across every serde and rmp
+        // release, and a divergence there would refuse boot on every checkpointed node
+        // with its WAL prefix already drained.
+        //
+        // Canonical bytes cannot show that: they re-encode byte-identically (pinned by
+        // `populated_snapshot_reencode_and_checksum_are_stable`), so both candidate
+        // checksums agree and the assertion holds either way. This file is instead
+        // noncanonical but decodable, carrying the version in a `u32` marker that
+        // `read_int` accepts and a re-encode collapses back to a fixint, so hashing a
+        // re-encode gives a different checksum and the test can fail.
+        const CHECKPOINT_OP: u64 = 42;
+        let canonical = protected_snapshot(CHECKPOINT_OP).encode().unwrap();
+        let on_disk = with_wide_version_marker(&canonical);
+
+        // Both halves of "noncanonical but decodable", so this cannot pass vacuously.
         assert_ne!(
-            decoded.encode().unwrap(),
-            legacy,
-            "the emulated legacy file must NOT round-trip byte-identically, else this \
-             test cannot distinguish the two checksum sources"
+            on_disk, canonical,
+            "the file must not be byte-identical to the canonical encoding"
+        );
+        let round_tripped = MetadataSnapshot::decode(&on_disk)
+            .expect("a wide version marker must still decode")
+            .encode()
+            .unwrap();
+        assert_ne!(
+            checkpoint_checksum(&on_disk),
+            checkpoint_checksum(&round_tripped),
+            "the two candidate checksums must differ, or this proves nothing"
         );
 
         let dir = tempdir().unwrap();
         let metadata_dir = dir.path().join("metadata");
         std::fs::create_dir_all(&metadata_dir).unwrap();
-        std::fs::write(metadata_dir.join("snapshot.bin"), &legacy).unwrap();
-        let state = vsr_state_with_checkpoint(CHECKPOINT_OP, checkpoint_checksum(&legacy));
+        let checksum = checkpoint_checksum(&on_disk);
+        IggySnapshot::write_durably(&metadata_dir.join("snapshot.bin"), on_disk)
+            .await
+            .unwrap();
+        let state = vsr_state_with_checkpoint(CHECKPOINT_OP, checksum);
         {
             let superblock = PingPongSuperblock::open(&metadata_dir).await.unwrap();
             superblock.write(&state.to_bytes()).await.unwrap();
@@ -1724,15 +3162,36 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
         assert_eq!(recovered.snapshot_checkpoint.0, CHECKPOINT_OP);
         assert_eq!(
-            recovered.snapshot_checkpoint.1,
-            checkpoint_checksum(&legacy),
+            recovered.snapshot_checkpoint.1, checksum,
             "the verified pairing must be the checksum of the bytes on disk"
         );
+    }
+
+    /// Re-encode a snapshot's leading `version` as an explicit msgpack `u32` marker
+    /// instead of the canonical fixint: same value, five bytes instead of one.
+    ///
+    /// `rmp` reads it back through the same `read_int` the peek uses, and a re-encode
+    /// canonicalizes it away, which is what makes it a probe for "did recovery hash
+    /// the file or its own re-encode".
+    fn with_wide_version_marker(canonical: &[u8]) -> Vec<u8> {
+        let mut cursor = canonical;
+        rmp::decode::read_array_len(&mut cursor).expect("a snapshot encodes as an array");
+        let array_header = canonical.len() - cursor.len();
+        let version: u32 =
+            rmp::decode::read_int(&mut cursor).expect("version is the first element");
+        let version_len = canonical.len() - cursor.len() - array_header;
+
+        let mut wide = Vec::with_capacity(canonical.len() + 4);
+        wide.extend_from_slice(&canonical[..array_header]);
+        rmp::encode::write_u32(&mut wide, version).expect("writing to a Vec cannot fail");
+        wide.extend_from_slice(&canonical[array_header + version_len..]);
+        wide
     }
 
     #[compio::test]
@@ -1755,6 +3214,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();

@@ -23,6 +23,9 @@ namespace Iggy_SDK.Examples.Shared;
 
 public static class ExampleHelpers
 {
+    private const int StreamNameAlreadyExists = 1012;
+    private const int TopicNameAlreadyExists = 2013;
+
     public static async Task EnsureStreamExists(
         IIggyClient client,
         Identifier streamId,
@@ -33,7 +36,13 @@ public static class ExampleHelpers
         var stream = await client.GetStreamByIdAsync(streamId, token);
         if (stream == null)
         {
-            await client.CreateStreamAsync(streamName, token: token);
+            try
+            {
+                await client.CreateStreamAsync(streamName, token: token);
+            }
+            catch (IggyInvalidStatusCodeException error) when (error.FromServer && error.StatusCode == StreamNameAlreadyExists)
+            {
+            }
         }
     }
 
@@ -49,12 +58,18 @@ public static class ExampleHelpers
         var topic = await client.GetTopicByIdAsync(streamId, topicId, cancellationToken);
         if (topic == null)
         {
-            await client.CreateTopicAsync(
-                streamId,
-                topicName,
-                partitionsCount,
-                token: cancellationToken
-            );
+            try
+            {
+                await client.CreateTopicAsync(
+                    streamId,
+                    topicName,
+                    partitionsCount,
+                    token: cancellationToken
+                );
+            }
+            catch (IggyInvalidStatusCodeException error) when (error.FromServer && error.StatusCode == TopicNameAlreadyExists)
+            {
+            }
         }
     }
 }

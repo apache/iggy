@@ -21,12 +21,14 @@ package org.apache.iggy.client.blocking;
 
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
-import org.apache.iggy.topic.CompressionAlgorithm;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
+import org.apache.iggy.topic.TopicOptions;
+import org.apache.iggy.topic.TopicUpdate;
 
-import java.math.BigInteger;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 public interface TopicsClient {
@@ -43,59 +45,42 @@ public interface TopicsClient {
 
     List<Topic> getTopics(StreamId streamId);
 
-    default TopicDetails createTopic(
-            Long streamId,
-            Long partitionsCount,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
-            String name) {
+    default TopicDetails createTopic(Long streamId, String name, long partitionsCount) {
+        return createTopic(StreamId.of(streamId), name, partitionsCount);
+    }
+
+    default TopicDetails createTopic(Long streamId, String name, long partitionsCount, TopicOptions options) {
+        return createTopic(StreamId.of(streamId), name, partitionsCount, options);
+    }
+
+    /** Creates a topic with the server's default settings. */
+    default TopicDetails createTopic(StreamId streamId, String name, long partitionsCount) {
         return createTopic(
-                StreamId.of(streamId),
-                partitionsCount,
-                compressionAlgorithm,
-                messageExpiry,
-                maxTopicSize,
-                replicationFactor,
-                name);
+                streamId, name, partitionsCount, TopicOptions.builder().build());
     }
 
-    TopicDetails createTopic(
-            StreamId streamId,
-            Long partitionsCount,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
-            String name);
-
-    default void updateTopic(
-            Long streamId,
-            Long topicId,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
-            String name) {
-        updateTopic(
-                StreamId.of(streamId),
-                TopicId.of(topicId),
-                compressionAlgorithm,
-                messageExpiry,
-                maxTopicSize,
-                replicationFactor,
-                name);
+    /** Creates a topic with typed settings. Unset keys resolve to the server defaults. */
+    default TopicDetails createTopic(StreamId streamId, String name, long partitionsCount, TopicOptions options) {
+        return createTopic(streamId, name, partitionsCount, options.entries());
     }
 
-    void updateTopic(
-            StreamId streamId,
-            TopicId topicId,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            Optional<Short> replicationFactor,
-            String name);
+    /**
+     * Creates a topic with settings keyed by option name, for keys newer than this build.
+     *
+     * <p>{@code options} reuses {@link HeaderValue} because options ride the user-headers codec. A key
+     * outside the catalog is refused by name.
+     */
+    TopicDetails createTopic(StreamId streamId, String name, long partitionsCount, Map<String, HeaderValue> options);
+
+    default void updateTopic(Long streamId, Long topicId, TopicUpdate update) {
+        updateTopic(StreamId.of(streamId), TopicId.of(topicId), update);
+    }
+
+    /**
+     * Updates a topic's name, message expiry or size cap, or resets the last two to their defaults. Every
+     * key left out keeps its value.
+     */
+    void updateTopic(StreamId streamId, TopicId topicId, TopicUpdate update);
 
     default void deleteTopic(Long streamId, Long topicId) {
         deleteTopic(StreamId.of(streamId), TopicId.of(topicId));

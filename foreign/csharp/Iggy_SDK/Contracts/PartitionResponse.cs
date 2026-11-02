@@ -25,10 +25,13 @@ namespace Apache.Iggy.Contracts;
 /// </summary>
 public sealed class PartitionResponse
 {
+    /// <summary>Captured incarnation and ownership authority for these offsets.</summary>
+    public PartitionContext Context { get; init; }
+
     /// <summary>
     ///     Partition identifier.
     /// </summary>
-    public required int Id { get; init; }
+    public required uint Id { get; init; }
 
     /// <summary>
     ///     Number of messages in the partition.
@@ -44,7 +47,7 @@ public sealed class PartitionResponse
     /// <summary>
     ///     Number of segments in the partition.
     /// </summary>
-    public required int SegmentsCount { get; init; }
+    public required uint SegmentsCount { get; init; }
 
     /// <summary>
     ///     Current offset of the partition.
@@ -56,4 +59,15 @@ public sealed class PartitionResponse
     /// </summary>
     [JsonConverter(typeof(SizeConverter))]
     public required ulong Size { get; init; }
+
+    /// <summary>
+    ///     Node ids that store the partition, in member order.
+    /// </summary>
+    public IReadOnlyList<byte> Members { get; init; } = [];
+
+    /// <summary>
+    ///     Node ids among <see cref="Members" /> that the partition's primary last reported in sync and that are up.
+    ///     Empty until the primary first reports.
+    /// </summary>
+    public IReadOnlyList<byte> InSyncMembers { get; init; } = [];
 }

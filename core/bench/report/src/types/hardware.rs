@@ -18,7 +18,7 @@
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
 
-#[derive(Debug, Serialize, Deserialize, Clone, derive_new::new, PartialEq, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub struct BenchmarkHardware {
     pub identifier: Option<String>,
     pub cpu_name: String,

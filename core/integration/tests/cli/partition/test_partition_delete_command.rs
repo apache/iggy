@@ -22,7 +22,8 @@ use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
 use iggy::prelude::IggyExpiry;
-use iggy::prelude::MaxTopicSize;
+use iggy::prelude::StreamCreateOptions;
+use iggy::prelude::TopicCreateOptions;
 use predicates::str::diff;
 use serial_test::parallel;
 
@@ -71,7 +72,9 @@ impl TestPartitionDeleteCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestPartitionDeleteCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name).await;
+        let stream = client
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
         self.actual_stream_id = Some(stream.unwrap().id);
 
@@ -79,11 +82,11 @@ impl IggyCmdTestCase for TestPartitionDeleteCmd {
             .create_topic(
                 &self.actual_stream_id.unwrap().try_into().unwrap(),
                 &self.topic_name,
-                self.partitions_count,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(self.partitions_count),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await;
         assert!(topic.is_ok());

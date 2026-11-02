@@ -31,21 +31,24 @@ mod jwks;
 mod jwt;
 mod metrics;
 mod reads;
+mod relay_proof;
 mod reply;
 mod session;
 mod state;
 mod submit;
 mod tls;
+#[cfg(feature = "iggy-web")]
+mod web;
 mod wire;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use axum::Router;
 use axum::extract::connect_info::Connected;
@@ -54,57 +57,70 @@ use axum::http::{HeaderName, HeaderValue, Method, StatusCode, Version, header::C
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::Response;
 use axum::routing::{delete, get, post, put};
-use compio::net::TcpListener;
-use configs::cluster::{ClusterConfig, TransportPorts, http_forwarding_key_material};
+use compio::net::{TcpListener, TcpStream};
+use configs::cluster::{ClusterConfig, http_forwarding_key_material};
 use configs::http::{HttpConfig, HttpCorsConfig};
-use configs::server::ServerSystemConfig;
+use configs::server::ServerConfig;
 use iggy_common::IggyError;
-use message_bus::client_listener;
+use message_bus::{ConnectionCap, ConnectionPermit, client_listener};
 use send_wrapper::SendWrapper;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
 
-use crate::bootstrap::ServerShard;
 use crate::cluster_meta::ClusterRoster;
 use crate::http::handlers::{
     change_password, create_cg, create_partitions, create_pat, create_stream, create_topic,
     create_user, delete_cg, delete_consumer_offset, delete_partitions, delete_pat, delete_segments,
-    delete_stream, delete_topic, delete_user, get_cg, get_cgs, get_client, get_clients,
-    get_cluster_metadata, get_consumer_offset, get_pats, get_snapshot, get_stats, get_stream,
-    get_streams, get_topic, get_topics, get_user, get_users, login_user,
-    login_with_personal_access_token, logout_user, ping, poll_messages, purge_stream, purge_topic,
-    refresh_token, send_messages, store_consumer_offset, update_permissions, update_stream,
-    update_topic, update_user,
+    delete_stream, delete_topic, delete_user, describe_options, get_cg, get_cgs, get_client,
+    get_clients, get_cluster_metadata, get_consumer_offset, get_metadata_changes, get_pats,
+    get_snapshot, get_stats, get_stream, get_streams, get_topic, get_topics, get_user, get_users,
+    login_user, login_with_personal_access_token, logout_user, ping, poll_messages,
+    poll_messages_committing, poll_messages_deferred, refresh_token, send_messages,
+    store_consumer_offset, update_permissions, update_stream, update_topic, update_user,
 };
 use crate::http::jwt::JwtManager;
 use crate::http::session::RegistrationBarrier;
-use crate::http::state::{HttpInner, HttpState, insert_view_header};
+use crate::http::state::{ForwardState, HttpInner, HttpState, insert_view_header};
 use crate::server_error::ServerError;
+use crate::shell::ServerShard;
 
-/// Bind the shard-0 HTTP listener and spawn the `cyper-axum` serve loop as a
-/// background task on shard 0's compio runtime. Serves HTTPS when
-/// `http.tls.enabled` (a TLS accept pump feeds handshaken streams to the
-/// serve loop, see [`mod@tls`]), plain HTTP otherwise.
-///
-/// The caller gates this to shard 0 and to `http.enabled`; the listener stops
-/// when the bus shutdown token fires.
+/// The shard-0 HTTP listener before its socket exists: the address to bind
+/// and the config products the serve loop needs. Built first at boot, so a
+/// bad `[http.*]` section fails before any listener accepts; [`Self::bind`]
+/// opens the socket.
+pub struct PreparedHttp {
+    addr: SocketAddr,
+    jwt: JwtManager,
+    forward: ForwardState,
+    cors: Option<CorsLayer>,
+    metrics_endpoint: Option<String>,
+    max_request_size: usize,
+}
+
+/// The shard-0 HTTP listener between bind and serve, held apart so the bound
+/// port can be published (cluster roster, `current_config.toml`) before any
+/// request is answered.
+pub struct BoundHttp {
+    listener: TcpListener,
+    pub bound_addr: SocketAddr,
+    prepared: PreparedHttp,
+}
+
+/// Validate the HTTP config and build what the serve loop needs, without
+/// opening the socket; [`PreparedHttp::bind`] binds it and [`start`] serves
+/// it. The caller gates this to shard 0 and to `http.enabled`.
 ///
 /// # Errors
 ///
 /// Returns [`ServerError`] if the JWT manager cannot be built from
 /// `http_config.jwt`, the `[http.cors]` config is invalid, the `[http.tls]`
-/// credentials cannot be loaded, or the listener cannot bind to `addr`.
-#[allow(clippy::too_many_arguments)]
-pub async fn start(
-    shard: &Rc<ServerShard>,
+/// forwarding credentials cannot be loaded, or the `[http.metrics]` endpoint
+/// is not a route path.
+pub fn prepare(
     addr: SocketAddr,
     http_config: &HttpConfig,
-    clients_table_max: usize,
-    max_tokens_per_user: u32,
     cluster: &ClusterConfig,
-    system_config: Arc<ServerSystemConfig>,
-    self_ports: TransportPorts,
-) -> Result<(), ServerError> {
+) -> Result<PreparedHttp, ServerError> {
     // In cluster mode with no configured JWT secret the signing key derives
     // from the cluster PSK, so a bearer minted on any node verifies on every
     // node - the invariant follower-to-primary forwarding depends on.
@@ -113,22 +129,22 @@ pub async fn start(
             .then_some(cluster.auth.shared_secret.as_str());
     let jwt = JwtManager::build(&http_config.jwt, cluster_psk)?;
     // Forwarding needs a bearer every node can verify; without key material it
-    // degrades to off (followers answer the transient 503) instead of failing
-    // the boot, so keyless clusters still serve HTTP node-locally.
-    let forwarding_active = http_forwarding_key_material(&http_config.jwt, cluster);
-    if cluster.enabled && !forwarding_active {
+    // degrades to off (metadata followers and partition backups answer the
+    // transient 503) instead of failing the boot, so keyless clusters still
+    // serve HTTP node-locally.
+    let key_material = http_forwarding_key_material(&http_config.jwt, cluster);
+    if cluster.enabled && key_material.is_none() {
         warn!(
-            "cluster mode with http enabled but no http.jwt secrets and no cluster.auth: bearers are node-local and follower-to-primary forwarding is disabled - control-plane writes on followers answer a transient 503; configure http.jwt encoding/decoding secrets or enable cluster.auth (identical on every node) to activate forwarding"
+            "cluster mode with http enabled but no http.jwt secrets and no cluster.auth: bearers are node-local and forwarding is disabled - control-plane writes on followers, and message sends, polls and consumer offset calls on a node that is not the partition primary, answer a transient 503 (code 58); partition primaries are spread over the nodes, which makes that the common case; configure http.jwt encoding/decoding secrets or enable cluster.auth (identical on every node) to activate forwarding"
         );
     }
     // Saturating: a configured limit past the pointer width (32-bit target,
     // >4 GiB value) clamps to the largest enforceable cap instead of wrapping.
     let max_request_size =
         usize::try_from(http_config.max_request_size.as_bytes_u64()).unwrap_or(usize::MAX);
-    let forward =
-        forward::build_forward_state(&http_config.tls, max_request_size, forwarding_active)?;
-    // Validated before bind so a bad [http.cors] fails boot before the socket
-    // opens and the "started" log prints.
+    let forward = forward::build_forward_state(&http_config.tls, max_request_size, key_material)?;
+    // Validated here, before the socket opens, so a bad [http.cors] fails boot
+    // before the "started" log prints.
     let cors = http_config
         .cors
         .enabled
@@ -137,63 +153,125 @@ pub async fn start(
     // Same early-fail rule for the scrape path: axum panics on a route
     // without a leading '/', so reject it as a config error instead.
     let metrics_endpoint = metrics::validated_endpoint(&http_config.metrics)?;
-    let (listener, bound_addr) = client_listener::tcp::bind(addr).await?;
+    Ok(PreparedHttp {
+        addr,
+        jwt,
+        forward,
+        cors,
+        metrics_endpoint,
+        max_request_size,
+    })
+}
 
+impl PreparedHttp {
+    /// Open the socket. Kept apart from [`prepare`] so the caller can order it
+    /// after any boot step that may block, and the port never sits listening
+    /// with nothing serving it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] if the listener cannot bind to the prepared
+    /// address.
+    pub fn bind(self) -> Result<BoundHttp, ServerError> {
+        let (listener, bound_addr) = client_listener::tcp::bind(self.addr).map_err(|source| {
+            error!(addr = %self.addr, error = %source, "failed to bind HTTP listener");
+            source
+        })?;
+        Ok(BoundHttp {
+            listener,
+            bound_addr,
+            prepared: self,
+        })
+    }
+}
+
+/// Assemble the router over a bound listener and spawn the `cyper-axum`
+/// serve loop as a background task on shard 0's compio runtime. Serves HTTPS
+/// when `http.tls.enabled` (a TLS accept pump feeds handshaken streams to the
+/// serve loop, see [`mod@tls`]), plain HTTP otherwise; the listener stops
+/// when the bus shutdown token fires.
+///
+/// Both paths count every accepted socket in `connections`, the node's cap on
+/// client sockets, and close a socket past it at accept.
+///
+/// `roster` is shard 0's own [`ClusterRoster`], so the HTTP and binary
+/// cluster-metadata reads serve one truth.
+///
+/// # Errors
+///
+/// Returns [`ServerError`] if the `[http.tls]` server credentials cannot be
+/// loaded.
+#[allow(clippy::too_many_arguments)]
+pub fn start(
+    bound: BoundHttp,
+    shard: &Rc<ServerShard>,
+    session_liveness: Rc<RefCell<crate::consumer_group::lease::ConsumerGroupLiveness>>,
+    http_config: &HttpConfig,
+    clients_table_max: usize,
+    server_config: Arc<ServerConfig>,
+    roster: Rc<ClusterRoster>,
+    connections: &Rc<ConnectionCap>,
+    shard_metrics_all: &[shard::metrics::ShardMetrics],
+) -> Result<(), ServerError> {
+    let BoundHttp {
+        listener,
+        bound_addr,
+        prepared:
+            PreparedHttp {
+                jwt,
+                forward,
+                cors,
+                metrics_endpoint,
+                max_request_size,
+                ..
+            },
+    } = bound;
     let state: HttpState = SendWrapper::new(Rc::new(HttpInner {
+        session_liveness,
         shard: Rc::clone(shard),
         jwt,
-        system_config,
+        server_config,
         sessions: RefCell::new(HashMap::new()),
         registrations: RegistrationBarrier::default(),
-        roster: ClusterRoster {
-            enabled: cluster.enabled,
-            name: cluster.name.clone(),
-            nodes: cluster.nodes.iter().cloned().map(Into::into).collect(),
-            self_ip: bound_addr.ip().to_string(),
-            // The self node reports the live bound HTTP port; the other client
-            // ports arrive resolved from the caller.
-            self_ports: TransportPorts {
-                http: Some(bound_addr.port()),
-                ..self_ports
-            },
-            // The HTTP listener is shard-0-only, where the live consensus
-            // handle supplies the leader; the published-view fallback is
-            // never consulted here.
-            metadata_view: Arc::new(AtomicU64::new(crate::cluster_meta::METADATA_VIEW_UNKNOWN)),
-        },
+        roster,
         max_http_sessions: crate::http::session::max_http_sessions(clients_table_max),
-        max_tokens_per_user,
         in_flight_writes: Cell::new(0),
         forward,
-        metrics: metrics::HttpMetrics::init(),
+        metrics: metrics::HttpMetrics::init(shard_metrics_all),
+        metadata_watermarks: Rc::default(),
     }));
-    let router = router(
+    let app = router(
         state,
         max_request_size,
         cors,
-        metrics_endpoint,
+        metrics_endpoint.as_deref(),
         http_config.web_ui,
     );
 
     if http_config.tls.enabled {
         let server_config = tls::load_http_tls_server_config(&http_config.tls)?;
-        let (connections, pump) = tls::spawn_accept_pump(
+        let (handshaken, pump) = tls::spawn_accept_pump(
             listener,
             server_config,
+            Rc::clone(connections),
             shard.bus.config().handshake_grace,
             shard.bus.token(),
         );
         shard.bus.track_background(pump);
         info!(address = %bound_addr, "server HTTPS listener started");
-        let handle = compio::runtime::spawn(tls::serve(connections, router, shard.bus.token()));
+        let handle = compio::runtime::spawn(tls::serve(handshaken, app, shard.bus.token()));
         shard.bus.track_background(handle);
     } else {
         info!(address = %bound_addr, "server HTTP listener started");
         let shutdown = shard.bus.token();
+        let listener = CappedListener {
+            listener,
+            connections: Rc::clone(connections),
+        };
         let handle = compio::runtime::spawn(async move {
             if let Err(error) = cyper_axum::serve(
                 listener,
-                router.into_make_service_with_connect_info::<ClientAddr>(),
+                app.into_make_service_with_connect_info::<ClientAddr>(),
             )
             .with_graceful_shutdown(async move { shutdown.wait().await })
             .await
@@ -215,12 +293,58 @@ pub async fn start(
 /// `ConnectInfo<ClientAddr>` extension per connection instead. Handlers read
 /// it through the `Identity` extractor's `client_ip`, which picks the
 /// advertised address a client is told about - never authorization.
-#[derive(Debug, Clone, Copy)]
-pub struct ClientAddr(pub SocketAddr);
+///
+/// It also holds the connection's slot in the node's connection cap. The
+/// per-connection service owns this value, so the slot frees when hyper drops
+/// the connection.
+#[derive(Debug, Clone)]
+pub struct ClientAddr {
+    pub addr: SocketAddr,
+    _permit: Option<Arc<ConnectionPermit>>,
+}
 
-impl Connected<cyper_axum::IncomingStream<'_, TcpListener>> for ClientAddr {
-    fn connect_info(stream: cyper_axum::IncomingStream<'_, TcpListener>) -> Self {
-        Self(*stream.remote_addr())
+impl Connected<cyper_axum::IncomingStream<'_, CappedListener>> for ClientAddr {
+    fn connect_info(stream: cyper_axum::IncomingStream<'_, CappedListener>) -> Self {
+        stream.remote_addr().clone()
+    }
+}
+
+/// The plain HTTP listener behind the node's connection cap. A socket past
+/// the cap is closed at accept.
+pub struct CappedListener {
+    listener: TcpListener,
+    connections: Rc<ConnectionCap>,
+}
+
+impl cyper_axum::Listener for CappedListener {
+    type Io = TcpStream;
+    /// The permit is `None` only for the listener's own local address.
+    type Addr = ClientAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            // The `TcpListener` impl retries accept errors, and waits a second
+            // after one that is not about the connection, such as `EMFILE`.
+            let (stream, addr) = cyper_axum::Listener::accept(&mut self.listener).await;
+            if let Some(permit) = self.connections.try_acquire() {
+                let permit = Some(Arc::new(permit));
+                return (
+                    stream,
+                    ClientAddr {
+                        addr,
+                        _permit: permit,
+                    },
+                );
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        let addr = self.listener.local_addr()?;
+        Ok(ClientAddr {
+            addr,
+            _permit: None,
+        })
     }
 }
 
@@ -236,9 +360,11 @@ const PING_PATH: &str = "/ping";
 /// whose writes all commit through the metadata consensus group - carry the
 /// `forward_to_primary` route layer, so on a follower they are relayed to the
 /// primary instead of failing with a transient 503 (reads under that layer
-/// still serve locally unless `?consistency=linearizable`). The local routes
-/// never need the metadata primary: health, the login/refresh flows (STM read
-/// + JWT mint), node-local reads, and the partition-plane routes.
+/// still serve locally unless `?consistency=linearizable`). The partition
+/// routes go to the primary of their partition instead. The local routes
+/// never need a primary: health, the login/refresh flows (STM read + JWT
+/// mint), node-local reads, and the metadata floor another node reads here,
+/// whose caller proves itself with a relay proof instead of a bearer.
 ///
 /// `max_request_size` becomes the router-wide `DefaultBodyLimit` (413 past
 /// it), exactly like the legacy server: it bounds the per-request term of the
@@ -255,14 +381,14 @@ const PING_PATH: &str = "/ping";
 /// the inner layer's `iggy-view`.
 ///
 /// `metrics_endpoint`, present only when `[http.metrics]` is enabled, mounts
-/// the public scrape route among the local routes (a scrape must describe the
-/// serving node, never a forwarded primary) and switches on the
+/// the auth-only scrape route among the local routes (a scrape must describe
+/// the serving node, never a forwarded primary) and switches on the
 /// request-counting layer.
 fn router(
     state: HttpState,
     max_request_size: usize,
     cors: Option<CorsLayer>,
-    metrics_endpoint: Option<String>,
+    metrics_endpoint: Option<&str>,
     web_ui: bool,
 ) -> Router {
     // Cloned for the response layer so `Iggy-View` reads the live view per
@@ -274,13 +400,7 @@ fn router(
         .is_some()
         .then(|| state.metrics.request_counter());
     let forwardable = forwardable_routes(state.clone());
-    // The partition-plane routes (produce, consumer-offset writes) stay local:
-    // each partition is its own consensus group whose primary can diverge from
-    // the metadata primary, so forwarding them to the metadata primary would
-    // livelock whenever the two disagree.
-    // TODO: forward partition-plane writes to their own partition group's
-    // primary (requires resolving the target partition from the request before
-    // dispatch, and rewriting balanced partitioning to an explicit partition).
+    let partitions = partition_routes(state.clone());
     let local = Router::new()
         .route(PING_PATH, get(ping))
         .route("/users/login", post(login_user))
@@ -289,42 +409,36 @@ fn router(
             "/personal-access-tokens/login",
             post(login_with_personal_access_token),
         )
-        .route(
-            "/streams/{stream_id}/topics/{topic_id}/messages",
-            get(poll_messages).post(send_messages),
-        )
-        .route(
-            "/streams/{stream_id}/topics/{topic_id}/consumer-offsets",
-            get(get_consumer_offset).put(store_consumer_offset),
-        )
-        .route(
-            "/streams/{stream_id}/topics/{topic_id}/consumer-offsets/{consumer_id}",
-            delete(delete_consumer_offset),
-        )
         .route("/stats", get(get_stats))
+        .route("/options/{scope}", get(describe_options))
         .route("/snapshot", post(get_snapshot))
+        .route("/metadata/changes", get(get_metadata_changes))
         .route("/cluster/metadata", get(get_cluster_metadata))
+        .route(
+            forward::METADATA_FLOOR_PATH,
+            get(forward::answer_metadata_floor),
+        )
         .route("/clients", get(get_clients))
         .route("/clients/{client_id}", get(get_client));
-    let local = match &metrics_endpoint {
-        Some(endpoint) => local.route(endpoint, get(metrics::get_metrics)),
+    let local = match metrics_endpoint {
+        Some(endpoint) => local.route(endpoint, get(handlers::get_metrics)),
         None => local,
     };
     let router = Router::new()
         .merge(forwardable)
+        .merge(partitions)
         .merge(local)
         .with_state(state)
         .layer(DefaultBodyLimit::max(max_request_size))
         .layer(from_fn(move |request: Request, next: Next| {
             let view_source = view_source.clone();
-            // `/ping` and the metrics scrape are the success routes reached
-            // without proving a credential, so they must not leak the
-            // cluster-internal view number (the anon-leak gate). Every other
-            // route authenticates before its handler, so a success/redirect
-            // there is an authed flow that may carry the header; the login
-            // routes prove credentials on success.
-            let suppress_view = request.uri().path() == PING_PATH
-                || metrics_endpoint.as_deref() == Some(request.uri().path());
+            // `/ping` is the one success route reached without proving a
+            // credential, so it must not leak the cluster-internal view number
+            // (the anon-leak gate). Every other route - the metrics scrape
+            // included - authenticates before its handler, so a success or
+            // redirect there is an authed flow that may carry the header; the
+            // login routes prove credentials on success.
+            let suppress_view = request.uri().path() == PING_PATH;
             async move {
                 let response = next.run(request).await;
                 if suppress_view {
@@ -357,6 +471,34 @@ fn router(
     merge_web_ui(router, web_ui).with_state(())
 }
 
+/// Every request of a partition runs on the primary of its partition group,
+/// reads included, as on the binary transports: the node that receives one
+/// chooses the partition, serves it, and relays the request once when its
+/// owner refuses as a backup ([`forward::serve_partition`]).
+fn partition_routes(state: HttpState) -> Router<HttpState> {
+    Router::new()
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/messages",
+            post(send_messages).get(poll_messages),
+        )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/messages/deferred",
+            get(poll_messages_deferred).post(poll_messages_committing),
+        )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/consumer-offsets",
+            put(store_consumer_offset).get(get_consumer_offset),
+        )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/consumer-offsets/{consumer_id}",
+            delete(delete_consumer_offset),
+        )
+        .route_layer(from_fn_with_state(
+            state,
+            forward::forward_partition_request,
+        ))
+}
+
 /// The control-plane route table: every write here commits through the
 /// metadata consensus group, so the shared `forward_to_primary` route layer
 /// (holding `state`) relays them on a follower.
@@ -377,7 +519,6 @@ fn forwardable_routes(state: HttpState) -> Router<HttpState> {
             "/streams/{stream_id}",
             get(get_stream).put(update_stream).delete(delete_stream),
         )
-        .route("/streams/{stream_id}/purge", delete(purge_stream))
         .route(
             "/streams/{stream_id}/topics",
             get(get_topics).post(create_topic),
@@ -385,10 +526,6 @@ fn forwardable_routes(state: HttpState) -> Router<HttpState> {
         .route(
             "/streams/{stream_id}/topics/{topic_id}",
             get(get_topic).put(update_topic).delete(delete_topic),
-        )
-        .route(
-            "/streams/{stream_id}/topics/{topic_id}/purge",
-            delete(purge_topic),
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/partitions",
@@ -411,7 +548,17 @@ fn forwardable_routes(state: HttpState) -> Router<HttpState> {
         .route_layer(from_fn_with_state(state, forward::forward_to_primary))
 }
 
-/// Stamp `Connection: close` on a 413, which rejects its request body unread.
+/// Close the connection after a 413, which rejects its request body unread.
+async fn close_on_payload_too_large(request: Request, next: Next) -> Response {
+    let version = request.version();
+    let response = next.run(request).await;
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return close_connection(version, response);
+    }
+    response
+}
+
+/// Stamp `Connection: close` on a response that leaves its request body unread.
 ///
 /// hyper decides to close only once it notices the dropped body, and that is
 /// after the response head is already encoded: the reply advertises keep-alive,
@@ -421,10 +568,8 @@ fn forwardable_routes(state: HttpState) -> Router<HttpState> {
 ///
 /// HTTP/2 carries no connection-level headers, so h2 replies are left alone
 /// rather than handed a header hyper would strip and warn about.
-async fn close_on_payload_too_large(request: Request, next: Next) -> Response {
-    let http2 = request.version() == Version::HTTP_2;
-    let mut response = next.run(request).await;
-    if !http2 && response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+fn close_connection(version: Version, mut response: Response) -> Response {
+    if version != Version::HTTP_2 {
         response
             .headers_mut()
             .insert(CONNECTION, HeaderValue::from_static("close"));
@@ -445,7 +590,7 @@ fn merge_web_ui(router: Router, web_ui: bool) -> Router {
     #[cfg(feature = "iggy-web")]
     let router = if web_ui {
         info!("Web UI enabled at /ui");
-        router.merge(crate::web::router())
+        router.merge(web::router())
     } else {
         router
     };

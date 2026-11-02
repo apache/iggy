@@ -32,15 +32,14 @@ public class TestHooks
     [BeforeScenario]
     public void BeforeScenario()
     {
-        _context.TcpUrl = Environment.GetEnvironmentVariable("IGGY_TCP_ADDRESS") ?? "127.0.0.1:8090";
-        _context.LeaderTcpUrl = Environment.GetEnvironmentVariable("IGGY_TCP_ADDRESS_LEADER") ?? "127.0.0.1:8091";
-        _context.FollowerTcpUrl = Environment.GetEnvironmentVariable("IGGY_TCP_ADDRESS_FOLLOWER") ?? "127.0.0.1:8092";
         _context.Clients.Clear();
         _context.CreatedStream = null;
         _context.RedirectionOccurred = false;
         _context.LastStreamId = null;
+        _context.LastStreamKey = null;
         _context.LastRawResponse = null;
         _context.LastRawError = null;
+        _context.LastCallError = null;
     }
 
     [AfterScenario]

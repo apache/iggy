@@ -17,8 +17,10 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { MAX_U32 } from '../constant.js';
 import type { ClientConfig } from './client.type.js';
 import {
+  DEFAULT_HEARTBEAT_INTERVAL,
   DEFAULT_MAX_RESPONSE_FRAME_SIZE,
   normalizeClientConfig
 } from './client.config.js';
@@ -39,7 +41,84 @@ describe('normalizeClientConfig', () => {
     );
   });
 
-  it('restricts the client to one pooled connection', () => {
+  it('enables the heartbeat by default and honours an explicit interval', () => {
+    assert.equal(DEFAULT_HEARTBEAT_INTERVAL, 5000);
+
+    assert.equal(
+      normalizeClientConfig(config()).heartbeatInterval,
+      DEFAULT_HEARTBEAT_INTERVAL
+    );
+
+    assert.equal(
+      normalizeClientConfig({ ...config(), heartbeatInterval: 1000 })
+        .heartbeatInterval,
+      1000
+    );
+
+    assert.equal(
+      normalizeClientConfig({ ...config(), heartbeatInterval: 0 })
+        .heartbeatInterval,
+      0
+    );
+  });
+
+  it('rejects unusable heartbeat intervals', () => {
+    for (const heartbeatInterval of [
+      -1, -5000, Number.NaN, 1.5, 2_147_483_648, 2 ** 32, Number.MAX_VALUE
+    ])
+      assert.throws(
+        () => normalizeClientConfig({
+          ...config(),
+          heartbeatInterval
+        }),
+        /heartbeatInterval/
+      );
+  });
+
+  it('accepts a usable reconnect interval', () => {
+    const reconnect = { enabled: true, interval: 1000, maxRetries: 3 };
+    assert.deepEqual(
+      normalizeClientConfig({ ...config(), reconnect }).reconnect,
+      reconnect
+    );
+  });
+
+  it('rejects unusable reconnect intervals', () => {
+    for (const interval of [
+      0, -1000, Number.NaN, 1.5, 2_147_483_648, Number.MAX_VALUE
+    ])
+      assert.throws(
+        () => normalizeClientConfig({
+          ...config(),
+          reconnect: { enabled: true, interval, maxRetries: 1 }
+        }),
+        /reconnect\.interval/
+      );
+  });
+
+  it('skips the interval check when reconnect is disabled', () => {
+    assert.doesNotThrow(() =>
+      normalizeClientConfig({
+        ...config(),
+        reconnect: { enabled: false, interval: 0, maxRetries: 0 }
+      })
+    );
+  });
+
+  it('rejects unusable reconnect maxRetries', () => {
+    for (const maxRetries of [
+      -1, Number.NaN, 1.5, MAX_U32 + 1, Number.MAX_VALUE
+    ])
+      assert.throws(
+        () => normalizeClientConfig({
+          ...config(),
+          reconnect: { enabled: true, interval: 1000, maxRetries }
+        }),
+        /reconnect\.maxRetries/
+      );
+  });
+
+  it('preserves the one-logical-client pool option', () => {
     const normalized = normalizeClientConfig(config());
     assert.deepEqual(normalized.poolSize, { min: 1, max: 1 });
 
@@ -48,8 +127,22 @@ describe('normalizeClientConfig', () => {
         ...config(),
         poolSize: { max: 2 }
       }),
-      /exactly one pooled connection/
+      /exactly one logical client/
     );
+  });
+
+  it('applies and validates shared mutation admission limits', () => {
+    const defaults = normalizeClientConfig(config());
+    assert.equal(defaults.maxPendingOperations, 256);
+    assert.equal(defaults.maxPendingOperationBytes, 64 * 1024 * 1024);
+    const bounded = normalizeClientConfig({ ...config(), maxPendingOperations: 1, maxPendingOperationBytes: 256 });
+    assert.equal(bounded.maxPendingOperations, 1);
+    assert.equal(bounded.maxPendingOperationBytes, 256);
+    for (const maxPendingOperations of [0, -1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1])
+      assert.throws(() => normalizeClientConfig({ ...config(), maxPendingOperations }), /maxPendingOperations/);
+    assert.equal(normalizeClientConfig({ ...config(), maxPendingOperationBytes: 1 }).maxPendingOperationBytes, 1);
+    for (const maxPendingOperationBytes of [0, -1, 256.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1])
+      assert.throws(() => normalizeClientConfig({ ...config(), maxPendingOperationBytes }), /maxPendingOperationBytes/);
   });
 
   it('supports TLS transport', () => {

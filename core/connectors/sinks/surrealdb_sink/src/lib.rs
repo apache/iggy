@@ -19,8 +19,8 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose;
 use bytes::Bytes;
-use iggy_connector_sdk::convert::owned_value_to_serde_json;
-use iggy_connector_sdk::retry::{exponential_backoff, jitter, parse_duration};
+use iggy_connector_sdk::convert::owned_value_into_serde_json;
+use iggy_connector_sdk::retry::{parse_duration, retry_backoff};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
@@ -583,7 +583,14 @@ impl SurrealDbSink {
             return request;
         };
 
-        request.basic_auth(username, Some(password.expose_secret()))
+        let mut request = request.basic_auth(username, Some(password.expose_secret()));
+        if matches!(self.auth_scope, AuthScope::Namespace | AuthScope::Database) {
+            request = request.header("Surreal-Auth-NS", &self.namespace);
+        }
+        if self.auth_scope == AuthScope::Database {
+            request = request.header("Surreal-Auth-DB", &self.database);
+        }
+        request
     }
 
     async fn process_messages(
@@ -773,11 +780,7 @@ impl SurrealDbSink {
                         }
                     }
 
-                    let delay = jitter(exponential_backoff(
-                        self.retry_delay,
-                        attempts.saturating_sub(1),
-                        self.max_retry_delay,
-                    ));
+                    let delay = retry_backoff(self.retry_delay, attempts, self.max_retry_delay);
                     warn!(
                         "Transient SurrealDB write error for connector ID: {} (attempt {attempts}/{}): {error}. Retrying in {:?}.",
                         self.id, self.max_retries, delay
@@ -890,9 +893,10 @@ fn build_insert_query(table: &str, records: &[Value]) -> Result<Bytes, Error> {
 }
 
 fn build_auto_payload_document(payload: Payload) -> Result<PayloadDocument, Error> {
+    let payload = payload.into_json_document();
     match payload {
         Payload::Json(value) => Ok(PayloadDocument {
-            value: owned_value_to_serde_json(&value),
+            value: owned_value_into_serde_json(value),
             encoding: ENCODING_JSON,
         }),
         Payload::Text(text) | Payload::Proto(text) => Ok(PayloadDocument {
@@ -908,7 +912,7 @@ fn build_auto_payload_document(payload: Payload) -> Result<PayloadDocument, Erro
 fn build_json_payload_document(payload: Payload) -> Result<PayloadDocument, Error> {
     match payload {
         Payload::Json(value) => Ok(PayloadDocument {
-            value: owned_value_to_serde_json(&value),
+            value: owned_value_into_serde_json(value),
             encoding: ENCODING_JSON,
         }),
         _ => {
@@ -1609,6 +1613,22 @@ mod tests {
     }
 
     #[test]
+    fn given_auto_payload_proto_holding_json_should_store_queryable_json() {
+        let payload = Payload::Proto(r#"{"id":1,"name":"row-1"}"#.to_string());
+        let document = build_auto_payload_document(payload).expect("Failed to build payload");
+        assert_eq!(document.value, json!({"id": 1, "name": "row-1"}));
+        assert_eq!(document.encoding, ENCODING_JSON);
+    }
+
+    #[test]
+    fn given_auto_payload_proto_text_should_store_text() {
+        let payload = Payload::Proto("name: \"row-1\"".to_string());
+        let document = build_auto_payload_document(payload).expect("Failed to build payload");
+        assert_eq!(document.value, Value::String("name: \"row-1\"".to_string()));
+        assert_eq!(document.encoding, ENCODING_TEXT);
+    }
+
+    #[test]
     fn given_auto_payload_text_should_store_text() {
         let payload = Payload::Text("hello".to_string());
         let document = build_auto_payload_document(payload).expect("Failed to build payload");
@@ -1629,6 +1649,15 @@ mod tests {
     #[test]
     fn given_json_payload_format_should_parse_raw_json() {
         let payload = Payload::Raw(br#"{"count":3}"#.to_vec());
+        let document = build_json_payload_document(payload).expect("Failed to build payload");
+
+        assert_eq!(document.encoding, ENCODING_JSON);
+        assert_eq!(document.value, json!({"count": 3}));
+    }
+
+    #[test]
+    fn given_json_payload_format_should_convert_a_json_payload_directly() {
+        let payload = json_payload(json!({"count": 3}));
         let document = build_json_payload_document(payload).expect("Failed to build payload");
 
         assert_eq!(document.encoding, ENCODING_JSON);

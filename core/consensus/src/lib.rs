@@ -34,6 +34,13 @@ pub trait Pipeline {
 
     fn pop(&mut self) -> Option<Self::Entry>;
 
+    /// Drop the newest entry when it is exactly `(op, checksum)`, returning it;
+    /// `None` and no mutation otherwise. Unwinds a push that proved not to be durable.
+    ///
+    /// The checksum is not redundant: op numbers repeat across views, so matching on
+    /// `op` alone can pop a live entry belonging to a later one.
+    fn remove_tail(&mut self, op: u64, checksum: u128) -> Option<Self::Entry>;
+
     fn clear(&mut self);
 
     fn entry_by_op(&self, op: u64) -> Option<&Self::Entry>;
@@ -52,6 +59,9 @@ pub trait Pipeline {
 
     fn len(&self) -> usize;
 
+    /// Requests parked waiting for a prepare slot (the second queue).
+    fn request_queue_len(&self) -> usize;
+
     /// In-flight prepare-queue capacity. `VsrConsensus` snapshots it at
     /// construction to size the loopback queue and to bound the uncommitted
     /// range a new primary may rebuild after a view change.
@@ -60,12 +70,18 @@ pub trait Pipeline {
     fn verify(&self);
 
     /// True iff either queue carries `client_id`. Used by metadata-plane
-    /// preflight for in-flight dedup. Partition plane is at-least-once
-    /// and skips. Default `false`; falls through to slot dedup in
-    /// `check_request`.
+    /// preflight for in-flight dedup. Default `false` falls through to the
+    /// committed receipt check.
     fn has_message_from_client(&self, _client_id: u128) -> bool {
         false
     }
+
+    fn pending_client_ids(&self) -> impl Iterator<Item = u128>;
+    /// The unresolved session, request number, and operation.
+    fn pending_request(
+        &self,
+        client_id: u128,
+    ) -> Option<(u64, u64, iggy_binary_protocol::Operation)>;
 
     /// Drop reply senders on every entry; receivers wake `Canceled`.
     /// View-change reset uses this to unblock awaiters while preserving
@@ -99,8 +115,9 @@ pub type AckMessage<C> = <C as Consensus>::Message<<C as Consensus>::AckHeader>;
 
 pub trait Consensus: Sized {
     type MessageBus: MessageBus;
-    #[rustfmt::skip] // Scuffed formatter.
-    type Message<H>: ConsensusMessage<H> where H: ConsensusHeader;
+    type Message<H>: ConsensusMessage<H>
+    where
+        H: ConsensusHeader;
 
     type RoutedRequestHeader: ConsensusHeader;
     type ReplicateHeader: ConsensusHeader;
@@ -115,6 +132,13 @@ pub trait Consensus: Sized {
     fn is_follower(&self) -> bool;
     fn is_normal(&self) -> bool;
     fn is_transferring(&self) -> bool;
+
+    /// A backup that serves its view: the primary of that view can take the
+    /// request at once, so the refusal is `NotPrimary`, not a retry later.
+    /// A ceded primary is still the primary of its view and stays out.
+    fn is_normal_backup(&self) -> bool {
+        self.is_normal() && !self.is_transferring() && self.is_follower()
+    }
 }
 
 /// Shared consensus lifecycle interface for control/data planes.
@@ -150,8 +174,9 @@ where
 pub mod client_table;
 pub mod le_cursor;
 pub use client_table::{
-    CachedReply, ClientEntrySnapshot, ClientTable, ClientTableDecodeError, ClientTableSnapshot,
-    ClientTableWireError, CommitReply,
+    CachedReply, ClientEntrySnapshot, ClientTable, ClientTableDecodeError, ClientTableMode,
+    ClientTableSnapshot, ClientTableWireError, CommitReply, DedupWatermark,
+    EXPIRED_SESSION_REQUEST_ID, RESERVED_CLIENT_ID, is_partition_receipt_operation,
 };
 pub mod state_manifest;
 pub use state_manifest::{
@@ -165,12 +190,19 @@ pub use state_transfer::{
 };
 // One-shot per `PipelineEntry` for in-process commit awaiters.
 pub(crate) mod oneshot;
-pub use oneshot::{Canceled, Receiver};
+pub use oneshot::{Canceled, Receiver, Sender, channel as oneshot_channel};
+
+pub use server_common::fatal::{FatalReason, fatal};
 
 mod impls;
 pub use impls::*;
 mod plane_mux;
 pub use plane_mux::*;
+mod replication;
+pub use replication::{
+    BackupPrefix, REPLICATION_BATCH_BYTES_MAX, ReplicationProgress, ReplicationSend,
+    ReplicationStats, ReplicationWork,
+};
 mod plane_helpers;
 pub use plane_helpers::*;
 mod metadata_helpers;
@@ -183,7 +215,9 @@ pub use view_change_quorum::*;
 
 mod dvc_merge;
 pub use dvc_merge::*;
+mod replica_set;
+pub use replica_set::{ReplicaSet, ReplicaSetError};
 mod vsr_state;
-pub use vsr_state::{VsrState, VsrStateError};
+pub use vsr_state::{AdoptedView, HistoryCertificate, HistoryRecovery, VsrState, VsrStateError};
 mod vsr_timeout;
-pub use vsr_timeout::TimeoutManager;
+pub use vsr_timeout::{TICK_INTERVAL, TimeoutManager};

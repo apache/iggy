@@ -1,0 +1,502 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::str::FromStr;
+
+use futures::StreamExt;
+use iggy::prelude::*;
+use iggy::stream_builder::{IggyConsumerConfig, IggyStreamConsumer};
+use integration::harness::wait_for_consumer_group_assignment;
+use integration::iggy_harness;
+use tokio::time::{Duration, timeout};
+
+const STREAM_NAME: &str = "test-offset-stream";
+const TOPIC_NAME: &str = "test-offset-topic";
+const CONSUMER_NAME: &str = "test-offset-consumer";
+const CONSUMER_GROUP_NAME: &str = "test-offset-group";
+const OFFSET_PARTITION_ID: u32 = 0;
+const ASSIGNED_PARTITION_ID: u32 = 3;
+const POLL_TIMEOUT: Duration = Duration::from_secs(10);
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[iggy_harness(test_client_transport = [Http, Tcp, Quic, WebSocket])]
+async fn given_consumer_and_group_offsets_when_managed_over_any_transport_should_store_read_and_delete(
+    harness: &TestHarness,
+) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
+
+    // A consumer-group member needs a persistent connection. Required
+    // for offset test cases using a consumer group.
+    let seed_client = harness
+        .tcp_root_client()
+        .await
+        .expect("Failed to get tcp seed client");
+
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+    let topic_id = Identifier::named(TOPIC_NAME).unwrap();
+    let group_id = Identifier::named(CONSUMER_GROUP_NAME).unwrap();
+
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    client
+        .create_topic(&stream_id, TOPIC_NAME, &TopicCreateOptions::default())
+        .await
+        .unwrap();
+
+    let mut messages = vec![
+        IggyMessage::from_str("message_1").unwrap(),
+        IggyMessage::from_str("message_2").unwrap(),
+        IggyMessage::from_str("message_3").unwrap(),
+        IggyMessage::from_str("message_4").unwrap(),
+        IggyMessage::from_str("message_5").unwrap(),
+    ];
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(OFFSET_PARTITION_ID),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+
+    // Setup a consumer that joins a group in order to store, read and delete
+    // offsets from a group member.
+    seed_client
+        .create_consumer_group(&stream_id, &topic_id, CONSUMER_GROUP_NAME)
+        .await
+        .unwrap();
+
+    seed_client
+        .join_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap();
+
+    wait_for_consumer_group_assignment(
+        &seed_client,
+        &stream_id,
+        &topic_id,
+        &group_id,
+        1,
+        RESOLVE_TIMEOUT,
+    )
+    .await;
+
+    let standalone_consumer = Consumer::new(Identifier::named(CONSUMER_NAME).unwrap());
+    let group_consumer = Consumer::group(group_id.clone());
+
+    // The group consumer must commit and delete through `seed_client`, the
+    // connection that actually joined the group: the server fences a
+    // group-offset write to the calling connection's own membership.
+    for (consumer, offset, owner) in [
+        (&standalone_consumer, 2_u64, &client),
+        (&group_consumer, 4_u64, &seed_client),
+    ] {
+        owner
+            .store_consumer_offset(
+                consumer,
+                &stream_id,
+                &topic_id,
+                Some(OFFSET_PARTITION_ID),
+                offset,
+            )
+            .await
+            .unwrap();
+
+        let stored_offset = client
+            .get_consumer_offset(consumer, &stream_id, &topic_id, Some(OFFSET_PARTITION_ID))
+            .await
+            .unwrap()
+            .map(|info| info.stored_offset);
+
+        assert_eq!(
+            stored_offset,
+            Some(offset),
+            "{consumer:?} stored offset should be readable over every transport"
+        );
+
+        owner
+            .delete_consumer_offset(consumer, &stream_id, &topic_id, Some(OFFSET_PARTITION_ID))
+            .await
+            .unwrap();
+
+        let stored_offset_after_delete = client
+            .get_consumer_offset(consumer, &stream_id, &topic_id, Some(OFFSET_PARTITION_ID))
+            .await
+            .unwrap()
+            .map(|info| info.stored_offset);
+
+        assert_eq!(
+            stored_offset_after_delete, None,
+            "{consumer:?} stored offset should be gone after delete over every transport"
+        );
+
+        // HTTP has no persistent connection to fence a group-offset write to,
+        // so store/delete/poll should reject consumer_kind=consumer_group.
+        if consumer.kind == ConsumerKind::ConsumerGroup
+            && harness.transport().expect("harness transport") == TransportProtocol::Http
+        {
+            let store_error = client
+                .store_consumer_offset(
+                    consumer,
+                    &stream_id,
+                    &topic_id,
+                    Some(OFFSET_PARTITION_ID),
+                    offset,
+                )
+                .await
+                .expect_err("HTTP store must reject a consumer-group kind");
+            assert!(
+                is_feature_unavailable(&store_error),
+                "expected a feature-unavailable rejection for HTTP store with consumer_kind=consumer_group, got {store_error:?}"
+            );
+
+            let delete_error = client
+                .delete_consumer_offset(consumer, &stream_id, &topic_id, Some(OFFSET_PARTITION_ID))
+                .await
+                .expect_err("HTTP delete must reject a consumer-group kind");
+            assert!(
+                is_feature_unavailable(&delete_error),
+                "expected a feature-unavailable rejection for HTTP delete with consumer_kind=consumer_group, got {delete_error:?}"
+            );
+
+            // The SDK refuses a group poll over HTTP before it sends anything.
+            let poll_error = client
+                .poll_messages(
+                    &stream_id,
+                    &topic_id,
+                    OFFSET_PARTITION_ID,
+                    consumer,
+                    &PollingStrategy::first(),
+                    PollOptions {
+                        count: 1,
+                        ..PollOptions::default()
+                    },
+                )
+                .await
+                .expect_err("HTTP poll must reject a consumer-group kind");
+            assert!(
+                matches!(poll_error, IggyError::FeatureUnavailable),
+                "expected FeatureUnavailable for HTTP poll with consumer_kind=consumer_group, got {poll_error:?}"
+            );
+        }
+    }
+}
+
+#[iggy_harness(test_client_transport = [Http])]
+async fn given_external_group_offset_when_managed_over_http_should_store_read_delete_and_reject_poll(
+    harness: &TestHarness,
+) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
+
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+    let topic_id = Identifier::named(TOPIC_NAME).unwrap();
+
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    client
+        .create_topic(&stream_id, TOPIC_NAME, &TopicCreateOptions::default())
+        .await
+        .unwrap();
+
+    let mut messages = vec![
+        IggyMessage::from_str("message_1").unwrap(),
+        IggyMessage::from_str("message_2").unwrap(),
+        IggyMessage::from_str("message_3").unwrap(),
+        IggyMessage::from_str("message_4").unwrap(),
+        IggyMessage::from_str("message_5").unwrap(),
+    ];
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(OFFSET_PARTITION_ID),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+
+    let group = client
+        .create_consumer_group(&stream_id, &topic_id, CONSUMER_GROUP_NAME)
+        .await
+        .unwrap();
+    let external_group =
+        Consumer::external_group(Identifier::numeric(group.id).expect("valid group id"));
+
+    client
+        .store_consumer_offset(
+            &external_group,
+            &stream_id,
+            &topic_id,
+            Some(OFFSET_PARTITION_ID),
+            3,
+        )
+        .await
+        .unwrap();
+
+    let stored_offset = client
+        .get_consumer_offset(
+            &external_group,
+            &stream_id,
+            &topic_id,
+            Some(OFFSET_PARTITION_ID),
+        )
+        .await
+        .unwrap()
+        .map(|info| info.stored_offset);
+    assert_eq!(
+        stored_offset,
+        Some(3),
+        "external group stored offset should be readable over HTTP"
+    );
+
+    client
+        .delete_consumer_offset(
+            &external_group,
+            &stream_id,
+            &topic_id,
+            Some(OFFSET_PARTITION_ID),
+        )
+        .await
+        .unwrap();
+
+    let stored_offset_after_delete = client
+        .get_consumer_offset(
+            &external_group,
+            &stream_id,
+            &topic_id,
+            Some(OFFSET_PARTITION_ID),
+        )
+        .await
+        .unwrap()
+        .map(|info| info.stored_offset);
+    assert_eq!(
+        stored_offset_after_delete, None,
+        "external group stored offset should be gone after delete over HTTP"
+    );
+
+    let poll_error = client
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            OFFSET_PARTITION_ID,
+            &external_group,
+            &PollingStrategy::first(),
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
+        )
+        .await
+        .expect_err("HTTP poll must reject an external-group kind");
+    assert!(
+        matches!(poll_error, IggyError::FeatureUnavailable),
+        "expected FeatureUnavailable for HTTP poll with consumer_kind=external_group, got {poll_error:?}"
+    );
+}
+
+#[iggy_harness]
+async fn standalone_consumer_deletes_partition_zero_on_none_in_delete_offset(
+    harness: &TestHarness,
+) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+    let topic_id = Identifier::named(TOPIC_NAME).unwrap();
+
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    client
+        .create_topic(
+            &stream_id,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(4),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // send messages to all partitions
+    for partition_id in [0, ASSIGNED_PARTITION_ID] {
+        let mut messages = vec![
+            IggyMessage::from_str("message_1").unwrap(),
+            IggyMessage::from_str("message_2").unwrap(),
+            IggyMessage::from_str("message_3").unwrap(),
+        ];
+        client
+            .send_messages(
+                &stream_id,
+                &topic_id,
+                &Partitioning::partition_id(partition_id),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+    }
+
+    // get consumer assigned to last partition
+    let mut consumer = client
+        .consumer(CONSUMER_NAME, STREAM_NAME, TOPIC_NAME)
+        .unwrap()
+        .partitions([ASSIGNED_PARTITION_ID])
+        .poll_options(PollOptions {
+            count: 1,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
+        .build();
+    consumer.init().await.unwrap();
+
+    timeout(POLL_TIMEOUT, consumer.next())
+        .await
+        .expect("Consumer should receive a message before timeout")
+        .expect("Consumer stream should remain open")
+        .expect("Consumer should poll from the assigned partition");
+    assert_eq!(consumer.partition_id(), ASSIGNED_PARTITION_ID);
+
+    // set offsets for assigned partition and partition 0 manually
+    consumer
+        .store_offset(2, Some(ASSIGNED_PARTITION_ID))
+        .await
+        .unwrap();
+    consumer.store_offset(1, Some(0)).await.unwrap();
+
+    // Check that the offset was stored on the server as intended.
+    let mut stored_offset =
+        fetch_stored_offset(&client, &stream_id, &topic_id, ASSIGNED_PARTITION_ID).await;
+    assert_eq!(stored_offset, Some(2));
+
+    let mut stored_offset_p0 = fetch_stored_offset(&client, &stream_id, &topic_id, 0).await;
+    assert_eq!(stored_offset_p0, Some(1));
+
+    // assigned partition was untouched
+    stored_offset =
+        fetch_stored_offset(&client, &stream_id, &topic_id, ASSIGNED_PARTITION_ID).await;
+    assert_eq!(stored_offset, Some(2));
+
+    // delete with none and check both again
+    consumer.delete_offset(None).await.unwrap();
+    // this fails, since partition 0 got deleted
+    stored_offset_p0 = fetch_stored_offset(&client, &stream_id, &topic_id, 0).await;
+    assert_eq!(stored_offset_p0, Some(1));
+}
+
+#[iggy_harness]
+async fn given_standalone_stream_consumer_when_creating_topic_should_select_partition_independently(
+    harness: &TestHarness,
+) {
+    let client = harness.root_client().await.expect("Root client");
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+
+    for (partitions_count, partition_id) in [(1, None), (4, Some(ASSIGNED_PARTITION_ID))] {
+        let topic_name = format!("{TOPIC_NAME}-{partitions_count}");
+        let topic_id = Identifier::named(&topic_name).unwrap();
+        let config = IggyConsumerConfig::builder()
+            .stream_name(STREAM_NAME)
+            .topic_name(topic_name)
+            .consumer_name(CONSUMER_NAME)
+            .consumer_kind(ConsumerKind::Consumer)
+            .create_stream_if_not_exists(true)
+            .create_topic_if_not_exists(true)
+            .partitions_count(partitions_count)
+            .maybe_partitions(partition_id.map(|partition_id| vec![partition_id]))
+            .poll_options(PollOptions {
+                count: 1,
+                ..PollOptions::wait(IggyDuration::ONE_SECOND)
+            })
+            .polling_strategy(PollingStrategy::first())
+            .polling_retry_interval(NonZeroIggyDuration::ONE_SECOND)
+            .init_retries(0)
+            .init_interval(NonZeroIggyDuration::ONE_SECOND)
+            .build();
+        let mut consumer = IggyStreamConsumer::build(&client, &config)
+            .await
+            .expect("Stream consumer should initialize");
+        let topic = client
+            .get_topic(&stream_id, &topic_id)
+            .await
+            .expect("Read created topic")
+            .expect("Topic should be created");
+        assert_eq!(topic.partitions_count, partitions_count);
+
+        let partition_id = partition_id.unwrap_or_default();
+        let mut messages = [IggyMessage::from_str(TOPIC_NAME).unwrap()];
+        client
+            .send_messages(
+                &stream_id,
+                &topic_id,
+                &Partitioning::partition_id(partition_id),
+                &mut messages,
+            )
+            .await
+            .expect("Send to selected partition");
+        timeout(POLL_TIMEOUT, consumer.next())
+            .await
+            .expect("Consumer should receive a message before timeout")
+            .expect("Consumer stream should remain open")
+            .expect("Consumer should poll the selected partition");
+        assert_eq!(consumer.partition_id(), partition_id);
+        consumer.shutdown().await.expect("Shut down consumer");
+    }
+}
+
+/// True when an HTTP error body wraps the `FeatureUnavailable` error code into a 400.
+fn is_feature_unavailable(error: &IggyError) -> bool {
+    let IggyError::HttpResponseError(_, body) = error else {
+        return false;
+    };
+
+    crate::server::scenarios::permissions_scenario::http_error_id(body)
+        == Some(IggyError::FeatureUnavailable.as_code())
+}
+
+/// Read the offset the server has stored for the consumer.
+async fn fetch_stored_offset(
+    client: &IggyClient,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    partition_id: u32,
+) -> Option<u64> {
+    client
+        .get_consumer_offset(
+            &Consumer::new(Identifier::named(CONSUMER_NAME).unwrap()),
+            stream_id,
+            topic_id,
+            Some(partition_id),
+        )
+        .await
+        .unwrap()
+        .map(|offset| offset.stored_offset)
+}

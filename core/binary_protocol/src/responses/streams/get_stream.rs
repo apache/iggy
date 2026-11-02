@@ -16,54 +16,61 @@
 // under the License.
 
 use crate::WireError;
-use crate::codec::{WireDecode, WireEncode, read_u8, read_u32_le, read_u64_le};
+use crate::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le};
 use crate::primitives::identifier::WireName;
+use crate::primitives::options::{
+    WireOptions, decode_options_prefixed, encode_options_prefixed, options_prefixed_size,
+};
 use crate::responses::streams::StreamResponse;
 use bytes::{BufMut, BytesMut};
-use std::borrow::Cow;
 
 /// Topic header within a `GetStream` response.
 ///
-/// Wire format (51 + `name_len` bytes):
+/// Wire format (33 + `name_len` + options bytes):
 /// ```text
-/// [id:4][created_at:8][partitions_count:4][message_expiry:8]
-/// [compression_algorithm:1][max_topic_size:8][replication_factor:1]
+/// [id:4][created_at:8][partitions_count:4]
 /// [size_bytes:8][messages_count:8][name_len:1][name:N]
+/// [explicit_options_len:4][explicit options TLV]
+/// [derived_options_len:4][derived options TLV]
 /// ```
+///
+/// `options` are the keys the client pinned at create; `derived_options` are
+/// the defaults the admitting primary resolved. A round-tripping client
+/// re-sends only `options`; the effective configuration is the union.
+/// Message expiry, compression and the size cap live in those blocks only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicHeader {
     pub id: u32,
     pub created_at: u64,
     pub partitions_count: u32,
-    pub message_expiry: u64,
-    pub compression_algorithm: u8,
-    pub max_topic_size: u64,
-    pub replication_factor: u8,
     pub size_bytes: u64,
     pub messages_count: u64,
     pub name: WireName,
+    pub options: WireOptions,
+    pub derived_options: WireOptions,
 }
 
 impl TopicHeader {
-    const FIXED_SIZE: usize = 4 + 8 + 4 + 8 + 1 + 8 + 1 + 8 + 8 + 1; // 51
+    pub(crate) const FIXED_SIZE: usize = 4 + 8 + 4 + 8 + 8 + 1; // 33
 }
 
 impl WireEncode for TopicHeader {
     fn encoded_size(&self) -> usize {
-        Self::FIXED_SIZE + self.name.len()
+        Self::FIXED_SIZE
+            + self.name.len()
+            + options_prefixed_size(&self.options)
+            + options_prefixed_size(&self.derived_options)
     }
 
     fn encode(&self, buf: &mut BytesMut) {
         buf.put_u32_le(self.id);
         buf.put_u64_le(self.created_at);
         buf.put_u32_le(self.partitions_count);
-        buf.put_u64_le(self.message_expiry);
-        buf.put_u8(self.compression_algorithm);
-        buf.put_u64_le(self.max_topic_size);
-        buf.put_u8(self.replication_factor);
         buf.put_u64_le(self.size_bytes);
         buf.put_u64_le(self.messages_count);
         self.name.encode(buf);
+        encode_options_prefixed(&self.options, buf);
+        encode_options_prefixed(&self.derived_options, buf);
     }
 }
 
@@ -72,27 +79,25 @@ impl WireDecode for TopicHeader {
         let id = read_u32_le(buf, 0)?;
         let created_at = read_u64_le(buf, 4)?;
         let partitions_count = read_u32_le(buf, 12)?;
-        let message_expiry = read_u64_le(buf, 16)?;
-        let compression_algorithm = read_u8(buf, 24)?;
-        let max_topic_size = read_u64_le(buf, 25)?;
-        let replication_factor = read_u8(buf, 33)?;
-        let size_bytes = read_u64_le(buf, 34)?;
-        let messages_count = read_u64_le(buf, 42)?;
-        let (name, name_consumed) = WireName::decode(&buf[50..])?;
-        let consumed = 50 + name_consumed;
+        let size_bytes = read_u64_le(buf, 16)?;
+        let messages_count = read_u64_le(buf, 24)?;
+        let (name, name_consumed) = WireName::decode(&buf[32..])?;
+        let mut consumed = 32 + name_consumed;
+        let (options, options_consumed) = decode_options_prefixed(buf, consumed)?;
+        consumed += options_consumed;
+        let (derived_options, derived_consumed) = decode_options_prefixed(buf, consumed)?;
+        consumed += derived_consumed;
 
         Ok((
             Self {
                 id,
                 created_at,
                 partitions_count,
-                message_expiry,
-                compression_algorithm,
-                max_topic_size,
-                replication_factor,
                 size_bytes,
                 messages_count,
                 name,
+                options,
+                derived_options,
             },
             consumed,
         ))
@@ -132,21 +137,25 @@ impl WireEncode for GetStreamResponse {
     }
 }
 
+/// Smallest a topic header can encode as: the fixed ids, timestamps, sizes,
+/// counts and name length, plus the shortest name `WireName` accepts (one byte,
+/// since it rejects an empty one) and two empty length-prefixed option blocks.
+const MIN_TOPIC_HEADER_SIZE: usize = TopicHeader::FIXED_SIZE + 1 + 4 + 4;
+
 impl WireDecode for GetStreamResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let (stream, mut pos) = StreamResponse::decode(buf)?;
-        let mut topics = Vec::new();
-        while pos < buf.len() {
+        // Count-driven: a topic element carries variable-length options
+        // blocks, so "consume until the buffer ends" no longer delimits it.
+        let mut topics = Vec::with_capacity(crate::codec::bounded_capacity(
+            stream.topics_count as usize,
+            buf.len().saturating_sub(pos),
+            MIN_TOPIC_HEADER_SIZE,
+        ));
+        for _ in 0..stream.topics_count {
             let (topic, consumed) = TopicHeader::decode(&buf[pos..])?;
             pos += consumed;
             topics.push(topic);
-        }
-        if topics.len() != stream.topics_count as usize {
-            return Err(WireError::Validation(Cow::Owned(format!(
-                "stream.topics_count={} but decoded {} topics",
-                stream.topics_count,
-                topics.len()
-            ))));
         }
         Ok((Self { stream, topics }, pos))
     }
@@ -164,6 +173,8 @@ mod tests {
             size_bytes: 2048,
             messages_count: 200,
             name: WireName::new("my-stream").unwrap(),
+            options: WireOptions::empty(),
+            derived_options: WireOptions::empty(),
         }
     }
 
@@ -172,13 +183,11 @@ mod tests {
             id,
             created_at: 1_710_000_000_000,
             partitions_count: 3,
-            message_expiry: 0,
-            compression_algorithm: 1,
-            max_topic_size: 0,
-            replication_factor: 1,
             size_bytes: 1024,
             messages_count: 100,
             name: WireName::new(name).unwrap(),
+            options: WireOptions::empty(),
+            derived_options: WireOptions::empty(),
         }
     }
 
@@ -213,10 +222,16 @@ mod tests {
     fn topic_header_roundtrip() {
         let topic = sample_topic(5, "events");
         let bytes = topic.to_bytes();
-        assert_eq!(bytes.len(), TopicHeader::FIXED_SIZE + 6);
+        assert_eq!(bytes.len(), TopicHeader::FIXED_SIZE + 6 + 4 + 4);
         let (decoded, consumed) = TopicHeader::decode(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, topic);
+    }
+
+    #[test]
+    fn min_topic_header_size_matches_the_shortest_encoding() {
+        let bytes = sample_topic(1, "t").to_bytes();
+        assert_eq!(bytes.len(), MIN_TOPIC_HEADER_SIZE);
     }
 
     #[test]

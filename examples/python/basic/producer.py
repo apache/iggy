@@ -19,7 +19,7 @@ import argparse
 import asyncio
 from typing import NamedTuple
 
-from apache_iggy import IggyClient, StreamDetails, TopicDetails
+from apache_iggy import IggyClient, Partitioning, StreamDetails, TopicDetails
 from apache_iggy import SendMessage as Message
 from loguru import logger
 
@@ -71,12 +71,7 @@ async def init_system(client: IggyClient):
     logger.info(f"Creating topic {TOPIC_NAME} in stream {STREAM_NAME}")
     topic: TopicDetails | None = await client.get_topic(STREAM_NAME, TOPIC_NAME)
     if topic is None:
-        await client.create_topic(
-            stream=STREAM_NAME,
-            partitions_count=1,
-            name=TOPIC_NAME,
-            replication_factor=1,
-        )
+        await client.create_topic(stream=STREAM_NAME, name=TOPIC_NAME)
         logger.info("Topic was created successfully.")
     else:
         logger.warning(f"Topic {topic.name} already exists with ID {topic.id}")
@@ -107,7 +102,11 @@ async def produce_messages(client: IggyClient):
             await client.send_messages(
                 stream=STREAM_NAME,
                 topic=TOPIC_NAME,
-                partitioning=PARTITION_ID,
+                # A fixed strategy sends the whole batch to this partition.
+                # For topics with multiple partitions, Partitioning.balanced()
+                # distributes batches round-robin, while
+                # Partitioning.messages_key(key) keeps equal keys on the same partition.
+                partitioning=Partitioning.partition_id(PARTITION_ID),
                 messages=messages,
             )
             n_sent_batches += 1

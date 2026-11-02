@@ -19,17 +19,11 @@ use super::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MessagesMaintenanceConfig,
     TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
 };
-use super::system::MessageDeduplicationConfig;
 use super::{
     http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig},
-    server::MessageSaverConfig,
-    system::{
-        CompressionConfig, EncryptionConfig, LoggingConfig, PartitionConfig, SegmentConfig,
-        StateConfig, StreamConfig, SystemConfig, TopicConfig,
-    },
+    system::{EncryptionConfig, LoggingConfig},
 };
-use configs::ConfigEnvMappings;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 
 impl Display for HttpConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -94,16 +88,6 @@ impl Display for HttpTlsConfig {
     }
 }
 
-impl Display for CompressionConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ allowed_override: {}, default_algorithm: {} }}",
-            self.allow_override, self.default_algorithm
-        )
-    }
-}
-
 impl Display for DataMaintenanceConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{{ messages: {} }}", self.messages)
@@ -124,18 +108,8 @@ impl Display for ConsumerGroupConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ rebalancing_timeout: {}, rebalancing_check_interval: {} }}",
-            self.rebalancing_timeout, self.rebalancing_check_interval
-        )
-    }
-}
-
-impl Display for MessageSaverConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ enabled: {}, enforce_fsync: {}, interval: {} }}",
-            self.enabled, self.enforce_fsync, self.interval
+            "{{ rebalancing_timeout: {}, heartbeat_interval: {} }}",
+            self.rebalancing_timeout, self.heartbeat_interval
         )
     }
 }
@@ -152,57 +126,24 @@ impl Display for HeartbeatConfig {
 
 impl Display for EncryptionConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ enabled: {} }}", self.enabled)
-    }
-}
-
-impl Display for StreamConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ path: {} }}", self.path)
-    }
-}
-
-impl Display for TopicConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ path: {}, max_size: {}, message_expiry: {} }}",
-            self.path, self.max_size, self.message_expiry
+            "{{ enabled: {}, previous_keys: {}, retired_kek_fingerprints: {:?} }}",
+            self.enabled,
+            self.previous_keys.len(),
+            self.retired_kek_fingerprints
         )
     }
 }
 
-impl Display for PartitionConfig {
+impl Debug for EncryptionConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ path: {}, messages_required_to_save: {}, size_of_messages_required_to_save: {}, enforce_fsync: {}, validate_checksum: {} }}",
-            self.path,
-            self.messages_required_to_save,
-            self.size_of_messages_required_to_save,
-            self.enforce_fsync,
-            self.validate_checksum
-        )
-    }
-}
-
-impl Display for MessageDeduplicationConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ enabled: {}, max_entries: {:?}, expiry: {:?} }}",
-            self.enabled, self.max_entries, self.expiry
-        )
-    }
-}
-
-impl Display for SegmentConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ size_bytes: {}, preallocate: {}, cache_indexes: {}, archive_expired: {} }}",
-            self.size, self.preallocate, self.cache_indexes, self.archive_expired,
-        )
+        f.debug_struct("EncryptionConfig")
+            .field("enabled", &self.enabled)
+            .field("key_set", &!self.key.is_empty())
+            .field("previous_keys", &self.previous_keys.len())
+            .field("retired_kek_fingerprints", &self.retired_kek_fingerprints)
+            .finish()
     }
 }
 
@@ -210,14 +151,15 @@ impl Display for LoggingConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ path: {}, level: {}, file_enabled: {}, max_file_size: {}, max_total_size: {}, rotation_check_interval: {}, retention: {} }}",
+            "{{ path: {}, level: {}, file_enabled: {}, max_file_size: {}, max_total_size: {}, rotation_check_interval: {}, retention: {}, sysinfo_print_interval: {} }}",
             self.path,
             self.level,
             self.file_enabled,
             self.max_file_size.as_human_string_with_zero_as_unlimited(),
             self.max_total_size.as_human_string_with_zero_as_unlimited(),
             self.rotation_check_interval,
-            self.retention
+            self.retention,
+            self.sysinfo_print_interval
         )
     }
 }
@@ -242,39 +184,12 @@ impl Display for TelemetryLogsConfig {
     }
 }
 
-impl Display for StateConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ enforce_fsync: {}, max_file_operation_retries: {}, retry_delay: {} }}",
-            self.enforce_fsync, self.max_file_operation_retries, self.retry_delay,
-        )
-    }
-}
-
 impl Display for TelemetryTracesConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "{{ transport: {}, endpoint: {} }}",
             self.transport, self.endpoint
-        )
-    }
-}
-
-impl<S: ConfigEnvMappings> Display for SystemConfig<S> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ path: {}, logging: {}, stream: {}, topic: {}, partition: {}, segment: {}, encryption: {}, state: {} }}",
-            self.path,
-            self.logging,
-            self.stream,
-            self.topic,
-            self.partition,
-            self.segment,
-            self.encryption,
-            self.state,
         )
     }
 }

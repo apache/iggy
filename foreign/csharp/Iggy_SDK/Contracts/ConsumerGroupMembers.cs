@@ -30,10 +30,10 @@ public sealed class ConsumerGroupMember
     /// <summary>
     ///     Number of partitions the consumer group member is consuming.
     /// </summary>
-    public required int PartitionsCount { get; init; }
+    public required uint PartitionsCount { get; init; }
 
     /// <summary>
     ///     List of partition identifiers the consumer group member is consuming.
     /// </summary>
-    public required List<int> Partitions { get; init; }
+    public required List<uint> Partitions { get; init; }
 }
