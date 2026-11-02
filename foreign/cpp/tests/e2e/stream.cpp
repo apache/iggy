@@ -102,7 +102,8 @@ TEST_F(E2E_Stream, UpdateStreamWorksCorrectly) {
     ForgetTrackedStream(stream_name);
     TrackStream(stream_id);
 
-    ASSERT_NO_THROW(client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name));
+    ASSERT_NO_THROW(client.UpdateStream(iggy::Identifier::String(stream_name),
+                                        iggy::StreamUpdateOptions().SetName(updated_stream_name)));
 
     ASSERT_THROW(client.GetStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
 
@@ -126,7 +127,8 @@ TEST_F(E2E_Stream, UpdateStreamWithSameNameIsIdempotent) {
     TrackStream(stream_name);
 
     auto first_read = client.GetStream(iggy::Identifier::String(stream_name));
-    ASSERT_NO_THROW(client.UpdateStream(iggy::Identifier::Numeric(first_read.Id()), stream_name));
+    ASSERT_NO_THROW(client.UpdateStream(iggy::Identifier::Numeric(first_read.Id()),
+                                        iggy::StreamUpdateOptions().SetName(stream_name)));
     auto second_read = client.GetStream(iggy::Identifier::Numeric(first_read.Id()));
 
     EXPECT_EQ(second_read.Id(), first_read.Id());
@@ -147,7 +149,8 @@ TEST_F(E2E_Stream, UpdateStreamWithUnsupportedOptionsRejectsAndPreservesName) {
     TrackStream(stream_name);
 
     const auto options = iggy::StreamUpdateOptions().SetRawEntries({{"not_a_real_option", "true"}});
-    ASSERT_THROW(client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name, options),
+    ASSERT_THROW(client.UpdateStream(iggy::Identifier::String(stream_name),
+                                     iggy::StreamUpdateOptions(options).SetName(updated_stream_name)),
                  iggy::IggyException);
 
     const auto stream = client.GetStream(iggy::Identifier::String(stream_name));
@@ -165,14 +168,17 @@ TEST_F(E2E_Stream, UpdateStreamBeforeLoginThrows) {
 
     auto unauthenticated_client = GetLoggedOutHighLevelClient();
 
-    ASSERT_THROW(unauthenticated_client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name),
+    ASSERT_THROW(unauthenticated_client.UpdateStream(iggy::Identifier::String(stream_name),
+                                                     iggy::StreamUpdateOptions().SetName(updated_stream_name)),
                  iggy::IggyException);
     ASSERT_NO_THROW(unauthenticated_client.Connect());
-    ASSERT_THROW(unauthenticated_client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name),
+    ASSERT_THROW(unauthenticated_client.UpdateStream(iggy::Identifier::String(stream_name),
+                                                     iggy::StreamUpdateOptions().SetName(updated_stream_name)),
                  iggy::IggyException);
     ASSERT_NO_THROW(unauthenticated_client.Login("iggy", "iggy"));
     ASSERT_NO_THROW(unauthenticated_client.Disconnect());
-    ASSERT_THROW(unauthenticated_client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name),
+    ASSERT_THROW(unauthenticated_client.UpdateStream(iggy::Identifier::String(stream_name),
+                                                     iggy::StreamUpdateOptions().SetName(updated_stream_name)),
                  iggy::IggyException);
 }
 
@@ -197,7 +203,8 @@ TEST_F(E2E_Stream, UpdateStreamWithVariousUtf8Characters) {
 
     for (const auto &updated_stream_name : updated_stream_names) {
         SCOPED_TRACE(updated_stream_name);
-        ASSERT_NO_THROW(client.UpdateStream(iggy::Identifier::Numeric(stream_id), updated_stream_name));
+        ASSERT_NO_THROW(client.UpdateStream(iggy::Identifier::Numeric(stream_id),
+                                            iggy::StreamUpdateOptions().SetName(updated_stream_name)));
         ASSERT_NO_THROW({
             const auto stream_details = client.GetStream(iggy::Identifier::Numeric(stream_id));
             EXPECT_EQ(stream_details.Name(), updated_stream_name);
@@ -210,7 +217,9 @@ TEST_F(E2E_Stream, UpdateNonExistentStreamThrows) {
     const std::string stream_name         = GetRandomName();
     const std::string updated_stream_name = GetRandomName();
     auto client                           = GetLoggedInHighLevelClient();
-    ASSERT_THROW(client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name), iggy::IggyException);
+    ASSERT_THROW(client.UpdateStream(iggy::Identifier::String(stream_name),
+                                     iggy::StreamUpdateOptions().SetName(updated_stream_name)),
+                 iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, UpdateStreamWithDuplicateNameThrows) {
@@ -223,7 +232,8 @@ TEST_F(E2E_Stream, UpdateStreamWithDuplicateNameThrows) {
     ASSERT_NO_THROW(client.CreateStream(second_stream_name));
     TrackStream(second_stream_name);
 
-    ASSERT_THROW(client.UpdateStream(iggy::Identifier::String(first_stream_name), second_stream_name),
+    ASSERT_THROW(client.UpdateStream(iggy::Identifier::String(first_stream_name),
+                                     iggy::StreamUpdateOptions().SetName(second_stream_name)),
                  iggy::IggyException);
 }
 
@@ -238,10 +248,13 @@ TEST_F(E2E_Stream, UpdateDeletedStreamThrows) {
     ASSERT_NO_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)));
     ForgetTrackedStream(stream_name);
 
-    ASSERT_THROW(client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name), iggy::IggyException);
+    ASSERT_THROW(client.UpdateStream(iggy::Identifier::String(stream_name),
+                                     iggy::StreamUpdateOptions().SetName(updated_stream_name)),
+                 iggy::IggyException);
 }
 
 TEST_F(E2E_Stream, UpdateStreamOnlyChangesName) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty(
         "description",
         "Changes only the stream name and leaves stream, topic, message, partition, and segment data intact.");
@@ -274,12 +287,13 @@ TEST_F(E2E_Stream, UpdateStreamOnlyChangesName) {
         messages.push_back(std::move(message));
     }
     ASSERT_NO_THROW(ffi_client->send_messages(make_numeric_identifier(stream_id), make_numeric_identifier(0),
-                                              "partition_id", partition_id_bytes(0), std::move(messages)));
+                                              "partition_id", partition_id_bytes(0), std::move(messages), error_info));
 
     auto stream_before_update      = client.GetStream(iggy::Identifier::Numeric(stream_id));
     const auto stats_before_update = client.GetStats();
 
-    ASSERT_NO_THROW(client.UpdateStream(iggy::Identifier::Numeric(stream_id), updated_stream_name));
+    ASSERT_NO_THROW(client.UpdateStream(iggy::Identifier::Numeric(stream_id),
+                                        iggy::StreamUpdateOptions().SetName(updated_stream_name)));
 
     ASSERT_THROW(client.GetStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
     auto stream_after_update      = client.GetStream(iggy::Identifier::Numeric(stream_id));
@@ -335,7 +349,8 @@ TEST_F(E2E_Stream, UpdateStreamValidatesNameBounds) {
     };
     for (const auto &invalid_stream_name : invalid_stream_names) {
         SCOPED_TRACE("invalid_stream_name_length=" + std::to_string(invalid_stream_name.size()));
-        ASSERT_THROW(client.UpdateStream(iggy::Identifier::Numeric(stream_id), invalid_stream_name),
+        ASSERT_THROW(client.UpdateStream(iggy::Identifier::Numeric(stream_id),
+                                         iggy::StreamUpdateOptions().SetName(invalid_stream_name)),
                      iggy::IggyException);
     }
 }
@@ -471,6 +486,7 @@ TEST_F(E2E_Stream, GetStreamsReturnsStreamAfterCreation) {
 }
 
 TEST_F(E2E_Stream, GetStreamsFieldsVerification) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description",
                    "Verifies get_streams returns correct field values after creating stream with topic and messages.");
     const std::string stream_name = GetRandomName();
@@ -493,7 +509,7 @@ TEST_F(E2E_Stream, GetStreamsFieldsVerification) {
         messages.push_back(std::move(msg));
     }
     ffi_client->send_messages(make_numeric_identifier(stream.Id()), make_numeric_identifier(0), "partition_id",
-                              partition_id_bytes(0), std::move(messages));
+                              partition_id_bytes(0), std::move(messages), error_info);
 
     auto streams = client.GetStreams();
     ASSERT_GE(streams.size(), 1u);

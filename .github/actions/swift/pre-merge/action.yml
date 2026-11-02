@@ -33,13 +33,18 @@ runs:
       uses: ./.github/actions/utils/setup-swift
 
     # swift-format ships with the toolchain; the configuration lives in
-    # foreign/swift/.swift-format.
+    # foreign/swift/.swift-format and covers the examples and the BDD runner
+    # too, which compile in their own lanes.
     - name: Format Check
       shell: bash
       if: inputs.task == 'lint'
       run: |
         cd foreign/swift
-        swift format lint --strict --recursive Sources Tests Package.swift
+        swift format lint --strict --recursive Sources Tests Examples Package.swift
+        cd ../..
+        for package in examples/swift/getting-started bdd/swift/tests; do
+          swift format lint --strict --recursive --configuration foreign/swift/.swift-format "$package/Sources" "$package/Package.swift"
+        done
 
     # A warning-free build is the lint gate the Swift compiler provides: the
     # SDK builds in Swift 6 language mode with strict concurrency checking.
@@ -105,10 +110,6 @@ runs:
         fi
         echo "✅ golden.json matches the Rust crates"
 
-    - name: Setup Rust for e2e
-      if: inputs.task == 'e2e'
-      uses: ./.github/actions/utils/setup-rust
-
     - name: Build the end-to-end suite
       shell: bash
       if: inputs.task == 'e2e'
@@ -116,14 +117,20 @@ runs:
         cd foreign/swift
         swift build --build-tests
 
-    # The SDK speaks the VSR wire protocol, so every e2e lane runs against a
-    # locally built VSR server.
+    - name: Download runtime binaries
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/download-runtime
+
+    # The SDK speaks the VSR wire protocol, so every e2e lane runs against the
+    # VSR server from the shared runtime archive.
     - name: Start Iggy server (plain)
       id: iggy
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
+        encryption-enabled: "true"
+        encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-swift-e2e.pid
         log-file: ${{ runner.temp }}/iggy-swift-e2e.log
@@ -150,12 +157,46 @@ runs:
         pid-file: ${{ steps.iggy.outputs.pid_file }}
         log-file: ${{ steps.iggy.outputs.log_file }}
 
+    - name: Start Iggy server (shipped default)
+      id: iggy-default
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-start
+      with:
+        bin: target/debug/iggy-server
+        replica-id: "0"
+        pid-file: ${{ runner.temp }}/iggy-swift-e2e-default.pid
+        log-file: ${{ runner.temp }}/iggy-swift-e2e-default.log
+        wait-timeout-seconds: "90"
+      env:
+        IGGY_PATH: ${{ runner.temp }}/iggy-swift-e2e-default-data
+
+    # The resource options cases need a server key, so they run on the other lanes.
+    - name: Run e2e tests (shipped default)
+      shell: bash
+      if: inputs.task == 'e2e'
+      env:
+        IGGY_TCP_ADDRESS: 127.0.0.1:8090
+        IGGY_ROOT_USERNAME: iggy
+        IGGY_ROOT_PASSWORD: iggy
+      run: |
+        cd foreign/swift
+        swift test --skip-build --filter IggyE2ETests --skip ResourceOptionsE2ETests
+
+    - name: Stop Iggy server (shipped default)
+      if: always() && inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy-default.outputs.pid_file }}
+        log-file: ${{ steps.iggy-default.outputs.log_file }}
+
     - name: Start Iggy server (TLS)
       id: iggy-tls
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
+        encryption-enabled: "true"
+        encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-swift-e2e-tls.pid
         log-file: ${{ runner.temp }}/iggy-swift-e2e-tls.log
@@ -196,7 +237,9 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
+        encryption-enabled: "true"
+        encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-swift-cluster-0.pid
         log-file: ${{ runner.temp }}/iggy-swift-cluster-0.log
@@ -210,7 +253,9 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
+        encryption-enabled: "true"
+        encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
         replica-id: "1"
         tcp_address: 127.0.0.1:8091
         http_address: 127.0.0.1:3001

@@ -18,10 +18,8 @@
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
-use iggy_common::Client;
-use iggy_common::Permissions;
-use iggy_common::UserStatus;
 use iggy_common::create_user::CreateUser;
+use iggy_common::{Client, OptionInputMap, Permissions, UserCreateOptions, UserStatus};
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{Level, event};
 
@@ -42,6 +40,7 @@ impl CreateUserCmd {
                 password: SecretString::from(password),
                 status,
                 permissions,
+                options: OptionInputMap::default(),
             },
         }
     }
@@ -60,6 +59,7 @@ impl CliCommand for CreateUserCmd {
                 self.create_user.password.expose_secret(),
                 self.create_user.status,
                 self.create_user.permissions.clone(),
+                &UserCreateOptions::default(),
             )
             .await
             .with_context(|| {

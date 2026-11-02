@@ -11,6 +11,7 @@ Source connectors are responsible for ingesting data from external sources into 
 | **elasticsearch_source** | Polls documents from Elasticsearch indices with timestamp-based tracking |
 | **http_source** | Webhook gateway: an embedded HTTP server shared by every instance, with per-endpoint bearer/HMAC auth and a management API for endpoints registered at runtime |
 | **influxdb_source** | Polls InfluxDB with cursor-based timestamp tracking; supports V2 (Flux, annotated CSV) and V3 (SQL, JSONL) |
+| **mqtt_source** | Subscribes to MQTT 3.1.1 or MQTT 5 brokers with QoS 0, 1, or 2 |
 | **postgres_source** | Reads rows from PostgreSQL tables with multiple strategies: delete after read, mark as processed, or timestamp tracking |
 | **random_source** | Generates random test messages (useful for testing and development) |
 
@@ -50,6 +51,7 @@ pub struct SourceConfig {
     pub plugin_config: Option<serde_json::Value>,
     pub verbose: bool, // Log message processing at info level instead of debug (default: false)
     pub benchmark: bool, // Emit per-batch timing events on the `iggy_connectors::benchmark` target (default: false)
+    pub exactly_once: bool, // Write each batch once, also after a crash of the runtime (default: false)
 }
 ```
 
@@ -76,6 +78,7 @@ path = "libiggy_connector_random_source" # Path to the source connector
 plugin_config_format = "toml"
 verbose = false # Log message processing at info level instead of debug
 benchmark = false # Emit per-batch timing events on `iggy_connectors::benchmark` target
+exactly_once = false # Write each batch once, also after a crash of the runtime
 
 # Collection of the streams to which the produced messages are sent
 [[streams]]
@@ -84,6 +87,7 @@ topic = "example_topic"
 schema = "json"
 batch_length = 100
 linger_time = "5ms"
+partition_id = 0 # Optional: the partition of every message, 0 for an exactly-once source when unset
 
 # Custom configuration for the source connector, deserialized to type T from `plugin_config` field
 [plugin_config]
@@ -108,6 +112,8 @@ For example, to override the `enabled` property for a source with ID `random`:
 ```bash
 IGGY_CONNECTORS_SOURCE_RANDOM_ENABLED=false
 ```
+
+The [runtime README](../runtime/README.md#exactly-once-sources) describes `exactly_once` and its limits.
 
 ## Sample implementation
 

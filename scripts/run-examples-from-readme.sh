@@ -21,7 +21,7 @@ set -euo pipefail
 # Unified script to run SDK examples from README.md files.
 # Usage: ./scripts/run-examples-from-readme.sh [OPTIONS]
 #
-#   --language LANG   Language to test: rust|go|node|python|php|java|csharp (default: all)
+#   --language LANG   Language to test: rust|go|node|python|php|java|csharp|swift (default: all)
 #   --target TARGET   Cargo target architecture for the server binary
 #   --skip-tls        Skip TLS example tests
 #
@@ -182,18 +182,19 @@ run_rust_examples() {
     resolve_server_binary "${TARGET}" "iggy-server"
     resolve_cli_binary "${TARGET}"
 
-    # The README documents credentials as <iggy_username>/<iggy_password>
-    # placeholders; the test server starts with iggy/iggy. The README keeps
-    # plain cargo run commands, so the cross-compile target is injected here.
-    if [ -n "${TARGET}" ]; then
-        TRANSFORM_COMMAND() {
-            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g; s|cargo run |cargo run --target ${TARGET} |g"
-        }
-    else
-        TRANSFORM_COMMAND() {
-            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g"
-        }
-    fi
+    TRANSFORM_COMMAND() {
+        local command="$1"
+        command="${command//<iggy_username>/iggy}"
+        command="${command//<iggy_password>/iggy}"
+        # Exercise the documented CLI arguments against the same binary as the other suites.
+        if [[ "$command" == 'cargo run --bin iggy -- '* ]]; then
+            printf '"%s" %s\n' "$CLI_BIN" "${command#cargo run --bin iggy -- }"
+        elif [ -n "${TARGET}" ]; then
+            printf '%s\n' "${command/cargo run /cargo run --target ${TARGET} }"
+        else
+            printf '%s\n' "$command"
+        fi
+    }
 
     # Pre-flight: run CLI commands from root README
     _rust_preflight() {
@@ -250,6 +251,26 @@ run_go_examples() {
         "^go run" \
         "--tls" \
         "^go run.*--tls" \
+        0 \
+        ""
+
+    SERVER_READY_PROBE="log"
+}
+
+# shellcheck disable=SC2329
+run_swift_examples() {
+    # The Swift SDK speaks only the VSR wire protocol.
+    resolve_server_binary "${TARGET}" "iggy-server"
+    SERVER_READY_PROBE="tcp"
+    unset -f TRANSFORM_COMMAND 2>/dev/null || true
+
+    run_language_examples \
+        "Swift" \
+        "examples/swift" \
+        "README.md" \
+        "^swift run" \
+        "--tls" \
+        "^swift run.*--tls" \
         0 \
         ""
 
@@ -427,14 +448,15 @@ case "${LANGUAGE}" in
     php)    run_one run_php_examples    "PHP"    ;;
     java)   run_one run_java_examples   "Java"   ;;
     csharp) run_one run_csharp_examples "C#"     ;;
+    swift)  run_one run_swift_examples  "Swift"  ;;
     all)
-        for lang in rust node go python php java csharp; do
+        for lang in rust node go python php java csharp swift; do
             run_one "run_${lang}_examples" "${lang}"
         done
         ;;
     *)
         echo "Unknown language: ${LANGUAGE}"
-        echo "Supported: rust, node, go, python, php, java, csharp, all"
+        echo "Supported: rust, node, go, python, php, java, csharp, swift, all"
         exit 1
         ;;
 esac

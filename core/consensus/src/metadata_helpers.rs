@@ -21,9 +21,10 @@
 
 use crate::client_table::{ClientTable, RequestStatus};
 use crate::{Consensus, Pipeline, PipelineEntry, VsrConsensus};
+use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
 use iggy_binary_protocol::{
     EvictionHeader, EvictionReason, HEADER_SIZE, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN,
-    Operation, PrepareHeader,
+    Operation, PrepareHeader, WireDecode,
 };
 use iggy_common::IggyError;
 use message_bus::MessageBus;
@@ -250,19 +251,26 @@ pub fn register_preflight<B, P>(
     user_id: u32,
     verifier_body: &[u8],
     request_checksum: u128,
+    account_is_active: impl FnOnce(u64) -> bool,
 ) -> PreflightOutcome
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
+    if message_bus::is_server_internal_client(client_id) {
+        return PreflightOutcome::Reject(IggyError::Unauthenticated.as_code());
+    }
     if !is_caught_up_primary(consensus) {
         return PreflightOutcome::NotReady;
     }
-    let Ok(verifier) = verifier_body.try_into() else {
+    let Ok(registration) = RegisterRequest::decode_from(verifier_body) else {
         return PreflightOutcome::Reject(IggyError::InvalidCommand.as_code());
     };
+    if !account_is_active(registration.user_created_at) {
+        return PreflightOutcome::Reject(IggyError::Unauthenticated.as_code());
+    }
     let table = client_table.borrow();
-    match table.registered_session(client_id, user_id, verifier) {
+    match table.registered_session(client_id, user_id, registration.bind_verifier) {
         Ok(Some(epoch)) => {
             let header = PrepareHeader {
                 cluster: consensus.cluster(),
@@ -419,16 +427,39 @@ where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    consensus.is_primary()
-        && !consensus.has_ceded_primaryship()
-        && consensus.is_normal()
-        && !consensus.is_transferring()
+    is_unceded_normal_primary(consensus)
         // Recovery re-pipelines the WAL's prepared-but-uncommitted suffix;
         // those ops were acked to clients before the restart, so admitting
         // new requests (a login is a Register write) before the suffix
         // re-commits would serve state that rolls back committed history.
         // Held transient until the retransmit path re-earns quorum.
         && consensus.commit_max() >= consensus.recovery_barrier()
+}
+
+/// [`is_caught_up_primary`] without the recovery barrier.
+///
+/// The barrier holds back only the recovered suffix above `commit_max`. State at
+/// or below `commit_min` is committed whatever becomes of that suffix, so a caller
+/// that only hands out such state, as a state transfer does, needs no barrier.
+/// Waiting for it can deadlock: when the only other live replica sits below this
+/// primary's WAL floor, a transfer is its one route to acking the suffix.
+pub fn is_caught_up_primary_except_barrier<B, P>(consensus: &VsrConsensus<B, P>) -> bool
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    is_unceded_normal_primary(consensus) && consensus.commit_min() == consensus.commit_max()
+}
+
+fn is_unceded_normal_primary<B, P>(consensus: &VsrConsensus<B, P>) -> bool
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    consensus.is_primary()
+        && !consensus.has_ceded_primaryship()
+        && consensus.is_normal()
+        && !consensus.is_transferring()
 }
 
 /// Build + best-effort send `Eviction`. `SendError` dropped: eviction is
@@ -452,6 +483,7 @@ pub async fn send_eviction_to_client<B, P>(
 
 #[cfg(test)]
 mod tests {
+    use iggy_binary_protocol::WireEncode;
     use std::rc::Rc;
 
     use super::*;
@@ -510,7 +542,6 @@ mod tests {
 
         fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
     }
 
     // A registered client's fresh Register dispatches instead of being
@@ -542,8 +573,13 @@ mod tests {
                     &client_table,
                     client_id,
                     ACTING_USER_ID,
-                    &[0x5a; 32],
-                    0
+                    &RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32]
+                    }
+                    .to_bytes(),
+                    0,
+                    |_| true
                 ),
                 PreflightOutcome::Replay(_)
             ),
@@ -551,6 +587,28 @@ mod tests {
         );
         let sends = consensus.message_bus().client_sends.borrow();
         assert!(sends.is_empty(), "preflight itself sends nothing");
+        assert!(
+            matches!(
+                register_preflight(
+                    &consensus,
+                    &client_table,
+                    client_id,
+                    ACTING_USER_ID,
+                    &RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32],
+                    }
+                    .to_bytes(),
+                    0,
+                    |created_at| {
+                        assert_eq!(created_at, 1);
+                        false
+                    },
+                ),
+                PreflightOutcome::Reject(code) if code == IggyError::Unauthenticated.as_code()
+            ),
+            "a stale account cannot recover an existing session"
+        );
     }
 
     // No-session: non-Register from unknown client -> Eviction(NoSession).
@@ -928,8 +986,13 @@ mod tests {
                     &client_table,
                     client_id,
                     IMPOSTOR,
-                    &[0x5a; 32],
-                    0
+                    &RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32]
+                    }
+                    .to_bytes(),
+                    0,
+                    |_| true
                 ),
                 PreflightOutcome::Reject(40)
             ),
@@ -937,7 +1000,19 @@ mod tests {
         );
         assert!(
             matches!(
-                register_preflight(&consensus, &client_table, client_id, OWNER, &[0x5a; 32], 0),
+                register_preflight(
+                    &consensus,
+                    &client_table,
+                    client_id,
+                    OWNER,
+                    &RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32]
+                    }
+                    .to_bytes(),
+                    0,
+                    |_| true
+                ),
                 PreflightOutcome::Replay(_)
             ),
             "the owner must recover the original session"
@@ -1007,8 +1082,13 @@ mod tests {
             &client_table,
             client_id,
             ACTING_USER_ID,
-            &[0x5a; 32],
+            &RegisterRequest {
+                user_created_at: 1,
+                bind_verifier: [0x5a; 32],
+            }
+            .to_bytes(),
             0,
+            |_| true,
         );
         assert!(
             matches!(result, PreflightOutcome::NotReady),
@@ -1055,6 +1135,56 @@ mod tests {
         assert!(!backup.is_primary());
         assert!(!is_caught_up_primary(&backup));
         assert!(!is_settled_primary(&backup));
+        assert!(!is_caught_up_primary_except_barrier(&backup));
+
+        // Recovered suffix above commit_max -> neither caught up nor settled, yet
+        // its committed state is servable.
+        let recovering = VsrConsensus::new(1, 0, 3, 0, ClientSpyBus::new(), LocalPipeline::new());
+        recovering.init();
+        recovering.set_recovery_barrier(recovering.commit_max() + 1);
+        assert!(!is_caught_up_primary(&recovering));
+        assert!(!is_settled_primary(&recovering));
+        assert!(is_caught_up_primary_except_barrier(&recovering));
+
+        // The barrier is the only clause it drops.
+        recovering.begin_state_transfer_await();
+        assert!(!is_caught_up_primary_except_barrier(&recovering));
+        recovering.set_state_transfer_stage(crate::StateTransferStage::Idle);
+        recovering.advance_commit_max(5);
+        assert!(!is_caught_up_primary_except_barrier(&recovering));
+    }
+
+    #[test]
+    fn given_reserved_client_id_when_registering_should_reject_before_catchup() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, ClientSpyBus::new(), LocalPipeline::new());
+        consensus.init();
+        let client_table = fresh_client_table();
+        let body = RegisterRequest {
+            user_created_at: 1,
+            bind_verifier: [0x5a; 32],
+        }
+        .to_bytes();
+        for commit_max in [0, 1] {
+            consensus.advance_commit_max(commit_max);
+            for client_id in [
+                message_bus::server_internal_client_id(0),
+                message_bus::AUTO_COMMIT_CLIENT_ID,
+            ] {
+                assert!(matches!(
+                    register_preflight(
+                        &consensus,
+                        &client_table,
+                        client_id,
+                        ACTING_USER_ID,
+                        &body,
+                        0,
+                        |_| true,
+                    ),
+                    PreflightOutcome::Reject(code) if code == IggyError::Unauthenticated.as_code()
+                ));
+                assert_eq!(client_table.borrow().get_epoch(client_id), None);
+            }
+        }
     }
 
     #[test]
@@ -1063,15 +1193,20 @@ mod tests {
         consensus.init();
 
         let client_table = fresh_client_table();
-        let client_id: u128 = 0xC0DE;
+        let client_id = message_bus::server_internal_client_id(0) - 1;
 
         let result = register_preflight(
             &consensus,
             &client_table,
             client_id,
             ACTING_USER_ID,
-            &[0x5a; 32],
+            &RegisterRequest {
+                user_created_at: 1,
+                bind_verifier: [0x5a; 32],
+            }
+            .to_bytes(),
             0,
+            |_| true,
         );
         assert!(
             matches!(result, PreflightOutcome::Dispatch),

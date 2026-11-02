@@ -75,7 +75,7 @@ async fn given_advanced_partition_view_when_survivor_restarts_should_recover_vie
         .await
         .expect("connect a root client to the node");
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream on the view-0 primary");
     let stream_id = Identifier::named(STREAM_NAME).expect("stream identifier");
@@ -236,11 +236,13 @@ async fn poll_all(client: &IggyClient) -> Result<u32, IggyError> {
         .poll_messages(
             &Identifier::named(STREAM_NAME).expect("stream identifier"),
             &Identifier::named(TOPIC_NAME).expect("topic identifier"),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            MESSAGES_COUNT,
-            false,
+            PollOptions {
+                count: MESSAGES_COUNT,
+                ..PollOptions::default()
+            },
         )
         .await?;
     Ok(polled.messages.len() as u32)

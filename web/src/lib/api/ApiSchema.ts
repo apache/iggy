@@ -15,6 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import type {
+  OptionInputValue,
+  StreamCreateBody,
+  StreamUpdateBody,
+  TopicCreateBody,
+  TopicUpdateBody,
+  UserUpdateBody
+} from '#lib/api/resourceOptions.js';
 import type { GlobalPermissions, StreamPermissions } from '#lib/domain/Permissions.js';
 import type { KeysToSnakeCase } from '#lib/utils/utilTypes.js';
 
@@ -34,6 +42,7 @@ type Users =
         password: string;
         status: 'active' | 'inactive';
         permissions: Permissions | null;
+        options?: Record<string, OptionInputValue>;
       };
     }
   | {
@@ -45,13 +54,9 @@ type Users =
       path: `/users/${number}`;
     }
   | {
-      method: 'GET';
+      method: 'PUT';
       path: `/users/${number}`;
-      body: {
-        username: string;
-        status: 'active' | 'inactive';
-        permissions: Permissions | null;
-      };
+      body: UserUpdateBody;
     }
   | {
       method: 'PUT';
@@ -85,16 +90,12 @@ type Streams =
   | {
       method: 'POST';
       path: '/streams';
-      body: {
-        name: string;
-      };
+      body: StreamCreateBody;
     }
   | {
       method: 'PUT';
       path: `/streams/${number}`;
-      body: {
-        name: string;
-      };
+      body: StreamUpdateBody;
     }
   | {
       method: 'DELETE';
@@ -117,23 +118,12 @@ type Topics =
   | {
       method: 'POST';
       path: `/streams/${number}/topics`;
-      body: {
-        compression_algorithm: 'none' | 'gzip';
-        max_topic_size: number;
-        message_expiry: number;
-        name: string;
-        partitions_count: number;
-      };
+      body: TopicCreateBody;
     }
   | {
       method: 'PUT';
       path: `/streams/${number}/topics/${number}`;
-      body: {
-        name: string;
-        message_expiry?: number;
-        compression_algorithm?: 'none' | 'gzip';
-        max_topic_size?: number;
-      };
+      body: TopicUpdateBody;
     }
   | {
       method: 'DELETE';

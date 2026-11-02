@@ -127,7 +127,10 @@ async fn init_system(
     topic_name: &str,
     topic_options: &TopicCreateOptions,
 ) {
-    client.create_stream(stream_name).await.unwrap();
+    client
+        .create_stream(stream_name, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &Identifier::named(stream_name).unwrap(),
@@ -204,7 +207,7 @@ async fn verify_all_messages_from_start(
     topic_name: &str,
     total_messages: u32,
 ) {
-    let polled = poll_until_expected_count(
+    let messages = poll_until_expected_count(
         client,
         stream_name,
         topic_name,
@@ -214,11 +217,11 @@ async fn verify_all_messages_from_start(
     .await;
 
     assert_eq!(
-        polled.messages.len() as u32,
+        messages.len() as u32,
         total_messages,
         "Expected {} messages from start, got {}",
         total_messages,
-        polled.messages.len()
+        messages.len()
     );
 }
 
@@ -235,7 +238,7 @@ async fn verify_messages_from_middle(
         let prior_batches_sum: u32 = batch_lengths[..3].iter().sum();
         let remaining_messages = total_messages - prior_batches_sum;
 
-        let polled = poll_until_expected_count(
+        let messages = poll_until_expected_count(
             client,
             stream_name,
             topic_name,
@@ -245,11 +248,11 @@ async fn verify_messages_from_middle(
         .await;
 
         assert_eq!(
-            polled.messages.len() as u32,
+            messages.len() as u32,
             remaining_messages,
             "Expected {} messages from middle, got {}",
             remaining_messages,
-            polled.messages.len()
+            messages.len()
         );
     }
 }
@@ -265,11 +268,13 @@ async fn verify_no_messages_beyond_end(
             .poll_messages(
                 &Identifier::named(stream_name).unwrap(),
                 &Identifier::named(topic_name).unwrap(),
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &Consumer::default(),
                 &PollingStrategy::offset(final_offset + 1),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -295,11 +300,13 @@ async fn verify_small_subset_from_start(
         .poll_messages(
             &Identifier::named(stream_name).unwrap(),
             &Identifier::named(topic_name).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            subset_size,
-            false,
+            PollOptions {
+                count: subset_size,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -327,11 +334,13 @@ async fn verify_messages_spanning_batches(
             .poll_messages(
                 &Identifier::named(stream_name).unwrap(),
                 &Identifier::named(topic_name).unwrap(),
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &Consumer::default(),
                 &PollingStrategy::offset(span_offset),
-                span_size,
-                false,
+                PollOptions {
+                    count: span_size,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -361,11 +370,13 @@ async fn verify_message_content(
             .poll_messages(
                 &Identifier::named(stream_name).unwrap(),
                 &Identifier::named(topic_name).unwrap(),
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &Consumer::default(),
                 &PollingStrategy::offset(span_offset),
-                span_size,
-                false,
+                PollOptions {
+                    count: span_size,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -425,28 +436,27 @@ async fn verify_sequential_chunk_reads(
     for chunk_start in (0..total_messages).step_by(chunk_size as usize) {
         let read_size = std::cmp::min(chunk_size, total_messages - chunk_start);
 
-        let polled = client
-            .poll_messages(
-                &Identifier::named(stream_name).unwrap(),
-                &Identifier::named(topic_name).unwrap(),
-                Some(PARTITION_ID),
-                &Consumer::default(),
-                &PollingStrategy::offset(chunk_start as u64),
-                read_size,
-                false,
-            )
-            .await
-            .unwrap();
+        let messages = poll_until_expected_count(
+            client,
+            stream_name,
+            topic_name,
+            &PollingStrategy::offset(chunk_start as u64),
+            read_size,
+        )
+        .await;
 
         assert_eq!(
-            polled.messages.len() as u32,
+            messages.len() as u32,
             read_size,
             "Failed to read chunk at offset {} with size {}",
             chunk_start,
             read_size
         );
 
-        verified_count += polled.messages.len() as u32;
+        for (index, message) in messages.iter().enumerate() {
+            assert_eq!(message.header.offset, chunk_start as u64 + index as u64);
+        }
+        verified_count += messages.len() as u32;
     }
 
     assert_eq!(

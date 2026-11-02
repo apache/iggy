@@ -17,6 +17,7 @@
 
 use crate::common::global_context::GlobalContext;
 use cucumber::{given, then, when};
+use iggy::prelude::StreamCreateOptions;
 use iggy::prelude::{Identifier, StreamClient, StreamUpdateOptions};
 
 #[given("I have no streams in the system")]
@@ -96,8 +97,10 @@ pub async fn when_update_stream_name(world: &mut GlobalContext, stream_name: Str
     client
         .update_stream(
             &Identifier::numeric(stream_id).expect("Stream ID should be valid"),
-            &stream_name,
-            &StreamUpdateOptions::default(),
+            &StreamUpdateOptions {
+                name: Some(stream_name.to_owned()),
+                ..StreamUpdateOptions::default()
+            },
         )
         .await
         .expect("Should be able to update stream");
@@ -142,7 +145,7 @@ pub async fn then_get_stream_returns_no_stream(world: &mut GlobalContext) {
 async fn create_stream(world: &mut GlobalContext, stream_name: &str) {
     let client = world.client.as_ref().expect("Client should be available");
     let stream = client
-        .create_stream(stream_name)
+        .create_stream(stream_name, &StreamCreateOptions::default())
         .await
         .expect("Should be able to create stream");
 

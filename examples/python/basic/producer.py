@@ -71,11 +71,7 @@ async def init_system(client: IggyClient):
     logger.info(f"Creating topic {TOPIC_NAME} in stream {STREAM_NAME}")
     topic: TopicDetails | None = await client.get_topic(STREAM_NAME, TOPIC_NAME)
     if topic is None:
-        await client.create_topic(
-            stream=STREAM_NAME,
-            partitions_count=1,
-            name=TOPIC_NAME,
-        )
+        await client.create_topic(stream=STREAM_NAME, name=TOPIC_NAME)
         logger.info("Topic was created successfully.")
     else:
         logger.warning(f"Topic {topic.name} already exists with ID {topic.id}")

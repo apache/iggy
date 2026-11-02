@@ -17,7 +17,12 @@
 
 package vsr
 
-import ierror "github.com/apache/iggy/foreign/go/errors"
+import (
+	"crypto/rand"
+	"encoding/binary"
+	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/apache/iggy/foreign/go/internal/command"
+)
 
 // EncodeRequest returns the complete request frame for a command code and its
 // already-encoded payload.
@@ -37,7 +42,7 @@ func EncodeRequest(session *Session, code uint32, payload []byte) ([]byte, error
 //
 // frame must be at least HeaderSize bytes long.
 func StampRequestHeader(session *Session, code uint32, frame []byte) error {
-	if len(frame) > MaxFrameSize {
+	if len(frame) < HeaderSize || len(frame) > MaxFrameSize {
 		return ierror.ErrInvalidConfiguration
 	}
 	operation := OperationForCode(code)
@@ -55,13 +60,9 @@ func StampRequestHeader(session *Session, code uint32, frame []byte) error {
 	case OperationRegister:
 		request = session.BeginRegister()
 	case OperationNonReplicated:
-		// Non-replicated operations bypass server-side dedup and are routed by
-		// transport identity, so they travel sessionless before Register.
-		request = session.CurrentRequestID()
-		if session.Bound() {
-			if request, err = session.NextRequestID(); err != nil {
-				return err
-			}
+		request, err = session.NextReadRequestID()
+		if err != nil {
+			return err
 		}
 		sessionID = session.SessionID()
 	default:
@@ -85,5 +86,41 @@ func StampRequestHeader(session *Session, code uint32, frame []byte) error {
 		fields.NonReplicatedCode = code
 	}
 	EncodeRequestHeader((*[HeaderSize]byte)(frame[:HeaderSize]), fields)
+	if operation != OperationNonReplicated && operation < OperationSendMessages {
+		for {
+			if _, err := rand.Read(frame[requestOffsetChecksum : requestOffsetChecksum+16]); err != nil {
+				return err
+			}
+			if binary.LittleEndian.Uint64(frame[requestOffsetChecksum:]) != 0 ||
+				binary.LittleEndian.Uint64(frame[requestOffsetChecksum+8:]) != 0 {
+				break
+			}
+		}
+	}
 	return nil
+}
+
+// DeferredCancellation returns the frame that cancels the deferred poll or fetch in frame: a header without a body that names the
+// same client, session and request. It must follow that request on the same
+// connection. It returns false for any other request.
+func DeferredCancellation(frame []byte) ([]byte, bool) {
+	code := binary.LittleEndian.Uint32(frame[requestOffsetReserved:])
+	if Operation(frame[requestOffsetOperation]) != OperationNonReplicated ||
+		code != uint32(command.PollMessagesDeferredCode) &&
+			code != uint32(command.FetchMessagesCode) {
+		return nil, false
+	}
+	cancellation := make([]byte, HeaderSize)
+	EncodeRequestHeader((*[HeaderSize]byte)(cancellation), RequestFields{
+		Size: HeaderSize,
+		Client: ClientID{
+			Lo: binary.LittleEndian.Uint64(frame[requestOffsetClient:]),
+			Hi: binary.LittleEndian.Uint64(frame[requestOffsetClient+8:]),
+		},
+		Request:           StampedRequestID(frame),
+		Operation:         OperationNonReplicated,
+		Session:           binary.LittleEndian.Uint64(frame[requestOffsetSession:]),
+		NonReplicatedCode: uint32(command.CancelDeferredRequestCode),
+	})
+	return cancellation, true
 }

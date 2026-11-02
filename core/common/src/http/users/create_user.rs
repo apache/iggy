@@ -16,6 +16,7 @@
 // under the License.
 
 use super::defaults::*;
+use crate::OptionInputMap;
 use crate::Permissions;
 use crate::UserStatus;
 use crate::Validatable;
@@ -40,6 +41,9 @@ pub struct CreateUser {
     pub status: UserStatus,
     /// Optional permissions of the user. If not provided, user will have no permissions.
     pub permissions: Option<Permissions>,
+    /// User options keyed by option name. Unknown keys are rejected.
+    #[serde(default, skip_serializing_if = "OptionInputMap::is_empty")]
+    pub options: OptionInputMap,
 }
 
 impl Default for CreateUser {
@@ -49,6 +53,7 @@ impl Default for CreateUser {
             password: SecretString::from("secret"),
             status: UserStatus::Active,
             permissions: None,
+            options: OptionInputMap::default(),
         }
     }
 }

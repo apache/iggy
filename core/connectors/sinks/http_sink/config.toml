@@ -28,7 +28,6 @@ stream = "my_stream"
 topics = ["my_topic"]
 schema = "json"
 batch_length = 50
-poll_interval = "100ms"
 consumer_group = "http_sink_group"
 
 [plugin_config]

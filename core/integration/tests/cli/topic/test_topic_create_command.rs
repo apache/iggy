@@ -27,6 +27,7 @@ use iggy::prelude::CompressionAlgorithm;
 use iggy::prelude::IggyByteSize;
 use iggy::prelude::IggyExpiry;
 use iggy::prelude::MaxTopicSize;
+use iggy::prelude::StreamCreateOptions;
 use predicates::str::diff;
 use serial_test::parallel;
 use std::str::FromStr;
@@ -89,7 +90,9 @@ impl TestTopicCreateCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestTopicCreateCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name).await;
+        let stream = client
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
     }
 
@@ -150,7 +153,7 @@ impl IggyCmdTestCase for TestTopicCreateCmd {
                 .parse::<HumanDuration>()
                 .unwrap();
             assert_eq!(
-                topic_details.message_expiry,
+                topic_details.resolved_options().message_expiry,
                 IggyExpiry::ExpireDuration(duration.into())
             );
         }

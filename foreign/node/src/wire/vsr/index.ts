@@ -16,10 +16,11 @@
 // under the License.
 
 import { createRequire } from 'node:module';
+import { randomFillSync } from 'node:crypto';
 import type { CommandResponse } from '../../client/client.type.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { responseError } from '../error.utils.js';
-import { HEADER_SIZE, encodeRequestHeader, type PartitionContext } from './header.js';
+import { HEADER_SIZE, REQUEST_OFFSET, encodeRequestHeader, type PartitionContext } from './header.js';
 import { Operation, operationForCode } from './operation.js';
 import {
   deserializeLoginRegister,
@@ -48,7 +49,7 @@ export class VsrSession {
   }
 
   reset(): void {
-    this.state = new ConsensusSession();
+    this.state.reset();
   }
 
   bind(session: bigint): void {
@@ -57,6 +58,10 @@ export class VsrSession {
 
   get hasActivity(): boolean {
     return this.state.hasActivity;
+  }
+
+  get sessionId(): bigint | null {
+    return this.state.session;
   }
 
   get clientId(): bigint {
@@ -97,7 +102,7 @@ export class VsrSession {
       request = this.state.beginRegister();
       session = 0n;
     } else if (operation === Operation.NonReplicated) {
-      request = this.state.isBound ? this.state.nextRequestId() : this.state.currentRequestId();
+      request = this.state.nextRequestId(false);
       session = this.state.session ?? 0n;
     } else {
       if (this.state.session === null)
@@ -118,6 +123,14 @@ export class VsrSession {
       nonReplicatedCode:
         operation === Operation.NonReplicated ? command : undefined,
     });
+    if (operation === Operation.Register) {
+      this.state.registerRequestIdentifier.copy(header, REQUEST_OFFSET.requestChecksum);
+    } else if (operation !== Operation.NonReplicated && operation < Operation.SendMessages) {
+      do {
+        randomFillSync(header, REQUEST_OFFSET.requestChecksum, 16);
+      } while (header.subarray(REQUEST_OFFSET.requestChecksum, REQUEST_OFFSET.requestChecksum + 16)
+        .every(byte => byte === 0));
+    }
     return payload.length === 0 ? header : Buffer.concat([header, payload]);
   }
 }

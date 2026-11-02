@@ -14,7 +14,7 @@ Set the broker credentials and connector configuration directory before starting
 
 The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available via `docker pull apache/iggy-connect`. It ships in two flavors: a default image with every connector plugin bundled, and a `-slim` runtime-only image.
 
-The runtime opens two Iggy TCP clients, one for producers and one for consumers. Set credentials matching the broker and a connector configuration provider. Omitted settings use the embedded defaults, including file-based source state storage. Save this example as `connectors.toml` in the repository root and replace `path/to/connectors` with your connector configuration directory.
+The runtime opens one Iggy TCP client that all sources share, and each sink opens its own client every time it starts. Set credentials matching the broker and a connector configuration provider. Omitted settings use the embedded defaults, including file-based source state storage. Save this example as `connectors.toml` in the repository root and replace `path/to/connectors` with your connector configuration directory.
 
 ```toml
 [iggy]
@@ -52,6 +52,26 @@ Run `iggy-connectors --list-config-env-vars` to print the supported names and te
 `<FIELD>` sets one lowercased top-level `plugin_config` key with underscores preserved (`A_B` becomes `a_b`, not nested `a.b`); nested plugin configuration keys cannot be set through environment variables. `FORMAT` is reserved and listed separately as `..._PLUGIN_CONFIG_FORMAT`.
 
 Source destination topics must persist every acknowledged batch before the runtime checkpoints the source or invokes its Ack hook. Missing topics are therefore created with `durability = "persisted"` and `messages_required_to_save = 1`. An existing topic must use `durability = "persisted"`; its save threshold may differ because persisted acknowledgments already wait for durable storage.
+
+Sink consumers use long polling. A poll returns when `min_count` messages are
+ready (default 1), when its reply reaches 1 MiB, or when `max_wait` expires
+(default `1s`). Set both on a sink `[[streams]]` entry to batch messages, for
+example `max_wait = "3s"` with `min_count` equal to `batch_length`. `min_count`
+must not exceed `batch_length`. `max_wait` must be above zero and at most 10
+minutes, and the server shortens a wait above its `deferred_poll_max_wait`.
+Use `max_wait` and `min_count` in place of `poll_interval`. If a sink
+`[[streams]]` entry sets `poll_interval`, that sink fails to start. The server
+commits the offset of each sink poll when it answers the poll, before the
+plugin consumes the messages. Sinks need a server that supports deferred polls
+(binary commands 106 and 109 in protocol 0.12.1).
+
+At each start, a sink connects an Iggy client of its own. After the last
+consumer of that start stops, the sink logs the client out and shuts it down.
+A poll of one sink that waits for messages thus does not delay the polls or
+offset stores of another sink. The consumers inside one sink share its client.
+They share the progress lane of each partition, which orders their polls and
+offset calls. They also share the limit of 64 deferred requests per client.
+The [SDK README](../../sdk/README.md) describes both.
 
 ## State storage
 
@@ -113,6 +133,47 @@ Any HTTP server can back the state endpoint if it meets this contract:
 This contract lets a deployment back the endpoint with a replicated store and revoke a stale writer's authority mid-flight: the stale writer's next conditional PUT fails `403`/`412`, its provider latches, and its pipeline stops advancing state - no backend-specific knowledge in the runtime.
 
 The runtime does not delete remote state. Disabling, removing, or restarting a source preserves its checkpoint. Deletion is an explicit administrative action on the backing store because automatic deletion would make a connector lifecycle operation silently rewind the source.
+
+## Exactly-once sources
+
+If a source sets `exactly_once = true`, the runtime writes each batch of the source once. This holds after a lost reply, a NACK, or a crash of the runtime. Each batch goes to one partition as a batch of an idempotent producer. The [SDK README](../../sdk/README.md#idempotent-producers) describes idempotent producers.
+
+```toml
+exactly_once = true
+
+[[streams]]
+stream = "orders"
+topic = "created"
+schema = "json"
+partition_id = 0 # the partition of every batch, 0 when unset
+```
+
+The runtime keeps a producer record in the state of the source, in front of the plugin's bytes. The record holds these values:
+
+- The producer id. The runtime gets it from the session of its Iggy client.
+- The epoch. After each start, batches keep the stored epoch until the first save after a batch, which moves to the next epoch. The new epoch fences an older copy of the runtime.
+- The partition, and the first sequence of the next batch in it.
+
+The runtime saves the state after each batch for which the plugin returns new state. The save moves the next sequence past the batch and stores the plugin's new bytes. A batch without new state is not saved. The plugin gets only its own bytes. A new record, a new epoch or a new partition is also saved before its first batch goes. The `iggy_send` stage histogram includes that save.
+
+After a NACK or a restart, the plugin produces a batch again from its saved state. No save moved the record past that batch, so the runtime sends it with the same producer id, epoch and sequence. The partition answers with the offset of the first write, and the batch lands once.
+
+These limits apply:
+
+- All batches go to one partition. Balanced and messages-key partitioning are not available.
+- Each batch of the plugin goes to Iggy in one request. `batch_length` and `linger_time` do not apply.
+- The plugin must produce the same messages from the same state. The partition keeps the first copy.
+- If the plugin produces another message count, the partition refuses the batch as out of order, and the runtime moves to a new epoch and logs a warning. The unsaved batch can then land twice.
+- A partition drops a producer that sent no batch for 24 hours. Above 4096 producers, it drops the one idle the longest.
+- If the partition dropped the producer, the runtime moves to a new epoch. The unsaved batch can then land twice.
+- The partition keeps the last five batches of a producer. If the plugin returns no state for more than five batches in a row, a restart can write those batches twice.
+- If you change `partition_id`, the unsaved batch can land twice.
+- Give the topic `persisted` durability. With `replicated`, a quorum of nodes that crash at the same time can lose acknowledged batches.
+- The record starts with the bytes `\0IGGYEO\x01`. Plugin state that starts with these bytes is not supported.
+
+You can turn `exactly_once` on or off for a source that has state. The runtime reads both state formats.
+An older runtime does not know the record: its plugin fails to read the state and starts again without its cursor. To roll back, turn `exactly_once` off first and wait until the source saves its state.
+Builds released before idempotent producers cannot poll the batches of an exactly-once source. These are the Rust SDK and every client that embeds it (the Python, C++ and PHP SDKs, the CLI, the Kafka gateway and older connector runtimes), and the Swift SDK. Older Iggy nodes cannot store these batches. Upgrade every Iggy node and every consumer of the topic first.
 
 ## Logging
 

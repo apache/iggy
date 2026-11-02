@@ -17,6 +17,7 @@
 
 using System.Text;
 using Apache.Iggy.Consumers;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
@@ -43,8 +44,7 @@ public class IggyTypedConsumerTests
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
         var consumerId = protocol == Protocol.Tcp ? 200 : 300;
-        IggyConsumer<string> consumer = BuildTypedConsumer(client, testStream, Consumer.New(consumerId),
-            AutoCommitMode.Disabled, new Utf8StringDeserializer());
+        IggyConsumer<string> consumer = BuildTypedConsumer(client, testStream, Consumer.New(consumerId), new Utf8StringDeserializer());
 
         await consumer.InitAsync();
 
@@ -80,8 +80,7 @@ public class IggyTypedConsumerTests
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
         var consumerId = protocol == Protocol.Tcp ? 201 : 301;
-        IggyConsumer<string> consumer = BuildTypedConsumer(client, testStream, Consumer.New(consumerId),
-            AutoCommitMode.Disabled, new Utf8StringDeserializer());
+        IggyConsumer<string> consumer = BuildTypedConsumer(client, testStream, Consumer.New(consumerId), new Utf8StringDeserializer());
 
         await Should.ThrowAsync<ConsumerNotInitializedException>(async () =>
         {
@@ -103,8 +102,8 @@ public class IggyTypedConsumerTests
 
         var consumerId = protocol == Protocol.Tcp ? 202 : 302;
         IggyConsumer<string> consumer = BuildTypedConsumer(client, testStream, Consumer.New(consumerId),
-            AutoCommitMode.AfterReceive, new Utf8StringDeserializer(),
-            PollingStrategy.First());
+            new Utf8StringDeserializer(), PollingStrategy.First(),
+            CommitPolicy.Auto(new AutoCommit { Every = CommitEvery.Message }));
 
         await consumer.InitAsync();
 
@@ -128,7 +127,9 @@ public class IggyTypedConsumerTests
             1u);
 
         offset.ShouldNotBeNull();
-        offset.StoredOffset.ShouldBe(3ul);
+        count.ShouldBe(5);
+        // Shutdown counts the last message handed over.
+        offset.StoredOffset.ShouldBe(4ul);
     }
 
     [Test]
@@ -142,7 +143,7 @@ public class IggyTypedConsumerTests
 
         var consumerId = protocol == Protocol.Tcp ? 203 : 303;
         IggyConsumer<string> consumer = BuildTypedConsumer(client, testStream, Consumer.New(consumerId),
-            AutoCommitMode.Disabled, new FailingDeserializer());
+            new FailingDeserializer());
 
         await consumer.InitAsync();
 
@@ -162,42 +163,39 @@ public class IggyTypedConsumerTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task ReceiveDeserializedAsync_Should_StopCleanly_OnCancellation(Protocol protocol)
+    public async Task ReceiveDeserializedAsync_Should_StopCleanly_WhenCanceledAfterYield(Protocol protocol)
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var testStream = await CreateTestStreamWithMessages(client, protocol);
 
         var consumerId = protocol == Protocol.Tcp ? 204 : 304;
-        IggyConsumer<string> consumer = BuildTypedConsumer(client, testStream, Consumer.New(consumerId),
-            AutoCommitMode.Disabled, new Utf8StringDeserializer());
+        await using IggyConsumer<string> consumer = BuildTypedConsumer(client, testStream, Consumer.New(consumerId), new Utf8StringDeserializer());
 
         await consumer.InitAsync();
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var receivedCount = 0;
 
         await Should.NotThrowAsync(async () =>
         {
-            try
+            await foreach (ReceivedMessage<string> _ in consumer.ReceiveDeserializedAsync(cts.Token))
             {
-                await foreach (ReceivedMessage<string> _ in consumer.ReceiveDeserializedAsync(cts.Token))
-                {
-                }
-            }
-            catch (OperationCanceledException)
-            {
+                receivedCount++;
+                cts.Cancel();
             }
         });
 
-        await consumer.DisposeAsync();
+        receivedCount.ShouldBe(1);
+        cts.IsCancellationRequested.ShouldBeTrue();
     }
 
     private static IggyConsumer<string> BuildTypedConsumer(IIggyClient client,
         TestStreamInfo stream,
         Consumer consumer,
-        AutoCommitMode autoCommitMode,
         IDeserializer<string> deserializer,
-        PollingStrategy? pollingStrategy = null)
+        PollingStrategy? pollingStrategy = null,
+        CommitPolicy? commit = null)
     {
         var config = new IggyConsumerConfig<string>
         {
@@ -205,11 +203,13 @@ public class IggyTypedConsumerTests
             TopicId = Identifier.String(stream.TopicId),
             Consumer = consumer,
             PollingStrategy = pollingStrategy ?? PollingStrategy.Next(),
-            BatchSize = 10,
-            PartitionId = 1,
-            AutoCommitMode = autoCommitMode,
-            AutoCommit = autoCommitMode != AutoCommitMode.Disabled,
-            PollingIntervalMs = 0,
+            Partitions = [1],
+            PollOptions = new PollOptions
+            {
+                Count = 10,
+                MaxWait = TimeSpan.FromSeconds(1),
+                Commit = commit ?? CommitPolicy.Manual
+            },
             Deserializer = deserializer
         };
         return new IggyConsumer<string>(client, config, NullLoggerFactory.Instance);

@@ -33,7 +33,6 @@ stream = "test_stream"
 topics = ["test_topic"]
 schema = "json"
 batch_length = 100
-poll_interval = "5ms"
 consumer_group = "stdout_missing_plugin_sink_connector"
 
 [plugin_config]

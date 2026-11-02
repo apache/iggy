@@ -135,7 +135,7 @@ async fn given_unassigned_owner_when_automatic_offsets_arrive_should_only_allow_
         partition.on_request(request, Some(sender)).await;
         assert_status(
             receiver,
-            IggyError::ConsumerGroupPartitionNotOwned(CONSUMER_ID, 0).as_code(),
+            IggyError::ConsumerGroupPartitionNotOwned(AUTO_COMMIT_CLIENT_ID, 0).as_code(),
         );
         assert_eq!(partition.get_consumer_offset(consumer), Some(0));
     }
@@ -181,7 +181,7 @@ async fn given_unassigned_owner_when_automatic_offsets_arrive_should_only_allow_
     partition.on_request(delayed_cleanup, Some(sender)).await;
     assert_status(
         receiver,
-        IggyError::ConsumerGroupPartitionNotOwned(CONSUMER_ID, 0).as_code(),
+        IggyError::ConsumerGroupPartitionNotOwned(AUTO_COMMIT_CLIENT_ID, 0).as_code(),
     );
     assert_eq!(partition.get_consumer_offset(consumer), Some(0));
 }
@@ -267,7 +267,7 @@ async fn partition_with_old_record(
         validate_checksum: true,
         segment_size,
         preallocate_segments: false,
-        encryptor: None,
+        key_context: Arc::default(),
         path_layout: PartitionPathLayout::default(),
     };
     let consensus = VsrConsensus::new(

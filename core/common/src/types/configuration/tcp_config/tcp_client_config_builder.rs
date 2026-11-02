@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::{
-    AutoLogin, IggyDuration, IggyError, NonZeroIggyDuration, TcpClientConfig,
-    validate_server_address,
+    AutoLogin, IggyDuration, IggyError, NonZeroIggyDuration, PendingOperationsConfig,
+    TcpClientConfig, validate_server_address,
 };
 
 /// Builder for the TCP client configuration.
@@ -44,6 +44,12 @@ impl TcpClientConfigBuilder {
         self
     }
 
+    /// Sets client-wide active and retained mutation limits.
+    pub fn with_pending_operations(mut self, pending_operations: PendingOperationsConfig) -> Self {
+        self.config.pending_operations = pending_operations;
+        self
+    }
+
     /// Sets the auto sign in during connection.
     pub fn with_auto_sign_in(mut self, auto_sign_in: AutoLogin) -> Self {
         self.config.auto_login = auto_sign_in;
@@ -61,13 +67,13 @@ impl TcpClientConfigBuilder {
         self
     }
 
-    /// Sets the interval between retries when connecting to the server.
+    /// Sets the full-jitter exponential backoff base, capped at 10 seconds.
     pub fn with_reconnection_interval(mut self, interval: NonZeroIggyDuration) -> Self {
         self.config.reconnection.interval = interval;
         self
     }
 
-    /// Sets the cooldown before reconnecting after a previously successful connection.
+    /// Sets the stable connection duration that resets the retry count and backoff.
     pub fn with_reestablish_after(mut self, reestablish_after: IggyDuration) -> Self {
         self.config.reconnection.reestablish_after = reestablish_after;
         self

@@ -60,6 +60,12 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 tempfile = { workspace = true }
 
+# Seeds root the way the simulator does, so it needs that feature.
+[[bench]]
+name = "change_log"
+harness = false
+required-features = ["simulator"]
+
 [lints.clippy]
 enum_glob_use = "deny"
 pedantic = { level = "deny", priority = -1 }

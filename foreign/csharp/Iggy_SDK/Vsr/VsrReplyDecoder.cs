@@ -16,6 +16,7 @@
 // under the License.
 
 using System.Buffers.Binary;
+using Apache.Iggy.Exceptions;
 
 namespace Apache.Iggy.Vsr;
 
@@ -63,7 +64,17 @@ internal static class VsrReplyDecoder
             throw VsrError.FromServer((int)status, $"Server rejected the request with status {status}.");
         }
 
-        return SplitResultSection(VsrHeader.ReadReplyOperation(header), body[..expectedBody]);
+        var committed = VsrHeader.ReadCommitted(header);
+        try
+        {
+            return SplitResultSection(VsrHeader.ReadReplyOperation(header), body[..expectedBody]);
+        }
+        catch (IggyInvalidStatusCodeException error) when (error.FromServer)
+        {
+            error.Committed = committed && error.StatusCode is not (VsrError.TRANSIENT_NOT_COMMITTED
+                or VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY);
+            throw;
+        }
     }
 
     /// <summary>Body length announced by the frame, i.e. the bytes to read after the header.</summary>
@@ -119,7 +130,7 @@ internal static class VsrReplyDecoder
     /// </summary>
     internal static uint? ReadResultCode(ReadOnlySpan<byte> body)
     {
-        if (!TryReadUInt32(body, 0, out var count))
+        if (!TryReadUInt32(body, 0, out var count) || ReadResultSectionLength(body) is null)
         {
             return null;
         }

@@ -128,7 +128,8 @@ public final class IggyTcpClientBuilder {
     }
 
     /**
-     * Sets the retry policy.
+     * Sets the retry policy for the redials after a connection loss, see
+     * {@link AsyncIggyTcpClientBuilder#retryPolicy(RetryPolicy)}.
      *
      * @param retryPolicy the retry policy to use
      * @return this builder
@@ -165,6 +166,30 @@ public final class IggyTcpClientBuilder {
      */
     public IggyTcpClientBuilder eventLoopGroup(IoEventLoopGroup eventLoopGroup) {
         asyncBuilder.eventLoopGroup(eventLoopGroup);
+        return this;
+    }
+
+    /**
+     * Sets how long a close waits for new tasks before it stops the event loop group that the client created for
+     * itself, see {@link AsyncIggyTcpClientBuilder#shutdownQuietPeriod(Duration)}.
+     *
+     * @param shutdownQuietPeriod the quiet period, zero or more
+     * @return this builder
+     */
+    public IggyTcpClientBuilder shutdownQuietPeriod(Duration shutdownQuietPeriod) {
+        asyncBuilder.shutdownQuietPeriod(shutdownQuietPeriod);
+        return this;
+    }
+
+    /**
+     * Sets the longest time that a close waits for the event loop group that the client created for itself to
+     * stop, see {@link AsyncIggyTcpClientBuilder#shutdownTimeout(Duration)}.
+     *
+     * @param shutdownTimeout the shutdown timeout, zero or more
+     * @return this builder
+     */
+    public IggyTcpClientBuilder shutdownTimeout(Duration shutdownTimeout) {
+        asyncBuilder.shutdownTimeout(shutdownTimeout);
         return this;
     }
 
@@ -208,6 +233,15 @@ public final class IggyTcpClientBuilder {
      */
     public IggyTcpClientBuilder tlsCertificate(String tlsCertificatePath) {
         asyncBuilder.tlsCertificate(tlsCertificatePath);
+        return this;
+    }
+
+    /**
+     * Bounds active and retained mutations; admission waits within each call's deadline. The count also bounds
+     * the proved replay outcomes that the client keeps for later resolves.
+     */
+    public IggyTcpClientBuilder pendingOperations(int count, long bytes) {
+        asyncBuilder.pendingOperations(count, bytes);
         return this;
     }
 

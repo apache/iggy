@@ -48,7 +48,7 @@ var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 
 			_, err := client.GetConsumerGroup(
 				context.Background(),
-				randomU32Identifier(),
+				nonExistingStreamIdentifier(client),
 				randomU32Identifier(),
 				randomU32Identifier(),
 			)

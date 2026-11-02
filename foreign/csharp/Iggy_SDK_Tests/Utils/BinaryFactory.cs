@@ -92,7 +92,7 @@ internal sealed class BinaryFactory
         ulong messagesCount, ulong createdAt)
     {
         var nameBytes = Encoding.UTF8.GetBytes(name);
-        var totalSize = 4 + 4 + 8 + 8 + 1 + 8 + nameBytes.Length + 4;
+        var totalSize = 4 + 4 + 8 + 8 + 1 + 8 + nameBytes.Length + 4 + 4;
         var payload = new byte[totalSize];
         BinaryPrimitives.WriteUInt32LittleEndian(payload, id);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(4), createdAt);
@@ -101,43 +101,47 @@ internal sealed class BinaryFactory
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(24), messagesCount);
         payload[32] = (byte)nameBytes.Length;
         nameBytes.CopyTo(payload.AsSpan(33));
-        // Empty length-prefixed options block.
+        // Empty length-prefixed explicit and derived options blocks.
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(33 + nameBytes.Length), 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(37 + nameBytes.Length), 0);
         return payload;
     }
 
-    internal static byte[] CreateTopicPayload(uint id, uint partitionsCount, uint messageExpiry, string name,
-        ulong sizeBytes, ulong messagesCount, ulong createdAt, ulong maxTopicSize, int compressionType,
-        byte[]? options = null)
+    internal static byte[] CreateTopicPayload(uint id, uint partitionsCount, string name, ulong sizeBytes,
+        ulong messagesCount, ulong createdAt, byte[]? options = null, byte[]? derivedOptions = null)
     {
         var nameBytes = Encoding.UTF8.GetBytes(name);
         var optionsBytes = options ?? [];
-        var totalSize = 4 + 8 + 4 + 8 + 1 + 8 + 8 + 8 + 1 + nameBytes.Length + 4 + optionsBytes.Length + 4;
+        var derivedBytes = derivedOptions ?? [];
+        var totalSize = 4 + 8 + 4 + 8 + 8 + 1 + nameBytes.Length + 4 + optionsBytes.Length + 4 + derivedBytes.Length;
 
         var payload = new byte[totalSize];
         BinaryPrimitives.WriteUInt32LittleEndian(payload, id);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(4), createdAt);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(12), partitionsCount);
-        BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(16), messageExpiry);
-        payload[24] = (byte)compressionType;
-        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(25), maxTopicSize);
-        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(33), sizeBytes);
-        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(41), messagesCount);
-        payload[49] = (byte)nameBytes.Length;
-        nameBytes.CopyTo(payload.AsSpan(50));
-        // Length-prefixed explicit options block, then an empty derived one.
-        var position = 50 + nameBytes.Length;
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(16), sizeBytes);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(24), messagesCount);
+        payload[32] = (byte)nameBytes.Length;
+        nameBytes.CopyTo(payload.AsSpan(33));
+        // Length-prefixed explicit options block, then the derived one.
+        var position = 33 + nameBytes.Length;
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(position), (uint)optionsBytes.Length);
         optionsBytes.CopyTo(payload.AsSpan(position + 4));
-        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(position + 4 + optionsBytes.Length), 0);
+        position += 4 + optionsBytes.Length;
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(position), (uint)derivedBytes.Length);
+        derivedBytes.CopyTo(payload.AsSpan(position + 4));
         return payload;
     }
 
-    /// <summary>One partition record of a topic details reply: 40 bytes of counters, then the 24-byte context.</summary>
+    /// <summary>
+    ///     One partition record of a topic details reply: 40 bytes of counters, the 24-byte context, then the
+    ///     members and the in-sync members, each a u8 count followed by that many u8 node ids.
+    /// </summary>
     internal static byte[] CreatePartitionPayload(uint id, ulong createdAt, uint segmentsCount, ulong currentOffset,
-        ulong sizeBytes, ulong messagesCount, PartitionContext context)
+        ulong sizeBytes, ulong messagesCount, PartitionContext context, byte[] members, byte[] inSyncMembers)
     {
-        var payload = new byte[40 + PartitionContext.ENCODED_SIZE];
+        var countersSize = 40 + PartitionContext.ENCODED_SIZE;
+        var payload = new byte[countersSize + 1 + members.Length + 1 + inSyncMembers.Length];
         BinaryPrimitives.WriteUInt32LittleEndian(payload, id);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(4), createdAt);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(12), segmentsCount);
@@ -147,6 +151,11 @@ internal sealed class BinaryFactory
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(40), context.Incarnation);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(48), context.OwnerGeneration);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(56), context.MetadataOp);
+        payload[countersSize] = (byte)members.Length;
+        members.CopyTo(payload.AsSpan(countersSize + 1));
+        var inSyncPosition = countersSize + 1 + members.Length;
+        payload[inSyncPosition] = (byte)inSyncMembers.Length;
+        inSyncMembers.CopyTo(payload.AsSpan(inSyncPosition + 1));
         return payload;
     }
 

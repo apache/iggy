@@ -49,8 +49,11 @@ pub fn sample(
         Outcome::UserAlreadyExists => shadow.pick_user_name(prng)?,
         // Not targeted outcomes (absent from `OUTCOMES`); the shadow only ever
         // mints in-bounds names, and the sim client never sends an options
-        // block.
-        Outcome::InvalidUsername | Outcome::InvalidOptionValue => return None,
+        // or a permissions block.
+        Outcome::InvalidUsername
+        | Outcome::StreamNotFound
+        | Outcome::TopicNotFound
+        | Outcome::InvalidOptionValue => return None,
     };
     Some(Input {
         password: format!("pw-{username}"),
@@ -79,8 +82,10 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
         Outcome::Ok => Effect::AddUser {
             name: input.username.clone(),
         },
-        Outcome::UserAlreadyExists | Outcome::InvalidUsername | Outcome::InvalidOptionValue => {
-            Effect::None
-        }
+        Outcome::UserAlreadyExists
+        | Outcome::InvalidUsername
+        | Outcome::StreamNotFound
+        | Outcome::TopicNotFound
+        | Outcome::InvalidOptionValue => Effect::None,
     }
 }

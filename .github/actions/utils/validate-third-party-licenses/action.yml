@@ -28,7 +28,7 @@ inputs:
   node-version:
     description: "Node.js version used by the npm path"
     required: false
-    default: "23"
+    default: "24"
 
 runs:
   using: composite
@@ -82,6 +82,10 @@ runs:
         ./scripts/ci/third-party-licenses.sh --validate \
           --manifest core/connectors/runtime/Cargo.toml \
           $MANIFEST_FLAGS
+
+    - name: Validate iggy-kafka-gateway bundle
+      shell: bash
+      run: ./scripts/ci/third-party-licenses.sh --validate --manifest gateways/kafka/Cargo.toml
 
     - name: Validate Python wheel bundle
       shell: bash

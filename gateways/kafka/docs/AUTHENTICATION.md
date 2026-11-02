@@ -1,13 +1,15 @@
 # Kafka authentication and Iggy identity
 
-Status: implemented. Answers [#3549](https://github.com/apache/iggy/issues/3549). The gateway listener
-still has no TLS, so PLAIN stays confined to a trusted network until that lands (see
-[Transport security](#transport-security)). The mechanism choice below is forced by how Iggy stores
-credentials, not preferred.
+Status: implemented. Answers [#3549](https://github.com/apache/iggy/issues/3549), and
+[#4510](https://github.com/apache/iggy/issues/4510) for the transport: a `SASL_SSL` listener
+encrypts the Kafka hop and `IGGY_KAFKA_IGGY_TLS_ENABLED` the Iggy hop, so PLAIN leaves the trusted
+network only inside TLS (see [Transport security](#transport-security)). A client certificate on an
+`SSL` listener names a principal too (see [Client certificates](#client-certificates)). The
+mechanism choice below is forced by how Iggy stores credentials, not preferred.
 
 ## Decision
 
-Four parts.
+Five parts.
 
 **Mechanism: SASL/PLAIN only.** SCRAM cannot be implemented against Iggy's credential store at all, and
 nothing else in Kafka's mechanism set maps without new server-side storage.
@@ -23,8 +25,14 @@ verified on every connection, against Iggy, and that verification is deliberatel
 
 **Authorization is meant to stay in Iggy.** The gateway will not implement its own ACL model. The intent is
 to carry the authenticated Iggy identity onto the data plane and let the server's existing permission checks
-decide what it can do. That is later work: today the verified client is shut down as soon as the credential
+decide what it can do. That is later work: today the verified client signs out and shuts down as soon as the credential
 clears, and nothing carries the principal past authentication.
+
+**A client certificate is an identity too, with the same reach.** On an `SSL` listener that verifies client
+certificates, the subject maps to an Iggy username through Kafka's `ssl.principal.mapping.rules` and the
+gateway confirms the user exists. Nothing is logged into on the client's behalf, since Iggy's own transports
+take no certificate ([#3930](https://github.com/apache/iggy/issues/3930)); the principal gates admission and
+answers `DescribeAcls`, exactly as a SASL one does, and acting as it on the data plane is the same later work.
 
 ## Why SCRAM is out
 
@@ -55,12 +63,12 @@ connection. The cost rules it out.
 | Argon2id verify, run inline on the shard thread | 19 MiB, t=2, p=1 |
 | Replicated VSR `Register` | one consensus commit |
 | Leader settlement round trip, plus a second login if it redirects | one or two round trips |
-| Session slots, cluster-wide across all transports | 8192, oldest committed evicted past it |
+| Session slots, cluster-wide across all transports | 8192, and a full table refuses new logins |
 
 The Argon2 verify runs on the shard's compio runtime, which has no blocking pool. A burst of Kafka
 connections therefore stalls that shard's entire request loop, including produce and fetch traffic that has
-nothing to do with authentication. The 8192 ceiling (`core/consensus/src/impls.rs:178`) is cluster-wide, so
-connection churn on the Kafka side turns directly into session-table pressure and eviction on the Iggy side.
+nothing to do with authentication. The 8192 ceiling (`[metadata] clients_table_max`, `core/consensus/src/impls.rs:211`) is cluster-wide.
+So connection churn on the Kafka side turns directly into session-table pressure on the Iggy side.
 
 ## Why not a shared service account
 
@@ -95,7 +103,7 @@ Two consequences worth naming rather than discovering:
   traffic on that shard. Measured on debug builds, a single login takes about 10 ms and 32 concurrent
   logins take about 75 ms each, with throughput flattening near 410 per second. The shape is the point,
   latency climbing while throughput plateaus, not the absolute numbers. `MANUAL_TESTING.md` has the table.
-- **Nothing holds the verified session.** The connection that proved a credential drops it at once.
+- **Nothing holds the verified session.** The connection that proved a credential signs out at once.
   Produce and Fetch act as the bridge's Iggy user for every client. A data client per principal needs
   pooling, a separate question from how credentials are verified. Pooling is gateway-side code over the
   public SDK and needs no SDK change.
@@ -195,24 +203,95 @@ rather than leaving an operator to discover it.
 
 ## Transport security
 
-SASL/PLAIN puts the password in the clear on the wire, and so does Iggy's own login. Both hops need TLS.
+SASL/PLAIN puts the password in the clear on the wire, and so does Iggy's own login. Both hops need TLS,
+and the two are configured independently because they protect different hops.
 
-The gateway listener has no TLS at all today, which makes a TLS listener a prerequisite rather than a
-follow-up. The Iggy side already supports it on both ends (client at
-`core/common/src/types/configuration/tcp_config/tcp_client_config.rs:30`, server at
-`core/configs/src/server_config/tcp.rs:31`), shipped disabled.
+**The Kafka hop** is a listener's security protocol. The gateway binds one listener per protocol, the way
+Kafka's `listeners` does (`IGGY_KAFKA_LISTENERS`), and `SASL_SSL` is the one for PLAIN outside a trusted
+network. TLS is rustls, one certificate for every `SSL` and `SASL_SSL` listener
+(`IGGY_KAFKA_TLS_CERT_FILE`, `IGGY_KAFKA_TLS_KEY_FILE`), re-read on an interval so a rotation goes live
+without a restart. Each listener advertises its own address, so a client on the TLS port is never
+pointed at the plaintext one. A `SASL_PLAINTEXT` listener still exists for trusted networks, and the
+gateway warns at startup that it carries the password in the clear.
 
-The two hops are configured independently. `IGGY_KAFKA_IGGY_TLS_ENABLED` and its companions encrypt
-only the connection the credential check makes to Iggy, and are what make SASL usable at all against a
-TLS-only Iggy server, where every verification would otherwise fail as unreachable. The bridge's own
-client has no TLS at any setting, so the bridge hop stays unencrypted and carries
-`IGGY_KAFKA_IGGY_PASSWORD` in the clear. The Kafka-side listener is the other half still missing.
+**The Iggy hop** is `IGGY_KAFKA_IGGY_TLS_ENABLED` and its companions. They cover every connection the
+gateway makes to Iggy: the credential check's and the bridge's, which carries `IGGY_KAFKA_IGGY_PASSWORD`.
+They are what make SASL usable against a TLS-only Iggy server at all, where every verification would
+otherwise fail as unreachable, and are refused while nothing dials Iggy.
 
-Two limits worth recording. There is no mTLS anywhere in the tree, every rustls config uses
-`with_no_client_auth()`, so certificate-based Kafka client authentication cannot map to an Iggy identity
-without an external terminator. And an Iggy password is capped at 100 bytes with a `u8` length prefix on
-the wire (`core/common/src/http/users/defaults.rs:20`), so a Kafka client with a longer PLAIN secret is
-rejected.
+Two limits worth recording. Iggy's own transports take no client certificate
+([#3930](https://github.com/apache/iggy/issues/3930)), so a certificate identity on the Kafka side is
+verified by the gateway and looked up through the bridge's session rather than presented to Iggy. And an
+Iggy password is capped at 100 bytes with a `u8` length prefix on the wire
+(`core/common/src/http/users/defaults.rs:20`), so a Kafka client with a longer PLAIN secret is rejected.
+
+## Client certificates
+
+`IGGY_KAFKA_TLS_CLIENT_AUTH` is Kafka's `ssl.client.auth`: `none`, `requested` or `required`. It applies
+to `SSL` listeners, which verify the client certificate against `IGGY_KAFKA_TLS_CLIENT_CA_FILE` during the
+handshake, and is refused when no `SSL` listener exists.
+
+A `SASL_SSL` listener never asks for a client certificate. Kafka applies `ssl.client.auth` to a
+`SASL_SSL` listener only when that listener overrides it, and leaves it at `none` otherwise; SASL names
+the principal there. A deployment that wants certificate identities uses `SSL`.
+
+On an `SSL` listener the certificate names the principal, in three steps the connection takes before its
+first frame:
+
+1. **Render the subject** the way Java's `X500Principal.getName()` does, RFC 2253 with the most specific
+   RDN first and no spaces: `CN=alice,OU=eng,O=Example`. Operators write mapping rules against Java's
+   rendering, so the gateway follows JDK 11 to 21's `AVA.toRFC2253String`: its keyword set, its escaping
+   (NUL as `\00`), Latin-1 for `PrintableString`, `IA5String` and `GeneralString`, and hex for the string
+   types Java does not decode, `UniversalString` among them. Malformed UTF-8 or BMP values are the one case
+   not checked against Java.
+2. **Map it** through `IGGY_KAFKA_TLS_PRINCIPAL_MAPPING_RULES`, Kafka's `ssl.principal.mapping.rules`
+   syntax: `RULE:pattern/replacement/[LU]` applies when the pattern matches the whole subject, `DEFAULT`
+   keeps it, the first match wins, and a subject no rule matches closes the connection with the subject in
+   the log at `warn`. The default is `DEFAULT`. Iggy only requires a username of 3 to 50 characters, but a
+   raw subject is usually longer than that and is rarely the name the operator created, so a deployment
+   sets at least one rule. A replacement with a bare `$`, or a `${name}` with no such named group, is
+   refused at startup, where Kafka would fail the first handshake it applies to. One that names a group
+   the pattern lacks is refused too, which is stricter than Kafka: a broker writes it literally, so
+   `RULE:^CN=(.*)$/$2/` maps to `$2`. The reverse case, `/$1\$2/`, makes Kafka throw while the gateway
+   maps `alice` to `alice$2`, which is harmless because that Iggy user must still exist. The replacement is applied as Java's `replaceAll`, to every match in the subject, so
+   `RULE:(.*)/$1@x/` maps `alice` to `alice@x@x` as it does on a broker. Patterns are the subset of
+   Java's regex syntax whose meaning the gateway can reproduce: `\d \s \w` and their negations match
+   ASCII only, and `.` outside `(?s)` stops at `\r`, U+0085, U+2028 and U+2029 as well as `\n`, both as
+   in Java. Rust would read them over Unicode, so a CA-signed `CN=\u212Aafka` (Kelvin sign) would match
+   `\w+` and lowercase to `kafka`. Case-insensitive matching (`(?i)`), the `u` and `U` flags, `\p{..}`
+   and `\P{..}`, POSIX classes such as `[[:alpha:]]`, word boundaries (`\b`, `\B`), the `m`, `x` and
+   `R` flags, `\v`, a quantifier directly after another (`.*+`, possessive in Java) and the `--` and
+   `~~` class operations are refused at startup with the construct named: each has no faithful
+   translation. Non-ASCII names still map, so
+   `CN=Zoë` under `RULE:^CN=([^,]+).*$/$1/` maps to `Zoë` as on a broker.
+3. **Look the name up** through the bridge's own session. The user must exist and be active, or the
+   connection is closed after the handshake with the name in the log at `warn`: a certificate the CA signed
+   for an account that does not exist is a provisioning mistake, not something the client can correct. The
+   bridge is therefore required for certificate identities, and its Iggy user needs `read_users`. A failed
+   lookup, including one refused for want of that permission, closes the connection too and never admits
+   the name unchecked.
+
+With `requested`, a client that presents no certificate is Kafka's `ANONYMOUS` principal, which holds no
+permissions: `DescribeAcls` describes it as holding nothing, and `DeleteTopics`, `AlterConfigs`,
+`DeleteGroups`, `OffsetDelete` and the auto topic creation a `Metadata` request asks for, which need a global
+`manage_topics` or `manage_streams`, are refused. Everything else is served as the bridge's user. With
+`required`, rustls fails the handshake instead.
+
+The same holds on every listener that names nobody once any listener names principals: a `PLAINTEXT`
+listener beside a `SASL_SSL` or mTLS one serves `ANONYMOUS`, so it cannot do what an authenticated user
+without `manage_topics` cannot. Only a gateway whose listeners all name nobody leaves those requests
+ungated.
+
+The principal a certificate yields is the same `AuthenticatedPrincipal` a SASL login yields, with its
+permissions read at admission, so everything written about the SASL identity above holds: it is a snapshot,
+it is not cached across connections, and nothing acts as it on the data plane yet
+([#4518](https://github.com/apache/iggy/issues/4518)).
+
+The snapshot follows Iggy's metadata change log when the bridge's Iggy user can read it, which needs root
+or the global `manage_servers` permission. A connection then takes each permission change of its user
+within about a second, and closes once its user is deleted or deactivated.
+[`ACL_MAPPING.md`](ACL_MAPPING.md#staleness) has the detail. Without that permission, the snapshot holds
+until the connection closes.
 
 ## Re-authentication
 
@@ -229,7 +308,9 @@ has to resolve it first.
 
 - SCRAM-SHA-256 and SCRAM-SHA-512, blocked on credential storage that does not exist.
 - SASL/OAUTHBEARER and GSSAPI.
-- mTLS and certificate-based identity.
+- Presenting a client certificate to Iggy's own transports, which take none
+  ([#3930](https://github.com/apache/iggy/issues/3930)); the gateway verifies it and looks the user up
+  instead.
 - Authorization. No handler asks Iggy about permissions yet, since the verified identity is not carried
   onto the data plane; SASL is an admission gate only. The `DescribeAcls` and `CreateAcls` API keys also
   stay unimplemented.

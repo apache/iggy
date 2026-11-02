@@ -33,6 +33,7 @@ use tokio::sync::SemaphorePermit;
 
 use iggy_gateway_kafka::GatewayConfig;
 use iggy_gateway_kafka::auth::{AuthError, AuthenticatedPrincipal, SaslAuthenticator};
+use iggy_gateway_kafka::listener::SecurityProtocol;
 use iggy_gateway_kafka::protocol::acl::PrincipalPermissions;
 use iggy_gateway_kafka::protocol::sasl::{MAX_PRE_AUTH_API_VERSIONS, PlainCredentials};
 
@@ -83,6 +84,7 @@ impl SaslAuthenticator for FixedCredentialAuthenticator {
         if matches {
             Ok(AuthenticatedPrincipal {
                 username: credentials.username.clone(),
+                user: None,
                 permissions: self.permissions,
                 permissions_known: true,
             })
@@ -94,7 +96,7 @@ impl SaslAuthenticator for FixedCredentialAuthenticator {
 
 fn sasl_config() -> GatewayConfig {
     GatewayConfig {
-        sasl_enabled: true,
+        listeners: vec![server::listener(SecurityProtocol::SaslPlaintext)],
         idle_timeout: Duration::from_secs(5),
         read_timeout: Duration::from_secs(5),
         write_timeout: Duration::from_secs(5),
@@ -975,11 +977,14 @@ async fn given_sasl_enabled_without_an_authenticator_should_refuse_to_start() {
     // Driven through `run` directly: the shared spawn helper discards the Result, so a test
     // written against it would pass whatever this guard did.
     use iggy_gateway_kafka::KafkaGateway;
-    use iggy_gateway_kafka::server::bind_listener;
+    use iggy_gateway_kafka::server::{BoundListener, bind_listener};
 
     let listener = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
+    let listener = BoundListener::new(server::listener(SecurityProtocol::SaslPlaintext), listener);
     let (_tx, rx) = tokio::sync::broadcast::channel(1);
-    let result = KafkaGateway::new(sasl_config()).run(listener, rx).await;
+    let result = KafkaGateway::new(sasl_config())
+        .run(vec![listener], rx)
+        .await;
     assert!(
         result.is_err(),
         "a gateway demanding SASL with nothing to verify against would reject every client"
@@ -991,9 +996,10 @@ async fn given_an_authenticator_without_sasl_enabled_should_refuse_to_start() {
     // The quieter half: a verifier attached while the flag is off serves everything
     // unauthenticated, with nothing in the log to say so.
     use iggy_gateway_kafka::KafkaGateway;
-    use iggy_gateway_kafka::server::bind_listener;
+    use iggy_gateway_kafka::server::{BoundListener, bind_listener};
 
     let listener = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
+    let listener = BoundListener::new(server::listener(SecurityProtocol::Plaintext), listener);
     let (_tx, rx) = tokio::sync::broadcast::channel(1);
     let authenticator = Arc::new(FixedCredentialAuthenticator {
         username: "alice",
@@ -1001,12 +1007,12 @@ async fn given_an_authenticator_without_sasl_enabled_should_refuse_to_start() {
         permissions: PrincipalPermissions::default(),
     });
     let config = GatewayConfig {
-        sasl_enabled: false,
+        listeners: vec![server::listener(SecurityProtocol::Plaintext)],
         ..sasl_config()
     };
     let result = KafkaGateway::new(config)
         .with_authenticator(authenticator)
-        .run(listener, rx)
+        .run(vec![listener], rx)
         .await;
     assert!(
         result.is_err(),
@@ -1030,6 +1036,7 @@ impl SaslAuthenticator for StallingAuthenticator {
         let _held = self.release.acquire().await;
         Ok(AuthenticatedPrincipal {
             username: credentials.username.clone(),
+            user: None,
             permissions: PrincipalPermissions::default(),
             permissions_known: true,
         })
@@ -1096,6 +1103,7 @@ impl SaslAuthenticator for ConcurrencyRecordingAuthenticator {
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         Ok(AuthenticatedPrincipal {
             username: credentials.username.clone(),
+            user: None,
             permissions: PrincipalPermissions::default(),
             permissions_known: true,
         })
@@ -1494,6 +1502,7 @@ impl SaslAuthenticator for UnreadPermissionsAuthenticator {
     ) -> Result<AuthenticatedPrincipal, AuthError> {
         Ok(AuthenticatedPrincipal {
             username: credentials.username.clone(),
+            user: None,
             permissions: PrincipalPermissions::default(),
             permissions_known: false,
         })

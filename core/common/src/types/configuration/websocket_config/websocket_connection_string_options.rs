@@ -16,13 +16,14 @@
 // under the License.
 
 use crate::{
-    ConnectionStringOptions, IggyDuration, IggyError, NonZeroIggyDuration,
+    ConnectionStringOptions, IggyDuration, IggyError, NonZeroIggyDuration, PendingOperationsConfig,
     WebSocketClientReconnectionConfig,
 };
 use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct WebSocketConnectionStringOptions {
+    pending_operations: PendingOperationsConfig,
     heartbeat_interval: NonZeroIggyDuration,
     reconnection: WebSocketClientReconnectionConfig,
 
@@ -41,6 +42,10 @@ pub struct WebSocketConnectionStringOptions {
 }
 
 impl WebSocketConnectionStringOptions {
+    pub fn pending_operations(&self) -> PendingOperationsConfig {
+        self.pending_operations
+    }
+
     pub fn heartbeat_interval(&self) -> NonZeroIggyDuration {
         self.heartbeat_interval
     }
@@ -113,6 +118,16 @@ impl ConnectionStringOptions for WebSocketConnectionStringOptions {
             }
 
             match parts[0] {
+                "max_pending_operations" => {
+                    parsed_options.pending_operations.max_operations = parts[1]
+                        .parse()
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
+                }
+                "max_pending_operation_bytes" => {
+                    parsed_options.pending_operations.max_bytes = parts[1]
+                        .parse()
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
+                }
                 "heartbeat_interval" => {
                     parsed_options.heartbeat_interval = NonZeroIggyDuration::from_str(parts[1])
                         .map_err(|_| IggyError::InvalidConnectionString)?;
@@ -195,6 +210,7 @@ impl ConnectionStringOptions for WebSocketConnectionStringOptions {
 impl Default for WebSocketConnectionStringOptions {
     fn default() -> Self {
         WebSocketConnectionStringOptions {
+            pending_operations: PendingOperationsConfig::default(),
             heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
             reconnection: WebSocketClientReconnectionConfig::default(),
             read_buffer_size: None,

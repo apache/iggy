@@ -15,6 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Single Apache Iggy node built from this checkout.
+#
+#   IGGY_ROOT_PASSWORD=... docker compose up -d
+#
+# The server refuses to start without root credentials. IGGY_ROOT_USERNAME
+# defaults to iggy.
+
 services:
   iggy-server:
     build:
@@ -34,6 +41,8 @@ services:
       # The image binds every listener to 0.0.0.0 (Dockerfile), so the address
       # clients dial has to be declared here.
       - IGGY_NODE_ADVERTISED_ADDRESS=localhost
+      - IGGY_ROOT_USERNAME=${IGGY_ROOT_USERNAME:-iggy}
+      - IGGY_ROOT_PASSWORD=${IGGY_ROOT_PASSWORD:?set IGGY_ROOT_PASSWORD}
     networks:
       - iggy
     ports:

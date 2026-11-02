@@ -19,12 +19,34 @@
 
 package org.apache.iggy.user;
 
+import org.apache.iggy.message.HeaderValue;
+
 import java.math.BigInteger;
+import java.util.Map;
 import java.util.Optional;
 
+/** A user with its permissions. See {@link UserInfo} for what {@code options} and {@code derivedOptions} carry. */
 public record UserInfoDetails(
-        Long id, BigInteger createdAt, UserStatus status, String username, Optional<Permissions> permissions) {
+        Long id,
+        BigInteger createdAt,
+        UserStatus status,
+        String username,
+        Optional<Permissions> permissions,
+        Map<String, HeaderValue> options,
+        Map<String, HeaderValue> derivedOptions) {
+    public UserInfoDetails {
+        options = options == null ? Map.of() : options;
+        derivedOptions = derivedOptions == null ? Map.of() : derivedOptions;
+    }
+
     public UserInfoDetails(UserInfo userInfo, Optional<Permissions> permissions) {
-        this(userInfo.id(), userInfo.createdAt(), userInfo.status(), userInfo.username(), permissions);
+        this(
+                userInfo.id(),
+                userInfo.createdAt(),
+                userInfo.status(),
+                userInfo.username(),
+                permissions,
+                userInfo.options(),
+                userInfo.derivedOptions());
     }
 }

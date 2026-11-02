@@ -165,11 +165,8 @@ pub(crate) fn accepts_state(
 /// that exact result instead of treating `Connecting` as success.
 #[derive(Debug)]
 pub(crate) struct ConnectCoordinator {
-    id: u64,
     active: AtomicBool,
     abandoned: AtomicBool,
-    active_token: AtomicU64,
-    next_token: AtomicU64,
     generation: AtomicU64,
     result: StdMutex<Option<(u64, Result<(), IggyError>)>>,
     changed: Notify,
@@ -178,64 +175,17 @@ pub(crate) struct ConnectCoordinator {
 impl ConnectCoordinator {
     pub(crate) fn new() -> Self {
         Self {
-            id: NEXT_CONNECT_COORDINATOR_ID.fetch_add(1, Ordering::SeqCst),
             active: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
-            active_token: AtomicU64::new(0),
-            next_token: AtomicU64::new(1),
             generation: AtomicU64::new(0),
             result: StdMutex::new(None),
             changed: Notify::new(),
         }
     }
 
-    pub(crate) fn is_active(&self) -> bool {
-        self.active.load(Ordering::SeqCst)
-    }
-
-    /// Returns once no connect runs or `while_held` is false. Both are read
-    /// at the call and after each connect ends.
-    pub(crate) async fn wait_until_inactive(&self, while_held: impl Fn() -> bool) {
-        loop {
-            let changed = self.changed.notified();
-            if !self.is_active() || !while_held() {
-                return;
-            }
-            changed.await;
-        }
-    }
-
-    pub(crate) fn current_owner_context(&self) -> Option<ConnectOwnerContext> {
-        let context = CONNECT_OWNER_CONTEXT.try_with(|context| *context).ok()?;
-        (context.coordinator_id == self.id
-            && context.token == self.active_token.load(Ordering::SeqCst))
-        .then_some(context)
-    }
-
-    pub(crate) fn owner_context(
-        &self,
-        token: ConnectOwnerToken,
-        settle_off_leader: bool,
-        single_attempt: bool,
-    ) -> ConnectOwnerContext {
-        ConnectOwnerContext {
-            coordinator_id: self.id,
-            token: token.0,
-            settle_off_leader,
-            single_attempt,
-        }
-    }
-
-    pub(crate) async fn scope_owner<Fut, T>(&self, context: ConnectOwnerContext, future: Fut) -> T
-    where
-        Fut: Future<Output = T>,
-    {
-        CONNECT_OWNER_CONTEXT.scope(context, future).await
-    }
-
     pub(crate) async fn run<F, Fut>(&self, operation: F) -> Result<(), IggyError>
     where
-        F: FnOnce(bool, ConnectOwnerToken) -> Fut,
+        F: FnOnce(bool) -> Fut,
         Fut: Future<Output = Result<(), IggyError>>,
     {
         let observed_generation = self.generation.load(Ordering::SeqCst);
@@ -245,14 +195,11 @@ impl ConnectCoordinator {
             .is_ok()
         {
             let abandoned = self.abandoned.swap(false, Ordering::SeqCst);
-            let token = self.next_token.fetch_add(1, Ordering::SeqCst).max(1);
-            self.active_token.store(token, Ordering::SeqCst);
             let mut owner = ConnectOwner {
                 coordinator: self,
-                token,
                 completed: false,
             };
-            let result = operation(abandoned, ConnectOwnerToken(token)).await;
+            let result = operation(abandoned).await;
             owner.complete(result.clone());
             return result;
         }
@@ -262,6 +209,16 @@ impl ConnectCoordinator {
             let generation = self.generation.load(Ordering::SeqCst);
             if generation > observed_generation {
                 return self.result_for(generation);
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) async fn wait_until_inactive(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if !self.active.load(Ordering::SeqCst) {
+                return;
             }
             changed.await;
         }
@@ -277,7 +234,7 @@ impl ConnectCoordinator {
             .unwrap_or(Err(IggyError::Disconnected))
     }
 
-    fn finish(&self, token: u64, result: Result<(), IggyError>, abandoned: bool) {
+    fn finish(&self, result: Result<(), IggyError>, abandoned: bool) {
         if abandoned {
             self.abandoned.store(true, Ordering::SeqCst);
         }
@@ -287,9 +244,6 @@ impl ConnectCoordinator {
             .unwrap_or_else(PoisonError::into_inner)
             .replace((generation, result));
         self.generation.store(generation, Ordering::SeqCst);
-        if self.active_token.load(Ordering::SeqCst) == token {
-            self.active_token.store(0, Ordering::SeqCst);
-        }
         self.active.store(false, Ordering::SeqCst);
         self.changed.notify_waiters();
     }
@@ -303,13 +257,12 @@ impl Default for ConnectCoordinator {
 
 struct ConnectOwner<'a> {
     coordinator: &'a ConnectCoordinator,
-    token: u64,
     completed: bool,
 }
 
 impl ConnectOwner<'_> {
     fn complete(&mut self, result: Result<(), IggyError>) {
-        self.coordinator.finish(self.token, result, false);
+        self.coordinator.finish(result, false);
         self.completed = true;
     }
 }
@@ -317,37 +270,9 @@ impl ConnectOwner<'_> {
 impl Drop for ConnectOwner<'_> {
     fn drop(&mut self) {
         if !self.completed {
-            self.coordinator
-                .finish(self.token, Err(IggyError::Disconnected), true);
+            self.coordinator.finish(Err(IggyError::Disconnected), true);
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ConnectOwnerToken(u64);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ConnectOwnerContext {
-    coordinator_id: u64,
-    token: u64,
-    settle_off_leader: bool,
-    single_attempt: bool,
-}
-
-impl ConnectOwnerContext {
-    pub(crate) fn settle_off_leader(self) -> bool {
-        self.settle_off_leader
-    }
-
-    pub(crate) fn single_attempt(self) -> bool {
-        self.single_attempt
-    }
-}
-
-static NEXT_CONNECT_COORDINATOR_ID: AtomicU64 = AtomicU64::new(1);
-
-tokio::task_local! {
-    static CONNECT_OWNER_CONTEXT: ConnectOwnerContext;
 }
 
 #[cfg(test)]
@@ -420,7 +345,7 @@ mod tests {
             let release = Arc::clone(&release);
             tokio::spawn(async move {
                 coordinator
-                    .run(|abandoned, _token| async move {
+                    .run(|abandoned| async move {
                         assert!(!abandoned);
                         operations.fetch_add(1, Ordering::SeqCst);
                         started.notify_one();
@@ -436,7 +361,7 @@ mod tests {
             let operations = Arc::clone(&operations);
             tokio::spawn(async move {
                 coordinator
-                    .run(|_, _token| async move {
+                    .run(|_| async move {
                         operations.fetch_add(1, Ordering::SeqCst);
                         Ok(())
                     })
@@ -466,7 +391,7 @@ mod tests {
             let started = Arc::clone(&started);
             tokio::spawn(async move {
                 coordinator
-                    .run(|_, _token| async move {
+                    .run(|_| async move {
                         started.notify_one();
                         std::future::pending::<Result<(), IggyError>>().await
                     })
@@ -476,7 +401,7 @@ mod tests {
         started.notified().await;
         let waiter = {
             let coordinator = Arc::clone(&coordinator);
-            tokio::spawn(async move { coordinator.run(|_, _token| async { Ok(()) }).await })
+            tokio::spawn(async move { coordinator.run(|_| async { Ok(()) }).await })
         };
         tokio::task::yield_now().await;
         owner.abort();
@@ -488,152 +413,13 @@ mod tests {
         let observed_abandoned = Arc::new(AtomicBool::new(false));
         let marker = Arc::clone(&observed_abandoned);
         coordinator
-            .run(|abandoned, _token| async move {
+            .run(|abandoned| async move {
                 marker.store(abandoned, Ordering::SeqCst);
                 Ok(())
             })
             .await
             .unwrap();
         assert!(observed_abandoned.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn connect_owner_context_is_visible_only_to_the_owner_task() {
-        let coordinator = Arc::new(ConnectCoordinator::new());
-        let started = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let owner = {
-            let coordinator = Arc::clone(&coordinator);
-            let owner_coordinator = Arc::clone(&coordinator);
-            let started = Arc::clone(&started);
-            let release = Arc::clone(&release);
-            tokio::spawn(async move {
-                coordinator
-                    .run(move |_, token| async move {
-                        let context = owner_coordinator.owner_context(token, true, true);
-                        owner_coordinator
-                            .scope_owner(context, async {
-                                assert_eq!(
-                                    owner_coordinator.current_owner_context(),
-                                    Some(context)
-                                );
-                                started.notify_one();
-                                release.notified().await;
-                                Ok(())
-                            })
-                            .await
-                    })
-                    .await
-            })
-        };
-        started.notified().await;
-
-        assert!(coordinator.is_active());
-        assert_eq!(coordinator.current_owner_context(), None);
-        release.notify_one();
-        owner.await.unwrap().unwrap();
-        assert_eq!(coordinator.current_owner_context(), None);
-    }
-
-    #[tokio::test]
-    async fn owner_tokens_cannot_collide_across_connect_coordinators() {
-        let first = Arc::new(ConnectCoordinator::new());
-        let second = Arc::new(ConnectCoordinator::new());
-        let second_started = Arc::new(Notify::new());
-        let second_release = Arc::new(Notify::new());
-        let second_owner = {
-            let second = Arc::clone(&second);
-            let owner_coordinator = Arc::clone(&second);
-            let second_started = Arc::clone(&second_started);
-            let second_release = Arc::clone(&second_release);
-            tokio::spawn(async move {
-                second
-                    .run(move |_, token| async move {
-                        let context = owner_coordinator.owner_context(token, false, false);
-                        owner_coordinator
-                            .scope_owner(context, async {
-                                second_started.notify_one();
-                                second_release.notified().await;
-                                Ok(())
-                            })
-                            .await
-                    })
-                    .await
-            })
-        };
-        second_started.notified().await;
-
-        let first_owner = Arc::clone(&first);
-        let second_from_first = Arc::clone(&second);
-        first
-            .run(move |_, token| async move {
-                let context = first_owner.owner_context(token, true, true);
-                first_owner
-                    .scope_owner(context, async {
-                        assert_eq!(first_owner.current_owner_context(), Some(context));
-                        assert_eq!(second_from_first.current_owner_context(), None);
-                        Ok(())
-                    })
-                    .await
-            })
-            .await
-            .unwrap();
-
-        second_release.notify_one();
-        second_owner.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_waiters_settlement_mode_cannot_leak_into_the_owner() {
-        let coordinator = Arc::new(ConnectCoordinator::new());
-        let started = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let waiter_ran = Arc::new(AtomicBool::new(false));
-        let owner = {
-            let coordinator = Arc::clone(&coordinator);
-            let owner_coordinator = Arc::clone(&coordinator);
-            let started = Arc::clone(&started);
-            let release = Arc::clone(&release);
-            tokio::spawn(async move {
-                coordinator
-                    .run(move |_, token| async move {
-                        let context = owner_coordinator.owner_context(token, false, false);
-                        owner_coordinator
-                            .scope_owner(context, async {
-                                assert!(!context.settle_off_leader());
-                                assert!(!context.single_attempt());
-                                started.notify_one();
-                                release.notified().await;
-                                Ok(())
-                            })
-                            .await
-                    })
-                    .await
-            })
-        };
-        started.notified().await;
-        let waiter = {
-            let coordinator = Arc::clone(&coordinator);
-            let waiter_coordinator = Arc::clone(&coordinator);
-            let waiter_ran = Arc::clone(&waiter_ran);
-            tokio::spawn(async move {
-                coordinator
-                    .run(move |_, token| async move {
-                        waiter_ran.store(true, Ordering::SeqCst);
-                        let context = waiter_coordinator.owner_context(token, true, true);
-                        assert!(context.settle_off_leader());
-                        assert!(context.single_attempt());
-                        Ok(())
-                    })
-                    .await
-            })
-        };
-        tokio::task::yield_now().await;
-        release.notify_one();
-
-        owner.await.unwrap().unwrap();
-        waiter.await.unwrap().unwrap();
-        assert!(!waiter_ran.load(Ordering::SeqCst));
     }
 
     #[test]

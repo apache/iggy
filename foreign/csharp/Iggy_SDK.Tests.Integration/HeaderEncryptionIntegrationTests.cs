@@ -43,7 +43,7 @@ public class HeaderEncryptionIntegrationTests
     {
         var encryptor = CreateEncryptor();
 
-        // Publisher on an encrypting client; a plain client raw-polls the same topic to prove the wire bytes
+        // Publisher on an encrypting client. A plain client raw-polls the same topic to prove the wire bytes
         // stay encrypted.
         var encryptingClient = await Fixture.CreateAuthenticatedClient(protocol, encryptor: encryptor);
         var plainClient = await Fixture.CreateAuthenticatedClient(protocol);
@@ -131,9 +131,7 @@ public class HeaderEncryptionIntegrationTests
         var consumer = IggyConsumerBuilder
             .Create(client, streamId, topicId, Consumer.New(1))
             .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(1)
-            .WithPartitionId(0)
-            .WithAutoCommitMode(AutoCommitMode.Disabled)
+            .WithPartitions(0)
             .Build();
 
         await consumer.InitAsync();

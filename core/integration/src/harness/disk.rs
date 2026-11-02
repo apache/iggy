@@ -38,6 +38,11 @@ use super::TestHarness;
 const CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(20);
 const CONVERGENCE_STABLE_POLLS: u32 = 3;
+/// Directory names under a partition's root, as `partitions::types` writes
+/// them.
+const OFFSETS_DIR: &str = "offsets";
+const CONSUMER_OFFSETS_DIR: &str = "consumers";
+const GROUP_OFFSETS_DIR: &str = "groups";
 
 /// Numeric regular offset files in one partition's selected kind directory.
 pub fn consumer_offset_file_ids(
@@ -399,10 +404,7 @@ fn total_log_bytes(root: &Path) -> u64 {
 
 /// The u64 offset persisted under any `offsets/consumers/<id>` file in a node's
 /// data dir, or `None` when no such file has been written yet. Walks the tree
-/// so it is robust to the stream/topic/partition id layout. Reads the leading
-/// u64 of the record: the file is offset + trailing checksum (see
-/// `partitions::offset_storage::encode_offset_record`), and a shorter read
-/// (persist truncates before writing) is treated as not-yet-written.
+/// so it is robust to the stream/topic/partition id layout.
 pub fn read_replicated_consumer_offset(data_dir: &Path) -> Option<u64> {
     let mut stack: Vec<PathBuf> = vec![data_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -418,24 +420,132 @@ pub fn read_replicated_consumer_offset(data_dir: &Path) -> Option<u64> {
                 stack.push(path);
                 continue;
             }
-            let is_consumer_offset = path
-                .parent()
-                .and_then(Path::file_name)
-                .is_some_and(|name| name == "consumers")
-                && path
-                    .parent()
-                    .and_then(Path::parent)
-                    .and_then(Path::file_name)
-                    .is_some_and(|name| name == "offsets");
-            if is_consumer_offset
-                && let Ok(bytes) = fs::read(&path)
-                && let Some(offset_bytes) = bytes.first_chunk::<8>()
+            if offset_file_kind(&path) == Some(CONSUMER_OFFSETS_DIR)
+                && let Some(offset) = read_offset_file(&path)
             {
-                return Some(u64::from_le_bytes(*offset_bytes));
+                return Some(offset);
             }
         }
     }
     None
+}
+
+/// Every consumer and group offset file found on any replica, with the value
+/// each node holds, and every reader whose stored offset differs between
+/// replicas.
+#[derive(Debug)]
+pub struct ReplicaOffsetComparison {
+    /// Relative path of each offset file, then the offset per node in node
+    /// order: `None` when the node has no such file or a torn one.
+    pub offsets: BTreeMap<String, Vec<Option<u64>>>,
+    pub problems: Vec<String>,
+}
+
+/// Compares the stored offsets of consumers and consumer groups across the
+/// given node data dirs. The decoded offset is compared, not the bytes, so a
+/// record written before the checksum existed still matches its successor.
+/// Finding no offset file at all is a problem, because the comparison would
+/// then pass without checking anything.
+pub fn compare_replica_offsets(data_paths: &[PathBuf]) -> ReplicaOffsetComparison {
+    let per_node: Vec<BTreeMap<String, Option<u64>>> = data_paths
+        .iter()
+        .map(|root| collect_offset_files(root))
+        .collect();
+    let all_keys: BTreeSet<&str> = per_node
+        .iter()
+        .flat_map(|node| node.keys().map(String::as_str))
+        .collect();
+    let mut problems = Vec::new();
+    if all_keys.is_empty() {
+        problems.push(
+            "no replica holds a consumer or group offset file, so the offset comparison \
+             would be vacuous"
+                .to_owned(),
+        );
+    }
+    let mut offsets = BTreeMap::new();
+    for key in all_keys {
+        let values: Vec<Option<u64>> = per_node
+            .iter()
+            .map(|node| node.get(key).copied().flatten())
+            .collect();
+        if values.iter().any(|value| *value != values[0]) {
+            let (partition, reader) = key.rsplit_once("/offsets/").unwrap_or((key, ""));
+            let per_node_values: Vec<String> = values
+                .iter()
+                .enumerate()
+                .map(|(node, value)| match value {
+                    Some(offset) => format!("node {node}={offset}"),
+                    None => format!("node {node}=none"),
+                })
+                .collect();
+            problems.push(format!(
+                "`{partition}` {reader}: stored offsets differ between replicas: {}",
+                per_node_values.join(", ")
+            ));
+        }
+        offsets.insert(key.to_owned(), values);
+    }
+    ReplicaOffsetComparison { offsets, problems }
+}
+
+/// Every consumer and group offset file under `root`, keyed by its
+/// `/`-separated relative path, with its decoded offset.
+fn collect_offset_files(root: &Path) -> BTreeMap<String, Option<u64>> {
+    let mut files = BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file()
+                && offset_file_kind(&path).is_some()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.parse::<u32>().is_ok())
+                && let Ok(rel) = path.strip_prefix(root)
+            {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                files.insert(rel, read_offset_file(&path));
+            }
+        }
+    }
+    files
+}
+
+/// `consumers` or `groups` when `path` sits in that directory under a
+/// partition's `offsets/`.
+fn offset_file_kind(path: &Path) -> Option<&'static str> {
+    let parent = path.parent()?;
+    let in_offsets = parent
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == OFFSETS_DIR);
+    if !in_offsets {
+        return None;
+    }
+    [CONSUMER_OFFSETS_DIR, GROUP_OFFSETS_DIR]
+        .into_iter()
+        .find(|kind| parent.file_name().is_some_and(|name| name == *kind))
+}
+
+/// The leading u64 of an offset record. The file is offset + trailing
+/// checksum (see `partitions::offset_storage::encode_offset_record`), and a
+/// shorter read (persist truncates before writing) is treated as
+/// not-yet-written.
+fn read_offset_file(path: &Path) -> Option<u64> {
+    let bytes = fs::read(path).ok()?;
+    bytes
+        .first_chunk::<8>()
+        .map(|offset| u64::from_le_bytes(*offset))
 }
 
 /// Decode a node's durable metadata `VsrState` from its on-disk superblock,
@@ -563,12 +673,14 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{assert_replica_data_identical, compare_replica_data};
+    use super::{assert_replica_data_identical, compare_replica_data, compare_replica_offsets};
 
     const SEGMENT_PATH: &str = "streams/1/topics/1/partitions/0/00000000000000000000.log";
     const NEXT_SEGMENT_PATH: &str = "streams/1/topics/1/partitions/0/00000000000000000010.log";
     const INDEX_PATH: &str = "streams/1/topics/1/partitions/0/00000000000000000000.index";
     const WAL_PATH: &str = "metadata/journal.wal";
+    const CONSUMER_OFFSET_PATH: &str = "streams/1/topics/1/partitions/0/offsets/consumers/10";
+    const GROUP_OFFSET_PATH: &str = "streams/1/topics/1/partitions/1/offsets/groups/1";
 
     #[test]
     fn given_identical_segments_when_comparing_should_inventory_only_replicated_files() {
@@ -649,6 +761,72 @@ mod tests {
         }
         let comparison = compare_replica_data(&[], false);
         assert!(!comparison.problems.is_empty(), "{comparison:?}");
+    }
+
+    #[test]
+    fn given_divergent_and_missing_offsets_when_comparing_should_name_reader_and_values() {
+        let directory = tempdir().unwrap();
+        let paths = [
+            directory.path().join("node0"),
+            directory.path().join("node1"),
+            directory.path().join("node2"),
+        ];
+        for path in &paths {
+            write_file(path, CONSUMER_OFFSET_PATH, &offset_record(42));
+        }
+        write_file(&paths[0], GROUP_OFFSET_PATH, &offset_record(7));
+        write_file(&paths[1], GROUP_OFFSET_PATH, &offset_record(7));
+        // A record written before the checksum existed holds the bare offset.
+        write_file(&paths[2], GROUP_OFFSET_PATH, &7u64.to_le_bytes());
+
+        let comparison = compare_replica_offsets(&paths);
+        assert!(comparison.problems.is_empty(), "{comparison:?}");
+        assert_eq!(
+            comparison.offsets.get(GROUP_OFFSET_PATH),
+            Some(&vec![Some(7); 3])
+        );
+
+        write_file(&paths[1], CONSUMER_OFFSET_PATH, &offset_record(41));
+        fs::remove_file(paths[2].join(GROUP_OFFSET_PATH)).unwrap();
+        let comparison = compare_replica_offsets(&paths);
+        assert_eq!(comparison.problems.len(), 2, "{comparison:?}");
+        assert!(
+            comparison.problems.iter().any(|problem| {
+                problem.contains("partitions/0` consumers/10")
+                    && problem.contains("node 0=42, node 1=41, node 2=42")
+            }),
+            "{comparison:?}"
+        );
+        assert!(
+            comparison.problems.iter().any(|problem| {
+                problem.contains("partitions/1` groups/1")
+                    && problem.contains("node 0=7, node 1=7, node 2=none")
+            }),
+            "{comparison:?}"
+        );
+    }
+
+    #[test]
+    fn given_no_offset_files_when_comparing_offsets_should_reject_vacuous_agreement() {
+        let directory = tempdir().unwrap();
+        let paths = [
+            directory.path().join("node0"),
+            directory.path().join("node1"),
+        ];
+        for path in &paths {
+            write_file(path, SEGMENT_PATH, b"messages without readers");
+        }
+
+        let comparison = compare_replica_offsets(&paths);
+        assert_eq!(comparison.problems.len(), 1, "{comparison:?}");
+        assert!(comparison.problems[0].contains("vacuous"), "{comparison:?}");
+    }
+
+    /// Offset plus an arbitrary checksum: the comparison reads the offset only.
+    fn offset_record(offset: u64) -> Vec<u8> {
+        let mut record = offset.to_le_bytes().to_vec();
+        record.extend_from_slice(&offset.wrapping_mul(31).to_le_bytes());
+        record
     }
 
     fn write_file(root: &Path, relative_path: &str, bytes: &[u8]) {

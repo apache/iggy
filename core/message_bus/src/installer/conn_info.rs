@@ -38,6 +38,25 @@ pub enum ClientTransportKind {
     Quic,
 }
 
+impl ClientTransportKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::TcpTls => "tcp_tls",
+            Self::Ws => "ws",
+            Self::Wss => "wss",
+            Self::Quic => "quic",
+        }
+    }
+}
+
+impl std::fmt::Display for ClientTransportKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// TLS handshake details for [`ClientTransportKind::TcpTls`] and
 /// [`ClientTransportKind::Wss`].
 ///

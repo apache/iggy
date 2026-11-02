@@ -16,8 +16,10 @@
 // under the License.
 
 using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
+using Apache.Iggy.Exceptions;
 using Apache.Iggy.Factory;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
@@ -150,9 +152,9 @@ public class IggyConsumerBuilder
     /// <summary>
     ///     Configures message encryption on the client this builder creates. Encryption is a client-level concern:
     ///     the encryptor decrypts on poll (and encrypts on send) for the whole connection. Only valid when the
-    ///     builder creates its own client; when an external client is supplied, configure the encryptor on that
+    ///     builder creates its own client. When an external client is supplied, configure the encryptor on that
     ///     client via <see cref="Configuration.IggyClientConfigurator.MessageEncryptor" /> instead.
-    ///     The caller owns the encryptor and must dispose it after the consumer is disposed; the builder never
+    ///     The caller owns the encryptor and must dispose it after the consumer is disposed. The builder never
     ///     disposes it (the same instance may be shared across clients).
     /// </summary>
     /// <param name="encryptor">The message encryptor to use.</param>
@@ -165,13 +167,13 @@ public class IggyConsumerBuilder
     }
 
     /// <summary>
-    ///     Specifies the partition for the consumer to consume messages from.
+    ///     The partitions of a standalone consumer. A consumer group reads the assignment of its member.
     /// </summary>
-    /// <param name="partitionId">The identifier of the partition to consume from.</param>
+    /// <param name="partitions">The partitions to consume from.</param>
     /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
-    public IggyConsumerBuilder WithPartitionId(uint partitionId)
+    public IggyConsumerBuilder WithPartitions(params uint[] partitions)
     {
-        Config.PartitionId = partitionId;
+        Config.Partitions = [.. partitions.Distinct()];
 
         return this;
     }
@@ -186,31 +188,6 @@ public class IggyConsumerBuilder
     public IggyConsumerBuilder WithPollingStrategy(PollingStrategy pollingStrategy)
     {
         Config.PollingStrategy = pollingStrategy;
-
-        return this;
-    }
-
-    /// <summary>
-    ///     Sets the batch size for the consumer. Default is 100.
-    /// </summary>
-    /// <param name="batchSize">The size of the batch to be consumed at one time.</param>
-    /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
-    public IggyConsumerBuilder WithBatchSize(uint batchSize)
-    {
-        Config.BatchSize = batchSize;
-
-        return this;
-    }
-
-    /// <summary>
-    ///     Configures the consumer builder with the specified auto-commit mode.
-    /// </summary>
-    /// <param name="autoCommit">The auto-commit mode to set for the consumer.</param>
-    /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
-    public IggyConsumerBuilder WithAutoCommitMode(AutoCommitMode autoCommit)
-    {
-        Config.AutoCommit = autoCommit == AutoCommitMode.Auto;
-        Config.AutoCommitMode = autoCommit;
 
         return this;
     }
@@ -232,25 +209,24 @@ public class IggyConsumerBuilder
     /// </summary>
     /// <param name="groupName">The name of the consumer group if consumer kind is numeric</param>
     /// <param name="createIfNotExists">Whether to create the consumer group if it doesn't exist.</param>
-    /// <param name="joinGroup">Whether to join the consumer group after creation/verification.</param>
     /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
-    public IggyConsumerBuilder WithConsumerGroup(string groupName, bool createIfNotExists = true, bool joinGroup = true)
+    public IggyConsumerBuilder WithConsumerGroup(string groupName, bool createIfNotExists = true)
     {
         Config.ConsumerGroupName = groupName;
         Config.CreateConsumerGroupIfNotExists = createIfNotExists;
-        Config.JoinConsumerGroup = joinGroup;
 
         return this;
     }
 
     /// <summary>
-    ///     Sets the interval between polling attempts to control the rate of server requests
+    ///     Sets the limits of each read and the commit policy. See <see cref="IggyConsumerConfig.PollOptions" />.
     /// </summary>
-    /// <param name="interval">The polling interval as a TimeSpan. Set to TimeSpan.Zero to disable throttling.</param>
+    /// <param name="options">The limits of each read and the commit policy.</param>
     /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining</returns>
-    public IggyConsumerBuilder WithPollingInterval(TimeSpan interval)
+    public IggyConsumerBuilder WithPollOptions(PollOptions options)
     {
-        Config.PollingIntervalMs = (int)interval.TotalMilliseconds;
+        ArgumentNullException.ThrowIfNull(options);
+        Config.PollOptions = options;
         return this;
     }
 
@@ -357,10 +333,10 @@ public class IggyConsumerBuilder
         }
 
         var hasEncryptor = _encryptor != null || IggyClient?.MessageEncryptor != null;
-        if (hasEncryptor && Config.AutoCommitMode == AutoCommitMode.Auto)
+        if (hasEncryptor && Config.PollOptions?.Commit.Mode == CommitMode.OnRead)
         {
             throw new InvalidOperationException(
-                "AutoCommitMode.Auto with a message encryptor risks silent message loss: the offset is committed before decryption. Use AutoCommitMode.AfterReceive or AutoCommitMode.Disabled.");
+                "Storing the offset on read with a message encryptor loses a batch that does not decrypt. Commit with CommitPolicy.Manual or CommitPolicy.Auto instead.");
         }
 
         if (Config.ReceiveBufferSize is <= 0)
@@ -373,19 +349,28 @@ public class IggyConsumerBuilder
             throw new InvalidOperationException("SendBufferSize must be greater than 0 when set.");
         }
 
-        if (Config.BatchSize == 0)
+        if (Config.PollOptions is null)
         {
-            throw new InvalidOperationException("BatchSize must be greater than 0.");
+            throw new InvalidOperationException("PollOptions must be set.");
         }
 
-        if (Config.BatchSize > int.MaxValue / 2)
+        try
         {
-            throw new InvalidOperationException($"BatchSize must be less than or equal to {int.MaxValue / 2}.");
+            Config.PollOptions.Validate();
+        }
+        catch (IggyInvalidStatusCodeException error)
+        {
+            throw new InvalidOperationException($"PollOptions are invalid: {error.Message}", error);
         }
 
-        if (Config.PollingIntervalMs < 0)
+        if (Config.Consumer.Type == ConsumerType.Consumer && Config.Partitions.Count == 0)
         {
-            throw new InvalidOperationException("PollingIntervalMs cannot be negative.");
+            throw new InvalidOperationException("A standalone consumer needs partitions, set them with WithPartitions.");
+        }
+
+        if (Config.Consumer.Type == ConsumerType.ConsumerGroup && Config.Partitions.Count > 0)
+        {
+            throw new InvalidOperationException("A consumer group reads the partitions of its assignment.");
         }
 
         if (Config.Consumer.Type == ConsumerType.ConsumerGroup)

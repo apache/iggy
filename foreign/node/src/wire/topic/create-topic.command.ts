@@ -19,10 +19,10 @@ import type { CommandResponse } from '../../client/client.type.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
-import { dedupeOptions, serializeOptions, type OptionEntry } from '../options.utils.js';
+import { dedupeOptions, serializeOptions, sortOptions, type OptionEntry } from '../options.utils.js';
 import { HeaderValue } from '../message/header.utils.js';
 import {
-  isValidCompressionAlgorithm, CompressionAlgorithm, Durability,
+  isValidCompressionAlgorithm, CompressionAlgorithm, Durability, PartitionResizePolicy,
   compressionAlgorithmName,
   deserializeTopic,
   type Topic,
@@ -31,17 +31,12 @@ import {
 
 
 /**
- * Parameters for the create topic command.
+ * Settings a topic takes at create. Only the message expiry and the size cap
+ * can change later, through `updateTopic`.
  */
-export type CreateTopic = {
-  /** Stream identifier (ID or name) */
-  streamId: Id,
-  /** Topic name (1-255 bytes) */
-  name: string,
-  /** Number of partitions to create */
-  partitionCount: number,
-  /** Compression algorithm (None or Gzip) */
-  compressionAlgorithm: CompressionAlgorithmT,
+export type TopicOptions = {
+  /** Compression algorithm label (None or Gzip), stored and reported only */
+  compressionAlgorithm?: CompressionAlgorithmT,
   /**
    * Message expiry time in microseconds. `0n` is not "unlimited": it omits the
    * key so the server resolves its own default, reported back as a derived
@@ -59,12 +54,24 @@ export type CreateTopic = {
   /** Message completion policy. Defaults to replicated, independently of offsets. */
   durability?: Durability,
   consumerOffsetDurability?: Durability,
+  /** Whether partitions can be added or deleted later. The server default is mutable. */
+  partitionResizePolicy?: PartitionResizePolicy,
   /** Message count that triggers a save (must be non-zero) */
   messagesRequiredToSave?: number,
   /** Accumulated message bytes that trigger a save */
   sizeOfMessagesRequiredToSave?: bigint,
   /** Preallocate segment files when the topic is created */
   preallocateSegments?: boolean,
+  /**
+   * Number of nodes that store each partition of the topic: 1 to 32 and at most
+   * the cluster's node count. Omitted, the server's `[cluster]
+   * default_replication_factor` applies: every node unless an operator set a
+   * number. A write commits on a quorum of those nodes, so 2 keeps two copies
+   * but stops taking writes while either node is down, like Kafka with
+   * `min.insync.replicas=2`. A value out of range is refused with error 2018,
+   * invalid replication factor.
+   */
+  replicationFactor?: number,
   /**
    * Option keys with no field of their own, for a key the server catalog gained
    * after this build shipped. A field above wins on collision, since the block
@@ -73,6 +80,18 @@ export type CreateTopic = {
    */
   options?: OptionEntry[]
 };
+
+/**
+ * Parameters for the create topic command.
+ */
+export type CreateTopic = {
+  /** Stream identifier (ID or name) */
+  streamId: Id,
+  /** Topic name (1-255 bytes) */
+  name: string,
+  /** Number of partitions to create */
+  partitionCount: number
+} & TopicOptions;
 
 /**
  * Create topic command definition.
@@ -93,9 +112,11 @@ export const CREATE_TOPIC = {
     segmentSize,
     durability = Durability.Replicated,
     consumerOffsetDurability = Durability.Replicated,
+    partitionResizePolicy,
     messagesRequiredToSave,
     sizeOfMessagesRequiredToSave,
     preallocateSegments,
+    replicationFactor,
     options: extraOptions = []
   }: CreateTopic
   ) => {
@@ -145,6 +166,13 @@ export const CREATE_TOPIC = {
       }
       options.push({ key, value: expected });
     }
+    if (partitionResizePolicy !== undefined) {
+      if (!Object.values<string>(PartitionResizePolicy).includes(partitionResizePolicy))
+        throw new Error(`Invalid partition_resize_policy: ${partitionResizePolicy}`);
+      options.push({
+        key: 'partition_resize_policy', value: HeaderValue.String(partitionResizePolicy)
+      });
+    }
     if (messagesRequiredToSave !== undefined)
       options.push({
         key: 'messages_required_to_save',
@@ -160,6 +188,11 @@ export const CREATE_TOPIC = {
         key: 'preallocate_segments',
         value: HeaderValue.Bool(preallocateSegments)
       });
+    if (replicationFactor !== undefined)
+      options.push({
+        key: 'replication_factor',
+        value: HeaderValue.Uint32(replicationFactor)
+      });
     const b = Buffer.allocUnsafe(4 + 1);
     b.writeUInt32LE(partitionCount, 0);
     b.writeUInt8(bName.length, 4);
@@ -168,7 +201,7 @@ export const CREATE_TOPIC = {
       streamIdentifier,
       b,
       bName,
-      serializeOptions(dedupeOptions(options)),
+      serializeOptions(sortOptions(dedupeOptions(options))),
     ]);
   },
 

@@ -64,14 +64,13 @@ public sealed class ExampleHelpersTests
         var token = TestContext.Current.CancellationToken;
         if (topic)
         {
-            client.Setup(value => value.CreateTopicAsync(streamId, topicId.GetString(), 1,
-                    CompressionAlgorithm.None, null, 0, null, token))
+            client.Setup(value => value.CreateTopicAsync(streamId, topicId.GetString(), 1, null, token))
                 .ThrowsAsync(error);
             await ExampleHelpers.EnsureTopicExists(client.Object, streamId, topicId, topicId.GetString(), 1, token);
         }
         else
         {
-            client.Setup(value => value.CreateStreamAsync(streamId.GetString(), token))
+            client.Setup(value => value.CreateStreamAsync(streamId.GetString(), null, token))
                 .ThrowsAsync(error);
             await ExampleHelpers.EnsureStreamExists(client.Object, streamId, streamId.GetString(), token);
         }

@@ -432,34 +432,4 @@ class LeaderAwarenessTest {
                     .isTrue();
         }
     }
-
-    @Nested
-    class RedirectionState {
-
-        @Test
-        void shouldCapConsecutiveRedirectsAtThree() {
-            var state = new LeaderAwareness.LeaderRedirectionState();
-            assertThat(state.canRedirect()).isTrue();
-
-            state.recordRedirect();
-            state.recordRedirect();
-            assertThat(state.canRedirect()).isTrue();
-
-            state.recordRedirect();
-            assertThat(state.canRedirect()).isFalse();
-        }
-
-        @Test
-        void shouldGrantFreshBudgetToEachCheck() {
-            var exhausted = new LeaderAwareness.LeaderRedirectionState();
-            exhausted.recordRedirect();
-            exhausted.recordRedirect();
-            exhausted.recordRedirect();
-            assertThat(exhausted.canRedirect()).isFalse();
-
-            var nextCheck = new LeaderAwareness.LeaderRedirectionState();
-
-            assertThat(nextCheck.canRedirect()).isTrue();
-        }
-    }
 }

@@ -23,6 +23,9 @@
  * the headers lead with unaligned u128 fields.
  */
 
+import { COMMAND_CODE } from '../command.code.js';
+import { Operation } from './operation.js';
+
 /** Size of every consensus header, both directions. */
 export const HEADER_SIZE = 256;
 
@@ -39,6 +42,7 @@ export const REQUEST_OFFSET = {
   size: 48,
   command: 60,
   client: 128,
+  requestChecksum: 144,
   timestamp: 160,
   request: 168,
   operation: 176,
@@ -53,10 +57,21 @@ export const REQUEST_OFFSET = {
 export const REPLY_OFFSET = {
   size: 48,
   command: 60,
+  requestChecksum: 128,
+  client: 160,
+  op: 176,
   commit: 184,
+  request: 200,
   operation: 208,
-  status: 216
+  status: 216,
+  reserved: 220,
+  partitionIncarnation: 224
 } as const;
+
+export const COMMITTED_RESULT_MARKER = 1;
+export const hasCommittedResult = (header: Buffer): boolean =>
+  peekCommand(header) === Command.Reply && readStatus(header) === 0 &&
+  header[REPLY_OFFSET.reserved] === COMMITTED_RESULT_MARKER;
 
 /** `EvictionHeader` field offsets the client reads. */
 export const EVICTION_OFFSET = {
@@ -135,6 +150,10 @@ export type RequestHeaderFields = {
 };
 
 const U64_MASK = 0xFFFFFFFFFFFFFFFFn;
+/** The requests that park on the server until their wait ends. */
+const DEFERRED_CODES = new Set<number>([
+  COMMAND_CODE.PollMessagesDeferred, COMMAND_CODE.FetchMessages
+]);
 
 /** Encodes one request identity and its captured partition context. */
 export const encodeRequestHeader = (fields: RequestHeaderFields): Buffer => {
@@ -157,6 +176,28 @@ export const encodeRequestHeader = (fields: RequestHeaderFields): Buffer => {
 };
 
 /**
+ * The header-only frame that cancels a deferred poll (106) or a fetch (109)
+ * parked on the server. It names the client, session
+ * and request id of `request`, as `RequestHeader::deferred_cancellation` in
+ * `core/binary_protocol/src/consensus/request.rs` does. Other requests do not
+ * park, so they have none.
+ */
+export const deferredCancellation = (request: Buffer): Buffer | undefined => {
+  if (request.readUInt8(REQUEST_OFFSET.operation) !== Operation.NonReplicated ||
+      !DEFERRED_CODES.has(request.readUInt32LE(REQUEST_OFFSET.reserved)))
+    return undefined;
+  return encodeRequestHeader({
+    size: HEADER_SIZE,
+    client: request.readBigUInt64LE(REQUEST_OFFSET.client) |
+      (request.readBigUInt64LE(REQUEST_OFFSET.client + 8) << 64n),
+    request: request.readBigUInt64LE(REQUEST_OFFSET.request),
+    operation: Operation.NonReplicated,
+    session: request.readBigUInt64LE(REQUEST_OFFSET.session),
+    nonReplicatedCode: COMMAND_CODE.CancelDeferredRequest
+  });
+};
+
+/**
  * Reads the frame discriminant. `command` sits at the same offset in every
  * consensus header, so one byte discriminates the frame type.
  */
@@ -167,7 +208,7 @@ export const peekCommand = (header: Buffer): number =>
 export const readSize = (header: Buffer): number =>
   header.readUInt32LE(REPLY_OFFSET.size);
 
-/** Reads the pre-commit denial status; 0 means the reply committed. */
+/** Reads the pre-commit denial status; zero alone does not prove commit. */
 export const readStatus = (header: Buffer): number =>
   header.readUInt32LE(REPLY_OFFSET.status);
 

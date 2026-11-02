@@ -317,6 +317,51 @@ public sealed class VsrProtocolDriftTests
     }
 
     /// <summary>
+    ///     Pins <see cref="VsrOperations.RequestOperation" /> against <c>Operation::request_operation</c>. A reply names
+    ///     the operation the server committed, which prepare may have rewritten, so a rewrite missing here rejects
+    ///     every successful reply to the request it came from as a mismatch.
+    /// </summary>
+    [Fact]
+    public void RequestOperations_MatchTheRustRewrites()
+    {
+        var source = ReadRustSource(OperationPath);
+        var start = source.IndexOf("fn request_operation(", StringComparison.Ordinal);
+        Assert.True(start >= 0, "Operation::request_operation is gone from the Rust source.");
+        var end = source.IndexOf("operation => *operation", start, StringComparison.Ordinal);
+        Assert.True(end >= 0, "Operation::request_operation no longer ends with an identity arm.");
+
+        var rewrites = new Dictionary<string, string>();
+        foreach (Match arm in Regex.Matches(source[start..end],
+                     @"((?:Self::\w+\s*\|\s*)*Self::\w+)\s*=>\s*\{?\s*Self::(\w+)"))
+        {
+            foreach (var rewritten in Regex.Matches(arm.Groups[1].Value, @"Self::(\w+)").Select(match => match.Groups[1].Value))
+            {
+                rewrites[rewritten] = arm.Groups[2].Value;
+            }
+        }
+
+        Assert.NotEmpty(rewrites);
+        var mismatches = rewrites
+            .Where(rewrite => !Enum.TryParse<VsrOperation>(rewrite.Key, out _)
+                              || !Enum.TryParse<VsrOperation>(rewrite.Value, out _))
+            .Select(rewrite => $"{rewrite.Key} => {rewrite.Value}: absent from .NET")
+            .ToList();
+        foreach (VsrOperation operation in Enum.GetValues<VsrOperation>())
+        {
+            var expected = rewrites.TryGetValue(operation.ToString(), out var target)
+                && Enum.TryParse<VsrOperation>(target, out var parsed)
+                    ? parsed
+                    : operation;
+            if (operation.RequestOperation() != expected)
+            {
+                mismatches.Add($"{operation}: rust {expected}, .NET {operation.RequestOperation()}");
+            }
+        }
+
+        Assert.Empty(mismatches);
+    }
+
+    /// <summary>
     ///     Pins <see cref="VsrOperations.IsResultFramed" /> against <c>Operation::is_result_framed</c>. The Rust
     ///     side composes it from <c>is_metadata</c> plus its own partition-plane list, so pinning
     ///     <c>is_metadata</c> alone leaves the second half free to drift. An operation that gains result framing

@@ -56,27 +56,19 @@ func (c *IggyTcpClient) CreateTopic(
 	ctx context.Context,
 	streamId iggcon.Identifier,
 	name string,
-	partitionsCount uint32,
-	compressionAlgorithm iggcon.CompressionAlgorithm,
-	messageExpiry iggcon.Duration,
-	maxTopicSize uint64,
-	options ...iggcon.HeaderEntry,
+	options *iggcon.TopicOptions,
 ) (*iggcon.TopicDetails, error) {
 	if len(name) == 0 || len(name) > MaxStringLength {
 		return nil, ierror.ErrInvalidTopicName
 	}
-	if partitionsCount > MaxPartitionCount {
+	request := &command.CreateTopic{StreamId: streamId, Name: name}
+	if options != nil {
+		request.Options = *options
+	}
+	if request.Options.PartitionsCount != nil && *request.Options.PartitionsCount > MaxPartitionCount {
 		return nil, ierror.ErrTooManyPartitions
 	}
-	buffer, err := c.do(ctx, &command.CreateTopic{
-		StreamId:             streamId,
-		Name:                 name,
-		PartitionsCount:      partitionsCount,
-		CompressionAlgorithm: compressionAlgorithm,
-		MessageExpiry:        messageExpiry,
-		MaxTopicSize:         maxTopicSize,
-		Options:              options,
-	})
+	buffer, err := c.do(ctx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -88,23 +80,17 @@ func (c *IggyTcpClient) UpdateTopic(
 	ctx context.Context,
 	streamId iggcon.Identifier,
 	topicId iggcon.Identifier,
-	name string,
-	compressionAlgorithm iggcon.CompressionAlgorithm,
-	messageExpiry iggcon.Duration,
-	maxTopicSize uint64,
-	options ...iggcon.HeaderEntry,
+	update iggcon.TopicUpdate,
 ) error {
-	if len(name) == 0 || len(name) > MaxStringLength {
-		return ierror.ErrInvalidTopicName
-	}
 	_, err := c.do(ctx, &command.UpdateTopic{
-		StreamId:             streamId,
-		TopicId:              topicId,
-		CompressionAlgorithm: compressionAlgorithm,
-		MessageExpiry:        messageExpiry,
-		MaxTopicSize:         maxTopicSize,
-		Name:                 name,
-		Options:              options,
+		StreamId:      streamId,
+		TopicId:       topicId,
+		Name:          update.Name,
+		MessageExpiry: update.MessageExpiry,
+		MaxTopicSize:  update.MaxTopicSize,
+		Reset:         update.Reset,
+		RawReset:      update.RawReset,
+		Options:       update.Options,
 	})
 	return err
 }
