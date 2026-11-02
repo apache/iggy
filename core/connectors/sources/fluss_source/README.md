@@ -4,6 +4,7 @@ Reads rows from an [Apache Fluss](https://fluss.apache.org/) log table and publi
 
 Each Fluss row becomes one Apache Iggy message. Offsets are tracked per bucket and persisted through the runtime state API, so a restart resumes where the previous run stopped.
 Offsets only advance once the runtime acknowledges a delivered batch. A rejected batch is kept and sent again on the next poll, and a poll that fails partway points the scanner back at the last acknowledged offsets before it reads on. The start position is persisted with the first poll even when it returns no rows, so a restart does not resolve `latest` again past rows written in between.
+After five rejected batches in a row the source stops and needs a manual connector restart.
 
 ## Configuration
 
@@ -20,7 +21,7 @@ Offsets only advance once the runtime acknowledges a delivered batch. A rejected
 | `batch_size` | no | `500` | Maximum records returned per poll (`scanner.log.max-poll-records`). Must be greater than 0. |
 | `payload_format` | no | `json` | Only `json` is accepted. See [Limitations](#limitations). |
 | `include_metadata` | no | `false` | Adds `_fluss_bucket`, `_fluss_offset` and `_fluss_timestamp` to each JSON object. While it is on, a column whose name starts with `_fluss_` is rejected at startup, since it would be overwritten. |
-| `sasl_username` | no | | Enables SASL/PLAIN together with `sasl_password`. Set both or neither. |
+| `sasl_username` | no | | Enables SASL/PLAIN together with `sasl_password`. Set both or neither. `fluss-rs` 1.0 has no TLS setting, so both cross the network in clear text. Use SASL only on a network you trust. |
 | `sasl_password` | no | | The connector never logs it and `/stats` never shows it, but the runtime does not redact it: it logs the raw plugin config at trace level and returns it from its config API, such as `GET /sources/{key}/configs/plugin`. |
 | `verbose_logging` | no | `false` | Logs per-batch counts at info instead of debug. |
 
@@ -47,6 +48,8 @@ table = "events"
 poll_interval = "1s"
 batch_size = 500
 ```
+
+The connector produces JSON, so give each `[[streams]]` entry `schema = "json"` or another schema the runtime can encode JSON into. `raw` is not one: the runtime rejects every batch, and the source stops after five of them.
 
 Bring up a local cluster with the [official Docker compose recipe](https://fluss.apache.org/docs/install-deploy/deploying-with-docker/) (ZooKeeper, one coordinator server, one tablet server), create the stream and topic with the Apache Iggy CLI, then start the connectors runtime.
 
@@ -81,6 +84,7 @@ These are limits of this connector, not of the `fluss-rs` client.
 - **Primary-key tables are not supported yet.** `fluss-rs` 1.0 reads their changelog, but mapping its insert, update and delete records onto messages is left for a follow-up, so `table_type = "primary_key"` is rejected at startup.
 - **`payload_format = "arrow_ipc"` is not implemented yet.** The client does expose an Arrow `RecordBatch` scanner, but it uses a different offset-tracking path, so it is left for a follow-up.
 - **Partitioned tables are not supported.** They are detected and rejected at startup.
+- **Do not set `exactly_once` for this source.** The runtime's [exactly-once mode](../../runtime/README.md#exactly-once-sources) needs the same messages from the same state, but after a restart the first poll from the saved offsets can return other rows than the batch in flight. A batch with another row count can land twice. On a table with several buckets, one with the same count passes as a duplicate, so its rows are dropped while the offsets move past them.
 - **Rows that cannot be converted are skipped.** A value the JSON mapping cannot hold, such as a date beyond what `chrono` represents, fails the same way on every read. Such a row is dropped and logged at error level with its bucket and offset, the offsets move past it, and the number of skipped rows is logged when the connector closes.
 - **A crash right after starting from `latest` can miss rows.** The resolved start offsets stay in memory until the first batch is acknowledged, which normally takes one poll. If the connector crashes in that window, the next start resolves `latest` again and misses the rows written in between.
 - **An unreadable saved state stops the connector at startup.** Starting over from `starting_offset` could skip rows that were never delivered, `latest` above all, so the connector refuses to open until the saved state is removed (the `source_<key>.state` file under the runtime's state path with the default file storage).
