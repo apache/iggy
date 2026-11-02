@@ -17,8 +17,10 @@
 
 //! Three Iggy nodes and a gateway process beside each, deployed as the gateway documentation
 //! describes it. Gateway `n` dials node `n - 1`, and every gateway lists all of them in
-//! `IGGY_KAFKA_BROKERS`. The gateways run the compiled binary, so a stop is a SIGTERM and a crash
-//! a SIGKILL, as an orchestrator sends them.
+//! `IGGY_KAFKA_BROKERS`. Every gateway runs with `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, so a batch
+//! that an idempotent producer sends again through another gateway is written once. The gateways
+//! run the compiled binary, so a stop is a SIGTERM and a crash a SIGKILL, as an orchestrator sends
+//! them.
 //!
 //! Callers must also declare the `codec`, `gateways`, `iggy_server`, `tcp` and `wire` modules at
 //! their crate root, as for `gateways.rs`.
@@ -31,8 +33,8 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 use iggy::prelude::{
-    AutoLogin, Client, ClusterClient, ClusterNodeRole, Credentials, IggyClient, IggyClientBuilder,
-    UserClient,
+    AutoLogin, Client, ClusterClient, ClusterNodeRole, Consumer, Credentials, Identifier,
+    IggyClient, IggyClientBuilder, MessageClient, PollOptions, PollingStrategy, UserClient,
 };
 use iggy_binary_protocol::codes::GET_PARTITION_ROUTE_CODE;
 use iggy_binary_protocol::requests::messages::GetPartitionRouteRequest;
@@ -66,8 +68,10 @@ pub const TAIL_LINES: usize = 40;
 
 /// The nodes and their gateways, until the test drops it.
 pub struct Deployment {
-    pub cluster: TestCluster,
+    /// Dropped first. A gateway's SIGTERM hands its groups over through Iggy, so the nodes must
+    /// still run. Stopped after them, it waits for them and gets SIGKILL.
     gateways: Vec<GatewayProcess>,
+    pub cluster: TestCluster,
     log_dir: PathBuf,
 }
 
@@ -115,8 +119,8 @@ impl Deployment {
             gateway.wait_listening().await;
         }
         Self {
-            cluster,
             gateways,
+            cluster,
             log_dir,
         }
     }
@@ -136,6 +140,15 @@ impl Deployment {
     /// The address of every gateway, stopped ones included, in node id order.
     pub fn addrs(&self) -> Vec<SocketAddr> {
         self.gateways.iter().map(|gateway| gateway.addr).collect()
+    }
+
+    /// The address of gateway `node_id`, also while it is stopped.
+    pub fn addr_of(&self, node_id: u16) -> SocketAddr {
+        self.gateways
+            .iter()
+            .find(|gateway| gateway.node_id == node_id)
+            .expect("a listed gateway")
+            .addr
     }
 
     /// The address of each running gateway.
@@ -243,6 +256,42 @@ impl Deployment {
         routes
     }
 
+    /// When Iggy stored the message at `offset` of partition `partition_id` of `topic` in `stream`:
+    /// the clock of the partition's primary at the prepare, in microseconds since the Unix epoch.
+    /// `None` when no node answers, or the partition holds no message at `offset`.
+    pub async fn stored_at(
+        &self,
+        stream: &str,
+        topic: &str,
+        partition_id: u32,
+        offset: u64,
+    ) -> Option<u64> {
+        let client = self.client().await?;
+        let polled = async {
+            tokio::time::timeout(
+                QUERY_LIMIT,
+                client.poll_messages(
+                    &Identifier::named(stream).ok()?,
+                    &Identifier::named(topic).ok()?,
+                    partition_id,
+                    &Consumer::default(),
+                    &PollingStrategy::offset(offset),
+                    PollOptions {
+                        count: 1,
+                        ..PollOptions::default()
+                    },
+                ),
+            )
+            .await
+            .ok()?
+            .ok()
+        }
+        .await;
+        sign_out(&client).await;
+        let message = polled?.messages.into_iter().next()?;
+        (message.header.offset == offset).then_some(message.header.timestamp)
+    }
+
     /// The last [`TAIL_LINES`] lines of the log of each gateway.
     pub fn gateway_log_tails(&self) -> String {
         self.gateways
@@ -341,6 +390,7 @@ impl GatewayProcess {
             .env("IGGY_KAFKA_NODE_ID", self.node_id.to_string())
             .env("IGGY_KAFKA_BROKERS", &self.brokers)
             .env("IGGY_KAFKA_COORDINATOR_LOG", "true")
+            .env("IGGY_KAFKA_IDEMPOTENT_PRODUCERS", "true")
             .stdout(log.try_clone().expect("share the gateway log"))
             .stderr(log)
             .spawn()

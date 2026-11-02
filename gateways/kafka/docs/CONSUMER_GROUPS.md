@@ -313,8 +313,14 @@ a warning. A gateway with `IGGY_KAFKA_COORDINATOR_LOG=true` does not start. The 
   broker and keeps one answer per group.
 
 After a crash, the takeover waits for the Iggy session timeout, 1.2 times `heartbeat.interval`,
-36 s by default. `tests/cluster_failover_tests.rs` measures about 39 s, and 10 to 11 s with an 8 s
-`heartbeat.interval` and a 1 s `consumer_group.heartbeat_interval`.
+36 s by default. Each node reports its sessions once per `consumer_group.heartbeat_interval`. The
+metadata primary ends the sessions that no node reported for the timeout, in a pass at the same
+interval. So the session of a crashed gateway ends up to one interval before or after the
+timeout. The successor then needs up to 4 s to read its lease and load the groups.
+`tests/cluster_failover_tests.rs` checks that the takeover comes 31 to 45 s after the crash by
+default. With an 8 s `heartbeat.interval` and a 1 s `consumer_group.heartbeat_interval`, it checks
+8.6 to 14.6 s. A crash that also takes the metadata primary adds a view change of up to 10 s, and
+the new primary starts the timeout again.
 
 With `IGGY_KAFKA_COORDINATOR_LOG=false`, group membership is process memory alone. With
 `IGGY_KAFKA_BROKERS`, every gateway's `FindCoordinator` then names the gateway with the lowest node

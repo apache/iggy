@@ -88,13 +88,15 @@ pub struct Container {
 }
 
 impl Container {
-    /// Starts `args` in `image`, with each `(host file, guest path)` of `mounts` read-only.
-    /// `timeout` inside the container ends it after `lifetime`, also when this process dies before
-    /// it can remove the container. Its output goes to `<log>.out` and `<log>.err` as well.
+    /// Starts `args` in `image`, with each `(host file, guest path)` of `mounts` read-only and each
+    /// `(name, value)` of `env` set. `timeout` inside the container ends it after `lifetime`, also
+    /// when this process dies before it can remove the container. Its output goes to `<log>.out`
+    /// and `<log>.err` as well.
     pub fn start(
         image: &str,
         args: &[&str],
         mounts: &[(&Path, &str)],
+        env: &[(&str, &str)],
         lifetime: Duration,
         log: &Path,
     ) -> Self {
@@ -118,6 +120,9 @@ impl Container {
             command
                 .arg("-v")
                 .arg(format!("{}:{guest}:ro", host.display()));
+        }
+        for (name, value) in env {
+            command.arg("-e").arg(format!("{name}={value}"));
         }
         let mut process = command
             .arg(image)
@@ -164,16 +169,42 @@ impl Container {
         stderr[stderr.len().saturating_sub(lines)..].join("\n")
     }
 
+    /// The lines on stderr so far that contain `needle`.
+    pub fn stderr_count(&self, needle: &str) -> usize {
+        self.stderr
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|line| line.contains(needle))
+            .count()
+    }
+
     /// Sends `signal` to the client, as `docker kill --signal` does. `timeout`, which runs as the
     /// container's first process, passes it on to the client.
     pub fn signal(&self, signal: &str) {
-        let sent = Command::new("docker")
-            .args(["kill", "--signal", signal, &self.name])
+        self.docker(&["kill", "--signal", signal]);
+    }
+
+    /// Freezes every process of the container, as `docker pause` does. The client sends nothing,
+    /// heartbeats included, until [`Self::unpause`].
+    pub fn pause(&self) {
+        self.docker(&["pause"]);
+    }
+
+    pub fn unpause(&self) {
+        self.docker(&["unpause"]);
+    }
+
+    /// Runs `docker <args> <name>`, and fails the test when it fails.
+    fn docker(&self, args: &[&str]) {
+        let done = Command::new("docker")
+            .args(args)
+            .arg(&self.name)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|status| status.success());
-        assert!(sent, "send {signal} to client container {}", self.name);
+        assert!(done, "docker {} {}", args.join(" "), self.name);
     }
 
     /// Waits until the client exits, at most `limit`, and returns whether it did. Every line it

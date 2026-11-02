@@ -352,7 +352,9 @@ cargo run -p iggy-gateway-kafka
   with their members and offsets. A member that keeps its heartbeat goes on without a rebalance.
   A stop on SIGTERM hands the partitions over without waiting for the session timeout. After a
   crash, the takeover waits for the Iggy session timeout, 1.2 times `heartbeat.interval`, 36 s by
-  default. `tests/cluster_failover_tests.rs` measures about 39 s.
+  default. Iggy ends the session up to one `consumer_group.heartbeat_interval` (5 s by default)
+  before or after the timeout, and the successor needs up to 4 s more.
+  `tests/cluster_failover_tests.rs` checks that the takeover comes 31 to 45 s after the crash.
 - Metadata lists each gateway that owns a log partition, and this gateway. It names this gateway
   as the leader of every partition. Any gateway can serve any partition, because the Iggy SDK
   sends each partition request to its primary. A client of a stopped or crashed gateway goes on
@@ -387,8 +389,9 @@ cargo run -p iggy-gateway-kafka
 - To lower the takeover time after a crash, lower Iggy's `heartbeat.interval`. It must stay above
   (3 times `consumer_group.heartbeat_interval` + 6.2 s) / 1.2. With
   `consumer_group.heartbeat_interval = "1s"`, that is about 7.7 s. An 8 s `heartbeat.interval`
-  gives a session timeout of 9.6 s, and `tests/cluster_failover_tests.rs` measures a takeover
-  after 10 to 11 s. See `core/server/config.toml`.
+  gives a session timeout of 9.6 s, and `tests/cluster_failover_tests.rs` checks a takeover 8.6
+  to 14.6 s after a crash. A crash that also takes the metadata primary adds a view change, up to
+  10 s. See `core/server/config.toml`.
 - Each gateway holds the Iggy sessions that "Concurrency ceiling" counts, up to 256 producer
   sessions and about 30 others. N gateways times their sessions must stay below Iggy's
   cluster-wide clients table, 8192 sessions. Three gateways at the default limits hold about 860.
