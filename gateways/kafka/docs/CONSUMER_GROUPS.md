@@ -312,8 +312,9 @@ a warning. A gateway with `IGGY_KAFKA_COORDINATOR_LOG=true` does not start. The 
   this gateway. The others get `NOT_COORDINATOR` per group. The Java admin client asks every
   broker and keeps one answer per group.
 
-Not tested: the takeover time after a crash. It waits for the Iggy session timeout, 1.2 times
-`heartbeat.interval`, 36 s by default.
+After a crash, the takeover waits for the Iggy session timeout, 1.2 times `heartbeat.interval`,
+36 s by default. `tests/cluster_failover_tests.rs` measures about 39 s, and 10 to 11 s with an 8 s
+`heartbeat.interval` and a 1 s `consumer_group.heartbeat_interval`.
 
 With `IGGY_KAFKA_COORDINATOR_LOG=false`, group membership is process memory alone. With
 `IGGY_KAFKA_BROKERS`, every gateway's `FindCoordinator` then names the gateway with the lowest node

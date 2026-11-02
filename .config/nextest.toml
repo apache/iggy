@@ -75,6 +75,23 @@ max-threads = 1
 filter = 'binary_id(iggy-gateway-kafka::kafka_client_e2e_tests)'
 test-group = "kafka_client_e2e"
 
+# Each test in these binaries runs a three-node cluster, so they run one at a time.
+[test-groups.kafka_cluster]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary_id(iggy-gateway-kafka::coordinator_cluster_tests)'
+test-group = "kafka_cluster"
+
+# The failover tests also run three gateway processes and Kafka clients in Docker for minutes, and
+# they time takeovers. Each gets the whole machine, so other tests do not distort that timing, and
+# up to ten minutes.
+[[profile.default.overrides]]
+filter = 'binary_id(iggy-gateway-kafka::cluster_failover_tests)'
+test-group = "kafka_cluster"
+threads-required = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 10 }
+
 # Each ext-auth test spawns its own iggy-server + mock HTTP server. Each server opens io_uring
 # rings and listener sockets, so running all 24 at once wastes descriptors for no coverage gain.
 [test-groups.ext-auth]
