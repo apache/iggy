@@ -2258,6 +2258,9 @@ mod stale_prepare_commit_tests;
 mod replication_flow_tests;
 
 #[cfg(test)]
+mod readiness_mirror_tests;
+
+#[cfg(test)]
 mod tests {
     use super::partition_repair_driver_tests::{
         cluster, is_commit_for, prepare_for, sharded_cluster,

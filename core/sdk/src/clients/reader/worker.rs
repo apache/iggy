@@ -947,15 +947,10 @@ impl Worker {
         let by_group = !self.groups.is_empty();
         // Every partition is in a group fetch, so the walk below would find nothing.
         if by_group
-            && self.probing.is_empty()
-            && self.read_alone.is_empty()
-            && self.catch_up.is_empty()
-            && !(self.config.on_read() && self.config.start.kind == PollingKind::Next)
-            && fetched_by_group_kind(self.config.start.kind)
             && self
-                .positions
-                .values()
-                .all(|position| fetched_by_group_kind(position.kind))
+                .partitions
+                .iter()
+                .all(|partition| self.fetched_by_group(*partition))
         {
             return;
         }
@@ -1038,13 +1033,14 @@ impl Worker {
     }
 
     fn needs_start(&self, partition: u32) -> bool {
+        if !self.config.on_read() {
+            return false;
+        }
         let position = self.position(partition);
-        self.config.on_read()
-            && matches!(
-                position.kind,
-                PollingKind::Next | PollingKind::Last | PollingKind::Timestamp
-            )
-            && position.context().is_none()
+        matches!(
+            position.kind,
+            PollingKind::Next | PollingKind::Last | PollingKind::Timestamp
+        ) && position.context().is_none()
     }
 
     fn is_idle(&self, partition: u32) -> bool {
@@ -2024,6 +2020,8 @@ impl Worker {
         self.positions.insert(partition, position);
     }
 
+    /// Ends the catch-up of `partition` and reports the range that it did not read again.
+    /// Returns whether it reported one.
     fn interrupt_catch_up(&mut self, partition: u32) -> bool {
         let Some(until) = self.catch_up.remove(&partition) else {
             return false;
@@ -2038,7 +2036,8 @@ impl Worker {
             .and_then(|retained| retained.batch.messages.first())
             .map_or(until, |first| first.header.offset.saturating_sub(1));
         let operation = self.lost_operations.remove(&partition).unwrap_or_default();
-        if position.value <= lost_end {
+        let lost = position.value <= lost_end;
+        if lost {
             error!(
                 "Partition: {partition} lost offsets from: {} to: {lost_end} during read recovery",
                 position.value
@@ -2081,7 +2080,7 @@ impl Worker {
                 });
             }
         }
-        true
+        lost
     }
 
     /// Abandons the operations of lost committing reads, so their progress blocks go. The next
@@ -2202,7 +2201,7 @@ impl Worker {
             }
             IggyError::HistoryUnavailable => {
                 for &partition in partitions {
-                    let interrupted = self.interrupt_catch_up(partition);
+                    let reported = self.interrupt_catch_up(partition);
                     self.shared.progress.forget_undecoded(partition);
                     // A position without a history reads the history of the cached route, which
                     // the driver drops after this refusal, so only a lost history stops.
@@ -2216,7 +2215,7 @@ impl Worker {
                     self.positions.remove(&partition);
                     self.retry_at.remove(&partition);
                     self.stopped.insert(partition);
-                    if !interrupted {
+                    if !reported && !self.report_pending_loss(partition) {
                         self.report(ReadError::new(Some(partition), error.clone()));
                     }
                 }
@@ -2251,8 +2250,24 @@ impl Worker {
             self.lasting_refusals.remove(&partition);
             self.retry_at.remove(&partition);
             self.stopped.insert(partition);
-            self.report(ReadError::new(Some(partition), error.clone()));
+            if !self.interrupt_catch_up(partition) && !self.report_pending_loss(partition) {
+                self.report(ReadError::new(Some(partition), error.clone()));
+            }
         }
+    }
+
+    /// A stop before the next read showed what a lost committing read stored leaves that read
+    /// pending, and a seek to `Next` would then skip its range without a word. So the stop
+    /// reports the lost read instead of its own error. Returns whether it did.
+    fn report_pending_loss(&mut self, partition: u32) -> bool {
+        let Some(&operation) = self.lost_operations.get(&partition) else {
+            return false;
+        };
+        self.report(ReadError::new(
+            Some(partition),
+            IggyError::FetchProgressUncertain(operation),
+        ));
+        true
     }
 
     /// The driver blocks the partition until `abandon_operation`. With `OnRead`, the partition
@@ -4812,6 +4827,69 @@ mod tests {
         assert_eq!(
             next_error(&mut receiver),
             ReadError::new(Some(0), IggyError::Unauthorized)
+        );
+    }
+
+    /// A seek resumes a stopped partition and drops its catch-up, so a lasting stop during a
+    /// catch-up reports the range that the lost read stored, as the other stops do.
+    #[tokio::test]
+    async fn given_a_catch_up_when_lasting_refusals_stop_its_partition_should_report_the_lost_range()
+     {
+        let (mut worker, mut receiver) = worker_of(committing(builder_for(group())));
+        assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0]])));
+        worker.positions.insert(0, next_at(0, 5));
+        worker.refuse(&[0], IggyError::FetchProgressUncertain(OPERATION));
+        worker.complete(polled(
+            &worker,
+            FetchKind::Alone,
+            next_at(0, 5),
+            0,
+            Ok(batch(0, [7, 8], 8)),
+        ));
+        assert!(
+            worker.catch_up.contains_key(&0),
+            "the skipped offsets are read again"
+        );
+
+        for _ in 0..MAX_LASTING_REFUSALS {
+            worker.refuse(&[0], IggyError::Unauthorized);
+        }
+
+        assert!(worker.stopped.contains(&0));
+        worker.flush_errors();
+        let error = next_error(&mut receiver);
+        assert_eq!(error.error, IggyError::FetchProgressUncertain(OPERATION));
+        assert_eq!(error.skip, Some(at(0, 7)));
+        assert_eq!(offsets(&next_batches(&mut receiver)[0]), [7, 8]);
+        assert!(worker.catch_up.is_empty());
+    }
+
+    /// A lost committing read is pending until the next read shows what it stored. A stop before
+    /// that read would leave a seek to `Next` to skip the range without a word, so the stop
+    /// reports the lost read instead.
+    #[tokio::test]
+    async fn given_a_pending_lost_read_when_lasting_refusals_stop_its_partition_should_report_the_lost_read()
+     {
+        let (mut worker, mut receiver) = worker_of(committing(builder_for(group())));
+        assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0]])));
+        worker.positions.insert(0, next_at(0, 5));
+        worker.refuse(&[0], IggyError::FetchProgressUncertain(OPERATION));
+        assert!(worker.lost_operations.contains_key(&0));
+
+        for _ in 0..MAX_LASTING_REFUSALS {
+            worker.refuse(&[0], IggyError::Unauthorized);
+        }
+
+        assert!(worker.stopped.contains(&0));
+        worker.flush_errors();
+        let error = next_error(&mut receiver);
+        assert_eq!(
+            (error.partition_id, error.error, error.skip),
+            (Some(0), IggyError::FetchProgressUncertain(OPERATION), None)
+        );
+        assert!(
+            worker.lost_operations.contains_key(&0),
+            "the lost read stays pending until a seek takes the partition"
         );
     }
 

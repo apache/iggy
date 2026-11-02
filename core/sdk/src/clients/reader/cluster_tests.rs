@@ -1023,6 +1023,46 @@ async fn given_a_lost_committing_reply_when_seeking_should_read_from_the_new_pos
     );
 }
 
+/// A seek to `Next` leaves the partition without a known start, which a poll resolves before a
+/// committing fetch reads it, whatever start the reader was built with.
+#[tokio::test(start_paused = true)]
+async fn given_a_committing_reader_started_at_first_when_a_partition_is_sought_to_next_should_read_it_again()
+ {
+    const RESUMED_OFFSET: u64 = 5;
+    let (client, cluster) = connect_to_three_replicas().await;
+    script_fetches(
+        &cluster,
+        [
+            served_answer(PARTITION, 0),
+            served_answer(PARTITION, RESUMED_OFFSET),
+        ],
+    );
+    script_initial_next(&cluster, &[(PARTITION, RESUMED_OFFSET)]);
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::first())
+        .build()
+        .await
+        .unwrap();
+    let first = timeout(POLL_TIMEOUT, reader.next()).await.unwrap().unwrap();
+
+    reader
+        .seek(PARTITION, PollingStrategy::next())
+        .await
+        .unwrap();
+    let resumed = timeout(POLL_TIMEOUT, reader.next()).await;
+
+    assert_eq!(partition_and_offsets(&first), (PARTITION, vec![0]));
+    let resumed = resumed
+        .expect("the partition sought to next should be read again")
+        .unwrap();
+    assert_eq!(
+        partition_and_offsets(&resumed),
+        (PARTITION, vec![RESUMED_OFFSET])
+    );
+    assert_eq!(cluster.count(POLL_MESSAGES_DEFERRED_CODE), 1);
+    reader.close().await.unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn given_a_partition_refused_beside_a_served_one_when_a_fetch_completes_should_deliver_the_served_batch()
  {
