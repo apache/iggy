@@ -123,6 +123,7 @@ impl PendingOperationException {
 pub struct ReadException {
     partition_id: Option<u32>,
     skip: Option<PollingStrategy>,
+    lasting_refusal: bool,
 }
 
 #[php_impl]
@@ -138,6 +139,13 @@ impl ReadException {
     #[php(getter)]
     pub fn skip(&self) -> Option<PollingStrategy> {
         self.skip.clone()
+    }
+
+    /// Whether the reader stopped the partition after six refusals in a row that a retry does
+    /// not change, such as Unauthorized (41). A seek of the partition reads it again.
+    #[php(getter, change_case = "snake_case")]
+    pub fn is_lasting_refusal(&self) -> bool {
+        self.lasting_refusal
     }
 }
 
@@ -167,6 +175,7 @@ impl IntoPhpException for ReadError {
         let code = self.error.as_code() as i32;
         let exception = ReadException {
             partition_id: self.partition_id,
+            lasting_refusal: self.is_lasting_refusal(),
             skip: self.skip.map(PollingStrategy::from),
         };
 
