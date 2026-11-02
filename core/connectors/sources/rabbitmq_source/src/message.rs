@@ -129,25 +129,23 @@ const MAX_PAYLOAD_BYTES: usize = 64_000_000;
 const MAX_HEADER_BYTES: usize = 100_000;
 
 pub fn prepare_delivery(
-    delivery: &Delivery,
+    delivery: &mut Delivery,
     include_metadata: bool,
     connector_id: u32,
 ) -> Result<Option<ProducedMessage>, Error> {
     if unsupported_body(delivery.data.len(), include_metadata) {
         return Ok(None);
     }
-    let payload = if include_metadata {
-        encode_delivery(delivery).map_err(|error| Error::Serialization(error.to_string()))?
+    let (payload, headers) = if include_metadata {
+        let payload =
+            encode_delivery(delivery).map_err(|error| Error::Serialization(error.to_string()))?;
+        if exceeds_payload_limit(payload.len()) {
+            return Ok(None);
+        }
+        (payload, None)
     } else {
-        delivery.data.clone()
-    };
-    if exceeds_payload_limit(payload.len()) {
-        return Ok(None);
-    }
-    let headers = if include_metadata {
-        None
-    } else {
-        Some(raw_headers(delivery, connector_id)?)
+        let headers = raw_headers(delivery, connector_id)?;
+        (std::mem::take(&mut delivery.data), Some(headers))
     };
     Ok(Some(ProducedMessage {
         id: None,
@@ -235,10 +233,13 @@ mod tests {
             .with_content_encoding("gzip".into())
             .with_correlation_id("correlation-1".into())
             .with_reply_to("reply-queue".into());
-        let message = prepare_delivery(&delivery, false, 1)
+        let body_ptr = delivery.data.as_ptr();
+        let message = prepare_delivery(&mut delivery, false, 1)
             .expect("conversion must succeed")
             .expect("delivery must be supported");
         assert_eq!(message.payload, vec![0, 255]);
+        assert_eq!(message.payload.as_ptr(), body_ptr);
+        assert!(delivery.data.is_empty());
         assert!(message.id.is_none());
         let headers = message.headers.expect("raw headers must exist");
         let key = HeaderKey::try_from("amqp.exchange").expect("key must be valid");
@@ -282,11 +283,11 @@ mod tests {
         delivery.properties = BasicProperties::default()
             .with_message_id("00000000-0000-0000-0000-000000000000".into());
         assert!(
-            prepare_delivery(&delivery, false, 1)
+            prepare_delivery(&mut delivery, false, 1)
                 .expect("conversion must succeed")
                 .is_none()
         );
-        let message = prepare_delivery(&delivery, true, 1)
+        let message = prepare_delivery(&mut delivery, true, 1)
             .expect("conversion must succeed")
             .expect("envelope must be supported");
         assert!(message.id.is_none());
@@ -318,7 +319,7 @@ mod tests {
                 if let Some(id) = id {
                     delivery.properties = BasicProperties::default().with_message_id(id.into());
                 }
-                let message = prepare_delivery(&delivery, include_metadata, 1)
+                let message = prepare_delivery(&mut delivery, include_metadata, 1)
                     .expect("conversion must succeed")
                     .expect("delivery must be supported");
                 assert!(message.id.is_none());

@@ -65,8 +65,8 @@ pub mod batch {
             self.in_flight = false;
         }
 
-        pub async fn acknowledge(self) -> Result<(), Error> {
-            for (_, acker) in self.deliveries {
+        pub async fn acknowledge(&self) -> Result<(), Error> {
+            for (_, acker) in &self.deliveries {
                 match acker.ack(BasicAckOptions::default()).await {
                     Ok(true) => {}
                     Ok(false) => {
@@ -74,7 +74,9 @@ pub mod batch {
                             "RabbitMQ acknowledgement was refused".into(),
                         ));
                     }
-                    Err(error) => return Err(Error::Connection(error.to_string())),
+                    Err(_) => {
+                        return Err(Error::Connection("RabbitMQ acknowledgement failed".into()));
+                    }
                 }
             }
             Ok(())
@@ -249,9 +251,11 @@ source_connector!(RabbitMqSource);
 pub struct RabbitMqSource {
     id: u32,
     config: RabbitMqSourceConfig,
+    batch_timeout: Duration,
     tls: OwnedTLSConfig,
     driver: Mutex<Option<RabbitMqDriver>>,
     pending: Mutex<Option<PendingBatch>>,
+    deferred_failure: Mutex<Option<Failure>>,
     retry_attempts: AtomicU32,
     last_warning: Mutex<BTreeMap<(&'static str, Option<String>), Instant>>,
 }
@@ -271,20 +275,15 @@ impl Failure {
         }
     }
 
-    fn lapin(operation: &'static str, error: lapin::Error, disclose: bool) -> Self {
+    fn lapin(operation: &'static str, error: lapin::Error) -> Self {
         let reply_code = match error.kind() {
             lapin::ErrorKind::ProtocolError(error) => Some(error.get_id().to_string()),
             _ => None,
         };
-        let detail = if disclose {
-            error.to_string()
-        } else {
-            "connection failed".into()
-        };
         Self {
             operation,
             reply_code,
-            error: Error::Connection(detail),
+            error: Error::Connection(format!("RabbitMQ {operation} failed")),
         }
     }
 }
@@ -304,9 +303,11 @@ impl RabbitMqSource {
         Self {
             id,
             config,
+            batch_timeout: Duration::ZERO,
             tls: OwnedTLSConfig::default(),
             driver: Mutex::new(None),
             pending: Mutex::new(None),
+            deferred_failure: Mutex::new(None),
             retry_attempts: AtomicU32::new(0),
             last_warning: Mutex::new(BTreeMap::new()),
         }
@@ -322,8 +323,8 @@ impl RabbitMqSource {
 
     async fn connect(&self) -> Result<RabbitMqDriver, Failure> {
         let duration = Duration::from_secs(self.config.timeout_secs);
-        let runtime = lapin::runtime::default_runtime()
-            .map_err(|error| Failure::lapin("runtime", error, true))?;
+        let runtime =
+            lapin::runtime::default_runtime().map_err(|error| Failure::lapin("runtime", error))?;
         let connection = timeout(
             duration,
             Connection::connect_with_config(
@@ -335,14 +336,14 @@ impl RabbitMqSource {
         )
         .await
         .map_err(|_| Failure::simple("connect", "RabbitMQ connection timed out"))?
-        .map_err(|error| Failure::lapin("connect", error, false))?;
+        .map_err(|error| Failure::lapin("connect", error))?;
         timeout(
             duration,
             RabbitMqDriver::consume(connection, &self.config.queue, self.config.batch_size),
         )
         .await
         .map_err(|_| Failure::simple("consumer_setup", "RabbitMQ consumer setup timed out"))?
-        .map_err(|error| Failure::lapin(error.operation, error.error, true))
+        .map_err(|error| Failure::lapin(error.operation, error.error))
     }
 
     async fn wait_before_retry(&self, failure: &Failure) {
@@ -370,8 +371,8 @@ impl RabbitMqSource {
         .await
         {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                warn!(connector_id = self.id, queue = %self.config.queue, error = %error, "Failed to close RabbitMQ connection")
+            Ok(Err(_)) => {
+                warn!(connector_id = self.id, queue = %self.config.queue, "Failed to close RabbitMQ connection")
             }
             Err(_) => {
                 warn!(connector_id = self.id, queue = %self.config.queue, "RabbitMQ connection close timed out")
@@ -391,7 +392,7 @@ impl RabbitMqSource {
 #[async_trait]
 impl Source for RabbitMqSource {
     async fn open(&mut self) -> Result<(), Error> {
-        self.config.validate()?;
+        self.batch_timeout = self.config.validate()?;
         self.tls = tls::build(self.config.tls.as_ref())?;
         let driver = self.connect().await.map_err(|failure| failure.error)?;
         *self.driver.get_mut() = Some(driver);
@@ -419,8 +420,6 @@ impl Source for RabbitMqSource {
                 }
             },
         };
-        let batch_timeout = humantime::parse_duration(&self.config.batch_timeout)
-            .map_err(|error| Error::InvalidConfigValue(error.to_string()))?;
         let mut deliveries = Vec::new();
         let mut deadline = None;
         loop {
@@ -430,11 +429,11 @@ impl Source for RabbitMqSource {
             if wait.is_zero() {
                 break;
             }
-            let delivery = match timeout(wait, driver.next()).await {
+            let mut delivery = match timeout(wait, driver.next()).await {
                 Err(_) => break,
                 Ok(Some(Ok(delivery))) => delivery,
                 Ok(Some(Err(error))) => {
-                    let failure = Failure::lapin("consume", error, true);
+                    let failure = Failure::lapin("consume", error);
                     self.close_driver(driver).await;
                     self.wait_before_retry(&failure).await;
                     return Err(failure.error);
@@ -447,22 +446,28 @@ impl Source for RabbitMqSource {
                 }
             };
             let received_at = Instant::now();
-            let message = match prepare_delivery(&delivery, self.config.include_metadata, self.id) {
-                Ok(message) => message,
-                Err(error) => {
-                    let failure = Failure {
-                        operation: "prepare",
-                        reply_code: None,
-                        error,
-                    };
-                    self.close_driver(driver).await;
-                    self.wait_before_retry(&failure).await;
-                    return Err(failure.error);
-                }
-            };
+            let message =
+                match prepare_delivery(&mut delivery, self.config.include_metadata, self.id) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        let failure = Failure {
+                            operation: "prepare",
+                            reply_code: None,
+                            error,
+                        };
+                        if !deliveries.is_empty() {
+                            // The valid deliveries need their original channel until they are acknowledged.
+                            *self.deferred_failure.lock().await = Some(failure);
+                            break;
+                        }
+                        self.close_driver(driver).await;
+                        self.wait_before_retry(&failure).await;
+                        return Err(failure.error);
+                    }
+                };
             if let Some(message) = message {
                 deliveries.push((message, delivery.acker));
-                deadline.get_or_insert(received_at + batch_timeout);
+                deadline.get_or_insert(received_at + self.batch_timeout);
                 if deliveries.len() >= usize::from(self.config.batch_size) {
                     break;
                 }
@@ -477,7 +482,7 @@ impl Source for RabbitMqSource {
                     Ok(Ok(true)) => {}
                     result => {
                         let failure = match result {
-                            Ok(Err(error)) => Failure::lapin("poison_ack", error, true),
+                            Ok(Err(error)) => Failure::lapin("poison_ack", error),
                             _ => Failure::simple(
                                 "poison_ack",
                                 "RabbitMQ poison acknowledgement failed",
@@ -532,12 +537,22 @@ impl Source for RabbitMqSource {
             if let Some(driver) = driver {
                 self.close_driver(driver).await;
             }
+        } else {
+            let failure = self.deferred_failure.lock().await.take();
+            if let Some(failure) = failure {
+                let driver = self.driver.lock().await.take();
+                if let Some(driver) = driver {
+                    self.close_driver(driver).await;
+                }
+                self.wait_before_retry(&failure).await;
+            }
         }
         result
     }
 
     async fn close(&mut self) -> Result<(), Error> {
         self.pending.get_mut().take();
+        self.deferred_failure.get_mut().take();
         if let Some(driver) = self.driver.get_mut().take() {
             self.close_driver(driver).await;
         }
@@ -547,7 +562,7 @@ impl Source for RabbitMqSource {
 
 #[cfg(test)]
 mod source_tests {
-    use super::RabbitMqSource;
+    use super::{Failure, RabbitMqSource};
     use crate::{batch::PendingBatch, config::RabbitMqSourceConfig};
     use iggy_connector_sdk::{ProducedMessage, Schema, Source, source::SourceBatchResult};
     use lapin::message::Delivery;
@@ -567,6 +582,42 @@ mod source_tests {
             origin_timestamp: None,
             headers: None,
             payload,
+        }
+    }
+
+    #[test]
+    fn given_lapin_error_with_url_secrets_should_not_expose_error_details() {
+        let secret_url = "amqp://user:password@broker.example/private?token=secret";
+        let error = std::io::Error::other(secret_url);
+        let failure = Failure::lapin("consumer_setup", error.into());
+
+        assert_eq!(failure.operation, "consumer_setup");
+        let message = failure.error.to_string();
+        assert!(message.contains("consumer_setup"));
+        for secret in [
+            "user",
+            "password",
+            "broker.example",
+            "private",
+            "token",
+            "secret",
+        ] {
+            assert!(!message.contains(secret));
+        }
+    }
+
+    #[test]
+    fn given_invalid_url_with_credentials_should_not_expose_credentials() {
+        let config: RabbitMqSourceConfig = serde_json::from_str(
+            r#"{"amqp_url":"amqp://user:password@[invalid/private?token=secret","queue":"events"}"#,
+        )
+        .expect("configuration must deserialize");
+        let error = config
+            .validate()
+            .expect_err("URL must be invalid")
+            .to_string();
+        for secret in ["user", "password", "private", "token", "secret"] {
+            assert!(!error.contains(secret));
         }
     }
 
@@ -690,6 +741,42 @@ mod source_tests {
             assert!(source.pending.lock().await.is_none());
         });
     }
+
+    #[test]
+    fn given_deferred_preparation_failure_when_batch_is_retried_should_wait_for_ack() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime must start");
+        runtime.block_on(async {
+            let source = source();
+            let delivery = Delivery::mock(1, "".into(), "events".into(), false, vec![1]);
+            let acker = delivery.acker.clone();
+            let mut batch =
+                PendingBatch::new(Schema::Raw, vec![(message(delivery.data), delivery.acker)]);
+            batch.next_attempt().expect("batch must be available");
+            *source.pending.lock().await = Some(batch);
+            *source.deferred_failure.lock().await = Some(Failure::simple("prepare", "failed"));
+
+            source
+                .on_batch_result(SourceBatchResult::Nack)
+                .await
+                .expect("Nack must succeed");
+            assert!(source.deferred_failure.lock().await.is_some());
+            assert!(acker.usable());
+            source
+                .pending
+                .lock()
+                .await
+                .as_mut()
+                .expect("batch must remain pending")
+                .next_attempt()
+                .expect("batch must be replayable");
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("Ack must succeed");
+            assert!(!acker.usable());
+            assert!(source.deferred_failure.lock().await.is_none());
+        });
+    }
 }
 
 #[cfg(test)]
@@ -709,7 +796,10 @@ mod tests {
         assert_eq!(config.batch_timeout, "10ms");
         assert!(!config.include_metadata);
         assert_eq!(config.timeout_secs, 30);
-        assert!(config.validate().is_ok());
+        assert_eq!(
+            config.validate().unwrap(),
+            std::time::Duration::from_millis(10)
+        );
     }
 
     #[test]

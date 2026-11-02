@@ -47,7 +47,7 @@ pub struct RabbitMqTlsConfig {
 }
 
 impl RabbitMqSourceConfig {
-    pub fn validate(&self) -> Result<(), Error> {
+    pub fn validate(&self) -> Result<Duration, Error> {
         let url = Url::parse(self.amqp_url.expose_secret())
             .map_err(|_| Error::InvalidConfigValue("invalid AMQP URL".into()))?;
         if !matches!(url.scheme(), "amqp" | "amqps") || url.host_str().is_none() {
@@ -87,7 +87,7 @@ impl RabbitMqSourceConfig {
                 ));
             }
         }
-        Ok(())
+        Ok(timeout)
     }
 }
 

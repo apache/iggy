@@ -17,7 +17,7 @@
 
 use futures_util::StreamExt;
 use lapin::{
-    Channel, Connection, Consumer,
+    Connection, Consumer,
     message::Delivery,
     options::{BasicConsumeOptions, BasicQosOptions},
     types::FieldTable,
@@ -25,7 +25,6 @@ use lapin::{
 
 pub struct RabbitMqDriver {
     connection: Connection,
-    channel: Channel,
     consumer: Consumer,
 }
 
@@ -71,10 +70,10 @@ impl RabbitMqDriver {
                     operation: "basic_consume",
                     error,
                 })?;
-            Ok::<_, DriverError>((channel, consumer))
+            Ok::<_, DriverError>(consumer)
         }
         .await;
-        let (channel, consumer) = match setup {
+        let consumer = match setup {
             Ok(value) => value,
             Err(error) => {
                 if connection.status().connected() {
@@ -85,7 +84,6 @@ impl RabbitMqDriver {
         };
         Ok(Self {
             connection,
-            channel,
             consumer,
         })
     }
@@ -95,16 +93,10 @@ impl RabbitMqDriver {
     }
 
     pub async fn close(self) -> lapin::Result<()> {
-        let connection_result = if self.connection.status().connected() {
+        if self.connection.status().connected() {
             self.connection.close(200, "OK".into()).await
         } else {
             Ok(())
-        };
-        let channel_result = if self.channel.status().connected() {
-            self.channel.close(200, "OK".into()).await
-        } else {
-            Ok(())
-        };
-        channel_result.and(connection_result)
+        }
     }
 }

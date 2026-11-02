@@ -166,6 +166,8 @@ The source keeps one batch in flight. If Iggy rejects a batch, the source retrie
 
 If the connector stops while a delivery is unacknowledged, RabbitMQ can requeue it. Iggy can receive a duplicate if RabbitMQ redelivers a message after Iggy accepted it but before RabbitMQ received its acknowledgement.
 
+After Iggy accepts a batch, the source acknowledges each delivery separately. If an acknowledgement fails or times out, the source stops and attempts to close its RabbitMQ connection. When the connection closes, RabbitMQ requeues deliveries that remain unacknowledged. Earlier acknowledgements can succeed, and the outcome of an acknowledgement can be uncertain if the connection fails. Redelivery can therefore create duplicates in Iggy.
+
 ## Failure Handling
 
 | Condition | Behavior |
