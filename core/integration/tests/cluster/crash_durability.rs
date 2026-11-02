@@ -151,11 +151,13 @@ async fn wait_for_acked_readable(
             .poll_messages(
                 &stream,
                 &topic,
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                want,
-                false,
+                PollOptions {
+                    count: want,
+                    ..PollOptions::default()
+                },
             )
             .await
         {
@@ -864,11 +866,13 @@ async fn given_all_replicas_checkpointed_when_restarted_should_elect_and_extend_
             .poll_messages(
                 &stream,
                 &topic,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(offset),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -963,11 +967,13 @@ async fn verify_checkpoint_quarantine(
             .poll_messages(
                 &stream,
                 &topic,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await
             .is_ok_and(|polled| {

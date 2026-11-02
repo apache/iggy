@@ -18,6 +18,7 @@
 use futures::StreamExt;
 use iggy::prelude::*;
 use iggy_common::{Credentials, Durability};
+use integration::harness::GroupPoller;
 use integration::iggy_harness;
 use secrecy::SecretString;
 use std::str::FromStr;
@@ -193,11 +194,10 @@ async fn verify_replacement_after_restart(
         .poll_messages(
             &stream,
             &topic,
-            None,
+            0,
             &consumer,
             &PollingStrategy::next(),
-            1,
-            true,
+            on_read_options(),
         )
         .await
         .unwrap();
@@ -250,11 +250,13 @@ async fn verify_replacement_after_restart(
             .poll_messages(
                 &stream,
                 &topic,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(1),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -269,17 +271,18 @@ async fn verify_replacement_after_restart(
     };
     assert_eq!(direct.messages.len(), 1, "retained data must be readable");
 
+    // The original member can hold the partition until its session expires, so the
+    // replacement polls only what its synced assignment holds.
+    let mut poller = GroupPoller::new(group_id.clone());
     let deadline = tokio::time::Instant::now() + STALE_EVICTION_TIMEOUT;
     loop {
-        let polled = replacement
-            .poll_messages(
+        let polled = poller
+            .poll(
+                &replacement,
                 &stream,
                 &topic,
-                None,
-                &consumer,
                 &PollingStrategy::next(),
-                1,
-                true,
+                on_read_options(),
             )
             .await
             .expect("replacement group poll must succeed");
@@ -402,6 +405,15 @@ async fn setup_resources(client: &IggyClient, durability: Durability) {
     }
 }
 
+/// One message per poll, whose offset the server stores at the read.
+fn on_read_options() -> PollOptions {
+    PollOptions {
+        count: 1,
+        commit: CommitPolicy::OnRead,
+        ..PollOptions::default()
+    }
+}
+
 /// Tests that a stale client receives clean errors and can manually reconnect.
 #[iggy_harness(server(
     heartbeat.enabled = true,
@@ -432,20 +444,18 @@ async fn should_handle_stale_client_with_manual_reconnection(
         .await
         .unwrap();
 
-    let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+    let mut stale_poller = GroupPoller::new(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
 
     // Poll first 5 messages
     let mut messages_polled = 0;
     while messages_polled < 5 {
-        let polled = stale_client
-            .poll_messages(
+        let polled = stale_poller
+            .poll(
+                &stale_client,
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
-                None,
-                &consumer,
                 &PollingStrategy::next(),
-                1,
-                true,
+                on_read_options(),
             )
             .await
             .unwrap();
@@ -471,15 +481,13 @@ async fn should_handle_stale_client_with_manual_reconnection(
 
     let mut got_error = false;
     for _ in 0..3 {
-        if stale_client
-            .poll_messages(
+        if stale_poller
+            .poll(
+                &stale_client,
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
-                None,
-                &consumer,
                 &PollingStrategy::next(),
-                1,
-                true,
+                on_read_options(),
             )
             .await
             .is_err()
@@ -508,18 +516,17 @@ async fn should_handle_stale_client_with_manual_reconnection(
         .unwrap();
 
     // Poll remaining messages
+    let mut new_poller = GroupPoller::new(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
     let mut remaining_polled = 0;
     let start = std::time::Instant::now();
     while remaining_polled < 5 && start.elapsed() < Duration::from_secs(5) {
-        match new_client
-            .poll_messages(
+        match new_poller
+            .poll(
+                &new_client,
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
-                None,
-                &consumer,
                 &PollingStrategy::next(),
-                1,
-                true,
+                on_read_options(),
             )
             .await
         {
@@ -555,11 +562,13 @@ async fn should_handle_stale_client_with_auto_reconnection(
     let mut consumer: IggyConsumer = consumer_client
         .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
-        .batch_length(1)
+        .poll_options(PollOptions {
+            count: 1,
+            commit: CommitPolicy::OnRead,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .polling_strategy(PollingStrategy::next())
-        .auto_join_consumer_group()
         .create_consumer_group_if_not_exists()
-        .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
         .polling_retry_interval(NonZeroIggyDuration::from_str("500ms").unwrap())
         .build();
 
@@ -570,7 +579,7 @@ async fn should_handle_stale_client_with_auto_reconnection(
     let timeout = STALE_EVICTION_TIMEOUT + Duration::from_secs(15);
 
     while messages_consumed < TOTAL_MESSAGES && start.elapsed() < timeout {
-        let poll_result: Option<Result<ReceivedMessage, IggyError>> =
+        let poll_result: Option<Result<ReceivedMessage, ReadError>> =
             tokio::time::timeout(Duration::from_millis(500), consumer.next())
                 .await
                 .ok()

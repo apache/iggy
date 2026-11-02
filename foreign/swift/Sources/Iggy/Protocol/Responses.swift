@@ -98,10 +98,19 @@ enum Responses {
         let sizeBytes = try reader.readUInt64()
         let messagesCount = try reader.readUInt64()
         let context = try PartitionContext.decode(from: &reader)
+        let members = try nodes(from: &reader)
+        let inSyncMembers = try nodes(from: &reader)
         return Partition(
             id: id, createdAt: IggyTimestamp(microseconds: createdAt),
             segmentsCount: segmentsCount, currentOffset: currentOffset,
-            sizeBytes: sizeBytes, messagesCount: messagesCount, context: context)
+            sizeBytes: sizeBytes, messagesCount: messagesCount, context: context,
+            members: members, inSyncMembers: inSyncMembers)
+    }
+
+    /// `[count: u8][ids: count x u8]`, one node list of a partition.
+    private static func nodes(from reader: inout ByteReader) throws -> [UInt8] {
+        let count = Int(try reader.readUInt8())
+        return Array(try reader.readBytes(count))
     }
 
     static func topicDetails(_ body: ArraySlice<UInt8>) throws -> TopicDetails {
@@ -563,6 +572,55 @@ enum Responses {
                 throw WireError.validation("send_messages response has \(reader.remaining) trailing bytes")
             }
             return SendMessagesResponse(confirmations: confirmations)
+        }
+    }
+
+    /// `FETCH_SECTION_HEADER_SIZE`: one entry of the section table of a fetch reply.
+    static let fetchSectionHeaderSize = 56
+
+    /// `FetchMessagesResponse::head_size`: the section count and the table
+    /// of `sections` entries, which come before the records.
+    static func fetchHeadSize(_ sections: Int) -> Int {
+        MemoryLayout<UInt32>.size + sections * fetchSectionHeaderSize
+    }
+
+    /// A fetch reply: `[sections_count:4]`, then per section
+    /// `[partition_id:4][status:4][current_offset:8][messages_count:4][context:24][next_offset:8][records_len:4]`,
+    /// then the records of every section in table order. As
+    /// `FetchMessagesResponse::decode` checks, a section with an error holds
+    /// no records, and the records fill the body exactly.
+    static func fetchSections(_ body: ArraySlice<UInt8>) throws -> [FetchSection] {
+        try decode(body) { reader in
+            let count = try reader.readUInt32()
+            // Compared as `UInt32` so a hostile count never traps a 32-bit `Int`.
+            guard count <= UInt32(Requests.maxPartitionsPerRequest), fetchHeadSize(Int(count)) <= body.count else {
+                throw WireError.validation("a fetch reply of \(body.count) bytes cannot hold \(count) sections")
+            }
+            var sections: [FetchSection] = []
+            var lengths: [UInt32] = []
+            sections.reserveCapacity(Int(count))
+            lengths.reserveCapacity(Int(count))
+            for _ in 0..<count {
+                sections.append(
+                    FetchSection(
+                        partitionID: try reader.readUInt32(), status: try reader.readUInt32(), currentOffset: try reader.readUInt64(),
+                        messagesCount: try reader.readUInt32(), context: try PartitionContext.decode(from: &reader), nextOffset: try reader.readUInt64(),
+                        records: []))
+                lengths.append(try reader.readUInt32())
+            }
+            for index in sections.indices {
+                guard sections[index].status == 0 || lengths[index] == 0 else {
+                    throw WireError.validation("the section of partition \(sections[index].partitionID) has an error and records")
+                }
+                guard let length = Int(exactly: lengths[index]), length <= reader.remaining else {
+                    throw WireError.validation("the records of partition \(sections[index].partitionID) run past the fetch reply")
+                }
+                sections[index].records = try reader.readBytes(length)
+            }
+            guard reader.isAtEnd else {
+                throw WireError.validation("a fetch reply has \(reader.remaining) bytes after its records")
+            }
+            return sections
         }
     }
 

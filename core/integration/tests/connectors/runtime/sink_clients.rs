@@ -21,7 +21,7 @@
 //! a member leaves. These tests therefore tell the members apart by the
 //! clients that the server lists, each with the number of groups it is in.
 
-use iggy::prelude::{Identifier, IggyClient, SystemClient};
+use iggy::prelude::{Identifier, IggyClient, StreamClient, SystemClient};
 use iggy_common::ClientInfo;
 use iggy_connector_sdk::api::{ConnectorStatus, SinkInfoResponse};
 use integration::harness::{seeds, wait_for_consumer_group_assignment};
@@ -43,6 +43,8 @@ const MEMBERSHIP_BUDGET: Duration = Duration::from_secs(30);
 /// expires, so only a logout passes within this budget.
 const LOGOUT_BUDGET: Duration = Duration::from_secs(10);
 const CLIENTS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const INSTANCE_CLOSE_BUDGET: Duration = Duration::from_secs(10);
+const STDOUT_SINK_OPENED: &str = "Opened stdout sink connector with ID: ";
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/runtime/sink_clients.toml")),
@@ -166,6 +168,61 @@ async fn given_sink_with_failing_second_stream_when_runtime_starts_should_leave_
         clients.iter().all(|info| info.consumer_groups_count == 0),
         "no client should stay a group member after the failed setup, got: {clients:?}"
     );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/runtime/sink_restart.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_running_sink_when_restart_setup_fails_should_close_the_new_plugin_instance(
+    harness: &TestHarness,
+) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("root client should connect");
+    wait_for_sink_group(&client, RESTART_SINK_KEY, 1, MEMBERSHIP_BUDGET).await;
+    // A start opens the plugin before it builds the consumers, and a missing
+    // stream fails that second step.
+    client
+        .delete_stream(&Identifier::named(seeds::names::STREAM).expect("valid stream name"))
+        .await
+        .expect("stream should be deleted");
+
+    let runtime = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available");
+    let response = Client::new()
+        .post(format!(
+            "{}/sinks/{RESTART_SINK_KEY}/restart",
+            runtime.http_url()
+        ))
+        .send()
+        .await
+        .expect("restart request should complete");
+    assert!(
+        !response.status().is_success(),
+        "the restart should fail without its stream, got: {}",
+        response.status()
+    );
+
+    let opened = last_opened_stdout_sink_id(&runtime.collect_logs().0)
+        .expect("the restart should open a new plugin instance");
+    let closed = format!("Stdout sink connector with ID: {opened} is closed.");
+    let deadline = Instant::now() + INSTANCE_CLOSE_BUDGET;
+    while !runtime.collect_logs().0.contains(&closed) && Instant::now() < deadline {
+        sleep(CLIENTS_POLL_INTERVAL).await;
+    }
+    assert!(
+        runtime.collect_logs().0.contains(&closed),
+        "the failed restart should close the plugin instance {opened} that it opened"
+    );
+}
+
+/// The id of the stdout sink instance that the runtime opened last.
+fn last_opened_stdout_sink_id(logs: &str) -> Option<u32> {
+    let start = logs.rfind(STDOUT_SINK_OPENED)? + STDOUT_SINK_OPENED.len();
+    logs[start..].split(',').next()?.parse().ok()
 }
 
 async fn wait_for_sink_group(

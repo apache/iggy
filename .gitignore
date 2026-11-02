@@ -21,6 +21,7 @@ test_logs/
 !/foreign/python/src/bin
 *.iml
 foreign/cpp/build
+/foreign/csharp/TestResults/
 foreign/java/**/build
 foreign/java/**/out
 foreign/node/**/dist

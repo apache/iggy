@@ -18,12 +18,13 @@
 use iggy::prelude::IggyError;
 use thiserror::Error;
 
-use crate::bridge::iggy_bridge::ClusterIdCall;
+use crate::bridge::iggy_bridge::{ClusterIdCall, CoordinatorLogCall};
 use crate::cluster_id::InvalidClusterId;
 use crate::protocol::api::{
-    ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_INVALID_PARTITIONS, ERROR_INVALID_REQUEST,
-    ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_POLICY_VIOLATION,
-    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED,
+    ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_INVALID_PARTITIONS, ERROR_INVALID_PRODUCER_EPOCH,
+    ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NOT_LEADER_OR_FOLLOWER,
+    ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
+    ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_PRODUCER_ID,
     ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 
@@ -116,6 +117,17 @@ pub enum BridgeError {
         topic: &'static str,
         source: Box<Self>,
     },
+    /// A call to Iggy that prepares the coordinator log failed. Made only at startup.
+    #[error(
+        "cannot {call} '{stream}/{topic}' for the coordinator log: {source}{}",
+        call.permission_hint(source, stream)
+    )]
+    CoordinatorLogCall {
+        call: CoordinatorLogCall,
+        stream: String,
+        topic: &'static str,
+        source: Box<Self>,
+    },
 }
 
 impl BridgeError {
@@ -146,9 +158,10 @@ impl BridgeError {
             // is reachable only if a future caller starts constructing configs at request time.
             // `UNKNOWN_SERVER_ERROR` at least doesn't claim a specific, wrong cause the way
             // `UNSUPPORTED_VERSION` (misleadingly implies a Kafka API version mismatch) would.
-            Self::InvalidConfig(_) | Self::InvalidClusterId { .. } | Self::ClusterIdCall { .. } => {
-                ERROR_UNKNOWN_SERVER_ERROR
-            }
+            Self::InvalidConfig(_)
+            | Self::InvalidClusterId { .. }
+            | Self::ClusterIdCall { .. }
+            | Self::CoordinatorLogCall { .. } => ERROR_UNKNOWN_SERVER_ERROR,
         }
     }
 
@@ -193,6 +206,37 @@ impl BridgeError {
             ) => ERROR_NOT_LEADER_OR_FOLLOWER,
             Self::Iggy(IggyError::RequestTooOld) => ERROR_REQUEST_TIMED_OUT,
             _ => self.to_kafka_error_code(),
+        }
+    }
+
+    /// [`Self::to_kafka_error_code`] for Produce. The SDK returns `HistoryUnavailable`,
+    /// `LifecycleBusy` and `ClientShutdown` only for a send that wrote nothing, because a send
+    /// that may have landed ends as `OperationUncertain`. So these answer 6, which clients retry,
+    /// not -1, which loses the records.
+    #[must_use]
+    pub const fn to_produce_error_code(&self) -> i16 {
+        match self {
+            Self::Iggy(
+                IggyError::HistoryUnavailable
+                | IggyError::LifecycleBusy
+                | IggyError::ClientShutdown,
+            ) => ERROR_NOT_LEADER_OR_FOLLOWER,
+            _ => self.to_kafka_error_code(),
+        }
+    }
+
+    /// True when the same call can succeed later: Kafka clients retry its code, 6 or 7. A wrong
+    /// password, a missing permission or a bad configuration is not.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        match self {
+            Self::ClusterIdCall { source, .. } | Self::CoordinatorLogCall { source, .. } => {
+                source.is_retriable()
+            }
+            _ => matches!(
+                self.to_kafka_error_code(),
+                ERROR_NOT_LEADER_OR_FOLLOWER | ERROR_REQUEST_TIMED_OUT
+            ),
         }
     }
 
@@ -277,6 +321,10 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         // The outcome was forgotten; a retry after client eviction could duplicate the write.
         // UNKNOWN_SERVER_ERROR is non-retryable in the Kafka protocol.
         IggyError::RequestTooOld => ERROR_UNKNOWN_SERVER_ERROR,
+        // The partition refused an idempotent batch and wrote nothing, as Kafka's log does.
+        IggyError::ProducerSequenceOutOfOrder => ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
+        IggyError::ProducerEpochFenced => ERROR_INVALID_PRODUCER_EPOCH,
+        IggyError::ProducerUnknown => ERROR_UNKNOWN_PRODUCER_ID,
         // Not `ERROR_INVALID_PARTITIONS` (37): that code's own text, per `kafka-protocol`'s
         // table, is "Number of partitions is below 1" - the opposite condition from "too many"
         // (Iggy's server-side cap, above 1000). Reusing 37 for both directions would return a
@@ -405,6 +453,47 @@ mod tests {
                 "{err}"
             );
             assert_eq!(err.to_list_offsets_error_code(), code, "{err}");
+        }
+    }
+
+    #[test]
+    fn given_a_send_that_wrote_nothing_when_mapped_for_produce_should_answer_retriable() {
+        let wrote_nothing = [
+            IggyError::HistoryUnavailable,
+            IggyError::LifecycleBusy,
+            IggyError::ClientShutdown,
+        ];
+        for error in wrote_nothing {
+            let err = BridgeError::Iggy(error);
+            assert_eq!(
+                err.to_kafka_error_code(),
+                ERROR_UNKNOWN_SERVER_ERROR,
+                "{err}"
+            );
+            assert_eq!(
+                err.to_produce_error_code(),
+                ERROR_NOT_LEADER_OR_FOLLOWER,
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_send_that_may_have_landed_when_mapped_for_produce_should_keep_the_shared_code() {
+        let may_have_landed = [
+            (
+                BridgeError::Iggy(IggyError::OperationUncertain(1)),
+                ERROR_REQUEST_TIMED_OUT,
+            ),
+            (BridgeError::Timeout, ERROR_REQUEST_TIMED_OUT),
+            // A retry after the client was evicted could write it twice.
+            (
+                BridgeError::Iggy(IggyError::RequestTooOld),
+                ERROR_UNKNOWN_SERVER_ERROR,
+            ),
+        ];
+        for (err, code) in may_have_landed {
+            assert_eq!(err.to_produce_error_code(), code, "{err}");
         }
     }
 
@@ -634,6 +723,15 @@ mod tests {
             ),
             (ERROR_INVALID_PARTITIONS, ResponseError::InvalidPartitions),
             (ERROR_INVALID_REQUEST, ResponseError::InvalidRequest),
+            (
+                ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
+                ResponseError::OutOfOrderSequenceNumber,
+            ),
+            (
+                ERROR_INVALID_PRODUCER_EPOCH,
+                ResponseError::InvalidProducerEpoch,
+            ),
+            (ERROR_UNKNOWN_PRODUCER_ID, ResponseError::UnknownProducerId),
         ] {
             assert_eq!(ours, theirs.code());
         }
@@ -657,5 +755,44 @@ mod tests {
         }
         assert!(!BridgeError::Iggy(IggyError::Unauthorized).is_bridge_login_rejected());
         assert!(!BridgeError::Timeout.is_bridge_login_rejected());
+    }
+
+    #[test]
+    fn given_an_iggy_that_is_not_up_yet_should_be_retriable() {
+        for error in [
+            BridgeError::Iggy(IggyError::CannotEstablishConnection),
+            BridgeError::Iggy(IggyError::Disconnected),
+            BridgeError::Timeout,
+        ] {
+            assert!(error.is_retriable(), "{error}");
+        }
+        let call = BridgeError::ClusterIdCall {
+            call: ClusterIdCall::Poll,
+            stream: "kafka".to_string(),
+            topic: "topic",
+            source: Box::new(BridgeError::Iggy(IggyError::NotConnected)),
+        };
+        assert!(
+            call.is_retriable(),
+            "a cluster id call answers for its cause"
+        );
+    }
+
+    #[test]
+    fn given_a_wrong_setting_should_not_be_retriable() {
+        for error in [
+            BridgeError::Iggy(IggyError::InvalidCredentials),
+            BridgeError::Iggy(IggyError::Unauthorized),
+            BridgeError::InvalidConfig("empty address".to_string()),
+        ] {
+            assert!(!error.is_retriable(), "{error}");
+        }
+        let call = BridgeError::ClusterIdCall {
+            call: ClusterIdCall::CreateStream,
+            stream: "kafka".to_string(),
+            topic: "topic",
+            source: Box::new(BridgeError::Iggy(IggyError::Unauthorized)),
+        };
+        assert!(!call.is_retriable());
     }
 }

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use iggy::prelude::{IggyError, IggyMessage, Sizeable};
+use iggy::prelude::{BatchProducer, IggyError, Sizeable};
 use kafka_protocol::messages::produce_request::PartitionProduceData;
 use kafka_protocol::messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
 use kafka_protocol::messages::{ProduceRequest, ProduceResponse};
@@ -29,14 +29,17 @@ use kafka_protocol::protocol::StrBytes;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit};
 
 use crate::auth::AuthenticatedPrincipal;
-use crate::bridge::{BridgeError, IggyBridge, ProduceTurn, Producer, TopicTarget};
+use crate::bridge::{
+    BridgeError, IggyBridge, PartitionBatch, ProduceTurn, Producer, TopicTarget, iggy_producer_id,
+};
 use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_PRODUCE, ApiVersionRange, ConnectionState, ERROR_INVALID_RECORD,
     ERROR_INVALID_REQUIRED_ACKS, ERROR_MESSAGE_TOO_LARGE, ERROR_NONE, ERROR_NOT_LEADER_OR_FOLLOWER,
-    ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-    ERROR_UNSUPPORTED_COMPRESSION_TYPE, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
-    REQUEST_DEADLINE, UNKNOWN_OFFSET, supported_max_version,
+    ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_PRODUCER_ID, ERROR_UNKNOWN_SERVER_ERROR,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_COMPRESSION_TYPE,
+    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, REQUEST_DEADLINE, UNKNOWN_OFFSET,
+    supported_max_version,
 };
 use crate::protocol::bounds_guard::validate_produce_shape;
 use crate::protocol::handlers::{
@@ -45,8 +48,8 @@ use crate::protocol::handlers::{
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::records::{
-    Allowance, DecompressionBudget, RecordCodecError, TimestampWindow, Zstd, decode_batch,
-    is_compressed, producer_id, record_slots, to_iggy,
+    Allowance, DecompressionBudget, RecordCodecError, TimestampWindow, Zstd, batch_producer,
+    decode_batch, is_compressed, producer_id, record_slots, to_iggy,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -300,7 +303,7 @@ fn producer_of(
         .flat_map(|topic| &topic.partition_data)
         .find_map(|partition| partition.records.as_deref())
         .and_then(producer_id)
-        .filter(|id| state.producer_ids.issued(*id))
+        .filter(|id| state.issued_producer_id(*id))
         .map_or_else(
             || Producer::Connection(connection.id()),
             |id| Producer::Id {
@@ -374,6 +377,7 @@ async fn write_request(
     deadline: Deadline,
 ) -> Vec<TopicProduceResponse> {
     let max_send = bridge.max_send_bytes();
+    let writes_producers = bridge.writes_producers();
     let mut held = Some(held);
     let mut topics = Vec::with_capacity(request.topic_data.len());
     for topic in &request.topic_data {
@@ -385,9 +389,12 @@ async fn write_request(
             let (outcome, kept) = match (&target, held.take()) {
                 (Ok(target), Some(kept)) if !deadline.passed() => {
                     match plan(&budget, zstd, name, partition, max_send) {
-                        Ok((id, messages)) => {
+                        Ok(mut batch) => {
+                            if !writes_producers {
+                                batch.producer = None;
+                            }
                             let (sent, kept) =
-                                send_by(bridge, kept, target, name, id, messages, deadline).await;
+                                send_by(bridge, kept, target, name, batch, deadline).await;
                             (sent.map_err(Refusal::from), kept)
                         }
                         Err(refusal) => (Err(refusal), Some(kept)),
@@ -424,7 +431,7 @@ fn plan(
     kafka_topic: &str,
     partition: &PartitionProduceData,
     max_send: u64,
-) -> std::result::Result<(u32, Vec<IggyMessage>), Refusal> {
+) -> std::result::Result<PartitionBatch, Refusal> {
     let run = || plan_partition(budget, zstd, kafka_topic, partition, max_send);
     // A spent budget refuses before it reads a byte, so there is nothing to move off the worker.
     let heavy = !budget.is_spent()
@@ -448,7 +455,15 @@ fn partition_outcome(
             }),
         ),
         Err(Refusal { code, message }) => {
-            partition_response(index, code).with_error_message(message.map(StrBytes::from_string))
+            let response = partition_response(index, code)
+                .with_error_message(message.map(StrBytes::from_string));
+            // The Java producer retries a 59 unchanged while the log start is unknown, until the
+            // delivery timeout. With a known start, it moves to a new epoch and sends again.
+            if code == ERROR_UNKNOWN_PRODUCER_ID {
+                response.with_log_start_offset(0)
+            } else {
+                response
+            }
         }
     }
 }
@@ -461,7 +476,7 @@ fn plan_partition(
     kafka_topic: &str,
     partition: &PartitionProduceData,
     max_send: u64,
-) -> std::result::Result<(u32, Vec<IggyMessage>), Refusal> {
+) -> std::result::Result<PartitionBatch, Refusal> {
     // The records are not what is wrong with a negative index, so not `INVALID_RECORD`.
     let Ok(partition_id) = u32::try_from(partition.index) else {
         return Err(ERROR_UNKNOWN_TOPIC_OR_PARTITION.into());
@@ -473,6 +488,23 @@ fn plan_partition(
     let refuse = |error: RecordCodecError| {
         tracing::debug!(%error, kafka_topic, partition_id, "refused a Produce record batch");
         Refusal::from(error)
+    };
+
+    // An idempotent batch carries its producer to Iggy, which writes it once. A batch with a
+    // producer id but a negative epoch or sequence is one no Kafka producer sends. An id without
+    // the Iggy mark, as older gateways gave out, writes as a plain batch.
+    let producer = match batch_producer(blob) {
+        None => None,
+        Some(fields) => {
+            let (Ok(id), Ok(epoch), Ok(sequence)) = (
+                u64::try_from(fields.producer_id),
+                u16::try_from(fields.producer_epoch),
+                u32::try_from(fields.base_sequence),
+            ) else {
+                return Err(ERROR_INVALID_RECORD.into());
+            };
+            iggy_producer_id(id).and_then(|id| BatchProducer::new(id, epoch, sequence))
+        }
     };
 
     // The clone is a refcount, and `decode_batch` drains what it is given.
@@ -501,7 +533,11 @@ fn plan_partition(
         );
         return Err(ERROR_MESSAGE_TOO_LARGE.into());
     }
-    Ok((partition_id, messages))
+    Ok(PartitionBatch {
+        partition: partition_id,
+        producer,
+        messages,
+    })
 }
 
 /// The shorter of the client's `timeout_ms` and this gateway's ceiling.
@@ -517,40 +553,50 @@ fn request_timeout(timeout_ms: i32) -> Duration {
         .min(REQUEST_DEADLINE)
 }
 
-/// Sends one partition's messages, or answers 7 once the deadline has passed. Hands `held` back,
+/// Sends one partition's messages, and gives up on them at the deadline. Hands `held` back,
 /// unless the send still runs and keeps it.
 ///
-/// 7 means nothing was written, or the send may still land and a retry duplicate it.
+/// 7 means nothing was written, or the send may still land and a retry duplicate it. 6 means that
+/// it never went out.
 async fn send_by(
     bridge: &IggyBridge,
     (turn, admission): Held,
     target: &TopicTarget,
     kafka_topic: &str,
-    partition_id: u32,
-    messages: Vec<IggyMessage>,
+    batch: PartitionBatch,
     deadline: Deadline,
 ) -> (std::result::Result<Option<u64>, i16>, Option<Held>) {
+    let partition_id = batch.partition;
     let (sent, held) = bridge
-        .send_records(turn, admission, target, partition_id, messages, deadline.at)
+        .send_records(turn, admission, target, batch, deadline.at)
         .await;
     let sent = match sent {
         Ok(base_offset) => Ok(base_offset),
-        Err(BridgeError::Timeout) => {
+        // The SDK retries a send until the deadline, and then ends it with one of these two: not
+        // sent, or in doubt.
+        Err(
+            error @ (BridgeError::Timeout
+            | BridgeError::Iggy(
+                IggyError::TransientNotAccepted | IggyError::OperationUncertain(_),
+            )),
+        ) => {
             // The client picks `timeout_ms`, so its expiry is no signal to the operator.
             if deadline.ceiling {
                 tracing::warn!(
+                    %error,
                     kafka_topic,
                     partition_id,
                     "Produce ran past the gateway deadline"
                 );
             } else {
                 tracing::debug!(
+                    %error,
                     kafka_topic,
                     partition_id,
                     "Produce ran past the client deadline"
                 );
             }
-            Err(ERROR_REQUEST_TIMED_OUT)
+            Err(error.to_produce_error_code())
         }
         Err(error) => Err(refusal_code(kafka_topic, &error)),
     };
@@ -559,7 +605,7 @@ async fn send_by(
 
 /// The Kafka code for a bridge refusal, logged at a level that matches who can fix it.
 fn refusal_code(kafka_topic: &str, error: &BridgeError) -> i16 {
-    let code = error.to_kafka_error_code();
+    let code = error.to_produce_error_code();
     if error.is_bridge_login_rejected() {
         tracing::error!(%error, kafka_topic, "Iggy rejected the bridge's credentials");
     } else if matches!(code, ERROR_UNKNOWN_SERVER_ERROR) {
@@ -682,6 +728,7 @@ fn partition_response(index: i32, error_code: i16) -> PartitionProduceResponse {
 mod tests {
     use super::*;
     use bytes::BytesMut;
+    use iggy::prelude::IggyMessage;
     use kafka_protocol::indexmap::IndexMap;
     use kafka_protocol::messages::TopicName;
     use kafka_protocol::messages::produce_request::TopicProduceData;
@@ -692,6 +739,7 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
+    use crate::bridge::kafka_producer_id;
     use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
     use crate::protocol::acl::PrincipalPermissions;
     use crate::records::encode_batch;
@@ -744,7 +792,86 @@ mod tests {
         zstd: Zstd,
         entry: &PartitionProduceData,
     ) -> std::result::Result<(u32, Vec<IggyMessage>), i16> {
-        plan_partition(budget, zstd, TOPIC, entry, u64::MAX).map_err(|refusal| refusal.code)
+        plan_partition(budget, zstd, TOPIC, entry, u64::MAX)
+            .map(|batch| (batch.partition, batch.messages))
+            .map_err(|refusal| refusal.code)
+    }
+
+    /// Two records of Iggy producer 7 at epoch 1, the first at `base_sequence`.
+    fn idempotent_batch(base_sequence: i32) -> Bytes {
+        batch_of_producer(kafka_producer_id(7).unwrap(), base_sequence)
+    }
+
+    fn batch_of_producer(producer_id: i64, base_sequence: i32) -> Bytes {
+        let records: Vec<Record> = (0..2)
+            .map(|offset| Record {
+                producer_id,
+                producer_epoch: 1,
+                sequence: base_sequence.wrapping_add(i32::try_from(offset).unwrap()),
+                ..record(offset, b"v")
+            })
+            .collect();
+        compressed_batch(&records, Compression::None)
+    }
+
+    #[test]
+    fn given_an_idempotent_batch_when_planned_should_carry_its_producer() {
+        let planned = plan_partition(
+            &partition_budget(TEST_BUDGET, usize::MAX),
+            Zstd::Allowed,
+            TOPIC,
+            &entry(0, Some(idempotent_batch(5))),
+            u64::MAX,
+        )
+        .unwrap_or_else(|refusal| panic!("refused with {}", refusal.code));
+
+        assert_eq!(planned.producer, Some(BatchProducer::new(7, 1, 5).unwrap()));
+        assert_eq!(planned.messages.len(), 2);
+        let plain = plan_partition(
+            &partition_budget(TEST_BUDGET, usize::MAX),
+            Zstd::Allowed,
+            TOPIC,
+            &entry(
+                0,
+                Some(compressed_batch(&[record(0, b"v")], Compression::None)),
+            ),
+            u64::MAX,
+        )
+        .unwrap_or_else(|refusal| panic!("refused with {}", refusal.code));
+        assert_eq!(plain.producer, None);
+    }
+
+    #[test]
+    fn given_a_producer_id_without_the_iggy_mark_when_planned_should_write_a_plain_batch() {
+        let planned = plan_partition(
+            &partition_budget(TEST_BUDGET, usize::MAX),
+            Zstd::Allowed,
+            TOPIC,
+            &entry(0, Some(batch_of_producer(7, 5))),
+            u64::MAX,
+        )
+        .unwrap_or_else(|refusal| panic!("refused with {}", refusal.code));
+
+        assert_eq!(planned.producer, None);
+        assert_eq!(planned.messages.len(), 2);
+    }
+
+    #[test]
+    fn given_a_producer_id_without_a_sequence_when_planned_should_refuse_the_batch() {
+        assert_eq!(
+            planned(&entry(0, Some(idempotent_batch(NO_SEQUENCE)))),
+            Err(ERROR_INVALID_RECORD)
+        );
+    }
+
+    #[test]
+    fn given_an_unknown_producer_when_answered_should_name_a_log_start() {
+        let unknown = partition_outcome(0, Err(ERROR_UNKNOWN_PRODUCER_ID.into()));
+        assert_eq!(unknown.error_code, ERROR_UNKNOWN_PRODUCER_ID);
+        assert_eq!(unknown.log_start_offset, 0);
+
+        let timed_out = partition_outcome(0, Err(ERROR_REQUEST_TIMED_OUT.into()));
+        assert_eq!(timed_out.log_start_offset, UNKNOWN_OFFSET);
     }
 
     fn planned(entry: &PartitionProduceData) -> std::result::Result<(u32, Vec<IggyMessage>), i16> {
@@ -837,6 +964,7 @@ mod tests {
     fn principal(username: &str) -> AuthenticatedPrincipal {
         AuthenticatedPrincipal {
             username: username.to_string(),
+            user: None,
             permissions: PrincipalPermissions::default(),
             permissions_known: true,
         }

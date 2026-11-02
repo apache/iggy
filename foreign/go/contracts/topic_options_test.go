@@ -83,6 +83,13 @@ func TestTopicOptions_ConstructorsEncodeKeyAndValue(t *testing.T) {
 			wantKind:  Bool,
 			wantValue: []byte{0},
 		},
+		{
+			name:      "replication factor",
+			entry:     ReplicationFactorOption(3),
+			wantKey:   "replication_factor",
+			wantKind:  Uint32,
+			wantValue: []byte{3, 0, 0, 0},
+		},
 	}
 
 	for _, test := range tests {
@@ -114,6 +121,7 @@ func TestTopicOptions_ConstructorEntriesSurviveTheHeaderCodec(t *testing.T) {
 		MessagesRequiredToSaveOption(7),
 		SizeOfMessagesRequiredToSaveOption(4096),
 		PreallocateSegmentsOption(false),
+		ReplicationFactorOption(3),
 	}
 
 	decoded, err := DeserializeHeaders(GetHeadersBytes(entries))

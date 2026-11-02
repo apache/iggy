@@ -29,8 +29,12 @@ async fn main() -> Result<(), IggyError> {
 
     println!("Build iggy producer & consumer");
     // For customization, use the `new` or `from_stream_topic` constructor
-    let consumer_config = IggyConsumerConfig::default()
-        .with_auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages));
+    let consumer_config = IggyConsumerConfig::default();
+    let poll_options = PollOptions {
+        commit: CommitPolicy::OnRead,
+        ..consumer_config.poll_options()
+    };
+    let consumer_config = consumer_config.with_poll_options(poll_options);
     let stream_config = IggyStreamConfig::new(consumer_config, IggyProducerConfig::default());
     let (producer, mut consumer) = IggyStream::build(&client, &stream_config).await?;
 

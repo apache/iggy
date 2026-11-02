@@ -356,8 +356,10 @@ pub enum RepairConclusion {
     /// The walk reached the requested frontier; the session was dropped.
     Done,
     /// The floor's continuity check failed: ops below it are neither locally
-    /// durable nor repaired. The session was dropped here -- state transfer
-    /// supersedes repair -- and the caller arms the transfer.
+    /// durable nor repaired. The repair walk of an unproven view log that
+    /// outgrew its byte budget also ends here, with `floor` at `commit_min`.
+    /// The session was dropped here -- state transfer supersedes repair -- and
+    /// the caller arms the transfer.
     FloorRefused { floor: u64, to_op: u64 },
 }
 

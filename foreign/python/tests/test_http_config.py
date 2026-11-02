@@ -32,10 +32,20 @@ from datetime import timedelta
 
 import pytest
 
-from apache_iggy import Consumer, HttpConfig, IggyClient, PollingStrategy
+from apache_iggy import (
+    CommitPolicy,
+    Consumer,
+    HttpConfig,
+    IggyClient,
+    IggyError,
+    PollingStrategy,
+    PollOptions,
+)
 from apache_iggy import SendMessage as Message
 
 from .utils import get_http_server_config, wait_for_ping
+
+FEATURE_UNAVAILABLE = 5
 
 
 @pytest.mark.unit
@@ -259,17 +269,16 @@ class TestHttpConfigAgainstServer:
             messages=[Message(payload)],
         )
 
-        polled_messages = await client.poll_messages(
-            stream=stream_name,
-            topic=topic_name,
+        polled = await client.poll_messages(
+            stream_name,
+            topic_name,
             consumer=Consumer.Single("http-round-trip"),
             partition_id=0,
             polling_strategy=PollingStrategy.First(),
-            count=1,
-            auto_commit=True,
+            options=PollOptions(count=1, commit=CommitPolicy.OnRead()),
         )
 
-        assert [message.payload().decode() for message in polled_messages] == [payload]
+        assert [message.payload().decode() for message in polled.messages] == [payload]
 
     @pytest.mark.asyncio
     async def test_jwt_config_actually_authenticates(self, unique_name):
@@ -333,13 +342,9 @@ class TestHttpConfigAgainstServer:
     async def test_consumer_group_is_rejected(self, unique_name):
         """Test that a consumer group fails loudly over HTTP, not silently.
 
-        `join_consumer_group` answers `Feature is unavailable` over HTTP, and
-        `consumer_group(...)` awaits that join before returning, so the
-        failure surfaces at construction. `auto_join_consumer_group=False`
-        is not a way around it: the join is skipped, but the first poll
-        raises the same error, because a group member is pinned to no
-        partition and a consumer-group poll without one is rejected
-        client-side.
+        The HTTP client refuses `join_consumer_group` with
+        `FeatureUnavailable`, and `consumer_group(...)` always joins before
+        it returns, so the failure surfaces at construction.
         """
         host, port = get_http_server_config()
         stream_name = unique_name()
@@ -353,7 +358,8 @@ class TestHttpConfigAgainstServer:
         await client.create_stream(stream_name)
         await client.create_topic(stream=stream_name, name=topic_name)
 
-        with pytest.raises(RuntimeError, match="Feature is unavailable"):
+        with pytest.raises(IggyError, match="Feature is unavailable") as refusal:
             await client.consumer_group(
                 name=unique_name(), stream=stream_name, topic=topic_name
             )
+        assert refusal.value.code == FEATURE_UNAVAILABLE

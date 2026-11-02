@@ -74,6 +74,8 @@ const HEARTBEAT_VERSION: i16 = 4;
 const LEAVE_VERSION: i16 = 5;
 const SESSION_TIMEOUT_MS: i32 = 10_000;
 const REBALANCE_TIMEOUT_MS: i32 = 20_000;
+/// The `client_id` of every request header that `write_request` sends.
+const CLIENT_ID: &str = "consumer-group-test";
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -1498,6 +1500,9 @@ struct Described {
 }
 
 struct DescribedMember {
+    member_id: String,
+    client_id: String,
+    client_host: String,
     metadata: Bytes,
     assignment: Bytes,
 }
@@ -1525,20 +1530,21 @@ impl DescribeResponse {
             let member_count = read_array_count(&mut decoder, flexible);
             let mut members = Vec::with_capacity(member_count);
             for _ in 0..member_count {
-                let _member_id = read_nullable(&mut decoder, flexible);
+                let member_id = read_nullable(&mut decoder, flexible).unwrap_or_default();
                 if version >= 4 {
                     let _instance_id = read_nullable(&mut decoder, flexible);
                 }
-                let client_id = read_nullable(&mut decoder, flexible);
-                let client_host = read_nullable(&mut decoder, flexible);
-                assert_eq!(client_id.as_deref(), Some(""));
-                assert_eq!(client_host.as_deref(), Some(""));
+                let client_id = read_nullable(&mut decoder, flexible).unwrap_or_default();
+                let client_host = read_nullable(&mut decoder, flexible).unwrap_or_default();
                 let metadata = read_bytes_field(&mut decoder, flexible);
                 let assignment = read_bytes_field(&mut decoder, flexible);
                 if flexible {
                     decoder.read_tagged_fields().unwrap();
                 }
                 members.push(DescribedMember {
+                    member_id,
+                    client_id,
+                    client_host,
                     metadata,
                     assignment,
                 });
@@ -2255,6 +2261,12 @@ async fn given_a_live_group_over_tcp_should_describe_and_list_it_through_the_rea
     assert_eq!(described.groups[0].group_id, GROUP);
     assert_eq!(described.groups[0].state, "Stable");
     assert_eq!(described.groups[0].members.len(), 1);
+    // The client id of the request headers and the address of the socket, as Kafka reports them.
+    let described_member = &described.groups[0].members[0];
+    assert_eq!(described_member.member_id, member);
+    assert!(member.starts_with(&format!("{CLIENT_ID}-")));
+    assert_eq!(described_member.client_id, CLIENT_ID);
+    assert_eq!(described_member.client_host, "/127.0.0.1");
 
     write_request(
         &mut stream,
@@ -2278,13 +2290,7 @@ async fn write_request(
     correlation_id: i32,
     body: &Bytes,
 ) {
-    let frame = build_request_frame(
-        api_key,
-        api_version,
-        correlation_id,
-        Some("consumer-group-test"),
-        body,
-    );
+    let frame = build_request_frame(api_key, api_version, correlation_id, Some(CLIENT_ID), body);
     stream.write_all(&frame).await.expect("write request");
 }
 

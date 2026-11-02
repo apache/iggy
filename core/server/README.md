@@ -57,6 +57,21 @@ replacing the 12-byte assignments and single request-wide view in older metadata
 WAL entries. This boundary also rejects `IGGY-BOUND-GRANTS-4` and
 `IGGY-BOUND-GRANTS-5` directories from upstream and earlier development builds,
 unchanged before replay.
+Replication factors change what replicas send each other: partition member
+lists, partition status on metadata probes and replies, retirement debt on session
+finalization and the paid-through mark on session retirement. Peers compare a
+replica wire revision at the handshake, so a build from before that change and a
+build after it refuse each other even when both report the same version, for
+example two consecutive `:edge` images. Stop every node and start them all on the
+new build. Their `IGGY-METADATA-CHANGE-LOG-1` data directories are kept: older
+metadata snapshots and journal entries read with every partition on every node,
+and older builds refuse the newer snapshot format instead of misreading it.
+Topics created without `replication_factor` still go on every node, so clients
+that never send the key, which includes every SDK, connector, benchmark and MCP
+release before the option, keep the old layout. Set `[cluster]
+default_replication_factor` to a number to give those topics fewer copies.
+Topic responses carry each partition's member list and in-sync members, a client
+wire change that SDKs from before this release cannot decode.
 No in-place upgrade, storage conversion tool or retained-data migration is
 provided. Use an offline cutover with logical re-ingestion:
 
@@ -322,11 +337,122 @@ partitions. Neither policy prevents retention or deletion of the topic.
 Set the option through `TopicCreateOptions::partition_resize_policy`, HTTP's
 `options` map, or the CLI's `--set partition_resize_policy=fixed`.
 
+### Replication factor
+
+A topic's create-only `replication_factor` is the number of nodes that store
+each of its partitions. It applies to every partition of the topic, including
+ones added later, and takes 1 to 32 but no more than the cluster's node count.
+Any other number is refused with `InvalidReplicationFactor` (2018), and a value
+that is not a number with `InvalidOptionValue` (4042). Omitted, it is the
+server's `[cluster] default_replication_factor`: `"all"` by default, which stores
+each partition on every node, or a number from 1 to 32, lowered to the node count
+when larger, so `"3"` keeps three copies on clusters of any size, like Kafka's
+`default.replication.factor`. The metadata primary resolves it when it admits the
+create, so set the same value on every node. `DescribeOptions` reports the value
+that node resolves to, and a topic created without the key stores it as derived.
+Metadata is always on every node.
+
+`GetTopic` lists, for each partition, its `members`, the node ids that store it,
+and its `in_sync_members`, the members its primary last reported in sync, which
+the metadata primary narrows to the nodes answering its probes. A member missing
+from the second list is down or behind. Before restarting a node, check that
+every partition it is a member of keeps, without it, enough in-sync members to
+elect a primary: 2 of 2 or 3, 3 of 4 or 5, 4 of 6, and 5 of 7. A restart of a
+node that leads a partition needs that many, not just a write quorum.
+The in-sync list is empty until a partition's primary first reports, about a
+second after it is created, and from shortly after its primary stops leading it
+until a member leads it again. A primary reports only while it leads, and the
+metadata primary drops a report it has not heard again for 6 seconds, 2 more for
+every 512 partitions past the first 512 in the cluster.
+
+At create the metadata primary picks each partition's nodes: the primary is the
+ready node leading the fewest partitions, and the other members are the nodes
+storing the fewest, each in a rack the partition does not use yet while one has
+a ready node, like Kafka's `broker.rack`. A node names its rack, or availability
+zone, with `rack` in its `[[cluster.nodes]]` entry. Set it on every node or on
+none: a node starts with a configuration that sets it on only some. Each rack
+then holds about an equal share of the copies, so a rack with fewer nodes puts
+more on each of them, and with a factor equal to the number of racks a rack of
+one node stores every partition. A node that is down is picked only when too few
+are up. The assignment never moves. While a member is down its partitions run
+with fewer copies, and the member catches up from the others when it comes back.
+A new metadata primary refuses creates with `TransientNotAccepted` (58) until
+every node has answered its probe or missed it, so the node whose failure
+started the view is not picked.
+
+The metadata primary reports in `/metrics`, on its first shard, the cluster's
+`partitions_under_replicated`, partitions with a member out of sync, and
+`partitions_below_write_quorum`, partitions that cannot commit. For a partition
+whose primary answers its probes, it counts the members of the primary's last
+report that answer too: a member is out of the report while the primary cannot
+reach it or while it has trailed the commit point for 30 seconds, Kafka's
+`replica.lag.time.max.ms` default. A dropped report, or none that long after the
+partition is created, counts no member, as when every member is up but none can
+lead, such as both members of a factor-2 partition back on empty storage. For a
+partition whose primary does not answer, it counts the members that answer,
+which must be enough to elect a primary before anything commits. Every other
+node reports 0, so, like Kafka's `UnderReplicatedPartitions`, summing the series
+over every node gives the cluster's total.
+
+A write commits on a quorum of a partition's members: 2 of 3, 3 of 5, and at
+most 3 for wider groups. A factor of 2 keeps two copies but stops accepting
+writes while either member is down, like Kafka with `min.insync.replicas=2`,
+because the two members have no third party to decide between them. A factor
+of 1 keeps one copy, and the default `replicated` durability acknowledges a
+write before that copy reaches disk; set `durability=persisted` on such a topic
+to acknowledge only written data.
+
+Deleting a topic or stream waits while one of its partitions lacks a quorum of
+its members, and completes once they return, like Kafka's pending deletes, or
+once enough of them came back without their copy that the rest cannot elect a
+primary: 1 of 2, 2 of 3 or 4, and 3 of 5. A pending consumer group deletion on
+the topic does not hold the delete back: the delete takes it over and removes
+the group with the topic.
+
+Logins keep working while a partition lacks a quorum of its members. A session
+that ends then cannot be retired on that partition, so the partition owes the
+retirement instead of holding the session's slot in the client table. The
+partition's next primary pays it before serving sessions again, and refuses
+their requests and polls that commit their offset on read with
+`TransientNotAccepted` (58) until it has. `/metrics`
+reports `partitions_owing_retirement`, the partitions still refusing sessions
+for that reason, and `retirement_debts_paid`, the payments a node made.
+
+A node that comes back with empty storage refuses to serve a factor-1
+partition created before it, because that data was only on this node and
+serving it again would reuse its offsets. A member of a wider partition copies
+the data from a member that kept it instead. Until then it never leads, and it
+votes in an election only to let every member report, which elects a member that
+kept the data once fewer than a write quorum of members lost theirs. So a
+2-member partition elects its other member when one member comes back empty, as
+replacing one disk at a time with `--fresh` does, and a 3-member partition with
+one member down and another back on empty storage waits for the one that is
+down. With `durability` and `consumer_offset_durability` both `persisted`, if a
+write quorum of members lost their storage, none of them serves the partition
+rather than restart it at offset 0 or without ops that only they held, like Kafka
+with `unclean.leader.election.enable` off. Delete and recreate the topic to
+accept the loss: the delete completes once the members that lost their copy
+leave too few to elect a primary, and frees the name. The default `replicated`
+durability acknowledges a write before it reaches the disk, so a restart of
+every member can lose acknowledged writes, and members that lost their storage
+are counted the same way: once every member reports, the partition elects on the
+logs that are left, like Kafka with `unclean.leader.election.enable` on.
+
+A node that does not store a partition answers its route lookups from what the
+partition's primary last reported, or from the partition's initial primary
+before any report, and it refuses sends and polls for it with `NotPrimary`, so
+clients go to the primary. The metadata primary relays a report that names a
+new primary or changes the in-sync members in its next probe, about a second
+after it hears it, and cycles through the others 512 per probe. Its topic and
+stream counters follow those reports too, so they trail the members.
+
+Topics created before replication factors keep every partition on every node.
+
 ## Resource options
 
 Streams, topics and users take their settings from one option catalog. The binary `DescribeOptions` command (13), `GET /options/{scope}` over HTTP (`stream`, `topic` or `user`) and `iggy options <scope>` list every key a client can see with its kind, default, description and five flags: updatable, resettable, secret, read-only and critical.
 
-Most keys are fixed at create. A topic's `compression_algorithm`, `segment_size`, `durability`, `consumer_offset_durability`, `partition_resize_policy` and save thresholds, and a stream's `encryption_key`, are refused by an update with `OptionNotUpdatable` (4103). `compression_algorithm` is create-only because the server never applies it and stored batches carry no codec marker.
+Most keys are fixed at create. A topic's `compression_algorithm`, `segment_size`, `durability`, `consumer_offset_durability`, `partition_resize_policy`, `replication_factor` and save thresholds, and a stream's `encryption_key`, are refused by an update with `OptionNotUpdatable` (4103). `compression_algorithm` is create-only because the server never applies it and stored batches carry no codec marker.
 
 The updatable keys are `name` for streams and topics, `username` and `status` for users, and a topic's `message_expiry` and `max_topic_size`. Only those two topic keys can be reset to their default, any other reset is refused with `OptionNotResettable` (4104). Read-only keys, such as the stream key projections below, are refused with `ReadOnlyOption` (4105).
 
@@ -390,7 +516,8 @@ Each ring also keeps at most 128 MiB of record bodies and evicts its oldest reco
 
 This release changes protocol and storage formats. Servers and compatible
 clients deploy together; mixed versions and rolling upgrades are unsupported.
-Peers verify protocol, release and storage-format identity before admission.
+Peers verify protocol, replica wire, release and storage-format identity before
+admission.
 Executable packaging does not affect that identity, so stripping or rebuilding
 the same compatible release does not by itself prevent a replica from joining.
 
@@ -398,7 +525,7 @@ This checkout uses protocol 0.12.0, and 0.12.0 is also its minimum. It is a brea
 
 REST has no version handshake, so a 0.11 HTTP client is not refused at login. A create body that sends an option beside `options`, such as a top-level `message_expiry`, and an update body with a nested member, such as the `{"name": ..., "options": {}}` stream update older SDKs send, are refused with `InvalidCommand` (3), and the error's `field` names the member.
 
-Metadata snapshot format 13 is both the current and the oldest readable format. A data directory holding an older snapshot is refused, and journals written by older builds hold operations this build no longer knows. Start this release from fresh storage on every replica.
+Metadata snapshot format 15 is the current format and 14 the oldest readable one. A data directory holding an older snapshot is refused, and journals written by older builds hold operations this build no longer knows. Start this release from fresh storage on every replica.
 
 The protocol number is independent of server and SDK package versions. Its
 current and minimum values are maintained manually for stable releases. The

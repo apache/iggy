@@ -204,7 +204,7 @@ func (c *IggyTcpClient) pollGroup(
 		}
 
 		polled, err := c.pollPartition(
-			ctx, streamId, topicId, consumer, strategy, count, autoCommit, &partitionId)
+			ctx, streamId, topicId, consumer, strategy, count, autoCommit, &partitionId, nil)
 		if err != nil {
 			if !isAssignmentStale(err) {
 				return nil, err

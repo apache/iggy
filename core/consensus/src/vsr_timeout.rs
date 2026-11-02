@@ -121,6 +121,7 @@ impl Timeout {
 pub enum TimeoutKind {
     Prepare,
     CommitMessage,
+    CheckQuorum,
     NormalHeartbeat,
     StartViewChangeMessage,
     ViewChangeStatus,
@@ -136,6 +137,7 @@ pub enum TimeoutKind {
 pub struct TimeoutManager {
     prepare: Timeout,
     commit_message: Timeout,
+    check_quorum: Timeout,
     normal_heartbeat: Timeout,
     start_view_change_message: Timeout,
     do_view_change_message: Timeout,
@@ -179,6 +181,7 @@ impl TimeoutManager {
         Self {
             prepare: Timeout::new(replica_id, Self::PREPARE_TICKS),
             commit_message: Timeout::new(replica_id, Self::COMMIT_MESSAGE_TICKS),
+            check_quorum: Timeout::new(replica_id, Self::NORMAL_HEARTBEAT_TICKS),
             normal_heartbeat: Timeout::new(replica_id, Self::NORMAL_HEARTBEAT_TICKS),
             start_view_change_message: Timeout::new(
                 replica_id,
@@ -196,12 +199,13 @@ impl TimeoutManager {
         }
     }
 
-    /// Override the backup's primary-liveness window (`[cluster]
+    /// Override the backup's primary-liveness and primary's quorum window (`[cluster]
     /// heartbeat_timeout`). Replaces the timeout object, so any countdown
     /// already in flight is discarded: call before the replica starts
     /// ticking (i.e. before `init` / `init_as_backup`).
     pub const fn set_normal_heartbeat_ticks(&mut self, ticks: u64) {
         self.normal_heartbeat = Timeout::new(self.normal_heartbeat.id, ticks);
+        self.check_quorum = Timeout::new(self.check_quorum.id, ticks);
     }
 
     /// Override the primary's commit-broadcast interval (`[cluster]
@@ -256,6 +260,7 @@ impl TimeoutManager {
     pub const fn tick(&mut self) {
         self.prepare.tick();
         self.commit_message.tick();
+        self.check_quorum.tick();
         self.normal_heartbeat.tick();
         self.start_view_change_message.tick();
         self.do_view_change_message.tick();
@@ -273,6 +278,7 @@ impl TimeoutManager {
         match kind {
             TimeoutKind::Prepare => &self.prepare,
             TimeoutKind::CommitMessage => &self.commit_message,
+            TimeoutKind::CheckQuorum => &self.check_quorum,
             TimeoutKind::NormalHeartbeat => &self.normal_heartbeat,
             TimeoutKind::StartViewChangeMessage => &self.start_view_change_message,
             TimeoutKind::ViewChangeStatus => &self.view_change_status,
@@ -285,6 +291,7 @@ impl TimeoutManager {
         match kind {
             TimeoutKind::Prepare => &mut self.prepare,
             TimeoutKind::CommitMessage => &mut self.commit_message,
+            TimeoutKind::CheckQuorum => &mut self.check_quorum,
             TimeoutKind::NormalHeartbeat => &mut self.normal_heartbeat,
             TimeoutKind::StartViewChangeMessage => &mut self.start_view_change_message,
             TimeoutKind::ViewChangeStatus => &mut self.view_change_status,
@@ -309,6 +316,7 @@ impl TimeoutManager {
         let timeout = match kind {
             TimeoutKind::Prepare => &mut self.prepare,
             TimeoutKind::CommitMessage => &mut self.commit_message,
+            TimeoutKind::CheckQuorum => &mut self.check_quorum,
             TimeoutKind::NormalHeartbeat => &mut self.normal_heartbeat,
             TimeoutKind::StartViewChangeMessage => &mut self.start_view_change_message,
             TimeoutKind::ViewChangeStatus => &mut self.view_change_status,

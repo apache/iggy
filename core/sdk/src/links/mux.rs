@@ -21,7 +21,7 @@
 //! each reply goes to the request with its id. So a caller that goes away
 //! never leaves a frame half written or half read on the connection.
 
-use crate::links::{Frame, Reply};
+use crate::links::{Frame, LateReply, Reply, committing_cancelled};
 use crate::vsr::{decode_eviction, eviction_reason, peek_command, reply_request_id, response_size};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -30,6 +30,7 @@ use iggy_binary_protocol::consensus::{Command, EvictionReason, HEADER_SIZE};
 use iggy_common::IggyError;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -89,7 +90,34 @@ struct MuxShared {
 struct Pending {
     /// Cleared when the link closes. A closed link never opens again.
     open: bool,
-    waiters: HashMap<u64, (Waiter, Option<usize>)>,
+    waiters: HashMap<u64, (Awaiting, Option<usize>)>,
+}
+
+/// What waits for the reply of a request.
+enum Awaiting {
+    Caller(Waiter),
+    /// A committing request whose caller left after the cancel. Its one reply settles it.
+    Cancelled(LateReply),
+}
+
+impl fmt::Debug for Awaiting {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Caller(_) => "Caller",
+            Self::Cancelled(_) => "Cancelled",
+        })
+    }
+}
+
+impl Awaiting {
+    fn answer(self, result: Result<Reply, IggyError>) {
+        match self {
+            Self::Caller(waiter) => {
+                let _ = waiter.send(result);
+            }
+            Self::Cancelled(late) => late(result),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -113,6 +141,10 @@ struct PendingEntry<'a> {
     /// answer the next request with the same id.
     close_if_abandoned: bool,
     cancellation: Option<(mpsc::OwnedPermit<QueuedFrame>, Frame)>,
+    /// The reply of the request, until the caller takes it.
+    reply: Option<oneshot::Receiver<Result<Reply, IggyError>>>,
+    /// Takes the reply that the cancel of a committing request leaves.
+    late: Option<LateReply>,
 }
 
 impl MuxLink {
@@ -158,6 +190,7 @@ impl MuxLink {
         frame: Frame,
         deadline: Instant,
         sent: &mut bool,
+        late: Option<LateReply>,
     ) -> Result<Reply, IggyError> {
         let request = frame.header.request;
         let unbound = frame.header.session == 0;
@@ -194,6 +227,7 @@ impl MuxLink {
         let mut entry = self
             .shared
             .wait_for(request, waiter, frame.response_body_limit())?;
+        entry.reply = Some(reply);
         if !matches!(
             timeout_at(
                 deadline,
@@ -212,8 +246,34 @@ impl MuxLink {
         write_permit.forget();
         *sent = true;
         entry.close_if_abandoned = unbound;
+        entry.late = late.filter(|_| cancellation.is_some());
         entry.cancellation = cancellation;
-        match timeout_at(deadline, reply).await {
+        let committing = entry.late.is_some();
+        let Some(reply) = entry.reply.as_mut() else {
+            return Err(IggyError::Disconnected);
+        };
+        let cancellation = &mut entry.cancellation;
+        let replied = timeout_at(deadline, async {
+            if committing {
+                tokio::select! {
+                    biased;
+                    replied = &mut *reply => return replied,
+                    () = committing_cancelled() => {}
+                }
+                // The server answers the request once more, which settles it.
+                if let Some((permit, frame)) = cancellation.take() {
+                    permit.send(QueuedFrame {
+                        frame,
+                        uses_write_permit: false,
+                    });
+                }
+            }
+            reply.await
+        })
+        .await;
+        // The caller takes the reply, or ends at its deadline without one.
+        entry.late = None;
+        match replied {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(IggyError::Disconnected),
             Err(_) => {
@@ -310,12 +370,14 @@ impl MuxShared {
                 Err(IggyError::NotConnected)
             }
             Entry::Vacant(entry) => {
-                entry.insert((waiter, limit));
+                entry.insert((Awaiting::Caller(waiter), limit));
                 Ok(PendingEntry {
                     shared: self,
                     request,
                     close_if_abandoned: false,
                     cancellation: None,
+                    reply: None,
+                    late: None,
                 })
             }
         }
@@ -382,9 +444,7 @@ impl MuxShared {
                 let request = reply_request_id(&reply.header);
                 let waiter = self.lock_pending().waiters.remove(&request);
                 match waiter {
-                    Some((waiter, _)) => {
-                        let _ = waiter.send(Ok(reply));
-                    }
+                    Some((waiter, _)) => waiter.answer(Ok(reply)),
                     None => trace!(
                         "Dropped a reply to request {request} from {}, which nothing waits for.",
                         self.peer
@@ -421,7 +481,7 @@ impl MuxShared {
         self.write_permits.close();
         self.closed.send_replace(true);
         for (waiter, _) in waiters.into_values() {
-            let _ = waiter.send(Err(reason.clone()));
+            waiter.answer(Err(reason.clone()));
         }
     }
 
@@ -452,12 +512,37 @@ impl MuxShared {
 
 impl Drop for PendingEntry<'_> {
     fn drop(&mut self) {
-        let abandoned = self
-            .shared
-            .lock_pending()
-            .waiters
-            .remove(&self.request)
-            .is_some();
+        let late = self.late.take();
+        let (abandoned, late) = {
+            let mut pending = self.shared.lock_pending();
+            match pending.waiters.remove(&self.request) {
+                // The cancel follows, and the server answers it once.
+                Some((_, limit)) if late.is_some() && pending.open => {
+                    if let Some(late) = late {
+                        pending
+                            .waiters
+                            .insert(self.request, (Awaiting::Cancelled(late), limit));
+                    }
+                    (true, None)
+                }
+                Some(_) => (true, None),
+                None => (false, late),
+            }
+        };
+        // The reply arrived before the caller left, so it settles the request now.
+        if let Some(late) = late
+            && let Some(mut reply) = self.reply.take()
+        {
+            match reply.try_recv() {
+                Ok(result) => late(result),
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    tokio::spawn(async move {
+                        late(reply.await.unwrap_or(Err(IggyError::Disconnected)));
+                    });
+                }
+                Err(oneshot::error::TryRecvError::Closed) => late(Err(IggyError::Disconnected)),
+            }
+        }
         if abandoned && let Some((permit, frame)) = self.cancellation.take() {
             // Reserved before sending the poll, so cancellation cannot lose a
             // race with queue backpressure and always follows the original frame.
@@ -752,7 +837,7 @@ mod tests {
     }
 
     async fn send(link: &MuxLink, frame: Frame, deadline: Instant) -> Result<Reply, IggyError> {
-        link.send(frame, deadline, &mut false).await
+        link.send(frame, deadline, &mut false, None).await
     }
 
     #[tokio::test]
@@ -1203,6 +1288,28 @@ mod tests {
         );
         assert_eq!(first.unwrap().body[..], 1u64.to_le_bytes());
         assert_eq!(second.unwrap().body[..], 2u64.to_le_bytes());
+    }
+
+    #[tokio::test]
+    async fn given_a_reply_being_dispatched_when_its_caller_leaves_should_still_settle_it() {
+        let (link, _peer) = tcp_link();
+        let (waiter, reply) = oneshot::channel();
+        let (settled, late_reply) = oneshot::channel();
+        let mut entry = link.shared.wait_for(1, waiter, None).unwrap();
+        entry.reply = Some(reply);
+        entry.late = Some(Box::new(move |result| {
+            let _ = settled.send(result);
+        }));
+
+        let (dispatching, _) = link.shared.lock_pending().waiters.remove(&1).unwrap();
+        drop(entry);
+        dispatching.answer(Ok(Reply {
+            header: [0; HEADER_SIZE],
+            body: Bytes::from_static(b"stored"),
+        }));
+
+        let result = timeout(TEST_BUDGET, late_reply).await.unwrap().unwrap();
+        assert_eq!(result.unwrap().body[..], *b"stored");
     }
 
     #[tokio::test]

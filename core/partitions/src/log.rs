@@ -351,6 +351,16 @@ where
         &self.storage
     }
 
+    /// Path of the log file of the segment that starts at `start_offset`.
+    #[must_use]
+    pub fn messages_path(&self, start_offset: u64) -> Option<String> {
+        let slot = self
+            .segments
+            .binary_search_by_key(&start_offset, |segment| segment.start_offset)
+            .ok()?;
+        self.storage.get(slot)?.segment_and_index_paths().0
+    }
+
     pub const fn messages_writers(&self) -> &Vec<Option<Rc<MessagesWriter>>> {
         &self.messages_writers
     }

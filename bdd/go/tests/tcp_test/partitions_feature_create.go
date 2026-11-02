@@ -51,7 +51,7 @@ var _ = ginkgo.Describe("CREATE PARTITION:", func() {
 			client := createAuthorizedConnection()
 			err := client.CreatePartitions(
 				context.Background(),
-				randomU32Identifier(),
+				nonExistingStreamIdentifier(client),
 				randomU32Identifier(),
 				10,
 			)
