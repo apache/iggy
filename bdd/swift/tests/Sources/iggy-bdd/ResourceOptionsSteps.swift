@@ -239,7 +239,8 @@ enum ResourceOptionsSteps {
 
     private static func pollFirst(_ world: World) async throws -> IggyMessage {
         let polled = try await world.requireClient().pollMessages(
-            streamID: try world.requireStream(), topicID: try world.requireTopic(), partitionID: partitionID, strategy: .offset(0), options: PollOptions(count: 1))
+            streamID: try world.requireStream(), topicID: try world.requireTopic(), partitionID: partitionID, strategy: .offset(0),
+            options: PollOptions(count: 1))
         guard let message = polled.messages.first else {
             throw StepFailure("the poll returned no message")
         }
