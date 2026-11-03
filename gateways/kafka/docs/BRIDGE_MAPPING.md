@@ -498,12 +498,13 @@ topic costs CPU on the read path and saves bytes on the wire to the consumer.
 
 Default: always emit uncompressed, and revisit when a benchmark says it matters.
 
-### Not asked here
+### Topic configuration
 
-A Kafka `retention.ms` topic config could map onto Iggy's `message_expiry` at creation time.
-`ensure_stream_and_topic` leaves topics on the server default, which never expires. That belongs
-to CreateTopics ([#3538](https://github.com/apache/iggy/issues/3538)), which owns topic
-configuration, rather than to the record mapping.
+Topic configuration is not part of the record mapping. `CreateTopics` maps `retention.ms` onto
+Iggy's `message_expiry`, `retention.bytes` onto `max_topic_size` times the partition count, and
+`segment.bytes` onto `segment_size`. The Kafka replication factor is Iggy's `replication_factor`.
+A `cleanup.policy` without `delete` gives the topic no expiry and no size cap, because Iggy does
+not compact. See [`CONFIGS.md`](CONFIGS.md).
 
 ## References
 

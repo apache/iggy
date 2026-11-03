@@ -15,47 +15,50 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Topic configuration shared by `DescribeConfigs`, `AlterConfigs` and
+//! Topic configuration shared by `CreateTopics`, `DescribeConfigs`, `AlterConfigs` and
 //! `IncrementalAlterConfigs`.
 //!
-//! Iggy stores `message_expiry` as [`IggyExpiry`]. A duration is microseconds
-//! (`IggyDuration::from(u64)` / `as_micros`). `u64::MAX` is [`IggyExpiry::NeverExpire`]
-//! and `0` is [`IggyExpiry::ServerDefault`], so neither is a usable millisecond expiry.
-//! Kafka `retention.ms` is a decimal millisecond count, or `-1` when sealed segments
-//! never expire. `retention.minutes` and `retention.hours` are not Kafka topic-level
-//! configs - only the broker-level `log.retention.minutes`/`log.retention.hours` exist
-//! in real Kafka - so both are rejected the same as any other unknown key.
+//! [`keys`] lists every Kafka topic key and what the gateway does with it. This module turns the
+//! configuration a request names into the Iggy settings to create or write, and answers each
+//! value it refuses as Kafka does. `crate::bridge::topic_settings` maps the settings onto Iggy
+//! topic options.
+
+pub mod keys;
 
 use std::collections::HashSet;
-use std::str::FromStr;
 
-use iggy::prelude::{HeaderKey, IggyDuration, IggyExpiry, ResourceOptions, topic_option_keys};
+use iggy::prelude::{IggyExpiry, MaxTopicSize};
+use iggy_common::{DEFAULT_SEGMENT_SIZE, MAX_TOPIC_SEGMENT_SIZE, MIN_TOPIC_SEGMENT_SIZE};
 use kafka_protocol::messages::alter_configs_request::AlterConfigsResource;
 use kafka_protocol::messages::describe_configs_request::DescribeConfigsResource;
 use kafka_protocol::messages::incremental_alter_configs_request::AlterConfigsResource as IncrementalAlterConfigsResource;
 use kafka_protocol::protocol::StrBytes;
 
 use crate::auth::AuthenticatedPrincipal;
-use crate::bridge::BridgeError;
+use crate::bridge::topic_settings::expiry_from_retention_ms;
+use crate::bridge::{
+    BridgeError, CleanupPolicy, KafkaTopicSettings, RetentionBytes, SettingChange,
+    TopicConfigSnapshot, TopicConfigUpdate, TopicDefaults,
+};
+use keys::{ConfigType, ConfigValue, Refusal, TOPIC_KEYS, TopicKey, TopicKeyKind, topic_key};
 
 /// Kafka `ConfigResource.Type.TOPIC`.
 pub const RESOURCE_TYPE_TOPIC: i8 = 2;
 
+/// Kafka `ConfigResource.Type.BROKER`.
+pub const RESOURCE_TYPE_BROKER: i8 = 4;
+
 /// Kafka `ConfigSource.DYNAMIC_TOPIC_CONFIG`: the value was stored on the topic.
 pub const CONFIG_SOURCE_TOPIC: i8 = 1;
 
-/// Kafka `ConfigSource.DEFAULT_CONFIG`: the value is the gateway default.
+/// Kafka `ConfigSource.STATIC_BROKER_CONFIG`: the value comes from the configuration of the
+/// broker, here a gateway variable.
+pub const CONFIG_SOURCE_STATIC_BROKER: i8 = 4;
+
+/// Kafka `ConfigSource.DEFAULT_CONFIG`: the value is the default.
 pub const CONFIG_SOURCE_DEFAULT: i8 = 5;
 
-/// Kafka `ConfigType.LONG`.
-pub const CONFIG_TYPE_LONG: i8 = 5;
-
-pub const RETENTION_MS: &str = "retention.ms";
-pub const CLEANUP_POLICY: &str = "cleanup.policy";
-
 pub const ONLY_TOPIC_RESOURCES: &str = "only topic resources are supported";
-
-pub const RETENTION_DOC: &str = "How long a sealed segment is kept, in milliseconds. The active segment does not expire. -1 means sealed segments never expire.";
 
 /// Distinct topic names one `CreateTopics`, `CreatePartitions`, `DescribeConfigs`, `AlterConfigs`
 /// or `IncrementalAlterConfigs` request may address through the bridge.
@@ -67,29 +70,29 @@ pub const RETENTION_DOC: &str = "How long a sealed segment is kept, in milliseco
 /// batch is `POLICY_VIOLATION` on every resource.
 pub const MAX_CONFIG_TOPICS: usize = 100;
 
-const CLEANUP_POLICY_READ_ONLY: &str = "cleanup.policy is read-only";
-
 const NOT_AUTHORIZED_TO_ALTER: &str =
     "the authenticated principal is not authorized to alter topic configuration";
 
-/// One config name a describe request asked for, in request order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ListedKey {
-    Retention,
-    /// An unmodeled name, including `cleanup.policy`, `retention.minutes` and
-    /// `retention.hours`. The name itself is never read back out: `DescribeConfigs` omits
-    /// every `Unknown` entry from its response, so carrying the name here would only pay a
-    /// `String` allocation for a value no caller inspects.
-    Unknown,
-}
-
-/// Why one resource's alter cannot be stored. Every variant is `INVALID_CONFIG` (40).
+/// Why the configuration of one topic cannot be created or stored. Every variant is
+/// `INVALID_CONFIG` (40).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigFault {
     UnknownKey(String),
+    /// `CreateTopics` keys without a value, in request order.
+    NullValues(Vec<String>),
     Repeated(String),
-    ReadOnly(&'static str),
-    InvalidRetention,
+    InvalidValue {
+        name: String,
+        value: String,
+        reason: String,
+    },
+    /// Kafka's whole text for a value it refuses without naming the value.
+    Message(String),
+    /// A key Iggy sets only when it creates a topic, which an alter would reset.
+    Unresettable {
+        name: &'static str,
+        current: u64,
+    },
     /// An `APPEND` or `SUBTRACT` on a key that is not a list, in Kafka's own words.
     NotAList {
         operation: ConfigOperation,
@@ -101,12 +104,21 @@ impl ConfigFault {
     #[must_use]
     pub fn message(&self) -> String {
         match self {
-            Self::UnknownKey(name) => format!("unknown config key '{name}'"),
+            Self::UnknownKey(name) => format!("Unknown topic config name: {name}"),
+            Self::NullValues(names) => format!(
+                "Null value not supported for topic configs: {}",
+                names.join(",")
+            ),
             Self::Repeated(name) => format!("config key '{name}' is repeated"),
-            Self::ReadOnly(message) => (*message).to_string(),
-            Self::InvalidRetention => format!(
-                "retention.ms must be -1 or a positive count whose duration is at most {} seconds",
-                u32::MAX
+            Self::InvalidValue {
+                name,
+                value,
+                reason,
+            } => format!("Invalid value {value} for configuration {name}: {reason}"),
+            Self::Message(message) => message.clone(),
+            Self::Unresettable { name, current } => format!(
+                "{name} cannot go back to its default, because Iggy sets it only when it creates \
+                 a topic. This topic has {current}."
             ),
             Self::NotAList { operation, key } => {
                 let operation = operation.kafka_name();
@@ -183,99 +195,6 @@ impl RequestFault {
             Self::UnknownOperation(operation) => format!("Unknown operations type {operation}"),
         }
     }
-}
-
-/// `retention.ms` as Kafka should report it, plus the config source byte.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetentionMs {
-    pub value: String,
-    pub source: i8,
-}
-
-/// Whether the topic's `message_expiry` option was sent by a client.
-///
-/// Admission stores the never-expire default with `explicit == false`. An alter
-/// of `retention.ms` stores the key with `explicit == true`, including `-1`.
-#[must_use]
-pub fn message_expiry_is_explicit(options: &ResourceOptions) -> bool {
-    let Ok(key) = HeaderKey::from_str(topic_option_keys::MESSAGE_EXPIRY) else {
-        return false;
-    };
-    options.get(&key).is_some_and(|entry| entry.explicit)
-}
-
-/// Map an Iggy expiry onto Kafka `retention.ms`.
-///
-/// A derived never-expire value is [`CONFIG_SOURCE_DEFAULT`]. An explicit one,
-/// and any stored duration, is [`CONFIG_SOURCE_TOPIC`]. A duration that is not a
-/// positive whole number of milliseconds is refused: reporting a rounded count
-/// would describe a different value than Iggy stored.
-///
-/// # Errors
-///
-/// Returns `Err` when `expiry` is a duration of `0` microseconds or a duration
-/// that is not a whole number of milliseconds.
-pub fn retention_ms(expiry: IggyExpiry, explicit: bool) -> Result<RetentionMs, ()> {
-    match expiry {
-        IggyExpiry::NeverExpire | IggyExpiry::ServerDefault => Ok(RetentionMs {
-            value: "-1".to_string(),
-            source: if explicit {
-                CONFIG_SOURCE_TOPIC
-            } else {
-                CONFIG_SOURCE_DEFAULT
-            },
-        }),
-        IggyExpiry::ExpireDuration(duration) => {
-            let micros = duration.as_micros();
-            if micros == 0 || !micros.is_multiple_of(1_000) {
-                return Err(());
-            }
-            Ok(RetentionMs {
-                value: (micros / 1_000).to_string(),
-                source: CONFIG_SOURCE_TOPIC,
-            })
-        }
-    }
-}
-
-/// Parse a Kafka `retention.ms` value into the expiry `update_topic` stores.
-///
-/// `-1` is [`IggyExpiry::NeverExpire`] (`u64::MAX` on the wire), not
-/// [`IggyExpiry::ServerDefault`] (`0`), because the server ignores the `0`
-/// sentinel and leaves the previous expiry in place. The text must be the
-/// canonical decimal of the parsed integer, so a later describe reports the
-/// same characters the alter accepted.
-///
-/// # Errors
-///
-/// Returns [`ConfigFault::InvalidRetention`] for any value other than `-1` or a
-/// positive millisecond count of at most `u32::MAX` seconds.
-pub fn parse_retention_ms(value: &str) -> Result<IggyExpiry, ConfigFault> {
-    let Ok(count) = value.parse::<i64>() else {
-        return Err(ConfigFault::InvalidRetention);
-    };
-    if count.to_string() != value {
-        return Err(ConfigFault::InvalidRetention);
-    }
-    if count == -1 {
-        return Ok(IggyExpiry::NeverExpire);
-    }
-    if count <= 0 {
-        return Err(ConfigFault::InvalidRetention);
-    }
-    // `count > 0` was just checked, so this conversion is lossless for every `i64`.
-    let millis = u64::try_from(count).map_err(|_| ConfigFault::InvalidRetention)?;
-    // `IggyExpiry::from_str` rejects `as_secs() > u32::MAX`. The typed update path
-    // does not, but a value the server's own parser refuses is not one this gateway
-    // should store.
-    if millis / 1_000 > u64::from(u32::MAX) {
-        return Err(ConfigFault::InvalidRetention);
-    }
-    // `millis <= u32::MAX * 1_000` was just proven above, so `millis * 1_000` is far
-    // short of `u64::MAX` and cannot overflow.
-    Ok(IggyExpiry::ExpireDuration(IggyDuration::from(
-        millis * 1_000,
-    )))
 }
 
 /// Whether `names` contains more than [`MAX_CONFIG_TOPICS`] distinct strings.
@@ -409,7 +328,7 @@ pub fn name_reason(error: &BridgeError) -> String {
 ///
 /// Only [`BridgeError::Timeout`] gets its own arm. `InvalidKafkaTopicName` and `SendLost` are
 /// unreachable here: the handler already validated the Kafka name before calling the bridge (so
-/// the bridge's own, redundant validation inside `get_kafka_topic`/`update_kafka_topic_message_expiry`
+/// the bridge's own, redundant validation inside `get_kafka_topic`/`update_kafka_topic_config`
 /// cannot fail), and `SendLost` is only ever produced by the Produce path (`iggy_bridge/produce.rs`),
 /// never by a config read or write. Both fall into the generic arm below rather than keeping a
 /// branch no call site here can reach.
@@ -431,64 +350,6 @@ pub fn bridge_failure(error: &BridgeError, handler: &str, action: &str) -> (i16,
             )
         }
     }
-}
-
-/// Keys to return for one describe resource.
-///
-/// `None` and an empty list both mean `retention.ms`. A name repeated in
-/// `configuration_keys` is collapsed to one entry, in its first position. Any other name,
-/// including `cleanup.policy`, `retention.minutes` and `retention.hours`, is
-/// [`ListedKey::Unknown`]. `DescribeConfigs` omits those names from the response and does not
-/// fail the resource.
-///
-/// `cleanup.policy` stays unknown until the gateway stores a policy per topic. Kafka Connect
-/// refuses an internal topic that reports any policy other than `compact`, but it starts when
-/// the entry is missing (`TopicAdmin.verifyTopicCleanupPolicyOnlyCompact`). A fixed `delete`
-/// therefore stops Connect even on topics an operator created for it.
-#[must_use]
-pub fn listed_keys(configuration_keys: Option<&[StrBytes]>) -> Vec<ListedKey> {
-    let Some(keys) = configuration_keys.filter(|keys| !keys.is_empty()) else {
-        return vec![ListedKey::Retention];
-    };
-    let mut seen = HashSet::new();
-    keys.iter()
-        .filter(|key| seen.insert(key.as_str()))
-        .map(|key| match key.as_str() {
-            RETENTION_MS => ListedKey::Retention,
-            _ => ListedKey::Unknown,
-        })
-        .collect()
-}
-
-/// The expiry to store, or `None` when the resource names no `retention.ms` key.
-///
-/// One invalid, unknown, or repeated key fails the whole resource and selects nothing.
-/// `update_topic` stores the millisecond expiry this returns.
-///
-/// # Errors
-///
-/// Returns the first [`ConfigFault`] in request order.
-pub fn plan_retention_update<'a>(
-    configs: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
-) -> Result<Option<IggyExpiry>, ConfigFault> {
-    let mut seen = HashSet::new();
-    let mut expiry = None;
-    for (name, value) in configs {
-        if !seen.insert(name) {
-            return Err(ConfigFault::Repeated(name.to_string()));
-        }
-        match name {
-            RETENTION_MS => {
-                let Some(value) = value else {
-                    return Err(ConfigFault::InvalidRetention);
-                };
-                expiry = Some(parse_retention_ms(value)?);
-            }
-            CLEANUP_POLICY => return Err(ConfigFault::ReadOnly(CLEANUP_POLICY_READ_ONLY)),
-            other => return Err(ConfigFault::UnknownKey(other.to_string())),
-        }
-    }
-    Ok(expiry)
 }
 
 /// The entries of one `IncrementalAlterConfigs` resource, checked in the order Kafka's broker
@@ -530,150 +391,985 @@ pub fn incremental_ops<'a>(
         .collect()
 }
 
-/// The expiry an incremental alter stores, or `None` when no entry changes `retention.ms`.
+/// `AlterConfigs` null values, in Kafka's words for the request fault (42) it answers before any
+/// other check.
+#[must_use]
+pub fn null_values<'a>(
+    configs: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+) -> Option<RequestFault> {
+    let names: Vec<String> = configs
+        .into_iter()
+        .filter(|(_, value)| value.is_none())
+        .map(|(name, _)| name.to_string())
+        .collect();
+    (!names.is_empty()).then_some(RequestFault::NullValues(names))
+}
+
+/// Logs that `kafka_topic` asks for compaction, which Iggy does not do (#4521). `changed` tells
+/// whether the request changed the topic. A request that only repeats the policy logs at debug,
+/// because tools such as the Strimzi Topic Operator send it again on every pass.
+pub fn log_compaction(kafka_topic: &str, policy: CleanupPolicy, changed: bool) {
+    if !policy.compact {
+        return;
+    }
+    let effect = if policy.delete {
+        "removes old records by retention only"
+    } else {
+        "keeps every record"
+    };
+    if changed {
+        tracing::warn!(
+            kafka_topic,
+            cleanup_policy = %policy,
+            "the Kafka topic asks for compaction, which Iggy does not do (#4521), so it {effect}"
+        );
+    } else {
+        tracing::debug!(
+            kafka_topic,
+            cleanup_policy = %policy,
+            "the Kafka topic asks for compaction again, so it still {effect}"
+        );
+    }
+}
+
+/// The settings that the configuration of one `CreateTopics` topic names.
 ///
-/// `SET` stores the parsed value. `DELETE` stores never-expire, the value a topic has before any
-/// alter, and a delete of any other key changes nothing: Kafka removes an override there, and
-/// this gateway stored none. `APPEND` and `SUBTRACT` are refused for every key: `cleanup.policy`
-/// is a list in Kafka but read-only here, and no other key this gateway knows is a list. Kafka
-/// refuses them the same way for a key it does not know.
+/// A name that repeats keeps its last value, as Kafka's `translateCreationConfigs` does. Each
+/// value is checked as Kafka checks it, and a fixed key must name the value the gateway reports.
+/// Unless the policy keeps every record, `retention.bytes` must keep at least one segment in each
+/// partition, because Iggy never trims a partition below its newest sealed segment.
+///
+/// # Errors
+///
+/// Returns every null value at once, as Kafka does, otherwise the first [`ConfigFault`] in
+/// request order.
+pub fn plan_create<'a>(
+    configs: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+) -> Result<KafkaTopicSettings, ConfigFault> {
+    let mut named: Vec<(&str, Option<&str>)> = Vec::new();
+    for (name, value) in configs {
+        named.retain(|(seen, _)| *seen != name);
+        named.push((name, value));
+    }
+    let nulls: Vec<String> = named
+        .iter()
+        .filter(|(_, value)| value.is_none())
+        .map(|(name, _)| (*name).to_string())
+        .collect();
+    if !nulls.is_empty() {
+        return Err(ConfigFault::NullValues(nulls));
+    }
+
+    let mut settings = KafkaTopicSettings::default();
+    for (name, value) in named {
+        let key = topic_key(name).ok_or_else(|| ConfigFault::UnknownKey(name.to_string()))?;
+        let value = value.unwrap_or_default();
+        match key.kind {
+            TopicKeyKind::RetentionMs => settings.message_expiry = Some(retention_ms(key, value)?),
+            TopicKeyKind::RetentionBytes => {
+                settings.retention_bytes = Some(retention_bytes(key, value)?);
+            }
+            TopicKeyKind::SegmentBytes => settings.segment_size = Some(segment_bytes(key, value)?),
+            TopicKeyKind::CleanupPolicy => settings.cleanup_policy = cleanup_policy(key, value)?,
+            TopicKeyKind::Ignored | TopicKeyKind::Fixed { .. } => {
+                key.check(value).map_err(|refusal| refused(key, refusal))?;
+            }
+        }
+    }
+    if !settings.cleanup_policy.keeps_every_record()
+        && let Some(retention) = settings.retention_bytes
+    {
+        keeps_a_segment(
+            retention,
+            settings.segment_size.unwrap_or(DEFAULT_SEGMENT_SIZE),
+        )?;
+    }
+    Ok(settings)
+}
+
+/// What one `AlterConfigs` resource writes.
+///
+/// Kafka's `AlterConfigs` replaces the whole configuration of a topic, so each stored key the
+/// resource leaves out goes back to its default: the gateway default where one is set, else the
+/// Iggy default. `segment.bytes` cannot go back once Iggy created the topic with another size. A
+/// `cleanup.policy` without `delete` keeps every record, whatever the retention keys say.
+///
+/// # Errors
+///
+/// Returns the first [`ConfigFault`]: the named keys in request order, then the keys left out.
+pub fn plan_replace<'a>(
+    configs: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    topic: &TopicConfigSnapshot,
+    defaults: &TopicDefaults,
+) -> Result<TopicConfigUpdate, ConfigFault> {
+    let mut named = HashSet::new();
+    let mut update = TopicConfigUpdate::default();
+    for (name, value) in configs {
+        if !named.insert(name) {
+            return Err(ConfigFault::Repeated(name.to_string()));
+        }
+        let key = topic_key(name).ok_or_else(|| ConfigFault::UnknownKey(name.to_string()))?;
+        plan_set(&mut update, key, value.unwrap_or_default(), topic)?;
+    }
+    for key in TOPIC_KEYS.iter().filter(|key| !named.contains(key.name)) {
+        plan_delete(&mut update, key, topic, defaults)?;
+    }
+    settle_retention(&mut update, topic)?;
+    Ok(update)
+}
+
+/// What one `IncrementalAlterConfigs` resource writes.
+///
+/// `SET` writes a stored key, and checks any other key as [`plan_create`] does. `DELETE` takes a
+/// stored key back to its default, as [`plan_replace`] does for a key left out, and changes
+/// nothing for any other key. `APPEND` and `SUBTRACT` apply to a list key from the value the
+/// gateway reports, which for `cleanup.policy` is `delete`, and then check the list as a `SET`
+/// does. On any other key they are refused with Kafka's own text, a key Kafka does not know among
+/// them.
+///
+/// The gateway does not store `cleanup.policy`, so a retention change that names no policy
+/// applies even to a topic created with `compact`.
 ///
 /// # Errors
 ///
 /// Returns the first [`ConfigFault`] in request order.
-pub fn plan_incremental_update(ops: &[ConfigOp<'_>]) -> Result<Option<IggyExpiry>, ConfigFault> {
-    let mut expiry = None;
+pub fn plan_incremental(
+    ops: &[ConfigOp<'_>],
+    topic: &TopicConfigSnapshot,
+    defaults: &TopicDefaults,
+) -> Result<TopicConfigUpdate, ConfigFault> {
+    let mut update = TopicConfigUpdate::default();
     for op in ops {
+        let key = topic_key(op.name);
         match op.operation {
-            ConfigOperation::Set => match op.name {
-                RETENTION_MS => {
-                    let value = op.value.ok_or(ConfigFault::InvalidRetention)?;
-                    expiry = Some(parse_retention_ms(value)?);
-                }
-                CLEANUP_POLICY => return Err(ConfigFault::ReadOnly(CLEANUP_POLICY_READ_ONLY)),
-                other => return Err(ConfigFault::UnknownKey(other.to_string())),
-            },
+            ConfigOperation::Set => {
+                let key = key.ok_or_else(|| ConfigFault::UnknownKey(op.name.to_string()))?;
+                plan_set(&mut update, key, op.value.unwrap_or_default(), topic)?;
+            }
             ConfigOperation::Delete => {
-                if op.name == RETENTION_MS {
-                    expiry = Some(IggyExpiry::NeverExpire);
+                if let Some(key) = key {
+                    plan_delete(&mut update, key, topic, defaults)?;
                 }
             }
             ConfigOperation::Append | ConfigOperation::Subtract => {
-                if op.name == CLEANUP_POLICY {
-                    return Err(ConfigFault::ReadOnly(CLEANUP_POLICY_READ_ONLY));
-                }
-                return Err(ConfigFault::NotAList {
-                    operation: op.operation,
-                    key: op.name.to_string(),
-                });
+                let append = op.operation == ConfigOperation::Append;
+                let values = op.value.unwrap_or_default();
+                let list = key
+                    .filter(|key| key.config_type == ConfigType::List)
+                    .and_then(|key| Some((key, key.default_list_after(append, values)?)));
+                let Some((key, list)) = list else {
+                    return Err(ConfigFault::NotAList {
+                        operation: op.operation,
+                        key: op.name.to_string(),
+                    });
+                };
+                plan_set(&mut update, key, &list, topic)?;
             }
         }
     }
-    Ok(expiry)
+    settle_retention(&mut update, topic)?;
+    Ok(update)
+}
+
+/// A `SET` of `key` to `value` on an existing topic.
+fn plan_set(
+    update: &mut TopicConfigUpdate,
+    key: &TopicKey,
+    value: &str,
+    topic: &TopicConfigSnapshot,
+) -> Result<(), ConfigFault> {
+    match key.kind {
+        TopicKeyKind::RetentionMs => {
+            update.message_expiry = Some(SettingChange::Set(retention_ms(key, value)?));
+        }
+        TopicKeyKind::RetentionBytes => {
+            let retention = retention_bytes(key, value)?;
+            update.max_topic_size = Some(SettingChange::Set(
+                retention.topic_size(topic.partitions_count),
+            ));
+        }
+        TopicKeyKind::SegmentBytes => {
+            if segment_bytes(key, value)? != topic.segment_size {
+                let reason = format!(
+                    "Iggy sets segment.bytes only when it creates a topic, and this topic has {}",
+                    topic.segment_size
+                );
+                return Err(invalid(key, value, reason));
+            }
+        }
+        TopicKeyKind::CleanupPolicy => update.cleanup_policy = Some(cleanup_policy(key, value)?),
+        TopicKeyKind::Ignored | TopicKeyKind::Fixed { .. } => {
+            key.check(value).map_err(|refusal| refused(key, refusal))?;
+        }
+    }
+    Ok(())
+}
+
+/// A `DELETE` of `key` on an existing topic: back to the gateway default where one is set, else
+/// the Iggy default. Nothing is written when the topic already has that value.
+fn plan_delete(
+    update: &mut TopicConfigUpdate,
+    key: &TopicKey,
+    topic: &TopicConfigSnapshot,
+    defaults: &TopicDefaults,
+) -> Result<(), ConfigFault> {
+    match key.kind {
+        TopicKeyKind::RetentionMs => {
+            update.message_expiry = back_to_default(
+                defaults.expiry(),
+                topic.message_expiry,
+                topic.message_expiry_explicit,
+            );
+        }
+        TopicKeyKind::RetentionBytes => {
+            update.max_topic_size = back_to_default(
+                defaults
+                    .retention()
+                    .map(|retention| retention.topic_size(topic.partitions_count)),
+                topic.max_topic_size,
+                topic.max_topic_size_explicit,
+            );
+        }
+        TopicKeyKind::SegmentBytes => {
+            if topic.segment_size != DEFAULT_SEGMENT_SIZE {
+                return Err(ConfigFault::Unresettable {
+                    name: key.name,
+                    current: topic.segment_size,
+                });
+            }
+        }
+        TopicKeyKind::CleanupPolicy => update.cleanup_policy = Some(CleanupPolicy::default()),
+        TopicKeyKind::Ignored | TopicKeyKind::Fixed { .. } => {}
+    }
+    Ok(())
+}
+
+/// The retention an alter leaves, once every key of it is planned. A policy without `delete`
+/// keeps every record, so it writes no expiry and no size cap in place of what the retention keys
+/// say. Otherwise a new size cap must keep one segment in each partition.
+fn settle_retention(
+    update: &mut TopicConfigUpdate,
+    topic: &TopicConfigSnapshot,
+) -> Result<(), ConfigFault> {
+    if update
+        .cleanup_policy
+        .is_some_and(CleanupPolicy::keeps_every_record)
+    {
+        update.message_expiry = (topic.message_expiry != IggyExpiry::NeverExpire)
+            .then_some(SettingChange::Set(IggyExpiry::NeverExpire));
+        update.max_topic_size = (topic.max_topic_size != MaxTopicSize::Unlimited)
+            .then_some(SettingChange::Set(MaxTopicSize::Unlimited));
+        return Ok(());
+    }
+    if let Some(SettingChange::Set(size)) = update.max_topic_size {
+        keeps_a_segment(
+            RetentionBytes::share_of(size, topic.partitions_count),
+            topic.segment_size,
+        )?;
+    }
+    Ok(())
+}
+
+/// The write that takes a stored value back to `gateway_default`, or to the Iggy default when
+/// none is set, or `None` when the value is there already.
+fn back_to_default<T: PartialEq + Copy>(
+    gateway_default: Option<T>,
+    current: T,
+    explicit: bool,
+) -> Option<SettingChange<T>> {
+    match gateway_default {
+        Some(value) if explicit && current == value => None,
+        Some(value) => Some(SettingChange::Set(value)),
+        None => explicit.then_some(SettingChange::Reset),
+    }
+}
+
+/// `retention.ms`: -1 or more, as Kafka's `atLeast(-1)` allows.
+fn retention_ms(key: &TopicKey, value: &str) -> Result<IggyExpiry, ConfigFault> {
+    match key.config_type.parse(value) {
+        Ok(ConfigValue::Long(millis)) if millis >= -1 => Ok(expiry_from_retention_ms(millis)),
+        Ok(_) => Err(invalid(key, value, "Value must be at least -1")),
+        Err(reason) => Err(invalid(key, value, reason)),
+    }
+}
+
+/// `retention.bytes`: any count, and a negative one caps nothing, as in Kafka.
+fn retention_bytes(key: &TopicKey, value: &str) -> Result<RetentionBytes, ConfigFault> {
+    match key.config_type.parse(value) {
+        Ok(ConfigValue::Long(bytes)) => Ok(
+            u64::try_from(bytes).map_or(RetentionBytes::Unlimited, RetentionBytes::PerPartition)
+        ),
+        Ok(_) => Err(invalid(key, value, "Not a number of type LONG")),
+        Err(reason) => Err(invalid(key, value, reason)),
+    }
+}
+
+/// `segment.bytes`: a size Iggy accepts, a multiple of 512 from 1 MiB to 1 GiB. Kafka accepts
+/// any size from 1 MiB.
+fn segment_bytes(key: &TopicKey, value: &str) -> Result<u64, ConfigFault> {
+    let bytes = match key.config_type.parse(value) {
+        Ok(ConfigValue::Long(bytes)) => u64::try_from(bytes).unwrap_or(0),
+        Ok(_) => 0,
+        Err(reason) => return Err(invalid(key, value, reason)),
+    };
+    if bytes < MIN_TOPIC_SEGMENT_SIZE {
+        return Err(invalid(
+            key,
+            value,
+            format!("Value must be at least {MIN_TOPIC_SEGMENT_SIZE}"),
+        ));
+    }
+    if bytes > MAX_TOPIC_SEGMENT_SIZE || !bytes.is_multiple_of(512) {
+        return Err(invalid(
+            key,
+            value,
+            format!("Iggy needs a multiple of 512 bytes, at most {MAX_TOPIC_SEGMENT_SIZE}"),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Iggy keeps the newest sealed segment of a partition whatever its size cap, so a cap below one
+/// segment would not hold.
+fn keeps_a_segment(retention: RetentionBytes, segment_size: u64) -> Result<(), ConfigFault> {
+    match retention {
+        RetentionBytes::PerPartition(bytes) if bytes < segment_size => {
+            Err(ConfigFault::InvalidValue {
+                name: keys::RETENTION_BYTES.to_string(),
+                value: bytes.to_string(),
+                reason: format!(
+                    "Iggy keeps at least one segment of each partition, so retention.bytes must be -1 \
+                 or at least segment.bytes ({segment_size})"
+                ),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `cleanup.policy`: a list of `compact` and `delete`, empty or not, as Kafka checks it.
+fn cleanup_policy(key: &TopicKey, value: &str) -> Result<CleanupPolicy, ConfigFault> {
+    let ConfigValue::List(items) = key.check(value).map_err(|refusal| refused(key, refusal))?
+    else {
+        return Ok(CleanupPolicy::default());
+    };
+    Ok(CleanupPolicy {
+        delete: items.iter().any(|item| item == "delete"),
+        compact: items.iter().any(|item| item == "compact"),
+    })
+}
+
+fn refused(key: &TopicKey, refusal: Refusal) -> ConfigFault {
+    match refusal {
+        Refusal::Value { value, reason } => ConfigFault::InvalidValue {
+            name: key.name.to_string(),
+            value,
+            reason,
+        },
+        Refusal::Message(message) => ConfigFault::Message(message),
+    }
+}
+
+fn invalid(key: &TopicKey, value: &str, reason: impl Into<String>) -> ConfigFault {
+    ConfigFault::InvalidValue {
+        name: key.name.to_string(),
+        value: value.to_string(),
+        reason: reason.into(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use iggy::prelude::{IggyByteSize, MaxTopicSize};
+
+    use super::keys::{
+        CLEANUP_POLICY, MIN_INSYNC_REPLICAS, RETENTION_BYTES, RETENTION_MS, SEGMENT_BYTES,
+    };
     use super::*;
 
-    #[test]
-    fn retention_ms_round_trips_a_positive_value_and_never_expire() {
-        let expiry = parse_retention_ms("1500").expect("1500 ms");
-        let described = retention_ms(expiry, true).expect("representable");
-        assert_eq!(described.value, "1500");
-        assert_eq!(described.source, CONFIG_SOURCE_TOPIC);
-        assert_eq!(
-            u64::from(expiry),
-            1_500_000,
-            "IggyDuration stores microseconds"
-        );
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
 
-        let never = parse_retention_ms("-1").expect("never expire");
-        assert_eq!(never, IggyExpiry::NeverExpire);
-        let described = retention_ms(never, true).expect("never expire");
-        assert_eq!(described.value, "-1");
-        assert_eq!(described.source, CONFIG_SOURCE_TOPIC);
-        let unset = retention_ms(IggyExpiry::NeverExpire, false).expect("default");
-        assert_eq!(unset.value, "-1");
-        assert_eq!(unset.source, CONFIG_SOURCE_DEFAULT);
+    fn topic() -> TopicConfigSnapshot {
+        TopicConfigSnapshot {
+            partitions_count: 3,
+            message_expiry: IggyExpiry::NeverExpire,
+            message_expiry_explicit: false,
+            max_topic_size: MaxTopicSize::Unlimited,
+            max_topic_size_explicit: false,
+            segment_size: DEFAULT_SEGMENT_SIZE,
+            segment_size_explicit: false,
+        }
+    }
+
+    fn incremental(
+        entries: &[(&'static str, i8, Option<&'static str>)],
+        topic: &TopicConfigSnapshot,
+        defaults: &TopicDefaults,
+    ) -> Result<TopicConfigUpdate, ConfigFault> {
+        let ops = incremental_ops(entries.iter().copied()).expect("well formed");
+        plan_incremental(&ops, topic, defaults)
+    }
+
+    fn size(bytes: u64) -> MaxTopicSize {
+        MaxTopicSize::Custom(IggyByteSize::from(bytes))
     }
 
     #[test]
-    fn retention_ms_rejects_zero_noncanonical_and_unrepresentable_values() {
-        assert!(parse_retention_ms("0").is_err());
-        assert!(parse_retention_ms("-2").is_err());
-        assert!(parse_retention_ms("0001").is_err());
-        assert!(parse_retention_ms("+1").is_err());
-        assert!(parse_retention_ms("1.5").is_err());
-        assert!(parse_retention_ms("").is_err());
-        assert!(parse_retention_ms(&i64::MAX.to_string()).is_err());
-        let max_secs_ms = u64::from(u32::MAX) * 1_000;
-        let at_cap = parse_retention_ms(&max_secs_ms.to_string()).expect("u32::MAX seconds");
-        assert_eq!(u64::from(at_cap), max_secs_ms * 1_000);
-        let with_remainder = max_secs_ms + 999;
+    fn given_create_configs_should_map_the_stored_keys_and_accept_reported_defaults() {
+        let settings = plan_create([
+            (RETENTION_MS, Some("120000")),
+            (RETENTION_BYTES, Some("67108864")),
+            (SEGMENT_BYTES, Some("67108864")),
+            (CLEANUP_POLICY, Some("delete")),
+            ("message.timestamp.type", Some("CreateTime")),
+            ("min.insync.replicas", Some("1")),
+        ])
+        .expect("valid");
+        assert_eq!(
+            settings.message_expiry,
+            Some(expiry_from_retention_ms(120_000))
+        );
+        assert_eq!(
+            settings.retention_bytes,
+            Some(RetentionBytes::PerPartition(64 * MIB))
+        );
+        assert_eq!(settings.segment_size, Some(64 * MIB));
+        assert_eq!(
+            plan_create([] as [(&str, Option<&str>); 0]).expect("empty"),
+            KafkaTopicSettings::default()
+        );
+    }
+
+    #[test]
+    fn given_create_configs_should_accept_every_retention_ms_kafka_accepts() {
+        for value in ["-1", "0", "+1", "0001", " 5000 ", "9223372036854775807"] {
+            assert!(
+                plan_create([(RETENTION_MS, Some(value))]).is_ok(),
+                "{value}"
+            );
+        }
+        let fault = plan_create([(RETENTION_MS, Some("-2"))]).expect_err("below -1");
+        assert_eq!(
+            fault.message(),
+            "Invalid value -2 for configuration retention.ms: Value must be at least -1"
+        );
+        let fault = plan_create([(RETENTION_MS, Some("1.5"))]).expect_err("not a long");
+        assert_eq!(
+            fault.message(),
+            "Invalid value 1.5 for configuration retention.ms: Not a number of type LONG"
+        );
+    }
+
+    #[test]
+    fn given_create_configs_should_refuse_what_iggy_cannot_hold() {
+        let fault = plan_create([(RETENTION_BYTES, Some("104857600"))]).expect_err("floor");
+        assert_eq!(
+            fault.message(),
+            "Invalid value 104857600 for configuration retention.bytes: Iggy keeps at least one \
+             segment of each partition, so retention.bytes must be -1 or at least segment.bytes \
+             (1073741824)"
+        );
         assert!(
-            parse_retention_ms(&with_remainder.to_string()).is_ok(),
-            "a remainder under one second stays within IggyExpiry::from_str"
+            plan_create([
+                (RETENTION_BYTES, Some("104857600")),
+                (SEGMENT_BYTES, Some("104857600")),
+            ])
+            .is_ok()
         );
-        assert!(parse_retention_ms(&(max_secs_ms + 1_000).to_string()).is_err());
-        assert!(parse_retention_ms(&(u64::MAX / 1_000).to_string()).is_err());
-
-        let sub_ms = IggyExpiry::ExpireDuration(IggyDuration::from(1_500_u64));
-        assert!(retention_ms(sub_ms, true).is_err());
+        assert!(plan_create([(RETENTION_BYTES, Some("-5"))]).is_ok());
+        assert!(plan_create([(RETENTION_BYTES, Some("0"))]).is_err());
+        for value in ["1048575", "1048577", "2147483647", "2147483648"] {
+            assert!(
+                plan_create([(SEGMENT_BYTES, Some(value))]).is_err(),
+                "{value}"
+            );
+        }
+        let fault =
+            plan_create([("message.timestamp.type", Some("LogAppendTime"))]).expect_err("fixed");
+        assert_eq!(
+            fault.message(),
+            "Invalid value LogAppendTime for configuration message.timestamp.type: Iggy keeps the \
+             timestamp that the producer sets, so this gateway accepts only CreateTime"
+        );
+        let fault =
+            plan_create([("max.message.bytes", Some("2097152"))]).expect_err("fixed size limit");
+        assert!(matches!(fault, ConfigFault::InvalidValue { .. }));
     }
 
     #[test]
-    fn listed_keys_defaults_to_retention_and_keeps_an_unknown_name() {
-        assert_eq!(listed_keys(None), vec![ListedKey::Retention]);
-        assert_eq!(listed_keys(Some(&[])), vec![ListedKey::Retention]);
-        let asked = [
-            StrBytes::from_static_str(RETENTION_MS),
-            StrBytes::from_static_str("no.such"),
-        ];
+    fn given_create_configs_should_accept_keys_iggy_ignores_at_any_value_kafka_accepts() {
+        let settings = plan_create([
+            (MIN_INSYNC_REPLICAS, Some("2")),
+            ("compression.type", Some("zstd")),
+            ("segment.ms", Some("3600000")),
+            ("min.compaction.lag.ms", Some("86400000")),
+            ("unclean.leader.election.enable", Some("true")),
+        ])
+        .expect("ignored keys");
+        assert_eq!(settings, KafkaTopicSettings::default());
+        let fault = plan_create([(MIN_INSYNC_REPLICAS, Some("0"))]).expect_err("Kafka refuses 0");
         assert_eq!(
-            listed_keys(Some(&asked)),
-            vec![ListedKey::Retention, ListedKey::Unknown]
+            fault.message(),
+            "Invalid value 0 for configuration min.insync.replicas: Value must be at least 1"
         );
     }
 
     #[test]
-    fn cleanup_policy_is_an_unknown_name_even_when_asked_for() {
-        let asked = [StrBytes::from_static_str(CLEANUP_POLICY)];
-        assert_eq!(listed_keys(Some(&asked)), vec![ListedKey::Unknown]);
-    }
-
-    #[test]
-    fn listed_keys_collapses_a_name_repeated_in_the_request() {
-        let asked = [
-            StrBytes::from_static_str(RETENTION_MS),
-            StrBytes::from_static_str(RETENTION_MS),
-            StrBytes::from_static_str(CLEANUP_POLICY),
-        ];
+    fn given_a_create_policy_without_delete_should_keep_every_record() {
+        let compact = plan_create([
+            (CLEANUP_POLICY, Some("compact")),
+            (RETENTION_MS, Some("1000")),
+            (RETENTION_BYTES, Some("1048576")),
+        ])
+        .expect("retention is ignored, so the floor does not apply");
         assert_eq!(
-            listed_keys(Some(&asked)),
-            vec![ListedKey::Retention, ListedKey::Unknown]
+            compact.cleanup_policy,
+            CleanupPolicy {
+                delete: false,
+                compact: true
+            }
+        );
+        assert!(compact.cleanup_policy.keeps_every_record());
+        let empty = plan_create([(CLEANUP_POLICY, Some(""))]).expect("Kafka 4.4 accepts it");
+        assert!(empty.cleanup_policy.keeps_every_record());
+        assert!(!empty.cleanup_policy.compact);
+
+        let both = plan_create([(CLEANUP_POLICY, Some("delete,compact"))]).expect("both");
+        assert!(!both.cleanup_policy.keeps_every_record());
+        assert!(both.cleanup_policy.compact);
+        assert!(
+            plan_create([
+                (CLEANUP_POLICY, Some("compact,delete")),
+                (RETENTION_BYTES, Some("1048576")),
+            ])
+            .is_err(),
+            "delete applies retention, so the floor does"
+        );
+
+        let fault = plan_create([(CLEANUP_POLICY, Some("compact,"))]).expect_err("empty item");
+        assert_eq!(
+            fault.message(),
+            "Configuration 'cleanup.policy' values must not be empty."
+        );
+        let fault = plan_create([(CLEANUP_POLICY, Some("Delete"))]).expect_err("case");
+        assert_eq!(
+            fault.message(),
+            "Invalid value Delete for configuration cleanup.policy: String must be one of: \
+             compact, delete"
         );
     }
 
     #[test]
-    fn retention_minutes_and_hours_are_unknown_keys() {
-        let asked = [
-            StrBytes::from_static_str("retention.minutes"),
-            StrBytes::from_static_str("retention.hours"),
-        ];
+    fn given_create_configs_should_name_an_unknown_key_and_every_null_value() {
+        let fault = plan_create([("no.such", Some("1"))]).expect_err("unknown");
+        assert_eq!(fault.message(), "Unknown topic config name: no.such");
+        let fault = plan_create([("message.format.version", Some("3.0"))]).expect_err("removed");
         assert_eq!(
-            listed_keys(Some(&asked)),
-            vec![ListedKey::Unknown, ListedKey::Unknown]
+            fault,
+            ConfigFault::UnknownKey("message.format.version".to_string())
         );
-        let err = plan_retention_update([("retention.minutes", Some("2"))])
-            .expect_err("not a real topic config");
+        let fault = plan_create([
+            (RETENTION_MS, None),
+            ("no.such", Some("1")),
+            (SEGMENT_BYTES, None),
+        ])
+        .expect_err("nulls first");
         assert_eq!(
-            err,
+            fault.message(),
+            "Null value not supported for topic configs: retention.ms,segment.bytes"
+        );
+    }
+
+    #[test]
+    fn given_a_repeated_create_config_should_keep_its_last_value() {
+        let settings = plan_create([(RETENTION_MS, Some("-2")), (RETENTION_MS, Some("1000"))])
+            .expect("the last value counts");
+        assert_eq!(
+            settings.message_expiry,
+            Some(expiry_from_retention_ms(1_000))
+        );
+    }
+
+    #[test]
+    fn given_incremental_sets_should_write_the_stored_keys() {
+        let update = incremental(
+            &[
+                (RETENTION_MS, 0, Some("1500")),
+                (RETENTION_BYTES, 0, Some("1073741824")),
+            ],
+            &topic(),
+            &TopicDefaults::default(),
+        )
+        .expect("valid");
+        assert_eq!(
+            update.message_expiry,
+            Some(SettingChange::Set(expiry_from_retention_ms(1_500)))
+        );
+        assert_eq!(
+            update.max_topic_size,
+            Some(SettingChange::Set(size(3 * GIB)))
+        );
+
+        let floor = incremental(
+            &[(RETENTION_BYTES, 0, Some("1048576"))],
+            &topic(),
+            &TopicDefaults::default(),
+        )
+        .expect_err("below one segment");
+        assert!(matches!(floor, ConfigFault::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn given_incremental_sets_of_other_keys_should_write_nothing_or_be_refused() {
+        let same = incremental(
+            &[
+                (SEGMENT_BYTES, 0, Some("1073741824")),
+                (CLEANUP_POLICY, 0, Some("delete")),
+                (MIN_INSYNC_REPLICAS, 0, Some("2")),
+                ("message.timestamp.type", 0, Some("CreateTime")),
+            ],
+            &topic(),
+            &TopicDefaults::default(),
+        )
+        .expect("no change");
+        assert!(same.is_empty());
+        assert_eq!(same.cleanup_policy, Some(CleanupPolicy::default()));
+        let timestamps = incremental(
+            &[("message.timestamp.type", 0, Some("LogAppendTime"))],
+            &topic(),
+            &TopicDefaults::default(),
+        )
+        .expect_err("fixed");
+        assert!(matches!(timestamps, ConfigFault::InvalidValue { .. }));
+
+        let segment = incremental(
+            &[(SEGMENT_BYTES, 0, Some("67108864"))],
+            &topic(),
+            &TopicDefaults::default(),
+        )
+        .expect_err("fixed at create");
+        assert_eq!(
+            segment.message(),
+            "Invalid value 67108864 for configuration segment.bytes: Iggy sets segment.bytes only \
+             when it creates a topic, and this topic has 1073741824"
+        );
+        let unknown = incremental(
+            &[("no.such", 0, Some("1"))],
+            &topic(),
+            &TopicDefaults::default(),
+        )
+        .expect_err("unknown");
+        assert_eq!(unknown, ConfigFault::UnknownKey("no.such".to_string()));
+    }
+
+    #[test]
+    fn given_incremental_deletes_should_go_back_to_the_iggy_default_without_a_gateway_default() {
+        let unset = incremental(
+            &[
+                (RETENTION_MS, 1, None),
+                (RETENTION_BYTES, 1, None),
+                ("no.such", 1, None),
+            ],
+            &topic(),
+            &TopicDefaults::default(),
+        )
+        .expect("valid");
+        assert!(unset.is_empty(), "nothing was set, so nothing is written");
+
+        let set = TopicConfigSnapshot {
+            message_expiry: expiry_from_retention_ms(1_000),
+            message_expiry_explicit: true,
+            max_topic_size: size(3 * GIB),
+            max_topic_size_explicit: true,
+            ..topic()
+        };
+        let reset = incremental(
+            &[(RETENTION_MS, 1, Some("")), (RETENTION_BYTES, 1, None)],
+            &set,
+            &TopicDefaults::default(),
+        )
+        .expect("valid");
+        assert_eq!(reset.message_expiry, Some(SettingChange::Reset));
+        assert_eq!(reset.max_topic_size, Some(SettingChange::Reset));
+    }
+
+    #[test]
+    fn given_incremental_deletes_should_go_back_to_the_gateway_default() {
+        let defaults = TopicDefaults {
+            retention_ms: Some(604_800_000),
+            retention_bytes: Some(2 * GIB),
+            ..TopicDefaults::default()
+        };
+        let update = incremental(
+            &[(RETENTION_MS, 1, None), (RETENTION_BYTES, 1, None)],
+            &topic(),
+            &defaults,
+        )
+        .expect("valid");
+        assert_eq!(
+            update.message_expiry,
+            Some(SettingChange::Set(expiry_from_retention_ms(604_800_000)))
+        );
+        assert_eq!(
+            update.max_topic_size,
+            Some(SettingChange::Set(size(6 * GIB)))
+        );
+
+        let at_default = TopicConfigSnapshot {
+            message_expiry: expiry_from_retention_ms(604_800_000),
+            message_expiry_explicit: true,
+            max_topic_size: size(6 * GIB),
+            max_topic_size_explicit: true,
+            ..topic()
+        };
+        let update = incremental(
+            &[(RETENTION_MS, 1, None), (RETENTION_BYTES, 1, None)],
+            &at_default,
+            &defaults,
+        )
+        .expect("valid");
+        assert!(update.is_empty());
+    }
+
+    #[test]
+    fn given_a_delete_of_a_segment_size_set_at_create_should_be_refused() {
+        let created = TopicConfigSnapshot {
+            segment_size: 64 * MIB,
+            segment_size_explicit: true,
+            ..topic()
+        };
+        let fault = incremental(
+            &[(SEGMENT_BYTES, 1, None)],
+            &created,
+            &TopicDefaults::default(),
+        )
+        .expect_err("cannot reset");
+        assert_eq!(
+            fault.message(),
+            "segment.bytes cannot go back to its default, because Iggy sets it only when it \
+             creates a topic. This topic has 67108864."
+        );
+        let at_default = TopicConfigSnapshot {
+            segment_size_explicit: true,
+            ..topic()
+        };
+        assert!(
+            incremental(
+                &[(SEGMENT_BYTES, 1, None)],
+                &at_default,
+                &TopicDefaults::default()
+            )
+            .expect("already the default")
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn given_append_and_subtract_should_apply_to_the_reported_list_or_be_refused() {
+        let expiring = TopicConfigSnapshot {
+            message_expiry: expiry_from_retention_ms(1_000),
+            message_expiry_explicit: true,
+            max_topic_size: size(3 * GIB),
+            max_topic_size_explicit: true,
+            ..topic()
+        };
+        let both = incremental(
+            &[(CLEANUP_POLICY, 2, Some("compact"))],
+            &expiring,
+            &TopicDefaults::default(),
+        )
+        .expect("compact,delete");
+        assert!(both.is_empty(), "delete still applies retention");
+        assert!(both.cleanup_policy.is_some_and(|policy| policy.compact));
+        let emptied = incremental(
+            &[(CLEANUP_POLICY, 3, Some("delete"))],
+            &expiring,
+            &TopicDefaults::default(),
+        )
+        .expect("an empty list keeps every record");
+        assert_eq!(
+            emptied.message_expiry,
+            Some(SettingChange::Set(IggyExpiry::NeverExpire))
+        );
+        assert_eq!(
+            emptied.max_topic_size,
+            Some(SettingChange::Set(MaxTopicSize::Unlimited))
+        );
+        let throttled = incremental(
+            &[("leader.replication.throttled.replicas", 2, Some("0:1"))],
+            &topic(),
+            &TopicDefaults::default(),
+        )
+        .expect("ignored");
+        assert!(throttled.is_empty());
+
+        let not_a_list = incremental(
+            &[(RETENTION_MS, 2, Some("1"))],
+            &topic(),
+            &TopicDefaults::default(),
+        )
+        .expect_err("not a list");
+        assert_eq!(
+            not_a_list.message(),
+            "Can't APPEND to key retention.ms because its type is not LIST."
+        );
+        let unknown = incremental(
+            &[("no.such", 3, Some("1"))],
+            &topic(),
+            &TopicDefaults::default(),
+        )
+        .expect_err("not a list");
+        assert_eq!(
+            unknown.message(),
+            "Can't SUBTRACT to key no.such because its type is not LIST."
+        );
+    }
+
+    #[test]
+    fn given_a_replace_should_reset_each_stored_key_it_leaves_out() {
+        let set = TopicConfigSnapshot {
+            message_expiry: expiry_from_retention_ms(1_000),
+            message_expiry_explicit: true,
+            max_topic_size: size(3 * GIB),
+            max_topic_size_explicit: true,
+            ..topic()
+        };
+        let update = plan_replace(
+            [(RETENTION_MS, Some("2000"))],
+            &set,
+            &TopicDefaults::default(),
+        )
+        .expect("valid");
+        assert_eq!(
+            update.message_expiry,
+            Some(SettingChange::Set(expiry_from_retention_ms(2_000)))
+        );
+        assert_eq!(update.max_topic_size, Some(SettingChange::Reset));
+
+        let everything = plan_replace(
+            [] as [(&str, Option<&str>); 0],
+            &set,
+            &TopicDefaults::default(),
+        )
+        .expect("an empty list resets");
+        assert_eq!(everything.message_expiry, Some(SettingChange::Reset));
+        assert_eq!(everything.max_topic_size, Some(SettingChange::Reset));
+
+        let created = TopicConfigSnapshot {
+            segment_size: 64 * MIB,
+            segment_size_explicit: true,
+            ..topic()
+        };
+        assert!(matches!(
+            plan_replace(
+                [(RETENTION_MS, Some("1"))],
+                &created,
+                &TopicDefaults::default()
+            ),
+            Err(ConfigFault::Unresettable { .. })
+        ));
+        assert!(
+            plan_replace(
+                [(SEGMENT_BYTES, Some("67108864"))],
+                &created,
+                &TopicDefaults::default()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn given_an_alter_to_compact_should_keep_every_record_over_its_retention_keys() {
+        let expiring = TopicConfigSnapshot {
+            message_expiry: expiry_from_retention_ms(1_000),
+            message_expiry_explicit: true,
+            max_topic_size: size(3 * GIB),
+            max_topic_size_explicit: true,
+            ..topic()
+        };
+        let incremental_compact = incremental(
+            &[
+                (RETENTION_MS, 0, Some("5000")),
+                (CLEANUP_POLICY, 0, Some("compact")),
+                (RETENTION_BYTES, 0, Some("1048576")),
+            ],
+            &expiring,
+            &TopicDefaults::default(),
+        )
+        .expect("compact wins, and the floor does not apply");
+        assert_eq!(
+            incremental_compact.message_expiry,
+            Some(SettingChange::Set(IggyExpiry::NeverExpire))
+        );
+        assert_eq!(
+            incremental_compact.max_topic_size,
+            Some(SettingChange::Set(MaxTopicSize::Unlimited))
+        );
+
+        let defaults = TopicDefaults {
+            retention_ms: Some(604_800_000),
+            ..TopicDefaults::default()
+        };
+        let replace_compact =
+            plan_replace([(CLEANUP_POLICY, Some("compact"))], &expiring, &defaults).expect("valid");
+        assert_eq!(
+            replace_compact.message_expiry,
+            Some(SettingChange::Set(IggyExpiry::NeverExpire))
+        );
+        assert_eq!(
+            replace_compact.max_topic_size,
+            Some(SettingChange::Set(MaxTopicSize::Unlimited))
+        );
+
+        let kept = TopicConfigSnapshot {
+            message_expiry: IggyExpiry::NeverExpire,
+            message_expiry_explicit: true,
+            max_topic_size: MaxTopicSize::Unlimited,
+            max_topic_size_explicit: true,
+            ..topic()
+        };
+        let again =
+            plan_replace([(CLEANUP_POLICY, Some("compact"))], &kept, &defaults).expect("valid");
+        assert!(again.is_empty(), "the topic keeps every record already");
+        let back_to_delete =
+            plan_replace([(CLEANUP_POLICY, Some("delete"))], &kept, &defaults).expect("valid");
+        assert_eq!(
+            back_to_delete.message_expiry,
+            Some(SettingChange::Set(expiry_from_retention_ms(604_800_000))),
+            "delete takes the retention the replace leaves, here the gateway default"
+        );
+    }
+
+    #[test]
+    fn given_a_replace_should_refuse_a_repeated_or_unknown_key() {
+        let fault = plan_replace(
+            [(RETENTION_MS, Some("1000")), (RETENTION_MS, Some("1000"))],
+            &topic(),
+            &TopicDefaults::default(),
+        )
+        .expect_err("repeated");
+        assert_eq!(fault, ConfigFault::Repeated(RETENTION_MS.to_string()));
+        let fault = plan_replace(
+            [("retention.minutes", Some("2"))],
+            &topic(),
+            &TopicDefaults::default(),
+        )
+        .expect_err("not a topic key");
+        assert_eq!(
+            fault,
             ConfigFault::UnknownKey("retention.minutes".to_string())
         );
-        let err = plan_retention_update([("retention.hours", Some("1"))])
-            .expect_err("not a real topic config");
-        assert_eq!(err, ConfigFault::UnknownKey("retention.hours".to_string()));
+    }
+
+    #[test]
+    fn given_alter_null_values_should_name_them_as_kafka_does() {
+        assert_eq!(null_values([(RETENTION_MS, Some("1"))]), None);
+        let fault = null_values([(RETENTION_MS, None), (RETENTION_BYTES, None)]).expect("nulls");
+        assert_eq!(
+            fault.message(),
+            "Null value not supported for : retention.ms, retention.bytes"
+        );
     }
 
     #[test]
@@ -685,33 +1381,6 @@ mod tests {
     #[test]
     fn find_duplicate_names_is_empty_when_every_name_is_unique() {
         assert!(find_duplicate_names(["orders", "payments"]).is_empty());
-    }
-
-    #[test]
-    fn one_bad_key_rejects_the_whole_alter_plan() {
-        let err = plan_retention_update([(RETENTION_MS, Some("5000")), ("no.such", Some("1"))])
-            .expect_err("unknown key");
-        assert_eq!(err, ConfigFault::UnknownKey("no.such".to_string()));
-
-        let err = plan_retention_update([(CLEANUP_POLICY, Some("delete"))]).expect_err("read only");
-        assert!(matches!(err, ConfigFault::ReadOnly(_)));
-
-        assert_eq!(
-            plan_retention_update([(RETENTION_MS, Some("-1"))]).expect("clear"),
-            Some(IggyExpiry::NeverExpire)
-        );
-        assert_eq!(
-            plan_retention_update([] as [(&str, Option<&str>); 0]).expect("empty"),
-            None
-        );
-    }
-
-    #[test]
-    fn a_repeated_retention_ms_key_fails_the_resource() {
-        let err =
-            plan_retention_update([(RETENTION_MS, Some("1000")), (RETENTION_MS, Some("1000"))])
-                .expect_err("repeated key");
-        assert_eq!(err, ConfigFault::Repeated(RETENTION_MS.to_string()));
     }
 
     #[test]
@@ -768,85 +1437,6 @@ mod tests {
                     value: Some("1"),
                 },
             ]
-        );
-    }
-
-    #[test]
-    fn incremental_plan_sets_and_deletes_retention() {
-        let set = incremental_ops([(RETENTION_MS, 0, Some("1500"))]).expect("ops");
-        assert_eq!(
-            plan_incremental_update(&set).expect("set"),
-            Some(IggyExpiry::ExpireDuration(IggyDuration::from(
-                1_500_000_u64
-            )))
-        );
-        let delete = incremental_ops([(RETENTION_MS, 1, None)]).expect("ops");
-        assert_eq!(
-            plan_incremental_update(&delete).expect("delete"),
-            Some(IggyExpiry::NeverExpire)
-        );
-    }
-
-    #[test]
-    fn incremental_plan_ignores_a_delete_of_a_key_it_never_stored() {
-        let ops = incremental_ops([("no.such", 1, None), (CLEANUP_POLICY, 1, None)]).expect("ops");
-        assert_eq!(plan_incremental_update(&ops).expect("no-op"), None);
-        assert_eq!(plan_incremental_update(&[]).expect("empty"), None);
-    }
-
-    #[test]
-    fn incremental_plan_refuses_set_of_unknown_read_only_and_invalid_values() {
-        let unknown = incremental_ops([("no.such", 0, Some("1"))]).expect("ops");
-        assert_eq!(
-            plan_incremental_update(&unknown).expect_err("unknown"),
-            ConfigFault::UnknownKey("no.such".to_string())
-        );
-        let read_only = incremental_ops([(CLEANUP_POLICY, 0, Some("compact"))]).expect("ops");
-        assert_eq!(
-            plan_incremental_update(&read_only).expect_err("read only"),
-            ConfigFault::ReadOnly(CLEANUP_POLICY_READ_ONLY)
-        );
-        let invalid = incremental_ops([(RETENTION_MS, 0, Some("abc"))]).expect("ops");
-        assert_eq!(
-            plan_incremental_update(&invalid).expect_err("invalid"),
-            ConfigFault::InvalidRetention
-        );
-    }
-
-    #[test]
-    fn incremental_plan_refuses_append_and_subtract_on_every_key() {
-        let append = incremental_ops([(RETENTION_MS, 2, Some("1"))]).expect("ops");
-        let err = plan_incremental_update(&append).expect_err("append");
-        assert_eq!(
-            err,
-            ConfigFault::NotAList {
-                operation: ConfigOperation::Append,
-                key: RETENTION_MS.to_string(),
-            }
-        );
-        assert_eq!(
-            err.message(),
-            "Can't APPEND to key retention.ms because its type is not LIST."
-        );
-        let subtract = incremental_ops([("no.such", 3, Some("1"))]).expect("ops");
-        let err = plan_incremental_update(&subtract).expect_err("subtract");
-        assert_eq!(
-            err.message(),
-            "Can't SUBTRACT to key no.such because its type is not LIST."
-        );
-    }
-
-    #[test]
-    fn incremental_plan_refuses_append_and_subtract_on_cleanup_policy_as_read_only() {
-        let append = incremental_ops([(CLEANUP_POLICY, 2, Some("compact"))]).expect("ops");
-        assert_eq!(
-            plan_incremental_update(&append).expect_err("append"),
-            ConfigFault::ReadOnly(CLEANUP_POLICY_READ_ONLY)
-        );
-        let subtract = incremental_ops([(CLEANUP_POLICY, 3, Some("delete"))]).expect("ops");
-        assert_eq!(
-            plan_incremental_update(&subtract).expect_err("subtract"),
-            ConfigFault::ReadOnly(CLEANUP_POLICY_READ_ONLY)
         );
     }
 }

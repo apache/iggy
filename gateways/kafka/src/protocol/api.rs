@@ -163,6 +163,23 @@ impl Brokers {
         listed
     }
 
+    /// `count` gateway node ids for the replicas of a partition: this gateway first, then the
+    /// next ones in node id order, wrapping round. Never more than every gateway, and never fewer
+    /// than this one.
+    #[must_use]
+    pub fn replicas(&self, count: u32) -> Vec<i32> {
+        let mut ids: Vec<i32> = self.peers.iter().map(|(node, _)| *node).collect();
+        ids.push(self.node_id);
+        ids.sort_unstable();
+        let own = ids
+            .iter()
+            .position(|node| *node == self.node_id)
+            .unwrap_or(0);
+        ids.rotate_left(own);
+        ids.truncate(usize::try_from(count).unwrap_or(usize::MAX).max(1));
+        ids
+    }
+
     /// The gateway that coordinates every consumer group: the lowest node id. Every gateway names
     /// the same one, so the members of a group never split over two coordinators.
     #[must_use]

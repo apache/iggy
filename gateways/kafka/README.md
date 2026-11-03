@@ -11,8 +11,9 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > DeleteTopics, CreatePartitions and both alter APIs run as the bridge's own Iggy user**: with the
 > bridge on and `IGGY_KAFKA_SASL_ENABLED` off (the default), any client that can reach this port
 > can create topics (up to 1000 partitions each), grow them by up to 1000 partitions per topic per
-> request (100 topics per request), delete topics and their data, or shorten a topic's
-> `retention.ms` low enough that the cleaner drops sealed segments, deleting data. With
+> request (100 topics per request), delete topics and their data, or lower a topic's
+> `retention.ms` or `retention.bytes` far enough that the cleaner drops sealed segments, deleting
+> data. With
 > `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` and no listener that names principals, any client
 > that reaches this port can also create topics just by naming them in a `Metadata` request. When
 > the connection has a principal (SASL, or a client certificate mapped to an Iggy user),
@@ -258,7 +259,7 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 - [docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md) — group membership, rebalances, and which gateway coordinates a group
 - [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — how a Kafka client authenticates, and why PLAIN only
 - [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) — how Iggy permissions are described as Kafka ACLs
-- [docs/CONFIGS.md](docs/CONFIGS.md) — DescribeConfigs, AlterConfigs and IncrementalAlterConfigs for topic `retention.ms`
+- [docs/CONFIGS.md](docs/CONFIGS.md) — topic configurations on CreateTopics, DescribeConfigs and both alter APIs, the replication factor, and the broker resource
 
 ### Delivery guarantees
 
@@ -729,6 +730,9 @@ Limits:
 | `IGGY_KAFKA_PRODUCE_SESSIONS` | `256` | Producers that get an Iggy client of their own. The rest share one. `0`: all share one |
 | `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` | `600` | An unused Produce client closes after this long |
 | `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` | `false` | `true` passes the producer of an idempotent batch to Iggy, so each batch lands once. Turn it on after every Iggy node, gateway and consumer of the topics is upgraded. See [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) |
+| `IGGY_KAFKA_TOPIC_RETENTION_MS` | `-1` | Kafka's `log.retention.ms`: the `retention.ms` of each topic the gateway creates without one. `-1` never expires. Kafka's default is 7 days, `604800000`. See [docs/CONFIGS.md](docs/CONFIGS.md) |
+| `IGGY_KAFKA_TOPIC_RETENTION_BYTES` | `-1` | Kafka's `log.retention.bytes`: the `retention.bytes` of each partition of a topic the gateway creates without one. `-1` caps nothing. Otherwise at least `1073741824`, the largest Iggy segment |
+| `IGGY_KAFKA_TOPIC_DURABILITY` | `replicated` | Iggy durability of the messages and consumer offsets of each topic the gateway creates: `replicated` or `persisted` |
 
 The initial connect retries a fixed, bounded number of times (`RECONNECTION_RETRIES = 3`, not the
 Iggy SDK client's own default of unlimited retries, one dial per second, forever), and the whole
@@ -794,16 +798,23 @@ call created it." A *different* `partition_count` against an already-existing to
 `BridgeError::PartitionCountMismatch` rather than silently keeping the old count or growing it -
 two concurrent callers requesting different counts for the same topic must not both see success.
 
-Topics created this way have **no message expiry** - Iggy's own server default, not Kafka's 7-day
-default. `AlterConfigs` or `IncrementalAlterConfigs` can set that expiry afterwards through `retention.ms`
-([docs/CONFIGS.md](docs/CONFIGS.md)). Until a client does, messages never expire, so a Kafka app
-that assumes the 7-day default will accumulate data on this bridge.
+A topic that `CreateTopics` or auto-creation makes takes `retention.ms`, `retention.bytes` and
+`segment.bytes` from the request, else from `IGGY_KAFKA_TOPIC_RETENTION_MS` and
+`IGGY_KAFKA_TOPIC_RETENTION_BYTES`. With neither set, it has no message expiry and no size cap,
+as Iggy does by default, not Kafka's 7-day default. A Kafka app that assumes the 7-day default
+thus accumulates data on this bridge. To bound it, set the variable, or set `retention.ms` on the
+topic ([docs/CONFIGS.md](docs/CONFIGS.md)).
 
-They also use Iggy's default **durability**, `Durability::Replicated` - quorum commit without an
-additional stable-storage barrier, with the disk write itself threshold-gated (flushed at 1024
-messages or 1 MiB of unflushed data, whichever comes first). Kafka's own defaults take the same
-posture, so this isn't a wrong choice, but on a single node both can lose an acked write to a power
-cut before that threshold is reached - worth knowing rather than discovering later.
+Iggy does not compact (#4521). A topic created with `cleanup.policy=compact`, as Kafka Connect and
+Schema Registry create theirs, keeps every record and grows without bound. The gateway logs a
+warning for it. The replication factor of the request is the number of Iggy nodes that store each
+partition, and `-1` takes the Iggy default, which is every node.
+
+Its durability is `IGGY_KAFKA_TOPIC_DURABILITY`, by default Iggy's `Durability::Replicated`. That
+is a quorum commit without an additional stable-storage barrier. The disk write itself waits for a
+threshold: 1024 messages or 1 MiB of unflushed data, whichever comes first. Kafka's own defaults
+take the same posture. But on a single node, both can lose an acked write to a power cut before
+that threshold. With `persisted`, a write completes only once it is on disk.
 
 The bridge also keeps the Kafka cluster id in Iggy, in topic `cluster_id` of stream
 `<default stream>.meta`, created on the first start with durability `persisted`, no expiry and no

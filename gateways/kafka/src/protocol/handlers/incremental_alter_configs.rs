@@ -20,13 +20,13 @@
 //! `kafka-configs --alter` on a topic has sent this key since Kafka 2.5. `AlterConfigs` (33)
 //! comes from Java `Admin.alterConfigs` before 4.0, which removed it, and from other clients'
 //! non-incremental alter calls such as librdkafka's `rd_kafka_AlterConfigs`. Each entry carries
-//! one operation on one key, where 33 carries a whole new set. Both end in the same write, `retention.ms` onto the topic's
-//! `message_expiry`, behind the same checks. See `docs/CONFIGS.md`.
+//! one operation on one key, where 33 carries a whole new set. Both end in the same write of the
+//! topic's `message_expiry` and `max_topic_size`, behind the same checks. See `docs/CONFIGS.md`.
 
 use std::collections::HashSet;
 
 use bytes::Bytes;
-use iggy::prelude::{IggyError, IggyExpiry};
+use iggy::prelude::IggyError;
 use kafka_protocol::messages::IncrementalAlterConfigsRequest;
 use kafka_protocol::messages::incremental_alter_configs_request::AlterConfigsResource;
 use kafka_protocol::messages::incremental_alter_configs_response::{
@@ -37,7 +37,7 @@ use tokio::time::Instant;
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::topic_map::validate_kafka_topic_name;
-use crate::bridge::{BridgeError, IggyBridge, StreamTopicCache, TopicLoad};
+use crate::bridge::{BridgeError, IggyBridge, StreamTopicCache, TopicConfigUpdate, TopicLoad};
 use crate::protocol::api::{
     API_KEY_INCREMENTAL_ALTER_CONFIGS, ApiVersionRange, ERROR_INVALID_CONFIG,
     ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_NOT_CONTROLLER,
@@ -47,7 +47,7 @@ use crate::protocol::api::{
 use crate::protocol::bounds_guard::validate_incremental_alter_configs_shape;
 use crate::protocol::handlers::topic_config::{
     ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, alter_denial, bridge_failure, incremental_ops,
-    name_reason, plan_incremental_update, topic_cap_and_duplicates, topic_cap_message,
+    log_compaction, name_reason, plan_incremental, topic_cap_and_duplicates, topic_cap_message,
 };
 use crate::protocol::handlers::{
     decode_guarded, encode_message, is_supported_version, respond_or_close,
@@ -265,8 +265,8 @@ async fn alter_one(
         }
     };
 
-    match cache.lookup(bridge, name, deadline, API_NAME).await {
-        TopicLoad::Found(_) => {}
+    let topic = match cache.lookup(bridge, name, deadline, API_NAME).await {
+        TopicLoad::Found(topic) => *topic,
         TopicLoad::Missing => {
             return resource_error(resource, ERROR_UNKNOWN_TOPIC_OR_PARTITION, None);
         }
@@ -277,10 +277,10 @@ async fn alter_one(
         TopicLoad::NotStarted | TopicLoad::TimedOut => {
             return resource_error(resource, ERROR_REQUEST_TIMED_OUT, None);
         }
-    }
+    };
 
-    let expiry = match plan_incremental_update(&ops) {
-        Ok(expiry) => expiry,
+    let update = match plan_incremental(&ops, &topic, bridge.topic_defaults()) {
+        Ok(update) => update,
         Err(fault) => {
             return resource_error(
                 resource,
@@ -292,22 +292,24 @@ async fn alter_one(
     if validate_only {
         return resource_error(resource, ERROR_NONE, None);
     }
-    // Nothing named `retention.ms`, so there is nothing to store. Kafka answers an empty
-    // operation list, and a delete of an override that was never set, the same way.
-    let Some(expiry) = expiry else {
-        return resource_error(resource, ERROR_NONE, None);
-    };
-
-    write_expiry(bridge, resource, expiry, deadline).await
+    write_update(bridge, resource, &update, deadline).await
 }
 
-async fn write_expiry(
+/// Writes `update`. An empty one writes nothing: Kafka answers an empty operation list, and a
+/// delete of an override that was never set, the same way.
+async fn write_update(
     bridge: &IggyBridge,
     resource: &AlterConfigsResource,
-    expiry: IggyExpiry,
+    update: &TopicConfigUpdate,
     deadline: Instant,
 ) -> AlterConfigsResourceResponse {
     let name = resource.resource_name.as_str();
+    if update.is_empty() {
+        if let Some(policy) = update.cleanup_policy {
+            log_compaction(name, policy, false);
+        }
+        return resource_error(resource, ERROR_NONE, None);
+    }
     // Not started past the deadline and not wrapped in `timeout_at`: dropping the future does not
     // abort the SDK call. The bridge bounds its own round trip with `with_request_timeout`, so a
     // write can still commit after this handler answered REQUEST_TIMED_OUT.
@@ -318,8 +320,11 @@ async fn write_expiry(
         );
         return resource_error(resource, ERROR_REQUEST_TIMED_OUT, None);
     }
-    match bridge.update_kafka_topic_message_expiry(name, expiry).await {
+    match bridge.update_kafka_topic_config(name, update).await {
         Ok(()) | Err(BridgeError::Iggy(IggyError::RequestAlreadyApplied)) => {
+            if let Some(policy) = update.cleanup_policy {
+                log_compaction(name, policy, true);
+            }
             resource_error(resource, ERROR_NONE, None)
         }
         Err(error) => {
@@ -343,7 +348,10 @@ fn resource_error(
 
 #[cfg(test)]
 mod tests {
+    use iggy::prelude::IggyExpiry;
+
     use super::*;
+    use crate::bridge::SettingChange;
     use crate::protocol::acl::PrincipalPermissions;
 
     fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
@@ -401,13 +409,11 @@ mod tests {
     #[tokio::test]
     async fn given_a_passed_deadline_when_writing_should_answer_timed_out_without_calling_iggy() {
         let bridge = IggyBridge::offline();
-        let response = write_expiry(
-            &bridge,
-            &resource("orders"),
-            IggyExpiry::NeverExpire,
-            Instant::now(),
-        )
-        .await;
+        let update = TopicConfigUpdate {
+            message_expiry: Some(SettingChange::Set(IggyExpiry::NeverExpire)),
+            ..TopicConfigUpdate::default()
+        };
+        let response = write_update(&bridge, &resource("orders"), &update, Instant::now()).await;
         // A write started on the offline bridge fails fast as NOT_LEADER_OR_FOLLOWER instead.
         assert_eq!(response.error_code, ERROR_REQUEST_TIMED_OUT);
         assert!(response.error_message.is_none());
