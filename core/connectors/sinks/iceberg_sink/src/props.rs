@@ -16,6 +16,7 @@
 // under the License.
 
 use super::{Error, IcebergSinkConfig, IcebergSinkStoreClass};
+use secrecy::ExposeSecret;
 use std::collections::HashMap;
 
 pub fn init_props(config: &IcebergSinkConfig) -> Result<HashMap<String, String>, Error> {
@@ -36,10 +37,13 @@ fn get_props_s3(config: &IcebergSinkConfig) -> Result<HashMap<String, String>, E
     );
     match (&config.store_access_key_id, &config.store_secret_access_key) {
         (Some(access_key_id), Some(secret_access_key)) => {
-            props.insert("s3.access-key-id".to_string(), access_key_id.clone());
+            props.insert(
+                "s3.access-key-id".to_string(),
+                access_key_id.expose_secret().to_owned(),
+            );
             props.insert(
                 "s3.secret-access-key".to_string(),
-                secret_access_key.clone(),
+                secret_access_key.expose_secret().to_owned(),
             );
         }
         (None, None) => {}
@@ -54,6 +58,7 @@ fn get_props_s3(config: &IcebergSinkConfig) -> Result<HashMap<String, String>, E
 mod tests {
     use super::*;
     use crate::{IcebergSinkConfig, IcebergSinkStoreClass, IcebergSinkTypes};
+    use secrecy::SecretString;
 
     fn base_config() -> IcebergSinkConfig {
         IcebergSinkConfig {
@@ -96,8 +101,8 @@ mod tests {
     #[test]
     fn test_get_props_s3_full_credentials() {
         let config = IcebergSinkConfig {
-            store_access_key_id: Some("admin".to_string()),
-            store_secret_access_key: Some("password".to_string()),
+            store_access_key_id: Some(SecretString::from("admin")),
+            store_secret_access_key: Some(SecretString::from("password")),
             ..base_config()
         };
         let props = get_props_s3(&config).expect("Should succeed with full credentials");
@@ -108,9 +113,23 @@ mod tests {
     }
 
     #[test]
+    fn given_store_credentials_when_the_config_is_debug_printed_should_redact_them() {
+        let config = IcebergSinkConfig {
+            store_access_key_id: Some(SecretString::from("AKIAEXAMPLEKEY")),
+            store_secret_access_key: Some(SecretString::from("example-secret-value")),
+            ..base_config()
+        };
+
+        let printed = format!("{config:?}");
+
+        assert!(!printed.contains("AKIAEXAMPLEKEY"), "{printed}");
+        assert!(!printed.contains("example-secret-value"), "{printed}");
+    }
+
+    #[test]
     fn test_get_props_s3_partial_access_key() {
         let config = IcebergSinkConfig {
-            store_access_key_id: Some("admin".to_string()),
+            store_access_key_id: Some(SecretString::from("admin")),
             store_secret_access_key: None,
             ..base_config()
         };
@@ -124,7 +143,7 @@ mod tests {
     fn test_get_props_s3_partial_secret_key() {
         let config = IcebergSinkConfig {
             store_access_key_id: None,
-            store_secret_access_key: Some("password".to_string()),
+            store_secret_access_key: Some(SecretString::from("password")),
             ..base_config()
         };
         assert!(

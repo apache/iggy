@@ -67,7 +67,7 @@ connection. The cost rules it out.
 
 The Argon2 verify runs on the shard's compio runtime, which has no blocking pool. A burst of Kafka
 connections therefore stalls that shard's entire request loop, including produce and fetch traffic that has
-nothing to do with authentication. The 8192 ceiling (`[metadata] clients_table_max`, `core/consensus/src/impls.rs:211`) is cluster-wide.
+nothing to do with authentication. The 8192 ceiling (`[metadata] clients_table_max`, `core/consensus/src/impls.rs:249`) is cluster-wide.
 So connection churn on the Kafka side turns directly into session-table pressure on the Iggy side.
 
 ## Why not a shared service account

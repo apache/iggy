@@ -92,6 +92,7 @@ jobs:
           download-deps: "false"
 
       - name: Setup Swift for examples
+        id: setup-swift
         if: matrix.task == 'examples-swift'
         uses: ./.github/actions/utils/setup-swift
         with:
@@ -102,6 +103,13 @@ jobs:
       - name: Build Swift examples
         if: matrix.task == 'examples-swift'
         run: swift build --package-path examples/swift/getting-started -Xswiftc -warnings-as-errors
+
+      - name: Save Swift build directory
+        if: matrix.task == 'examples-swift' && steps.setup-swift.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: examples/swift/getting-started/.build
+          key: ${{ steps.setup-swift.outputs.cache-key }}
 
       - name: Test Go examples
         if: matrix.task == 'examples-go'
