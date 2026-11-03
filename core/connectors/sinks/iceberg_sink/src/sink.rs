@@ -73,15 +73,17 @@ impl Sink for IcebergSink {
         );
 
         let catalog: Box<dyn Catalog> = init_catalog(&self.config).await?;
+        let invalid_rows = self.config.invalid_rows.unwrap_or_default();
 
         if self.config.dynamic_routing {
             self.router = Some(Box::new(DynamicRouter::new(
                 catalog,
                 self.config.dynamic_route_field.clone(),
+                invalid_rows,
             )))
         } else {
             self.router = Some(Box::new(
-                StaticRouter::new(catalog, &self.config.tables).await?,
+                StaticRouter::new(catalog, &self.config.tables, invalid_rows).await?,
             ));
         }
 

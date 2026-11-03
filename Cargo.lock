@@ -7590,10 +7590,11 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_iceberg_sink"
-version = "0.5.1-edge.1"
+version = "0.5.1-edge.2"
 dependencies = [
  "arrow-array 58.4.1",
  "arrow-json 58.4.1",
+ "arrow-schema 58.4.1",
  "async-trait",
  "dashmap",
  "iceberg",

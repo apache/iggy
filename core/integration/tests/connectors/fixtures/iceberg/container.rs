@@ -49,6 +49,7 @@ pub const ENV_SINK_STORE_SECRET: &str =
     "IGGY_CONNECTORS_SINK_ICEBERG_PLUGIN_CONFIG_STORE_SECRET_ACCESS_KEY";
 pub const ENV_SINK_STORE_REGION: &str = "IGGY_CONNECTORS_SINK_ICEBERG_PLUGIN_CONFIG_STORE_REGION";
 pub const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_ICEBERG_PATH";
+pub const ENV_SINK_INVALID_ROWS: &str = "IGGY_CONNECTORS_SINK_ICEBERG_PLUGIN_CONFIG_INVALID_ROWS";
 
 pub const ENV_AWS_ACCESS_KEY_ID: &str = "AWS_ACCESS_KEY_ID";
 pub const ENV_AWS_SECRET_ACCESS_KEY: &str = "AWS_SECRET_ACCESS_KEY";
@@ -454,6 +455,36 @@ impl TestFixture for IcebergPreCreatedFixture {
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
         self.inner.connectors_runtime_envs()
+    }
+}
+
+/// Same table as `IcebergPreCreatedFixture`, with a sink that skips rows that do not match it.
+pub struct IcebergSkipInvalidRowsFixture {
+    inner: IcebergPreCreatedFixture,
+}
+
+impl IcebergOps for IcebergSkipInvalidRowsFixture {
+    fn catalog_url(&self) -> &str {
+        self.inner.catalog_url()
+    }
+
+    fn http_client(&self) -> &HttpClient {
+        self.inner.http_client()
+    }
+}
+
+#[async_trait]
+impl TestFixture for IcebergSkipInvalidRowsFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            inner: IcebergPreCreatedFixture::setup().await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_SINK_INVALID_ROWS.to_string(), "skip".to_string());
+        envs
     }
 }
 

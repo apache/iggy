@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::InvalidRows;
 use crate::router::{Router, is_valid_namespaced_table, table_exists, write_data};
 use async_trait::async_trait;
 use iceberg::Catalog;
@@ -28,6 +29,7 @@ use tracing::{info, warn};
 pub struct DynamicRouter {
     catalog: Box<dyn Catalog>,
     route_field: String,
+    invalid_rows: InvalidRows,
 }
 
 pub struct DynamicWriter {
@@ -75,10 +77,11 @@ impl DynamicWriter {
 }
 
 impl DynamicRouter {
-    pub fn new(catalog: Box<dyn Catalog>, route_field: String) -> Self {
+    pub fn new(catalog: Box<dyn Catalog>, route_field: String, invalid_rows: InvalidRows) -> Self {
         Self {
             catalog,
             route_field,
+            invalid_rows,
         }
     }
 
@@ -155,18 +158,17 @@ impl Router for DynamicRouter {
                 None => continue,
             };
 
-            let data: Vec<Payload> = batch_messages.into_iter().map(|m| m.payload).collect();
-
             write_data(
-                &data,
+                &batch_messages,
                 table_obj,
                 self.catalog.as_ref(),
                 messages_metadata.schema,
+                self.invalid_rows,
             )
             .await?;
             info!(
                 "Dynamically routed {} messages to {} iceberg table",
-                data.len(),
+                batch_messages.len(),
                 table_name
             );
         }
