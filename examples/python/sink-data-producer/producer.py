@@ -19,11 +19,11 @@ import argparse
 import asyncio
 import json
 import os
-import secrets
+import random
 import string
-from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
+from urllib.parse import quote
 
 from apache_iggy import DirectProducerConfig, IggyClient, Partitioning
 from apache_iggy import SendMessage as Message
@@ -51,21 +51,12 @@ class ArgNamespace(NamedTuple):
     connection_string: str
 
 
-@dataclass
-class Record:
-    user_id: str
-    user_type: int
-    email: str
-    source: str
-    state: str
-    created_at: str
-    message: str
-
-
 def parse_args() -> ArgNamespace:
     address = os.getenv("IGGY_ADDRESS", "127.0.0.1:8090")
     username = os.getenv("IGGY_USERNAME", "iggy")
     password = os.getenv("IGGY_PASSWORD", "iggy")
+    encoded_username = quote(username, safe="")  # noqa: S311
+    encoded_password = quote(password, safe="")  # noqa: S311
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "connection_string",
@@ -73,7 +64,7 @@ def parse_args() -> ArgNamespace:
             "Connection string for Iggy, for example "
             "'iggy+tcp://iggy:iggy@127.0.0.1:8090'"
         ),
-        default=f"iggy+tcp://{username}:{password}@{address}",
+        default=f"iggy+tcp://{encoded_username}:{encoded_password}@{address}",
         nargs="?",
     )
     return ArgNamespace(**vars(parser.parse_args()))
@@ -81,28 +72,24 @@ def parse_args() -> ArgNamespace:
 
 def random_alnum(length: int) -> str:
     alphabet = string.ascii_letters + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(length))
+    return "".join(random.choices(alphabet, k=length))  # noqa: S311
 
 
-def random_record() -> Record:
-    source = SOURCES[secrets.randbelow(len(SOURCES))]
-    state = STATES[secrets.randbelow(len(STATES))]
-    email = (
-        f"{random_alnum(3 + secrets.randbelow(17))}"
-        f"@{DOMAINS[secrets.randbelow(len(DOMAINS))]}"
-    )
-    created_at = (
-        datetime.now(UTC) - timedelta(days=secrets.randbelow(1000))
-    ).isoformat()
-    return Record(
-        user_id=f"user_{1 + secrets.randbelow(99)}",
-        user_type=1 + secrets.randbelow(4),
-        email=email,
-        source=source,
-        state=state,
-        message=random_alnum(10 + secrets.randbelow(90)),
-        created_at=created_at,
-    )
+def random_record() -> dict:
+    return {
+        "user_id": f"user_{1 + random.randrange(99)}",  # noqa: S311
+        "user_type": 1 + random.randrange(4),  # noqa: S311
+        "email": (
+            f"{random_alnum(3 + random.randrange(17))}"  # noqa: S311
+            f"@{DOMAINS[random.randrange(len(DOMAINS))]}"  # noqa: S311
+        ),
+        "source": SOURCES[random.randrange(len(SOURCES))],  # noqa: S311
+        "state": STATES[random.randrange(len(STATES))],  # noqa: S311
+        "message": random_alnum(10 + random.randrange(90)),  # noqa: S311
+        "created_at": (
+            datetime.now(UTC) - timedelta(days=random.randrange(1000))  # noqa: S311
+        ).isoformat(),
+    }
 
 
 async def main() -> None:
@@ -126,22 +113,19 @@ async def main() -> None:
         create_topic_if_not_exists=True,
     )
 
-    batches_count = 0
     total_msg = 0
 
     async with producer:
-        while batches_count < MAX_BATCHES:
-            records_count = MIN_RECORDS_PER_BATCH + secrets.randbelow(
+        for _ in range(MAX_BATCHES):
+            records_count = MIN_RECORDS_PER_BATCH + random.randrange(  # noqa: S311
                 MAX_RECORDS_PER_BATCH - MIN_RECORDS_PER_BATCH
             )
             messages = [
-                Message(json.dumps(asdict(random_record())))
-                for _ in range(records_count)
+                Message(json.dumps(random_record())) for _ in range(records_count)
             ]
             await producer.send(messages)
             logger.info(f"Sent {records_count} messages")
             total_msg += records_count
-            batches_count += 1
 
     logger.info("Reached maximum batches count")
     logger.info(f"Produced {total_msg} messages.")

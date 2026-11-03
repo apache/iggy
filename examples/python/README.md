@@ -167,6 +167,8 @@ Environment variables:
 - `IGGY_USERNAME` - authentication username (default: `iggy`)
 - `IGGY_PASSWORD` - authentication password (default: `iggy`)
 
+When a connection string is provided through the command line, it takes precedence over and replaces the `IGGY_ADDRESS`, `IGGY_USERNAME`, and `IGGY_PASSWORD` environment variables.
+
 The producer checks for and creates the stream and topic if they are missing. It
 retains the stream and topic after execution and does not delete them.
 
