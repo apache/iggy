@@ -21,7 +21,8 @@
 //! `kafka_protocol`'s client-side decoder reads, the way a consumer would.
 
 use std::collections::BTreeMap;
-use std::mem::offset_of;
+use std::future::Future;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,10 +31,6 @@ use futures::future::join_all;
 use iggy::prelude::{
     HeaderKey, HeaderValue, Identifier, IggyMessage, MessageClient, Partitioning, TopicClient,
 };
-use iggy_binary_protocol::WireDecode;
-use iggy_binary_protocol::codes::{POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE};
-use iggy_binary_protocol::consensus::{HEADER_SIZE, Operation, RequestHeader};
-use iggy_binary_protocol::requests::messages::{DeferredPollMessagesRequest, PollMessagesRequest};
 use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
 use kafka_protocol::messages::fetch_response::PartitionData;
@@ -47,10 +44,6 @@ use kafka_protocol::records::{
     RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
 };
 use serial_test::serial;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -64,8 +57,11 @@ use iggy_gateway_kafka::records::{MAPPING_VERSION, TimestampWindow, VERSION_HEAD
 
 #[path = "common/iggy_server.rs"]
 mod iggy_server;
+#[path = "common/poll_relay.rs"]
+mod poll_relay;
 
 use iggy_server::{TestServer, raw_client};
+use poll_relay::PollRelay;
 
 /// The stream every unmapped Kafka topic resolves to, per `TopicMapping`'s default rule.
 const STREAM: &str = "kafka";
@@ -78,9 +74,14 @@ const VERSION: i16 = 12;
 const PARTITION_MAX_BYTES: i32 = 1024 * 1024;
 /// A Fetch that finds records or an error answers well inside this.
 const PROMPT: Duration = Duration::from_secs(5);
-/// The handler's limit on one Iggy poll, and how long a partition then answers 6 without a poll.
+/// The handler's time for one Iggy poll, and for a read to start its polls.
 const POLL_DEADLINE: Duration = Duration::from_secs(2);
-const UNREACHABLE_FOR: Duration = Duration::from_secs(2);
+/// The most a poll of a partition whose pages took long may take.
+const MAX_POLL_ALLOWANCE: Duration = Duration::from_secs(10);
+/// The longest pause between two re-checks of a stalled partition.
+const MAX_RECHECK_PAUSE: Duration = Duration::from_secs(8);
+/// How much sooner than the gateway the SDK stops a poll, with room for the timer.
+const SDK_STOP_ROOM: Duration = Duration::from_millis(100);
 /// Room for a request that makes no Iggy call that waits.
 const AT_ONCE: Duration = Duration::from_millis(500);
 
@@ -861,84 +862,20 @@ async fn given_read_committed_when_fetching_should_set_last_stable_offset_to_hig
     assert_eq!(offsets(partition), vec![0, 1]);
 }
 
-/// `server`'s bridge config, with every Iggy connection through a relay that drops each poll of
-/// the `stalled` partitions while `stall` holds `true`. Iggy then never answers those polls, as
-/// when the node of a partition stops.
-async fn relay_stalling(
-    server: &TestServer,
-    stalled: &'static [u32],
-    stall: watch::Receiver<bool>,
-) -> IggyBridgeConfig {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("relay");
-    let mut config = server.test_config();
-    let relay = listener.local_addr().expect("relay address").to_string();
-    let upstream = std::mem::replace(&mut config.address, relay);
-    tokio::spawn(async move {
-        while let Ok((inbound, _)) = listener.accept().await {
-            let outbound = TcpStream::connect(&upstream).await.expect("upstream");
-            let stall = stall.clone();
-            tokio::spawn(async move {
-                let (mut requests, mut replies) = inbound.into_split();
-                let (mut responses, mut writes) = outbound.into_split();
-                tokio::select! {
-                    () = pass_requests(&mut requests, &mut writes, stalled, &stall) => {}
-                    _ = copy(&mut responses, &mut replies) => {}
-                }
-            });
-        }
-    });
-    config
+/// The read slots of a gateway with one, so a poll that keeps it would hold up every other read.
+const ONE_SLOT: NonZeroUsize = NonZeroUsize::MIN;
+
+/// `work`, with how long it took.
+async fn timed<T>(work: impl Future<Output = T>) -> (T, Duration) {
+    let started = Instant::now();
+    let done = work.await;
+    (done, started.elapsed())
 }
 
-/// Passes request frames on until a side closes, except each poll of a `stalled` partition while
-/// `stall` holds `true`.
-async fn pass_requests(
-    requests: &mut OwnedReadHalf,
-    writes: &mut OwnedWriteHalf,
-    stalled: &[u32],
-    stall: &watch::Receiver<bool>,
-) {
-    let mut header = [0; HEADER_SIZE];
-    let size_at = offset_of!(RequestHeader, size);
-    loop {
-        if requests.read_exact(&mut header).await.is_err() {
-            return;
-        }
-        let size = u32::from_le_bytes(header[size_at..size_at + 4].try_into().expect("4 bytes"));
-        let mut body = vec![0; usize::try_from(size).expect("a frame size") - HEADER_SIZE];
-        if requests.read_exact(&mut body).await.is_err() {
-            return;
-        }
-        if *stall.borrow()
-            && polled_partition(&header, &body).is_some_and(|polled| stalled.contains(&polled))
-        {
-            continue;
-        }
-        if writes.write_all(&header).await.is_err() || writes.write_all(&body).await.is_err() {
-            return;
-        }
-    }
-}
-
-/// The partition that a request frame polls, if it is a poll. The SDK sends a poll with options,
-/// as the bridge's are, as a deferred poll.
-fn polled_partition(header: &[u8; HEADER_SIZE], body: &[u8]) -> Option<u32> {
-    let code_at = offset_of!(RequestHeader, reserved);
-    let code = u32::from_le_bytes(header[code_at..code_at + 4].try_into().ok()?);
-    if header[offset_of!(RequestHeader, operation)] != Operation::NonReplicated as u8 {
-        return None;
-    }
-    match code {
-        POLL_MESSAGES_CODE => PollMessagesRequest::decode(body).ok()?.0.partition_id,
-        POLL_MESSAGES_DEFERRED_CODE => {
-            DeferredPollMessagesRequest::decode(body)
-                .ok()?
-                .0
-                .poll
-                .partition_id
-        }
-        _ => None,
-    }
+/// Whether a request took one poll time: its unanswered polls ended together. The SDK ends a poll
+/// with no answer a little before its time.
+fn one_poll_time(took: Duration) -> bool {
+    took >= POLL_DEADLINE.saturating_sub(SDK_STOP_ROOM) && took < POLL_DEADLINE + AT_ONCE
 }
 
 #[tokio::test]
@@ -947,51 +884,197 @@ async fn given_partitions_whose_polls_go_unanswered_when_fetching_should_serve_t
 {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
-    let (stall, stalled) = watch::channel(true);
-    let mut config = relay_stalling(&server, &[1, 2], stalled).await;
-    // One read slot, so a poll that keeps it would hold up every other read too.
-    config.fetch_slots = 1;
+    let relay = PollRelay::start(&server, &[1, 2]).await;
+    let mut config = relay.config(&server);
+    config.fetch_slots = ONE_SLOT;
     let state = gateway_on(config, 3).await;
     for (partition, value) in [(0, b"a"), (1, b"b"), (2, b"c")] {
         store(&server, partition, &[keyed(value)]).await;
     }
+    relay.stall(true);
 
     // The stalled partitions come first, and their polls run at once. Read in turn, each would
     // hold up the partitions after it.
     let all = request(TOPIC, &[(1, 0), (2, 0), (0, 0)]).with_max_wait_ms(0);
-    let started = Instant::now();
-    let response = fetch(&state, &all).await;
-    let took = started.elapsed();
+    let (response, took) = timed(fetch(&state, &all)).await;
     let partitions = &response.responses[0].partitions;
     assert_refused(&partitions[0], ERROR_NOT_LEADER_OR_FOLLOWER);
     assert_refused(&partitions[1], ERROR_NOT_LEADER_OR_FOLLOWER);
     assert_eq!(values(&partitions[2]), vec![Some(Bytes::from_static(b"a"))]);
     assert!(
-        took >= POLL_DEADLINE && took < POLL_DEADLINE + AT_ONCE,
-        "the unanswered polls end together, at their own deadline: {took:?}"
+        one_poll_time(took),
+        "the unanswered polls end together: {took:?}"
     );
+    let dialed = relay.connections();
 
-    // Their consumers now get 6 without a poll, and the one slot stays free for partition 0.
+    // Their consumers now get 6 with no poll, and the one slot stays free for partition 0. The
+    // re-checks of partition 1 wait for Iggy beside the requests, so this holds for the whole
+    // stall, through re-checks that get no answer either.
     let stalled_one = request(TOPIC, &[(1, 0)]).with_max_wait_ms(0);
     let healthy = request(TOPIC, &[(0, 0)]).with_max_wait_ms(0);
-    let started = Instant::now();
-    let (refusals, other) = tokio::join!(
-        join_all((0..8).map(|_| fetch(&state, &stalled_one))),
-        fetch(&state, &healthy),
-    );
-    let took = started.elapsed();
-    for response in &refusals {
-        assert_refused(only(response), ERROR_NOT_LEADER_OR_FOLLOWER);
+    let stall_ends = Instant::now() + MAX_RECHECK_PAUSE + POLL_DEADLINE;
+    while Instant::now() < stall_ends {
+        let ((refusals, other), took) = timed(async {
+            tokio::join!(
+                join_all((0..8).map(|_| fetch(&state, &stalled_one))),
+                fetch(&state, &healthy),
+            )
+        })
+        .await;
+        for response in &refusals {
+            assert_refused(only(response), ERROR_NOT_LEADER_OR_FOLLOWER);
+        }
+        assert_eq!(values(only(&other)), vec![Some(Bytes::from_static(b"a"))]);
+        assert!(took < AT_ONCE, "nothing waits for partition 1: {took:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert_eq!(values(only(&other)), vec![Some(Bytes::from_static(b"a"))]);
-    assert!(took < AT_ONCE, "nothing waits for partition 1: {took:?}");
 
-    // Once Iggy answers again, the first poll after the pause serves the records.
-    stall.send(false).expect("the relay watches");
-    tokio::time::sleep(UNREACHABLE_FOR).await;
-    let response = fetch(&state, &stalled_one).await;
+    // Iggy now answers the kept polls late, on the connections they came in on. The next
+    // re-check that answers ends the stall, and partition 1 serves again.
+    relay.stall(false);
+    let serves_by = Instant::now() + MAX_RECHECK_PAUSE + POLL_DEADLINE + AT_ONCE;
+    loop {
+        let response = fetch(&state, &stalled_one).await;
+        let partition = only(&response);
+        if partition.error_code == ERROR_NONE {
+            assert_eq!(values(partition), vec![Some(Bytes::from_static(b"b"))]);
+            break;
+        }
+        assert_refused(partition, ERROR_NOT_LEADER_OR_FOLLOWER);
+        assert!(Instant::now() < serves_by, "partition 1 still stalls");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert_eq!(
-        values(only(&response)),
-        vec![Some(Bytes::from_static(b"b"))]
+        relay.connections(),
+        dialed,
+        "every client kept its connection through the stall"
+    );
+}
+
+/// A Fetch that queues for the one slot while the first poll of a stalled partition runs placed
+/// the partition before the stall showed. It checks again once it has the slot, and answers 6
+/// with no poll, so the healthy Fetch behind it waits for one poll time, not two.
+#[tokio::test]
+#[serial]
+async fn given_fetches_queued_behind_a_poll_that_gets_no_answer_when_they_get_the_slot_should_not_poll_again()
+ {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let relay = PollRelay::start(&server, &[1]).await;
+    let mut config = relay.config(&server);
+    config.fetch_slots = ONE_SLOT;
+    let state = gateway_on(config, 2).await;
+    for (partition, value) in [(0, b"a"), (1, b"b")] {
+        store(&server, partition, &[keyed(value)]).await;
+    }
+    let stalled_one = request(TOPIC, &[(1, 0)]).with_max_wait_ms(0);
+    let healthy = request(TOPIC, &[(0, 0)]).with_max_wait_ms(0);
+    let later = |millis| tokio::time::sleep(Duration::from_millis(millis));
+    // Connects the probe and slot clients, so the first poll starts at once.
+    let warm = fetch(&state, &healthy).await;
+    assert_eq!(values(only(&warm)), vec![Some(Bytes::from_static(b"a"))]);
+    relay.stall(true);
+
+    let (first, queued, (other, took)) = tokio::join!(
+        fetch(&state, &stalled_one),
+        async {
+            later(100).await;
+            fetch(&state, &stalled_one).await
+        },
+        async {
+            later(200).await;
+            timed(fetch(&state, &healthy)).await
+        },
+    );
+    assert_refused(only(&first), ERROR_NOT_LEADER_OR_FOLLOWER);
+    assert_refused(only(&queued), ERROR_NOT_LEADER_OR_FOLLOWER);
+    assert_eq!(values(only(&other)), vec![Some(Bytes::from_static(b"a"))]);
+    assert!(
+        took < POLL_DEADLINE + AT_ONCE,
+        "the healthy Fetch waits only for the first poll: {took:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn given_more_stalled_partitions_than_polls_at_once_when_fetching_should_answer_in_one_poll_time()
+ {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let relay = PollRelay::start(&server, &[0, 1, 2, 3, 4, 5, 6, 7, 8]).await;
+    let state = gateway_on(relay.config(&server), 10).await;
+    for partition in 0..10 {
+        store(&server, partition, &[keyed(b"z")]).await;
+    }
+    relay.stall(true);
+    let every: Vec<(i32, i64)> = (0..10).map(|partition| (partition, 0)).collect();
+    let all = request(TOPIC, &every).with_max_wait_ms(0);
+    let healthy = 9;
+
+    // 8 polls run at once, and the read waits for none past one poll time. So the 9th answers 0
+    // with no records rather than hold the read for one more poll time. The 10th answers 0 too,
+    // with its record if its poll answered by then.
+    let (response, took) = timed(fetch(&state, &all)).await;
+    let partitions = &response.responses[0].partitions;
+    for partition in &partitions[..8] {
+        assert_refused(partition, ERROR_NOT_LEADER_OR_FOLLOWER);
+    }
+    assert_eq!(partitions[8].error_code, ERROR_NONE);
+    assert_eq!(records(&partitions[8]), []);
+    assert_eq!(partitions[healthy].error_code, ERROR_NONE);
+    assert!(one_poll_time(took), "{took:?}");
+
+    // The first 8 stall and answer 6 with no poll. The 9th gets no answer, and the 10th serves.
+    let (response, took) = timed(fetch(&state, &all)).await;
+    let partitions = &response.responses[0].partitions;
+    for partition in &partitions[..healthy] {
+        assert_refused(partition, ERROR_NOT_LEADER_OR_FOLLOWER);
+    }
+    let z = vec![Some(Bytes::from_static(b"z"))];
+    assert_eq!(values(&partitions[healthy]), z);
+    assert!(one_poll_time(took), "{took:?}");
+
+    // Every stalled partition answers 6 at once now.
+    let (response, took) = timed(fetch(&state, &all)).await;
+    let partitions = &response.responses[0].partitions;
+    for partition in &partitions[..healthy] {
+        assert_refused(partition, ERROR_NOT_LEADER_OR_FOLLOWER);
+    }
+    assert_eq!(values(&partitions[healthy]), z);
+    assert!(took < AT_ONCE, "{took:?}");
+}
+
+#[tokio::test]
+#[serial]
+async fn given_a_record_slower_to_send_than_one_poll_time_when_fetching_should_still_serve_it() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let relay = PollRelay::start(&server, &[]).await;
+    let state = gateway_on(relay.config(&server), 1).await;
+    let large = vec![b'x'; 3 * 1024 * 1024];
+    store(&server, 0, &[keyed(&large)]).await;
+    // About 3 s for the record, longer than one poll time.
+    relay.pace(Some(1024 * 1024));
+
+    let one = request(TOPIC, &[(0, 0)]).with_max_wait_ms(0);
+    let serves_by = Instant::now() + 2 * MAX_POLL_ALLOWANCE;
+    let mut codes = Vec::new();
+    let served = loop {
+        let response = tokio::time::timeout(MAX_POLL_ALLOWANCE, fetch_at(&state, VERSION, &one))
+            .await
+            .expect("no poll takes longer than the SDK's limit");
+        let partition = only(&response).clone();
+        codes.push(partition.error_code);
+        if !records(&partition).is_empty() {
+            break partition;
+        }
+        assert!(Instant::now() < serves_by, "never served: {codes:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(values(&served), vec![Some(Bytes::from(large))]);
+    assert_eq!(
+        codes.first(),
+        Some(&ERROR_NOT_LEADER_OR_FOLLOWER),
+        "the first poll had too little time: {codes:?}"
     );
 }

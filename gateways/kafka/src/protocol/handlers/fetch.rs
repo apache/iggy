@@ -24,10 +24,9 @@ use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::stream::{FuturesUnordered, StreamExt};
 use iggy::prelude::{
     DEFAULT_POLL_MAX_BYTES, IGGY_MESSAGE_HEADER_SIZE, IggyError, IggyMessage, PollOptions,
-    PolledMessages,
+    PolledMessages, PollingStrategy,
 };
 use kafka_protocol::indexmap::IndexSet;
 use kafka_protocol::messages::fetch_response::{FetchableTopicResponse, PartitionData};
@@ -35,9 +34,12 @@ use kafka_protocol::messages::{FetchRequest, FetchResponse};
 use kafka_protocol::protocol::Encodable;
 use kafka_protocol::records::Record;
 use tokio::sync::watch;
-use tokio::time::{Instant, sleep_until};
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, sleep_until, timeout_at};
 
-use crate::bridge::iggy_bridge::{FetchSlot, ONE_MESSAGE_MAX_BYTES, PartitionProbe, TopicProbe};
+use crate::bridge::iggy_bridge::{
+    FetchClient, FetchSlot, ONE_MESSAGE_MAX_BYTES, PartitionProbe, TopicProbe,
+};
 use crate::bridge::topic_map::validate_kafka_topic_name;
 use crate::bridge::{BridgeError, IggyBridge};
 use crate::error::Result;
@@ -80,14 +82,24 @@ const UNPLACED_GRACE: Duration = Duration::from_secs(30);
 /// How long the last good probe of a topic stands in while its refreshes fail.
 const LAST_GOOD_TTL: Duration = Duration::from_secs(30);
 
-/// Longest one Iggy poll may take. A partition whose node stopped then answers 6 long before the
-/// request deadline, and the other partitions of the request still answer.
-const POLL_DEADLINE: Duration = Duration::from_secs(2);
-/// First polls that one request runs at once. See [`Reader::first_polls`].
-const POLLS_AT_ONCE: usize = 8;
-/// How long a partition whose poll ran out of [`POLL_DEADLINE`] answers 6 without a poll, for the
-/// whole gateway. Its consumers then do not each spend a read slot on it.
-const UNREACHABLE_FOR: Duration = Duration::from_secs(2);
+/// How long one Iggy poll of a partition may take, unless its pages took longer before. A
+/// partition whose node stopped then answers 6 long before the request deadline, and the other
+/// partitions of the request still answer. A read also starts polls only this long after it takes
+/// its slot.
+pub(crate) const POLL_DEADLINE: Duration = Duration::from_secs(2);
+/// The most a poll of a partition whose pages took long may take. The SDK's own limit for a poll
+/// that does not wait, so no poll had longer before.
+const MAX_POLL_ALLOWANCE: Duration = Duration::from_secs(10);
+/// Polls that one read or `ListOffsets` request runs at once. See [`ReadAhead`].
+pub(crate) const POLLS_AT_ONCE: usize = 8;
+/// The pause after the first poll of a partition that got no answer before its re-check. It
+/// doubles with each re-check that gets no answer either, up to [`MAX_RECHECK_PAUSE`].
+const RECHECK_PAUSE: Duration = Duration::from_millis(500);
+/// The longest pause between two re-checks of a stalled partition. So a partition stays stalled
+/// for at most about this pause and one poll time after its node answers again.
+const MAX_RECHECK_PAUSE: Duration = Duration::from_secs(8);
+/// How often the log warns again of a partition that stays stalled.
+const STALL_WARN_EVERY: Duration = Duration::from_secs(30);
 
 /// Most messages one partition read takes from Iggy, over all its polls.
 const MAX_POLL_COUNT: u32 = 1000;
@@ -452,6 +464,22 @@ impl<'a> Fetch<'a> {
         sight_loading(&self.state.loading, topic, partition, Instant::now())
     }
 
+    /// How long a poll of `partition` of `topic` that starts at `now` may take. `None` while the
+    /// partition stalls, and then its re-check starts at `end` when one is due. See
+    /// [`PollRecord`].
+    fn admit(&self, topic: &str, partition: u32, end: u64, now: Instant) -> Option<Duration> {
+        let records = &self.state.poll_records;
+        match admit(records, topic, partition, now) {
+            Admit::Poll(allowance) => Some(allowance),
+            Admit::Stalled { recheck_due } => {
+                if recheck_due {
+                    recheck(self.bridge, records, topic, partition, end);
+                }
+                None
+            }
+        }
+    }
+
     /// Probes until the bytes waiting reach `min_bytes`, a partition fails, or `wait_until`
     /// passes. Holds no slot while it waits.
     ///
@@ -727,8 +755,8 @@ fn position(want: &Wanted<'_>, probes: &Probes) -> Position {
 
 /// Reads partitions in request order, as Kafka does from v3, and spends one byte budget on them.
 ///
-/// The first poll of each partition runs ahead, at the same time as the others. See
-/// [`Reader::first_polls`].
+/// The first poll of each partition runs ahead of the read, at most [`POLLS_AT_ONCE`] at once.
+/// See [`ReadAhead`].
 struct Reader<'a> {
     fetch: &'a Fetch<'a>,
     bytes_left: usize,
@@ -736,15 +764,31 @@ struct Reader<'a> {
     /// the limits say (KIP-74). A record larger than every limit would stall the consumer
     /// otherwise.
     owes_first_record: bool,
-    /// Taken at the first poll, and freed before the probes that decide empty polls.
+    /// Taken before the first poll, and freed before the probes that decide empty polls.
     slot: Option<FetchSlot>,
+    /// The end of the read's polls: [`POLL_DEADLINE`] after it took its slot. No poll starts
+    /// after it, and the read waits past it only for a partition whose pages took long. So a read
+    /// that meets partitions that stall holds its slot for about one poll's time, however many
+    /// stall. The partitions that it did not read by then answer 0 with no records.
+    polls_until: Instant,
 }
 
 /// One poll's answer, with when it went out.
 struct PollOutcome {
     asked: Instant,
-    /// `None` once the request ran out of time.
-    page: Option<core::result::Result<PolledMessages, BridgeError>>,
+    page: Page,
+}
+
+/// What one poll of a partition brought.
+enum Page {
+    /// Iggy answered, with records or a refusal, or [`BridgeError::Timeout`] when it did not
+    /// answer in the poll's time.
+    Polled(core::result::Result<PolledMessages, BridgeError>),
+    /// The partition stalled before the poll could start. It answers 6.
+    Stalled,
+    /// No poll ran, or the request ran out of time first: no answer either way. The partition
+    /// answers 0 with no records.
+    Unread,
 }
 
 /// What reading one partition gave.
@@ -781,6 +825,7 @@ impl<'a> Reader<'a> {
             bytes_left: fetch.response_bytes,
             owes_first_record: true,
             slot: None,
+            polls_until: fetch.give_up_at,
         }
     }
 
@@ -792,10 +837,21 @@ impl<'a> Reader<'a> {
             .iter()
             .map(|want| self.place(want, probes))
             .collect();
-        let mut first_polls = self.first_polls(&positions).await;
+        let plan = plan_first_polls(
+            &fetch.wanted,
+            &positions,
+            self.bytes_left,
+            self.owes_first_record,
+        );
+        let mut ahead = ReadAhead::new(plan);
+        if ahead.has_polls() {
+            // With no slot by the deadline, each read finds none in its turn either.
+            self.client().await;
+        }
         let mut answers = Vec::with_capacity(fetch.wanted.len());
         let mut empty = Vec::new();
-        for ((want, position), first) in fetch.wanted.iter().zip(positions).zip(&mut first_polls) {
+        for (index, (want, position)) in fetch.wanted.iter().zip(positions).enumerate() {
+            self.start_ahead(&mut ahead, index);
             let read = match position {
                 Position::Refused(code) => Read::Done(refused(want.partition, code)),
                 Position::CaughtUp { at, probe } => {
@@ -804,12 +860,13 @@ impl<'a> Reader<'a> {
                 }
                 Position::Behind { at, offset, probe } => {
                     let polled = Polled::new(offset, probe.high_watermark);
-                    self.read(want, at, offset, probe, polled, first.take())
-                        .await
+                    let first = ahead.take(index).await;
+                    self.read(want, at, offset, probe, polled, first).await
                 }
                 Position::Unsure { at, offset, probe }
                 | Position::Loading { at, offset, probe } => {
-                    self.settle(want, at, offset, probe, first.take()).await
+                    let first = ahead.take(index).await;
+                    self.settle(want, at, offset, probe, first).await
                 }
             };
             let answer = match read {
@@ -831,8 +888,8 @@ impl<'a> Reader<'a> {
     }
 
     /// [`position`], refused when no poll may run: 6 for a partition that reads as loading, for
-    /// [`UNPLACED_GRACE`], and for one whose poll ran out of time, for [`UNREACHABLE_FOR`]. -1
-    /// while this connection holds the partition at the offset.
+    /// [`UNPLACED_GRACE`], and for one that stalls (see [`PollRecord`]). -1 while this connection
+    /// holds the partition at the offset.
     ///
     /// Past the grace a poll decides a load, so counters that drifted cannot stall a consumer.
     fn place(&self, want: &Wanted<'_>, probes: &Probes) -> Position {
@@ -842,96 +899,106 @@ impl<'a> Reader<'a> {
         {
             return Position::Refused(ERROR_NOT_LEADER_OR_FOLLOWER);
         }
-        let (Position::Behind { at, offset, .. }
-        | Position::Unsure { at, offset, .. }
-        | Position::Loading { at, offset, .. }) = position
+        let (Position::Behind { at, offset, probe }
+        | Position::Unsure { at, offset, probe }
+        | Position::Loading { at, offset, probe }) = position
         else {
             return position;
         };
-        let (stuck, now) = (&self.fetch.connection.stuck_offsets, Instant::now());
-        if held(stuck, want.topic, at.index, offset, now) {
+        let (fetch, now) = (self.fetch, Instant::now());
+        if held(
+            &fetch.connection.stuck_offsets,
+            want.topic,
+            at.index,
+            offset,
+            now,
+        ) {
             Position::Refused(ERROR_UNKNOWN_SERVER_ERROR)
-        } else if unreachable(&self.fetch.state.unreachable, want.topic, at.index, now) {
+        } else if fetch
+            .admit(want.topic, at.index, probe.high_watermark, now)
+            .is_none()
+        {
             Position::Refused(ERROR_NOT_LEADER_OR_FOLLOWER)
         } else {
             position
         }
     }
 
-    /// The first poll of each partition that polls, at most [`POLLS_AT_ONCE`] at a time. Read in
-    /// turn, a partition that Iggy holds up would hold up each partition after it, by up to
-    /// [`POLL_DEADLINE`] each.
+    /// Starts the first polls that `ahead` holds, up to [`POLLS_AT_ONCE`] running from the
+    /// partition at `cursor` on, while the read may start polls.
     ///
-    /// Plans the byte budget in request order, the way [`Self::read`] spends it, from what the
-    /// probes expect. A partition with no budget in the plan polls in its turn, if the reads before
-    /// it leave room. A first poll asks for what fits the planned budget, and its read keeps what
-    /// fits the budget it really gets. So a request reads at most one page more per partition than
-    /// it serves.
-    async fn first_polls(&mut self, positions: &[Position]) -> Vec<Option<PollOutcome>> {
-        let fetch = self.fetch;
-        let mut planned = Vec::new();
-        let (mut bytes_left, mut owes_first_record) = (self.bytes_left, self.owes_first_record);
-        for (index, (want, position)) in fetch.wanted.iter().zip(positions).enumerate() {
-            let (at, offset, probe, behind) = match *position {
-                Position::Behind { at, offset, probe } => (at, offset, probe, true),
-                Position::Unsure { at, offset, probe }
-                | Position::Loading { at, offset, probe } => (at, offset, probe, false),
-                Position::Refused(_) | Position::CaughtUp { .. } => continue,
-            };
-            let budget = want.max_bytes.min(bytes_left);
-            if !worth_polling(owes_first_record, budget, probe.average_size) {
-                continue;
-            }
-            let count = if behind {
-                let expected = bytes_waiting(offset, probe, budget);
-                bytes_left =
-                    bytes_left.saturating_sub(usize::try_from(expected).unwrap_or(usize::MAX));
-                owes_first_record &= expected == 0;
-                next_page(
-                    &Polled::new(offset, probe.high_watermark),
-                    budget,
-                    probe.average_size,
-                )
-            } else {
-                Some(poll_count(
-                    budget,
-                    probe.average_size,
-                    u64::from(MAX_POLL_COUNT),
-                ))
-            };
-            if let Some(count) = count {
-                planned.push(PlannedPoll {
-                    index,
-                    topic: want.topic,
-                    partition: at.index,
-                    offset,
-                    options: page_options(count, budget),
-                });
-            }
-        }
-        let mut first_polls: Vec<Option<PollOutcome>> = std::iter::repeat_with(|| None)
-            .take(fetch.wanted.len())
-            .collect();
-        if planned.is_empty() {
-            return first_polls;
-        }
-        // With no slot by the deadline, each read finds none in its turn either.
-        let Some(slot) = self.slot().await else {
-            return first_polls;
+    /// Each checks its partition again as it starts, since the slot can come long after the read
+    /// placed it: one that stalled meanwhile answers 6 with no poll.
+    fn start_ahead(&self, ahead: &mut ReadAhead, cursor: usize) {
+        let Some(slot) = &self.slot else {
+            return;
         };
-        let mut planned = planned.into_iter();
-        let mut running: FuturesUnordered<_> = planned
-            .by_ref()
-            .take(POLLS_AT_ONCE)
-            .map(|poll| first_poll(fetch, slot, poll))
-            .collect();
-        while let Some((index, outcome)) = running.next().await {
-            first_polls[index] = Some(outcome);
-            if let Some(poll) = planned.next() {
-                running.push(first_poll(fetch, slot, poll));
-            }
+        if Instant::now() >= self.polls_until {
+            return;
         }
-        first_polls
+        let client = slot.client();
+        while let Some((index, poll)) = ahead.next_due(cursor) {
+            let started = self.start(&client, index, poll);
+            ahead.started(index, started);
+        }
+    }
+
+    /// Starts `poll`, the first poll of the partition at `index`, unless its partition stalled
+    /// since the read placed it.
+    fn start(&self, client: &FetchClient, index: usize, poll: PlannedPoll) -> Ahead {
+        let fetch = self.fetch;
+        let topic = fetch.wanted[index].topic;
+        let now = Instant::now();
+        let Some(allowance) = fetch.admit(topic, poll.partition, poll.end, now) else {
+            return Ahead::Stalled;
+        };
+        let page_poll = PagePoll::new(poll.offset, poll.options, now, allowance, fetch.give_up_at);
+        Ahead::Running(self.spawn(client, topic, poll.partition, page_poll, allowance))
+    }
+
+    /// Runs `page_poll` of `partition` of `topic` as a task, so it runs while the read waits for
+    /// the partitions before it, and ends in its own time when the read stops waiting for it.
+    fn spawn(
+        &self,
+        client: &FetchClient,
+        topic: &str,
+        partition: u32,
+        page_poll: PagePoll,
+        allowance: Duration,
+    ) -> Running {
+        let fetch = self.fetch;
+        let (asked, deadline) = (page_poll.asked, page_poll.deadline);
+        // A partition whose pages took long keeps its own time, so its page still comes.
+        let wait_until = if allowance > POLL_DEADLINE {
+            deadline
+        } else {
+            deadline.min(self.polls_until)
+        };
+        let (bridge, records) = (
+            Arc::clone(fetch.bridge),
+            Arc::clone(&fetch.state.poll_records),
+        );
+        let (client, topic) = (client.clone(), topic.to_owned());
+        let task = tokio::spawn(async move {
+            page_poll
+                .run(&bridge, &records, &client, &topic, partition)
+                .await
+        });
+        Running {
+            task,
+            asked,
+            wait_until,
+        }
+    }
+
+    /// The read slot's client. Takes the slot at the first call, and starts the time of the
+    /// read's polls. `None` if no slot frees by `give_up_at`.
+    async fn client(&mut self) -> Option<FetchClient> {
+        if self.slot.is_none() {
+            self.slot = self.fetch.bridge.fetch_slot(self.fetch.give_up_at).await;
+            self.polls_until = Instant::now() + POLL_DEADLINE;
+        }
+        self.slot.as_ref().map(FetchSlot::client)
     }
 
     /// Ends this connection's spell at `at`: it just read there in range.
@@ -954,22 +1021,24 @@ impl<'a> Reader<'a> {
         if worth_polling(self.owes_first_record, budget, probe.average_size) {
             while let Some(count) = next_page(&polled, budget, probe.average_size) {
                 let left = budget.saturating_sub(polled.bytes);
-                let outcome = self
+                let page_at = (polled.next, probe.high_watermark);
+                let PollOutcome { asked, page } = self
                     .poll_or(
                         first.take(),
                         want.topic,
                         at.index,
-                        polled.next,
+                        page_at,
                         page_options(count, left),
                     )
                     .await;
-                let asked = outcome.asked;
-                let Some(page) = outcome.page else {
-                    break;
-                };
                 match page {
+                    Page::Stalled if polled.messages.is_empty() => {
+                        return Read::Done(refused(want.partition, ERROR_NOT_LEADER_OR_FOLLOWER));
+                    }
                     // The probe showed records, yet the first poll found none.
-                    Ok(page) if page.messages.is_empty() && polled.messages.is_empty() => {
+                    Page::Polled(Ok(page))
+                        if page.messages.is_empty() && polled.messages.is_empty() =>
+                    {
                         return Read::Empty(EmptyRead {
                             at,
                             offset,
@@ -977,12 +1046,12 @@ impl<'a> Reader<'a> {
                             asked,
                         });
                     }
-                    Ok(page) => polled.add(page),
-                    Err(error) if polled.messages.is_empty() => {
+                    Page::Polled(Ok(page)) => polled.add(page),
+                    Page::Polled(Err(error)) if polled.messages.is_empty() => {
                         return Read::Done(self.refuse(want, at, offset, &error));
                     }
-                    // Serve what the earlier polls brought.
-                    Err(_) => break,
+                    // Serve what the earlier polls brought, if any.
+                    Page::Unread | Page::Stalled | Page::Polled(Err(_)) => break,
                 }
             }
         }
@@ -1045,28 +1114,30 @@ impl<'a> Reader<'a> {
             return Read::Done(unread);
         }
         let count = poll_count(budget, probe.average_size, u64::from(MAX_POLL_COUNT));
+        let page_at = (offset, probe.high_watermark);
         let PollOutcome { asked, page } = self
             .poll_or(
                 first,
                 want.topic,
                 at.index,
-                offset,
+                page_at,
                 page_options(count, budget),
             )
             .await;
         match page {
-            None => Read::Done(unread),
-            Some(Err(error)) => Read::Done(self.refuse(want, at, offset, &error)),
-            Some(Ok(page)) if !page.messages.is_empty() => {
+            Page::Unread => Read::Done(unread),
+            Page::Stalled => Read::Done(refused(want.partition, ERROR_NOT_LEADER_OR_FOLLOWER)),
+            Page::Polled(Err(error)) => Read::Done(self.refuse(want, at, offset, &error)),
+            Page::Polled(Ok(page)) if !page.messages.is_empty() => {
                 let mut polled = Polled::new(offset, probe.high_watermark);
                 polled.add(page);
                 self.read(want, at, offset, probe, polled, None).await
             }
-            Some(Ok(page)) if caught_up(offset, page.current_offset) => {
+            Page::Polled(Ok(page)) if caught_up(offset, page.current_offset) => {
                 self.placed(want, at);
                 Read::Done(served(want.partition, offset, Bytes::new()))
             }
-            Some(Ok(_)) => Read::Empty(EmptyRead {
+            Page::Polled(Ok(_)) => Read::Empty(EmptyRead {
                 at,
                 offset,
                 before: probe,
@@ -1167,95 +1238,295 @@ impl<'a> Reader<'a> {
         refused(want.partition, code)
     }
 
-    /// `first`, if the partition polled ahead, or else a poll by `options` at `offset`.
+    /// `first`, if the partition polled ahead, or else a poll by `options` at `offset`, unless the
+    /// partition stalls or the read may start no more polls. `end` is the partition's end, where
+    /// a re-check of a stalled partition polls.
     async fn poll_or(
         &mut self,
         first: Option<PollOutcome>,
         topic: &str,
         index: u32,
-        offset: u64,
+        (offset, end): (u64, u64),
         options: PollOptions,
     ) -> PollOutcome {
         if let Some(first) = first {
             return first;
         }
-        let asked = Instant::now();
-        let fetch = self.fetch;
-        let page = match self.slot().await {
-            Some(slot) => poll_page(fetch, slot, topic, index, offset, options).await,
-            None => None,
+        let Some(client) = self.client().await else {
+            return PollOutcome {
+                asked: Instant::now(),
+                page: Page::Unread,
+            };
         };
-        PollOutcome { asked, page }
-    }
-
-    /// The read slot, taken at the first poll. `None` if none frees by `give_up_at`.
-    async fn slot(&mut self) -> Option<&FetchSlot> {
-        if self.slot.is_none() {
-            self.slot = self.fetch.bridge.fetch_slot(self.fetch.give_up_at).await;
+        let (fetch, asked) = (self.fetch, Instant::now());
+        if asked >= self.polls_until {
+            return PollOutcome {
+                asked,
+                page: Page::Unread,
+            };
         }
-        self.slot.as_ref()
+        let Some(allowance) = fetch.admit(topic, index, end, asked) else {
+            return PollOutcome {
+                asked,
+                page: Page::Stalled,
+            };
+        };
+        let page_poll = PagePoll::new(offset, options, asked, allowance, fetch.give_up_at);
+        self.spawn(&client, topic, index, page_poll, allowance)
+            .outcome()
+            .await
     }
 }
 
-/// A first poll that [`Reader::first_polls`] plans for the partition at `index` of the request.
-struct PlannedPoll<'a> {
-    index: usize,
-    topic: &'a str,
+/// A first poll that [`plan_first_polls`] plans for one partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlannedPoll {
     partition: u32,
     offset: u64,
+    /// The partition's end in the probe, where its re-check polls if it stalls.
+    end: u64,
     options: PollOptions,
 }
 
-/// Runs `poll`, and returns it with the place of its partition in the request.
-async fn first_poll(
-    fetch: &Fetch<'_>,
-    slot: &FetchSlot,
-    poll: PlannedPoll<'_>,
-) -> (usize, PollOutcome) {
-    let asked = Instant::now();
-    let page = poll_page(
-        fetch,
-        slot,
-        poll.topic,
-        poll.partition,
-        poll.offset,
-        poll.options,
-    )
-    .await;
-    (poll.index, PollOutcome { asked, page })
-}
-
-/// Polls one page in `slot`, for at most [`POLL_DEADLINE`]. `None` once the request's
-/// `give_up_at` passes.
+/// The first poll of each partition that polls, planned in request order the way [`Reader::read`]
+/// spends the budget, from what the probes expect. A partition with no budget in the plan gets
+/// none, and polls in its turn if the reads before it leave room.
 ///
-/// A poll that runs out of its own time makes the partition unreachable, and one that answers
-/// makes it reachable again. See [`mark_unreachable`].
-async fn poll_page(
-    fetch: &Fetch<'_>,
-    slot: &FetchSlot,
-    topic: &str,
-    partition: u32,
+/// A first poll asks for what fits the planned budget, and its read keeps what fits the budget it
+/// really gets. Only a partition with records waiting lowers the planned budget, by what its probe
+/// expects it to serve: one the probe cannot place may serve nothing, and the polls of the next
+/// partitions must not wait for it. [`ReadAhead`] runs at most [`POLLS_AT_ONCE`] ahead, so a read
+/// holds at most that many pages more than it serves.
+fn plan_first_polls(
+    wanted: &[Wanted<'_>],
+    positions: &[Position],
+    mut bytes_left: usize,
+    mut owes_first_record: bool,
+) -> Vec<Option<PlannedPoll>> {
+    wanted
+        .iter()
+        .zip(positions)
+        .map(|(want, position)| {
+            let (at, offset, probe, behind) = match *position {
+                Position::Behind { at, offset, probe } => (at, offset, probe, true),
+                Position::Unsure { at, offset, probe }
+                | Position::Loading { at, offset, probe } => (at, offset, probe, false),
+                Position::Refused(_) | Position::CaughtUp { .. } => return None,
+            };
+            let budget = want.max_bytes.min(bytes_left);
+            if !worth_polling(owes_first_record, budget, probe.average_size) {
+                return None;
+            }
+            let count = if behind {
+                let expected = bytes_waiting(offset, probe, budget);
+                bytes_left =
+                    bytes_left.saturating_sub(usize::try_from(expected).unwrap_or(usize::MAX));
+                // Its read keeps one record when one is owed, whatever the budget.
+                owes_first_record = false;
+                let polled = Polled::new(offset, probe.high_watermark);
+                next_page(&polled, budget, probe.average_size)?
+            } else {
+                poll_count(budget, probe.average_size, u64::from(MAX_POLL_COUNT))
+            };
+            Some(PlannedPoll {
+                partition: at.index,
+                offset,
+                end: probe.high_watermark,
+                options: page_options(count, budget),
+            })
+        })
+        .collect()
+}
+
+/// The first polls of one read, run ahead of it: at most [`POLLS_AT_ONCE`] at once, for the next
+/// partitions it reads. A page waits here until the read reaches its partition, so a read holds
+/// at most that many pages ahead, and a partition that stalls holds up only the polls behind it in
+/// that window.
+///
+/// The polls run as tasks, so they go on while the read waits for its own. Dropping this stops the
+/// ones still running.
+struct ReadAhead {
+    polls: Vec<Ahead>,
+    /// The place of each partition with a planned poll, in request order.
+    planned: Vec<usize>,
+    /// The first of `planned` that did not start yet.
+    next: usize,
+    /// Polls started and not taken yet.
+    running: usize,
+}
+
+/// The first poll of one partition in a [`ReadAhead`].
+enum Ahead {
+    /// None ahead: the partition polls in its turn, if at all.
+    InTurn,
+    /// Planned, not started.
+    Planned(PlannedPoll),
+    Running(Running),
+    /// The partition stalled when its poll was to start.
+    Stalled,
+}
+
+/// A poll that runs as a task, so it ends in its own time even when the read stops waiting for
+/// it, and its partition's record learns what it showed.
+struct Running {
+    task: JoinHandle<Page>,
+    asked: Instant,
+    /// When the read stops waiting for it. See [`Reader::polls_until`].
+    wait_until: Instant,
+}
+
+impl Running {
+    /// What the poll brought by `wait_until`. Past that, the partition answers 0 with no records,
+    /// and the poll goes on.
+    async fn outcome(mut self) -> PollOutcome {
+        let page = match timeout_at(self.wait_until, &mut self.task).await {
+            Ok(Ok(page)) => page,
+            Ok(Err(_)) | Err(_) => Page::Unread,
+        };
+        PollOutcome {
+            asked: self.asked,
+            page,
+        }
+    }
+}
+
+impl ReadAhead {
+    fn new(plan: Vec<Option<PlannedPoll>>) -> Self {
+        let planned = plan
+            .iter()
+            .enumerate()
+            .filter_map(|(index, poll)| poll.map(|_| index))
+            .collect();
+        let polls = plan
+            .into_iter()
+            .map(|poll| poll.map_or(Ahead::InTurn, Ahead::Planned))
+            .collect();
+        Self {
+            polls,
+            planned,
+            next: 0,
+            running: 0,
+        }
+    }
+
+    const fn has_polls(&self) -> bool {
+        !self.planned.is_empty()
+    }
+
+    /// The next planned poll, at `cursor` or after it, if fewer than [`POLLS_AT_ONCE`] run.
+    fn next_due(&mut self, cursor: usize) -> Option<(usize, PlannedPoll)> {
+        while self.running < POLLS_AT_ONCE {
+            let &index = self.planned.get(self.next)?;
+            self.next += 1;
+            // The read passed it with no poll started.
+            if index < cursor {
+                continue;
+            }
+            if let Ahead::Planned(poll) = std::mem::replace(&mut self.polls[index], Ahead::InTurn) {
+                return Some((index, poll));
+            }
+        }
+        None
+    }
+
+    /// Puts what starting the poll at `index` gave in its place.
+    fn started(&mut self, index: usize, started: Ahead) {
+        if matches!(started, Ahead::Running(_)) {
+            self.running += 1;
+        }
+        self.polls[index] = started;
+    }
+
+    /// The first poll of the partition at `index`, which the read reached. `None` if the
+    /// partition polls in its turn.
+    async fn take(&mut self, index: usize) -> Option<PollOutcome> {
+        let page = match std::mem::replace(&mut self.polls[index], Ahead::InTurn) {
+            Ahead::InTurn => return None,
+            // Its turn to start never came before the read stopped starting polls.
+            Ahead::Planned(_) => Page::Unread,
+            Ahead::Stalled => Page::Stalled,
+            Ahead::Running(poll) => {
+                self.running -= 1;
+                return Some(poll.outcome().await);
+            }
+        };
+        Some(PollOutcome {
+            asked: Instant::now(),
+            page,
+        })
+    }
+}
+
+impl Drop for ReadAhead {
+    fn drop(&mut self) {
+        for poll in &self.polls {
+            if let Ahead::Running(poll) = poll {
+                poll.task.abort();
+            }
+        }
+    }
+}
+
+/// One poll of a page of a partition: what it asks for, when it went out, and its deadline.
+struct PagePoll {
     offset: u64,
     options: PollOptions,
-) -> Option<core::result::Result<PolledMessages, BridgeError>> {
-    let now = Instant::now();
-    if now >= fetch.give_up_at {
-        return None;
-    }
-    let deadline = (now + POLL_DEADLINE).min(fetch.give_up_at);
-    let page = fetch
-        .bridge
-        .poll_in(slot, topic, partition, offset, options, deadline)
-        .await;
-    let unreachable = &fetch.state.unreachable;
-    match page {
-        Err(BridgeError::Timeout) if deadline == fetch.give_up_at => return None,
-        Err(BridgeError::Timeout) => {
-            mark_unreachable(unreachable, topic, partition, Instant::now());
+    asked: Instant,
+    deadline: Instant,
+    /// The request's deadline comes before the poll's allowance runs out, so no answer by then
+    /// proves nothing about the partition.
+    cut: bool,
+}
+
+impl PagePoll {
+    fn new(
+        offset: u64,
+        options: PollOptions,
+        asked: Instant,
+        allowance: Duration,
+        give_up_at: Instant,
+    ) -> Self {
+        let full = asked + allowance;
+        Self {
+            offset,
+            options,
+            asked,
+            deadline: full.min(give_up_at),
+            cut: give_up_at < full,
         }
-        _ => mark_reachable(unreachable, topic, partition),
     }
-    Some(page)
+
+    /// Polls the page of `partition` of `topic` with `client`, and records what the poll showed
+    /// of the partition. See [`record_poll`].
+    async fn run(
+        self,
+        bridge: &IggyBridge,
+        records: &Mutex<PollRecords>,
+        client: &FetchClient,
+        topic: &str,
+        partition: u32,
+    ) -> Page {
+        let strategy = PollingStrategy::offset(self.offset);
+        let page = bridge
+            .poll_in(
+                client,
+                topic,
+                partition,
+                strategy,
+                self.options,
+                self.deadline,
+            )
+            .await;
+        let now = Instant::now();
+        let answered = match &page {
+            Err(BridgeError::Timeout) if self.cut => return Page::Unread,
+            Err(BridgeError::Timeout) => None,
+            _ => Some(now.saturating_duration_since(self.asked)),
+        };
+        let poll = PollKind::Read;
+        record_poll(records, topic, partition, poll, self.asked, answered, now);
+        Page::Polled(page)
+    }
 }
 
 /// Whether an empty poll at `offset` proves the consumer is at the end: Iggy's commit counter,
@@ -1509,52 +1780,300 @@ pub(crate) fn sight_first(
         .is_new()
 }
 
-/// Per Kafka topic, then partition, until when a partition answers 6 without a poll. See
-/// [`mark_unreachable`].
-pub(crate) type Unreachable = PartitionMap<Instant>;
+/// Per Kafka topic, then partition, what its Iggy polls showed lately, for the whole gateway. See
+/// [`PollRecord`].
+pub(crate) type PollRecords = PartitionMap<PollRecord>;
 
-/// Whether `partition` of `topic` answers 6 without a poll at `now`.
-fn unreachable(map: &Mutex<Unreachable>, topic: &str, partition: u32, now: Instant) -> bool {
-    map.lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(topic, partition)
-        .is_some_and(|until| now < *until)
+/// What the Iggy polls of one partition showed lately.
+///
+/// A poll that gets no answer in its time stalls the partition: Fetch and `ListOffsets` answer 6
+/// for it with no poll, so its consumers do not each spend a read slot waiting on it. While it
+/// stalls, one re-check at a time polls it, beside the requests. The first poll that answers ends
+/// the stall. See [`recheck`].
+///
+/// Gateway-wide, since the node behind a partition answers no consumer once it stops.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PollRecord {
+    /// When the last report that changed this record came in. A miss of a poll that went out
+    /// before it tells nothing new: a poll that went out later answered, or missed first.
+    changed: Option<Instant>,
+    /// Polls in a row that got no answer in their time. Above 0, the partition stalls.
+    misses: u32,
+    /// How long its next poll may take: [`POLL_DEADLINE`], or more for a partition whose pages
+    /// took long, up to [`MAX_POLL_ALLOWANCE`].
+    allowance: Duration,
+    /// While it stalls, when its next re-check may start. `None` while one runs.
+    recheck_at: Option<Instant>,
+    /// When the stall began, and when the log last warned of it.
+    stalled_at: Instant,
+    warned_at: Instant,
 }
 
-/// Makes `partition` of `topic` answer 6 without a poll for [`UNREACHABLE_FOR`] from `now`: Iggy
-/// did not answer a poll of it within [`POLL_DEADLINE`].
-///
-/// Gateway-wide, since the node behind a partition answers no consumer once it stops. Warns when
-/// the partition answered a poll since, or ran out of time last more than [`UNPLACED_GRACE`] ago.
-fn mark_unreachable(map: &Mutex<Unreachable>, topic: &str, partition: u32, now: Instant) {
-    let before = map.lock().unwrap_or_else(PoisonError::into_inner).insert(
-        topic,
-        partition,
-        now + UNREACHABLE_FOR,
-        |until| now.saturating_duration_since(*until) < UNPLACED_GRACE,
-    );
-    if before.is_none_or(|until| now.saturating_duration_since(until) >= UNPLACED_GRACE) {
-        tracing::warn!(
-            kafka_topic = topic,
-            partition,
-            poll_deadline_ms = POLL_DEADLINE.as_millis(),
-            "Iggy did not answer a Fetch poll in time. Fetch answers 6 for the partition until a \
-             poll answers"
-        );
-    } else {
-        tracing::debug!(
-            kafka_topic = topic,
-            partition,
-            "Iggy still does not answer Fetch polls in time"
-        );
+/// Whether a poll of a partition may start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admit {
+    /// Yes, for this long.
+    Poll(Duration),
+    /// No, the partition stalls. `recheck_due` when its next re-check may start.
+    Stalled { recheck_due: bool },
+}
+
+/// Which poll reports to [`record_poll`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PollKind {
+    /// A poll for a consumer, of a page or a record.
+    Read,
+    /// The re-check of a stalled partition.
+    Recheck,
+}
+
+/// Whether a poll of `partition` of `topic` may start at `now`, and for how long.
+pub(crate) fn admit(
+    records: &Mutex<PollRecords>,
+    topic: &str,
+    partition: u32,
+    now: Instant,
+) -> Admit {
+    let records = records.lock().unwrap_or_else(PoisonError::into_inner);
+    match records.get(topic, partition) {
+        None => Admit::Poll(POLL_DEADLINE),
+        Some(record) if record.misses == 0 => Admit::Poll(record.allowance),
+        Some(record) => Admit::Stalled {
+            recheck_due: record.recheck_at.is_some_and(|at| now >= at),
+        },
     }
 }
 
-/// Ends [`mark_unreachable`] for `partition` of `topic`: a poll of it answered.
-fn mark_reachable(map: &Mutex<Unreachable>, topic: &str, partition: u32) {
-    map.lock()
+/// Starts the due re-check of `partition` of `topic`, which stalls, on the client of a read slot
+/// that has a re-check place free: a poll of at most one message at `end`, the partition's end,
+/// for [`POLL_DEADLINE`]. No transfer then counts against it, so a node that answers answers it in
+/// time however large the partition's records.
+///
+/// It runs beside the requests, and no request waits for it. Does nothing if another request
+/// claimed the re-check, or if every place is taken: the next request that names the partition
+/// tries again.
+pub(crate) fn recheck(
+    bridge: &Arc<IggyBridge>,
+    records: &Arc<Mutex<PollRecords>>,
+    topic: &str,
+    partition: u32,
+    end: u64,
+) {
+    let Some(place) = bridge.recheck_place() else {
+        return;
+    };
+    let asked = Instant::now();
+    if !claim_recheck(records, topic, partition, asked) {
+        return;
+    }
+    let (bridge, records, topic) = (Arc::clone(bridge), Arc::clone(records), topic.to_owned());
+    tokio::spawn(async move {
+        let options = PollOptions {
+            count: 1,
+            max_bytes: ONE_MESSAGE_MAX_BYTES,
+            ..PollOptions::default()
+        };
+        let strategy = PollingStrategy::offset(end);
+        let deadline = asked + POLL_DEADLINE;
+        let polled = bridge
+            .poll_in(
+                place.client(),
+                &topic,
+                partition,
+                strategy,
+                options,
+                deadline,
+            )
+            .await;
+        drop(place);
+        let now = Instant::now();
+        let answered = (!matches!(polled, Err(BridgeError::Timeout)))
+            .then(|| now.saturating_duration_since(asked));
+        let poll = PollKind::Recheck;
+        record_poll(&records, &topic, partition, poll, asked, answered, now);
+    });
+}
+
+/// Claims the due re-check of `partition` of `topic`. `false` if none is due, or another request
+/// claimed it.
+fn claim_recheck(records: &Mutex<PollRecords>, topic: &str, partition: u32, now: Instant) -> bool {
+    records
+        .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .remove(topic, partition);
+        .get_mut(topic, partition)
+        .is_some_and(|record| record.claim_recheck(now))
+}
+
+/// Records what a `poll` of `partition` of `topic` that went out at `asked` showed at `now`: an
+/// answer that came after `answered`, or none in its time. Logs once the lock is free.
+pub(crate) fn record_poll(
+    records: &Mutex<PollRecords>,
+    topic: &str,
+    partition: u32,
+    poll: PollKind,
+    asked: Instant,
+    answered: Option<Duration>,
+    now: Instant,
+) {
+    let news = {
+        let mut records = records.lock().unwrap_or_else(PoisonError::into_inner);
+        if records.get(topic, partition).is_none() {
+            let fresh = PollRecord::new(now);
+            records.insert(topic, partition, fresh, |record| record.live(now));
+        }
+        records
+            .get_mut(topic, partition)
+            .and_then(|record| match answered {
+                Some(took) => record.answered(poll, took, now),
+                None => record.missed(poll, asked, now),
+            })
+    };
+    if let Some(news) = news {
+        news.log(topic, partition);
+    }
+}
+
+/// A change in a partition's stall, for the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallNews {
+    Began,
+    /// It stalls on. `warn` once every [`STALL_WARN_EVERY`].
+    Lasts {
+        stalled: Duration,
+        misses: u32,
+        warn: bool,
+    },
+    Ended {
+        stalled: Duration,
+    },
+}
+
+impl StallNews {
+    fn log(self, topic: &str, partition: u32) {
+        match self {
+            Self::Began => tracing::warn!(
+                kafka_topic = topic,
+                partition,
+                "Iggy did not answer a poll of the partition in time. Fetch and ListOffsets answer \
+                 6 for it until a poll answers"
+            ),
+            Self::Lasts {
+                stalled,
+                misses,
+                warn: true,
+            } => tracing::warn!(
+                kafka_topic = topic,
+                partition,
+                stalled_secs = stalled.as_secs(),
+                misses,
+                "Iggy still does not answer polls of the partition"
+            ),
+            Self::Lasts {
+                stalled, misses, ..
+            } => tracing::debug!(
+                kafka_topic = topic,
+                partition,
+                stalled_secs = stalled.as_secs(),
+                misses,
+                "Iggy still does not answer polls of the partition"
+            ),
+            Self::Ended { stalled } => tracing::info!(
+                kafka_topic = topic,
+                partition,
+                stalled_secs = stalled.as_secs(),
+                "Iggy answers polls of the partition again"
+            ),
+        }
+    }
+}
+
+impl PollRecord {
+    const fn new(now: Instant) -> Self {
+        Self {
+            changed: None,
+            misses: 0,
+            allowance: POLL_DEADLINE,
+            recheck_at: None,
+            stalled_at: now,
+            warned_at: now,
+        }
+    }
+
+    /// Whether a sweep keeps it: while the partition stalls or polls slowly, and while a poll that
+    /// went out before its last change can still miss.
+    fn live(&self, now: Instant) -> bool {
+        self.misses > 0
+            || self.allowance > POLL_DEADLINE
+            || self
+                .changed
+                .is_some_and(|changed| now.saturating_duration_since(changed) < MAX_POLL_ALLOWANCE)
+    }
+
+    /// Claims its due re-check. `false` if it does not stall, or its re-check is not due.
+    fn claim_recheck(&mut self, now: Instant) -> bool {
+        let due = self.misses > 0 && self.recheck_at.is_some_and(|at| now >= at);
+        if due {
+            self.recheck_at = None;
+        }
+        due
+    }
+
+    /// Takes an answer that came `took` after its `poll` went out.
+    fn answered(&mut self, poll: PollKind, took: Duration, now: Instant) -> Option<StallNews> {
+        let news = (self.misses > 0).then(|| StallNews::Ended {
+            stalled: now.saturating_duration_since(self.stalled_at),
+        });
+        if news.is_none() && poll == PollKind::Read {
+            // Room for a page as slow as this one, so a slow link does not stall the partition.
+            // An answer that ends a stall keeps the time that its miss raised for the next page.
+            self.allowance = took
+                .saturating_mul(2)
+                .clamp(POLL_DEADLINE, MAX_POLL_ALLOWANCE);
+        }
+        self.changed = Some(now);
+        self.misses = 0;
+        self.recheck_at = None;
+        news
+    }
+
+    /// Takes a `poll` that went out at `asked` and got no answer in its time.
+    fn missed(&mut self, poll: PollKind, asked: Instant, now: Instant) -> Option<StallNews> {
+        // Every change since leaves no claim of this poll behind: an answer ends the stall, and a
+        // miss sets the time of the next re-check.
+        if self.changed.is_some_and(|changed| asked < changed) {
+            return None;
+        }
+        self.changed = Some(now);
+        self.misses = self.misses.saturating_add(1);
+        if poll == PollKind::Read {
+            // The page may need longer than it had. The re-check tells whether Iggy answers at
+            // all, and if it does, the next page gets twice the time, up to the SDK's limit.
+            self.allowance = self.allowance.saturating_mul(2).min(MAX_POLL_ALLOWANCE);
+        }
+        self.recheck_at = Some(now + recheck_pause(self.misses));
+        if self.misses == 1 {
+            (self.stalled_at, self.warned_at) = (now, now);
+            return Some(StallNews::Began);
+        }
+        let warn = now.saturating_duration_since(self.warned_at) >= STALL_WARN_EVERY;
+        if warn {
+            self.warned_at = now;
+        }
+        Some(StallNews::Lasts {
+            stalled: now.saturating_duration_since(self.stalled_at),
+            misses: self.misses,
+            warn,
+        })
+    }
+}
+
+/// The pause before the next re-check after `misses` polls in a row got no answer:
+/// [`RECHECK_PAUSE`], doubled with each miss past the first, up to [`MAX_RECHECK_PAUSE`].
+fn recheck_pause(misses: u32) -> Duration {
+    let doublings = misses.saturating_sub(1).min(16);
+    RECHECK_PAUSE
+        .saturating_mul(1 << doublings)
+        .min(MAX_RECHECK_PAUSE)
 }
 
 /// Per Kafka topic, then partition, the offset that one connection's Fetches cannot place. A read
@@ -2658,27 +3177,271 @@ mod tests {
         );
     }
 
+    /// Records a `poll` of partition 0 of topic `a`.
+    fn report(
+        records: &Mutex<PollRecords>,
+        poll: PollKind,
+        asked: Instant,
+        answered: Option<Duration>,
+        now: Instant,
+    ) {
+        record_poll(records, "a", 0, poll, asked, answered, now);
+    }
+
+    const MILLI: Duration = Duration::from_millis(1);
+
     #[test]
-    fn given_a_poll_that_ran_out_of_time_when_placed_again_should_refuse_the_partition_for_a_while()
-    {
-        let map = Mutex::default();
+    fn given_a_poll_with_no_answer_in_its_time_when_admitted_again_should_stall_until_a_re_check_answers()
+     {
+        let records = Mutex::default();
         let start = Instant::now();
-        assert!(!unreachable(&map, "a", 0, start), "never timed out");
-        mark_unreachable(&map, "a", 0, start);
-        assert!(unreachable(&map, "a", 0, start));
-        assert!(unreachable(&map, "a", 0, start + UNREACHABLE_FOR / 2));
-        assert!(!unreachable(&map, "a", 1, start), "per partition");
-        assert!(!unreachable(&map, "b", 0, start), "per topic");
-        assert!(
-            !unreachable(&map, "a", 0, start + UNREACHABLE_FOR),
-            "the next poll then decides"
+        let polls = Admit::Poll(POLL_DEADLINE);
+        assert_eq!(admit(&records, "a", 0, start), polls, "never polled");
+
+        let missed = start + POLL_DEADLINE;
+        report(&records, PollKind::Read, start, None, missed);
+        let stalled = Admit::Stalled { recheck_due: false };
+        assert_eq!(admit(&records, "a", 0, missed), stalled);
+        assert_eq!(admit(&records, "a", 1, missed), polls, "per partition");
+        assert_eq!(admit(&records, "b", 0, missed), polls, "per topic");
+
+        let due = missed + RECHECK_PAUSE;
+        assert_eq!(
+            admit(&records, "a", 0, due),
+            Admit::Stalled { recheck_due: true }
         );
-        mark_unreachable(&map, "a", 0, start + UNREACHABLE_FOR);
-        assert!(unreachable(&map, "a", 0, start + UNREACHABLE_FOR));
-        mark_reachable(&map, "a", 0);
+        assert!(claim_recheck(&records, "a", 0, due));
+        assert!(!claim_recheck(&records, "a", 0, due), "one at a time");
+        assert_eq!(
+            admit(&records, "a", 0, due),
+            stalled,
+            "the others answer 6 while it runs"
+        );
+
+        report(&records, PollKind::Recheck, due, Some(MILLI), due + MILLI);
+        assert_eq!(
+            admit(&records, "a", 0, due + MILLI),
+            Admit::Poll(2 * POLL_DEADLINE),
+            "an answer ends the stall, and the next page gets twice the time it missed in"
+        );
+    }
+
+    #[test]
+    fn given_a_re_check_with_no_answer_when_the_stall_lasts_should_wait_longer_for_the_next() {
+        let records = Mutex::default();
+        let start = Instant::now();
+        report(&records, PollKind::Read, start, None, start + POLL_DEADLINE);
+        let due = start + POLL_DEADLINE + recheck_pause(1);
+        assert!(claim_recheck(&records, "a", 0, due));
+
+        let missed = due + POLL_DEADLINE;
+        report(&records, PollKind::Recheck, due, None, missed);
+        let next = missed + recheck_pause(2);
+        assert_eq!(
+            admit(&records, "a", 0, next - MILLI),
+            Admit::Stalled { recheck_due: false }
+        );
+        assert_eq!(
+            admit(&records, "a", 0, next),
+            Admit::Stalled { recheck_due: true }
+        );
+
+        assert!(claim_recheck(&records, "a", 0, next));
+        report(&records, PollKind::Recheck, next, Some(MILLI), next + MILLI);
+        assert_eq!(
+            admit(&records, "a", 0, next + MILLI),
+            Admit::Poll(2 * POLL_DEADLINE),
+            "a re-check that misses leaves the time of the next page alone"
+        );
+    }
+
+    #[test]
+    fn given_misses_in_a_row_when_pausing_should_double_the_pause_up_to_the_cap() {
+        let pauses = [1, 2, 3, 4, 5, 6, u32::MAX].map(recheck_pause);
+        let seconds = |millis| Duration::from_millis(millis);
+        assert_eq!(
+            pauses,
+            [500, 1000, 2000, 4000, 8000, 8000, 8000].map(seconds),
+        );
+        assert_eq!(recheck_pause(1), RECHECK_PAUSE);
+        assert_eq!(recheck_pause(u32::MAX), MAX_RECHECK_PAUSE);
+    }
+
+    #[test]
+    fn given_a_poll_that_went_out_before_an_answer_when_it_misses_should_not_stall_the_partition() {
+        let records = Mutex::default();
+        let old = Instant::now();
+        let newer = old + Duration::from_millis(100);
+        report(&records, PollKind::Read, newer, Some(MILLI), newer + MILLI);
+        report(&records, PollKind::Read, old, None, old + POLL_DEADLINE);
+        assert_eq!(
+            admit(&records, "a", 0, old + POLL_DEADLINE),
+            Admit::Poll(POLL_DEADLINE),
+            "a poll that went out later answered, so the partition answers"
+        );
+    }
+
+    #[test]
+    fn given_polls_that_miss_together_when_reported_should_count_one_miss() {
+        let records = Mutex::default();
+        let start = Instant::now();
+        let missed = start + POLL_DEADLINE;
+        report(&records, PollKind::Read, start, None, missed);
+        let later = start + Duration::from_millis(10);
+        report(&records, PollKind::Read, later, None, later + POLL_DEADLINE);
+
+        assert_eq!(
+            admit(&records, "a", 0, missed + recheck_pause(1)),
+            Admit::Stalled { recheck_due: true },
+            "the pause after one miss"
+        );
+        assert!(claim_recheck(&records, "a", 0, missed + recheck_pause(1)));
+        let answered = missed + recheck_pause(1) + MILLI;
+        report(&records, PollKind::Recheck, answered, Some(MILLI), answered);
+        assert_eq!(
+            admit(&records, "a", 0, answered),
+            Admit::Poll(2 * POLL_DEADLINE),
+            "the time of the next page doubled once"
+        );
+    }
+
+    #[test]
+    fn given_a_re_check_that_misses_after_an_older_page_answered_should_leave_the_partition_answering()
+     {
+        let records = Mutex::default();
+        let start = Instant::now();
+        report(&records, PollKind::Read, start, None, start + POLL_DEADLINE);
+        let due = start + POLL_DEADLINE + RECHECK_PAUSE;
+        assert!(claim_recheck(&records, "a", 0, due));
+        // A slow page from before the stall lands, so Iggy answers.
+        let took = due + MILLI - start;
+        report(&records, PollKind::Read, start, Some(took), due + MILLI);
+        report(&records, PollKind::Recheck, due, None, due + POLL_DEADLINE);
         assert!(
-            !unreachable(&map, "a", 0, start + UNREACHABLE_FOR),
-            "a poll that answers ends it"
+            matches!(admit(&records, "a", 0, due + POLL_DEADLINE), Admit::Poll(_)),
+            "the re-check went out before that answer, so its miss is old news"
+        );
+    }
+
+    #[test]
+    fn given_slow_pages_when_they_answer_should_give_the_next_poll_twice_their_time_up_to_the_cap()
+    {
+        let records = Mutex::default();
+        let mut now = Instant::now();
+        let mut answer = |took: Duration| {
+            report(&records, PollKind::Read, now, Some(took), now + took);
+            now += took;
+            admit(&records, "a", 0, now)
+        };
+        let seconds = Duration::from_secs;
+        assert_eq!(answer(seconds(3)), Admit::Poll(seconds(6)));
+        assert_eq!(answer(seconds(9)), Admit::Poll(MAX_POLL_ALLOWANCE));
+        assert_eq!(answer(MILLI), Admit::Poll(POLL_DEADLINE), "a fast page");
+    }
+
+    #[test]
+    fn given_pages_that_miss_while_iggy_answers_when_re_checked_should_double_their_time_up_to_the_cap()
+     {
+        let records = Mutex::default();
+        let mut now = Instant::now();
+        let mut allowances = Vec::new();
+        for _ in 0..4 {
+            let Admit::Poll(allowance) = admit(&records, "a", 0, now) else {
+                panic!("the stall ended");
+            };
+            allowances.push(allowance);
+            report(&records, PollKind::Read, now, None, now + allowance);
+            now += allowance + recheck_pause(1);
+            assert!(claim_recheck(&records, "a", 0, now));
+            report(&records, PollKind::Recheck, now, Some(MILLI), now + MILLI);
+            now += MILLI;
+        }
+        let seconds = Duration::from_secs;
+        assert_eq!(
+            allowances,
+            [POLL_DEADLINE, seconds(4), seconds(8), MAX_POLL_ALLOWANCE]
+        );
+        assert_eq!(
+            admit(&records, "a", 0, now),
+            Admit::Poll(MAX_POLL_ALLOWANCE)
+        );
+    }
+
+    /// Each first poll that [`plan_first_polls`] plans for `wanted`, as its count and byte cap.
+    fn planned(
+        wanted: &[Wanted<'_>],
+        found: &[(u32, PartitionProbe)],
+        bytes_left: usize,
+    ) -> Vec<Option<(u32, u32)>> {
+        let probes = probes(found);
+        let positions: Vec<Position> = wanted.iter().map(|want| position(want, &probes)).collect();
+        plan_first_polls(wanted, &positions, bytes_left, true)
+            .into_iter()
+            .map(|poll| poll.map(|poll| (poll.options.count, poll.options.max_bytes)))
+            .collect()
+    }
+
+    const MIB: u32 = 1024 * 1024;
+
+    #[test]
+    fn given_partitions_with_records_waiting_when_planning_first_polls_should_spend_the_budget_in_request_order()
+     {
+        // 100 kB waits in each, at 100 bytes a record.
+        let found = [
+            (0, probe(1000, 100)),
+            (1, probe(1000, 100)),
+            (2, probe(1000, 100)),
+        ];
+        let wanted = [want(0, 0), want(1, 0), want(2, 0)];
+        assert_eq!(
+            planned(&wanted, &found, 150_000),
+            vec![
+                Some((1000, MIB)),
+                Some((500, MIB)),
+                // The two before it spend the budget, and a record is no longer owed.
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn given_partitions_the_probe_cannot_place_when_planning_first_polls_should_poll_each_without_spending_the_budget()
+     {
+        let found = [
+            (0, probe(1000, 0)),
+            (1, probe(1000, 100)),
+            (2, probe(1000, 100)),
+            (3, probe(1000, 100)),
+        ];
+        // No stats, past the end, caught up, missing, and records waiting.
+        let wanted = [
+            want(0, 5),
+            want(1, 2000),
+            want(2, 1000),
+            want(5, 0),
+            want(3, 0),
+        ];
+        assert_eq!(
+            planned(&wanted, &found, 150_000),
+            vec![
+                Some((1000, MIB)),
+                Some((1000, MIB)),
+                None,
+                None,
+                // The whole budget is still there.
+                Some((1000, MIB)),
+            ]
+        );
+    }
+
+    #[test]
+    fn given_no_budget_left_when_planning_first_polls_should_still_poll_for_the_record_owed() {
+        let found = [(0, probe(1000, 100)), (1, probe(1000, 100))];
+        let wanted = [want(0, 0), want(1, 0)];
+        assert_eq!(
+            planned(&wanted, &found, 0),
+            vec![Some((1, ONE_MESSAGE_MAX_BYTES)), None],
+            "the first record is owed past every limit, and once polled for, it is not owed again"
         );
     }
 

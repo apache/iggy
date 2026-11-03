@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
 
@@ -40,7 +41,10 @@ const DEFAULT_IGGY_USERNAME: &str = "iggy";
 /// Iggy's default `message_bus.max_message_size`.
 pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 64 * 1024 * 1024;
 /// Fetch requests that read from Iggy at once, when `IGGY_KAFKA_FETCH_SLOTS` is unset.
-pub const DEFAULT_FETCH_SLOTS: usize = 4;
+pub const DEFAULT_FETCH_SLOTS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+/// Most read slots. Each opens an Iggy session at startup, and Iggy holds 8192 for every client
+/// of the cluster, so a typo cannot take them or the memory of their clients.
+pub const MAX_FETCH_SLOTS: usize = 256;
 
 /// How the gateway reaches Iggy: the bridge's own clients and the SASL credential check alike.
 ///
@@ -162,8 +166,10 @@ pub struct IggyBridgeConfig {
     pub topic_mapping: TopicMapping,
     /// Iggy's `message_bus.max_message_size`, in bytes. Larger partitions answer 10.
     pub max_message_size: u64,
-    /// Fetch requests that read from Iggy at once, each on an Iggy client of its own. At least 1.
-    pub fetch_slots: usize,
+    /// Fetch requests that read from Iggy at once, each on an Iggy client of its own. At most
+    /// [`MAX_FETCH_SLOTS`], which [`IggyBridge::connect`](crate::bridge::IggyBridge::connect)
+    /// checks too.
+    pub fetch_slots: NonZeroUsize,
     /// Transport security of every client the bridge opens.
     pub tls: IggyTls,
     pub produce_sessions: ProduceSessionLimits,
@@ -299,12 +305,13 @@ impl IggyBridgeConfig {
             Err(_) => DEFAULT_FETCH_SLOTS,
             // With 0, no Fetch could read.
             Ok(value) => value
-                .parse()
+                .parse::<NonZeroUsize>()
                 .ok()
-                .filter(|slots| *slots > 0)
+                .filter(|slots| slots.get() <= MAX_FETCH_SLOTS)
                 .ok_or_else(|| {
                     BridgeError::InvalidConfig(format!(
-                        "IGGY_KAFKA_FETCH_SLOTS '{value}' is not a count above 0, for example 4"
+                        "IGGY_KAFKA_FETCH_SLOTS '{value}' is not a count from 1 to \
+                         {MAX_FETCH_SLOTS}, for example 4"
                     ))
                 })?,
         };
@@ -466,6 +473,14 @@ mod tests {
         }
         let sixteen = IggyBridgeConfig::from_env();
         unsafe {
+            std::env::set_var("IGGY_KAFKA_FETCH_SLOTS", MAX_FETCH_SLOTS.to_string());
+        }
+        let most = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_FETCH_SLOTS", (MAX_FETCH_SLOTS + 1).to_string());
+        }
+        let too_many = IggyBridgeConfig::from_env();
+        unsafe {
             std::env::set_var("IGGY_KAFKA_FETCH_SLOTS", "0");
         }
         let none = IggyBridgeConfig::from_env();
@@ -478,9 +493,17 @@ mod tests {
             std::env::remove_var("IGGY_KAFKA_FETCH_SLOTS");
         }
 
-        assert_eq!(sixteen.unwrap().fetch_slots, 16);
-        assert!(matches!(none, Err(BridgeError::InvalidConfig(_))));
-        assert!(matches!(garbage, Err(BridgeError::InvalidConfig(_))));
+        assert_eq!(sixteen.unwrap().fetch_slots.get(), 16);
+        assert_eq!(most.unwrap().fetch_slots.get(), MAX_FETCH_SLOTS);
+        for refused in [too_many, none, garbage] {
+            assert!(
+                matches!(
+                    &refused,
+                    Err(BridgeError::InvalidConfig(message)) if message.contains("IGGY_KAFKA_FETCH_SLOTS")
+                ),
+                "{refused:?}"
+            );
+        }
     }
 
     #[test]

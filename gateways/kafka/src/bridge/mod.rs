@@ -29,7 +29,8 @@ pub mod nodes;
 pub mod topic_map;
 
 pub use config::{
-    DEFAULT_FETCH_SLOTS, DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, ProduceSessionLimits,
+    DEFAULT_FETCH_SLOTS, DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, MAX_FETCH_SLOTS,
+    ProduceSessionLimits,
 };
 pub use error::BridgeError;
 pub use iggy_bridge::{
