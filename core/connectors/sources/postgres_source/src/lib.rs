@@ -763,7 +763,7 @@ impl PostgresSource {
             if let Some(change_record) =
                 self.parse_logical_replication_message(&data, &capture_ops, captured_tables)
             {
-                let payload = simd_json::to_vec(&change_record).map_err(|e| {
+                let payload = serde_json::to_vec(&change_record).map_err(|e| {
                     error!("Failed to serialize CDC row: {e}");
                     Error::InvalidRecord
                 })?;
@@ -1493,7 +1493,7 @@ impl PostgresSource {
                     old_data: None,
                 }
             };
-            simd_json::to_vec(&record).map_err(|_| Error::InvalidRecord)?
+            serde_json::to_vec(&record).map_err(|_| Error::InvalidRecord)?
         };
 
         let message = ProducedMessage {
@@ -1536,7 +1536,7 @@ impl PostgresSource {
                 let json_value: Option<serde_json::Value> = row
                     .try_get(column_index)
                     .map_err(|_| Error::InvalidRecord)?;
-                simd_json::to_vec(&json_value.unwrap_or(serde_json::Value::Null))
+                serde_json::to_vec(&json_value.unwrap_or(serde_json::Value::Null))
                     .map_err(|_| Error::InvalidRecord)
             }
             PayloadFormat::Json => {

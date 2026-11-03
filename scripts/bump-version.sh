@@ -26,6 +26,10 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+SWIFT_VERSION_FILE="foreign/swift/Sources/Iggy/Iggy.swift"
+SWIFT_GOLDEN_GENERATOR="foreign/swift/Tools/golden-vectors/Cargo.toml"
+SWIFT_GOLDEN_FIXTURE="foreign/swift/Tests/IggyTests/Fixtures/golden.json"
+
 usage() {
     cat <<'EOF'
 Usage:
@@ -58,6 +62,7 @@ Components:
   sdk-go               foreign/go/contracts/version.go
   sdk-csharp           foreign/csharp/Iggy_SDK/Iggy_SDK.csproj
   sdk-java             foreign/java/gradle.properties
+  sdk-swift            foreign/swift/Sources/Iggy/Iggy.swift + regenerated golden vectors
   web-ui               web/package.json
 
 Version flags (exactly one required):
@@ -91,11 +96,11 @@ RUST_COMPONENTS="rust-sdk rust-common rust-binary-protocol rust-server rust-cli 
 CONNECTOR_SINK_COMPONENTS="rust-connector-clickhouse-sink rust-connector-delta-sink rust-connector-doris-sink rust-connector-elasticsearch-sink rust-connector-http-sink rust-connector-iceberg-sink rust-connector-influxdb-sink rust-connector-meilisearch-sink rust-connector-mongodb-sink rust-connector-postgres-sink rust-connector-quickwit-sink rust-connector-rabbitmq-sink rust-connector-redshift-sink rust-connector-s3-sink rust-connector-stdout-sink rust-connector-surrealdb-sink"
 CONNECTOR_SOURCE_COMPONENTS="rust-connector-elasticsearch-source rust-connector-http-source rust-connector-influxdb-source rust-connector-postgres-source rust-connector-random-source"
 CONNECTOR_COMPONENTS="rust-connector-runtime ${CONNECTOR_SINK_COMPONENTS} ${CONNECTOR_SOURCE_COMPONENTS}"
-SDK_COMPONENTS="sdk-python sdk-node sdk-go sdk-csharp sdk-java"
+SDK_COMPONENTS="sdk-python sdk-node sdk-go sdk-csharp sdk-java sdk-swift"
 ALL_COMPONENTS="${RUST_COMPONENTS} ${CONNECTOR_COMPONENTS} ${SDK_COMPONENTS} web-ui"
 
 # Returns "file:format" lines per component.
-# Format keys: cargo, cargo-ws-dep:PKG, cargo-dep:PKG, python-cargo, pyproject, json, csproj, gradle, go
+# Format keys: cargo, cargo-ws-dep:PKG, cargo-dep:PKG, python-cargo, pyproject, json, csproj, gradle, go, swift
 get_version_files() {
     local component="$1"
     case "$component" in
@@ -167,6 +172,9 @@ get_version_files() {
             ;;
         sdk-java)
             echo "foreign/java/gradle.properties:gradle"
+            ;;
+        sdk-swift)
+            echo "${SWIFT_VERSION_FILE}:swift"
             ;;
         web-ui)
             echo "web/package.json:json"
@@ -249,7 +257,7 @@ translate_version() {
     read -r base pre_type pre_num <<< "$parsed"
 
     case "$format" in
-        cargo|cargo-ws-dep:*|cargo-dep:*|json|csproj|go)
+        cargo|cargo-ws-dep:*|cargo-dep:*|json|csproj|go|swift)
             echo "$canonical" ;;
         python-cargo)
             case "$pre_type" in
@@ -276,7 +284,7 @@ translate_version() {
 canonicalize_version() {
     local raw="$1" format="$2"
     case "$format" in
-        cargo|cargo-ws-dep:*|cargo-dep:*|json|csproj|go)
+        cargo|cargo-ws-dep:*|cargo-dep:*|json|csproj|go|swift)
             echo "$raw" ;;
         python-cargo)
             # Handle both old (0.7.2-dev.1) and new (0.7.2-dev1) formats
@@ -331,6 +339,8 @@ read_current_version() {
             grep '^version=' "$abs_file" | head -1 | sed 's/version=//' ;;
         go)
             grep 'const Version' "$abs_file" | head -1 | sed 's/.*const Version = "\([^"]*\)".*/\1/' ;;
+        swift)
+            grep 'static let sdkVersion = ' "$abs_file" | head -1 | sed 's/.*sdkVersion = "\([^"]*\)".*/\1/' ;;
         *)
             echo -e "${RED}Unknown format: ${format}${NC}" >&2
             return 1 ;;
@@ -375,6 +385,8 @@ write_version() {
             sedi "s/^version=.*/version=${translated}/" "$abs_file" ;;
         go)
             sedi "1,/const Version = \"[^\"]*\"/{s/const Version = \"[^\"]*\"/const Version = \"${translated}\"/;}" "$abs_file" ;;
+        swift)
+            sedi "s/\(static let sdkVersion = \"\)[^\"]*\"/\1${translated}\"/" "$abs_file" ;;
         *)
             echo -e "${RED}Unknown format: ${format}${NC}" >&2
             return 1 ;;
@@ -563,6 +575,11 @@ cmd_bump() {
     echo -e "${CYAN}New:${NC}       ${new_ver}"
     echo ""
 
+    if [[ "$component" == "sdk-swift" ]] && ! command -v cargo > /dev/null 2>&1; then
+        echo -e "${RED}sdk-swift needs cargo to regenerate ${SWIFT_GOLDEN_FIXTURE}${NC}" >&2
+        return 1
+    fi
+
     local changed_files=()
     while IFS= read -r entry; do
         local file="${entry%%:*}"
@@ -588,6 +605,22 @@ cmd_bump() {
             fi
         fi
     done < <(get_version_files "$component")
+
+    # Swift golden vectors embed the SDK version. A failed generator run leaves the fixture untouched.
+    if [[ "$component" == "sdk-swift" && ${#changed_files[@]} -gt 0 ]]; then
+        printf "  %-55s %s\n" "$SWIFT_GOLDEN_FIXTURE" "regenerated"
+        changed_files+=("$SWIFT_GOLDEN_FIXTURE")
+        if [[ $apply -eq 1 ]]; then
+            trap 'write_version "$SWIFT_VERSION_FILE" swift "$current"; exit 130' INT TERM
+            if ! cargo run --quiet --manifest-path "${REPO_ROOT}/${SWIFT_GOLDEN_GENERATOR}" -- "${REPO_ROOT}/${SWIFT_GOLDEN_FIXTURE}"; then
+                trap - INT TERM
+                write_version "$SWIFT_VERSION_FILE" swift "$current"
+                echo -e "${RED}Golden vector generation failed, restored ${SWIFT_VERSION_FILE}${NC}" >&2
+                return 1
+            fi
+            trap - INT TERM
+        fi
+    fi
 
     echo ""
     if [[ $apply -eq 1 ]]; then

@@ -271,7 +271,7 @@ async fn cleanup(client: &IggyClient) {
 }
 
 fn get_process_memory(pid: u32) -> u64 {
-    let mut sys = System::new();
+    let mut sys = System::new().expect("sysinfo supports this platform");
     sys.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
     sys.process(Pid::from_u32(pid))
         .map(|p| p.memory())
