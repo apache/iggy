@@ -7590,7 +7590,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_iceberg_sink"
-version = "0.5.1-edge.1"
+version = "0.5.1-edge.2"
 dependencies = [
  "arrow-array 58.4.1",
  "arrow-json 58.4.1",
@@ -7601,6 +7601,7 @@ dependencies = [
  "iceberg-storage-opendal",
  "iggy_connector_sdk",
  "parquet 58.4.1",
+ "secrecy",
  "serde",
  "simd-json",
  "strum 0.28.0",
@@ -7851,7 +7852,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_sdk"
-version = "0.5.1-edge.2"
+version = "0.5.1-edge.3"
 dependencies = [
  "anyhow",
  "apache-avro 0.22.0",
@@ -7881,6 +7882,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "uuid",
  "wiremock",
