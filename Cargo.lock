@@ -7222,7 +7222,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.5.1-edge.7"
+version = "0.5.1-edge.8"
 dependencies = [
  "apache-avro 0.22.0",
  "async-trait",
@@ -7535,7 +7535,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_http_sink"
-version = "0.5.1-edge.1"
+version = "0.5.1-edge.2"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -7844,7 +7844,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_sdk"
-version = "0.5.1-edge.2"
+version = "0.5.1-edge.3"
 dependencies = [
  "anyhow",
  "apache-avro 0.22.0",
