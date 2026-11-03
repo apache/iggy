@@ -52,6 +52,7 @@ RELEASE_PATHS=(
   "Dockerfile"
   "LICENSE"
   "NOTICE"
+  "Package.swift"
   "about.hbs"
   "about.toml"
   "docker-compose.yml"

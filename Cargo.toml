@@ -220,7 +220,7 @@ iggy-gateway-kafka = { path = "gateways/kafka" }
 iggy_binary_protocol = { path = "core/binary_protocol", version = "0.11.1-edge.8" }
 iggy_common = { path = "core/common", version = "0.11.1-edge.10" }
 iggy_connector_doris_sink = { path = "core/connectors/sinks/doris_sink" }
-iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.5.1-edge.2" }
+iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.5.1-edge.3" }
 iggy_kafka_wire = { path = "core/kafka_wire" }
 indexmap = "2.14.2"
 integration = { path = "core/integration" }
@@ -372,6 +372,7 @@ tonic-prost = "0.14.9"
 tower-http = { version = "0.7.1", features = ["add-extension", "cors", "trace"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
+tracing-log = "0.2.0"
 tracing-opentelemetry = "0.34.0"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [
     "fmt",
