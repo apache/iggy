@@ -231,18 +231,18 @@ mod tests {
     use async_broadcast::Receiver;
     use async_trait::async_trait;
     use iggy_common::{
-        Client, ClientInfo, ClientInfoDetails, ClusterClient, ClusterMetadata,
-        CompressionAlgorithm, Consumer, ConsumerGroup, ConsumerGroupClient, ConsumerGroupDetails,
-        ConsumerOffsetClient, ConsumerOffsetInfo, ConsumerPosition, DiagnosticEvent, Identifier,
-        IdentityInfo, IggyByteSize, IggyError, IggyExpiry, IggyMessage, IggyTimestamp,
-        MAX_PARTITIONS_COUNT, MaxTopicSize, MessageClient, NonZeroIggyDuration, OptionSpec,
-        OptionsScope, Partition, PartitionClient, PartitionContext, Partitioning, Permissions,
-        PersonalAccessTokenClient, PersonalAccessTokenExpiry, PersonalAccessTokenInfo,
-        PolledMessages, PollingStrategy, RawPersonalAccessToken, SegmentClient,
-        SendMessagesResponse, Snapshot, SnapshotCompression, Stats, Stream, StreamClient,
-        StreamDetails, StreamUpdateOptions, SystemClient, SystemSnapshotType, Topic, TopicClient,
-        TopicCreateOptions, TopicDetails, TopicUpdateOptions, UserClient, UserInfo,
-        UserInfoDetails, UserStatus, UserUpdateOptions,
+        Checkpoint, Client, ClientInfo, ClientInfoDetails, ClusterClient, ClusterMetadata,
+        Consumer, ConsumerGroup, ConsumerGroupClient, ConsumerGroupDetails, ConsumerOffsetClient,
+        ConsumerOffsetInfo, DiagnosticEvent, Identifier, IdentityInfo, IggyByteSize, IggyError,
+        IggyMessage, IggyTimestamp, MAX_PARTITIONS_COUNT, MessageClient, MetadataChanges,
+        MetadataChangesQuery, NonZeroIggyDuration, OptionSpec, OptionsScope, Partition,
+        PartitionClient, PartitionContext, Partitioning, Permissions, PersonalAccessTokenClient,
+        PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PollOptions, PolledMessages,
+        PollingStrategy, RawPersonalAccessToken, SegmentClient, SendMessagesResponse, Snapshot,
+        SnapshotCompression, Stats, Stream, StreamClient, StreamCreateOptions, StreamDetails,
+        StreamUpdateOptions, SystemClient, SystemSnapshotType, Topic, TopicClient,
+        TopicCreateOptions, TopicDetails, TopicUpdateOptions, UserClient, UserCreateOptions,
+        UserInfo, UserInfoDetails, UserStatus, UserUpdateOptions,
     };
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -309,9 +309,6 @@ mod tests {
             created_at: IggyTimestamp::zero(),
             name: "topic".to_owned(),
             size: IggyByteSize::default(),
-            message_expiry: IggyExpiry::NeverExpire,
-            compression_algorithm: CompressionAlgorithm::None,
-            max_topic_size: MaxTopicSize::Unlimited,
             messages_count: 0,
             partitions_count: u32::try_from(partitions.len()).unwrap(),
             partitions,
@@ -328,6 +325,8 @@ mod tests {
             size: IggyByteSize::default(),
             messages_count: 0,
             context: PartitionContext::default(),
+            members: Vec::new(),
+            in_sync_members: Vec::new(),
         }
     }
 
@@ -396,6 +395,13 @@ mod tests {
         ) -> Result<Snapshot, IggyError> {
             fail()
         }
+
+        async fn get_metadata_changes(
+            &self,
+            _query: &MetadataChangesQuery,
+        ) -> Result<MetadataChanges, IggyError> {
+            fail()
+        }
     }
 
     #[async_trait]
@@ -417,6 +423,7 @@ mod tests {
             _password: &str,
             _status: UserStatus,
             _permissions: Option<Permissions>,
+            _options: &UserCreateOptions,
         ) -> Result<UserInfoDetails, IggyError> {
             fail()
         }
@@ -428,8 +435,6 @@ mod tests {
         async fn update_user(
             &self,
             _user_id: &Identifier,
-            _username: Option<&str>,
-            _status: Option<UserStatus>,
             _options: &UserUpdateOptions,
         ) -> Result<(), IggyError> {
             fail()
@@ -506,14 +511,17 @@ mod tests {
             fail()
         }
 
-        async fn create_stream(&self, _name: &str) -> Result<StreamDetails, IggyError> {
+        async fn create_stream(
+            &self,
+            _name: &str,
+            _options: &StreamCreateOptions,
+        ) -> Result<StreamDetails, IggyError> {
             fail()
         }
 
         async fn update_stream(
             &self,
             _stream_id: &Identifier,
-            _name: &str,
             _options: &StreamUpdateOptions,
         ) -> Result<(), IggyError> {
             fail()
@@ -565,7 +573,6 @@ mod tests {
             &self,
             _stream_id: &Identifier,
             _topic_id: &Identifier,
-            _name: &str,
             _options: &TopicUpdateOptions,
         ) -> Result<(), IggyError> {
             fail()
@@ -620,11 +627,10 @@ mod tests {
             &self,
             _stream_id: &Identifier,
             _topic_id: &Identifier,
-            _partition_id: Option<u32>,
+            _partition_id: u32,
             _consumer: &Consumer,
             _strategy: &PollingStrategy,
-            _count: u32,
-            _auto_commit: bool,
+            _options: PollOptions,
         ) -> Result<PolledMessages, IggyError> {
             fail()
         }
@@ -647,7 +653,7 @@ mod tests {
             _consumer: &Consumer,
             _stream_id: &Identifier,
             _topic_id: &Identifier,
-            _position: ConsumerPosition,
+            _checkpoint: &Checkpoint,
         ) -> Result<(), IggyError> {
             fail()
         }
@@ -689,6 +695,16 @@ mod tests {
             _stream_id: &Identifier,
             _topic_id: &Identifier,
             _partition_id: Option<u32>,
+        ) -> Result<(), IggyError> {
+            fail()
+        }
+
+        async fn delete_consumer_position(
+            &self,
+            _consumer: &Consumer,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _checkpoint: &Checkpoint,
         ) -> Result<(), IggyError> {
             fail()
         }

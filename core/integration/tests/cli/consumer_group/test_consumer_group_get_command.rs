@@ -214,7 +214,10 @@ impl TestConsumerGroupGetLagWithoutStoredOffsetCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestConsumerGroupGetLagWithoutStoredOffsetCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name).await.unwrap();
+        let stream = client
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
+            .await
+            .unwrap();
         self.stream_id = stream.id;
 
         let topic = client
@@ -327,7 +330,10 @@ impl TestConsumerGroupGetLagWithStoredOffsetCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestConsumerGroupGetLagWithStoredOffsetCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name).await.unwrap();
+        let stream = client
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
+            .await
+            .unwrap();
         self.stream_id = stream.id;
 
         let topic = client
