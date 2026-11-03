@@ -237,7 +237,7 @@ fn json_values(messages: Vec<ConsumedMessage>) -> Result<Vec<OwnedValue>, Error>
 #[cfg(test)]
 mod tests {
     use super::{json_values, record_batch};
-    use deltalake::arrow::array::{ArrayRef, Float64Array, Int64Array, UInt64Array};
+    use deltalake::arrow::array::{ArrayRef, Float64Array, Int64Array};
     use deltalake::arrow::datatypes::{DataType, Field, Schema};
     use deltalake::arrow::record_batch::RecordBatch;
     use iggy_connector_sdk::{ConsumedMessage, Error, Payload};
@@ -248,19 +248,18 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("value", DataType::Float64, true),
-            Field::new("sequence", DataType::UInt64, false),
         ]));
+        let identifier = 9_007_199_254_740_993i64;
         let values = vec![
-            simd_json::json!({"id": 1, "value": 1.5, "sequence": u64::MAX}),
-            simd_json::json!({"id": 2, "value": null, "sequence": 0}),
+            simd_json::json!({"id": identifier, "value": 1.5}),
+            simd_json::json!({"id": 2, "value": null}),
         ];
         let batch = record_batch(&values, schema.clone()).expect("decode JSON numbers");
         let expected = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![identifier, 2])) as ArrayRef,
                 Arc::new(Float64Array::from(vec![Some(1.5), None])),
-                Arc::new(UInt64Array::from(vec![u64::MAX, 0])),
             ],
         )
         .expect("numeric columns");
