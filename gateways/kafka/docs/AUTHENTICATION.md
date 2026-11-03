@@ -67,7 +67,7 @@ connection. The cost rules it out.
 
 The Argon2 verify runs on the shard's compio runtime, which has no blocking pool. A burst of Kafka
 connections therefore stalls that shard's entire request loop, including produce and fetch traffic that has
-nothing to do with authentication. The 8192 ceiling (`[metadata] clients_table_max`, `core/consensus/src/impls.rs:211`) is cluster-wide.
+nothing to do with authentication. The 8192 ceiling (`[metadata] clients_table_max`, `core/consensus/src/impls.rs:249`) is cluster-wide.
 So connection churn on the Kafka side turns directly into session-table pressure on the Iggy side.
 
 ## Why not a shared service account
@@ -286,6 +286,12 @@ The principal a certificate yields is the same `AuthenticatedPrincipal` a SASL l
 permissions read at admission, so everything written about the SASL identity above holds: it is a snapshot,
 it is not cached across connections, and nothing acts as it on the data plane yet
 ([#4518](https://github.com/apache/iggy/issues/4518)).
+
+The snapshot follows Iggy's metadata change log when the bridge's Iggy user can read it, which needs root
+or the global `manage_servers` permission. A connection then takes each permission change of its user
+within about a second, and closes once its user is deleted or deactivated.
+[`ACL_MAPPING.md`](ACL_MAPPING.md#staleness) has the detail. Without that permission, the snapshot holds
+until the connection closes.
 
 ## Re-authentication
 

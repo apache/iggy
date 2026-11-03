@@ -34,18 +34,18 @@ use crate::bridge::{
 };
 use crate::error::Result;
 use crate::protocol::api::{
-    API_KEY_CREATE_TOPICS, ApiVersionRange, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS,
-    ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST,
-    ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
-    ERROR_TOPIC_ALREADY_EXISTS, GatewayState, HandleOutcome,
+    API_KEY_CREATE_TOPICS, ApiVersionRange, ConnectionState, ERROR_INVALID_CONFIG,
+    ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REPLICATION_FACTOR,
+    ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION,
+    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_create_topics_shape;
 use crate::protocol::handlers::topic_config::{
     MAX_CONFIG_TOPICS, find_duplicate_names, topic_cap_message,
 };
 use crate::protocol::handlers::{
-    clamp_request_timeout, decode_guarded, encode_message, handle_versioned_request,
-    is_supported_version, respond_or_close, unsupported_version_response,
+    another_controller, clamp_request_timeout, decode_guarded, encode_message,
+    handle_versioned_request, is_supported_version, respond_or_close, unsupported_version_response,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -54,7 +54,12 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
     max_version: 5,
 };
 
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     let Some(bridge) = &state.bridge else {
         return handle_versioned_request(
             API_KEY_CREATE_TOPICS,
@@ -90,6 +95,12 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
             );
         }
     };
+    if another_controller(state, &connection.brokers) {
+        return respond_or_close(
+            encode_inner(api_version, &req.topics, ERROR_NOT_CONTROLLER),
+            "CreateTopics",
+        );
+    }
 
     let topic_names: Vec<&str> = req.topics.iter().map(|topic| topic.name.as_str()).collect();
     let duplicate_names = find_duplicate_names(topic_names.iter().copied());

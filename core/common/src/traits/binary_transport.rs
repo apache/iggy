@@ -30,8 +30,12 @@ use iggy_binary_protocol::requests::messages::{FetchMessagesRequest, PollMessage
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
+use pin_project_lite::pin_project;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::task::futures::TaskLocalFuture;
 use tokio::time::Instant;
 
 /// Default budget shared by a binary call's lookups, admission and retries.
@@ -68,25 +72,65 @@ impl BinaryOperationLineage {
     }
 }
 
+pin_project! {
+    /// [`with_binary_deadline`]: the future until its first poll, then the scope that it runs
+    /// in, whose deadline needs the deadline in force at that poll.
+    #[project = DeadlineScopeProjection]
+    #[project_replace = DeadlineScopeOwned]
+    enum DeadlineScope<F: Future> {
+        Waiting { deadline: Instant, future: F },
+        Running { #[pin] scope: TaskLocalFuture<Instant, F> },
+        /// Only while the first poll moves the future into its scope.
+        Moving,
+    }
+}
+
+impl<F: Future> Future for DeadlineScope<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<F::Output> {
+        if matches!(*self, Self::Waiting { .. })
+            && let DeadlineScopeOwned::Waiting { deadline, future } =
+                self.as_mut().project_replace(Self::Moving)
+        {
+            let deadline = OPERATION_DEADLINE
+                .try_with(|current| deadline.min(*current))
+                .unwrap_or(deadline);
+            self.set(Self::Running {
+                scope: OPERATION_DEADLINE.scope(deadline, future),
+            });
+        }
+        match self.project() {
+            DeadlineScopeProjection::Running { scope } => scope.poll(context),
+            DeadlineScopeProjection::Waiting { .. } | DeadlineScopeProjection::Moving => {
+                Poll::Pending
+            }
+        }
+    }
+}
+
 #[doc(hidden)]
 pub fn binary_operation_lineage() -> Option<BinaryOperationLineage> {
     OPERATION_LINEAGE.try_get().ok().flatten()
 }
 
+// Neither helper is an `async fn`: one would keep `future` beside the scope that took it,
+// which doubles every call these helpers wrap.
 #[doc(hidden)]
-pub async fn with_binary_lineage<F: Future>(
+pub fn with_binary_lineage<F: Future>(
     lineage: Option<BinaryOperationLineage>,
     future: F,
-) -> F::Output {
-    OPERATION_LINEAGE.scope(lineage, future).await
+) -> impl Future<Output = F::Output> {
+    OPERATION_LINEAGE.scope(lineage, future)
 }
 
+/// The deadline is the earlier of `deadline` and the one in force when the future first runs.
 #[doc(hidden)]
-pub async fn with_binary_deadline<F: Future>(deadline: Instant, future: F) -> F::Output {
-    let deadline = OPERATION_DEADLINE
-        .try_with(|current| deadline.min(*current))
-        .unwrap_or(deadline);
-    OPERATION_DEADLINE.scope(deadline, future).await
+pub fn with_binary_deadline<F: Future>(
+    deadline: Instant,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    DeadlineScope::Waiting { deadline, future }
 }
 
 #[doc(hidden)]
@@ -378,6 +422,12 @@ pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
     /// Implemented by the transports so the value is the SDK crate's own
     /// `CARGO_PKG_VERSION` (`iggy` for Rust), not `iggy_common`'s.
     fn sdk_version(&self) -> &'static str;
+    /// The next producer id of this client's session. See
+    /// [`crate::MessageClient::next_producer_id`].
+    #[doc(hidden)]
+    fn next_producer_id(&self) -> Result<u64, IggyError> {
+        Err(IggyError::FeatureUnavailable)
+    }
 }
 
 pub use vsr_session_sealed::Sealed as VsrSessionSealed;

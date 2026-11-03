@@ -61,8 +61,10 @@ export type ConsumerGroupRequest = Omit<ConsumerRequest, 'partitions'>;
  * `consume()` returns with success (`after: processing`), or on `mark()`,
  * and the latest counted position is stored at the interval or event of the
  * policy and on shutdown. A read error that the reader retries by itself goes
- * to `onError` and the consumer goes on. A message that does not decode ends
- * the iteration with its `ReadError`, whose `skip` passes it with `seek`.
+ * to `onError` and the consumer goes on. A stop of a partition
+ * (`stopsPartition`) ends the iteration with its `ReadError`, and so does a
+ * message that does not decode, whose `skip` passes it with `seek`. A
+ * `resumable` stop reads again after a `seek` to Next.
  */
 export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
   private uncounted?: { checkpoint: Checkpoint, endsBatch: boolean };
@@ -184,7 +186,7 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
         return await this.reader.next();
       } catch (error) {
         if (this.stopped && !(error instanceof ReadError)) return undefined;
-        if (!(error instanceof ReadError) || error.skip) throw error;
+        if (!(error instanceof ReadError) || error.skip || error.stopsPartition) throw error;
         this.onError?.(error);
       }
     }
