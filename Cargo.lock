@@ -13070,7 +13070,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.9.1-edge.8"
+version = "0.9.1-edge.9"
 dependencies = [
  "ahash",
  "arc-swap",
