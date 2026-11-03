@@ -67,17 +67,6 @@ runs:
         done
         echo "✅ Root manifest and legal files present"
 
-    - name: Setup Swift
-      uses: ./.github/actions/utils/setup-swift
-      with:
-        cache-key: "release"
-        package-path: "."
-
-    # An unpinned release build checks dependency resolution before the tag exists.
-    - name: Build the published package
-      shell: bash
-      run: swift build -c release --product Iggy
-
     - name: Summary
       shell: bash
       env:
@@ -101,7 +90,5 @@ runs:
           echo ""
           if [ "$DRY_RUN" = "true" ]; then
             echo "**Note:** Dry run, no tag will be created"
-          else
-            echo "**Note:** The publish workflow creates the tag after this step"
           fi
         } >> "$GITHUB_STEP_SUMMARY"

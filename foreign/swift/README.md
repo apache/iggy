@@ -36,28 +36,32 @@ The SDK depends on [SwiftNIO](https://github.com/apple/swift-nio),
 
 ## Installation
 
-Swift Package Manager resolves a package from the root of a git repository, so the Iggy repository root carries a `Package.swift` that publishes this SDK. Depend on the Iggy repository itself, replacing `0.1.10` with a released version:
+Swift Package Manager resolves a package from the root of a git repository, so the Iggy repository root carries a `Package.swift` that publishes this SDK. Depend on the Iggy repository itself.
+
+There is no stable Swift release yet. Until there is, pin a development snapshot exactly, replacing `0.1.10-edge.1` with the newest `vX.Y.Z-edge.N` tag:
 
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/apache/iggy.git", from: "0.1.10")
+    .package(url: "https://github.com/apache/iggy.git", exact: "0.1.10-edge.1")
 ],
 targets: [
     .target(name: "MyApp", dependencies: [.product(name: "Iggy", package: "iggy")])
 ]
 ```
 
-Stable Swift releases use `vX.Y.Z` tags after PMC approval. An `X.Y.Z-edge.N` tag is a development snapshot of unreleased changes, not an Apache release. A version range such as `from: "0.1.10"` never selects a snapshot. The first resolve clones the whole Iggy repository, which SwiftPM then caches.
+Stable Swift releases use `vX.Y.Z` tags after PMC approval. An `X.Y.Z-edge.N` tag is a development snapshot of unreleased changes, not an Apache release, and a version range never selects one. Once a stable release exists, depend on it with `.upToNextMinor(from: "X.Y.Z")`: while the SDK is 0.x, `from:` would also take the next minor release. A requirement must start at the first stable `v0.1.x` tag, because the repository's `0.0.4` to `0.0.52` tags predate the Swift SDK and have no root manifest.
 
-From a checkout of this repository, or a vendored copy, depend on it by path:
+The first resolve mirror-clones the whole Iggy repository, about 145 MiB with every pull request ref, and checks out its 67 MiB tree for a 0.8 MiB SDK. SwiftPM keeps the clone in its cache, so later resolves fetch only new commits.
+
+From a checkout of this repository, depend on its root by path. SwiftPM names a path dependency after its directory, so the package is `iggy` for a checkout in `../iggy`:
 
 ```swift
 dependencies: [
-    .package(name: "apache-iggy", path: "../iggy/foreign/swift")
+    .package(path: "../iggy")
 ],
 targets: [
-    .target(name: "MyApp", dependencies: [.product(name: "Iggy", package: "apache-iggy")])
+    .target(name: "MyApp", dependencies: [.product(name: "Iggy", package: "iggy")])
 ]
 ```
 
@@ -537,19 +541,20 @@ swift format lint --strict --recursive Sources Tests Package.swift
 swift build -Xswiftc -warnings-as-errors
 ```
 
-The same configuration covers the examples and the BDD runner, from the repository root:
+The same configuration covers the examples, the BDD runner and the root manifest, from the repository root:
 
 ```bash
 for package in examples/swift/getting-started bdd/swift/tests; do
   swift format lint --strict --recursive --configuration foreign/swift/.swift-format "$package/Sources" "$package/Package.swift"
 done
+swift format lint --strict --configuration foreign/swift/.swift-format Package.swift
 ```
 
 ### Releasing
 
-`IggyVersion.sdkVersion` in `Sources/Iggy/Iggy.swift` is the SDK version. Change it only with `scripts/bump-version.sh sdk-swift` from the repository root, which also regenerates the golden vectors that embed it: `--edge` for the next development snapshot, `--strip-edge` for the version that goes to a release vote.
+`IggyVersion.sdkVersion` in `Sources/Iggy/Iggy.swift` is the SDK version. Change it only with `scripts/bump-version.sh sdk-swift` from the repository root, which also regenerates the golden vectors that embed it: `--edge` for the next development snapshot, `--patch --edge` for the first snapshot after a stable release, `--strip-edge` for the version that goes to a release vote.
 
-After a merge to master, CI tags an untagged `X.Y.Z-edge.N` version as `vX.Y.Z-edge.N`. Developers who choose to test unreleased changes can select an existing snapshot with an exact requirement such as `exact: "0.1.10-edge.1"`.
+After a merge to master, CI tags an untagged `X.Y.Z-edge.N` version as `vX.Y.Z-edge.N`.
 
 For a stable release, the PMC vote must cover the Swift version and source archive, including the root manifest. The release manager verifies the vote result and publishes the signed source release through Apache's release process. The workflow does not verify the vote automatically. Merging a plain `X.Y.Z` version to master does not publish a stable Swift tag.
 

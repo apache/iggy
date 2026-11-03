@@ -492,20 +492,6 @@ preflight_consistency_check() {
     echo "$first_canonical"
 }
 
-# Swift golden vectors embed the SDK version. A failed run leaves the fixture untouched.
-regenerate_swift_golden() {
-    local generated
-    generated=$(mktemp "${REPO_ROOT}/${SWIFT_GOLDEN_FIXTURE}.XXXXXX") || return 1
-    if ! cargo run --quiet --manifest-path "${REPO_ROOT}/${SWIFT_GOLDEN_GENERATOR}" -- "$generated"; then
-        rm -f "$generated"
-        return 1
-    fi
-    if ! chmod 644 "$generated" || ! mv -f "$generated" "${REPO_ROOT}/${SWIFT_GOLDEN_FIXTURE}"; then
-        rm -f "$generated"
-        return 1
-    fi
-}
-
 # Main bump logic.
 cmd_bump() {
     local component="$1"
@@ -589,17 +575,9 @@ cmd_bump() {
     echo -e "${CYAN}New:${NC}       ${new_ver}"
     echo ""
 
-    local swift_backup=""
-    if [[ "$component" == "sdk-swift" && $apply -eq 1 ]]; then
-        if ! command -v cargo > /dev/null 2>&1; then
-            echo -e "${RED}sdk-swift needs cargo to regenerate ${SWIFT_GOLDEN_FIXTURE}${NC}" >&2
-            return 1
-        fi
-        swift_backup=$(mktemp) || return 1
-        if ! cp "${REPO_ROOT}/${SWIFT_VERSION_FILE}" "$swift_backup"; then
-            rm -f "$swift_backup"
-            return 1
-        fi
+    if [[ "$component" == "sdk-swift" ]] && ! command -v cargo > /dev/null 2>&1; then
+        echo -e "${RED}sdk-swift needs cargo to regenerate ${SWIFT_GOLDEN_FIXTURE}${NC}" >&2
+        return 1
     fi
 
     local changed_files=()
@@ -628,18 +606,20 @@ cmd_bump() {
         fi
     done < <(get_version_files "$component")
 
-    if [[ -n "$swift_backup" ]]; then
-        if [[ ${#changed_files[@]} -gt 0 ]]; then
-            echo "  Regenerating ${SWIFT_GOLDEN_FIXTURE}"
-            if ! regenerate_swift_golden; then
-                cp "$swift_backup" "${REPO_ROOT}/${SWIFT_VERSION_FILE}"
-                rm -f "$swift_backup"
+    # Swift golden vectors embed the SDK version. A failed generator run leaves the fixture untouched.
+    if [[ "$component" == "sdk-swift" && ${#changed_files[@]} -gt 0 ]]; then
+        printf "  %-55s %s\n" "$SWIFT_GOLDEN_FIXTURE" "regenerated"
+        changed_files+=("$SWIFT_GOLDEN_FIXTURE")
+        if [[ $apply -eq 1 ]]; then
+            trap 'write_version "$SWIFT_VERSION_FILE" swift "$current"; exit 130' INT TERM
+            if ! cargo run --quiet --manifest-path "${REPO_ROOT}/${SWIFT_GOLDEN_GENERATOR}" -- "${REPO_ROOT}/${SWIFT_GOLDEN_FIXTURE}"; then
+                trap - INT TERM
+                write_version "$SWIFT_VERSION_FILE" swift "$current"
                 echo -e "${RED}Golden vector generation failed, restored ${SWIFT_VERSION_FILE}${NC}" >&2
                 return 1
             fi
-            changed_files+=("$SWIFT_GOLDEN_FIXTURE")
+            trap - INT TERM
         fi
-        rm -f "$swift_backup"
     fi
 
     echo ""

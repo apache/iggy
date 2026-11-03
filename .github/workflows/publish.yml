@@ -185,6 +185,7 @@ jobs:
       docker_components: ${{ steps.mk.outputs.docker_components }}
       count: ${{ steps.mk.outputs.count }}
       has_python: ${{ steps.mk.outputs.has_python }}
+      has_swift: ${{ steps.mk.outputs.has_swift }}
       has_docker: ${{ steps.mk.outputs.has_docker }}
     steps:
       - name: Download latest copy script from master
@@ -364,6 +365,8 @@ jobs:
             } else {
               core.setOutput('has_python', 'false');
             }
+
+            core.setOutput('has_swift', String(targets.some(t => t.key === 'sdk-swift')));
 
   check-tags:
     name: Existing tags
@@ -661,6 +664,50 @@ jobs:
       upload_artifacts: true
       use_latest_ci: ${{ inputs.use_latest_ci }}
       commit: ${{ needs.validate.outputs.commit }}
+
+  # Without a lockfile SwiftPM runs the newest dependency manifests, unsandboxed
+  # on Linux, so the build a consumer would get runs without a write token.
+  build-swift-package:
+    name: Build Swift package
+    needs: [validate, plan, check-tags]
+    if: |
+      needs.validate.outputs.has_targets == 'true' &&
+      needs.plan.outputs.has_swift == 'true'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
+      - name: Checkout at commit
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts
+
+          /tmp/copy-latest-from-master.sh apply
+
+      # A cold resolve is what a consumer gets, so this build reads no cache.
+      - name: Setup Swift
+        uses: ./.github/actions/utils/setup-swift
+        with:
+          read-cache: "false"
+
+      - name: Build the published package
+        run: swift build -c release --product Iggy
 
   # Sequential Rust crate publishing to handle dependencies properly
   publish-rust-crates:
@@ -992,13 +1039,14 @@ jobs:
   # Note: This job runs in parallel with Docker publishing - no dependency between them
   publish:
     name: ${{ matrix.name }}
-    needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
+    needs: [validate, plan, check-tags, build-python-wheels, build-swift-package, publish-rust-crates]
     if: |
       !cancelled() &&
       needs.check-tags.result == 'success' &&
       needs.validate.outputs.has_targets == 'true' &&
       fromJson(needs.plan.outputs.non_docker_targets).include[0].key != 'noop' &&
       (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped') &&
+      (needs.build-swift-package.result == 'success' || needs.build-swift-package.result == 'skipped') &&
       (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped')
     runs-on: ubuntu-26.04
     permissions:
@@ -1310,6 +1358,7 @@ jobs:
         plan,
         check-tags,
         build-python-wheels,
+        build-swift-package,
         publish-rust-crates,
         publish-docker,
         docker-manifests,
@@ -1443,6 +1492,16 @@ jobs:
               echo
             fi
 
+            if [ "${{ needs.plan.outputs.has_swift }}" = "true" ]; then
+              echo "### Swift Package Build"
+              case "${{ needs.build-swift-package.result }}" in
+                success)   echo "✅ **Swift package built from the root manifest**" ;;
+                failure)   echo "❌ **Swift package build failed**" ;;
+                skipped)   echo "⏭️ **Swift package build was skipped**" ;;
+              esac
+              echo
+            fi
+
             # Rust crates publishing status
             if [ -n "${{ inputs.publish_crates }}" ]; then
               echo "### Rust Crates Publishing (Sequential)"
@@ -1502,6 +1561,7 @@ jobs:
         validate,
         plan,
         build-python-wheels,
+        build-swift-package,
         publish-rust-crates,
         publish-docker,
         docker-manifests,
