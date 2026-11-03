@@ -7091,7 +7091,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.11.1-edge.8"
+version = "0.11.1-edge.9"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -7223,7 +7223,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.5.1-edge.6"
+version = "0.5.1-edge.7"
 dependencies = [
  "apache-avro 0.22.0",
  "async-trait",
@@ -7370,7 +7370,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.11.1-edge.9"
+version = "0.11.1-edge.10"
 dependencies = [
  "aes-gcm 0.11.1",
  "aes-gcm-siv",
@@ -7390,6 +7390,7 @@ dependencies = [
  "humantime",
  "iggy_binary_protocol",
  "papaya",
+ "pin-project-lite",
  "ring",
  "secrecy",
  "serde",
@@ -13000,7 +13001,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.9.1-edge.7"
+version = "0.9.1-edge.8"
 dependencies = [
  "ahash",
  "arc-swap",

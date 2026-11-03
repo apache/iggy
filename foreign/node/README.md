@@ -269,7 +269,9 @@ try {
   names the partition of an error, or none for an error of the whole reader,
   and the reader retries by itself. Error 87 stops a partition until `seek`
   when its position came from an earlier read, and so do error 80 and a refusal
-  that six retries did not change.
+  that six retries did not change. The error of each stop sets
+  `stopsPartition`, and that of an 87 or a refusal stop also sets `resumable`:
+  a `seek` to Next reads the partition again after its stored offset.
 - For a message that does not decode, `ReadError` carries `skip`, `offset` and
   `record`, the record as the reply carried it: its 48-byte frame header,
   payload and user headers, so the message can be kept or inspected. When the
@@ -330,8 +332,12 @@ await consumer.shutdown();
   the first and ends as it does. `seek` drops the rest of the batch of its
   partition.
 - A read error that the reader retries by itself goes to `onError` and the
-  consumer goes on. A message that does not decode ends the iteration with its
-  `ReadError`, whose `skip` passes it with `seek`.
+  consumer goes on. A stop of a partition (`stopsPartition`) ends the
+  iteration with its `ReadError`, and so does a message that does not decode,
+  whose `skip` passes it with `seek`. A `resumable` stop reads again after a
+  `seek` to Next. A stop while a committing read that lost its reply is still
+  pending reports that read as 14010 instead, since a seek to Next would skip
+  what it stored.
 - `toReadable()` takes the next message only when its own reader asks for it,
   and destroying it shuts the consumer down.
 

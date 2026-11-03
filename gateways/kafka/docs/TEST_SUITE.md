@@ -91,10 +91,11 @@ file under `tests/` anymore.
 | [`metadata_changes_real_bridge_tests.rs`](../tests/metadata_changes_real_bridge_tests.rs) | The bridge following Iggy's metadata change log against a real, spawned `iggy-server`. A group that one gateway stores a first offset for lists on another within about a second, with no scan client, and a deleted topic takes its groups off the list. A bridge user without `manage_servers` still lists groups through the scan. A permission change and a delete of a user reach the bridge, and over SASL an open connection takes the change and closes once its user is deleted | No (needs the `iggy-server` binary - see Prerequisites) |
 | [`coordinator_real_bridge_tests.rs`](../tests/coordinator_real_bridge_tests.rs) | Several in-process gateways sharing their groups through the coordinator log on one real, spawned `iggy-server`: every gateway names the same coordinator for each group and the groups spread over all of them, a stopped coordinator's group goes on at another gateway with its member, generation, offsets and commit metadata, a foreign newer claim stops the coordinator until it claims again and reloads, only the controller creates topics, each gateway leads every partition, and a restarted gateway loads its groups, also from checkpoints | Needs `iggy-server` |
 | [`coordinator_cluster_tests.rs`](../tests/coordinator_cluster_tests.rs) | Three gateways beside a three-node Iggy cluster, one beside each node: the coordinating gateway stops, an Iggy node stops, and each gateway restarts in turn. The member keeps its id and generation through each, and its offsets stay | Needs `iggy-server` |
+| [`cluster_failover_tests.rs`](../tests/cluster_failover_tests.rs) | Three compiled gateways with `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true` run beside a three-node Iggy cluster. An idempotent Java producer and a Java consumer group of two members load them, and bootstrap from the group's coordinator alone. Each gateway restarts in turn with SIGTERM. Each node stops, the metadata primary first, then the primary of the group's coordinator partition. Each gateway stops with its node. The coordinator stops during a rebalance. The coordinator crashes with SIGKILL during a burst of Produce requests: alone, and with its node, which holds the metadata primary. Each crash checks that Iggy answers a resend of a written batch with its first offset. kcat finds every acknowledged record once, at its acknowledged offset, and no other record, and the group reads each once. Every commit succeeds, and the coordinator returns the last one, the offset after the last record read. The group does not rebalance after it settles. Two gateways answer as coordinator of one group only while it moves, for at most 2 s. Each crash checks its takeover window: 31 to 45 s with the default 36 s session timeout, and 8.6 to 14.6 s with a 9.6 s one. A crash of the metadata primary adds 10 s | No, but needs Docker and a built `iggy-server` |
 | [`cluster_id_real_bridge_tests.rs`](../tests/cluster_id_real_bridge_tests.rs) | The cluster id stored in a real, spawned `iggy-server`: one id for every bridge, the first write winning when several start at once, a persisted topic with no expiry or size cap, the id surviving an `iggy-server` SIGKILL, a stored value that is not an id refused, one id per default stream, and the compiled gateway binary reporting the same id in Metadata and DescribeCluster across a restart ([#4519](https://github.com/apache/iggy/issues/4519)) | No (needs both binaries - see Prerequisites) |
-| [`phase1_e2e_tests.rs`](../tests/phase1_e2e_tests.rs) | [#3539](https://github.com/apache/iggy/issues/3539) acceptance: CreateTopics → Metadata → Produce → ListOffsets over real TCP against the real compiled `iggy-gateway-kafka` binary bridged to a real spawned `iggy-server` - with `cluster_id_real_bridge_tests.rs`, one of the two suites that spawn the gateway as a process rather than calling `KafkaGateway::run` in-process. A gateway started 16 s before its `iggy-server` waits for it and then serves | No (needs both binaries - see Prerequisites) |
+| [`phase1_e2e_tests.rs`](../tests/phase1_e2e_tests.rs) | [#3539](https://github.com/apache/iggy/issues/3539) acceptance: CreateTopics → Metadata → Produce → ListOffsets over real TCP against the real compiled `iggy-gateway-kafka` binary, bridged to a real spawned `iggy-server`. With `cluster_id_real_bridge_tests.rs` and `cluster_failover_tests.rs`, it is one of the three suites that spawn the gateway as a process rather than calling `KafkaGateway::run` in-process. A gateway started 16 s before its `iggy-server` waits for it and then serves | No (needs both binaries - see Prerequisites) |
 
-`tests/common/` holds shared helpers (`certs.rs`, `codec.rs`, `fixtures.rs`, `gateway_process.rs`,
+`tests/common/` holds shared helpers (`certs.rs`, `codec.rs`, `deployment.rs`, `docker_clients.rs`, `fixtures.rs`, `gateway_process.rs`,
 `gateways.rs`, `scope.rs`, `server.rs`, `iggy_server.rs`, `tcp.rs`, `wire.rs`), compiled per test binary via `#[path]`, not a test binary itself. `certs.rs`
 mints a CA, server and client certificates with `rcgen` per test, so nothing in the tree can expire. `codec.rs`
 is test-only primitive encode/decode scaffolding for hand-building legacy/adversarial wire shapes
@@ -129,6 +130,26 @@ shard pools, so the two can run alongside each other.
 
 It automates categories S and T of [`MANUAL_TESTING.md`](MANUAL_TESTING.md). Those procedures stay,
 because they cover cases a test does not assert, but the load-bearing ones now run in CI.
+
+## Failover suite
+
+`cluster_failover_tests.rs` uses the same two images and `KAFKA_E2E_REQUIRED` as the real-client
+suite, and skips in the same way. It needs no JDK. Cargo builds the gateway binary for the test,
+but `iggy-server` comes from another package, so build it first:
+
+```bash
+cargo build --bin iggy-server
+docker pull edenhill/kcat:1.7.1
+docker pull apache/kafka:3.9.0
+KAFKA_E2E_REQUIRED=1 cargo test -p iggy-gateway-kafka --test cluster_failover_tests
+```
+
+Each test takes 1 to 3 minutes. It runs in the `kafka_cluster` nextest group, alone on the machine,
+so other tests do not change the takeover times it checks. That group also holds
+`coordinator_cluster_tests.rs`, so those tests run one at a time too. Nextest gives each test up to
+5 minutes, and a test fails itself at 270 s, so it still reports its logs. The `ci` profile does
+not retry a failed one, since a retry hides a race that fails one run in a few. At its start, a
+test prints where its logs go. A failed test keeps the logs of its nodes, gateways and clients.
 
 ## Adding new tests
 
