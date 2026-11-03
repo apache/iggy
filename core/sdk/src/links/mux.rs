@@ -977,6 +977,7 @@ mod tests {
         for websocket in [false, true] {
             let (client, server) = duplex(DUPLEX_CAPACITY);
             let (resume, paused) = oneshot::channel();
+            let (queued, queue) = oneshot::channel();
             let (link, mut peer) = if websocket {
                 let (client, server) = tokio::join!(
                     client_async("ws://localhost/", client),
@@ -987,7 +988,8 @@ mod tests {
                     MuxLink::start(
                         LOCALHOST,
                         |frames, shared| async move {
-                            paused.await.unwrap();
+                            queued.send(frames).unwrap();
+                            let frames = paused.await.unwrap();
                             write_websocket(sink, frames, shared).await;
                         },
                         |shared| read_websocket(stream, shared),
@@ -1000,7 +1002,8 @@ mod tests {
                     MuxLink::start(
                         LOCALHOST,
                         |frames, shared| async move {
-                            paused.await.unwrap();
+                            queued.send(frames).unwrap();
+                            let frames = paused.await.unwrap();
                             write_tcp(BufWriter::new(writer), frames, shared).await;
                         },
                         |shared| read_tcp(BufReader::new(reader), shared),
@@ -1008,6 +1011,7 @@ mod tests {
                     Peer::Tcp(server),
                 )
             };
+            let frames = queue.await.unwrap();
             let deadline = Instant::now() + TEST_BUDGET;
             let poll = |id| {
                 let mut frame = request(id, BOUND_SESSION);
@@ -1019,7 +1023,9 @@ mod tests {
                 (1..=LINK_WRITE_QUEUE as u64).map(poll),
             ));
             timeout(TEST_BUDGET, async {
-                while link.queue.capacity() != MAX_PENDING_PER_LINK - LINK_WRITE_QUEUE {
+                // Reservations consume capacity before the send finishes.
+                // Wait for the original frames themselves before dropping callers.
+                while frames.len() != LINK_WRITE_QUEUE {
                     assert!(futures::poll!(&mut abandoned).is_pending());
                     tokio::task::yield_now().await;
                 }
@@ -1055,7 +1061,7 @@ mod tests {
                 "cancels and reservations fill the FIFO"
             );
             assert_eq!(link.shared.write_permits.available_permits(), 0);
-            resume.send(()).unwrap();
+            resume.send(frames).unwrap();
 
             let mut pending_cancels = BTreeSet::new();
             tokio::select! {
