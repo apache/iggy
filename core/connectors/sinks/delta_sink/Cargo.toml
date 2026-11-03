@@ -49,6 +49,7 @@ tracing = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
 simd-json = { workspace = true }
 
 [lints]

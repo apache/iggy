@@ -7786,7 +7786,6 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "simd-json",
  "sqlx",
  "tokio",
  "tracing",
