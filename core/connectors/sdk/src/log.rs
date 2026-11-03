@@ -16,8 +16,12 @@
 // under the License.
 
 use tracing::field::{Field, Visit};
+use tracing::level_filters::LevelFilter;
 use tracing::{Event, Level, Subscriber};
-use tracing_subscriber::layer::{Context, Layer};
+use tracing_log::{AsLog, LogTracer, NormalizeEvent};
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Registry};
 
 /// Callback for plugins to send log records to the runtime.
 ///
@@ -37,6 +41,20 @@ pub type LogCallback = extern "C" fn(
 
 /// A tracing Layer that forwards events to the runtime via callback.
 /// This allows plugin logs to be routed through the runtime's OTEL subscriber.
+/// Installs the subscriber of a plugin, which hands every event to the runtime through
+/// `callback`, and routes the `log` records of the plugin's dependencies into it. Only the first
+/// call of a plugin library takes effect.
+pub(crate) fn init_plugin_logging(callback: LogCallback) {
+    _ = Registry::default()
+        .with(CallbackLayer::new(callback))
+        .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
+        .try_init();
+    // Each plugin library has its own `log` logger, and records sent to an unset one vanish.
+    _ = LogTracer::builder()
+        .with_max_level(LevelFilter::current().as_log())
+        .init();
+}
+
 pub struct CallbackLayer {
     callback: LogCallback,
 }
@@ -49,7 +67,10 @@ impl CallbackLayer {
 
 impl<S: Subscriber> Layer<S> for CallbackLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        let level = match *event.metadata().level() {
+        // A record bridged from `log` keeps its own target and level here.
+        let normalized = event.normalized_metadata();
+        let metadata = normalized.as_ref().unwrap_or_else(|| event.metadata());
+        let level = match *metadata.level() {
             Level::TRACE => 0u8,
             Level::DEBUG => 1,
             Level::INFO => 2,
@@ -57,7 +78,7 @@ impl<S: Subscriber> Layer<S> for CallbackLayer {
             Level::ERROR => 4,
         };
 
-        let target = event.metadata().target();
+        let target = metadata.target();
 
         let mut visitor = MessageVisitor::default();
         event.record(&mut visitor);

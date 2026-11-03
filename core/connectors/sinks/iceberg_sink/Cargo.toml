@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_iceberg_sink"
-version = "0.5.1-edge.1"
+version = "0.5.1-edge.2"
 edition = "2024"
 license = "Apache-2.0"
 keywords = ["iggy", "messaging", "streaming"]
@@ -44,6 +44,7 @@ iceberg-catalog-rest = { workspace = true }
 iceberg-storage-opendal = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 parquet = { workspace = true }
+secrecy = { workspace = true }
 serde = { workspace = true }
 simd-json = { workspace = true }
 strum = { workspace = true }
