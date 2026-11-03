@@ -92,10 +92,7 @@ impl DynamicRouter {
 /// holding JSON arrives here as `Payload::Json`; proto text that is not JSON
 /// holds no document and does not route, and neither does any other variant.
 fn route_value(payload: &Payload, route_field: &str) -> Option<String> {
-    let Some(document) = payload.json_document() else {
-        warn!("Unsupported format for iceberg connector");
-        return None;
-    };
+    let document = payload.json_document()?;
     document
         .as_object()
         .and_then(|obj| obj.get(route_field))
@@ -114,9 +111,12 @@ impl Router for DynamicRouter {
             // Normalised once here so the routing read and the later write both
             // work off the document, rather than parsing the same proto text twice.
             message.payload = message.payload.into_json_document();
-            let route_field_val = match self.extract_route_field(&message) {
-                Some(val) => val,
-                None => continue,
+            let Some(route_field_val) = self.extract_route_field(&message) else {
+                warn!(
+                    "Dropping the message at offset {}: it is not a JSON object with the route field: {}",
+                    message.offset, self.route_field
+                );
+                continue;
             };
 
             let message = match writer.push_to_existing(&route_field_val, message) {
@@ -126,7 +126,8 @@ impl Router for DynamicRouter {
 
             if !is_valid_namespaced_table(&route_field_val) {
                 warn!(
-                    "Found invalid route field name on message: {route_field_val}. Route fields should have at least 1 namespace separated by '.' character before the table"
+                    "Dropping the message at offset {}: its route field value: {route_field_val} names no table. It needs at least one namespace before the table, separated by '.'",
+                    message.offset
                 );
                 continue;
             }
@@ -146,6 +147,11 @@ impl Router for DynamicRouter {
                         .table_to_message
                         .insert(route_field_val_cloned, message_vec);
                 }
+            } else {
+                warn!(
+                    "Dropping the message at offset {}: table: {route_field_val} does not load from the catalog",
+                    message.offset
+                );
             }
         }
 

@@ -50,8 +50,8 @@ const (
 	// 35, 103, 104, 123, 124, 204 and 304 are retired and must never be reused.
 	GetPartitionRouteCode     Code = 105
 	PollMessagesDeferredCode  Code = 106
-	WaitForMessagesCode       Code = 107
 	CancelDeferredRequestCode Code = 108
+	FetchMessagesCode         Code = 109
 	GetOffsetCode             Code = 120
 	StoreOffsetCode           Code = 121
 	DeleteConsumerOffsetCode  Code = 122

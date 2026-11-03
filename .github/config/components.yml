@@ -145,7 +145,7 @@ components:
   # existing deployments, which no other check covers. Matching is literal
   # glob with no crate-graph expansion, so every crate has to be spelled out:
   # `core/server/**` does not cover `core/server_common/**`.
-  # `breaking:storage` on the PR skips it (see .github/workflows/_rust.yml).
+  # `breaking:storage` or `breaking:protocol` on the PR skips it (see .github/workflows/_rust.yml).
   rust-storage-compat:
     depends_on:
       - "rust-workspace"
@@ -357,6 +357,8 @@ components:
       - "foreign/swift/**"
       - "bdd/swift/**"
       - "examples/swift/**"
+      - "Package.swift"
+      - ".spi.yml"
     tasks: ["lint", "test", "build", "build-macos", "golden", "e2e"]
 
   # Shared BDD infrastructure that affects all BDD tests
@@ -403,6 +405,7 @@ components:
     paths:
       - "bdd/php/**"
       - "bdd/scenarios/basic_messaging.feature"
+      - "bdd/scenarios/deferred_polling.feature"
     tasks: ["bdd-php"]
 
   bdd-go:
@@ -467,6 +470,18 @@ components:
       - "bdd/cpp/**"
       - "bdd/scenarios/**"
     tasks: ["bdd-cpp"]
+
+  bdd-swift:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk"
+      - "sdk-swift"
+      - "bdd-infrastructure"
+      - "ci-infrastructure"
+    paths:
+      - "bdd/swift/**"
+      - "bdd/scenarios/**"
+    tasks: ["bdd-swift"]
 
   examples-rust:
     depends_on:
@@ -550,6 +565,18 @@ components:
       - "scripts/run-examples-from-readme.sh"
       - "scripts/utils.sh"
     tasks: ["examples-java"]
+
+  examples-swift:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "sdk-swift"
+      - "ci-infrastructure"
+    paths:
+      - "examples/swift/**"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
+    tasks: ["examples-swift"]
 
   web-ui:
     paths:

@@ -20,7 +20,6 @@
 //! whether the route is mounted. The scrape handler itself lives with the
 //! other route handlers so this leaf never imports the state hub.
 
-use std::fmt::Write;
 use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -29,9 +28,7 @@ use configs::http::HttpMetricsConfig;
 use iggy_common::{IggyError, stats_rollup_underflows};
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::text::encode;
-use prometheus_client::encoding::{
-    DescriptorEncoder, EncodeLabelValue, EncodeMetric, LabelValueEncoder,
-};
+use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric};
 use prometheus_client::metrics::MetricType;
 use prometheus_client::metrics::counter::{ConstCounter, Counter};
 use prometheus_client::metrics::gauge::{ConstGauge, Gauge};
@@ -155,34 +152,10 @@ fn encode_topic_gauge(
         let Some(value) = value(sample) else {
             continue;
         };
-        let labels = [
-            ("stream", EscapedLabelValue(&sample.stream)),
-            ("topic", EscapedLabelValue(&sample.topic)),
-        ];
+        let labels = [("stream", &*sample.stream), ("topic", &*sample.topic)];
         ConstGauge::new(value).encode(metric_encoder.encode_family(&labels)?)?;
     }
     Ok(())
-}
-
-/// prometheus-client writes label values verbatim, and stream and topic names
-/// may contain any character the exposition format treats as syntax.
-struct EscapedLabelValue<'a>(&'a str);
-
-impl EncodeLabelValue for EscapedLabelValue<'_> {
-    fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), std::fmt::Error> {
-        if !self.0.contains(['\\', '"', '\n']) {
-            return encoder.write_str(self.0);
-        }
-        for character in self.0.chars() {
-            match character {
-                '\\' => encoder.write_str("\\\\")?,
-                '"' => encoder.write_str("\\\"")?,
-                '\n' => encoder.write_str("\\n")?,
-                other => encoder.write_char(other)?,
-            }
-        }
-        Ok(())
-    }
 }
 
 /// The legacy server's metric set, registered under the same names and help

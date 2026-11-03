@@ -51,6 +51,7 @@ pub struct SourceConfig {
     pub plugin_config: Option<serde_json::Value>,
     pub verbose: bool, // Log message processing at info level instead of debug (default: false)
     pub benchmark: bool, // Emit per-batch timing events on the `iggy_connectors::benchmark` target (default: false)
+    pub exactly_once: bool, // Write each batch once, also after a crash of the runtime (default: false)
 }
 ```
 
@@ -77,6 +78,7 @@ path = "libiggy_connector_random_source" # Path to the source connector
 plugin_config_format = "toml"
 verbose = false # Log message processing at info level instead of debug
 benchmark = false # Emit per-batch timing events on `iggy_connectors::benchmark` target
+exactly_once = false # Write each batch once, also after a crash of the runtime
 
 # Collection of the streams to which the produced messages are sent
 [[streams]]
@@ -85,6 +87,7 @@ topic = "example_topic"
 schema = "json"
 batch_length = 100
 linger_time = "5ms"
+partition_id = 0 # Optional: the partition of every message, 0 for an exactly-once source when unset
 
 # Custom configuration for the source connector, deserialized to type T from `plugin_config` field
 [plugin_config]
@@ -109,6 +112,8 @@ For example, to override the `enabled` property for a source with ID `random`:
 ```bash
 IGGY_CONNECTORS_SOURCE_RANDOM_ENABLED=false
 ```
+
+The [runtime README](../runtime/README.md#exactly-once-sources) describes `exactly_once` and its limits.
 
 ## Sample implementation
 

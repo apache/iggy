@@ -121,6 +121,7 @@ where
     fence_published: Rc<Cell<bool>>,
     persistence_notifier: RefCell<Option<crate::PersistenceNotifier>>,
     io_notifier: RefCell<Option<(crate::PartitionIoNotifier, usize)>>,
+    repair_memory: Option<Arc<crate::RepairMemoryBudget>>,
     loopback_ready: Rc<LoopbackReady>,
     /// Debug-only tripwire: counts live [`Self::with_partition`] borrows so
     /// `insert` / `remove` can assert the partitions vec is never mutated
@@ -167,6 +168,7 @@ where
             fence_published: Rc::default(),
             persistence_notifier: RefCell::new(None),
             io_notifier: RefCell::new(None),
+            repair_memory: None,
             loopback_ready: Rc::default(),
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
@@ -189,10 +191,24 @@ where
             fence_published: Rc::default(),
             persistence_notifier: RefCell::new(None),
             io_notifier: RefCell::new(None),
+            repair_memory: None,
             loopback_ready: Rc::default(),
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
         }
+    }
+
+    /// Build an empty shard collection using the node's shared repair budget.
+    #[must_use]
+    pub fn with_repair_memory(
+        shard_id: ShardId,
+        config: PartitionsConfig,
+        capacity: usize,
+        budget: Arc<crate::RepairMemoryBudget>,
+    ) -> Self {
+        let mut partitions = Self::with_capacity(shard_id, config, capacity);
+        partitions.repair_memory = Some(budget);
+        partitions
     }
 
     /// This node's key-encryption keys, for wrapping new stream keys.
@@ -393,6 +409,9 @@ where
         }
         if let Some((notifier, bytes_max)) = self.io_notifier.borrow().as_ref() {
             partition.set_io_notifier(Rc::clone(notifier), *bytes_max);
+        }
+        if let Some(budget) = &self.repair_memory {
+            partition.proof_walk_memory = Some(budget.reservation());
         }
         self.install_loopback_notifier(namespace, &partition);
         partition.publish_current_offset();

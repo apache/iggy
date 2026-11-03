@@ -17,11 +17,12 @@
 
 //! The node-wide applied metadata frontier and the wait a read parks on.
 
+use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Mutex;
 use std::sync::PoisonError;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -56,6 +57,37 @@ pub struct AppliedFrontier {
     waiters: Mutex<Waiters>,
     read_budget: Duration,
     partition_freshness: Option<PartitionFreshness>,
+    recovering_shards: AtomicUsize,
+}
+
+/// A shard's recovery state, shared with the node's primary placement probes.
+/// Dropping a shard releases its registration even during interrupted shutdown.
+pub struct PartitionRecovery {
+    frontier: Arc<AppliedFrontier>,
+    active: Cell<bool>,
+}
+
+impl PartitionRecovery {
+    pub fn set_active(&self, active: bool) {
+        if self.active.replace(active) == active {
+            return;
+        }
+        if active {
+            self.frontier
+                .recovering_shards
+                .fetch_add(1, Ordering::Release);
+        } else {
+            self.frontier
+                .recovering_shards
+                .fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for PartitionRecovery {
+    fn drop(&mut self) {
+        self.set_active(false);
+    }
 }
 
 /// Volatile quorum evidence. Recovery restores metadata, never freshness.
@@ -113,7 +145,21 @@ impl AppliedFrontier {
             }),
             read_budget,
             partition_freshness: None,
+            recovering_shards: AtomicUsize::new(0),
         }
+    }
+
+    #[must_use]
+    pub fn track_partition_recovery(self: &Arc<Self>) -> PartitionRecovery {
+        PartitionRecovery {
+            frontier: Arc::clone(self),
+            active: Cell::new(false),
+        }
+    }
+
+    #[must_use]
+    pub fn has_partition_recovery(&self) -> bool {
+        self.recovering_shards.load(Ordering::Acquire) != 0
     }
 
     /// Arm admission for a multi-node process. `epoch` must use the bus clock;
@@ -345,6 +391,24 @@ mod tests {
     use std::sync::Arc;
     use std::task::{Context, Poll};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn given_recovering_shards_when_one_finishes_should_wait_for_the_last_registration() {
+        let frontier = Arc::new(AppliedFrontier::default());
+        let first = frontier.track_partition_recovery();
+        let second = frontier.track_partition_recovery();
+        assert!(!frontier.has_partition_recovery());
+        first.set_active(true);
+        first.set_active(true);
+        second.set_active(true);
+        first.set_active(false);
+        assert!(frontier.has_partition_recovery());
+        drop(second);
+        assert!(!frontier.has_partition_recovery());
+        first.set_active(true);
+        drop(first);
+        assert!(!frontier.has_partition_recovery());
+    }
 
     #[test]
     fn given_quorum_credit_when_the_deadline_arrives_should_expire_without_an_owner_tick() {

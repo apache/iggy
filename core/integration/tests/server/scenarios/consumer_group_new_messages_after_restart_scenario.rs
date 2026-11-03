@@ -222,11 +222,13 @@ async fn create_consumer(client: &IggyClient) -> IggyConsumer {
     let mut consumer = client
         .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
-        .batch_length(10)
+        .poll_options(PollOptions {
+            count: 10,
+            commit: CommitPolicy::OnRead,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .polling_strategy(PollingStrategy::next())
-        .auto_join_consumer_group()
         .create_consumer_group_if_not_exists()
-        .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
         .build();
 
     consumer.init().await.unwrap();

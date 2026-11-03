@@ -67,6 +67,7 @@ use message_bus::replica::handshake::ReplicaHandshakeCtx;
 use message_bus::transports::tls::install_default_crypto_provider;
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
 use metadata::change_log::{ChangeLogCapacities, MetadataChangeLog};
+use metadata::impls::metadata::StreamsFrontend;
 use metadata::impls::recovery::recover;
 use metadata::{AppliedFrontier, ReplicaIdentity};
 use server_common::bootstrap::create_directories;
@@ -295,6 +296,7 @@ pub fn bootstrap(
     install_default_crypto_provider();
     let mut root_credentials = resolve_root_credentials(&config)?;
     warm_dummy_password_hash();
+    crate::external_auth::preflight(&config.external_auth)?;
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
@@ -344,6 +346,11 @@ pub fn bootstrap(
         &config,
         total_shards,
     )?));
+    let repair_memory = Arc::new(partitions::RepairMemoryBudget::new(
+        usize::try_from(config.partition.repair_memory_bytes_max.as_bytes_u64()).map_err(|_| {
+            ServerError::Config(configs::ConfigurationError::InvalidConfigurationValue)
+        })?,
+    ));
 
     // Single-shot bundle handoff (see `MetadataHandoff`): shard 0 sends
     // one cloned `ServerMetadataBundle` per peer; each peer drains
@@ -406,6 +413,7 @@ pub fn bootstrap(
         let config_for_shard = Arc::clone(&config);
         let shutdown_flag_for_shard = Arc::clone(&shutdown_flag);
         let owner_table_for_shard = Arc::clone(&owner_table);
+        let repair_memory_for_shard = Arc::clone(&repair_memory);
         let metadata_handoff_for_shard = if shard_id == 0 {
             MetadataHandoff::Owner {
                 bundle_tx: metadata_bundle_tx.clone(),
@@ -447,6 +455,7 @@ pub fn bootstrap(
                     metadata_handoff_for_shard,
                     barrier_for_shard,
                     owner_table_for_shard,
+                    repair_memory_for_shard,
                     roster_cells_for_shard,
                     applied_frontier_for_shard,
                     shard_metrics_for_shard,
@@ -521,6 +530,7 @@ async fn shard_main(
     metadata_handoff: MetadataHandoff,
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
+    repair_memory: Arc<partitions::RepairMemoryBudget>,
     roster_cells: RosterCells,
     metadata_applied_frontier: Arc<AppliedFrontier>,
     shard_metrics_all: Vec<ShardMetrics>,
@@ -595,6 +605,33 @@ async fn shard_main(
                 )
                 .await
                 .map_err(ServerError::MetadataRecovery)?;
+                let fresh_storage = recovered.last_journaled_op.unwrap_or_else(|| {
+                    recovered
+                        .snapshot
+                        .as_ref()
+                        .map_or(0, metadata::stm::snapshot::Snapshot::sequence_number)
+                }) == 0
+                    && recovered.recovered_state.is_none();
+                if let Some((namespace, node)) = recovered
+                    .mux_stm
+                    .streams()
+                    .member_outside_cluster(topology.replica_count)
+                {
+                    return Err(ServerError::PartitionMemberOutsideCluster {
+                        namespace_raw: namespace.inner(),
+                        node,
+                        nodes: topology.replica_count,
+                    });
+                }
+                // Peers may already hold partitions this node stored before
+                // it lost its storage; see `load_partition_or_fence`.
+                if fresh_storage && topology.replica_count > 1 {
+                    crate::partition_helpers::record_storage_epoch(
+                        &config.get_system_path(),
+                        iggy_common::IggyTimestamp::now().as_micros(),
+                    )
+                    .await?;
+                }
                 (
                     Rc::new(recovered.mux_stm),
                     Rc::new(recovered.change_log),
@@ -706,6 +743,14 @@ async fn shard_main(
     // session (and trip its empty-table assert).
     metadata.set_clients_table_max(config.metadata.clients_table_max);
     metadata.set_partitions_max(config.metadata.partitions_max);
+    metadata.set_default_replication_factor(config.cluster.default_replication_factor.factor());
+    let mut racks = vec![None; config.cluster.nodes.len()];
+    for node in &config.cluster.nodes {
+        if let Some(rack) = racks.get_mut(usize::from(node.replica_id)) {
+            rack.clone_from(&node.rack);
+        }
+    }
+    metadata.set_node_racks(&racks);
     metadata.set_max_tokens_per_user(config.personal_access_token.max_tokens_per_user);
     // Reinstall the sessions recovery restored from the checkpoint and the WAL
     // suffix, so a rebooted node dedups retries and admits continuations from
@@ -751,6 +796,7 @@ async fn shard_main(
         reply_inbox,
         shard_metrics,
         &roster_cells,
+        repair_memory,
     ))
     .await?;
 

@@ -72,7 +72,7 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			maxTopicSize := uint64(math.MaxUint64)
 			err := client.UpdateTopic(
 				context.Background(),
-				randomU32Identifier(),
+				nonExistingStreamIdentifier(client),
 				randomU32Identifier(),
 				iggcon.TopicUpdate{Name: &name, MaxTopicSize: &maxTopicSize})
 

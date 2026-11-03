@@ -10,13 +10,13 @@
 
 Official Swift client SDK for [Apache Iggy](https://iggy.apache.org) message streaming.
 
-The SDK is built up in stages. The client is a TCP connection with optional TLS that
-speaks the consensus protocol, signs in, keeps the session alive with a heartbeat,
-reconnects, and follows the cluster leader. It manages streams, topics, partitions,
-segments, users, personal access tokens, and consumer groups, sends and polls messages,
-stores consumer offsets, produces with a batching producer, and consumes with a
-consumer that tracks and commits its position. Examples and BDD scenarios follow in
-later changes.
+The client is a TCP connection with optional TLS that speaks the consensus protocol,
+signs in, keeps the session alive with a heartbeat, reconnects, and follows the cluster
+leader. It manages streams, topics, partitions, segments, users, personal access tokens,
+and consumer groups, sends and polls messages, stores consumer offsets, produces with a
+batching producer, and consumes with a consumer that tracks and commits its position.
+A runnable producer and consumer live in [`examples/swift`](../../examples/swift), and the
+scenarios every SDK shares run against this one from [`bdd/swift`](../../bdd/swift).
 
 Swift supports the consensus wire protocol and checks commitment proof during
 automatic retries. It does not yet expose retained-operation resolve/abandon APIs,
@@ -36,28 +36,32 @@ The SDK depends on [SwiftNIO](https://github.com/apple/swift-nio),
 
 ## Installation
 
-Swift Package Manager fetches a package from the root of a git repository, so the SDK
-cannot be depended on straight from this monorepo's subdirectory. Add it through the
-package mirror, which carries every release as a `v<version>` tag:
+Swift Package Manager resolves a package from the root of a git repository, so the Iggy repository root carries a `Package.swift` that publishes this SDK. Depend on the Iggy repository itself.
+
+There is no stable Swift release yet. Until there is, pin a development snapshot exactly, replacing `0.1.10-edge.1` with the newest `vX.Y.Z-edge.N` tag:
 
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/apache/iggy-swift.git", from: "0.1.1")
+    .package(url: "https://github.com/apache/iggy.git", exact: "0.1.10-edge.1")
 ],
 targets: [
-    .target(name: "MyApp", dependencies: [.product(name: "Iggy", package: "iggy-swift")])
+    .target(name: "MyApp", dependencies: [.product(name: "Iggy", package: "iggy")])
 ]
 ```
 
-From a checkout of this repository, or a vendored copy, depend on it by path:
+Stable Swift releases use `vX.Y.Z` tags after PMC approval. An `X.Y.Z-edge.N` tag is a development snapshot of unreleased changes, not an Apache release, and a version range never selects one. Once a stable release exists, depend on it with `.upToNextMinor(from: "X.Y.Z")`: while the SDK is 0.x, `from:` would also take the next minor release. A requirement must start at the first stable `v0.1.x` tag, because the repository's `0.0.4` to `0.0.52` tags predate the Swift SDK and have no root manifest.
+
+The first resolve mirror-clones the whole Iggy repository, about 145 MiB with every pull request ref, and checks out its 67 MiB tree for a 0.8 MiB SDK. SwiftPM keeps the clone in its cache, so later resolves fetch only new commits.
+
+From a checkout of this repository, depend on its root by path. SwiftPM names a path dependency after its directory, so the package is `iggy` for a checkout in `../iggy`:
 
 ```swift
 dependencies: [
-    .package(name: "apache-iggy", path: "../iggy/foreign/swift")
+    .package(path: "../iggy")
 ],
 targets: [
-    .target(name: "MyApp", dependencies: [.product(name: "Iggy", package: "apache-iggy")])
+    .target(name: "MyApp", dependencies: [.product(name: "Iggy", package: "iggy")])
 ]
 ```
 
@@ -77,8 +81,10 @@ await client.shutdown()
 ```
 
 One client owns one connection and is safe to share between tasks: requests are
-serialized on the connection. `disconnect()` closes the connection until the next
-`connect()`, `shutdown()` is final.
+serialized on the connection. A deferred poll or fetch is the
+exception. The server can hold it for its whole wait, so it goes over a connection of its
+own, bound to the same session. `disconnect()` closes the connection until the next `connect()`,
+`shutdown()` is final.
 
 ### Configuration
 
@@ -95,6 +101,40 @@ let client = IggyClient(configuration: configuration)
 
 The server certificate is verified against the system roots, or against `caFile` when
 set, and against the host of the address unless `TLSOptions.domain` names another one.
+
+### Connection strings
+
+A client can also take the connection string every Iggy SDK reads. The credentials
+become the auto-login, either `username:password` or a personal access token alone:
+
+```swift
+let client = try IggyClient(connectionString: "iggy://iggy:iggy@localhost:8090?tls=true&tls_ca_file=/etc/iggy/ca.pem")
+let configuration = try ClientConfiguration(connectionString: "iggy+tcp://\(token)@[::1]:8090?reconnection_retries=5")
+```
+
+The options are `tls`, `tls_domain`, `tls_ca_file`, `reconnection_retries` (a count or
+`unlimited`), `reconnection_interval`, `reestablish_after`, `heartbeat_interval`, `nodelay`,
+`max_pending_operations`, and `max_pending_operation_bytes`. Durations take the spellings
+of the Rust SDK, such as `500ms`, `5s`, or `1h 30m`. An unknown option or a malformed
+value fails with `invalidConnectionString`, and a bad retry count with
+`invalidNumberValue`, so a string is valid in every SDK or in none. Only the `iggy://`
+and `iggy+tcp://` schemes are accepted.
+
+Some options read differently than in Rust:
+
+- `tls` and `nodelay` take `true` or `false`, and any other value fails, where Rust
+  reads it as false.
+- Without `nodelay` the client keeps Nagle off, its own default.
+- `reconnection_interval` is the full pause between rounds over the endpoints. Rust
+  takes it as the base of a jittered backoff capped at 10 seconds.
+- `reestablish_after` is how long after the last successful connection the client
+  waits before redialing that endpoint. Rust takes it as the uptime that resets the
+  backoff.
+- A request that needs the connection waits for the redial, up to the request timeout
+  (30 seconds by default), and fails when the wait, or the `reconnection_interval`
+  pause, outlasts it. An explicit `connect()` waits it out.
+- The pending operation limits are checked and then ignored, since this client keeps
+  no operations to replay.
 
 ### Resource options
 
@@ -231,52 +271,86 @@ session. Best-effort roster discovery does not turn a successful sign-in into a 
 
 ### Messages
 
-`sendMessages` writes a batch to one partition. The server routes explicit partitions
-only, so `balanced` (the default) and `messagesKey` are resolved on the client:
-balanced round-robins over the topic's partitions, and a key is hashed with XXH32 the
-way every other SDK hashes it. A message without an id gets a random one, written back
-into the batch, so sending the same batch again after `transientNotCommitted` carries
-the same ids. `pollMessages` reads from a partition, starting where the strategy says:
+`sendMessages` writes a batch to one partition. The server routes explicit partitions only, so `balanced` (the default) and `messagesKey` are resolved on the client: balanced round-robins over the topic's partitions, and a key is hashed with XXH32 the way every other SDK hashes it. A message without an id gets a random one, written back into the batch, so sending the same batch again after `transientNotCommitted` carries the same ids.
+
+`pollMessages` reads one partition with one request, starting where the strategy says, within the limits of `PollOptions`:
 
 ```swift
 var batch: [IggyMessage] = ["placed"]
 try await client.sendMessages(streamID: "orders", topicID: "created", partitioning: .messagesKey("customer-42"), messages: &batch)
 let polled = try await client.pollMessages(
-    streamID: "orders", topicID: "created", partitionID: 0, consumer: .consumer(1), strategy: .next, count: 100, autoCommit: true)
+    streamID: "orders", topicID: "created", partitionID: 0, consumer: .consumer(1), strategy: .next,
+    options: PollOptions(count: 100, maxWait: .seconds(5), commit: .onRead))
 for message in polled.messages {
     print(message.offset, message.payloadString)
 }
+let more = try await client.pollMessages(
+    streamID: "orders", topicID: "created", partitionID: 0, consumer: .consumer(1), strategy: polled.continuation)
 ```
 
-Every partition request carries the partition context the server requires: the
-partition's incarnation, which changes when a deleted partition id is reused. The
-client reads it from the partition's route and caches it. A poll reply carries the
-context it was served under; hand it back with `.offset(_:context:)` to continue the
-same partition, or in a `ConsumerPosition` to store a checkpoint. The server refuses
-either with `historyUnavailable` once the partition was recreated, and a consumer-group
-checkpoint with `consumerGroupPartitionNotOwned` once the partition moved to another
-member.
+Every poll is deferred (binary command 106). The server answers once `minCount` messages are readable, the next message would pass `maxBytes`, or `maxWait` ran out, and then returns what the partition holds, which can be nothing. `PollOptions()` reads up to 1000 messages and 1 MiB with no wait and `minCount` 1.
+
+The call takes at most its request timeout, `maxWait` plus ten seconds: the route lookup, a reconnect, the wait, the reply and every retry. A first message larger than `maxBytes` comes alone in its own reply. The client refuses options out of range before it sends anything: a `minCount` outside `1...count` with `invalidMessagesCount`, a wait above 600 seconds with `invalidCommand`, a `maxBytes` below 344 with `invalidSizeBytes`.
+
+`commit` is a `CommitPolicy`. `.manual`, the default, stores nothing. `.onRead` makes the server store the offset of the last message of each read as part of the read, in one round trip. While the primary stays up a message is delivered at most once. A failover before the store replicates can deliver the last batch again.
+
+`.auto(_)` stores counted positions on the client and needs a `PartitionReader` or an `IggyConsumer`: a single poll refuses it with `invalidConfiguration`, as it has nothing to count.
+
+Positions are opaque. `polled.continuation` is where the next poll of the same partition starts, and a poll of another partition refuses it with `invalidCommand`. `polled.checkpoint` and `polled.checkpoint(at:)` are the positions after a message, which `storeConsumerPosition(consumer:streamID:topicID:checkpoint:)` stores.
+
+Both carry the partition context the read was served under: the partition's incarnation, which changes when a deleted partition id is reused. The server refuses either with `historyUnavailable` once the partition was recreated, and a consumer-group checkpoint with `consumerGroupPartitionNotOwned` once the partition moved to another member.
+
+To cancel a poll, cancel its task. The client then sends command 108 on the connection of the request. A poll that commits nothing gets no reply, and a reply that still arrives is dropped.
+
+A poll with `.onRead` gets exactly one reply, which the cancelled caller waits for: `CancellationError` when the cancellation won and the server stored nothing, or the messages the server stored before the cancellation arrived. A poll with `.onRead` that lost its reply, to a broken connection or to `disconnect()`, or whose reply arrived after the caller signed in or out, may have stored its offset.
+
+It fails with `fetchProgressUncertain` (14010), whose `operationID` names it, and is not sent again. Every later poll with `.onRead` or `.next` and every offset store or delete of that partition on the same client then fails with `partitionLaneBlocked` (14009) naming the same operation, also after a reconnect and a new session, until `abandonOperation(_:)` takes that operation.
+
+Offset reads still work, so the caller can look at what the server stored before it abandons.
+
+A client keeps at most 64 deferred requests in flight. A request waits for a free slot within its request timeout, and fails with `transientNotAccepted` when none frees up in time. If the server refuses to admit a request with `deferredPollCapacityExceeded`, the client pauses and sends it again within the same timeout.
+
+### Partition reader
+
+`PartitionReader` reads the partitions of one topic in batches. A standalone consumer reads the partitions it names, and a consumer group member reads the partitions the server assigns to it: the reader joins the group, creating it when it is missing and named by name, joins again after a lost membership, and leaves it in `close()`.
+
+```swift
+let reader = try await client.reader(
+    streamID: "orders", topicID: "created", consumer: .group("billing"),
+    configuration: ReaderConfiguration(options: PollOptions(count: 100, maxWait: .seconds(5), commit: .auto(.default))))
+for try await batch in reader {
+    print(batch.partitionID, batch.messages.count)
+}
+```
+
+The reader groups its partitions by their primary and reads each group with one request, which the server holds until a message arrives or the wait runs out. A moved primary, a rebalance and a lost connection are repaired inside, so a caller never groups partitions or handles `notPrimary`.
+
+The partitions that a read served go last in the next read of their group, so a backlog does not starve the other partitions. The partitions whose last read ended before their head are spread over the free requests of the reader, each share in a fetch of its own with the full `count` and `maxBytes`, while the quiet partitions of a group share one fetch that may wait.
+
+`next()` returns a batch of one partition, never empty, in offset order within one generation of the partition: from its first read, from each `seek(partitionID:to:)`, and from each new assignment. The default wait of a reader is five seconds. With a zero `maxWait`, a partition that a read found empty waits `retryInterval` before it is read again.
+
+- `.manual`: `commit(_:)` stores a checkpoint that the reader delivered.
+- `.onRead`: the server stores each read, and the reader reads only when `next()` waits with nothing queued, so no batch is stored before it was asked for. It then fills its free requests: the quiet partitions of a group share one fetch that may wait, and the backlogged ones take a committing fetch each beside it, with the full `count` and `maxBytes`. A partition that leaves the assignment still hands over the reads that the server stored for it.
+
+  `close()` moves the offset of each partition back to the last batch delivered. It cancels the committing reads in flight first, and each waits for its one reply, so a parked read ends the close in about a round trip.
+
+  A read that lost its reply, or a section whose error leaves the outcome unknown, may have stored messages that never arrived. The reader abandons that read and reads its partitions again after `retryInterval`: the next reply then starts past those messages, and the reader reads that gap again without a commit and delivers it first.
+
+  A forward jump without such a lost read is a store of the application or of another session, and the reader delivers from there. When the partition moved to another member before the gap was read, the reader reports `fetchProgressUncertain` with the lost range.
+
+  A seek to an offset above zero stores the offset before it first, once the committing read of the partition in flight ended, so a restart resumes at the sought offset. A refused store fails the seek and moves nothing. A seek to offset zero or to another strategy stores nothing. A partition that a lost read of another caller on the same client blocks reports `partitionLaneBlocked` once and reads again after that operation was abandoned.
+
+- `.auto(AutoCommit(interval:every:after:))`: the reader counts a batch when `next()` returns it (`.delivery`), when the next one is asked for or the reader closes (`.processing`), or when the application calls `mark(_:)` (`.marked`), and stores the latest counted position of each partition at the interval, on the event of `every` (`.message`, `.messages(n)` counted per partition, `.batch`), before a rebalance takes a partition away, and in `close()`.
+
+  `AutoCommit.default` stores every 10,000 messages or 5 seconds after `.processing`. A store only moves forward, and a position of an older generation is dropped.
+
+A failed read is thrown as a `ReadError` with the partition, the `IggyError` and, for a message that does not decode, its offset, its record and `skip`, the continuation after it. The reader reads its partitions again after `retryInterval`. A message that does not decode, and `historyUnavailable` for a position read in a history that is gone, stop the partition until a seek.
 
 ### Consumer groups
 
-A member polls without a partition id and the client takes the next partition of its
-assignment, round-robin, syncing the assignment from the server when it changes. The
-heartbeat syncs every joined group, so a member picks up new partitions on its own:
+`joinConsumerGroup`, `leaveConsumerGroup`, `createConsumerGroup` and `getConsumerGroup` manage groups directly, but reading a group goes through a `PartitionReader` or an `IggyConsumer` that names `.group(id)`, which joins on its own. Membership belongs to the session. A reconnect resumes the session and keeps it.
 
-```swift
-try await client.joinConsumerGroup(streamID: "orders", topicID: "created", groupID: "billing")
-let batch = try await client.pollMessages(
-    streamID: "orders", topicID: "created", partitionID: nil, consumer: .group("billing"), strategy: .next, count: 100, autoCommit: true)
-```
-
-A member holding no partitions gets an empty poll whose partition id is
-`PolledMessages.noAssignedPartition`, and a client that is not a member gets
-`consumerGroupMemberNotFound`. Membership belongs to the session. A reconnect resumes
-the session and keeps it, but when the server no longer holds the session the client
-signs in under a new one and the caller must call `joinConsumerGroup` again: the next
-group poll fails with `consumerGroupMemberNotFound` until it does. In a cluster, polls
-and offset writes go to the partition's primary over a second connection bound to the
-same session.
+When the server no longer holds the session, the client signs in under a new one and the reader joins again. In a cluster, reads and offset writes go to the partition's primary over a second connection bound to the same session, and the heartbeat syncs every joined group.
 
 ### Producer
 
@@ -325,49 +399,45 @@ lands behind them.
 
 ### Consumer
 
-`IggyConsumer` reads one topic and hands its messages over one at a time. A standalone
-consumer reads one partition; a member of a consumer group reads the partitions the
-server assigns, joining the group in `initialize()`:
+`IggyConsumer` reads one topic through one `PartitionReader` and hands its messages over one at a time. A standalone consumer reads the partitions it names, and a member of a consumer group reads the partitions the server assigns, joining the group in `initialize()`:
 
 ```swift
-let consumer = try client.consumerGroup(name: "billing", streamID: "orders", topicID: "created")
+let consumer = try client.consumerGroup(
+    name: "billing", streamID: "orders", topicID: "created",
+    configuration: ConsumerConfiguration(pollOptions: PollOptions(maxWait: .seconds(5), commit: .auto(.default))))
 try await consumer.initialize()
 for try await received in consumer {
     print(received.partitionID, received.message.offset, received.message.payloadString)
 }
 ```
 
-A poll refills the buffer once it runs empty. `pollingStrategy` says where reading a
-partition starts, and each later poll of it continues after the last message handed over
-from it. The exception is `.next` with an `autoCommit` that commits with every poll, as in
-the default configuration. That poll starts after the offset that the previous poll
-stored. A failed poll is thrown after the retry
-interval and leaves the consumer usable, so a caller of `next()` can call it again, and
-`consumeMessages(_:)` logs it and keeps reading until the client cannot come back on its
-own. Without `allowReplay` a message at or below the last one handed over from the same
-partition history is skipped.
+`pollOptions` sets the limits of each read and the `CommitPolicy`, `.manual` by default. Under `.manual`, `commit(received.checkpoint)` stores a message. Under `.auto`, a message counts when it is handed over (`.delivery`), once the next one is asked for or the consumer shuts down (`.processing`), or once it is marked with `mark(_:)` (`.marked`). `consumeMessages(_:)` counts a message under `.processing` after its handler returned.
 
-`autoCommit` decides when the position is stored. The default commits with every poll,
-before the batch is handed over, and on a one-second interval; `.disabled` leaves it to
-`storePosition(_:)` with the position of a `ReceivedMessage`, the only setting under which a
-message whose handling failed comes back on the next run. `shutdown()` sends the queued
-commits, stores the reading position of every partition read unless auto-commit is
-disabled, and leaves the group.
+A handler that throws leaves its message uncounted and ends `consumeMessages(_:)` with its error, so the message is read again by the next run. Under the other policies a handler that throws is logged and reading goes on.
 
-Unlike the Rust consumer this one has no encryptor, and it does not resolve a group create
-or join whose reply was lost, since the Swift client has no operation lanes yet.
+`pollingStrategy` says where a partition without a position starts. A failed read is thrown as a `ReadError` and leaves the consumer usable: a caller of `next()` can call it again, and `consumeMessages(_:)` logs it and keeps reading.
+
+`consumeMessages(_:)` ends with the error once the client cannot come back on its own, and for a message that does not decode or `historyUnavailable`, which stop the partition until a seek.
+
+It also ends with `partitionLaneBlocked` under `.onRead`: a lost committing read of another caller blocks the partition until `abandonOperation(_:)` takes that operation, after which the reader reads it again by itself. Without `allowReplay` a message at or below the last one handed over from the same partition history is skipped, unless `seek(partitionID:to:)` moved the partition back.
+
+`shutdown()` counts the last message under `.processing` and closes the reader within `offsetDrainTimeout`: it stores the counted positions under `.auto`, moves the offset of each partition back to the last message handed over under `.onRead`, and leaves the group.
+
+Unlike the Rust consumer this one has no encryptor, and it does not resolve a group create or join whose reply was lost, since the Swift client has no operation lanes. For the same reason a store of a partition waits for a read in flight that reads or moves the stored offset of that partition, and no such read starts while the store waits.
 
 ### Raw requests
 
 `sendRawRequest(code:payload:)` sends a command code with an encoded payload and returns the raw reply body. `sendRawRequest(code:payload:replica:)` sends it to one node of a cluster, named by the replica id that cluster metadata returns.
 
-Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, consumer-offset reads and session-control codes fail with `invalidCommand` before anything is sent. An id that cluster metadata does not name fails with `invalidIdentifier`. An unreachable node is retried until the request timeout, and `notPrimary` is returned rather than sent to another node.
+A raw deferred poll (106) takes the route and the limits of a typed poll. A raw fetch (109) goes to the primary of its first target and keeps the fences and the target limits of its payload. If its payload does not decode or its options are out of range, it fails with `invalidCommand`. A raw cancellation (108) fails with `invalidCommand`: cancel the task of the deferred request instead.
+
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, deferred polls, fetches, cancellations, consumer-offset reads and session-control codes fail with `invalidCommand` before anything is sent. An id that cluster metadata does not name fails with `invalidIdentifier`. An unreachable node is retried until the request timeout, and `notPrimary` is returned rather than sent to another node.
 
 ### Errors
 
 Every client operation throws `IggyError`, a value carrying the typed `code`
 (`IggyErrorCode`, one case per server error code), the raw wire code, and optional
-context. A cancelled task gets `CancellationError`. A direct producer send is the
+context. An error of a read carries the `partitionID` it names. A cancelled task gets `CancellationError`. A direct producer send is the
 exception: a failure while sending, cancellation included, throws `ProducerSendError`,
 carrying the `IggyError` as `cause`, the confirmations so far, and the unconfirmed
 `failed` tail. A send refused before it starts, such as with `producerClosed` after
@@ -390,6 +460,9 @@ Three codes tell what happened to a request that did not complete:
   safe.
 - `transientNotCommitted` (57): the outcome is unknown, and the server possibly applied
   the write. Read the state before you write it again.
+- `fetchProgressUncertain` (14010): a poll or fetch with `.onRead` lost its reply, so the
+  server may have stored its offset. Its partition is blocked with
+  `partitionLaneBlocked` (14009) until `abandonOperation(_:)` takes the operation.
 - `unauthenticated` (40): the request needs a session. Sign in, then retry.
 
 The Rust SDK and the other native SDKs keep a write with an unknown outcome in a
@@ -450,6 +523,13 @@ The resource options tests compare against `Tests/IggyTests/Fixtures/resource_op
 
 The metadata changes scenario that churns the change log past its capacity runs only when `IGGY_METADATA_CHANGE_LOG_RESOURCE_CAPACITY` is set for both the server and the test run, for example to 64.
 
+The shared scenarios in `bdd/scenarios` run through `bdd/swift/tests`, a package with a
+small Gherkin runner. CI runs it in Docker with `scripts/run-bdd-tests.sh swift`. Against a
+local server started as above with `IGGY_METADATA_CHANGE_LOG_RESOURCE_CAPACITY=64`, run one
+feature with `IGGY_TCP_ADDRESS=127.0.0.1:8090 IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy
+BDD_FEATURE=stream_options swift run iggy-bdd` from `bdd/swift/tests`. The examples run with
+`scripts/run-examples-from-readme.sh --language swift`.
+
 ## Contributing
 
 Format the sources with the toolchain's formatter before opening a pull request; CI runs it
@@ -460,3 +540,24 @@ swift format format --in-place --recursive Sources Tests Package.swift
 swift format lint --strict --recursive Sources Tests Package.swift
 swift build -Xswiftc -warnings-as-errors
 ```
+
+The same configuration covers the examples, the BDD runner and the root manifest, from the repository root:
+
+```bash
+for package in examples/swift/getting-started bdd/swift/tests; do
+  swift format lint --strict --recursive --configuration foreign/swift/.swift-format "$package/Sources" "$package/Package.swift"
+done
+swift format lint --strict --configuration foreign/swift/.swift-format Package.swift
+```
+
+### Releasing
+
+`IggyVersion.sdkVersion` in `Sources/Iggy/Iggy.swift` is the SDK version. Change it only with `scripts/bump-version.sh sdk-swift` from the repository root, which also regenerates the golden vectors that embed it: `--edge` for the next development snapshot, `--patch --edge` for the first snapshot after a stable release, `--strip-edge` for the version that goes to a release vote.
+
+After a merge to master, CI tags an untagged `X.Y.Z-edge.N` version as `vX.Y.Z-edge.N`.
+
+For a stable release, the PMC vote must cover the Swift version and source archive, including the root manifest. The release manager verifies the vote result and publishes the signed source release through Apache's release process. The workflow does not verify the vote automatically. Merging a plain `X.Y.Z` version to master does not publish a stable Swift tag.
+
+After that, run the Publish workflow on the voted commit with `publish_other=swift` and `create_edge_docker_tag=false`. Run with `dry_run=true` first, then `dry_run=false` and `skip_tag_creation=false` to publish the tag.
+
+The root `Package.swift` declares only the library. Its tools version, platforms, dependencies and `Iggy` target must match this package's manifest, and CI fails when they differ.

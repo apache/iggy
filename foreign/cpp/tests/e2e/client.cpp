@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -2227,12 +2228,12 @@ TEST_F(E2E_Client, DeleteSegmentsWithZeroCountIsNoOp) {
 
     const auto partition_before_delete = find_partition(0);
 
-    iggy::ffi::PolledMessages polled_before_delete{};
+    std::optional<iggy::ffi::PolledMessages> polled_before_delete;
     ASSERT_NO_THROW({
         iggy::ffi::ErrorInfo error_info{};
-        polled_before_delete =
-            sender->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
-                                  make_numeric_identifier(1005), "offset", 0, 1000, false, error_info);
+        polled_before_delete = sender->poll_messages(
+            make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
+            make_numeric_identifier(1005), make_polling_strategy("offset", 0), make_poll_options(1000), error_info);
     });
 
     ASSERT_NO_THROW(
@@ -2240,22 +2241,22 @@ TEST_F(E2E_Client, DeleteSegmentsWithZeroCountIsNoOp) {
 
     const auto partition_after_delete = find_partition(0);
 
-    iggy::ffi::PolledMessages polled_after_delete{};
+    std::optional<iggy::ffi::PolledMessages> polled_after_delete;
     ASSERT_NO_THROW({
         iggy::ffi::ErrorInfo error_info{};
-        polled_after_delete =
-            sender->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
-                                  make_numeric_identifier(1006), "offset", 0, 1000, false, error_info);
+        polled_after_delete = sender->poll_messages(
+            make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
+            make_numeric_identifier(1006), make_polling_strategy("offset", 0), make_poll_options(1000), error_info);
     });
 
     EXPECT_EQ(partition_after_delete.SegmentsCount(), partition_before_delete.SegmentsCount());
     EXPECT_EQ(partition_after_delete.CurrentOffset(), partition_before_delete.CurrentOffset());
     EXPECT_EQ(partition_after_delete.MessagesCount(), partition_before_delete.MessagesCount());
     EXPECT_EQ(partition_after_delete.SizeBytes(), partition_before_delete.SizeBytes());
-    EXPECT_EQ(polled_after_delete.count, polled_before_delete.count);
-    ASSERT_EQ(polled_after_delete.messages.size(), polled_before_delete.messages.size());
-    for (std::size_t i = 0; i < polled_before_delete.messages.size(); ++i) {
-        EXPECT_EQ(polled_after_delete.messages[i].offset, polled_before_delete.messages[i].offset);
+    EXPECT_EQ(polled_after_delete->count, polled_before_delete->count);
+    ASSERT_EQ(polled_after_delete->messages.size(), polled_before_delete->messages.size());
+    for (std::size_t i = 0; i < polled_before_delete->messages.size(); ++i) {
+        EXPECT_EQ(polled_after_delete->messages[i].offset, polled_before_delete->messages[i].offset);
     }
 }
 
@@ -2300,12 +2301,12 @@ TEST_F(E2E_Client, DeleteSegmentsWhenOnlyActiveSegmentRemainsIsNoOp) {
     const auto partition_before_delete = find_partition(0);
     ASSERT_EQ(partition_before_delete.SegmentsCount(), 1u);
 
-    iggy::ffi::PolledMessages polled_before_delete{};
+    std::optional<iggy::ffi::PolledMessages> polled_before_delete;
     ASSERT_NO_THROW({
         iggy::ffi::ErrorInfo error_info{};
-        polled_before_delete =
-            sender->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
-                                  make_numeric_identifier(1007), "offset", 0, 1000, false, error_info);
+        polled_before_delete = sender->poll_messages(
+            make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
+            make_numeric_identifier(1007), make_polling_strategy("offset", 0), make_poll_options(1000), error_info);
     });
 
     ASSERT_NO_THROW(
@@ -2313,22 +2314,22 @@ TEST_F(E2E_Client, DeleteSegmentsWhenOnlyActiveSegmentRemainsIsNoOp) {
 
     const auto partition_after_delete = find_partition(0);
 
-    iggy::ffi::PolledMessages polled_after_delete{};
+    std::optional<iggy::ffi::PolledMessages> polled_after_delete;
     ASSERT_NO_THROW({
         iggy::ffi::ErrorInfo error_info{};
-        polled_after_delete =
-            sender->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
-                                  make_numeric_identifier(1008), "offset", 0, 1000, false, error_info);
+        polled_after_delete = sender->poll_messages(
+            make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
+            make_numeric_identifier(1008), make_polling_strategy("offset", 0), make_poll_options(1000), error_info);
     });
 
     EXPECT_EQ(partition_after_delete.SegmentsCount(), partition_before_delete.SegmentsCount());
     EXPECT_EQ(partition_after_delete.CurrentOffset(), partition_before_delete.CurrentOffset());
     EXPECT_EQ(partition_after_delete.MessagesCount(), partition_before_delete.MessagesCount());
     EXPECT_EQ(partition_after_delete.SizeBytes(), partition_before_delete.SizeBytes());
-    EXPECT_EQ(polled_after_delete.count, polled_before_delete.count);
-    ASSERT_EQ(polled_after_delete.messages.size(), polled_before_delete.messages.size());
-    for (std::size_t i = 0; i < polled_before_delete.messages.size(); ++i) {
-        EXPECT_EQ(polled_after_delete.messages[i].offset, polled_before_delete.messages[i].offset);
+    EXPECT_EQ(polled_after_delete->count, polled_before_delete->count);
+    ASSERT_EQ(polled_after_delete->messages.size(), polled_before_delete->messages.size());
+    for (std::size_t i = 0; i < polled_before_delete->messages.size(); ++i) {
+        EXPECT_EQ(polled_after_delete->messages[i].offset, polled_before_delete->messages[i].offset);
     }
 }
 

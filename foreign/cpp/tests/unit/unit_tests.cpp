@@ -132,6 +132,7 @@ TEST(TopicCreateOptionsTest, DefaultHasNoValues) {
     EXPECT_FALSE(options.MessagesRequiredToSave().has_value());
     EXPECT_FALSE(options.SizeOfMessagesRequiredToSave().has_value());
     EXPECT_FALSE(options.PreallocateSegments().has_value());
+    EXPECT_FALSE(options.ReplicationFactor().has_value());
     EXPECT_TRUE(options.RawEntries().empty());
 }
 
@@ -192,6 +193,13 @@ TEST(TopicCreateOptionsTest, PreallocateSegmentsStoresBool) {
     disabled.SetPreallocateSegments(false);
     ASSERT_TRUE(disabled.PreallocateSegments().has_value());
     EXPECT_EQ(*disabled.PreallocateSegments(), false);
+}
+
+TEST(TopicCreateOptionsTest, ReplicationFactorStoresValue) {
+    iggy::TopicCreateOptions options;
+    options.SetReplicationFactor(3);
+    ASSERT_TRUE(options.ReplicationFactor().has_value());
+    EXPECT_EQ(*options.ReplicationFactor(), 3u);
 }
 
 TEST(TopicCreateOptionsTest, MaximumValuesPreserved) {
@@ -556,8 +564,6 @@ TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
     EXPECT_THROW(client.JoinConsumerGroup(stream, topic, group), iggy::IggyException);
     EXPECT_THROW(client.LeaveConsumerGroup(stream, topic, group), iggy::IggyException);
     EXPECT_THROW(client.StoreConsumerOffset(consumer, stream, topic, 0, 0), iggy::IggyException);
-    EXPECT_THROW(client.StoreConsumerPosition(consumer, stream, topic, 0, 0, iggy::PartitionContext(1, 0, 0)),
-                 iggy::IggyException);
     EXPECT_THROW(client.GetConsumerOffset(consumer, stream, topic, 0), iggy::IggyException);
     EXPECT_THROW(client.DeleteConsumerOffset(consumer, stream, topic, 0), iggy::IggyException);
     EXPECT_THROW((void)client.DescribeOptions(iggy::OptionsScope::Stream), iggy::IggyException);

@@ -18,7 +18,7 @@
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
 use iggy_common::{
-    Consumer, ConsumerOffsetClient, ConsumerOffsetInfo, ConsumerPosition, Identifier, IggyError,
+    Checkpoint, Consumer, ConsumerOffsetClient, ConsumerOffsetInfo, Identifier, IggyError,
 };
 
 #[async_trait]
@@ -28,11 +28,13 @@ impl ConsumerOffsetClient for ClientWrapper {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        position: ConsumerPosition,
+        checkpoint: &Checkpoint,
     ) -> Result<(), IggyError> {
         super::dispatch_client!(
             self,
-            ConsumerOffsetClient::store_consumer_position(consumer, stream_id, topic_id, position)
+            ConsumerOffsetClient::store_consumer_position(
+                consumer, stream_id, topic_id, checkpoint
+            )
         )
         .await
     }
@@ -86,6 +88,22 @@ impl ConsumerOffsetClient for ClientWrapper {
                 stream_id,
                 topic_id,
                 partition_id
+            )
+        )
+        .await
+    }
+
+    async fn delete_consumer_position(
+        &self,
+        consumer: &Consumer,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        checkpoint: &Checkpoint,
+    ) -> Result<(), IggyError> {
+        super::dispatch_client!(
+            self,
+            ConsumerOffsetClient::delete_consumer_position(
+                consumer, stream_id, topic_id, checkpoint
             )
         )
         .await

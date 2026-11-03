@@ -54,5 +54,8 @@ public enum TopicOptionKey
     SizeOfMessagesRequiredToSave,
 
     /// <summary><c>preallocate_segments</c>, create-only.</summary>
-    PreallocateSegments
+    PreallocateSegments,
+
+    /// <summary><c>replication_factor</c>, create-only.</summary>
+    ReplicationFactor
 }

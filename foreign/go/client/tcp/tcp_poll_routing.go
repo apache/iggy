@@ -201,11 +201,39 @@ func (p *pollRouter) invalidate(route pollRoute, refused bool) {
 	p.hints[route.key] = hint
 }
 
-// relookup starts again at the metadata primary after a missing namespace,
-// a lost partition history or a change of consumer group ownership.
+// refusedAt marks the cached route of query after a fetch got err for its
+// partition: it keeps the view floor for NotPrimary, and uses relookup for an
+// error that needsRelookup. A route that is not cached is looked up at its
+// next use anyway.
+func (p *pollRouter) refusedAt(query []byte, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	route, cached := p.routes[string(query)]
+	switch {
+	case !cached:
+	case errors.Is(err, ierror.ErrNotPrimary):
+		p.mayHaveMovedLocked(route)
+	case needsRelookup(err):
+		p.relookupLocked(route)
+	}
+}
+
+func (p *pollRouter) mayHaveMovedLocked(route pollRoute) {
+	if hint, known := p.staleLocked(route); known {
+		hint.preferred, hint.hasPreferred = route.primary, true
+		p.hints[route.key] = hint
+	}
+}
+
+// relookup starts again at the metadata primary after an error that
+// needsRelookup.
 func (p *pollRouter) relookup(route pollRoute) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.relookupLocked(route)
+}
+
+func (p *pollRouter) relookupLocked(route pollRoute) {
 	if hint, known := p.staleLocked(route); known {
 		hint.metadataFirst = true
 		hint.hasPreferred = false
@@ -353,6 +381,13 @@ func isNamespaceMiss(err error) bool {
 	return errors.Is(err, ierror.ErrStreamIdNotFound) || errors.Is(err, ierror.ErrStreamNameNotFound) ||
 		errors.Is(err, ierror.ErrTopicIdNotFound) || errors.Is(err, ierror.ErrTopicNameNotFound) ||
 		errors.Is(err, ierror.ErrPartitionNotFound)
+}
+
+// needsRelookup reports whether err leaves the route of its partition behind:
+// a missing namespace, a lost partition history or a change of consumer group
+// ownership.
+func needsRelookup(err error) bool {
+	return errors.Is(err, ierror.ErrHistoryUnavailable) || errors.Is(err, ierror.ErrConsumerGroupPartitionNotOwned) || isNamespaceMiss(err)
 }
 
 // isMetadataPrimary reports whether link reaches the metadata primary. Only its

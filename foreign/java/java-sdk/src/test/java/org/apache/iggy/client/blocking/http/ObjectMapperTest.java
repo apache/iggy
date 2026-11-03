@@ -22,9 +22,11 @@ package org.apache.iggy.client.blocking.http;
 import org.apache.iggy.cluster.ClusterNode;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.PolledMessages;
+import org.apache.iggy.partition.Partition;
 import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.system.CacheMetricsKey;
 import org.apache.iggy.system.Stats;
+import org.apache.iggy.topic.TopicDetails;
 import org.assertj.core.data.Offset;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -400,6 +402,47 @@ class ObjectMapperTest {
                           ]
                         }
                         """.formatted(base64Payload);
+            }
+        }
+
+        @Nested
+        @DisplayName("TopicDetails")
+        class TopicDetailsDeserialization {
+
+            @Test
+            void shouldReadPartitionMembersAndInSyncMembers() {
+                String json = """
+                        {"id": 2, "created_at": 0, "name": "topic", "size": "0 B", "messages_count": 0,
+                         "partitions_count": 1, "options": {},
+                         "partitions": [
+                           {"id": 1, "created_at": 0, "segments_count": 1, "current_offset": 0, "size": "0 B",
+                            "messages_count": 0,
+                            "context": {"incarnation": 23, "owner_generation": 0, "metadata_op": 101},
+                            "members": [0, 1, 2], "in_sync_members": [0]}
+                         ]}
+                        """;
+
+                var partition = objectMapper
+                        .readValue(json, TopicDetails.class)
+                        .partitions()
+                        .get(0);
+
+                assertThat(partition.members()).containsExactly(0, 1, 2);
+                assertThat(partition.inSyncMembers()).containsExactly(0);
+            }
+
+            @Test
+            void shouldReadAbsentNodeListsAsEmpty() {
+                String json = """
+                        {"id": 1, "created_at": 0, "segments_count": 1, "current_offset": 0, "size": "0 B",
+                         "messages_count": 0,
+                         "context": {"incarnation": 23, "owner_generation": 0, "metadata_op": 101}}
+                        """;
+
+                var partition = objectMapper.readValue(json, Partition.class);
+
+                assertThat(partition.members()).isEmpty();
+                assertThat(partition.inSyncMembers()).isEmpty();
             }
         }
     }

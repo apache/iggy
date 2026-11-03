@@ -366,11 +366,13 @@ async fn given_a_backup_when_auto_login_dials_it_should_settle_on_the_leader(
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll after a backup-dialed login");

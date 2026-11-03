@@ -27,26 +27,35 @@ import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.PartitioningKind;
+import org.apache.iggy.message.PollingKind;
+import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.temporal.ChronoUnit;
+import java.util.Arrays;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
 /**
  * Stamps raw partition commands with the partition context the server fences
  * them by, as Rust's raw API does: a send to an explicit partition shares the
- * typed sends' context cache, and polls, deferred polls and offset writes take
- * the routed path of a typed poll or offset write. Readiness waits, which Rust
- * routes to the primary of each partition they name, and deferred-request
- * cancels are refused. Other commands go out as they are.
+ * typed sends' context cache, and polls, deferred polls and
+ * offset writes take the routed path of the typed call. A fetch keeps the
+ * fences of its targets and goes to the primary of its first target, as a
+ * typed fetch goes. Deferred-request cancels are refused. Other commands go
+ * out as they are.
  */
 final class RawPartitionRequests {
     private static final int SEND_MESSAGES = CommandCode.Messages.SEND.getValue();
     private static final int POLL_MESSAGES = CommandCode.Messages.POLL.getValue();
     private static final int POLL_MESSAGES_DEFERRED = CommandCode.Messages.POLL_DEFERRED.getValue();
-    private static final int WAIT_FOR_MESSAGES = CommandCode.Messages.WAIT_FOR_MESSAGES.getValue();
+    private static final int FETCH_MESSAGES = CommandCode.Messages.FETCH_MESSAGES.getValue();
     private static final int CANCEL_DEFERRED_REQUEST = CommandCode.Messages.CANCEL_DEFERRED_REQUEST.getValue();
     private static final int STORE_CONSUMER_OFFSET = CommandCode.ConsumerOffset.STORE.getValue();
     private static final int DELETE_CONSUMER_OFFSET = CommandCode.ConsumerOffset.DELETE.getValue();
@@ -63,8 +72,6 @@ final class RawPartitionRequests {
     private static final int DELETE_OFFSET_SUFFIX_BYTES = 1;
     private static final String UNPARTITIONED_SEND = "A raw SendMessages request needs an explicit partition id."
             + " Send balanced or messages-key batches with MessagesClient.sendMessages.";
-    private static final String UNROUTED_WAIT = "A raw WaitForMessages request needs the primary of each partition"
-            + " it names, and this client does not route readiness waits.";
 
     private final Supplier<AsyncTcpConnection> connection;
     private final PollRouter pollRouter;
@@ -89,6 +96,7 @@ final class RawPartitionRequests {
      * deferred poll with limits that the server's decoder refuses fails the
      * same way.
      */
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
     CompletableFuture<ByteBuf> send(int code, byte[] payload) {
         try {
             if (code == SEND_MESSAGES) {
@@ -100,9 +108,8 @@ final class RawPartitionRequests {
             if (code == POLL_MESSAGES_DEFERRED) {
                 return pollMessagesDeferred(payload);
             }
-            if (code == WAIT_FOR_MESSAGES) {
-                throw IggyServerException.fromTcpResponse(
-                        IggyErrorCode.FEATURE_UNAVAILABLE.getCode(), UNROUTED_WAIT.getBytes(StandardCharsets.UTF_8));
+            if (code == FETCH_MESSAGES) {
+                return fetchMessages(payload);
             }
             if (code == CANCEL_DEFERRED_REQUEST) {
                 // A cancel names a pending request by its id, and the server answers no cancel,
@@ -174,6 +181,51 @@ final class RawPartitionRequests {
                 System.nanoTime() + options.requestTimeout().toNanos());
     }
 
+    /** Refuses a fetch that the server would refuse to decode, see FetchMessagesRequest in core/binary_protocol. */
+    private CompletableFuture<ByteBuf> fetchMessages(byte[] payload) {
+        int topic = consumerEnd(payload, FETCH_MESSAGES);
+        int limits = identifierEnd(payload, identifierEnd(payload, topic, FETCH_MESSAGES), FETCH_MESSAGES);
+        int targets = limits + FetchMessages.LIMITS_BYTES;
+        if (targets > payload.length) {
+            throw malformed(FETCH_MESSAGES, "fetch limits", limits);
+        }
+        ByteBuf fields = Unpooled.wrappedBuffer(payload);
+        long count = fields.getUnsignedIntLE(targets - Integer.BYTES);
+        if (count == 0
+                || count > FetchMessages.MAX_PARTITIONS_PER_REQUEST
+                || payload.length - targets != count * FetchMessages.TARGET_BYTES) {
+            throw malformed(FETCH_MESSAGES, "targets", targets - Integer.BYTES);
+        }
+        DeferredPollOptions options = new DeferredPollOptions(
+                Duration.of(fields.getLongLE(limits), ChronoUnit.MICROS),
+                fields.getUnsignedIntLE(limits + FetchMessages.MIN_COUNT_OFFSET),
+                fields.getUnsignedIntLE(limits + FetchMessages.MAX_BYTES_OFFSET),
+                Duration.of(fields.getLongLE(limits + Long.BYTES), ChronoUnit.MICROS));
+        options.validate(fields.getUnsignedIntLE(limits + FetchMessages.COUNT_OFFSET));
+        if (!FetchMessages.canStart(options)) {
+            throw malformed(FETCH_MESSAGES, "request timeout", limits + Long.BYTES);
+        }
+        List<Long> partitions = fetchPartitions(fields, targets, options.maxBytes());
+        byte[] topicBytes = Arrays.copyOfRange(payload, topic, limits);
+        CompletableFuture<ByteBuf> reply = FetchMessages.send(
+                pollRouter,
+                Unpooled.copiedBuffer(payload),
+                topicBytes,
+                partitions,
+                System.nanoTime() + options.requestTimeout().toNanos(),
+                pollRouter.startCall());
+        return AsyncTcpConnection.mapResponse(reply, body -> {
+            try {
+                FetchMessages.markMoved(
+                        pollRouter, topicBytes, BytesDeserializer.readFetchedMessages(body.duplicate()));
+            } catch (RuntimeException malformedReply) {
+                body.release();
+                throw malformedReply;
+            }
+            return body;
+        });
+    }
+
     private CompletableFuture<ByteBuf> writeOffset(int code, byte[] payload) {
         int target = targetEnd(payload, code);
         int suffix = code == STORE_CONSUMER_OFFSET ? STORE_OFFSET_SUFFIX_BYTES : DELETE_OFFSET_SUFFIX_BYTES;
@@ -183,17 +235,39 @@ final class RawPartitionRequests {
         return offsets.write(code, Unpooled.copiedBuffer(payload), Optional.empty());
     }
 
+    /** The partitions of the fetch targets that start at {@code targets} and end {@code fields}, in their order. */
+    private static List<Long> fetchPartitions(ByteBuf fields, int targets, long maxBytes) {
+        Set<Long> partitions = new LinkedHashSet<>();
+        for (int target = targets; target < fields.writerIndex(); target += FetchMessages.TARGET_BYTES) {
+            int kind = fields.getUnsignedByte(target + FetchMessages.STRATEGY_KIND_OFFSET);
+            long targetMaxBytes = fields.getUnsignedIntLE(target + FetchMessages.TARGET_MAX_BYTES_OFFSET);
+            if ((kind != PollingKind.Offset.asCode() && kind != PollingKind.Next.asCode())
+                    || targetMaxBytes < DeferredPollOptions.MIN_MAX_BYTES
+                    || targetMaxBytes > maxBytes) {
+                throw malformed(FETCH_MESSAGES, "target", target);
+            }
+            if (!partitions.add(fields.getUnsignedIntLE(target))) {
+                throw malformed(FETCH_MESSAGES, "unique partition id", target);
+            }
+        }
+        return List.copyOf(partitions);
+    }
+
     /** Where the consumer, stream, topic and optional partition that lead a poll or offset write end. */
     private static int targetEnd(byte[] payload, int code) {
-        int consumerKind = unsignedByteAt(payload, 0, code, "consumer");
-        if (consumerKind != Consumer.Kind.Consumer.asCode() && consumerKind != Consumer.Kind.ConsumerGroup.asCode()) {
-            throw malformed(code, "consumer", 0);
-        }
-        int partition = identifierEnd(payload, identifierEnd(payload, identifierEnd(payload, 1, code), code), code);
+        int partition = identifierEnd(payload, identifierEnd(payload, consumerEnd(payload, code), code), code);
         if (partition + OPTIONAL_PARTITION_BYTES > payload.length) {
             throw malformed(code, "partition id", partition);
         }
         return partition + OPTIONAL_PARTITION_BYTES;
+    }
+
+    private static int consumerEnd(byte[] payload, int code) {
+        int consumerKind = unsignedByteAt(payload, 0, code, "consumer");
+        if (consumerKind != Consumer.Kind.Consumer.asCode() && consumerKind != Consumer.Kind.ConsumerGroup.asCode()) {
+            throw malformed(code, "consumer", 0);
+        }
+        return identifierEnd(payload, 1, code);
     }
 
     private static int identifierEnd(byte[] payload, int start, int code) {

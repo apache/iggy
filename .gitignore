@@ -21,11 +21,16 @@ test_logs/
 !/foreign/python/src/bin
 *.iml
 foreign/cpp/build
+/foreign/csharp/TestResults/
 foreign/java/**/build
 foreign/java/**/out
 foreign/node/**/dist
 foreign/swift/.build
 foreign/swift/.swiftpm
+# The root manifest publishes the Swift SDK. Consumers resolve their own pins.
+/.build
+/.swiftpm
+/Package.resolved
 examples/swift/.build
 examples/swift/**/.build
 examples/swift/**/.swiftpm

@@ -20,6 +20,8 @@
 #include <cstdint>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -59,7 +61,8 @@ TEST_F(LowLevelE2E_Message, SendAndPollMessagesRoundTrip) {
     EXPECT_EQ(sent.confirmations.front().partition_id, 0u);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
+                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                        make_poll_options(100), error_info);
 
     ASSERT_EQ(polled.partition_id, 0u) << "Polled partition_id mismatches the partition we sent to";
     ASSERT_EQ(polled.count, 10u);
@@ -95,7 +98,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesVerifyMessageIds) {
                           partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
+                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                        make_poll_options(100), error_info);
 
     ASSERT_EQ(polled.messages.size(), 1u);
     ASSERT_EQ(polled.messages[0].id_lo, 42u);
@@ -116,7 +120,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesFromEmptyPartition) {
                          make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
+                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                        make_poll_options(100), error_info);
 
     ASSERT_EQ(polled.count, 0u);
     ASSERT_EQ(polled.messages.size(), 0u);
@@ -251,15 +256,15 @@ TEST_F(LowLevelE2E_Message, SendMessagesToSpecificPartitionVerified) {
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
                           partition_id_bytes(0), std::move(messages), error_info);
 
-    auto polled_part0 =
-        client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                              make_numeric_identifier(1), "offset", 0, 100, false, error_info);
+    auto polled_part0 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
+                                              "consumer", make_numeric_identifier(1),
+                                              make_polling_strategy("offset", 0), make_poll_options(100), error_info);
     ASSERT_EQ(polled_part0.partition_id, 0u);
     ASSERT_EQ(polled_part0.count, 5u);
 
-    auto polled_part1 =
-        client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 1, "consumer",
-                              make_numeric_identifier(1), "offset", 0, 100, false, error_info);
+    auto polled_part1 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 1,
+                                              "consumer", make_numeric_identifier(1),
+                                              make_polling_strategy("offset", 0), make_poll_options(100), error_info);
     ASSERT_EQ(polled_part1.partition_id, 1u);
     ASSERT_EQ(polled_part1.count, 0u);
 }
@@ -361,7 +366,8 @@ TEST_F(LowLevelE2E_Message, SendMessagesPreservesOrder) {
                           partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
+                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                        make_poll_options(100), error_info);
 
     ASSERT_EQ(polled.count, 50u);
     for (std::uint32_t i = 0; i < 50; i++) {
@@ -398,7 +404,8 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithDuplicateIds) {
                                           "partition_id", partition_id_bytes(0), std::move(messages), error_info));
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
+                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                        make_poll_options(100), error_info);
 
     ASSERT_EQ(polled.count, 3u);
     for (const auto &message : polled.messages) {
@@ -450,7 +457,8 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithVariousPayloads) {
                           partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
+                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                        make_poll_options(100), error_info);
 
     ASSERT_EQ(polled.count, 4u);
 
@@ -545,7 +553,8 @@ TEST_F(LowLevelE2E_Message, SendAndPollMessageWithTypedHeadersRoundTrip) {
                                           "partition_id", partition_id_bytes(0), std::move(messages), error_info));
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
+                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                        make_poll_options(100), error_info);
 
     constexpr std::size_t expected_message_count = sizeof(expected_messages) / sizeof(expected_messages[0]);
     ASSERT_EQ(polled.count, expected_message_count);
@@ -820,7 +829,8 @@ TEST_F(LowLevelE2E_Message, SendMessageAtUserHeadersSizeBoundary) {
                                           error_info));
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 10, false, error_info);
+                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                        make_poll_options(10), error_info);
 
     ASSERT_EQ(polled.count, 1u);
     ASSERT_EQ(polled.messages.size(), 1u);
@@ -837,12 +847,14 @@ TEST_F(LowLevelE2E_Message, PollMessagesBeforeLoginThrows) {
     ASSERT_NO_THROW(client->connect());
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(1), make_numeric_identifier(0), 0, "consumer",
-                                       make_numeric_identifier(1), "offset", 0, 10, false, error_info),
+                                       make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                       make_poll_options(10), error_info),
                  std::exception);
     ASSERT_NO_THROW(client->login_user("iggy", "iggy", error_info));
     ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(1), make_numeric_identifier(0), 0, "consumer",
-                                       make_numeric_identifier(1), "offset", 0, 10, false, error_info),
+                                       make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                       make_poll_options(10), error_info),
                  std::exception);
 }
 
@@ -855,9 +867,10 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidStreamIdThrows) {
     invalid_id.kind   = "invalid";
     invalid_id.length = 0;
 
-    ASSERT_THROW(client->poll_messages(invalid_id, make_numeric_identifier(0), 0, "consumer",
-                                       make_numeric_identifier(1), "offset", 0, 10, false, error_info),
-                 std::exception);
+    ASSERT_THROW(
+        client->poll_messages(invalid_id, make_numeric_identifier(0), 0, "consumer", make_numeric_identifier(1),
+                              make_polling_strategy("offset", 0), make_poll_options(10), error_info),
+        std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesFromNonExistentStreamThrows) {
@@ -866,7 +879,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesFromNonExistentStreamThrows) {
     iggy::ffi::Client *client = GetLoggedInClient();
 
     ASSERT_THROW(client->poll_messages(make_string_identifier("nonexistent-stream-poll"), make_numeric_identifier(0), 0,
-                                       "consumer", make_numeric_identifier(1), "offset", 0, 10, false, error_info),
+                                       "consumer", make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                       make_poll_options(10), error_info),
                  std::exception);
 }
 
@@ -884,7 +898,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidConsumerKindThrows) {
                          make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "invalid",
-                                       make_numeric_identifier(1), "offset", 0, 10, false, error_info),
+                                       make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                       make_poll_options(10), error_info),
                  std::exception);
 }
 
@@ -902,7 +917,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidStrategyKindThrows) {
                          make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                       make_numeric_identifier(1), "invalid", 0, 10, false, error_info),
+                                       make_numeric_identifier(1), make_polling_strategy("invalid", 0),
+                                       make_poll_options(10), error_info),
                  std::exception);
 }
 
@@ -929,7 +945,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesCountLessThanAvailable) {
                           partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 5, false, error_info);
+                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                        make_poll_options(5), error_info);
 
     ASSERT_EQ(polled.count, 5u);
     ASSERT_EQ(polled.messages.size(), 5u);
@@ -958,7 +975,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithLargeOffset) {
                           partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 999999, 100, false, error_info);
+                                        make_numeric_identifier(1), make_polling_strategy("offset", 999999),
+                                        make_poll_options(100), error_info);
 
     ASSERT_EQ(polled.count, 0u);
     ASSERT_EQ(polled.messages.size(), 0u);
@@ -987,7 +1005,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesFirstStrategy) {
                           partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "first", 0, 3, false, error_info);
+                                        make_numeric_identifier(1), make_polling_strategy("first", 0),
+                                        make_poll_options(3), error_info);
 
     ASSERT_EQ(polled.count, 3u);
     ASSERT_EQ(polled.messages.size(), 3u);
@@ -1023,7 +1042,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesLastStrategy) {
                           partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "last", 0, 3, false, error_info);
+                                        make_numeric_identifier(1), make_polling_strategy("last", 0),
+                                        make_poll_options(3), error_info);
 
     ASSERT_EQ(polled.count, 3u);
     ASSERT_EQ(polled.messages.size(), 3u);
@@ -1060,11 +1080,13 @@ TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyNoAutoCommit) {
                           partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled1 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                         make_numeric_identifier(1), "next", 0, 100, false, error_info);
+                                         make_numeric_identifier(1), make_polling_strategy("next", 0),
+                                         make_poll_options(100), error_info);
     ASSERT_EQ(polled1.count, 5u);
 
     auto polled2 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                         make_numeric_identifier(1), "next", 0, 100, false, error_info);
+                                         make_numeric_identifier(1), make_polling_strategy("next", 0),
+                                         make_poll_options(100), error_info);
     ASSERT_EQ(polled2.count, 5u);
     for (std::uint32_t i = 0; i < 5; i++) {
         EXPECT_EQ(polled1.messages[i].offset, static_cast<std::uint64_t>(i));
@@ -1103,13 +1125,15 @@ TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyAutoCommit) {
                           partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled1 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                         make_numeric_identifier(1), "next", 0, 5, true, error_info);
+                                         make_numeric_identifier(1), make_polling_strategy("next", 0),
+                                         make_poll_options(5, iggy::ffi::CommitPolicy::OnRead), error_info);
     ASSERT_EQ(polled1.count, 5u);
     EXPECT_EQ(polled1.messages[0].offset, 0u);
     EXPECT_EQ(polled1.messages[4].offset, 4u);
 
     auto polled2 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                         make_numeric_identifier(1), "next", 0, 5, true, error_info);
+                                         make_numeric_identifier(1), make_polling_strategy("next", 0),
+                                         make_poll_options(5, iggy::ffi::CommitPolicy::OnRead), error_info);
     ASSERT_EQ(polled2.count, 5u);
     EXPECT_EQ(polled2.messages[0].offset, 5u);
     EXPECT_EQ(polled2.messages[4].offset, 9u);
@@ -1125,7 +1149,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyAutoCommit) {
     }
 
     auto polled3 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                         make_numeric_identifier(1), "next", 0, 5, true, error_info);
+                                         make_numeric_identifier(1), make_polling_strategy("next", 0),
+                                         make_poll_options(5, iggy::ffi::CommitPolicy::OnRead), error_info);
     ASSERT_EQ(polled3.count, 0u);
 }
 
@@ -1152,16 +1177,18 @@ TEST_F(LowLevelE2E_Message, PollMessagesConsumerIdIndependence) {
                           partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled_c1 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
-                                           "consumer", make_numeric_identifier(1), "next", 0, 3, true, error_info);
+                                           "consumer", make_numeric_identifier(1), make_polling_strategy("next", 0),
+                                           make_poll_options(3, iggy::ffi::CommitPolicy::OnRead), error_info);
     ASSERT_EQ(polled_c1.count, 3u);
 
     auto polled_c2 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
-                                           "consumer", make_numeric_identifier(2), "next", 0, 5, true, error_info);
+                                           "consumer", make_numeric_identifier(2), make_polling_strategy("next", 0),
+                                           make_poll_options(5, iggy::ffi::CommitPolicy::OnRead), error_info);
     ASSERT_EQ(polled_c2.count, 5u);
 
-    auto polled_c1_again =
-        client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                              make_numeric_identifier(1), "next", 0, 5, true, error_info);
+    auto polled_c1_again = client->poll_messages(
+        make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer", make_numeric_identifier(1),
+        make_polling_strategy("next", 0), make_poll_options(5, iggy::ffi::CommitPolicy::OnRead), error_info);
     ASSERT_EQ(polled_c1_again.count, 2u);
 }
 
@@ -1197,7 +1224,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesMultipleSendsThenPollOrder) {
                           partition_id_bytes(0), std::move(batch2), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
+                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                        make_poll_options(100), error_info);
 
     ASSERT_EQ(polled.count, 10u);
     for (std::uint32_t i = 0; i < 10; i++) {
@@ -1241,7 +1269,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesMultipleCustomIds) {
                           partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
+                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                        make_poll_options(100), error_info);
 
     ASSERT_EQ(polled.count, 5u);
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -1275,7 +1304,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesAfterStreamDeletedThrows) {
     ForgetTrackedStream(saved_stream_id);
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(saved_stream_id), make_numeric_identifier(0), 0,
-                                       "consumer", make_numeric_identifier(1), "offset", 0, 10, false, error_info),
+                                       "consumer", make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                       make_poll_options(10), error_info),
                  std::exception);
 }
 
@@ -1293,7 +1323,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidPartitionIdThrows) {
                          make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 9999, "consumer",
-                                       make_numeric_identifier(1), "offset", 0, 10, false, error_info),
+                                       make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                       make_poll_options(10), error_info),
                  std::exception);
 }
 
@@ -1311,14 +1342,15 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithCountZeroThrows) {
                          make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                       make_numeric_identifier(1), "offset", 0, 0, false, error_info),
+                                       make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                       make_poll_options(0), error_info),
                  std::exception);
 }
 
-TEST_F(LowLevelE2E_Message, PollMessagesWithoutSpecifyingPartition) {
+TEST_F(LowLevelE2E_Message, PollMessagesWithMaximumPartitionIdThrows) {
     iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description",
-                   "Verifies polling with partition_id=u32::MAX defaults to partition 0 and returns messages.");
+                   "Verifies that partition_id=u32::MAX is an ordinary partition ID, not a request to pick one.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
@@ -1337,19 +1369,11 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithoutSpecifyingPartition) {
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
                           partition_id_bytes(0), std::move(messages), error_info);
 
-    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), UINT32_MAX,
-                                        "consumer", make_numeric_identifier(1), "offset", 0, 100, false, error_info);
-
-    // The Rust side maps UINT32_MAX to None, so the server picks a partition. With a single
-    // partition topic that should always be partition 0.
-    ASSERT_EQ(polled.partition_id, 0u) << "u32::MAX sentinel did not map to None — partition_id sentinel regression?";
-    ASSERT_EQ(polled.count, 5u);
-    ASSERT_EQ(polled.messages.size(), 5u);
-    for (std::uint32_t i = 0; i < 5; i++) {
-        std::string expected = "msg-" + std::to_string(i);
-        std::string actual(polled.messages[i].payload.begin(), polled.messages[i].payload.end());
-        EXPECT_EQ(actual, expected) << "Payload mismatch at index " << i;
-    }
+    // A poll requires its partition, so the old sentinel must not read partition 0.
+    ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), UINT32_MAX,
+                                       "consumer", make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                       make_poll_options(100), error_info),
+                 std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
@@ -1387,7 +1411,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
                           partition_id_bytes(0), std::move(batch2), error_info);
 
     auto all = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                     make_numeric_identifier(1), "offset", 0, 100, false, error_info);
+                                     make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                     make_poll_options(100), error_info);
     ASSERT_EQ(all.count, 10u);
 
     // IggyTimestamp::now() is microsecond-resolution and we slept 100ms between batches; a gap
@@ -1400,9 +1425,9 @@ TEST_F(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
         << "Timestamp gap collapsed (" << (batch2_timestamp - batch1_timestamp)
         << "us) — test no longer exercises timestamp filtering";
 
-    auto polled =
-        client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                              make_numeric_identifier(2), "timestamp", batch2_timestamp, 100, false, error_info);
+    auto polled = client->poll_messages(
+        make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer", make_numeric_identifier(2),
+        make_polling_strategy("timestamp", batch2_timestamp), make_poll_options(100), error_info);
 
     ASSERT_GE(polled.count, 5u);
     // The server contract is `timestamp >= polling_strategy_value`. If a batch1 message lands on
@@ -1443,9 +1468,9 @@ TEST_F(LowLevelE2E_Message, PollMessagesMonotonicOffsets) {
     std::uint64_t expected_offset = 0;
     for (int chunk = 0; chunk < 4; chunk++) {
         iggy::ffi::ErrorInfo error_info{};
-        auto polled =
-            client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                  make_numeric_identifier(1), "offset", expected_offset, 5, false, error_info);
+        auto polled = client->poll_messages(
+            make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer", make_numeric_identifier(1),
+            make_polling_strategy("offset", expected_offset), make_poll_options(5), error_info);
 
         ASSERT_EQ(polled.count, 5u) << "Chunk " << chunk;
         ASSERT_EQ(polled.messages.size(), 5u) << "Chunk " << chunk;
@@ -1483,7 +1508,8 @@ TEST_F(LowLevelE2E_Message, SendMessagesLargeBatch) {
                                           "partition_id", partition_id_bytes(0), std::move(messages), error_info));
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 1000, false, error_info);
+                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                        make_poll_options(1000), error_info);
 
     ASSERT_EQ(polled.count, 1000u);
     ASSERT_EQ(polled.messages.size(), 1000u);
@@ -1518,9 +1544,10 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidTopicIdThrows) {
     invalid_id.kind   = "invalid";
     invalid_id.length = 0;
 
-    ASSERT_THROW(client->poll_messages(make_numeric_identifier(1), invalid_id, 0, "consumer",
-                                       make_numeric_identifier(1), "offset", 0, 10, false, error_info),
-                 std::exception);
+    ASSERT_THROW(
+        client->poll_messages(make_numeric_identifier(1), invalid_id, 0, "consumer", make_numeric_identifier(1),
+                              make_polling_strategy("offset", 0), make_poll_options(10), error_info),
+        std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidConsumerIdThrows) {
@@ -1540,9 +1567,10 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidConsumerIdThrows) {
     invalid_id.kind   = "invalid";
     invalid_id.length = 0;
 
-    ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                       invalid_id, "offset", 0, 10, false, error_info),
-                 std::exception);
+    ASSERT_THROW(
+        client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer", invalid_id,
+                              make_polling_strategy("offset", 0), make_poll_options(10), error_info),
+        std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, ConsumerGroupCreateJoinAndPollMessages) {
@@ -1582,9 +1610,9 @@ TEST_F(LowLevelE2E_Message, ConsumerGroupCreateJoinAndPollMessages) {
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
                           partition_id_bytes(0), std::move(messages), error_info);
 
-    auto polled =
-        client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer_group",
-                              make_numeric_identifier(group.id), "offset", 0, 100, false, error_info);
+    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
+                                        "consumer_group", make_numeric_identifier(group.id),
+                                        make_polling_strategy("offset", 0), make_poll_options(100), error_info);
 
     ASSERT_EQ(polled.count, 10u);
     ASSERT_EQ(polled.messages.size(), 10u);
@@ -1600,4 +1628,111 @@ TEST_F(LowLevelE2E_Message, ConsumerGroupCreateJoinAndPollMessages) {
     auto group_after_leave = client->get_consumer_group(make_numeric_identifier(stream.id), make_numeric_identifier(0),
                                                         make_numeric_identifier(group.id));
     ASSERT_EQ(group_after_leave.members_count, 0u);
+}
+
+TEST_F(LowLevelE2E_Message, PollMessagesContinuationReadsTheNextBatch) {
+    iggy::ffi::ErrorInfo error_info{};
+    RecordProperty("description",
+                   "Polls a partition in batches, each from the continuation of the batch before it, and checks that "
+                   "the continuation of an empty batch keeps its start.");
+    const std::string stream_name = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    client->create_stream(stream_name, {}, error_info);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    TrackStream(stream.id);
+    client->create_topic(make_numeric_identifier(stream.id), GetRandomName(), make_topic_create_options(1), error_info);
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    for (std::uint32_t i = 0; i < 10; i++) {
+        messages.push_back(
+            iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>()));
+    }
+    client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                          partition_id_bytes(0), std::move(messages), error_info);
+
+    std::vector<std::uint64_t> offsets;
+    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                        make_poll_options(4), error_info);
+    while (offsets.size() < 10) {
+        ASSERT_FALSE(polled.messages.empty()) << "Empty batch after " << offsets.size() << " messages";
+        for (const auto &message : polled.messages) {
+            offsets.push_back(message.offset);
+        }
+        polled =
+            client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                                  make_numeric_identifier(1), *polled.continuation(), make_poll_options(4), error_info);
+    }
+    for (std::uint32_t i = 0; i < 10; i++) {
+        EXPECT_EQ(offsets[i], static_cast<std::uint64_t>(i)) << "Offset mismatch at index " << i;
+    }
+
+    EXPECT_TRUE(polled.messages.empty());
+    const auto continuation = polled.continuation();
+    EXPECT_EQ(std::string(continuation->kind()), "offset");
+    EXPECT_EQ(continuation->value(), 10u) << "An empty batch must keep the start of its request";
+}
+
+TEST_F(LowLevelE2E_Message, PollMessagesContinuationOfAnotherPartitionThrows) {
+    iggy::ffi::ErrorInfo error_info{};
+    RecordProperty("description", "A continuation of partition 0 is refused by a poll of partition 1.");
+    const std::string stream_name = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    client->create_stream(stream_name, {}, error_info);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    TrackStream(stream.id);
+    client->create_topic(make_numeric_identifier(stream.id), GetRandomName(), make_topic_create_options(2), error_info);
+
+    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                        make_poll_options(4), error_info);
+    ASSERT_THROW(
+        client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 1, "consumer",
+                              make_numeric_identifier(1), *polled.continuation(), make_poll_options(4), error_info),
+        std::exception);
+    EXPECT_EQ(error_info.kind, "invalid_command");
+}
+
+TEST_F(LowLevelE2E_Message, StoreConsumerPositionStoresTheOffsetOfTheCheckpoint) {
+    iggy::ffi::ErrorInfo error_info{};
+    RecordProperty("description",
+                   "Stores the checkpoint of a processed part of a batch and reads the stored offset back. An empty "
+                   "batch has no checkpoint.");
+    const std::string stream_name = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    client->create_stream(stream_name, {}, error_info);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    TrackStream(stream.id);
+    client->create_topic(make_numeric_identifier(stream.id), GetRandomName(), make_topic_create_options(1), error_info);
+
+    auto empty = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                                       make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                       make_poll_options(10), error_info);
+    EXPECT_THROW(empty.checkpoint(), std::exception);
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    for (std::uint32_t i = 0; i < 10; i++) {
+        messages.push_back(
+            iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>()));
+    }
+    client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                          partition_id_bytes(0), std::move(messages), error_info);
+    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                                        make_numeric_identifier(1), make_polling_strategy("offset", 0),
+                                        make_poll_options(10), error_info);
+    ASSERT_EQ(polled.messages.size(), 10u);
+    EXPECT_EQ(polled.checkpoint()->offset(), 9u);
+    EXPECT_THROW(polled.checkpoint_at(10), std::exception);
+
+    const auto checkpoint = polled.checkpoint_at(4);
+    EXPECT_EQ(checkpoint->partition_id(), 0u);
+    EXPECT_EQ(checkpoint->offset(), 4u);
+    ASSERT_NO_THROW(client->store_consumer_position(make_numeric_identifier(stream.id), make_numeric_identifier(0),
+                                                    "consumer", make_numeric_identifier(1), *checkpoint, error_info));
+    const auto stored = client->get_consumer_offset(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
+                                                    "consumer", make_numeric_identifier(1));
+    EXPECT_EQ(stored.stored_offset, 4u);
 }

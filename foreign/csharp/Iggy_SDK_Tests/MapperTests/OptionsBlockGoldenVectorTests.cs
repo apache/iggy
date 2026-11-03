@@ -100,7 +100,7 @@ public sealed class OptionsBlockGoldenVectorTests
 
         BinaryPrimitives.WriteUInt32LittleEndian(payload, 1);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(4), 1750000000000000);
-        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(12), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(12), 0);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(16), 0);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(24), 0);
         payload[32] = (byte)name.Length;

@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-cpp"
-version = "0.1.7"
+version = "0.1.11"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -30,6 +30,7 @@ crate-type = ["staticlib"]
 [dependencies]
 bytes = "1.12.1"
 cxx = "1.0.205"
+futures = "0.3.34"
 iggy = { path = "../../core/sdk" }
 iggy_binary_protocol = { path = "../../core/binary_protocol" }
 iggy_common = { path = "../../core/common" }
@@ -37,7 +38,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 # Explicitly enable the runtime + I/O drivers required by `Runtime::enable_all()` in lib.rs.
 # Listing the features here insulates this crate from upstream SDK feature changes.
-tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 
 [build-dependencies]
 cxx-build = "1.0.205"

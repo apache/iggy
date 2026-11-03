@@ -24,7 +24,7 @@ use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
 use compio::fs::File;
-use consensus::VsrState;
+use consensus::{StateArtifactHasher, VsrState};
 use futures::{StreamExt, TryStreamExt};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_common::MAX_MESSAGE_SIZE_UPPER_BYTES;
@@ -72,11 +72,13 @@ pub struct MaterializationIoJob {
     pub(crate) bodies_written: Option<u64>,
     pub(crate) written: u64,
     pub(crate) completes: bool,
+    pub(crate) checksum: Option<Box<StateArtifactHasher>>,
 }
 
 pub struct MaterializationIoResult {
     pub(crate) target: MaterializationTarget,
     pub(crate) outcome: Result<(u64, u64), IggyError>,
+    pub(crate) checksum: Option<Box<StateArtifactHasher>>,
 }
 
 pub enum PartitionIoJob<SB = PingPongSuperblock> {
@@ -180,6 +182,7 @@ pub struct CapturedPartitionIo<SB> {
 #[derive(Default)]
 pub struct PartitionIoQuiescence {
     active: Cell<Option<PartitionIoIdentity>>,
+    local_work: Cell<usize>,
     retiring: Cell<bool>,
     deleting: Cell<bool>,
     interrupted: Cell<bool>,
@@ -208,10 +211,23 @@ impl PartitionIoQuiescence {
 
     pub(crate) fn set(&self, active: Option<PartitionIoIdentity>) {
         self.active.set(active);
-        if active.is_none()
-            && let Some(waiter) = self.waiter.borrow_mut().take()
-        {
-            waiter.wake();
+        if active.is_none() {
+            self.wake_waiter();
+        }
+    }
+
+    pub(crate) fn begin_local_work(&self) -> bool {
+        if self.is_retiring() || self.is_interrupted() {
+            return false;
+        }
+        self.local_work.set(self.local_work.get() + 1);
+        true
+    }
+
+    pub(crate) fn settle_local_work(&self) {
+        self.local_work.set(self.local_work.get() - 1);
+        if self.local_work.get() == 0 {
+            self.wake_waiter();
         }
     }
 
@@ -248,13 +264,20 @@ impl PartitionIoQuiescence {
                     "partition writer was interrupted",
                 )));
             }
-            if self.active.get().is_none() {
+            if self.active.get().is_none() && self.local_work.get() == 0 {
                 return Poll::Ready(Ok(()));
             }
             *self.waiter.borrow_mut() = Some(context.waker().clone());
             Poll::Pending
         })
         .await
+    }
+
+    fn wake_waiter(&self) {
+        let waiter = self.waiter.borrow_mut().take();
+        if let Some(waiter) = waiter {
+            waiter.wake();
+        }
     }
 }
 
@@ -541,8 +564,23 @@ impl MaterializationIoJob {
             bodies_written,
             written,
             completes,
+            mut checksum,
             ..
         } = self;
+        for batch in &mut batches {
+            if batch.len() < size_of::<PrepareHeader>() {
+                return MaterializationIoResult {
+                    target,
+                    outcome: Err(IggyError::CannotWriteToFile),
+                    checksum: None,
+                };
+            }
+            *batch = batch.slice(size_of::<PrepareHeader>()..);
+        }
+        if let Some(hasher) = checksum.as_mut() {
+            crate::state_transfer::hash_yielding(hasher, batches.iter().map(Frozen::as_slice))
+                .await;
+        }
         let outcome = if let Some(saved) = bodies_written {
             target
                 .index_writer
@@ -556,11 +594,9 @@ impl MaterializationIoJob {
                 return MaterializationIoResult {
                     target,
                     outcome: Err(IggyError::CannotWriteToFile),
+                    checksum: None,
                 };
             };
-            for batch in &mut batches {
-                *batch = batch.slice(size_of::<PrepareHeader>()..);
-            }
             // Both halves must settle, including when either one fails.
             let (messages, indexes) = futures::future::join(
                 writer.save_frozen_batches_at(&batches, position, completes),
@@ -593,7 +629,11 @@ impl MaterializationIoJob {
                 Ok((0, 0))
             }
         });
-        MaterializationIoResult { target, outcome }
+        MaterializationIoResult {
+            target,
+            outcome,
+            checksum,
+        }
     }
 }
 

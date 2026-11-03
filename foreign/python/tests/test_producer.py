@@ -40,6 +40,7 @@ from apache_iggy import (
     MaxTopicSize,
     Partitioning,
     PollingStrategy,
+    PollOptions,
     ProducerSendError,
     ProducerSharding,
     SendMessage,
@@ -137,16 +138,15 @@ async def poll_payloads(
     *,
     partition_id: int = 0,
 ) -> list[str]:
-    messages = await client.poll_messages(
-        stream=stream,
-        topic=topic,
+    polled = await client.poll_messages(
+        stream,
+        topic,
         consumer=Consumer.Single(1),
         partition_id=partition_id,
         polling_strategy=PollingStrategy.First(),
-        count=100,
-        auto_commit=False,
+        options=PollOptions(count=100),
     )
-    return [message.payload().decode("utf-8") for message in messages]
+    return [message.payload().decode("utf-8") for message in polled.messages]
 
 
 async def wait_for_payloads(
