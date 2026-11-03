@@ -30,7 +30,7 @@ readme = "../../README.md"
 publish = false
 
 [package.metadata.cargo-machete]
-ignored = ["dashmap", "futures", "simd-json"]
+ignored = ["dashmap", "futures"]
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -51,7 +51,6 @@ iggy_connector_sdk = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-simd-json = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
