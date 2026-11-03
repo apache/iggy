@@ -40,8 +40,9 @@ use cgroup_memory::cgroup_available_memory;
 /// The CPU fields are deltas over the passed `System`'s refresh history,
 /// so the first capture on a fresh `System` reports zero. `run_time_secs`
 /// and `start_time_secs` are whole seconds (sysinfo's granularity);
-/// callers convert to their wire units.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// callers convert to their wire units. The all-zero `Default` stands in
+/// where sysinfo does not support the platform.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct SystemProbe {
     pub process_id: u32,
     pub cpu_usage: f32,
@@ -151,7 +152,7 @@ pub fn capture_allowed_cpus() {
 
 fn scan_open_files() -> Option<u64> {
     let pid = Pid::from_u32(std::process::id());
-    let mut sys = System::new();
+    let mut sys = System::new().ok()?;
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         true,
@@ -219,7 +220,7 @@ fn allowed_cores_cpu_usage(sys: &System, allowed: &[usize]) -> Option<f32> {
     let mut total_usage = 0.0f32;
     for cpu_id in allowed {
         let name = format!("cpu{cpu_id}");
-        total_usage += cpus.iter().find(|cpu| cpu.name() == name)?.cpu_usage();
+        total_usage += cpus.iter().find(|cpu| cpu.name() == name)?.usage();
     }
 
     Some(total_usage / allowed.len() as f32)
@@ -237,7 +238,7 @@ mod tests {
 
     #[test]
     fn given_fresh_system_when_capturing_probe_should_sample_own_process() {
-        let mut sys = System::new();
+        let mut sys = System::new().expect("sysinfo supports this platform");
 
         let probe = SystemProbe::capture(&mut sys);
 
@@ -291,7 +292,7 @@ mod tests {
 
     #[test]
     fn given_unrefreshed_system_when_probing_scoped_cpu_should_fall_back_to_global() {
-        let sys = System::new();
+        let sys = System::new().expect("sysinfo supports this platform");
 
         assert_eq!(scoped_total_cpu_usage(&sys), sys.global_cpu_usage());
     }
@@ -301,7 +302,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn given_allowed_core_subset_when_probing_scoped_cpu_should_average_those_cores() {
-        let mut sys = System::new();
+        let mut sys = System::new().expect("sysinfo supports this platform");
         sys.refresh_cpu_all();
         std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
         sys.refresh_cpu_all();
@@ -318,7 +319,7 @@ mod tests {
                 cpus.iter()
                     .find(|cpu| cpu.name() == format!("cpu{cpu_id}"))
                     .expect("linux names cores cpu0..cpuN")
-                    .cpu_usage()
+                    .usage()
             })
             .sum::<f32>()
             / allowed.len() as f32;
@@ -328,7 +329,7 @@ mod tests {
 
     #[test]
     fn given_own_process_when_probing_cgroup_memory_should_reflect_confinement() {
-        let mut sys = System::new();
+        let mut sys = System::new().expect("sysinfo supports this platform");
         sys.refresh_memory();
         let pid = Pid::from_u32(std::process::id());
         sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);

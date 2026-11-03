@@ -25,6 +25,7 @@ use std::rc::Rc;
 
 use axum::Json;
 use axum::body::{Body, Bytes};
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, FromRequest, FromRequestParts, Request};
 use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
@@ -32,7 +33,7 @@ use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use iggy_common::{
     IggyError, IggyTimestamp, OptionInputValue, OptionsUpdate, PersonalAccessToken, RESET_FIELD,
-    erase_buffer,
+    SendMessages, erase_buffer,
 };
 use send_wrapper::SendWrapper;
 use serde::Deserializer as _;
@@ -40,7 +41,7 @@ use serde::de::{DeserializeOwned, Error as _, IgnoredAny, MapAccess, Visitor};
 use tracing::debug;
 
 use super::HttpState;
-use super::error::{AuthError, WriteError};
+use super::error::{AuthError, PartitionWriteError, WriteError};
 use super::jwt::TokenSubject;
 use super::session::HttpSession;
 use super::state::HttpInner;
@@ -91,6 +92,12 @@ pub struct JsonMembers<T> {
 /// category the binary decoder gives the same patch, naming the first member
 /// at fault where one is.
 pub(in crate::http) struct JsonUpdate(pub OptionsUpdate);
+
+/// A produce body. A typed user header the header codec refuses answers 400
+/// with that header's `InvalidHeaderKey` or `InvalidHeaderValue`, the body
+/// `SendMessages::validate` gives on the same route. Every other rejection
+/// stays axum's own.
+pub(in crate::http) struct JsonSendMessages(pub SendMessages);
 
 /// Walks an update body with the member types [`OptionsUpdate`] parses and
 /// records the first member that does not parse: a repeated name, a `reset`
@@ -175,6 +182,35 @@ where
         };
         erase_buffer(bytes);
         update
+    }
+}
+
+impl<S> FromRequest<S> for JsonSendMessages
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (parts, body) = request.into_parts();
+        let bytes = Bytes::from_request(Request::from_parts(parts.clone(), body), state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        match Json::<SendMessages>::from_request(
+            Request::from_parts(parts, Body::from(bytes.clone())),
+            state,
+        )
+        .await
+        {
+            Ok(Json(command)) => Ok(Self(command)),
+            Err(JsonRejection::JsonDataError(rejection)) => {
+                Err(SendMessages::refused_user_header(&bytes).map_or_else(
+                    || rejection.into_response(),
+                    |error| PartitionWriteError::Rejected(error).into_response(),
+                ))
+            }
+            Err(rejection) => Err(rejection.into_response()),
+        }
     }
 }
 
