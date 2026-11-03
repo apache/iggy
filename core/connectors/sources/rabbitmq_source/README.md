@@ -42,9 +42,9 @@ The runtime converts `[plugin_config]` to JSON and passes it to the plugin. See 
 
 Use `amqps://` when the RabbitMQ listener uses TLS. If you add a `[plugin_config.tls]` table, the URL must use `amqps://`. The client certificate and key must appear together.
 
-## Runtime Configuration Example
+## Runtime Configuration Examples
 
-Create the queue and the Iggy stream and topic before you start the connector. This example uses raw mode:
+This complete example uses raw mode:
 
 ```toml
 type = "source"
@@ -71,6 +71,36 @@ include_metadata = false
 timeout_secs = 30
 verbose_logging = false
 ```
+
+This complete example uses a JSON envelope for each delivery:
+
+```toml
+type = "source"
+key = "rabbitmq"
+enabled = true
+version = 1
+name = "RabbitMQ source"
+path = "target/debug/libiggy_connector_rabbitmq_source"
+plugin_config_format = "json"
+
+[[streams]]
+stream = "events"
+topic = "rabbitmq"
+schema = "json"
+batch_length = 100
+linger_time = "5ms"
+
+[plugin_config]
+amqp_url = "amqp://rabbit_user:replace-me@127.0.0.1:5672/%2f"
+queue = "events"
+batch_size = 100
+batch_timeout = "10ms"
+include_metadata = true
+timeout_secs = 30
+verbose_logging = false
+```
+
+Use one example per connector configuration file. Change the stream, topic, queue, URL, and plugin path for your environment.
 
 The `amqp_url` value identifies the broker, port, credentials, and virtual host. Use a broker host name and port that the connectors runtime can reach.
 
@@ -110,7 +140,7 @@ The broker must trust the client certificate's CA and require client certificate
 
 ## Message Payloads and Headers
 
-Set the destination schema to match `include_metadata`:
+Set the destination schema to match `include_metadata`. With `false`, Iggy receives the original body as raw bytes. The source adds selected AMQP values, such as the exchange, routing key, redelivery flag, and message ID, as Iggy headers. With `true`, the source sends a JSON envelope with the body as Base64. The envelope contains AMQP properties, headers, and delivery details.
 
 | `include_metadata` | Schema | Output |
 | :--- | :--- | :--- |
@@ -164,9 +194,16 @@ RabbitMQ → source holds delivery → runtime writes batch to Iggy
 
 The source keeps one batch in flight. If Iggy rejects a batch, the source retries that batch before it reads newer deliveries. RabbitMQ does not receive an acknowledgement for that batch.
 
+The source stops after five consecutive batch failures. Restore the Iggy connection and restart the source or connectors runtime. RabbitMQ can redeliver messages that remain unacknowledged.
+
 If the connector stops while a delivery is unacknowledged, RabbitMQ can requeue it. Iggy can receive a duplicate if RabbitMQ redelivers a message after Iggy accepted it but before RabbitMQ received its acknowledgement.
 
-After Iggy accepts a batch, the source acknowledges each delivery separately. If an acknowledgement fails or times out, the source stops and attempts to close its RabbitMQ connection. When the connection closes, RabbitMQ requeues deliveries that remain unacknowledged. Earlier acknowledgements can succeed, and the outcome of an acknowledgement can be uncertain if the connection fails. Redelivery can therefore create duplicates in Iggy.
+After Iggy accepts a batch, the source acknowledges each RabbitMQ delivery. If an acknowledgement fails or times out, the source
+attempts to close its RabbitMQ connection and stops with an error. Lapin acknowledgement handles are single-use, so the source
+does not retry an acknowledgement or replay the batch. RabbitMQ requeues deliveries that remain unacknowledged when the
+connection closes. After the source restarts, RabbitMQ can redeliver those messages, so Iggy can receive duplicates. An
+acknowledgement error can have an uncertain outcome, so RabbitMQ can already have accepted the acknowledgement for a
+delivery. Consumers must handle duplicates.
 
 ## Failure Handling
 
@@ -175,9 +212,16 @@ After Iggy accepts a batch, the source acknowledges each delivery separately. If
 | RabbitMQ is unavailable at startup | Source initialization fails. Start RabbitMQ, then restart the connectors runtime. |
 | RabbitMQ disconnects after startup | The source waits for a random delay from 1 to 5 seconds, then retries connection and consume operations. |
 | Iggy rejects a batch | The source retains and retries the batch. RabbitMQ deliveries remain unacknowledged. |
-| A broker acknowledgement fails | The source closes its AMQP connection and reports an error. RabbitMQ can redeliver the message. |
+| A broker acknowledgement fails | The source attempts to close its AMQP connection and stops with an error. After restart, RabbitMQ can redeliver unacknowledged messages. |
 | Empty body in raw mode | The connector logs, acknowledges, and drops the delivery. |
 | Payload exceeds 64,000,000 bytes | The connector logs, acknowledges, and drops the delivery. |
+| Delivery preparation fails | The connector logs and rejects the delivery without requeuing it. RabbitMQ dead-letters it if a route exists. Otherwise, RabbitMQ drops it. |
 | Empty body in metadata mode | The connector can encode the empty body in the JSON envelope. |
 
 The 64,000,000-byte limit applies to the emitted payload, including the JSON envelope in metadata mode. The connector does not limit the total bytes in a batch.
+
+## Operations
+
+Read the connectors runtime logs for startup, connection, and delivery errors. A running source status alone does not prove that RabbitMQ has an active consumer. Inspect the queue's consumer count and its ready and unacknowledged message counts in RabbitMQ. Publish a message to the queue. Read it from the configured Iggy topic to make sure that the full path works.
+
+If the source fails to start, inspect the plugin path, broker URL, queue name, credentials, and TLS files. After you correct the problem, restart the source or connectors runtime. If RabbitMQ disconnects after startup, the source retries the connection.

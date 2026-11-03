@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 
@@ -47,17 +48,30 @@ pub fn encode_delivery(delivery: &Delivery) -> Result<Vec<u8>, serde_json::Error
         .as_ref()
         .map(encode_table)
         .unwrap_or_else(|| Value::Object(Map::new()));
-    serde_json::to_vec(&json!({
-        "version": 1,
-        "body_base64": STANDARD.encode(&delivery.data),
-        "properties": properties,
-        "headers": headers,
-        "delivery": {
+    let mut output = Vec::new();
+    output.extend_from_slice(b"{\"body_base64\":\"");
+    {
+        let mut encoder = base64::write::EncoderWriter::new(&mut output, &STANDARD);
+        encoder
+            .write_all(&delivery.data)
+            .map_err(serde_json::Error::io)?;
+        encoder.finish().map_err(serde_json::Error::io)?;
+    }
+    output.extend_from_slice(b"\",\"delivery\":");
+    serde_json::to_writer(
+        &mut output,
+        &json!({
             "exchange": delivery.exchange.as_str(),
             "routing_key": delivery.routing_key.as_str(),
             "redelivered": delivery.redelivered,
-        },
-    }))
+        }),
+    )?;
+    output.extend_from_slice(b",\"headers\":");
+    serde_json::to_writer(&mut output, &headers)?;
+    output.extend_from_slice(b",\"properties\":");
+    serde_json::to_writer(&mut output, &properties)?;
+    output.extend_from_slice(b",\"version\":1}");
+    Ok(output)
 }
 
 pub fn encode_table(table: &FieldTable) -> Value {

@@ -18,7 +18,10 @@
 use std::time::Duration;
 
 use crate::connectors::fixtures::{RabbitMqSourceFixture, RabbitMqSourceMetadataFixture};
-use iggy_common::{Consumer, Identifier, IggyMessage, MessageClient, PollingStrategy};
+use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
+use iggy_common::{
+    CommitPolicy, Consumer, Identifier, IggyMessage, MessageClient, PollOptions, PollingStrategy,
+};
 use iggy_connector_sdk::api::{ConnectorRuntimeStats, ConnectorStats, ConnectorStatus};
 use integration::harness::{TestHarness, seeds};
 use integration::iggy_harness;
@@ -198,11 +201,14 @@ async fn given_iggy_is_unavailable_when_delivery_arrives_should_retry_batch_afte
                 .poll_messages(
                     &stream,
                     &topic,
-                    None,
+                    DEFAULT_PARTITION_ID,
                     &Consumer::new(consumer.clone()),
                     &PollingStrategy::next(),
-                    10,
-                    true,
+                    PollOptions {
+                        count: 10,
+                        commit: CommitPolicy::OnRead,
+                        ..PollOptions::default()
+                    },
                 )
                 .await
                 && let Some(message) = polled
@@ -395,11 +401,14 @@ async fn next_message(harness: &TestHarness) -> IggyMessage {
                 .poll_messages(
                     &stream,
                     &topic,
-                    None,
+                    DEFAULT_PARTITION_ID,
                     &Consumer::new(consumer.clone()),
                     &PollingStrategy::next(),
-                    10,
-                    true,
+                    PollOptions {
+                        count: 10,
+                        commit: CommitPolicy::OnRead,
+                        ..PollOptions::default()
+                    },
                 )
                 .await
                 && let Some(message) = polled.messages.into_iter().next()

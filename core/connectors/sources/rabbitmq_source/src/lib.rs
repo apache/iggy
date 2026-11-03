@@ -43,6 +43,7 @@ pub mod batch {
                 return None;
             }
             self.in_flight = true;
+            // Keep the originals and their ackers for replay if the runtime returns a NACK.
             Some(ProducedMessages {
                 schema: self.schema,
                 messages: self
@@ -233,7 +234,11 @@ use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessages, Schema, Source, source::SourceBatchResult,
     source_connector,
 };
-use lapin::{Connection, ConnectionProperties, options::BasicAckOptions, tcp::OwnedTLSConfig};
+use lapin::{
+    Connection, ConnectionProperties,
+    options::{BasicAckOptions, BasicRejectOptions},
+    tcp::OwnedTLSConfig,
+};
 use secrecy::ExposeSecret;
 use tokio::{
     sync::Mutex,
@@ -276,14 +281,19 @@ impl Failure {
     }
 
     fn lapin(operation: &'static str, error: lapin::Error) -> Self {
-        let reply_code = match error.kind() {
-            lapin::ErrorKind::ProtocolError(error) => Some(error.get_id().to_string()),
-            _ => None,
+        // Lapin errors can contain connection details or credentials, so retain only safe details.
+        let (reply_code, detail) = match error.kind() {
+            lapin::ErrorKind::ProtocolError(error) => (
+                Some(error.get_id().to_string()),
+                format!("{} (reply code {})", error.kind(), error.get_id()),
+            ),
+            lapin::ErrorKind::IOError(error) => (None, format!("I/O error: {:?}", error.kind())),
+            _ => (None, "client error".to_string()),
         };
         Self {
             operation,
             reply_code,
-            error: Error::Connection(format!("RabbitMQ {operation} failed")),
+            error: Error::Connection(format!("RabbitMQ {operation} failed: {detail}")),
         }
     }
 }
@@ -401,7 +411,6 @@ impl Source for RabbitMqSource {
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
-        sleep(Duration::from_millis(10)).await;
         if let Some(batch) = self.pending.lock().await.as_mut() {
             return batch.next_attempt().ok_or(Error::InvalidState);
         }
@@ -420,7 +429,7 @@ impl Source for RabbitMqSource {
                 }
             },
         };
-        let mut deliveries = Vec::new();
+        let mut deliveries = Vec::with_capacity(usize::from(self.config.batch_size));
         let mut deadline = None;
         loop {
             let wait = deadline.map_or(Duration::from_secs(1), |deadline: Instant| {
@@ -446,25 +455,34 @@ impl Source for RabbitMqSource {
                 }
             };
             let received_at = Instant::now();
-            let message =
-                match prepare_delivery(&mut delivery, self.config.include_metadata, self.id) {
-                    Ok(message) => message,
-                    Err(error) => {
-                        let failure = Failure {
-                            operation: "prepare",
-                            reply_code: None,
-                            error,
-                        };
-                        if !deliveries.is_empty() {
-                            // The valid deliveries need their original channel until they are acknowledged.
-                            *self.deferred_failure.lock().await = Some(failure);
-                            break;
-                        }
-                        self.close_driver(driver).await;
-                        self.wait_before_retry(&failure).await;
-                        return Err(failure.error);
+            let message = match prepare_delivery(
+                &mut delivery,
+                self.config.include_metadata,
+                self.id,
+            ) {
+                Ok(message) => message,
+                Err(error) => {
+                    warn!(connector_id = self.id, queue = %self.config.queue, %error, "Rejecting RabbitMQ delivery after preparation failed");
+                    let result = timeout(
+                        Duration::from_secs(self.config.timeout_secs),
+                        delivery.acker.reject(BasicRejectOptions { requeue: false }),
+                    )
+                    .await;
+                    let failure = match result {
+                        Ok(Ok(true)) => continue,
+                        Ok(Err(error)) => Failure::lapin("poison_reject", error),
+                        _ => Failure::simple("poison_reject", "RabbitMQ poison rejection failed"),
+                    };
+                    if !deliveries.is_empty() {
+                        // The valid deliveries need their original channel until they are acknowledged.
+                        *self.deferred_failure.lock().await = Some(failure);
+                        break;
                     }
-                };
+                    self.close_driver(driver).await;
+                    self.wait_before_retry(&failure).await;
+                    return Err(failure.error);
+                }
+            };
             if let Some(message) = message {
                 deliveries.push((message, delivery.acker));
                 deadline.get_or_insert(received_at + self.batch_timeout);
@@ -473,6 +491,7 @@ impl Source for RabbitMqSource {
                 }
             } else {
                 warn!(connector_id = self.id, queue = %self.config.queue, "Dropping unsupported RabbitMQ delivery");
+                // Unsupported payloads cannot be forwarded, so redelivery would repeat the failure.
                 match timeout(
                     Duration::from_secs(self.config.timeout_secs),
                     delivery.acker.ack(BasicAckOptions::default()),
@@ -533,6 +552,8 @@ impl Source for RabbitMqSource {
             ))
         });
         if result.is_err() {
+            /* An acker is single-use and the broker outcome is uncertain. Closing the
+             * connection lets RabbitMQ requeue unsettled deliveries, possibly causing duplicates. */
             let driver = self.driver.lock().await.take();
             if let Some(driver) = driver {
                 self.close_driver(driver).await;
@@ -603,6 +624,26 @@ mod source_tests {
             "secret",
         ] {
             assert!(!message.contains(secret));
+        }
+    }
+
+    #[test]
+    fn given_broker_protocol_error_should_preserve_safe_details() {
+        for (code, description) in [(403, "ACCESS-REFUSED"), (404, "NOT-FOUND")] {
+            let broker_error = lapin::protocol::AMQPError::from_id(
+                code,
+                "amqp://user:password@broker?token=secret".into(),
+            )
+            .unwrap();
+            let error = lapin::ErrorKind::ProtocolError(broker_error).into();
+            let failure = Failure::lapin("basic_consume", error);
+            let message = failure.error.to_string();
+
+            assert_eq!(failure.reply_code, Some(code.to_string()));
+            assert!(message.contains(&code.to_string()));
+            assert!(message.to_uppercase().contains(description));
+            assert!(!message.contains("password"));
+            assert!(!message.contains("secret"));
         }
     }
 

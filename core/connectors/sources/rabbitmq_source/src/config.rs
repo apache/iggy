@@ -70,8 +70,9 @@ impl RabbitMqSourceConfig {
                 "timeouts must be positive".into(),
             ));
         }
-        if Instant::now().checked_add(timeout).is_none()
-            || Instant::now()
+        let now = Instant::now();
+        if now.checked_add(timeout).is_none()
+            || now
                 .checked_add(Duration::from_secs(self.timeout_secs))
                 .is_none()
         {
