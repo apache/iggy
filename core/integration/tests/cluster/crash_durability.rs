@@ -24,11 +24,13 @@
 //! quorum COMMIT, which for a topic below its flush thresholds means the
 //! batch lives only in the in-memory partition journal
 //! (`PartitionJournalMemStorage`) on each node. Process death never loses a
-//! completed `write()` (the page cache survives the process), so what SIGKILL
-//! probes is precisely that written-before-acked gap, not fsync ordering.
+//! completed `write()` (the page cache survives the process), but recovery
+//! only trusts what the published WAL frontier covers, and discards the bytes
+//! of a `replicated` partition past it even when they reached the segments.
 //!
-//! Single-node-crash tests must hold every ack via the surviving quorum;
-//! the whole-cluster-crash test must hold exactly what reached the segments.
+//! Single-node-crash tests must hold every ack via the surviving quorum. The
+//! whole-cluster-crash tests must hold what was made durable, and pin that a
+//! `replicated` partition loses the acks past its published frontier.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -130,6 +132,68 @@ async fn produce_acked(
         acked.push((confirmation.base_offset, payload));
     }
     acked
+}
+
+/// Send one message once the partition accepts writes again after a restart,
+/// returning its confirmed `(offset, payload)`.
+async fn produce_acked_when_serving(client: &IggyClient, budget: Duration) -> (u64, String) {
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    let payload = "after-restart".to_owned();
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let mut messages = vec![
+            IggyMessage::builder()
+                .payload(payload.clone().into())
+                .build()
+                .expect("build message"),
+        ];
+        match client
+            .send_messages(
+                &stream,
+                &topic,
+                &Partitioning::partition_id(PARTITION_ID),
+                &mut messages,
+            )
+            .await
+        {
+            Ok(response) => {
+                let confirmation = response
+                    .confirmations
+                    .first()
+                    .expect("the VSR server confirms every send");
+                return (confirmation.base_offset, payload);
+            }
+            Err(error) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "the partition did not accept a write after the restart: {error}"
+            ),
+        }
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The payloads of up to `count` messages from offset 0.
+async fn poll_payloads_from_start(client: &IggyClient, count: u32) -> Vec<String> {
+    let polled = client
+        .poll_messages(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            PARTITION_ID,
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            PollOptions {
+                count,
+                ..PollOptions::default()
+            },
+        )
+        .await
+        .expect("poll from offset 0");
+    polled
+        .messages
+        .iter()
+        .map(|message| String::from_utf8_lossy(&message.payload).into_owned())
+        .collect()
 }
 
 /// Poll from offset 0 until every acked `(offset, payload)` reads back at its
@@ -551,6 +615,65 @@ async fn given_eager_flush_topic_when_the_whole_cluster_is_killed_should_recover
         .unwrap_or_else(|state| {
             panic!("eagerly flushed acked data must survive a whole-cluster SIGKILL: {state}")
         });
+}
+
+/// The `replicated` twin of the eager-flush test above. A crash rolls a
+/// `replicated` partition back to the last WAL frontier it published, at a
+/// checkpoint, a durable operation or a graceful shutdown, so acks past it are
+/// lost even with every payload already in every node's segment files. Topics
+/// that must survive a whole-cluster crash use `persisted`.
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_replicated_eager_flush_topic_when_the_whole_cluster_is_killed_should_discard_acks_past_the_published_frontier(
+    harness: &mut TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                messages_required_to_save: Some(1),
+                durability: Durability::Replicated,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .expect("create topic");
+    let acked = produce_acked(&client, "flushed", 30).await;
+    let payloads: Vec<String> = acked.iter().map(|(_, payload)| payload.clone()).collect();
+    wait_until_payloads_installed(harness, &payloads, FLUSH_INSTALL_TIMEOUT).await;
+
+    // Same reason as above for keeping the producer's connection open.
+    harness.kill_cluster().expect("SIGKILL every node");
+    harness
+        .restart_cluster()
+        .await
+        .expect("restart the whole cluster");
+
+    let nodes: Vec<usize> = (0..harness.cluster_size()).collect();
+    let client = wait_until_cluster_serves(harness, &nodes, CONVERGE_TIMEOUT).await;
+    // A write that reads back proves the partition serves again, so the
+    // missing acks below are discarded, not still recovering.
+    let after_restart = produce_acked_when_serving(&client, CONVERGE_TIMEOUT).await;
+    wait_for_acked_readable(&client, &[after_restart], CONVERGE_TIMEOUT)
+        .await
+        .unwrap_or_else(|state| panic!("the partition should serve after the restart: {state}"));
+    let readable = poll_payloads_from_start(&client, acked.len() as u32 + 16).await;
+    let survived = payloads
+        .iter()
+        .filter(|payload| readable.contains(payload))
+        .count();
+    assert!(
+        survived < acked.len(),
+        "a whole-cluster SIGKILL discards replicated acks past the published WAL frontier, but \
+         all {survived} survived"
+    );
 }
 
 /// The kill follows the confirmation without waiting for segment installation.
