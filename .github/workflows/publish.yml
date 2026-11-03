@@ -49,7 +49,7 @@ on:
         required: false
         default: ""
       publish_other:
-        description: "Other SDKs to publish (comma-separated: python, node, java, csharp, go)"
+        description: "Other SDKs to publish (comma-separated: python, node, java, csharp, go, swift)"
         type: string
         required: false
         default: ""
@@ -185,6 +185,7 @@ jobs:
       docker_components: ${{ steps.mk.outputs.docker_components }}
       count: ${{ steps.mk.outputs.count }}
       has_python: ${{ steps.mk.outputs.has_python }}
+      has_swift: ${{ steps.mk.outputs.has_swift }}
       has_docker: ${{ steps.mk.outputs.has_docker }}
     steps:
       - name: Download latest copy script from master
@@ -258,7 +259,7 @@ jobs:
 
             // Parse other SDKs
             ('${{ inputs.publish_other }}').split(',').map(s => s.trim()).filter(Boolean).forEach(sdk => {
-              if (['python','node','java','csharp','go'].includes(sdk)) {
+              if (['python','node','java','csharp','go','swift'].includes(sdk)) {
                 wants.push(`sdk-${sdk}`);
               } else {
                 core.warning(`Unknown SDK: ${sdk}`);
@@ -272,7 +273,8 @@ jobs:
               npm: 'node',
               maven: 'java',
               nuget: 'csharp',
-              none: 'go'
+              none: 'go',
+              swiftpm: 'swift'
             }[entry.registry] || 'unknown');
 
             const targets = [];
@@ -363,6 +365,8 @@ jobs:
             } else {
               core.setOutput('has_python', 'false');
             }
+
+            core.setOutput('has_swift', String(targets.some(t => t.key === 'sdk-swift')));
 
   check-tags:
     name: Existing tags
@@ -660,6 +664,50 @@ jobs:
       upload_artifacts: true
       use_latest_ci: ${{ inputs.use_latest_ci }}
       commit: ${{ needs.validate.outputs.commit }}
+
+  # Without a lockfile SwiftPM runs the newest dependency manifests, unsandboxed
+  # on Linux, so the build a consumer would get runs without a write token.
+  build-swift-package:
+    name: Build Swift package
+    needs: [validate, plan, check-tags]
+    if: |
+      needs.validate.outputs.has_targets == 'true' &&
+      needs.plan.outputs.has_swift == 'true'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
+      - name: Checkout at commit
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts
+
+          /tmp/copy-latest-from-master.sh apply
+
+      # A cold resolve is what a consumer gets, so this build reads no cache.
+      - name: Setup Swift
+        uses: ./.github/actions/utils/setup-swift
+        with:
+          read-cache: "false"
+
+      - name: Build the published package
+        run: swift build -c release --product Iggy
 
   # Sequential Rust crate publishing to handle dependencies properly
   publish-rust-crates:
@@ -987,17 +1035,18 @@ jobs:
             Commit: ${{ needs.validate.outputs.commit }}
             Released by: GitHub Actions (workflow ${{ github.run_id }})
 
-  # Non-Docker, non-Rust publishing (Python, Node, Java, C#, Go SDKs)
+  # Non-Docker, non-Rust publishing (Python, Node, Java, C#, Go, Swift SDKs)
   # Note: This job runs in parallel with Docker publishing - no dependency between them
   publish:
     name: ${{ matrix.name }}
-    needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
+    needs: [validate, plan, check-tags, build-python-wheels, build-swift-package, publish-rust-crates]
     if: |
       !cancelled() &&
       needs.check-tags.result == 'success' &&
       needs.validate.outputs.has_targets == 'true' &&
       fromJson(needs.plan.outputs.non_docker_targets).include[0].key != 'noop' &&
       (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped') &&
+      (needs.build-swift-package.result == 'success' || needs.build-swift-package.result == 'skipped') &&
       (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped')
     runs-on: ubuntu-26.04
     permissions:
@@ -1157,13 +1206,24 @@ jobs:
           dry_run: ${{ inputs.dry_run }}
 
       # ─────────────────────────────────────────
+      # Swift Package (Tag-only, root Package.swift)
+      # ─────────────────────────────────────────
+      - name: Prepare Swift tag
+        if: matrix.type == 'swift'
+        uses: ./.github/actions/swift/post-merge
+        with:
+          version: ${{ steps.ver.outputs.version }}
+          tag: ${{ steps.ver.outputs.tag }}
+          dry_run: ${{ inputs.dry_run }}
+
+      # ─────────────────────────────────────────
       # Wait gates: do not push the git tag until the registry is actually
       # serving the new version. The Rust path already does this via
       # wait-for-crate; mirroring it here closes the "artifact published,
       # tag never created" rc1 failure class for foreign SDKs.
       #
-      # Go has no registry wait: the tag IS the release (the Go proxy
-      # fetches from git on demand).
+      # Go and Swift have no registry wait: the tag IS the release (the Go
+      # proxy and SwiftPM fetch from git on demand).
       # ─────────────────────────────────────────
       - name: Wait for PyPI availability
         if: |
@@ -1265,7 +1325,7 @@ jobs:
       # releases) and the "no tag_pattern" skip in one place — keeping the
       # rule symmetric with the docker-manifests job above. The wait gates
       # above ensure the tag is never pushed before the registry is serving
-      # the artifact (Go is exempt: the tag IS the release).
+      # the artifact (Go and Swift are exempt: the tag IS the release).
       - name: Tag SDK release (${{ matrix.key }})
         if: |
           success() &&
@@ -1298,6 +1358,7 @@ jobs:
         plan,
         check-tags,
         build-python-wheels,
+        build-swift-package,
         publish-rust-crates,
         publish-docker,
         docker-manifests,
@@ -1389,6 +1450,7 @@ jobs:
                 maven)      REGISTRY_DISPLAY="Maven" ;;
                 nuget)      REGISTRY_DISPLAY="NuGet" ;;
                 none)       REGISTRY_DISPLAY="Tag only" ;;
+                swiftpm)    REGISTRY_DISPLAY="Tag only (SwiftPM)" ;;
                 *)          REGISTRY_DISPLAY="$REGISTRY" ;;
               esac
 
@@ -1426,6 +1488,16 @@ jobs:
                 success)   echo "✅ **Python wheels built successfully for all platforms**" ;;
                 failure)   echo "❌ **Python wheel building failed**" ;;
                 skipped)   echo "⏭️ **Python wheel building was skipped**" ;;
+              esac
+              echo
+            fi
+
+            if [ "${{ needs.plan.outputs.has_swift }}" = "true" ]; then
+              echo "### Swift Package Build"
+              case "${{ needs.build-swift-package.result }}" in
+                success)   echo "✅ **Swift package built from the root manifest**" ;;
+                failure)   echo "❌ **Swift package build failed**" ;;
+                skipped)   echo "⏭️ **Swift package build was skipped**" ;;
               esac
               echo
             fi
@@ -1489,6 +1561,7 @@ jobs:
         validate,
         plan,
         build-python-wheels,
+        build-swift-package,
         publish-rust-crates,
         publish-docker,
         docker-manifests,
