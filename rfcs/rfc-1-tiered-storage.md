@@ -13,8 +13,9 @@
 Move sealed segment files from a partition's local directory to an object store (S3 and compatible
 stores first, GCS and Azure Blob behind the same abstraction) and serve them back through a local
 chunk cache, without changing what clients see. The partition primary uploads a segment once it
-seals and commits a `tiered_up_to_offset` floor to the partition's control log, a replicated log
-separate from the data log, where a small state machine applies it on every replica. Each replica
+seals and commits a `tiered_up_to_offset` floor to the partition's state-machine log, a second log
+of the partition's consensus group that shares the data log's op sequence but holds no messages,
+where a small state machine applies it on every replica. Each replica
 may then evict its local copy under a per-topic local retention policy. A tiered segment stays in
 the partition's segment list, backed by a small local marker, so offset and timestamp resolution
 never touch the network. Total retention is evaluated on the primary over local and remote data
@@ -168,9 +169,12 @@ Verified on `master @ 6ce2f92a9`.
   it clamped by the barrier, and its apply refuses a stale incarnation. Topic and partition deletes
   are two-phase: a history fence in the partition log, then completion in metadata.
 - Segments contain only message batches, and offsets are independent of op numbers. Replicated
-  partition state (fences, dedup receipts) lives in the data log. The partition plane has no
-  general state-machine facility and no control log, while the metadata plane has one.
-- Every node replicates every partition and only the primary serves polls. Primaries are spread and
+  partition state (consumer offsets, fences, session retirement, dedup receipts, producer state)
+  rides the data log's journal and pipeline beside message batches, applies at commit in op order,
+  is checkpointed at the commit point and travels in state transfer. Every prepare carries the
+  partition incarnation. The partition plane has no general state-machine facility.
+- A partition is replicated by its topic's members, every node by default, and only the primary
+  serves polls. Primaries are spread and
   rebalanced through a drained view change that waits only for pending history writes. Nodes can
   differ in shard count. Consensus repair never reads sealed segment bytes.
 - A disk poll runs as a detached task on the pump's thread and returns through a bounded completion
@@ -267,8 +271,8 @@ partition whose eviction waits on its floor goes first, a growing upload lag rai
 failed upload retries with backoff and blocks the floor.
 
 A rebalance does not wait for uploads: the old primary cancels them when it loses primacy. The new
-primary first re-commits the floor through its own markers, since a marker proves a floor once
-committed. It then lists the partition's prefix once to rebuild its deletion cursor, commits any
+primary first applies every command committed before its view started, so it acts on the latest
+floor. It then lists the partition's prefix once to rebuild its deletion cursor, commits any
 front truncation its trim point needs (see [Retention](#retention)), and only then uploads,
 skipping every segment that is not `Local`.
 
@@ -282,16 +286,15 @@ size and checksum, and a difference raises a divergence alarm and leaves the flo
 replica. If the primary's barrier-clamped removal retired the segment during the upload, its objects
 are scheduled for deletion and no advance covers it. The watermark alone never deletes an object.
 
-On success the primary commits `AdvanceTieredFloor { created_revision, start, up_to, hash }` to the
-partition's control log: the incarnation, the first offset the advance covers, the segment's last
-offset and its commit-path hash. `start` is the segment's first offset, or `floor + 1` when no
+On success the primary commits `AdvanceTieredFloor { start, up_to, hash }` through the partition's
+state-machine log: the first offset the advance covers, the segment's last offset and its
+commit-path hash. `start` is the segment's first offset, or `floor + 1` when no
 offset between the two holds a message, because each is at or below `deleted_up_to_offset` or inside
 a gap a durable `.anchor` records. Master's boot re-anchor leaves such a gap on a single-replica
 partition after a crash that lost unflushed messages, and without this case the floor would stop
-there forever. Nothing in the group that realizes the control log fences on partition primacy, so
-the command is safe by its contents: apply refuses a stale incarnation or a gap, and every replica
-checks the hash against its own bytes, so a late command from a former primary can only repeat a
-true statement.
+there forever. The command is fenced by view and bound to the partition incarnation like every op
+of the group, apply still refuses a gap, and every replica checks the hash against its own bytes,
+so a command a former primary prepared can only repeat a true statement.
 
 #### Every replica: local eviction
 
@@ -310,8 +313,9 @@ appends the marker, fsyncs it and unlinks the `.log`. The owner then marks the s
 as retention does after an unlink, drops what still names the file. The total size is unchanged.
 
 The hash check compares each advance with the replica's own segment, which must end at `up_to` and
-hash to `hash`. It runs when the advance applies, or when the replica seals that segment if its data
-log trails its control log. A mismatch never evicts that segment and raises a divergence alarm.
+hash to `hash`. It runs when the advance applies: the ops that filled and sealed the segment precede
+the advance in the group's op sequence, so every replica has committed them by then. A mismatch
+never evicts that segment and raises a divergence alarm.
 
 #### Free-space reserve
 
@@ -322,48 +326,65 @@ stalled floor frees nothing on any replica, every reclaim step writes before it 
 stops a node whose WAL write fails. A partition whose ingest outruns its uploads is throttled the
 same way, so it writes at its upload pace rather than spending the reserve.
 
-#### Partition state machine
+#### Partition state machines
 
-The floor lives in a replicated state machine fed by the partition's **control log**, a consensus
-sequence separate from the data log, so segments and the data journal hold only user messages. Its
-realization belongs to a general partition state-machine facility, specified in its own RFC because
-queue semantics, log compaction and the key-value store need it too: one control group per shard,
-whose membership cannot depend on a node's shard count, or the metadata plane, which already is a
-separate control log holding per-partition facts. Either way the primary forwards its command to
-that group's primary, possibly on another node. The floor advances at most once per uploaded
-segment, so either serves. This RFC needs from the facility the command encoding, the apply hook, a
-durable snapshot with the control log's own replay point, and state-transfer inclusion.
+The floor is replicated per-partition state that is not user data, and queue semantics, log
+compaction and the key-value store need the same kind of state. This RFC therefore adds a general
+facility for partition state machines and makes the floor its first machine. It follows Redpanda's
+model, where state machines live on the partition's own consensus group, with one difference: the
+commands are stored apart from the messages.
 
-The state machine holds one value, `tiered_up_to_offset`, and the `created_revision` it belongs to.
-The partition's current incarnation lives in metadata, which the control log is not ordered with, so
-the state carries its own. `AdvanceTieredFloor` applies as follows:
+Every partition's consensus group gains a second log, the **state-machine log**. The group still
+orders one op sequence, and each op is either a data op or a command, stored in exactly one of the
+two logs. The data log keeps what it holds on master, message batches and the existing control
+ops, so its journal, WAL and segments never see a command, and the state-machine log holds only
+commands. Message offsets are already independent of op numbers, so neither log needs a mapping
+between the two, where Redpanda's shared log needs an offset translator. Because the sequence is
+shared, a command is prepared, fenced by view, committed and repaired like any op, both logs have
+the same members and primary by construction, and on every replica a command applies only after
+every op before it, including the data it describes. Recovery, repair and state transfer read both
+logs and merge them by op number.
 
-- A `created_revision` below the state's is refused, so a delayed command of a deleted incarnation
-  never reaches its successor. One above the state's starts an empty floor for that incarnation.
+The facility provides:
+
+- **Ownership.** Each command type has exactly one owning machine, and the facility applies every
+  committed command to its owner in op order. A machine sees only its own commands.
+- **Deterministic apply.** Apply reads only the command and the machine's own state, finishes in
+  bounded time on the pump, and leaves slow work, such as eviction, to side effects staged after
+  it. A command its machine refuses commits as a no-op, so a refusal never stops a replica, while a
+  failure to persist the log stops it, as for data ops.
+- **Its own checkpoint.** A snapshot of every machine at one op is the state-machine log's replay
+  point, independent of the data log's checkpoint. Boot restores both checkpoints and replays each
+  log above its own, and the state-machine journal drops commands only below its checkpoint.
+- **State transfer.** An install carries the machines' snapshot as one artifact at the transfer's
+  commit point.
+- **A share of the pipeline.** Commands share the group's pipeline with message batches under a cap
+  on the slots they may hold, so a busy machine never stalls producers.
+- **Primacy.** A new primary acts on a machine's state only after applying every command committed
+  before its view started.
+
+Mixed-version clusters cannot form, so no replica meets a command or a snapshot it does not know,
+and a new machine or command type is a storage format change. The existing control ops stay in the
+data log. Since the sequence is shared, moving one into a machine later changes where it is stored,
+not when it applies.
+
+#### The tiered floor machine
+
+The machine holds one value, `tiered_up_to_offset`, empty until the first advance. Its state
+belongs to the partition incarnation like the rest of the group's state, so it carries no
+incarnation of its own and is removed with the incarnation. `AdvanceTieredFloor` applies as
+follows:
+
 - A `start` above `floor + 1` is refused, so the floor never jumps over a segment nobody uploaded.
   An empty floor counts as `floor + 1 = 0`.
 - Otherwise the floor becomes `max(floor, up_to)`, and a repeated advance is a no-op.
 
-The state learns of a new incarnation only from its first advance, so every reader of the floor
-(the upload loop, a new primary's duties, eviction) and every hash check uses the state or an
-advance only when its `created_revision` is the partition's local incarnation, and otherwise treats
-the floor as empty and the check as not yet due.
+The state holds no per-segment data: keys and markers carry the segment list, so the snapshot stays
+a few bytes, and each replica checks the hash outside the machine. The floor is monotone for the
+life of the partition incarnation.
 
-Apply reads nothing but the command and the state, so every replica reaches the same floor whatever
-its data log's progress, and eviction, not apply, clamps the floor to the local sealed chain. The
-state holds no per-segment data: keys and markers carry the segment list, so the snapshot stays a
-few bytes, and each replica checks the hash outside the state machine.
-
-The control log needs its own replay point: master's partition-state checkpoint is cut at the data
-log's commit point, so a floor applied after it would regress on restart, and the superblock, whose
-writes follow view changes rather than applies, is a poor fit. The floor rides state transfer,
-installed as the larger `(created_revision, floor)` pair, so a rebuilt replica never starts at
-zero, and a floor that still trails a replica's markers is re-committed through them by the next
-primary. The floor is monotone for the life of the partition incarnation.
-
-`TruncatePartition` stays in the metadata plane, where it already ships. If the facility settles on
-the metadata plane, both watermarks share a log from the start, and otherwise migrating it is a
-follow-up amendment (see [Unresolved questions](#unresolved-questions)).
+`TruncatePartition` stays in the metadata plane, where it already ships (see
+[Unresolved questions](#unresolved-questions)).
 
 ### Segment lifecycle
 
@@ -543,12 +564,11 @@ shard loses primacy or whose incarnation retires is cancelled for good.
 
 - **State transfer.** The chain file travels as one artifact rather than one entry per segment,
   since the transfer manifest's entry count is capped. The receiver installs it, trim point
-  included, with the floor, and fetches indexes lazily. No segment bytes cross between replicas
-  for tiered data.
-- **Delete.** The history fence of a two-phase delete does not reach the control log, so a delayed
-  floor command for a deleted incarnation is refused at apply once the new incarnation's first
-  advance has applied, and before that it only moves a floor no reader of the new incarnation
-  uses. When metadata completes the delete, the reconciler removes the directory and the
+  included, with the machines' snapshot, and fetches indexes lazily. No segment bytes cross between
+  replicas for tiered data.
+- **Delete.** The history fence of a two-phase delete is an op of the same sequence, so no floor
+  command commits after it, and the next incarnation starts with an empty floor. When metadata
+  completes the delete, the reconciler removes the directory and the
   incarnation's cache chunks, and the metadata primary queues its prefix for object deletion. An
   orphan sweep lists `{prefix}/{cluster_uid}/` at incarnation granularity under a metadata
   revision snapshot and deletes incarnations absent from metadata, as a safety net.
@@ -625,7 +645,7 @@ admission records explicitly set critical keys as well.
 | Store unreachable during upload | Uploads retry with backoff, the floor stays and eviction waits. Producers and consumers are unaffected while the disk has room, and the stalled gauge rises. Producers are refused before the free-space reserve, and eviction frees the space once the store returns. |
 | Store unreachable during a cold poll | The poll returns what it read within its deadline, or 58. Failed chunks are remembered, so retries cost no GETs, and the cold admission cap keeps warm polls serving. |
 | Store refuses for a permanent reason | `TieredReadFailed`, which no SDK retries, and an alarm naming the cause. |
-| Primary dies or is moved mid-upload | The old primary cancels its uploads. The new one re-commits the floor through its markers, lists the prefix, truncates to a verified trim point if needed and re-uploads. An existing `.log` key counts only after a size and checksum match, and an existing `.index` only needs to be valid. |
+| Primary dies or is moved mid-upload | The old primary cancels its uploads. The new one starts from the latest committed floor, lists the prefix, truncates to a verified trim point if needed and re-uploads. An existing `.log` key counts only after a size and checksum match, and an existing `.index` only needs to be valid. |
 | Upload lands after its segment was deleted | The uploader schedules the object's deletion. The listing on becoming primary catches what a lost primary left. |
 | Primary's stream hash or a batch checksum fails during upload | The upload fails, the floor stays and an alarm rises. The other replicas still hold good copies. |
 | Replica's hash differs from the advance's | That replica never evicts the segment and raises a divergence alarm. |
@@ -634,9 +654,10 @@ admission records explicitly set critical keys as well.
 | Chain file missing on a tiered partition | The replica rebuilds its markers from the store before serving the partition, or refuses it when a front stays unaccounted for. The rebuilt trim point drives no truncation or deletion until verified. |
 | Single-replica re-anchor gap | The `.anchor` stays beside the segment, and the segment's advance carries `start = floor + 1`, so the floor and eviction keep moving. |
 | Object missing on GET | Below what the primary's removal reached: retire locally. A primary whose metadata trails the latest watermark treats it as transient. Otherwise data loss: `TieredReadFailed` and a metric. |
-| Replica behind on the control log | It evicts less until it applies the latest floor. Reads are unaffected. |
-| Replica restarts or is rebuilt by state transfer | Markers rebuild segment metadata and the cache survives. The floor comes back from the control log's own replay point, or is installed as the larger of the two, and one that still trails the markers is re-committed through them by the next primary. |
-| Topic or partition deleted during an upload | The floor command names the deleted incarnation, so its apply is refused, and the metadata primary queues the prefix for deletion. |
+| Replica behind in the partition's op sequence | It evicts less until it applies the latest floor. Reads are unaffected. |
+| Replica restarts or is rebuilt by state transfer | Markers rebuild segment metadata and the cache survives. The floor comes back from the state-machine checkpoint and the commands above it, or with the install's snapshot. |
+| State-machine log or checkpoint unreadable | Boot refuses the partition and it is rebuilt from its peers, as for the data log. |
+| Topic or partition deleted during an upload | No floor command commits after the delete's history fence, and the metadata primary queues the prefix for deletion. |
 | WAL still hard-links an evicted segment | Eviction never touches the WAL tail or checkpoint-cursor segment. Below them, unlinking the public name is what retention does today. |
 | Cache full | The cache trims on the failed reservation. A fetch that still finds no room fails as transient, and the poll replies 58. |
 | Node boots during a store outage | It boots with `upload_stalled` raised and evicts nothing until it has read the store identity. Only a deterministic misconfiguration refuses boot. |
@@ -650,14 +671,13 @@ Each phase is one reviewable PR or a short stack. The phases form a graph, not a
 | Phase | Needs |
 | --- | --- |
 | 1. Local model and the `fs` store | nothing |
-| 2. The floor | the partition state-machine facility RFC |
+| 2. Partition state machines and the floor | nothing |
 | 3. Tier service and S3 | phase 1, for the trait and the semaphore only |
 | 4. End to end | phases 1, 2 and 3 |
 | 5. Age roll | the master fix that unlinks rolled `.log` files on WAL truncation |
 | 6. The bucket as an archive | phase 4; the GCS and Azure providers need only phase 3 |
 
-Phases 1, 3 and 5 can proceed in parallel. Phase 2 is the only one that waits on another RFC, and
-phase 4 is where the branches join. Every phase that changes what is on disk (1, 2 and 5) bumps
+Phases 1, 2, 3 and 5 can proceed in parallel, and phase 4 is where the branches join. Every phase that changes what is on disk (1, 2 and 5) bumps
 `STORAGE_FORMAT`, so an older binary refuses the directory instead of unlinking kept indexes and
 accepting a missing tiered prefix as a front trim.
 
@@ -665,8 +685,9 @@ accepting a missing tiered prefix as a front trim.
    contract tests and the counting semaphore. On top of them the segment location and commit-path
    hash, the chain file with its boot rules and its rebuild from the store, eviction driven by a
    test-set floor, remote sources in the poll plan and the chunk cache, all against `fs`.
-2. **Partition state machine and the floor.** Starts once the facility lands. The floor command,
-   its apply, its snapshot and state-transfer inclusion, and the per-replica hash check.
+2. **Partition state machines and the floor.** The state-machine log in the partition's consensus
+   group with its journal, checkpoint, recovery, repair, state transfer and pipeline share, the
+   machine registry, then the floor machine and the per-replica hash check.
 3. **Tier service and S3 provider.** The per-shard tier service with piece-wise tasks and class
    caps, the S3 provider, conditional create, the boot probe, retries, credentials, the `sim`
    backend, configuration, metrics, and a pump tick latency metric, the server's first latency
@@ -684,17 +705,18 @@ accepting a missing tiered prefix as a front trim.
    `meta/` prefix, then a conditional GET.
 
 Tests per phase: crash-point and boot tests against `fs` and the simulator's storage harness for
-phases 1 and 5, simulator scenarios for phase 2, provider contract tests against `fs` and MinIO for
+phases 1 and 5, simulator scenarios with view changes, repair and restarts across both logs for
+phase 2, provider contract tests against `fs` and MinIO for
 phase 3, and three-node integration scenarios under `--features vsr` for phase 4.
 
 ## Drawbacks
 
 [drawbacks]: #drawbacks
 
-- One command per uploaded segment in the partition's control log, and a dependency on a partition
-  state-machine facility and a control log that master has only in part. At the default 1 GiB
-  segment size the rate is negligible. With a short `segment_max_age` on many slow partitions it
-  could become chatty.
+- Every partition's consensus group gains a second log, so recovery, repair, state transfer and
+  checkpointing each handle two stores merged by op number, and commands take pipeline slots from
+  message batches. The floor adds one command per uploaded segment, negligible at the default 1 GiB
+  segment size but chatty with a short `segment_max_age` on many slow partitions.
 - A new crate with its own HTTP client, signers and provider parsers is code the project has to own
   and keep correct against three providers' quirks, where a vendor SDK would have absorbed them.
 - Tier work shares the shard's thread with producers and consumers, and compio has no scheduling
@@ -762,28 +784,26 @@ cost is that a fresh replica learns its remote segments from a peer through stat
 than from the bucket, and restore from the bucket needs the lazily uploaded manifest. Both are
 accepted.
 
-### Why a control log separate from the data log
+### Why a second log in the partition's own group
 
-Putting the floor command into the partition's data group would work: segments would stay pure,
-because the flush writes only message batches, and no offset translation would arise, because
-message offsets are independent of op numbers. What it would do is interleave control commands
-into the data journal and the data group's pipeline, which is harmless for one command per gigabyte
-and harmful for the high-rate state machines the facility exists to host, such as per-message
-delivery state. A separate control log keeps the data path for user messages only, at the price of
-cross-log ordering. The floor tolerates it because its command carries everything its apply checks
-(the incarnation, the first offset it covers and the hash), so apply never reads the data log, and
-eviction clamps the floor to each replica's local sealed chain. This departs from master's own
-precedent: the consumer-group and history fences and session retirement went into the data log,
-with an apply hook beside the message path.
+The partition's consensus group already has the members, the primary, the view fencing and the
+incarnation every machine needs. Each alternative lacks one of them. The metadata plane is one
+cluster-wide group on one shard, reaches a partition's shard through a reconcile pass and is not
+ordered with the partition's data. A control group per shard needs members independent of a node's
+shard count while members now vary per topic, and the partition primary would forward every
+command to another group's primary. A second group per partition doubles the groups, and its
+primary can differ from the data primary after an election.
 
-Between the two realizations, the metadata plane exists today and already holds
-`deleted_up_to_offset`, and master already has the submit path from the owner shard and the
-reconciler pass a floor there would need. Such a floor still lags the data by a reconcile interval
-and shares one cluster-wide group with everything else. A control group per shard avoids the shared
-group and the reconcile lag and scales with shards, though the partition primary still forwards its
-command to the group's primary, which may be on another node, and the group's membership must not
-depend on each node's shard count. The floor's rate makes the choice immaterial for this RFC, so it
-is deferred to the facility RFC rather than decided here.
+Inside the group, putting commands into the data log, as master does with its fences and session
+retirement, would work for the floor at one command per gigabyte. The facility exists for machines
+with far higher rates, such as per-message delivery state, and the data journal and WAL would then
+carry every machine's commands. A second log keeps them for messages and gives the machines a
+checkpoint of their own. The log shares the group's op sequence rather than having its own, so view
+change, repair and commit keep working on one sequence and each command applies after the data it
+describes, which a separate sequence would have to rebuild with cross-log ordering rules. Redpanda
+shares one Raft log between data and state machines and needs an offset translator to keep its
+commands out of Kafka offsets. Iggy's message offsets are independent of op numbers already, so
+the split here is about storage, not offsets.
 
 ### Why an Iggy-owned object store abstraction
 
@@ -832,7 +852,10 @@ not exist.
   cache admission and persistence, the retry model and the probing rules. It diverges on what the
   state machine holds (one offset, not the manifest), on conditional PUTs (possible here because
   bytes are replica-identical), on stitching one poll across remote and local segments, and on
-  explicit yields plus per-class caps instead of scheduling groups.
+  explicit yields plus per-class caps instead of scheduling groups. Its state machines share the
+  partition's Raft log with the data, and every machine sees every batch, so the slowest paces the
+  rest. This RFC keeps the shared sequence and the per-machine snapshots, stores commands in their
+  own log and gives each command type one owner.
 - **Apache Kafka KIP-405** tiered storage and **Apache Pulsar** ledger offload: the same shape as
   this RFC, whole sealed units copied to per-partition objects with an index object beside them.
 - **Rivet's SQLite storage engine** (July 2026): a replicated hot tier with S3 never on the write
@@ -864,11 +887,12 @@ not exist.
 
 Open design decisions:
 
-- **The partition state-machine facility.** The control log's realization, command encoding, apply
-  hook, snapshot and state-transfer inclusion belong to their own RFC, not yet drafted, and phase 2
-  waits on it. Mixed-version clusters cannot form, so no replica meets a command it does not know.
-- **Two watermarks, possibly two logs.** If the control log becomes per-shard groups, the consistent
-  end state moves `TruncatePartition`, with `DeleteSegments` resolution, there as a follow-up.
+- **Total retention's watermark.** `TruncatePartition` stays in the metadata plane. As a partition
+  machine it would be ordered with the data and share the floor's log, and `DeleteSegments`
+  resolution would move with it.
+- **Master's control ops as machines.** Consumer offsets, fences, session retirement and producer
+  state could move into machines. The shared sequence keeps their order, so only their storage,
+  checkpoint and transfer format would change.
 - **Compression ordering.** Per-flush-unit compression at seal is compatible with ranged GETs and
   whole-object compression is not. If compression lands first, tiering uploads segments unchanged.
 - **Cache warmth after a primary move.** Warming the target during the drain, or accepting a burst
