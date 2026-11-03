@@ -15,12 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
+
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::{Table, presets::ASCII_NO_BORDERS};
 use iggy_common::Client;
-use iggy_common::{Consumer, Identifier, Partition};
+use iggy_common::{Consumer, Identifier};
 use tracing::{Level, event};
 
 pub struct GetConsumerGroupCmd {
@@ -83,17 +85,13 @@ impl CliCommand for GetConsumerGroupCmd {
             })?;
 
         let consumer = Consumer::group(self.group_id.clone());
-        // Size the indexes from the topic partition list. `partitions_count` is a
-        // wire field, and a huge value must not allocate before the missing-id check.
-        let index_len = topic.partitions.len();
-        let mut partitions_by_id: Vec<Option<&Partition>> = vec![None; index_len];
-        for partition in &topic.partitions {
-            if let Some(slot) = partitions_by_id.get_mut(partition.id as usize) {
-                *slot = Some(partition);
-            }
-        }
-
-        let mut owners: Vec<Option<u32>> = vec![None; index_len];
+        let mut owners = HashMap::with_capacity(
+            consumer_group
+                .members
+                .iter()
+                .map(|member| member.partitions.len())
+                .sum(),
+        );
         let mut members_table = Table::new();
         let render_members = consumer_group.members_count > 0;
         if render_members {
@@ -102,9 +100,7 @@ impl CliCommand for GetConsumerGroupCmd {
         }
         for member in &consumer_group.members {
             for partition_id in &member.partitions {
-                if let Some(slot) = owners.get_mut(*partition_id as usize) {
-                    *slot = Some(member.id);
-                }
+                owners.insert(*partition_id, member.id);
             }
             if render_members {
                 members_table.add_row(vec![
@@ -131,18 +127,10 @@ impl CliCommand for GetConsumerGroupCmd {
             "Lag",
         ]);
 
-        for partition_id in 0..consumer_group.partitions_count {
-            let partition = partitions_by_id
-                .get(partition_id as usize)
-                .copied()
-                .flatten()
-                .with_context(|| {
-                    format!(
-                        "Partition with ID: {} in topic with ID: {} was not found",
-                        partition_id, self.topic_id
-                    )
-                })?;
-
+        let mut partitions: Vec<_> = topic.partitions.iter().collect();
+        partitions.sort_by_key(|partition| partition.id);
+        for partition in partitions {
+            let partition_id = partition.id;
             let consumer_offset = client
                 .get_consumer_offset(
                     &consumer,
@@ -159,9 +147,7 @@ impl CliCommand for GetConsumerGroupCmd {
                 })?;
 
             let member = owners
-                .get(partition_id as usize)
-                .copied()
-                .flatten()
+                .get(&partition_id)
                 .map(|member_id| format!("{member_id}"))
                 .unwrap_or_else(|| "-".to_string());
 
@@ -232,29 +218,30 @@ mod tests {
     use async_trait::async_trait;
     use iggy_common::{
         Checkpoint, Client, ClientInfo, ClientInfoDetails, ClusterClient, ClusterMetadata,
-        Consumer, ConsumerGroup, ConsumerGroupClient, ConsumerGroupDetails, ConsumerOffsetClient,
-        ConsumerOffsetInfo, DiagnosticEvent, Identifier, IdentityInfo, IggyByteSize, IggyError,
-        IggyMessage, IggyTimestamp, MAX_PARTITIONS_COUNT, MessageClient, MetadataChanges,
-        MetadataChangesQuery, NonZeroIggyDuration, OptionSpec, OptionsScope, Partition,
-        PartitionClient, PartitionContext, Partitioning, Permissions, PersonalAccessTokenClient,
-        PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PollOptions, PolledMessages,
-        PollingStrategy, RawPersonalAccessToken, SegmentClient, SendMessagesResponse, Snapshot,
-        SnapshotCompression, Stats, Stream, StreamClient, StreamCreateOptions, StreamDetails,
-        StreamUpdateOptions, SystemClient, SystemSnapshotType, Topic, TopicClient,
-        TopicCreateOptions, TopicDetails, TopicUpdateOptions, UserClient, UserCreateOptions,
-        UserInfo, UserInfoDetails, UserStatus, UserUpdateOptions,
+        Consumer, ConsumerGroup, ConsumerGroupClient, ConsumerGroupDetails, ConsumerGroupMember,
+        ConsumerOffsetClient, ConsumerOffsetInfo, DiagnosticEvent, Identifier, IdentityInfo,
+        IggyByteSize, IggyError, IggyMessage, IggyTimestamp, MAX_PARTITIONS_COUNT, MessageClient,
+        MetadataChanges, MetadataChangesQuery, NonZeroIggyDuration, OptionSpec, OptionsScope,
+        Partition, PartitionClient, PartitionContext, Partitioning, Permissions,
+        PersonalAccessTokenClient, PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PollOptions,
+        PolledMessages, PollingStrategy, RawPersonalAccessToken, SegmentClient,
+        SendMessagesResponse, Snapshot, SnapshotCompression, Stats, Stream, StreamClient,
+        StreamCreateOptions, StreamDetails, StreamUpdateOptions, SystemClient, SystemSnapshotType,
+        Topic, TopicClient, TopicCreateOptions, TopicDetails, TopicUpdateOptions, UserClient,
+        UserCreateOptions, UserInfo, UserInfoDetails, UserStatus, UserUpdateOptions,
     };
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::{CliCommand, GetConsumerGroupCmd};
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone)]
     enum TopicReply {
         Error,
         Missing,
         Empty,
         OnePartition,
         Count(u32),
+        Partitions(Vec<Partition>),
     }
 
     #[derive(Debug)]
@@ -264,6 +251,7 @@ mod tests {
         offset_fails: bool,
         /// `(current_offset, stored_offset)` returned for every partition.
         offset: Option<(u64, u64)>,
+        members: Vec<ConsumerGroupMember>,
     }
 
     struct LogBuffer(Arc<Mutex<Vec<u8>>>);
@@ -293,14 +281,10 @@ mod tests {
         Err(IggyError::Error)
     }
 
-    fn group(partitions_count: u32) -> ConsumerGroupDetails {
-        ConsumerGroupDetails {
-            id: 3,
-            name: "group".to_owned(),
-            partitions_count,
-            members_count: 0,
-            members: Vec::new(),
-        }
+    fn partition(id: u32) -> Partition {
+        let mut partition = partition_zero();
+        partition.id = id;
+        partition
     }
 
     fn topic_details(partitions: Vec<Partition>) -> TopicDetails {
@@ -343,6 +327,25 @@ mod tests {
         cmd.execute_cmd(client)
             .await
             .expect_err("consumer group get should fail")
+    }
+
+    async fn rendered(client: &ScriptedClient) -> String {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_level(false)
+            .with_writer(LogBuffer(Arc::clone(&logs)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let mut cmd = command();
+        cmd.execute_cmd(client)
+            .await
+            .expect("consumer group get should print the group");
+        drop(_guard);
+        String::from_utf8(logs.lock().expect("log buffer").clone()).expect("log is utf-8")
     }
 
     #[async_trait]
@@ -539,20 +542,15 @@ mod tests {
             _stream_id: &Identifier,
             _topic_id: &Identifier,
         ) -> Result<Option<TopicDetails>, IggyError> {
-            match self.topic {
+            match &self.topic {
                 TopicReply::Error => Err(IggyError::Error),
                 TopicReply::Missing => Ok(None),
                 TopicReply::Empty => Ok(Some(topic_details(Vec::new()))),
                 TopicReply::OnePartition => Ok(Some(topic_details(vec![partition_zero()]))),
-                TopicReply::Count(count) => Ok(Some(topic_details(
-                    (0..count)
-                        .map(|id| {
-                            let mut partition = partition_zero();
-                            partition.id = id;
-                            partition
-                        })
-                        .collect(),
-                ))),
+                TopicReply::Count(count) => {
+                    Ok(Some(topic_details((0..*count).map(partition).collect())))
+                }
+                TopicReply::Partitions(partitions) => Ok(Some(topic_details(partitions.clone()))),
             }
         }
 
@@ -718,7 +716,21 @@ mod tests {
             _topic_id: &Identifier,
             _group_id: &Identifier,
         ) -> Result<Option<ConsumerGroupDetails>, IggyError> {
-            Ok(Some(group(self.partitions_count)))
+            Ok(Some(ConsumerGroupDetails {
+                id: 3,
+                name: "group".to_owned(),
+                partitions_count: self.partitions_count,
+                members_count: u32::try_from(self.members.len()).unwrap(),
+                members: self
+                    .members
+                    .iter()
+                    .map(|member| ConsumerGroupMember {
+                        id: member.id,
+                        partitions_count: member.partitions_count,
+                        partitions: member.partitions.clone(),
+                    })
+                    .collect(),
+            }))
         }
 
         async fn get_consumer_groups(
@@ -792,6 +804,7 @@ mod tests {
             topic: TopicReply::Error,
             offset_fails: false,
             offset: None,
+            members: Vec::new(),
         })
         .await;
 
@@ -805,23 +818,70 @@ mod tests {
             topic: TopicReply::Missing,
             offset_fails: false,
             offset: None,
+            members: Vec::new(),
         })
         .await;
 
         assert!(error.to_string().contains("was not found"));
     }
 
-    #[tokio::test]
-    async fn should_report_missing_partition() {
-        let error = error_from(&ScriptedClient {
+    #[tokio::test(flavor = "current_thread")]
+    async fn should_render_group_when_the_topic_has_no_partitions() {
+        let output = rendered(&ScriptedClient {
             partitions_count: 1,
             topic: TopicReply::Empty,
             offset_fails: false,
             offset: None,
+            members: Vec::new(),
         })
         .await;
 
-        assert!(error.to_string().contains("Partition with ID: 0"));
+        assert!(output.contains("group"), "{output}");
+        assert!(!output.contains("Partition with ID: 0"), "{output}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn should_render_partition_ids_past_the_partition_count() {
+        let output = rendered(&ScriptedClient {
+            partitions_count: 1,
+            topic: TopicReply::Partitions(vec![partition(3)]),
+            offset_fails: false,
+            offset: Some((20, 5)),
+            members: vec![ConsumerGroupMember {
+                id: 17,
+                partitions_count: 1,
+                partitions: vec![3],
+            }],
+        })
+        .await;
+
+        assert!(output.contains("17"), "{output}");
+        assert!(output.contains("20"), "{output}");
+        assert!(!output.contains("Partition with ID: 0"), "{output}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn should_render_every_remaining_partition_when_ids_are_not_a_prefix() {
+        let output = rendered(&ScriptedClient {
+            partitions_count: 2,
+            topic: TopicReply::Partitions(vec![partition(4), partition(3)]),
+            offset_fails: false,
+            offset: Some((20, 5)),
+            members: vec![ConsumerGroupMember {
+                id: 17,
+                partitions_count: 2,
+                partitions: vec![4, 3],
+            }],
+        })
+        .await;
+
+        let row_3 = output
+            .find("  3         | 17")
+            .unwrap_or_else(|| panic!("partition 3 missing\n{output}"));
+        let row_4 = output
+            .find("  4         | 17")
+            .unwrap_or_else(|| panic!("partition 4 missing\n{output}"));
+        assert!(row_3 < row_4, "{output}");
     }
 
     #[tokio::test]
@@ -831,6 +891,7 @@ mod tests {
             topic: TopicReply::OnePartition,
             offset_fails: true,
             offset: None,
+            members: Vec::new(),
         })
         .await;
 
@@ -849,6 +910,7 @@ mod tests {
             topic: TopicReply::Count(MAX_PARTITIONS_COUNT + 1),
             offset_fails: false,
             offset: None,
+            members: Vec::new(),
         })
         .await
         .expect("a topic can grow past one create request");
@@ -873,6 +935,7 @@ mod tests {
             topic: TopicReply::OnePartition,
             offset_fails: false,
             offset: Some((4, 10)),
+            members: Vec::new(),
         })
         .await
         .expect("lag stays defined when the stored offset leads");
