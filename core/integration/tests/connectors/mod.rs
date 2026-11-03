@@ -28,6 +28,7 @@ mod influxdb;
 mod meilisearch;
 mod mongodb;
 mod mqtt;
+mod opendal;
 mod postgres;
 mod quickwit;
 mod rabbitmq;
