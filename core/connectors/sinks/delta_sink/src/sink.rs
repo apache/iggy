@@ -24,10 +24,8 @@ use deltalake::arrow::datatypes::SchemaRef;
 use deltalake::arrow::json::ReaderBuilder;
 use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::writer::{DeltaWriter, RecordBatchWriter};
-use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
-    owned_value_into_serde_json,
-};
+use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata};
+use simd_json::OwnedValue;
 use tracing::{debug, error, info};
 
 // TODO: Expose metrics for observability purposes
@@ -201,33 +199,30 @@ impl Sink for DeltaSink {
     }
 }
 
-fn record_batch(values: &[serde_json::Value], schema: SchemaRef) -> Result<RecordBatch, Error> {
-    // Arrow's Serde serializer treats arbitrary-precision numbers as structs.
-    // Decode JSON bytes so serde_json's private number representation stays internal.
-    let mut json = Vec::new();
-    for value in values {
-        serde_json::to_writer(&mut json, value)
-            .map_err(|e| Error::InvalidRecordValue(e.to_string()))?;
-        json.push(b'\n');
-    }
-    ReaderBuilder::new(schema)
+fn record_batch(values: &[OwnedValue], schema: SchemaRef) -> Result<RecordBatch, Error> {
+    let mut decoder = ReaderBuilder::new(schema)
         .with_batch_size(values.len())
-        .build(json.as_slice())
+        .build_decoder()
+        .map_err(|e| Error::InvalidRecordValue(e.to_string()))?;
+    // OwnedValue emits primitive numbers, independent of serde_json's features.
+    decoder
+        .serialize(values)
+        .map_err(|e| Error::InvalidRecordValue(e.to_string()))?;
+    decoder
+        .flush()
         .map_err(|e| Error::InvalidRecordValue(e.to_string()))?
-        .next()
-        .ok_or(Error::InvalidRecord)?
-        .map_err(|e| Error::InvalidRecordValue(e.to_string()))
+        .ok_or(Error::InvalidRecord)
 }
 
-/// Every message's JSON document as a serde value, or the batch error for a
+/// Every message's JSON document as a simd-json value, or the batch error for a
 /// payload that has none. Proto text holding JSON is the descriptor-less
 /// `proto_convert` fallback and is written as the document it holds; proto
 /// text that is not JSON fails the batch like any other non-JSON payload.
-fn json_values(messages: Vec<ConsumedMessage>) -> Result<Vec<serde_json::Value>, Error> {
+fn json_values(messages: Vec<ConsumedMessage>) -> Result<Vec<OwnedValue>, Error> {
     let mut json_values = Vec::with_capacity(messages.len());
     for message in messages {
         match message.payload.into_json_document() {
-            Payload::Json(document) => json_values.push(owned_value_into_serde_json(document)),
+            Payload::Json(document) => json_values.push(document),
             payload => {
                 error!(
                     "Unsupported payload type: {payload}. Delta sink only supports JSON payloads."
@@ -242,7 +237,7 @@ fn json_values(messages: Vec<ConsumedMessage>) -> Result<Vec<serde_json::Value>,
 #[cfg(test)]
 mod tests {
     use super::{json_values, record_batch};
-    use deltalake::arrow::array::{ArrayRef, Float64Array, Int64Array};
+    use deltalake::arrow::array::{ArrayRef, Float64Array, Int64Array, UInt64Array};
     use deltalake::arrow::datatypes::{DataType, Field, Schema};
     use deltalake::arrow::record_batch::RecordBatch;
     use iggy_connector_sdk::{ConsumedMessage, Error, Payload};
@@ -253,10 +248,11 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("value", DataType::Float64, true),
+            Field::new("sequence", DataType::UInt64, false),
         ]));
         let values = vec![
-            serde_json::json!({"id": 1, "value": 1.5}),
-            serde_json::json!({"id": 2, "value": null}),
+            simd_json::json!({"id": 1, "value": 1.5, "sequence": u64::MAX}),
+            simd_json::json!({"id": 2, "value": null, "sequence": 0}),
         ];
         let batch = record_batch(&values, schema.clone()).expect("decode JSON numbers");
         let expected = RecordBatch::try_new(
@@ -264,6 +260,7 @@ mod tests {
             vec![
                 Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
                 Arc::new(Float64Array::from(vec![Some(1.5), None])),
+                Arc::new(UInt64Array::from(vec![u64::MAX, 0])),
             ],
         )
         .expect("numeric columns");
@@ -293,7 +290,7 @@ mod tests {
 
         assert_eq!(
             values,
-            vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})]
+            vec![simd_json::json!({"id": 1}), simd_json::json!({"id": 2})]
         );
     }
 
