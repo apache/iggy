@@ -1015,9 +1015,12 @@ mod tests {
                     iggy_binary_protocol::codes::POLL_MESSAGES_DEFERRED_CODE.to_le_bytes();
                 send(&link, frame, deadline)
             };
-            let mut abandoned = Box::pin(futures::future::join_all(
+            // Since tokio 1.54 a send can take its queue permit and still yield
+            // to the coop budget, so the capacity check below would pass before
+            // every poll reached the FIFO. Unconstrained, one poll sends them all.
+            let mut abandoned = Box::pin(tokio::task::unconstrained(futures::future::join_all(
                 (1..=LINK_WRITE_QUEUE as u64).map(poll),
-            ));
+            )));
             timeout(TEST_BUDGET, async {
                 while link.queue.capacity() != MAX_PENDING_PER_LINK - LINK_WRITE_QUEUE {
                     assert!(futures::poll!(&mut abandoned).is_pending());
