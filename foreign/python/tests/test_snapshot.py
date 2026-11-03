@@ -21,9 +21,18 @@ import zipfile
 import pytest
 
 from apache_iggy import (
+    GlobalPermissions,
     IggyClient,
+    Permissions,
     SnapshotCompression,
     SystemSnapshotType,
+)
+
+from .utils import (
+    get_server_config,
+    login_fresh_client,
+    unique_credentials,
+    wait_for_server,
 )
 
 
@@ -86,3 +95,60 @@ class TestSnapshot:
         assert isinstance(data, bytes)
         assert len(data) > 0
         assert zipfile.is_zipfile(io.BytesIO(data))
+
+    @pytest.mark.asyncio
+    async def test_snapshot_before_login_fails(self):
+        """A connected client without authentication cannot capture a snapshot."""
+        host, port = get_server_config()
+        wait_for_server(host, port)
+
+        client = IggyClient(f"{host}:{port}")
+        await client.connect()
+
+        with pytest.raises(RuntimeError, match="Unauthenticated"):
+            await client.snapshot(
+                SnapshotCompression.Deflated, [SystemSnapshotType.Test]
+            )
+
+    @pytest.mark.asyncio
+    async def test_snapshot_without_server_permissions_fails(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """A user without server permissions is denied snapshot retrieval."""
+        username, password = unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password)
+
+        try:
+            client = await login_fresh_client(username, password)
+            with pytest.raises(RuntimeError, match="Unauthorized"):
+                await client.snapshot(
+                    SnapshotCompression.Deflated, [SystemSnapshotType.Test]
+                )
+        finally:
+            await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_snapshot_with_manage_servers_permission_succeeds(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """A non-root user with manage_servers permission can capture a snapshot."""
+        username, password = unique_credentials(unique_name)
+        created = await iggy_client.create_user(
+            username,
+            password,
+            permissions=Permissions(
+                global_permissions=GlobalPermissions(manage_servers=True)
+            ),
+        )
+
+        try:
+            client = await login_fresh_client(username, password)
+            data = await client.snapshot(
+                SnapshotCompression.Deflated, [SystemSnapshotType.Test]
+            )
+
+            assert isinstance(data, bytes)
+            assert len(data) > 0
+            assert zipfile.is_zipfile(io.BytesIO(data))
+        finally:
+            await iggy_client.delete_user(created.id)
