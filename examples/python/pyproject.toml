@@ -58,4 +58,5 @@ search-path = [
     "message-headers",
     "message-headers/plain-headers",
     "message-headers/typed-headers",
+    "multi-tenant",
 ]

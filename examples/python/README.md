@@ -157,3 +157,35 @@ To test with a TLS-enabled server, start the server with TLS configured (see mai
 uv run getting-started/producer.py --tcp-server-address localhost:8090 --tls --tls-ca-file ../../core/certs/iggy_ca_cert.pem
 uv run getting-started/consumer.py --tcp-server-address localhost:8090 --tls --tls-ca-file ../../core/certs/iggy_ca_cert.pem
 ```
+
+### Multi-Tenant
+
+Shows how to isolate tenants on one server. Each tenant gets its own stream and
+its own user, limited to that stream. The producer logs in as the root user to
+create the streams, the `events` topics and the users, then sends messages as
+each tenant. Before sending, every tenant checks that it can see its own stream
+and that reading another tenant's stream is refused. The consumer logs in as one
+tenant and reads only that tenant's stream, with the same check.
+
+The number of tenants comes from the `TENANTS_COUNT` environment variable
+(default `3`). Use the same value for the producer and the consumer. Run the
+producer first. Running it again appends more messages, and the consumer reads
+the whole stream each time.
+
+```bash
+# Using uv
+uv run multi-tenant/producer.py
+uv run multi-tenant/consumer.py
+uv run multi-tenant/consumer.py --tenant-id 2
+TENANTS_COUNT=5 uv run multi-tenant/producer.py
+TENANTS_COUNT=5 uv run multi-tenant/consumer.py --tenant-id 5
+
+# Without using uv
+python multi-tenant/producer.py
+python multi-tenant/consumer.py
+python multi-tenant/consumer.py --tenant-id 2
+```
+
+The producer needs root credentials (`iggy`/`iggy` by default) to create the
+users. Pass another connection string as the first argument if your server uses
+different ones.
