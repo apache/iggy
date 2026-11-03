@@ -1049,6 +1049,26 @@ pub struct HeaderEntry {
     pub value: HeaderValue,
 }
 
+/// A [`HeaderEntry`] as JSON carries it, before either field is checked, so a
+/// caller that needs the refusal as an [`IggyError`] rather than a serde error
+/// can convert it with `HeaderEntry::try_from`.
+#[derive(Deserialize)]
+pub(crate) struct RawHeaderEntry {
+    key: RawHeaderField,
+    value: RawHeaderField,
+}
+
+impl TryFrom<RawHeaderEntry> for HeaderEntry {
+    type Error = IggyError;
+
+    fn try_from(entry: RawHeaderEntry) -> Result<Self, Self::Error> {
+        Ok(Self {
+            key: HeaderKey::from_raw_bytes(entry.key.kind, entry.key.value)?,
+            value: HeaderValue::from_raw_bytes(entry.value.kind, entry.value.value)?,
+        })
+    }
+}
+
 pub fn serialize_headers<S>(headers: &Option<UserHeaders>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -1091,6 +1111,7 @@ where
 mod tests {
     use super::*;
     use crate::wire_conversions::{user_headers_from_wire, user_headers_to_wire};
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use bytes::{BufMut, BytesMut};
     use iggy_binary_protocol::WireUserHeaders;
 
@@ -1946,7 +1967,6 @@ mod tests {
         );
 
         // Oversized (> 255 bytes) rejected
-        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
         let oversized_b64 = BASE64.encode([0u8; 256]);
         let oversized_json = serde_json::json!({
             "kind": "string",
