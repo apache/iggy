@@ -3,7 +3,7 @@
 **Apache Iggy** is a persistent message streaming platform
 in Rust. Thread-per-core shared-nothing, `io_uring` + `compio`.
 Transports: QUIC, WebSocket, TCP (custom binary), HTTP (REST). SDKs:
-Rust, .NET, Java, Python, Go, C++, Node.js. A connectors subsystem
+Rust, .NET, Java, Python, Go, C++, Node.js, Swift. A connectors subsystem
 ingests from / egresses to external systems via dlopened plugins.
 
 > Skills live under `.claude/skills/`, with per-skill links under
@@ -115,7 +115,7 @@ iggy/
 │   ├── shard/            Shard runtime
 │   ├── harness_derive/   #[iggy_harness] proc macro
 │   └── metadata, partitions, server_common, configs_derive, clock, tools
-├── foreign/              Java / .NET / Python / Go / C++ / Node.js SDKs
+├── foreign/              Java / .NET / Python / Go / C++ / Node.js / Swift SDKs
 ├── bdd/                  Cross-language BDD (Gherkin)
 ├── examples/             Per-SDK runnable examples
 ├── helm/                 Helm charts
