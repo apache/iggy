@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use integration::harness::{TestBinaryError, TestFixture};
+use integration::harness::{SinglePortReserver, TestBinaryError, TestFixture};
 use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
@@ -50,13 +50,18 @@ pub const ENV_SINK_STORE_SECRET: &str =
 pub const ENV_SINK_STORE_REGION: &str = "IGGY_CONNECTORS_SINK_ICEBERG_PLUGIN_CONFIG_STORE_REGION";
 pub const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_ICEBERG_PATH";
 pub const ENV_SINK_INVALID_ROWS: &str = "IGGY_CONNECTORS_SINK_ICEBERG_PLUGIN_CONFIG_INVALID_ROWS";
+pub const ENV_SINK_MAX_RETRIES: &str = "IGGY_CONNECTORS_SINK_ICEBERG_PLUGIN_CONFIG_MAX_RETRIES";
+pub const ENV_SINK_RETRY_DELAY: &str = "IGGY_CONNECTORS_SINK_ICEBERG_PLUGIN_CONFIG_RETRY_DELAY";
+pub const ENV_SINK_MAX_RETRY_DELAY: &str =
+    "IGGY_CONNECTORS_SINK_ICEBERG_PLUGIN_CONFIG_MAX_RETRY_DELAY";
 
 pub const ENV_AWS_ACCESS_KEY_ID: &str = "AWS_ACCESS_KEY_ID";
 pub const ENV_AWS_SECRET_ACCESS_KEY: &str = "AWS_SECRET_ACCESS_KEY";
 
 pub struct IcebergRestContainer {
-    #[allow(dead_code)]
     container: ContainerAsync<GenericImage>,
+    // A fixed host port survives a restart, where Docker would map a new random one.
+    _host_port: SinglePortReserver,
     pub catalog_url: String,
 }
 
@@ -66,6 +71,8 @@ impl IcebergRestContainer {
         floci_internal_endpoint: &str,
     ) -> Result<Self, TestBinaryError> {
         let warehouse_path = format!("s3://{TEST_BUCKET}/");
+        let host_port = SinglePortReserver::new()?;
+        let mapped_port = host_port.address().port();
 
         let container = GenericImage::new(ICEBERG_REST_IMAGE, ICEBERG_REST_TAG)
             .with_exposed_port(ICEBERG_REST_PORT.tcp())
@@ -90,7 +97,7 @@ impl IcebergRestContainer {
             .with_env_var("AWS_REGION", REGION)
             .with_env_var("AWS_ACCESS_KEY_ID", ACCESS_KEY)
             .with_env_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY)
-            .with_mapped_port(0, ICEBERG_REST_PORT.tcp())
+            .with_mapped_port(mapped_port, ICEBERG_REST_PORT.tcp())
             .with_container_name(fixtures::unique_container_name("iceberg-rest"))
             .start()
             .await
@@ -101,33 +108,42 @@ impl IcebergRestContainer {
 
         info!("Started Iceberg REST catalog container");
 
-        let mapped_port = container
-            .ports()
-            .await
-            .map_err(|error| TestBinaryError::FixtureSetup {
-                fixture_type: "IcebergRestContainer".to_string(),
-                message: format!("Failed to get ports: {error}"),
-            })?
-            .map_to_host_port_ipv4(ICEBERG_REST_PORT)
-            .ok_or_else(|| TestBinaryError::FixtureSetup {
-                fixture_type: "IcebergRestContainer".to_string(),
-                message: "No mapping for Iceberg REST port".to_string(),
-            })?;
-
         let catalog_url = format!("http://localhost:{mapped_port}");
         info!("Iceberg REST catalog available at {catalog_url}");
 
         Ok(Self {
             container,
+            _host_port: host_port,
             catalog_url,
         })
+    }
+
+    /// Kills the catalog, as a crash would. Its tables survive a later `start_again`.
+    pub async fn stop(&self) -> Result<(), TestBinaryError> {
+        self.container
+            .stop_with_timeout(Some(0))
+            .await
+            .map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "IcebergRestContainer".to_string(),
+                message: format!("Failed to stop container: {error}"),
+            })
+    }
+
+    /// Starts a stopped catalog on the same host port, without waiting for it to serve.
+    pub async fn start_again(&self) -> Result<(), TestBinaryError> {
+        self.container
+            .start()
+            .await
+            .map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "IcebergRestContainer".to_string(),
+                message: format!("Failed to start container: {error}"),
+            })
     }
 }
 
 pub struct IcebergFixture {
     #[allow(dead_code)]
     floci: FlociContainer,
-    #[allow(dead_code)]
     iceberg_rest: IcebergRestContainer,
     http_client: HttpClient,
     pub catalog_url: String,
@@ -342,6 +358,16 @@ pub struct SnapshotSummary {
     pub changed_partition_count: Option<String>,
 }
 
+impl IcebergFixture {
+    pub async fn stop_catalog(&self) -> Result<(), TestBinaryError> {
+        self.iceberg_rest.stop().await
+    }
+
+    pub async fn start_catalog(&self) -> Result<(), TestBinaryError> {
+        self.iceberg_rest.start_again().await
+    }
+}
+
 impl IcebergOps for IcebergFixture {
     fn catalog_url(&self) -> &str {
         &self.catalog_url
@@ -484,6 +510,45 @@ impl TestFixture for IcebergSkipInvalidRowsFixture {
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
         let mut envs = self.inner.connectors_runtime_envs();
         envs.insert(ENV_SINK_INVALID_ROWS.to_string(), "skip".to_string());
+        envs
+    }
+}
+
+/// Same table as `IcebergPreCreatedFixture`, with commit retries that outlast a catalog restart.
+pub struct IcebergCatalogRestartFixture {
+    inner: IcebergPreCreatedFixture,
+}
+
+impl std::ops::Deref for IcebergCatalogRestartFixture {
+    type Target = IcebergFixture;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl IcebergOps for IcebergCatalogRestartFixture {
+    fn catalog_url(&self) -> &str {
+        self.inner.catalog_url()
+    }
+
+    fn http_client(&self) -> &HttpClient {
+        self.inner.http_client()
+    }
+}
+
+#[async_trait]
+impl TestFixture for IcebergCatalogRestartFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            inner: IcebergPreCreatedFixture::setup().await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_SINK_MAX_RETRIES.to_string(), "30".to_string());
+        envs.insert(ENV_SINK_RETRY_DELAY.to_string(), "200ms".to_string());
+        envs.insert(ENV_SINK_MAX_RETRY_DELAY.to_string(), "1s".to_string());
         envs
     }
 }

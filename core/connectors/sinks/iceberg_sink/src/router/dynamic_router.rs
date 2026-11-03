@@ -20,6 +20,7 @@ use crate::router::{Router, is_valid_namespaced_table, table_exists, write_data}
 use async_trait::async_trait;
 use iceberg::Catalog;
 use iceberg::table::Table;
+use iggy_connector_sdk::retry::RetryPolicy;
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload};
 use simd_json::base::ValueAsObject;
 use std::collections::HashMap;
@@ -30,6 +31,7 @@ pub struct DynamicRouter {
     catalog: Box<dyn Catalog>,
     route_field: String,
     invalid_rows: InvalidRows,
+    commit_retry: RetryPolicy,
 }
 
 pub struct DynamicWriter {
@@ -77,11 +79,17 @@ impl DynamicWriter {
 }
 
 impl DynamicRouter {
-    pub fn new(catalog: Box<dyn Catalog>, route_field: String, invalid_rows: InvalidRows) -> Self {
+    pub fn new(
+        catalog: Box<dyn Catalog>,
+        route_field: String,
+        invalid_rows: InvalidRows,
+        commit_retry: RetryPolicy,
+    ) -> Self {
         Self {
             catalog,
             route_field,
             invalid_rows,
+            commit_retry,
         }
     }
 
@@ -164,6 +172,7 @@ impl Router for DynamicRouter {
                 self.catalog.as_ref(),
                 messages_metadata.schema,
                 self.invalid_rows,
+                self.commit_retry,
             )
             .await?;
             info!(

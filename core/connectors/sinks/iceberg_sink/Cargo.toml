@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_iceberg_sink"
-version = "0.5.1-edge.2"
+version = "0.5.1-edge.3"
 edition = "2024"
 license = "Apache-2.0"
 keywords = ["iggy", "messaging", "streaming"]
@@ -40,6 +40,7 @@ arrow-json = { workspace = true }
 arrow-schema = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
+humantime = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-storage-opendal = { workspace = true }

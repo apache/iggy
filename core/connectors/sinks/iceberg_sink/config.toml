@@ -44,3 +44,6 @@ store_region = "us-east-1"
 store_class = "s3"
 store_path_style_access = true
 invalid_rows = "fail"
+max_retries = 5
+retry_delay = "1s"
+max_retry_delay = "30s"
