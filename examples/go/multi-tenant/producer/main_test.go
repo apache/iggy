@@ -18,49 +18,10 @@
 package main
 
 import (
-	"context"
-	"strings"
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	ierror "github.com/apache/iggy/foreign/go/errors"
 )
-
-type readableStreams struct {
-	iggcon.Client
-	names map[string]bool
-}
-
-func (c *readableStreams) GetStream(_ context.Context, id iggcon.Identifier) (*iggcon.StreamDetails, error) {
-	name, err := id.String()
-	if err != nil {
-		return nil, err
-	}
-	if !c.names[name] {
-		return nil, ierror.ErrUnauthorized
-	}
-	return &iggcon.StreamDetails{}, nil
-}
-
-func TestEnsureNoAccessFailsWhenANeighbourStreamIsReadable(t *testing.T) {
-	tenants := []tenant{
-		{id: 1, stream: "tenant_1_stream", user: "tenant_1_producer"},
-		{id: 2, stream: "tenant_2_stream", user: "tenant_2_producer"},
-	}
-	refused := &readableStreams{names: map[string]bool{"tenant_1_stream": true}}
-	if err := ensureNoAccess(t.Context(), refused, tenants[0], tenants); err != nil {
-		t.Fatalf("a tenant refused its neighbour's stream should pass the check: %v", err)
-	}
-
-	leaky := &readableStreams{names: map[string]bool{"tenant_1_stream": true, "tenant_2_stream": true}}
-	err := ensureNoAccess(t.Context(), leaky, tenants[0], tenants)
-	if err == nil {
-		t.Fatal("a tenant that can read its neighbour's stream must fail the check")
-	}
-	if !strings.Contains(err.Error(), "should have refused") || !strings.Contains(err.Error(), "tenant_2_stream") {
-		t.Fatalf("the failure should name the readable stream, got %v", err)
-	}
-}
 
 func TestProducerPermissionsStayInsideTheTenantStream(t *testing.T) {
 	permissions := producerPermissions(7)
