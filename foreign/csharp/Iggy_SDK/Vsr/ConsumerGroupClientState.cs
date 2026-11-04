@@ -122,6 +122,17 @@ internal sealed class ConsumerGroupClientState
         }
     }
 
+    /// <summary>
+    ///     The assigned partitions of a group, in assignment order, or an empty list when nothing is cached.
+    /// </summary>
+    internal IReadOnlyList<uint> AssignedPartitions(GroupKey key)
+    {
+        lock (_gate)
+        {
+            return _assignments.TryGetValue(key, out var assignment) ? assignment.Partitions : [];
+        }
+    }
+
     /// <summary>The next balanced produce partition for a topic, advancing the cursor.</summary>
     internal uint NextBalancedPartition(TopicKey key, uint partitionCount)
     {
@@ -196,8 +207,7 @@ internal sealed class ConsumerGroupClientState
     }
 
     /// <summary>
-    ///     Forgets a topic after a send to it was refused with status 87: another client deleted and recreated
-    ///     it, so every partition context and the partition count may be stale. Any other failure leaves both.
+    ///     Forgets a topic after a history or partition-not-found refusal, when its contexts and count may be stale.
     /// </summary>
     internal void InvalidateTopic(TopicKey key)
     {

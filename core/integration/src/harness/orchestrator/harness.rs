@@ -220,7 +220,6 @@ impl TestHarness {
             }
 
             const CLUSTER_READY_TIMEOUT: Duration = Duration::from_secs(15);
-            const CLUSTER_READY_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 
             let deadline = Instant::now() + CLUSTER_READY_TIMEOUT;
 
@@ -231,28 +230,52 @@ impl TestHarness {
             // every later op as a gap. Gating on all nodes meshed means the
             // test runs against a fully constructed cluster with no late
             // joiners.
-            while Instant::now() < deadline
-                && !self.servers.iter().all(ServerHandle::replica_mesh_complete)
-            {
-                sleep(CLUSTER_READY_RETRY_INTERVAL).await;
-            }
-            if !self.servers.iter().all(ServerHandle::replica_mesh_complete) {
-                let per_node: Vec<String> = self
-                    .servers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| format!("node{i}={}", s.replica_mesh_complete()))
-                    .collect();
-                return Err(TestBinaryError::InvalidState {
-                    message: format!(
-                        "Timed out waiting for VSR replica mesh to form on all nodes [{}]",
-                        per_node.join(", ")
-                    ),
-                });
-            }
+            self.wait_for_every_node(
+                deadline,
+                ServerHandle::replica_mesh_complete,
+                "VSR replica mesh to form",
+            )
+            .await?;
+            // Admission needs a probe round, not an op. A backup credits a
+            // probe only after applying the commit it carries, so the login
+            // waits until then instead of racing it.
+            self.wait_for_every_node(
+                deadline,
+                ServerHandle::partition_admission_open,
+                "partition admission to open",
+            )
+            .await?;
 
             self.wait_for_login_ready(deadline).await
         }
+    }
+
+    async fn wait_for_every_node(
+        &self,
+        deadline: Instant,
+        ready: fn(&ServerHandle) -> bool,
+        what: &str,
+    ) -> Result<(), TestBinaryError> {
+        const RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
+        while Instant::now() < deadline && !self.servers.iter().all(ready) {
+            sleep(RETRY_INTERVAL).await;
+        }
+        if self.servers.iter().all(ready) {
+            return Ok(());
+        }
+        let per_node: Vec<String> = self
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("node{i}={}", ready(s)))
+            .collect();
+        Err(TestBinaryError::InvalidState {
+            message: format!(
+                "Timed out waiting for {what} on all nodes [{}]",
+                per_node.join(", ")
+            ),
+        })
     }
 
     /// Poll a root login until one succeeds or `deadline` passes.
@@ -595,6 +618,13 @@ impl TestHarness {
     /// [`Self::isolate_node`] cut. Idempotent.
     pub fn heal_node(&self, index: usize) -> Result<(), TestBinaryError> {
         self.peer_relays()?.heal_node(index)
+    }
+
+    /// Close one live replica connection that node `from` dialed to node
+    /// `to`. The link stays up, so the redial goes through. Only a lower
+    /// index dials a higher one. Needs [`TestHarnessBuilder::peer_relays`].
+    pub fn drop_peer_connection(&self, from: usize, to: usize) -> Result<(), TestBinaryError> {
+        self.peer_relays()?.drop_connection(from, to)
     }
 
     fn peer_relays(&self) -> Result<&PeerRelays, TestBinaryError> {

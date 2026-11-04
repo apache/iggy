@@ -20,6 +20,7 @@
 package org.apache.iggy.client.blocking.tcp;
 
 import org.apache.iggy.client.ConnectionInfo;
+import org.apache.iggy.client.async.reader.PartitionReaderBuilder;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.client.blocking.ConsumerGroupsClient;
 import org.apache.iggy.client.blocking.ConsumerOffsetsClient;
@@ -31,11 +32,15 @@ import org.apache.iggy.client.blocking.StreamsClient;
 import org.apache.iggy.client.blocking.SystemClient;
 import org.apache.iggy.client.blocking.TopicsClient;
 import org.apache.iggy.client.blocking.UsersClient;
+import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
+import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.user.IdentityInfo;
 
 import java.io.Closeable;
+import java.time.Duration;
 
 public class IggyTcpClient implements IggyBaseClient, Closeable {
 
@@ -111,6 +116,37 @@ public class IggyTcpClient implements IggyBaseClient, Closeable {
         return FutureUtil.resolve(asyncClient.sendBinaryRequest(code, payload));
     }
 
+    /** {@inheritDoc} */
+    @Override
+    public byte[] sendBinaryRequestToReplica(int code, byte[] payload, int replicaId) {
+        return FutureUtil.resolve(asyncClient.sendBinaryRequestToReplica(code, payload, replicaId));
+    }
+
+    /**
+     * Resolves the retained operation under its original identity and returns its response body. A later resolve
+     * returns the same outcome without a request, see {@link AsyncIggyTcpClient#resolveOperation(long, Duration)}.
+     */
+    public byte[] resolveOperation(long operationId, Duration timeout) {
+        return FutureUtil.resolve(asyncClient.resolveOperation(operationId, timeout));
+    }
+
+    /**
+     * Releases local retention without cancelling or reversing server-side work. A replay of the operation that
+     * is already running keeps its lane until the replay ends, and it still keeps the outcome it proves for
+     * {@link #resolveOperation(long, Duration)}.
+     */
+    public void abandonOperation(long operationId) {
+        FutureUtil.resolve(asyncClient.abandonOperation(operationId));
+    }
+
+    /**
+     * Drops the connections without a sign-out, see {@link AsyncIggyTcpClient#disconnect()}. {@link #connect()} and a
+     * sign-in continue the client.
+     */
+    public void disconnect() {
+        FutureUtil.resolve(asyncClient.disconnect());
+    }
+
     @Override
     public void close() {
         FutureUtil.resolve(asyncClient.close());
@@ -170,6 +206,19 @@ public class IggyTcpClient implements IggyBaseClient, Closeable {
             throw new IggyNotConnectedException();
         }
         return consumerOffsetsClient;
+    }
+
+    /**
+     * Starts a reader of the partitions of {@code topicId}, as {@link AsyncIggyTcpClient#reader} does. Build a blocking
+     * reader with {@link org.apache.iggy.client.blocking.reader.PartitionReader#build}.
+     *
+     * @param streamId the stream identifier
+     * @param topicId  the topic identifier
+     * @param consumer the consumer or consumer group whose offsets the reader reads and stores
+     * @return the builder of the reader
+     */
+    public PartitionReaderBuilder reader(StreamId streamId, TopicId topicId, Consumer consumer) {
+        return asyncClient.reader(streamId, topicId, consumer);
     }
 
     @Override

@@ -18,6 +18,7 @@
 using Apache.Iggy;
 using Apache.Iggy.Benchmarks;
 using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.IggyClient;
@@ -58,10 +59,8 @@ try
 
         await clients[0].CreateTopicAsync(Identifier.Numeric(startingStreamId + i),
             $"Test bench topic_{i}",
-            compressionAlgorithm: CompressionAlgorithm.None,
-            messageExpiry: TimeSpan.Zero,
-            maxTopicSize: 2_000_000_000,
-            partitionsCount: 1);
+            partitionsCount: 1,
+            options: new TopicOptions { MaxTopicSize = 2_000_000_000 });
     }
 }
 catch

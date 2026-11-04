@@ -27,7 +27,6 @@ stream = "example_stream"
 topics = ["example_topic"]
 schema = "json"
 batch_length = 1000
-poll_interval = "5ms"
 consumer_group = "bigquery_sink_connector"
 
 [plugin_config]
@@ -228,7 +227,6 @@ The fake cannot check what only BigQuery knows: that it accepts the Arrow encodi
     topics = ["demo_topic"]
     schema = "json"
     batch_length = 100
-    poll_interval = "100ms"
     consumer_group = "bigquery_sink_test"
 
     [plugin_config]

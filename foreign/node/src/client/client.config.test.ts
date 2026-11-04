@@ -118,7 +118,7 @@ describe('normalizeClientConfig', () => {
       );
   });
 
-  it('restricts the client to one pooled connection', () => {
+  it('preserves the one-logical-client pool option', () => {
     const normalized = normalizeClientConfig(config());
     assert.deepEqual(normalized.poolSize, { min: 1, max: 1 });
 
@@ -127,8 +127,22 @@ describe('normalizeClientConfig', () => {
         ...config(),
         poolSize: { max: 2 }
       }),
-      /exactly one pooled connection/
+      /exactly one logical client/
     );
+  });
+
+  it('applies and validates shared mutation admission limits', () => {
+    const defaults = normalizeClientConfig(config());
+    assert.equal(defaults.maxPendingOperations, 256);
+    assert.equal(defaults.maxPendingOperationBytes, 64 * 1024 * 1024);
+    const bounded = normalizeClientConfig({ ...config(), maxPendingOperations: 1, maxPendingOperationBytes: 256 });
+    assert.equal(bounded.maxPendingOperations, 1);
+    assert.equal(bounded.maxPendingOperationBytes, 256);
+    for (const maxPendingOperations of [0, -1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1])
+      assert.throws(() => normalizeClientConfig({ ...config(), maxPendingOperations }), /maxPendingOperations/);
+    assert.equal(normalizeClientConfig({ ...config(), maxPendingOperationBytes: 1 }).maxPendingOperationBytes, 1);
+    for (const maxPendingOperationBytes of [0, -1, 256.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1])
+      assert.throws(() => normalizeClientConfig({ ...config(), maxPendingOperationBytes }), /maxPendingOperationBytes/);
   });
 
   it('supports TLS transport', () => {

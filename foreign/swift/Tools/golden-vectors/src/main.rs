@@ -28,12 +28,17 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::batch::{
-    BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, BatchHeader, calculate_batch_checksum,
+    BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, BatchHeader, BatchProducer,
+    calculate_batch_checksum,
 };
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::*;
 use iggy_binary_protocol::consensus::{
     Command, EvictionHeader, EvictionReason, HEADER_SIZE, Operation, ReplyHeader, RequestHeader,
+};
+use iggy_binary_protocol::primitives::metadata_changes::{
+    WireChangeOptions, WireMetadataChange, WireMetadataChangeCursor, WireMetadataChangeGroup,
+    WireMetadataChangePhase, WireMetadataChangeStatus, WireStreamBody, WireStreamKey,
 };
 use iggy_binary_protocol::primitives::options::WireOptions;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
@@ -44,7 +49,9 @@ use iggy_binary_protocol::primitives::user_headers::encode_user_headers;
 use iggy_binary_protocol::requests::consumer_groups::*;
 use iggy_binary_protocol::requests::consumer_offsets::*;
 use iggy_binary_protocol::requests::messages::{
-    GetPartitionRouteRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
+    DeferredPollMessagesRequest, FetchMessagesRequest, FetchMessagesTarget,
+    GetPartitionRouteRequest, MAX_DEFERRED_POLL_TIMEOUT_US, MAX_DEFERRED_POLL_WAIT_US,
+    MIN_DEFERRED_POLL_MAX_BYTES, PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
@@ -54,7 +61,7 @@ use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::*;
 use iggy_binary_protocol::requests::system::*;
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest, UpdateTopicRequest,
+    CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest,
 };
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::requests::users::*;
@@ -67,8 +74,9 @@ use iggy_binary_protocol::responses::consumer_groups::{
 };
 use iggy_binary_protocol::responses::consumer_offsets::ConsumerOffsetResponse;
 use iggy_binary_protocol::responses::messages::{
-    PartitionRouteResponse, PollMessagesResponseHeader, PollRoutingResponse,
-    SendMessagesConfirmationResponse, SendMessagesResponse,
+    FetchMessagesResponse, FetchMessagesSection, FetchMessagesSectionHeader,
+    PartitionRouteResponse, PollMessagesResponseHeader, SendMessagesConfirmationResponse,
+    SendMessagesResponse,
 };
 use iggy_binary_protocol::responses::personal_access_tokens::{
     GetPersonalAccessTokensResponse, PersonalAccessTokenResponse, RawPersonalAccessTokenResponse,
@@ -78,7 +86,8 @@ use iggy_binary_protocol::responses::streams::{
 };
 use iggy_binary_protocol::responses::system::get_stats::{CacheMetricEntry, StatsResponse};
 use iggy_binary_protocol::responses::system::{
-    ClusterMetadataResponse, ClusterNodeResponse, DescribeOptionsResponse, OptionDescriptor,
+    ClusterMetadataResponse, ClusterNodeResponse, DescribeOptionsResponse,
+    GetMetadataChangesResponse, OptionDescriptor, WireMetadataChangeRecord,
 };
 use iggy_binary_protocol::responses::topics::{
     GetTopicResponse, GetTopicsResponse, PartitionResponse,
@@ -91,14 +100,21 @@ use iggy_binary_protocol::{
     WireIdentifier, WireName, WirePartitioning, WirePollingStrategy,
 };
 use iggy_common::{
-    CompressionAlgorithm, Durability, IggyByteSize, IggyDuration, IggyError, IggyExpiry,
-    MaxTopicSize, NO_ASSIGNED_PARTITION, RESYNC_REQUIRED_PARTITION_SENTINEL, TopicCreateOptions,
-    TopicUpdateOptions,
+    CompressionAlgorithm, DeferredPollOptions, Durability, IggyByteSize, IggyDuration, IggyError,
+    IggyExpiry, MaxTopicSize, NO_ASSIGNED_PARTITION, OptionKey, OptionsPatch,
+    RESYNC_REQUIRED_PARTITION_SENTINEL, StreamCreateOptions, StreamEncryptionKey,
+    StreamUpdateOptions, TopicCreateOptions, TopicUpdateOptions, UserStatus, UserUpdateOptions,
+    stream_key_fingerprint,
 };
 use secrecy::SecretString;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use twox_hash::{XxHash3_64, XxHash32};
+
+/// The SDK sends `sdkVersion` in every login handshake, so the handshake
+/// vectors take it from the Swift source instead of a copy that a version
+/// bump would leave behind.
+const IGGY_SWIFT_SOURCE: &str = include_str!("../../../Sources/Iggy/Iggy.swift");
 
 /// Hash and error tables are maps keyed by length and code, so each entry is
 /// one line of the pretty-printed fixture and the file stays reviewable.
@@ -136,6 +152,15 @@ fn name(value: &str) -> WireName {
     WireName::new(value).expect("valid name")
 }
 
+fn metadata_cursor() -> WireMetadataChangeCursor {
+    WireMetadataChangeCursor {
+        log_id: 0x0d4b_8f2a_6e1c_93d7,
+        op: 4187,
+        checksum: 0xf2a4_c6e8_b0d1_f359,
+        ordinal: 1,
+    }
+}
+
 fn options(entries: &[(u8, &[u8], u8, &[u8])]) -> WireOptions {
     let mut buf = BytesMut::new();
     encode_user_headers(entries, &mut buf);
@@ -149,12 +174,62 @@ fn sample_options() -> WireOptions {
     ])
 }
 
+/// The cross-SDK block `core/binary_protocol/src/primitives/options.rs` pins by
+/// hand, in its insertion order rather than key order.
+fn golden_options_block() -> WireOptions {
+    options(&[
+        (2, b"preallocate_segments", 3, &[1]),
+        (2, b"segment_size", 12, &1_073_741_824u64.to_le_bytes()),
+        (2, b"durability", 2, b"persisted"),
+    ])
+}
+
+/// Key bytes 0 to 31, the key of the shared fingerprint vector.
+fn sample_key() -> [u8; 32] {
+    std::array::from_fn(|index| index as u8)
+}
+
+/// The read-only projections of a stream whose key the client chose, wrapped
+/// under two KEKs during a rotation.
+fn stream_projections() -> WireOptions {
+    let fingerprint = stream_key_fingerprint(&sample_key()).expect("32-byte key");
+    options(&[
+        (
+            2,
+            b"encryption_kek_fingerprint",
+            2,
+            b"39e4f0f95c3693c7,d55d479829bc2936",
+        ),
+        (2, b"encryption_key_fingerprint", 2, fingerprint.as_bytes()),
+        (2, b"encryption_key_source", 2, b"stream"),
+    ])
+}
+
+fn update_resource(target: ResourceTarget, patch: OptionsPatch) -> UpdateResourceRequest {
+    UpdateResourceRequest {
+        target,
+        reset: patch.reset,
+        options: patch.set,
+    }
+}
+
 fn version_info() -> ClientVersionInfo {
     ClientVersionInfo {
         protocol_version: IGGY_PROTOCOL_VERSION,
         sdk_name: name("swift-sdk"),
-        sdk_version: name("0.1.0"),
+        sdk_version: name(swift_sdk_version()),
     }
+}
+
+fn swift_sdk_version() -> &'static str {
+    IGGY_SWIFT_SOURCE
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("public static let sdkVersion = \"")?
+                .strip_suffix('"')
+        })
+        .expect("Iggy.swift declares sdkVersion")
 }
 
 fn sample_permissions() -> WirePermissions {
@@ -259,14 +334,18 @@ fn topic_header(id: u32, name_value: &str) -> TopicHeader {
         id,
         created_at: 1_710_000_000_000_000,
         partitions_count: 3,
-        message_expiry: 604_800_000_000,
-        compression_algorithm: 1,
-        max_topic_size: 1_073_741_824,
         size_bytes: 4096,
         messages_count: 100,
         name: name(name_value),
-        options: sample_options(),
-        derived_options: options(&[(2, b"max_topic_size", 12, &u64::MAX.to_le_bytes())]),
+        options: options(&[
+            (2, b"durability", 2, b"persisted"),
+            (2, b"message_expiry", 12, &604_800_000_000u64.to_le_bytes()),
+            (2, b"segment_size", 12, &1_073_741_824u64.to_le_bytes()),
+        ]),
+        derived_options: options(&[
+            (2, b"compression_algorithm", 2, b"none"),
+            (2, b"max_topic_size", 12, &u64::MAX.to_le_bytes()),
+        ]),
     }
 }
 
@@ -279,6 +358,7 @@ fn stream_response(id: u32, topics_count: u32) -> StreamResponse {
         messages_count: 200,
         name: name("my-stream"),
         options: WireOptions::empty(),
+        derived_options: stream_projections(),
     }
 }
 
@@ -294,8 +374,10 @@ fn request_header(
     session: u64,
     payload: &[u8],
 ) -> RequestHeader {
-    RequestHeader::for_request(code, client, request, session, payload)
-        .expect("fixture payloads fit a request frame")
+    let mut header = RequestHeader::for_request(code, client, request, session, payload)
+        .expect("fixture payloads fit a request frame");
+    header.request_checksum = 0;
+    header
 }
 
 fn main() {
@@ -378,6 +460,11 @@ fn main() {
     add(&mut vectors, "polling.last", &WirePollingStrategy::last());
     add(&mut vectors, "polling.next", &WirePollingStrategy::next());
     add(&mut vectors, "options.golden", &sample_options());
+    add(
+        &mut vectors,
+        "options.golden_block",
+        &golden_options_block(),
+    );
     add(&mut vectors, "permissions.sample", &sample_permissions());
     add(&mut vectors, "version_info", &version_info());
 
@@ -398,6 +485,21 @@ fn main() {
             options: sample_options(),
         },
     );
+    let key_options = StreamCreateOptions {
+        encryption_key: Some(StreamEncryptionKey::try_from(sample_key().as_slice()).expect("key")),
+        raw: BTreeMap::new(),
+    }
+    .to_wire()
+    .expect("encodes");
+    add(&mut vectors, "options.stream_create.key", &key_options);
+    add(
+        &mut vectors,
+        "request.create_stream.key",
+        &CreateStreamRequest {
+            name: name("test-stream"),
+            options: key_options,
+        },
+    );
     add(
         &mut vectors,
         "request.delete_stream",
@@ -415,12 +517,18 @@ fn main() {
     add(&mut vectors, "request.get_streams", &GetStreamsRequest);
     add(
         &mut vectors,
-        "request.update_stream",
-        &UpdateStreamRequest {
-            stream_id: named("old-name"),
-            name: name("new-name"),
-            options: WireOptions::empty(),
-        },
+        "request.update_resource.stream",
+        &update_resource(
+            ResourceTarget::Stream {
+                stream_id: named("old-name"),
+            },
+            StreamUpdateOptions {
+                name: Some("new-name".to_owned()),
+                ..Default::default()
+            }
+            .to_patch()
+            .expect("encodes"),
+        ),
     );
     add(
         &mut vectors,
@@ -455,15 +563,38 @@ fn main() {
             stream_id: numeric(42),
         },
     );
-    add(
-        &mut vectors,
-        "request.update_topic",
-        &UpdateTopicRequest {
+    let topic_update = update_resource(
+        ResourceTarget::Topic {
             stream_id: numeric(1),
             topic_id: numeric(2),
-            name: name("updated-topic"),
-            options: options(&[(2, b"message_expiry", 12, &604_800_000_000u64.to_le_bytes())]),
         },
+        TopicUpdateOptions {
+            name: Some("updated-topic".to_owned()),
+            message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::new_from_secs(
+                604_800,
+            ))),
+            reset: BTreeSet::from([OptionKey::MaxTopicSize]),
+            ..Default::default()
+        }
+        .to_patch()
+        .expect("encodes"),
+    );
+    add(&mut vectors, "request.update_resource.topic", &topic_update);
+    add(
+        &mut vectors,
+        "request.update_resource.topic.reset_only",
+        &update_resource(
+            ResourceTarget::Topic {
+                stream_id: named("stream"),
+                topic_id: named("topic"),
+            },
+            TopicUpdateOptions {
+                reset: BTreeSet::from([OptionKey::MaxTopicSize, OptionKey::MessageExpiry]),
+                ..Default::default()
+            }
+            .to_patch()
+            .expect("encodes"),
+        ),
     );
     add(
         &mut vectors,
@@ -626,6 +757,107 @@ fn main() {
             auto_commit: false,
         },
     );
+    let deferred_poll = PollMessagesRequest {
+        consumer: WireConsumer::consumer_group(numeric(7)),
+        stream_id: numeric(1),
+        topic_id: named("orders"),
+        partition_id: Some(3),
+        strategy: WirePollingStrategy::next(),
+        count: 100,
+        auto_commit: true,
+    };
+    let defaults = DeferredPollOptions::default();
+    add(
+        &mut vectors,
+        "request.poll_messages_deferred",
+        &DeferredPollMessagesRequest {
+            poll: deferred_poll.clone(),
+            wait_us: defaults.max_wait.as_micros(),
+            min_count: defaults.min_count,
+            max_bytes: defaults.max_bytes,
+            request_timeout_us: defaults.request_timeout.as_micros(),
+        },
+    );
+    add(
+        &mut vectors,
+        "request.poll_messages_deferred.limits",
+        &DeferredPollMessagesRequest {
+            poll: deferred_poll.clone(),
+            wait_us: MAX_DEFERRED_POLL_WAIT_US,
+            min_count: deferred_poll.count,
+            max_bytes: MIN_DEFERRED_POLL_MAX_BYTES as u32,
+            request_timeout_us: MAX_DEFERRED_POLL_TIMEOUT_US,
+        },
+    );
+    // The vectors of `wire.md`: an `Offset` and a `Next` target, then a read
+    // section and a `NotPrimary` section.
+    let fetch_target = |partition_id, strategy| FetchMessagesTarget {
+        partition_id,
+        strategy,
+        max_bytes: 524_288,
+        incarnation: 3,
+        owner_generation: 9,
+    };
+    let fetch_request = FetchMessagesRequest {
+        consumer: WireConsumer::consumer_group(numeric(7)),
+        stream_id: numeric(1),
+        topic_id: named("orders"),
+        wait_us: 5_000_000,
+        request_timeout_us: 6_000_000,
+        min_count: 1,
+        count: 100,
+        max_bytes: 1_048_576,
+        auto_commit: true,
+        targets: vec![
+            fetch_target(1, WirePollingStrategy::offset(41)),
+            fetch_target(2, WirePollingStrategy::next()),
+        ],
+    };
+    add(&mut vectors, "request.fetch_messages", &fetch_request);
+    {
+        let record = batch_record(
+            1,
+            41,
+            1_700_000_000_000_100,
+            1_700_000_000_000_000,
+            &[frame(1, 0, 0, b"hello", &[])],
+        );
+        let section = |partition_id, status, records: &[u8]| FetchMessagesSectionHeader {
+            partition_id,
+            status,
+            current_offset: 0,
+            messages_count: 0,
+            context: PartitionContext::default(),
+            next_offset: 0,
+            records_len: u32::try_from(records.len()).expect("fixture records fit a section"),
+        };
+        let response = FetchMessagesResponse {
+            sections: vec![
+                FetchMessagesSection {
+                    header: FetchMessagesSectionHeader {
+                        current_offset: 41,
+                        messages_count: 1,
+                        context: PartitionContext {
+                            incarnation: 3,
+                            owner_generation: 9,
+                            metadata_op: 12,
+                        },
+                        next_offset: 42,
+                        ..section(1, 0, &record)
+                    },
+                    records: &record,
+                },
+                FetchMessagesSection {
+                    header: section(2, IggyError::NotPrimary.as_code(), &[]),
+                    records: &[],
+                },
+            ],
+        };
+        vectors.insert(
+            "response.fetch_messages".to_owned(),
+            hex(&response.to_bytes().expect("the fixture table is valid")),
+        );
+    }
     add(
         &mut vectors,
         "request.get_partition_route",
@@ -674,23 +906,34 @@ fn main() {
     add(&mut vectors, "request.get_users", &GetUsersRequest);
     add(
         &mut vectors,
-        "request.update_user",
-        &UpdateUserRequest {
-            user_id: numeric(1),
-            username: Some(name("new-name")),
-            status: Some(2),
-            options: WireOptions::empty(),
-        },
+        "request.update_resource.user",
+        &update_resource(
+            ResourceTarget::User {
+                user_id: numeric(1),
+            },
+            UserUpdateOptions {
+                username: Some("new-name".to_owned()),
+                status: Some(UserStatus::Inactive),
+                ..Default::default()
+            }
+            .to_patch()
+            .expect("encodes"),
+        ),
     );
     add(
         &mut vectors,
-        "request.update_user.none",
-        &UpdateUserRequest {
-            user_id: numeric(5),
-            username: None,
-            status: None,
-            options: WireOptions::empty(),
-        },
+        "request.update_resource.user.status",
+        &update_resource(
+            ResourceTarget::User {
+                user_id: named("admin"),
+            },
+            UserUpdateOptions {
+                status: Some(UserStatus::Active),
+                ..Default::default()
+            }
+            .to_patch()
+            .expect("encodes"),
+        ),
     );
     add(
         &mut vectors,
@@ -798,6 +1041,20 @@ fn main() {
         &mut vectors,
         "request.describe_options",
         &DescribeOptionsRequest { scope: 1 },
+    );
+    add(
+        &mut vectors,
+        "request.get_metadata_changes",
+        &GetMetadataChangesRequest {
+            start: WireMetadataChangeStart::After(metadata_cursor()),
+            since: Some(1_760_356_800_000_000),
+            until: None,
+            limit: 500,
+            groups: vec![
+                WireMetadataChangeGroup::Topics.as_u8(),
+                WireMetadataChangeGroup::Streams.as_u8(),
+            ],
+        },
     );
 
     // Send messages: the full body a producer writes.
@@ -925,6 +1182,59 @@ fn main() {
             &[],
         ))),
     );
+    let deferred_payload = DeferredPollMessagesRequest {
+        poll: deferred_poll,
+        wait_us: defaults.max_wait.as_micros(),
+        min_count: defaults.min_count,
+        max_bytes: defaults.max_bytes,
+        request_timeout_us: defaults.request_timeout.as_micros(),
+    }
+    .to_bytes();
+    let mut deferred_request = request_header(
+        POLL_MESSAGES_DEFERRED_CODE,
+        client_id,
+        6,
+        99,
+        &deferred_payload,
+    );
+    PartitionContext {
+        incarnation: 17,
+        owner_generation: 9,
+        metadata_op: 52,
+    }
+    .stamp(&mut deferred_request);
+    vectors.insert(
+        "vsr.request.poll_messages_deferred".to_owned(),
+        hex(bytemuck::bytes_of(&deferred_request)),
+    );
+    vectors.insert(
+        "vsr.request.cancel_deferred".to_owned(),
+        hex(bytemuck::bytes_of(
+            &deferred_request
+                .deferred_cancellation()
+                .expect("a deferred poll has a cancellation"),
+        )),
+    );
+    // Each target carries its own fence, so the header of a fetch carries none.
+    let fetch_request = request_header(
+        FETCH_MESSAGES_CODE,
+        client_id,
+        7,
+        99,
+        &fetch_request.to_bytes(),
+    );
+    vectors.insert(
+        "vsr.request.fetch_messages".to_owned(),
+        hex(bytemuck::bytes_of(&fetch_request)),
+    );
+    vectors.insert(
+        "vsr.request.cancel_fetch".to_owned(),
+        hex(bytemuck::bytes_of(
+            &fetch_request
+                .deferred_cancellation()
+                .expect("a fetch has a cancellation"),
+        )),
+    );
     vectors.insert(
         "vsr.request.unknown_code".to_owned(),
         hex(bytemuck::bytes_of(&request_header(
@@ -933,6 +1243,22 @@ fn main() {
             5,
             99,
             &[],
+        ))),
+    );
+
+    let update_resource_payload = topic_update.to_bytes();
+    vectors.insert(
+        "payload.update_resource".to_owned(),
+        hex(&update_resource_payload),
+    );
+    vectors.insert(
+        "vsr.request.update_resource".to_owned(),
+        hex(bytemuck::bytes_of(&request_header(
+            UPDATE_RESOURCE_CODE,
+            client_id,
+            1,
+            99,
+            &update_resource_payload,
         ))),
     );
 
@@ -947,6 +1273,21 @@ fn main() {
         ..Default::default()
     };
     vectors.insert("vsr.reply.ok".to_owned(), hex(bytemuck::bytes_of(&reply)));
+    let mut committed = reply;
+    committed.reserved[0] = ReplyHeader::COMMITTED_RESULT;
+    vectors.insert(
+        "vsr.reply.committed".to_owned(),
+        hex(bytemuck::bytes_of(&committed)),
+    );
+    // The primary commits an `UpdateResource` under its scope's resolved
+    // operation, so the reply names that operation, not the request's.
+    let mut resolved = committed;
+    resolved.operation = Operation::UpdateTopicResolved;
+    resolved.size = (HEADER_SIZE + 4) as u32;
+    vectors.insert(
+        "vsr.reply.update_topic_resolved".to_owned(),
+        hex(bytemuck::bytes_of(&resolved)),
+    );
     let denied = ReplyHeader {
         command: Command::Reply,
         operation: Operation::NonReplicated,
@@ -1008,6 +1349,8 @@ fn main() {
             current_offset: 99,
             size_bytes: 1024,
             messages_count: 100,
+            members: vec![0, 1, 2],
+            in_sync_members: vec![0, 1],
         },
         PartitionResponse {
             context: Default::default(),
@@ -1017,6 +1360,8 @@ fn main() {
             current_offset: 0,
             size_bytes: 0,
             messages_count: 0,
+            members: vec![1, 2, 0],
+            in_sync_members: vec![],
         },
         PartitionResponse {
             context: Default::default(),
@@ -1026,6 +1371,8 @@ fn main() {
             current_offset: 7,
             size_bytes: 512,
             messages_count: 8,
+            members: vec![2, 0, 1],
+            in_sync_members: vec![2],
         },
     ];
     add(
@@ -1182,6 +1529,7 @@ fn main() {
         status: 1,
         username: name("admin"),
         options: WireOptions::empty(),
+        derived_options: WireOptions::empty(),
     };
     add(&mut vectors, "response.user", &user);
     add(
@@ -1212,6 +1560,7 @@ fn main() {
                     status: 2,
                     username: name("alice"),
                     options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
                 },
             ],
         },
@@ -1328,6 +1677,44 @@ fn main() {
             ],
         },
     );
+    let stream_created = WireMetadataChange::StreamCreated(WireStreamBody {
+        key: WireStreamKey {
+            stream_id: 3,
+            stream_created_op: 4121,
+        },
+        created_at: 1_760_356_800_123_456,
+        name: name("telemetry"),
+        options: WireChangeOptions::Readable {
+            explicit: WireOptions::empty(),
+            derived: WireOptions::empty(),
+        },
+    });
+    add(
+        &mut vectors,
+        "response.get_metadata_changes",
+        &GetMetadataChangesResponse {
+            status: WireMetadataChangeStatus::Ok,
+            phase: WireMetadataChangePhase::Changes,
+            log_id: Some(metadata_cursor().log_id),
+            oldest_op: 3871,
+            retained_since: 0,
+            head_op: 4190,
+            next: Some(metadata_cursor()),
+            has_more: false,
+            records: vec![WireMetadataChangeRecord {
+                op: 4121,
+                ordinal: 0,
+                checksum: 0xa5c1_f703_8b9e_3d65,
+                timestamp: 1_760_356_800_004_121,
+                actor_user_id: Some(0),
+                group: stream_created.group().as_u8(),
+                kind: stream_created.kind().as_u8(),
+                body: stream_created.body_bytes(),
+            }],
+            items: Vec::new(),
+            current_page_token: None,
+        },
+    );
     add(
         &mut vectors,
         "response.describe_options",
@@ -1336,13 +1723,29 @@ fn main() {
                 OptionDescriptor {
                     key: name("segment_size"),
                     kind: 12,
+                    flags: 0,
                     default_value: Bytes::copy_from_slice(&1_073_741_824u64.to_le_bytes()),
                     description: "Segment size".to_owned(),
                 },
                 OptionDescriptor {
                     key: name("durability"),
                     kind: 2,
+                    flags: 0,
                     default_value: Bytes::from_static(b"replicated"),
+                    description: String::new(),
+                },
+                OptionDescriptor {
+                    key: name("message_expiry"),
+                    kind: 12,
+                    flags: 0b11,
+                    default_value: Bytes::copy_from_slice(&u64::MAX.to_le_bytes()),
+                    description: String::new(),
+                },
+                OptionDescriptor {
+                    key: name("encryption_key"),
+                    kind: 1,
+                    flags: 0b1_0100,
+                    default_value: Bytes::new(),
                     description: String::new(),
                 },
             ],
@@ -1409,6 +1812,23 @@ fn main() {
         }
         .encode(&mut empty);
         vectors.insert("response.poll_messages.empty".to_owned(), hex(&empty));
+
+        // A batch of an idempotent producer.
+        let mut record = batch_record(7, 200, 7_000, 3_000, &[frame(21, 0, 0, b"k", &[])]);
+        let mut header = BatchHeader::decode(&record).expect("a batch header");
+        header.producer = Some(BatchProducer::new(4_000, 3, 17).expect("a producer"));
+        header.batch_checksum = calculate_batch_checksum(&header, &record[BATCH_HEADER_SIZE..]);
+        header.encode_into(&mut record[..BATCH_HEADER_SIZE]);
+        let mut produced = BytesMut::new();
+        PollMessagesResponseHeader {
+            context: Default::default(),
+            partition_id: 7,
+            current_offset: 200,
+            messages_count: 1,
+        }
+        .encode(&mut produced);
+        produced.put_slice(&record);
+        vectors.insert("response.poll_messages.producer".to_owned(), hex(&produced));
     }
     add(
         &mut vectors,
@@ -1419,33 +1839,6 @@ fn main() {
             view: 3,
             partitions_count: 4,
             primary_replica: 2,
-        },
-    );
-    add(
-        &mut vectors,
-        "response.poll_routing",
-        &PollRoutingResponse {
-            consumer_session: SessionIdentity {
-                client_id: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
-                session: 42,
-                metadata_watermark: 120,
-            },
-            context: PartitionContext {
-                incarnation: 7,
-                owner_generation: 3,
-                metadata_op: 110,
-            },
-            primary: ClusterNodeResponse {
-                replica_id: 2,
-                name: "node-3".to_owned(),
-                ip: "10.0.0.3".to_owned(),
-                tcp_port: 8092,
-                quic_port: 0,
-                http_port: 3002,
-                websocket_port: 0,
-                role: 1,
-                status: 0,
-            },
         },
     );
 
@@ -1464,6 +1857,7 @@ fn main() {
         messages_required_to_save: Some(7),
         size_of_messages_required_to_save: Some(IggyByteSize::from(4096)),
         preallocate_segments: Some(false),
+        replication_factor: Some(2),
         raw: BTreeMap::new(),
     };
     add(
@@ -1472,15 +1866,14 @@ fn main() {
         &create_options.to_wire().expect("encodes"),
     );
     let update_options = TopicUpdateOptions {
-        compression_algorithm: Some(CompressionAlgorithm::None),
         message_expiry: Some(IggyExpiry::NeverExpire),
         max_topic_size: Some(MaxTopicSize::Unlimited),
-        raw: BTreeMap::new(),
+        ..Default::default()
     };
     add(
         &mut vectors,
         "options.topic_update.full",
-        &update_options.to_wire().expect("encodes"),
+        &update_options.to_patch().expect("encodes").set,
     );
     let mut raw = BTreeMap::new();
     raw.insert("durability".to_owned(), "persisted".to_owned());
@@ -1492,6 +1885,11 @@ fn main() {
         &mut vectors,
         "options.topic_create.raw",
         &raw_options.to_wire().expect("encodes"),
+    );
+
+    vectors.insert(
+        "stream_key.fingerprint".to_owned(),
+        stream_key_fingerprint(&sample_key()).expect("32-byte key"),
     );
 
     let golden = Golden {

@@ -34,3 +34,32 @@ async fn hello_world(harness: &TestHarness) {
     client.ping().await.unwrap();
     client.logout_user().await.unwrap();
 }
+
+// The matrix varies the inner transport of ClientWrapper::Iggy.
+#[iggy_harness(test_client_transport = [Tcp, Http, Quic, WebSocket])]
+async fn nested_client_wrapper_forwards_results_and_errors(harness: &TestHarness) {
+    let client = harness.root_client().await.unwrap();
+    let name = "nested-wrapper";
+    let options = StreamCreateOptions::default();
+    let stream = client.create_stream(name, &options).await.unwrap();
+    let expected_error = client.create_stream(name, &options).await.unwrap_err();
+    let client = ClientWrapper::Iggy(client);
+    let stream_id = Identifier::numeric(stream.id).unwrap();
+
+    assert_eq!(
+        client.get_stream(&stream_id).await.unwrap().unwrap().name,
+        name
+    );
+    assert_eq!(
+        client
+            .create_stream(name, &options)
+            .await
+            .unwrap_err()
+            .to_string(),
+        expected_error.to_string()
+    );
+
+    client.delete_stream(&stream_id).await.unwrap();
+    assert!(client.get_stream(&stream_id).await.unwrap().is_none());
+    client.shutdown().await.unwrap();
+}

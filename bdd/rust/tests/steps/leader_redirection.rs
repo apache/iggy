@@ -180,7 +180,7 @@ async fn when_create_stream(world: &mut LeaderContext, stream_name: String) {
         .expect("Client should be available");
 
     let stream = client
-        .create_stream(&stream_name)
+        .create_stream(&stream_name, &StreamCreateOptions::default())
         .await
         .expect("Should be able to create stream");
 

@@ -20,13 +20,16 @@ import asyncio
 import pytest
 
 from apache_iggy import (
+    CommitPolicy,
     Consumer,
     Durability,
     IggyClient,
     Permissions,
     PollingStrategy,
+    PollOptions,
     SendMessage,
     StreamPermissions,
+    TopicOptions,
     TopicPermissions,
 )
 
@@ -41,6 +44,9 @@ PARTITION_ID = 0
 SEGMENT_SIZE = 1024 * 1024
 PAYLOAD_SIZE = 220_000
 MESSAGES_PER_SEALED_SEGMENT = 5
+# Each poll reads up to twelve PAYLOAD_SIZE messages in one reply, which the
+# default 1 MiB reply limit would split.
+POLL_MAX_BYTES = 4 * 1024 * 1024
 
 
 class TestSegmentManagement:
@@ -55,10 +61,11 @@ class TestSegmentManagement:
         await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
-            partitions_count=1,
-            segment_size=SEGMENT_SIZE,
-            durability=Durability.PERSISTED,
-            messages_required_to_save=1,
+            options=TopicOptions(
+                segment_size=SEGMENT_SIZE,
+                durability=Durability.PERSISTED,
+                messages_required_to_save=1,
+            ),
         )
         stream = await iggy_client.get_stream(stream_name)
         assert stream is not None
@@ -78,15 +85,14 @@ class TestSegmentManagement:
         # afterwards, so poll until the surviving offsets settle.
         for _ in range(100):
             polled = await iggy_client.poll_messages(
-                stream=stream_id,
-                topic=topic_id,
+                stream_id,
+                topic_id,
                 partition_id=PARTITION_ID,
                 consumer=Consumer.Single(99),
                 polling_strategy=PollingStrategy.First(),
-                count=100,
-                auto_commit=False,
+                options=PollOptions(count=100, max_bytes=POLL_MAX_BYTES),
             )
-            offsets = [message.offset() for message in polled]
+            offsets = [message.offset() for message in polled.messages]
             if offsets == list(range(5, 10)):
                 break
             await asyncio.sleep(0.1)
@@ -102,10 +108,11 @@ class TestSegmentManagement:
         await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
-            partitions_count=1,
-            segment_size=SEGMENT_SIZE,
-            durability=Durability.PERSISTED,
-            messages_required_to_save=1,
+            options=TopicOptions(
+                segment_size=SEGMENT_SIZE,
+                durability=Durability.PERSISTED,
+                messages_required_to_save=1,
+            ),
         )
         for _ in range(2 * MESSAGES_PER_SEALED_SEGMENT + 2):
             await iggy_client.send_messages(
@@ -121,15 +128,14 @@ class TestSegmentManagement:
 
         for _ in range(100):
             polled = await iggy_client.poll_messages(
-                stream=stream_name,
-                topic=topic_name,
+                stream_name,
+                topic_name,
                 partition_id=PARTITION_ID,
                 consumer=Consumer.Single(99),
                 polling_strategy=PollingStrategy.First(),
-                count=100,
-                auto_commit=False,
+                options=PollOptions(count=100, max_bytes=POLL_MAX_BYTES),
             )
-            offsets = [message.offset() for message in polled]
+            offsets = [message.offset() for message in polled.messages]
             if offsets == [10, 11]:
                 break
             await asyncio.sleep(0.1)
@@ -145,10 +151,11 @@ class TestSegmentManagement:
         await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
-            partitions_count=1,
-            segment_size=SEGMENT_SIZE,
-            durability=Durability.PERSISTED,
-            messages_required_to_save=1,
+            options=TopicOptions(
+                segment_size=SEGMENT_SIZE,
+                durability=Durability.PERSISTED,
+                messages_required_to_save=1,
+            ),
         )
         for _ in range(2 * MESSAGES_PER_SEALED_SEGMENT + 2):
             await iggy_client.send_messages(
@@ -160,29 +167,31 @@ class TestSegmentManagement:
         # Commit offset 5: the first sealed segment (offsets 0-4) is behind the
         # consumer and deletable, the second (offsets 5-9) is not.
         polled = await iggy_client.poll_messages(
-            stream=stream_name,
-            topic=topic_name,
+            stream_name,
+            topic_name,
             partition_id=PARTITION_ID,
             consumer=Consumer.Single(1),
             polling_strategy=PollingStrategy.First(),
-            count=MESSAGES_PER_SEALED_SEGMENT + 1,
-            auto_commit=True,
+            options=PollOptions(
+                count=MESSAGES_PER_SEALED_SEGMENT + 1,
+                max_bytes=POLL_MAX_BYTES,
+                commit=CommitPolicy.OnRead(),
+            ),
         )
-        assert [message.offset() for message in polled] == list(range(6))
+        assert [message.offset() for message in polled.messages] == list(range(6))
 
         await iggy_client.delete_segments(stream_name, topic_name, PARTITION_ID, 2)
 
         for _ in range(100):
             polled = await iggy_client.poll_messages(
-                stream=stream_name,
-                topic=topic_name,
+                stream_name,
+                topic_name,
                 partition_id=PARTITION_ID,
                 consumer=Consumer.Single(99),
                 polling_strategy=PollingStrategy.First(),
-                count=100,
-                auto_commit=False,
+                options=PollOptions(count=100, max_bytes=POLL_MAX_BYTES),
             )
-            offsets = [message.offset() for message in polled]
+            offsets = [message.offset() for message in polled.messages]
             if offsets == list(range(5, 12)):
                 break
             await asyncio.sleep(0.1)
@@ -198,10 +207,11 @@ class TestSegmentManagement:
         await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
-            partitions_count=1,
-            segment_size=SEGMENT_SIZE,
-            durability=Durability.PERSISTED,
-            messages_required_to_save=1,
+            options=TopicOptions(
+                segment_size=SEGMENT_SIZE,
+                durability=Durability.PERSISTED,
+                messages_required_to_save=1,
+            ),
         )
         for _ in range(MESSAGES_PER_SEALED_SEGMENT + 1):
             await iggy_client.send_messages(
@@ -217,15 +227,14 @@ class TestSegmentManagement:
         # act before checking that nothing was trimmed.
         await asyncio.sleep(1.5)
         polled = await iggy_client.poll_messages(
-            stream=stream_name,
-            topic=topic_name,
+            stream_name,
+            topic_name,
             partition_id=PARTITION_ID,
             consumer=Consumer.Single(99),
             polling_strategy=PollingStrategy.First(),
-            count=100,
-            auto_commit=False,
+            options=PollOptions(count=100, max_bytes=POLL_MAX_BYTES),
         )
-        assert [message.offset() for message in polled] == list(range(6))
+        assert [message.offset() for message in polled.messages] == list(range(6))
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("missing", ["stream", "topic", "partition"])
@@ -235,7 +244,7 @@ class TestSegmentManagement:
         stream_name = unique_name()
         topic_name = unique_name()
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(stream_name, topic_name, partitions_count=1)
+        await iggy_client.create_topic(stream_name, topic_name)
         missing_name = unique_name()
         stream_id = missing_name if missing == "stream" else stream_name
         topic_id = missing_name if missing == "topic" else topic_name
@@ -287,10 +296,8 @@ class TestSegmentManagement:
         topic_name = unique_name()
         other_topic_name = unique_name()
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(stream_name, topic_name, partitions_count=1)
-        await iggy_client.create_topic(
-            stream_name, other_topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream_name, topic_name)
+        await iggy_client.create_topic(stream_name, other_topic_name)
         stream = await iggy_client.get_stream(stream_name)
         assert stream is not None
         topic = await iggy_client.get_topic(stream.id, topic_name)

@@ -29,7 +29,6 @@ topics = ["test_topic"]
 schema = "avro"
 avro_schema_json = '{"type":"record","name":"Event","fields":[{"name":"id","type":"long"},{"name":"name","type":"string"}]}'
 batch_length = 10
-poll_interval = "5ms"
 consumer_group = "schema_tagging_sink_connector"
 
 [plugin_config]

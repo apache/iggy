@@ -24,15 +24,14 @@ import {
   isMetadata,
   isResultFramed,
   Operation,
-  operationForCode
+  operationForCode,
+  requestOperation
 } from './operation.js';
 
 const replicated = new Map<number, number>([
   [COMMAND_CODE.CreateStream, Operation.CreateStream],
-  [COMMAND_CODE.UpdateStream, Operation.UpdateStream],
   [COMMAND_CODE.DeleteStream, Operation.DeleteStream],
   [COMMAND_CODE.CreateTopic, Operation.CreateTopic],
-  [COMMAND_CODE.UpdateTopic, Operation.UpdateTopic],
   [COMMAND_CODE.DeleteTopic, Operation.DeleteTopic],
   [COMMAND_CODE.CreatePartitions, Operation.CreatePartitions],
   [COMMAND_CODE.DeletePartitions, Operation.DeletePartitions],
@@ -40,7 +39,6 @@ const replicated = new Map<number, number>([
   [COMMAND_CODE.CreateGroup, Operation.CreateConsumerGroup],
   [COMMAND_CODE.DeleteGroup, Operation.DeleteConsumerGroup],
   [COMMAND_CODE.CreateUser, Operation.CreateUser],
-  [COMMAND_CODE.UpdateUser, Operation.UpdateUser],
   [COMMAND_CODE.DeleteUser, Operation.DeleteUser],
   [COMMAND_CODE.ChangePassword, Operation.ChangePassword],
   [COMMAND_CODE.UpdatePermissions, Operation.UpdatePermissions],
@@ -48,6 +46,7 @@ const replicated = new Map<number, number>([
   [COMMAND_CODE.DeleteAccessToken, Operation.DeletePersonalAccessToken],
   [COMMAND_CODE.JoinGroup, Operation.JoinConsumerGroup],
   [COMMAND_CODE.LeaveGroup, Operation.LeaveConsumerGroup],
+  [COMMAND_CODE.UpdateResource, Operation.UpdateResource],
   [COMMAND_CODE.SendMessages, Operation.SendMessages],
   [COMMAND_CODE.StoreOffset, Operation.StoreConsumerOffset],
   [COMMAND_CODE.DeleteConsumerOffset, Operation.DeleteConsumerOffset]
@@ -86,10 +85,32 @@ describe('VSR operation classification', () => {
     assert.equal(isMetadata(Operation.CreateStream), true);
     assert.equal(isMetadata(Operation.LeaveConsumerGroup), true);
     assert.equal(isMetadata(Operation.DeleteSegments), false);
-    assert.equal(isMetadata(150), false);
+    assert.equal(isMetadata(Operation.UpdateResource), true);
+    assert.equal(isResultFramed(Operation.UpdateResource), true);
+    for (const resolved of [Operation.UpdateStreamResolved, Operation.UpdateTopicResolved,
+      Operation.UpdateUserResolved, Operation.RewrapStreamKeys]) {
+      assert.equal(isInternal(resolved), true);
+      assert.equal(isMetadata(resolved), true);
+      assert.equal(isResultFramed(resolved), true);
+    }
+    assert.equal(isMetadata(151), false);
     assert.equal(isResultFramed(Operation.StoreConsumerOffset), true);
     assert.equal(isResultFramed(Operation.DeleteConsumerOffset), true);
     assert.equal(isResultFramed(Operation.SendMessages), false);
+  });
+
+  it('maps a resolved committed operation back to the request operation', () => {
+    for (const [committed, request] of [
+      [Operation.CreateTopicWithAssignments, Operation.CreateTopic],
+      [Operation.CreatePartitionsWithAssignments, Operation.CreatePartitions],
+      [Operation.TruncatePartition, Operation.DeleteSegments],
+      [Operation.UpdateStreamResolved, Operation.UpdateResource],
+      [Operation.UpdateTopicResolved, Operation.UpdateResource],
+      [Operation.UpdateUserResolved, Operation.UpdateResource],
+      [Operation.RewrapStreamKeys, Operation.RewrapStreamKeys],
+      [Operation.CreateStream, Operation.CreateStream]
+    ])
+      assert.equal(requestOperation(committed), request);
   });
 
   it('recognizes only declared operation discriminants', () => {
@@ -99,7 +120,7 @@ describe('VSR operation classification', () => {
     assert.equal(isKnownOperation(Operation.FinalizeSession), true);
     assert.equal(isKnownOperation(Operation.RetireConsumerGroupOwners), true);
     assert.equal(isInternal(Operation.RetireConsumerGroupOwners), true);
-    for (const undeclared of [69, 127, 131, 135, 150, 159, 163, 164, 165, 170, 255])
+    for (const undeclared of [69, 76, 127, 129, 131, 133, 135, 142, 151, 159, 163, 164, 165, 170, 255])
       assert.equal(isKnownOperation(undeclared), false);
   });
 });

@@ -40,12 +40,13 @@ pub const DEFAULT_RESTART_STABILITY_TICKS: u64 = 500;
 /// Actions [`ActionWeights::uniform`] leaves at weight 0. Replacing a fixture
 /// changes what every partition-plane op on it can observe, and a fixture group
 /// join hands its partitions to a new owner, so only a preset that asks for them
-/// draws one.
+/// draws one. A poll needs a session, which only the shell path binds.
 const UNIFORM_EXCLUDED: &[Action] = &[
     Action::ReplaceFixtureTopic,
     Action::JoinFixtureGroup,
     Action::LeaveFixtureGroup,
     Action::StoreStaleOwnerOffset,
+    Action::PollMessages,
 ];
 
 /// Per-action sampling weights as percentages. Unlisted variants default
@@ -104,6 +105,20 @@ impl ActionWeights {
         ])
     }
 
+    /// Writes and offset reads over the fixture topics, as consumers and as the
+    /// fixture group, while clients join and leave that group so group reads meet
+    /// owner handoffs. Shell only: a poll needs a bound session.
+    #[must_use]
+    pub fn consumer() -> Self {
+        Self::new(&[
+            (Action::SendMessages, 40),
+            (Action::PollMessages, 30),
+            (Action::StoreConsumerOffset, 10),
+            (Action::JoinFixtureGroup, 12),
+            (Action::LeaveFixtureGroup, 8),
+        ])
+    }
+
     /// Metadata plane only, weighted so creates outrun deletes and the shadow keeps
     /// a live population to sample duplicate- and missing-target outcomes against.
     /// `DeleteSegments` is excluded: it resolves against partition state the
@@ -111,7 +126,8 @@ impl ActionWeights {
     #[must_use]
     pub fn metadata_only() -> Self {
         Self::new(&[
-            (Action::CreateStream, 12),
+            (Action::CreateStream, 9),
+            (Action::CreateKeyedStream, 3),
             (Action::UpdateStream, 10),
             (Action::DeleteStream, 6),
             (Action::CreateTopic, 12),

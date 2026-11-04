@@ -134,15 +134,16 @@ func (s basicMessagingSteps) whenPollMessages(
 	streamIdentifier, _ := iggcon.NewIdentifier(streamID)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicID)
 	uint32PartitionID := partitionID
+	options := iggcon.DefaultPollOptions()
+	options.Count = 100
 	polledMessages, err := c.client.PollMessages(
 		ctx,
 		streamIdentifier,
 		topicIdentifier,
+		uint32PartitionID,
 		consumer,
 		iggcon.OffsetPollingStrategy(startOffset),
-		100,
-		false,
-		&uint32PartitionID,
+		options,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to poll messages: %w", err)
@@ -228,7 +229,7 @@ func (s basicMessagingSteps) givenNoStreams(ctx context.Context) error {
 
 func (s basicMessagingSteps) whenCreateStream(ctx context.Context, streamName string) error {
 	c := getBasicMessagingCtx(ctx)
-	stream, err := c.client.CreateStream(ctx, streamName)
+	stream, err := c.client.CreateStream(ctx, streamName, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create stream: %w", err)
 	}
@@ -259,14 +260,12 @@ func (s basicMessagingSteps) whenCreateTopic(ctx context.Context,
 	partitionsCount uint32) error {
 	c := getBasicMessagingCtx(ctx)
 	streamIdentifier, _ := iggcon.NewIdentifier(streamID)
+	expiry := iggcon.IggyExpiryNeverExpire
 	topic, err := c.client.CreateTopic(
 		ctx,
 		streamIdentifier,
 		topicName,
-		partitionsCount,
-		iggcon.CompressionAlgorithmNone,
-		iggcon.IggyExpiryNeverExpire,
-		0,
+		&iggcon.TopicOptions{PartitionsCount: &partitionsCount, MessageExpiry: &expiry},
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create topic: %w", err)

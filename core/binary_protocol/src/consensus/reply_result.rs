@@ -59,8 +59,8 @@ fn read_u32(reply_body: &[u8], offset: usize) -> Option<u32> {
 /// caller treats `None` as malformed, never Ok ("classify never guesses").
 #[must_use]
 pub fn result_code(reply_body: &[u8]) -> Option<u32> {
-    let count = read_u32(reply_body, 0)?;
-    if count == 0 {
+    let section_len = result_section_len(reply_body)?;
+    if section_len == RESULT_COUNT_LEN {
         Some(0)
     } else {
         // First entry's `result` sits past the count and its leading index; a
@@ -80,8 +80,10 @@ pub fn result_code(reply_body: &[u8]) -> Option<u32> {
 /// guessed offset.
 #[must_use]
 pub fn result_section_len(reply_body: &[u8]) -> Option<usize> {
-    let count = read_u32(reply_body, 0)? as usize;
-    let len = RESULT_COUNT_LEN + count * RESULT_ENTRY_LEN;
+    let count = usize::try_from(read_u32(reply_body, 0)?).ok()?;
+    let len = count
+        .checked_mul(RESULT_ENTRY_LEN)?
+        .checked_add(RESULT_COUNT_LEN)?;
     (reply_body.len() >= len).then_some(len)
 }
 
@@ -157,5 +159,32 @@ mod tests {
         assert_eq!(result_section_len(&1u32.to_le_bytes()), None);
         assert_eq!(result_code(&[1, 0, 0, 0, 0, 0, 0, 0]), None); // result missing
         assert_eq!(result_section_len(&[1, 0, 0, 0, 0, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn given_truncated_result_entries_when_decoding_should_not_return_the_first_error() {
+        let mut body = rejection_body(1009);
+        body[..RESULT_COUNT_LEN].copy_from_slice(&2u32.to_le_bytes());
+        for missing_tail in [0, RESULT_ENTRY_LEN - 1] {
+            let mut truncated = body.clone();
+            truncated.extend(std::iter::repeat_n(0, missing_tail));
+            assert_eq!(result_code(&truncated), None);
+            assert_eq!(result_section_len(&truncated), None);
+        }
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&1010u32.to_le_bytes());
+        assert_eq!(result_code(&body), Some(1009));
+        assert_eq!(
+            result_section_len(&body),
+            Some(RESULT_COUNT_LEN + 2 * RESULT_ENTRY_LEN)
+        );
+    }
+
+    #[test]
+    fn given_maximum_result_count_when_body_is_short_should_reject_without_overflow() {
+        let mut body = rejection_body(1009);
+        body[..RESULT_COUNT_LEN].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(result_code(&body), None);
+        assert_eq!(result_section_len(&body), None);
     }
 }

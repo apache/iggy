@@ -243,9 +243,7 @@ class TestGetStreams:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         streams = await iggy_client.get_streams()
         listed = next(

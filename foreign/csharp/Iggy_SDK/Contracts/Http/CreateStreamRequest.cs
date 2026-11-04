@@ -15,6 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text.Json.Serialization;
+
 namespace Apache.Iggy.Contracts.Http;
 
-internal sealed record CreateStreamRequest(string Name);
+/// <summary>
+///     A stream create over REST. <paramref name="Options" /> holds option values as <see cref="OptionInputs" />
+///     renders them, and stays out of the body when there are none.
+/// </summary>
+internal sealed record CreateStreamRequest(
+    string Name,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    Dictionary<string, object>? Options);

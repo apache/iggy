@@ -33,9 +33,13 @@ async fn authentication(harness: &TestHarness) {
     authentication_scenario::run(harness).await;
 }
 
+// Placement spreads partition primaries over the nodes. The node the HTTP
+// client calls relays a request for another node's partition only when every
+// node verifies its bearer.
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
+        config_path = "tests/server/shared_jwt_secrets.toml",
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -55,9 +59,11 @@ async fn user(harness: &TestHarness) {
     user_scenario::run(harness).await;
 }
 
+// Same HTTP relay requirement as `system`.
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
+        config_path = "tests/server/shared_jwt_secrets.toml",
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )

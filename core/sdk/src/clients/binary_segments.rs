@@ -30,10 +30,6 @@ impl SegmentClient for IggyClient {
         partition_id: u32,
         segments_count: u32,
     ) -> Result<(), IggyError> {
-        self.client
-            .read()
-            .await
-            .delete_segments(stream_id, topic_id, partition_id, segments_count)
-            .await
+        super::with_client!(self, client => client.delete_segments(stream_id, topic_id, partition_id, segments_count).await)
     }
 }

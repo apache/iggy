@@ -724,6 +724,10 @@ where
                 self.on_message(message).await;
                 self.partition_io.continue_ready(namespace, incarnation);
             }
+            partitions::PartitionIoStep::PrimaryTransfer(request) => {
+                self.apply_primary_transfer(namespace, request).await;
+                self.partition_io.continue_ready(namespace, incarnation);
+            }
             partitions::PartitionIoStep::Progress => {
                 self.partition_io.continue_ready(namespace, incarnation);
             }
@@ -780,8 +784,10 @@ impl<SB> Drop for InterruptionMarker<SB> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, Ref, RefCell};
+    use std::collections::BTreeMap;
     use std::io;
+    use std::ops::RangeInclusive;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::Arc;
@@ -791,7 +797,8 @@ mod tests {
 
     use consensus::{
         ArtifactProgress, Consensus, DvcSuffix, LocalPipeline, PartitionsHandle, Pipeline, Plane,
-        Sequencer, StateArtifact, StateTransferStage, VsrAction, VsrConsensus, artifact_kind,
+        REPLICATION_BATCH_BYTES_MAX, ReplicationSend, Sequencer, StateArtifact, StateTransferStage,
+        TimeoutManager, VsrAction, VsrConsensus, artifact_kind,
     };
     use futures::FutureExt;
     use futures::channel::oneshot;
@@ -799,6 +806,8 @@ mod tests {
     use iggy_binary_protocol::primitives::consumer::WireConsumer;
     use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::users::CreateUserRequest;
+    use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
     use iggy_binary_protocol::{
         AckLevel, Command, CommitHeader, ConsensusHeader, DoViewChangeHeader, GenericHeader,
         Operation, PrepareHeader, PrepareOkHeader, RepairRangeReplyHeader, ReplyHeader,
@@ -816,10 +825,11 @@ mod tests {
     use journal::superblock::{SuperblockContents, SuperblockStore};
     use message_bus::{IggyMessageBus, MessageBus};
     use metadata::stm::stream::{Partition, Stream, Streams, StreamsInner, Topic};
-    use metadata::stm::user::Users;
+    use metadata::stm::user::{Users, UsersInner};
     use metadata::{IggyMetadata, MuxStateMachine};
     use partitions::state_transfer::{
-        PartitionArtifactSource, PartitionTransferSession, TransferArtifact,
+        LocalWork, PartitionArtifactSource, PartitionTransferSession, PrefixSeed, ReuseScanned,
+        StagedSegmentMeta, TransferArtifact,
     };
     use partitions::{
         IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionPathLayout,
@@ -836,6 +846,7 @@ mod tests {
     use crate::host::NoopHost;
     use crate::metrics::ShardMetrics;
     use crate::shards_table::{PapayaShardsTable, ShardsTable};
+    use crate::test_support::connect_replica_on;
     use crate::{
         IggyShard, LifecycleFrame, PARTITION_REPAIRS_INFLIGHT_MAX, PartitionConsensusConfig,
         REPAIR_GAP_DEBOUNCE_TICKS_MIN, Receiver, ReconcileOp, ReplicaTopology, ShardFrame,
@@ -918,12 +929,15 @@ mod tests {
                 };
                 owner.on_message(message).await;
                 let consensus = partitions.get_by_ns(&namespace).unwrap().consensus();
+                let drops = owner.metrics.partition_incarnation_mismatch_value(command);
                 if incoming == INCARNATION {
                     assert!(
                         consensus.view() > REPAIR_VIEW || consensus.commit_max() == NEXT_COMMIT,
                         "matching {command:?} did not reach consensus"
                     );
+                    assert_eq!(drops, 0, "matching {command:?} counted as a drop");
                 } else {
+                    assert_eq!(drops, 1, "foreign {command:?} not counted once");
                     assert_eq!(
                         consensus.view(),
                         REPAIR_VIEW,
@@ -952,7 +966,7 @@ mod tests {
                 captured.borrow_mut().push(frame);
                 Ok(())
             }));
-            assert!(bus.owner_table().try_claim(PEER, 1));
+            crate::test_support::connect_replica_on(&bus, PEER, 1);
             let group = if incarnation == 0 {
                 METADATA_GROUP
             } else {
@@ -974,6 +988,7 @@ mod tests {
                     commit: 0,
                     group,
                     suffix: DvcSuffix::empty(),
+                    untrusted_log: false,
                 },
                 VsrAction::SendRequestStartView { view, group },
                 VsrAction::SendStartView {
@@ -990,6 +1005,7 @@ mod tests {
                     commit: 0,
                     group,
                     timestamp_monotonic: 1,
+                    target: None,
                 },
             ];
             crate::dispatch_vsr_actions::<_, _, PrepareJournal>(&consensus, None, &actions).await;
@@ -1005,12 +1021,14 @@ mod tests {
                     1,
                     group,
                     consensus.partition_incarnation(),
+                    None,
                 )
                 .await;
             owner
                 .send_request_state_chunk(
                     consensus.cluster(),
                     consensus.replica(),
+                    *consensus.members(),
                     PEER,
                     1,
                     group,
@@ -1028,6 +1046,66 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_a_prepare_ok_from_outside_the_group_when_dispatched_should_drop_it() {
+        const OUTSIDER: u8 = 4;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let partitions = owner.plane.partitions();
+        partitions.remove(&namespace).unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            2,
+            namespace.inner(),
+            Rc::clone(&bus),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        partitions.insert(
+            namespace,
+            IggyPartition::with_in_memory_storage(
+                Arc::new(PartitionStats::default()),
+                consensus,
+                IggyByteSize::from(SEGMENT_BYTES),
+            ),
+        );
+        partitions
+            .on_request_with_reply(send_request(namespace, 1), None)
+            .await;
+        let prepare = partitions
+            .get_by_ns(&namespace)
+            .unwrap()
+            .consensus()
+            .pipeline_head_header()
+            .expect("the write is pipelined");
+        let ack = Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>()).transmute_header(
+            |_, ack: &mut PrepareOkHeader| {
+                ack.command = Command::PrepareOk;
+                ack.cluster = 1;
+                ack.replica = OUTSIDER;
+                ack.view = prepare.view;
+                ack.op = prepare.op;
+                ack.prepare_checksum = prepare.checksum;
+                ack.operation = prepare.operation;
+                ack.group = prepare.group;
+                ack.size = u32::try_from(size_of::<PrepareOkHeader>()).unwrap();
+                ack.seal();
+            },
+        );
+        owner.on_message(MessageBag::PrepareOk(ack)).await;
+        assert_eq!(
+            partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .consensus()
+                .pipeline_head_header(),
+            Some(prepare),
+            "an ack from a replica outside the group must not count"
+        );
+    }
+
+    #[compio::test]
     async fn given_a_partition_transfer_offer_when_serving_a_chunk_should_stamp_the_hosted_incarnation()
      {
         const INCARNATION: u64 = 7;
@@ -1041,12 +1119,31 @@ mod tests {
             captured.borrow_mut().push(frame);
             Ok(())
         }));
-        assert!(bus.owner_table().try_claim(REQUESTER, 1));
+        crate::test_support::connect_replica_on(&bus, REQUESTER, 1);
         let (mut owner, _sender) = test_owner(&bus, None);
         owner.partition_consensus.replica_count = 2;
         let namespace = IggyNamespace::new(0, 0, 0);
         let directory = tempfile::tempdir().unwrap();
         let partitions = owner.plane.partitions();
+        // The requester has to be a member of the group it pulls from.
+        partitions.remove(&namespace).unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            2,
+            namespace.inner(),
+            Rc::clone(&bus),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        partitions.insert(
+            namespace,
+            IggyPartition::with_in_memory_storage(
+                Arc::new(PartitionStats::default()),
+                consensus,
+                IggyByteSize::from(SEGMENT_BYTES),
+            ),
+        );
         let partition = partitions.get_mut_by_ns(&namespace).unwrap();
         partition.set_created_revision(INCARNATION);
         attach_segment_files(partition, directory.path(), false).await;
@@ -1057,6 +1154,30 @@ mod tests {
             });
         let (reply, replied) = consensus::oneshot_channel();
         partitions.on_request_with_reply(request, Some(reply)).await;
+        owner
+            .process_loopback(&mut crate::router::LoopbackRound::default())
+            .await;
+        let prepare = partitions
+            .get_by_ns(&namespace)
+            .unwrap()
+            .consensus()
+            .pipeline_head_header()
+            .expect("the write is pipelined");
+        let ack = Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>()).transmute_header(
+            |_, ack: &mut PrepareOkHeader| {
+                ack.command = Command::PrepareOk;
+                ack.cluster = 1;
+                ack.replica = REQUESTER;
+                ack.view = prepare.view;
+                ack.op = prepare.op;
+                ack.prepare_checksum = prepare.checksum;
+                ack.operation = prepare.operation;
+                ack.group = prepare.group;
+                ack.size = u32::try_from(size_of::<PrepareOkHeader>()).unwrap();
+                ack.seal();
+            },
+        );
+        owner.on_message(MessageBag::PrepareOk(ack)).await;
         owner
             .process_loopback(&mut crate::router::LoopbackRound::default())
             .await;
@@ -1111,6 +1232,443 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_a_served_snapshot_when_later_writes_overflow_the_ring_should_keep_its_repair_tail()
+     {
+        const NONCE: u128 = 1;
+        const OPS: u64 = 8;
+        const BUDGET: usize = 64 * 1024;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let targets = record_transfer_targets(&bus);
+        connect_replica_on(&bus, TRANSFER_REQUESTER, 1);
+        let (mut owner, _sender) = test_owner_with_repair_memory(
+            &bus,
+            None,
+            Some(Arc::new(partitions::RepairMemoryBudget::new(BUDGET))),
+        );
+        owner.partition_consensus.replica_count = TRANSFER_REQUESTER + 1;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let directory = tempfile::tempdir().unwrap();
+        let partitions = owner.plane.partitions();
+        serve_to_requester(&owner, &bus, namespace);
+        let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+        attach_segment_files(partition, directory.path(), false).await;
+        let journal = &partition.log.journal().inner;
+        journal.set_repair_retention(true);
+        journal.set_ring_caps(1, u64::MAX);
+        for op in 1..=OPS {
+            commit_acked_write(&owner, namespace, op).await;
+            if op == 1 {
+                owner
+                    .on_message(request_state_transfer(namespace, NONCE, SERVED_INCARNATION))
+                    .await;
+                assert_eq!(
+                    targets.borrow().last(),
+                    Some(&(namespace.inner(), NONCE, OFFERED))
+                );
+            }
+        }
+        let partition = partitions.get_by_ns(&namespace).unwrap();
+        // Flushing also exercises eviction after the offer's pinned cut.
+        partition
+            .log
+            .journal()
+            .inner
+            .evict_prefix(usize::try_from(OPS).unwrap());
+        let journal = &partition.log.journal().inner;
+        assert_eq!(journal.repair_retained_from(), Some(2));
+        for op in 2..=OPS {
+            assert!(
+                journal.repair_entry(op).is_some(),
+                "snapshot tail lost op {op}"
+            );
+        }
+        owner.ticks.set(9);
+        let repair = Message::<RequestPreparesHeader>::new(size_of::<RequestPreparesHeader>())
+            .transmute_header(|_, header: &mut RequestPreparesHeader| {
+                header.command = Command::RequestPrepares;
+                header.size = u32::try_from(size_of::<RequestPreparesHeader>()).unwrap();
+                header.cluster = 1;
+                header.group = namespace.inner();
+                header.replica = TRANSFER_REQUESTER;
+                header.partition_incarnation = SERVED_INCARNATION;
+                header.nonce = NONCE + 1;
+                header.from_op = 2;
+                header.to_op = OPS;
+                header.seal();
+            });
+        owner.on_message(MessageBag::RequestPrepares(repair)).await;
+        partition.expire_transfer_tails(10, 10);
+        assert_eq!(
+            journal.repair_retained_from(),
+            Some(2),
+            "active pull repair must renew the snapshot suffix"
+        );
+        partition.expire_transfer_tails(19, 10);
+        assert_eq!(journal.repair_retained_from(), Some(OPS));
+        owner
+            .on_message(request_state_transfer(namespace, NONCE, SERVED_INCARNATION))
+            .await;
+        assert_eq!(
+            targets.borrow().last(),
+            Some(&(namespace.inner(), NONCE, REFUSED))
+        );
+        assert_eq!(
+            owner.state_transfer_offers.borrow()[&(namespace.inner(), TRANSFER_REQUESTER)].nonce,
+            NONCE
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_large_transfer_artifact_when_requesting_a_range_should_read_only_that_range() {
+        const NONCE: u128 = 1;
+        const PREFIX: &[u8] = b"held prefix";
+        const SUFFIX: &[u8] = b"remaining segment";
+        const CHUNK_LEN: u32 = 4;
+        for offset in [0, PREFIX.len()] {
+            let bus = Rc::new(IggyMessageBus::new(0));
+            let sent = Rc::new(RefCell::new(Vec::new()));
+            let captured = Rc::clone(&sent);
+            bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+                captured.borrow_mut().push(frame);
+                Ok(())
+            }));
+            connect_replica_on(&bus, TRANSFER_REQUESTER, 1);
+            let (mut owner, _sender) = test_owner(&bus, None);
+            owner.partition_consensus.replica_count = TRANSFER_REQUESTER + 1;
+            let namespace = IggyNamespace::new(0, 0, 0);
+            serve_to_requester(&owner, &bus, namespace);
+            let directory = tempfile::tempdir().unwrap();
+            let log_path = directory.path().join("segment.log");
+            let mut bytes = [PREFIX, SUFFIX].concat();
+            bytes.resize(crate::STATE_CHUNK_LEN as usize + 1, 0);
+            let entry = StateArtifact::for_bytes(artifact_kind::SEGMENT_LOG, 0, &bytes);
+            let expected = bytes[offset..offset + CHUNK_LEN as usize].to_vec();
+            // Unrequested bytes need not be read to answer this chunk.
+            bytes[..offset].fill(0);
+            bytes.truncate(offset + CHUNK_LEN as usize);
+            std::fs::write(&log_path, &bytes).unwrap();
+            let offer = partitions::state_transfer::PartitionStateTransferOffer {
+                commit_op: 0,
+                segments: vec![partitions::state_transfer::SegmentArtifactSource {
+                    entry,
+                    log_path: log_path.to_str().unwrap().to_owned(),
+                }],
+                offsets: (
+                    StateArtifact::for_bytes(artifact_kind::CONSUMER_OFFSETS, 0, &[]),
+                    Rc::new(Vec::new()),
+                ),
+            };
+            owner.state_transfer_offers.borrow_mut().insert(
+                (namespace.inner(), TRANSFER_REQUESTER),
+                crate::ServedStateTransfer {
+                    nonce: NONCE,
+                    offer: crate::ServedOffer::Partition(Rc::new(offer)),
+                    idle_ticks: 0,
+                    fully_served: false,
+                },
+            );
+            let request =
+                Message::<RequestStateChunkHeader>::new(size_of::<RequestStateChunkHeader>())
+                    .transmute_header(|_, header: &mut RequestStateChunkHeader| {
+                        header.command = Command::RequestStateChunk;
+                        header.size = u32::try_from(size_of::<RequestStateChunkHeader>()).unwrap();
+                        header.cluster = 1;
+                        header.group = namespace.inner();
+                        header.replica = TRANSFER_REQUESTER;
+                        header.partition_incarnation = SERVED_INCARNATION;
+                        header.nonce = NONCE;
+                        header.offset = offset as u64;
+                        header.len = CHUNK_LEN;
+                        header.seal();
+                    });
+            owner
+                .on_message(MessageBag::RequestStateChunk(request))
+                .await;
+            assert!(
+                sent.borrow().is_empty(),
+                "the chunk goes out once its read lands"
+            );
+            owner.settle_served_reads().await;
+            let frames = sent.borrow();
+            assert_eq!(frames.len(), 1, "one reply for the requested chunk");
+            assert_eq!(
+                frames[0].as_slice()[std::mem::offset_of!(GenericHeader, command)],
+                Command::StateChunk as u8,
+                "the held prefix and unread tail must not be loaded"
+            );
+            let chunk =
+                Message::<StateChunkHeader>::try_from(Owned::copy_from_slice(frames[0].as_slice()))
+                    .unwrap();
+            assert_eq!(chunk.header().offset, offset as u64);
+            assert_eq!(chunk.body(), expected);
+            assert!(
+                !owner.state_transfer_offers.borrow()[&(namespace.inner(), TRANSFER_REQUESTER)]
+                    .fully_served
+            );
+        }
+    }
+
+    /// The offer can change while a chunk read runs. Bytes read for the
+    /// artifact of the old offer never answer the request or fill the cache:
+    /// the serve reads the artifact of the offer of now.
+    #[compio::test]
+    async fn given_a_chunk_read_when_the_offer_changes_before_it_lands_should_serve_the_new_artifact()
+     {
+        const NONCE: u128 = 1;
+        const OLD: &[u8] = b"old segment bytes";
+        const NEW: &[u8] = b"new segment bytes";
+        const CHUNK_LEN: u32 = 8;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&sent);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            captured.borrow_mut().push(frame);
+            Ok(())
+        }));
+        connect_replica_on(&bus, TRANSFER_REQUESTER, 1);
+        let (mut owner, _sender) = test_owner(&bus, None);
+        owner.partition_consensus.replica_count = TRANSFER_REQUESTER + 1;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        serve_to_requester(&owner, &bus, namespace);
+        let directory = tempfile::tempdir().unwrap();
+        let offer_of = |name: &str, bytes: &[u8]| {
+            let log_path = directory.path().join(name);
+            std::fs::write(&log_path, bytes).unwrap();
+            let offer = partitions::state_transfer::PartitionStateTransferOffer {
+                commit_op: 0,
+                segments: vec![partitions::state_transfer::SegmentArtifactSource {
+                    entry: StateArtifact::for_bytes(artifact_kind::SEGMENT_LOG, 0, bytes),
+                    log_path: log_path.to_str().unwrap().to_owned(),
+                }],
+                offsets: (
+                    StateArtifact::for_bytes(artifact_kind::CONSUMER_OFFSETS, 0, &[]),
+                    Rc::new(Vec::new()),
+                ),
+            };
+            crate::ServedStateTransfer {
+                nonce: NONCE,
+                offer: crate::ServedOffer::Partition(Rc::new(offer)),
+                idle_ticks: 0,
+                fully_served: false,
+            }
+        };
+        let offer_key = (namespace.inner(), TRANSFER_REQUESTER);
+        owner
+            .state_transfer_offers
+            .borrow_mut()
+            .insert(offer_key, offer_of("old.log", OLD));
+        let request = Message::<RequestStateChunkHeader>::new(size_of::<RequestStateChunkHeader>())
+            .transmute_header(|_, header: &mut RequestStateChunkHeader| {
+                header.command = Command::RequestStateChunk;
+                header.size = u32::try_from(size_of::<RequestStateChunkHeader>()).unwrap();
+                header.cluster = 1;
+                header.group = namespace.inner();
+                header.replica = TRANSFER_REQUESTER;
+                header.partition_incarnation = SERVED_INCARNATION;
+                header.nonce = NONCE;
+                header.len = CHUNK_LEN;
+                header.seal();
+            });
+
+        owner
+            .on_message(MessageBag::RequestStateChunk(request))
+            .await;
+        owner
+            .state_transfer_offers
+            .borrow_mut()
+            .insert(offer_key, offer_of("new.log", NEW));
+        owner.settle_served_reads().await;
+
+        let frames = sent.borrow();
+        assert_eq!(frames.len(), 1, "one reply for the requested chunk");
+        let chunk =
+            Message::<StateChunkHeader>::try_from(Owned::copy_from_slice(frames[0].as_slice()))
+                .unwrap();
+        assert_eq!(chunk.body(), &NEW[..CHUNK_LEN as usize]);
+    }
+
+    /// A request frame that fails the gates, here one with a stale partition
+    /// incarnation, must leave the parked request of its requester in place,
+    /// so the tick answers that request once its plan pins.
+    #[compio::test]
+    async fn given_a_parked_transfer_request_when_a_stale_request_arrives_should_answer_the_parked_one()
+     {
+        const PARKED_NONCE: u128 = 1;
+        const STALE_NONCE: u128 = 2;
+        const STALE_INCARNATION: u64 = SERVED_INCARNATION - 1;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let targets = record_transfer_targets(&bus);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let directory = tempfile::tempdir().unwrap();
+        let (owner, _sender) = serving_shard(&bus, &[namespace], directory.path()).await;
+        owner
+            .on_message(request_state_transfer(
+                namespace,
+                PARKED_NONCE,
+                SERVED_INCARNATION,
+            ))
+            .await;
+        assert_eq!(parked_nonce(&owner, namespace), Some(PARKED_NONCE));
+
+        owner
+            .on_message(request_state_transfer(
+                namespace,
+                STALE_NONCE,
+                STALE_INCARNATION,
+            ))
+            .await;
+
+        assert_eq!(
+            parked_nonce(&owner, namespace),
+            Some(PARKED_NONCE),
+            "a request that fails the gates must not replace the parked one"
+        );
+        pin_transfer_plans(&owner, &[namespace]).await;
+        owner.serve_parked_partition_transfer_requests().await;
+        assert_eq!(
+            *targets.borrow(),
+            [(namespace.inner(), PARKED_NONCE, OFFERED)],
+            "the tick must answer the parked request with its offer"
+        );
+    }
+
+    /// Two parked requests whose plans pin together at their bound must start
+    /// their offer builds on two ticks. One build reads and hashes up to a
+    /// whole round budget, and every timer of the shard waits for the tick
+    /// that runs it. The bound refuses only a request that still waits for its
+    /// pin, so the request that misses the bound tick builds on the next one.
+    #[compio::test]
+    async fn given_two_parked_transfer_requests_when_their_plans_pin_at_the_bound_should_answer_both_on_two_ticks()
+     {
+        const NONCE: u128 = 1;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let targets = record_transfer_targets(&bus);
+        let namespaces = [IggyNamespace::new(0, 0, 0), IggyNamespace::new(0, 0, 1)];
+        let directory = tempfile::tempdir().unwrap();
+        let (owner, _sender) = serving_shard(&bus, &namespaces, directory.path()).await;
+        for namespace in namespaces {
+            owner
+                .on_message(request_state_transfer(namespace, NONCE, SERVED_INCARNATION))
+                .await;
+        }
+        for _ in 1..PARKED_WAIT_TICKS {
+            owner.serve_parked_partition_transfer_requests().await;
+        }
+        assert!(targets.borrow().is_empty());
+        pin_transfer_plans(&owner, &namespaces).await;
+
+        owner.serve_parked_partition_transfer_requests().await;
+        assert_eq!(
+            *targets.borrow(),
+            [(namespaces[0].inner(), NONCE, OFFERED)],
+            "the bound tick must start one offer build"
+        );
+        assert_eq!(parked_nonce(&owner, namespaces[1]), Some(NONCE));
+        owner.serve_parked_partition_transfer_requests().await;
+
+        assert_eq!(
+            *targets.borrow(),
+            [
+                (namespaces[0].inner(), NONCE, OFFERED),
+                (namespaces[1].inner(), NONCE, OFFERED),
+            ],
+            "the request that missed the bound tick must get its offer, not a refusal"
+        );
+    }
+
+    /// A parked request whose plan does not pin must get one transient refusal
+    /// at its bound, before the requester re-sends and burns a stall retry.
+    /// The build slot stays claimed, as for any resumable refusal.
+    #[compio::test]
+    async fn given_a_parked_transfer_request_when_its_plan_does_not_pin_should_refuse_it_at_the_bound()
+     {
+        const NONCE: u128 = 1;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let targets = record_transfer_targets(&bus);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let directory = tempfile::tempdir().unwrap();
+        let (owner, _sender) = serving_shard(&bus, &[namespace], directory.path()).await;
+        owner
+            .on_message(request_state_transfer(namespace, NONCE, SERVED_INCARNATION))
+            .await;
+        assert_eq!(parked_nonce(&owner, namespace), Some(NONCE));
+        assert!(
+            owner
+                .partition_offer_builds
+                .borrow()
+                .contains_key(&namespace.inner())
+        );
+
+        for _ in 1..PARKED_WAIT_TICKS {
+            owner.serve_parked_partition_transfer_requests().await;
+        }
+        assert!(
+            targets.borrow().is_empty(),
+            "the request must wait its whole bound"
+        );
+        owner.serve_parked_partition_transfer_requests().await;
+
+        assert_eq!(*targets.borrow(), [(namespace.inner(), NONCE, REFUSED)]);
+        assert_eq!(parked_nonce(&owner, namespace), None);
+        assert!(
+            owner
+                .partition_offer_builds
+                .borrow()
+                .contains_key(&namespace.inner()),
+            "the build slot must stay claimed for the next request"
+        );
+    }
+
+    /// A re-send of a parked request keeps the wait of its nonce, so re-sends
+    /// cannot hold the build slot past the bound. A request with a new nonce
+    /// replaces the parked one and waits a whole bound of its own.
+    #[compio::test]
+    async fn given_a_parked_transfer_request_when_it_is_re_sent_should_refuse_it_at_the_bound_of_its_nonce()
+     {
+        const NONCE: u128 = 1;
+        const NEW_NONCE: u128 = 2;
+        const RE_SENT_AT: u32 = PARKED_WAIT_TICKS / 2;
+        for (re_sent, refused_at) in [
+            (NONCE, PARKED_WAIT_TICKS),
+            (NEW_NONCE, RE_SENT_AT + PARKED_WAIT_TICKS),
+        ] {
+            let bus = Rc::new(IggyMessageBus::new(0));
+            let targets = record_transfer_targets(&bus);
+            let namespace = IggyNamespace::new(0, 0, 0);
+            let directory = tempfile::tempdir().unwrap();
+            let (owner, _sender) = serving_shard(&bus, &[namespace], directory.path()).await;
+            owner
+                .on_message(request_state_transfer(namespace, NONCE, SERVED_INCARNATION))
+                .await;
+            for _ in 0..RE_SENT_AT {
+                owner.serve_parked_partition_transfer_requests().await;
+            }
+            owner
+                .on_message(request_state_transfer(
+                    namespace,
+                    re_sent,
+                    SERVED_INCARNATION,
+                ))
+                .await;
+
+            for _ in RE_SENT_AT + 1..refused_at {
+                owner.serve_parked_partition_transfer_requests().await;
+            }
+            assert!(
+                targets.borrow().is_empty(),
+                "nonce {re_sent} must wait until tick {refused_at}"
+            );
+            owner.serve_parked_partition_transfer_requests().await;
+
+            assert_eq!(
+                *targets.borrow(),
+                [(namespace.inner(), re_sent, REFUSED)],
+                "nonce {re_sent} must get its refusal at tick {refused_at}"
+            );
+        }
+    }
+
+    #[compio::test]
     async fn given_a_partition_incarnation_when_foreign_repair_or_transfer_requests_arrive_should_not_reply()
      {
         const INCARNATION: u64 = 7;
@@ -1131,7 +1689,7 @@ mod tests {
                     captured.borrow_mut().push(frame);
                     Ok(())
                 }));
-                assert!(bus.owner_table().try_claim(REQUESTER, 1));
+                crate::test_support::connect_replica_on(&bus, REQUESTER, 1);
                 let (mut owner, _sender) = test_owner(&bus, None);
                 owner.partition_consensus.replica_count = 3;
                 let partitions = owner.plane.partitions();
@@ -1219,7 +1777,7 @@ mod tests {
                     captured.borrow_mut().push(frame);
                     Ok(())
                 }));
-                assert!(bus.owner_table().try_claim(REPAIR_PRIMARY, 1));
+                crate::test_support::connect_replica_on(&bus, REPAIR_PRIMARY, 1);
                 let (mut owner, _sender) = test_owner(&bus, None);
                 owner.partition_consensus.replica_count = 3;
                 let partitions = owner.plane.partitions();
@@ -1251,6 +1809,10 @@ mod tests {
                         })],
                         target_accepted: command == Command::StateChunk,
                         idle_ticks: IDLE_TICKS,
+                        spill: None,
+                        scan: None,
+                        seed: None,
+                        pulled_len: 0,
                     });
                 }
                 partitions.insert(namespace, partition);
@@ -2096,7 +2658,7 @@ mod tests {
             Ok(())
         }));
         for replica in 1..3 {
-            assert!(bus.owner_table().try_claim(replica, 1));
+            crate::test_support::connect_replica_on(&bus, replica, 1);
         }
         let (owner, _sender) = test_owner(&bus, None);
         let partitions = owner.plane.partitions();
@@ -2122,6 +2684,8 @@ mod tests {
             owner.partition_io.notifier(),
             owner.partition_io.limits.bytes_max(),
         );
+        // A vote two views ahead shows that replica 1 left view 0, so even its
+        // primary joins the vote and enters the view change.
         let message = Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>())
             .transmute_header(|_, header: &mut StartViewChangeHeader| {
                 header.command = Command::StartViewChange;
@@ -2129,7 +2693,7 @@ mod tests {
                 header.cluster = 1;
                 header.group = namespace.inner();
                 header.replica = 1;
-                header.view = 1;
+                header.view = 2;
                 header.seal();
             });
         owner.on_start_view_change(message).await;
@@ -2369,6 +2933,10 @@ mod tests {
                     })],
                     target_accepted: true,
                     idle_ticks: 0,
+                    spill: None,
+                    scan: None,
+                    seed: None,
+                    pulled_len: 0,
                 });
 
                 owner
@@ -2476,6 +3044,8 @@ mod tests {
                     floor: None,
                     peer: 1,
                     idle_ticks: 0,
+                    floor_pulled_from: 0,
+                    requested_from: Some(1),
                 });
                 let reply =
                     Message::<RepairRangeReplyHeader>::new(size_of::<RepairRangeReplyHeader>())
@@ -2548,6 +3118,8 @@ mod tests {
             floor: None,
             peer: 0,
             idle_ticks: 0,
+            floor_pulled_from: 0,
+            requested_from: Some(1),
         });
         assert_eq!(
             partition.complete_repair(partitions.config()).await,
@@ -2726,6 +3298,8 @@ mod tests {
             .get_io_owner(&identity.namespace)
             .unwrap();
         assert!(partition.fatal().is_some());
+        assert!(!partition.needs_persistence_checkpoint());
+        assert!(owner.tick_partitions(&mut Vec::new()).await.is_some());
         assert!(partition.capture_teardown().drain().await.is_err());
         assert_eq!(owner.partition_io.counters.active.get(), 0);
         assert_eq!(owner.partition_io.counters.quarantined.get(), 1);
@@ -3192,7 +3766,9 @@ mod tests {
                 fetch_to_op: commit_max,
                 floor: None,
                 peer: 0,
+                floor_pulled_from: 0,
                 idle_ticks: 0,
+                requested_from: Some(1),
             });
             owner.plane.partitions().insert(namespace, partition);
 
@@ -3361,15 +3937,13 @@ mod tests {
     }
 
     /// Each peer that the ring reaches gets the whole budget, and the
-    /// rotations add up until the ring is spent. The ring prefers the
-    /// primary, so in a group of five the session alternates between the
-    /// primary and one backup, and the rotations, not the distinct peers,
-    /// spend the ring.
+    /// rotations add up until the ring is spent. The walk steps around the
+    /// ring from the primary, so in a group of five every other replica gets
+    /// one session before the fourth spends the ring. Stepping back to the
+    /// primary after each backup alternated between two of them.
     #[compio::test]
     async fn given_rotated_session_when_new_peer_spends_its_budget_should_rotate_again() {
         const GROUP_OF_FIVE: u8 = 5;
-        /// The ring's next replica after the primary, skipping this backup.
-        const NEXT_BACKUP: u8 = REPAIR_BACKUP + 1;
         let bus = Rc::new(IggyMessageBus::new(0));
         let (owner, _sender) = test_owner(&bus, None);
         owner.set_repair_retry_ticks(1);
@@ -3388,7 +3962,10 @@ mod tests {
 
         let budget = REPAIR_MAX_STALL_RETRIES as usize;
         let mut expected = vec![(Some(REPAIR_PRIMARY), None); budget];
-        for peer in [NEXT_BACKUP, REPAIR_PRIMARY, NEXT_BACKUP] {
+        let ring_after_primary = (1..GROUP_OF_FIVE)
+            .map(|step| (REPAIR_PRIMARY + step) % GROUP_OF_FIVE)
+            .filter(|&peer| peer != REPAIR_BACKUP);
+        for peer in ring_after_primary {
             expected.extend(vec![(Some(peer), None); budget + 1]);
         }
         expected.push((None, Some(REPAIR_PRIMARY)));
@@ -3396,7 +3973,7 @@ mod tests {
 
         assert_eq!(
             observed, expected,
-            "each peer must spend a whole budget until the fourth session spends the ring"
+            "each other replica must spend a whole budget until the fourth session spends the ring"
         );
     }
 
@@ -3484,7 +4061,9 @@ mod tests {
             let mut observed = stall_rounds(&owner, namespace, budget + 1).await;
             let backup = partitions.get_mut_by_ns(&namespace).unwrap();
             match progress {
-                Progress::Frame => backup.apply_repaired_prepare(above_hole).await,
+                Progress::Frame => {
+                    backup.apply_repaired_prepare(above_hole).await;
+                }
                 // A transfer stage is one of the pauses.
                 Progress::PausedFrame => {
                     let op = above_hole.header().op;
@@ -3518,16 +4097,28 @@ mod tests {
         }
     }
 
-    /// A spent ring that cannot convert keeps rotating at the pace of the
+    /// A spent ring that cannot convert never arms a transfer. A primary has no
+    /// primary to transfer from, so it keeps rotating at the pace of the
     /// budget, one rotation per spent budget. A backup with a scheduled re-arm
-    /// waits for it, and a primary has no primary to transfer from.
+    /// leaves recovery to the re-arm, so its spent session ends without a
+    /// successor.
     #[compio::test]
-    async fn given_ring_that_cannot_convert_when_ring_is_spent_should_rotate_once_per_budget() {
+    async fn given_ring_that_cannot_convert_when_ring_is_spent_should_never_arm_a_transfer() {
         const REARM_BACKOFF_TICKS: u32 = 1024;
         let budget = REPAIR_MAX_STALL_RETRIES as usize;
-        for (case, replica, peer) in [
-            ("a backup waiting to re-arm", REPAIR_BACKUP, REPAIR_PRIMARY),
-            ("a primary", REPAIR_PRIMARY, REPAIR_BACKUP),
+        for (case, replica, peer, successor) in [
+            (
+                "a backup waiting to re-arm",
+                REPAIR_BACKUP,
+                REPAIR_PRIMARY,
+                None,
+            ),
+            (
+                "a primary",
+                REPAIR_PRIMARY,
+                REPAIR_BACKUP,
+                Some(REPAIR_NEXT_PEER),
+            ),
         ] {
             let bus = Rc::new(IggyMessageBus::new(0));
             let (owner, _sender) = test_owner(&bus, None);
@@ -3550,15 +4141,257 @@ mod tests {
             owner.plane.partitions().insert(namespace, partition);
 
             let mut expected = vec![(Some(peer), None); budget];
-            expected.extend(vec![(Some(REPAIR_NEXT_PEER), None); budget + 1]);
-            expected.push((Some(peer), None));
+            expected.extend(vec![(successor, None); budget + 1]);
+            expected.push((successor.map(|_| peer), None));
             let observed = stall_rounds(&owner, namespace, expected.len()).await;
 
             assert_eq!(
                 observed, expected,
-                "{case} must rotate once per spent budget and never arm a transfer"
+                "{case} must rotate only without a scheduled re-arm and never arm a transfer"
             );
         }
+    }
+
+    /// A prefix read that has not landed by its bound is asked to stop. The
+    /// pull waits until the read lands, so the read frees its artifact buffer
+    /// before the pull fetches the whole artifact into a new one. The pull
+    /// then asks for the whole artifact while the serving offer still lives
+    /// and burns no retry of the peer. From then on the stall sweep runs as
+    /// for any pull.
+    #[compio::test]
+    async fn given_a_prefix_read_that_does_not_land_by_its_bound_when_it_lands_should_pull_the_artifact_whole()
+     {
+        const INCARNATION: u64 = 7;
+        const NONCE: u128 = 7;
+        const RETRY_TICKS: u32 = 2;
+        const OFFSETS: &[u8] = b"offsets";
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&requests);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            let message =
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            if message.header().command == Command::RequestStateChunk {
+                let request = Message::<RequestStateChunkHeader>::try_from(Owned::copy_from_slice(
+                    frame.as_slice(),
+                ))
+                .unwrap();
+                let header = request.header();
+                captured
+                    .borrow_mut()
+                    .push((header.artifact, header.offset, header.len));
+            }
+            Ok(())
+        }));
+        connect_replica_on(&bus, REPAIR_PRIMARY, 1);
+        let (owner, _sender) = test_owner(&bus, None);
+        owner.set_repair_retry_ticks(RETRY_TICKS);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let directory = tempfile::tempdir().unwrap();
+        let segment = send_request(namespace, 1).body().to_vec();
+        let partitions = owner.plane.partitions();
+        partitions.remove(&namespace).unwrap();
+        let mut partition =
+            repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+        partition.repair = None;
+        partition.set_created_revision(INCARNATION);
+        partition.set_partition_dir(directory.path().to_str().unwrap().to_owned());
+        partition
+            .consensus()
+            .set_state_transfer_stage(StateTransferStage::AwaitingTarget);
+        partition
+            .consensus()
+            .set_state_transfer_stage(StateTransferStage::Fetching);
+        partition.transfer = Some(PartitionTransferSession {
+            nonce: NONCE,
+            peer: REPAIR_PRIMARY,
+            commit_op: 0,
+            artifacts: vec![
+                TransferArtifact::Pending(ArtifactProgress {
+                    entry: StateArtifact::for_bytes(artifact_kind::SEGMENT_LOG, 0, &segment),
+                    buf: Vec::new(),
+                }),
+                TransferArtifact::Pending(ArtifactProgress {
+                    entry: StateArtifact::for_bytes(artifact_kind::CONSUMER_OFFSETS, 0, OFFSETS),
+                    buf: Vec::new(),
+                }),
+            ],
+            target_accepted: true,
+            idle_ticks: 0,
+            spill: None,
+            scan: None,
+            seed: Some(PrefixSeed::Reading {
+                artifact: 0,
+                read: LocalWork::default(),
+            }),
+            pulled_len: 0,
+        });
+        partitions.insert(namespace, partition);
+        let bound = RETRY_TICKS * crate::STATE_TRANSFER_OFFER_EXPIRY_MULTIPLE
+            / crate::LOCAL_WORK_WAIT_DIVISOR;
+        let whole = (0, 0, u32::try_from(segment.len()).unwrap());
+
+        stall_rounds(&owner, namespace, bound as usize).await;
+        assert!(
+            requests.borrow().is_empty(),
+            "the pull must wait for its read"
+        );
+        let read = || {
+            let Some(PrefixSeed::Reading { read, .. }) = &partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .transfer
+                .as_ref()
+                .unwrap()
+                .seed
+            else {
+                panic!("the session must keep the read until it lands");
+            };
+            read
+        };
+        assert!(!read().stop(), "the bound must ask the read to stop");
+        stall_rounds(&owner, namespace, RETRY_TICKS as usize).await;
+        assert!(
+            requests.borrow().is_empty(),
+            "the pull must not fetch the artifact while the stopped read holds its buffer"
+        );
+        *read().result.borrow_mut() = Some(Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "the transfer gave up this prefix read",
+        )));
+        stall_rounds(&owner, namespace, 1).await;
+        assert_eq!(
+            *requests.borrow(),
+            [whole],
+            "the pull must ask for the whole artifact once the read lands"
+        );
+        assert_eq!(
+            partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .transfer_attempts(),
+            0,
+            "a slow local read must not burn a retry of the peer"
+        );
+        stall_rounds(&owner, namespace, RETRY_TICKS as usize).await;
+        assert_eq!(
+            (
+                requests.borrow().clone(),
+                partitions
+                    .get_by_ns(&namespace)
+                    .unwrap()
+                    .transfer_attempts()
+            ),
+            (vec![whole, whole], 1),
+            "the stall sweep must re-request the whole artifact after the bound"
+        );
+
+        let size = size_of::<StateChunkHeader>() + segment.len();
+        let mut chunk = Message::<StateChunkHeader>::new(size);
+        chunk.as_mut_slice()[size_of::<StateChunkHeader>()..].copy_from_slice(&segment);
+        let chunk = chunk.transmute_header(|_, header: &mut StateChunkHeader| {
+            header.command = Command::StateChunk;
+            header.size = u32::try_from(size).unwrap();
+            header.cluster = 1;
+            header.group = namespace.inner();
+            header.replica = REPAIR_PRIMARY;
+            header.partition_incarnation = INCARNATION;
+            header.nonce = NONCE;
+            header.seal();
+        });
+        owner.on_message(MessageBag::StateChunk(chunk)).await;
+        settle_transfer_spill(&owner, namespace).await;
+
+        let session = partitions
+            .get_by_ns(&namespace)
+            .unwrap()
+            .transfer
+            .as_ref()
+            .unwrap();
+        assert!(
+            matches!(session.artifacts[0], TransferArtifact::Staged(_)),
+            "the whole pull must stage the artifact"
+        );
+        assert_eq!(
+            requests.borrow().last(),
+            Some(&(1, 0, u32::try_from(OFFSETS.len()).unwrap())),
+            "the session must go on to its next artifact"
+        );
+    }
+
+    /// The I/O turn that hands a landed prefix read to the pull leaves the
+    /// ready queue. The partition takes another turn, so I/O work that the
+    /// read went ahead of does not wait for the next notification.
+    #[compio::test]
+    async fn given_a_landed_prefix_read_when_its_turn_resumes_the_pull_should_keep_the_partition_ready()
+     {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        bus.set_replica_forward_fn(Box::new(|_, _, _| Ok(())));
+        connect_replica_on(&bus, REPAIR_PRIMARY, 1);
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let partitions = owner.plane.partitions();
+        partitions.remove(&namespace).unwrap();
+        let mut partition =
+            repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+        partition.repair = None;
+        partition
+            .consensus()
+            .set_state_transfer_stage(StateTransferStage::AwaitingTarget);
+        partition
+            .consensus()
+            .set_state_transfer_stage(StateTransferStage::Fetching);
+        partition.transfer = Some(PartitionTransferSession {
+            nonce: 1,
+            peer: REPAIR_PRIMARY,
+            commit_op: 0,
+            artifacts: vec![TransferArtifact::Pending(ArtifactProgress {
+                entry: StateArtifact::for_bytes(artifact_kind::SEGMENT_LOG, 0, b"segment"),
+                buf: Vec::new(),
+            })],
+            target_accepted: true,
+            idle_ticks: 0,
+            spill: None,
+            scan: None,
+            seed: Some(PrefixSeed::Reading {
+                artifact: 0,
+                read: LocalWork {
+                    result: Rc::new(RefCell::new(Some(Err(io::Error::other("the read failed"))))),
+                    ..LocalWork::default()
+                },
+            }),
+            pulled_len: 0,
+        });
+        partitions.insert(namespace, partition);
+        partitions.set_io_notifier(
+            owner.partition_io.notifier(),
+            owner.partition_io.limits.bytes_max(),
+        );
+        while let Some((ready, incarnation)) = owner.partition_io.head() {
+            owner.partition_io.pop_ready(ready, incarnation);
+        }
+        let incarnation = partitions.get_io_owner(&namespace).unwrap().incarnation();
+        partitions.get_io_owner(&namespace).unwrap().notify_io();
+
+        owner.service_partition_io().await;
+
+        assert!(
+            partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .transfer
+                .as_ref()
+                .unwrap()
+                .seed
+                .is_none(),
+            "the turn must hand the landed read to the pull"
+        );
+        assert_eq!(
+            owner.partition_io.head(),
+            Some((namespace, incarnation)),
+            "the partition must keep a turn for the work that the read went ahead of"
+        );
     }
 
     /// A spent ring rotates as before, here dropping the session of a group
@@ -3566,6 +4399,213 @@ mod tests {
     /// backoff, a busy stage belongs to the transfer in flight, a session can
     /// outlive its stage when an election clears the stage, and a transfer
     /// carries no uncommitted suffix.
+    /// A reuse scan that outlives its bound is asked to stop. The pull still
+    /// waits until the task lands, because the scan writes the staging names
+    /// that the pull spills to. It then fetches every segment that the scan did
+    /// not reuse and finishes. The wait burns no retry of the peer.
+    #[compio::test]
+    async fn given_a_reuse_scan_that_does_not_land_by_its_bound_when_it_lands_should_pull_the_rest_and_finish()
+     {
+        let receiver = scanning_receiver();
+        let bound = SCANNING_RETRY_TICKS * crate::STATE_TRANSFER_OFFER_EXPIRY_MULTIPLE
+            / crate::LOCAL_WORK_WAIT_DIVISOR;
+        let partitions = receiver.owner.plane.partitions();
+        let session = || {
+            partitions
+                .get_by_ns(&receiver.namespace)
+                .unwrap()
+                .transfer
+                .as_ref()
+        };
+
+        stall_rounds(&receiver.owner, receiver.namespace, bound as usize).await;
+        assert!(
+            receiver.requests.borrow().is_empty(),
+            "the pull must wait for its scan"
+        );
+        let scan = session().unwrap().scan.as_ref().unwrap();
+        assert!(!scan.stop(), "the bound must ask the scan to stop");
+        *scan.result.borrow_mut() = Some(ReuseScanned::default());
+        stall_rounds(&receiver.owner, receiver.namespace, 1).await;
+        assert_eq!(
+            *receiver.requests.borrow(),
+            [(0, 0, u32::try_from(receiver.segment.len()).unwrap())],
+            "the pull must fetch the segment that the scan did not reuse"
+        );
+        receiver
+            .owner
+            .on_message(MessageBag::StateChunk(receiver.chunk(0, &receiver.segment)))
+            .await;
+        settle_transfer_spill(&receiver.owner, receiver.namespace).await;
+        receiver
+            .owner
+            .on_message(MessageBag::StateChunk(receiver.chunk(1, SCANNING_OFFSETS)))
+            .await;
+
+        assert_eq!(
+            receiver.requests.borrow().last(),
+            Some(&(1, 0, u32::try_from(SCANNING_OFFSETS.len()).unwrap())),
+        );
+        assert!(
+            session().is_none(),
+            "the session must finish its pull and hand it to the install"
+        );
+        assert_eq!(
+            partitions
+                .get_by_ns(&receiver.namespace)
+                .unwrap()
+                .transfer_attempts(),
+            0,
+            "a slow scan must not burn a retry of the peer"
+        );
+    }
+
+    #[compio::test]
+    async fn given_local_transfer_work_when_ticks_pass_should_refresh_the_same_offer() {
+        let receiver = scanning_receiver();
+        stall_rounds(
+            &receiver.owner,
+            receiver.namespace,
+            3 * SCANNING_RETRY_TICKS as usize,
+        )
+        .await;
+
+        assert_eq!(
+            *receiver.offer_requests.borrow(),
+            [(
+                receiver.namespace.inner(),
+                SCANNING_INCARNATION,
+                SCANNING_NONCE
+            ); 3],
+            "local work must renew the accepted offer instead of minting a new session"
+        );
+        assert_eq!(
+            receiver
+                .owner
+                .plane
+                .partitions()
+                .get_by_ns(&receiver.namespace)
+                .unwrap()
+                .transfer_attempts(),
+            0,
+            "waiting for local I/O must not spend the peer's retry budget"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_completed_artifact_when_receiving_its_last_chunk_should_queue_staging() {
+        let receiver = scanning_receiver();
+        let partitions = receiver.owner.plane.partitions();
+        *partitions
+            .get_by_ns(&receiver.namespace)
+            .unwrap()
+            .transfer
+            .as_ref()
+            .unwrap()
+            .scan
+            .as_ref()
+            .unwrap()
+            .result
+            .borrow_mut() = Some(ReuseScanned::default());
+        receiver
+            .owner
+            .on_partition_transfer_progress(receiver.namespace.inner())
+            .await;
+
+        receiver
+            .owner
+            .on_message(MessageBag::StateChunk(receiver.chunk(0, &receiver.segment)))
+            .await;
+
+        assert!(
+            !receiver
+                .directory
+                .path()
+                .join("00000000000000000000.log.staging")
+                .exists(),
+            "receiving a chunk must return before staging I/O runs on the shard pump"
+        );
+        settle_transfer_spill(&receiver.owner, receiver.namespace).await;
+        assert!(matches!(
+            partitions
+                .get_by_ns(&receiver.namespace)
+                .unwrap()
+                .transfer
+                .as_ref()
+                .unwrap()
+                .artifacts[0],
+            TransferArtifact::Staged(_)
+        ));
+    }
+
+    /// The pull neither requests nor spills while its reuse scan runs, and the
+    /// wait burns no retry of the peer. Once the scan lands, the pull fetches
+    /// only what the scan did not reuse.
+    #[compio::test]
+    async fn given_a_running_reuse_scan_when_the_pull_progresses_should_request_nothing_until_it_lands()
+     {
+        let receiver = scanning_receiver();
+        let partitions = receiver.owner.plane.partitions();
+        let session = || {
+            partitions
+                .get_by_ns(&receiver.namespace)
+                .unwrap()
+                .transfer
+                .as_ref()
+                .unwrap()
+        };
+
+        receiver
+            .owner
+            .on_partition_transfer_progress(receiver.namespace.inner())
+            .await;
+        stall_rounds(
+            &receiver.owner,
+            receiver.namespace,
+            2 * SCANNING_RETRY_TICKS as usize,
+        )
+        .await;
+        assert!(
+            receiver.requests.borrow().is_empty(),
+            "the pull must wait for its scan"
+        );
+        assert_eq!(
+            partitions
+                .get_by_ns(&receiver.namespace)
+                .unwrap()
+                .transfer_attempts(),
+            0,
+            "a running scan must not burn a retry of the peer"
+        );
+        let adopted = StagedSegmentMeta {
+            start_offset: 0,
+            end_offset: 0,
+            index_size: 0,
+            size: receiver.segment.len() as u64,
+            start_timestamp: 0,
+            end_timestamp: 0,
+            max_timestamp: 0,
+            log_staging: PathBuf::new(),
+            index_staging: PathBuf::new(),
+            checksum: 0,
+            linked: false,
+        };
+        let mut scanned = ReuseScanned::default();
+        scanned.reused.push((0, adopted));
+        *session().scan.as_ref().unwrap().result.borrow_mut() = Some(scanned);
+        stall_rounds(&receiver.owner, receiver.namespace, 1).await;
+
+        assert_eq!(
+            *receiver.requests.borrow(),
+            [(1, 0, u32::try_from(SCANNING_OFFSETS.len()).unwrap())],
+            "the pull must fetch only what the scan did not reuse"
+        );
+        assert!(matches!(
+            session().artifacts[0],
+            TransferArtifact::Staged(_)
+        ));
+    }
+
     #[compio::test]
     async fn given_transfer_that_cannot_take_over_when_ring_is_spent_should_rotate_instead_of_arming()
      {
@@ -3597,6 +4637,10 @@ mod tests {
                     artifacts: Vec::new(),
                     target_accepted: false,
                     idle_ticks: 0,
+                    spill: None,
+                    scan: None,
+                    seed: None,
+                    pulled_len: 0,
                 });
             }),
         ];
@@ -3775,6 +4819,204 @@ mod tests {
             observed.contains(&(None, Some(REPAIR_PRIMARY))),
             "the re-arm must fire within twice its backoff: {observed:?}"
         );
+    }
+
+    /// The order a lagging backup saw under load. Its repair peer had evicted
+    /// the bottom of the window, so the reply carried `RangeEvicted` and then
+    /// ops above a hole. The backup armed a transfer, the peer refused it as
+    /// transient, and the live stream then delivered the hole. The live
+    /// prepares must fill the hole and carry the head over the run that repair
+    /// journaled, and the scheduled re-arm must not start a transfer while the
+    /// commit walk catches up.
+    #[compio::test]
+    async fn given_repair_above_a_hole_when_the_live_stream_fills_it_should_need_no_transfer() {
+        /// Committed and applied before the repair round.
+        const APPLIED: u64 = 4;
+        /// The lowest op the repair peer still retains, so the hole
+        /// `APPLIED + 1..RETAINED_FROM` is 28 ops long.
+        const RETAINED_FROM: u64 = APPLIED + 29;
+        /// The end of the one chunk the peer serves from `RETAINED_FROM`.
+        const SERVED_THROUGH: u64 = RETAINED_FROM + crate::REPAIR_CHUNK_MAX - 1;
+        /// The group head and commit point: four bounded commit walks above
+        /// `APPLIED`, so the re-arm comes due while the walk still runs.
+        const HEAD: u64 = APPLIED + 4 * partitions::COMMIT_WALK_OPS_MAX as u64;
+        const NONCE: u128 = 1;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (mut owner, _sender) = test_owner(&bus, None);
+        owner.partition_consensus.replica_count = 3;
+        owner.set_repair_retry_ticks(1);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, HEAD).await;
+        let applied = usize::try_from(APPLIED).unwrap();
+        let mut backup = repairing_backup(&bus, namespace, 0, 0);
+        backup.repair = None;
+        for prepare in &prepares[..applied] {
+            backup.on_replicate(prepare.clone()).await;
+        }
+        backup.consensus().advance_commit_max(APPLIED);
+        backup
+            .commit_journal(owner.plane.partitions().config())
+            .await;
+        assert_eq!(backup.consensus().commit_min(), APPLIED);
+        backup.consensus().advance_commit_max(HEAD);
+        backup.repair = Some(RepairSession {
+            nonce: NONCE,
+            view: REPAIR_VIEW,
+            from_op: APPLIED + 1,
+            commit_to_op: HEAD,
+            fetch_to_op: HEAD,
+            floor: None,
+            peer: REPAIR_PRIMARY,
+            idle_ticks: 0,
+            floor_pulled_from: 0,
+            requested_from: Some(APPLIED + 1),
+        });
+        owner.plane.partitions().remove(&namespace).unwrap();
+        owner.plane.partitions().insert(namespace, backup);
+
+        let evicted = repair_done(namespace, REPAIR_PRIMARY, NONCE, RETAINED_FROM)
+            .transmute_header(|done, header: &mut RepairRangeReplyHeader| {
+                *header = done;
+                header.command = Command::RangeEvicted;
+                header.seal();
+            });
+        owner.on_repair_range_reply(&evicted).await;
+        for op in RETAINED_FROM..=SERVED_THROUGH {
+            let prepare = prepares[usize::try_from(op - 1).unwrap()].clone();
+            owner.on_repair_prepare(as_repair_prepare(prepare)).await;
+        }
+        owner
+            .on_repair_range_reply(&repair_done(
+                namespace,
+                REPAIR_PRIMARY,
+                NONCE,
+                SERVED_THROUGH,
+            ))
+            .await;
+        let transfer_nonce = {
+            let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+            partition
+                .transfer
+                .as_ref()
+                .expect("the floor the peer evicted past arms a transfer")
+                .nonce
+        };
+        let refusal =
+            Message::<StateTransferTargetHeader>::new(size_of::<StateTransferTargetHeader>())
+                .transmute_header(|_, header: &mut StateTransferTargetHeader| {
+                    header.command = Command::StateTransferTarget;
+                    header.size = u32::try_from(size_of::<StateTransferTargetHeader>()).unwrap();
+                    header.cluster = 1;
+                    header.group = namespace.inner();
+                    header.replica = REPAIR_PRIMARY;
+                    header.nonce = transfer_nonce;
+                    header.unavailable_transient = 1;
+                    header.seal();
+                });
+        owner
+            .on_message(MessageBag::StateTransferTarget(refusal))
+            .await;
+        {
+            let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+            assert!(partition.transfer.is_none());
+            assert!(partition.transfer_rearm.is_some());
+            for prepare in &prepares[applied..] {
+                partition.on_replicate(prepare.clone()).await;
+            }
+            assert_eq!(
+                partition.held_through(),
+                HEAD,
+                "the live stream must fill the hole below the repaired run"
+            );
+            assert_eq!(partition.consensus().sequencer().current_sequence(), HEAD);
+        }
+
+        let rounds = usize::try_from(HEAD - APPLIED).unwrap() / partitions::COMMIT_WALK_OPS_MAX + 1;
+        let observed = stall_rounds(&owner, namespace, rounds).await;
+
+        assert!(
+            observed.iter().all(|(_, transfer)| transfer.is_none()),
+            "a journal that holds every committed op needs no transfer: {observed:?}"
+        );
+        let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+        assert_eq!(partition.consensus().commit_min(), HEAD);
+        assert!(partition.transfer_rearm.is_none());
+    }
+
+    /// A live copy of an op that repair journaled above a hole leaves the head
+    /// below the hole. A head above a hole can win a view change that this
+    /// replica cannot walk.
+    #[compio::test]
+    async fn given_repaired_op_above_a_hole_when_its_live_copy_arrives_should_keep_the_head_below_the_hole()
+     {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let (mut backup, [below, _, above]) =
+            Box::pin(backup_with_repaired_op_above_a_hole(&bus, namespace)).await;
+
+        backup.on_replicate(above).await;
+
+        assert_eq!(
+            backup.consensus().sequencer().current_sequence(),
+            below.header().op,
+            "the head must stay below the hole"
+        );
+    }
+
+    /// A live prepare that fills a hole below a repaired op carries offsets
+    /// below the dirty offset, so only its link to the entry below it shows
+    /// that it belongs to this log. A copy with another parent stays out of the
+    /// journal, and the chained copy then fills the hole.
+    #[compio::test]
+    async fn given_hole_below_a_repaired_op_when_a_live_prepare_does_not_chain_to_it_should_not_journal_it()
+     {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let (mut backup, [_, hole, _]) =
+            Box::pin(backup_with_repaired_op_above_a_hole(&bus, namespace)).await;
+        let op = hole.header().op;
+        let unchained = hole
+            .clone()
+            .transmute_header(|original, header: &mut PrepareHeader| {
+                *header = original;
+                header.parent = !original.parent;
+                header.checksum = header.identity_checksum();
+            });
+
+        backup.on_replicate(unchained).await;
+        let unchained_journaled = backup.log.journal().inner.holds_op(op);
+        backup.on_replicate(hole).await;
+
+        assert_eq!(
+            (unchained_journaled, backup.log.journal().inner.holds_op(op)),
+            (false, true),
+            "(unchained copy journaled, chained copy journaled)"
+        );
+    }
+
+    /// A backup that journaled the first of three ops from the live stream and
+    /// the third from repair, so the second is a hole below a repaired op.
+    /// Returned with the three prepares.
+    #[allow(clippy::future_not_send)]
+    async fn backup_with_repaired_op_above_a_hole(
+        bus: &Rc<IggyMessageBus>,
+        namespace: IggyNamespace,
+    ) -> (
+        IggyPartition<Rc<IggyMessageBus>, HeldSuperblock>,
+        [Message<PrepareHeader>; 3],
+    ) {
+        let mut prepares = primary_prepares(bus, namespace, 3).await;
+        let above = prepares.pop().unwrap();
+        let hole = prepares.pop().unwrap();
+        let below = prepares.pop().unwrap();
+        let mut backup = repairing_backup(bus, namespace, 0, above.header().op);
+        backup.on_replicate(below.clone()).await;
+        backup.apply_repaired_prepare(above.clone()).await;
+        assert!(
+            backup.log.journal().inner.holds_op(above.header().op),
+            "repair journals the op above the hole"
+        );
+        (backup, [below, hole, above])
     }
 
     /// A rotation that the live-session ceiling refuses opens no session, so
@@ -4025,8 +5267,11 @@ mod tests {
         }
     }
 
+    /// A transfer abandoned at the session ceiling schedules a re-arm and opens
+    /// no repair session while it waits, so its slot goes to a waiting group.
     #[compio::test]
-    async fn given_transfer_abandoned_at_ceiling_when_repair_rearms_should_count_new_session() {
+    async fn given_transfer_abandoned_at_ceiling_when_its_re_arm_waits_should_give_the_slot_to_a_waiting_group()
+     {
         const OTHER_SESSIONS: usize = PARTITION_REPAIRS_INFLIGHT_MAX - 1;
         const SWEEPS: usize = 2;
         for retry_ticks in [1, partitions::REPAIR_RETRY_TICKS] {
@@ -4080,21 +5325,29 @@ mod tests {
                     live,
                     "interval {retry_ticks}, sweep {sweep}"
                 );
-                assert!(
-                    partitions
-                        .get_by_ns(&transferring)
-                        .unwrap()
-                        .repair
-                        .is_some()
+                let abandoned = partitions.get_by_ns(&transferring).unwrap();
+                assert_eq!(
+                    (
+                        abandoned.repair.is_some(),
+                        abandoned.transfer_rearm.is_some(),
+                        partitions.get_by_ns(&waiting).unwrap().repair.is_some(),
+                    ),
+                    (false, true, true),
+                    "(abandoned group repairs, its re-arm waits, waiting group repairs) at \
+                     interval {retry_ticks}, sweep {sweep}"
                 );
-                assert!(partitions.get_by_ns(&waiting).unwrap().repair.is_none());
             }
         }
     }
 
+    /// A transfer that supersedes a partly spent repair restarts the repair
+    /// budget. Once the transfer is abandoned, no repair session opens while
+    /// its re-arm waits, and the re-arm then arms the transfer again.
     #[compio::test]
-    async fn given_partly_spent_repair_when_transfer_supersedes_it_should_restart_fallback_budget()
-    {
+    async fn given_superseded_repair_when_its_transfer_is_abandoned_should_open_no_repair_until_the_re_arm()
+     {
+        /// Long enough for a repair session to spend a whole budget and rotate
+        /// while the re-arm waits.
         const REARM_BACKOFF_TICKS: u32 = 2 * (REPAIR_MAX_STALL_RETRIES + 1);
         let bus = Rc::new(IggyMessageBus::new(0));
         let (owner, _sender) = test_owner(&bus, None);
@@ -4118,15 +5371,496 @@ mod tests {
         owner
             .abandon_or_rearm_partition_transfer(&mut backup, REPAIR_PRIMARY)
             .await;
-        backup.transfer_rearm.as_mut().unwrap().after_ticks = REARM_BACKOFF_TICKS;
+        assert!(backup.repair.is_none());
+        let rearm = backup.transfer_rearm.as_mut().unwrap();
+        rearm.after_ticks = REARM_BACKOFF_TICKS;
+        let rearm_peer = rearm.peer;
         owner.plane.partitions().insert(namespace, backup);
-        let budget = REPAIR_MAX_STALL_RETRIES as usize;
-        let observed = stall_rounds(&owner, namespace, budget + 1).await;
-        let mut expected = vec![(Some(REPAIR_PRIMARY), None); budget];
-        expected.push((Some(REPAIR_NEXT_PEER), None));
+        let waiting = REARM_BACKOFF_TICKS as usize;
+        let observed = stall_rounds(&owner, namespace, waiting + 1).await;
+        let mut expected = vec![(None, None); waiting];
+        expected.push((None, Some(rearm_peer)));
         assert_eq!(
             observed, expected,
-            "fallback repair must get the whole stall budget"
+            "a repair session must not open while the re-arm waits"
+        );
+    }
+
+    /// A lagging backup whose peers evicted the ops it misses converts its
+    /// repair to a state transfer. Each transient refusal schedules a re-arm,
+    /// and no repair session opens while it waits. The frames that peers
+    /// serve above their floor and the live prepares above the hole therefore
+    /// stay out of the journal until the transfer installs.
+    #[compio::test]
+    async fn given_peers_serving_above_their_floor_when_the_transfer_is_refused_repeatedly_should_not_grow_the_journal()
+     {
+        const FIRST_FLOOR: u64 = 4;
+        const REFUSALS: u64 = 3;
+        /// Room for one more served reply per refusal above the first one.
+        const COMMIT_MAX: u64 = FIRST_FLOOR + (REFUSALS + 1) * FRAMES_ABOVE_FLOOR;
+        /// A flat re-arm fires on the second tick at a one-tick retry interval,
+        /// so four ticks leave slack.
+        const REARM_TICKS_MAX: usize = 4;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&sent);
+        bus.set_replica_forward_fn(Box::new(move |peer, _, frame| {
+            captured.borrow_mut().push((peer, frame));
+            Ok(())
+        }));
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, COMMIT_MAX + REFUSALS).await;
+        let mut floor = FIRST_FLOOR;
+        let (owner, _sender) = floor_converted_backup(
+            &bus,
+            namespace,
+            floor,
+            &prepares[..usize::try_from(COMMIT_MAX).unwrap()],
+        )
+        .await;
+        let partitions = owner.plane.partitions();
+        let recovery = || {
+            let partition = partitions.get_by_ns(&namespace).unwrap();
+            let journal = &partition.log.journal().inner;
+            (
+                journal.resident_count(),
+                journal.last_op(),
+                partition.transfer.is_some(),
+            )
+        };
+        let converted = recovery();
+        assert_eq!(
+            converted,
+            (
+                usize::try_from(FRAMES_ABOVE_FLOOR).unwrap(),
+                Some(FIRST_FLOOR + FRAMES_ABOVE_FLOOR),
+                true
+            ),
+            "the first conversion journals the frames served above the floor and arms a transfer"
+        );
+        sent.borrow_mut().clear();
+
+        for refusal in 1..=REFUSALS {
+            let (peer, nonce) = {
+                let partition = partitions.get_by_ns(&namespace).unwrap();
+                let transfer = partition.transfer.as_ref().unwrap();
+                (transfer.peer, transfer.nonce)
+            };
+            owner
+                .on_message(transient_transfer_refusal(namespace, (peer, nonce)))
+                .await;
+            let live = prepares[usize::try_from(COMMIT_MAX + refusal - 1).unwrap()].clone();
+            partitions
+                .get_mut_by_ns(&namespace)
+                .unwrap()
+                .on_replicate(live)
+                .await;
+            for _ in 0..REARM_TICKS_MAX {
+                let requests: Vec<_> = sent
+                    .borrow_mut()
+                    .drain(..)
+                    .filter_map(|(peer, frame)| {
+                        let request = Message::<RequestPreparesHeader>::try_from(
+                            Owned::copy_from_slice(frame.as_slice()),
+                        )
+                        .ok()?;
+                        (request.header().command == Command::RequestPrepares)
+                            .then(|| (peer, request.header().nonce))
+                    })
+                    .collect();
+                for request in requests {
+                    floor += FRAMES_ABOVE_FLOOR;
+                    serve_above_floor(&owner, namespace, request, floor, &prepares).await;
+                }
+                if partitions.get_by_ns(&namespace).unwrap().transfer.is_some() {
+                    break;
+                }
+                assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+            }
+            assert_eq!(
+                recovery(),
+                converted,
+                "(resident entries, last op, transfer re-armed) after refusal {refusal}"
+            );
+        }
+    }
+
+    /// A backup adopts a `StartView` at the head it holds while a transfer
+    /// re-arm waits, so the next live prepare passes the gap check above its
+    /// hole. The backup journals and acknowledges nothing, because the
+    /// install wipes the journal. The primary sends to the other backups.
+    #[compio::test]
+    async fn given_start_view_adopted_while_a_transfer_re_arm_waits_when_a_live_prepare_arrives_should_drop_it_without_growing_the_journal()
+     {
+        const FLOOR: u64 = 4;
+        /// The backup holds every op above the floor through the group head.
+        const HEAD: u64 = FLOOR + FRAMES_ABOVE_FLOOR;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&sent);
+        bus.set_replica_forward_fn(Box::new(move |replica, _, frame| {
+            let message =
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            captured
+                .borrow_mut()
+                .push((replica, message.header().command));
+            Ok(())
+        }));
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, HEAD + 1).await;
+        let head = usize::try_from(HEAD).unwrap();
+        let (owner, _sender) =
+            floor_converted_backup(&bus, namespace, FLOOR, &prepares[..head]).await;
+        let partitions = owner.plane.partitions();
+        let transfer = {
+            let partition = partitions.get_by_ns(&namespace).unwrap();
+            let transfer = partition.transfer.as_ref().unwrap();
+            (transfer.peer, transfer.nonce)
+        };
+        owner
+            .on_message(transient_transfer_refusal(namespace, transfer))
+            .await;
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                REPAIR_VIEW,
+                HEAD,
+                HEAD,
+                &[*prepares[head - 1].header()],
+            ))
+            .await;
+        let journal_shape = || {
+            let journal = &partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .log
+                .journal()
+                .inner;
+            (journal.resident_count(), journal.last_op())
+        };
+        let adopted = journal_shape();
+        {
+            let partition = partitions.get_by_ns(&namespace).unwrap();
+            assert!(partition.transfer_rearm.is_some(), "the re-arm still waits");
+            assert_eq!(partition.consensus().sequencer().current_sequence(), HEAD);
+        }
+        sent.borrow_mut().clear();
+
+        partitions
+            .get_mut_by_ns(&namespace)
+            .unwrap()
+            .on_replicate(prepares[head].clone())
+            .await;
+
+        assert_eq!(journal_shape(), adopted, "(resident entries, last op)");
+        assert!(
+            sent.borrow().is_empty(),
+            "refused data is neither forwarded nor acknowledged"
+        );
+    }
+
+    /// The live stream fills the hole of a backup whose transfer re-arm waits
+    /// out a long backoff. The re-arm stands down at once, so a gap that opens
+    /// later reaches the gap detector and is repaired, not transferred.
+    #[compio::test]
+    async fn given_hole_filled_while_a_long_re_arm_waits_when_a_new_gap_opens_should_repair_it() {
+        /// The ops that the live stream delivers into the hole.
+        const HEAD: u64 = 3;
+        /// Far past the rounds below, so only a stand-down lets repair run.
+        const REARM_BACKOFF_TICKS: u32 = 1024;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        owner.set_repair_retry_ticks(1);
+        owner.set_repair_gap_debounce_ticks(REPAIR_GAP_DEBOUNCE_TICKS_MIN);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let mut backup = repairing_backup(&bus, namespace, 0, HEAD);
+        backup.repair = None;
+        backup.transfer_rearm = Some(partitions::state_transfer::PendingTransferRearm {
+            peer: REPAIR_PRIMARY,
+            after_ticks: REARM_BACKOFF_TICKS,
+        });
+        for prepare in primary_prepares(&bus, namespace, HEAD).await {
+            backup.on_replicate(prepare).await;
+        }
+        assert_eq!(backup.held_through(), HEAD);
+        owner.plane.partitions().insert(namespace, backup);
+
+        assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+        {
+            let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+            assert!(
+                partition.transfer_rearm.is_none(),
+                "a journal that holds every op through commit_max must stand the re-arm down"
+            );
+            partition.consensus().advance_commit_max(HEAD + 1);
+        }
+        let debounce = REPAIR_GAP_DEBOUNCE_TICKS_MIN as usize;
+        let observed = stall_rounds(&owner, namespace, debounce).await;
+
+        let mut expected = vec![(None, None); debounce - 1];
+        expected.push((Some(REPAIR_PRIMARY), None));
+        assert_eq!(
+            observed, expected,
+            "the new gap must open a repair session, never a transfer"
+        );
+    }
+
+    /// A backup lagging from op 1 to the last of `prepares` whose first repair
+    /// met a peer that evicted every op up to `floor`. The backup journaled the
+    /// prepares served above the floor and armed a transfer.
+    #[allow(clippy::future_not_send)]
+    async fn floor_converted_backup(
+        bus: &Rc<IggyMessageBus>,
+        namespace: IggyNamespace,
+        floor: u64,
+        prepares: &[Message<PrepareHeader>],
+    ) -> (IoTestShard, TaggedSender) {
+        for peer in [REPAIR_NEXT_PEER, REPAIR_PRIMARY] {
+            connect_replica_on(bus, peer, 1);
+        }
+        let (mut owner, sender) = test_owner(bus, None);
+        owner.partition_consensus.replica_count = 3;
+        owner.set_repair_retry_ticks(1);
+        let commit_max = u64::try_from(prepares.len()).unwrap();
+        let partitions = owner.plane.partitions();
+        partitions.remove(&namespace).unwrap();
+        partitions.insert(namespace, repairing_backup(bus, namespace, 0, commit_max));
+        let session = partitions.get_by_ns(&namespace).unwrap().repair.unwrap();
+        serve_above_floor(
+            &owner,
+            namespace,
+            (session.peer, session.nonce),
+            floor,
+            prepares,
+        )
+        .await;
+        assert!(
+            partitions.get_by_ns(&namespace).unwrap().transfer.is_some(),
+            "the evicted floor arms a transfer"
+        );
+        (owner, sender)
+    }
+
+    /// The answer of the transfer peer that it cannot serve the session
+    /// `(peer, nonce)` yet.
+    fn transient_transfer_refusal(
+        namespace: IggyNamespace,
+        (peer, nonce): (u8, u128),
+    ) -> MessageBag {
+        MessageBag::StateTransferTarget(
+            Message::<StateTransferTargetHeader>::new(size_of::<StateTransferTargetHeader>())
+                .transmute_header(|_, header: &mut StateTransferTargetHeader| {
+                    header.command = Command::StateTransferTarget;
+                    header.size = u32::try_from(size_of::<StateTransferTargetHeader>()).unwrap();
+                    header.cluster = 1;
+                    header.group = namespace.inner();
+                    header.replica = peer;
+                    header.nonce = nonce;
+                    header.unavailable_transient = 1;
+                    header.seal();
+                }),
+        )
+    }
+
+    /// Prepares a peer serves above its eviction floor in one repair reply.
+    const FRAMES_ABOVE_FLOOR: u64 = 4;
+
+    /// Answer the repair request `(peer, nonce)` as a peer that evicted every
+    /// op up to `floor`: `RangeEvicted`, the next [`FRAMES_ABOVE_FLOOR`]
+    /// prepares, then `RepairDone`.
+    #[allow(clippy::future_not_send)]
+    async fn serve_above_floor(
+        owner: &IoTestShard,
+        namespace: IggyNamespace,
+        (peer, nonce): (u8, u128),
+        floor: u64,
+        prepares: &[Message<PrepareHeader>],
+    ) {
+        let last = floor + FRAMES_ABOVE_FLOOR;
+        let evicted = repair_done(namespace, peer, nonce, floor + 1).transmute_header(
+            |done, evicted: &mut RepairRangeReplyHeader| {
+                *evicted = done;
+                evicted.command = Command::RangeEvicted;
+                evicted.seal();
+            },
+        );
+        owner.on_repair_range_reply(&evicted).await;
+        let served = usize::try_from(floor).unwrap()..usize::try_from(last).unwrap();
+        for prepare in &prepares[served] {
+            owner
+                .on_repair_prepare(as_repair_prepare(prepare.clone()))
+                .await;
+        }
+        owner
+            .on_repair_range_reply(&repair_done(namespace, peer, nonce, last))
+            .await;
+    }
+
+    /// A group whose served transfer finished asks again at once. The slot
+    /// goes to the group that waited while it was served.
+    #[compio::test]
+    async fn given_fully_served_group_when_it_asks_again_should_leave_its_slot_to_the_waiting_group()
+     {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = one_transfer_slot_owner(&bus);
+        let [served, waiting] =
+            [0, 1].map(|partition_id| IggyNamespace::new(0, 0, partition_id).inner());
+        serve_partition_offer(&owner, served, false);
+        assert!(!owner.admit_partition_transfer(waiting));
+
+        serve_partition_offer(&owner, served, true);
+
+        assert_eq!(
+            (
+                owner.admit_partition_transfer(served),
+                owner.admit_partition_transfer(waiting)
+            ),
+            (false, true),
+            "(finished group admitted, waiting group admitted)"
+        );
+    }
+
+    /// Refused groups take a freed slot in the order of their first refusal,
+    /// whichever of them asks first.
+    #[compio::test]
+    async fn given_two_waiting_groups_when_a_slot_frees_should_admit_the_oldest_waiter() {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = one_transfer_slot_owner(&bus);
+        let [served, oldest, newest] =
+            [0, 1, 2].map(|partition_id| IggyNamespace::new(0, 0, partition_id).inner());
+        serve_partition_offer(&owner, served, false);
+        assert!(!owner.admit_partition_transfer(oldest));
+        assert!(!owner.admit_partition_transfer(newest));
+
+        owner.state_transfer_offers.borrow_mut().clear();
+
+        assert_eq!(
+            (
+                owner.admit_partition_transfer(newest),
+                owner.admit_partition_transfer(oldest)
+            ),
+            (false, true),
+            "(newest waiter admitted, oldest waiter admitted)"
+        );
+    }
+
+    /// A waiter that stops asking ages out on the clock of an abandoned build,
+    /// so the free slot it held reaches the waiter behind it.
+    #[compio::test]
+    async fn given_waiter_that_stops_asking_when_its_idle_window_passes_should_free_its_turn() {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = one_transfer_slot_owner(&bus);
+        owner.set_repair_retry_ticks(1);
+        let [served, silent, asking] =
+            [0, 1, 2].map(|partition_id| IggyNamespace::new(0, 0, partition_id).inner());
+        serve_partition_offer(&owner, served, false);
+        assert!(!owner.admit_partition_transfer(silent));
+        assert!(!owner.admit_partition_transfer(asking));
+        owner.state_transfer_offers.borrow_mut().clear();
+
+        for sweep in 0..crate::STATE_TRANSFER_OFFER_EXPIRY_MULTIPLE {
+            assert!(
+                !owner.admit_partition_transfer(asking),
+                "the silent waiter keeps its turn through sweep {sweep}"
+            );
+            owner.expire_idle_state_transfer_offers();
+        }
+
+        assert!(owner.admit_partition_transfer(asking));
+    }
+
+    /// A replica that is not the primary of a group refuses a transfer request
+    /// for it without queueing the group, so a freed slot goes to the next
+    /// group that asks.
+    #[compio::test]
+    async fn given_backup_of_a_group_when_its_transfer_is_requested_should_refuse_without_queueing_it()
+     {
+        const REQUESTER: u8 = 0;
+        const NONCE: u128 = 1;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&sent);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            captured.borrow_mut().push(frame);
+            Ok(())
+        }));
+        connect_replica_on(&bus, REQUESTER, 1);
+        let (mut owner, _sender) = one_transfer_slot_owner(&bus);
+        owner.partition_consensus.replica_count = 3;
+        let [served, backed_up, next] =
+            [0, 1, 2].map(|partition_id| IggyNamespace::new(0, 0, partition_id));
+        let mut backup = repairing_backup(&bus, backed_up, 0, 0);
+        backup.repair = None;
+        owner.plane.partitions().insert(backed_up, backup);
+        serve_partition_offer(&owner, served.inner(), false);
+        let request =
+            Message::<RequestStateTransferHeader>::new(size_of::<RequestStateTransferHeader>())
+                .transmute_header(|_, header: &mut RequestStateTransferHeader| {
+                    header.command = Command::RequestStateTransfer;
+                    header.size = u32::try_from(size_of::<RequestStateTransferHeader>()).unwrap();
+                    header.cluster = 1;
+                    header.group = backed_up.inner();
+                    header.replica = REQUESTER;
+                    header.nonce = NONCE;
+                    header.seal();
+                });
+
+        owner.on_partition_request_state_transfer(&request).await;
+        owner.state_transfer_offers.borrow_mut().clear();
+
+        let refusals: Vec<_> = sent
+            .borrow()
+            .iter()
+            .map(|frame| {
+                let reply = Message::<StateTransferTargetHeader>::try_from(Owned::copy_from_slice(
+                    frame.as_slice(),
+                ))
+                .unwrap();
+                (
+                    reply.header().available,
+                    reply.header().unavailable_transient,
+                )
+            })
+            .collect();
+        let queued = owner.partition_transfer_waiters.borrow().len();
+        assert_eq!(
+            (
+                refusals,
+                queued,
+                owner.admit_partition_transfer(next.inner())
+            ),
+            (vec![(0, 1)], 0, true),
+            "((available, transient) per reply, queued groups, next group admitted)"
+        );
+    }
+
+    /// A test owner whose served-payload budget holds one transfer slot.
+    fn one_transfer_slot_owner(bus: &Rc<IggyMessageBus>) -> (IoTestShard, TaggedSender) {
+        let (owner, sender) = test_owner(bus, None);
+        owner.set_served_segment_cache_bytes_max(crate::PARTITION_ARTIFACT_LEN_DEFAULT);
+        assert_eq!(owner.partition_transfer_admission_cap(), 1);
+        (owner, sender)
+    }
+
+    /// Record an offer of the partition `namespace` served to [`REPAIR_BACKUP`].
+    fn serve_partition_offer(owner: &IoTestShard, namespace: u64, fully_served: bool) {
+        let offer = partitions::state_transfer::PartitionStateTransferOffer {
+            commit_op: 0,
+            segments: Vec::new(),
+            offsets: (
+                StateArtifact::for_bytes(artifact_kind::CONSUMER_OFFSETS, 0, &[]),
+                Rc::new(Vec::new()),
+            ),
+        };
+        owner.state_transfer_offers.borrow_mut().insert(
+            (namespace, REPAIR_BACKUP),
+            crate::ServedStateTransfer {
+                nonce: 0,
+                offer: crate::ServedOffer::Partition(Rc::new(offer)),
+                idle_ticks: 0,
+                fully_served,
+            },
         );
     }
 
@@ -4172,6 +5906,412 @@ mod tests {
         IggyShard<B, PrepareJournal, (), IoTestMetadata, PapayaShardsTable, HeldSuperblock>;
 
     #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_delayed_old_repair_when_a_probe_announces_an_appending_head_should_not_commit_it()
+     {
+        const REPLICAS: u8 = 5;
+        const OLD_PRIMARY: usize = 0;
+        const PRIMARY: usize = 1;
+        const BACKUP: usize = 4;
+        const OLD_CLIENT: u128 = 11;
+        const CLIENT: u128 = 22;
+        const ROOT_OP: u64 = 1;
+        const REGISTER_OP: u64 = ROOT_OP + 1;
+        const STEP_LIMIT: usize = 10_000;
+        let root_slot = usize::try_from(ROOT_OP).unwrap();
+        let register_slot = usize::try_from(REGISTER_OP).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let frames: Vec<MetadataFrames> = (0..REPLICAS)
+            .map(|_| Rc::new(RefCell::new(Vec::new())))
+            .collect();
+        let mut owners = Vec::new();
+        for replica in 0..REPLICAS {
+            let bus = Rc::new(IggyMessageBus::new(0));
+            let captured = Rc::clone(&frames[usize::from(replica)]);
+            bus.set_replica_forward_fn(Box::new(move |target, _, frame| {
+                let message =
+                    Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                        .unwrap();
+                captured.borrow_mut().push((target, message));
+                Ok(())
+            }));
+            for peer in 0..REPLICAS {
+                if peer != replica {
+                    crate::test_support::connect_replica_on(&bus, peer, 1);
+                }
+            }
+            let (mut owner, inbox_owner) = test_owner(&bus, None);
+            let consensus = VsrConsensus::new(
+                1,
+                replica,
+                REPLICAS,
+                METADATA_GROUP,
+                Rc::clone(&bus),
+                LocalPipeline::new(),
+            );
+            consensus.set_incarnation(u128::from(replica) + 1);
+            consensus.init();
+            consensus.mark_superblock_durable(0, 0);
+            let journal =
+                PrepareJournal::open(&directory.path().join(format!("metadata-{replica}.wal")), 0)
+                    .await
+                    .unwrap();
+            owner.plane.inner_mut().0 = IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                IoTestMetadata::new((
+                    UsersInner::new().into(),
+                    (StreamsInner::default().into(), ()),
+                )),
+                None,
+            );
+            owners.push((owner, inbox_owner));
+        }
+        let (owners, _inbox_owners): (Vec<_>, Vec<_>) = owners.into_iter().unzip();
+        let metadata = |replica: usize| &owners[replica].plane.inner().0;
+        let consensus = |replica| metadata(replica).consensus.as_ref().unwrap();
+        let journal = |replica| metadata(replica).journal.as_ref().unwrap();
+        let take = |source: usize, target: usize, command: Command| {
+            let mut pending = frames[source].borrow_mut();
+            let index = pending
+                .iter()
+                .position(|(replica, message)| {
+                    usize::from(*replica) == target && message.header().command == command
+                })
+                .unwrap_or_else(|| panic!("missing {command:?} from {source} to {target}"));
+            pending.remove(index).1
+        };
+        let root_request = CreateUserRequest {
+            username: WireName::new("root").unwrap(),
+            password: "hash".to_owned(),
+            status: iggy_common::UserStatus::Active.as_code(),
+            permissions: None,
+            options: WireOptions::empty(),
+        };
+        let mut root = Box::pin(metadata(OLD_PRIMARY).submit_root_user_in_process(&root_request));
+        let mut root_status = None;
+        for _ in 0..STEP_LIMIT {
+            if root_status.is_none()
+                && let std::task::Poll::Ready(result) = futures::poll!(&mut root)
+            {
+                root_status = Some(result.unwrap());
+            }
+            deliver_metadata_frames(&owners, &frames, &[0, 1, 2, 3, 4]).await;
+            for owner in &owners {
+                owner.tick_metadata().await;
+                owner
+                    .process_loopback(&mut crate::router::LoopbackRound::default())
+                    .await;
+            }
+            if root_status.is_some()
+                && (0..usize::from(REPLICAS))
+                    .all(|replica| consensus(replica).commit_min() == ROOT_OP)
+            {
+                break;
+            }
+            compio::runtime::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(root_status, Some(0));
+        for replica in 0..usize::from(REPLICAS) {
+            assert_eq!(consensus(replica).commit_min(), ROOT_OP);
+            assert_eq!(
+                journal(replica).header(root_slot).unwrap().operation,
+                Operation::CreateUser
+            );
+        }
+        for pending in &frames {
+            pending.borrow_mut().clear();
+        }
+        let registration = RegisterRequest {
+            user_created_at: journal(OLD_PRIMARY).header(root_slot).unwrap().timestamp,
+            bind_verifier: [0x5a; 32],
+        };
+        let mut abandoned =
+            Box::pin(metadata(OLD_PRIMARY).submit_register_in_process(OLD_CLIENT, 0, registration));
+        for _ in 0..STEP_LIMIT {
+            assert!(futures::poll!(&mut abandoned).is_pending());
+            if journal(OLD_PRIMARY).header(register_slot).is_some() {
+                break;
+            }
+            compio::runtime::time::sleep(Duration::from_millis(1)).await;
+        }
+        let old_header = *journal(OLD_PRIMARY).header(register_slot).unwrap();
+        assert_eq!(old_header.client, OLD_CLIENT);
+        assert_eq!(consensus(OLD_PRIMARY).commit_min(), ROOT_OP);
+        frames[OLD_PRIMARY].borrow_mut().clear();
+
+        consensus(BACKUP).init_as_backup();
+        consensus(BACKUP).begin_view_probe();
+        for _ in 0..STEP_LIMIT {
+            owners[BACKUP].tick_metadata().await;
+            if frames[BACKUP]
+                .borrow()
+                .iter()
+                .any(|(_, frame)| frame.header().command == Command::RequestStartView)
+            {
+                break;
+            }
+        }
+        let probe = take(BACKUP, OLD_PRIMARY, Command::RequestStartView);
+        owners[OLD_PRIMARY]
+            .on_message(MessageBag::try_from(probe).unwrap())
+            .await;
+        let announced = take(OLD_PRIMARY, BACKUP, Command::StartView);
+        owners[BACKUP]
+            .on_message(MessageBag::try_from(announced).unwrap())
+            .await;
+        let first_request = take(BACKUP, OLD_PRIMARY, Command::RequestPrepares);
+        let request = first_request
+            .clone()
+            .try_into_typed::<RequestPreparesHeader>()
+            .unwrap();
+        assert_eq!(
+            (request.header().view, request.header().to_op),
+            (0, REGISTER_OP)
+        );
+        owners[OLD_PRIMARY]
+            .on_message(MessageBag::try_from(first_request).unwrap())
+            .await;
+        let first_body = take(OLD_PRIMARY, BACKUP, Command::RepairPrepare);
+        let first_done = take(OLD_PRIMARY, BACKUP, Command::RepairDone);
+
+        // The first response is delayed long enough for the receiver to retry.
+        for _ in 0..STEP_LIMIT {
+            owners[BACKUP].tick_metadata().await;
+            if frames[BACKUP].borrow().iter().any(|(replica, frame)| {
+                usize::from(*replica) == OLD_PRIMARY
+                    && frame.header().command == Command::RequestPrepares
+            }) {
+                break;
+            }
+        }
+        let retry = take(BACKUP, OLD_PRIMARY, Command::RequestPrepares);
+        owners[OLD_PRIMARY]
+            .on_message(MessageBag::try_from(retry).unwrap())
+            .await;
+        let delayed_body = take(OLD_PRIMARY, BACKUP, Command::RepairPrepare);
+        owners[BACKUP]
+            .on_message(MessageBag::try_from(first_body).unwrap())
+            .await;
+        owners[BACKUP]
+            .on_message(MessageBag::try_from(first_done).unwrap())
+            .await;
+        assert_eq!(
+            journal(BACKUP).header(register_slot).unwrap().checksum,
+            old_header.checksum
+        );
+        assert!(!consensus(BACKUP).view_log_unproven());
+        for pending in &frames {
+            pending.borrow_mut().clear();
+        }
+
+        // Only the three replicas without X communicate during this election.
+        for _ in 0..STEP_LIMIT {
+            for owner in &owners[1..=3] {
+                owner.tick_metadata().await;
+            }
+            deliver_metadata_frames(&owners, &frames, &[1, 2, 3]).await;
+            if (1..=3)
+                .all(|replica| consensus(replica).view() == 1 && consensus(replica).is_normal())
+            {
+                break;
+            }
+        }
+        assert_eq!(consensus(PRIMARY).view(), 1);
+        assert!(consensus(PRIMARY).is_normal());
+        assert_eq!(consensus(PRIMARY).sequencer().current_sequence(), ROOT_OP);
+        for pending in &frames {
+            pending.borrow_mut().clear();
+        }
+
+        for _ in 0..STEP_LIMIT {
+            owners[PRIMARY].tick_metadata().await;
+            if frames[PRIMARY].borrow().iter().any(|(replica, frame)| {
+                usize::from(*replica) == BACKUP && frame.header().command == Command::Commit
+            }) {
+                break;
+            }
+        }
+        let heartbeat = take(PRIMARY, BACKUP, Command::Commit);
+        owners[BACKUP]
+            .on_message(MessageBag::try_from(heartbeat).unwrap())
+            .await;
+        for _ in 0..STEP_LIMIT {
+            owners[BACKUP].tick_metadata().await;
+            if frames[BACKUP].borrow().iter().any(|(replica, frame)| {
+                usize::from(*replica) == PRIMARY
+                    && frame.header().command == Command::RequestStartView
+            }) {
+                break;
+            }
+        }
+        let probe = take(BACKUP, PRIMARY, Command::RequestStartView);
+        let mut replacement =
+            Box::pin(metadata(PRIMARY).submit_register_in_process(CLIENT, 0, registration));
+        assert!(futures::poll!(&mut replacement).is_pending());
+        assert_eq!(
+            consensus(PRIMARY).sequencer().current_sequence(),
+            REGISTER_OP
+        );
+        assert!(
+            journal(PRIMARY).header(register_slot).is_none(),
+            "the real WAL append is still suspended"
+        );
+        owners[PRIMARY]
+            .on_message(MessageBag::try_from(probe).unwrap())
+            .await;
+        let announced = take(PRIMARY, BACKUP, Command::StartView)
+            .try_into_typed::<StartViewHeader>()
+            .unwrap();
+        assert_eq!(
+            (announced.header().view, announced.header().op),
+            (1, REGISTER_OP)
+        );
+        let suffix = consensus::dvc_suffix_decode(announced.body(), REGISTER_OP, 0, 0).unwrap();
+        assert_eq!(
+            consensus::dvc_header_kind(&suffix.headers()[0]),
+            consensus::DvcHeaderKind::Blank
+        );
+        owners[BACKUP].on_start_view(announced).await;
+        assert!(consensus(BACKUP).view_log_unproven());
+        assert_eq!(
+            journal(BACKUP).header(register_slot).unwrap().checksum,
+            old_header.checksum
+        );
+        for _ in 0..STEP_LIMIT {
+            owners[BACKUP].tick_metadata().await;
+            if owners[BACKUP]
+                .metadata_repair
+                .borrow()
+                .is_some_and(|session| session.view == 1)
+            {
+                break;
+            }
+        }
+        assert!(
+            owners[BACKUP]
+                .metadata_repair
+                .borrow()
+                .is_some_and(|session| session.view == 1)
+        );
+        owners[BACKUP]
+            .on_message(MessageBag::try_from(delayed_body).unwrap())
+            .await;
+        let proved_from_old_body = !consensus(BACKUP).view_log_unproven();
+
+        for _ in 0..STEP_LIMIT {
+            if let std::task::Poll::Ready(result) = futures::poll!(&mut replacement) {
+                assert_eq!(result.unwrap().epoch, REGISTER_OP);
+                break;
+            }
+            deliver_metadata_frames(&owners, &frames, &[1, 2, 3]).await;
+            owners[PRIMARY]
+                .process_loopback(&mut crate::router::LoopbackRound::default())
+                .await;
+            compio::runtime::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(consensus(PRIMARY).commit_min(), REGISTER_OP);
+        let replacement_header = *journal(PRIMARY).header(register_slot).unwrap();
+        assert_eq!(replacement_header.client, CLIENT);
+        assert_ne!(replacement_header.checksum, old_header.checksum);
+        frames[PRIMARY]
+            .borrow_mut()
+            .retain(|(_, message)| message.header().command != Command::Commit);
+        for _ in 0..STEP_LIMIT {
+            owners[PRIMARY].tick_metadata().await;
+            if frames[PRIMARY].borrow().iter().any(|(replica, frame)| {
+                usize::from(*replica) == BACKUP && frame.header().command == Command::Commit
+            }) {
+                break;
+            }
+        }
+        let heartbeat = take(PRIMARY, BACKUP, Command::Commit);
+        owners[BACKUP]
+            .on_message(MessageBag::try_from(heartbeat).unwrap())
+            .await;
+        assert!(
+            consensus(BACKUP).commit_min() == ROOT_OP
+                || journal(BACKUP).header(register_slot).unwrap().checksum
+                    == replacement_header.checksum,
+            "the delayed old repair must not prove and commit X under Y's view: proved={proved_from_old_body}, backup_commit={}, old_client={OLD_CLIENT}, committed_client={CLIENT}",
+            consensus(BACKUP).commit_min(),
+        );
+        assert!(!proved_from_old_body);
+        assert_eq!(
+            metadata(BACKUP).client_table.borrow().get_epoch(OLD_CLIENT),
+            None
+        );
+
+        for _ in 0..STEP_LIMIT {
+            for owner in &owners[1..=BACKUP] {
+                owner.tick_metadata().await;
+                owner
+                    .process_loopback(&mut crate::router::LoopbackRound::default())
+                    .await;
+            }
+            deliver_metadata_frames(&owners, &frames, &[1, 2, 3, BACKUP]).await;
+            if consensus(BACKUP).commit_min() == REGISTER_OP
+                && !consensus(BACKUP).view_log_unproven()
+            {
+                break;
+            }
+            compio::runtime::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            consensus(BACKUP).commit_min(),
+            REGISTER_OP,
+            "repair must finish after communication resumes"
+        );
+        assert_eq!(
+            consensus(BACKUP).view(),
+            1,
+            "the accepted view must repair without another election"
+        );
+        assert!(!consensus(BACKUP).view_log_unproven());
+        assert_eq!(
+            journal(BACKUP).header(register_slot).unwrap().checksum,
+            replacement_header.checksum
+        );
+        assert_eq!(
+            metadata(BACKUP).client_table.borrow().get_epoch(CLIENT),
+            Some(REGISTER_OP)
+        );
+        assert_eq!(
+            metadata(BACKUP).client_table.borrow().get_epoch(OLD_CLIENT),
+            None
+        );
+    }
+
+    type MetadataFrames = Rc<RefCell<Vec<(u8, Message<GenericHeader>)>>>;
+
+    #[allow(clippy::future_not_send)]
+    async fn deliver_metadata_frames(
+        owners: &[IoTestShard],
+        frames: &[MetadataFrames],
+        connected: &[usize],
+    ) {
+        const FRAME_LIMIT: usize = 10_000;
+        for _ in 0..FRAME_LIMIT {
+            let next = connected.iter().find_map(|source| {
+                let mut pending = frames[*source].borrow_mut();
+                let index = pending
+                    .iter()
+                    .position(|(target, _)| connected.contains(&usize::from(*target)))?;
+                Some(pending.remove(index))
+            });
+            let Some((target, message)) = next else {
+                return;
+            };
+            owners[usize::from(target)]
+                .on_message(MessageBag::try_from(message).unwrap())
+                .await;
+        }
+        panic!("metadata handlers did not drain their bounded message burst");
+    }
+
+    #[compio::test]
     async fn given_metadata_suffix_mutation_when_stale_commit_arrives_should_publish_fresh_headers()
     {
         const VIEW: u32 = 3;
@@ -4185,7 +6325,7 @@ mod tests {
             Ok(())
         }));
         for replica in [1, 2] {
-            assert!(bus.owner_table().try_claim(replica, 1));
+            crate::test_support::connect_replica_on(&bus, replica, 1);
         }
         let (mut owner, _sender) = test_owner(&bus, None);
         let mut consensus = VsrConsensus::new(
@@ -4280,7 +6420,7 @@ mod tests {
             }
             Ok(())
         }));
-        assert!(bus.owner_table().try_claim(0, 1));
+        crate::test_support::connect_replica_on(&bus, 0, 1);
         let (mut owner, _sender) = test_owner(&bus, None);
         let mut consensus = VsrConsensus::new(
             1,
@@ -4341,6 +6481,326 @@ mod tests {
         assert_eq!(owner.metadata_repair.borrow().unwrap().to_op, HEAD);
     }
 
+    #[compio::test]
+    async fn given_a_busy_divergent_metadata_removal_when_the_fenced_op_is_repaired_should_retry_it()
+     {
+        const HEAD: u64 = 6;
+        const DIVERGENT: u64 = HEAD - 1;
+        const VIEW: u32 = 3;
+        let directory = tempfile::tempdir().unwrap();
+        let bus = Rc::new(IggyMessageBus::new(0));
+        bus.set_replica_forward_fn(Box::new(|_, _, _| Ok(())));
+        crate::test_support::connect_replica_on(&bus, 0, 1);
+        let (mut owner, _sender) = test_owner(&bus, None);
+        let mut consensus = VsrConsensus::new(
+            1,
+            2,
+            3,
+            METADATA_GROUP,
+            Rc::clone(&bus),
+            LocalPipeline::new(),
+        );
+        consensus.set_view(1);
+        consensus.set_log_view(1);
+        consensus.init();
+        let journal = PrepareJournal::open(&directory.path().join("metadata.wal"), 0)
+            .await
+            .unwrap();
+        let prepares = metadata_prepares(HEAD, 1);
+        let divergent = usize::try_from(DIVERGENT - 1).unwrap();
+        let stale =
+            prepares[divergent]
+                .clone()
+                .transmute_header(|original, header: &mut PrepareHeader| {
+                    *header = original;
+                    header.timestamp += 1;
+                    header.checksum = header.identity_checksum();
+                });
+        let stale_checksum = stale.header().checksum;
+        for (index, prepare) in prepares.iter().enumerate() {
+            let entry = if index == divergent {
+                stale.clone()
+            } else {
+                prepare.clone()
+            };
+            journal.append(entry).await.unwrap();
+        }
+        consensus.sequencer().set_sequence(HEAD);
+        owner.plane.inner_mut().0.consensus = Some(consensus);
+        owner.plane.inner_mut().0.journal = Some(journal);
+        let metadata = &owner.plane.inner().0;
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let journal = metadata.journal.as_ref().unwrap();
+        let resident = || {
+            journal
+                .header(usize::try_from(DIVERGENT).unwrap())
+                .map(|header| header.checksum)
+        };
+
+        // A checkpoint drain in flight refuses the removal as busy.
+        let mut checkpoint = Box::pin(journal.drain(1..=1));
+        assert!(futures::poll!(&mut checkpoint).is_pending());
+        owner
+            .on_start_view(start_view_suffix(
+                IggyNamespace::from_raw(METADATA_GROUP),
+                VIEW,
+                HEAD,
+                0,
+                &[*prepares.last().unwrap().header()],
+            ))
+            .await;
+        drop(checkpoint);
+        assert_eq!(consensus.view_log_repair_op(), Some(DIVERGENT));
+        assert_eq!(resident(), Some(stale_checksum), "the busy WAL kept it");
+        assert!(owner.metadata_repair.borrow().is_some());
+
+        let repaired = prepares[divergent].clone().transmute_header(
+            |header, repaired: &mut iggy_binary_protocol::RepairPrepareHeader| {
+                repaired.0 = header;
+                repaired.0.command = Command::RepairPrepare;
+            },
+        );
+        owner.on_repair_prepare(repaired).await;
+        assert_ne!(
+            resident(),
+            Some(stale_checksum),
+            "the repaired op the fence waits on never retried the removal, so every \
+             later repair of it is dropped against the divergent entry"
+        );
+    }
+
+    /// Removals a [`CountingJournal`] accepts before it fails every further one,
+    /// so a reconcile that keeps removing nothing fails its test instead of
+    /// spinning in it: the double never yields.
+    const REMOVALS_MAX: usize = 64;
+
+    /// Counts WAL rewrites the way `PrepareJournal` makes them: one per removal
+    /// that drops an entry.
+    #[derive(Default)]
+    struct CountingJournal {
+        headers: RefCell<BTreeMap<u64, PrepareHeader>>,
+        rewrites: Cell<usize>,
+        removals: Cell<usize>,
+        fail_next_rewrite: Cell<bool>,
+    }
+
+    impl Journal for CountingJournal {
+        type Header = PrepareHeader;
+        type Entry = Message<PrepareHeader>;
+        type HeaderRef<'a> = Ref<'a, PrepareHeader>;
+
+        fn header(&self, idx: usize) -> Option<Self::HeaderRef<'_>> {
+            let op = u64::try_from(idx).ok()?;
+            Ref::filter_map(self.headers.borrow(), |headers| headers.get(&op)).ok()
+        }
+
+        fn previous_header(&self, header: &Self::Header) -> Option<Self::HeaderRef<'_>> {
+            self.header(usize::try_from(header.op.checked_sub(1)?).ok()?)
+        }
+
+        fn append(&self, entry: Self::Entry) -> impl Future<Output = io::Result<()>> {
+            self.headers
+                .borrow_mut()
+                .insert(entry.header().op, *entry.header());
+            std::future::ready(Ok(()))
+        }
+
+        fn entry(&self, _header: &Self::Header) -> impl Future<Output = Option<Self::Entry>> {
+            std::future::ready(None)
+        }
+
+        fn remove_range(
+            &self,
+            ops: RangeInclusive<u64>,
+        ) -> impl Future<Output = io::Result<usize>> {
+            let removals = self.removals.get() + 1;
+            self.removals.set(removals);
+            let removed = if removals > REMOVALS_MAX {
+                Err(io::Error::other("removals past the test bound"))
+            } else if self.fail_next_rewrite.replace(false) {
+                Err(io::Error::other("injected WAL rewrite failure"))
+            } else {
+                let mut headers = self.headers.borrow_mut();
+                let held = headers.len();
+                headers.retain(|op, _| !ops.contains(op));
+                let removed = held - headers.len();
+                if removed > 0 {
+                    self.rewrites.set(self.rewrites.get() + 1);
+                }
+                Ok(removed)
+            };
+            std::future::ready(removed)
+        }
+
+        fn last_op(&self) -> Option<u64> {
+            self.headers.borrow().keys().next_back().copied()
+        }
+
+        fn snapshot_op(&self) -> u64 {
+            0
+        }
+
+        fn set_snapshot_op(&self, _op: u64) {}
+    }
+
+    #[compio::test]
+    async fn given_a_divergent_metadata_run_when_reconciling_should_rewrite_the_wal_once() {
+        const VIEW: u32 = 3;
+        const FIRST: u64 = 3;
+        const DIVERGENT: u64 = 32;
+        const LAST: u64 = FIRST + DIVERGENT - 1;
+        const HEAD: u64 = LAST + 4;
+        const UNKNOWN: u64 = FIRST + 9;
+        let canonical: Vec<_> = metadata_prepares(HEAD, VIEW)
+            .iter()
+            .map(|prepare| *prepare.header())
+            .collect();
+        let mut parent = canonical[usize::try_from(FIRST - 2).unwrap()].checksum;
+        let held: BTreeMap<_, _> = canonical
+            .iter()
+            .map(|header| {
+                let mut header = *header;
+                if (FIRST..=LAST).contains(&header.op) {
+                    header.client += 1;
+                    header.parent = parent;
+                    header.checksum = header.identity_checksum();
+                    parent = header.checksum;
+                }
+                (header.op, header)
+            })
+            .collect();
+
+        for (rewrite_fails, unknown) in [(false, false), (true, false), (false, true)] {
+            let bus = Rc::new(IggyMessageBus::new(0));
+            let mut consensus = VsrConsensus::new(
+                1,
+                2,
+                3,
+                METADATA_GROUP,
+                Rc::clone(&bus),
+                LocalPipeline::new(),
+            );
+            consensus.set_view(1);
+            consensus.set_log_view(1);
+            consensus.init();
+            consensus.sequencer().set_sequence(HEAD);
+            let suffix: Vec<_> = canonical
+                .iter()
+                .rev()
+                .map(|header| {
+                    if unknown && header.op == UNKNOWN {
+                        consensus::dvc_blank(UNKNOWN)
+                    } else {
+                        *header
+                    }
+                })
+                .collect();
+            let view = start_view_suffix(
+                IggyNamespace::from_raw(METADATA_GROUP),
+                VIEW,
+                HEAD,
+                0,
+                &suffix,
+            );
+            consensus.handle_start_view(consensus::PlaneKind::Metadata, view.header(), view.body());
+            assert!(consensus.view_log_unproven());
+            let journal = CountingJournal {
+                headers: RefCell::new(held.clone()),
+                ..CountingJournal::default()
+            };
+            if rewrite_fails {
+                journal.fail_next_rewrite.set(true);
+                crate::reconcile_metadata_view_log(0, &consensus, &journal).await;
+                assert_eq!(journal.rewrites.get(), 0);
+                assert_eq!(*journal.headers.borrow(), held);
+                assert!(consensus.view_log_unproven());
+            }
+
+            crate::reconcile_metadata_view_log(0, &consensus, &journal).await;
+
+            assert_eq!(
+                journal.rewrites.get(),
+                1,
+                "one rewrite removes the whole proven run"
+            );
+            let removed = if unknown { UNKNOWN } else { FIRST }..=LAST;
+            let headers = journal.headers.borrow();
+            for (op, header) in &held {
+                assert_eq!(
+                    headers.get(op),
+                    (!removed.contains(op)).then_some(header),
+                    "op {op}: the canonical tail and entries past an unknown op stay"
+                );
+            }
+            assert!(consensus.view_log_unproven());
+            assert_eq!(
+                consensus.view_log_repair_op(),
+                Some(*removed.start()),
+                "repair opens at the lowest removed op, so one window refetches the run"
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_bridged_header_off_the_view_chain_when_reconciling_metadata_should_fetch_its_op()
+     {
+        const VIEW: u32 = 3;
+        const HEAD: u64 = 8;
+        const BRIDGED: u64 = 5;
+        let canonical: Vec<_> = metadata_prepares(HEAD, VIEW)
+            .iter()
+            .rev()
+            .map(|prepare| *prepare.header())
+            .collect();
+        let held: BTreeMap<_, _> = canonical
+            .iter()
+            .filter(|header| header.op != BRIDGED)
+            .map(|header| (header.op, *header))
+            .collect();
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let mut consensus = VsrConsensus::new(
+            1,
+            2,
+            3,
+            METADATA_GROUP,
+            Rc::clone(&bus),
+            LocalPipeline::new(),
+        );
+        consensus.set_view(1);
+        consensus.set_log_view(1);
+        consensus.init();
+        consensus.sequencer().set_sequence(HEAD);
+        let view = start_view_suffix(
+            IggyNamespace::from_raw(METADATA_GROUP),
+            VIEW,
+            HEAD,
+            0,
+            &off_chain_at(&canonical, BRIDGED),
+        );
+        consensus.handle_start_view(consensus::PlaneKind::Metadata, view.header(), view.body());
+        assert!(consensus.view_log_unproven());
+        let journal = CountingJournal {
+            headers: RefCell::new(held.clone()),
+            ..CountingJournal::default()
+        };
+
+        crate::reconcile_metadata_view_log(0, &consensus, &journal).await;
+
+        assert_eq!(
+            journal.removals.get(),
+            0,
+            "op {BRIDGED} is not held, so a removal there removes nothing and the next \
+             proof names it again"
+        );
+        assert_eq!(*journal.headers.borrow(), held);
+        assert!(consensus.view_log_unproven());
+        assert_eq!(
+            consensus.view_log_repair_op(),
+            Some(BRIDGED),
+            "the op under the off-chain header is a gap to fetch"
+        );
+    }
+
     fn metadata_prepares(head: u64, view: u32) -> Vec<Message<PrepareHeader>> {
         let mut parent = 0;
         (1..=head)
@@ -4386,7 +6846,7 @@ mod tests {
             Ok(())
         }));
         for replica in [0, 2] {
-            assert!(bus.owner_table().try_claim(replica, 1));
+            crate::test_support::connect_replica_on(&bus, replica, 1);
         }
         let (mut owner, _sender) = test_owner(&bus, None);
         owner.partition_consensus.replica_count = 3;
@@ -4472,7 +6932,7 @@ mod tests {
             }
             Ok(())
         }));
-        assert!(bus.owner_table().try_claim(NEW_PRIMARY, 1));
+        crate::test_support::connect_replica_on(&bus, NEW_PRIMARY, 1);
         let (owner, _sender) = test_owner(&bus, None);
         let namespace = IggyNamespace::new(0, 0, 0);
         let prepares = primary_prepares(&bus, namespace, NEW_HEAD).await;
@@ -4517,7 +6977,7 @@ mod tests {
             let expected_from = if partition.consensus().view_log_entry_proven(missing) {
                 missing
             } else {
-                missing.saturating_sub(CHUNK - 1).max(APPLIED + 1)
+                missing.saturating_sub(CHUNK - 1).max(LOCAL_HEAD + 1)
             };
             assert_eq!(request.from_op, expected_from);
             assert_eq!(request.to_op, missing);
@@ -4552,6 +7012,7 @@ mod tests {
                 owner.on_repair_prepare(repaired).await;
             }
             let before = partition.consensus().commit_min();
+            let requested = requests.borrow().len();
             for command in [Command::RangeEvicted, Command::RepairDone] {
                 let foreign_reply = reply.clone().transmute_header(
                     |header, foreign: &mut RepairRangeReplyHeader| {
@@ -4564,8 +7025,9 @@ mod tests {
                 owner.on_repair_range_reply(&foreign_reply).await;
                 assert_eq!(partition.consensus().commit_min(), before);
                 assert_eq!(partition.repair.unwrap().floor, None);
-                assert!(
-                    requests.borrow().is_empty(),
+                assert_eq!(
+                    requests.borrow().len(),
+                    requested,
                     "a different peer cannot complete or advance this repair session"
                 );
             }
@@ -4582,11 +7044,1246 @@ mod tests {
             owner.on_repair_range_reply(&reply).await;
         }
         assert_eq!(rounds, (NEW_HEAD - LOCAL_HEAD).div_ceil(CHUNK) + 1);
-        assert_eq!(bodies, NEW_HEAD - APPLIED);
+        assert_eq!(bodies, NEW_HEAD - LOCAL_HEAD);
         assert!(requests.borrow().is_empty());
         let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
         assert!(!partition.consensus().view_log_unproven());
         assert_eq!(partition.consensus().commit_min(), NEW_HEAD);
+    }
+
+    /// The three-replica group of [`HeadlessReplica`]: the primary of
+    /// [`HEADLESS_VIEW`] is down, and the candidate is the next view's primary.
+    const HEADLESS_REPLICAS: u8 = 3;
+    const HEADLESS_PRIMARY: u8 = REPAIR_PRIMARY;
+    const HEADLESS_BACKUP: u8 = 0;
+    const HEADLESS_CANDIDATE: u8 = REPAIR_BACKUP;
+    const HEADLESS_VIEW: u32 = 4;
+    const HEADLESS_NEXT_VIEW: u32 = HEADLESS_VIEW + 1;
+
+    /// Every frame a replica sent, with the replica it targeted.
+    type TargetedFrames = Rc<RefCell<Vec<(u8, Message<GenericHeader>)>>>;
+
+    /// A live replica of the group whose [`HEADLESS_VIEW`] primary is down.
+    struct HeadlessReplica {
+        owner: IoTestShard,
+        _sender: TaggedSender,
+        sent: TargetedFrames,
+    }
+
+    impl HeadlessReplica {
+        /// Replica `replica` in [`REPAIR_VIEW`] with `held` journaled. With
+        /// `persisted`, its partition WAL lives in that directory and its views go
+        /// to that superblock store.
+        #[allow(clippy::future_not_send)]
+        async fn journaled(
+            replica: u8,
+            namespace: IggyNamespace,
+            held: &[Message<PrepareHeader>],
+            persisted: Option<(&Path, &Rc<HeldSuperblock>)>,
+        ) -> Self {
+            assert_eq!(
+                u32::from(HEADLESS_PRIMARY),
+                HEADLESS_VIEW % u32::from(HEADLESS_REPLICAS)
+            );
+            assert_eq!(
+                u32::from(HEADLESS_CANDIDATE),
+                HEADLESS_NEXT_VIEW % u32::from(HEADLESS_REPLICAS)
+            );
+            let bus = Rc::new(IggyMessageBus::new(0));
+            let sent = Rc::new(RefCell::new(Vec::new()));
+            let captured = Rc::clone(&sent);
+            bus.set_replica_forward_fn(Box::new(move |target, _, frame| {
+                let message =
+                    Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                        .unwrap();
+                captured.borrow_mut().push((target, message));
+                Ok(())
+            }));
+            for peer in (0..HEADLESS_REPLICAS).filter(|peer| *peer != replica) {
+                crate::test_support::connect_replica_on(&bus, peer, 1);
+            }
+            let (owner, sender) = test_owner(&bus, None);
+            let mut partition = repairing_replica(
+                &bus,
+                namespace,
+                (replica, HEADLESS_REPLICAS),
+                HEADLESS_PRIMARY,
+                0,
+                0,
+            );
+            partition.repair = None;
+            if let Some((directory, store)) = persisted {
+                partition.set_partition_dir(directory.to_str().unwrap().to_owned());
+                Box::pin(partition.open_persistence()).await.unwrap();
+                partition.set_superblock(Rc::clone(store), None);
+            }
+            for prepare in held {
+                Box::pin(partition.on_replicate(prepare.clone())).await;
+            }
+            let partitions = owner.plane.partitions();
+            partitions.remove(&namespace).unwrap();
+            partitions.insert(namespace, partition);
+            partitions.set_io_notifier(
+                owner.partition_io.notifier(),
+                owner.partition_io.limits.bytes_max(),
+            );
+            Self {
+                owner,
+                _sender: sender,
+                sent,
+            }
+        }
+
+        fn partition(
+            &self,
+            namespace: IggyNamespace,
+        ) -> &IggyPartition<Rc<IggyMessageBus>, HeldSuperblock> {
+            self.owner.plane.partitions().get_by_ns(&namespace).unwrap()
+        }
+
+        /// Removes the first `command` frame this replica sent to `target`.
+        fn take(&self, target: u8, command: Command) -> MessageBag {
+            let mut sent = self.sent.borrow_mut();
+            let index = sent
+                .iter()
+                .position(|(replica, message)| {
+                    *replica == target && message.header().command == command
+                })
+                .unwrap_or_else(|| panic!("missing {command:?} to replica {target}"));
+            MessageBag::try_from(sent.remove(index).1).unwrap()
+        }
+
+        fn sent_to(&self, target: u8, command: Command, view: u32) -> bool {
+            self.sent.borrow().iter().any(|(replica, message)| {
+                *replica == target
+                    && message.header().command == command
+                    && message.header().view == view
+            })
+        }
+
+        /// One tick sweep and one pass of the IO lane, then one tick of wall time
+        /// for the WAL and superblock tasks that the lane spawned.
+        #[allow(clippy::future_not_send)]
+        async fn step(&self, scratch: &mut Vec<IggyNamespace>) {
+            assert!(self.owner.tick_partitions(scratch).await.is_none());
+            self.owner.service_partition_io().await;
+            compio::time::sleep(crate::CONSENSUS_TICK_INTERVAL).await;
+        }
+    }
+
+    /// Both live replicas vote to leave [`HEADLESS_VIEW`]. The vote of the
+    /// candidate starts [`HEADLESS_NEXT_VIEW`] at `backup`, which holds the proven
+    /// log of [`HEADLESS_VIEW`] and has run nothing since its proof settled. The
+    /// backup sends its view change messages only after the held write of `store`
+    /// persists the new view, and the candidate wins the view with them.
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    async fn elect_beside_proven_backup(
+        namespace: IggyNamespace,
+        backup: &HeadlessReplica,
+        candidate: &HeadlessReplica,
+        store: &HeldSuperblock,
+    ) {
+        let backup_consensus = || backup.partition(namespace).consensus();
+        let candidate_consensus = || candidate.partition(namespace).consensus();
+        let backup_voted = || {
+            [Command::StartViewChange, Command::DoViewChange]
+                .into_iter()
+                .all(|command| backup.sent_to(HEADLESS_CANDIDATE, command, HEADLESS_NEXT_VIEW))
+        };
+        let candidate_voted = || {
+            candidate.sent_to(
+                HEADLESS_BACKUP,
+                Command::StartViewChange,
+                HEADLESS_NEXT_VIEW,
+            )
+        };
+        assert!(backup_consensus().is_normal());
+        assert!(!backup_consensus().view_log_unproven());
+
+        let mut scratch = Vec::new();
+        for _ in 0..2 * TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+            if candidate_voted() {
+                break;
+            }
+            assert!(
+                candidate
+                    .owner
+                    .tick_partitions(&mut scratch)
+                    .await
+                    .is_none()
+            );
+        }
+        assert!(
+            candidate_voted(),
+            "the candidate's heartbeat timeout votes to leave the view"
+        );
+        // Only the consensus of the backup ticks, so no persist sweep runs after its
+        // proof settled. Its own vote stays unsent, and the vote of the candidate
+        // completes its quorum.
+        let backup_heartbeat_voted = (0..TimeoutManager::NORMAL_HEARTBEAT_TICKS)
+            .flat_map(|_| backup_consensus().tick(consensus::PlaneKind::Partitions))
+            .any(|action| {
+                matches!(
+                    action,
+                    VsrAction::SendStartViewChange { view, .. } if view == HEADLESS_NEXT_VIEW
+                )
+            });
+        assert!(
+            backup_heartbeat_voted,
+            "the backup's heartbeat timeout votes to leave the view"
+        );
+        let (entered, mut started) = oneshot::channel();
+        let (release, held) = oneshot::channel();
+        *store.entered.borrow_mut() = Some(entered);
+        *store.held.borrow_mut() = Some(held);
+        backup
+            .owner
+            .on_message(candidate.take(HEADLESS_BACKUP, Command::StartViewChange))
+            .await;
+        assert_eq!(backup_consensus().view(), HEADLESS_NEXT_VIEW);
+        assert!(!backup_consensus().is_normal());
+
+        let persisting = async {
+            while started.try_recv().unwrap().is_none() {
+                backup.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(persisting))
+            .await
+            .expect("the backup must persist the view once its WAL certifies the view it proved");
+        assert!(
+            !backup_voted(),
+            "the votes must wait for the superblock write"
+        );
+        release.send(()).unwrap();
+        let votes = async {
+            while !backup_voted() {
+                backup.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(votes))
+            .await
+            .expect("the backup must vote once its superblock write completes");
+
+        candidate
+            .owner
+            .on_message(backup.take(HEADLESS_CANDIDATE, Command::StartViewChange))
+            .await;
+        candidate
+            .owner
+            .on_message(backup.take(HEADLESS_CANDIDATE, Command::DoViewChange))
+            .await;
+        for _ in 0..TimeoutManager::VIEW_CHANGE_STATUS_TICKS {
+            if candidate_consensus().is_normal() {
+                break;
+            }
+            assert!(
+                candidate
+                    .owner
+                    .tick_partitions(&mut scratch)
+                    .await
+                    .is_none()
+            );
+        }
+        assert!(candidate_consensus().is_normal());
+        assert!(candidate_consensus().is_primary());
+        assert_eq!(candidate_consensus().view(), HEADLESS_NEXT_VIEW);
+        backup
+            .owner
+            .on_message(candidate.take(HEADLESS_BACKUP, Command::StartView))
+            .await;
+        assert!(backup_consensus().is_normal());
+        assert_eq!(backup_consensus().view(), HEADLESS_NEXT_VIEW);
+    }
+
+    /// A backup proves its adopted log through a repair while its WAL still
+    /// certifies the view it replicated in. The next view change reaches it before
+    /// any persist sweep certifies the proven view, and that view's primary is down.
+    #[compio::test]
+    async fn given_settled_view_proof_when_start_view_change_precedes_wal_certification_should_elect_primary()
+     {
+        const LOCAL_HEAD: u64 = 1;
+        const HEAD: u64 = 2;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Rc::new(HeldSuperblock {
+            entered: RefCell::new(None),
+            held: RefCell::new(None),
+        });
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&Rc::new(IggyMessageBus::new(0)), namespace, HEAD).await;
+        let local = usize::try_from(LOCAL_HEAD).unwrap();
+        let backup = Box::pin(HeadlessReplica::journaled(
+            HEADLESS_BACKUP,
+            namespace,
+            &prepares[..local],
+            Some((directory.path(), &store)),
+        ))
+        .await;
+        let candidate = Box::pin(HeadlessReplica::journaled(
+            HEADLESS_CANDIDATE,
+            namespace,
+            &prepares,
+            None,
+        ))
+        .await;
+        let start_view = start_view_suffix(
+            namespace,
+            HEADLESS_VIEW,
+            HEAD,
+            0,
+            &[*prepares.last().unwrap().header()],
+        );
+        for replica in [&backup, &candidate] {
+            replica.owner.on_start_view(start_view.clone()).await;
+        }
+        assert!(
+            !candidate
+                .partition(namespace)
+                .consensus()
+                .view_log_unproven()
+        );
+        assert!(backup.partition(namespace).consensus().view_log_unproven());
+
+        backup
+            .owner
+            .on_repair_prepare(as_repair_prepare(prepares[local].clone()))
+            .await;
+        elect_beside_proven_backup(namespace, &backup, &candidate, &store).await;
+    }
+
+    /// A backup adopts a view whose log ends below an op it held. Dropping that op
+    /// proves the adopted log with no repair frame, so no frame moves the chain
+    /// anchor off the dropped op. The next view change reaches the backup before
+    /// any prepare of the adopted view.
+    #[compio::test]
+    async fn given_adopted_head_below_held_op_when_start_view_change_precedes_any_prepare_should_elect_primary()
+     {
+        Box::pin(elect_after_dropping_held_op(false)).await;
+    }
+
+    /// As above, but the adopted head is the commit point. A segment holds it, so
+    /// the resident headers no longer do.
+    #[compio::test]
+    async fn given_evicted_commit_point_below_held_op_when_start_view_change_precedes_any_prepare_should_elect_primary()
+     {
+        Box::pin(elect_after_dropping_held_op(true)).await;
+    }
+
+    /// If `head_committed`, the adopted head is also the commit point, and the
+    /// backup holds it only in the repair ring.
+    #[allow(clippy::future_not_send)]
+    async fn elect_after_dropping_held_op(head_committed: bool) {
+        const ADOPTED_HEAD: u64 = 1;
+        const HELD_HEAD: u64 = ADOPTED_HEAD + 1;
+        let commit = if head_committed { ADOPTED_HEAD } else { 0 };
+        let directory = tempfile::tempdir().unwrap();
+        let store = Rc::new(HeldSuperblock {
+            entered: RefCell::new(None),
+            held: RefCell::new(None),
+        });
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares =
+            primary_prepares(&Rc::new(IggyMessageBus::new(0)), namespace, HELD_HEAD).await;
+        let adopted = usize::try_from(ADOPTED_HEAD).unwrap();
+        let backup = Box::pin(HeadlessReplica::journaled(
+            HEADLESS_BACKUP,
+            namespace,
+            &prepares,
+            Some((directory.path(), &store)),
+        ))
+        .await;
+        assert_eq!(
+            backup.partition(namespace).log.journal().inner.last_op(),
+            Some(HELD_HEAD)
+        );
+        let candidate = Box::pin(HeadlessReplica::journaled(
+            HEADLESS_CANDIDATE,
+            namespace,
+            &prepares[..adopted],
+            None,
+        ))
+        .await;
+        if head_committed {
+            for replica in [&backup, &candidate] {
+                replica
+                    .partition(namespace)
+                    .consensus()
+                    .restore_commit_state(commit, commit);
+            }
+            let journal = &backup.partition(namespace).log.journal().inner;
+            journal.evict_prefix(adopted);
+            assert_eq!(journal.resident_entries().len(), prepares.len() - adopted);
+            assert!(journal.header_by_op(ADOPTED_HEAD).is_none());
+            assert!(journal.repair_header(ADOPTED_HEAD).is_some());
+        }
+        let start_view = start_view_suffix(
+            namespace,
+            HEADLESS_VIEW,
+            ADOPTED_HEAD,
+            commit,
+            &[*prepares[adopted - 1].header()],
+        );
+        for replica in [&backup, &candidate] {
+            replica.owner.on_start_view(start_view.clone()).await;
+        }
+        // The adoption leaves the drop of the held op to the IO lane, and the
+        // backup runs nothing once its proof settles.
+        let mut scratch = Vec::new();
+        let settling = async {
+            while backup.partition(namespace).consensus().view_log_unproven() {
+                backup.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(settling))
+            .await
+            .expect("dropping the held op must prove the adopted log");
+        let partition = backup.partition(namespace);
+        assert!(partition.repair.is_none());
+        assert_eq!(
+            partition.log.journal().inner.last_op(),
+            (!head_committed).then_some(ADOPTED_HEAD)
+        );
+        assert_eq!(
+            partition.consensus().sequencer().current_sequence(),
+            ADOPTED_HEAD
+        );
+        elect_beside_proven_backup(namespace, &backup, &candidate, &store).await;
+    }
+
+    /// The candidate becomes the [`HEADLESS_NEXT_VIEW`] primary-elect beside the
+    /// backup. It truncates the op that the merged log replaces, which clears the
+    /// WAL certificate of the view it replicated in, and proves the merge through
+    /// a repair. Returns the backup and the elect, whose view has not started.
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    async fn elect_with_settled_merge(
+        namespace: IggyNamespace,
+        directory: &Path,
+        store: &Rc<HeldSuperblock>,
+    ) -> (HeadlessReplica, HeadlessReplica) {
+        const HEAD: u64 = 2;
+        let prepares = primary_prepares(&Rc::new(IggyMessageBus::new(0)), namespace, HEAD).await;
+        let prefix = usize::try_from(HEAD - 1).unwrap();
+        // The primary of both views prepared op 2 in the elect's view, lost it,
+        // and prepared another op 2 in the adopted view.
+        let merged =
+            prepares[prefix]
+                .clone()
+                .transmute_header(|previous, header: &mut PrepareHeader| {
+                    *header = previous;
+                    header.view = HEADLESS_VIEW;
+                    header.request += 1;
+                    header.checksum = header.identity_checksum();
+                });
+        let backup = Box::pin(HeadlessReplica::journaled(
+            HEADLESS_BACKUP,
+            namespace,
+            &prepares[..prefix],
+            None,
+        ))
+        .await;
+        let elect = Box::pin(HeadlessReplica::journaled(
+            HEADLESS_CANDIDATE,
+            namespace,
+            &prepares,
+            Some((directory, store)),
+        ))
+        .await;
+        backup
+            .owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                HEADLESS_VIEW,
+                HEAD,
+                0,
+                &[*merged.header()],
+            ))
+            .await;
+        backup
+            .owner
+            .on_repair_prepare(as_repair_prepare(merged.clone()))
+            .await;
+        let backup_consensus = || backup.partition(namespace).consensus();
+        let elect_partition = || elect.partition(namespace);
+        assert!(backup_consensus().is_normal());
+        assert!(!backup_consensus().view_log_unproven());
+        assert_eq!(elect_partition().log.journal().inner.last_op(), Some(HEAD));
+
+        // The heartbeat timeout of the backup votes to leave the view. The elect
+        // never left `REPAIR_VIEW`, so that vote is more than one view ahead of it,
+        // and the elect joins it.
+        let mut scratch = Vec::new();
+        for _ in 0..2 * TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+            if backup.sent_to(
+                HEADLESS_CANDIDATE,
+                Command::StartViewChange,
+                HEADLESS_NEXT_VIEW,
+            ) {
+                break;
+            }
+            assert!(backup.owner.tick_partitions(&mut scratch).await.is_none());
+        }
+        elect
+            .owner
+            .on_message(backup.take(HEADLESS_CANDIDATE, Command::StartViewChange))
+            .await;
+        let announced = async {
+            while !elect.sent_to(
+                HEADLESS_BACKUP,
+                Command::StartViewChange,
+                HEADLESS_NEXT_VIEW,
+            ) {
+                elect.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(announced))
+            .await
+            .expect("the elect must announce the view change");
+        backup
+            .owner
+            .on_message(elect.take(HEADLESS_BACKUP, Command::StartViewChange))
+            .await;
+        assert_eq!(backup_consensus().view(), HEADLESS_NEXT_VIEW);
+        elect
+            .owner
+            .on_message(backup.take(HEADLESS_CANDIDATE, Command::DoViewChange))
+            .await;
+        assert!(elect_partition().consensus().is_primary_elect());
+        // The IO lane truncates the replaced op, then the elect fetches the merged one.
+        let truncating = async {
+            while elect_partition().repair.is_none() {
+                elect.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(truncating))
+            .await
+            .expect("the elect must truncate the replaced op and fetch the merged one");
+        assert_eq!(
+            elect_partition().log.journal().inner.last_op(),
+            Some(HEAD - 1)
+        );
+        elect
+            .owner
+            .on_repair_prepare(as_repair_prepare(merged))
+            .await;
+        assert!(!elect_partition().consensus().view_log_unproven());
+        assert!(elect_partition().consensus().is_primary_elect());
+        assert_eq!(elect_partition().consensus().log_view(), REPAIR_VIEW);
+        (backup, elect)
+    }
+
+    /// A primary-elect truncates the op that the merged log replaces and proves the
+    /// merge through a repair. Its `log_view` names the view it replicated in until
+    /// the view starts, so its WAL must not certify that view over the merged
+    /// journal in between.
+    #[compio::test]
+    async fn given_a_settled_merge_when_the_elect_persists_before_the_view_starts_should_not_certify_its_old_log_view()
+     {
+        // Persist calls between the settled proof and the view start, one tick
+        // apart. The WAL task publishes a queued certificate within the first few.
+        const WINDOW_ROUNDS: usize = 20;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Rc::new(HeldSuperblock {
+            entered: RefCell::new(None),
+            held: RefCell::new(None),
+        });
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let (backup, elect) = Box::pin(elect_with_settled_merge(
+            namespace,
+            directory.path(),
+            &store,
+        ))
+        .await;
+        let backup_consensus = || backup.partition(namespace).consensus();
+        let elect_partition = || elect.partition(namespace);
+        let mut scratch = Vec::new();
+
+        // The next tick sweep starts the view. Until then the journal is the
+        // merged log while `log_view` still names the elect's own view.
+        for _ in 0..WINDOW_ROUNDS {
+            assert!(
+                !elect_partition().persist_superblock_if_needed().await,
+                "the WAL must not certify view {REPAIR_VIEW} over the merged log"
+            );
+            compio::time::sleep(crate::CONSENSUS_TICK_INTERVAL).await;
+        }
+        let started = async {
+            while !elect.sent_to(HEADLESS_BACKUP, Command::StartView, HEADLESS_NEXT_VIEW) {
+                elect.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(started))
+            .await
+            .expect("the elect must start the view once its WAL certifies it");
+        assert!(elect_partition().consensus().is_primary());
+        assert_eq!(elect_partition().consensus().log_view(), HEADLESS_NEXT_VIEW);
+        backup
+            .owner
+            .on_message(elect.take(HEADLESS_BACKUP, Command::StartView))
+            .await;
+        assert!(backup_consensus().is_normal());
+        assert_eq!(backup_consensus().view(), HEADLESS_NEXT_VIEW);
+    }
+
+    /// As above, but the backup's view change supersedes the elect before its view
+    /// starts. The third replica is down, so the new view needs the elect's votes,
+    /// and those wait for a superblock write.
+    #[compio::test]
+    async fn given_a_settled_merge_when_a_view_change_supersedes_the_elect_should_vote_and_elect_a_primary()
+     {
+        const SUPERSEDING_VIEW: u32 = HEADLESS_NEXT_VIEW + 1;
+        const SUPERSEDING_PRIMARY: u8 = HEADLESS_BACKUP;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Rc::new(HeldSuperblock {
+            entered: RefCell::new(None),
+            held: RefCell::new(None),
+        });
+        let namespace = IggyNamespace::new(0, 0, 0);
+        assert_eq!(
+            u32::from(SUPERSEDING_PRIMARY),
+            SUPERSEDING_VIEW % u32::from(HEADLESS_REPLICAS)
+        );
+        let (backup, elect) = Box::pin(elect_with_settled_merge(
+            namespace,
+            directory.path(),
+            &store,
+        ))
+        .await;
+        let backup_consensus = || backup.partition(namespace).consensus();
+        let elect_consensus = || elect.partition(namespace).consensus();
+        // What the first refresh after the settled proof snapshots.
+        crate::refresh_partition_dvc_suffix(elect.partition(namespace));
+        let settled = elect_consensus().local_dvc_suffix();
+
+        // Only the backup ticks: its status timeout votes to supersede the elect,
+        // which runs nothing after its proof settled. The elect joins that vote
+        // from its view change.
+        let mut scratch = Vec::new();
+        for _ in 0..2 * TimeoutManager::VIEW_CHANGE_STATUS_TICKS {
+            if backup.sent_to(
+                HEADLESS_CANDIDATE,
+                Command::StartViewChange,
+                SUPERSEDING_VIEW,
+            ) {
+                break;
+            }
+            assert!(backup.owner.tick_partitions(&mut scratch).await.is_none());
+        }
+        // `take` returns the first match, so drop the frames of earlier views, the
+        // backup's retransmits among them.
+        for replica in [&backup, &elect] {
+            replica
+                .sent
+                .borrow_mut()
+                .retain(|(_, frame)| frame.header().view == SUPERSEDING_VIEW);
+        }
+        assert!(elect_consensus().view_log_merged());
+        elect
+            .owner
+            .on_message(backup.take(HEADLESS_CANDIDATE, Command::StartViewChange))
+            .await;
+        assert_eq!(elect_consensus().view(), SUPERSEDING_VIEW);
+
+        let voted = async {
+            while ![Command::StartViewChange, Command::DoViewChange]
+                .into_iter()
+                .all(|command| elect.sent_to(SUPERSEDING_PRIMARY, command, SUPERSEDING_VIEW))
+            {
+                elect.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(voted))
+            .await
+            .expect("the superseded elect must persist the view and vote in it");
+        let MessageBag::DoViewChange(vote) = elect.take(SUPERSEDING_PRIMARY, Command::DoViewChange)
+        else {
+            unreachable!("take returns the command it was asked for");
+        };
+        let header = *vote.header();
+        assert_eq!(
+            header.log_view, REPAIR_VIEW,
+            "the merge never started, so the elect claims the view it replicated in"
+        );
+        assert_eq!(
+            (header.commit, header.nack_bitset, header.present_bitset),
+            (0, 0, 0),
+            "nothing is committed, and an unproven journal neither offers nor nacks an uncommitted op"
+        );
+        let suffix = consensus::dvc_suffix_decode(
+            vote.body(),
+            header.op,
+            header.nack_bitset,
+            header.present_bitset,
+        )
+        .unwrap();
+        assert!(
+            !suffix.is_empty(),
+            "the vote must carry the snapshot taken before the view change"
+        );
+        assert_eq!(
+            (suffix.headers(), header.nack_bitset, header.present_bitset),
+            (
+                settled.headers(),
+                settled.nack_bitset(),
+                settled.present_bitset()
+            ),
+            "the superseding handler must vote with the snapshot of the settled proof"
+        );
+
+        backup
+            .owner
+            .on_message(elect.take(SUPERSEDING_PRIMARY, Command::StartViewChange))
+            .await;
+        assert_eq!(backup_consensus().view(), SUPERSEDING_VIEW);
+        backup
+            .owner
+            .on_message(MessageBag::DoViewChange(vote))
+            .await;
+        for _ in 0..TimeoutManager::VIEW_CHANGE_STATUS_TICKS {
+            if backup_consensus().is_normal() {
+                break;
+            }
+            assert!(backup.owner.tick_partitions(&mut scratch).await.is_none());
+        }
+        assert!(backup_consensus().is_normal());
+        assert!(backup_consensus().is_primary());
+        assert_eq!(backup_consensus().view(), SUPERSEDING_VIEW);
+        elect
+            .owner
+            .on_message(backup.take(HEADLESS_CANDIDATE, Command::StartView))
+            .await;
+        assert!(elect_consensus().is_normal());
+        assert_eq!(elect_consensus().view(), SUPERSEDING_VIEW);
+    }
+
+    /// As above, but the elect adopted the view of the third replica, which goes
+    /// silent after it prepares one more op. The third replica still votes for the
+    /// next view with that op, then goes down. The merge truncates nothing, so the
+    /// elect's WAL still certifies its `log_view`, and the backup's `log_view` is
+    /// below it. Only the elect's journal then holds every op, so it must stay
+    /// proven and offer them.
+    #[compio::test]
+    async fn given_a_settled_merge_that_kept_the_wal_certificate_when_a_lagging_backup_supersedes_the_elect_should_elect_the_backup_from_the_merged_log()
+     {
+        const HEAD: u64 = 3;
+        const SUPERSEDING_VIEW: u32 = HEADLESS_NEXT_VIEW + 1;
+        const SUPERSEDING_PRIMARY: u8 = HEADLESS_BACKUP;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Rc::new(HeldSuperblock {
+            entered: RefCell::new(None),
+            held: RefCell::new(None),
+        });
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&Rc::new(IggyMessageBus::new(0)), namespace, HEAD).await;
+        let adopted = usize::try_from(HEAD - 1).unwrap();
+        // The primary prepared the last op after it started the adopted view.
+        let lagged =
+            prepares[adopted]
+                .clone()
+                .transmute_header(|previous, header: &mut PrepareHeader| {
+                    *header = previous;
+                    header.view = HEADLESS_VIEW;
+                    header.checksum = header.identity_checksum();
+                });
+        let backup = Box::pin(HeadlessReplica::journaled(
+            HEADLESS_BACKUP,
+            namespace,
+            &prepares[..1],
+            None,
+        ))
+        .await;
+        let elect = Box::pin(HeadlessReplica::journaled(
+            HEADLESS_CANDIDATE,
+            namespace,
+            &prepares[..adopted],
+            Some((directory.path(), &store)),
+        ))
+        .await;
+        let backup_consensus = || backup.partition(namespace).consensus();
+        let elect_partition = || elect.partition(namespace);
+        let elect_consensus = || elect.partition(namespace).consensus();
+        elect
+            .owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                HEADLESS_VIEW,
+                HEAD - 1,
+                0,
+                &[*prepares[adopted - 1].header()],
+            ))
+            .await;
+        assert!(!elect_consensus().view_log_unproven());
+        assert_eq!(elect_consensus().log_view(), HEADLESS_VIEW);
+
+        let mut scratch = Vec::new();
+        let certified = async {
+            while !elect_partition().wal_keeps_log_view() {
+                elect.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(certified))
+            .await
+            .expect("the elect's WAL must certify the view it adopted");
+        // The third replica goes silent, so the heartbeat timeout of the elect votes
+        // to leave the view.
+        for _ in 0..TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+            assert!(elect.owner.tick_partitions(&mut scratch).await.is_none());
+        }
+        let voted = async {
+            while !elect.sent_to(
+                HEADLESS_BACKUP,
+                Command::StartViewChange,
+                HEADLESS_NEXT_VIEW,
+            ) {
+                elect.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(voted))
+            .await
+            .expect("the elect must vote to leave the view");
+        // The backup never left `REPAIR_VIEW`, so that vote is more than one view
+        // ahead of it, and the backup joins it.
+        backup
+            .owner
+            .on_message(elect.take(HEADLESS_BACKUP, Command::StartViewChange))
+            .await;
+        elect
+            .owner
+            .on_message(backup.take(HEADLESS_CANDIDATE, Command::StartViewChange))
+            .await;
+        assert_eq!(elect_consensus().view(), HEADLESS_NEXT_VIEW);
+        let announced = async {
+            while !elect.sent_to(
+                HEADLESS_BACKUP,
+                Command::StartViewChange,
+                HEADLESS_NEXT_VIEW,
+            ) {
+                elect.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(announced))
+            .await
+            .expect("the elect must announce the view change");
+        // The backup's own DoViewChange never arrives, so the quorum is the elect's
+        // and the third replica's, which offers a body for every op.
+        let third_replica = DvcSuffix::new(
+            [&lagged, &prepares[1], &prepares[0]]
+                .map(|prepare| *prepare.header())
+                .to_vec(),
+            0,
+            (1 << HEAD) - 1,
+        );
+        elect
+            .owner
+            .on_message(MessageBag::DoViewChange(do_view_change_suffix(
+                namespace,
+                HEADLESS_PRIMARY,
+                HEADLESS_NEXT_VIEW,
+                HEADLESS_VIEW,
+                HEAD,
+                &third_replica,
+            )))
+            .await;
+        assert!(elect_consensus().is_primary_elect());
+        let fetching = async {
+            while elect_partition().repair.is_none() {
+                elect.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(fetching))
+            .await
+            .expect("the elect must fetch the op it lacks");
+        assert_eq!(
+            elect_partition().log.journal().inner.last_op(),
+            Some(HEAD - 1),
+            "the elect holds a prefix of the merged log, so nothing truncates"
+        );
+        elect
+            .owner
+            .on_repair_prepare(as_repair_prepare(lagged.clone()))
+            .await;
+        assert!(!elect_consensus().view_log_unproven());
+        assert!(elect_consensus().is_primary_elect());
+        assert!(elect_partition().wal_keeps_log_view());
+
+        // Only the backup ticks: its status timeout votes to supersede the elect,
+        // which runs nothing after its proof settled. The elect joins that vote
+        // from its view change.
+        for _ in 0..2 * TimeoutManager::VIEW_CHANGE_STATUS_TICKS {
+            if backup.sent_to(
+                HEADLESS_CANDIDATE,
+                Command::StartViewChange,
+                SUPERSEDING_VIEW,
+            ) {
+                break;
+            }
+            assert!(backup.owner.tick_partitions(&mut scratch).await.is_none());
+        }
+        for replica in [&backup, &elect] {
+            replica
+                .sent
+                .borrow_mut()
+                .retain(|(_, frame)| frame.header().view == SUPERSEDING_VIEW);
+        }
+        elect
+            .owner
+            .on_message(backup.take(HEADLESS_CANDIDATE, Command::StartViewChange))
+            .await;
+        let voted = async {
+            while ![Command::StartViewChange, Command::DoViewChange]
+                .into_iter()
+                .all(|command| elect.sent_to(SUPERSEDING_PRIMARY, command, SUPERSEDING_VIEW))
+            {
+                elect.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(voted))
+            .await
+            .expect("the superseded elect must vote");
+        let MessageBag::DoViewChange(vote) = elect.take(SUPERSEDING_PRIMARY, Command::DoViewChange)
+        else {
+            unreachable!("take returns the command it was asked for");
+        };
+        assert!(
+            backup_consensus().log_view() < vote.header().log_view,
+            "no copy the backup holds can stand in for the elect's"
+        );
+        backup
+            .owner
+            .on_message(elect.take(SUPERSEDING_PRIMARY, Command::StartViewChange))
+            .await;
+        assert_eq!(backup_consensus().view(), SUPERSEDING_VIEW);
+        backup
+            .owner
+            .on_message(MessageBag::DoViewChange(vote))
+            .await;
+
+        let merging = async {
+            while backup.partition(namespace).repair.is_none() {
+                backup.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(merging))
+            .await
+            .expect("the backup must merge the elect's log and fetch the ops it lacks");
+        for prepare in [&prepares[1], &lagged] {
+            backup
+                .owner
+                .on_repair_prepare(as_repair_prepare(prepare.clone()))
+                .await;
+        }
+        for _ in 0..TimeoutManager::VIEW_CHANGE_STATUS_TICKS {
+            if backup_consensus().is_normal() {
+                break;
+            }
+            assert!(backup.owner.tick_partitions(&mut scratch).await.is_none());
+        }
+        assert!(backup_consensus().is_normal());
+        assert!(backup_consensus().is_primary());
+        assert_eq!(backup_consensus().view(), SUPERSEDING_VIEW);
+        elect
+            .owner
+            .on_message(backup.take(HEADLESS_CANDIDATE, Command::StartView))
+            .await;
+        assert!(elect_consensus().is_normal());
+        assert_eq!(elect_consensus().view(), SUPERSEDING_VIEW);
+    }
+
+    /// The walk refuses an unproven view log, so a resident op after
+    /// `commit_min` cannot move a group whose proof waits on a missing body.
+    /// When the session ceiling refuses the arm at `StartView` adoption, the
+    /// gap detector is the only site left to fetch that body.
+    #[compio::test]
+    async fn given_a_proof_waiting_above_a_resident_next_op_when_the_edge_arm_is_refused_should_arm_from_the_tick()
+     {
+        const APPLIED: u64 = 2;
+        const LOCAL_HEAD: u64 = 4;
+        const NEW_HEAD: u64 = 8;
+        const NEW_VIEW: u32 = 3;
+        const NEW_PRIMARY: u8 = 0;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        owner.set_repair_gap_debounce_ticks(REPAIR_GAP_DEBOUNCE_TICKS_MIN);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, NEW_HEAD).await;
+        let mut partition =
+            repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+        partition.repair = None;
+        for prepare in prepares.iter().take(usize::try_from(LOCAL_HEAD).unwrap()) {
+            partition.on_replicate(prepare.clone()).await;
+        }
+        partition.consensus().advance_commit_max(APPLIED);
+        partition
+            .commit_journal(owner.plane.partitions().config())
+            .await;
+        owner.plane.partitions().remove(&namespace).unwrap();
+        owner.plane.partitions().insert(namespace, partition);
+        // Other groups hold every session slot when the view change lands.
+        owner
+            .partition_repairs_inflight
+            .set(PARTITION_REPAIRS_INFLIGHT_MAX);
+
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                NEW_VIEW,
+                NEW_HEAD,
+                NEW_HEAD,
+                &[*prepares.last().unwrap().header()],
+            ))
+            .await;
+        let proof_op = {
+            let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+            assert!(
+                partition.repair.is_none(),
+                "the ceiling must refuse the edge arm"
+            );
+            assert_eq!(partition.consensus().commit_min(), APPLIED);
+            assert!(partition.log.journal().inner.holds_op(APPLIED + 1));
+            let proof_op = partition.consensus().view_log_repair_op().unwrap();
+            assert!(!partition.log.journal().inner.holds_op(proof_op));
+            proof_op
+        };
+
+        let mut expected = vec![(None, None); REPAIR_GAP_DEBOUNCE_TICKS_MIN as usize - 1];
+        expected.push((Some(NEW_PRIMARY), None));
+        let observed = stall_rounds(&owner, namespace, expected.len()).await;
+
+        assert_eq!(
+            observed, expected,
+            "the detector must arm once its debounce runs out"
+        );
+        let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+        assert_eq!(
+            partition.repair.map(|session| session.from_op),
+            Some(proof_op)
+        );
+    }
+
+    /// Host at `namespace` a backup of [`REPAIR_VIEW`] that applied `prepares`.
+    #[allow(clippy::future_not_send)]
+    async fn host_applied_backup(
+        owner: &IoTestShard,
+        bus: &Rc<IggyMessageBus>,
+        namespace: IggyNamespace,
+        prepares: &[Message<PrepareHeader>],
+    ) {
+        let mut partition =
+            repairing_replica(bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+        partition.repair = None;
+        for prepare in prepares {
+            partition.on_replicate(prepare.clone()).await;
+        }
+        let applied = u64::try_from(prepares.len()).unwrap();
+        partition.consensus().advance_commit_max(applied);
+        partition
+            .commit_journal(owner.plane.partitions().config())
+            .await;
+        assert_eq!(partition.consensus().commit_min(), applied);
+        owner.plane.partitions().remove(&namespace).unwrap();
+        owner.plane.partitions().insert(namespace, partition);
+    }
+
+    #[compio::test]
+    async fn given_a_start_view_that_contradicts_an_applied_op_when_adopting_should_refuse_it() {
+        const APPLIED: u64 = 2;
+        const NEW_VIEW: u32 = 3;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, APPLIED).await;
+        host_applied_backup(&owner, &bus, namespace, &prepares).await;
+        let mut forged = *prepares.last().unwrap().header();
+        forged.timestamp += 1;
+        forged.checksum = forged.identity_checksum();
+
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                NEW_VIEW,
+                APPLIED,
+                APPLIED,
+                &[forged],
+            ))
+            .await;
+
+        // The refusal also fences the partition for resync, behind the tombstone.
+        let partition = owner.plane.partitions().get_io_owner(&namespace).unwrap();
+        assert_eq!(
+            partition.consensus().view(),
+            REPAIR_VIEW,
+            "a log naming another prepare at applied op {APPLIED} must be refused, not adopted"
+        );
+        assert_eq!(partition.consensus().applied_log_contradictions(), 1);
+    }
+
+    #[compio::test]
+    async fn given_a_refused_contradicting_start_view_when_ticking_should_export_it_once() {
+        const APPLIED: u64 = 2;
+        const NEW_VIEW: u32 = 3;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, APPLIED).await;
+        host_applied_backup(&owner, &bus, namespace, &prepares).await;
+        let mut forged = *prepares.last().unwrap().header();
+        forged.timestamp += 1;
+        forged.checksum = forged.identity_checksum();
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                NEW_VIEW,
+                APPLIED,
+                APPLIED,
+                &[forged],
+            ))
+            .await;
+
+        for _ in 0..2 {
+            assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+        }
+
+        assert_eq!(
+            owner.metrics.partition_applied_log_contradictions_value(),
+            1
+        );
+        let partition = owner.plane.partitions().get_io_owner(&namespace).unwrap();
+        assert_eq!(
+            partition.consensus().applied_log_contradictions(),
+            1,
+            "the export must leave the total for the simulator invariants"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_start_view_contradicting_an_evicted_applied_op_when_refused_should_fence_the_partition_for_resync()
+     {
+        const APPLIED: u64 = 2;
+        const NEW_VIEW: u32 = 3;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, APPLIED).await;
+        host_applied_backup(&owner, &bus, namespace, &prepares).await;
+        {
+            let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+            let journal = &partition.log.journal().inner;
+            journal.evict_prefix(usize::try_from(APPLIED).unwrap());
+            assert!(journal.header_by_op(APPLIED).is_none());
+            assert!(partition.wal_checksum(APPLIED).is_none());
+            assert!(partition.applied_header(APPLIED).is_some());
+        }
+        let mut forged = *prepares.last().unwrap().header();
+        forged.timestamp += 1;
+        forged.checksum = forged.identity_checksum();
+
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                NEW_VIEW,
+                APPLIED,
+                APPLIED,
+                &[forged],
+            ))
+            .await;
+
+        let partitions = owner.plane.partitions();
+        assert!(
+            partitions.is_tombstoned(&namespace),
+            "an op only the repair ring still holds must fence the partition it refused on"
+        );
+        assert_eq!(owner.metrics.partition_applied_divergences_value(), 1);
+        assert_eq!(
+            partitions
+                .get_io_owner(&namespace)
+                .unwrap()
+                .consensus()
+                .view(),
+            REPAIR_VIEW
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_refused_contradicting_metadata_log_when_ticking_should_export_it_once() {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (mut owner, _sender) = test_owner(&bus, None);
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            METADATA_GROUP,
+            Rc::clone(&bus),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        owner.plane.inner_mut().0 = IggyMetadata::new(
+            Some(consensus),
+            None,
+            None,
+            None,
+            IoTestMetadata::new((
+                UsersInner::new().into(),
+                (StreamsInner::default().into(), ()),
+            )),
+            None,
+        );
+        let announced = PrepareHeader {
+            checksum: 1,
+            ..PrepareHeader::default()
+        };
+        let consensus = owner.plane.inner().0.consensus.as_ref().unwrap();
+        assert!(consensus.contradicts_applied_log(
+            consensus::PlaneKind::Metadata,
+            consensus::ContradictionSource::StartView,
+            1,
+            [&announced],
+            |_| Some(PrepareHeader {
+                checksum: 2,
+                ..announced
+            }),
+        ));
+
+        for _ in 0..2 {
+            owner.tick_metadata().await;
+        }
+
+        assert_eq!(owner.metrics.metadata_applied_log_contradictions_value(), 1);
+        assert_eq!(
+            owner
+                .plane
+                .inner()
+                .0
+                .consensus
+                .as_ref()
+                .unwrap()
+                .applied_log_contradictions(),
+            1
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_start_view_that_matches_the_applied_ops_when_adopting_should_adopt_it() {
+        const APPLIED: u64 = 2;
+        const NEW_VIEW: u32 = 3;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, APPLIED).await;
+        host_applied_backup(&owner, &bus, namespace, &prepares).await;
+
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                NEW_VIEW,
+                APPLIED,
+                APPLIED,
+                &[*prepares.last().unwrap().header()],
+            ))
+            .await;
+
+        let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+        assert_eq!(partition.consensus().view(), NEW_VIEW);
+        assert!(!partition.consensus().view_log_unproven());
+        assert_eq!(partition.consensus().applied_log_contradictions(), 0);
     }
 
     #[compio::test]
@@ -4686,6 +8383,243 @@ mod tests {
         assert!(!partition.consensus().view_log_unproven());
         partition.commit_journal(partitions.config()).await;
         assert_eq!(partition.consensus().commit_min(), HEAD);
+    }
+
+    #[compio::test]
+    async fn given_a_divergent_partition_run_when_reconciling_should_remove_it_at_once() {
+        const APPLIED: u64 = 2;
+        const FIRST: u64 = APPLIED + 1;
+        const DIVERGENT: u64 = 32;
+        const LAST: u64 = FIRST + DIVERGENT - 1;
+        const HEAD: u64 = LAST + 3;
+        const NEW_VIEW: u32 = 3;
+        for deferred in [true, false] {
+            let bus = Rc::new(IggyMessageBus::new(0));
+            let (owner, _sender) = test_owner(&bus, None);
+            let namespace = IggyNamespace::new(0, 0, 0);
+            let prepares = primary_prepares(&bus, namespace, HEAD).await;
+            let canonical: Vec<_> = prepares
+                .iter()
+                .rev()
+                .take(usize::try_from(HEAD - APPLIED).unwrap())
+                .map(|prepare| *prepare.header())
+                .collect();
+            let view = || start_view_suffix(namespace, NEW_VIEW, HEAD, HEAD, &canonical);
+            install_divergent_backup(&owner, &bus, namespace, &prepares, APPLIED, FIRST..=LAST)
+                .await;
+            let partitions = owner.plane.partitions();
+            if deferred {
+                partitions.set_io_notifier(
+                    owner.partition_io.notifier(),
+                    owner.partition_io.limits.bytes_max(),
+                );
+            }
+            owner.on_start_view(view()).await;
+
+            assert_eq!(
+                settle_view_truncation(&owner, namespace, FIRST..=LAST).await,
+                usize::from(deferred),
+                "one transition truncates the whole proven run"
+            );
+            let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+            assert!(partition.consensus().view_log_unproven());
+            assert_eq!(
+                partition.consensus().view_log_repair_op(),
+                Some(FIRST),
+                "repair opens at the lowest removed op, so one window refetches the run"
+            );
+            partition.commit_journal(partitions.config()).await;
+            assert_eq!(partition.consensus().commit_min(), APPLIED);
+            let journal = &partition.log.journal().inner;
+            for prepare in prepares.iter().skip(usize::try_from(APPLIED).unwrap()) {
+                let op = prepare.header().op;
+                if op <= LAST {
+                    assert!(!journal.holds_op(op), "divergent op {op} must go");
+                } else {
+                    assert_eq!(
+                        journal.header_by_op(op),
+                        Some(*prepare.header()),
+                        "canonical op {op} must stay"
+                    );
+                }
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_bridged_header_off_the_view_chain_when_reconciling_a_partition_should_fetch_its_op()
+     {
+        const APPLIED: u64 = 2;
+        const HEAD: u64 = 8;
+        const BRIDGED: u64 = 5;
+        const NEW_VIEW: u32 = 3;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, HEAD).await;
+        let canonical: Vec<_> = prepares
+            .iter()
+            .rev()
+            .take(usize::try_from(HEAD - APPLIED).unwrap())
+            .map(|prepare| *prepare.header())
+            .collect();
+        install_divergent_backup(
+            &owner,
+            &bus,
+            namespace,
+            &prepares,
+            APPLIED,
+            BRIDGED..=BRIDGED,
+        )
+        .await;
+        let partitions = owner.plane.partitions();
+        partitions
+            .get_by_ns(&namespace)
+            .unwrap()
+            .log
+            .journal()
+            .inner
+            .remove_range(BRIDGED..=BRIDGED)
+            .await
+            .unwrap();
+        partitions.set_io_notifier(
+            owner.partition_io.notifier(),
+            owner.partition_io.limits.bytes_max(),
+        );
+
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                NEW_VIEW,
+                HEAD,
+                HEAD,
+                &off_chain_at(&canonical, BRIDGED),
+            ))
+            .await;
+
+        let partition = partitions.get_by_ns(&namespace).unwrap();
+        assert!(
+            !partition.view_truncation_pending(),
+            "op {BRIDGED} is not held, so a truncation there removes nothing and the next \
+             proof defers it again"
+        );
+        assert!(partition.consensus().view_log_unproven());
+        assert_eq!(
+            partition.consensus().view_log_repair_op(),
+            Some(BRIDGED),
+            "the op under the off-chain header is a gap to fetch"
+        );
+        let journal = &partition.log.journal().inner;
+        for prepare in prepares.iter().skip(usize::try_from(APPLIED).unwrap()) {
+            let op = prepare.header().op;
+            assert_eq!(
+                journal.header_by_op(op),
+                (op != BRIDGED).then_some(*prepare.header()),
+                "op {op}: the canonical tail and the unproven entries below the gap stay"
+            );
+        }
+    }
+
+    /// Service the I/O lane until the view truncation settles, and count the steps
+    /// that removed part of `divergent`.
+    #[allow(clippy::future_not_send)]
+    async fn settle_view_truncation(
+        owner: &IoTestShard,
+        namespace: IggyNamespace,
+        divergent: RangeInclusive<u64>,
+    ) -> usize {
+        let partitions = owner.plane.partitions();
+        let pending = || {
+            partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .view_truncation_pending()
+        };
+        let held = || {
+            let partition = partitions.get_by_ns(&namespace).unwrap();
+            divergent
+                .clone()
+                .filter(|op| partition.log.journal().inner.holds_op(*op))
+                .count()
+        };
+        let mut still_held = held();
+        let mut truncations = 0;
+        for _ in 0..crate::router::COOPERATIVE_EVENT_BUDGET {
+            if !pending() {
+                break;
+            }
+            owner.service_partition_io().await;
+            let now_held = held();
+            if now_held < still_held {
+                truncations += 1;
+                still_held = now_held;
+            }
+        }
+        assert!(!pending(), "the view truncation never settled");
+        truncations
+    }
+
+    /// Install a backup that journaled `prepares`, applied through `applied`, and
+    /// holds a stale copy of every op in `divergent`. It inherits the I/O lane only
+    /// once the test set one.
+    #[allow(clippy::future_not_send)]
+    async fn install_divergent_backup(
+        owner: &IoTestShard,
+        bus: &Rc<IggyMessageBus>,
+        namespace: IggyNamespace,
+        prepares: &[Message<PrepareHeader>],
+        applied: u64,
+        divergent: RangeInclusive<u64>,
+    ) {
+        let mut partition =
+            repairing_replica(bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+        partition.repair = None;
+        for prepare in prepares {
+            partition.on_replicate(prepare.clone()).await;
+        }
+        partition.consensus().advance_commit_max(applied);
+        partition
+            .commit_journal(owner.plane.partitions().config())
+            .await;
+        let journal = &partition.log.journal().inner;
+        journal.remove_range(divergent.clone()).await.unwrap();
+        for prepare in prepares
+            .iter()
+            .filter(|prepare| divergent.contains(&prepare.header().op))
+        {
+            let stale = prepare
+                .clone()
+                .transmute_header(|previous, header: &mut PrepareHeader| {
+                    *header = previous;
+                    header.client += 1;
+                    header.checksum = header.identity_checksum();
+                });
+            journal.append(stale.into_frozen()).await.unwrap();
+        }
+        let partitions = owner.plane.partitions();
+        partitions.remove(&namespace).unwrap();
+        partitions.insert(namespace, partition);
+    }
+
+    /// `suffix`, high to low, with the header at `bridged` moved off the view's
+    /// chain. The header above it goes blank, so the suffix still decodes: only
+    /// adjacent headers must chain there.
+    fn off_chain_at(suffix: &[PrepareHeader], bridged: u64) -> Vec<PrepareHeader> {
+        suffix
+            .iter()
+            .map(|header| {
+                if header.op == bridged + 1 {
+                    consensus::dvc_blank(header.op)
+                } else if header.op == bridged {
+                    let mut off_chain = *header;
+                    off_chain.client += 1;
+                    off_chain.checksum = off_chain.identity_checksum();
+                    off_chain
+                } else {
+                    *header
+                }
+            })
+            .collect()
     }
 
     #[compio::test]
@@ -4896,7 +8830,7 @@ mod tests {
             captured.borrow_mut().push(frame);
             Ok(())
         }));
-        assert!(bus.owner_table().try_claim(REPAIR_PRIMARY, 1));
+        crate::test_support::connect_replica_on(&bus, REPAIR_PRIMARY, 1);
         let (owner, _sender) = test_owner(&bus, None);
         let namespace = IggyNamespace::new(0, 0, 0);
         let prepares = primary_prepares(&bus, namespace, HEAD).await;
@@ -4969,7 +8903,7 @@ mod tests {
             Ok(())
         }));
         for requester in [BACKUP, NEXT_PRIMARY] {
-            assert!(bus.owner_table().try_claim(requester, 1));
+            crate::test_support::connect_replica_on(&bus, requester, 1);
         }
         let (owner, _sender) = test_owner(&bus, None);
         let namespace = IggyNamespace::new(0, 0, 0);
@@ -4983,14 +8917,16 @@ mod tests {
         donor
             .commit_journal(owner.plane.partitions().config())
             .await;
-        let change =
-            view_control_message(namespace, Command::StartViewChange, NEXT_VIEW, NEXT_PRIMARY);
-        let MessageBag::StartViewChange(change) = change else {
-            unreachable!()
-        };
-        donor
-            .consensus()
-            .handle_start_view_change(consensus::PlaneKind::Partitions, change.header());
+        for voter in [REPAIR_PRIMARY, BACKUP] {
+            let change =
+                view_control_message(namespace, Command::StartViewChange, NEXT_VIEW, voter);
+            let MessageBag::StartViewChange(change) = change else {
+                unreachable!()
+            };
+            donor
+                .consensus()
+                .handle_start_view_change(consensus::PlaneKind::Partitions, change.header());
+        }
         assert_eq!(donor.consensus().status(), consensus::Status::ViewChange);
         owner.plane.partitions().remove(&namespace).unwrap();
         owner.plane.partitions().insert(namespace, donor);
@@ -5023,8 +8959,1322 @@ mod tests {
         }
     }
 
+    /// A donor whose evicted ring released the bodies of ops 1..=3 to their
+    /// segment serves them from the segment, byte for byte. It never serves a
+    /// corrupt or a torn body: the round stops there, and from then on the
+    /// ops up to it answer `RangeEvicted`.
+    #[compio::test]
+    async fn given_bodies_released_to_a_segment_when_a_backup_requests_them_should_serve_only_intact_ones()
+     {
+        let donor = Box::pin(SegmentDonor::new(4)).await;
+        let SegmentDonor {
+            prepares,
+            log_path,
+            positions,
+            ..
+        } = &donor;
+
+        assert_eq!(
+            donor.answers(1).await,
+            [
+                (Command::RepairPrepare, 1),
+                (Command::RepairPrepare, 2),
+                (Command::RepairPrepare, 3),
+                (Command::RepairPrepare, 4),
+                (Command::RepairDone, 4),
+            ]
+        );
+
+        // A flipped byte at the end of the body of op 2, and op 3 cut in half.
+        let mut segment = std::fs::read(log_path).unwrap();
+        let op_3_start = usize::try_from(positions[&3]).unwrap();
+        segment[op_3_start - 1] ^= 0xFF;
+        segment
+            .truncate(op_3_start + (prepares[2].as_slice().len() - size_of::<PrepareHeader>()) / 2);
+        std::fs::write(log_path, &segment).unwrap();
+        assert_eq!(
+            donor.answers(1).await,
+            [(Command::RepairPrepare, 1), (Command::RepairDone, 1)],
+            "the corrupt body of op 2 is not served"
+        );
+        assert_eq!(
+            donor.answers(2).await,
+            [(Command::RangeEvicted, 3), (Command::RepairDone, 2)],
+            "the torn body of op 3 is not served"
+        );
+        assert_eq!(
+            donor.answers(3).await,
+            [
+                (Command::RangeEvicted, 4),
+                (Command::RepairPrepare, 4),
+                (Command::RepairDone, 4),
+            ]
+        );
+    }
+
+    /// A round that needs released bodies sends nothing until a detached read
+    /// brings them back, so the pump goes on while the disk works: another
+    /// requester's round of a resident op goes out first. A request that
+    /// repeats the round waits for its read. Once the bodies land, the round
+    /// goes out in op order and `RepairDone` ends it.
+    #[compio::test]
+    async fn given_a_read_of_released_bodies_when_other_requests_arrive_should_serve_them_meanwhile()
+     {
+        const OTHER_REQUESTER: u8 = 0;
+        let donor = Box::pin(SegmentDonor::new(4)).await;
+        connect_replica_on(&donor.owner.bus, OTHER_REQUESTER, 1);
+        donor.sent.borrow_mut().clear();
+        let request = repair_request(donor.namespace, 1, donor.prepares.len());
+        let resident = repair_request(donor.namespace, 4, donor.prepares.len()).transmute_header(
+            |old, header: &mut RequestPreparesHeader| {
+                *header = old;
+                header.replica = OTHER_REQUESTER;
+            },
+        );
+
+        let held = donor.owner.served_reads.hold();
+        donor.owner.on_request_prepares(&request).await;
+        donor.owner.on_request_prepares(&request).await;
+        donor.owner.on_request_prepares(&resident).await;
+        assert_eq!(
+            sent_answers(&donor.sent, &donor.prepares),
+            [(Command::RepairPrepare, 4), (Command::RepairDone, 4)],
+            "only the resident round goes out while the read waits"
+        );
+
+        drop(held);
+        donor.owner.settle_served_reads().await;
+        assert_eq!(
+            sent_answers(&donor.sent, &donor.prepares),
+            [
+                (Command::RepairPrepare, 1),
+                (Command::RepairPrepare, 2),
+                (Command::RepairPrepare, 3),
+                (Command::RepairPrepare, 4),
+                (Command::RepairDone, 4),
+            ],
+            "the repeated request is answered once"
+        );
+    }
+
+    /// The running pump serves other frames while a round waits for its
+    /// released bodies, and answers that round once the bodies land.
+    #[compio::test]
+    async fn given_a_running_pump_when_a_round_waits_for_released_bodies_should_serve_other_frames()
+    {
+        const OTHER_REQUESTER: u8 = 0;
+        const PUMP_WAITS_MAX: usize = 1000;
+        let donor = &Box::pin(SegmentDonor::new(4)).await;
+        connect_replica_on(&donor.owner.bus, OTHER_REQUESTER, 1);
+        donor.sent.borrow_mut().clear();
+        let deliver = |request: Message<RequestPreparesHeader>| {
+            donor
+                .sender
+                .try_send(ShardFrame::consensus(
+                    donor.owner.id,
+                    MessageBag::RequestPrepares(request),
+                ))
+                .expect("fixture request fits the inbox");
+        };
+        let sent_frames = |count: usize| async move {
+            for _ in 0..PUMP_WAITS_MAX {
+                if donor.sent.borrow().len() >= count {
+                    return;
+                }
+                donor.owner.bus.sleep(Duration::from_millis(1)).await;
+            }
+            panic!(
+                "the pump sent {} of {count} frames",
+                donor.sent.borrow().len()
+            );
+        };
+        let (stop, stopped) = channel(1);
+        let pump = donor
+            .owner
+            .run_message_pump(stopped, Arc::new(AtomicBool::new(false)));
+        let exercise = async {
+            let held = donor.owner.served_reads.hold();
+            deliver(repair_request(donor.namespace, 1, donor.prepares.len()));
+            deliver(
+                repair_request(donor.namespace, 4, donor.prepares.len()).transmute_header(
+                    |old, header: &mut RequestPreparesHeader| {
+                        *header = old;
+                        header.replica = OTHER_REQUESTER;
+                    },
+                ),
+            );
+            sent_frames(2).await;
+            assert_eq!(
+                sent_answers(&donor.sent, &donor.prepares),
+                [(Command::RepairPrepare, 4), (Command::RepairDone, 4)]
+            );
+
+            drop(held);
+            sent_frames(5).await;
+            assert_eq!(
+                sent_answers(&donor.sent, &donor.prepares),
+                [
+                    (Command::RepairPrepare, 1),
+                    (Command::RepairPrepare, 2),
+                    (Command::RepairPrepare, 3),
+                    (Command::RepairPrepare, 4),
+                    (Command::RepairDone, 4),
+                ]
+            );
+            stop.try_send(()).unwrap();
+        };
+        let (fault, ()) = futures::join!(pump, exercise);
+        assert!(fault.is_none());
+    }
+
+    /// The bodies can land after the partition left the shard. The serve
+    /// checks the state again, so it sends nothing, and a later request reads
+    /// again.
+    #[compio::test]
+    async fn given_a_read_of_released_bodies_when_the_partition_leaves_should_send_nothing() {
+        let donor = Box::pin(SegmentDonor::new(4)).await;
+        let partitions = donor.owner.plane.partitions();
+        donor.sent.borrow_mut().clear();
+        donor
+            .owner
+            .on_request_prepares(&repair_request(donor.namespace, 1, donor.prepares.len()))
+            .await;
+        let partition = partitions.remove(&donor.namespace).unwrap();
+        donor.owner.settle_served_reads().await;
+        assert!(donor.sent.borrow().is_empty());
+
+        partitions.insert(donor.namespace, partition);
+        assert_eq!(
+            donor.answers(1).await,
+            [
+                (Command::RepairPrepare, 1),
+                (Command::RepairPrepare, 2),
+                (Command::RepairPrepare, 3),
+                (Command::RepairPrepare, 4),
+                (Command::RepairDone, 4),
+            ]
+        );
+    }
+
+    /// A read starts only after the pump took the bytes of the read before
+    /// it, so a busy pump holds the bodies of one round, not of every round
+    /// that waits.
+    #[compio::test]
+    async fn given_a_landed_read_when_the_pump_has_not_taken_it_should_start_no_other_read() {
+        const OTHER_REQUESTER: u8 = 0;
+        // Ample time for a second read of the fixture segment to land, if it
+        // could start before the take.
+        const SECOND_READ_WINDOW: Duration = Duration::from_millis(10);
+        let donor = Box::pin(SegmentDonor::new(4)).await;
+        connect_replica_on(&donor.owner.bus, OTHER_REQUESTER, 1);
+        donor.sent.borrow_mut().clear();
+        let round = [
+            (Command::RepairPrepare, 1),
+            (Command::RepairPrepare, 2),
+            (Command::RepairPrepare, 3),
+            (Command::RepairPrepare, 4),
+            (Command::RepairDone, 4),
+        ];
+        let other = repair_request(donor.namespace, 1, donor.prepares.len()).transmute_header(
+            |old, header: &mut RequestPreparesHeader| {
+                *header = old;
+                header.replica = OTHER_REQUESTER;
+            },
+        );
+        donor
+            .owner
+            .on_request_prepares(&repair_request(donor.namespace, 1, donor.prepares.len()))
+            .await;
+        donor.owner.on_request_prepares(&other).await;
+
+        donor.owner.served_reads.landed().await;
+        donor.owner.bus.sleep(SECOND_READ_WINDOW).await;
+        assert_eq!(
+            donor.owner.served_reads.landed_count(),
+            1,
+            "the second read waits for the pump to take the first"
+        );
+
+        donor.owner.settle_served_reads().await;
+        assert_eq!(
+            sent_answers(&donor.sent, &donor.prepares),
+            [round, round].concat()
+        );
+    }
+
+    /// A replay to a backup reads no released body that the replication
+    /// window refuses. A window with room for op 1 reads op 1 only, and a full
+    /// window reads nothing. The body of op 2 is corrupt, so a read of it
+    /// would drop ops 1..=2 from the ring.
+    #[compio::test]
+    async fn given_released_bodies_when_the_replication_window_refuses_them_should_not_read_them() {
+        const HEAD: u64 = 3;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let replayed = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&replayed);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            let message =
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            if message.header().command == Command::Prepare {
+                let prepare: Message<PrepareHeader> = message.try_into_typed().unwrap();
+                captured.borrow_mut().push(prepare.header().op);
+            }
+            Ok(())
+        }));
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let (mut primary, prepares) = journaling_primary(&bus, namespace, HEAD, 1).await;
+        let directory = tempfile::tempdir().unwrap();
+        let (log_path, _) = attach_segment_files(&mut primary, directory.path(), false).await;
+        let positions = release_bodies_to_segment(&primary, &log_path, &prepares);
+        let mut segment = std::fs::read(&log_path).unwrap();
+        segment[usize::try_from(positions[&2]).unwrap()] ^= 0xFF;
+        std::fs::write(&log_path, &segment).unwrap();
+        let partitions = owner.plane.partitions();
+        partitions.remove(&namespace).unwrap();
+        partitions.insert(namespace, primary);
+        connect_replica_on(&bus, REPAIR_BACKUP, 1);
+        let first = u64::from(prepares[0].header().size);
+        let incarnation = {
+            let consensus = partitions.get_by_ns(&namespace).unwrap().consensus();
+            assert!(consensus.admit_replication(REPAIR_BACKUP, 1, first, ReplicationSend::Live));
+            consensus.record_replication_failure(REPAIR_BACKUP, 1);
+            let _checkpoint = consensus.record_replication_send(
+                REPAIR_BACKUP,
+                1,
+                REPLICATION_BATCH_BYTES_MAX - first,
+                ReplicationSend::Retransmit,
+            );
+            consensus.partition_incarnation()
+        };
+        let replay = |from_op| {
+            Message::<RequestPreparesHeader>::new(size_of::<RequestPreparesHeader>())
+                .transmute_header(|_, header: &mut RequestPreparesHeader| {
+                    header.command = Command::RequestPrepares;
+                    header.size = u32::try_from(size_of::<RequestPreparesHeader>()).unwrap();
+                    header.replica = REPAIR_BACKUP;
+                    header.group = namespace.inner();
+                    header.partition_incarnation = incarnation;
+                    header.from_op = from_op;
+                    header.to_op = HEAD;
+                })
+        };
+        let retained_from = || {
+            partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .log
+                .journal()
+                .inner
+                .repair_retained_from()
+        };
+
+        assert_eq!(
+            owner.serve_prepares(&replay(1), true, None).await,
+            None,
+            "the body of op 1 is on disk"
+        );
+        owner.settle_served_reads().await;
+        assert_eq!(*replayed.borrow(), [1], "the window must take op 1 only");
+        assert_eq!(
+            retained_from(),
+            Some(1),
+            "the replay must not read the body of op 2 that the window refuses"
+        );
+        assert_eq!(owner.serve_prepares(&replay(2), true, None).await, Some(1));
+        assert_eq!(*replayed.borrow(), [1], "a full window must take nothing");
+        assert_eq!(
+            retained_from(),
+            Some(1),
+            "a full window must not read a body"
+        );
+    }
+
+    /// A log file that cannot be opened for now fails the read with an error
+    /// that can pass, like a file descriptor limit. A link that points at
+    /// itself stands in for it, because a lower limit would reach the other
+    /// tests in the process. The round answers without the released ops and
+    /// keeps them, so a later round serves them.
+    #[compio::test]
+    async fn given_a_log_file_that_cannot_be_opened_when_a_backup_requests_released_bodies_should_serve_them_once_it_opens()
+     {
+        let donor = Box::pin(SegmentDonor::new(3)).await;
+        let segment = std::fs::read(&donor.log_path).unwrap();
+        std::fs::remove_file(&donor.log_path).unwrap();
+        std::os::unix::fs::symlink(&donor.log_path, &donor.log_path).unwrap();
+        assert_eq!(donor.answers(1).await, [(Command::RepairDone, 0)]);
+
+        std::fs::remove_file(&donor.log_path).unwrap();
+        std::fs::write(&donor.log_path, &segment).unwrap();
+        assert_eq!(
+            donor.answers(1).await,
+            [
+                (Command::RepairPrepare, 1),
+                (Command::RepairPrepare, 2),
+                (Command::RepairPrepare, 3),
+                (Command::RepairDone, 3),
+            ]
+        );
+    }
+
+    /// A whole batch that passes its own checks, but sits where the ring
+    /// expects another body, is never served: here the body of op 3 written
+    /// over the body of op 2, which has the same length.
+    #[compio::test]
+    async fn given_another_batch_at_a_released_body_position_when_a_backup_requests_it_should_not_serve_it()
+     {
+        let donor = Box::pin(SegmentDonor::new(4)).await;
+        let body = |op: usize| &donor.prepares[op - 1].as_slice()[size_of::<PrepareHeader>()..];
+        assert_eq!(body(2).len(), body(3).len());
+        let mut segment = std::fs::read(&donor.log_path).unwrap();
+        let op_2_start = usize::try_from(donor.positions[&2]).unwrap();
+        segment[op_2_start..op_2_start + body(3).len()].copy_from_slice(body(3));
+        std::fs::write(&donor.log_path, &segment).unwrap();
+
+        assert_eq!(
+            donor.answers(1).await,
+            [(Command::RepairPrepare, 1), (Command::RepairDone, 1)],
+            "the batch of op 3 is not served as op 2"
+        );
+        assert_eq!(
+            donor.answers(2).await,
+            [
+                (Command::RangeEvicted, 3),
+                (Command::RepairPrepare, 3),
+                (Command::RepairPrepare, 4),
+                (Command::RepairDone, 4),
+            ]
+        );
+    }
+
+    /// Released bodies that lie back to back in a segment file come back in
+    /// one read. A run ends at a gap in the file and at the end of its
+    /// segment, also where the next body starts at the same position in the
+    /// next file. Every body reaches the backup byte for byte.
+    #[compio::test]
+    async fn given_released_bodies_in_runs_across_two_segments_when_a_backup_requests_them_should_serve_each_one()
+     {
+        const HEAD: u64 = 6;
+        const GAP: usize = 64;
+        const SECOND_SEGMENT_START: u64 = 1000;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&sent);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            captured.borrow_mut().push(
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap(),
+            );
+            Ok(())
+        }));
+        connect_replica_on(&bus, REPAIR_PRIMARY, 1);
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, HEAD).await;
+        let mut donor =
+            repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+        donor.repair = None;
+        let directory = tempfile::tempdir().unwrap();
+        let (first_path, _) = attach_segment_files(&mut donor, directory.path(), false).await;
+        for prepare in &prepares {
+            donor.on_replicate(prepare.clone()).await;
+        }
+        let second_path =
+            attach_next_segment_file(&mut donor, directory.path(), SECOND_SEGMENT_START).await;
+
+        // Ops 1 and 2 back to back, a gap, then op 3 in the first file. Ops 4
+        // and 5 back to back in the second file, op 4 where op 3 ends.
+        let body = |op: u64| {
+            &prepares[usize::try_from(op - 1).unwrap()].as_slice()[size_of::<PrepareHeader>()..]
+        };
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        let mut positions = BTreeMap::new();
+        for op in 1..=2 {
+            positions.insert(op, (0, first.len()));
+            first.extend_from_slice(body(op));
+        }
+        first.resize(first.len() + GAP, u8::MAX);
+        positions.insert(3, (0, first.len()));
+        first.extend_from_slice(body(3));
+        second.resize(first.len(), 0);
+        for op in 4..=5 {
+            positions.insert(op, (SECOND_SEGMENT_START, second.len()));
+            second.extend_from_slice(body(op));
+        }
+        std::fs::write(&first_path, &first).unwrap();
+        std::fs::write(&second_path, &second).unwrap();
+        release_bodies(&donor, &prepares, |op| {
+            positions
+                .get(&op)
+                .map(|&(segment_start, position)| partitions::BodyPosition {
+                    segment_start,
+                    position: u64::try_from(position).unwrap(),
+                })
+        });
+        owner.plane.partitions().remove(&namespace).unwrap();
+        owner.plane.partitions().insert(namespace, donor);
+
+        assert_eq!(
+            repair_answers(&owner, &sent, namespace, 1, &prepares).await,
+            (1..=HEAD)
+                .map(|op| (Command::RepairPrepare, op))
+                .chain([(Command::RepairDone, HEAD)])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Asks `owner` for ops `from_op..` of `prepares` as the primary of
+    /// [`REPAIR_VIEW`], serves the reads that land, and returns what
+    /// [`sent_answers`] finds.
+    #[allow(clippy::future_not_send)]
+    async fn repair_answers(
+        owner: &IoTestShard,
+        sent: &RefCell<Vec<Message<GenericHeader>>>,
+        namespace: IggyNamespace,
+        from_op: u64,
+        prepares: &[Message<PrepareHeader>],
+    ) -> Vec<(Command, u64)> {
+        sent.borrow_mut().clear();
+        owner
+            .on_request_prepares(&repair_request(namespace, from_op, prepares.len()))
+            .await;
+        owner.settle_served_reads().await;
+        sent_answers(sent, prepares)
+    }
+
+    /// A request of [`REPAIR_PRIMARY`] in [`REPAIR_VIEW`] for ops
+    /// `from_op..=head`.
+    fn repair_request(
+        namespace: IggyNamespace,
+        from_op: u64,
+        head: usize,
+    ) -> Message<RequestPreparesHeader> {
+        Message::<RequestPreparesHeader>::new(size_of::<RequestPreparesHeader>()).transmute_header(
+            |_, header: &mut RequestPreparesHeader| {
+                header.command = Command::RequestPrepares;
+                header.cluster = 1;
+                header.group = namespace.inner();
+                header.replica = REPAIR_PRIMARY;
+                header.view = REPAIR_VIEW;
+                header.from_op = from_op;
+                header.to_op = u64::try_from(head).unwrap();
+                header.size = u32::try_from(size_of::<RequestPreparesHeader>()).unwrap();
+                header.seal();
+            },
+        )
+    }
+
+    /// Takes the frames in `sent`, and returns the command and op of each.
+    /// Each `RepairPrepare` must carry its prepare from `prepares` verbatim.
+    fn sent_answers(
+        sent: &RefCell<Vec<Message<GenericHeader>>>,
+        prepares: &[Message<PrepareHeader>],
+    ) -> Vec<(Command, u64)> {
+        const COMMAND_OFFSET: usize = std::mem::offset_of!(GenericHeader, command);
+        sent.borrow_mut()
+            .drain(..)
+            .map(|message| {
+                let command = message.header().command;
+                if command != Command::RepairPrepare {
+                    let reply: Message<RepairRangeReplyHeader> = message.try_into_typed().unwrap();
+                    return (command, reply.header().op);
+                }
+                let prepare: Message<iggy_binary_protocol::RepairPrepareHeader> =
+                    message.try_into_typed().unwrap();
+                let op = prepare.header().0.op;
+                let mut expected = prepares[usize::try_from(op).unwrap() - 1]
+                    .as_slice()
+                    .to_vec();
+                expected[COMMAND_OFFSET] = Command::RepairPrepare as u8;
+                assert_eq!(
+                    prepare.as_slice(),
+                    expected,
+                    "op {op} reaches the backup as journaled"
+                );
+                (command, op)
+            })
+            .collect()
+    }
+
+    #[compio::test]
+    async fn given_large_resident_repairs_when_serving_should_bound_bytes_and_allow_one_oversized_frame()
+     {
+        const HEAD: u64 = 3;
+        for payload_bytes in [4 * 1024 * 1024, 12 * 1024 * 1024] {
+            let bus = Rc::new(IggyMessageBus::new(0));
+            let sent = Rc::new(RefCell::new(Vec::new()));
+            let captured = Rc::clone(&sent);
+            bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+                captured.borrow_mut().push(
+                    Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                        .unwrap(),
+                );
+                Ok(())
+            }));
+            connect_replica_on(&bus, REPAIR_PRIMARY, 1);
+            let (owner, _sender) = test_owner(&bus, None);
+            let namespace = IggyNamespace::new(0, 0, 0);
+            let prepares = sized_primary_prepares(&bus, namespace, HEAD, payload_bytes).await;
+            let mut donor =
+                repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+            donor.repair = None;
+            for prepare in &prepares {
+                donor.on_replicate(prepare.clone()).await;
+            }
+            owner.plane.partitions().remove(&namespace).unwrap();
+            owner.plane.partitions().insert(namespace, donor);
+
+            let mut from_op = 1;
+            while from_op <= HEAD {
+                let answers = repair_answers(&owner, &sent, namespace, from_op, &prepares).await;
+                let served: Vec<_> = answers
+                    .iter()
+                    .filter(|(command, _)| *command == Command::RepairPrepare)
+                    .map(|(_, op)| *op)
+                    .collect();
+                assert!(
+                    !served.is_empty(),
+                    "a legal oversized frame must make progress"
+                );
+                let bytes: usize = served
+                    .iter()
+                    .map(|op| prepares[usize::try_from(op - 1).unwrap()].total_len())
+                    .sum();
+                assert!(
+                    bytes <= usize::try_from(crate::REPAIR_BYTES_MAX).unwrap() || served.len() == 1,
+                    "resident response exceeded the byte budget: {bytes} bytes, ops {served:?}"
+                );
+                let through = *served.last().unwrap();
+                assert_eq!(answers.last(), Some(&(Command::RepairDone, through)));
+                assert_eq!(served, (from_op..=through).collect::<Vec<_>>());
+                from_op = through + 1;
+            }
+        }
+    }
+
+    /// A primary whose evicted ring released bodies of 1 MiB to their segment
+    /// reads at most `REPAIR_BYTES_MAX` of them per round, from the
+    /// bottom of the window. A backup that adopted the view walks its unproven
+    /// log down from the hole below the adopted head. Each window starts above
+    /// the bodies the backup holds below the hole, and a round that brought
+    /// such bodies pulls the next window at once, so the walk reaches the hole
+    /// and proves the log without a state transfer.
+    #[compio::test]
+    async fn given_released_bodies_past_the_disk_budget_when_a_backup_walks_down_should_reach_the_hole()
+     {
+        const HEAD: u64 = 40;
+        const BATCH_BYTES: usize = 1024 * 1024;
+        const NEW_VIEW: u32 = REPAIR_VIEW + 3;
+        const EXCHANGES_MAX: usize = 32;
+        let primary_bus = Rc::new(IggyMessageBus::new(0));
+        let backup_bus = Rc::new(IggyMessageBus::new(0));
+        let served = capture_replica_frames(&primary_bus);
+        let requested = capture_replica_frames(&backup_bus);
+        connect_replica_on(&primary_bus, REPAIR_BACKUP, 1);
+        connect_replica_on(&backup_bus, REPAIR_PRIMARY, 1);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = sized_primary_prepares(&primary_bus, namespace, HEAD, BATCH_BYTES).await;
+        served.borrow_mut().clear();
+
+        let mut consensus = VsrConsensus::new(
+            1,
+            REPAIR_PRIMARY,
+            3,
+            namespace.inner(),
+            Rc::clone(&primary_bus),
+            LocalPipeline::new(),
+        );
+        consensus.set_view(NEW_VIEW);
+        consensus.set_log_view(NEW_VIEW);
+        consensus.init();
+        consensus.advance_commit_max(HEAD);
+        let mut primary = IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(SEGMENT_BYTES),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let (log_path, _) = attach_segment_files(&mut primary, directory.path(), false).await;
+        for prepare in &prepares {
+            primary
+                .log
+                .journal()
+                .inner
+                .append(prepare.clone().into_frozen())
+                .await
+                .unwrap();
+        }
+        release_bodies_to_segment(&primary, &log_path, &prepares);
+        let (primary_owner, _primary_sender) = test_owner(&primary_bus, None);
+        primary_owner.plane.partitions().remove(&namespace).unwrap();
+        primary_owner.plane.partitions().insert(namespace, primary);
+
+        let (backup_owner, _backup_sender) = test_owner(&backup_bus, None);
+        backup_owner.set_repair_retry_ticks(1);
+        let mut backup = repairing_replica(
+            &backup_bus,
+            namespace,
+            (REPAIR_BACKUP, 3),
+            REPAIR_PRIMARY,
+            0,
+            0,
+        );
+        backup.repair = None;
+        let partitions = backup_owner.plane.partitions();
+        partitions.remove(&namespace).unwrap();
+        partitions.insert(namespace, backup);
+        backup_owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                NEW_VIEW,
+                HEAD,
+                HEAD,
+                &[*prepares.last().unwrap().header()],
+            ))
+            .await;
+        let backup = partitions.get_by_ns(&namespace).unwrap();
+        let hole = backup.consensus().view_log_repair_op().unwrap();
+        assert!(!backup.consensus().view_log_entry_proven(hole));
+
+        let mut stall_ticks = 0;
+        for _ in 0..EXCHANGES_MAX {
+            if !backup.consensus().view_log_unproven() {
+                break;
+            }
+            let requests: Vec<_> = requested
+                .borrow_mut()
+                .drain(..)
+                .filter(|(_, frame)| frame.header().command == Command::RequestPrepares)
+                .collect();
+            if requests.is_empty() {
+                stall_ticks += 1;
+                assert!(
+                    backup_owner
+                        .tick_partitions(&mut Vec::new())
+                        .await
+                        .is_none()
+                );
+                continue;
+            }
+            for (peer, request) in requests {
+                assert_eq!(peer, REPAIR_PRIMARY, "the walk left the primary");
+                primary_owner
+                    .on_request_prepares(&request.try_into_typed().unwrap())
+                    .await;
+                primary_owner.settle_served_reads().await;
+            }
+            let frames: Vec<_> = served.borrow_mut().drain(..).collect();
+            for (_, frame) in frames {
+                match frame.header().command {
+                    Command::RepairPrepare => {
+                        backup_owner
+                            .on_repair_prepare(frame.try_into_typed().unwrap())
+                            .await;
+                    }
+                    command => {
+                        assert_ne!(command, Command::RangeEvicted, "the primary holds every op");
+                        backup_owner
+                            .on_repair_range_reply(&frame.try_into_typed().unwrap())
+                            .await;
+                    }
+                }
+            }
+        }
+        assert!(
+            !backup.consensus().view_log_unproven(),
+            "the walk never reached its hole at op {hole}"
+        );
+        assert_eq!(
+            stall_ticks, 0,
+            "a round that brought ops below the hole pulls the next window at once"
+        );
+        assert!(backup.log.journal().inner.holds_op(hole));
+        assert!(backup.transfer.is_none());
+        assert_eq!(
+            backup.consensus().state_transfer_stage(),
+            consensus::StateTransferStage::Idle
+        );
+    }
+
+    /// Frames a shard sent to claimed replicas, each with its replica.
+    type ReplicaFrames = Rc<RefCell<Vec<(u8, Message<GenericHeader>)>>>;
+
+    /// Every frame the shard on `bus` sends to a claimed replica, with that
+    /// replica.
+    fn capture_replica_frames(bus: &IggyMessageBus) -> ReplicaFrames {
+        let frames = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&frames);
+        bus.set_replica_forward_fn(Box::new(move |replica, _, frame| {
+            captured.borrow_mut().push((
+                replica,
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap(),
+            ));
+            Ok(())
+        }));
+        frames
+    }
+
+    /// A primary of [`REPAIR_VIEW`] that journaled ops `1..=head` and released
+    /// every body but the newest one to the log file of its first segment.
+    struct SegmentDonor {
+        owner: IoTestShard,
+        sent: Rc<RefCell<Vec<Message<GenericHeader>>>>,
+        namespace: IggyNamespace,
+        prepares: Vec<Message<PrepareHeader>>,
+        log_path: PathBuf,
+        /// The position of each released body in the log file.
+        positions: BTreeMap<u64, u64>,
+        sender: TaggedSender,
+        _directory: tempfile::TempDir,
+    }
+
+    impl SegmentDonor {
+        #[allow(clippy::future_not_send)]
+        async fn new(head: u64) -> Self {
+            let bus = Rc::new(IggyMessageBus::new(0));
+            let sent = Rc::new(RefCell::new(Vec::new()));
+            let captured = Rc::clone(&sent);
+            bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+                captured.borrow_mut().push(
+                    Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                        .unwrap(),
+                );
+                Ok(())
+            }));
+            connect_replica_on(&bus, REPAIR_PRIMARY, 1);
+            let (owner, sender) = test_owner(&bus, None);
+            let namespace = IggyNamespace::new(0, 0, 0);
+            let prepares = primary_prepares(&bus, namespace, head).await;
+            let mut donor =
+                repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+            donor.repair = None;
+            let directory = tempfile::tempdir().unwrap();
+            let (log_path, _) = attach_segment_files(&mut donor, directory.path(), false).await;
+            for prepare in &prepares {
+                donor.on_replicate(prepare.clone()).await;
+            }
+            let positions = release_bodies_to_segment(&donor, &log_path, &prepares);
+            owner.plane.partitions().remove(&namespace).unwrap();
+            owner.plane.partitions().insert(namespace, donor);
+            Self {
+                owner,
+                sent,
+                namespace,
+                prepares,
+                log_path,
+                positions,
+                sender,
+                _directory: directory,
+            }
+        }
+
+        /// See [`repair_answers`].
+        #[allow(clippy::future_not_send)]
+        async fn answers(&self, from_op: u64) -> Vec<(Command, u64)> {
+            repair_answers(
+                &self.owner,
+                &self.sent,
+                self.namespace,
+                from_op,
+                &self.prepares,
+            )
+            .await
+        }
+    }
+
+    /// Writes the bodies of `prepares`, which `donor` journaled, back to back
+    /// into the log file of the first segment at `log_path`, and releases
+    /// them there with [`release_bodies`]. Returns the position of each body
+    /// in the file.
+    fn release_bodies_to_segment(
+        donor: &IggyPartition<Rc<IggyMessageBus>, HeldSuperblock>,
+        log_path: &Path,
+        prepares: &[Message<PrepareHeader>],
+    ) -> BTreeMap<u64, u64> {
+        let mut segment = Vec::new();
+        let mut positions = BTreeMap::new();
+        for prepare in prepares {
+            positions.insert(prepare.header().op, u64::try_from(segment.len()).unwrap());
+            segment.extend_from_slice(&prepare.as_slice()[size_of::<PrepareHeader>()..]);
+        }
+        std::fs::write(log_path, &segment).unwrap();
+        release_bodies(donor, prepares, |op| {
+            positions
+                .get(&op)
+                .map(|&position| partitions::BodyPosition {
+                    segment_start: 0,
+                    position,
+                })
+        });
+        positions
+    }
+
+    /// Moves `prepares`, which `donor` journaled, into its evicted ring with
+    /// every body but the newest one released to the place `locate` names.
+    fn release_bodies(
+        donor: &IggyPartition<Rc<IggyMessageBus>, HeldSuperblock>,
+        prepares: &[Message<PrepareHeader>],
+        locate: impl Fn(u64) -> Option<partitions::BodyPosition>,
+    ) {
+        let journal = &donor.log.journal().inner;
+        // Room for the body of the newest op only.
+        journal.set_ring_caps(
+            partitions::EVICTED_RING_CAPACITY,
+            u64::try_from(prepares.last().unwrap().as_slice().len()).unwrap(),
+        );
+        journal.evict_prefix_located(prepares.len(), locate);
+    }
+
+    /// Seven replicas: the requester committed ops 1..=2 in view 1, adopted view 2
+    /// at op 2 and learned commit 3 from view 2's primary. A stale donor serves the
+    /// op 3 view 1 prepared, which view 2 replaced. Nothing the requester holds
+    /// vouches for it, so it is refused and the window is re-requested from the
+    /// primary, whose op 3 commits instead.
+    #[compio::test]
+    async fn given_a_stale_donor_serving_an_abandoned_op_when_commit_covers_it_should_commit_the_primary_op()
+     {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let requests = capture_repair_requests(&bus);
+        crate::test_support::connect_replica_on(&bus, STALE_SHAPE_PRIMARY, 1);
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let (abandoned, committed) = Box::pin(requester_past_an_abandoned_op(
+            &owner,
+            &bus,
+            namespace,
+            STALE_SHAPE_DONOR,
+        ))
+        .await;
+
+        owner.on_repair_prepare(as_repair_prepare(abandoned)).await;
+        let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+        partition
+            .commit_journal(owner.plane.partitions().config())
+            .await;
+        assert_eq!(
+            partition.consensus().commit_min(),
+            STALE_SHAPE_COMMITTED,
+            "the abandoned op committed"
+        );
+        assert!(!partition.log.journal().inner.holds_op(STALE_SHAPE_OP));
+        let session = partition.repair.unwrap();
+        assert_eq!(session.peer, STALE_SHAPE_PRIMARY);
+        assert_ne!(session.nonce, STALE_SHAPE_NONCE);
+        let request = requests.borrow_mut().pop().expect("a re-request");
+        assert_eq!(
+            (
+                request.0,
+                request.1.nonce,
+                request.1.from_op,
+                request.1.to_op
+            ),
+            (
+                STALE_SHAPE_PRIMARY,
+                session.nonce,
+                STALE_SHAPE_OP,
+                STALE_SHAPE_OP
+            )
+        );
+
+        owner
+            .on_repair_range_reply(&repair_done(
+                namespace,
+                STALE_SHAPE_DONOR,
+                STALE_SHAPE_NONCE,
+                STALE_SHAPE_OP,
+            ))
+            .await;
+        let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+        assert_eq!(
+            partition
+                .repair
+                .map(|standing| (standing.peer, standing.nonce)),
+            Some((session.peer, session.nonce))
+        );
+        assert!(!partition.log.journal().inner.holds_op(STALE_SHAPE_OP));
+        assert!(requests.borrow().is_empty());
+
+        commit_from_primary(&owner, namespace, &committed, session.nonce).await;
+    }
+
+    /// Bodies name no sender, so a body that the session's peer did not serve
+    /// is told apart only by the gates: one nothing vouches for is refused, and
+    /// the session against the primary stands.
+    #[compio::test]
+    async fn given_a_body_from_a_peer_outside_the_session_when_nothing_vouches_for_it_should_refuse_it()
+     {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let requests = capture_repair_requests(&bus);
+        crate::test_support::connect_replica_on(&bus, STALE_SHAPE_PRIMARY, 1);
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let (abandoned, committed) = Box::pin(requester_past_an_abandoned_op(
+            &owner,
+            &bus,
+            namespace,
+            STALE_SHAPE_PRIMARY,
+        ))
+        .await;
+
+        owner.on_repair_prepare(as_repair_prepare(abandoned)).await;
+        let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+        partition
+            .commit_journal(owner.plane.partitions().config())
+            .await;
+        assert_eq!(partition.consensus().commit_min(), STALE_SHAPE_COMMITTED);
+        assert!(!partition.log.journal().inner.holds_op(STALE_SHAPE_OP));
+        let session = partition.repair.unwrap();
+        assert_eq!(
+            (session.peer, session.nonce),
+            (STALE_SHAPE_PRIMARY, STALE_SHAPE_NONCE)
+        );
+        assert!(requests.borrow().is_empty());
+
+        commit_from_primary(&owner, namespace, &committed, session.nonce).await;
+    }
+
+    /// Repair rotates off a peer that served an abandoned branch. The primary's
+    /// prepares are never spliced onto the bodies that branch left unproven, the
+    /// proof walk removes the branch from the view's head down, and the old
+    /// peer's late bodies and terminator change nothing.
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_an_abandoned_branch_from_the_previous_peer_when_repair_rotates_should_never_splice_it()
+     {
+        const REPLICAS: u8 = 5;
+        const REQUESTER: u8 = 4;
+        const OLD_PEER: u8 = 1;
+        const OLD_NONCE: u128 = 1;
+        const NEW_VIEW: u32 = 2;
+        const PRIMARY: u8 = 2;
+        const APPLIED: u64 = 2;
+        const FORK: u64 = 3;
+        const HEAD: u64 = 6;
+        const CHUNK: u64 = 4;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let requests = capture_repair_requests(&bus);
+        crate::test_support::connect_replica_on(&bus, PRIMARY, 1);
+        let (owner, _sender) = test_owner(&bus, None);
+        owner.set_repair_chunk_max(CHUNK);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, HEAD).await;
+        let abandoned = abandoned_branch(&prepares, FORK);
+        let canonical = |op: u64| prepares[usize::try_from(op - 1).unwrap()].clone();
+        let branch = |op: u64| abandoned[usize::try_from(op - FORK).unwrap()].clone();
+        let checksum = |prepare: Message<PrepareHeader>| Some(prepare.header().checksum);
+        let mut partition =
+            repairing_replica(&bus, namespace, (REQUESTER, REPLICAS), REPAIR_PRIMARY, 0, 0);
+        partition.repair = None;
+        for op in 1..=APPLIED {
+            partition.on_replicate(canonical(op)).await;
+        }
+        partition.consensus().advance_commit_max(APPLIED);
+        partition
+            .commit_journal(owner.plane.partitions().config())
+            .await;
+        assert_eq!(partition.consensus().commit_min(), APPLIED);
+        owner.plane.partitions().remove(&namespace).unwrap();
+        owner.plane.partitions().insert(namespace, partition);
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                NEW_VIEW,
+                HEAD,
+                HEAD,
+                &[*canonical(HEAD).header()],
+            ))
+            .await;
+        let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+        assert!(partition.consensus().view_log_unproven());
+        let session = partition.repair.as_mut().unwrap();
+        session.peer = OLD_PEER;
+        session.nonce = OLD_NONCE;
+        requests.borrow_mut().clear();
+        let held = |op: u64| {
+            owner
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .unwrap()
+                .log
+                .journal()
+                .inner
+                .header_by_op(op)
+                .map(|header| header.checksum)
+        };
+
+        // The view's head bridges op 6, so the walk asks for 3..=5. The old peer
+        // serves them with its op 3 delayed. Nothing held is next to op 4, so it
+        // waits for the walk; op 5 does not chain to the view's head.
+        for op in FORK + 1..=HEAD {
+            owner.on_repair_prepare(as_repair_prepare(branch(op))).await;
+        }
+        assert_eq!(held(4), checksum(branch(4)));
+        assert_eq!(held(5), None);
+        assert_eq!(held(HEAD), None);
+        let session = partition.repair.unwrap();
+        assert_eq!(session.peer, PRIMARY);
+        assert_ne!(session.nonce, OLD_NONCE);
+        // The branch's op 4 is held below the hole, so the window starts above it.
+        let request = requests.borrow_mut().pop().expect("a re-request");
+        assert_eq!(
+            (
+                request.0,
+                request.1.nonce,
+                request.1.from_op,
+                request.1.to_op
+            ),
+            (PRIMARY, session.nonce, HEAD - 1, HEAD - 1)
+        );
+        owner
+            .on_repair_range_reply(&repair_done(namespace, OLD_PEER, OLD_NONCE, HEAD - 1))
+            .await;
+        assert_eq!(
+            partition
+                .repair
+                .map(|standing| (standing.peer, standing.nonce)),
+            Some((session.peer, session.nonce))
+        );
+        assert!(requests.borrow().is_empty());
+
+        // The primary's chunk. Op 3 chains to the committed prefix but not to the
+        // branch's op 4 above it. Op 5 chains to the view's head, and the walk
+        // removes the branch's op 4.
+        owner
+            .on_repair_prepare(as_repair_prepare(canonical(FORK)))
+            .await;
+        assert_eq!(held(FORK), None, "op 3 spliced under the abandoned branch");
+        for op in FORK + 1..HEAD {
+            owner
+                .on_repair_prepare(as_repair_prepare(canonical(op)))
+                .await;
+        }
+        assert_eq!(held(4), None);
+        assert_eq!(held(5), checksum(canonical(5)));
+
+        for op in FORK + 1..=HEAD {
+            owner.on_repair_prepare(as_repair_prepare(branch(op))).await;
+        }
+        owner
+            .on_repair_range_reply(&repair_done(namespace, OLD_PEER, OLD_NONCE, HEAD - 1))
+            .await;
+        assert_eq!(held(4), None, "a late body from the old peer was journaled");
+        assert_eq!(held(5), checksum(canonical(5)));
+        assert_eq!(
+            held(HEAD),
+            None,
+            "a late body from the old peer was journaled"
+        );
+        assert!(requests.borrow().is_empty());
+
+        for (served_through, window) in [(HEAD - 1, FORK..=4), (4, HEAD..=HEAD)] {
+            owner
+                .on_repair_range_reply(&repair_done(
+                    namespace,
+                    PRIMARY,
+                    session.nonce,
+                    served_through,
+                ))
+                .await;
+            let request = requests.borrow_mut().pop().expect("the next chunk");
+            assert_eq!(request.1.from_op..=request.1.to_op, window);
+            for op in window {
+                owner
+                    .on_repair_prepare(as_repair_prepare(canonical(op)))
+                    .await;
+            }
+        }
+        assert!(!partition.consensus().view_log_unproven());
+        owner
+            .on_repair_prepare(as_repair_prepare(branch(FORK)))
+            .await;
+        assert_eq!(held(FORK), checksum(canonical(FORK)));
+
+        let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+        while partition.consensus().commit_min() < HEAD {
+            let before = partition.consensus().commit_min();
+            partition
+                .commit_journal(owner.plane.partitions().config())
+                .await;
+            assert!(partition.consensus().commit_min() > before);
+        }
+        for op in FORK..=HEAD {
+            assert_eq!(held(op), checksum(canonical(op)), "op {op}");
+        }
+    }
+
     #[compio::test]
     async fn given_a_blank_start_view_head_when_repair_arrives_should_preserve_and_prove_history() {
+        const HEAD: u64 = 3;
+        for held in [false, true] {
+            for canonical in [true, false] {
+                let (bus, _probes) = probe_capturing_bus();
+                let (owner, _sender) = test_owner(&bus, None);
+                let namespace = IggyNamespace::new(0, 0, 0);
+                let prepares =
+                    Box::pin(blank_head_backup(&owner, &bus, namespace, HEAD, held)).await;
+                let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+                // Bodies stamped in an older view prove nothing, but stay held.
+                assert!(partition.consensus().view_log_unproven());
+                assert!((1..=HEAD).all(|op| partition.log.journal().inner.holds_op(op)));
+                assert!(partition.view_fence_unanchored());
+                partition
+                    .commit_journal(owner.plane.partitions().config())
+                    .await;
+                assert_eq!(partition.consensus().commit_min(), 0);
+
+                let head = *prepares.last().unwrap().header();
+                let answer = if canonical { head } else { forked(head) };
+                owner
+                    .on_start_view(start_view_suffix(
+                        namespace,
+                        BLANK_HEAD_VIEW,
+                        HEAD,
+                        HEAD,
+                        &[answer],
+                    ))
+                    .await;
+                let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+                partition
+                    .commit_journal(owner.plane.partitions().config())
+                    .await;
+                if canonical {
+                    assert!(!partition.view_fenced());
+                    assert_eq!(partition.consensus().commit_min(), HEAD);
+                } else {
+                    assert!(
+                        partition.consensus().commit_min() < HEAD,
+                        "held={held}: a head the view names differently must not commit"
+                    );
+                }
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_probe_answer_naming_a_held_entry_differently_when_proving_should_not_commit_it()
+     {
+        const HEAD: u64 = 4;
+        let (bus, _probes) = probe_capturing_bus();
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = Box::pin(blank_head_backup(&owner, &bus, namespace, HEAD, true)).await;
+        let headers: Vec<_> = prepares.iter().map(|prepare| *prepare.header()).collect();
+        // The lowest sealed header anchors the fence below the diverging head.
+        let answer = [forked(headers[3]), headers[2], headers[1]];
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                BLANK_HEAD_VIEW,
+                HEAD,
+                HEAD,
+                &answer,
+            ))
+            .await;
+        let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+        partition
+            .commit_journal(owner.plane.partitions().config())
+            .await;
+        assert!(partition.consensus().commit_min() < HEAD);
+        assert!(
+            partition.view_truncation_pending() || !partition.log.journal().inner.holds_op(HEAD)
+        );
+    }
+
+    const BLANK_HEAD_VIEW: u32 = 3;
+
+    /// A bus that records the `RequestStartView` probes sent to the view's primary.
+    fn probe_capturing_bus() -> (Rc<IggyMessageBus>, Rc<RefCell<Vec<RequestStartViewHeader>>>) {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let probes = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&probes);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            let message =
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            if message.header().command == Command::RequestStartView {
+                let probe = Message::<RequestStartViewHeader>::try_from(Owned::copy_from_slice(
+                    frame.as_slice(),
+                ))
+                .unwrap();
+                captured.borrow_mut().push(*probe.header());
+            }
+            Ok(())
+        }));
+        let primary = u8::try_from(BLANK_HEAD_VIEW % 3).unwrap();
+        crate::test_support::connect_replica_on(&bus, primary, 1);
+        (bus, probes)
+    }
+
+    /// A backup that adopted [`BLANK_HEAD_VIEW`] from a `StartView` with a blank head
+    /// and then received the history up to `head` through repair, in bodies stamped
+    /// by an older view that the view's log does not vouch for. With `journaled`, it
+    /// held that history before the adoption.
+    #[allow(clippy::future_not_send)]
+    async fn blank_head_backup(
+        owner: &IoTestShard,
+        bus: &Rc<IggyMessageBus>,
+        namespace: IggyNamespace,
+        head: u64,
+        journaled: bool,
+    ) -> Vec<Message<PrepareHeader>> {
+        let prepares = primary_prepares(bus, namespace, head).await;
+        let mut partition =
+            repairing_replica(bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+        partition.repair = None;
+        if journaled {
+            for prepare in &prepares {
+                partition.on_replicate(prepare.clone()).await;
+            }
+        }
+        owner.plane.partitions().remove(&namespace).unwrap();
+        owner.plane.partitions().insert(namespace, partition);
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                BLANK_HEAD_VIEW,
+                head,
+                head,
+                &[consensus::dvc_blank(head)],
+            ))
+            .await;
+        let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+        assert!(partition.consensus().view_log_unproven());
+        assert!(!partition.view_truncation_pending());
+        assert_eq!(partition.log.journal().inner.holds_op(head), journaled);
+        let repaired: Vec<_> = if journaled {
+            prepares.last().into_iter().cloned().collect()
+        } else {
+            prepares.clone()
+        };
+        for prepare in repaired.into_iter().rev() {
+            owner
+                .on_repair_prepare(prepare.transmute_header(
+                    |header, repaired: &mut iggy_binary_protocol::RepairPrepareHeader| {
+                        repaired.0 = header;
+                        repaired.0.command = Command::RepairPrepare;
+                    },
+                ))
+                .await;
+        }
+        prepares
+    }
+
+    /// A sealed header at the same op and on the same parent as `header`, naming a
+    /// different entry.
+    fn forked(header: PrepareHeader) -> PrepareHeader {
+        let mut fork = header;
+        fork.checksum_body ^= 1;
+        fork.checksum = fork.identity_checksum();
+        assert_ne!(fork.checksum, header.checksum);
+        fork
+    }
+
+    #[compio::test]
+    async fn given_a_blank_start_view_head_when_repair_arrives_should_require_vouched_history() {
         const HEAD: u64 = 1;
         const NEW_VIEW: u32 = 3;
         for held in [false, true] {
@@ -5054,7 +10304,22 @@ mod tests {
             assert!(partition.consensus().view_log_unproven());
             assert!(!partition.view_truncation_pending());
             assert_eq!(partition.log.journal().inner.holds_op(HEAD), held);
+            let vouched =
+                consensus::restamp_prepare_view(prepare.clone().into_frozen(), NEW_VIEW).unwrap();
+            let vouched =
+                Message::<PrepareHeader>::try_from(Owned::copy_from_slice(vouched.as_slice()))
+                    .unwrap();
             let repaired = prepare.transmute_header(
+                |header, repaired: &mut iggy_binary_protocol::RepairPrepareHeader| {
+                    repaired.0 = header;
+                    repaired.0.command = Command::RepairPrepare;
+                },
+            );
+            owner.on_repair_prepare(repaired).await;
+            let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+            assert!(partition.consensus().view_log_unproven());
+            assert_eq!(partition.consensus().commit_min(), 0);
+            let repaired = vouched.transmute_header(
                 |header, repaired: &mut iggy_binary_protocol::RepairPrepareHeader| {
                     repaired.0 = header;
                     repaired.0.command = Command::RepairPrepare;
@@ -5096,9 +10361,247 @@ mod tests {
         })
     }
 
+    /// The vote of `replica` in `view` with `suffix` as its log up to `op` and
+    /// nothing committed.
+    fn do_view_change_suffix(
+        namespace: IggyNamespace,
+        replica: u8,
+        view: u32,
+        log_view: u32,
+        op: u64,
+        suffix: &DvcSuffix,
+    ) -> Message<DoViewChangeHeader> {
+        let header_size = size_of::<DoViewChangeHeader>();
+        let total = header_size + suffix.encoded_len();
+        let mut message = Message::<DoViewChangeHeader>::new(total);
+        suffix.encode_into(&mut message.as_mut_slice()[header_size..]);
+        let checksum_body = crate::control_body_checksum(&message.as_slice()[header_size..]);
+        message.transmute_header(|_, header: &mut DoViewChangeHeader| {
+            header.command = Command::DoViewChange;
+            header.cluster = 1;
+            header.group = namespace.inner();
+            header.replica = replica;
+            header.view = view;
+            header.log_view = log_view;
+            header.op = op;
+            header.nack_bitset = suffix.nack_bitset();
+            header.present_bitset = suffix.present_bitset();
+            header.size = u32::try_from(total).unwrap();
+            header.checksum_body = checksum_body;
+            header.seal();
+        })
+    }
+
+    /// The seven-replica stale-donor shape of
+    /// [`requester_past_an_abandoned_op`]: view 2's primary, a donor still on view
+    /// 1's log and the requester between them.
+    const STALE_SHAPE_REPLICAS: u8 = 7;
+    const STALE_SHAPE_REQUESTER: u8 = 4;
+    const STALE_SHAPE_DONOR: u8 = 3;
+    const STALE_SHAPE_VIEW: u32 = 2;
+    const STALE_SHAPE_PRIMARY: u8 = 2;
+    const STALE_SHAPE_COMMITTED: u64 = 2;
+    const STALE_SHAPE_OP: u64 = 3;
+    const STALE_SHAPE_NONCE: u128 = 1;
+
+    /// Installs a requester that committed ops 1..=2 in view 1, adopted
+    /// [`STALE_SHAPE_VIEW`] at op 2 and learned commit 3 from its primary, with a
+    /// repair session for op 3 against `peer`. Returns view 1's op 3, which the
+    /// view replaced, and the op 3 the view's primary prepared.
+    #[allow(clippy::future_not_send)]
+    async fn requester_past_an_abandoned_op(
+        owner: &IoTestShard,
+        bus: &Rc<IggyMessageBus>,
+        namespace: IggyNamespace,
+        peer: u8,
+    ) -> (Message<PrepareHeader>, Message<PrepareHeader>) {
+        let mut prepares = primary_prepares(bus, namespace, STALE_SHAPE_OP).await;
+        let abandoned = prepares.pop().unwrap();
+        let committed =
+            abandoned
+                .clone()
+                .transmute_header(|previous, header: &mut PrepareHeader| {
+                    *header = previous;
+                    header.view = STALE_SHAPE_VIEW;
+                    header.timestamp += 1;
+                    header.checksum = header.identity_checksum();
+                });
+        let mut partition = repairing_replica(
+            bus,
+            namespace,
+            (STALE_SHAPE_REQUESTER, STALE_SHAPE_REPLICAS),
+            peer,
+            0,
+            0,
+        );
+        partition.repair = None;
+        for prepare in &prepares {
+            partition.on_replicate(prepare.clone()).await;
+        }
+        partition
+            .consensus()
+            .advance_commit_max(STALE_SHAPE_COMMITTED);
+        partition
+            .commit_journal(owner.plane.partitions().config())
+            .await;
+        owner.plane.partitions().remove(&namespace).unwrap();
+        owner.plane.partitions().insert(namespace, partition);
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                STALE_SHAPE_VIEW,
+                STALE_SHAPE_COMMITTED,
+                STALE_SHAPE_COMMITTED,
+                &[*prepares.last().unwrap().header()],
+            ))
+            .await;
+        let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+        assert_eq!(partition.consensus().commit_min(), STALE_SHAPE_COMMITTED);
+        assert!(!partition.consensus().view_log_unproven());
+        partition.consensus().advance_commit_max(STALE_SHAPE_OP);
+        partition.repair = Some(RepairSession {
+            nonce: STALE_SHAPE_NONCE,
+            view: STALE_SHAPE_VIEW,
+            from_op: STALE_SHAPE_OP,
+            commit_to_op: STALE_SHAPE_OP,
+            fetch_to_op: STALE_SHAPE_OP,
+            floor: None,
+            floor_pulled_from: 0,
+            requested_from: Some(STALE_SHAPE_OP),
+            peer,
+            idle_ticks: 0,
+        });
+        (abandoned, committed)
+    }
+
+    /// The primary of [`STALE_SHAPE_VIEW`] serves `committed` to the session
+    /// `nonce`, which then commits it.
+    #[allow(clippy::future_not_send)]
+    async fn commit_from_primary(
+        owner: &IoTestShard,
+        namespace: IggyNamespace,
+        committed: &Message<PrepareHeader>,
+        nonce: u128,
+    ) {
+        owner
+            .on_repair_prepare(as_repair_prepare(committed.clone()))
+            .await;
+        owner
+            .on_repair_range_reply(&repair_done(
+                namespace,
+                STALE_SHAPE_PRIMARY,
+                nonce,
+                STALE_SHAPE_OP,
+            ))
+            .await;
+        let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+        partition
+            .commit_journal(owner.plane.partitions().config())
+            .await;
+        assert_eq!(partition.consensus().commit_min(), STALE_SHAPE_OP);
+        assert_eq!(
+            partition
+                .log
+                .journal()
+                .inner
+                .header_by_op(STALE_SHAPE_OP)
+                .map(|header| header.checksum),
+            Some(committed.header().checksum)
+        );
+    }
+
+    /// The branch an earlier view's primary prepared on top of op `fork - 1` and
+    /// no later view committed: another prepare at each op of `canonical` from
+    /// `fork` on, each chained to the branch's previous op.
+    fn abandoned_branch(
+        canonical: &[Message<PrepareHeader>],
+        fork: u64,
+    ) -> Vec<Message<PrepareHeader>> {
+        let fork = usize::try_from(fork).unwrap();
+        let mut parent = canonical[fork - 2].header().checksum;
+        canonical[fork - 1..]
+            .iter()
+            .map(|prepare| {
+                let chained_to = parent;
+                let abandoned =
+                    prepare
+                        .clone()
+                        .transmute_header(|previous, header: &mut PrepareHeader| {
+                            *header = previous;
+                            header.timestamp += 1;
+                            header.parent = chained_to;
+                            header.checksum = header.identity_checksum();
+                        });
+                parent = abandoned.header().checksum;
+                abandoned
+            })
+            .collect()
+    }
+
+    fn as_repair_prepare(
+        prepare: Message<PrepareHeader>,
+    ) -> Message<iggy_binary_protocol::RepairPrepareHeader> {
+        prepare.transmute_header(
+            |header, repaired: &mut iggy_binary_protocol::RepairPrepareHeader| {
+                repaired.0 = header;
+                repaired.0.command = Command::RepairPrepare;
+            },
+        )
+    }
+
+    fn repair_done(
+        namespace: IggyNamespace,
+        replica: u8,
+        nonce: u128,
+        op: u64,
+    ) -> Message<RepairRangeReplyHeader> {
+        Message::<RepairRangeReplyHeader>::new(size_of::<RepairRangeReplyHeader>())
+            .transmute_header(|_, header: &mut RepairRangeReplyHeader| {
+                header.command = Command::RepairDone;
+                header.size = u32::try_from(size_of::<RepairRangeReplyHeader>()).unwrap();
+                header.cluster = 1;
+                header.group = namespace.inner();
+                header.replica = replica;
+                header.nonce = nonce;
+                header.op = op;
+                header.seal();
+            })
+    }
+
+    /// Every `RequestPrepares` the shard sends to a claimed replica, with that
+    /// replica.
+    fn capture_repair_requests(
+        bus: &IggyMessageBus,
+    ) -> Rc<RefCell<Vec<(u8, RequestPreparesHeader)>>> {
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&requests);
+        bus.set_replica_forward_fn(Box::new(move |replica, _, frame| {
+            let message =
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            if message.header().command == Command::RequestPrepares {
+                let request = Message::<RequestPreparesHeader>::try_from(Owned::copy_from_slice(
+                    frame.as_slice(),
+                ))
+                .unwrap();
+                captured.borrow_mut().push((replica, *request.header()));
+            }
+            Ok(())
+        }));
+        requests
+    }
+
     fn test_owner<B: MessageBus + Clone + 'static>(
         bus: &B,
         store: Option<&Rc<HeldSuperblock>>,
+    ) -> (IoTestShard<B>, TaggedSender) {
+        test_owner_with_repair_memory(bus, store, None)
+    }
+
+    fn test_owner_with_repair_memory<B: MessageBus + Clone + 'static>(
+        bus: &B,
+        store: Option<&Rc<HeldSuperblock>>,
+        repair_memory: Option<Arc<partitions::RepairMemoryBudget>>,
     ) -> (IoTestShard<B>, TaggedSender) {
         let shard_id = ShardId::new(0);
         let config = PartitionsConfig {
@@ -5107,10 +10610,13 @@ mod tests {
             validate_checksum: true,
             segment_size: IggyByteSize::from(SEGMENT_BYTES),
             preallocate_segments: false,
-            encryptor: None,
+            key_context: Arc::default(),
             path_layout: PartitionPathLayout::default(),
         };
-        let partitions = IggyPartitions::new(shard_id, config);
+        let partitions = match repair_memory {
+            Some(budget) => IggyPartitions::with_repair_memory(shard_id, config, 0, budget),
+            None => IggyPartitions::new(shard_id, config),
+        };
         let routes = PapayaShardsTable::new();
         let mut inner = StreamsInner::default();
         let mut stream = Stream::default();
@@ -5227,6 +10733,8 @@ mod tests {
             floor: None,
             peer,
             idle_ticks: 0,
+            floor_pulled_from: 0,
+            requested_from: Some(commit_min + 1),
         });
         partition
     }
@@ -5239,6 +10747,33 @@ mod tests {
         namespace: IggyNamespace,
         ops: u64,
     ) -> Vec<Message<PrepareHeader>> {
+        sized_primary_prepares(bus, namespace, ops, 1).await
+    }
+
+    /// [`primary_prepares`] whose one message per send carries `payload_len`
+    /// bytes.
+    #[allow(clippy::future_not_send)]
+    async fn sized_primary_prepares(
+        bus: &Rc<IggyMessageBus>,
+        namespace: IggyNamespace,
+        ops: u64,
+        payload_len: usize,
+    ) -> Vec<Message<PrepareHeader>> {
+        journaling_primary(bus, namespace, ops, payload_len).await.1
+    }
+
+    /// The primary of [`REPAIR_VIEW`] after it journaled the first `ops` sends
+    /// of `payload_len` bytes each, with a copy of each prepare.
+    #[allow(clippy::future_not_send)]
+    async fn journaling_primary(
+        bus: &Rc<IggyMessageBus>,
+        namespace: IggyNamespace,
+        ops: u64,
+        payload_len: usize,
+    ) -> (
+        IggyPartition<Rc<IggyMessageBus>, HeldSuperblock>,
+        Vec<Message<PrepareHeader>>,
+    ) {
         let mut consensus = VsrConsensus::new(
             1,
             REPAIR_PRIMARY,
@@ -5257,7 +10792,7 @@ mod tests {
         );
         let mut prepares = Vec::new();
         for op in 1..=ops {
-            origin.on_request(send_request(namespace, op), None).await;
+            Box::pin(origin.on_request(sized_send_request(namespace, op, payload_len), None)).await;
             let frozen = origin.log.journal().inner.repair_entry(op).unwrap();
             let mut prepare = Message::<PrepareHeader>::new(frozen.len());
             prepare.as_mut_slice().copy_from_slice(frozen.as_slice());
@@ -5266,7 +10801,154 @@ mod tests {
             origin.consensus().clear_pipeline();
             origin.consensus().drain_loopback_into(&mut Vec::new());
         }
-        prepares
+        (origin, prepares)
+    }
+
+    const SCANNING_INCARNATION: u64 = 7;
+    const SCANNING_NONCE: u128 = 7;
+    const SCANNING_RETRY_TICKS: u32 = 2;
+    const SCANNING_OFFSETS: &[u8] = b"offsets";
+
+    /// A receiver whose session waits for a reuse scan before it pulls a
+    /// segment and an offsets artifact from `REPAIR_PRIMARY`.
+    struct ScanningReceiver {
+        owner: IoTestShard,
+        _sender: TaggedSender,
+        /// `(artifact, offset, len)` of each chunk request that it sends.
+        requests: Rc<RefCell<Vec<(u32, u64, u32)>>>,
+        offer_requests: Rc<RefCell<Vec<(u64, u64, u128)>>>,
+        namespace: IggyNamespace,
+        segment: Vec<u8>,
+        directory: tempfile::TempDir,
+    }
+
+    impl ScanningReceiver {
+        fn chunk(&self, artifact: u32, payload: &[u8]) -> Message<StateChunkHeader> {
+            let size = size_of::<StateChunkHeader>() + payload.len();
+            let mut chunk = Message::<StateChunkHeader>::new(size);
+            chunk.as_mut_slice()[size_of::<StateChunkHeader>()..].copy_from_slice(payload);
+            chunk.transmute_header(|_, header: &mut StateChunkHeader| {
+                header.command = Command::StateChunk;
+                header.size = u32::try_from(size).unwrap();
+                header.cluster = 1;
+                header.group = self.namespace.inner();
+                header.replica = REPAIR_PRIMARY;
+                header.partition_incarnation = SCANNING_INCARNATION;
+                header.nonce = SCANNING_NONCE;
+                header.artifact = artifact;
+                header.seal();
+            })
+        }
+    }
+
+    fn scanning_receiver() -> ScanningReceiver {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&requests);
+        let offer_requests = Rc::new(RefCell::new(Vec::new()));
+        let captured_offers = Rc::clone(&offer_requests);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            let message =
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            if message.header().command == Command::RequestStateChunk {
+                let request = Message::<RequestStateChunkHeader>::try_from(Owned::copy_from_slice(
+                    frame.as_slice(),
+                ))
+                .unwrap();
+                let header = request.header();
+                captured
+                    .borrow_mut()
+                    .push((header.artifact, header.offset, header.len));
+            } else if message.header().command == Command::RequestStateTransfer {
+                let request = Message::<RequestStateTransferHeader>::try_from(
+                    Owned::copy_from_slice(frame.as_slice()),
+                )
+                .unwrap();
+                let header = request.header();
+                captured_offers.borrow_mut().push((
+                    header.group,
+                    header.partition_incarnation,
+                    header.nonce,
+                ));
+            }
+            Ok(())
+        }));
+        connect_replica_on(&bus, REPAIR_PRIMARY, 1);
+        let (owner, sender) = test_owner(&bus, None);
+        owner.set_repair_retry_ticks(SCANNING_RETRY_TICKS);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let directory = tempfile::tempdir().unwrap();
+        let segment = send_request(namespace, 1).body().to_vec();
+        let partitions = owner.plane.partitions();
+        partitions.remove(&namespace).unwrap();
+        let mut partition =
+            repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+        partition.repair = None;
+        partition.set_created_revision(SCANNING_INCARNATION);
+        partition.set_partition_dir(directory.path().to_str().unwrap().to_owned());
+        partition
+            .consensus()
+            .set_state_transfer_stage(StateTransferStage::AwaitingTarget);
+        partition
+            .consensus()
+            .set_state_transfer_stage(StateTransferStage::Fetching);
+        partition.transfer = Some(PartitionTransferSession {
+            nonce: SCANNING_NONCE,
+            peer: REPAIR_PRIMARY,
+            commit_op: 0,
+            artifacts: vec![
+                TransferArtifact::Pending(ArtifactProgress {
+                    entry: StateArtifact::for_bytes(artifact_kind::SEGMENT_LOG, 0, &segment),
+                    buf: Vec::new(),
+                }),
+                TransferArtifact::Pending(ArtifactProgress {
+                    entry: StateArtifact::for_bytes(
+                        artifact_kind::CONSUMER_OFFSETS,
+                        0,
+                        SCANNING_OFFSETS,
+                    ),
+                    buf: Vec::new(),
+                }),
+            ],
+            target_accepted: true,
+            idle_ticks: 0,
+            spill: None,
+            scan: Some(LocalWork::default()),
+            seed: None,
+            pulled_len: 0,
+        });
+        partitions.insert(namespace, partition);
+        ScanningReceiver {
+            owner,
+            _sender: sender,
+            requests,
+            offer_requests,
+            namespace,
+            segment,
+            directory,
+        }
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn settle_transfer_spill(owner: &IoTestShard, namespace: IggyNamespace) {
+        const TURNS_MAX: usize = 1024;
+        for _ in 0..TURNS_MAX {
+            let pending = owner
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .and_then(|partition| partition.transfer.as_ref())
+                .is_some_and(|session| session.spill.is_some());
+            if !pending {
+                return;
+            }
+            compio::runtime::time::sleep(Duration::from_millis(1)).await;
+            owner
+                .on_partition_transfer_progress(namespace.inner())
+                .await;
+        }
+        panic!("the queued spill did not settle");
     }
 
     /// Run `rounds` stall rounds, one per sweep, and record after each the
@@ -5336,6 +11018,35 @@ mod tests {
         (log_path, index_path)
     }
 
+    /// Adds a segment that starts at `start_offset` behind the ones of
+    /// `partition`, backed by a fresh log file in `directory`, and returns the
+    /// path of that file.
+    #[allow(clippy::future_not_send)]
+    async fn attach_next_segment_file(
+        partition: &mut IggyPartition<Rc<IggyMessageBus>, HeldSuperblock>,
+        directory: &Path,
+        start_offset: u64,
+    ) -> PathBuf {
+        let log_path = directory.join(format!("{start_offset:020}.log"));
+        let index_path = directory.join(format!("{start_offset:020}.index"));
+        let storage = SegmentStorage::new(
+            log_path.to_str().unwrap(),
+            index_path.to_str().unwrap(),
+            0,
+            0,
+            false,
+        )
+        .await
+        .unwrap();
+        partition.log.add_persisted_segment(
+            Segment::new(start_offset, IggyByteSize::from(SEGMENT_BYTES)),
+            storage,
+            None,
+            None,
+        );
+        log_path
+    }
+
     fn submit(
         sender: &TaggedSender,
         namespace: IggyNamespace,
@@ -5354,14 +11065,23 @@ mod tests {
     /// Each request comes from its own client, because a client has one request
     /// in flight per partition.
     fn send_request(namespace: IggyNamespace, request: u64) -> Message<RoutedRequestHeader> {
+        sized_send_request(namespace, request, 1)
+    }
+
+    /// [`send_request`] whose message carries `payload_len` bytes.
+    fn sized_send_request(
+        namespace: IggyNamespace,
+        request: u64,
+        payload_len: usize,
+    ) -> Message<RoutedRequestHeader> {
         let mut messages = IggyMessages::with_capacity(1);
         messages.push(IggyMessage {
             header: IggyMessageHeader {
                 id: u128::from(request),
-                payload_length: 1,
+                payload_length: u32::try_from(payload_len).unwrap(),
                 ..Default::default()
             },
-            payload: vec![1].into(),
+            payload: vec![1; payload_len].into(),
             user_headers: None,
         });
         SendMessagesOwned::from_messages(namespace, &messages)
@@ -5376,6 +11096,200 @@ mod tests {
                 ..Default::default()
             })
             .unwrap()
+    }
+
+    /// Incarnation of the groups that a [`serving_shard`] hosts.
+    const SERVED_INCARNATION: u64 = 7;
+    /// The replica that asks a [`serving_shard`] for every transfer.
+    const TRANSFER_REQUESTER: u8 = 1;
+
+    /// Rebuilds `namespace` at [`SERVED_INCARNATION`] as a two-member group
+    /// with [`TRANSFER_REQUESTER`] as its backup: a requester has to be a member
+    /// of the group it pulls from.
+    fn serve_to_requester(owner: &IoTestShard, bus: &Rc<IggyMessageBus>, namespace: IggyNamespace) {
+        let partitions = owner.plane.partitions();
+        partitions.remove(&namespace).unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            TRANSFER_REQUESTER + 1,
+            namespace.inner(),
+            Rc::clone(bus),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let mut partition = IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(SEGMENT_BYTES),
+        );
+        partition.set_created_revision(SERVED_INCARNATION);
+        partitions.insert(namespace, partition);
+    }
+
+    /// Commits write `op` of a [`serve_to_requester`] group once
+    /// [`TRANSFER_REQUESTER`] acks it.
+    #[allow(clippy::future_not_send)]
+    async fn commit_acked_write(owner: &IoTestShard, namespace: IggyNamespace, op: u64) {
+        let partitions = owner.plane.partitions();
+        let request = send_request(namespace, op).transmute_header(
+            |old, header: &mut RoutedRequestHeader| {
+                *header = old;
+                header.partition_incarnation = SERVED_INCARNATION;
+            },
+        );
+        let (reply, replied) = consensus::oneshot_channel();
+        partitions.on_request_with_reply(request, Some(reply)).await;
+        owner
+            .process_loopback(&mut crate::router::LoopbackRound::default())
+            .await;
+        let prepare = partitions
+            .get_by_ns(&namespace)
+            .unwrap()
+            .consensus()
+            .pipeline_head_header()
+            .expect("the write is pipelined");
+        let ack = Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>()).transmute_header(
+            |_, ack: &mut PrepareOkHeader| {
+                ack.command = Command::PrepareOk;
+                ack.cluster = 1;
+                ack.replica = TRANSFER_REQUESTER;
+                ack.view = prepare.view;
+                ack.op = prepare.op;
+                ack.prepare_checksum = prepare.checksum;
+                ack.operation = prepare.operation;
+                ack.group = prepare.group;
+                ack.size = u32::try_from(size_of::<PrepareOkHeader>()).unwrap();
+                ack.seal();
+            },
+        );
+        owner.on_message(MessageBag::PrepareOk(ack)).await;
+        owner
+            .process_loopback(&mut crate::router::LoopbackRound::default())
+            .await;
+        assert_eq!(replied.await.unwrap().header().status, 0);
+    }
+
+    /// A shard whose primaries of `namespaces` each hold one committed op in
+    /// segment files under `directory`. Its I/O owner pins their transfer
+    /// plans, so a transfer request parks until an I/O turn pins its plan.
+    #[allow(clippy::future_not_send)]
+    async fn serving_shard(
+        bus: &Rc<IggyMessageBus>,
+        namespaces: &[IggyNamespace],
+        directory: &Path,
+    ) -> (IoTestShard, TaggedSender) {
+        connect_replica_on(bus, TRANSFER_REQUESTER, 1);
+        let (mut owner, sender) = test_owner(bus, None);
+        owner.partition_consensus.replica_count = TRANSFER_REQUESTER + 1;
+        let partitions = owner.plane.partitions();
+        for namespace in namespaces {
+            let directory = directory.join(namespace.inner().to_string());
+            std::fs::create_dir(&directory).unwrap();
+            serve_to_requester(&owner, bus, *namespace);
+            let partition = partitions.get_mut_by_ns(namespace).unwrap();
+            attach_segment_files(partition, &directory, false).await;
+            commit_acked_write(&owner, *namespace, 1).await;
+        }
+        partitions.set_io_notifier(
+            owner.partition_io.notifier(),
+            owner.partition_io.limits.bytes_max(),
+        );
+        (owner, sender)
+    }
+
+    /// A `RequestStateTransfer` for `namespace` from [`TRANSFER_REQUESTER`].
+    fn request_state_transfer(
+        namespace: IggyNamespace,
+        nonce: u128,
+        partition_incarnation: u64,
+    ) -> MessageBag {
+        MessageBag::RequestStateTransfer(
+            Message::<RequestStateTransferHeader>::new(size_of::<RequestStateTransferHeader>())
+                .transmute_header(|_, header: &mut RequestStateTransferHeader| {
+                    header.command = Command::RequestStateTransfer;
+                    header.size = u32::try_from(size_of::<RequestStateTransferHeader>()).unwrap();
+                    header.cluster = 1;
+                    header.group = namespace.inner();
+                    header.replica = TRANSFER_REQUESTER;
+                    header.partition_incarnation = partition_incarnation;
+                    header.nonce = nonce;
+                    header.seal();
+                }),
+        )
+    }
+
+    /// `available` and `unavailable_transient` of a transfer target that
+    /// carries an offer.
+    const OFFERED: (u8, u8) = (1, 0);
+    /// `available` and `unavailable_transient` of a transient refusal.
+    const REFUSED: (u8, u8) = (0, 1);
+    /// Ticks that a parked request waits for its plan pin at the default
+    /// repair-retry interval.
+    const PARKED_WAIT_TICKS: u32 =
+        partitions::REPAIR_RETRY_TICKS / crate::PARKED_TRANSFER_REQUEST_WAIT_DIVISOR;
+
+    /// `(group, nonce, (available, unavailable_transient))` of each
+    /// `StateTransferTarget` that a bus forwarded.
+    type RecordedTargets = Rc<RefCell<Vec<(u64, u128, (u8, u8))>>>;
+
+    /// Records each `StateTransferTarget` that `bus` forwards.
+    fn record_transfer_targets(bus: &IggyMessageBus) -> RecordedTargets {
+        let targets = Rc::new(RefCell::new(Vec::new()));
+        let recorded = Rc::clone(&targets);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            let message =
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            if message.header().command == Command::StateTransferTarget {
+                let target = Message::<StateTransferTargetHeader>::try_from(
+                    Owned::copy_from_slice(frame.as_slice()),
+                )
+                .unwrap();
+                let header = target.header();
+                recorded.borrow_mut().push((
+                    header.group,
+                    header.nonce,
+                    (header.available, header.unavailable_transient),
+                ));
+            }
+            Ok(())
+        }));
+        targets
+    }
+
+    fn parked_nonce(owner: &IoTestShard, namespace: IggyNamespace) -> Option<u128> {
+        owner
+            .parked_partition_transfer_requests
+            .borrow()
+            .get(&(namespace.inner(), TRANSFER_REQUESTER))
+            .map(|parked| parked.header.nonce)
+    }
+
+    /// Runs I/O turns until the transfer plans of `namespaces` are pinned. A
+    /// pin waits for one flush, so it gets the [`REPLY_DEADLINE`] that these
+    /// tests give one write, also on a loaded host.
+    #[allow(clippy::future_not_send)]
+    async fn pin_transfer_plans(owner: &IoTestShard, namespaces: &[IggyNamespace]) {
+        let pinned = || {
+            namespaces.iter().all(|namespace| {
+                owner
+                    .plane
+                    .partitions()
+                    .get_by_ns(namespace)
+                    .is_some_and(IggyPartition::transfer_plan_pinned)
+            })
+        };
+        let pin = async {
+            while !pinned() {
+                owner.service_partition_io().await;
+                compio::time::sleep(TASK_POLL_INTERVAL).await;
+            }
+        };
+        assert!(
+            compio::time::timeout(REPLY_DEADLINE, pin).await.is_ok(),
+            "the I/O turns must pin every transfer plan"
+        );
     }
 
     fn view_control_message(

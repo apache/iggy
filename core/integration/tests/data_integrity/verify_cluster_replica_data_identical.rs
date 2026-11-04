@@ -73,7 +73,10 @@ const BURST_BATCH_MESSAGES: u32 = 2;
 #[iggy_harness(cluster_nodes = 3)]
 async fn should_persist_byte_identical_data_across_cluster_replicas(harness: &mut TestHarness) {
     let client = harness.tcp_root_client().await.unwrap();
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -173,6 +176,166 @@ async fn should_persist_byte_identical_data_across_cluster_replicas(harness: &mu
     drop(_burst_clients);
 
     disk::assert_replica_data_identical(&data_paths, true);
+}
+
+const ENCRYPTED_STREAM_NAME: &str = "di-encrypted-stream";
+const ENCRYPTED_PAYLOAD_PREFIX: &str = "server-encrypted-identity-payload";
+
+// Server-side encryption happens once on the primary before replication, so
+// every replica must persist the same ciphertext and none may hold plaintext.
+#[iggy_harness(
+    cluster_nodes = 3,
+    server(encryption = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=")
+)]
+async fn given_three_nodes_with_server_encryption_when_persisting_should_store_identical_ciphertext(
+    harness: &mut TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    client
+        .create_stream(ENCRYPTED_STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    client
+        .create_topic(
+            &Identifier::named(ENCRYPTED_STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                messages_required_to_save: Some(1),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut messages: Vec<IggyMessage> = (0..MESSAGES)
+        .map(|i| {
+            IggyMessage::builder()
+                .id(u128::from(i + 1))
+                .payload(format!("{ENCRYPTED_PAYLOAD_PREFIX}-{i:04}").into())
+                .build()
+                .unwrap()
+        })
+        .collect();
+    client
+        .send_messages(
+            &Identifier::named(ENCRYPTED_STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+
+    let data_paths: Vec<PathBuf> = harness
+        .all_servers()
+        .iter()
+        .map(|server| server.data_path())
+        .collect();
+    assert_eq!(data_paths.len(), CLUSTER_NODES);
+    disk::wait_for_log_convergence(&data_paths).await;
+    harness.stop().await.unwrap();
+
+    disk::assert_replica_data_identical(&data_paths, true);
+    for data_path in &data_paths {
+        let files = disk::collect_comparable_files(data_path, true);
+        assert!(
+            files.keys().any(|path| path.ends_with(".log")),
+            "{} holds no segment log",
+            data_path.display()
+        );
+        for (path, bytes) in files {
+            assert!(
+                !bytes
+                    .windows(ENCRYPTED_PAYLOAD_PREFIX.len())
+                    .any(|window| window == ENCRYPTED_PAYLOAD_PREFIX.as_bytes()),
+                "{path} on {} holds a plaintext payload",
+                data_path.display()
+            );
+        }
+    }
+}
+
+#[iggy_harness(
+    cluster_nodes = 3,
+    server(encryption = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=")
+)]
+async fn given_three_nodes_with_custom_keys_when_persisting_should_store_identical_ciphertext(
+    harness: &mut TestHarness,
+) {
+    let streams = [
+        (
+            "client-key-replicas",
+            Some(StreamEncryptionKey::try_from([3u8; 32].as_slice()).unwrap()),
+        ),
+        ("generated-key-replicas", None),
+    ];
+    let client = harness.tcp_root_client().await.unwrap();
+    for (name, encryption_key) in &streams {
+        client
+            .create_stream(
+                name,
+                &StreamCreateOptions {
+                    encryption_key: encryption_key.clone(),
+                    ..StreamCreateOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        client
+            .create_topic(
+                &Identifier::named(name).unwrap(),
+                TOPIC_NAME,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    messages_required_to_save: Some(1),
+                    ..TopicCreateOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        for batch in 0..4u32 {
+            let mut messages: Vec<IggyMessage> = (0..MESSAGES / 4)
+                .map(|i| {
+                    IggyMessage::builder()
+                        .payload(format!("{ENCRYPTED_PAYLOAD_PREFIX}-{name}-{batch}-{i:04}").into())
+                        .build()
+                        .unwrap()
+                })
+                .collect();
+            client
+                .send_messages(
+                    &Identifier::named(name).unwrap(),
+                    &Identifier::named(TOPIC_NAME).unwrap(),
+                    &Partitioning::partition_id(0),
+                    &mut messages,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    let data_paths: Vec<PathBuf> = harness
+        .all_servers()
+        .iter()
+        .map(|server| server.data_path())
+        .collect();
+    disk::wait_for_log_convergence(&data_paths).await;
+    harness.stop().await.unwrap();
+
+    disk::assert_replica_data_identical(&data_paths, true);
+    for data_path in &data_paths {
+        for (path, bytes) in disk::collect_comparable_files(data_path, true) {
+            assert!(
+                !bytes
+                    .windows(ENCRYPTED_PAYLOAD_PREFIX.len())
+                    .any(|window| window == ENCRYPTED_PAYLOAD_PREFIX.as_bytes()),
+                "{path} on {} holds a plaintext payload",
+                data_path.display()
+            );
+        }
+    }
 }
 
 /// Drive a concurrent send burst across independent connections so the primary

@@ -21,9 +21,17 @@ use std::str::FromStr;
 #[derive(Debug, Clone)]
 pub struct QuicClientReconnectionConfig {
     pub enabled: bool,
+    /// Retry passes after the initial bootstrap pass, and consecutive background
+    /// dial attempts per replica. `None` permits unlimited retries; `Some(0)`
+    /// permits only the initial bootstrap pass. The limit covers one reconnect
+    /// burst: while the client is signed in, each `IggyClient` heartbeat
+    /// restarts the replica links that used it up, with a fresh budget. A
+    /// transport client without `IggyClient` has no heartbeat, so only
+    /// `connect()` restarts them.
     pub max_retries: Option<u32>,
-    /// Delay between connection attempts.
+    /// Full-jitter exponential backoff base, capped at 10 seconds.
     pub interval: NonZeroIggyDuration,
+    /// Stable connection duration that resets the retry count and backoff.
     pub reestablish_after: IggyDuration,
 }
 

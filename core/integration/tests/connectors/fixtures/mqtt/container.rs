@@ -17,6 +17,7 @@
 
 use crate::connectors::fixtures;
 use integration::harness::TestBinaryError;
+use reqwest::StatusCode;
 use serde_json::json;
 use std::time::Duration;
 use testcontainers_modules::testcontainers::core::IntoContainerPort;
@@ -203,34 +204,40 @@ async fn wait_for_dashboard_token(dashboard_url: &str) -> Result<String, TestBin
     Ok(token)
 }
 
+/// EMQX answers dashboard logins before its authenticator chain accepts user
+/// writes, so a single POST races the broker and fails with HTTP 400. Retry on
+/// the same budget as the dashboard wait, and accept 409 from a prior attempt
+/// whose reply was lost.
 async fn create_mqtt_user(dashboard_url: &str, token: &str) -> Result<(), TestBinaryError> {
-    let response = reqwest::Client::new()
-        .post(format!(
-            "{dashboard_url}/api/v5/authentication/password_based%3Abuilt_in_database/users"
-        ))
-        .bearer_auth(token)
-        .json(&json!({
-            "user_id": MQTT_USERNAME,
-            "password": MQTT_PASSWORD,
-        }))
-        .send()
-        .await
-        .map_err(|error| TestBinaryError::FixtureSetup {
-            fixture_type: "MqttBrokerContainer".to_string(),
-            message: format!("Failed to create EMQX MQTT test user: {error}"),
-        })?;
-
-    if !response.status().is_success() {
-        return Err(TestBinaryError::FixtureSetup {
-            fixture_type: "MqttBrokerContainer".to_string(),
-            message: format!(
-                "Failed to create EMQX MQTT test user: HTTP {}",
-                response.status()
-            ),
-        });
+    let client = reqwest::Client::new();
+    let users_url =
+        format!("{dashboard_url}/api/v5/authentication/password_based%3Abuilt_in_database/users");
+    let mut last_failure = String::from("no attempt was made");
+    for _ in 0..EMQX_START_ATTEMPTS {
+        match client
+            .post(&users_url)
+            .bearer_auth(token)
+            .json(&json!({
+                "user_id": MQTT_USERNAME,
+                "password": MQTT_PASSWORD,
+            }))
+            .send()
+            .await
+        {
+            Ok(response)
+                if response.status().is_success() || response.status() == StatusCode::CONFLICT =>
+            {
+                return Ok(());
+            }
+            Ok(response) => last_failure = format!("HTTP {}", response.status()),
+            Err(error) => last_failure = error.to_string(),
+        }
+        sleep(EMQX_START_INTERVAL).await;
     }
-
-    Ok(())
+    Err(TestBinaryError::FixtureSetup {
+        fixture_type: "MqttBrokerContainer".to_string(),
+        message: format!("Failed to create EMQX MQTT test user: {last_failure}"),
+    })
 }
 
 async fn wait_for_mqtt(

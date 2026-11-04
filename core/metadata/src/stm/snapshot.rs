@@ -19,6 +19,7 @@ use iggy_binary_protocol::IGGY_PROTOCOL_VERSION;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
 
+use crate::change_log::{ChangeLogSnapshot, RingSnapshot};
 use crate::stm::stream::StreamsSnapshot;
 use crate::stm::user::UsersSnapshot;
 
@@ -59,13 +60,26 @@ use crate::stm::user::UsersSnapshot;
 ///
 /// Version 12: pending consumer group owner generations equal their metadata
 /// operation, replacing independently incremented generations.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 12;
+///
+/// Version 13: `TopicSnapshot` dropped its typed expiry, compression and size
+/// fields, which the options map already holds, and `StreamSnapshot` gained
+/// `created_op`, the identity of a stream incarnation.
+///
+/// Version 14: `TopicSnapshot` gained `created_op`, the identity of a topic
+/// incarnation, and the snapshot carries the metadata change log.
+///
+/// Version 15: `PartitionSnapshot` gained `members` and `retirement_debt_op`,
+/// and each pending lifecycle target `retired_members`, as trailing, defaulted
+/// fields.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 15;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
-/// Session protection is mandatory and its nested layout changed. Older
-/// snapshots cannot prove the current retry contract and are refused.
-pub const MIN_READABLE_SNAPSHOT_FORMAT_VERSION: u32 = SNAPSHOT_FORMAT_VERSION;
+/// Session protection is mandatory and its nested layout changed in version
+/// 14, so older snapshots cannot prove the current retry contract and are
+/// refused. Version 14 reads with every partition on every node and no
+/// retirement debt.
+pub const MIN_READABLE_SNAPSHOT_FORMAT_VERSION: u32 = 14;
 
 /// The release that wrote a snapshot: the packed `iggy_binary_protocol` semver of
 /// this build. [`iggy_binary_protocol::ProtocolVersion`] documents the packing and
@@ -135,6 +149,13 @@ pub enum SnapshotError {
         commit_op: u64,
         table_frontier: u64,
     },
+    /// A state transfer moved the history certificate off the WAL suffix above
+    /// `snapshot_seq` and could not make that binding durable. The suffix stays: a
+    /// restart after removing it would find the recorded binding gone and certify
+    /// no view.
+    HistoryBindingNotDurable {
+        snapshot_seq: u64,
+    },
 }
 
 /// Stage at which snapshot persistence failed.
@@ -197,6 +218,13 @@ impl fmt::Display for SnapshotError {
                      commit_op {commit_op}, table frontier {table_frontier}"
                 )
             }
+            Self::HistoryBindingNotDurable { snapshot_seq } => {
+                write!(
+                    f,
+                    "state transfer to op {snapshot_seq} could not persist its history \
+                     binding; the WAL suffix above it was kept"
+                )
+            }
         }
     }
 }
@@ -214,7 +242,8 @@ impl std::error::Error for SnapshotError {
             | Self::InvalidTrailer
             | Self::Truncated { .. }
             | Self::UnsupportedFormatVersion { .. }
-            | Self::IncoherentManifest { .. } => None,
+            | Self::IncoherentManifest { .. }
+            | Self::HistoryBindingNotDurable { .. } => None,
         }
     }
 }
@@ -259,6 +288,10 @@ pub struct MetadataSnapshot {
     /// op. Not a state machine, but folded in so a restart that drained the WAL
     /// prefix still recovers pre-checkpoint sessions.
     pub client_table: Option<consensus::ClientTableSnapshot>,
+    /// The change log at the checkpoint op. Not a state machine either, it
+    /// is folded in so a restart or a transfer keeps the history readers
+    /// resume from.
+    pub change_log: ChangeLogSnapshot,
     /// The release that wrote this snapshot, as a packed `iggy_binary_protocol`
     /// semver. Provenance only, never a gate. See [`SNAPSHOT_WRITER_RELEASE`].
     pub writer_release: u32,
@@ -286,6 +319,22 @@ impl MetadataSnapshot {
             users: None,
             streams: None,
             client_table: None,
+            change_log: ChangeLogSnapshot {
+                log_id: None,
+                last_record_op: 0,
+                resource: RingSnapshot {
+                    evicted_through_op: 0,
+                    evicted_through_ordinal: 0,
+                    evicted_through_timestamp: 0,
+                    entries: Vec::new(),
+                },
+                activity: RingSnapshot {
+                    evicted_through_op: 0,
+                    evicted_through_ordinal: 0,
+                    evicted_through_timestamp: 0,
+                    entries: Vec::new(),
+                },
+            },
             writer_release: SNAPSHOT_WRITER_RELEASE,
         }
     }
@@ -328,8 +377,9 @@ impl MetadataSnapshot {
     pub(crate) fn validate(&self) -> Result<(), SnapshotError> {
         if let Some(streams) = &self.streams {
             streams.validate_ownership_history(self.sequence_number)?;
+            streams.validate_partition_members()?;
         }
-        Ok(())
+        self.change_log.validate(self.sequence_number)
     }
 }
 
@@ -577,10 +627,12 @@ macro_rules! impl_fill_restore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stm::stream::{PartitionSnapshot, StatsSnapshot, StreamSnapshot, TopicSnapshot};
+    use crate::stm::stream::{
+        PartitionSnapshot, StatsSnapshot, StreamSnapshot, StreamsSnapshot, TopicSnapshot,
+    };
     use crate::stm::user::UserSnapshot;
     use iggy_common::{
-        CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, ResourceOptions,
+        HeaderKey, HeaderValue, IggyTimestamp, OptionKey, OptionValue, ResourceOptions,
     };
 
     #[test]
@@ -606,8 +658,8 @@ mod tests {
         // turns "shape changed, version did not" into a failing test rather than an
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
-        const FIELD_COUNT: u32 = 7;
-        const PINNED_VERSION: u32 = 12;
+        const FIELD_COUNT: u32 = 8;
+        const PINNED_VERSION: u32 = 15;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -623,14 +675,15 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn nested_snapshot_shapes_are_pinned_too() {
         // The top-level count above is blind to everything under it, which is how
         // `TopicSnapshot` once swapped a removed field for an added one and kept
         // the same element count: a version 2 file then decoded field-by-field
         // one position out of place instead of failing. The types the STM
         // actually grows need their own pins.
-        const TOPIC_FIELD_COUNT: u32 = 12;
-        const STREAM_FIELD_COUNT: u32 = 6;
+        const TOPIC_FIELD_COUNT: u32 = 10;
+        const STREAM_FIELD_COUNT: u32 = 7;
         const STREAMS_FIELD_COUNT: u32 = 4;
         const USER_FIELD_COUNT: u32 = 7;
         // Version 4 appended `fences`; it is defaulted on read, which is what
@@ -639,7 +692,8 @@ mod tests {
         const CLIENT_TABLE_FIELD_COUNT: u32 = 2;
         // Version 5 appended `created_view` the same way. Version 10 dropped
         // `purge_generation` from the middle, which no default can cover.
-        const PARTITION_FIELD_COUNT: u32 = 6;
+        // `members` and `retirement_debt_op` are appended with defaults.
+        const PARTITION_FIELD_COUNT: u32 = 8;
 
         let client_table = consensus::ClientTableSnapshot {
             slots: Vec::new(),
@@ -657,9 +711,6 @@ mod tests {
             id: 0,
             name: String::new(),
             created_at: IggyTimestamp::default(),
-            message_expiry: IggyExpiry::default(),
-            compression_algorithm: CompressionAlgorithm::default(),
-            max_topic_size: MaxTopicSize::default(),
             stats: StatsSnapshot {
                 size_bytes: 0,
                 messages_count: 0,
@@ -670,6 +721,7 @@ mod tests {
             next_consumer_group_id: 0,
             options: ResourceOptions::new(),
             consumer_group_catalog_op: 0,
+            created_op: 0,
         };
         let encoded = rmp_serde::to_vec(&topic).unwrap();
         assert_eq!(
@@ -685,6 +737,8 @@ mod tests {
             created_revision: 0,
             deleted_up_to_offset: 0,
             created_view: 0,
+            members: Vec::new(),
+            retirement_debt_op: 0,
         };
         let encoded = rmp_serde::to_vec(&partition).unwrap();
         assert_eq!(
@@ -704,6 +758,7 @@ mod tests {
             },
             topics: Vec::new(),
             options: ResourceOptions::new(),
+            created_op: 0,
         };
         let encoded = rmp_serde::to_vec(&stream).unwrap();
         assert_eq!(
@@ -790,8 +845,24 @@ mod tests {
     }
 
     #[test]
+    fn given_change_log_above_the_snapshot_when_decoding_should_refuse_it() {
+        let mut snapshot = MetadataSnapshot::new(9);
+        snapshot.change_log.log_id = Some(1);
+        snapshot.change_log.last_record_op = 10;
+        let encoded = snapshot.encode().unwrap();
+
+        assert!(matches!(
+            MetadataSnapshot::decode(&encoded),
+            Err(SnapshotError::InvalidState(_))
+        ));
+        snapshot.change_log.last_record_op = 9;
+        let decoded = MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
+        assert_eq!(decoded.change_log, snapshot.change_log);
+    }
+
+    #[test]
     fn decode_refuses_snapshots_without_durable_session_protection() {
-        for version in 0..SNAPSHOT_FORMAT_VERSION {
+        for version in 0..MIN_READABLE_SNAPSHOT_FORMAT_VERSION {
             let mut snapshot = MetadataSnapshot::new(9);
             snapshot.version = version;
             let bytes = snapshot.encode().unwrap();
@@ -810,6 +881,79 @@ mod tests {
             MetadataSnapshot::decode(&encoded),
             Err(SnapshotError::UnsupportedFormatVersion { found, expected })
                 if found == INDEPENDENT_OWNER_GENERATION_FORMAT && expected == SNAPSHOT_FORMAT_VERSION
+        ));
+    }
+
+    #[test]
+    fn given_format_fourteen_partition_when_decoding_should_default_members_and_debt() {
+        #[derive(Serialize)]
+        struct FormatFourteenPartition {
+            id: usize,
+            consensus_group_id: u64,
+            created_at: IggyTimestamp,
+            created_revision: u64,
+            deleted_up_to_offset: u64,
+            created_view: u32,
+        }
+        let mut snapshot = MetadataSnapshot::new(9);
+        snapshot.version = MIN_READABLE_SNAPSHOT_FORMAT_VERSION;
+        assert!(MetadataSnapshot::decode(&snapshot.encode().unwrap()).is_ok());
+
+        let encoded = rmp_serde::to_vec(&FormatFourteenPartition {
+            id: 2,
+            consensus_group_id: 3,
+            created_at: IggyTimestamp::from(4),
+            created_revision: 5,
+            deleted_up_to_offset: 6,
+            created_view: 7,
+        })
+        .unwrap();
+        let decoded: PartitionSnapshot = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!((decoded.id, decoded.created_view), (2, 7));
+        assert!(decoded.members.is_empty(), "stored on every node");
+        assert_eq!(decoded.retirement_debt_op, 0);
+    }
+
+    #[test]
+    fn given_format_fourteen_snapshot_when_restoring_should_preserve_options_and_created_op() {
+        const PREVIOUS_FORMAT: u32 = 13;
+        let mut options = ResourceOptions::new();
+        options.insert(
+            HeaderKey::from(OptionKey::MessageExpiry),
+            OptionValue::explicit(HeaderValue::from(60_000_000u64)),
+        );
+        options.insert(
+            HeaderKey::from(OptionKey::MaxTopicSize),
+            OptionValue::derived(HeaderValue::from(u64::MAX)),
+        );
+        let mut stream = stream_snapshot_fixture(
+            3,
+            "orders",
+            StatsSnapshot {
+                size_bytes: 0,
+                messages_count: 0,
+                segments_count: 0,
+            },
+        );
+        stream.created_op = 41;
+        stream.options = options.clone();
+        let mut snapshot = MetadataSnapshot::new(50);
+        snapshot.streams = Some(StreamsSnapshot {
+            lifecycle_intents: std::collections::BTreeMap::default(),
+            revision: 0,
+            namespace_revision: 0,
+            items: vec![(3, stream)],
+        });
+
+        let decoded = MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
+        let (_, restored) = &decoded.streams.as_ref().unwrap().items[0];
+        assert_eq!(restored.created_op, 41);
+        assert_eq!(restored.options, options);
+
+        snapshot.version = PREVIOUS_FORMAT;
+        assert!(matches!(
+            MetadataSnapshot::decode(&snapshot.encode().unwrap()),
+            Err(SnapshotError::UnsupportedFormatVersion { found, .. }) if found == PREVIOUS_FORMAT
         ));
     }
 
@@ -891,9 +1035,6 @@ mod tests {
                             id: 0,
                             name: "topic".to_string(),
                             created_at: ts,
-                            message_expiry: IggyExpiry::default(),
-                            compression_algorithm: CompressionAlgorithm::default(),
-                            max_topic_size: MaxTopicSize::default(),
                             stats: StatsSnapshot {
                                 size_bytes: 256,
                                 messages_count: 12,
@@ -906,6 +1047,8 @@ mod tests {
                                 created_revision: 0,
                                 deleted_up_to_offset: 0,
                                 created_view: 0,
+                                members: vec![2, 0, 1],
+                                retirement_debt_op: 9,
                             }],
                             consumer_groups: Vec::new(),
                             // Nonzero and distinct from every id above so the
@@ -914,9 +1057,11 @@ mod tests {
                             next_consumer_group_id: 5,
                             options: ResourceOptions::default(),
                             consumer_group_catalog_op: 7,
+                            created_op: 8,
                         },
                     )],
                     options: ResourceOptions::default(),
+                    created_op: 9,
                 },
             )],
         });
@@ -941,10 +1086,12 @@ mod tests {
         let (_, topic) = &stream.topics[0];
         assert_eq!(topic.partitions.len(), 1);
         assert_eq!(topic.partitions[0].consensus_group_id, 33);
+        assert_eq!(topic.partitions[0].retirement_debt_op, 9);
         // Never-reuse counter: `#[serde(default)]` would silently restore 0 if
         // the field were dropped from the wire format, so pin its survival.
         assert_eq!(topic.next_consumer_group_id, 5);
         assert_eq!(topic.consumer_group_catalog_op, 7);
+        assert_eq!(topic.created_op, 8);
     }
 
     fn user_snapshot_fixture(id: u32, username: &str, password_hash: &str) -> UserSnapshot {
@@ -968,6 +1115,7 @@ mod tests {
             stats,
             topics: vec![],
             options: ResourceOptions::default(),
+            created_op: 0,
         }
     }
 

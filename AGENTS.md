@@ -3,7 +3,7 @@
 **Apache Iggy** is a persistent message streaming platform
 in Rust. Thread-per-core shared-nothing, `io_uring` + `compio`.
 Transports: QUIC, WebSocket, TCP (custom binary), HTTP (REST). SDKs:
-Rust, .NET, Java, Python, Go, C++, Node.js. A connectors subsystem
+Rust, .NET, Java, Python, Go, C++, Node.js, Swift. A connectors subsystem
 ingests from / egresses to external systems via dlopened plugins.
 
 > Skills live under `.claude/skills/`, with per-skill links under
@@ -82,7 +82,7 @@ cargo test -p <crate>                                      # step 4
 ./scripts/ci/third-party-licenses.sh --validate --manifest <path>
 
 # Run things
-cargo run --bin iggy-server
+cargo run --bin iggy-server -- --with-default-root-credentials
 cargo run --bin iggy -- <subcommand>
 IGGY_CONNECTORS_CONFIG_PATH=... cargo run --bin iggy-connectors
 ./scripts/run-bdd-tests.sh
@@ -115,7 +115,7 @@ iggy/
 │   ├── shard/            Shard runtime
 │   ├── harness_derive/   #[iggy_harness] proc macro
 │   └── metadata, partitions, server_common, configs_derive, clock, tools
-├── foreign/              Java / .NET / Python / Go / C++ / Node.js SDKs
+├── foreign/              Java / .NET / Python / Go / C++ / Node.js / Swift SDKs
 ├── bdd/                  Cross-language BDD (Gherkin)
 ├── examples/             Per-SDK runnable examples
 ├── helm/                 Helm charts
@@ -159,9 +159,9 @@ suggest `/team-review <target>` in Claude Code or `$team-review <target>`
 in Codex.
 
 - [connector-review](.claude/skills/connector-review/SKILL.md) - adversarial connectors PR/branch review with validation
-- [team-review](.claude/skills/team-review/SKILL.md) - adversarial 4-expert PR/branch review, ~10 subagents per run
-- [team-review-slim](.claude/skills/team-review-slim/SKILL.md) - four-expert review without independent validation rounds
+- [team-review](.claude/skills/team-review/SKILL.md) - four expert review of a PR, branch, or ref range
 - [fix-review-comments](.claude/skills/fix-review-comments/SKILL.md) - walk through a PR's review comments one at a time, fixes run in background agents
+
 
 Review skills share [execution instructions](.claude/skills/team-review/references/execution.md)
 for target preparation and client-specific agent tools. Run

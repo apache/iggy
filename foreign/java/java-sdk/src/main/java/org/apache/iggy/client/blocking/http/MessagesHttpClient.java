@@ -20,6 +20,8 @@
 package org.apache.iggy.client.blocking.http;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import org.apache.hc.core5.http.ClassicHttpRequest;
+import org.apache.hc.core5.http.NameValuePair;
 import org.apache.hc.core5.http.message.BasicNameValuePair;
 import org.apache.iggy.client.blocking.MessagesClient;
 import org.apache.iggy.client.blocking.TopicsClient;
@@ -27,13 +29,20 @@ import org.apache.iggy.client.blocking.http.SendContexts.TopicContexts;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyAuthorizationException;
 import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.exception.IggyTimeoutException;
+import org.apache.iggy.exception.IggyValidationException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.CommitErrorScope;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PartitioningKind;
+import org.apache.iggy.message.PollOptions;
 import org.apache.iggy.message.PolledMessages;
+import org.apache.iggy.message.PollingKind;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
 import org.apache.iggy.partition.Partition;
@@ -41,12 +50,24 @@ import org.apache.iggy.partition.PartitionContext;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 class MessagesHttpClient implements MessagesClient {
+
+    /**
+     * The server applies the byte limit to the equivalent binary selection and
+     * then encodes it as JSON, which is larger. Rust bounds the JSON body at the
+     * same multiple.
+     */
+    private static final long JSON_BODY_EXPANSION = 16;
+
+    private static final long INITIAL_RETRY_INTERVAL_MILLIS = 50;
+    private static final long MAX_RETRY_INTERVAL_MILLIS = 1000;
 
     private final InternalHttpClient httpClient;
     private final TopicsClient topicsClient;
@@ -62,11 +83,52 @@ class MessagesHttpClient implements MessagesClient {
     public PolledMessages pollMessages(
             StreamId streamId,
             TopicId topicId,
+            long partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            PollOptions options) {
+        strategy.requirePartition(partitionId);
+        options.validate();
+        if (options.autoCommit().isPresent()) {
+            throw new IggyValidationException(
+                    IggyErrorCode.INVALID_CONFIGURATION,
+                    IggyErrorCode.INVALID_CONFIGURATION.getCode(),
+                    "A poll of one partition has nothing to count for an automatic commit",
+                    Optional.empty(),
+                    Optional.empty());
+        }
+        return pollMessagesDeferred(
+                streamId,
+                topicId,
+                Optional.of(partitionId),
+                consumer,
+                strategy,
+                options.count(),
+                options.commitsOnRead(),
+                options.deferredOptions());
+    }
+
+    @Override
+    public PolledMessages pollMessages(
+            StreamId streamId,
+            TopicId topicId,
             Optional<Long> partitionId,
             Consumer consumer,
             PollingStrategy strategy,
             Long count,
             boolean autoCommit) {
+        if (autoCommit) {
+            // The server refuses a GET that stores its offset, which a proxy could resend.
+            return pollMessagesDeferred(
+                    streamId,
+                    topicId,
+                    partitionId,
+                    consumer,
+                    strategy,
+                    count,
+                    true,
+                    DeferredPollOptions.defaults().withMaxWait(Duration.ZERO));
+        }
         var request = httpClient.prepareGetRequest(
                 path(streamId, topicId),
                 new BasicNameValuePair("consumer_id", consumer.id().toString()),
@@ -75,13 +137,133 @@ class MessagesHttpClient implements MessagesClient {
                         .orElse(null),
                 new BasicNameValuePair("kind", strategy.kind().name().toLowerCase()),
                 new BasicNameValuePair("value", strategy.value().toString()),
-                strategy.context()
-                        .map(context -> new BasicNameValuePair(
-                                "context", ObjectMapperFactory.getInstance().writeValueAsString(context)))
-                        .orElse(null),
+                contextParameter(strategy),
                 new BasicNameValuePair("count", count.toString()),
                 new BasicNameValuePair("auto_commit", Boolean.toString(autoCommit)));
         return httpClient.execute(request, PolledMessages.class);
+    }
+
+    @Override
+    @SuppressWarnings({"checkstyle:ParameterNumber", "checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
+    public PolledMessages pollMessagesDeferred(
+            StreamId streamId,
+            TopicId topicId,
+            Optional<Long> partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            Long count,
+            boolean autoCommit,
+            DeferredPollOptions options) {
+        options.validate(count);
+        if (consumer.kind() == Consumer.Kind.ConsumerGroup) {
+            // The server refuses consumer_group on HTTP: without a persistent
+            // connection the client cannot follow the group's partition assignment.
+            throw new IggyOperationNotSupportedException(
+                    "A consumer group cannot poll over HTTP, which cannot follow the group's partition assignment");
+        }
+        var progress = InternalHttpClient.ProgressKey.of(streamId, topicId, partitionId, strategy.context());
+        // A poll that stores its offset or starts at it advances the progress of its partition.
+        boolean advances = autoCommit || strategy.kind() == PollingKind.Next;
+        if (advances) {
+            // Before the lane wait, so a poll behind a parked one sees the block of a lost one at once.
+            httpClient.checkProgress(progress);
+        }
+        long startNanos = System.nanoTime();
+        long requestDeadlineNanos = startNanos + options.requestTimeout().toNanos();
+        // A first message larger than maxBytes comes alone in the reply.
+        long maxBodyBytes = Math.multiplyExact(
+                Math.max(options.maxBytes(), DeferredPollOptions.MAX_RECORD_POLL_REPLY_SIZE), JSON_BODY_EXPANSION);
+        long retryIntervalMillis = INITIAL_RETRY_INTERVAL_MILLIS;
+        InternalHttpClient.ProgressLane lane =
+                advances ? httpClient.enterProgressLane(progress, requestDeadlineNanos) : null;
+        try {
+            while (true) {
+                if (advances) {
+                    // Another poll can block the partition during the lane wait or a retry pause.
+                    httpClient.checkProgress(progress);
+                }
+                // Both budgets carry across retries rather than restarting.
+                DeferredPollOptions remaining = options.remaining(Duration.ofNanos(System.nanoTime() - startNanos))
+                        .orElseThrow(() -> InternalHttpClient.deferredFailure(
+                                false, new IggyTimeoutException("Deferred poll exceeded its request timeout")));
+                ClassicHttpRequest request = deferredRequest(
+                        streamId, topicId, partitionId, consumer, strategy, count, autoCommit, remaining);
+                try {
+                    return httpClient.executeDeferred(
+                            request, PolledMessages.class, requestDeadlineNanos, maxBodyBytes);
+                } catch (IggyServerException refused) {
+                    if (autoCommit && !CommitErrorScope.REQUEST.provesNothingStored(refused.getRawErrorCode())) {
+                        // The server can have stored the offset, so the partition waits for an abandon.
+                        throw httpClient.loseProgress(
+                                progress, refused.getCause() != null ? refused.getCause() : refused);
+                    }
+                    // Only an explicit non-admission proves nothing was served. An
+                    // opaque 503 can be an ambiguous not-committed or a proxy fault.
+                    if (refused.getRawErrorCode() != IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode()
+                            && refused.getRawErrorCode() != IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode()) {
+                        throw refused;
+                    }
+                    sleepBeforeRetry(retryIntervalMillis, requestDeadlineNanos, refused);
+                    retryIntervalMillis = Math.min(retryIntervalMillis * 2, MAX_RETRY_INTERVAL_MILLIS);
+                }
+            }
+        } finally {
+            if (lane != null) {
+                httpClient.leaveProgressLane(lane);
+            }
+        }
+    }
+
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    private ClassicHttpRequest deferredRequest(
+            StreamId streamId,
+            TopicId topicId,
+            Optional<Long> partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            Long count,
+            boolean autoCommit,
+            DeferredPollOptions options) {
+        NameValuePair[] query = {
+            new BasicNameValuePair("consumer_id", consumer.id().toString()),
+            partitionId
+                    .map(id -> new BasicNameValuePair("partition_id", id.toString()))
+                    .orElse(null),
+            new BasicNameValuePair("kind", strategy.kind().name().toLowerCase()),
+            new BasicNameValuePair("value", strategy.value().toString()),
+            contextParameter(strategy),
+            new BasicNameValuePair("count", count.toString()),
+            new BasicNameValuePair("auto_commit", Boolean.toString(autoCommit)),
+            new BasicNameValuePair("wait_us", Long.toString(options.maxWaitMicros())),
+            new BasicNameValuePair("min_count", Long.toString(options.minCount())),
+            new BasicNameValuePair("max_bytes", Long.toString(options.maxBytes())),
+            new BasicNameValuePair("request_timeout_us", Long.toString(options.requestTimeoutMicros()))
+        };
+        String deferredPath = path(streamId, topicId) + "/deferred";
+        // A poll that stores its offset changes state, so it is a POST that no proxy or library resends.
+        return autoCommit
+                ? httpClient.preparePostQueryRequest(deferredPath, query)
+                : httpClient.prepareGetRequest(deferredPath, query);
+    }
+
+    // Without the context the server would read a recreated partition instead of refusing the poll.
+    private static NameValuePair contextParameter(PollingStrategy strategy) {
+        return strategy.context()
+                .map(context -> new BasicNameValuePair(
+                        "context", ObjectMapperFactory.getInstance().writeValueAsString(context)))
+                .orElse(null);
+    }
+
+    private static void sleepBeforeRetry(long intervalMillis, long requestDeadlineNanos, IggyServerException refused) {
+        if (requestDeadlineNanos - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(intervalMillis)) {
+            throw refused;
+        }
+        try {
+            Thread.sleep(intervalMillis);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw InternalHttpClient.deferredFailure(false, interrupted);
+        }
     }
 
     @Override

@@ -46,16 +46,10 @@ inputs:
   free-disk-space:
     description: >-
       Whether to reclaim runner disk before the build. Default "true".
-      Set "false" for light legs (fmt/sort/clippy/check/machete/doctest) that
-      fit in the ~89 GiB default headroom and should not pay the ~20-45s cost.
+      Artifact builders, Rust test shards, Miri and lightweight checks
+      disable cleanup when they fit within the runner's available disk space.
     required: false
     default: "true"
-  free-disk-space-aggressive:
-    description: >-
-      Forwarded to free-disk-space. When "true", run jlumbroso for a deep
-      cleanup. Enable for disk-heavy jobs (e.g. llvm-cov instrumented builds).
-    required: false
-    default: "false"
 
 runs:
   using: "composite"
@@ -63,8 +57,6 @@ runs:
     - name: Free runner disk space
       if: inputs.free-disk-space == 'true'
       uses: ./.github/actions/utils/free-disk-space
-      with:
-        aggressive: ${{ inputs.free-disk-space-aggressive }}
 
     - name: Install system dependencies (Linux)
       if: runner.os == 'Linux' && inputs.install-system-dependencies == 'true'
@@ -84,12 +76,12 @@ runs:
 
     - name: Setup Rust toolchain
       run: |
-        # macOS runners provision Rust via the Homebrew `rustup` formula, which
-        # installs only `rustup-init` plus brew shims that resolve back to it in
-        # installer mode - so `cargo` errors out and ~/.cargo/bin has no proxies.
-        # Run rustup-init once to generate the real cargo/rustc proxies.
-        if [ "$RUNNER_OS" = "macOS" ]; then
-          rustup-init -y --no-modify-path --default-toolchain none
+        # Runner images differ in how they ship Rust. Bootstrap rustup only
+        # when the image has none, so the step works on every image.
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 5 --retry-all-errors https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --default-toolchain none
+          export PATH="$HOME/.cargo/bin:$PATH"
         fi
         rustup show
         # rust-cache hashes every installed toolchain, including unused runner defaults.
@@ -101,6 +93,9 @@ runs:
             rustup toolchain uninstall "$toolchain"
           fi
         done <<< "$installed_toolchains"
+        # Later steps unpack cargo tools here, and an image whose rustup lives
+        # elsewhere does not create it.
+        mkdir -p "$HOME/.cargo/bin"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       shell: bash
 
@@ -150,7 +145,7 @@ runs:
       if: inputs.install-nextest == 'true'
       uses: taiki-e/install-action@v2
       with:
-        tool: cargo-nextest@0.9.148
+        tool: cargo-nextest@0.9.149
 
     - name: Install cargo-llvm-cov
       if: inputs.coverage == 'true'

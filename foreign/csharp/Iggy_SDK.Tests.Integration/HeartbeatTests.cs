@@ -38,6 +38,10 @@ public class HeartbeatTests
     // renewing after 1.2 intervals and ends 1.2 intervals later. The rest covers the report and expiry passes.
     private static readonly TimeSpan IdleFor = IggyServerFixture.ServerHeartbeatInterval * 3;
 
+    // A stale eviction drops only the link, and its redial must bind the session before that lease ends. The
+    // default first retry can wait up to 5 seconds, which can come after the end of the lease.
+    private static readonly TimeSpan ReconnectDelay = TimeSpan.FromMilliseconds(500);
+
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
     public required IggyServerFixture Fixture { get; init; }
 
@@ -61,7 +65,7 @@ public class HeartbeatTests
     }
 
     [Test]
-    public async Task IdleGroupMember_WithSlowHeartbeat_Should_BeEvicted_And_Reconnect()
+    public async Task IdleGroupMember_WithSlowHeartbeat_Should_RebindAndStayMember()
     {
         // Heartbeat cannot be turned off, so a ping interval far past the server's threshold stands in for one.
         using var client = await CreateClient(TimeSpan.FromHours(1));
@@ -69,17 +73,17 @@ public class HeartbeatTests
 
         await Task.Delay(IdleFor);
 
+        // The server evicts the silent link, and the redial binds the same session again. That renews its lease,
+        // so the membership stays.
         using var observer = await Fixture.CreateAuthenticatedClient(Protocol.Tcp);
         var group = await observer.GetConsumerGroupByIdAsync(Identifier.String(streamName),
             Identifier.String(TopicName), Identifier.Numeric(groupId));
         group.ShouldNotBeNull();
-        group.MembersCount.ShouldBe(0u);
+        group.MembersCount.ShouldBe(1u);
 
-        // The eviction reaches the client with its next request, which the default reconnection replays over a
-        // fresh, auto-logged-in session.
         var me = await client.GetMeAsync();
         me.ShouldNotBeNull();
-        me.ConsumerGroupsCount.ShouldBe(0u);
+        me.ConsumerGroupsCount.ShouldBe(1u);
     }
 
     [Test]
@@ -95,20 +99,21 @@ public class HeartbeatTests
 
         await Task.Delay(IdleFor);
 
+        // The rebind keeps the session inside its lease, so the member survives the eviction.
         var group = await issuer.GetConsumerGroupByIdAsync(Identifier.String(streamName),
             Identifier.String(TopicName), Identifier.Numeric(groupId));
         group.ShouldNotBeNull();
-        group.MembersCount.ShouldBe(0u);
+        group.MembersCount.ShouldBe(1u);
 
         var me = await client.GetMeAsync();
         me.ShouldNotBeNull();
-        me.ConsumerGroupsCount.ShouldBe(0u);
+        me.ConsumerGroupsCount.ShouldBe(1u);
     }
 
     /// <summary>
-    ///     An eviction is the server's heartbeat verifier reacting to silence, not caller intent, so a client
-    ///     that signed in by hand recovers from it exactly like one whose credentials were configured: the
-    ///     sign-in it remembered re-establishes the session. Only an explicit sign-out or Dispose ends it.
+    ///     An eviction is the server's heartbeat verifier reacting to silence, not caller intent. It drops only the
+    ///     link, so a client that signed in by hand binds the same session again, exactly like one whose credentials
+    ///     were configured. Only an explicit sign-out, Dispose or the end of the lease ends the session.
     /// </summary>
     [Test]
     public async Task EvictedClient_WithoutAutoLogin_Should_ReestablishItsSession()
@@ -119,17 +124,13 @@ public class HeartbeatTests
 
         await Task.Delay(IdleFor);
 
-        // A read is replay-safe, so the eviction is absorbed: the reconnect signs in again with the
-        // credentials the hand-run login remembered, and the request completes over the session it
-        // re-established.
         var stream = await client.GetStreamByIdAsync(Identifier.String(streamName));
         stream.ShouldNotBeNull();
 
-        // The session is a new one, though: what the server evicted stays evicted, so the group membership
-        // that belonged to it is gone.
+        // The rebind keeps the session inside its lease, so its group membership survives the eviction.
         var me = await client.GetMeAsync();
         me.ShouldNotBeNull();
-        me.ConsumerGroupsCount.ShouldBe(0u);
+        me.ConsumerGroupsCount.ShouldBe(1u);
     }
 
     private Task<IIggyClient> CreateClient(TimeSpan heartbeatInterval, bool autoLogin = true)
@@ -145,6 +146,7 @@ public class HeartbeatTests
             BaseAddress = await Fixture.GetIggyAddressAsync(Protocol.Tcp),
             Protocol = Protocol.Tcp,
             HeartbeatInterval = heartbeatInterval,
+            ReconnectionSettings = new ReconnectionSettings { InitialDelay = ReconnectDelay },
             AutoLoginSettings = autoLogin
         });
         await client.ConnectAsync();

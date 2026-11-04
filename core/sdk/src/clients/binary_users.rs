@@ -15,26 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::clients::redirect_login_settled;
 use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_common::UserClient;
-use iggy_common::UserUpdateOptions;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
     Identifier, IdentityInfo, IggyError, Permissions, UserInfo, UserInfoDetails, UserStatus,
 };
-use tracing::info;
+use iggy_common::{UserCreateOptions, UserUpdateOptions};
 
 #[async_trait]
 impl UserClient for IggyClient {
     async fn get_user(&self, user_id: &Identifier) -> Result<Option<UserInfoDetails>, IggyError> {
-        self.client.read().await.get_user(user_id).await
+        super::with_client!(self, client => client.get_user(user_id).await)
     }
 
     async fn get_users(&self) -> Result<Vec<UserInfo>, IggyError> {
-        self.client.read().await.get_users().await
+        super::with_client!(self, client => client.get_users().await)
     }
 
     async fn create_user(
@@ -43,30 +40,21 @@ impl UserClient for IggyClient {
         password: &str,
         status: UserStatus,
         permissions: Option<Permissions>,
+        options: &UserCreateOptions,
     ) -> Result<UserInfoDetails, IggyError> {
-        self.client
-            .read()
-            .await
-            .create_user(username, password, status, permissions)
-            .await
+        super::with_client!(self, client => client.create_user(username, password, status, permissions, options).await)
     }
 
     async fn delete_user(&self, user_id: &Identifier) -> Result<(), IggyError> {
-        self.client.read().await.delete_user(user_id).await
+        super::with_client!(self, client => client.delete_user(user_id).await)
     }
 
     async fn update_user(
         &self,
         user_id: &Identifier,
-        username: Option<&str>,
-        status: Option<UserStatus>,
         options: &UserUpdateOptions,
     ) -> Result<(), IggyError> {
-        self.client
-            .read()
-            .await
-            .update_user(user_id, username, status, options)
-            .await
+        super::with_client!(self, client => client.update_user(user_id, options).await)
     }
 
     async fn update_permissions(
@@ -74,11 +62,7 @@ impl UserClient for IggyClient {
         user_id: &Identifier,
         permissions: Option<Permissions>,
     ) -> Result<(), IggyError> {
-        self.client
-            .read()
-            .await
-            .update_permissions(user_id, permissions)
-            .await
+        super::with_client!(self, client => client.update_permissions(user_id, permissions).await)
     }
 
     async fn change_password(
@@ -87,52 +71,14 @@ impl UserClient for IggyClient {
         current_password: &str,
         new_password: &str,
     ) -> Result<(), IggyError> {
-        self.client
-            .read()
-            .await
-            .change_password(user_id, current_password, new_password)
-            .await
+        super::with_client!(self, client => client.change_password(user_id, current_password, new_password).await)
     }
 
     async fn login_user(&self, username: &str, password: &str) -> Result<IdentityInfo, IggyError> {
-        let identity = self
-            .client
-            .read()
-            .await
-            .login_user(username, password)
-            .await?;
-
-        let should_redirect = {
-            let client = self.client.read().await;
-            match &*client {
-                ClientWrapper::Tcp(tcp_client) => tcp_client.handle_leader_redirection().await?,
-                ClientWrapper::Quic(quic_client) => quic_client.handle_leader_redirection().await?,
-                ClientWrapper::WebSocket(ws_client) => {
-                    ws_client.handle_leader_redirection().await?
-                }
-                _ => false,
-            }
-        };
-
-        if should_redirect {
-            info!("Redirected to leader, reconnecting and re-authenticating");
-            self.reconnect_after_redirect().await?;
-            // The reconnect signs in with the credentials this very call just
-            // remembered, so on a client without a configured `AutoLogin` the
-            // session is already this user's: signing in again would cost a
-            // logout and a second login (an argon2 each, on the server) for
-            // nothing. With `AutoLogin::Enabled` the reconnect signed in the
-            // configured user, who may not be this one, so the login runs.
-            if redirect_login_settled(&*self.client.read().await).await {
-                return Ok(identity);
-            }
-            self.login_user(username, password).await
-        } else {
-            Ok(identity)
-        }
+        super::with_client!(self, client => client.login_user(username, password).await)
     }
 
     async fn logout_user(&self) -> Result<(), IggyError> {
-        self.client.read().await.logout_user().await
+        super::with_client!(self, client => client.logout_user().await)
     }
 }

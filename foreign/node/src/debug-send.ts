@@ -89,8 +89,7 @@ try {
     streamId: streamName,
     topicId: topicName,
     pollingStrategy: PollingStrategy.Next,
-    count: 1,
-    interval: 5000
+    count: 1
   };
 
   const cs = await groupConsumerStream(opt)(pollReq);

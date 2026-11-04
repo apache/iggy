@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
@@ -24,8 +24,7 @@ use consensus::PartitionsHandle;
 use futures::channel::oneshot;
 use iggy_common::{IggyError, PollingStrategy};
 use message_bus::{
-    BusMessage, ClientForwardFn, ConnectionLostFn, JoinHandle, MessageBus, ReplicaForwardFn,
-    SendError,
+    BusMessage, ConnectionLostFn, JoinHandle, MessageBus, ReplicaForwardFn, SendError,
 };
 use metadata::IggyMetadata;
 use partitions::{IggyPartitions, PollFragments, PollingArgs, PollingConsumer};
@@ -438,16 +437,15 @@ async fn given_disconnected_owner_when_disk_poll_arrives_should_reject_before_di
     assert_eq!(committed, None);
 }
 
-/// Remove the fixture's only resident batch to select disk dispatch without
+/// Remove the fixture's resident batches to select disk dispatch without
 /// creating files. Captured tasks must stay unpolled: these tests establish
 /// admission behavior, while real disk reads are covered in partition tests.
-fn evict_messages_for_disk_dispatch(owner: &PollTestShard, namespace: IggyNamespace) {
+pub(super) fn evict_messages_for_disk_dispatch(owner: &PollTestShard, namespace: IggyNamespace) {
     let partitions = owner.plane.partitions();
     let partition = partitions
         .remove(&namespace)
         .expect("fixture partition exists");
-    let retained = partition.log.journal().inner.evict_prefix(1);
-    assert!(retained.is_empty(), "fixture has exactly one batch");
+    partition.log.journal().inner.evict_prefix(usize::MAX);
     assert!(
         partition
             .log
@@ -504,12 +502,17 @@ pub type CapturedTask = Pin<Box<dyn Future<Output = ()>>>;
 /// executing their synthetic disk plans.
 #[derive(Clone, Default)]
 pub struct PollTestBus {
+    pub(super) now: Rc<Cell<u64>>,
     next_timeout: Rc<RefCell<Option<oneshot::Receiver<()>>>>,
     pub(crate) spawned_tasks: Rc<RefCell<Vec<CapturedTask>>>,
 }
 
 #[allow(clippy::future_not_send)]
 impl MessageBus for PollTestBus {
+    fn monotonic_micros(&self) -> u64 {
+        self.now.get()
+    }
+
     fn spawn(&self, future: impl Future<Output = ()> + 'static) {
         self.spawned_tasks.borrow_mut().push(Box::pin(future));
     }
@@ -547,6 +550,5 @@ impl MessageBus for PollTestBus {
 
     fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
     fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
-    fn set_client_forward_fn(&self, _f: ClientForwardFn) {}
     fn track_background(&self, _handle: JoinHandle<()>) {}
 }

@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::{
-    Identifier, IdentityInfo, IggyError, Permissions, UserInfo, UserInfoDetails, UserStatus,
-    UserUpdateOptions,
+    Identifier, IdentityInfo, IggyError, Permissions, UserCreateOptions, UserInfo, UserInfoDetails,
+    UserStatus, UserUpdateOptions,
 };
 use async_trait::async_trait;
 
@@ -48,19 +48,19 @@ pub trait UserClient {
         password: &str,
         status: UserStatus,
         permissions: Option<Permissions>,
+        options: &UserCreateOptions,
     ) -> Result<UserInfoDetails, IggyError>;
     /// Delete a user by unique ID or username.
     ///
     /// Authentication is required, and the permission to manage the users.
     async fn delete_user(&self, user_id: &Identifier) -> Result<(), IggyError>;
-    /// Update a user by unique ID or username.
+    /// Patch a user by unique ID or username: rename it, change its status or
+    /// its options. Keys `options` leaves out keep their values.
     ///
     /// Authentication is required, and the permission to manage the users.
     async fn update_user(
         &self,
         user_id: &Identifier,
-        username: Option<&str>,
-        status: Option<UserStatus>,
         options: &UserUpdateOptions,
     ) -> Result<(), IggyError>;
     /// Update the permissions of a user by unique ID or username.
