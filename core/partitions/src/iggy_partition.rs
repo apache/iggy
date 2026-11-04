@@ -3915,6 +3915,24 @@ where
         );
     }
 
+    /// Lower the logical value of a recovered offset that lies past the partition's offset space,
+    /// keeping the high-water read from its file.
+    pub fn clamp_recovered_consumer_offset(
+        &self,
+        kind: ConsumerKind,
+        consumer_id: u32,
+        committed_offset: u64,
+    ) {
+        if let Some(state) = self.durable_consumer_offsets.get(kind, consumer_id) {
+            self.durable_consumer_offsets.record_explicit(
+                kind,
+                consumer_id,
+                committed_offset,
+                state.persisted_high_water,
+            );
+        }
+    }
+
     pub fn seed_stranded_consumer_offset(&self, kind: ConsumerKind, consumer_id: u32) -> bool {
         if !self.durable_consumer_offsets.contains(kind, consumer_id) {
             self.consumer_offset_capacity_for(kind)
