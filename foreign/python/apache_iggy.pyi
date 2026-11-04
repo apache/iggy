@@ -4649,10 +4649,6 @@ class SnapshotCompression:
     r"""
     Compress the file using ZStandard.
     """
-    Lzma: typing.ClassVar[SnapshotCompression]
-    r"""
-    Compress the file using LZMA.
-    """
     Xz: typing.ClassVar[SnapshotCompression]
     r"""
     Compress the file using XZ.

@@ -34,8 +34,6 @@ pub enum SnapshotCompression {
     Bzip2,
     /// Compress the file using ZStandard.
     Zstd,
-    /// Compress the file using LZMA.
-    Lzma,
     /// Compress the file using XZ.
     Xz,
 }
@@ -47,21 +45,7 @@ impl From<SnapshotCompression> for RustSnapshotCompression {
             SnapshotCompression::Deflated => RustSnapshotCompression::Deflated,
             SnapshotCompression::Bzip2 => RustSnapshotCompression::Bzip2,
             SnapshotCompression::Zstd => RustSnapshotCompression::Zstd,
-            SnapshotCompression::Lzma => RustSnapshotCompression::Lzma,
             SnapshotCompression::Xz => RustSnapshotCompression::Xz,
-        }
-    }
-}
-
-impl From<RustSnapshotCompression> for SnapshotCompression {
-    fn from(compression: RustSnapshotCompression) -> Self {
-        match compression {
-            RustSnapshotCompression::Stored => SnapshotCompression::Stored,
-            RustSnapshotCompression::Deflated => SnapshotCompression::Deflated,
-            RustSnapshotCompression::Bzip2 => SnapshotCompression::Bzip2,
-            RustSnapshotCompression::Zstd => SnapshotCompression::Zstd,
-            RustSnapshotCompression::Lzma => SnapshotCompression::Lzma,
-            RustSnapshotCompression::Xz => SnapshotCompression::Xz,
         }
     }
 }
@@ -97,20 +81,6 @@ impl From<SystemSnapshotType> for RustSystemSnapshotType {
             SystemSnapshotType::ServerLogs => RustSystemSnapshotType::ServerLogs,
             SystemSnapshotType::ServerConfig => RustSystemSnapshotType::ServerConfig,
             SystemSnapshotType::All => RustSystemSnapshotType::All,
-        }
-    }
-}
-
-impl From<RustSystemSnapshotType> for SystemSnapshotType {
-    fn from(snapshot_type: RustSystemSnapshotType) -> Self {
-        match snapshot_type {
-            RustSystemSnapshotType::FilesystemOverview => SystemSnapshotType::FilesystemOverview,
-            RustSystemSnapshotType::ProcessList => SystemSnapshotType::ProcessList,
-            RustSystemSnapshotType::ResourceUsage => SystemSnapshotType::ResourceUsage,
-            RustSystemSnapshotType::Test => SystemSnapshotType::Test,
-            RustSystemSnapshotType::ServerLogs => SystemSnapshotType::ServerLogs,
-            RustSystemSnapshotType::ServerConfig => SystemSnapshotType::ServerConfig,
-            RustSystemSnapshotType::All => SystemSnapshotType::All,
         }
     }
 }
