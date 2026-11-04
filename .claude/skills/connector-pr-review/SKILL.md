@@ -363,6 +363,22 @@ Paste into the PR description (or run mentally before `/ready`):
 Recurring comments mined from connector PRs including (non-exhaustive):
 SurrealDB sink (#3453), Meilisearch sink/source (#3497/#3498), OpenSearch
 source (#3515), Quickwit convention (#3523), MySQL source (#3568), JDBC
+source (#3588), Doris retry (#3574) and sink review (#3215), Redshift sink
+(#3654), Airflow trigger (#3716), Fluss sink (#3782), S3 sink (#3103),
+Google BigQuery sink (#4394), Delta sink production hardening (#4219),
+RabbitMQ sink (#3973), Elasticsearch sink batch semantics (#4154),
+Postgres source ACK/NACK + CDC hardening (#3957), the shared
+`retry_async`/`RetryPolicy` SDK helper review (#4104). Highest-density
+themes: delivery/offset semantics, idempotency IDs, transient/permanent
+mapping, config-name drift, secrets, README/code drift, false-green tests,
+CI/lockfile hygiene, zero-delivered-still-reports-Ok, a wrapping timeout
+that doesn't cancel in-flight work, ack-path work blowing its fixed budget,
+and holding a lock across slow I/O.
+
+Re-derive or extend this list with `gh pr list --repo apache/iggy --search
+"connectors in:title" --state all --limit 100` plus `gh api
+repos/apache/iggy/pulls/<N>/comments --paginate` for PRs under
+`core/connectors/`.
 
 ---
 

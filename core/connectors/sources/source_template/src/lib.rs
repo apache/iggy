@@ -247,7 +247,8 @@ impl TemplateSource {
     /// result row/document/event to a `FetchedRecord`, using something that
     /// monotonically increases (a timestamp, an ID, a page token) as
     /// `cursor_value` so the state-staging logic in `poll()` below can
-    /// advance the cursor correctly.
+    /// advance the cursor correctly, and set `natural_id` from a true
+    /// per-record identity if one exists (see the field's own doc comment).
     async fn fetch_records(
         &self,
         client: &ClientWithMiddleware,
@@ -404,9 +405,10 @@ impl Source for TemplateSource {
             // into `messages` - advancing on a dropped (unserializable) record
             // would stage a cursor past data that was never produced, and a
             // later Ack would commit past it permanently.
+            let natural_id = record.natural_id;
             new_cursor = Some(record.cursor_value);
             messages.push(ProducedMessage {
-                id: None,
+                id: natural_id,
                 headers: None,
                 checksum: None,
                 timestamp: None,
@@ -569,6 +571,7 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_empty_connection_string_should_reject_open() {
         let mut config = test_config();
         config.connection_string = SecretString::from("   ");
         let mut source = TemplateSource::new(1, config, None);
@@ -656,7 +659,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn poll_returns_empty_without_error_when_circuit_is_open() {
+    async fn given_open_circuit_breaker_should_return_empty_without_error() {
         let source = TemplateSource::new(1, test_config(), None);
         source.circuit_breaker.record_failure().await;
         source.circuit_breaker.record_failure().await;
