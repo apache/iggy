@@ -262,7 +262,10 @@ async fn should_restart_connector() {
     let (result, output) = run(&mut command).await;
 
     result.unwrap();
-    assert_eq!(output, "sink orders-sink restarted successfully");
+    assert_eq!(
+        output,
+        "restart requested for sink orders-sink, the runtime skips it when another restart is running"
+    );
 }
 
 #[tokio::test]
@@ -327,7 +330,7 @@ async fn should_list_config_versions() {
     let (result, output) = run(&mut command).await;
 
     result.unwrap();
-    assert!(output.contains("Version") && output.contains("Active"));
+    assert!(output.contains("Version") && output.contains("Running"));
     assert!(output.contains("old") && output.contains("new"));
 }
 
@@ -505,7 +508,7 @@ async fn should_delete_the_requested_config_version() {
     result.unwrap();
     assert_eq!(
         output,
-        "configuration version 3 deleted successfully for sink orders-sink"
+        "configuration version 3 deleted successfully for sink orders-sink, if it was the active version the runtime activates the newest remaining one"
     );
 }
 
@@ -588,7 +591,24 @@ async fn should_fail_on_wrong_key_without_asking_again() {
 
     let (result, _) = run(&mut command).await;
 
-    assert!(format!("{:#}", result.unwrap_err()).contains("401"));
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains("401") && error.contains("IGGY_CONNECTORS_API_KEY"));
+}
+
+#[tokio::test]
+async fn should_fail_when_list_body_is_not_an_array() {
+    let server = MockServer::start().await;
+    expect(&server, "GET", "/sinks", ok(json!({ "error": "proxy" }))).await;
+    let mut command = GetConnectorsCmd::new(
+        ConnectorKind::Sinks,
+        GetConnectorsOutput::Table,
+        endpoint(&server),
+    );
+
+    let (result, output) = run(&mut command).await;
+
+    assert!(format!("{:#}", result.unwrap_err()).contains("not a JSON array"));
+    assert!(output.is_empty());
 }
 
 #[tokio::test]

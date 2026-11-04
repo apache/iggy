@@ -38,6 +38,15 @@ pub(crate) fn bool_field(value: &Value, key: &str) -> bool {
     value.get(key).and_then(Value::as_bool).unwrap_or_default()
 }
 
+/// Reads a response body as a JSON array, failing on any other shape so a
+/// changed or proxied reply is not shown as an empty list.
+pub(crate) fn as_array<'a>(value: &'a Value, what: &str) -> anyhow::Result<&'a [Value]> {
+    value
+        .as_array()
+        .map(Vec::as_slice)
+        .ok_or_else(|| anyhow::anyhow!("connectors API returned {what} that is not a JSON array"))
+}
+
 /// Renders one JSON value for a table cell: strings bare, anything else compact.
 pub(crate) fn cell(value: &Value) -> String {
     match value {
@@ -70,6 +79,13 @@ mod tests {
         let value = json!({ "enabled": true });
         assert!(bool_field(&value, "enabled"));
         assert!(!bool_field(&value, "missing"));
+    }
+
+    #[test]
+    fn should_read_array_only_for_arrays() {
+        assert_eq!(as_array(&json!([1, 2]), "x").unwrap().len(), 2);
+        assert!(as_array(&json!({}), "x").is_err());
+        assert!(as_array(&Value::Null, "x").is_err());
     }
 
     #[test]

@@ -16,7 +16,7 @@
 // under the License.
 
 use super::client::{ConnectorEndpoint, ConnectorKind};
-use super::{bool_field, str_field};
+use super::{as_array, bool_field, str_field};
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -75,7 +75,7 @@ impl CliCommand for GetConnectorConfigsCmd {
                     self.key
                 )
             })?;
-        let configs = configs.as_array().cloned().unwrap_or_default();
+        let configs = as_array(&configs, "configurations")?;
 
         if configs.is_empty() {
             event!(target: PRINT_TARGET, Level::INFO,
@@ -84,7 +84,7 @@ impl CliCommand for GetConnectorConfigsCmd {
         }
 
         let mut table = Table::new();
-        table.set_header(vec!["Version", "Active", "Enabled", "Name"]);
+        table.set_header(vec!["Version", "Running", "Enabled", "Name"]);
         configs.iter().for_each(|config| {
             table.add_row(vec![
                 config.get("version").map(super::cell).unwrap_or_default(),
@@ -372,7 +372,7 @@ impl CliCommand for DeleteConnectorConfigCmd {
             })?;
 
         event!(target: PRINT_TARGET, Level::INFO,
-            "configuration version {} deleted successfully for {} {}",
+            "configuration version {} deleted successfully for {} {}, if it was the active version the runtime activates the newest remaining one",
             self.version, self.kind.singular(), self.key);
 
         Ok(())
@@ -435,7 +435,7 @@ impl CliCommand for ActivateConnectorConfigCmd {
         })?;
 
         event!(target: PRINT_TARGET, Level::INFO,
-            "configuration version {} marked active for {} {}, the running connector keeps its configuration",
+            "configuration version {} marked active for {} {}, the running connector keeps its configuration until it restarts",
             self.version, self.kind.singular(), self.key);
 
         Ok(())

@@ -16,7 +16,7 @@
 // under the License.
 
 use super::client::{ConnectorEndpoint, ConnectorKind};
-use super::{bool_field, str_field};
+use super::{as_array, bool_field, str_field};
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -77,7 +77,7 @@ impl CliCommand for GetConnectorsCmd {
             .get_value(&self.path())
             .await
             .with_context(|| format!("problem getting list of {}", self.kind.path()))?;
-        let connectors = connectors.as_array().cloned().unwrap_or_default();
+        let connectors = as_array(&connectors, "list of connectors")?;
 
         if connectors.is_empty() {
             event!(target: PRINT_TARGET, Level::INFO, "No {} found!", self.kind.path());

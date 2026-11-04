@@ -60,7 +60,7 @@ impl CliCommand for RestartConnectorCmd {
             .with_context(|| format!("problem restarting {} {}", self.kind.singular(), self.key))?;
 
         event!(target: PRINT_TARGET, Level::INFO,
-            "{} {} restarted successfully", self.kind.singular(), self.key);
+            "restart requested for {} {}, the runtime skips it when another restart is running", self.kind.singular(), self.key);
 
         Ok(())
     }

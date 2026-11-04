@@ -220,6 +220,12 @@ impl ConnectorsApiClient {
         {
             bail!("connectors API {path} failed with {code}: {reason}");
         }
+        if status == StatusCode::UNAUTHORIZED {
+            bail!(
+                "connectors API {path} failed with status {status}, pass --connectors-api-key, \
+                 set IGGY_CONNECTORS_API_KEY or save connectors_api_key in the context"
+            );
+        }
         bail!("connectors API {path} failed with status {status}: {body}");
     }
 }

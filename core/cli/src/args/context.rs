@@ -152,7 +152,12 @@ impl From<ContextCreateArgs> for ContextConfig {
             token_name: args.token_name,
             connectors_api_url: args.connectors_api_url,
             connectors_api_key: args.connectors_api_key,
-            connectors_tls_ca_file: args.connectors_tls_ca_file,
+            // Stored absolute so the context works from any directory.
+            connectors_tls_ca_file: args.connectors_tls_ca_file.map(|path| {
+                std::fs::canonicalize(&path)
+                    .map(|absolute| absolute.to_string_lossy().into_owned())
+                    .unwrap_or(path)
+            }),
             iggy: ArgsOptional {
                 transport: args.transport,
                 tcp_server_address: args.tcp_server_address,
@@ -221,6 +226,42 @@ mod tests {
         assert!(config.iggy.http_api_url.is_none());
         assert!(config.iggy.quic_server_address.is_none());
         assert_eq!(config.iggy.tcp_tls_enabled, Some(true));
+    }
+
+    #[test]
+    fn should_store_relative_ca_file_as_absolute_path() {
+        let directory = std::env::temp_dir();
+        let file = directory.join(format!("iggy-cli-ca-{}.pem", std::process::id()));
+        std::fs::write(&file, "x").unwrap();
+        let args = ContextCreateArgs {
+            context_name: "tls".to_string(),
+            transport: None,
+            tcp_server_address: None,
+            http_api_url: None,
+            quic_server_address: None,
+            tcp_tls_enabled: None,
+            username: None,
+            password: None,
+            token: None,
+            token_name: None,
+            connectors_api_url: None,
+            connectors_api_key: None,
+            connectors_tls_ca_file: Some(
+                directory
+                    .join("..")
+                    .join(directory.file_name().unwrap())
+                    .join(file.file_name().unwrap())
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        };
+
+        let config: ContextConfig = args.into();
+        std::fs::remove_file(&file).unwrap();
+
+        let stored = config.connectors_tls_ca_file.unwrap();
+        assert!(!stored.contains(".."));
+        assert!(std::path::Path::new(&stored).is_absolute());
     }
 
     #[test]

@@ -26,6 +26,22 @@ pub(crate) enum ConnectorKind {
     Source,
 }
 
+/// Same rule as the runtime, so a key cannot carry `/`, `?`, `#` or `..`
+/// into the request path.
+fn parse_connector_key(key: &str) -> Result<String, String> {
+    let mut chars = key.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if valid {
+        Ok(key.to_string())
+    } else {
+        Err(
+            "must start with a letter or digit and contain only letters, digits, '.', '_' and '-'"
+                .to_string(),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum ConnectorAction {
     /// List all sinks or sources
@@ -78,6 +94,7 @@ pub(crate) struct ConnectorGetArgs {
     /// Connector kind
     pub(crate) kind: ConnectorKind,
     /// Connector key
+    #[clap(value_parser = parse_connector_key)]
     pub(crate) key: String,
 }
 
@@ -85,7 +102,8 @@ pub(crate) struct ConnectorGetArgs {
 pub(crate) enum ConnectorConfigAction {
     /// List all configuration versions of a sink or source
     ///
-    /// Each version carries whether it is the active one. The responses
+    /// The Running column marks the version the connector runs now, which
+    /// differs from the activated one until a restart. The responses
     /// include plugin credentials in plaintext.
     ///
     /// Examples:
@@ -94,8 +112,8 @@ pub(crate) enum ConnectorConfigAction {
     List(ConnectorGetArgs),
     /// Get one configuration version
     ///
-    /// Without a version reads the active version. The response includes
-    /// plugin credentials in plaintext.
+    /// Without a version reads the version the connector runs now. The
+    /// response includes plugin credentials in plaintext.
     ///
     /// Examples:
     ///  iggy connector config get sink my-sink
@@ -124,7 +142,8 @@ pub(crate) enum ConnectorConfigAction {
     /// Delete a configuration version
     ///
     /// The version is required: the runtime deletes the active version when
-    /// none is given.
+    /// none is given. Deleting the active version activates the newest
+    /// remaining one.
     ///
     /// Examples:
     ///  iggy connector config delete sink my-sink --version 3
@@ -146,8 +165,9 @@ pub(crate) struct ConnectorConfigGetArgs {
     /// Connector kind
     pub(crate) kind: ConnectorKind,
     /// Connector key
+    #[clap(value_parser = parse_connector_key)]
     pub(crate) key: String,
-    /// Configuration version, defaults to the active version
+    /// Configuration version, defaults to the running version
     #[clap(short, long)]
     pub(crate) version: Option<u64>,
 }
@@ -157,6 +177,7 @@ pub(crate) struct ConnectorConfigPluginArgs {
     /// Connector kind
     pub(crate) kind: ConnectorKind,
     /// Connector key
+    #[clap(value_parser = parse_connector_key)]
     pub(crate) key: String,
     /// Output format (json, yaml, toml or text)
     #[clap(short, long)]
@@ -168,6 +189,7 @@ pub(crate) struct ConnectorConfigCreateArgs {
     /// Connector kind
     pub(crate) kind: ConnectorKind,
     /// Connector key
+    #[clap(value_parser = parse_connector_key)]
     pub(crate) key: String,
     /// JSON configuration file, reads stdin when omitted
     #[clap(short, long)]
@@ -179,6 +201,7 @@ pub(crate) struct ConnectorConfigDeleteArgs {
     /// Connector kind
     pub(crate) kind: ConnectorKind,
     /// Connector key
+    #[clap(value_parser = parse_connector_key)]
     pub(crate) key: String,
     /// Configuration version to delete
     #[clap(short, long)]
@@ -190,6 +213,7 @@ pub(crate) struct ConnectorConfigActivateArgs {
     /// Connector kind
     pub(crate) kind: ConnectorKind,
     /// Connector key
+    #[clap(value_parser = parse_connector_key)]
     pub(crate) key: String,
     /// Configuration version to activate
     #[clap(short, long)]
@@ -258,6 +282,25 @@ mod tests {
                 .kind(),
             ErrorKind::InvalidValue
         );
+    }
+
+    #[test]
+    fn should_reject_keys_that_change_the_request_path() {
+        for key in [
+            "x/../../sources/y",
+            "..",
+            ".hidden",
+            "a?b",
+            "a#b",
+            "a b",
+            "",
+        ] {
+            assert!(
+                parse(&["connector", "get", "sink", key]).is_err(),
+                "key {key:?} was accepted"
+            );
+        }
+        assert!(parse(&["connector", "get", "sink", "orders_sink-1.v2"]).is_ok());
     }
 
     #[test]

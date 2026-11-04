@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::cell;
 use super::client::{ConnectorEndpoint, ConnectorKind};
+use super::{as_array, cell};
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -64,7 +64,7 @@ impl CliCommand for GetTransformsCmd {
                 self.key
             )
         })?;
-        let transforms = transforms.as_array().cloned().unwrap_or_default();
+        let transforms = as_array(&transforms, "transforms")?;
 
         if transforms.is_empty() {
             event!(target: PRINT_TARGET, Level::INFO,

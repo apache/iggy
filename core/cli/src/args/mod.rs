@@ -162,8 +162,9 @@ pub(crate) struct CliOptions {
     /// Connectors runtime HTTP API key
     ///
     /// Sent as the api-key header. Falls back to IGGY_CONNECTORS_API_KEY,
-    /// then to the active context. When the runtime answers 401 and stdin
-    /// is a terminal, the key is prompted for and the request retried once.
+    /// then to the active context. When no key is configured, the runtime
+    /// answers 401 and stdin is a terminal, the key is prompted for and
+    /// the request retried once.
     #[clap(long, verbatim_doc_comment)]
     pub(crate) connectors_api_key: Option<String>,
 
@@ -338,13 +339,16 @@ impl IggyMergedConsoleArgs {
 }
 
 /// Flag first, then the environment, then the saved context. An empty
-/// variable counts as unset.
+/// value counts as unset.
 fn resolve_connectors_api_key(
     flag: Option<String>,
     env: Option<String>,
     context: Option<String>,
 ) -> Option<String> {
-    flag.or(env.filter(|key| !key.is_empty())).or(context)
+    [flag, env, context]
+        .into_iter()
+        .flatten()
+        .find(|key| !key.is_empty())
 }
 
 #[cfg(test)]
@@ -378,5 +382,14 @@ mod tests {
             resolve_connectors_api_key(None, key(""), key("context")),
             key("context")
         );
+    }
+
+    #[test]
+    fn should_ignore_empty_flag_and_context_keys() {
+        assert_eq!(
+            resolve_connectors_api_key(key(""), key("env"), key("context")),
+            key("env")
+        );
+        assert_eq!(resolve_connectors_api_key(None, None, key("")), None);
     }
 }
