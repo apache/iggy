@@ -249,17 +249,14 @@ WHEN("^I abandon the operation of the deferred poll$") {
 }
 
 WHEN("^I send a message with payload \"([^\"]+)\" to partition ([0-9]+)$") {
-    iggy::ffi::ErrorInfo error_info{};
     REGEX_PARAM(std::string, payload);
     REGEX_PARAM(int, partition_id);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    messages.push_back(iggy::ffi::make_message(bdd::to_payload(payload), rust::Vec<iggy::ffi::HeaderEntry>{}));
-    context->client->send_messages(bdd::make_string_identifier(context->last_stream_name.value()),
-                                   bdd::make_string_identifier(context->last_topic_name.value()), "partition_id",
-                                   bdd::partition_id_bytes(static_cast<std::uint32_t>(partition_id)),
-                                   std::move(messages), error_info);
+    const std::vector<iggy::IggyMessageToSend> messages{iggy::IggyMessageToSend::Create(payload)};
+    context->client->SendMessages(iggy::Identifier::String(context->last_stream_name.value()),
+                                  iggy::Identifier::String(context->last_topic_name.value()),
+                                  iggy::Partitioning::PartitionId(static_cast<std::uint32_t>(partition_id)), messages);
 }
 
 THEN("^the deferred poll should return the payload \"([^\"]+)\" within ([0-9]+) seconds?$") {

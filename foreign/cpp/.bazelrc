@@ -20,6 +20,10 @@
 # Enable BzlMod
 common --enable_bzlmod
 
+# C++ standard
+build --cxxopt=-std=c++20
+build --host_cxxopt=-std=c++20
+
 # Default test behavior
 test --test_output=errors
 test --cache_test_results=no

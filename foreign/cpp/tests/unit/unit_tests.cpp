@@ -23,6 +23,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -32,16 +33,13 @@
 
 #include "iggy.hpp"
 
-static_assert(!std::is_constructible_v<iggy::IggyException, const std::string &, const iggy::ffi::ErrorInfo &>,
-              "Only IggyBlockingClient may turn bridge error details into an IggyException");
+static_assert(std::is_base_of_v<std::runtime_error, iggy::IggyException>,
+              "Client exceptions must support standard runtime error handling");
 static_assert(std::is_nothrow_copy_constructible_v<iggy::IggyException>,
               "Copying an exception while it propagates must not throw");
 
 TEST(ConnectionStringTest, ConstructsQuicClient) {
-    iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::from_connection_string("iggy+quic://iggy:iggy@127.0.0.1:8080"); });
-    ASSERT_NE(client, nullptr);
-    iggy::ffi::delete_client(client);
+    EXPECT_NO_THROW((void)iggy::IggyBlockingClient::FromConnectionString("iggy+quic://iggy:iggy@127.0.0.1:8080"));
 }
 
 TEST(CompressionAlgorithmTest, ReturnsExpectedValues) {
@@ -500,22 +498,35 @@ TEST(IggyBlockingClientBuilderTest, PendingOperationLimitsMustBePositive) {
     EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithPendingOperations(1, 0), iggy::IggyException);
 }
 
-TEST(IggyFfiRecoveryTest, PerCallDetailsSurviveExceptionsAndResetOnValidation) {
-    auto *client         = iggy::ffi::new_connection({});
+TEST(IggyBlockingClientTest, PerCallExceptionsKeepIndependentErrorDetails) {
+    auto client          = iggy::IggyBlockingClient::Builder().Build();
     const auto operation = std::numeric_limits<std::uint64_t>::max();
-    iggy::ffi::ErrorInfo error_info{};
-    EXPECT_THROW(client->resolve_operation(operation, 1000, error_info), std::exception);
-    EXPECT_EQ(error_info.code, 14008u);
-    EXPECT_EQ(std::string(error_info.kind), "operation_not_retained");
-    EXPECT_TRUE(error_info.has_operation_id);
-    EXPECT_EQ(error_info.operation_id, operation);
+    std::optional<iggy::IggyException> recovery_error;
+    try {
+        client.ResolveOperation(operation, std::chrono::microseconds(1000));
+        FAIL() << "An unknown operation must not resolve";
+    } catch (const iggy::IggyException &error) {
+        recovery_error.emplace(error);
+    }
+    ASSERT_TRUE(recovery_error.has_value());
+    EXPECT_EQ(recovery_error->Code(), 14008u);
+    EXPECT_EQ(recovery_error->Kind(), "operation_not_retained");
+    EXPECT_EQ(recovery_error->OperationId(), operation);
 
-    EXPECT_THROW(client->delete_stream({}, error_info), std::exception);
-    EXPECT_EQ(error_info.code, 0u);
-    EXPECT_TRUE(error_info.kind.empty());
-    EXPECT_FALSE(error_info.has_operation_id);
-    EXPECT_EQ(error_info.operation_id, 0u);
-    iggy::ffi::delete_client(client);
+    try {
+        client.StoreConsumerOffset(iggy::Consumer::Single(iggy::Identifier::Numeric(1)), iggy::Identifier::Numeric(1),
+                                   iggy::Identifier::Numeric(1), std::numeric_limits<std::uint32_t>::max(), 0);
+        FAIL() << "The reserved partition ID must be rejected";
+    } catch (const iggy::IggyException &error) {
+        EXPECT_STREQ(error.what(), "partition_id cannot be the maximum std::uint32_t value");
+        EXPECT_FALSE(error.Code().has_value());
+        EXPECT_TRUE(error.Kind().empty());
+        EXPECT_FALSE(error.OperationId().has_value());
+        EXPECT_FALSE(error.BlockedPartitionId().has_value());
+    }
+    EXPECT_EQ(recovery_error->Code(), 14008u);
+    EXPECT_EQ(recovery_error->Kind(), "operation_not_retained");
+    EXPECT_EQ(recovery_error->OperationId(), operation);
 }
 
 TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
@@ -591,15 +602,6 @@ TEST(IggyBlockingClientTest, ConsumerOffsetOperationsRejectMaximumPartitionId) {
     expect_rejection([&] { client.StoreConsumerOffset(consumer, stream, topic, maximum_partition, 0); });
     expect_rejection([&] { (void)client.GetConsumerOffset(consumer, stream, topic, maximum_partition); });
     expect_rejection([&] { client.DeleteConsumerOffset(consumer, stream, topic, maximum_partition); });
-}
-
-TEST(AutoLoginKindTest, HasStableDiscriminantsAndZeroInitializedDefault) {
-    EXPECT_EQ(static_cast<std::uint8_t>(iggy::ffi::AutoLoginKind::Disabled), 0u);
-    EXPECT_EQ(static_cast<std::uint8_t>(iggy::ffi::AutoLoginKind::UsernamePassword), 1u);
-    EXPECT_EQ(static_cast<std::uint8_t>(iggy::ffi::AutoLoginKind::PersonalAccessToken), 2u);
-
-    const iggy::ffi::IggyClientConfig config{};
-    EXPECT_EQ(config.auto_login_kind, iggy::ffi::AutoLoginKind::Disabled);
 }
 
 TEST(IggyBlockingClientBuilderTest, BuildsWithEachAutoLoginKind) {

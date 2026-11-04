@@ -66,8 +66,9 @@ bazel coverage \
 sed 's|^SF:|SF:foreign/cpp/|' "$CPP_RAW" >"$OUTPUT"
 
 "$LLVM_COV" export \
-  --object bazel-bin/unit \
+  --object bazel-bin/cpp_unit \
   --object bazel-bin/e2e \
+  --object bazel-bin/rust_unit_tests \
   -instr-profile="$PROFDATA" \
   -format=lcov \
   -ignore-filename-regex='(\.cargo/|/rustc/|/core/|cxxbridge|/registry/)' |

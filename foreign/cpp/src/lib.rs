@@ -31,8 +31,8 @@ use client::{
     parse_metadata_change_cursor, parse_metadata_current_page_token,
     validate_metadata_changes_query,
 };
-use consumer::Consumer;
-use messages::{BatchPositions, Checkpoint, Continuation, default_poll_options, make_message};
+use consumer::IggyConsumer;
+use messages::{BatchPositions, Checkpoint, Continuation, default_poll_options};
 use pending_poll::PendingPoll;
 use producer::Producer;
 use reader::PartitionReader;
@@ -477,6 +477,22 @@ mod ffi {
         stored_offset: u64,
     }
 
+    /// Kind of the consumer a poll or a consumer-offset call names.
+    #[repr(u8)]
+    enum ConsumerKind {
+        Consumer = 1,
+        ConsumerGroup = 2,
+    }
+
+    /// The consumer a poll or a consumer-offset call names. It carries both the
+    /// kind and the identifier the server keys the stored offset on. Two callers
+    /// sharing one identifier share one offset, so under the `next` strategy with
+    /// auto-commit each of them reads only what the other has not read yet.
+    struct Consumer {
+        kind: ConsumerKind,
+        id: Identifier,
+    }
+
     struct ClientInfo {
         client_id: u32,
         has_user_id: bool,
@@ -906,7 +922,7 @@ mod ffi {
         /// that it delivered.
         type Checkpoint;
         type Client;
-        type Consumer;
+        type IggyConsumer;
         /// The position after a batch, from `continuation` of the batch or
         /// `skip` of a read error. It keeps the partition and the context of
         /// its batch: a read of another partition refuses it, and a read after
@@ -1041,8 +1057,7 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             partition_id: u32,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
             offset: u64,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
@@ -1051,16 +1066,14 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             partition_id: u32,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
         ) -> Result<ConsumerOffsetInfo>;
         fn delete_consumer_offset(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             partition_id: u32,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         /// Stores the offset of `checkpoint` under its context. Every retry
@@ -1071,8 +1084,7 @@ mod ffi {
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
             checkpoint: &Checkpoint,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
@@ -1086,8 +1098,7 @@ mod ffi {
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
             checkpoint: &Checkpoint,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
@@ -1109,8 +1120,7 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             partition_id: u32,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
             strategy: PollingStrategy,
             options: PollOptions,
             error_info: &mut ErrorInfo,
@@ -1124,8 +1134,7 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             partition_id: u32,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
             continuation: &Continuation,
             options: PollOptions,
             error_info: &mut ErrorInfo,
@@ -1163,8 +1172,7 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             partition_id: u32,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
             strategy: PollingStrategy,
             options: PollOptions,
         ) -> Result<Box<PendingPoll>>;
@@ -1188,8 +1196,7 @@ mod ffi {
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
             options: ReaderOptions,
             error_info: &mut ErrorInfo,
         ) -> Result<Box<PartitionReader>>;
@@ -1256,8 +1263,6 @@ mod ffi {
         /// and every other call on a closed reader fails. Dropping a reader
         /// without `close` moves no offset back.
         fn close(self: &PartitionReader, error_info: &mut ErrorInfo) -> Result<()>;
-
-        fn make_message(payload: Vec<u8>, user_headers: Vec<HeaderEntry>) -> IggyMessageToSend;
 
         #[allow(clippy::too_many_arguments)]
         fn send_messages(
@@ -1421,47 +1426,50 @@ mod ffi {
             group: bool,
             options: ConsumerOptions,
             error_info: &mut ErrorInfo,
-        ) -> Result<Box<Consumer>>;
+        ) -> Result<Box<IggyConsumer>>;
         /// Waits up to `timeout_micros` for the next message. An empty vector
         /// means that the time ran out. Under `CommitAfter::Processing` it
         /// counts the message handed over before. The consumer stays usable
         /// after an error and retries by itself.
         fn next(
-            self: &Consumer,
+            self: &IggyConsumer,
             timeout_micros: u64,
             error_info: &mut ReadErrorInfo,
         ) -> Result<Vec<ReceivedMessage>>;
         /// Stores the offset of a checkpoint that this consumer handed over.
         /// Refused with `CommitPolicy::OnRead`.
         fn commit(
-            self: &Consumer,
+            self: &IggyConsumer,
             checkpoint: &Checkpoint,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         /// Counts a checkpoint that this consumer handed over, under
         /// `CommitPolicy::Auto`.
-        fn mark(self: &Consumer, checkpoint: &Checkpoint, error_info: &mut ErrorInfo)
-        -> Result<()>;
+        fn mark(
+            self: &IggyConsumer,
+            checkpoint: &Checkpoint,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
         /// Sets the next read position of a partition. With
         /// `CommitPolicy::OnRead` a seek to an offset above 0 first stores the
         /// offset before it, and a failed store fails the seek with nothing
         /// moved. Every other seek stores nothing.
         fn seek(
-            self: &Consumer,
+            self: &IggyConsumer,
             partition_id: u32,
             start: PollingStrategy,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         #[cxx_name = "seek"]
         fn seek_to(
-            self: &Consumer,
+            self: &IggyConsumer,
             partition_id: u32,
             continuation: &Continuation,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         /// Stops the consumer and stores as its commit policy says, as a
         /// reader does. A second call does nothing.
-        fn close(self: &Consumer, error_info: &mut ErrorInfo) -> Result<()>;
+        fn close(self: &IggyConsumer, error_info: &mut ErrorInfo) -> Result<()>;
 
         // Producer methods
         // fn stream(self: &Producer) -> Result<Identifier>;

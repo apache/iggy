@@ -17,102 +17,81 @@
  * under the License.
  */
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
 #include <gtest/gtest.h>
 
-#include "lib.rs.h"
+#include "iggy.hpp"
 
-TEST(MessageTest, MakeMessageSetsPayload) {
-    RecordProperty("description", "Verifies make_message stores payload bytes correctly.");
-    rust::Vec<std::uint8_t> payload;
+TEST(MessageTest, CreateSetsPayload) {
+    RecordProperty("description", "Verifies Create stores payload bytes correctly.");
     const std::string text = "hello world";
-    for (const char c : text) {
-        payload.push_back(static_cast<std::uint8_t>(c));
-    }
+    const auto message     = iggy::IggyMessageToSend::Create(text);
 
-    auto msg = iggy::ffi::make_message(std::move(payload), rust::Vec<iggy::ffi::HeaderEntry>());
-
-    ASSERT_EQ(msg.payload.size(), text.size());
-    for (std::size_t i = 0; i < text.size(); i++) {
-        EXPECT_EQ(msg.payload[i], static_cast<std::uint8_t>(text[i]));
+    ASSERT_EQ(message.Payload().size(), text.size());
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        EXPECT_EQ(message.Payload()[index], static_cast<std::uint8_t>(text[index]));
     }
 }
 
-TEST(MessageTest, MakeMessageZerosIdAndHeaders) {
-    RecordProperty("description", "Verifies make_message initializes id and user_headers to zero/empty.");
-    rust::Vec<std::uint8_t> payload;
-    payload.push_back(0x42);
+TEST(MessageTest, CreateDefaultsIdAndHeaders) {
+    RecordProperty("description", "Verifies Create initializes the message ID to zero and headers to empty.");
+    const auto message = iggy::IggyMessageToSend::Create("B");
 
-    auto msg = iggy::ffi::make_message(std::move(payload), rust::Vec<iggy::ffi::HeaderEntry>());
-
-    EXPECT_EQ(msg.id_lo, 0u);
-    EXPECT_EQ(msg.id_hi, 0u);
-    EXPECT_TRUE(msg.user_headers.empty());
+    EXPECT_EQ(message.Id(), 0);
+    EXPECT_TRUE(message.UserHeaders().empty());
 }
 
-TEST(MessageTest, MakeMessageWithEmptyPayload) {
-    RecordProperty("description", "Verifies make_message accepts an empty payload.");
-    rust::Vec<std::uint8_t> empty_payload;
+TEST(MessageTest, CreateWithEmptyPayload) {
+    RecordProperty("description", "Verifies Create accepts an empty payload before send-time validation.");
+    const auto message = iggy::IggyMessageToSend::Create("");
 
-    auto msg = iggy::ffi::make_message(std::move(empty_payload), rust::Vec<iggy::ffi::HeaderEntry>());
-
-    ASSERT_EQ(msg.payload.size(), 0u);
+    EXPECT_TRUE(message.Payload().empty());
 }
 
-TEST(MessageTest, MakeMessageWithSingleByte) {
-    RecordProperty("description", "Verifies make_message works with a single-byte payload.");
-    rust::Vec<std::uint8_t> payload;
-    payload.push_back(0xFF);
+TEST(MessageTest, CreateWithSingleByte) {
+    RecordProperty("description", "Verifies Create works with a single-byte payload.");
+    const std::string payload(1, static_cast<char>(0xFF));
+    const auto message = iggy::IggyMessageToSend::Create(payload);
 
-    auto msg = iggy::ffi::make_message(std::move(payload), rust::Vec<iggy::ffi::HeaderEntry>());
-
-    ASSERT_EQ(msg.payload.size(), 1u);
-    EXPECT_EQ(msg.payload[0], 0xFF);
+    ASSERT_EQ(message.Payload().size(), 1u);
+    EXPECT_EQ(message.Payload()[0], 0xFF);
 }
 
-TEST(MessageTest, MakeMessageWithNullBytes) {
-    RecordProperty("description", "Verifies make_message preserves null bytes in payload.");
-    rust::Vec<std::uint8_t> payload;
-    payload.push_back(0x00);
-    payload.push_back(0x01);
-    payload.push_back(0x00);
+TEST(MessageTest, CreatePreservesNullBytes) {
+    RecordProperty("description", "Verifies Create preserves null bytes in the payload.");
+    std::string payload(3, '\0');
+    payload[1]         = '\1';
+    const auto message = iggy::IggyMessageToSend::Create(payload);
 
-    auto msg = iggy::ffi::make_message(std::move(payload), rust::Vec<iggy::ffi::HeaderEntry>());
-
-    ASSERT_EQ(msg.payload.size(), 3u);
-    EXPECT_EQ(msg.payload[0], 0x00);
-    EXPECT_EQ(msg.payload[1], 0x01);
-    EXPECT_EQ(msg.payload[2], 0x00);
+    ASSERT_EQ(message.Payload().size(), 3u);
+    EXPECT_EQ(message.Payload()[0], 0x00);
+    EXPECT_EQ(message.Payload()[1], 0x01);
+    EXPECT_EQ(message.Payload()[2], 0x00);
 }
 
-TEST(MessageTest, MakeMessageThenSetCustomId) {
-    RecordProperty("description", "Verifies custom ID can be set after make_message without affecting payload.");
-    rust::Vec<std::uint8_t> payload;
-    payload.push_back(0x42);
-    auto msg = iggy::ffi::make_message(std::move(payload), rust::Vec<iggy::ffi::HeaderEntry>());
+TEST(MessageTest, CreateWithCustomIdPreservesPayload) {
+    RecordProperty("description", "Verifies Create keeps a full-width custom ID without affecting the payload.");
+    const auto message = iggy::IggyMessageToSend::Create("B", {}, absl::MakeUint128(200, 100));
 
-    msg.id_lo = 100;
-    msg.id_hi = 200;
-
-    EXPECT_EQ(msg.id_lo, 100u);
-    EXPECT_EQ(msg.id_hi, 200u);
-    ASSERT_EQ(msg.payload.size(), 1u);
-    EXPECT_EQ(msg.payload[0], 0x42);
+    EXPECT_EQ(absl::Uint128Low64(message.Id()), 100u);
+    EXPECT_EQ(absl::Uint128High64(message.Id()), 200u);
+    ASSERT_EQ(message.Payload().size(), 1u);
+    EXPECT_EQ(message.Payload()[0], 0x42);
 }
 
-TEST(MessageTest, MakeMessageWithLargePayload) {
-    RecordProperty("description", "Verifies make_message handles a larger payload correctly.");
-    rust::Vec<std::uint8_t> payload;
-    for (std::uint32_t i = 0; i < 10000; i++) {
-        payload.push_back(static_cast<std::uint8_t>(i % 256));
+TEST(MessageTest, CreateWithLargePayload) {
+    RecordProperty("description", "Verifies Create handles a larger binary payload correctly.");
+    std::string payload(10000, '\0');
+    for (std::size_t index = 0; index < payload.size(); ++index) {
+        payload[index] = static_cast<char>(index % 256);
     }
+    const auto message = iggy::IggyMessageToSend::Create(payload);
 
-    auto msg = iggy::ffi::make_message(std::move(payload), rust::Vec<iggy::ffi::HeaderEntry>());
-
-    ASSERT_EQ(msg.payload.size(), 10000u);
-    EXPECT_EQ(msg.payload[0], 0u);
-    EXPECT_EQ(msg.payload[255], 255u);
-    EXPECT_EQ(msg.payload[256], 0u);
+    ASSERT_EQ(message.Payload().size(), 10000u);
+    EXPECT_EQ(message.Payload()[0], 0u);
+    EXPECT_EQ(message.Payload()[255], 255u);
+    EXPECT_EQ(message.Payload()[256], 0u);
 }

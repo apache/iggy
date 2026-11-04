@@ -17,6 +17,7 @@
  * under the License.
  */
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -24,263 +25,255 @@
 
 #include <gtest/gtest.h>
 
-#include "lib.rs.h"
+#include "iggy.hpp"
 #include "tests/e2e/test_helpers.hpp"
 
 namespace {
 
-constexpr std::uint64_t kReadTimeoutMicros     = 10'000'000;
-constexpr std::uint64_t kIdleReadTimeoutMicros = 200'000;
-constexpr std::uint32_t kMessagesCount         = 10;
-constexpr std::uint32_t kBatchCount            = 4;
+constexpr auto kReadTimeout            = std::chrono::seconds(10);
+constexpr auto kIdleReadTimeout        = std::chrono::milliseconds(200);
+constexpr std::uint32_t kMessagesCount = 10;
+constexpr std::uint32_t kBatchCount    = 4;
 
-iggy::ffi::ReaderOptions standalone_options(const std::uint32_t partition_id, const iggy::ffi::CommitPolicy commit) {
-    iggy::ffi::ReaderOptions options{};
-    options.partitions.push_back(partition_id);
-    options.has_start        = true;
-    options.start            = make_polling_strategy("offset", 0);
-    options.has_poll_options = true;
-    options.poll_options     = make_poll_options(kBatchCount, commit);
-    return options;
+iggy::ReaderOptions standalone_options(const std::uint32_t partition_id, const iggy::CommitPolicy commit) {
+    return iggy::ReaderOptions()
+        .SetPartitions({partition_id})
+        .SetStart(iggy::PollingStrategy::Offset(0))
+        .SetPollOptions(iggy::PollOptions().SetCount(kBatchCount).SetCommit(commit));
 }
 
 }  // namespace
 
-class LowLevelE2E_Reader : public E2ETestFixture {
+class E2E_Reader : public E2ETestFixture {
   protected:
-    // One topic with one partition. The messages go to partition 0 and carry their index as payload.
-    std::uint32_t CreateTopicWithMessages(iggy::ffi::Client *client, const std::uint32_t messages_count) {
-        iggy::ffi::ErrorInfo error_info{};
-        const std::string stream_name = GetRandomName();
-        client->create_stream(stream_name, {}, error_info);
-        const auto stream = client->get_stream(make_string_identifier(stream_name));
-        TrackStream(stream.id);
-        client->create_topic(make_numeric_identifier(stream.id), GetRandomName(), make_topic_create_options(1),
-                             error_info);
+    iggy::Identifier CreateTopicWithMessages(iggy::IggyBlockingClient &client, const std::uint32_t messages_count) {
+        const auto stream = client.CreateStream(GetRandomName());
+        TrackStream(stream.Id());
+        const auto stream_id = iggy::Identifier::Numeric(stream.Id());
+        client.CreateTopic(stream_id, GetRandomName(), iggy::TopicCreateOptions().SetPartitionsCount(1));
         if (messages_count > 0) {
-            rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-            for (std::uint32_t i = 0; i < messages_count; i++) {
-                messages.push_back(
-                    iggy::ffi::make_message(to_payload(std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>()));
+            std::vector<iggy::IggyMessageToSend> messages;
+            messages.reserve(messages_count);
+            for (std::uint32_t index = 0; index < messages_count; ++index) {
+                messages.push_back(iggy::IggyMessageToSend::Create(std::to_string(index)));
             }
-            client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                                  partition_id_bytes(0), std::move(messages), error_info);
+            client.SendMessages(stream_id, iggy::Identifier::Numeric(0), iggy::Partitioning::PartitionId(0), messages);
         }
-        return stream.id;
+        return stream_id;
     }
 };
 
-TEST_F(LowLevelE2E_Reader, ReadsEveryMessageAndCommitStoresTheOffset) {
+TEST_F(E2E_Reader, ReadsEveryMessageAndCommitStoresTheOffset) {
     RecordProperty("description",
                    "Reads every message of one partition with a reader, commits the last checkpoint and reads the "
                    "stored offset back.");
-    iggy::ffi::ErrorInfo error_info{};
-    iggy::ffi::ReadErrorInfo read_error{};
-    iggy::ffi::Client *client     = GetLoggedInClient();
-    const std::uint32_t stream_id = CreateTopicWithMessages(client, kMessagesCount);
-
-    auto reader =
-        client->reader(make_numeric_identifier(stream_id), make_numeric_identifier(0), "consumer",
-                       make_numeric_identifier(1), standalone_options(0, iggy::ffi::CommitPolicy::Manual), error_info);
-    const auto partitions = reader->partitions();
+    auto client           = GetLoggedInHighLevelClient();
+    const auto stream     = CreateTopicWithMessages(client, kMessagesCount);
+    const auto topic      = iggy::Identifier::Numeric(0);
+    const auto consumer   = iggy::Consumer::Single(iggy::Identifier::Numeric(1));
+    auto reader           = client.Reader(consumer, stream, topic, standalone_options(0, iggy::CommitPolicy::Manual));
+    const auto partitions = reader.Partitions();
     ASSERT_EQ(partitions.size(), 1u);
     EXPECT_EQ(partitions[0], 0u);
 
     std::vector<std::uint64_t> offsets;
-    std::optional<rust::Box<iggy::ffi::Checkpoint>> last;
+    offsets.reserve(kMessagesCount);
+    std::optional<iggy::Checkpoint> last;
     while (offsets.size() < kMessagesCount) {
-        auto batch = reader->next(kReadTimeoutMicros, read_error);
-        ASSERT_FALSE(batch.messages.empty()) << "No batch before the timeout after " << offsets.size() << " messages";
-        EXPECT_EQ(batch.partition_id, 0u);
-        for (const auto &message : batch.messages) {
-            offsets.push_back(message.offset);
+        const auto batch = reader.Next(kReadTimeout);
+        ASSERT_TRUE(batch.has_value()) << "No batch before the timeout after " << offsets.size() << " messages";
+        ASSERT_FALSE(batch->Messages().empty());
+        EXPECT_EQ(batch->PartitionId(), 0u);
+        for (const auto &message : batch->Messages()) {
+            offsets.push_back(message.Offset());
         }
-        last = batch.checkpoint();
+        last = batch->Checkpoint();
     }
-    for (std::uint32_t i = 0; i < kMessagesCount; i++) {
-        EXPECT_EQ(offsets[i], static_cast<std::uint64_t>(i)) << "Offset mismatch at index " << i;
+    for (std::uint32_t index = 0; index < kMessagesCount; ++index) {
+        EXPECT_EQ(offsets[index], static_cast<std::uint64_t>(index)) << "Offset mismatch at index " << index;
     }
     ASSERT_TRUE(last.has_value());
-    const auto &checkpoint = **last;
-    EXPECT_EQ(checkpoint.partition_id(), 0u);
-    EXPECT_EQ(checkpoint.offset(), kMessagesCount - 1);
+    EXPECT_EQ(last->PartitionId(), 0u);
+    EXPECT_EQ(last->Offset(), kMessagesCount - 1);
 
-    ASSERT_NO_THROW(reader->commit(checkpoint, error_info));
-    const auto stored = client->get_consumer_offset(make_numeric_identifier(stream_id), make_numeric_identifier(0), 0,
-                                                    "consumer", make_numeric_identifier(1));
-    EXPECT_EQ(stored.stored_offset, kMessagesCount - 1);
-    ASSERT_NO_THROW(reader->close(error_info));
+    ASSERT_NO_THROW(reader.Commit(*last));
+    const auto stored = client.GetConsumerOffset(consumer, stream, topic, 0);
+    EXPECT_EQ(stored.StoredOffset(), kMessagesCount - 1);
+    ASSERT_NO_THROW(reader.Close());
 }
 
-TEST_F(LowLevelE2E_Reader, SeekReadsThePartitionAgainFromTheNewStart) {
+TEST_F(E2E_Reader, SeekReadsThePartitionAgainFromTheNewStart) {
     RecordProperty("description",
                    "Reads one batch, seeks back to offset 0 and expects the next batch to start there. Then reads on, "
                    "seeks to the continuation of the first batch and expects the next batch to start after it.");
-    iggy::ffi::ErrorInfo error_info{};
-    iggy::ffi::ReadErrorInfo read_error{};
-    iggy::ffi::Client *client     = GetLoggedInClient();
-    const std::uint32_t stream_id = CreateTopicWithMessages(client, kMessagesCount);
-    auto reader =
-        client->reader(make_numeric_identifier(stream_id), make_numeric_identifier(0), "consumer",
-                       make_numeric_identifier(1), standalone_options(0, iggy::ffi::CommitPolicy::Manual), error_info);
+    auto client         = GetLoggedInHighLevelClient();
+    const auto stream   = CreateTopicWithMessages(client, kMessagesCount);
+    const auto topic    = iggy::Identifier::Numeric(0);
+    const auto consumer = iggy::Consumer::Single(iggy::Identifier::Numeric(1));
+    auto reader         = client.Reader(consumer, stream, topic, standalone_options(0, iggy::CommitPolicy::Manual));
 
-    const auto first = reader->next(kReadTimeoutMicros, read_error);
-    ASSERT_FALSE(first.messages.empty());
-    EXPECT_EQ(first.messages.front().offset, 0u);
+    const auto first = reader.Next(kReadTimeout);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_FALSE(first->Messages().empty());
+    EXPECT_EQ(first->Messages().front().Offset(), 0u);
 
-    ASSERT_NO_THROW(reader->seek(0, make_polling_strategy("offset", 0), error_info));
-    const auto again = reader->next(kReadTimeoutMicros, read_error);
-    ASSERT_FALSE(again.messages.empty());
-    EXPECT_EQ(again.messages.front().offset, 0u) << "A batch queued before the seek was delivered after it";
+    ASSERT_NO_THROW(reader.Seek(0, iggy::PollingStrategy::Offset(0)));
+    const auto again = reader.Next(kReadTimeout);
+    ASSERT_TRUE(again.has_value());
+    ASSERT_FALSE(again->Messages().empty());
+    EXPECT_EQ(again->Messages().front().Offset(), 0u) << "A batch queued before the seek was delivered after it";
 
-    const auto later = reader->next(kReadTimeoutMicros, read_error);
-    ASSERT_FALSE(later.messages.empty());
-    ASSERT_NO_THROW(reader->seek(0, *first.continuation(), error_info));
-    const auto resumed = reader->next(kReadTimeoutMicros, read_error);
-    ASSERT_FALSE(resumed.messages.empty());
-    EXPECT_EQ(resumed.messages.front().offset, first.messages.back().offset + 1)
+    const auto later = reader.Next(kReadTimeout);
+    ASSERT_TRUE(later.has_value());
+    ASSERT_FALSE(later->Messages().empty());
+    ASSERT_NO_THROW(reader.Seek(0, first->Continuation()));
+    const auto resumed = reader.Next(kReadTimeout);
+    ASSERT_TRUE(resumed.has_value());
+    ASSERT_FALSE(resumed->Messages().empty());
+    EXPECT_EQ(resumed->Messages().front().Offset(), first->Messages().back().Offset() + 1)
         << "A seek to a continuation must read on after its batch";
 
-    EXPECT_THROW(reader->seek(1, make_polling_strategy("offset", 0), error_info), std::exception)
-        << "A seek of a partition that the reader does not read must fail";
-    EXPECT_EQ(error_info.kind, "invalid_command");
-    ASSERT_NO_THROW(reader->close(error_info));
+    try {
+        reader.Seek(1, iggy::PollingStrategy::Offset(0));
+        FAIL() << "A seek of a partition that the reader does not read must fail";
+    } catch (const iggy::IggyException &error) {
+        EXPECT_EQ(error.Kind(), "invalid_command");
+    }
+    ASSERT_NO_THROW(reader.Close());
 }
 
-TEST_F(LowLevelE2E_Reader, NextReturnsAnEmptyBatchWhenTheTimeRunsOut) {
-    RecordProperty("description", "Waits for the next batch of an empty partition and gets an empty batch.");
-    iggy::ffi::ErrorInfo error_info{};
-    iggy::ffi::ReadErrorInfo read_error{};
-    iggy::ffi::Client *client     = GetLoggedInClient();
-    const std::uint32_t stream_id = CreateTopicWithMessages(client, 0);
-    auto reader =
-        client->reader(make_numeric_identifier(stream_id), make_numeric_identifier(0), "consumer",
-                       make_numeric_identifier(1), standalone_options(0, iggy::ffi::CommitPolicy::Manual), error_info);
+TEST_F(E2E_Reader, NextReturnsNoBatchWhenTheTimeRunsOut) {
+    RecordProperty("description", "Waits for the next batch of an empty partition and gets no batch.");
+    auto client         = GetLoggedInHighLevelClient();
+    const auto stream   = CreateTopicWithMessages(client, 0);
+    const auto topic    = iggy::Identifier::Numeric(0);
+    const auto consumer = iggy::Consumer::Single(iggy::Identifier::Numeric(1));
+    auto reader         = client.Reader(consumer, stream, topic, standalone_options(0, iggy::CommitPolicy::Manual));
 
-    const auto batch = reader->next(kIdleReadTimeoutMicros, read_error);
-    EXPECT_TRUE(batch.messages.empty());
-    EXPECT_EQ(batch.count, 0u);
-    EXPECT_THROW(batch.checkpoint(), std::exception);
-    ASSERT_NO_THROW(reader->close(error_info));
+    const auto batch = reader.Next(kIdleReadTimeout);
+    EXPECT_FALSE(batch.has_value());
+    const auto empty = client.PollMessages(consumer, stream, topic, 0, iggy::PollingStrategy::Offset(0),
+                                           iggy::PollOptions().SetCount(kBatchCount));
+    EXPECT_TRUE(empty.Messages().empty());
+    EXPECT_EQ(empty.Count(), 0u);
+    EXPECT_THROW((void)empty.Checkpoint(), iggy::IggyException);
+    ASSERT_NO_THROW(reader.Close());
 }
 
-TEST_F(LowLevelE2E_Reader, CommitIsRefusedWhenTheServerCommitsOnRead) {
+TEST_F(E2E_Reader, CommitIsRefusedWhenTheServerCommitsOnRead) {
     RecordProperty("description", "A reader whose server commits on read refuses a commit from the caller.");
-    iggy::ffi::ErrorInfo error_info{};
-    iggy::ffi::ReadErrorInfo read_error{};
-    iggy::ffi::Client *client     = GetLoggedInClient();
-    const std::uint32_t stream_id = CreateTopicWithMessages(client, kMessagesCount);
-    auto reader =
-        client->reader(make_numeric_identifier(stream_id), make_numeric_identifier(0), "consumer",
-                       make_numeric_identifier(1), standalone_options(0, iggy::ffi::CommitPolicy::OnRead), error_info);
+    auto client         = GetLoggedInHighLevelClient();
+    const auto stream   = CreateTopicWithMessages(client, kMessagesCount);
+    const auto consumer = iggy::Consumer::Single(iggy::Identifier::Numeric(1));
+    auto reader         = client.Reader(consumer, stream, iggy::Identifier::Numeric(0),
+                                        standalone_options(0, iggy::CommitPolicy::OnRead));
 
-    const auto batch = reader->next(kReadTimeoutMicros, read_error);
-    ASSERT_FALSE(batch.messages.empty());
-    EXPECT_THROW(reader->commit(*batch.checkpoint(), error_info), std::exception);
-    EXPECT_EQ(error_info.kind, "invalid_command");
-    ASSERT_NO_THROW(reader->close(error_info));
+    const auto batch = reader.Next(kReadTimeout);
+    ASSERT_TRUE(batch.has_value());
+    ASSERT_FALSE(batch->Messages().empty());
+    try {
+        reader.Commit(batch->Checkpoint());
+        FAIL() << "An on-read commit policy must refuse a manual commit";
+    } catch (const iggy::IggyException &error) {
+        EXPECT_EQ(error.Kind(), "invalid_command");
+    }
+    ASSERT_NO_THROW(reader.Close());
 }
 
-TEST_F(LowLevelE2E_Reader, EveryCallButCloseThrowsAfterClose) {
+TEST_F(E2E_Reader, EveryCallButCloseThrowsAfterClose) {
     RecordProperty("description", "A closed reader refuses every later call, and a second close does nothing.");
-    iggy::ffi::ErrorInfo error_info{};
-    iggy::ffi::ReadErrorInfo read_error{};
-    iggy::ffi::Client *client     = GetLoggedInClient();
-    const std::uint32_t stream_id = CreateTopicWithMessages(client, kMessagesCount);
-    auto reader =
-        client->reader(make_numeric_identifier(stream_id), make_numeric_identifier(0), "consumer",
-                       make_numeric_identifier(1), standalone_options(0, iggy::ffi::CommitPolicy::Manual), error_info);
-    const auto batch = reader->next(kReadTimeoutMicros, read_error);
-    ASSERT_FALSE(batch.messages.empty());
+    auto client         = GetLoggedInHighLevelClient();
+    const auto stream   = CreateTopicWithMessages(client, kMessagesCount);
+    const auto consumer = iggy::Consumer::Single(iggy::Identifier::Numeric(1));
+    auto reader         = client.Reader(consumer, stream, iggy::Identifier::Numeric(0),
+                                        standalone_options(0, iggy::CommitPolicy::Manual));
+    const auto batch    = reader.Next(kReadTimeout);
+    ASSERT_TRUE(batch.has_value());
+    ASSERT_FALSE(batch->Messages().empty());
 
-    ASSERT_NO_THROW(reader->close(error_info));
-    EXPECT_THROW(reader->next(kIdleReadTimeoutMicros, read_error), std::exception);
-    EXPECT_THROW(reader->commit(*batch.checkpoint(), error_info), std::exception);
-    EXPECT_THROW(reader->seek(0, make_polling_strategy("offset", 0), error_info), std::exception);
-    EXPECT_THROW(reader->seek(0, *batch.continuation(), error_info), std::exception);
-    EXPECT_THROW(reader->partitions(), std::exception);
-    EXPECT_NO_THROW(reader->close(error_info));
+    ASSERT_NO_THROW(reader.Close());
+    EXPECT_THROW((void)reader.Next(kIdleReadTimeout), iggy::IggyException);
+    EXPECT_THROW(reader.Commit(batch->Checkpoint()), iggy::IggyException);
+    EXPECT_THROW(reader.Seek(0, iggy::PollingStrategy::Offset(0)), iggy::IggyException);
+    EXPECT_THROW(reader.Seek(0, batch->Continuation()), iggy::IggyException);
+    EXPECT_THROW((void)reader.Partitions(), iggy::IggyException);
+    EXPECT_NO_THROW(reader.Close());
 }
 
-TEST_F(LowLevelE2E_Reader, ConsumerGroupReaderJoinsInBuildAndLeavesInClose) {
+TEST_F(E2E_Reader, ConsumerGroupReaderJoinsInBuildAndLeavesInClose) {
     RecordProperty("description",
                    "A group reader joins its group when it is built, reads the assigned partition and leaves the "
                    "group when it is closed.");
-    iggy::ffi::ErrorInfo error_info{};
-    iggy::ffi::ReadErrorInfo read_error{};
-    iggy::ffi::Client *client     = GetLoggedInClient();
-    const std::uint32_t stream_id = CreateTopicWithMessages(client, kMessagesCount);
-    const auto group = client->create_consumer_group(make_numeric_identifier(stream_id), make_numeric_identifier(0),
-                                                     GetRandomName(), error_info);
+    auto client         = GetLoggedInHighLevelClient();
+    const auto stream   = CreateTopicWithMessages(client, kMessagesCount);
+    const auto topic    = iggy::Identifier::Numeric(0);
+    const auto group    = client.CreateConsumerGroup(stream, topic, GetRandomName());
+    const auto group_id = iggy::Identifier::Numeric(group.Id());
+    auto reader         = client.Reader(iggy::Consumer::Group(group_id), stream, topic,
+                                        iggy::ReaderOptions().SetStart(iggy::PollingStrategy::Offset(0)));
+    EXPECT_EQ(client.GetConsumerGroup(stream, topic, group_id).MembersCount(), 1u);
 
-    iggy::ffi::ReaderOptions options{};
-    options.has_start = true;
-    options.start     = make_polling_strategy("offset", 0);
-    auto reader       = client->reader(make_numeric_identifier(stream_id), make_numeric_identifier(0), "consumer_group",
-                                       make_numeric_identifier(group.id), std::move(options), error_info);
-    EXPECT_EQ(client
-                  ->get_consumer_group(make_numeric_identifier(stream_id), make_numeric_identifier(0),
-                                       make_numeric_identifier(group.id))
-                  .members_count,
-              1u);
+    const auto batch = reader.Next(kReadTimeout);
+    ASSERT_TRUE(batch.has_value());
+    ASSERT_FALSE(batch->Messages().empty());
+    EXPECT_EQ(batch->PartitionId(), 0u);
+    EXPECT_EQ(batch->Messages().front().Offset(), 0u);
 
-    const auto batch = reader->next(kReadTimeoutMicros, read_error);
-    ASSERT_FALSE(batch.messages.empty());
-    EXPECT_EQ(batch.partition_id, 0u);
-    EXPECT_EQ(batch.messages.front().offset, 0u);
-
-    ASSERT_NO_THROW(reader->close(error_info));
-    EXPECT_EQ(client
-                  ->get_consumer_group(make_numeric_identifier(stream_id), make_numeric_identifier(0),
-                                       make_numeric_identifier(group.id))
-                  .members_count,
-              0u);
+    ASSERT_NO_THROW(reader.Close());
+    EXPECT_EQ(client.GetConsumerGroup(stream, topic, group_id).MembersCount(), 0u);
 }
 
-TEST_F(LowLevelE2E_Reader, AutoCommitStoresTheMarkedPositionWhenTheReaderCloses) {
+TEST_F(E2E_Reader, AutoCommitStoresTheMarkedPositionWhenTheReaderCloses) {
     RecordProperty("description",
                    "Marks the second message of a batch under CommitPolicy::Auto with CommitAfter::Marked, closes the "
                    "reader and reads back the offset of the mark. A reader without Auto refuses the mark.");
-    iggy::ffi::ErrorInfo error_info{};
-    iggy::ffi::ReadErrorInfo read_error{};
-    iggy::ffi::Client *client              = GetLoggedInClient();
-    const std::uint32_t stream_id          = CreateTopicWithMessages(client, kMessagesCount);
-    auto options                           = standalone_options(0, iggy::ffi::CommitPolicy::Auto);
-    options.poll_options.has_auto_interval = false;
-    options.poll_options.has_auto_every    = true;
-    options.poll_options.auto_every        = iggy::ffi::CommitEvery::Batch;
-    options.poll_options.auto_after        = iggy::ffi::CommitAfter::Marked;
-    auto reader = client->reader(make_numeric_identifier(stream_id), make_numeric_identifier(0), "consumer",
-                                 make_numeric_identifier(1), options, error_info);
+    auto client         = GetLoggedInHighLevelClient();
+    const auto stream   = CreateTopicWithMessages(client, kMessagesCount);
+    const auto topic    = iggy::Identifier::Numeric(0);
+    const auto consumer = iggy::Consumer::Single(iggy::Identifier::Numeric(1));
+    auto options        = standalone_options(0, iggy::CommitPolicy::Auto);
+    options.SetPollOptions(iggy::PollOptions()
+                               .SetCount(kBatchCount)
+                               .SetAutoCommit(iggy::AutoCommit()
+                                                  .SetInterval(std::nullopt)
+                                                  .SetEvery(iggy::CommitEvery::Batch())
+                                                  .SetAfter(iggy::CommitAfter::Marked)));
+    auto reader = client.Reader(consumer, stream, topic, options);
 
-    const auto batch = reader->next(kReadTimeoutMicros, read_error);
-    ASSERT_GE(batch.messages.size(), 2u);
-    ASSERT_NO_THROW(reader->mark(*batch.checkpoint_at(1), error_info));
-    ASSERT_NO_THROW(reader->close(error_info));
+    const auto batch = reader.Next(kReadTimeout);
+    ASSERT_TRUE(batch.has_value());
+    ASSERT_GE(batch->Messages().size(), 2u);
+    ASSERT_NO_THROW(reader.Mark(batch->CheckpointAt(1)));
+    ASSERT_NO_THROW(reader.Close());
 
-    const auto stored = client->get_consumer_offset(make_numeric_identifier(stream_id), make_numeric_identifier(0), 0,
-                                                    "consumer", make_numeric_identifier(1));
-    EXPECT_EQ(stored.stored_offset, 1u);
+    const auto stored = client.GetConsumerOffset(consumer, stream, topic, 0);
+    EXPECT_EQ(stored.StoredOffset(), 1u);
 
-    auto manual =
-        client->reader(make_numeric_identifier(stream_id), make_numeric_identifier(0), "consumer",
-                       make_numeric_identifier(2), standalone_options(0, iggy::ffi::CommitPolicy::Manual), error_info);
-    const auto manual_batch = manual->next(kReadTimeoutMicros, read_error);
-    ASSERT_FALSE(manual_batch.messages.empty());
-    EXPECT_THROW(manual->mark(*manual_batch.checkpoint(), error_info), std::exception);
-    EXPECT_EQ(error_info.kind, "invalid_command");
-    ASSERT_NO_THROW(manual->close(error_info));
+    auto manual             = client.Reader(iggy::Consumer::Single(iggy::Identifier::Numeric(2)), stream, topic,
+                                            standalone_options(0, iggy::CommitPolicy::Manual));
+    const auto manual_batch = manual.Next(kReadTimeout);
+    ASSERT_TRUE(manual_batch.has_value());
+    ASSERT_FALSE(manual_batch->Messages().empty());
+    try {
+        manual.Mark(manual_batch->Checkpoint());
+        FAIL() << "A manual commit policy must refuse a mark";
+    } catch (const iggy::IggyException &error) {
+        EXPECT_EQ(error.Kind(), "invalid_command");
+    }
+    ASSERT_NO_THROW(manual.Close());
 }
 
-TEST_F(LowLevelE2E_Reader, OneShotPollRefusesAutoCommit) {
+TEST_F(E2E_Reader, OneShotPollRefusesAutoCommit) {
     RecordProperty("description", "A one-shot poll has nothing to count, so CommitPolicy::Auto is refused.");
-    iggy::ffi::ErrorInfo error_info{};
-    iggy::ffi::Client *client     = GetLoggedInClient();
-    const std::uint32_t stream_id = CreateTopicWithMessages(client, 1);
+    auto client       = GetLoggedInHighLevelClient();
+    const auto stream = CreateTopicWithMessages(client, 1);
 
-    EXPECT_THROW(client->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(0), 0, "consumer",
-                                       make_numeric_identifier(1), make_polling_strategy("offset", 0),
-                                       make_poll_options(1, iggy::ffi::CommitPolicy::Auto), error_info),
-                 std::exception);
-    EXPECT_EQ(error_info.kind, "invalid_configuration");
+    try {
+        client.PollMessages(iggy::Consumer::Single(iggy::Identifier::Numeric(1)), stream, iggy::Identifier::Numeric(0),
+                            0, iggy::PollingStrategy::Offset(0),
+                            iggy::PollOptions().SetCount(1).SetCommit(iggy::CommitPolicy::Auto));
+        FAIL() << "A one-shot poll must refuse automatic commits";
+    } catch (const iggy::IggyException &error) {
+        EXPECT_EQ(error.Kind(), "invalid_configuration");
+    }
 }

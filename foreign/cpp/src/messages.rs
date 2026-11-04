@@ -42,18 +42,6 @@ pub struct BatchPositions {
     continuation: PollingStrategy,
 }
 
-pub fn make_message(
-    payload: Vec<u8>,
-    user_headers: Vec<ffi::HeaderEntry>,
-) -> ffi::IggyMessageToSend {
-    ffi::IggyMessageToSend {
-        id_lo: 0,
-        id_hi: 0,
-        payload,
-        user_headers,
-    }
-}
-
 pub fn default_poll_options() -> ffi::PollOptions {
     PollOptions::default().into()
 }

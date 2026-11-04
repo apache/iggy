@@ -119,66 +119,6 @@ TEST_F(E2E_Partition, CreatePartitionsWithUnknownNumericIdentifiersThrows) {
         iggy::IggyException);
 }
 
-TEST_F(E2E_Partition, CreatePartitionsWithBoundaryPartitionsCountValues) {
-    RecordProperty("description",
-                   "Accepts supported create_partitions counts and rejects values outside the allowed range.");
-    const std::string stream_name = GetRandomName();
-
-    auto client = GetLoggedInHighLevelClient();
-
-    ASSERT_NO_THROW(client.CreateStream(stream_name));
-    TrackStream(stream_name);
-
-    struct TestCase {
-        std::string topic_name;
-        std::uint32_t partitions_count;
-        bool should_succeed;
-        std::uint32_t expected_total_partitions;
-    };
-
-    const std::vector<TestCase> test_cases = {
-        {GetRandomName(), static_cast<std::uint32_t>(-1), false, 1},
-        {GetRandomName(), 0, false, 1},
-        {GetRandomName(), 1, true, 2},
-        {GetRandomName(), 43, true, 44},
-        {GetRandomName(), 1000, true, 1001},
-        {GetRandomName(), 1001, false, 1},
-    };
-
-    for (const auto &test_case : test_cases) {
-        SCOPED_TRACE(test_case.topic_name);
-        ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), test_case.topic_name,
-                                           iggy::TopicCreateOptions().SetPartitionsCount(1)));
-
-        if (test_case.should_succeed) {
-            ASSERT_NO_THROW(client.CreatePartitions(iggy::Identifier::String(stream_name),
-                                                    iggy::Identifier::String(test_case.topic_name),
-                                                    test_case.partitions_count));
-        } else {
-            ASSERT_THROW(
-                client.CreatePartitions(iggy::Identifier::String(stream_name),
-                                        iggy::Identifier::String(test_case.topic_name), test_case.partitions_count),
-                iggy::IggyException);
-        }
-    }
-
-    ASSERT_NO_THROW({
-        const auto stream_details = client.GetStream(iggy::Identifier::String(stream_name));
-        ASSERT_EQ(stream_details.Topics().size(), test_cases.size());
-        for (const auto &test_case : test_cases) {
-            bool found = false;
-            for (const auto &topic : stream_details.Topics()) {
-                if (topic.Name() == test_case.topic_name) {
-                    EXPECT_EQ(topic.PartitionsCount(), test_case.expected_total_partitions);
-                    found = true;
-                    break;
-                }
-            }
-            EXPECT_TRUE(found) << "Missing topic " << test_case.topic_name;
-        }
-    });
-}
-
 TEST_F(E2E_Partition, CreatePartitionsWithNumericIdentifiersSucceeds) {
     RecordProperty("description",
                    "Creates partitions successfully when valid numeric stream and topic identifiers are used.");

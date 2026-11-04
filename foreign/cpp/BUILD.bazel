@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+load("@bazel_skylib//rules:native_binary.bzl", "native_test")
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_import", "cc_library", "cc_test")
 
 config_setting(
@@ -34,6 +35,7 @@ genrule(
         "include/lib.rs.h",
         "cxxbridge/rust/cxx.h",
         "cxxbridge/sources/lib.rs.cc",
+        "rust_unit_tests",
     ],
     cmd = """
         set -euo pipefail
@@ -46,6 +48,7 @@ genrule(
         OUT_RS="$$EXECROOT/$(location include/lib.rs.h)"
         OUT_CXX="$$EXECROOT/$(location cxxbridge/rust/cxx.h)"
         OUT_CC="$$EXECROOT/$(location cxxbridge/sources/lib.rs.cc)"
+        OUT_TESTS="$$EXECROOT/$(location rust_unit_tests)"
 
         PROJECT_ROOT="$$(dirname $$(readlink -f $(location Cargo.toml)))"
         cd "$$PROJECT_ROOT"
@@ -61,7 +64,12 @@ genrule(
         env -u PWD \
             CARGO_TARGET_DIR="$$CARGO_TARGET_DIR" \
             RUSTC="$$RUSTC" \
-            "$$CARGO" build --quiet $$FLAGS
+            "$$CARGO" build --quiet --lib $$FLAGS
+
+        env -u PWD \
+            CARGO_TARGET_DIR="$$CARGO_TARGET_DIR" \
+            RUSTC="$$RUSTC" \
+            "$$CARGO" rustc --quiet --tests $$FLAGS -- --emit="link=$$OUT_TESTS"
 
         cp "$$CARGO_TARGET_DIR/$$PROFILE/libiggy_cpp.a" "$$OUT_LIB"
 
@@ -92,6 +100,11 @@ genrule(
         "@rs_host_tools//:rust_toolchain",
         "@rs_host_tools//:rustc",
     ],
+)
+
+native_test(
+    name = "rust_unit",
+    src = ":rust_unit_tests",
 )
 
 genrule(
@@ -226,7 +239,7 @@ cc_binary(
 )
 
 cc_test(
-    name = "unit",
+    name = "cpp_unit",
     srcs = glob([
         "tests/unit/*.cpp",
     ]),
@@ -253,8 +266,18 @@ cc_test(
     ],
 )
 
+test_suite(
+    name = "unit",
+    tests = [
+        ":cpp_unit",
+        ":rust_unit",
+    ],
+)
+
 cc_test(
     name = "e2e",
+    # The suite already takes about four of the default five minutes.
+    timeout = "long",
     srcs = glob([
         "tests/e2e/*.cpp",
     ]) + [
@@ -278,8 +301,6 @@ cc_test(
     tags = [
         "e2e",
     ],
-    # The suite already takes about four of the default five minutes.
-    timeout = "long",
     deps = [
         ":iggy-cpp",
         "@googletest//:gtest_main",
