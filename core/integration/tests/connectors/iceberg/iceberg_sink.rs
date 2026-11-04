@@ -22,11 +22,11 @@ use crate::connectors::fixtures::{
     IcebergSkipInvalidRowsFixture,
 };
 use bytes::Bytes;
-use iggy::prelude::{Consumer, ConsumerOffsetClient, IggyClient, IggyMessage, Partitioning};
+use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::Identifier;
 use iggy_common::MessageClient;
 use iggy_connector_sdk::api::SinkInfoResponse;
-use integration::harness::seeds;
+use integration::harness::{ConnectorsRuntimeHandle, seeds};
 use integration::iggy_harness;
 use reqwest::Client;
 use std::time::Duration;
@@ -37,7 +37,6 @@ const SNAPSHOT_POLL_ATTEMPTS: usize = 30;
 const SNAPSHOT_POLL_INTERVAL_MS: u64 = 500;
 const BULK_SNAPSHOT_POLL_ATTEMPTS: usize = 60;
 const CATALOG_RESTART_SNAPSHOT_POLL_ATTEMPTS: usize = 120;
-const SINK_CONSUMER_GROUP: &str = "iceberg_sink_connector";
 /// `create_test_messages` alternates `active`, so this many messages span both partition values.
 const PARTITIONED_MESSAGE_COUNT: usize = 5;
 const ACTIVE_PARTITION_COUNT: usize = 2;
@@ -449,9 +448,12 @@ async fn given_a_catalog_restart_when_a_commit_fails_should_retry_until_the_batc
         .send_messages(&stream_id, &topic_id, &partitioning, &mut second_batch)
         .await
         .expect("Failed to send messages");
-    // The runtime stores the offset when it reads a batch, so the sink holds the
-    // second batch once the offset reaches its last message.
-    wait_for_stored_offset(&client, &stream_id, &topic_id, 6).await;
+    wait_for_failed_commit(
+        harness
+            .connectors_runtime()
+            .expect("connector runtime should be available"),
+    )
+    .await;
     fixture
         .start_catalog()
         .await
@@ -497,26 +499,16 @@ fn json_messages(first_id: u128, count: usize) -> Vec<IggyMessage> {
         .collect()
 }
 
-async fn wait_for_stored_offset(
-    client: &IggyClient,
-    stream_id: &Identifier,
-    topic_id: &Identifier,
-    offset: u64,
-) {
-    let consumer = Consumer::group(
-        Identifier::named(SINK_CONSUMER_GROUP).expect("Invalid consumer group name"),
-    );
+/// Waits for the sink to fail its first attempt to commit a batch, so that the batch can only
+/// land through a retry.
+async fn wait_for_failed_commit(runtime: &ConnectorsRuntimeHandle) {
+    let failed_attempt =
+        format!("Commit to Iceberg table {DEFAULT_NAMESPACE}.{DEFAULT_TABLE} failed on attempt 1/");
     for _ in 0..SNAPSHOT_POLL_ATTEMPTS {
-        let stored_offset = client
-            .get_consumer_offset(&consumer, stream_id, topic_id, Some(0))
-            .await
-            .ok()
-            .flatten()
-            .map(|info| info.stored_offset);
-        if stored_offset >= Some(offset) {
+        if runtime.collect_logs().0.contains(&failed_attempt) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(SNAPSHOT_POLL_INTERVAL_MS)).await;
     }
-    panic!("The sink did not read up to offset {offset}");
+    panic!("The sink did not fail a commit while the catalog was down");
 }

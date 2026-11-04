@@ -129,10 +129,10 @@ create duplicates.
 ## Commit Retries
 
 The sink writes the data files of a batch once, then retries the catalog commit when the catalog
-cannot be reached or answers with an unexpected status, such as a 5xx. It makes up to
+cannot be reached, fails with a 5xx, or throttles the sink with a 429. It makes up to
 `max_retries` attempts in total and waits about `retry_delay` before the first retry, doubling the
-wait up to `max_retry_delay`. A commit that the catalog refuses for good, such as one to a table
-that no longer exists, fails without a retry.
+wait up to `max_retry_delay`. A commit that the catalog refuses for good, such as one rejected with
+another 4xx or one to a table that no longer exists, fails without a retry.
 
 Each commit tags its snapshot with an `iggy.commit-id` summary property. Before a retry, the sink
 reloads the table and stops if a snapshot with that id is already there, so a commit whose response
