@@ -21,15 +21,23 @@ use clap::{Parser, Subcommand};
 use iggy_gateway_kafka::protocol::api::supported_api_ranges;
 use kafka_protocol::messages::add_partitions_to_txn_request::*;
 use kafka_protocol::messages::alter_configs_request::AlterConfigsResource;
+use kafka_protocol::messages::create_partitions_request::*;
 use kafka_protocol::messages::create_topics_request::*;
 use kafka_protocol::messages::delete_records_request::*;
 use kafka_protocol::messages::delete_topics_request::*;
 use kafka_protocol::messages::describe_configs_request::*;
 use kafka_protocol::messages::fetch_request::*;
+use kafka_protocol::messages::incremental_alter_configs_request::{
+    AlterConfigsResource as IncrementalAlterConfigsResource,
+    AlterableConfig as IncrementalAlterableConfig,
+};
 use kafka_protocol::messages::join_group_request::*;
 use kafka_protocol::messages::leave_group_request::MemberIdentity;
 use kafka_protocol::messages::list_offsets_request::*;
 use kafka_protocol::messages::offset_commit_request::*;
+use kafka_protocol::messages::offset_delete_request::{
+    OffsetDeleteRequestPartition, OffsetDeleteRequestTopic,
+};
 use kafka_protocol::messages::offset_fetch_request::OffsetFetchRequestGroup;
 use kafka_protocol::messages::produce_request::*;
 use kafka_protocol::messages::txn_offset_commit_request::*;
@@ -572,6 +580,59 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .with_auth_bytes(Bytes::from_static(b"\x00iggy\x00secret"))
                 .encode(&mut buf, version)
                 .context("SaslAuthenticate")?;
+        }
+        37 => {
+            let topic = CreatePartitionsTopic::default()
+                .with_name(TopicName::from(StrBytes::from_static_str(
+                    "iggy-test-topic",
+                )))
+                .with_count(2)
+                .with_assignments(None);
+            CreatePartitionsRequest::default()
+                .with_topics(vec![topic])
+                .with_timeout_ms(30_000)
+                .with_validate_only(false)
+                .encode(&mut buf, version)
+                .context("CreatePartitions")?;
+        }
+        42 => {
+            DeleteGroupsRequest::default()
+                .with_groups_names(vec![GroupId::from(StrBytes::from_static_str("test-group"))])
+                .encode(&mut buf, version)
+                .context("DeleteGroups")?;
+        }
+        44 => {
+            let config = IncrementalAlterableConfig::default()
+                .with_name(StrBytes::from_static_str("retention.ms"))
+                .with_config_operation(0)
+                .with_value(Some(StrBytes::from_static_str("60000")));
+            let resource = IncrementalAlterConfigsResource::default()
+                .with_resource_type(2)
+                .with_resource_name(StrBytes::from_static_str("test-topic"))
+                .with_configs(vec![config]);
+            IncrementalAlterConfigsRequest::default()
+                .with_resources(vec![resource])
+                .with_validate_only(false)
+                .encode(&mut buf, version)
+                .context("IncrementalAlterConfigs")?;
+        }
+        47 => {
+            let topic = OffsetDeleteRequestTopic::default()
+                .with_name(TopicName::from(StrBytes::from_static_str("test-topic")))
+                .with_partitions(vec![
+                    OffsetDeleteRequestPartition::default().with_partition_index(0),
+                ]);
+            OffsetDeleteRequest::default()
+                .with_group_id(GroupId::from(StrBytes::from_static_str("test-group")))
+                .with_topics(vec![topic])
+                .encode(&mut buf, version)
+                .context("OffsetDelete")?;
+        }
+        60 => {
+            DescribeClusterRequest::default()
+                .with_include_cluster_authorized_operations(false)
+                .encode(&mut buf, version)
+                .context("DescribeCluster")?;
         }
         other => {
             warn!("api_key={other}: no explicit builder — empty payload (framing test)");

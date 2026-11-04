@@ -22,6 +22,7 @@ use crate::cli::common::{
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
+use iggy::prelude::StreamCreateOptions;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
 
@@ -43,7 +44,9 @@ impl TestStreamListCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestStreamListCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.name).await;
+        let stream = client
+            .create_stream(&self.name, &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
     }
 
@@ -62,7 +65,11 @@ impl IggyCmdTestCase for TestStreamListCmd {
                 "Executing list streams in {} mode",
                 self.output
             )))
-            .stdout(contains(self.name.clone()));
+            .stdout(contains(self.name.clone()))
+            .stdout(contains(match self.output {
+                OutputFormat::List => format!("{}|0 B|0|0|none\n", self.name),
+                OutputFormat::Default | OutputFormat::Table => "| Encryption |".to_owned(),
+            }));
     }
 
     async fn verify_server_state(&self, _client: &dyn Client) {}

@@ -18,9 +18,8 @@
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::personal_access_tokens_from_wire;
 use crate::{
-    BinaryClient, ClientState, Credentials, DiagnosticEvent, IdentityInfo, IggyError,
-    PersonalAccessTokenClient, PersonalAccessTokenExpiry, PersonalAccessTokenInfo,
-    RawPersonalAccessToken,
+    BinaryClient, Credentials, IdentityInfo, IggyError, PersonalAccessTokenClient,
+    PersonalAccessTokenExpiry, PersonalAccessTokenInfo, RawPersonalAccessToken,
 };
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
@@ -34,7 +33,6 @@ use iggy_binary_protocol::requests::personal_access_tokens::{
 };
 use iggy_binary_protocol::responses::personal_access_tokens::create_personal_access_token::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::get_personal_access_tokens::GetPersonalAccessTokensResponse;
-use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use secrecy::SecretString;
 
 #[async_trait::async_trait]
@@ -92,31 +90,9 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
     ) -> Result<IdentityInfo, IggyError> {
         crate::with_binary_deadline(crate::binary_operation_deadline(), async {
             super::validate_token(token)?;
-            super::logout_before_relogin(self).await?;
             let credentials =
                 Credentials::PersonalAccessToken(SecretString::from(token.to_string()));
-            let fence = self.session_fence();
-            let (code, payload) = super::sign_in_request(
-                &credentials,
-                super::rust_sdk_version_info(self.sdk_version())?,
-                self.session_bind_secret().await?,
-            )?;
-            let response = self.send_raw_with_response(code, payload).await?;
-            let wire_resp = super::decode_response::<LoginRegisterResponse>(&response)?;
-            self.bind_vsr_session_at(fence, wire_resp.session).await?;
-            tracing::debug!(
-                server_version = %wire_resp.server_version,
-                server_protocol_version = wire_resp.server_protocol_version,
-                "authenticated against iggy server"
-            );
-            self.set_state(ClientState::Authenticated).await;
-            self.remember_session_credentials(credentials, wire_resp.user_id)
-                .await;
-            self.publish_event(DiagnosticEvent::SignedIn).await;
-            Ok(IdentityInfo {
-                user_id: wire_resp.user_id,
-                access_token: None,
-            })
+            self.sign_in_with_credentials(credentials).await
         })
         .await
     }

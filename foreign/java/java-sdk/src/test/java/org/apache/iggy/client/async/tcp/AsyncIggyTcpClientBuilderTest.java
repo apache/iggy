@@ -24,6 +24,7 @@ import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.local.LocalIoHandler;
 import io.netty.channel.nio.NioIoHandler;
 import org.apache.iggy.client.BaseIntegrationTest;
+import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyAuthenticationException;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
@@ -226,6 +227,19 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
+    /** A read returns a first message larger than its byte limit, so every link reads a reply of the largest one. */
+    @Test
+    void shouldRejectMaximumVsrFrameSizeBelowAReplyOfTheLargestMessage() {
+        AsyncIggyTcpClientBuilder builder =
+                AsyncIggyTcpClient.builder().maxVsrFrameSize(AsyncIggyTcpClientBuilder.MIN_MAX_VSR_FRAME_SIZE - 1);
+
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+        client = AsyncIggyTcpClient.builder()
+                .maxVsrFrameSize(AsyncIggyTcpClientBuilder.MIN_MAX_VSR_FRAME_SIZE)
+                .build();
+        assertThat(client).isNotNull();
+    }
+
     @Test
     void shouldRejectNonPositiveMaximumVsrFrameSize() {
         assertThatThrownBy(() -> AsyncIggyTcpClient.builder().maxVsrFrameSize(0).build())
@@ -240,6 +254,14 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().maxVsrFrameSize((long) Integer.MAX_VALUE + 1);
 
         assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldDefaultPendingOperationLimitsToTheSessionDefaults() {
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder();
+
+        assertThat(builder.maxPendingOperations()).isEqualTo(ConsensusSession.DEFAULT_MAX_PENDING_OPERATIONS);
+        assertThat(builder.maxPendingOperationBytes()).isEqualTo(ConsensusSession.DEFAULT_MAX_PENDING_OPERATION_BYTES);
     }
 
     @Test

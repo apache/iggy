@@ -30,10 +30,29 @@ use server::boot::{
 use server::server_error::ServerError;
 use server_common::fatal::{FatalReason, descriptors_exhausted, fatal_with_log_flush};
 use server_common::log::Logging;
+use std::error::Error;
+use std::io::{self, Write};
+use std::process::ExitCode;
 use system_stats::capture_allowed_cpus;
 use tracing::{error, info, warn};
 
-fn main() -> Result<(), ServerError> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let mut stderr = io::stderr().lock();
+            let _ = writeln!(stderr, "Error: {error}");
+            let mut source = error.source();
+            while let Some(cause) = source {
+                let _ = writeln!(stderr, "  Caused by: {cause}");
+                source = cause.source();
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), ServerError> {
     // This prelude must stay ahead of the first thread the process ever
     // spawns: `--with-default-root-credentials` writes to the environment,
     // and `set_var` is only sound while single-threaded. `early_init` just
@@ -68,8 +87,7 @@ fn main() -> Result<(), ServerError> {
     capture_allowed_cpus();
 
     // Before bootstrap: partition persistence sizes its offset-file budget
-    // from the soft limit it reads first, and nothing else raises it except a
-    // side effect of sysinfo's first process refresh on Linux.
+    // from the soft limit it reads first, and nothing else raises it.
     match raise_open_file_limit() {
         Ok(limit) => info!(
             soft_before = limit.soft_before,

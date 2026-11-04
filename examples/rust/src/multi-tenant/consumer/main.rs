@@ -23,7 +23,6 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
-use std::str::FromStr;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 use tracing_subscriber::layer::SubscriberExt;
@@ -154,7 +153,6 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
             &tenant.stream,
             TOPICS,
             args.messages_per_batch,
-            &args.interval,
         )
         .await?;
         tenant.add_consumers(consumers);
@@ -221,7 +219,13 @@ async fn create_user(
         ..Default::default()
     };
     let user = client
-        .create_user(username, PASSWORD, UserStatus::Active, Some(permissions))
+        .create_user(
+            username,
+            PASSWORD,
+            UserStatus::Active,
+            Some(permissions),
+            &UserCreateOptions::default(),
+        )
         .await?;
     info!(
         "Created user: {username} with ID: {}, with permissions for topics: {:?} in stream: {stream_name}",
@@ -285,18 +289,18 @@ async fn create_consumers(
     stream: &str,
     topics: &[&str],
     batch_length: u32,
-    interval: &str,
 ) -> Result<Vec<TenantConsumer>, IggyError> {
     let mut consumers = Vec::new();
     for topic in topics {
         for id in 1..=consumers_count {
             let mut consumer = client
                 .consumer_group(CONSUMER_GROUP, stream, topic)?
-                .batch_length(batch_length)
-                .poll_interval(IggyDuration::from_str(interval).expect("Invalid duration"))
                 .polling_strategy(PollingStrategy::next())
-                .auto_join_consumer_group()
-                .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
+                .poll_options(PollOptions {
+                    count: batch_length,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::wait(IggyDuration::ONE_SECOND)
+                })
                 .build();
             consumer.init().await?;
             consumers.push(TenantConsumer::new(

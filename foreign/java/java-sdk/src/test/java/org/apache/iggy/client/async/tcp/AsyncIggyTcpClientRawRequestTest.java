@@ -29,8 +29,10 @@ import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.message.PollingKind;
 import org.apache.iggy.message.PollingStrategy;
 import org.junit.jupiter.api.Test;
 
@@ -40,8 +42,11 @@ import java.math.BigInteger;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -50,6 +55,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientFetchMessagesTest.assertGoldenBody;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.BIND_SESSION_CODE;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_CLUSTER_METADATA_CODE;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_PARTITION_ROUTE_CODE;
@@ -68,6 +74,9 @@ import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailov
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.singleNodeMetadata;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.transientResult;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.writeResponse;
+import static org.apache.iggy.client.async.tcp.FetchMessagesTest.GOLDEN_LIMITS;
+import static org.apache.iggy.client.async.tcp.FetchMessagesTest.GOLDEN_MAX_BYTES;
+import static org.apache.iggy.client.async.tcp.FetchMessagesTest.GOLDEN_REQUEST;
 import static org.apache.iggy.serde.BytesSerializer.encodeMessagesBatchInto;
 import static org.apache.iggy.serde.BytesSerializer.toBytes;
 import static org.apache.iggy.serde.BytesSerializer.toBytesAsU64;
@@ -77,6 +86,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class AsyncIggyTcpClientRawRequestTest {
     private static final int SEND_CODE = 101;
     private static final int GET_PARTITION_ROUTE_CODE = 105;
+    private static final int POLL_DEFERRED_CODE = 106;
+    private static final int CANCEL_DEFERRED_REQUEST_CODE = 108;
+    private static final int FETCH_MESSAGES_CODE = 109;
     private static final int STORE_OFFSET_CODE = 121;
     private static final int DELETE_OFFSET_CODE = 122;
     private static final int GET_OFFSET_ROUTING_CODE = 105;
@@ -94,6 +106,7 @@ class AsyncIggyTcpClientRawRequestTest {
     private static final long METADATA_OP = 7;
     private static final StreamId STREAM = StreamId.of(1L);
     private static final TopicId TOPIC = TopicId.of(2L);
+    private static final DeferredPollOptions DEFERRED = DeferredPollOptions.defaults();
     // Replicated commands travel under their operation and carry no command code.
     private static final Map<Integer, Integer> REPLICATED_CODES = Map.of(
             OPERATION_SEND_MESSAGES, SEND_CODE,
@@ -367,6 +380,94 @@ class AsyncIggyTcpClientRawRequestTest {
     }
 
     @Test
+    void shouldRouteRawDeferredPollsLikeTypedDeferredPolls() throws Exception {
+        assertRawRequests(request -> null, (client, requests) -> {
+            client.sendBinaryRequest(
+                            POLL_DEFERRED_CODE,
+                            deferred(rawPoll(), DEFERRED.minCount(), DEFERRED.requestTimeoutMicros()))
+                    .get(5, TimeUnit.SECONDS);
+
+            assertThat(requests)
+                    .extracting(AsyncIggyTcpClientRawRequestTest::code)
+                    .containsExactly(GET_PARTITION_ROUTE_CODE, POLL_DEFERRED_CODE);
+            assertCapturedContext(List.of(requests.get(1)));
+            // The budget counts down from the request timeout in the payload, so routing time comes off it.
+            ByteBuffer body = ByteBuffer.wrap(requests.get(1).body()).order(ByteOrder.LITTLE_ENDIAN);
+            assertThat(body.getLong(body.limit() - Long.BYTES))
+                    .isLessThan(DEFERRED.requestTimeoutMicros())
+                    .isGreaterThan(DEFERRED.requestTimeoutMicros() / 2);
+        });
+    }
+
+    @Test
+    void shouldRouteRawFetchesLikeTypedFetches() throws Exception {
+        ByteBuf sections = Unpooled.buffer().writeIntLE(0);
+        assertRawRequests(
+                request -> code(request) == FETCH_MESSAGES_CODE
+                        ? Response.success(OPERATION_NON_REPLICATED, sections.retainedDuplicate())
+                        : null,
+                (client, requests) -> {
+                    byte[] reply = client.sendBinaryRequest(
+                                    FETCH_MESSAGES_CODE, HexFormat.of().parseHex(GOLDEN_REQUEST))
+                            .get(5, TimeUnit.SECONDS);
+
+                    assertThat(reply).isEqualTo(bytes(sections));
+                    assertThat(requests)
+                            .extracting(AsyncIggyTcpClientRawRequestTest::code)
+                            .containsExactly(GET_PARTITION_ROUTE_CODE, FETCH_MESSAGES_CODE);
+                    Request fetch = requests.get(1);
+                    // The targets keep the fences and caps of the payload, so the header carries no fence.
+                    assertGoldenBody(fetch.body(), GOLDEN_REQUEST, GOLDEN_LIMITS, GOLDEN_LIMITS + Long.BYTES);
+                    assertThat(List.of(fetch.incarnation(), fetch.ownerGeneration()))
+                            .containsOnly(0L);
+                });
+    }
+
+    @Test
+    void shouldRejectMalformedRawFetchesWithoutSendingThem() throws Exception {
+        int limits = GOLDEN_LIMITS;
+        int targets = limits + FetchMessages.LIMITS_BYTES;
+        int second = targets + FetchMessages.TARGET_BYTES;
+        byte[] golden = HexFormat.of().parseHex(GOLDEN_REQUEST);
+        assertRawRequests(request -> null, (client, requests) -> {
+            assertMalformed(client.sendBinaryRequest(FETCH_MESSAGES_CODE, Arrays.copyOf(golden, golden.length - 1)));
+            ByteBuf noTargets = Unpooled.wrappedBuffer(Arrays.copyOf(golden, targets));
+            assertMalformed(client.sendBinaryRequest(
+                    FETCH_MESSAGES_CODE, bytes(noTargets.setIntLE(limits + FetchMessages.TARGETS_COUNT_OFFSET, 0))));
+            assertMalformed(client.sendBinaryRequest(FETCH_MESSAGES_CODE, bytes(golden().setIntLE(second, 1))));
+            assertMalformed(client.sendBinaryRequest(
+                    FETCH_MESSAGES_CODE,
+                    bytes(golden().setByte(second + FetchMessages.STRATEGY_KIND_OFFSET, PollingKind.First.asCode()))));
+            assertMalformed(client.sendBinaryRequest(
+                    FETCH_MESSAGES_CODE,
+                    bytes(golden().setIntLE(
+                                    targets + FetchMessages.TARGET_MAX_BYTES_OFFSET, (int) GOLDEN_MAX_BYTES + 1))));
+            assertMalformed(client.sendBinaryRequest(
+                    FETCH_MESSAGES_CODE,
+                    bytes(golden().setIntLE(
+                                    targets + FetchMessages.TARGET_MAX_BYTES_OFFSET,
+                                    (int) DeferredPollOptions.MIN_MAX_BYTES - 1))));
+            assertMalformed(client.sendBinaryRequest(
+                    FETCH_MESSAGES_CODE, bytes(golden().setIntLE(limits + FetchMessages.COUNT_OFFSET, 0))));
+            long replyMarginMicros = TimeUnit.NANOSECONDS.toMicros(DeferredPollOptions.REPLY_MARGIN.toNanos());
+            for (long timeout : List.of(replyMarginMicros - 1, replyMarginMicros)) {
+                assertMalformed(client.sendBinaryRequest(
+                        FETCH_MESSAGES_CODE,
+                        bytes(golden().setLongLE(limits, 0).setLongLE(limits + Long.BYTES, timeout))));
+            }
+            assertThat(requests).isEmpty();
+        });
+    }
+
+    @Test
+    void shouldRefuseRawDeferredCancelsWithoutSendingThem() throws Exception {
+        assertRawRequests(request -> null, (client, requests) -> {
+            assertServerError(client.sendBinaryRequest(CANCEL_DEFERRED_REQUEST_CODE, new byte[0]), INVALID_COMMAND);
+            assertThat(requests).isEmpty();
+        });
+    }
+
+    @Test
     void shouldRouteRawOffsetWritesLikeTypedOffsetWrites() throws Exception {
         assertRawRequests(request -> null, (client, requests) -> {
             client.sendBinaryRequest(STORE_OFFSET_CODE, rawStoreOffset()).get(5, TimeUnit.SECONDS);
@@ -425,6 +526,8 @@ class AsyncIggyTcpClientRawRequestTest {
             byte[] delete = rawDeleteOffset();
             delete[bytes(offsetTarget()).length - OPTIONAL_PARTITION_BYTES] = 0;
             assertMalformed(client.sendBinaryRequest(POLL_CODE, groupPoll));
+            assertMalformed(client.sendBinaryRequest(
+                    POLL_DEFERRED_CODE, deferred(groupPoll, DEFERRED.minCount(), DEFERRED.requestTimeoutMicros())));
             assertMalformed(client.sendBinaryRequest(STORE_OFFSET_CODE, store));
             assertMalformed(client.sendBinaryRequest(DELETE_OFFSET_CODE, delete));
             assertThat(requests).isEmpty();
@@ -456,6 +559,11 @@ class AsyncIggyTcpClientRawRequestTest {
             badIdentifier[Integer.BYTES + 1] = 5;
             assertMalformed(client.sendBinaryRequest(SEND_CODE, badIdentifier));
             assertMalformed(client.sendBinaryRequest(POLL_CODE, Arrays.copyOf(poll, poll.length - 1)));
+            // No deferred limits, a minimum above the poll's count of one, and no request budget.
+            assertMalformed(client.sendBinaryRequest(POLL_DEFERRED_CODE, poll));
+            assertMalformed(client.sendBinaryRequest(
+                    POLL_DEFERRED_CODE, deferred(poll, DEFERRED.minCount() + 1, DEFERRED.requestTimeoutMicros())));
+            assertMalformed(client.sendBinaryRequest(POLL_DEFERRED_CODE, deferred(poll, DEFERRED.minCount(), 0)));
             assertMalformed(client.sendBinaryRequest(STORE_OFFSET_CODE, bytes(offsetTarget())));
             assertMalformed(client.sendBinaryRequest(DELETE_OFFSET_CODE, Arrays.copyOf(delete, delete.length + 1)));
             assertMalformed(client.sendBinaryRequest(STORE_OFFSET_CODE, Arrays.copyOf(store, 2)));
@@ -589,7 +697,7 @@ class AsyncIggyTcpClientRawRequestTest {
                                 .writeByte(0));
             case GET_OFFSET_CODE -> Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
             case SEND_CODE -> Response.success(OPERATION_SEND_MESSAGES, Unpooled.EMPTY_BUFFER);
-            case POLL_CODE -> Response.success(OPERATION_NON_REPLICATED, emptyPoll(0));
+            case POLL_CODE, POLL_DEFERRED_CODE -> Response.success(OPERATION_NON_REPLICATED, emptyPoll(0));
             case STORE_OFFSET_CODE, DELETE_OFFSET_CODE ->
                 Response.success(request.operation(), Unpooled.buffer().writeIntLE(0));
             default -> Response.error(request.operation(), INVALID_COMMAND);
@@ -636,6 +744,16 @@ class AsyncIggyTcpClientRawRequestTest {
         return bytes(payload);
     }
 
+    private static byte[] deferred(byte[] poll, long minCount, long requestTimeoutMicros) {
+        return bytes(
+                Unpooled.wrappedBuffer(poll),
+                Unpooled.buffer()
+                        .writeLongLE(DEFERRED.maxWaitMicros())
+                        .writeIntLE((int) minCount)
+                        .writeIntLE((int) DEFERRED.maxBytes())
+                        .writeLongLE(requestTimeoutMicros));
+    }
+
     static byte[] rawStoreOffset() {
         return bytes(
                 offsetTarget(), toBytesAsU64(BigInteger.TEN), Unpooled.buffer().writeByte(1));
@@ -651,6 +769,10 @@ class AsyncIggyTcpClientRawRequestTest {
         target.writeBytes(toBytes(TOPIC));
         target.writeBytes(toBytes(Optional.of(0L)));
         return target;
+    }
+
+    private static ByteBuf golden() {
+        return Unpooled.wrappedBuffer(HexFormat.of().parseHex(GOLDEN_REQUEST));
     }
 
     private static byte[] bytes(ByteBuf... parts) {

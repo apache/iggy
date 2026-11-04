@@ -41,6 +41,7 @@ import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.PollingKind;
 import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.partition.PartitionRoute;
@@ -50,14 +51,23 @@ import org.apache.iggy.serde.CommandCode;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -71,29 +81,44 @@ import java.util.function.Supplier;
  */
 final class PollRouter {
     static final int POLL_PARAMETERS_BYTES = 14;
+    // A deferred poll ends with [wait_us u64][min_count u32][max_bytes u32][request_timeout_us u64].
+    static final int DEFERRED_PARAMETERS_BYTES = 2 * Long.BYTES + 2 * Integer.BYTES;
 
     static final Duration POLL_TIMEOUT = Duration.ofSeconds(30);
+    static final int MAX_CONCURRENT_DIALS = 4;
+    // Deferred polls and fetches together, as MAX_DEFERRED_REQUESTS in core/sdk/src/driver.rs.
+    private static final int MAX_DEFERRED_REQUESTS = 64;
+    private static final int MAX_ROUTE_LOOKUPS_IN_FLIGHT = 16;
+
+    private static final int DEFERRED_MIN_COUNT_OFFSET = Long.BYTES;
+    private static final int DEFERRED_MAX_BYTES_OFFSET = Long.BYTES + Integer.BYTES;
+    private static final int DEFERRED_TIMEOUT_OFFSET = Long.BYTES + 2 * Integer.BYTES;
+
     private static final int MAX_ROUTES = 4096;
     private static final int MAX_CONNECTIONS = 256;
     private static final int MAX_PENDING_POLLS = 4096;
     private static final long RETRY_INTERVAL_MILLIS = 50;
-    private static final int MAX_CONCURRENT_DIALS = 4;
+    private static final long MAX_RETRY_INTERVAL_MILLIS = 1000;
     private static final long MAX_REDIAL_MILLIS = 2000;
 
     private final Supplier<AsyncTcpConnection> coordinator;
     private final Function<ConnectionInfo, AsyncTcpConnection> connectData;
     private final Duration pollTimeout;
-    private final Map<String, Route> routes = new LinkedHashMap<>(16, 0.75f, true);
+    private final Map<TargetKey, Route> routes = new LinkedHashMap<>(16, 0.75f, true);
     private Supplier<ConnectionInfo> coordinatorEndpoint;
     private ConnectionInfo configuredEndpoint;
     private int activeDials;
     private long topologyGeneration;
     private final Map<ConnectionInfo, Slot> connections = new HashMap<>();
     private final Set<Poll> pending = new HashSet<>();
+    private final Set<Poll> deferredWaiting = new LinkedHashSet<>();
+    private int activeDeferredPolls;
     private volatile int rosterSize;
-    private final Map<Integer, ConnectionInfo> replicas = new HashMap<>();
-    private ConnectionInfo metadataPrimary;
-    private final Map<String, Long> partitionCounts = new HashMap<>();
+    private final NavigableMap<Integer, ConnectionInfo> replicas = new TreeMap<>();
+    // Read without the monitor: a slot opens its link under the slot monitor, and the client reads this there to size
+    // the dial timeout.
+    private volatile ConnectionInfo metadataPrimary;
+    private final Map<TargetKey, Long> partitionCounts = new HashMap<>();
 
     PollRouter(Supplier<AsyncTcpConnection> coordinator, Function<ConnectionInfo, AsyncTcpConnection> connectData) {
         this(coordinator, connectData, POLL_TIMEOUT);
@@ -123,7 +148,14 @@ final class PollRouter {
     CompletableFuture<AsyncTcpConnection> connectionFor(ConnectionInfo endpoint, long deadline) {
         Route route = attachmentRoute(endpoint);
         Slot slot = slotFor(endpoint);
-        return slot.prepare(route, deadline).thenApply(ignored -> slot.connection);
+        // A close of the slot during its bind clears the link, and the bind can still end without an error.
+        return slot.prepare(route, deadline).thenApply(ignored -> {
+            AsyncTcpConnection prepared = slot.connection;
+            if (prepared == null) {
+                throw notAccepted();
+            }
+            return prepared;
+        });
     }
 
     private Route attachmentRoute(ConnectionInfo endpoint) {
@@ -187,6 +219,9 @@ final class PollRouter {
     }
 
     private CompletableFuture<Void> beforeDeadline(CompletableFuture<Void> source, long deadline) {
+        if (source.isDone()) {
+            return source;
+        }
         CompletableFuture<Void> result = new CompletableFuture<>();
         var timer = coordinator
                 .get()
@@ -213,14 +248,15 @@ final class PollRouter {
     }
 
     private void dialWhenAvailable(AsyncTcpConnection data, long deadline, CompletableFuture<Void> result) {
+        if (result.isDone()) {
+            return;
+        }
+        // Outside the monitor: the waiters of the dial fail inline, and they take the slot, poll and client monitors.
+        if (deadline - System.nanoTime() <= 0) {
+            result.completeExceptionally(notAccepted());
+            return;
+        }
         synchronized (this) {
-            if (result.isDone()) {
-                return;
-            }
-            if (deadline - System.nanoTime() <= 0) {
-                result.completeExceptionally(notAccepted());
-                return;
-            }
             if (activeDials >= MAX_CONCURRENT_DIALS) {
                 coordinator
                         .get()
@@ -263,9 +299,20 @@ final class PollRouter {
 
     CompletableFuture<ByteBuf> partitionRequest(
             int command, ByteBuf payload, Optional<PartitionContext> context, long deadline) {
+        return partitionRequest(command, payload, context, deadline, startCall());
+    }
+
+    CompletableFuture<ByteBuf> partitionRequest(
+            int command,
+            ByteBuf payload,
+            Optional<PartitionContext> context,
+            long deadline,
+            AsyncTcpConnection.TransientFailoverState state) {
         try {
             byte[] query = partitionQuery(command, payload);
-            return send(new Poll(query, command, payload, deadline, context));
+            Poll poll = new Poll(query, command, payload, deadline, context);
+            poll.state = state;
+            return send(poll);
         } catch (RuntimeException error) {
             payload.release();
             return CompletableFuture.failedFuture(error);
@@ -277,11 +324,71 @@ final class PollRouter {
     }
 
     CompletableFuture<ByteBuf> sendMessages(ByteBuf payload, ByteBuf query, long deadline) {
-        byte[] target = takeBytes(query);
-        return send(new Poll(target, CommandCode.Messages.SEND.getValue(), payload, deadline, Optional.empty()));
+        return sendMessages(payload, query, deadline, startCall());
     }
 
-    CompletableFuture<Long> partitionCount(StreamId stream, TopicId topic, long deadline) {
+    CompletableFuture<ByteBuf> sendMessages(
+            ByteBuf payload, ByteBuf query, long deadline, AsyncTcpConnection.TransientFailoverState state) {
+        return targetedRequest(
+                CommandCode.Messages.SEND.getValue(), payload, takeBytes(query), Optional.empty(), deadline, state);
+    }
+
+    /**
+     * Sends one fetch to the primary of its first partition, {@code partition}, using its route.
+     * Each target of a fetch carries its own fence, so the request header carries none.
+     *
+     * @param topic the encoded stream and topic identifiers
+     */
+    CompletableFuture<ByteBuf> fetchRequest(
+            ByteBuf payload,
+            byte[] topic,
+            long partition,
+            long deadline,
+            AsyncTcpConnection.TransientFailoverState state) {
+        return targetedRequest(
+                CommandCode.Messages.FETCH_MESSAGES.getValue(),
+                payload,
+                target(topic, partition),
+                Optional.of(PartitionContext.EMPTY),
+                deadline,
+                state);
+    }
+
+    private CompletableFuture<ByteBuf> targetedRequest(
+            int command,
+            ByteBuf payload,
+            byte[] target,
+            Optional<PartitionContext> context,
+            long deadline,
+            AsyncTcpConnection.TransientFailoverState state) {
+        Poll poll;
+        try {
+            poll = new Poll(target, command, payload, deadline, context);
+        } catch (RuntimeException error) {
+            payload.release();
+            return CompletableFuture.failedFuture(error);
+        }
+        poll.state = state;
+        return send(poll);
+    }
+
+    /**
+     * Sends a non-replicated request to the replica with {@code replicaId} on its link, stamped with the session's
+     * metadata watermark. An id that the roster does not name after a roster read fails with code 6. A lost link or a
+     * refusal with code 58 goes to the same replica again until the deadline, which ends the call with code 58. Any
+     * other reply, code 89 included, is the caller's, because the caller chose the node.
+     */
+    CompletableFuture<ByteBuf> replicaRequest(int replicaId, int code, byte[] payload) {
+        CompletableFuture<ByteBuf> result = new CompletableFuture<>();
+        replicaAttempt(replicaId, code, payload, operationDeadline(), result);
+        return result;
+    }
+
+    CompletableFuture<Long> partitionCount(
+            StreamId stream, TopicId topic, long deadline, AsyncTcpConnection.TransientFailoverState state) {
+        if (state.signedOut()) {
+            return CompletableFuture.failedFuture(state.lineageEnded(null));
+        }
         ByteBuf query = BytesSerializer.toBytes(stream);
         ByteBuf topicBytes = BytesSerializer.toBytes(topic);
         try {
@@ -291,22 +398,153 @@ final class PollRouter {
             topicBytes.release();
         }
         byte[] target = takeBytes(query);
-        String topicKey = ByteBufUtil.hexDump(target, 0, target.length - Integer.BYTES);
+        TargetKey topicKey = TargetKey.of(target).topic();
         synchronized (this) {
             Long count = partitionCounts.get(topicKey);
             if (count != null) {
                 return CompletableFuture.completedFuture(count);
             }
         }
+        return lookup(target, deadline, state, Route::partitionsCount);
+    }
+
+    /**
+     * The partitions grouped by their primary and split to fit one fetch each, each group in the
+     * order of {@code partitions}. A partition without a current route costs a route lookup, and at most {@value
+     * #MAX_ROUTE_LOOKUPS_IN_FLIGHT} of them run at once. Once the returned future ends, also by a cancel, no lookup of
+     * it runs on. Mirrors readiness_groups in core/sdk/src/driver.rs.
+     *
+     * @param topic the encoded stream and topic identifiers
+     */
+    CompletableFuture<List<List<Long>>> readinessGroups(
+            byte[] topic, List<Long> partitions, long deadline, AsyncTcpConnection.TransientFailoverState state) {
+        return withRoutes(topic, partitions, deadline, state, known -> groupByPrimary(partitions, known));
+    }
+
+    /**
+     * The context of the current route of each of {@code partitions}, which a fetch stamps on a target whose strategy
+     * has none. Routes are looked up as {@link #readinessGroups} looks them up.
+     *
+     * @param topic the encoded stream and topic identifiers
+     */
+    CompletableFuture<Map<Long, PartitionContext>> routeContexts(
+            byte[] topic, List<Long> partitions, long deadline, AsyncTcpConnection.TransientFailoverState state) {
+        return withRoutes(topic, partitions, deadline, state, known -> {
+            Map<Long, PartitionContext> contexts = new HashMap<>();
+            known.forEach((partition, route) -> contexts.put(partition, route.context));
+            return contexts;
+        });
+    }
+
+    private <T> CompletableFuture<T> withRoutes(
+            byte[] topic,
+            List<Long> partitions,
+            long deadline,
+            AsyncTcpConnection.TransientFailoverState state,
+            Function<Map<Long, Route>, T> answer) {
+        Map<Long, Route> known = new ConcurrentHashMap<>();
+        List<Long> unknown = new ArrayList<>();
+        synchronized (this) {
+            for (long partition : partitions) {
+                Route route = routes.get(TargetKey.of(target(topic, partition)));
+                if (route != null && routeIsCurrent(route)) {
+                    known.put(partition, route);
+                } else {
+                    unknown.add(partition);
+                }
+            }
+        }
+        CompletableFuture<T> groups = new CompletableFuture<>();
+        Set<CompletableFuture<Route>> lookups = ConcurrentHashMap.newKeySet();
+        groups.whenComplete((ignored, error) -> lookups.forEach(lookup -> lookup.cancel(false)));
+        CompletableFuture<Void> looked = CompletableFuture.completedFuture(null);
+        for (int start = 0; start < unknown.size(); start += MAX_ROUTE_LOOKUPS_IN_FLIGHT) {
+            List<Long> batch = unknown.subList(start, Math.min(unknown.size(), start + MAX_ROUTE_LOOKUPS_IN_FLIGHT));
+            looked = looked.thenCompose(ignored -> groups.isDone()
+                    ? CompletableFuture.completedFuture(null)
+                    : CompletableFuture.allOf(batch.stream()
+                            .map(partition -> {
+                                CompletableFuture<Route> lookup = lookup(
+                                        target(topic, partition), deadline, state.nextHistory(), Function.identity());
+                                lookups.add(lookup);
+                                // If the groups ended after the check above, their cancel missed this lookup.
+                                if (groups.isDone()) {
+                                    lookup.cancel(false);
+                                }
+                                return lookup.thenAccept(route -> known.put(partition, route));
+                            })
+                            .toArray(CompletableFuture[]::new)));
+        }
+        looked.whenComplete((ignored, error) -> {
+            if (error != null) {
+                groups.completeExceptionally(unwrap(error));
+                return;
+            }
+            if (groups.isDone()) {
+                return;
+            }
+            try {
+                groups.complete(answer.apply(known));
+            } catch (RuntimeException failure) {
+                groups.completeExceptionally(failure);
+            }
+        });
+        return groups;
+    }
+
+    /**
+     * Marks the routes of {@code partitions} stale after a fetch over them got NOT_PRIMARY, which does not
+     * name the partition that moved. Each next lookup asks the last known primary first, and the view of each route
+     * stays its floor, so a partition that did not move keeps its route. Mirrors may_have_moved in
+     * core/sdk/src/driver/route_cache.rs.
+     *
+     * @param topic the encoded stream and topic identifiers
+     */
+    synchronized void mayHaveMoved(byte[] topic, List<Long> partitions) {
+        for (long partition : partitions) {
+            TargetKey key = TargetKey.of(target(topic, partition));
+            Route previous = routes.get(key);
+            if (previous != null) {
+                routes.put(key, previous.markedStale(previous.view, previous.endpoint));
+            }
+        }
+    }
+
+    private static List<List<Long>> groupByPrimary(List<Long> partitions, Map<Long, Route> routes) {
+        Map<ConnectionInfo, List<Long>> byPrimary = new LinkedHashMap<>();
+        for (long partition : partitions) {
+            byPrimary
+                    .computeIfAbsent(routes.get(partition).endpoint, primary -> new ArrayList<>())
+                    .add(partition);
+        }
+        List<List<Long>> groups = new ArrayList<>();
+        for (List<Long> group : byPrimary.values()) {
+            for (int start = 0; start < group.size(); start += FetchMessages.MAX_PARTITIONS_PER_REQUEST) {
+                int end = Math.min(group.size(), start + FetchMessages.MAX_PARTITIONS_PER_REQUEST);
+                groups.add(List.copyOf(group.subList(start, end)));
+            }
+        }
+        return List.copyOf(groups);
+    }
+
+    /** The routing target of {@code partition}, which follows the encoded stream and topic identifiers. */
+    private static byte[] target(byte[] topic, long partition) {
+        return takeBytes(
+                Unpooled.buffer(topic.length + Integer.BYTES).writeBytes(topic).writeIntLE((int) partition));
+    }
+
+    private <T> CompletableFuture<T> lookup(
+            byte[] target, long deadline, AsyncTcpConnection.TransientFailoverState state, Function<Route, T> answer) {
         Poll lookup = new Poll(
                 target,
                 CommandCode.Messages.GET_PARTITION_ROUTE.getValue(),
                 Unpooled.wrappedBuffer(target),
                 deadline,
                 Optional.empty());
+        lookup.state = state;
         return AsyncTcpConnection.mapResponse(send(lookup), response -> {
             response.release();
-            return lookup.partitionsCount;
+            return answer.apply(lookup.route);
         });
     }
 
@@ -315,7 +553,7 @@ final class PollRouter {
         ByteBuf topicBytes = BytesSerializer.toBytes(topic);
         try {
             prefix.writeBytes(topicBytes);
-            String key = ByteBufUtil.hexDump(prefix);
+            TargetKey key = TargetKey.of(ByteBufUtil.getBytes(prefix));
             partitionCounts.remove(key);
             routes.keySet().removeIf(route -> route.startsWith(key));
         } finally {
@@ -404,29 +642,38 @@ final class PollRouter {
         partitionCounts.clear();
     }
 
+    void observeTopology(ClusterMetadata metadata) {
+        // Outside the monitor, as in clearSession: a close takes the slot monitor, which a slot holds while it opens
+        // its link, and fails the waiters of the dial inline.
+        applyTopology(metadata).forEach(Slot::close);
+    }
+
+    /** Returns the slots whose endpoints left the roster. */
     @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
-    synchronized void observeTopology(ClusterMetadata metadata) {
+    private synchronized List<Slot> applyTopology(ClusterMetadata metadata) {
         replicas.clear();
-        metadataPrimary = null;
+        ConnectionInfo leader = null;
         rosterSize = metadata.nodes().size();
         for (var node : metadata.nodes()) {
             if (node.endpoints().tcp() != 0) {
                 ConnectionInfo endpoint = LeaderAwareness.nodeTarget(metadata, node, configuredEndpoint);
                 replicas.put(node.replicaId(), endpoint);
                 if (node.role() == ClusterNodeRole.Leader) {
-                    metadataPrimary = endpoint;
+                    leader = endpoint;
                 }
             }
         }
+        metadataPrimary = leader;
         if (connectData == null || !coordinator.get().isAuthenticated()) {
-            return;
+            return List.of();
         }
-        var obsolete = connections.entrySet().iterator();
-        while (obsolete.hasNext()) {
-            var entry = obsolete.next();
+        List<Slot> obsolete = new ArrayList<>();
+        var entries = connections.entrySet().iterator();
+        while (entries.hasNext()) {
+            var entry = entries.next();
             if (!replicas.containsValue(entry.getKey())) {
-                obsolete.remove();
-                entry.getValue().close();
+                entries.remove();
+                obsolete.add(entry.getValue());
             }
         }
         for (ConnectionInfo endpoint : replicas.values()) {
@@ -445,6 +692,12 @@ final class PollRouter {
                 maintain(endpoint, slot, topologyGeneration, 0);
             }
         }
+        return obsolete;
+    }
+
+    /** The node that the last roster named as metadata primary, or null if it named none. */
+    ConnectionInfo metadataPrimary() {
+        return metadataPrimary;
     }
 
     private static byte[] partitionQuery(int command, ByteBuf request) {
@@ -461,7 +714,9 @@ final class PollRouter {
             if (!explicit) {
                 if (command == CommandCode.ConsumerOffset.STORE.getValue()
                         || command == CommandCode.ConsumerOffset.DELETE.getValue()
-                        || (command == CommandCode.Messages.POLL.getValue() && consumerKind == 2)) {
+                        || ((command == CommandCode.Messages.POLL.getValue()
+                                        || command == CommandCode.Messages.POLL_DEFERRED.getValue())
+                                && consumerKind == 2)) {
                     throw new IggyInvalidArgumentException("A group poll or offset mutation requires a partition id");
                 }
                 partition = 0;
@@ -485,7 +740,7 @@ final class PollRouter {
         body.skipBytes(length);
     }
 
-    private static byte[] takeBytes(ByteBuf payload) {
+    static byte[] takeBytes(ByteBuf payload) {
         try {
             return ByteBufUtil.getBytes(payload);
         } finally {
@@ -493,13 +748,108 @@ final class PollRouter {
         }
     }
 
-    private CompletableFuture<ByteBuf> send(Poll poll) {
-        poll.result.whenComplete((response, error) -> {
-            poll.finish(error);
-            synchronized (this) {
-                pending.remove(poll);
+    /** Appends the limits that end a deferred poll request. */
+    static void writeDeferredOptions(ByteBuf request, DeferredPollOptions options) {
+        request.writeLongLE(options.maxWaitMicros())
+                .writeIntLE((int) options.minCount())
+                .writeIntLE((int) options.maxBytes())
+                .writeLongLE(options.requestTimeoutMicros());
+    }
+
+    /** The limits that end a deferred poll request or frame, checked by the {@link DeferredPollOptions} constructor. */
+    static DeferredPollOptions deferredOptions(ByteBuf request) {
+        int parameters = deferredWait(request);
+        return new DeferredPollOptions(
+                Duration.of(request.getLongLE(parameters), ChronoUnit.MICROS),
+                request.getUnsignedIntLE(parameters + DEFERRED_MIN_COUNT_OFFSET),
+                deferredMaxBytes(request),
+                Duration.of(request.getLongLE(deferredTimeout(request)), ChronoUnit.MICROS));
+    }
+
+    /** The index in a deferred poll request or frame of its wait, the first of the limits that end it. */
+    static int deferredWait(ByteBuf request) {
+        return request.writerIndex() - DEFERRED_PARAMETERS_BYTES;
+    }
+
+    /** The index in a deferred poll request or frame of its request timeout. */
+    static int deferredTimeout(ByteBuf request) {
+        return deferredWait(request) + DEFERRED_TIMEOUT_OFFSET;
+    }
+
+    /** The byte limit of a deferred poll request or frame, which also bounds its reply body. */
+    static long deferredMaxBytes(ByteBuf request) {
+        return request.getUnsignedIntLE(deferredWait(request) + DEFERRED_MAX_BYTES_OFFSET);
+    }
+
+    /** The wait and request timeout of a deferred request, checked by the {@link DeferredPollOptions} constructor. */
+    static DeferredPollOptions deferredBudget(long waitMicros, long requestTimeoutMicros) {
+        return new DeferredPollOptions(
+                Duration.of(waitMicros, ChronoUnit.MICROS),
+                DeferredPollOptions.DEFAULT_MIN_COUNT,
+                DeferredPollOptions.DEFAULT_MAX_BYTES,
+                Duration.of(requestTimeoutMicros, ChronoUnit.MICROS));
+    }
+
+    /**
+     * The index in {@code request} of the wait of a fetch whose body starts at {@code body}. The consumer,
+     * stream and topic lead the body, and the request timeout follows the wait.
+     */
+    static int waitParameters(ByteBuf request, int body) {
+        ByteBuf fields = request.duplicate().readerIndex(body);
+        fields.skipBytes(Byte.BYTES);
+        skipIdentifier(fields);
+        skipIdentifier(fields);
+        skipIdentifier(fields);
+        return fields.readerIndex();
+    }
+
+    ConsensusSession sessionOwner() {
+        return coordinator.get().sessionOwner();
+    }
+
+    AsyncTcpConnection.TransientFailoverState startCall() {
+        var state = new AsyncTcpConnection.TransientFailoverState();
+        state.startIn(sessionOwner());
+        return state;
+    }
+
+    /**
+     * Passes the outcome of {@code source} to the returned future in a task of the client event loop. The router
+     * completes {@code source} under its monitors, and a caller callback there that waits for the client monitor can
+     * close a cycle with a sign-in that holds the client monitor and ends the pending polls. The loop is read once
+     * here, so a coordinator that is gone when {@code source} completes cannot strand the caller. The loop runs these
+     * tasks in order. A cancel of the returned future cancels {@code source}, and it wins over an outcome that has not
+     * reached the loop yet. A loop that rejects the task completes the returned future in place, under the monitors of
+     * the completing thread. Netty can also drop a task that it accepts during its final shutdown, and then the
+     * returned future never completes.
+     */
+    <T> CompletableFuture<T> onClientLoop(CompletableFuture<T> source) {
+        var loop = coordinator.get().eventLoop();
+        CompletableFuture<T> caller = new CompletableFuture<>();
+        caller.whenComplete((value, error) -> {
+            if (caller.isCancelled()) {
+                source.cancel(false);
             }
         });
+        source.whenComplete((value, error) -> {
+            Runnable relay = () -> {
+                if (error == null) {
+                    caller.complete(value);
+                } else {
+                    caller.completeExceptionally(error);
+                }
+            };
+            try {
+                loop.execute(relay);
+            } catch (RejectedExecutionException loopGone) {
+                relay.run();
+            }
+        });
+        return caller;
+    }
+
+    private CompletableFuture<ByteBuf> send(Poll poll) {
+        poll.result.whenComplete((response, error) -> finish(poll, error));
         synchronized (this) {
             if (pending.size() >= MAX_PENDING_POLLS) {
                 poll.result.completeExceptionally(
@@ -509,11 +859,26 @@ final class PollRouter {
             pending.add(poll);
         }
         try {
+            poll.state.startIn(coordinator.get().sessionOwner());
             var timeout = coordinator
                     .get()
                     .eventLoop()
                     .schedule(poll::endPending, Math.max(0, poll.deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
             poll.result.whenComplete((response, error) -> timeout.cancel(false));
+            synchronized (this) {
+                if (poll.result.isDone()) {
+                    return poll.result;
+                }
+                if (poll.dataCommand == CommandCode.Messages.POLL_DEFERRED.getValue()
+                        || poll.dataCommand == CommandCode.Messages.FETCH_MESSAGES.getValue()) {
+                    if (activeDeferredPolls >= MAX_DEFERRED_REQUESTS) {
+                        deferredWaiting.add(poll);
+                        return poll.result;
+                    }
+                    poll.deferredAdmitted = true;
+                    activeDeferredPolls++;
+                }
+            }
             attempt(poll);
         } catch (RuntimeException error) {
             poll.fail(error);
@@ -521,33 +886,177 @@ final class PollRouter {
         return poll.result;
     }
 
+    private void replicaAttempt(
+            int replicaId, int code, byte[] payload, long deadline, CompletableFuture<ByteBuf> result) {
+        replicaLink(replicaId, deadline)
+                .thenCompose(link -> link.sendRouted(
+                        code,
+                        Unpooled.wrappedBuffer(payload),
+                        0,
+                        deadline,
+                        new AsyncTcpConnection.TransientFailoverState()))
+                .whenComplete((response, error) -> {
+                    if (error == null) {
+                        if (!result.complete(response)) {
+                            response.release();
+                        }
+                        return;
+                    }
+                    if (!connectionFailed(error) && !isNotAccepted(error)) {
+                        result.completeExceptionally(unwrap(error));
+                        return;
+                    }
+                    if (result.isDone()
+                            || deadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(RETRY_INTERVAL_MILLIS)) {
+                        result.completeExceptionally(notAccepted());
+                        return;
+                    }
+                    try {
+                        coordinator
+                                .get()
+                                .eventLoop()
+                                .schedule(
+                                        () -> replicaAttempt(replicaId, code, payload, deadline, result),
+                                        RETRY_INTERVAL_MILLIS,
+                                        TimeUnit.MILLISECONDS);
+                    } catch (RejectedExecutionException loopGone) {
+                        result.completeExceptionally(notAccepted());
+                    }
+                });
+    }
+
+    private CompletableFuture<AsyncTcpConnection> replicaLink(int replicaId, long deadline) {
+        AsyncTcpConnection parent = coordinator.get();
+        if (!parent.isAuthenticated()) {
+            return parent.awaitAuthentication(deadline, new AsyncTcpConnection.TransientFailoverState())
+                    .thenComposeAsync(ignored -> replicaLink(replicaId, deadline), parent.eventLoop());
+        }
+        ConnectionInfo known = replicaEndpoint(replicaId);
+        CompletableFuture<ConnectionInfo> endpoint = known != null
+                ? CompletableFuture.completedFuture(known)
+                : refreshRoster(parent, deadline).thenApply(ignored -> replicaEndpoint(replicaId));
+        return endpoint.thenCompose(target -> {
+            if (target == null) {
+                return CompletableFuture.failedFuture(
+                        IggyServerException.fromTcpResponse(IggyErrorCode.INVALID_IDENTIFIER.getCode(), new byte[0]));
+            }
+            if (coordinatorEndpoint != null && LeaderAwareness.isSameSpelling(target, coordinatorEndpoint.get())) {
+                return CompletableFuture.completedFuture(parent);
+            }
+            return connectionFor(target, deadline);
+        });
+    }
+
+    private synchronized ConnectionInfo replicaEndpoint(int replicaId) {
+        return replicas.get(replicaId);
+    }
+
+    private void finish(Poll poll, Throwable error) {
+        poll.finish(error);
+        Poll next = null;
+        synchronized (this) {
+            pending.remove(poll);
+            deferredWaiting.remove(poll);
+            if (poll.deferredAdmitted) {
+                activeDeferredPolls--;
+                var waiting = deferredWaiting.iterator();
+                while (waiting.hasNext()) {
+                    Poll candidate = waiting.next();
+                    waiting.remove();
+                    if (!candidate.result.isDone()) {
+                        candidate.deferredAdmitted = true;
+                        activeDeferredPolls++;
+                        next = candidate;
+                        break;
+                    }
+                }
+            }
+        }
+        if (next != null) {
+            startDeferred(next);
+        }
+    }
+
+    private void startDeferred(Poll poll) {
+        try {
+            // Completion can hold another poll's monitor, so admission continues on the client loop.
+            coordinator.get().eventLoop().execute(() -> {
+                try {
+                    attempt(poll);
+                } catch (RuntimeException error) {
+                    poll.fail(error);
+                }
+            });
+        } catch (RuntimeException error) {
+            List<Poll> waiting;
+            synchronized (this) {
+                waiting = List.copyOf(deferredWaiting);
+                deferredWaiting.clear();
+            }
+            poll.fail(error);
+            waiting.forEach(queued -> queued.fail(error));
+        }
+    }
+
+    /** Completes once every committing poll and fetch that is pending now has ended, with any outcome. */
+    CompletableFuture<Void> committingReadsEnded() {
+        List<CompletableFuture<ByteBuf>> committing;
+        synchronized (this) {
+            committing = pending.stream()
+                    .filter(poll -> poll.commits)
+                    .map(poll -> poll.result)
+                    .toList();
+        }
+        return CompletableFuture.allOf(committing.stream()
+                .map(result -> result.handle((response, error) -> null))
+                .toArray(CompletableFuture[]::new));
+    }
+
     CompletableFuture<Void> clearSession() {
         return clearSession(null);
     }
 
-    synchronized CompletableFuture<Void> clearSession(AsyncTcpConnection keep) {
-        topologyGeneration++;
-        clear();
-        for (Poll poll : Set.copyOf(pending)) {
-            poll.endPending();
+    CompletableFuture<Void> clearSession(AsyncTcpConnection keep) {
+        Set<Poll> ending;
+        List<Slot> closing;
+        synchronized (this) {
+            topologyGeneration++;
+            clear();
+            ending = Set.copyOf(pending);
+            deferredWaiting.clear();
+            closing = List.copyOf(connections.values());
+            connections.clear();
         }
-        CompletableFuture<?>[] closing =
-                connections.values().stream().map(slot -> slot.close(keep)).toArray(CompletableFuture[]::new);
-        connections.clear();
-        return CompletableFuture.allOf(closing);
+        // A poll timeout holds its own monitor while completion callbacks acquire the router's monitor.
+        ending.forEach(Poll::endPending);
+        return CompletableFuture.allOf(
+                closing.stream().map(slot -> slot.close(keep)).toArray(CompletableFuture[]::new));
     }
 
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
     private void attempt(Poll poll) {
         if (poll.result.isDone()) {
             return;
         }
+        if (poll.deadline - System.nanoTime() <= 0) {
+            poll.endPending();
+            return;
+        }
+        if (poll.state.signedOut()) {
+            poll.fail(poll.state.lineageEnded(null));
+            return;
+        }
         poll.dataSent = false;
-        if (poll.state.ticket() == null && poll.requiresLane()) {
+        if (poll.state.ticket() == null && poll.requiresLane) {
             try {
                 synchronized (this) {
                     Route known = routes.get(poll.key);
                     if (known != null) {
-                        coordinator.get().sessionOwner().checkRetained(poll.laneFor(known.context));
+                        var session = coordinator.get().sessionOwner();
+                        boolean inspect = !poll.advancesProgress() && !poll.isMutation();
+                        for (ConsensusSession.LaneKey lane : poll.lanesFor(known.context)) {
+                            session.checkRetained(lane, poll.isMutation(), inspect);
+                        }
                     }
                 }
             } catch (RuntimeException error) {
@@ -575,16 +1084,26 @@ final class PollRouter {
     @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
     private void failedAttempt(Poll poll, Throwable error) {
         if (poll.retryingRefusal && unwrap(error) instanceof IggyTimeoutException) {
-            poll.fail(notAccepted());
+            poll.fail(poll.deadlineRefusal());
             return;
         }
         IggyServerException refusal = AsyncTcpConnection.findServerError(error);
-        if ((!poll.requiresLane() || poll.isMutation())
-                && (connectionFailed(error)
+        boolean notPrimary = refusal != null && refusal.getRawErrorCode() == AsyncTcpConnection.NOT_PRIMARY;
+        if (notPrimary && poll.dataCommand == CommandCode.Messages.FETCH_MESSAGES.getValue()) {
+            // A fetch names several partitions and its refusal does not name the one that moved, so the
+            // caller looks up every route of the request again, see mayHaveMoved.
+            poll.fail(error);
+            return;
+        }
+        boolean lostLink = connectionFailed(error);
+        invalidateRoute(poll, error, notPrimary);
+        if (!poll.advancesProgress()
+                && (lostLink
                         || (refusal != null
                                 && refusal.getRawErrorCode() == AsyncTcpConnection.TRANSIENT_NOT_COMMITTED))) {
             if (poll.deadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(RETRY_INTERVAL_MILLIS)) {
-                poll.fail(uncommitted());
+                // A mutation that an attempt can have applied keeps that in its ticket, which fail() retains.
+                poll.fail(lostLink && (poll.isMutation() || !poll.dataSent) ? notAccepted() : uncommitted());
             } else {
                 coordinator
                         .get()
@@ -593,8 +1112,6 @@ final class PollRouter {
             }
             return;
         }
-        boolean notPrimary = refusal != null && refusal.getRawErrorCode() == AsyncTcpConnection.NOT_PRIMARY;
-        invalidateRoute(poll, error, notPrimary);
         if (poll.restartHistory(refusal)) {
             attempt(poll);
             return;
@@ -603,40 +1120,56 @@ final class PollRouter {
             retryLifecycle(poll, refusal);
             return;
         }
-        if (!poll.terminalRoutingRefusal && (isNotAccepted(error) || notPrimary)) {
-            retry(poll, notPrimary);
+        if (!poll.terminalRoutingRefusal
+                && (isNotAccepted(error)
+                        || notPrimary
+                        || (refusal != null
+                                && refusal.getRawErrorCode()
+                                        == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode()))) {
+            retry(poll, notPrimary, refusal);
         } else {
             poll.fail(error);
         }
     }
 
+    @SuppressWarnings("checkstyle:CyclomaticComplexity")
     private synchronized void invalidateRoute(Poll poll, Throwable error, boolean notPrimary) {
         IggyServerException server = AsyncTcpConnection.findServerError(error);
+        boolean lostLink = connectionFailed(error);
         if (server != null && server.getRawErrorCode() == IggyErrorCode.HISTORY_UNAVAILABLE.getCode()) {
-            String topic = poll.topicKey();
+            TargetKey topic = poll.key.topic();
             routes.keySet().removeIf(route -> route.startsWith(topic));
             partitionCounts.remove(topic);
-        } else if (isNotAccepted(error) || notPrimary) {
+        } else if (isNotAccepted(error) || notPrimary || lostLink) {
             Route previous = routes.get(poll.key);
             if (previous != null) {
                 routes.put(
                         poll.key,
-                        new Route(
-                                previous.endpoint,
-                                previous.attachment,
-                                previous.parent,
-                                previous.generation,
-                                previous.bindSecret,
-                                previous.context,
-                                previous.partitionsCount,
-                                previous.local,
+                        previous.markedStale(
                                 notPrimary && poll.dataSent
-                                        ? Math.max(previous.view, Math.min(0xffff_ffffL, poll.routeView + 1))
+                                        ? Math.max(previous.view, Math.min(0xffff_ffffL, poll.route.view + 1))
                                         : previous.view,
-                                true,
-                                notPrimary && poll.dataSent ? previous.endpoint : previous.hint));
+                                poll.backupMiss
+                                        ? metadataPrimary
+                                        : notPrimary && poll.dataSent
+                                                ? previous.endpoint
+                                                : lostLink ? nextReplica(previous.endpoint) : previous.hint));
             }
         }
+    }
+
+    /**
+     * The replica after {@code failed} in id order, or null if the roster does not name {@code failed}. A view change
+     * passes the primary to the next replica, so it is the likely primary after {@code failed}.
+     */
+    private synchronized ConnectionInfo nextReplica(ConnectionInfo failed) {
+        for (var replica : replicas.entrySet()) {
+            if (replica.getValue().equals(failed)) {
+                var next = replicas.higherEntry(replica.getKey());
+                return (next == null ? replicas.firstEntry() : next).getValue();
+            }
+        }
+        return null;
     }
 
     private void retryLifecycle(Poll poll, IggyServerException refusal) {
@@ -651,11 +1184,14 @@ final class PollRouter {
         coordinator.get().eventLoop().schedule(() -> attempt(poll), delay, TimeUnit.MILLISECONDS);
     }
 
-    private void retry(Poll poll, boolean notPrimary) {
-        if (!poll.retryRefusal()) {
+    private void retry(Poll poll, boolean notPrimary, IggyServerException refusal) {
+        long delay = notPrimary ? poll.notPrimarySeen ? poll.notPrimaryRetryMillis : 0 : RETRY_INTERVAL_MILLIS;
+        if (!poll.retryRefusal(delay, refusal)) {
             return;
         }
-        long delay = notPrimary && !poll.notPrimarySeen ? 0 : RETRY_INTERVAL_MILLIS;
+        if (notPrimary && poll.notPrimarySeen) {
+            poll.notPrimaryRetryMillis = Math.min(delay * 2, MAX_RETRY_INTERVAL_MILLIS);
+        }
         poll.notPrimarySeen |= notPrimary;
         coordinator.get().eventLoop().schedule(() -> attempt(poll), delay, TimeUnit.MILLISECONDS);
     }
@@ -663,7 +1199,8 @@ final class PollRouter {
     private CompletableFuture<Route> route(Poll poll) {
         AsyncTcpConnection parent = coordinator.get();
         if (!parent.isAuthenticated()) {
-            return CompletableFuture.failedFuture(new IggyNotConnectedException("Not authenticated, call login first"));
+            return parent.awaitAuthentication(poll.deadline, poll.state)
+                    .thenComposeAsync(ignored -> route(poll), parent.eventLoop());
         }
         Route cached;
         synchronized (this) {
@@ -679,13 +1216,15 @@ final class PollRouter {
                 })
                 : CompletableFuture.completedFuture(null);
         return roster.thenCompose(ignored -> lookupConnection(poll, cached))
-                .thenCompose(source -> source.sendRouted(
+                .thenCompose(source -> confirmNamespaceMiss(
+                        source,
+                        poll,
+                        source.sendRouted(
                                 CommandCode.Messages.GET_PARTITION_ROUTE.getValue(),
                                 Unpooled.wrappedBuffer(poll.routingBody),
                                 0,
                                 poll.deadline,
-                                new AsyncTcpConnection.TransientFailoverState())
-                        .exceptionallyCompose(error -> CompletableFuture.failedFuture(lookupFailure(source, error))))
+                                new AsyncTcpConnection.TransientFailoverState())))
                 .thenCompose(response -> {
                     PartitionRoute decoded;
                     try {
@@ -703,9 +1242,35 @@ final class PollRouter {
                 });
     }
 
-    private Throwable lookupFailure(AsyncTcpConnection source, Throwable error) {
+    /**
+     * Turns a namespace miss that {@code hop} answered into a non-admission unless {@code hop} is the metadata
+     * primary, so the attempt routes again from the metadata primary and the deadline ends the call with code 58. A
+     * backup can lack metadata that the metadata primary already committed, and it refused the request before
+     * admission.
+     */
+    private CompletableFuture<ByteBuf> confirmNamespaceMiss(
+            AsyncTcpConnection hop, Poll poll, CompletableFuture<ByteBuf> exchange) {
+        return exchange.exceptionallyCompose(error -> {
+            if (!isNamespaceMiss(error) || poll.state.committed()) {
+                return CompletableFuture.failedFuture(error);
+            }
+            // The miss refused the request before admission, so a deadline during the roster read ends the call as
+            // not accepted.
+            poll.dataSent = false;
+            return isMetadataPrimary(hop, poll.deadline).thenCompose(primary -> {
+                if (primary) {
+                    return CompletableFuture.failedFuture(error);
+                }
+                poll.backupMiss = true;
+                return CompletableFuture.failedFuture(notAccepted());
+            });
+        });
+    }
+
+    /** Whether {@code error} tells that the replica has no such stream, topic or partition. */
+    static boolean isNamespaceMiss(Throwable error) {
         IggyServerException refusal = AsyncTcpConnection.findServerError(error);
-        boolean missing = refusal != null
+        return refusal != null
                 && switch (refusal.getErrorCode()) {
                     case STREAM_ID_NOT_FOUND,
                             STREAM_NAME_NOT_FOUND,
@@ -714,24 +1279,62 @@ final class PollRouter {
                             PARTITION_NOT_FOUND -> true;
                     default -> false;
                 };
-        // A backup can lack metadata that the leader is still materializing.
-        return missing && !isMetadataPrimary(source) ? notAccepted() : error;
     }
 
-    private synchronized boolean isMetadataPrimary(AsyncTcpConnection source) {
+    /**
+     * Whether {@code hop} reaches the metadata primary, whose namespace miss is final. The belief can predate a view
+     * change, so a roster read on {@code hop} must still name its node. No lookup reaches a believed metadata primary
+     * without a link, so then the roster on {@code hop} is read to update the belief.
+     */
+    private CompletableFuture<Boolean> isMetadataPrimary(AsyncTcpConnection hop, long deadline) {
         if (connectData == null) {
-            return true;
+            return CompletableFuture.completedFuture(true);
         }
-        if (metadataPrimary == null) {
-            return false;
+        ConnectionInfo believed = metadataPrimary();
+        CompletableFuture<Boolean> matches =
+                believed != null && hasLink(believed) ? isNode(hop, believed) : CompletableFuture.completedFuture(true);
+        return matches.thenCompose(sameNode -> {
+            if (!sameNode) {
+                return CompletableFuture.completedFuture(false);
+            }
+            return refreshRoster(hop, deadline)
+                    .handle((ignored, error) -> error == null ? metadataPrimary() : null)
+                    .thenCompose(
+                            named -> named == null ? CompletableFuture.completedFuture(false) : isNode(hop, named));
+        });
+    }
+
+    /** Whether the slot of {@code endpoint} holds a connection that is bound and has an open channel. */
+    private synchronized boolean hasLink(ConnectionInfo endpoint) {
+        Slot slot = connections.get(endpoint);
+        AsyncTcpConnection link = slot == null ? null : slot.connection;
+        return link != null && slot.attachment != null && link.hasOpenChannel();
+    }
+
+    /**
+     * Whether {@code hop} is a connection to the roster node at {@code endpoint}. The client can name the node of its
+     * own connection with another spelling than the roster, such as a hostname for an address.
+     */
+    private CompletableFuture<Boolean> isNode(AsyncTcpConnection hop, ConnectionInfo endpoint) {
+        Slot slot;
+        synchronized (this) {
+            slot = connections.get(endpoint);
         }
-        if (source == coordinator.get()
-                && coordinatorEndpoint != null
-                && LeaderAwareness.isSameSpelling(metadataPrimary, coordinatorEndpoint.get())) {
-            return true;
+        if (slot != null && slot.connection == hop) {
+            return CompletableFuture.completedFuture(true);
         }
-        Slot primary = connections.get(metadataPrimary);
-        return primary != null && primary.connection == source;
+        if (hop != coordinator.get() || coordinatorEndpoint == null) {
+            return CompletableFuture.completedFuture(false);
+        }
+        ConnectionInfo configured = coordinatorEndpoint.get();
+        if (configured.port() != endpoint.port()) {
+            return CompletableFuture.completedFuture(false);
+        }
+        if (LeaderAwareness.isSameSpelling(configured, endpoint)) {
+            return CompletableFuture.completedFuture(true);
+        }
+        // Address comparison can resolve a hostname. A slow resolver must not block socket reads or deadlines.
+        return CompletableFuture.supplyAsync(() -> LeaderAwareness.isSameAddress(configured, endpoint));
     }
 
     @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
@@ -744,6 +1347,8 @@ final class PollRouter {
         synchronized (this) {
             if (stale != null && stale.hint != null && !poll.lookupVisited.contains(stale.hint)) {
                 target = stale.hint;
+            } else if (poll.backupMiss && metadataPrimary != null && !poll.lookupVisited.contains(metadataPrimary)) {
+                target = metadataPrimary;
             } else if (!poll.lookupVisited.contains(coordinatorEndpoint.get())) {
                 target = coordinatorEndpoint.get();
             } else {
@@ -823,9 +1428,9 @@ final class PollRouter {
         }
         if (routes.size() >= MAX_ROUTES && !routes.containsKey(poll.key)) {
             var oldest = routes.keySet().iterator();
-            String evicted = oldest.next();
+            TargetKey evicted = oldest.next();
             oldest.remove();
-            partitionCounts.remove(evicted.substring(0, evicted.length() - 2 * Integer.BYTES));
+            partitionCounts.remove(evicted.topic());
         }
         if (parent.sessionOwner() != coordinator.get().sessionOwner()
                 || parent.sessionOwner().generation() != generation) {
@@ -833,7 +1438,7 @@ final class PollRouter {
         }
         poll.lookupVisited.clear();
         routes.put(poll.key, route);
-        partitionCounts.put(poll.topicKey(), decoded.partitionsCount());
+        partitionCounts.put(poll.key.topic(), decoded.partitionsCount());
         return route;
     }
 
@@ -849,8 +1454,8 @@ final class PollRouter {
         if (poll.result.isDone()) {
             return CompletableFuture.failedFuture(notAccepted());
         }
-        poll.partitionsCount = route.partitionsCount;
-        poll.routeView = route.view;
+        poll.route = route;
+        poll.backupMiss = false;
         if (poll.dataCommand == CommandCode.Messages.GET_PARTITION_ROUTE.getValue()) {
             return CompletableFuture.completedFuture(Unpooled.EMPTY_BUFFER);
         }
@@ -858,8 +1463,8 @@ final class PollRouter {
         poll.context.compareAndSet(null, route.context);
         poll.state.setContext(poll.context.get());
         poll.state.setRoutingBody(poll.routingBody);
-        if (poll.requiresLane()) {
-            poll.state.setLane(poll.laneFor(poll.context.get()));
+        if (poll.requiresLane) {
+            poll.state.setLanes(poll.lanesFor(route.context));
         }
         if (route.local) {
             poll.dataSent = true;
@@ -869,7 +1474,7 @@ final class PollRouter {
             if (poll.result.isDone()) {
                 exchange.cancel(false);
             }
-            return exchange;
+            return confirmNamespaceMiss(route.parent, poll, exchange);
         }
         return slotFor(route.endpoint).poll(route, poll);
     }
@@ -886,7 +1491,7 @@ final class PollRouter {
         return slot;
     }
 
-    private static Throwable unwrap(Throwable error) {
+    static Throwable unwrap(Throwable error) {
         return error instanceof CompletionException && error.getCause() != null ? unwrap(error.getCause()) : error;
     }
 
@@ -950,7 +1555,7 @@ final class PollRouter {
             if (poll.result.isDone()) {
                 exchange.cancel(false);
             }
-            return exchange;
+            return confirmNamespaceMiss(data, poll, exchange);
         }
 
         private CompletableFuture<Void> prepare(Route route, long deadline) {
@@ -1063,6 +1668,7 @@ final class PollRouter {
 
         CompletableFuture<Void> close(AsyncTcpConnection keep) {
             AsyncTcpConnection previous;
+            CompletableFuture<Void> dialing;
             synchronized (this) {
                 if (maintenance != null) {
                     maintenance.cancel(false);
@@ -1071,11 +1677,14 @@ final class PollRouter {
                 previous = connection;
                 connection = null;
                 attachment = null;
-                if (connecting != null) {
-                    connecting.cancel(false);
-                    connecting = null;
-                }
+                dialing = connecting;
+                connecting = null;
                 binding = null;
+            }
+            // Outside the monitor: the waiters of the dial fail inline, and they take the router, poll and client
+            // monitors.
+            if (dialing != null) {
+                dialing.cancel(false);
             }
             return previous == null || previous == keep ? CompletableFuture.completedFuture(null) : previous.close();
         }
@@ -1083,7 +1692,7 @@ final class PollRouter {
 
     /** One poll or offset write, routed by the routing command and sent as the data command. */
     private static final class Poll {
-        private final String key;
+        private final TargetKey key;
         private final byte[] routingBody;
         private final int dataCommand;
         private final ByteBuf payload;
@@ -1091,18 +1700,30 @@ final class PollRouter {
         private final CompletableFuture<ByteBuf> result = new CompletableFuture<>();
         private final long deadline;
         private volatile CompletableFuture<ByteBuf> activeExchange;
+        private boolean deferredAdmitted;
         // The caller's context, or else the first route's, stays fixed within one operation.
         private final AtomicReference<PartitionContext> context;
         private final boolean hasCallerContext;
+        // Read once, since the deadline timer can run after the payload was released.
+        private final boolean requiresLane;
+        private final List<ConsensusSession.LaneKey> fetchLanes;
+        // A poll or fetch that commits on the server. Its cancel waits for the reply, which tells whether it stored.
+        private final boolean commits;
         private boolean historyRefreshed;
         private boolean retryingRefusal;
+        // The last capacity refusal, which the call reports when its deadline ends the retries. A budget too short
+        // for another attempt also ends them with 58, which would hide it.
+        private IggyServerException capacityRefusal;
         private boolean notPrimarySeen;
+        private long notPrimaryRetryMillis = RETRY_INTERVAL_MILLIS;
         private boolean terminalRoutingRefusal;
         private boolean dataSent;
+        // The lookups until a route is used start at the metadata primary, which a backup that missed the namespace
+        // lags behind.
+        private boolean backupMiss;
         private long lifecycleRetryMillis = RETRY_INTERVAL_MILLIS;
         private IggyServerException lifecycleRefusal;
-        private long partitionsCount;
-        private long routeView;
+        private Route route;
         private final Set<ConnectionInfo> lookupVisited = new HashSet<>();
         private AsyncTcpConnection.TransientFailoverState state = new AsyncTcpConnection.TransientFailoverState();
 
@@ -1112,20 +1733,25 @@ final class PollRouter {
                 ByteBuf payload,
                 long deadline,
                 Optional<PartitionContext> callerContext) {
-            this.key = ByteBufUtil.hexDump(routingBody);
+            this.key = TargetKey.of(routingBody);
             this.routingBody = routingBody;
             this.dataCommand = dataCommand;
             this.payload = payload;
             this.deadline = deadline;
             this.context = new AtomicReference<>(callerContext.orElse(null));
             this.hasCallerContext = callerContext.isPresent();
-        }
-
-        private boolean requiresLane() {
-            return isMutation()
-                    || (dataCommand == CommandCode.Messages.POLL.getValue()
-                            && (payload.getUnsignedByte(payload.writerIndex() - 1) != 0
-                                    || payload.getUnsignedByte(payload.writerIndex() - POLL_PARAMETERS_BYTES)
+            int pollEnd = payload.writerIndex()
+                    - (dataCommand == CommandCode.Messages.POLL_DEFERRED.getValue() ? DEFERRED_PARAMETERS_BYTES : 0);
+            boolean fetch = dataCommand == CommandCode.Messages.FETCH_MESSAGES.getValue();
+            this.fetchLanes = fetch ? FetchMessages.progressLanes(payload) : List.of();
+            this.commits = CommittingRead.commits(dataCommand, payload);
+            this.requiresLane = isMutation()
+                    || dataCommand == CommandCode.ConsumerOffset.GET.getValue()
+                    || !fetchLanes.isEmpty()
+                    || ((dataCommand == CommandCode.Messages.POLL.getValue()
+                                    || dataCommand == CommandCode.Messages.POLL_DEFERRED.getValue())
+                            && (payload.getUnsignedByte(pollEnd - 1) != 0
+                                    || payload.getUnsignedByte(pollEnd - POLL_PARAMETERS_BYTES)
                                             == PollingKind.Next.asCode()));
         }
 
@@ -1133,13 +1759,25 @@ final class PollRouter {
             return VsrOperation.operationForCode(dataCommand) != VsrOperation.NON_REPLICATED;
         }
 
+        private boolean advancesProgress() {
+            return requiresLane && !isMutation() && dataCommand != CommandCode.ConsumerOffset.GET.getValue();
+        }
+
+        private List<ConsensusSession.LaneKey> lanesFor(PartitionContext fallback) {
+            return dataCommand == CommandCode.Messages.FETCH_MESSAGES.getValue()
+                    ? fetchLanes
+                    : List.of(laneFor(fallback));
+        }
+
         private ConsensusSession.LaneKey laneFor(PartitionContext fallback) {
             PartitionContext captured = context.get();
+            long incarnation = captured == null ? 0 : captured.incarnation().longValue();
             ByteBuf query = Unpooled.wrappedBuffer(routingBody);
             try {
                 return new ConsensusSession.LaneKey(
-                        (captured == null ? fallback : captured).incarnation().longValue(),
-                        query.getUnsignedIntLE(query.writerIndex() - Integer.BYTES));
+                        incarnation == 0 ? fallback.incarnation().longValue() : incarnation,
+                        query.getUnsignedIntLE(query.writerIndex() - Integer.BYTES),
+                        dataCommand != CommandCode.Messages.SEND.getValue());
             } finally {
                 query.release();
             }
@@ -1166,13 +1804,9 @@ final class PollRouter {
                 state.ticket().complete();
             }
             context.set(null);
-            state = new AsyncTcpConnection.TransientFailoverState();
+            state = state.nextHistory();
             lookupVisited.clear();
             return true;
-        }
-
-        private String topicKey() {
-            return key.substring(0, key.length() - 2 * Integer.BYTES);
         }
 
         private void discardConnection() {
@@ -1189,10 +1823,14 @@ final class PollRouter {
             lifecycleRefusal = null;
         }
 
-        private synchronized boolean retryRefusal() {
+        private synchronized boolean retryRefusal(long delayMillis, IggyServerException refusal) {
             retryingRefusal = true;
-            if (deadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(RETRY_INTERVAL_MILLIS)) {
-                fail(notAccepted());
+            if (refusal != null
+                    && refusal.getRawErrorCode() == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode()) {
+                capacityRefusal = refusal;
+            }
+            if (deadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(delayMillis)) {
+                fail(deadlineRefusal());
                 return false;
             }
             return !result.isDone();
@@ -1206,16 +1844,24 @@ final class PollRouter {
             if (payloadLease != null) {
                 payloadLease.finishWrite();
             }
-            if (state.ticket() != null) {
-                if (error != null
-                        && !state.committed()
-                        && (state.wasUncertain()
-                                || unwrap(error) instanceof IggyOperationException operationError
-                                        && operationError.getErrorCode() == IggyErrorCode.OPERATION_UNCERTAIN)) {
-                    state.retainTicket();
-                } else {
-                    state.ticket().complete();
-                }
+            CompletableFuture<Void> settled =
+                    state.ticket() == null ? null : state.ticket().attemptSettled();
+            if (commits && result.isCancelled() && settled != null && !settled.isDone()) {
+                settled.whenComplete((ignored, attemptError) -> settleTicket(error));
+            } else if (state.ticket() != null) {
+                settleTicket(error);
+            }
+        }
+
+        private void settleTicket(Throwable error) {
+            if (error != null
+                    && !state.committed()
+                    && (state.wasUncertain()
+                            || unwrap(error) instanceof IggyOperationException operationError
+                                    && operationError.getErrorCode() == IggyErrorCode.OPERATION_UNCERTAIN)) {
+                state.retainTicket();
+            } else {
+                state.ticket().complete();
             }
         }
 
@@ -1226,13 +1872,68 @@ final class PollRouter {
                             : unwrap(error));
         }
 
+        /** Ends a poll between attempts, preserving uncertainty once its frame may have been sent. */
+        @SuppressWarnings("checkstyle:CyclomaticComplexity")
         private synchronized void endPending() {
+            // Admission supplies the ticket before a lane-bound request can be written.
+            boolean mayBeWritten = dataSent && (!requiresLane || state.ticket() != null);
             fail(
                     state.ticket() != null && dataSent && !retryingRefusal && lifecycleRefusal == null
                             ? state.retainTicket()
-                            : lifecycleRefusal != null
-                                    ? lifecycleRefusal
-                                    : retryingRefusal || !dataSent ? notAccepted() : uncommitted());
+                            : state.signedOut()
+                                    ? state.lineageEnded(null)
+                                    : lifecycleRefusal != null
+                                            ? lifecycleRefusal
+                                            : retryingRefusal
+                                                    ? deadlineRefusal()
+                                                    : !mayBeWritten ? notAccepted() : uncommitted());
+        }
+
+        private synchronized IggyServerException deadlineRefusal() {
+            return capacityRefusal != null ? capacityRefusal : notAccepted();
+        }
+    }
+
+    /**
+     * The target bytes of a partition request, or their stream and topic prefix, compared by content. Nothing writes
+     * the bytes after a key holds them.
+     */
+    private static final class TargetKey {
+        private final byte[] target;
+        private final int length;
+        private final int hash;
+
+        private TargetKey(byte[] target, int length) {
+            this.target = target;
+            this.length = length;
+            int contentHash = 1;
+            for (int index = 0; index < length; index++) {
+                contentHash = 31 * contentHash + target[index];
+            }
+            this.hash = contentHash;
+        }
+
+        static TargetKey of(byte[] target) {
+            return new TargetKey(target, target.length);
+        }
+
+        /** The stream and topic of a partition target, without its trailing partition id. */
+        TargetKey topic() {
+            return new TargetKey(target, length - Integer.BYTES);
+        }
+
+        boolean startsWith(TargetKey prefix) {
+            return length >= prefix.length && Arrays.equals(target, 0, prefix.length, prefix.target, 0, prefix.length);
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof TargetKey key && Arrays.equals(target, 0, length, key.target, 0, key.length);
+        }
+
+        @Override
+        public int hashCode() {
+            return hash;
         }
     }
 
@@ -1253,7 +1954,26 @@ final class PollRouter {
             boolean local,
             long view,
             boolean stale,
-            ConnectionInfo hint) {}
+            ConnectionInfo hint) {
+        /**
+         * This route, to be looked up again before its next use. The lookup asks {@code lookupHint} first, and an answer
+         * of the same incarnation with a view below {@code floorView} does not replace the route.
+         */
+        Route markedStale(long floorView, ConnectionInfo lookupHint) {
+            return new Route(
+                    endpoint,
+                    attachment,
+                    parent,
+                    generation,
+                    bindSecret,
+                    context,
+                    partitionsCount,
+                    local,
+                    floorView,
+                    true,
+                    lookupHint);
+        }
+    }
 
     private record Attachment(long clientLow, long clientHigh, long session, long watermark) {
         private Attachment {

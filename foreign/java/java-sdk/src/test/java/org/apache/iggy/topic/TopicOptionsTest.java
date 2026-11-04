@@ -38,9 +38,8 @@ class TopicOptionsTest {
 
     @Test
     void shouldEmitOnlyTheKeysThatWereSet() {
-        var options = TopicOptions.builder()
-                .durability(org.apache.iggy.topic.Durability.PERSISTED)
-                .build();
+        var options =
+                TopicOptions.builder().durability(Durability.PERSISTED).build().entries();
 
         assertThat(options).containsOnlyKeys("durability", "consumer_offset_durability");
         assertThat(options.get("durability").kind()).isEqualTo(HeaderKind.String);
@@ -51,11 +50,13 @@ class TopicOptionsTest {
     void shouldEncodeEveryKeyInItsCatalogKind() {
         var options = TopicOptions.builder()
                 .segmentSize(BigInteger.valueOf(134_217_728))
-                .durability(org.apache.iggy.topic.Durability.REPLICATED)
+                .durability(Durability.REPLICATED)
                 .messagesRequiredToSave(1024)
                 .sizeOfMessagesRequiredToSave(BigInteger.valueOf(1_048_576))
                 .preallocateSegments(true)
-                .build();
+                .replicationFactor(3)
+                .build()
+                .entries();
 
         assertThat(options)
                 .containsOnlyKeys(
@@ -64,11 +65,14 @@ class TopicOptionsTest {
                         "consumer_offset_durability",
                         "messages_required_to_save",
                         "size_of_messages_required_to_save",
-                        "preallocate_segments");
+                        "preallocate_segments",
+                        "replication_factor");
         assertThat(options.get("segment_size").kind()).isEqualTo(HeaderKind.Uint64);
         assertThat(options.get("messages_required_to_save").kind()).isEqualTo(HeaderKind.Uint32);
         assertThat(options.get("size_of_messages_required_to_save").kind()).isEqualTo(HeaderKind.Uint64);
         assertThat(options.get("preallocate_segments").kind()).isEqualTo(HeaderKind.Bool);
+        assertThat(options.get("replication_factor").kind()).isEqualTo(HeaderKind.Uint32);
+        assertThat(options.get("replication_factor").value()).containsExactly(3, 0, 0, 0);
         // Little-endian, so the low byte of 128 MiB leads and the high bytes are zero.
         assertThat(options.get("segment_size").value()).containsExactly(0, 0, 0, 8, 0, 0, 0, 0);
     }
@@ -78,8 +82,9 @@ class TopicOptionsTest {
         var options = TopicOptions.builder()
                 .preallocateSegments(true)
                 .segmentSize(BigInteger.valueOf(134_217_728))
-                .durability(org.apache.iggy.topic.Durability.REPLICATED)
-                .build();
+                .durability(Durability.REPLICATED)
+                .build()
+                .entries();
 
         assertThat(options.keySet())
                 .containsExactly("durability", "consumer_offset_durability", "preallocate_segments", "segment_size");

@@ -51,7 +51,7 @@ async fn given_replicated_partition_when_no_ack_offsets_mutate_should_converge_a
     let stream = Identifier::named(STREAM_NAME).expect("stream identifier");
     let topic = Identifier::named(TOPIC_NAME).expect("topic identifier");
     let stream_details = client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let topic_details = client
@@ -150,11 +150,14 @@ async fn given_replicated_partition_when_no_ack_offsets_mutate_should_converge_a
         .poll_messages(
             &stream,
             &topic,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &auto_commit_consumer,
             &PollingStrategy::first(),
-            1,
-            true,
+            PollOptions {
+                count: 1,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("auto-commit poll within limit");

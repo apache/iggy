@@ -20,7 +20,6 @@
 //! whether the route is mounted. The scrape handler itself lives with the
 //! other route handlers so this leaf never imports the state hub.
 
-use std::fmt::Write;
 use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -29,9 +28,7 @@ use configs::http::HttpMetricsConfig;
 use iggy_common::{IggyError, stats_rollup_underflows};
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::text::encode;
-use prometheus_client::encoding::{
-    DescriptorEncoder, EncodeLabelValue, EncodeMetric, LabelValueEncoder,
-};
+use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric};
 use prometheus_client::metrics::MetricType;
 use prometheus_client::metrics::counter::{ConstCounter, Counter};
 use prometheus_client::metrics::gauge::{ConstGauge, Gauge};
@@ -156,34 +153,10 @@ fn encode_topic_gauge(
         let Some(value) = value(sample) else {
             continue;
         };
-        let labels = [
-            ("stream", EscapedLabelValue(&sample.stream)),
-            ("topic", EscapedLabelValue(&sample.topic)),
-        ];
+        let labels = [("stream", &*sample.stream), ("topic", &*sample.topic)];
         ConstGauge::new(value).encode(metric_encoder.encode_family(&labels)?)?;
     }
     Ok(())
-}
-
-/// prometheus-client writes label values verbatim, and stream and topic names
-/// may contain any character the exposition format treats as syntax.
-struct EscapedLabelValue<'a>(&'a str);
-
-impl EncodeLabelValue for EscapedLabelValue<'_> {
-    fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), std::fmt::Error> {
-        if !self.0.contains(['\\', '"', '\n']) {
-            return encoder.write_str(self.0);
-        }
-        for character in self.0.chars() {
-            match character {
-                '\\' => encoder.write_str("\\\\")?,
-                '"' => encoder.write_str("\\\"")?,
-                '\n' => encoder.write_str("\\n")?,
-                other => encoder.write_char(other)?,
-            }
-        }
-        Ok(())
-    }
 }
 
 /// Exports the disk usage estimate as a gauge, read at encode time like
@@ -253,6 +226,14 @@ pub(in crate::http) struct HttpMetrics {
     pub(in crate::http) users: Gauge,
     pub(in crate::http) clients: Gauge,
     pub(in crate::http) topic_usage: TopicUsage,
+    /// Partition primary lookups on the owning shard for HTTP partition requests.
+    pub(in crate::http) partition_primary_probes: Counter,
+    /// Attempts to relay an HTTP partition request to another node.
+    pub(in crate::http) partition_relays: Counter,
+    /// Requests for the metadata primary's commit floor, one per attempt.
+    pub(in crate::http) metadata_floor_reads: Counter,
+    /// VSR `Register` submits for HTTP sessions, one per minted client id.
+    pub(in crate::http) session_registers: Counter,
     last_output_len: AtomicUsize,
 }
 
@@ -283,6 +264,31 @@ impl HttpMetrics {
         registry.register("messages", "total count of messages", messages.clone());
         registry.register("users", "total count of users", users.clone());
         registry.register("clients", "total count of clients", clients.clone());
+        // Not legacy parity: what routing the HTTP partition requests cost.
+        let partition_primary_probes = Counter::default();
+        let partition_relays = Counter::default();
+        let metadata_floor_reads = Counter::default();
+        let session_registers = Counter::default();
+        registry.register(
+            "http_partition_primary_probes",
+            "partition primary lookups on the owning shard for HTTP partition requests",
+            partition_primary_probes.clone(),
+        );
+        registry.register(
+            "http_partition_relays",
+            "attempts to relay an HTTP partition request to the partition primary on another node",
+            partition_relays.clone(),
+        );
+        registry.register(
+            "http_metadata_floor_reads",
+            "requests for the metadata primary's commit floor by linearizable HTTP partition reads",
+            metadata_floor_reads.clone(),
+        );
+        registry.register(
+            "http_session_registers",
+            "VSR Register submits that open an HTTP session, a metadata commit each",
+            session_registers.clone(),
+        );
         // Not a legacy-parity metric, and not a mirrored one: the source is a
         // process-wide static the scrape reads directly.
         registry.register_collector(Box::new(StatsRollupUnderflows));
@@ -314,6 +320,10 @@ impl HttpMetrics {
             users,
             clients,
             topic_usage,
+            partition_primary_probes,
+            partition_relays,
+            metadata_floor_reads,
+            session_registers,
             last_output_len: AtomicUsize::new(0),
         }
     }

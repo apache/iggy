@@ -173,6 +173,15 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
     CompletableFuture<Optional<ConsumerGroupAssignment>> syncConsumerGroup(
             StreamId streamId, TopicId topicId, ConsumerId groupId, long deadline) {
+        return syncConsumerGroup(streamId, topicId, groupId, deadline, new AsyncTcpConnection.TransientFailoverState());
+    }
+
+    CompletableFuture<Optional<ConsumerGroupAssignment>> syncConsumerGroup(
+            StreamId streamId,
+            TopicId topicId,
+            ConsumerId groupId,
+            long deadline,
+            AsyncTcpConnection.TransientFailoverState state) {
         var payload = Unpooled.buffer();
         payload.writeBytes(BytesSerializer.toBytes(streamId));
         payload.writeBytes(BytesSerializer.toBytes(topicId));
@@ -184,7 +193,7 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
         // to an empty Optional; a member owning zero partitions still gets a
         // non-empty body with a zero partition count.
         return AsyncTcpConnection.mapResponse(
-                connection().send(CommandCode.ConsumerGroup.SYNC.getValue(), payload, deadline), response -> {
+                connection().send(CommandCode.ConsumerGroup.SYNC.getValue(), payload, deadline, state), response -> {
                     try {
                         return response.isReadable()
                                 ? Optional.of(BytesDeserializer.readConsumerGroupAssignment(response))

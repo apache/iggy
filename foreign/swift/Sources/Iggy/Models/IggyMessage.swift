@@ -182,6 +182,11 @@ public struct PolledMessages: Sendable, Hashable {
     /// Number of messages the server reported.
     public var count: UInt32
     public var messages: [IggyMessage]
+    /// The start of the request, which the continuation of an empty batch
+    /// keeps.
+    var start: PollingStrategy?
+    /// The reader and generation that delivered the batch.
+    var stamp: ReaderStamp?
 
     public init(partitionID: UInt32, currentOffset: UInt64, count: UInt32, messages: [IggyMessage], context: PartitionContext = .empty) {
         self.context = context
@@ -202,6 +207,55 @@ public struct PolledMessages: Sendable, Hashable {
     /// `RESYNC_REQUIRED_PARTITION_SENTINEL` in `core/common`. The client
     /// syncs the assignment and polls again, so callers never see it.
     static let resyncRequiredPartition: UInt32 = UInt32.max
+}
+
+/// One partition of a fetch reply, as `FetchMessagesSection` in the Rust
+/// SDK. A section with a nonzero ``status`` holds no position: its offsets
+/// and context are zero, and the partition stays where the fetch started it.
+struct FetchSection: Sendable, Hashable {
+    var partitionID: UInt32
+    /// Zero for a partition that was read, else the code of the error the
+    /// server answered for this partition alone.
+    var status: UInt32
+    /// The newest offset the partition had when it was read.
+    var currentOffset: UInt64
+    var messagesCount: UInt32
+    var context: PartitionContext
+    /// Where the next fetch of the partition starts: after the last message
+    /// read, or, with nothing read, where this fetch started, past messages
+    /// that retention removed.
+    var nextOffset: UInt64
+    /// The undecoded batch records, as a poll reply carries them after its
+    /// header. They share the buffer of the whole reply.
+    var records: ArraySlice<UInt8>
+    /// ``IggyErrorCode/fetchProgressUncertain`` naming the fetch, for a
+    /// committing section whose error leaves the outcome unknown.
+    var uncertainty: IggyError? = nil
+
+    /// The error of the partition, nil for one that was read.
+    var error: IggyError? {
+        uncertainty ?? (status == 0 ? nil : IggyError(wireCode: status))
+    }
+
+    /// The messages of the section. A section with an error throws it.
+    func decode() throws -> PolledMessages {
+        if let error {
+            throw error
+        }
+        let messages = try Responses.decode(records) { reader in try Batch.decodeMessages(reader.rest, expectedCount: messagesCount) }
+        return PolledMessages(partitionID: partitionID, currentOffset: currentOffset, count: messagesCount, messages: messages, context: context)
+    }
+
+    /// The offset of the first message, read from the table alone. Nil
+    /// without messages. The offsets of a partition have no gaps, so the
+    /// messages end right before ``nextOffset``.
+    var firstOffset: UInt64? {
+        let count = UInt64(messagesCount)
+        guard count > 0, count <= nextOffset else {
+            return nil
+        }
+        return nextOffset - count
+    }
 }
 
 /// One confirmation of a committed batch.

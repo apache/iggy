@@ -31,6 +31,10 @@ The crash behavior is intentionally at-least-once:
 
 An ACK follows Iggy's quorum confirmation. The topic's `durability` policy decides whether that confirmation also waits for stable storage on the quorum. Both policies normally write messages to disk.
 
+A source with `exactly_once = true` removes the duplicates of the second and third rows. Before each send, the runtime stores the producer id, epoch and first sequence of the batch in the source's state. After a NACK or a crash, the plugin produces the batch again from its saved state.
+
+If that batch has the same message count, the runtime sends it with the stored values. The partition then answers with the offset of the first write and writes nothing. The plugin must produce the same messages from the same state, because the partition keeps the first copy. The [runtime README](../runtime/README.md#exactly-once-sources) describes the configuration and the limits.
+
 Source-side ACK work should be idempotent because process termination can interrupt it. NACK handling must discard staged cursor changes and staged delete or mark operations so polling can redeliver the batch. The SDK retries NACKed batches with capped exponential backoff and stops after five consecutive NACKs by default.
 
 A source whose accepted input cannot be re-read after a restart can override `Source::batch_policy()` and call `BatchPolicy::with_max_consecutive_nacks(None)` to keep retrying until shutdown. The SDK warns after 30 seconds without a batch result, but keeps that batch in flight until the runtime replies or the source shuts down.
@@ -174,7 +178,7 @@ The source sends 100 records, then continues polling without new messages. Stdou
 
 The format-conversion transforms define no per-key defaults. Every non-optional key shown above must be present, or the configuration fails to deserialize (`schema_path`, `message_type`, `field_mappings`, and `descriptor_set` are optional).
 
-The two `[[streams]]` shapes differ: a source produces to a single `topic` and can tune batching via `batch_length` and `linger_time`, while a sink consumes from a list of `topics` and can additionally set `batch_length`, `poll_interval`, and `consumer_group`.
+The two `[[streams]]` shapes differ. A source produces to a single `topic` and can tune batching with `batch_length` and `linger_time`. A sink consumes from a list of `topics` and can set `batch_length` and `consumer_group`.
 
 Transforms are keyed by type, so one connector configures at most one `proto_convert`.
 
@@ -189,6 +193,7 @@ These are SDK configuration fields, not Random or Stdout `plugin_config` keys. T
 - **`schema_path`**: Path to the `.proto` file containing message definitions
 - **`message_type`**: Fully qualified name of the protobuf message type to use
 - **`use_any_wrapper`**: Selects the Any fallback when no message descriptor is loaded; a loaded descriptor takes precedence
+- **`field_mappings`**: Maps protobuf field names (keys) to JSON field names (values); JSON field names must be unique
 
 #### Transform Options
 

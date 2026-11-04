@@ -22,17 +22,23 @@ use std::time::Duration;
 
 use tokio::signal;
 use tokio::sync::{Semaphore, broadcast};
+use tokio::time::Instant;
 use tracing::{info, warn};
 
 use iggy_gateway_kafka::auth::IggyAuthenticator;
-use iggy_gateway_kafka::bridge::{IggyBridge, IggyBridgeConfig, IggyTls};
+use iggy_gateway_kafka::bridge::{
+    BridgeError, DEFAULT_TOPIC_PARTITIONS, IggyBridge, IggyBridgeConfig, IggyTls,
+    MAX_TOPIC_PARTITIONS,
+};
 use iggy_gateway_kafka::env::parse_bool;
 use iggy_gateway_kafka::listener::{
-    ListenerConfig, SecurityProtocol, apply_advertised_listeners, parse_listeners,
+    ListenerConfig, SecurityProtocol, apply_advertised_listeners, check_brokers, parse_brokers,
+    parse_listeners,
 };
+use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
 use iggy_gateway_kafka::server::{bind_listeners, init_tracing};
 use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
-use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
+use iggy_gateway_kafka::{CoordinatorLog, GatewayConfig, KafkaGateway};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,12 +53,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .listeners
         .iter()
         .any(|listener| listener.protocol == SecurityProtocol::SaslPlaintext);
-    let bridge = connect_bridge(sasl_enabled).await?;
+    let give_up = Instant::now() + IGGY_STARTUP_LIMIT;
+    let bridge = connect_bridge(sasl_enabled, give_up).await?;
+    // Loaded before the listeners bind, so no client waits in the backlog behind Iggy.
+    let cluster_id = match &bridge {
+        Some(bridge) => Some(
+            retry_until("load the Kafka cluster id", give_up, || {
+                bridge.load_cluster_id()
+            })
+            .await
+            .map_err(|e| e.to_string())?,
+        ),
+        None => None,
+    };
 
     let listeners = bind_listeners(&config).map_err(|e| e.to_string())?;
     let mut server = KafkaGateway::new(config).with_bridge(bridge.clone());
+    if let Some(cluster_id) = cluster_id {
+        server = server.with_cluster_id(cluster_id);
+    }
     if sasl_enabled {
-        let authenticator = IggyAuthenticator::from_env()?;
+        let mut authenticator = IggyAuthenticator::from_env()?;
+        if let Some(bridge) = &bridge {
+            authenticator = authenticator.with_nodes(bridge.known_nodes());
+        }
         if plaintext_sasl {
             // This is the hop the Kafka client's password actually crosses. The warning is tied
             // to the listener that exposes it, not to the Iggy hop, so encrypting the Iggy side
@@ -87,6 +111,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     close_bridge(bridge.as_deref()).await;
     Ok(outcome??)
+}
+
+/// How long startup waits for Iggy. A gateway can start before its Iggy node, and one connect of
+/// the bridge gives up within 15 s.
+const IGGY_STARTUP_LIMIT: Duration = Duration::from_secs(60);
+
+/// The pause between two startup attempts to reach Iggy.
+const IGGY_STARTUP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Runs `attempt` until it succeeds. An error that a retry can fix starts a new attempt, until
+/// `give_up`.
+async fn retry_until<T, Attempt>(
+    what: &str,
+    give_up: Instant,
+    mut attempt: impl FnMut() -> Attempt,
+) -> Result<T, BridgeError>
+where
+    Attempt: Future<Output = Result<T, BridgeError>>,
+{
+    loop {
+        match attempt().await {
+            Err(error)
+                if error.is_retriable()
+                    && Instant::now() + IGGY_STARTUP_RETRY_INTERVAL < give_up =>
+            {
+                warn!("cannot {what} yet, retrying in {IGGY_STARTUP_RETRY_INTERVAL:?}: {error}");
+                tokio::time::sleep(IGGY_STARTUP_RETRY_INTERVAL).await;
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 /// How long shutdown waits for the Iggy clients to sign out. The connection drain before it can
@@ -138,9 +193,14 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS",
     "IGGY_KAFKA_BRIDGE_ENABLED",
     "IGGY_KAFKA_INSTANCE_ID",
+    "IGGY_KAFKA_NODE_ID",
+    "IGGY_KAFKA_BROKERS",
+    "IGGY_KAFKA_COORDINATOR_LOG",
     "IGGY_KAFKA_SASL_ENABLED",
     "IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS",
     "IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS",
+    "IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED",
+    "IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS",
 ];
 
 /// The variables of the single-listener form, which `IGGY_KAFKA_LISTENERS` replaces as a whole.
@@ -187,10 +247,13 @@ fn reject_unknown_kafka_env_vars() -> Result<(), String> {
 /// Connects the Iggy bridge when `IGGY_KAFKA_BRIDGE_ENABLED` is true, otherwise returns `None`
 /// and every handler keeps answering with its stub.
 ///
-/// Off by default, so wiring one API at a time does not change what an operator sees. A failed
-/// connect is fatal: an operator who turned the bridge on must learn it is unreachable at
-/// startup, not from `NOT_LEADER_OR_FOLLOWER` on every produce.
-async fn connect_bridge(sasl_enabled: bool) -> Result<Option<Arc<IggyBridge>>, String> {
+/// Off by default, so wiring one API at a time does not change what an operator sees. A connect
+/// that still fails at `give_up` is fatal: an operator who turned the bridge on must learn it is
+/// unreachable at startup, not from `NOT_LEADER_OR_FOLLOWER` on every produce.
+async fn connect_bridge(
+    sasl_enabled: bool,
+    give_up: Instant,
+) -> Result<Option<Arc<IggyBridge>>, String> {
     if !bridge_enabled()? {
         let set: Vec<&str> = IggyBridgeConfig::KNOWN_ENV_VARS
             .iter()
@@ -221,9 +284,11 @@ async fn connect_bridge(sasl_enabled: bool) -> Result<Option<Arc<IggyBridge>>, S
              in the clear; set IGGY_KAFKA_IGGY_TLS_ENABLED=true to encrypt it"
         );
     }
-    let bridge = IggyBridge::connect(config)
-        .await
-        .map_err(|e| format!("failed to connect the Iggy bridge: {e}"))?;
+    let bridge = retry_until("connect the Iggy bridge", give_up, || {
+        IggyBridge::connect(config.clone())
+    })
+    .await
+    .map_err(|e| format!("failed to connect the Iggy bridge: {e}"))?;
     info!("Iggy bridge connected");
     Ok(Some(Arc::new(bridge)))
 }
@@ -299,17 +364,29 @@ fn load_config() -> Result<GatewayConfig, String> {
             .map_err(|e| format!("invalid IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS `{raw}`: {e}"))?;
         config.shutdown_drain_timeout = Duration::from_secs(secs);
     }
+    load_brokers(&mut config)?;
     // Not `parse_positive`: 0 is the default, and the right value for a single gateway.
     if let Some(raw) = env_var("IGGY_KAFKA_INSTANCE_ID") {
         config.instance_id = raw
             .parse()
             .map_err(|e| format!("invalid IGGY_KAFKA_INSTANCE_ID `{raw}`: {e}"))?;
+    } else if env_var("IGGY_KAFKA_NODE_ID").is_some() {
+        // The node id is already unique among the gateways, so it keeps their producer ids apart.
+        config.instance_id = config.node_id;
     } else {
         // A second gateway left on the default hands out the same producer ids as the first,
         // and nothing in the cluster can detect it, so an unset value is surfaced at startup.
         warn!(
             "IGGY_KAFKA_INSTANCE_ID is not set, defaulting to 0: every gateway fronting the same \
              Iggy cluster needs its own value, or they hand out colliding producer ids"
+        );
+    }
+    config.coordinator_log = load_coordinator_log(&config, bridge_enabled()?)?;
+    config.auto_topic_creation = load_auto_topic_creation(bridge_enabled()?)?;
+    if config.auto_topic_creation.enabled {
+        info!(
+            partitions = config.auto_topic_creation.partitions,
+            "auto topic creation is on: a Metadata lookup of a missing topic creates it"
         );
     }
     reject_unread_iggy_tls(
@@ -319,6 +396,61 @@ fn load_config() -> Result<GatewayConfig, String> {
     )?;
 
     Ok(config)
+}
+
+/// Whether the gateways share their groups through the coordinator log. On by default when
+/// `IGGY_KAFKA_BROKERS` lists the gateways and the bridge is on, unless the bridge user cannot
+/// read Iggy's metadata change log. Set on, the log needs that.
+fn load_coordinator_log(
+    config: &GatewayConfig,
+    bridge_enabled: bool,
+) -> Result<CoordinatorLog, String> {
+    let Some(raw) = env_var("IGGY_KAFKA_COORDINATOR_LOG") else {
+        let preferred = bridge_enabled && !config.brokers.is_empty();
+        return Ok(if preferred {
+            CoordinatorLog::Preferred
+        } else {
+            CoordinatorLog::Off
+        });
+    };
+    let enabled = parse_bool("IGGY_KAFKA_COORDINATOR_LOG", &raw)?;
+    if enabled && !bridge_enabled {
+        return Err("IGGY_KAFKA_COORDINATOR_LOG needs IGGY_KAFKA_BRIDGE_ENABLED=true".to_string());
+    }
+    if !enabled && config.brokers.len() > 1 {
+        warn!(
+            "IGGY_KAFKA_COORDINATOR_LOG is false while IGGY_KAFKA_BROKERS lists several \
+             gateways: the gateway with the lowest node id coordinates every group, and its \
+             groups do not move when it stops"
+        );
+    }
+    Ok(if enabled {
+        CoordinatorLog::Required
+    } else {
+        CoordinatorLog::Off
+    })
+}
+
+/// This gateway's node id and the list of every gateway, from `IGGY_KAFKA_NODE_ID` and
+/// `IGGY_KAFKA_BROKERS`. The list needs the node id, since it names this gateway too.
+fn load_brokers(config: &mut GatewayConfig) -> Result<(), String> {
+    let node_id = env_var("IGGY_KAFKA_NODE_ID");
+    if let Some(raw) = &node_id {
+        config.node_id = raw
+            .parse()
+            .map_err(|e| format!("invalid IGGY_KAFKA_NODE_ID `{raw}`: {e}"))?;
+    }
+    let Some(raw) = env_var("IGGY_KAFKA_BROKERS") else {
+        return Ok(());
+    };
+    if node_id.is_none() {
+        return Err(
+            "IGGY_KAFKA_BROKERS lists every gateway, so IGGY_KAFKA_NODE_ID must name this one"
+                .to_string(),
+        );
+    }
+    config.brokers = parse_brokers(&raw).map_err(|e| e.to_string())?;
+    check_brokers(&config.brokers, &config.listeners, config.node_id).map_err(|e| e.to_string())
 }
 
 /// The listeners, from `IGGY_KAFKA_LISTENERS` or from the single-listener variables.
@@ -530,6 +662,47 @@ where
     Ok(value)
 }
 
+/// `IGGY_KAFKA_AUTO_CREATE_TOPICS_*`. A partition count with creation off, or creation without a
+/// bridge to create through, is refused rather than silently ignored.
+fn load_auto_topic_creation(bridge_enabled: bool) -> Result<AutoTopicCreationConfig, String> {
+    let enabled = match env_var("IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED") {
+        Some(raw) => parse_bool("IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED", &raw)?,
+        None => false,
+    };
+    let partitions = env_var("IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS");
+    if !enabled {
+        if partitions.is_some() {
+            return Err("IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS is set but \
+                 IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED is not true"
+                .to_string());
+        }
+        return Ok(AutoTopicCreationConfig::default());
+    }
+    if !bridge_enabled {
+        return Err(
+            "IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED needs IGGY_KAFKA_BRIDGE_ENABLED=true"
+                .to_string(),
+        );
+    }
+    let partitions = match partitions {
+        Some(raw) => {
+            let count: u32 = parse_positive("IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS", &raw)?;
+            if count > MAX_TOPIC_PARTITIONS {
+                return Err(format!(
+                    "IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS {count} exceeds Iggy's per-topic \
+                     maximum {MAX_TOPIC_PARTITIONS}"
+                ));
+            }
+            count
+        }
+        None => DEFAULT_TOPIC_PARTITIONS,
+    };
+    Ok(AutoTopicCreationConfig {
+        enabled,
+        partitions,
+    })
+}
+
 /// Wait for Ctrl-C (SIGINT) or, on Unix, SIGTERM (`docker stop`).
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -671,6 +844,50 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial]
+    fn given_a_node_id_and_every_gateway_when_loading_config_should_list_them_and_reuse_the_id() {
+        let config = load_with(&[
+            ("IGGY_KAFKA_NODE_ID", "2"),
+            ("IGGY_KAFKA_BROKERS", "1@gw-1:9093,2@gw-2:9093,3@gw-3:9093"),
+        ])
+        .expect("a node id listed among the gateways must load");
+
+        assert_eq!(config.node_id, 2);
+        assert_eq!(config.brokers.len(), 3);
+        assert_eq!(
+            config.instance_id, 2,
+            "the producer id instance follows the node id when no instance id is set"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn given_an_instance_id_beside_a_node_id_when_loading_config_should_keep_both() {
+        let config = load_with(&[("IGGY_KAFKA_NODE_ID", "2"), ("IGGY_KAFKA_INSTANCE_ID", "9")])
+            .expect("both ids must load");
+
+        assert_eq!((config.node_id, config.instance_id), (2, 9));
+    }
+
+    #[test]
+    #[serial]
+    fn given_brokers_that_do_not_name_this_gateway_when_loading_config_should_refuse_them() {
+        let without_node_id = load_with(&[("IGGY_KAFKA_BROKERS", "1@gw-1:9093")])
+            .expect_err("the list needs this gateway's node id");
+        let not_listed = load_with(&[
+            ("IGGY_KAFKA_NODE_ID", "4"),
+            ("IGGY_KAFKA_BROKERS", "1@gw-1:9093,2@gw-2:9093"),
+        ])
+        .expect_err("node 4 is not in the list");
+
+        assert!(
+            without_node_id.contains("IGGY_KAFKA_NODE_ID"),
+            "{without_node_id}"
+        );
+        assert!(not_listed.contains("node 4"), "{not_listed}");
+    }
+
     /// A bad instance id must fail startup loudly. Silently defaulting to 0 would let two
     /// gateways mint colliding producer ids, which Kafka requires to be unique cluster-wide,
     /// and the message has to name the variable and the offending value or an operator cannot
@@ -691,6 +908,59 @@ mod tests {
                 error.contains(raw),
                 "`{raw}` rejection must quote the offending value, got: {error}"
             );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn given_no_auto_create_vars_when_loading_config_should_leave_auto_creation_off() {
+        let config = load_with(&[]).expect("defaults load");
+        assert!(!config.auto_topic_creation.enabled);
+    }
+
+    #[test]
+    #[serial]
+    fn given_auto_creation_with_a_bridge_when_loading_config_should_read_the_partition_count() {
+        let config = load_with(&[
+            ("IGGY_KAFKA_BRIDGE_ENABLED", "true"),
+            ("IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED", "true"),
+            ("IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS", "6"),
+        ])
+        .expect("a valid auto-creation config loads");
+        assert!(config.auto_topic_creation.enabled);
+        assert_eq!(config.auto_topic_creation.partitions, 6);
+    }
+
+    #[test]
+    #[serial]
+    fn given_an_invalid_auto_create_setting_when_loading_config_should_refuse_and_name_it() {
+        let cases: [(&[(&str, &str)], &str); 4] = [
+            (
+                &[("IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED", "true")],
+                "IGGY_KAFKA_BRIDGE_ENABLED",
+            ),
+            (
+                &[("IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS", "3")],
+                "IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED",
+            ),
+            (
+                &[
+                    ("IGGY_KAFKA_BRIDGE_ENABLED", "true"),
+                    ("IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED", "true"),
+                    ("IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS", "1001"),
+                ],
+                "IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS",
+            ),
+            (
+                &[("IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED", "yes")],
+                "IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED",
+            ),
+        ];
+        for (vars, named) in cases {
+            let error = load_with(vars)
+                .err()
+                .unwrap_or_else(|| panic!("{vars:?} must be refused"));
+            assert!(error.contains(named), "{vars:?}: {error}");
         }
     }
 

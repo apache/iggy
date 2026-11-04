@@ -224,7 +224,7 @@ func TestExchange_GivesUpOnNotCommittedWhenTheBudgetExpires(t *testing.T) {
 
 	_, err := client.do(ctx, &command.CreateStream{Name: "orders"})
 	require.Error(t, err)
-	var uncertain ierror.UncertainOutcome
+	var uncertain ierror.OperationUncertain
 	require.ErrorAs(t, err, &uncertain)
 	require.NotZero(t, uncertain.OperationID)
 }
@@ -252,7 +252,7 @@ func TestExchange_PreservesUncertaintyAfterALaterRefusal(t *testing.T) {
 	}
 	frame, err := appendCommandFrame(nil, request)
 	require.NoError(t, err)
-	_, err = client.drive(context.Background(), request.Code(), nil, frame, nil)
+	_, err = client.drive(context.Background(), request.Code(), nil, frame, nil, nil)
 	require.NoError(t, err, "a later refusal must not escape as permission to register a fresh identity")
 	allRecorded := server.recorded()
 	recorded := allRecorded[:0]
@@ -286,12 +286,11 @@ func TestExchange_RetriesALifecycleRefusalAsANewRequest(t *testing.T) {
 		return replyFrame(vsr.OperationJoinConsumerGroup, append(resultSection(), "joined"...))
 	})
 	captured := iggcon.PartitionContext{Incarnation: 17, OwnerGeneration: 3, MetadataOp: 4}
-	ctx := context.WithValue(context.Background(), capturedPartitionContext{}, captured)
 
 	join := lifecycleBusyJoin(t)
 	frame, err := appendCommandFrame(nil, join)
 	require.NoError(t, err)
-	response, err := client.drive(ctx, join.Code(), nil, frame, &captured)
+	response, err := client.drive(context.Background(), join.Code(), nil, frame, &captured, nil)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("joined"), response)
 
@@ -451,7 +450,7 @@ func TestExchange_SessionEvictionLeavesASentWriteUncertainUntilTheResetDropsIt(t
 
 				err := write.send(context.Background(), client)
 
-				var uncertain ierror.UncertainOutcome
+				var uncertain ierror.OperationUncertain
 				require.ErrorAs(t, err, &uncertain)
 				require.Len(t, requestsFor(server.recorded(), write.operation), 1)
 				client.mtx.Lock()
@@ -494,7 +493,7 @@ func TestExchange_LostLinkKeepsTheSessionAndTheSentWrite(t *testing.T) {
 
 				err := write.send(ctx, client)
 
-				var uncertain ierror.UncertainOutcome
+				var uncertain ierror.OperationUncertain
 				require.ErrorAs(t, err, &uncertain)
 				client.mtx.Lock()
 				bound, kept := client.session.Bound(), client.session.SessionID()
@@ -529,7 +528,7 @@ func TestExchange_LostLinkKeepsTheSessionAndTheSentWrite(t *testing.T) {
 	}
 }
 
-func TestExchange_EvictedPollThatMovesItsConsumerEndsNotCommitted(t *testing.T) {
+func TestExchange_EvictedPollThatMovesItsConsumerEndsWithItsUnknownOutcome(t *testing.T) {
 	for _, test := range []struct {
 		name       string
 		reason     vsr.EvictionReason
@@ -537,10 +536,10 @@ func TestExchange_EvictedPollThatMovesItsConsumerEndsNotCommitted(t *testing.T) 
 		autoCommit bool
 		want       error
 	}{
-		{"no_session/auto_commit", vsr.EvictionNoSession, iggcon.FirstPollingStrategy(), true, ierror.ErrTransientNotCommitted},
+		{"no_session/auto_commit", vsr.EvictionNoSession, iggcon.FirstPollingStrategy(), true, ierror.FetchProgressUncertain{}},
 		{"no_session/next", vsr.EvictionNoSession, iggcon.NextPollingStrategy(), false, ierror.ErrTransientNotCommitted},
 		{"no_session/read_only", vsr.EvictionNoSession, iggcon.FirstPollingStrategy(), false, ierror.ErrTransientNotCommitted},
-		{"stale_client/next", vsr.EvictionStaleClient, iggcon.NextPollingStrategy(), true, ierror.ErrTransientNotCommitted},
+		{"stale_client/auto_commit", vsr.EvictionStaleClient, iggcon.NextPollingStrategy(), true, ierror.FetchProgressUncertain{}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client, serverConn := newOfflinePipeClient(t)
@@ -549,7 +548,7 @@ func TestExchange_EvictedPollThatMovesItsConsumerEndsNotCommitted(t *testing.T) 
 			})
 			partition := uint32(0)
 
-			_, err := client.PollMessages(context.Background(), numericIdentifier(t, 1), numericIdentifier(t, 2),
+			_, err := client.pollMessages(context.Background(), numericIdentifier(t, 1), numericIdentifier(t, 2),
 				iggcon.NewSingleConsumer(numericIdentifier(t, 3)), test.strategy, 1, test.autoCommit, &partition)
 
 			require.ErrorIs(t, err, test.want)
@@ -569,7 +568,7 @@ func TestExchange_DenyReplyToASentWriteStaysDefinitive(t *testing.T) {
 			err := write.send(context.Background(), client)
 
 			require.ErrorIs(t, err, ierror.ErrNotConnected)
-			require.NotErrorIs(t, err, ierror.ErrUncertainOutcome)
+			require.NotErrorIs(t, err, ierror.ErrOperationUncertain)
 			written := requestsFor(server.recorded(), write.operation)
 			require.Len(t, written, 1)
 			require.ErrorIs(t, client.ResolveOperation(context.Background(), written[0].requestID()), ierror.ErrOperationNotRetained)
@@ -701,7 +700,7 @@ func TestSendMessages_RejectsAnEmptyReplyBody(t *testing.T) {
 	_, err = client.SendMessages(context.Background(),
 		numericIdentifier(t, 1), numericIdentifier(t, 1),
 		iggcon.PartitionId(0), []iggcon.IggyMessage{message})
-	assert.ErrorIs(t, err, ierror.ErrUncertainOutcome)
+	assert.ErrorIs(t, err, ierror.ErrOperationUncertain)
 }
 
 func TestSendMessages_AcceptsAZeroCountConfirmationBody(t *testing.T) {
@@ -866,7 +865,7 @@ func TestSendMessages_RejectsAnEmptyBatch(t *testing.T) {
 func topicDetailsBody(t *testing.T, partitionsCount uint32) []byte {
 	t.Helper()
 
-	const nameLenOffset = 49
+	const nameLenOffset = 32
 	name := "orders"
 	body := make([]byte, nameLenOffset+1+len(name)+4+4)
 	binary.LittleEndian.PutUint32(body[0:4], 1)
@@ -874,4 +873,15 @@ func topicDetailsBody(t *testing.T, partitionsCount uint32) []byte {
 	body[nameLenOffset] = byte(len(name))
 	copy(body[nameLenOffset+1:], name)
 	return body
+}
+
+// partitionDetailsBody is one GetTopic/CreateTopic partition entry: zeroed
+// counters and context, then the two u8-counted node lists.
+func partitionDetailsBody(id uint32, members, inSyncMembers []uint8) []byte {
+	body := binary.LittleEndian.AppendUint32(nil, id)
+	body = append(body, make([]byte, 8+4+8+8+8+iggcon.PartitionContextSize)...)
+	body = append(body, uint8(len(members)))
+	body = append(body, members...)
+	body = append(body, uint8(len(inSyncMembers)))
+	return append(body, inSyncMembers...)
 }

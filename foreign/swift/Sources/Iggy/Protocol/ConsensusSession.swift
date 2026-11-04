@@ -37,12 +37,14 @@ struct ConsensusSession: Sendable {
     /// Bearer proof that binds connections to this logical session, sent with
     /// every login. Generated per session and never logged.
     let bindSecret: [UInt8]
+    let registerRequestIdentifier: UInt128Value
     private var requestCounter: UInt64
 
     init(clientID: UInt128Value = .random()) {
         var generator = SystemRandomNumberGenerator()
         self.clientID = clientID
         self.bindSecret = (0..<Requests.bindSecretSize).map { _ in UInt8.random(in: UInt8.min...UInt8.max, using: &generator) }
+        self.registerRequestIdentifier = .random()
         self.session = nil
         self.requestCounter = 1
     }

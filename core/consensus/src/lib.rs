@@ -198,6 +198,11 @@ mod impls;
 pub use impls::*;
 mod plane_mux;
 pub use plane_mux::*;
+mod replication;
+pub use replication::{
+    BackupPrefix, REPLICATION_BATCH_BYTES_MAX, ReplicationProgress, ReplicationSend,
+    ReplicationStats, ReplicationWork,
+};
 mod plane_helpers;
 pub use plane_helpers::*;
 mod metadata_helpers;
@@ -210,7 +215,9 @@ pub use view_change_quorum::*;
 
 mod dvc_merge;
 pub use dvc_merge::*;
+mod replica_set;
+pub use replica_set::{ReplicaSet, ReplicaSetError};
 mod vsr_state;
-pub use vsr_state::{VsrState, VsrStateError};
+pub use vsr_state::{AdoptedView, HistoryCertificate, HistoryRecovery, VsrState, VsrStateError};
 mod vsr_timeout;
 pub use vsr_timeout::{TICK_INTERVAL, TimeoutManager};

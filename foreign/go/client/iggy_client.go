@@ -20,7 +20,6 @@ package client
 import (
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -30,16 +29,13 @@ type Options struct {
 	protocol   iggcon.Protocol
 	tcpOptions []tcp.Option
 	logger     *slog.Logger
-
-	heartbeatInterval time.Duration
 }
 
 func GetDefaultOptions() Options {
 	return Options{
-		protocol:          iggcon.Tcp,
-		tcpOptions:        nil,
-		logger:            slog.New(slog.DiscardHandler),
-		heartbeatInterval: 5 * time.Second,
+		protocol:   iggcon.Tcp,
+		tcpOptions: nil,
+		logger:     slog.New(slog.DiscardHandler),
 	}
 }
 
@@ -67,6 +63,9 @@ func WithLogger(logger *slog.Logger) Option {
 
 type IggyClient struct{ iggcon.Client }
 
+// Unwrap is the client of the protocol, which a reader.PartitionReader reads through.
+func (c *IggyClient) Unwrap() iggcon.Client { return c.Client }
+
 // NewIggyClient creates the IggyClient instance without connecting.
 // Call Connect to establish the connection to the server.
 // If no Option is provided, NewIggyClient will create a default TCP client.
@@ -80,7 +79,6 @@ func NewIggyClient(options ...Option) (iggcon.Client, error) {
 	var cli iggcon.Client
 	switch opts.protocol {
 	case iggcon.Tcp:
-		opts.tcpOptions = append([]tcp.Option{tcp.WithHeartbeatInterval(opts.heartbeatInterval)}, opts.tcpOptions...)
 		cli = tcp.NewIggyTcpClient(opts.logger, opts.tcpOptions...)
 	default:
 		return nil, fmt.Errorf("unknown protocol type: %v", opts.protocol)

@@ -20,8 +20,9 @@ use async_trait::async_trait;
 use iggy_common::SystemClient;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
-    ClientInfo, ClientInfoDetails, IggyError, NonZeroIggyDuration, OptionSpec, OptionsScope,
-    Snapshot, SnapshotCompression, Stats, SystemSnapshotType,
+    ClientInfo, ClientInfoDetails, IggyError, MetadataChanges, MetadataChangesQuery,
+    NonZeroIggyDuration, OptionSpec, OptionsScope, Snapshot, SnapshotCompression, Stats,
+    SystemSnapshotType,
 };
 
 #[async_trait]
@@ -60,5 +61,12 @@ impl SystemClient for IggyClient {
         snapshot_types: Vec<SystemSnapshotType>,
     ) -> Result<Snapshot, IggyError> {
         super::with_client!(self, client => client.snapshot(compression, snapshot_types).await)
+    }
+
+    async fn get_metadata_changes(
+        &self,
+        query: &MetadataChangesQuery,
+    ) -> Result<MetadataChanges, IggyError> {
+        super::with_client!(self, client => client.get_metadata_changes(query).await)
     }
 }

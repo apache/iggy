@@ -29,21 +29,22 @@ import { Partitioning } from '../message/partitioning.utils.js';
 const BIND_SECRET = Buffer.alloc(32, 0x5a);
 
 describe('VSR custom request framing', () => {
-  it('stamps metadata and session payloads with the Rust XXH3-64 checksum', () => {
-    const vectors = [
-      [Buffer.alloc(0), 0x2d06800538d394c2n],
-      [Buffer.from([1, 2, 3]), 0xebce9b7632ae733bn],
-      [Buffer.from('abc'), 0x78af5f94892f3950n]
-    ] as const;
+  it('stamps distinct random identifiers for metadata and session requests', () => {
+    const payloads = [Buffer.alloc(0), Buffer.from([1, 2, 3]), Buffer.from('abc')];
     for (const command of [COMMAND_CODE.LoginRegister, COMMAND_CODE.LoginRegisterWithAccessToken,
       COMMAND_CODE.LogoutUser, COMMAND_CODE.CreateStream, COMMAND_CODE.DeleteSegments]) {
       const session = new VsrSession(7n);
       session.bind(42n);
-      for (const [payload, checksum] of vectors) {
+      for (const payload of payloads) {
         const frame = session.encode(command, payload);
-        assert.equal(frame.readBigUInt64LE(REQUEST_OFFSET.requestChecksum), checksum,
-          `command ${command}, payload ${payload.toString('hex')}`);
-        assert.equal(frame.readBigUInt64LE(REQUEST_OFFSET.requestChecksum + 8), 0n);
+        const another = session.encode(command, payload);
+        const identifier = frame.subarray(REQUEST_OFFSET.requestChecksum, REQUEST_OFFSET.requestChecksum + 16);
+        assert.notDeepEqual(identifier, Buffer.alloc(16));
+        const repeated = another.subarray(REQUEST_OFFSET.requestChecksum, REQUEST_OFFSET.requestChecksum + 16);
+        if (command === COMMAND_CODE.LoginRegister || command === COMMAND_CODE.LoginRegisterWithAccessToken)
+          assert.deepEqual(identifier, repeated);
+        else
+          assert.notDeepEqual(identifier, repeated);
         assert.deepEqual(frame.subarray(HEADER_SIZE), payload);
       }
     }

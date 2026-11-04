@@ -7,7 +7,7 @@
       "src/bdd/**/*.ts"
     ],
     "paths": [
-      "../../bdd/**/*.feature",
+      "../../bdd/scenarios/**/*.feature",
       "./bdd/**/*.feature"
     ]
   }

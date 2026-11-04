@@ -21,11 +21,9 @@ package org.apache.iggy.client.blocking;
 
 import org.apache.iggy.client.BaseIntegrationTest;
 import org.apache.iggy.stream.StreamDetails;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 
-import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -91,15 +89,7 @@ public abstract class IntegrationTest extends BaseIntegrationTest {
 
     protected void setUpStreamAndTopic() {
         setUpStream();
-        client.topics()
-                .createTopic(
-                        STREAM_NAME,
-                        1L,
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        TOPIC_NAME.getName(),
-                        PERSISTED_TOPIC_OPTIONS);
+        client.topics().createTopic(STREAM_NAME, TOPIC_NAME.getName(), 1L, PERSISTED_TOPIC_OPTIONS);
     }
 
     protected void login() {

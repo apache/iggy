@@ -20,26 +20,32 @@
 //! exercises directly: `ensure_stream_and_topic` idempotent on repeated calls, and the bridge
 //! module invoked from a real (non-unit) test rather than only compiled.
 
+use iggy::prelude::StreamCreateOptions;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Duration;
 
 use iggy::prelude::{
-    Identifier, IggyError, IggyMessage, MessageClient, Partitioning, StreamClient, TopicClient,
+    ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, Identifier, IggyError,
+    IggyMessage, MessageClient, Partitioning, StreamClient, TopicClient, TransportEndpoints,
 };
 use secrecy::SecretString;
 use serial_test::serial;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
+use iggy_gateway_kafka::auth::{IggyAuthenticator, SaslAuthenticator};
 use iggy_gateway_kafka::bridge::{
-    BridgeError, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls, OffsetCalls,
-    ProduceSessionLimits, Producer, TopicCreationOutcome, TopicMapping, TopicOverride,
+    BridgeError, DEFAULT_FETCH_SLOTS, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig,
+    IggyTls, KnownNodes, OffsetCalls, PartitionBatch, ProduceSessionLimits, Producer,
+    TopicCreationOutcome, TopicMapping, TopicOverride,
 };
 use iggy_gateway_kafka::protocol::api::ERROR_REQUEST_TIMED_OUT;
+use iggy_gateway_kafka::protocol::sasl::PlainCredentials;
 
 #[path = "common/certs.rs"]
 mod certs;
@@ -92,15 +98,19 @@ async fn given_timed_out_writes_when_writing_again_should_resolve_all_client_lan
     let bridge = IggyBridge::connect(config).await.expect("bridge");
     let raw = raw_client(&server).await;
     let stream = Identifier::named("kafka").expect("stream name");
-    // The first stream write commits successfully; the second commits an already-exists rejection.
+    bridge
+        .ensure_stream_and_topic("rejected", 1)
+        .await
+        .expect("seed the topic the second write is refused for");
+    // The first topic write commits successfully; the second commits an already-exists rejection.
     for (delayed, next) in [("delayed", "next"), ("rejected", "after_rejection")] {
         replies.send(false).expect("hold replies");
         let result = bridge.create_kafka_topic(delayed, 1).await;
         assert!(matches!(result, Err(BridgeError::Timeout)), "{result:?}");
         assert!(
-            raw.get_stream(&stream)
+            raw.get_topic(&stream, &Identifier::named(delayed).expect("topic name"))
                 .await
-                .expect("stream lookup")
+                .expect("topic lookup")
                 .is_some(),
             "the canceled write committed before its reply was released"
         );
@@ -139,7 +149,7 @@ async fn given_timed_out_writes_when_writing_again_should_resolve_all_client_lan
                 .expect("next topic")
                 .is_some()
         );
-        for unsent in [delayed, "blocked", "blocked_deadline"] {
+        for unsent in ["blocked", "blocked_deadline"] {
             assert!(
                 bridge
                     .get_kafka_topic(unsent)
@@ -164,8 +174,11 @@ async fn given_timed_out_writes_when_writing_again_should_resolve_all_client_lan
                     turn,
                     (),
                     &target,
-                    0,
-                    vec![IggyMessage::from_str(payload).expect("message")],
+                    PartitionBatch {
+                        partition: 0,
+                        producer: None,
+                        messages: vec![IggyMessage::from_str(payload).expect("message")],
+                    },
                     deadline,
                 )
                 .await
@@ -552,7 +565,7 @@ async fn ensure_topic_targets_the_streams_live_incarnation_after_a_delete_and_re
         .await
         .expect("delete the stream (and its topic with it)");
     let recreated = raw
-        .create_stream("kafka")
+        .create_stream("kafka", &StreamCreateOptions::default())
         .await
         .expect("recreate a stream under the same name");
     if recreated.id == original.id {
@@ -607,8 +620,11 @@ async fn connect_to_unreachable_iggy_returns_err_not_panic() {
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("valid mapping for this test's fixture data"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        fetch_slots: DEFAULT_FETCH_SLOTS,
         tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
+        idempotent_producers: false,
+        nodes: KnownNodes::default(),
     };
 
     let result = IggyBridge::connect(config).await;
@@ -632,8 +648,11 @@ async fn connect_to_a_black_hole_address_times_out_instead_of_hanging() {
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("valid mapping for this test's fixture data"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        fetch_slots: DEFAULT_FETCH_SLOTS,
         tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
+        idempotent_producers: false,
+        nodes: KnownNodes::default(),
     };
 
     let start = tokio::time::Instant::now();
@@ -1131,4 +1150,74 @@ async fn list_kafka_topics_lists_an_override_target_in_a_non_default_stream_alon
     assert_eq!(topics[0].partitions_count, 2);
     assert_eq!(topics[1].kafka_topic, "payments");
     assert_eq!(topics[1].partitions_count, 1);
+}
+
+/// A roster of one node: the server at `address`.
+fn roster_at(address: &str) -> ClusterMetadata {
+    let socket: SocketAddr = address
+        .parse()
+        .expect("the test server listens on an IP address");
+    ClusterMetadata {
+        name: "iggy-cluster".to_string(),
+        nodes: vec![ClusterNode {
+            replica_id: 0,
+            name: "iggy-node-0".to_string(),
+            ip: socket.ip().to_string(),
+            endpoints: TransportEndpoints::new(socket.port(), 0, 0, 0),
+            role: ClusterNodeRole::Leader,
+            status: ClusterNodeStatus::Healthy,
+        }],
+    }
+}
+
+/// Beside a stopped node, the configured address is down. A new client then dials the nodes of
+/// the last roster the bridge read, so the gateway still opens clients through the other nodes.
+#[tokio::test]
+#[serial]
+async fn given_a_stopped_configured_node_when_connecting_should_dial_the_next_known_node() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let live = server.test_config();
+    let stopped = PortGuard::acquire(); // locked but never bound, like a stopped node
+    let config = IggyBridgeConfig {
+        address: format!("127.0.0.1:{}", stopped.port),
+        ..live.clone()
+    };
+    config.nodes.learn(&roster_at(&live.address));
+
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("the bridge connects through the next known node");
+    bridge
+        .ensure_stream_and_topic("orders", 1)
+        .await
+        .expect("the bridge serves through that node");
+}
+
+/// A SASL login dials the same known nodes, so it is checked beside a stopped node too.
+#[tokio::test]
+#[serial]
+async fn given_a_stopped_configured_node_when_checking_a_login_should_verify_it_on_the_next_node() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let root = server.test_config();
+    let stopped = PortGuard::acquire();
+    let nodes = KnownNodes::default();
+    nodes.learn(&roster_at(&root.address));
+    let authenticator =
+        IggyAuthenticator::new(format!("127.0.0.1:{}", stopped.port)).with_nodes(nodes);
+    let credentials = PlainCredentials {
+        username: root.username.clone(),
+        password: root.password.clone(),
+    };
+    let slots = Semaphore::new(1);
+
+    let principal = authenticator
+        .authenticate(
+            &credentials,
+            slots.acquire().await.expect("an open semaphore"),
+        )
+        .await
+        .expect("the login is verified on the next known node");
+    assert_eq!(principal.username, root.username);
 }

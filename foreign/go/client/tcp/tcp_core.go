@@ -59,13 +59,22 @@ type IggyTcpClient struct {
 	sessionFence       uint64
 	sessionUserID      uint32
 	loggedOut          bool
+	autoLoginBlocked   bool
 	rememberedLogin    AutoLogin
+	epoch              atomic.Pointer[signInEpoch]
 	metadataWatermark  atomic.Uint64
 	operations         *operationRegistry
 	links              *replicaLinks
 	polls              pollRouter
 	groups             groupAssignmentCache
 	topics             topicCache
+	// deferred holds one slot for each deferred poll and fetch
+	// in flight.
+	deferred chan struct{}
+	// commits counts the fetches with auto-commit that may be in flight, and
+	// Close waits for them. Each Add happens under mtx before the close of
+	// closed, or not at all.
+	commits sync.WaitGroup
 }
 
 type config struct {
@@ -173,11 +182,16 @@ func WithServerAddress(address string) Option {
 	}
 }
 
-// WithAutoLogin supplies credentials for the initial session and terminal
-// session recovery. Replacement links bind the existing identity. Without it,
-// successful explicit sign-ins supply remembered credentials until logout.
-// A committed password change or rename of that user updates the stored
-// credentials, also when it is sent raw or proved by ResolveOperation.
+// WithAutoLogin supplies credentials for the initial session. Replacement
+// links bind the existing identity. A terminal session recovery signs in with
+// these credentials until the caller signs in with LoginUser or
+// LoginWithPersonalAccessToken, and as that sign-in after it. After
+// LogoutUser, only such a sign-in by the caller or a Connect after Disconnect
+// signs in again. Disconnect forgets the sign-in of the caller, so the next
+// Connect signs in with these credentials. A failed explicit sign-in or a
+// credential refusal blocks automatic sign-in until another explicit attempt.
+// A committed password change or rename updates stored credentials, also
+// when it is sent raw or proved by ResolveOperation.
 func WithAutoLogin(credentials Credentials) Option {
 	return func(opts *Options) {
 		opts.config.autoLogin = NewAutoLogin(credentials)
@@ -229,6 +243,7 @@ func WithNoDelay(noDelay bool) Option {
 }
 
 // WithPendingOperations bounds active and retained mutation frames, including headers.
+// The same limits independently bound committing-fetch recovery IDs and target keys.
 func WithPendingOperations(maxOperations, maxBytes int) Option {
 	return func(opts *Options) {
 		opts.config.maxPendingOperations = maxOperations
@@ -252,9 +267,10 @@ func NewIggyTcpClient(logger *slog.Logger, options ...Option) *IggyTcpClient {
 			opt(&opts)
 		}
 	}
-	client := &IggyTcpClient{config: opts.config, logger: logger, session: vsr.NewSession(), sessionFence: 1, registerGate: make(chan struct{}, 1), closed: make(chan struct{})}
+	client := &IggyTcpClient{config: opts.config, logger: logger, session: vsr.NewSession(), sessionFence: 1, registerGate: make(chan struct{}, 1), closed: make(chan struct{}), deferred: make(chan struct{}, maxDeferredRequests)}
 	client.operations = newOperationRegistry(opts.config.maxPendingOperations, opts.config.maxPendingBytes)
 	client.links = newReplicaLinks(client)
+	client.epoch.Store(newSignInEpoch())
 	return client
 }
 
@@ -265,16 +281,39 @@ const (
 	replayInterval            = 50 * time.Millisecond
 	lifecycleRetryMaxInterval = time.Second
 	failoverDialTimeout       = 2 * time.Second
+	// maxDeferredRequests bounds the deferred polls and fetches that the client
+	// parks at once. The server parks at most as many for one session on one shard.
+	maxDeferredRequests = 64
 )
 
-type operationDeadline struct{}
+// operationScope marks the context of a call. Its value is the sign-in epoch
+// that the call started in, which every request inside the call keeps.
+type operationScope struct{}
 
-func operationContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	if ctx.Value(operationDeadline{}) != nil {
+func (c *IggyTcpClient) operationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx.Value(operationScope{}) != nil {
 		return ctx, func() {}
 	}
 	timed, cancel := context.WithTimeout(ctx, responseReadTimeout)
-	return context.WithValue(timed, operationDeadline{}, true), cancel
+	return context.WithValue(timed, operationScope{}, c.epoch.Load()), cancel
+}
+
+// deferredContext bounds a deferred poll or a fetch by its
+// own request timeout instead of the default operation budget.
+func (c *IggyTcpClient) deferredContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	timed, cancel := context.WithTimeout(ctx, timeout)
+	if ctx.Value(operationScope{}) != nil {
+		return timed, cancel
+	}
+	return context.WithValue(timed, operationScope{}, c.epoch.Load()), cancel
+}
+
+// callEpoch is the sign-in epoch that the call of ctx started in.
+func (c *IggyTcpClient) callEpoch(ctx context.Context) *signInEpoch {
+	if epoch, ok := ctx.Value(operationScope{}).(*signInEpoch); ok {
+		return epoch
+	}
+	return c.epoch.Load()
 }
 
 // requestBufPool reuses wire-payload buffers across RPCs. A fresh buffer
@@ -306,10 +345,17 @@ func releaseRequestBuf(bp *[]byte) {
 // do sends the command and returns the response body. Commands implementing
 // the appender interface encode directly into a pooled buffer.
 func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, error) {
+	return c.doCaptured(ctx, cmd, nil, nil)
+}
+
+// doCaptured is do for a partition command that carries captured, a context
+// the caller holds, instead of the context its route names, and for a command
+// sent to the replica the caller chose.
+func (c *IggyTcpClient) doCaptured(ctx context.Context, cmd command.Command, captured *iggcon.PartitionContext, replica *uint8) ([]byte, error) {
 	if ctx == nil {
 		return nil, ierror.ErrNilContext
 	}
-	ctx, cancel := operationContext(ctx)
+	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 	bp := acquireRequestBuf()
 	defer releaseRequestBuf(bp)
@@ -325,16 +371,16 @@ func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, er
 		if err != nil {
 			return nil, err
 		}
-		var captured *iggcon.PartitionContext
-		if value, ok := ctx.Value(capturedPartitionContext{}).(iggcon.PartitionContext); ok {
-			captured = &value
-		}
 		if poll, ok := cmd.(*command.PollMessages); ok && poll.Strategy.Context != nil {
 			captured = poll.Strategy.Context
 		}
-		return c.sendRouted(ctx, cmd.Code(), query, frame, captured)
+		if cmd.Code() == command.FetchMessagesCode {
+			// Each target of a fetch carries its own fence.
+			captured = &iggcon.PartitionContext{}
+		}
+		return c.drive(ctx, cmd.Code(), query, frame, captured, nil)
 	}
-	return c.drive(ctx, cmd.Code(), nil, frame, nil)
+	return c.drive(ctx, cmd.Code(), nil, frame, nil, replica)
 }
 
 // rawRequest carries a SendBinaryRequest through do, so a raw partition
@@ -351,16 +397,57 @@ func (r rawRequest) MarshalBinary() ([]byte, error) { return r.payload, nil }
 func (r rawRequest) AppendBinary(b []byte) ([]byte, error) { return append(b, r.payload...), nil }
 
 // SendBinaryRequest sends a command code and payload and returns the raw response body.
-// Session-control codes return ierror.ErrInvalidCommand without writing to the connection.
-// Message sends, polls and consumer offset writes are stamped with the partition context
-// their typed methods would capture, and keep it across retries. A send must name an
-// explicit partition id: a balanced or key-partitioned send returns
-// ierror.ErrFeatureUnavailable without writing, so use SendMessages for those.
+// Session-control codes and deferred-request cancels return ierror.ErrInvalidCommand
+// without writing to the connection. Message sends, polls and consumer offset writes are
+// stamped with the partition context their typed methods would capture, and keep it
+// across retries. A send must name an explicit partition id: a balanced or
+// key-partitioned send returns ierror.ErrFeatureUnavailable without writing, so use
+// SendMessages for those. Deferred polls and fetches take the paths
+// of a deferred poll and a fetch, and limits that the
+// server refuses fail before anything is sent. A fetch preserves its target caps
+// and nonzero fences, resolving zero incarnations before progress admission.
 func (c *IggyTcpClient) SendBinaryRequest(ctx context.Context, code uint32, payload []byte) ([]byte, error) {
-	if isSessionControlCode(code) {
+	if isSessionControlCode(code) || code == uint32(command.CancelDeferredRequestCode) {
 		return nil, ierror.ErrInvalidCommand
 	}
+	if ctx == nil {
+		return nil, ierror.ErrNilContext
+	}
+	switch command.Code(code) {
+	case command.FetchMessagesCode:
+		fetch, err := parseFetch(payload)
+		if err != nil {
+			return nil, err
+		}
+		ctx, cancel := c.deferredContext(ctx, fetch.options.RequestTimeout)
+		defer cancel()
+		reply, _, err := c.fetchMessages(ctx, fetch)
+		return reply, err
+	case command.PollMessagesDeferredCode:
+		options, err := rawDeferredPollOptions(payload)
+		if err != nil {
+			return nil, err
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = c.deferredContext(ctx, options.RequestTimeout)
+		defer cancel()
+	}
 	return c.do(ctx, rawRequest{code: command.Code(code), payload: payload})
+}
+
+// SendBinaryRequestToReplica sends a command code and payload to the replica with id
+// replicaID and returns that replica's raw response body. Session-control codes,
+// replicated commands, polls, fetches, deferred-request cancels and
+// consumer offset reads return ierror.ErrInvalidCommand without writing to the
+// connection. A replica the roster does not name, after one roster read, returns
+// ierror.ErrInvalidIdentifier. The replica's own refusal, such as ierror.ErrNotPrimary,
+// is returned as it is.
+func (c *IggyTcpClient) SendBinaryRequestToReplica(ctx context.Context, code uint32, payload []byte, replicaID uint8) ([]byte, error) {
+	if _, replicated := vsr.ReplicatedOperation(code); replicated || isSessionControlCode(code) || isPartitionRead(command.Code(code)) ||
+		code == uint32(command.CancelDeferredRequestCode) {
+		return nil, ierror.ErrInvalidCommand
+	}
+	return c.doCaptured(ctx, rawRequest{code: command.Code(code), payload: payload}, nil, &replicaID)
 }
 
 // reserveHeader returns buf truncated to exactly the header prologue, growing
@@ -369,6 +456,18 @@ func (c *IggyTcpClient) SendBinaryRequest(ctx context.Context, code uint32, payl
 // write four extra cache lines per request.
 func reserveHeader(buf []byte) []byte {
 	return slices.Grow(buf[:0], vsr.HeaderSize)[:vsr.HeaderSize]
+}
+
+// isPartitionRead reports whether code reads a partition through its primary and
+// incarnation, which a request to a chosen replica does not carry.
+func isPartitionRead(code command.Code) bool {
+	switch code {
+	case command.PollMessagesCode, command.PollMessagesDeferredCode, command.FetchMessagesCode,
+		command.GetOffsetCode:
+		return true
+	default:
+		return false
+	}
 }
 
 func isSessionControlCode(code uint32) bool {
@@ -402,12 +501,29 @@ func appendCommandFrame(buf []byte, cmd command.Command) ([]byte, error) {
 }
 
 func (c *IggyTcpClient) Connect(ctx context.Context) error {
+	err := c.connect(ctx)
+	var refusal *signInRefusal
+	if errors.As(err, &refusal) {
+		return refusal.err
+	}
+	return err
+}
+
+// connect is Connect, except that a refused sign-in stays a signInRefusal, so
+// the recovery and the calls that wait for the attempt can tell it apart.
+func (c *IggyTcpClient) connect(ctx context.Context) error {
 	if ctx == nil {
 		return ierror.ErrNilContext
 	}
 	if c.config.maxPendingOperations <= 0 || c.config.maxPendingBytes <= 0 {
 		return ierror.ErrInvalidConfiguration
 	}
+	epoch := c.callEpoch(ctx)
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(epoch.ctx, cancel)
+	defer cancel()
+	defer stop()
+	ctx = context.WithValue(ctx, operationScope{}, epoch)
 	c.connectMu.Lock()
 	if attempt := c.connectionAttempt; attempt != nil {
 		c.connectMu.Unlock()
@@ -429,14 +545,16 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 		if lifetime == nil {
 			err = ierror.ErrNotConnected
 		} else {
-			sessionCtx, cancel := context.WithCancel(ctx)
-			stop := context.AfterFunc(lifetime, cancel)
-			budgetCtx, endBudget := operationContext(sessionCtx)
-			err = c.establishSession(budgetCtx, link)
-			endBudget()
+			sessionCtx, endSignIn := signInContext(ctx, epoch)
+			stop := context.AfterFunc(lifetime, endSignIn)
+			err = c.establishSession(sessionCtx, link)
 			stop()
-			cancel()
+			endSignIn()
 		}
+	}
+	var refusal *signInRefusal
+	if ended := epoch.err(); ended != nil && !errors.As(err, &refusal) {
+		err = ended
 	}
 	c.connectMu.Lock()
 	attempt.link, attempt.err = link, err
@@ -450,14 +568,34 @@ func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
 	return &iggcon.ConnectionInfo{Protocol: iggcon.Tcp, ServerAddress: c.links.address()}
 }
 
+// GetNoDelay reports whether TCP_NODELAY is set on new connections, which
+// tests and callers can use to observe the parsed nodelay option before a
+// connection exists to read it off.
+func (c *IggyTcpClient) GetNoDelay() bool {
+	// The client configuration does not change after construction, so this
+	// reads the field directly, like the dial path does.
+	return c.config.noDelay
+}
+
+// GetHeartbeatInterval reports the pacing of the managed heartbeat task on
+// ready replica links, which tests and callers can use to observe the
+// parsed heartbeat_interval option before a connection exists.
+func (c *IggyTcpClient) GetHeartbeatInterval() time.Duration {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return c.config.heartbeatInterval
+}
+
 // ResolveOperation replays the retained bytes under their original identity.
 // A committed business rejection is returned unchanged and releases the lane.
 // For an operation that is no longer retained, it returns what a replay proved.
+// An unknown committing fetch returns FetchProgressUncertain without I/O, and its
+// recovery ID is local ownership, not a replayable server receipt.
 func (c *IggyTcpClient) ResolveOperation(ctx context.Context, operationID uint64) error {
 	if ctx == nil {
 		return ierror.ErrNilContext
 	}
-	ctx, cancel := operationContext(ctx)
+	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 	ticket, err := c.operations.resume(ctx, operationID)
 	if errors.Is(err, ierror.ErrOperationNotRetained) {
@@ -483,8 +621,19 @@ func (c *IggyTcpClient) AbandonOperation(ctx context.Context, operationID uint64
 }
 
 func (c *IggyTcpClient) Disconnect() error {
-	c.resetSession(false)
-	c.links.disconnect(true)
+	epoch := c.resetSession(false)
+	c.mtx.Lock()
+	if c.epoch.Load() != epoch {
+		c.mtx.Unlock()
+		return nil
+	}
+	// Registration publication is fenced by the reset. Forget credentials
+	// before waiting, so completion cannot erase a later explicit sign-in.
+	c.rememberedLogin = AutoLogin{}
+	c.loggedOut = c.autoLoginBlocked
+	stopped := c.links.detach()
+	c.mtx.Unlock()
+	stopped(true)
 	c.connectMu.Lock()
 	attempt := c.connectionAttempt
 	c.connectMu.Unlock()
@@ -494,9 +643,30 @@ func (c *IggyTcpClient) Disconnect() error {
 	return nil
 }
 
+// Close ends the client. A fetch with auto-commit is never cancelled,
+// because a cancel after its read drops what it stored, so Close waits for
+// the reply of each one in flight before it closes the links.
 func (c *IggyTcpClient) Close() error {
+	c.mtx.Lock()
 	c.closeOnce.Do(func() { close(c.closed) })
-	return c.Disconnect()
+	c.mtx.Unlock()
+	c.commits.Wait()
+	return errors.Join(c.Disconnect(), c.operations.unresolvedFetch())
+}
+
+// startCommit counts a fetch with auto-commit before it may send. It fails
+// once Close started, so Close waits only for the fetches that it lets
+// through.
+func (c *IggyTcpClient) startCommit() bool {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	select {
+	case <-c.closed:
+		return false
+	default:
+		c.commits.Add(1)
+		return true
+	}
 }
 
 func (c *IggyTcpClient) pause(ctx context.Context, interval time.Duration) error {

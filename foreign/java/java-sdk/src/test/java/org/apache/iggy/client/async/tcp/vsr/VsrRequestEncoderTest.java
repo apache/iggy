@@ -24,10 +24,12 @@ import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.partition.PartitionContext;
+import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -122,6 +124,20 @@ class VsrRequestEncoderTest {
         ByteBuf first = encoder.encode(alloc, CREATE_STREAM_CODE, Unpooled.EMPTY_BUFFER);
         ByteBuf second = encoder.encode(alloc, CREATE_STREAM_CODE, Unpooled.EMPTY_BUFFER);
         try {
+            byte[] firstIdentifier = new byte[16];
+            byte[] secondIdentifier = new byte[16];
+            first.getBytes(VsrHeaders.REQUEST_CHECKSUM_OFFSET, firstIdentifier);
+            second.getBytes(VsrHeaders.REQUEST_CHECKSUM_OFFSET, secondIdentifier);
+            assertThat(firstIdentifier).isNotEqualTo(new byte[16]);
+            assertThat(firstIdentifier).isNotEqualTo(secondIdentifier);
+            ByteBuf retry = first.retainedDuplicate();
+            try {
+                byte[] retryIdentifier = new byte[16];
+                retry.getBytes(VsrHeaders.REQUEST_CHECKSUM_OFFSET, retryIdentifier);
+                assertThat(retryIdentifier).isEqualTo(firstIdentifier);
+            } finally {
+                retry.release();
+            }
             assertThat(first.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(1);
             assertThat(second.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(2);
             assertThat(second.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(42);
@@ -200,6 +216,58 @@ class VsrRequestEncoderTest {
             assertThat(reservedTail).isEqualTo(new byte[32]);
         } finally {
             frame.release();
+        }
+    }
+
+    @Test
+    void shouldKeepFetchHeaderContextZeroAfterObservingMetadata() {
+        session.bind(42);
+        session.observeMetadata(52);
+        PartitionContext context =
+                new PartitionContext(BigInteger.valueOf(17), BigInteger.valueOf(9), BigInteger.valueOf(49));
+
+        for (PartitionContext supplied : List.of(PartitionContext.EMPTY, context)) {
+            ByteBuf frame = encoder.encode(
+                    alloc, CommandCode.Messages.FETCH_MESSAGES.getValue(), Unpooled.EMPTY_BUFFER, supplied);
+            try {
+                assertThat(frame.getLongLE(VsrHeaders.REQUEST_INCARNATION_OFFSET))
+                        .isZero();
+                assertThat(frame.getLongLE(VsrHeaders.REQUEST_OWNER_GENERATION_OFFSET))
+                        .isZero();
+                assertThat(frame.getLongLE(VsrHeaders.REQUEST_METADATA_OP_OFFSET))
+                        .isZero();
+                assertThat(frame.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(42);
+            } finally {
+                frame.release();
+            }
+        }
+    }
+
+    @Test
+    void shouldKeepMetadataFencesForDeferredPollsAndMetadataReads() {
+        session.bind(42);
+        session.observeMetadata(52);
+        PartitionContext context =
+                new PartitionContext(BigInteger.valueOf(17), BigInteger.valueOf(9), BigInteger.valueOf(49));
+        ByteBuf fencedPoll =
+                encoder.encode(alloc, CommandCode.Messages.POLL_DEFERRED.getValue(), Unpooled.EMPTY_BUFFER, context);
+        ByteBuf poll = encoder.encode(alloc, CommandCode.Messages.POLL_DEFERRED.getValue(), Unpooled.EMPTY_BUFFER);
+        ByteBuf metadata = encoder.encode(alloc, GET_CLUSTER_METADATA_CODE, Unpooled.EMPTY_BUFFER);
+        try {
+            assertThat(fencedPoll.getLongLE(VsrHeaders.REQUEST_INCARNATION_OFFSET))
+                    .isEqualTo(17);
+            assertThat(fencedPoll.getLongLE(VsrHeaders.REQUEST_OWNER_GENERATION_OFFSET))
+                    .isEqualTo(9);
+            assertThat(fencedPoll.getLongLE(VsrHeaders.REQUEST_METADATA_OP_OFFSET))
+                    .isEqualTo(49);
+            assertThat(poll.getLongLE(VsrHeaders.REQUEST_METADATA_OP_OFFSET)).isEqualTo(52);
+            assertThat(metadata.getLongLE(VsrHeaders.REQUEST_METADATA_OP_OFFSET))
+                    .isEqualTo(52);
+            assertThat(metadata.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(42);
+        } finally {
+            fencedPoll.release();
+            poll.release();
+            metadata.release();
         }
     }
 

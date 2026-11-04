@@ -15,9 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{AutoLogin, ConnectionStringOptions, Credentials, IggyError, TransportProtocol};
-use secrecy::SecretString;
 use std::str::FromStr;
+
+use secrecy::SecretString;
+
+use crate::{
+    AutoLogin, ConnectionStringOptions, Credentials, IggyError, TransportProtocol,
+    validate_server_address,
+};
 
 const DEFAULT_CONNECTION_STRING_PREFIX: &str = "iggy://";
 const CONNECTION_STRING_PREFIX: &str = "iggy+";
@@ -77,21 +82,16 @@ impl<T: ConnectionStringOptions + Default> ConnectionString<T> {
         }
 
         let server_address = server_and_options[0];
-        if server_address.is_empty() {
-            return Err(IggyError::InvalidConnectionString);
-        }
-
-        if !server_address.contains(':') || server_address.starts_with(':') {
-            return Err(IggyError::InvalidConnectionString);
-        }
-
-        let port = server_address.split(':').collect::<Vec<&str>>()[1];
-        if port.is_empty() {
-            return Err(IggyError::InvalidConnectionString);
-        }
-
-        if port.parse::<u16>().is_err() {
-            return Err(IggyError::InvalidConnectionString);
+        if server_address.starts_with('[') {
+            validate_server_address(server_address)
+                .map_err(|_| IggyError::InvalidConnectionString)?;
+        } else {
+            let (host, port) = server_address
+                .split_once(':')
+                .ok_or(IggyError::InvalidConnectionString)?;
+            if host.is_empty() || !port.parse::<u16>().is_ok_and(|port| port != 0) {
+                return Err(IggyError::InvalidConnectionString);
+            }
         }
 
         let connection_string_options;
@@ -158,9 +158,140 @@ impl ConnectionStringUtils {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NonZeroIggyDuration;
-    use crate::TcpConnectionStringOptions;
+    use crate::{
+        HttpClientConfig, HttpConnectionStringOptions, NonZeroIggyDuration, QuicClientConfig,
+        QuicConnectionStringOptions, TcpClientConfig, TcpConnectionStringOptions,
+        WebSocketClientConfig, WebSocketConnectionStringOptions,
+    };
     use secrecy::ExposeSecret;
+
+    #[test]
+    fn should_succeed_with_ipv4_address_or_hostname() {
+        for server_address in [
+            "127.0.0.1:8090",
+            "localhost:8090",
+            "iggy.default.svc.cluster.local:8090",
+            "my_iggy_server:8090",
+        ] {
+            let value = format!("iggy://user:secret@{server_address}");
+            let connection_string =
+                ConnectionString::<TcpConnectionStringOptions>::new(&value).unwrap();
+            assert_eq!(connection_string.server_address(), server_address);
+        }
+    }
+
+    #[test]
+    fn should_succeed_with_ipv6_address() {
+        for server_address in [
+            "[2001:db8::1]:8090",
+            "[2001:db8:0:0:0:0:0:1]:65535",
+            "[::ffff:192.0.2.1]:8090",
+        ] {
+            let value = format!(
+                "iggy://user:secret@{server_address}?reconnection_retries=3&heartbeat_interval=10s"
+            );
+            let connection_string = ConnectionString::<TcpConnectionStringOptions>::new(&value)
+                .unwrap_or_else(|error| panic!("Failed to parse {server_address}: {error}"));
+
+            assert_eq!(connection_string.server_address(), server_address);
+            match connection_string.auto_login() {
+                AutoLogin::Enabled(Credentials::UsernamePassword(username, password)) => {
+                    assert_eq!(username, "user");
+                    assert_eq!(password.expose_secret(), "secret");
+                }
+                _ => panic!("Expected UsernamePassword credentials"),
+            }
+            assert_eq!(connection_string.options().retries(), Some(3));
+            assert_eq!(
+                connection_string.options().heartbeat_interval(),
+                NonZeroIggyDuration::from_str("10s").unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn should_succeed_with_bracketed_ipv6_address_and_port() {
+        let connection_string =
+            ConnectionString::<TcpConnectionStringOptions>::new("iggy://user:secret@[::1]:8090")
+                .unwrap();
+
+        assert_eq!(connection_string.server_address(), "[::1]:8090");
+    }
+
+    #[test]
+    fn should_succeed_with_ipv6_address_and_pat() {
+        let value = "iggy://iggypat-1234567890abcdef@[::1]:8090";
+        let connection_string = ConnectionString::<TcpConnectionStringOptions>::new(value).unwrap();
+
+        assert_eq!(connection_string.server_address(), "[::1]:8090");
+        match connection_string.auto_login() {
+            AutoLogin::Enabled(Credentials::PersonalAccessToken(token)) => {
+                assert_eq!(token.expose_secret(), "iggypat-1234567890abcdef");
+            }
+            _ => panic!("Expected PersonalAccessToken credentials"),
+        }
+    }
+
+    #[test]
+    fn should_preserve_ipv6_address_in_client_configs() {
+        let tcp = ConnectionString::<TcpConnectionStringOptions>::new(
+            "iggy+tcp://user:secret@[::1]:8090",
+        )
+        .unwrap();
+        assert_eq!(TcpClientConfig::from(tcp).server_address, "[::1]:8090");
+
+        let quic = ConnectionString::<QuicConnectionStringOptions>::new(
+            "iggy+quic://user:secret@[::1]:8080",
+        )
+        .unwrap();
+        assert_eq!(QuicClientConfig::from(quic).server_address, "[::1]:8080");
+
+        let http = ConnectionString::<HttpConnectionStringOptions>::new(
+            "iggy+http://user:secret@[::1]:3000",
+        )
+        .unwrap();
+        assert_eq!(HttpClientConfig::from(http).api_url, "http://[::1]:3000");
+
+        let websocket = ConnectionString::<WebSocketConnectionStringOptions>::new(
+            "iggy+ws://user:secret@[::1]:8092",
+        )
+        .unwrap();
+        assert_eq!(
+            WebSocketClientConfig::from(websocket).server_address,
+            "[::1]:8092"
+        );
+    }
+
+    #[test]
+    fn should_fail_with_invalid_ipv6_address_or_port() {
+        for server_address in [
+            "[::1]",
+            "[::1]:",
+            "[::1]:invalid",
+            "[::1]:65536",
+            "[::1]:0",
+            "[::1]:-1",
+            "[::1]:8090:1234",
+            "[::1:8090",
+            "::1:8090",
+            "2001:db8::1:8090",
+            "[]:8090",
+            "[localhost]:8090",
+            "[gggg::1]:8090",
+            "localhost",
+            "localhost:0",
+            "127.0.0.1:0",
+        ] {
+            let value = format!("iggy://user:secret@{server_address}");
+            assert!(
+                matches!(
+                    ConnectionString::<TcpConnectionStringOptions>::new(&value),
+                    Err(IggyError::InvalidConnectionString)
+                ),
+                "Expected InvalidConnectionString for {server_address}"
+            );
+        }
+    }
 
     #[test]
     fn should_fail_without_username() {

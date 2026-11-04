@@ -26,26 +26,37 @@ import (
 )
 
 func (c *IggyTcpClient) GetClusterMetadata(ctx context.Context) (*iggcon.ClusterMetadata, error) {
-	c.mtx.Lock()
-	fence := c.sessionFence
-	c.mtx.Unlock()
-	body, err := c.do(ctx, &command.GetClusterMetadata{})
-	if err != nil {
-		return nil, err
+	if ctx == nil {
+		return nil, ierror.ErrNilContext
 	}
-	var metadata iggcon.ClusterMetadata
-	if err = metadata.UnmarshalBinary(body); err != nil {
-		return nil, err
+	ctx, cancel := c.operationContext(ctx)
+	defer cancel()
+	for {
+		// The fence refuses a roster that a session change overtook, so it is
+		// taken only after a running recovery, and a recovery that overtakes
+		// the read starts it again under the new session.
+		if err := c.waitForRecovery(ctx); err != nil {
+			return nil, err
+		}
+		c.mtx.Lock()
+		fence := c.sessionFence
+		c.mtx.Unlock()
+		body, err := c.do(ctx, &command.GetClusterMetadata{})
+		if err != nil {
+			return nil, err
+		}
+		var metadata iggcon.ClusterMetadata
+		if err = metadata.UnmarshalBinary(body); err != nil {
+			return nil, err
+		}
+		err = c.installRoster(fence, &metadata)
+		if err == nil {
+			return &metadata, nil
+		}
+		if !c.sessionRecovers(ctx, err) {
+			return nil, err
+		}
 	}
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
-	if c.sessionFence != fence {
-		return nil, ierror.ErrUnauthenticated
-	}
-	if err = c.links.install(&metadata); err != nil {
-		return nil, err
-	}
-	return &metadata, nil
 }
 
 func (c *IggyTcpClient) refreshRoster(ctx context.Context, link *tcpLink) error {
@@ -66,10 +77,16 @@ func (c *IggyTcpClient) refreshRoster(ctx context.Context, link *tcpLink) error 
 	if err = metadata.UnmarshalBinary(body); err != nil {
 		return err
 	}
+	return c.installRoster(fence, &metadata)
+}
+
+// installRoster installs metadata read under the session of fence, unless a
+// session change overtook that read.
+func (c *IggyTcpClient) installRoster(fence uint64, metadata *iggcon.ClusterMetadata) error {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	if c.sessionFence != fence {
 		return ierror.ErrUnauthenticated
 	}
-	return c.links.install(&metadata)
+	return c.links.install(metadata)
 }

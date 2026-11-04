@@ -29,7 +29,7 @@ import {
   peekCommand, readEviction, readReplyOperation, readSize, readStatus, hasCommittedResult,
   REQUEST_OFFSET, REPLY_OFFSET
 } from './header.js';
-import { Operation, isKnownOperation, isResultFramed } from './operation.js';
+import { Operation, isKnownOperation, isResultFramed, requestOperation } from './operation.js';
 
 /** `IggyError` codes this funnel raises client-side. */
 const INVALID_COMMAND = 3;
@@ -65,11 +65,8 @@ const serverError = (command: number, code: number): ResponseError => {
 export const validateReplyForRequest = (reply: Buffer, request: Buffer, command: number): void => {
   const operation = request[REQUEST_OFFSET.operation];
   const actual = readReplyOperation(reply);
-  const matches = actual === operation ||
-    (operation === Operation.CreateTopic && actual === Operation.CreateTopicWithAssignments) ||
-    (operation === Operation.CreatePartitions && actual === Operation.CreatePartitionsWithAssignments) ||
-    (operation === Operation.DeleteSegments && actual === Operation.TruncatePartition);
-  if (reply.readBigUInt64LE(REPLY_OFFSET.request) !== request.readBigUInt64LE(REQUEST_OFFSET.request) || !matches)
+  if (reply.readBigUInt64LE(REPLY_OFFSET.request) !== request.readBigUInt64LE(REQUEST_OFFSET.request) ||
+      requestOperation(actual) !== operation)
     throw responseError(command, INVALID_COMMAND, 'reply does not match request');
   if (!hasCommittedResult(reply))
     return;

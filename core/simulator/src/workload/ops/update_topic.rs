@@ -17,11 +17,17 @@
 
 //! `UpdateTopic` op.
 //!
-//! Targets `Ok` (rename live topic to fresh name), `StreamNotFound` (fabricated
-//! parent stream), or `TopicNotFound` (live stream, fabricated topic).
+//! Targets `Ok` (rename live topic to fresh name, sometimes also setting or
+//! resetting the updatable options), `StreamNotFound` (fabricated parent
+//! stream), or `TopicNotFound` (live stream, fabricated topic).
 //! `NameAlreadyExists` not targeted.
 
+use std::collections::BTreeSet;
+use std::time::Duration;
+
 use iggy_binary_protocol::RoutedRequestHeader;
+use iggy_common::{IggyDuration, IggyExpiry, OptionKey, TopicUpdateOptions};
+use rand::RngExt;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use server_common::Message;
 
@@ -37,6 +43,10 @@ pub struct Input {
     pub stream: String,
     pub topic: String,
     pub new_name: String,
+    /// Set beside the rename so replicas must agree on the canonical value.
+    pub message_expiry: Option<IggyExpiry>,
+    /// Reset beside the rename so replicas must agree on the default resolved at prepare.
+    pub reset: BTreeSet<OptionKey>,
 }
 
 pub const OUTCOMES: &[Outcome] = &[Outcome::Ok, Outcome::StreamNotFound, Outcome::TopicNotFound];
@@ -51,16 +61,32 @@ pub fn sample(
         Outcome::Ok => {
             let (stream, topic) = shadow.pick_topic_pair(prng)?;
             let new_name = shadow.fresh_name("topic");
+            let (message_expiry, reset) = match prng.random_range(0..3u8) {
+                0 => (None, BTreeSet::new()),
+                1 => {
+                    let minutes = 1 + prng.random_range(0..60u64);
+                    let expiry = IggyDuration::from(Duration::from_secs(minutes * 60));
+                    (Some(IggyExpiry::ExpireDuration(expiry)), BTreeSet::new())
+                }
+                _ => (
+                    None,
+                    BTreeSet::from([OptionKey::MessageExpiry, OptionKey::MaxTopicSize]),
+                ),
+            };
             Some(Input {
                 stream,
                 topic,
                 new_name,
+                message_expiry,
+                reset,
             })
         }
         Outcome::StreamNotFound => Some(Input {
             stream: shadow.fabricate_absent_name("stream"),
             topic: shadow.fabricate_absent_name("topic"),
             new_name: shadow.fresh_name("topic"),
+            message_expiry: None,
+            reset: BTreeSet::new(),
         }),
         Outcome::TopicNotFound => {
             let stream = shadow.pick_stream_name(prng)?;
@@ -68,20 +94,34 @@ pub fn sample(
                 stream,
                 topic: shadow.fabricate_absent_name("topic"),
                 new_name: shadow.fresh_name("topic"),
+                message_expiry: None,
+                reset: BTreeSet::new(),
             })
         }
         Outcome::NameAlreadyExists => {
             unreachable!("update_topic does not target NameAlreadyExists")
         }
-        Outcome::InvalidOptionValue | Outcome::UnsupportedOptionKey => {
-            unreachable!("the simulator only sends an empty update options block")
+        Outcome::InvalidOptionValue | Outcome::OptionsBlockTooLarge => {
+            unreachable!("the simulator only sends valid option values")
+        }
+        Outcome::InvalidTopicSize => {
+            unreachable!("the simulator never sets an explicit max topic size")
         }
     }
 }
 
 #[must_use]
 pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
-    client.update_topic(&input.stream, &input.topic, &input.new_name)
+    client.update_topic(
+        &input.stream,
+        &input.topic,
+        &TopicUpdateOptions {
+            name: Some(input.new_name.clone()),
+            message_expiry: input.message_expiry,
+            reset: input.reset.clone(),
+            ..TopicUpdateOptions::default()
+        },
+    )
 }
 
 /// Decode committed `code` into this op's outcome.

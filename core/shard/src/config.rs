@@ -23,14 +23,10 @@
 //! `configs` and `shard` share no dependency edge.
 
 /// Tunables for [`crate::coordinator::ShardZeroCoordinator`].
-#[derive(Debug, Clone)]
+///
+/// Replica links are placed by `message_bus::LinkLayout`, not here.
+#[derive(Debug, Clone, Default)]
 pub struct CoordinatorConfig {
-    /// When `total_shards > 1`, exclude shard 0 from replica placement.
-    /// Shard 0 already hosts the coordinator, the metadata writer, and
-    /// both listeners; replicas are long-lived steady flows, so offload
-    /// them to peer shards by default.
-    pub skip_shard_zero_for_replicas: bool,
-
     /// When `total_shards > 1`, exclude shard 0 from client placement.
     /// Default false: shard 0 continues to serve client traffic because
     /// client connections are short-lived and benefit from shard-0
@@ -38,11 +34,26 @@ pub struct CoordinatorConfig {
     pub skip_shard_zero_for_clients: bool,
 }
 
-impl Default for CoordinatorConfig {
+/// Owner-local deferred poll limits. Running reads retain their byte reservation
+/// until I/O and completion delivery end, even if their caller disconnects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeferredPollConfig {
+    pub max_wait_us: u64,
+    pub max_pending: usize,
+    pub max_pending_per_session: usize,
+    pub max_read_bytes: usize,
+    pub max_inflight_bytes: usize,
+}
+
+/// The defaults of `core/server/config.toml`. A server boot test pins that the two match.
+impl Default for DeferredPollConfig {
     fn default() -> Self {
         Self {
-            skip_shard_zero_for_replicas: true,
-            skip_shard_zero_for_clients: false,
+            max_wait_us: 30_000_000,
+            max_pending: 1024,
+            max_pending_per_session: 64,
+            max_read_bytes: 16 * 1024 * 1024,
+            max_inflight_bytes: 64 * 1024 * 1024,
         }
     }
 }

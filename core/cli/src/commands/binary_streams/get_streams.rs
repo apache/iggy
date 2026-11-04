@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::commands::binary_streams::get_stream::encryption_source;
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -71,7 +72,13 @@ impl CliCommand for GetStreamsCmd {
                 let mut table = Table::new();
 
                 table.set_header(vec![
-                    "ID", "Created", "Name", "Size (B)", "Messages", "Topics",
+                    "ID",
+                    "Created",
+                    "Name",
+                    "Size (B)",
+                    "Messages",
+                    "Topics",
+                    "Encryption",
                 ]);
 
                 streams.iter().for_each(|stream| {
@@ -82,6 +89,7 @@ impl CliCommand for GetStreamsCmd {
                         format!("{}", stream.size),
                         format!("{}", stream.messages_count),
                         format!("{}", stream.topics_count),
+                        encryption_source(stream.encryption_key_source()).to_owned(),
                     ]);
                 });
 
@@ -90,13 +98,14 @@ impl CliCommand for GetStreamsCmd {
             GetStreamsOutput::List => {
                 streams.iter().for_each(|stream| {
                     event!(target: PRINT_TARGET, Level::INFO,
-                        "{}|{}|{}|{}|{}|{}",
+                        "{}|{}|{}|{}|{}|{}|{}",
                         stream.id,
                         stream.created_at,
                         stream.name,
                         stream.size,
                         stream.messages_count,
-                        stream.topics_count
+                        stream.topics_count,
+                        encryption_source(stream.encryption_key_source())
                     );
                 });
             }

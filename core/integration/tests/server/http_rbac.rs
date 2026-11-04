@@ -36,9 +36,9 @@
 
 use crate::server::http_client::HttpClient;
 use iggy::prelude::*;
-use iggy_common::IggyMessagesBatch;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::create_topic::CreateTopic;
+use iggy_common::{IggyMessagesBatch, OptionInputMap};
 use integration::iggy_harness;
 use reqwest::{Response, StatusCode};
 use serde_json::{Value, json};
@@ -94,7 +94,11 @@ impl ClientExt for HttpClient {
         let response = self
             .post_json(
                 "/streams",
-                &serde_json::to_value(CreateStream { name: name.into() }).unwrap(),
+                &serde_json::to_value(CreateStream {
+                    name: name.into(),
+                    options: OptionInputMap::default(),
+                })
+                .unwrap(),
             )
             .await;
         assert!(
@@ -112,11 +116,8 @@ impl ClientExt for HttpClient {
         let command = CreateTopic {
             stream_id: Identifier::default(),
             partitions_count: partitions,
-            compression_algorithm: CompressionAlgorithm::None,
-            message_expiry: IggyExpiry::NeverExpire,
-            max_topic_size: MaxTopicSize::ServerDefault,
             name: topic.to_string(),
-            options: Default::default(),
+            options: OptionInputMap::default(),
         };
         let response = self
             .post_json(
@@ -785,7 +786,7 @@ async fn given_own_password_when_current_wrong_should_reject_and_correct_should_
 /// Admin-initiated change (target != caller): the current password is checked
 /// against the TARGET's stored hash, so a wrong one is 400 `InvalidCredentials`;
 /// a target that does not resolve is left to the replicated apply, which
-/// answers 404 `UserNotFound` (the plaintext is still stripped + hashed first).
+/// answers 404 `UserNotFound` (both plaintext passwords are stripped first).
 #[iggy_harness]
 async fn given_admin_change_password_when_target_current_wrong_or_missing_should_reject(
     harness: &TestHarness,

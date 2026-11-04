@@ -60,7 +60,10 @@ async fn consumer_group_retries_rejoin_after_failure(harness: &TestHarness) {
         streams: None,
     };
 
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &stream_id,
@@ -83,6 +86,7 @@ async fn consumer_group_retries_rejoin_after_failure(harness: &TestHarness) {
             CONSUMER_PASSWORD,
             UserStatus::Active,
             Some(consumer_permissions.clone()),
+            &UserCreateOptions::default(),
         )
         .await
         .unwrap();
@@ -96,8 +100,10 @@ async fn consumer_group_retries_rejoin_after_failure(harness: &TestHarness) {
     let mut consumer = consumer_client
         .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
-        .batch_length(1)
-        .auto_join_consumer_group()
+        .poll_options(PollOptions {
+            count: 1,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .build();
     consumer.init().await.unwrap();
 
@@ -151,7 +157,13 @@ async fn consumer_group_retries_rejoin_after_failure(harness: &TestHarness) {
         .await
         .expect("Consumer rejoin should fail before timeout")
         .expect("Consumer stream should remain open");
-    assert!(matches!(rejoin_result, Err(IggyError::Unauthorized)));
+    assert!(matches!(
+        rejoin_result,
+        Err(ReadError {
+            error: IggyError::Unauthorized,
+            ..
+        })
+    ));
 
     root_client
         .update_permissions(&user_id, Some(consumer_permissions))
@@ -174,7 +186,7 @@ async fn consumer_group_retries_rejoin_after_failure(harness: &TestHarness) {
     assert_eq!(group.members.len(), 1);
 }
 
-// A group member polls its partitions round-robin. Under a strategy other than `next()` the
+// A group member reads all of its partitions. Under a strategy other than `next()` the
 // continuation must be kept per partition: one shared cursor would ask the second partition for
 // the offset reached in the first one and skip its beginning.
 #[iggy_harness(
@@ -191,7 +203,10 @@ async fn given_offset_strategy_when_member_polls_two_partitions_should_read_each
     let stream_id = Identifier::named(STREAM_NAME).unwrap();
     let topic_id = Identifier::named(TOPIC_NAME).unwrap();
 
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &stream_id,
@@ -223,8 +238,10 @@ async fn given_offset_strategy_when_member_polls_two_partitions_should_read_each
         .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
         .polling_strategy(PollingStrategy::offset(0))
-        .batch_length(MESSAGES_PER_PARTITION)
-        .auto_commit(AutoCommit::Disabled)
+        .poll_options(PollOptions {
+            count: MESSAGES_PER_PARTITION,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .build();
     consumer.init().await.unwrap();
 

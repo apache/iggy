@@ -21,11 +21,10 @@ use crate::http::path::encode_segment;
 use crate::prelude::Identifier;
 use crate::prelude::IggyError;
 use async_trait::async_trait;
-use iggy_common::StreamClient;
-use iggy_common::StreamUpdateOptions;
 use iggy_common::create_stream::CreateStream;
-use iggy_common::update_stream::UpdateStream;
-use iggy_common::{Stream, StreamDetails};
+use iggy_common::{
+    OptionInputMap, Stream, StreamClient, StreamCreateOptions, StreamDetails, StreamUpdateOptions,
+};
 
 const PATH: &str = "/streams";
 
@@ -57,12 +56,18 @@ impl StreamClient for HttpClient {
         Ok(streams)
     }
 
-    async fn create_stream(&self, name: &str) -> Result<StreamDetails, IggyError> {
+    async fn create_stream(
+        &self,
+        name: &str,
+        options: &StreamCreateOptions,
+    ) -> Result<StreamDetails, IggyError> {
+        // The options erase on drop, the JSON body the HTTP client serializes does not.
         let response = self
             .post(
                 PATH,
                 &CreateStream {
                     name: name.to_string(),
+                    options: OptionInputMap(options.to_input_map()?),
                 },
             )
             .await?;
@@ -76,16 +81,11 @@ impl StreamClient for HttpClient {
     async fn update_stream(
         &self,
         stream_id: &Identifier,
-        name: &str,
         options: &StreamUpdateOptions,
     ) -> Result<(), IggyError> {
         self.put(
             &get_details_path(&stream_id.as_cow_str()),
-            &UpdateStream {
-                stream_id: stream_id.clone(),
-                name: name.to_string(),
-                options: options.raw.clone(),
-            },
+            &options.to_update_body()?,
         )
         .await?;
         Ok(())

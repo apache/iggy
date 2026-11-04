@@ -18,12 +18,14 @@
 package tcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -32,6 +34,9 @@ import (
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/require"
 )
+
+// recoveryWaitDeadline bounds how long a test call waits for a held recovery.
+const recoveryWaitDeadline = 100 * time.Millisecond
 
 func committedReply(read request, code ierror.Code) []byte {
 	var body []byte
@@ -66,7 +71,7 @@ func serveWrites(peer net.Conn, answer func(write, attempt int, read request) []
 }
 
 // uncertainAnswer answers the first two attempts of a write: 57 makes it
-// uncertain and an unproved rejection ends the call with UncertainOutcome.
+// uncertain and an unproved rejection ends the call with OperationUncertain.
 func uncertainAnswer(attempt int, read request) []byte {
 	if attempt == 0 {
 		return statusReplyFrame(read.operation(), uint32(ierror.TransientNotCommittedCode), nil)
@@ -79,7 +84,7 @@ func uncertainAnswer(attempt int, read request) []byte {
 func uncertainWrite(t *testing.T, client *IggyTcpClient) uint64 {
 	t.Helper()
 	_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
-	var uncertain ierror.UncertainOutcome
+	var uncertain ierror.OperationUncertain
 	require.ErrorAs(t, err, &uncertain)
 	return uncertain.OperationID
 }
@@ -109,7 +114,7 @@ func TestDriverRetainsUnprovedRejectionAndResolvesExactCommittedResult(t *testin
 		}
 	})
 	_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
-	var uncertain ierror.UncertainOutcome
+	var uncertain ierror.OperationUncertain
 	require.ErrorAs(t, err, &uncertain)
 	_, err = client.do(context.Background(), &command.CreateStream{Name: "blocked"})
 	var blocked ierror.LaneBlocked
@@ -347,7 +352,7 @@ func TestDriverLinkAdmissionDeadlineReportsNotAccepted(t *testing.T) {
 			stream, topic, group := groupConsumer(t)
 			partition := uint32(0)
 			consumer := iggcon.NewSingleConsumer(group.Id)
-			_, err := client.PollMessages(context.Background(), stream, topic, consumer, iggcon.FirstPollingStrategy(), 1, false, &partition)
+			_, err := client.pollMessages(context.Background(), stream, topic, consumer, iggcon.FirstPollingStrategy(), 1, false, &partition)
 			require.NoError(t, err)
 			before := len(server.recorded())
 			link := client.links.metadata()
@@ -367,7 +372,7 @@ func TestDriverLinkAdmissionDeadlineReportsNotAccepted(t *testing.T) {
 			case "read":
 				err = client.Ping(ctx)
 			case "progress":
-				_, err = client.PollMessages(ctx, stream, topic, consumer, iggcon.NextPollingStrategy(), 1, true, &partition)
+				_, err = client.pollMessages(ctx, stream, topic, consumer, iggcon.NextPollingStrategy(), 1, true, &partition)
 			}
 			require.ErrorIs(t, err, ierror.ErrTransientNotAccepted)
 			require.Len(t, server.recorded(), before)
@@ -385,8 +390,8 @@ func TestDriverMalformedProgressReplyReportsUnknownWithoutReplay(t *testing.T) {
 	})
 	stream, topic, group := groupConsumer(t)
 	partition := uint32(0)
-	_, err := client.PollMessages(context.Background(), stream, topic, iggcon.NewSingleConsumer(group.Id), iggcon.NextPollingStrategy(), 1, true, &partition)
-	require.ErrorIs(t, err, ierror.ErrTransientNotCommitted)
+	_, err := client.pollMessages(context.Background(), stream, topic, iggcon.NewSingleConsumer(group.Id), iggcon.NextPollingStrategy(), 1, true, &partition)
+	require.ErrorIs(t, err, ierror.FetchProgressUncertain{})
 	require.Equal(t, uint32(1), polls.Load())
 	require.Empty(t, client.operations.retained)
 	require.Empty(t, client.operations.lanes)
@@ -401,7 +406,7 @@ func TestDriverCancelledMutationRetainsItsLaneUntilAbandon(t *testing.T) {
 	go func() { _, err := client.do(ctx, &command.CreateStream{Name: "lost"}); done <- err }()
 	<-received
 	cancel()
-	var uncertain ierror.UncertainOutcome
+	var uncertain ierror.OperationUncertain
 	require.ErrorAs(t, <-done, &uncertain)
 	require.NoError(t, client.AbandonOperation(context.Background(), uncertain.OperationID))
 	require.ErrorIs(t, client.AbandonOperation(context.Background(), uncertain.OperationID), ierror.ErrOperationNotRetained)
@@ -444,7 +449,7 @@ func TestDriverUncertainMutationStaysUncertainWhenTheFenceChangesBeforeItsReplay
 	fence := client.sessionFence
 	client.mtx.Unlock()
 	client.recoverSession(fence)
-	var uncertain ierror.UncertainOutcome
+	var uncertain ierror.OperationUncertain
 	require.ErrorAs(t, <-done, &uncertain)
 	require.Equal(t, id, uncertain.OperationID)
 	creates := 0
@@ -457,7 +462,7 @@ func TestDriverUncertainMutationStaysUncertainWhenTheFenceChangesBeforeItsReplay
 	require.ErrorIs(t, client.ResolveOperation(context.Background(), id), ierror.ErrOperationNotRetained)
 }
 
-func TestDriverUnsentCallFailsWithNotAcceptedOnlyWhileTheSessionRecovers(t *testing.T) {
+func TestDriverUnsentCallWaitsForARunningRecoveryUntilItsDeadline(t *testing.T) {
 	for _, end := range []struct {
 		name string
 		want error
@@ -481,13 +486,16 @@ func TestDriverUnsentCallFailsWithNotAcceptedOnlyWhileTheSessionRecovers(t *test
 					link.writes <- linkTestFrame(uint64(plug))
 				}
 				<-plugged
+				start := time.Now()
+				ctx, cancel := context.WithTimeout(context.Background(), recoveryWaitDeadline)
+				defer cancel()
 				done := make(chan error, 1)
 				go func() {
 					if kind == "read" {
-						done <- client.Ping(context.Background())
+						done <- client.Ping(ctx)
 						return
 					}
-					_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
+					_, err := client.do(ctx, &command.CreateStream{Name: "orders"})
 					done <- err
 				}()
 				require.Eventually(t, func() bool { link.mu.Lock(); defer link.mu.Unlock(); return len(link.pending) == 1 }, time.Second, time.Millisecond)
@@ -499,13 +507,16 @@ func TestDriverUnsentCallFailsWithNotAcceptedOnlyWhileTheSessionRecovers(t *test
 					client.links.disconnect(true)
 				}
 				require.ErrorIs(t, <-done, end.want)
+				if end.name == "recovery" {
+					require.GreaterOrEqual(t, time.Since(start), recoveryWaitDeadline, "the call waits for the recovery until its deadline")
+				}
 				require.Len(t, server.recorded(), 1, "only the first plug reached the server")
 			})
 		}
 	}
 }
 
-func TestDriverSessionRecoveryFailsUnsentCallsWithNotAcceptedUntilItFails(t *testing.T) {
+func TestDriverSessionRecoveryHoldsUnsentCallsUntilItFails(t *testing.T) {
 	client, peer := newPipeClient(t)
 	client.config.reconnection.enabled = false
 	client.config.serverAddress = "invalid-address"
@@ -534,10 +545,8 @@ func TestDriverSessionRecoveryFailsUnsentCallsWithNotAcceptedUntilItFails(t *tes
 	}, time.Second, time.Millisecond)
 	release := holdRecovery(t, client)
 	recoverNow(client)
-	var uncertain ierror.UncertainOutcome
-	require.ErrorAs(t, <-first, &uncertain)
-	require.ErrorIs(t, <-read, ierror.ErrTransientNotAccepted, "a sent read cannot have changed server state")
-	require.ErrorIs(t, <-waiting, ierror.ErrTransientNotAccepted)
+	var uncertain ierror.OperationUncertain
+	require.ErrorAs(t, <-first, &uncertain, "a sent mutation ends without waiting for the recovery")
 	stream, topic, group := groupConsumer(t)
 	partition := uint32(0)
 	create := func() error {
@@ -545,16 +554,93 @@ func TestDriverSessionRecoveryFailsUnsentCallsWithNotAcceptedUntilItFails(t *tes
 		return err
 	}
 	poll := func() error {
-		_, err := client.PollMessages(context.Background(), stream, topic, iggcon.NewSingleConsumer(group.Id), iggcon.FirstPollingStrategy(), 1, false, &partition)
+		_, err := client.pollMessages(context.Background(), stream, topic, iggcon.NewSingleConsumer(group.Id), iggcon.FirstPollingStrategy(), 1, false, &partition)
 		return err
 	}
-	require.ErrorIs(t, create(), ierror.ErrTransientNotAccepted)
-	require.ErrorIs(t, poll(), ierror.ErrTransientNotAccepted)
+	created, polled := make(chan error, 1), make(chan error, 1)
+	go func() { created <- create() }()
+	go func() { polled <- poll() }()
+	held := []chan error{read, waiting, created, polled}
+	require.Never(t, func() bool {
+		for _, call := range held {
+			if len(call) != 0 {
+				return true
+			}
+		}
+		return false
+	}, recoveryWaitDeadline, time.Millisecond, "the calls wait for the running recovery")
 	release()
 	awaitRecoveryEnd(t, client)
-	require.ErrorIs(t, create(), ierror.ErrUnauthenticated, "a failed recovery leaves no session to retry on")
+	require.ErrorIs(t, <-read, ierror.ErrNotConnected, "a failed recovery leaves no link to restart the read on")
+	for _, call := range held[1:] {
+		require.ErrorIs(t, <-call, ierror.ErrUnauthenticated, "a failed recovery leaves no session to restart under")
+	}
+	require.ErrorIs(t, create(), ierror.ErrUnauthenticated)
 	require.ErrorIs(t, poll(), ierror.ErrUnauthenticated)
-	require.Len(t, server.recorded(), 2)
+	require.Len(t, server.recorded(), 2, "no call went out again")
+}
+
+// Two creates wait in the lane of a create that the server answers with an
+// eviction that ends the session. The sent create ends uncertain and never goes
+// out again. The waiting ones keep their order and complete under the session
+// of the recovery.
+func TestDriverUnsentCallsInFlightAtAnEvictionCompleteUnderTheRecoveredSession(t *testing.T) {
+	received, release := make(chan struct{}), make(chan struct{})
+	var registers atomic.Uint64
+	var server *testListener
+	server = listenVSR(t, nil, func(connection, index int, read request) []byte {
+		switch {
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, managedLinkSession+registers.Add(1))
+		case read.operation() == vsr.OperationCreateStream && bytes.Contains(read.payload, []byte("sent")):
+			close(received)
+			<-release
+			return evictionFrame(vsr.EvictionSessionError, 0, 0)
+		case read.operation() == vsr.OperationCreateStream:
+			return committedReply(read, 0)
+		default:
+			return singleNodeHandler(t, func() string { return server.address() })(connection, index, read)
+		}
+	})
+	client := newDialingClient(t, server.address(), WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+	require.NoError(t, client.Connect(context.Background()))
+	create := func(name string, result chan<- error) {
+		_, err := client.do(context.Background(), &command.CreateStream{Name: name})
+		result <- err
+	}
+	sent := make(chan error, 1)
+	go create("sent", sent)
+	<-received
+	waiting := []string{"first", "second"}
+	results := make([]chan error, len(waiting))
+	for index, name := range waiting {
+		results[index] = make(chan error, 1)
+		go create(name, results[index])
+		require.Eventually(t, func() bool {
+			client.operations.mu.Lock()
+			defer client.operations.mu.Unlock()
+			return len(client.operations.lanes[laneKey{}].waiters) == index+1
+		}, time.Second, time.Millisecond)
+	}
+
+	close(release)
+
+	var uncertain ierror.OperationUncertain
+	require.ErrorAs(t, <-sent, &uncertain)
+	for _, result := range results {
+		require.NoError(t, <-result)
+	}
+	creates := requestsFor(server.recorded(), vsr.OperationCreateStream)
+	require.Len(t, creates, 1+len(waiting), "each create went out once")
+	require.Equal(t, uncertain.OperationID, creates[0].requestID())
+	require.ErrorIs(t, client.ResolveOperation(context.Background(), uncertain.OperationID), ierror.ErrOperationNotRetained,
+		"the new session cannot replay an operation of the lost one")
+	require.Len(t, registerRequests(server), 2)
+	for index, name := range waiting {
+		waited := creates[index+1]
+		require.True(t, bytes.Contains(waited.payload, []byte(name)), "the waiting creates keep their order")
+		require.Equal(t, managedLinkSession+2, waited.sessionID(), "under the session of the recovery")
+	}
 }
 
 func TestDriverProgressUncertaintyEndsCallAndReleasesLane(t *testing.T) {
@@ -585,17 +671,26 @@ func TestDriverProgressUncertaintyEndsCallAndReleasesLane(t *testing.T) {
 					strategy = iggcon.OffsetPollingStrategy(0)
 				}
 				ctx, cancel := context.WithCancel(context.Background())
+				if lostReply && autoCommit {
+					// A poll that stores its offset waits for its reply after a cancel, so its reply is lost at the deadline.
+					ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
+				}
 				defer cancel()
 				done := make(chan error, 1)
 				go func() {
-					_, err := client.PollMessages(ctx, stream, topic, iggcon.NewSingleConsumer(consumer), strategy, 1, autoCommit, &partition)
+					_, err := client.pollMessages(ctx, stream, topic, iggcon.NewSingleConsumer(consumer), strategy, 1, autoCommit, &partition)
 					done <- err
 				}()
 				<-received
-				if lostReply {
+				if lostReply && !autoCommit {
 					cancel()
 				}
-				require.ErrorIs(t, <-done, ierror.ErrTransientNotCommitted)
+				var want error = ierror.ErrTransientNotCommitted
+				if autoCommit {
+					// The server can have stored the offset, which only a read shows.
+					want = ierror.FetchProgressUncertain{}
+				}
+				require.ErrorIs(t, <-done, want)
 				require.Equal(t, uint32(1), polls.Load())
 				require.Equal(t, 1, requestCount(server.recorded(), command.PollMessagesCode))
 				client.operations.mu.Lock()
@@ -606,6 +701,139 @@ func TestDriverProgressUncertaintyEndsCallAndReleasesLane(t *testing.T) {
 				require.NoError(t, client.Ping(context.Background()))
 			})
 		}
+	}
+}
+
+// laneCalls makes the calls of the lane tests, all on one partition.
+type laneCalls struct {
+	stream, topic iggcon.Identifier
+	consumer      iggcon.Consumer
+	partition     uint32
+	message       iggcon.IggyMessage
+}
+
+func newLaneCalls(t *testing.T) laneCalls {
+	t.Helper()
+	message, err := iggcon.NewIggyMessage([]byte("payload"))
+	require.NoError(t, err)
+	return laneCalls{
+		stream:    numericIdentifier(t, 1),
+		topic:     numericIdentifier(t, 2),
+		consumer:  iggcon.NewSingleConsumer(numericIdentifier(t, 3)),
+		partition: 1,
+		message:   message,
+	}
+}
+
+func (c laneCalls) send(ctx context.Context, client *IggyTcpClient) error {
+	_, err := client.SendMessages(ctx, c.stream, c.topic, iggcon.PartitionId(c.partition), []iggcon.IggyMessage{c.message})
+	return err
+}
+
+func (c laneCalls) poll(ctx context.Context, client *IggyTcpClient, strategy iggcon.PollingStrategy, autoCommit bool) error {
+	_, err := client.pollMessages(ctx, c.stream, c.topic, c.consumer, strategy, 1, autoCommit, &c.partition)
+	return err
+}
+
+func (c laneCalls) getOffset(ctx context.Context, client *IggyTcpClient) error {
+	_, err := client.GetConsumerOffset(ctx, c.consumer, c.stream, c.topic, &c.partition)
+	return err
+}
+
+func (c laneCalls) storeOffset(ctx context.Context, client *IggyTcpClient) error {
+	return client.StoreConsumerOffset(ctx, c.consumer, c.stream, c.topic, 7, &c.partition)
+}
+
+func (c laneCalls) deleteOffset(ctx context.Context, client *IggyTcpClient) error {
+	return client.DeleteConsumerOffset(ctx, c.consumer, c.stream, c.topic, &c.partition)
+}
+
+// consumerOffsetBody builds the reply of an offset read: the partition, its
+// current offset and the stored offset.
+func consumerOffsetBody(partition uint32) []byte {
+	body := binary.LittleEndian.AppendUint32(nil, partition)
+	body = binary.LittleEndian.AppendUint64(body, 0)
+	return binary.LittleEndian.AppendUint64(body, 0)
+}
+
+// progressLaneWaiters counts the calls that wait for a progress lane.
+func progressLaneWaiters(client *IggyTcpClient) int {
+	client.operations.mu.Lock()
+	defer client.operations.mu.Unlock()
+	waiters := 0
+	for key, lane := range client.operations.lanes {
+		if key.progress {
+			waiters += len(lane.waiters)
+		}
+	}
+	return waiters
+}
+
+// An uncertain offset store or delete blocks the progress of its partition
+// until it is resolved or abandoned, because a replay can still move the
+// offset. An uncertain send blocks only the later writes.
+func TestDriverOnlyARetainedOffsetWriteBlocksProgress(t *testing.T) {
+	calls := newLaneCalls(t)
+	for _, test := range []struct {
+		name           string
+		write          func(context.Context, *IggyTcpClient) error
+		blocksProgress bool
+	}{
+		{"store", calls.storeOffset, true},
+		{"delete", calls.deleteOffset, true},
+		{"send", calls.send, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, serverConn := newPipeClient(t)
+			attempts := make(map[uint64]int)
+			servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+				switch {
+				case read.operation() != vsr.OperationNonReplicated:
+					// 57 makes the write uncertain, and the refusal of its
+					// replay does not prove the outcome.
+					status := ierror.UnauthorizedCode
+					if attempts[read.requestID()] == 0 {
+						status = ierror.TransientNotCommittedCode
+					}
+					attempts[read.requestID()]++
+					return statusReplyFrame(read.operation(), uint32(status), nil)
+				case read.code() == uint32(command.GetOffsetCode):
+					return replyFrame(vsr.OperationNonReplicated, consumerOffsetBody(calls.partition))
+				default:
+					return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(calls.partition))
+				}
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), deferredTestTimeout)
+			defer cancel()
+			var uncertain ierror.OperationUncertain
+			require.ErrorAs(t, test.write(ctx, client), &uncertain)
+			requireBlocked := func(err error, call string) {
+				t.Helper()
+				var blocked ierror.LaneBlocked
+				require.ErrorAs(t, err, &blocked, call)
+				require.Equal(t, uncertain.OperationID, blocked.OperationID, call)
+			}
+
+			requireBlocked(calls.send(ctx, client), "a send")
+			requireBlocked(calls.storeOffset(ctx, client), "an offset store")
+			for _, progress := range []struct {
+				call string
+				err  error
+			}{
+				{"an offset read", calls.getOffset(ctx, client)},
+				{"a Next poll", calls.poll(ctx, client, iggcon.NextPollingStrategy(), false)},
+				{"an auto-commit poll", calls.poll(ctx, client, iggcon.OffsetPollingStrategy(0), true)},
+			} {
+				if test.blocksProgress {
+					requireBlocked(progress.err, progress.call)
+				} else {
+					require.NoError(t, progress.err, progress.call)
+				}
+			}
+			require.NoError(t, calls.poll(ctx, client, iggcon.OffsetPollingStrategy(0), false), "a plain poll takes no lane")
+			require.NoError(t, client.AbandonOperation(ctx, uncertain.OperationID))
+			require.NoError(t, calls.poll(ctx, client, iggcon.NextPollingStrategy(), false))
+		})
 	}
 }
 
@@ -705,7 +933,7 @@ func TestDriverAfterSilentMetadataReplicaDiscoversThroughAnotherLink(t *testing.
 	newPeer, connection := net.Pipe()
 	defer func() { _ = newPeer.Close() }()
 	newLink := newTCPLink(connection, newAddress)
-	newLink.markBound(client.sessionFence, ^uint64(0))
+	newLink.markBound(client.sessionFence)
 	client.links.slots[1] = &replicaSlot{endpoint: newAddress, link: newLink, cancel: func() {}}
 	client.links.rosterOrder = []uint8{0, 1}
 	oldServer := serve(oldPeer, func(_ int, _ request) []byte { return nil })
@@ -766,4 +994,57 @@ func TestDetachedLinkPreservesRetainedMutation(t *testing.T) {
 			require.Len(t, registerRequests(server), 1)
 		})
 	}
+}
+
+// A caller sign-in replaces the session while a read waits to retry the bind
+// of its link. The read ends with 40, as after a session change during any
+// other exchange, so a running recovery could restart it.
+func TestDriverEndsACallWith40WhenItsSessionChangesDuringABind(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client, peer := newPipeClient(t)
+		client.links.bootstrap.markBound(0)
+		var binds atomic.Uint32
+		serve(peer, func(_ int, read request) []byte {
+			if read.code() != uint32(command.BindSessionCode) {
+				return replyFrame(vsr.OperationNonReplicated, nil)
+			}
+			if binds.Add(1) == 1 {
+				return statusReplyFrame(read.operation(), uint32(ierror.TransientNotAcceptedCode), nil)
+			}
+			return bindReplyFrame(7, read.sessionID())
+		})
+		pinged := make(chan error, 1)
+		go func() { pinged <- client.Ping(context.Background()) }()
+		synctest.Wait()
+
+		client.mtx.Lock()
+		client.endSignInEpochLocked(nil)
+		client.invalidateSessionLocked()
+		client.mtx.Unlock()
+
+		require.ErrorIs(t, <-pinged, ierror.ErrUnauthenticated)
+		require.Equal(t, uint32(2), binds.Load(), "the bind went again under the replaced session")
+	})
+}
+
+// A session loss restarts a read whose context ended during its exchange. The
+// read then fails with 58, as a call that waits for the recovery does, and
+// not with the error of its context.
+func TestDriverEndsARestartedReadWith58AfterItsContextEnds(t *testing.T) {
+	client, peer := newPipeClient(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serve(peer, func(_ int, _ request) []byte {
+		// The read sees both changes at once, because it compares the fence
+		// under the same lock.
+		client.mtx.Lock()
+		defer client.mtx.Unlock()
+		cancel()
+		client.recovery, client.recoveryCancel = context.WithCancel(context.Background())
+		client.session.Reset()
+		client.invalidateSessionLocked()
+		return nil
+	})
+
+	require.ErrorIs(t, client.Ping(ctx), ierror.ErrTransientNotAccepted)
 }

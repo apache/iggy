@@ -24,6 +24,7 @@ use iggy::prelude::ClientInfoDetails;
 use iggy::prelude::ConsumerGroupDetails;
 use iggy::prelude::Identifier;
 use iggy::prelude::IggyExpiry;
+use iggy::prelude::StreamCreateOptions;
 use iggy::prelude::{
     ConsumerGroupClient, StreamClient, SystemClient, TopicClient, TopicCreateOptions,
 };
@@ -40,7 +41,10 @@ pub async fn run(harness: &TestHarness) {
     let client3 = create_client(harness).await;
 
     // 1. Create the stream
-    let stream = system_client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = system_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     let stream_id = stream.id;
 

@@ -20,7 +20,6 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
-	"io"
 	"log/slog"
 	"net"
 	"sync"
@@ -30,6 +29,7 @@ import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
+	"github.com/apache/iggy/foreign/go/internal/fakevsr"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/require"
 )
@@ -166,34 +166,9 @@ func bindReplyFrame(userID uint32, session uint64) []byte {
 }
 
 // clusterMetadataFrame builds a cluster roster where the node at leaderIndex
-// is the healthy leader.
+// is the healthy leader, through the shared fakevsr builder.
 func clusterMetadataFrame(t *testing.T, leaderIndex int, addresses ...string) []byte {
-	t.Helper()
-
-	metadata := iggcon.ClusterMetadata{Name: "test-cluster"}
-	for index, address := range addresses {
-		host, port, err := net.SplitHostPort(address)
-		require.NoError(t, err)
-		tcpPort, err := net.LookupPort("tcp", port)
-		require.NoError(t, err)
-
-		role := iggcon.RoleFollower
-		if index == leaderIndex {
-			role = iggcon.RoleLeader
-		}
-		metadata.Nodes = append(metadata.Nodes, iggcon.ClusterNode{
-			ReplicaID: uint8(index),
-			Name:      host,
-			IP:        host,
-			Role:      role,
-			Status:    iggcon.Healthy,
-			Endpoints: iggcon.TransportEndpoints{Tcp: uint16(tcpPort)},
-		})
-	}
-
-	body, err := metadata.MarshalBinary()
-	require.NoError(t, err)
-	return replyFrame(vsr.OperationNonReplicated, body)
+	return fakevsr.ClusterMetadataFrame(t, leaderIndex, addresses...)
 }
 
 // echoReplyRequest stamps the request id into a reply frame the way the
@@ -241,35 +216,25 @@ func versionInfoEnd(t *testing.T, payload []byte) int {
 	return offset
 }
 
-// readRequest reads one complete frame from conn.
+// readRequest reads one complete frame from conn through the shared
+// fakevsr reader, adapting the result to the request type the assertions
+// use.
 func readRequest(conn net.Conn) (request, error) {
-	var read request
-	if _, err := io.ReadFull(conn, read.header[:]); err != nil {
-		return read, err
-	}
-	size := binary.LittleEndian.Uint32(read.header[frameOffsetSize:])
-	if size > vsr.HeaderSize {
-		read.payload = make([]byte, int(size)-vsr.HeaderSize)
-		if _, err := io.ReadFull(conn, read.payload); err != nil {
-			return read, err
-		}
-	}
-	return read, nil
+	read, err := fakevsr.ReadRequest(conn)
+	return request{header: read.Header, payload: read.Payload}, err
 }
 
 // fakeServer answers frames from a handler and records what it was asked.
 type fakeServer struct {
 	mtx      sync.Mutex
 	requests []request
-	done     chan struct{}
 }
 
 // serve reads frames off conn until it closes, answering each with the frame
 // the handler returns. A nil answer leaves the request unanswered.
 func serve(conn net.Conn, handler func(index int, read request) []byte) *fakeServer {
-	server := &fakeServer{done: make(chan struct{})}
+	server := &fakeServer{}
 	go func() {
-		defer close(server.done)
 		for index := 0; ; index++ {
 			read, err := readRequest(conn)
 			if err != nil {
@@ -321,24 +286,35 @@ func servePartitionOperations(t *testing.T, conn net.Conn, handler func(index in
 
 // newPipeClient builds a client wired to one end of an in-memory pipe, with a
 // session already bound so replicated commands encode.
-func newPipeClient(t *testing.T) (*IggyTcpClient, net.Conn) {
+func newPipeClient(t testing.TB) (*IggyTcpClient, net.Conn) {
 	t.Helper()
 	serverConn, clientConn := net.Pipe()
 	client := newTestClient(t, clientConn)
 	client.session.BeginRegister()
 	require.NoError(t, client.session.Bind(100))
 	client.rememberedLogin = NewAutoLogin(NewUsernamePasswordCredentials("iggy", "secret"))
-	client.links.bootstrap.markBound(client.sessionFence, ^uint64(0))
+	client.links.bootstrap.markBound(client.sessionFence)
 	client.links.slots[0] = &replicaSlot{endpoint: "pipe", link: client.links.bootstrap, cancel: func() {}}
 	client.links.rosterOrder = []uint8{0}
-	client.links.hasRoster = true
+	client.links.hasRoster.Store(true)
 	client.links.hasPrimary = true
 	client.links.primary = 0
 	t.Cleanup(func() { _ = client.Close(); _ = serverConn.Close() })
 	return client, serverConn
 }
 
-func newTestClient(t *testing.T, conn net.Conn) *IggyTcpClient {
+// newRosterPipeClient is a pipe client that keeps its link when it installs a
+// one-node roster, which names the configured endpoint. A namespace miss of the
+// node reads that roster to confirm the node is the metadata primary.
+func newRosterPipeClient(t testing.TB) (*IggyTcpClient, net.Conn) {
+	t.Helper()
+	client, serverConn := newPipeClient(t)
+	client.config.serverAddress = "pipe"
+	client.links.bootstrap = nil
+	return client, serverConn
+}
+
+func newTestClient(t testing.TB, conn net.Conn) *IggyTcpClient {
 	t.Helper()
 	client := NewIggyTcpClient(slog.New(slog.DiscardHandler), WithHeartbeatInterval(0))
 	client.links.ctx, client.links.cancel = context.WithCancel(context.Background())

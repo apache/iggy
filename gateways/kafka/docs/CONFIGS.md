@@ -1,25 +1,25 @@
 # Topic configuration
 
-`DescribeConfigs` (32) and `AlterConfigs` (33) apply to Kafka topic resources only
-(resource type 2). Only the deprecated `Admin.alterConfigs` (API 33) writes
-retention. `IncrementalAlterConfigs` (44) is not in this change and is not
-advertised in `ApiVersions`. A client picks its admin API from that response, so
-a Java or librdkafka client that would otherwise send 44 raises an
-`UnsupportedVersionException` (or the librdkafka equivalent) locally and never
-sends the request - the gateway never sees it, and the connection is not
-affected. Only `AlterConfigs` (33) writes retention.
+`DescribeConfigs` (32), `AlterConfigs` (33) and `IncrementalAlterConfigs` (44)
+apply to Kafka topic resources only (resource type 2). Both alter APIs write the
+same single value, `retention.ms`. `kafka-configs --alter` on a topic has sent
+API 44 since Kafka 2.5. Java `Admin.incrementalAlterConfigs` (the only alter
+method left in Kafka 4.0), MirrorMaker 2's configuration sync and kafka-ui also
+send API 44. API 33 comes from Java `Admin.alterConfigs` on clients older than
+4.0 and from other clients' non-incremental alter calls, such as librdkafka's
+`rd_kafka_AlterConfigs`.
 
-With the bridge off, both APIs answer `NOT_CONTROLLER` (41) for each resource and
-do not read or write Iggy.
+With the bridge off, all three APIs answer `NOT_CONTROLLER` (41) for each resource
+and do not read or write Iggy.
 
 ## Authorization
 
-`AlterConfigs` requires the `manage_topics` (or `manage_streams`) Iggy permission
-on the authenticated principal when SASL is enabled. A principal without it gets
-`TOPIC_AUTHORIZATION_FAILED` (29) for every resource in the request, and
-`update_topic` is never called. With SASL disabled there is no principal to
-check, and the request is not gated here. `DescribeConfigs` performs no
-authorization check of its own.
+`AlterConfigs` and `IncrementalAlterConfigs` require the `manage_topics` (or
+`manage_streams`) Iggy permission on the authenticated principal when SASL is
+enabled. A principal without it gets `TOPIC_AUTHORIZATION_FAILED` (29) for every
+resource in the request, and `update_topic` is never called. With SASL disabled
+there is no principal to check, and the request is not gated here.
+`DescribeConfigs` performs no authorization check of its own.
 
 ## What a describe returns
 
@@ -90,28 +90,74 @@ resources in the same request are still processed.
 `validate_only` runs the same checks, including the topic lookup, and does not
 call `update_topic`.
 
+## What an incremental alter does
+
+`IncrementalAlterConfigs` (44) carries one operation per entry instead of a whole
+new set. The entries of one resource are applied together, and the result is the
+same single write as `AlterConfigs`: `retention.ms` onto `message_expiry`.
+
+| Operation | `retention.ms` | `cleanup.policy` | Any other key |
+| --------- | -------------- | ---------------- | ------------- |
+| `SET` (0) | Stored, with the checks listed under "What an alter stores" | `INVALID_CONFIG` (40), read-only | `INVALID_CONFIG` (40), unknown key |
+| `DELETE` (1) | Stores never expire, the value a topic has before any alter. The value sent with the delete is ignored; `kafka-configs --delete-config` sends an empty string | No-op, `NONE` (0) | No-op, `NONE` (0) |
+| `APPEND` (2), `SUBTRACT` (3) | `INVALID_CONFIG` (40), `Can't APPEND to key retention.ms because its type is not LIST.` | `INVALID_CONFIG` (40), read-only | `INVALID_CONFIG` (40), not a list |
+
+A delete of a key other than `retention.ms` succeeds without writing, because
+Kafka removes an override there and this gateway never stored one. An empty
+operation list is a no-op, not a reset, and answers `NONE` (0) once the topic
+lookup succeeds.
+
+Three request faults are answered `INVALID_REQUEST` (42) before the topic lookup
+and without any Iggy call: a config name that appears twice in one resource
+(`Error due to duplicate config keys`), a null value on anything but a `DELETE`
+(`Null value not supported for : <names>`), and an operation byte outside 0-3
+(`Unknown operations type <n>`). The first two texts are Kafka's own. The third is
+borrowed from Kafka's broker-resource check, because Kafka's topic path has no
+well-formed answer for an unknown operation. A topic named by more than one
+resource gets `INVALID_REQUEST` (42) on every occurrence, with
+`Each resource must appear at most once.`
+
+The order of checks is: authorization, the topic cap, the resource type, the
+topic name, the request faults, the topic lookup, then the config faults. A
+missing topic is `UNKNOWN_TOPIC_OR_PARTITION` (3) for an entry that would also be
+`INVALID_CONFIG`, as with `AlterConfigs`. Kafka orders these checks differently;
+see "Limitations".
+
+`validate_only` runs every check, including the topic lookup, and writes nothing.
+
 ## Limitations
 
-- `IncrementalAlterConfigs` (API 44) is not implemented and is not
-  advertised. No client falls back to `AlterConfigs` (33) on its own. The Java
-  client and librdkafka fail locally, as the top of this page says. Kafka 4.0
-  removed `Admin.alterConfigs`, and `kafka-configs --alter` sends only API 44.
-  A Java 4.x client or tool therefore cannot change `retention.ms` through this
-  gateway.
-- `retention.ms` remains the only value Iggy stores.
+- `retention.ms` remains the only value Iggy stores, through either alter API.
+- A `DELETE` of `retention.ms` stores never expire instead of removing the entry.
+  Iggy marks any value a client sent as explicit, so a later describe reports
+  `-1` from `DYNAMIC_TOPIC_CONFIG` (1), where Kafka would report its broker
+  default from `DEFAULT_CONFIG` (5). A topic that was never altered is written
+  too, so its describe source flips from `DEFAULT_CONFIG` (5) to
+  `DYNAMIC_TOPIC_CONFIG` (1) although the value stays `-1`; Kafka writes nothing
+  there. `kafka-configs --delete-config retention.ms` on such a topic fails on
+  the client side before any request, as it does against Kafka, because the tool
+  first describes the topic's dynamic configs. After any alter, a repeated delete
+  always succeeds.
+- Kafka validates the configuration before it checks that the topic exists, and
+  checks duplicate names and null values before the topic name. This gateway
+  looks the topic up first, so a missing topic with a bad entry answers
+  `UNKNOWN_TOPIC_OR_PARTITION` (3) where Kafka answers `INVALID_CONFIG` (40).
+  `AlterConfigs` checks in the same order.
 - `cleanup.policy` is not reported. See "What a describe returns".
 
 ## Other resource errors
 
 | Condition | Code | Notes |
 | --------- | ---- | ----- |
-| Caller lacks `manage_topics` (SASL on, `AlterConfigs` only) | `TOPIC_AUTHORIZATION_FAILED` (29) | Checked before the topic lookup. Every resource in the request |
+| Caller lacks `manage_topics` (SASL on, both alter APIs) | `TOPIC_AUTHORIZATION_FAILED` (29) | Checked before the topic lookup. Every resource in the request |
 | Resource type other than topic | `INVALID_REQUEST` (42) | Message is `only topic resources are supported`. Other resources in the batch still run |
 | Topic name fails the same rules as CreateTopics | `INVALID_TOPIC_EXCEPTION` (17) | The message is the validation reason and does not repeat the topic name |
 | Topic does not exist | `UNKNOWN_TOPIC_OR_PARTITION` (3) | Checked before config keys, so a missing topic is not `INVALID_CONFIG` |
-| Empty `configs` list on alter | `INVALID_CONFIG` (40) | Kafka would replace the set, which is a reset. This gateway patches named keys, so an empty list is rejected and writes nothing |
+| Empty `configs` list on `AlterConfigs` | `INVALID_CONFIG` (40) | Kafka would replace the set, which is a reset. This gateway patches named keys, so an empty list is rejected and writes nothing. On `IncrementalAlterConfigs` an empty list is a no-op |
+| Duplicate config name, null value, or unknown operation on `IncrementalAlterConfigs` | `INVALID_REQUEST` (42) | Message text under "What an incremental alter does". Checked before the topic lookup, so a missing topic gets this code too |
+| `APPEND` or `SUBTRACT` on `IncrementalAlterConfigs` | `INVALID_CONFIG` (40) | `retention.ms` is not a list, and `cleanup.policy` is read-only here. Checked after the topic lookup |
 | More than 100 distinct topic names | `POLICY_VIOLATION` (44) | Every resource in the request, checked before the bridge-availability check |
-| A topic name repeated across resources | `INVALID_REQUEST` (42) | Every occurrence of the duplicate, not just the second one. Same choice CreateTopics makes for a repeated topic name |
+| A topic name repeated across resources | `INVALID_REQUEST` (42) | Every occurrence of the duplicate, not just the second one. Same choice CreateTopics makes for a repeated topic name. `IncrementalAlterConfigs` adds Kafka's message, `Each resource must appear at most once.` |
 
 Unknown tagged fields at the request, resource, or config-entry level are
 ignored, not rejected: Kafka's flexible versions define them as a forward-compatible

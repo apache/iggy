@@ -55,7 +55,10 @@ async fn concurrent_produce_consume_no_offset_skip(harness: &TestHarness) {
     let topic_id = Identifier::named(TOPIC_NAME).unwrap();
 
     let setup = harness.tcp_root_client().await.unwrap();
-    setup.create_stream(STREAM_NAME).await.unwrap();
+    setup
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     setup
         .create_topic(
             &stream_id,
@@ -105,11 +108,15 @@ async fn concurrent_produce_consume_no_offset_skip(harness: &TestHarness) {
                 .poll_messages(
                     &stream,
                     &topic,
-                    Some(0),
+                    0,
                     &consumer,
                     &PollingStrategy::next(),
-                    CONSUMER_BATCH_SIZE,
-                    true, // auto_commit - this is what makes the skip permanent
+                    PollOptions {
+                        count: CONSUMER_BATCH_SIZE,
+                        // The server commit is what makes the skip permanent.
+                        commit: CommitPolicy::OnRead,
+                        ..PollOptions::default()
+                    },
                 )
                 .await;
 
