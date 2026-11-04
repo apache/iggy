@@ -16,7 +16,7 @@
 // under the License.
 
 use deltalake::DeltaTable;
-use deltalake::writer::JsonWriter;
+use deltalake::writer::RecordBatchWriter;
 use iggy_connector_sdk::sink_connector;
 use secrecy::SecretString;
 use serde::Deserialize;
@@ -48,7 +48,7 @@ pub struct DeltaSink {
 #[derive(Debug)]
 struct SinkState {
     table: DeltaTable,
-    writer: JsonWriter,
+    writer: RecordBatchWriter,
     coercion_tree: CoercionTree,
 }
 
