@@ -25,154 +25,19 @@ use partitions::{
     PartitionPathLayout, PartitionRecoveryError, PartitionRecoveryRefusal, PartitionsConfig,
     RecoveredSegment, load_persisted_segments, load_persisted_segments_with_checkpoint,
 };
-use server_common::send_messages::{
-    COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
-    calculate_batch_checksum,
-};
+use server_common::send_messages::COMMAND_HEADER_SIZE;
 use server_common::sharding::IggyNamespace;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
-use std::sync::Arc;
-use tempfile::{TempDir, tempdir};
+use tempfile::tempdir;
+
+#[path = "../src/segment_recovery_fixtures.rs"]
+mod fixtures;
+use fixtures::*;
 
 const IGGY_INDEX_SIZE: usize = std::mem::size_of::<u64>() * 3;
-
-const STREAM_ID: usize = 1;
-const TOPIC_ID: usize = 1;
-const PARTITION_ID: usize = 1;
-const SEGMENT_MAX_SIZE: u64 = 16 * 1024 * 1024;
-const FIXTURE_TIMESTAMP: u64 = 1_700_000_000_000_000;
-// Longer than one batch header and nonzero in the header's reserved
-// region, so no prefix of it decodes as a batch.
-const GARBAGE: [u8; 384] = [0xAB; 384];
-
-/// Same relative shape as the default server config, rooted at the tempdir.
-fn test_config(tmp: &TempDir) -> PartitionsConfig {
-    PartitionsConfig {
-        messages_required_to_save: iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
-        size_of_messages_required_to_save: IggyByteSize::from(
-            iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
-        ),
-        validate_checksum: true,
-        segment_size: IggyByteSize::from(SEGMENT_MAX_SIZE),
-        preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
-        key_context: Arc::default(),
-        path_layout: PartitionPathLayout {
-            streams_root: tmp.path().join("streams").to_string_lossy().into_owned(),
-        },
-    }
-}
-
-fn prepare_partition_dir(config: &PartitionsConfig) -> String {
-    let partition_path = config.get_partition_path(STREAM_ID, TOPIC_ID, PARTITION_ID);
-    fs::create_dir_all(&partition_path).expect("create partition dir");
-    partition_path
-}
-
-// Batch header wire offsets the zero-padded fixtures plant values at.
 const HEADER_BATCH_LENGTH_OFFSET: usize = 32;
-const HEADER_MESSAGE_COUNT_OFFSET: usize = 48;
-
-/// A zero-padded record that also plants a `base_offset`, so probe
-/// candidates that hit it look like a plausible chain continuation and
-/// pay a checksum verify over the whole claimed slice (which never
-/// verifies: the stored batch checksum stays zero).
-/// One fixed-width zero-padded record of the shape foreign storage
-/// formats emit: a monotone u64 where the batch header keeps
-/// `batch_length`, a nonzero u32 where it keeps `message_count`, zeros
-/// everywhere else -- so its header decodes without any of it being a
-/// batch.
-fn zero_padded_record(claimed_batch_length: u64, sequence: u32) -> Vec<u8> {
-    let mut record = vec![0u8; COMMAND_HEADER_SIZE];
-    record[HEADER_BATCH_LENGTH_OFFSET..HEADER_BATCH_LENGTH_OFFSET + 8]
-        .copy_from_slice(&claimed_batch_length.to_le_bytes());
-    record[HEADER_MESSAGE_COUNT_OFFSET..HEADER_MESSAGE_COUNT_OFFSET + 4]
-        .copy_from_slice(&sequence.to_le_bytes());
-    record
-}
-
-/// One valid on-disk batch record: real message frames with their
-/// per-message checksums, and the server-owned header fields stamped the
-/// way persistence stamps them.
-fn encoded_batch(base_offset: u64, message_count: usize) -> Vec<u8> {
-    encoded_batch_with_payload(
-        base_offset,
-        message_count,
-        &Bytes::from_static(b"segment-recovery-fixture"),
-    )
-}
-
-fn encoded_batch_with_payload(base_offset: u64, message_count: usize, payload: &Bytes) -> Vec<u8> {
-    encoded_batch_stamped(base_offset, message_count, payload, PARTITION_ID as u64)
-}
-
-/// Like [`encoded_batch`], but stamped with an arbitrary `partition_id`
-/// and re-checksummed, so a foreign record verifies while contradicting
-/// the identity of the partition being recovered.
-fn encoded_foreign_batch(base_offset: u64, message_count: usize, partition_id: u64) -> Vec<u8> {
-    encoded_batch_stamped(
-        base_offset,
-        message_count,
-        &Bytes::from_static(b"segment-recovery-fixture"),
-        partition_id,
-    )
-}
-
-fn encoded_batch_stamped(
-    base_offset: u64,
-    message_count: usize,
-    payload: &Bytes,
-    partition_id: u64,
-) -> Vec<u8> {
-    let mut messages = IggyMessages::with_capacity(message_count);
-    for _ in 0..message_count {
-        messages.push(IggyMessage {
-            header: IggyMessageHeader {
-                origin_timestamp: FIXTURE_TIMESTAMP,
-                ..IggyMessageHeader::default()
-            },
-            payload: payload.clone(),
-            user_headers: None,
-        });
-    }
-    let namespace = IggyNamespace::new(STREAM_ID, TOPIC_ID, PARTITION_ID);
-    let SendMessagesOwned { mut header, blob } =
-        SendMessagesOwned::from_messages(namespace, &messages).expect("encode fixture batch");
-    header.partition_id = partition_id;
-    header.base_offset = base_offset;
-    header.base_timestamp = FIXTURE_TIMESTAMP;
-    header.batch_checksum = calculate_batch_checksum(&header, &blob);
-    let mut record = vec![0u8; header.total_size()];
-    header.encode_into(&mut record[..COMMAND_HEADER_SIZE]);
-    record[COMMAND_HEADER_SIZE..].copy_from_slice(&blob);
-    record
-}
-
-/// One sparse index entry, mirroring the `IggyIndexWriter` layout the
-/// recovery reader expects.
-fn index_entry(offset: u64, position: u64) -> Vec<u8> {
-    let mut entry = Vec::new();
-    entry.extend_from_slice(&offset.to_le_bytes());
-    entry.extend_from_slice(&FIXTURE_TIMESTAMP.to_le_bytes());
-    entry.extend_from_slice(&position.to_le_bytes());
-    entry
-}
-
-/// Writes a segment's `.log` and `.index` fixtures and returns their
-/// paths as `(messages_path, index_path)`.
-fn write_segment(
-    config: &PartitionsConfig,
-    start_offset: u64,
-    log: &[u8],
-    index: &[u8],
-) -> (String, String) {
-    let messages_path = config.get_messages_path(STREAM_ID, TOPIC_ID, PARTITION_ID, start_offset);
-    let index_path = config.get_index_path(STREAM_ID, TOPIC_ID, PARTITION_ID, start_offset);
-    fs::write(&messages_path, log).expect("write log fixture");
-    fs::write(&index_path, index).expect("write index fixture");
-    (messages_path, index_path)
-}
 
 /// Path of the anchor beside the segment planted at `start_offset`.
 fn anchor_fixture_path(config: &PartitionsConfig, start_offset: u64) -> String {
@@ -214,12 +79,6 @@ fn len_of(path: &str) -> u64 {
     fs::metadata(path).expect("stat fixture file").len()
 }
 
-fn bytes_of(path: &str) -> Vec<u8> {
-    fs::read(path).expect("read fixture file")
-}
-
-/// Bytes of a segment file after recovery moved it into the first fence
-/// directory, keyed by the name it had at its original path.
 fn fenced_bytes(partition_path: &str, original_path: &str) -> Vec<u8> {
     let fenced_dir = format!("{partition_path}.fenced.0");
     let name = Path::new(original_path)
@@ -228,31 +87,13 @@ fn fenced_bytes(partition_path: &str, original_path: &str) -> Vec<u8> {
     fs::read(Path::new(&fenced_dir).join(name)).expect("read fenced fixture file")
 }
 
-async fn recover(
-    config: &PartitionsConfig,
-) -> Result<Vec<RecoveredSegment>, PartitionRecoveryError> {
-    recover_with(config, false).await
-}
-
-async fn recover_under_fsync(
-    config: &PartitionsConfig,
-    durable_segments: bool,
-) -> Result<Vec<RecoveredSegment>, PartitionRecoveryError> {
-    recover_with(config, durable_segments).await
-}
-
-async fn recover_with(
-    config: &PartitionsConfig,
-    durable_segments: bool,
-) -> Result<Vec<RecoveredSegment>, PartitionRecoveryError> {
-    load_persisted_segments(
-        config,
-        IggyNamespace::new(STREAM_ID, TOPIC_ID, PARTITION_ID),
-        IggyByteSize::from(SEGMENT_MAX_SIZE),
-        durable_segments,
-        &PartitionStats::default(),
+fn encoded_foreign_batch(base_offset: u64, message_count: usize, partition_id: u64) -> Vec<u8> {
+    encoded_batch_stamped(
+        base_offset,
+        message_count,
+        &Bytes::from_static(b"segment-recovery-fixture"),
+        partition_id,
     )
-    .await
 }
 
 fn read_u64_le(bytes: &[u8], at: usize) -> u64 {

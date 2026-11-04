@@ -20,27 +20,10 @@ use message_bus::IggyMessageBus;
 use server_common::SegmentStorage;
 use std::time::Duration;
 
-use crate::{IggyPartition, Segment, SegmentRemoval};
-
-/// Highest `end_offset` among the leading run of expired sealed segments, or
-/// `None` when none are expired. The last element is the active segment and is
-/// never considered. `expiry` must be resolved; a `ServerDefault` expires
-/// nothing (see [`Segment::is_expired`]).
-fn leading_expired_end(
-    segments: &[Segment],
-    now: IggyTimestamp,
-    expiry: IggyExpiry,
-) -> Option<u64> {
-    let last_idx = segments.len().saturating_sub(1);
-    let mut up_to = None;
-    for (idx, segment) in segments.iter().enumerate() {
-        if idx == last_idx || !segment.is_expired(now, expiry) {
-            break;
-        }
-        up_to = Some(segment.end_offset);
-    }
-    up_to
-}
+use crate::{
+    IggyPartition, Segment, SegmentRemoval,
+    iggy_partition::{leading_expired_end, leading_oversized_end, nth_oldest_sealed_end},
+};
 
 fn segment(end_offset: u64, max_timestamp: u64, size: u64, sealed: bool) -> Segment {
     let mut segment = Segment::new(0, IggyByteSize::from(0u64));
@@ -83,40 +66,6 @@ fn sealed_run_segment(start_offset: u64) -> Segment {
     );
     segment.start_offset = start_offset;
     segment
-}
-
-pub fn leading_oversized_end(segments: &[Segment], max_bytes: u64) -> Option<u64> {
-    let last_idx = segments.len().saturating_sub(1);
-    let mut resident: u64 = segments
-        .iter()
-        .take(last_idx)
-        .map(|segment| segment.size.as_bytes_u64())
-        .sum();
-    let mut up_to = None;
-    for (idx, segment) in segments.iter().enumerate() {
-        if idx == last_idx || !segment.sealed || resident <= max_bytes {
-            break;
-        }
-        resident -= segment.size.as_bytes_u64();
-        up_to = Some(segment.end_offset);
-    }
-    up_to
-}
-
-fn nth_oldest_sealed_end(segments: &[Segment], count: u32) -> Option<u64> {
-    if count == 0 {
-        return None;
-    }
-    // Exclude the active (last) segment, take the leading sealed run, then the
-    // `count`-th of those (or the last available when fewer exist).
-    let last_idx = segments.len().saturating_sub(1);
-    segments
-        .iter()
-        .take(last_idx)
-        .take_while(|segment| segment.sealed)
-        .take(count as usize)
-        .map(|segment| segment.end_offset)
-        .last()
 }
 
 /// Partition whose log is `sealed_count` sealed segments followed by the

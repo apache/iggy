@@ -78,25 +78,6 @@ async fn disk_poll_partition_with_replicas(
     (directory, partition)
 }
 
-// /// A SOLO partition, the shape the offset reservation is scoped to.
-// fn solo_recording_partition() -> IggyPartition<IggyMessageBus, RecordingSuperblock> {
-//     let namespace = IggyNamespace::new(1, 1, 0);
-//     let consensus = VsrConsensus::new(
-//         TEST_CLUSTER,
-//         0,
-//         1,
-//         namespace.inner(),
-//         IggyMessageBus::new(0),
-//         LocalPipeline::new(),
-//     );
-//     consensus.init();
-//     IggyPartition::with_in_memory_storage(
-//         Arc::new(PartitionStats::default()),
-//         consensus,
-//         IggyByteSize::from(1024 * 1024),
-//     )
-// }
-
 #[compio::test]
 async fn retransmission_catches_up_sequencer_after_wal_admission_backpressure() {
     let mut partition = partition_at_view(1, 1);
@@ -1362,4 +1343,3 @@ async fn checkpoint_paths_include_offset_parent_directories() {
 //         .restore_commit_state(through, through);
 //     checkpoint.persist_retry_checkpoint(through).await.unwrap();
 // }
-

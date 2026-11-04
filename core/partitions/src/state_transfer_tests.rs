@@ -18,6 +18,25 @@
 use super::*;
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 
+/// A producer entry with `(first_sequence, last_sequence, base_offset)`
+/// batches, oldest first.
+fn producer_entry(producer_id: u64, batches: &[(u32, u32, u64)]) -> (u64, ProducerEntry) {
+    let batches: Vec<ProducerBatch> = batches
+        .iter()
+        .map(
+            |&(first_sequence, last_sequence, base_offset)| ProducerBatch {
+                first_sequence,
+                last_sequence,
+                base_offset,
+            },
+        )
+        .collect();
+    (
+        producer_id,
+        ProducerEntry::restored(3, 1_000, &batches).expect("at most the retained batches"),
+    )
+}
+
 #[test]
 fn given_a_prefix_read_that_stops_without_a_result_should_land_an_error_and_wake() {
     let result = Rc::new(RefCell::new(None));
@@ -788,4 +807,93 @@ fn given_offset_count_above_transfer_ceiling_when_validated_should_reject() {
         !error.transient(),
         "an artifact that cannot fit the decoder will not heal by retrying"
     );
+}
+
+#[test]
+fn given_producers_when_encoded_should_round_trip() {
+    let wire = ConsumerOffsetsWire {
+        producers: vec![
+            producer_entry(4, &[(0, 2, 10)]),
+            producer_entry(9, &[(0, 0, 11), (1, 4, 12)]),
+        ],
+        ..table()
+    };
+
+    assert_eq!(ConsumerOffsetsWire::decode(&wire.encode()), Ok(wire));
+}
+
+#[test]
+fn given_a_malformed_producer_entry_when_decoded_should_reject_it() {
+    let one = [(0, 0, 1)];
+    let mut epoch_over_max = producer_entry(1, &one);
+    epoch_over_max.1.epoch = BatchProducer::EPOCH_MAX + 1;
+    let cases = [
+        vec![producer_entry(2, &one), producer_entry(2, &one)],
+        vec![producer_entry(3, &one), producer_entry(2, &one)],
+        vec![producer_entry(1, &[])],
+        vec![producer_entry(BatchProducer::PRODUCER_ID_MAX + 1, &one)],
+        vec![epoch_over_max],
+        vec![producer_entry(
+            1,
+            &[(BatchProducer::SEQUENCE_MAX + 1, 0, 1)],
+        )],
+    ];
+    for producers in cases {
+        let wire = ConsumerOffsetsWire {
+            producers: producers.clone(),
+            ..table()
+        };
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&wire.encode()),
+            Err(ConsumerOffsetsWireError::InvalidProducer),
+            "{producers:?}"
+        );
+    }
+}
+
+/// A writer with a wider window stores more batches, and the decoder keeps
+/// the newest.
+#[test]
+fn given_more_batches_than_the_window_when_decoded_should_keep_the_newest() {
+    let newest: Vec<(u32, u32, u64)> = (1..=PRODUCER_BATCHES_RETAINED)
+        .map(|batch| {
+            let sequence = u32::try_from(batch).unwrap();
+            (sequence, sequence, u64::from(sequence))
+        })
+        .collect();
+    let kept = ConsumerOffsetsWire {
+        producers: vec![producer_entry(1, &newest)],
+        ..table()
+    };
+    let encoded = kept.encode();
+    // An entry cannot hold one batch more, so the older batch goes in on the wire.
+    let content_len = encoded.len() - size_of::<u64>();
+    let batches_at = content_len - PRODUCER_BATCHES_RETAINED * PRODUCER_BATCH_LEN;
+    let mut wider = encoded[..batches_at].to_vec();
+    wider[batches_at - 1] += 1;
+    wider.extend_from_slice(&[0; PRODUCER_BATCH_LEN]);
+    wider.extend_from_slice(&encoded[batches_at..content_len]);
+    let trailer = state_artifact_checksum(&wider);
+    wider.extend_from_slice(&trailer.to_le_bytes());
+
+    assert_eq!(ConsumerOffsetsWire::decode(&wider), Ok(kept));
+}
+
+/// Version 8 ends at the paid-through op, and its builds kept no
+/// producers.
+#[test]
+fn given_version_8_offsets_artifact_when_decoded_should_read_no_producers() {
+    const RELEASED_VERSION: u8 = 8;
+    let paid = ConsumerOffsetsWire {
+        retirement_paid_through: 9,
+        ..table()
+    };
+    let encoded = paid.encode();
+    let content_end = encoded.len() - size_of::<u64>() - size_of::<u32>();
+    let mut released = encoded[..content_end].to_vec();
+    released[CONSUMER_OFFSETS_MAGIC.len()] = RELEASED_VERSION;
+    let trailer = state_artifact_checksum(&released);
+    released.extend_from_slice(&trailer.to_le_bytes());
+
+    assert_eq!(ConsumerOffsetsWire::decode(&released), Ok(paid));
 }
