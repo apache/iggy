@@ -162,7 +162,6 @@ in Codex.
 - [team-review](.claude/skills/team-review/SKILL.md) - four expert review of a PR, branch, or ref range
 - [fix-review-comments](.claude/skills/fix-review-comments/SKILL.md) - walk through a PR's review comments one at a time, fixes run in background agents
 
-
 Review skills share [execution instructions](.claude/skills/team-review/references/execution.md)
 for target preparation and client-specific agent tools. Run
 `./scripts/ci/skills.sh` to check skill metadata, links, and invocation policies.
