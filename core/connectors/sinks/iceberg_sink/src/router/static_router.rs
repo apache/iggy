@@ -16,11 +16,11 @@
 // under the License.
 
 use crate::InvalidRows;
-use crate::router::{Router, is_valid_namespaced_table, table_exists, write_data};
+use crate::router::{BatchOrigin, Router, is_valid_namespaced_table, table_exists, write_data};
 use async_trait::async_trait;
 use iceberg::Catalog;
 use iceberg::table::Table;
-use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata};
+use iggy_connector_sdk::{ConsumedMessage, Error, Schema};
 use tracing::{error, info, warn};
 
 #[derive(Debug)]
@@ -79,15 +79,17 @@ impl StaticRouter {
 impl Router for StaticRouter {
     async fn route_data(
         &self,
-        messages_metadata: MessagesMetadata,
+        origin: &BatchOrigin<'_>,
+        messages_schema: Schema,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), crate::Error> {
         for table in &self.tables {
             write_data(
+                origin,
                 &messages,
                 table,
                 self.catalog.as_ref(),
-                messages_metadata.schema,
+                messages_schema,
                 self.invalid_rows,
             )
             .await?;

@@ -16,11 +16,11 @@
 // under the License.
 
 use crate::InvalidRows;
-use crate::router::{Router, is_valid_namespaced_table, table_exists, write_data};
+use crate::router::{BatchOrigin, Router, is_valid_namespaced_table, table_exists, write_data};
 use async_trait::async_trait;
 use iceberg::Catalog;
 use iceberg::table::Table;
-use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload};
+use iggy_connector_sdk::{ConsumedMessage, Error, Payload, Schema};
 use simd_json::base::ValueAsObject;
 use std::collections::HashMap;
 use tracing::{info, warn};
@@ -32,18 +32,15 @@ pub struct DynamicRouter {
     invalid_rows: InvalidRows,
 }
 
+/// Each table the run routes to, keyed by route field value, with the messages routed to it.
 pub struct DynamicWriter {
-    pub tables_to_write: HashMap<String, Table>,
-    pub table_to_message: HashMap<String, Vec<ConsumedMessage>>,
+    pub tables: HashMap<String, (Table, Vec<ConsumedMessage>)>,
 }
 
 impl DynamicWriter {
     pub fn new() -> Self {
-        let tables_to_write = HashMap::new();
-        let table_to_message = HashMap::new();
         Self {
-            tables_to_write,
-            table_to_message,
+            tables: HashMap::new(),
         }
     }
 
@@ -52,25 +49,27 @@ impl DynamicWriter {
         route_field_val: &str,
         message: ConsumedMessage,
     ) -> Option<ConsumedMessage> {
-        if let Some(message_vec) = self.table_to_message.get_mut(route_field_val) {
-            message_vec.push(message);
+        if let Some((_, messages)) = self.tables.get_mut(route_field_val) {
+            messages.push(message);
             None
         } else {
             Some(message)
         }
     }
 
+    /// Loads the table that `route_field_val` names, with `message` as the first one routed to it.
     async fn load_table_if_exists(
         &mut self,
         route_field_val: &str,
         catalog: &dyn Catalog,
+        message: ConsumedMessage,
     ) -> Result<(), Error> {
         let table = table_exists(route_field_val, catalog)
             .await
             .ok_or(Error::InvalidState)?;
 
-        self.tables_to_write
-            .insert(route_field_val.to_string(), table);
+        self.tables
+            .insert(route_field_val.to_string(), (table, vec![message]));
 
         Ok(())
     }
@@ -106,7 +105,8 @@ fn route_value(payload: &Payload, route_field: &str) -> Option<String> {
 impl Router for DynamicRouter {
     async fn route_data(
         &self,
-        messages_metadata: MessagesMetadata,
+        origin: &BatchOrigin<'_>,
+        messages_schema: Schema,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), crate::Error> {
         let mut writer = DynamicWriter::new();
@@ -135,40 +135,25 @@ impl Router for DynamicRouter {
                 continue;
             }
 
-            let route_field_val_cloned = route_field_val.clone();
-
+            let offset = message.offset;
             if writer
-                .load_table_if_exists(&route_field_val_cloned, self.catalog.as_ref())
+                .load_table_if_exists(&route_field_val, self.catalog.as_ref(), message)
                 .await
-                .is_ok()
+                .is_err()
             {
-                if let Some(msgs) = writer.table_to_message.get_mut(&route_field_val_cloned) {
-                    msgs.push(message);
-                } else {
-                    let message_vec: Vec<ConsumedMessage> = vec![message];
-                    writer
-                        .table_to_message
-                        .insert(route_field_val_cloned, message_vec);
-                }
-            } else {
                 warn!(
-                    "Dropping the message at offset {}: table: {route_field_val} does not load from the catalog",
-                    message.offset
+                    "Dropping the message at offset {offset}: table: {route_field_val} does not load from the catalog"
                 );
             }
         }
 
-        for (table_name, table_obj) in &writer.tables_to_write {
-            let batch_messages = match writer.table_to_message.remove(table_name) {
-                Some(m) => m,
-                None => continue,
-            };
-
+        for (table_name, (table, batch_messages)) in &writer.tables {
             write_data(
-                &batch_messages,
-                table_obj,
+                origin,
+                batch_messages,
+                table,
                 self.catalog.as_ref(),
-                messages_metadata.schema,
+                messages_schema,
                 self.invalid_rows,
             )
             .await?;
