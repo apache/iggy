@@ -84,7 +84,7 @@ impl Router for StaticRouter {
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), crate::Error> {
         for table in &self.tables {
-            write_data(
+            let committed_rows = write_data(
                 origin,
                 &messages,
                 table,
@@ -94,7 +94,7 @@ impl Router for StaticRouter {
             )
             .await?;
             info!(
-                "Routed {} messages to iceberg table {} successfully",
+                "Routed {} input rows to iceberg table {}, committed {committed_rows}",
                 messages.len(),
                 table.identifier().name()
             );

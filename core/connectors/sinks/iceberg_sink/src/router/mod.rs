@@ -99,6 +99,7 @@ async fn table_exists(route_field_val: &str, catalog: &dyn Catalog) -> Option<Ta
     catalog.load_table(&table_ident).await.ok()
 }
 
+/// Returns the number of rows committed, which leaves out the rows the sink skipped.
 async fn write_data(
     origin: &BatchOrigin<'_>,
     messages: &[ConsumedMessage],
@@ -106,13 +107,14 @@ async fn write_data(
     catalog: &dyn Catalog,
     messages_schema: Schema,
     invalid_rows: InvalidRows,
-) -> Result<(), Error> {
+) -> Result<u64, Error> {
     let data_files =
         write_data_files(origin, messages, table, messages_schema, invalid_rows).await?;
     if data_files.is_empty() {
         // Every row was skipped, and an empty append would still add a snapshot.
-        return Ok(());
+        return Ok(0);
     }
+    let committed_rows = data_files.iter().map(DataFile::record_count).sum();
 
     // Data files are kept on commit failure: the catalog may have applied the
     // commit before the error surfaced, and deleting files referenced by a
@@ -145,7 +147,7 @@ async fn write_data(
         );
         Error::CatalogCommitError(chain)
     })?;
-    Ok(())
+    Ok(committed_rows)
 }
 
 /// Writes the JSON payloads as Parquet data files under the table location,
@@ -231,14 +233,13 @@ async fn write_data_files(
 
     let write_result: Result<(), Error> = async {
         for chunk in documents.chunks(ROWS_PER_BATCH) {
-            let batches = decode_rows(
+            if let Some(batch) = decode_rows(
                 origin,
                 table.identifier(),
                 &arrow_schema,
                 chunk,
                 invalid_rows,
-            )?;
-            for batch in batches {
+            )? {
                 writer.write(batch).await?;
             }
         }
@@ -258,22 +259,22 @@ async fn write_data_files(
     Ok(data_files)
 }
 
-/// Decodes the JSON documents into record batches of `schema`. A row that does not match fails
+/// Decodes the JSON documents into a record batch of `schema`. A row that does not match fails
 /// the whole batch, unless `invalid_rows` skips it: then each such row is logged with its offset,
-/// origin and table and left out, and the others are decoded.
+/// origin and table and left out, and the others are decoded. `None` when every row is skipped.
 fn decode_rows(
     origin: &BatchOrigin<'_>,
     table: &TableIdent,
     schema: &SchemaRef,
     documents: &[(u64, Cow<'_, simd_json::OwnedValue>)],
     invalid_rows: InvalidRows,
-) -> Result<Vec<RecordBatch>, Error> {
+) -> Result<Option<RecordBatch>, Error> {
     let rows: Vec<&simd_json::OwnedValue> = documents
         .iter()
         .map(|(_, document)| document.as_ref())
         .collect();
-    let error = match read_batches(schema, &rows) {
-        Ok(batches) => return Ok(batches),
+    let error = match read_batch(schema, &rows) {
+        Ok(batch) => return Ok(batch),
         Err(error) => error,
     };
     if invalid_rows == InvalidRows::Fail {
@@ -283,7 +284,7 @@ fn decode_rows(
     // The batch read only says that some row does not match, so each row is read on its own.
     let mut valid = Vec::with_capacity(rows.len());
     for (offset, document) in documents {
-        match read_batches(schema, &[document.as_ref()]) {
+        match read_batch(schema, &[document.as_ref()]) {
             Ok(_) => valid.push(document.as_ref()),
             Err(row_error) => warn!(
                 "Skipping the row at offset: {offset} ({origin}) for table: {table}, which does not match the table schema. {row_error}"
@@ -291,20 +292,21 @@ fn decode_rows(
         }
     }
     if valid.is_empty() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
-    read_batches(schema, &valid).inspect_err(|error| {
+    read_batch(schema, &valid).inspect_err(|error| {
         error!("Error while getting record batch: {error}");
     })
 }
 
 /// The reader allocates its buffers for a full batch, so the batch size is the row count: a row
-/// checked on its own is read without the buffers of a default-sized batch.
-fn read_batches(
+/// checked on its own is read without the buffers of a default-sized batch, and every row lands
+/// in the one batch the reader yields.
+fn read_batch(
     schema: &SchemaRef,
     rows: &[&simd_json::OwnedValue],
-) -> Result<Vec<RecordBatch>, Error> {
-    let reader = ReaderBuilder::new(Arc::clone(schema))
+) -> Result<Option<RecordBatch>, Error> {
+    let mut reader = ReaderBuilder::new(Arc::clone(schema))
         .with_batch_size(rows.len())
         .build(JsonArrowReader::new(rows))
         .map_err(|err| {
@@ -312,8 +314,9 @@ fn read_batches(
             Error::InitError(err.to_string())
         })?;
     reader
-        .map(|batch| batch.map_err(|err| Error::InvalidRecordValue(format_error_chain(&err))))
-        .collect()
+        .next()
+        .transpose()
+        .map_err(|err| Error::InvalidRecordValue(format_error_chain(&err)))
 }
 
 /// Files finalized by a failed batch are never committed, so they are removed

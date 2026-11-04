@@ -20,9 +20,10 @@ use crate::router::{BatchOrigin, Router, is_valid_namespaced_table, table_exists
 use async_trait::async_trait;
 use iceberg::Catalog;
 use iceberg::table::Table;
-use iggy_connector_sdk::{ConsumedMessage, Error, Payload, Schema};
+use iggy_connector_sdk::{ConsumedMessage, Payload, Schema};
 use simd_json::base::ValueAsObject;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use tracing::{info, warn};
 
 #[derive(Debug)]
@@ -30,49 +31,6 @@ pub struct DynamicRouter {
     catalog: Box<dyn Catalog>,
     route_field: String,
     invalid_rows: InvalidRows,
-}
-
-/// Each table the run routes to, keyed by route field value, with the messages routed to it.
-pub struct DynamicWriter {
-    pub tables: HashMap<String, (Table, Vec<ConsumedMessage>)>,
-}
-
-impl DynamicWriter {
-    pub fn new() -> Self {
-        Self {
-            tables: HashMap::new(),
-        }
-    }
-
-    fn push_to_existing(
-        &mut self,
-        route_field_val: &str,
-        message: ConsumedMessage,
-    ) -> Option<ConsumedMessage> {
-        if let Some((_, messages)) = self.tables.get_mut(route_field_val) {
-            messages.push(message);
-            None
-        } else {
-            Some(message)
-        }
-    }
-
-    /// Loads the table that `route_field_val` names, with `message` as the first one routed to it.
-    async fn load_table_if_exists(
-        &mut self,
-        route_field_val: &str,
-        catalog: &dyn Catalog,
-        message: ConsumedMessage,
-    ) -> Result<(), Error> {
-        let table = table_exists(route_field_val, catalog)
-            .await
-            .ok_or(Error::InvalidState)?;
-
-        self.tables
-            .insert(route_field_val.to_string(), (table, vec![message]));
-
-        Ok(())
-    }
 }
 
 impl DynamicRouter {
@@ -109,7 +67,7 @@ impl Router for DynamicRouter {
         messages_schema: Schema,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), crate::Error> {
-        let mut writer = DynamicWriter::new();
+        let mut tables: HashMap<String, (Table, Vec<ConsumedMessage>)> = HashMap::new();
         for mut message in messages {
             // Normalised once here so the routing read and the later write both
             // work off the document, rather than parsing the same proto text twice.
@@ -122,12 +80,16 @@ impl Router for DynamicRouter {
                 continue;
             };
 
-            let message = match writer.push_to_existing(&route_field_val, message) {
-                Some(msg) => msg,
-                None => continue,
+            let entry = match tables.entry(route_field_val) {
+                Entry::Occupied(mut entry) => {
+                    entry.get_mut().1.push(message);
+                    continue;
+                }
+                Entry::Vacant(entry) => entry,
             };
+            let route_field_val = entry.key();
 
-            if !is_valid_namespaced_table(&route_field_val) {
+            if !is_valid_namespaced_table(route_field_val) {
                 warn!(
                     "Dropping the message at offset {}: its route field value: {route_field_val} names no table. It needs at least one namespace before the table, separated by '.'",
                     message.offset
@@ -135,20 +97,18 @@ impl Router for DynamicRouter {
                 continue;
             }
 
-            let offset = message.offset;
-            if writer
-                .load_table_if_exists(&route_field_val, self.catalog.as_ref(), message)
-                .await
-                .is_err()
-            {
+            let Some(table) = table_exists(route_field_val, self.catalog.as_ref()).await else {
                 warn!(
-                    "Dropping the message at offset {offset}: table: {route_field_val} does not load from the catalog"
+                    "Dropping the message at offset {}: table: {route_field_val} does not load from the catalog",
+                    message.offset
                 );
-            }
+                continue;
+            };
+            entry.insert((table, vec![message]));
         }
 
-        for (table_name, (table, batch_messages)) in &writer.tables {
-            write_data(
+        for (table_name, (table, batch_messages)) in &tables {
+            let committed_rows = write_data(
                 origin,
                 batch_messages,
                 table,
@@ -158,9 +118,8 @@ impl Router for DynamicRouter {
             )
             .await?;
             info!(
-                "Dynamically routed {} messages to {} iceberg table",
-                batch_messages.len(),
-                table_name
+                "Dynamically routed {} input rows to iceberg table {table_name}, committed {committed_rows}",
+                batch_messages.len()
             );
         }
 
