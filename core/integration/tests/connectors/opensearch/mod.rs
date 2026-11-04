@@ -23,7 +23,7 @@ use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
 use iggy_common::{
     CommitPolicy, Consumer, Identifier, IggyMessage, MessageClient, PollOptions, PollingStrategy,
 };
-use integration::harness::seeds;
+use integration::harness::{TestHarness, seeds};
 use serde_json::Value;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -33,6 +33,19 @@ const POLL_ATTEMPTS: usize = 100;
 const POLL_INTERVAL_MS: u64 = 50;
 const NEXT_POLL_COUNT: u32 = 10;
 const FULL_READ_POLL_COUNT: u32 = 100;
+const CHECKPOINT_FILE: &str = "source_opensearch.state";
+const CHECKPOINT_FAILURE_LOG: &str = "Failed to save state for source connector";
+
+async fn wait_for_failed_checkpoint(harness: &TestHarness) -> bool {
+    let runtime = harness.connectors_runtime().expect("connector runtime");
+    for _ in 0..POLL_ATTEMPTS {
+        if runtime.collect_logs().0.contains(CHECKPOINT_FAILURE_LOG) {
+            return true;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    false
+}
 
 /// Reads new messages with a committed consumer until `min_messages` have arrived.
 async fn poll_next(

@@ -52,6 +52,7 @@ const MAX_BATCH_SIZE: usize = 10_000;
 const DOCUMENT_ID_HEADER: &str = "opensearch.document_id";
 const INDEX_HEADER: &str = "opensearch.index";
 const MAX_HEADER_VALUE_LENGTH: usize = 255;
+const MAX_LAST_ERROR_CHARS: usize = 512;
 
 static DOCUMENT_ID_HEADER_KEY: std::sync::LazyLock<HeaderKey> = std::sync::LazyLock::new(|| {
     HeaderKey::try_from(DOCUMENT_ID_HEADER).expect("document id header key is a valid literal")
@@ -276,6 +277,7 @@ impl OpenSearchSource {
             || async {
                 let response = client
                     .search(SearchParts::Index(&[&self.config.index]))
+                    .allow_partial_search_results(false)
                     .body(search_body)
                     .send()
                     .await
@@ -311,6 +313,7 @@ impl OpenSearchSource {
         let mut response_body: Value = response.json().await.map_err(|e| {
             Error::PermanentHttpError(format!("Failed to parse search response: {e}"))
         })?;
+        ensure_complete_response(&response_body)?;
 
         let hits: Vec<Value> = response_body
             .get_mut("hits")
@@ -393,6 +396,7 @@ impl OpenSearchSource {
         let mut state = self.state.lock().await.clone();
         state.total_documents_published += outcome.messages.len();
         state.poll_count += 1;
+        let cursor_moved = outcome.search_after.is_some();
         if let Some(cursor) = outcome.search_after {
             state.search_after = Some(cursor);
         }
@@ -417,17 +421,18 @@ impl OpenSearchSource {
         let produced_count = outcome.messages.len();
         let total_documents_published = state.total_documents_published;
         let messages = outcome.messages;
-        // Nothing to publish means no batch result will arrive, so commit directly. The
-        // cursor may still have moved past hits without `_source`; they have no body to lose.
-        let persisted_state = if messages.is_empty() {
-            *self.state.lock().await = state;
-            None
-        } else {
+        // A moved cursor waits for the batch result so a Nack can undo it, including a page
+        // whose hits were all skipped for lacking `_source`. A poll that saw no hits has no
+        // cursor to protect, so its counters commit directly.
+        let persisted_state = if cursor_moved {
             let persisted = self.serialize_state(&state).ok_or_else(|| {
                 Error::Serialization("failed to serialize source state".to_string())
             })?;
             *self.pending_state.lock().await = Some(state);
             Some(persisted)
+        } else {
+            *self.state.lock().await = state;
+            None
         };
 
         if self.verbose {
@@ -474,13 +479,18 @@ impl OpenSearchSource {
     }
 
     async fn handle_poll_error(&self, error: Error) -> Result<ProducedMessages, Error> {
-        self.circuit_breaker.record_failure().await;
+        // Only cluster-side trouble opens the breaker. A permanent error (bad query, missing
+        // sort tuple) is a configuration or mapping problem that skipping polls cannot fix,
+        // and an open breaker would hide it behind a quiet empty batch.
+        if matches!(error, Error::Connection(_) | Error::HttpRequestFailed(_)) {
+            self.circuit_breaker.record_failure().await;
+        }
         let mut state = self.state.lock().await;
         // error_count and last_error accumulate in State and are captured by the next
         // finalize_poll call (success path). Both runtime ConnectorState and file state
         // preserve these values across restarts.
         state.error_count += 1;
-        state.last_error = Some(error.to_string());
+        state.last_error = Some(truncated(error.to_string()));
         drop(state);
         error!(
             "{CONNECTOR_NAME} connector ID: {} poll failed: {error}",
@@ -488,6 +498,35 @@ impl OpenSearchSource {
         );
         Err(error)
     }
+}
+
+// `last_error` is persisted with every batch, and an OpenSearch error body can be large.
+fn truncated(message: String) -> String {
+    match message.char_indices().nth(MAX_LAST_ERROR_CHARS) {
+        Some((end, _)) => format!("{}...", &message[..end]),
+        None => message,
+    }
+}
+
+// A partial page can omit hits sorted before the last returned one. The cursor would then move
+// past them for good, so such a response must fail the poll before any cursor update.
+fn ensure_complete_response(body: &Value) -> Result<(), Error> {
+    if body.get("timed_out").and_then(Value::as_bool) == Some(true) {
+        return Err(Error::HttpRequestFailed(
+            "OpenSearch search timed out; results may be partial".to_string(),
+        ));
+    }
+    let failed_shards = body
+        .get("_shards")
+        .and_then(|shards| shards.get("failed"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if failed_shards > 0 {
+        return Err(Error::HttpRequestFailed(format!(
+            "OpenSearch search failed on {failed_shards} shards; results may be partial"
+        )));
+    }
+    Ok(())
 }
 
 fn restore_state(id: u32, state: Option<ConnectorState>) -> (State, Option<String>) {
@@ -505,6 +544,8 @@ fn restore_state(id: u32, state: Option<ConnectorState>) -> (State, Option<Strin
             (restored, None)
         }
         None => {
+            // Starting fresh would re-publish the whole index, so refuse to open and let the
+            // operator repair or delete the state instead of silently resetting the cursor.
             let cause = "persisted state exists but could not be deserialized. \
                          Refusing to start to prevent silent cursor reset."
                 .to_string();
@@ -527,6 +568,16 @@ fn validate_open_config(config: &OpenSearchSourceConfig) -> Result<(), Error> {
         return Err(Error::InvalidConfigValue(format!(
             "batch_size must be between 1 and {MAX_BATCH_SIZE}, got {batch_size}"
         )));
+    }
+
+    if config
+        .query
+        .as_ref()
+        .is_some_and(|query| !query.is_object())
+    {
+        return Err(Error::InvalidConfigValue(
+            "query must be a JSON object".to_string(),
+        ));
     }
 
     Ok(())
@@ -833,6 +884,27 @@ mod tests {
     }
 
     #[test]
+    fn given_long_error_message_when_truncated_should_stay_bounded_on_char_boundary() {
+        let message = "é".repeat(MAX_LAST_ERROR_CHARS * 2);
+
+        let shortened = truncated(message);
+
+        assert_eq!(
+            shortened.chars().count(),
+            MAX_LAST_ERROR_CHARS + "...".len()
+        );
+        assert_eq!(truncated("short".to_string()), "short");
+    }
+
+    #[test]
+    fn given_non_object_query_when_validate_should_fail() {
+        let mut config = test_config();
+        config.query = Some(json!("match_all"));
+        let error = validate_open_config(&config).expect_err("non-object query");
+        assert!(matches!(error, Error::InvalidConfigValue(_)));
+    }
+
+    #[test]
     fn given_empty_timestamp_field_when_validate_should_fail() {
         let mut config = test_config();
         config.timestamp_field = Some(String::new());
@@ -941,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn given_state_when_serialized_should_round_trip_through_connector_state() {
+    fn state_should_be_serializable_and_deserializable() {
         let source = OpenSearchSource::new(1, test_config(), None);
         let state = test_state();
 

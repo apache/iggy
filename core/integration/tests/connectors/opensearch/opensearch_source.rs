@@ -16,8 +16,8 @@
 // under the License.
 
 use super::{
-    POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT, expected_ids, json_payloads, poll_next,
-    read_from_start, sorted_document_ids,
+    CHECKPOINT_FILE, POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT, expected_ids,
+    json_payloads, poll_next, read_from_start, sorted_document_ids, wait_for_failed_checkpoint,
 };
 use crate::connectors::fixtures::{
     OpenSearchSourceMissingIndexFixture, OpenSearchSourcePreCreatedFixture,
@@ -27,6 +27,7 @@ use iggy_connector_sdk::api::{ConnectorStatus, SourceInfoResponse};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use reqwest::Client;
+use std::fs;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -128,6 +129,62 @@ async fn given_runtime_state_when_connector_restarts_should_resume_after_cursor(
         sorted_document_ids(&json_payloads(&all_messages)),
         expected_ids(1, TEST_MESSAGE_COUNT * 2),
         "first batch must not be re-read and second batch must arrive after restart"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn checkpoint_failure_source_replays_documents_until_acknowledged(
+    harness: &TestHarness,
+    fixture: OpenSearchSourcePreCreatedFixture,
+) {
+    // A directory where the runtime renames its checkpoint makes every state save fail.
+    let checkpoint = harness
+        .connectors_runtime()
+        .expect("connector runtime")
+        .state_path()
+        .join(CHECKPOINT_FILE);
+    fs::create_dir(&checkpoint).expect("force checkpoint rename failure");
+
+    fixture
+        .insert_documents(TEST_MESSAGE_COUNT)
+        .await
+        .expect("Failed to insert documents");
+
+    let checkpoint_failed = wait_for_failed_checkpoint(harness).await;
+    fs::remove_dir(&checkpoint).expect("restore checkpoint destination");
+    assert!(checkpoint_failed, "the produced batch must receive a Nack");
+
+    for _ in 0..POLL_ATTEMPTS {
+        if checkpoint.is_file() {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    assert!(
+        checkpoint.is_file(),
+        "checkpoint must recover after the failure"
+    );
+
+    let client = harness.root_client().await.unwrap();
+    let replayed = read_from_start(&client, "checkpoint_replay", TEST_MESSAGE_COUNT * 2).await;
+    let ids = sorted_document_ids(&json_payloads(&replayed));
+    for id in expected_ids(1, TEST_MESSAGE_COUNT) {
+        let copies = ids.iter().filter(|published| **published == id).count();
+        assert!(
+            copies >= 2,
+            "a Nacked document must be replayed; document {id} was published {copies} time(s)"
+        );
+    }
+
+    sleep(Duration::from_millis(POLL_INTERVAL_MS * 5)).await;
+    let settled = read_from_start(&client, "checkpoint_settled", replayed.len()).await;
+    assert_eq!(
+        settled.len(),
+        replayed.len(),
+        "once the checkpoint is saved the cursor must stop replaying"
     );
 }
 

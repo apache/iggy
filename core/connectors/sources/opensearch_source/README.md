@@ -49,7 +49,7 @@ query = { match_all = {} }
 | `url` | required | OpenSearch base URL. |
 | `index` | required | Index name or pattern. `open()` fails if it does not exist. |
 | `timestamp_field` | required | Field used for sort order. It must be sortable in the index mapping. |
-| `username` / `password` | none | HTTP basic authentication. |
+| `username` / `password` | none | HTTP basic authentication, used only when both are set. |
 | `query` | `match_all` | Query DSL object, applied on every poll. |
 | `polling_interval` | `10s` | Wait before each poll, so the first poll also waits. |
 | `batch_size` | `100` | Documents per search, `1` to `10000` (the OpenSearch default `max_result_window`). |
@@ -73,13 +73,16 @@ boundary, including across the indices of a pattern.
 For every hit:
 
 - The `_source` becomes the JSON payload.
-- The message `id` is a 128-bit BLAKE3 hash of `_index` and `_id`. The same
-  document always gets the same id.
+- The message `id` is a 128-bit BLAKE3 hash of `_index` and `_id`. It names the
+  document, not a version of it: an update that is fetched again keeps the same
+  id, so a consumer that drops repeated ids also drops the updated body. Read
+  the id from the message instead of recomputing it.
 - The headers `opensearch.document_id` and `opensearch.index` carry the raw
   values. A header over 255 bytes is dropped with a warning.
 - `origin_timestamp` is taken from `timestamp_field` when it parses as an RFC
   3339 string or an integer (above `1e12` means milliseconds, otherwise
-  seconds). Anything else leaves it unset and the document is still published.
+  seconds, so milliseconds before September 2001 are misread). Anything else
+  leaves it unset and the document is still published.
 
 Two cases do not produce a message. A hit without `_source` (for example an
 index mapped with `"_source": false`) is skipped with a warning, and the cursor
@@ -96,8 +99,10 @@ rejected batch is fetched again. If the batch reached Iggy but the state save
 failed, the batch is replayed as well. Consumers should dedupe on the message
 `id`.
 
-A page where every hit lacks `_source` publishes nothing and has no batch result
-to wait for, so its cursor is committed directly.
+A page where every hit lacks `_source` publishes nothing, but its cursor still
+moves, so it goes through the same `Ack` and `Nack` handling and is saved by the
+runtime. A poll that returns no hits at all has no cursor to protect and is
+counted directly.
 
 The state holds the `search_after` cursor, `last_poll_timestamp` (informational
 only), document and poll counters, the last error, and processing stats. A
@@ -115,17 +120,25 @@ Network errors, HTTP `429` and `5xx` are retried with exponential backoff and
 jitter. Other `4xx` responses and unparsable search responses fail immediately.
 The delay is always computed locally, so a `Retry-After` header is ignored.
 
-After the retry budget is spent the poll fails, and consecutive failures count
-toward the circuit breaker. While it is open, `poll()` logs a warning, sleeps
-`polling_interval` and returns an empty batch without touching the cursor. A
-successful search resets the breaker.
+Searches are sent with `allow_partial_search_results=false`, and a response that
+reports `timed_out` or failed shards is rejected before the cursor moves. A
+partial page could omit documents that sort before its last hit, and the cursor
+would skip them for good.
+
+After the retry budget is spent the poll fails. Network errors and `429`/`5xx`
+failures count toward the circuit breaker; permanent errors do not, because
+pausing polls cannot fix a bad query or mapping and the error should stay
+visible. While the breaker is open, `poll()` logs a warning, sleeps
+`polling_interval` and returns an empty batch without touching the cursor. After
+the cool-down, polls resume and the breaker reopens once the threshold is hit
+again. A successful search resets it.
 
 | Error | Raised when |
 | --- | --- |
 | `InitError` | Corrupt saved state, missing index or unreachable cluster in `open()`. |
-| `InvalidConfigValue` | `timestamp_field` is missing or `batch_size` is outside `1..=10000`. |
+| `InvalidConfigValue` | Invalid `url`, missing `timestamp_field`, `batch_size` outside `1..=10000`, or a `query` that is not an object. |
 | `Connection` | Network failure during a search. |
-| `HttpRequestFailed` | `429` or `5xx` after the retries are used up. |
+| `HttpRequestFailed` | `429` or `5xx` after the retries are used up, or a search that timed out or failed on some shards. |
 | `PermanentHttpError` | Other `4xx`, or a search response that cannot be parsed. |
 | `SchemaMismatch` | A hit has no sort tuple. |
 

@@ -524,7 +524,7 @@ async fn poll_single_page(hits: Vec<Value>) -> (OpenSearchSource, ProducedMessag
 }
 
 #[tokio::test]
-async fn given_all_hits_missing_source_when_poll_should_skip_them_and_advance_cursor() {
+async fn given_all_hits_missing_source_when_poll_should_skip_them_and_advance_cursor_on_ack() {
     let (source, produced) = poll_single_page(vec![
         hit_with_sort_no_source("doc-1", "2024-01-01T00:00:00Z"),
         hit_with_sort_no_source("doc-2", "2024-01-02T00:00:00Z"),
@@ -532,6 +532,12 @@ async fn given_all_hits_missing_source_when_poll_should_skip_them_and_advance_cu
     .await;
 
     assert!(produced.messages.is_empty());
+    assert!(
+        produced.state.is_some(),
+        "a moved cursor must be handed to the runtime for persistence"
+    );
+    assert!(source.test_search_after().await.is_none());
+    ack(&source).await;
     let cursor = source.test_search_after().await.expect("cursor advanced");
     assert_eq!(
         cursor[1].as_str(),
@@ -624,6 +630,31 @@ async fn given_poll_when_search_sent_should_disable_total_hit_counting() {
     source.poll().await.unwrap();
 
     assert_eq!(bodies.lock().await[0]["track_total_hits"], json!(false));
+}
+
+#[tokio::test]
+async fn given_poll_when_search_sent_should_forbid_partial_results() {
+    let queries = Arc::new(Mutex::new(Vec::<String>::new()));
+    let captured = queries.clone();
+    let app = mock_router(StatusCode::OK, move |request| {
+        let captured = captured.clone();
+        async move {
+            captured
+                .lock()
+                .await
+                .push(request.uri().query().unwrap_or_default().to_string());
+            (StatusCode::OK, search_response(vec![]).to_string())
+        }
+    });
+    let base = start_server(app).await;
+    let mut source = OpenSearchSource::new(1, base_config(&base), None);
+    source.open().await.unwrap();
+    source.poll().await.unwrap();
+
+    assert!(
+        queries.lock().await[0].contains("allow_partial_search_results=false"),
+        "partial results can hide documents behind the cursor"
+    );
 }
 
 #[tokio::test]
@@ -734,6 +765,66 @@ async fn given_persistent_503_when_poll_should_stop_at_attempt_budget() {
     let (requests, error) = poll_against_status(StatusCode::SERVICE_UNAVAILABLE, 3).await;
     assert_eq!(requests, 3, "max_retries is a total attempt count");
     assert!(matches!(error, Error::HttpRequestFailed(_)));
+}
+
+#[tokio::test]
+async fn given_partial_search_response_when_poll_should_fail_without_moving_cursor() {
+    for partial_marker in [
+        json!({ "timed_out": true }),
+        json!({ "_shards": { "total": 3, "successful": 2, "failed": 1 } }),
+    ] {
+        let mut body =
+            search_response(vec![search_hit("doc-2", "2024-01-02T00:00:00Z", json!({}))]);
+        body.as_object_mut()
+            .unwrap()
+            .extend(partial_marker.as_object().unwrap().clone());
+        let body = body.to_string();
+        let app = mock_router(StatusCode::OK, move |_| {
+            let body = body.clone();
+            async move { (StatusCode::OK, body) }
+        });
+        let base = start_server(app).await;
+        let mut source = OpenSearchSource::new(1, base_config(&base), None);
+        source.open().await.unwrap();
+
+        let error = source.poll().await.expect_err("partial page must fail");
+
+        assert!(
+            matches!(error, Error::HttpRequestFailed(_)),
+            "got {error:?}"
+        );
+        assert!(source.test_search_after().await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn given_permanent_error_when_polled_repeatedly_should_not_open_circuit_breaker() {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let count = request_count.clone();
+    let app = mock_router(StatusCode::OK, move |_| {
+        let count = count.clone();
+        async move {
+            count.fetch_add(1, Ordering::SeqCst);
+            (StatusCode::BAD_REQUEST, "bad query".to_string())
+        }
+    });
+    let base = start_server(app).await;
+    let mut config = base_config(&base);
+    config.circuit_breaker_threshold = Some(1);
+    let mut source = OpenSearchSource::new(1, config, None);
+    source.open().await.unwrap();
+
+    for _ in 0..3 {
+        let error = source
+            .poll()
+            .await
+            .expect_err("permanent error must surface");
+        assert!(
+            matches!(error, Error::PermanentHttpError(_)),
+            "got {error:?}"
+        );
+    }
+    assert_eq!(request_count.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]
