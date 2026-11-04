@@ -87,7 +87,12 @@ async fn write_data(
     // committed snapshot would corrupt the table.
     let table_commit = Transaction::new(table);
 
-    let action = table_commit.fast_append().add_data_files(data_files);
+    // The check reads every manifest of the table at once on each commit, and the data files
+    // carry fresh UUID names it could never match.
+    let action = table_commit
+        .fast_append()
+        .with_check_duplicate(false)
+        .add_data_files(data_files);
 
     let tx = action.apply(table_commit).map_err(|err| {
         let chain = format_error_chain(&err);
