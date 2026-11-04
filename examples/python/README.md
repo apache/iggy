@@ -1,6 +1,6 @@
 # Iggy Examples
 
-This directory contains Python SDK examples for connection configuration, sending and polling messages, user headers, and TLS. To learn more about building applications with Iggy, please refer to the [getting started](https://iggy.apache.org/docs/introduction/getting-started) guide.
+This directory contains Python SDK examples for connection configuration, sending and polling messages, user headers, multi-tenant permissions, and TLS. To learn more about building applications with Iggy, please refer to the [getting started](https://iggy.apache.org/docs/introduction/getting-started) guide.
 
 ## Running Examples
 
@@ -181,6 +181,26 @@ python sink-data-producer/producer.py
 
 # With custom stream and topic
 IGGY_STREAM=test-stream IGGY_TOPIC=test-topic uv run sink-data-producer/producer.py
+```
+
+### Multi-Tenant
+
+Shows several tenants sharing one server, each limited to its own stream. The producer connects as root and creates a
+stream and a user for each tenant, with permissions on that stream only. It then connects as each tenant, checks that
+the other tenants' streams are refused, and sends messages to the `events`, `logs` and `notifications` topics. The
+consumer creates a read-only user for one tenant, runs the same check, and reads that tenant's messages.
+
+Both scripts read the tenant count from `TENANTS_COUNT` (default 3). The consumer reads the tenant set by `TENANT_ID`
+(default 1). Run the producer first.
+
+```bash
+# Using uv
+uv run multi-tenant/producer.py
+uv run multi-tenant/consumer.py
+
+# Without using uv
+python multi-tenant/producer.py
+python multi-tenant/consumer.py
 ```
 
 ## TLS Examples
