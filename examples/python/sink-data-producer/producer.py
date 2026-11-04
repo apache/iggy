@@ -23,9 +23,14 @@ import random
 import string
 from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
-from urllib.parse import quote
 
-from apache_iggy import DirectProducerConfig, IggyClient, Partitioning
+from apache_iggy import (
+    AutoLogin,
+    DirectProducerConfig,
+    IggyClient,
+    Partitioning,
+    TcpConfig,
+)
 from apache_iggy import SendMessage as Message
 from loguru import logger
 
@@ -48,15 +53,16 @@ MAX_RECORDS_PER_BATCH = 500
 
 
 class ArgNamespace(NamedTuple):
-    connection_string: str
+    connection_string: str | None
+    address: str
+    username: str
+    password: str
 
 
 def parse_args() -> ArgNamespace:
     address = os.getenv("IGGY_ADDRESS", "127.0.0.1:8090")
     username = os.getenv("IGGY_USERNAME", "iggy")
     password = os.getenv("IGGY_PASSWORD", "iggy")
-    encoded_username = quote(username, safe="")  # noqa: S311
-    encoded_password = quote(password, safe="")  # noqa: S311
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "connection_string",
@@ -64,10 +70,16 @@ def parse_args() -> ArgNamespace:
             "Connection string for Iggy, for example "
             "'iggy+tcp://iggy:iggy@127.0.0.1:8090'"
         ),
-        default=f"iggy+tcp://{encoded_username}:{encoded_password}@{address}",
+        default=None,
         nargs="?",
     )
-    return ArgNamespace(**vars(parser.parse_args()))
+    args = parser.parse_args()
+    return ArgNamespace(
+        connection_string=args.connection_string,
+        address=address,
+        username=username,
+        password=password,
+    )
 
 
 def random_alnum(length: int) -> str:
@@ -81,10 +93,10 @@ def random_record() -> dict:
         "user_type": 1 + random.randrange(4),  # noqa: S311
         "email": (
             f"{random_alnum(3 + random.randrange(17))}"  # noqa: S311
-            f"@{DOMAINS[random.randrange(len(DOMAINS))]}"  # noqa: S311
+            f"@{random.choice(DOMAINS)}"  # noqa: S311
         ),
-        "source": SOURCES[random.randrange(len(SOURCES))],  # noqa: S311
-        "state": STATES[random.randrange(len(STATES))],  # noqa: S311
+        "source": random.choice(SOURCES),  # noqa: S311
+        "state": random.choice(STATES),  # noqa: S311
         "message": random_alnum(10 + random.randrange(90)),  # noqa: S311
         "created_at": (
             datetime.now(UTC) - timedelta(days=random.randrange(1000))  # noqa: S311
@@ -94,7 +106,15 @@ def random_record() -> dict:
 
 async def main() -> None:
     args = parse_args()
-    client = IggyClient.from_connection_string(args.connection_string)
+
+    if args.connection_string:
+        client = IggyClient.from_connection_string(args.connection_string)
+    else:
+        config = TcpConfig(
+            server_address=args.address,
+            auto_login=AutoLogin.username_password(args.username, args.password),
+        )
+        client = IggyClient(config)
 
     logger.info("Starting data producer...")
     logger.info(f"Stream: {STREAM_NAME}, Topic: {TOPIC_NAME}")
