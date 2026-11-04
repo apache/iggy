@@ -247,6 +247,7 @@ class IggyErrorCodeTest {
         // VSR protocol errors
         "14003, INCOMPATIBLE_PROTOCOL_VERSION",
         "14004, SESSION_MISMATCH",
+        "14009, PARTITION_LANE_BLOCKED",
     })
     void fromCodeReturnsExpectedIggyErrorCodeWhenCodeIsValid(int code, IggyErrorCode expected) {
         var iggyErrorCode = IggyErrorCode.fromCode(code);

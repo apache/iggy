@@ -52,6 +52,7 @@ pub struct ConsensusSession {
     /// itself always uses request=0.
     request_counter: u64,
     bind_secret: BindSecret,
+    register_request_identifier: Option<u128>,
 }
 
 impl ConsensusSession {
@@ -69,6 +70,7 @@ impl ConsensusSession {
             session: None,
             request_counter: 1,
             bind_secret: BindSecret::new(Box::new(rand::random())),
+            register_request_identifier: None,
         }
     }
 
@@ -123,6 +125,23 @@ impl ConsensusSession {
     ///
     pub const fn register_request_id(&self) -> u64 {
         0
+    }
+
+    pub(crate) fn register_request_identifier(&mut self) -> Result<u128, IggyError> {
+        if let Some(identifier) = self.register_request_identifier {
+            return Ok(identifier);
+        }
+        let random = ring::rand::SystemRandom::new();
+        loop {
+            let mut bytes = [0u8; 16];
+            ring::rand::SecureRandom::fill(&random, &mut bytes)
+                .map_err(|_| IggyError::InvalidConfiguration)?;
+            let identifier = u128::from_le_bytes(bytes);
+            if identifier != 0 {
+                self.register_request_identifier = Some(identifier);
+                return Ok(identifier);
+            }
+        }
     }
 
     /// Get the next application request ID and advance the counter.

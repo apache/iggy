@@ -21,12 +21,15 @@ package org.apache.iggy.client.blocking.http;
 
 import org.apache.iggy.client.blocking.StreamsClient;
 import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
+import org.apache.iggy.stream.StreamUpdate;
 import tools.jackson.core.type.TypeReference;
 
 import java.math.BigInteger;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 class StreamsHttpClient implements StreamsClient {
@@ -51,18 +54,21 @@ class StreamsHttpClient implements StreamsClient {
     @Override
     public List<StreamBase> getStreams() {
         var request = httpClient.prepareGetRequest(STREAMS);
-        return httpClient.execute(request, new TypeReference<>() {});
+        List<HttpStream> streams = httpClient.execute(request, new TypeReference<>() {});
+        return streams.stream().map(HttpStream::toStreamBase).toList();
     }
 
     @Override
-    public StreamDetails createStream(String name) {
-        var request = httpClient.preparePostRequest(STREAMS, new CreateStream(name));
-        return httpClient.execute(request, new TypeReference<>() {});
+    public StreamDetails createStream(String name, Map<String, HeaderValue> options) {
+        var request =
+                httpClient.preparePostRequest(STREAMS, new CreateStream(name, HttpOptionValue.requestValues(options)));
+        return httpClient.execute(request, HttpStreamDetails.class).toStreamDetails();
     }
 
     @Override
-    public void updateStream(StreamId streamId, String name) {
-        var request = httpClient.preparePutRequest(STREAMS + "/" + streamId, new UpdateStream(name));
+    public void updateStream(StreamId streamId, StreamUpdate update) {
+        var request = httpClient.preparePutRequest(
+                STREAMS + "/" + streamId, HttpOptionValue.updateBody(update.entries(), update.resetKeys()));
         httpClient.execute(request);
     }
 
@@ -73,17 +79,38 @@ class StreamsHttpClient implements StreamsClient {
         sendContexts.clear();
     }
 
-    record CreateStream(String name) {}
-
-    record UpdateStream(String name) {}
+    record CreateStream(String name, Map<String, Object> options) {}
 
     /**
-     * The REST shape of a stream with its topics.
+     * The REST shape of a stream.
      *
-     * <p>Only the nested topics need mapping: they carry options, which REST reports in one map with a
-     * per-entry provenance flag rather than as the two blocks the binary protocol sends. See
-     * {@link TopicsHttpClient.HttpTopic}.
+     * <p>REST reports every option in one map with a per-entry provenance flag rather than as the two
+     * blocks the binary protocol sends. Splitting here is what lets a caller read {@code options()} and
+     * {@code derivedOptions()} the same way on either transport.
      */
+    record HttpStream(
+            Long id,
+            BigInteger createdAt,
+            String name,
+            String size,
+            BigInteger messagesCount,
+            Long topicsCount,
+            Map<String, HttpOptionValue> options) {
+
+        StreamBase toStreamBase() {
+            return new StreamBase(
+                    id,
+                    createdAt,
+                    name,
+                    size,
+                    messagesCount,
+                    topicsCount,
+                    HttpOptionValue.select(options, true),
+                    HttpOptionValue.select(options, false));
+        }
+    }
+
+    /** The REST shape of a stream with its topics. See {@link HttpStream}. */
     record HttpStreamDetails(
             Long id,
             BigInteger createdAt,
@@ -91,7 +118,8 @@ class StreamsHttpClient implements StreamsClient {
             String size,
             BigInteger messagesCount,
             Long topicsCount,
-            List<TopicsHttpClient.HttpTopic> topics) {
+            List<TopicsHttpClient.HttpTopic> topics,
+            Map<String, HttpOptionValue> options) {
 
         StreamDetails toStreamDetails() {
             return new StreamDetails(
@@ -105,7 +133,9 @@ class StreamsHttpClient implements StreamsClient {
                             ? List.of()
                             : topics.stream()
                                     .map(TopicsHttpClient.HttpTopic::toTopic)
-                                    .toList());
+                                    .toList(),
+                    HttpOptionValue.select(options, true),
+                    HttpOptionValue.select(options, false));
         }
     }
 }

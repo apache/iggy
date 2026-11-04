@@ -17,12 +17,16 @@
 
 use crate::shard_allocator::ShardingError;
 use consensus::VsrStateError;
+use iggy_binary_protocol::Operation;
 use metadata::impls::recovery::RecoveryError;
 use partitions::PartitionRecoveryError;
 use server_common::log::LogError;
 use shard::ShardCtorError;
+use std::error::Error as _;
 use std::path::PathBuf;
 use thiserror::Error;
+
+const ROOT_BOOTSTRAP_RECOVERY: &str = "Restore a compatible data directory containing metadata/snapshot.bin, or use --fresh to delete local data. In multi-node clusters, use --fresh on at most one replica at a time while the others hold quorum.";
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -39,10 +43,31 @@ pub enum ServerError {
     },
     #[error(transparent)]
     Iggy(Box<iggy_common::IggyError>),
+    #[error(
+        "stream {stream_id} is encrypted under server keys with fingerprints [{stored_kek_fingerprints}], this node holds [{node_kek_fingerprints}]: {source}. Configure the key the stream was wrapped with as the encryption key or as a previous key"
+    )]
+    StreamKeyUnavailable {
+        stream_id: usize,
+        stored_kek_fingerprints: String,
+        node_kek_fingerprints: String,
+        #[source]
+        source: Box<iggy_common::IggyError>,
+    },
+    #[error(
+        "topic {topic_id} of stream {stream_id} holds critical options this build cannot read: {source}. Run a build that understands them"
+    )]
+    TopicOptionsUnavailable {
+        stream_id: usize,
+        topic_id: usize,
+        #[source]
+        source: Box<iggy_common::IggyError>,
+    },
     #[error("failed to load server config")]
     Config(#[source] configs::ConfigurationError),
     #[error("failed to allocate shards from sharding.cpu_allocation")]
     ShardAllocator(#[source] ShardingError),
+    #[error("cluster.coordinator.replica_connections_per_peer cannot run on this node")]
+    ReplicaLinkLayout(#[source] message_bus::LinkLayoutError),
     #[error("failed to bind shard {shard_id} to its CPU set")]
     CpuAffinityFailed {
         shard_id: u16,
@@ -206,6 +231,15 @@ pub enum ServerError {
         namespace_raw: u64,
         created_revision: u64,
     },
+    #[error(
+        "partition {namespace_raw} incarnation {created_revision} is stored only on this node, \
+         and this node's storage began after it was created without any record of it: \
+         refusing to serve it from offset 0; delete and recreate the topic to accept the loss"
+    )]
+    PartitionLostWithStorage {
+        namespace_raw: u64,
+        created_revision: u64,
+    },
     // Quarantines the one partition rather than treating the group as fresh or
     // reading through to a superseded view: mirrors the metadata plane's
     // `RecoveryError::SuperblockUnreadable` policy, minus the boot refusal,
@@ -309,6 +343,15 @@ pub enum ServerError {
     #[error("cluster mode requires --replica-id to identify the current node")]
     MissingReplicaId,
     #[error(
+        "committed metadata places partition {namespace_raw} on node {node}, but the cluster \
+         has {nodes} nodes; adding or removing nodes is not supported"
+    )]
+    PartitionMemberOutsideCluster {
+        namespace_raw: u64,
+        node: u8,
+        nodes: u8,
+    },
+    #[error(
         "--replica-id {supplied} was passed with cluster.enabled=false; the WAL would commit \
          under replica {default} which permanently fixes this node's identity. Either set \
          cluster.enabled=true with a matching nodes[] entry, or drop --replica-id"
@@ -323,12 +366,30 @@ pub enum ServerError {
         replica_id: u8,
     },
     #[error(
-        "cluster bootstrap with empty metadata requires both {username_env} and {password_env} to be set before server can create the root user deterministically"
+        "Root credentials are required. Set both {username_env} and {password_env}, or use --with-default-root-credentials for local development only."
     )]
-    ClusterRootCredentialsRequired {
+    RootCredentialsRequired {
         username_env: &'static str,
         password_env: &'static str,
     },
+    #[error("Root initialization was rejected with status {status}")]
+    RootInitializationRejected { status: u32 },
+    #[error(
+        "Metadata journal at {path} has op {op}, operation {operation:?}, client {client}, user_id {user_id}. Expected root CreateUser at op 1 from client 0 and user_id 0. {recovery}",
+        recovery = ROOT_BOOTSTRAP_RECOVERY
+    )]
+    RootBootstrapNotPersisted {
+        path: PathBuf,
+        op: u64,
+        operation: Operation,
+        client: u128,
+        user_id: u32,
+    },
+    #[error(
+        "Metadata journal at {path} contains complete prepares but no validated op 1. {recovery}",
+        recovery = ROOT_BOOTSTRAP_RECOVERY
+    )]
+    RootBootstrapMissing { path: PathBuf },
     #[error(
         "{provided_env} is set but {missing_env} is not; the root user credentials must be \
          provided as a pair"
@@ -371,6 +432,8 @@ pub enum ServerError {
     Panicked { description: String },
     #[error("Failed to list config environment variables")]
     ListConfigEnvVars(#[source] std::io::Error),
+    #[error("failed to build the external auth HTTP client: {reason}")]
+    ExternalAuthClient { reason: String },
 }
 
 /// Per-shard outcome captured by [`crate::boot::ShardHandles::join_all`]
@@ -407,7 +470,14 @@ fn format_shard_failures(failures: &[ShardJoinFailure]) -> String {
         }
         match &failure.kind {
             ShardJoinFailureKind::Error(err) => {
+                // The process prints only this error's own source chain, so each
+                // shard's cause has to be inlined or the operator never sees it.
                 let _ = write!(out, "shard {} -> {err}", failure.shard_id);
+                let mut source = err.source();
+                while let Some(cause) = source {
+                    let _ = write!(out, ": {cause}");
+                    source = cause.source();
+                }
             }
             ShardJoinFailureKind::Panic { message } => {
                 let _ = write!(out, "shard {} panicked: {message}", failure.shard_id);
@@ -460,6 +530,25 @@ mod tests {
         assert!(
             rendered.contains("shard 2 panicked: boom"),
             "shard 2 panic entry missing: {rendered}"
+        );
+    }
+
+    #[test]
+    fn given_shard_error_with_a_source_when_rendering_join_failures_should_inline_the_cause() {
+        let failures = vec![ShardJoinFailure {
+            shard_id: 0,
+            kind: ShardJoinFailureKind::Error(Box::new(ServerError::ListConfigEnvVars(
+                std::io::Error::other("refusing to truncate"),
+            ))),
+        }];
+
+        let rendered = ServerError::ShardJoinFailures { failures }.to_string();
+
+        assert!(
+            rendered.contains(
+                "shard 0 -> Failed to list config environment variables: refusing to truncate"
+            ),
+            "source chain missing: {rendered}"
         );
     }
 }

@@ -65,7 +65,7 @@ async fn create_topic_with(
 async fn given_out_of_bounds_topic_when_creating_should_reject_typed(harness: &TestHarness) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
     client
-        .create_stream("admission-stream")
+        .create_stream("admission-stream", &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let stream_id = Identifier::from_str_value("admission-stream").expect("stream identifier");
@@ -124,7 +124,7 @@ async fn given_topic_size_below_segment_size_when_updating_should_reject_typed(
 ) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
     client
-        .create_stream("update-bounds-stream")
+        .create_stream("update-bounds-stream", &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let stream_id = Identifier::from_str_value("update-bounds-stream").expect("stream identifier");
@@ -155,8 +155,8 @@ async fn given_topic_size_below_segment_size_when_updating_should_reject_typed(
                 .update_topic(
                     stream_id,
                     topic_id,
-                    "update-bounds-topic",
                     &TopicUpdateOptions {
+                        name: Some("update-bounds-topic".to_owned()),
                         max_topic_size: Some(max_topic_size),
                         ..TopicUpdateOptions::default()
                     },
@@ -178,7 +178,8 @@ async fn given_topic_size_below_segment_size_when_updating_should_reject_typed(
         .expect("get topic")
         .expect("topic exists");
     assert_eq!(
-        topic.max_topic_size, at_floor,
+        topic.resolved_options().max_topic_size,
+        at_floor,
         "the rejected update must not reach consensus, so the stored cap is unchanged"
     );
 
@@ -201,7 +202,7 @@ async fn given_topic_size_below_segment_size_when_updating_should_reject_typed(
         .expect("get topic")
         .expect("topic exists");
     assert_eq!(
-        topic.max_topic_size,
+        topic.resolved_options().max_topic_size,
         MaxTopicSize::Unlimited,
         "a sentinel update carries no cap, so the stored one survives"
     );
@@ -213,7 +214,7 @@ async fn given_topic_size_below_segment_size_when_updating_should_reject_typed(
 async fn given_updated_topic_when_getting_topic_should_echo_stored_values(harness: &TestHarness) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
     client
-        .create_stream("echo-stream")
+        .create_stream("echo-stream", &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let stream_id = Identifier::from_str_value("echo-stream").expect("stream identifier");
@@ -237,8 +238,8 @@ async fn given_updated_topic_when_getting_topic_should_echo_stored_values(harnes
                 .update_topic(
                     stream_id,
                     topic_id,
-                    "echo-topic",
                     &TopicUpdateOptions {
+                        name: Some("echo-topic".to_owned()),
                         message_expiry: Some(message_expiry),
                         max_topic_size: Some(max_topic_size),
                         ..TopicUpdateOptions::default()
@@ -252,9 +253,18 @@ async fn given_updated_topic_when_getting_topic_should_echo_stored_values(harnes
                 .expect("get topic")
                 .expect("topic exists");
             let reported_options = TopicCreateOptions::from_resource_options(&topic.options);
-            assert_eq!(reported_options.max_topic_size, Some(topic.max_topic_size));
-            assert_eq!(reported_options.message_expiry, Some(topic.message_expiry));
-            (topic.max_topic_size, topic.message_expiry)
+            assert_eq!(
+                reported_options.max_topic_size,
+                Some(topic.resolved_options().max_topic_size)
+            );
+            assert_eq!(
+                reported_options.message_expiry,
+                Some(topic.resolved_options().message_expiry)
+            );
+            (
+                topic.resolved_options().max_topic_size,
+                topic.resolved_options().message_expiry,
+            )
         }
     };
 
@@ -286,7 +296,7 @@ async fn given_sentinel_option_when_creating_topic_should_store_the_resolved_def
 ) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
     client
-        .create_stream("sentinel-stream")
+        .create_stream("sentinel-stream", &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let stream_id = Identifier::from_str_value("sentinel-stream").expect("stream identifier");
@@ -322,7 +332,7 @@ async fn given_sentinel_option_when_creating_topic_should_store_the_resolved_def
         .get(&HeaderKey::from_str("max_topic_size").expect("option key"))
         .expect("max_topic_size is stored");
     assert_eq!(
-        u64::from(topic.max_topic_size),
+        u64::from(topic.resolved_options().max_topic_size),
         iggy_common::DEFAULT_MAX_TOPIC_SIZE,
         "the typed field resolves to the node default"
     );
@@ -339,7 +349,7 @@ async fn given_out_of_bounds_partitions_count_when_mutating_should_reject_typed(
 ) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
     client
-        .create_stream("partitions-stream")
+        .create_stream("partitions-stream", &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let stream_id = Identifier::from_str_value("partitions-stream").expect("stream identifier");
@@ -409,7 +419,7 @@ async fn given_over_count_when_deleting_partitions_should_reject_invalid_partiti
 ) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
     client
-        .create_stream("over-count-stream")
+        .create_stream("over-count-stream", &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let stream_id = Identifier::from_str_value("over-count-stream").expect("stream identifier");

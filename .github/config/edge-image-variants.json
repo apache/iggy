@@ -96,6 +96,28 @@
       ]
     },
     {
+      "id": "rust-kafka-gateway",
+      "dimensions": { "component": "rust-kafka-gateway" },
+      "cargo_roots": [
+        { "package": "iggy-gateway-kafka", "target": { "name": "iggy-gateway-kafka", "kind": "bin" } }
+      ],
+      "external_paths": [
+        ".github/actions/utils/docker-buildx/**",
+        ".github/actions/utils/docker-login/**",
+        ".github/config/publish.yml",
+        ".github/workflows/post-merge.yml",
+        ".github/workflows/publish.yml",
+        "LICENSE",
+        "NOTICE",
+        "about.toml",
+        "about.hbs",
+        "gateways/kafka/Dockerfile",
+        "gateways/kafka/Dockerfile.dockerignore",
+        "scripts/extract-version.sh",
+        "scripts/ci/third-party-licenses.sh"
+      ]
+    },
+    {
       "id": "web-ui",
       "dimensions": { "component": "web-ui" },
       "external_paths": [

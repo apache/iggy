@@ -27,6 +27,10 @@ pub trait PersonalAccessTokenClient {
     /// Get the info about all the personal access tokens of the currently authenticated user.
     async fn get_personal_access_tokens(&self) -> Result<Vec<PersonalAccessTokenInfo>, IggyError>;
     /// Create a new personal access token for the currently authenticated user.
+    /// If the successful reply is lost, replay or operation resolution returns
+    /// `PersonalAccessTokenAlreadyExists`: the create committed, but its secret
+    /// cannot be recovered. Delete the token by name and create it again to obtain
+    /// a usable secret; an already-exists error can also be an original rejection.
     async fn create_personal_access_token(
         &self,
         name: &str,

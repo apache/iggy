@@ -22,6 +22,7 @@ use crate::cli::common::{
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
+use iggy::prelude::StreamCreateOptions;
 use predicates::str::diff;
 use serial_test::parallel;
 
@@ -44,10 +45,16 @@ impl TestStreamUpdateCmd {
 
     fn to_args(&self) -> Vec<String> {
         match self.using_identifier {
-            TestStreamId::Named => vec![self.stream_name.clone(), self.new_name.clone()],
-            TestStreamId::Numeric => {
-                vec![format!("{}", self.stream_id), self.new_name.clone()]
-            }
+            TestStreamId::Named => vec![
+                self.stream_name.clone(),
+                "--name".to_owned(),
+                self.new_name.clone(),
+            ],
+            TestStreamId::Numeric => vec![
+                format!("{}", self.stream_id),
+                "--name".to_owned(),
+                self.new_name.clone(),
+            ],
         }
     }
 }
@@ -55,7 +62,9 @@ impl TestStreamUpdateCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestStreamUpdateCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name).await;
+        let stream = client
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
     }
 
@@ -70,11 +79,11 @@ impl IggyCmdTestCase for TestStreamUpdateCmd {
     fn verify_command(&self, command_state: Assert) {
         let message = match self.using_identifier {
             TestStreamId::Named => format!(
-                "Executing update stream with ID: {} and name: {}\nStream with ID: {} updated name: {}\n",
+                "Executing update stream with ID: {} (name: {})\nStream with ID: {} updated (name: {})\n",
                 self.stream_name, self.new_name, self.stream_name, self.new_name
             ),
             TestStreamId::Numeric => format!(
-                "Executing update stream with ID: {} and name: {}\nStream with ID: {} updated name: {}\n",
+                "Executing update stream with ID: {} (name: {})\nStream with ID: {} updated (name: {})\n",
                 self.stream_id, self.new_name, self.stream_id, self.new_name
             ),
         };
@@ -130,15 +139,16 @@ pub async fn should_help_match() {
         .execute_test_for_help_command(TestHelpCmd::new(
             vec!["stream", "update", "--help"],
             format!(
-                r#"Update stream name for given stream ID
+                r#"Update stream name or options for given stream ID
 
 Stream ID can be specified as a stream name or ID
+Only the settings passed change, every other setting keeps its value.
 
 Examples:
- iggy stream update 1 production
- iggy stream update test development
+ iggy stream update 1 --name production
+ iggy stream update test --name development
 
-{USAGE_PREFIX} stream update <STREAM_ID> <NAME>
+{USAGE_PREFIX} stream update [OPTIONS] <STREAM_ID>
 
 Arguments:
   <STREAM_ID>
@@ -146,10 +156,21 @@ Arguments:
 {CLAP_INDENT}
           Stream ID can be specified as a stream name or ID
 
-  <NAME>
+Options:
+  -n, --name <NAME>
           New name for the stream
 
-Options:
+      --set <KEY=VALUE>
+          Updatable stream option as key=value, repeatable
+{CLAP_INDENT}
+          Values are sent as strings and parsed server-side.
+          Run "iggy options stream" to list the keys and which ones can change.
+
+  -r, --reset <RESET>
+          Setting to return to its default, repeatable
+{CLAP_INDENT}
+          The server refuses a key that cannot be reset.
+
   -h, --help
           Print help (see a summary with '-h')
 "#,
@@ -167,16 +188,18 @@ pub async fn should_short_help_match() {
         .execute_test_for_help_command(TestHelpCmd::new(
             vec!["stream", "update", "-h"],
             format!(
-                r#"Update stream name for given stream ID
+                r#"Update stream name or options for given stream ID
 
-{USAGE_PREFIX} stream update <STREAM_ID> <NAME>
+{USAGE_PREFIX} stream update [OPTIONS] <STREAM_ID>
 
 Arguments:
   <STREAM_ID>  Stream ID to update
-  <NAME>       New name for the stream
 
 Options:
-  -h, --help  Print help (see more with '--help')
+  -n, --name <NAME>      New name for the stream
+      --set <KEY=VALUE>  Updatable stream option as key=value, repeatable
+  -r, --reset <RESET>    Setting to return to its default, repeatable
+  -h, --help             Print help (see more with '--help')
 "#,
             ),
         ))

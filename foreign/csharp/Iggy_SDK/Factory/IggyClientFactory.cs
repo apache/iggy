@@ -17,6 +17,7 @@
 
 using System.ComponentModel;
 using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.IggyClient.Implementations;
@@ -33,6 +34,8 @@ namespace Apache.Iggy.Factory;
 /// </remarks>
 public static class IggyClientFactory
 {
+    private static readonly TimeSpan HttpTimeoutMargin = TimeSpan.FromSeconds(10);
+
     /// <summary>
     ///     Creates and returns an instance of <see cref="IIggyClient" /> based on the provided configuration options.
     /// </summary>
@@ -46,8 +49,10 @@ public static class IggyClientFactory
     ///     supported.
     /// </exception>
     /// <exception cref="ArgumentOutOfRangeException">
-    ///     Thrown when <see cref="IggyClientConfigurator.MaxResponseFrameSize" /> is below the 256-byte header or a
-    ///     configured socket buffer size is not positive.
+    ///     Thrown when <see cref="IggyClientConfigurator.MaxResponseFrameSize" /> is below the 256-byte header, a
+    ///     configured socket buffer size is not positive, or, over <see cref="Protocol.Tcp" />,
+    ///     <see cref="IggyClientConfigurator.MaxPendingOperations" /> or
+    ///     <see cref="IggyClientConfigurator.MaxPendingOperationBytes" /> is not positive.
     /// </exception>
     public static IIggyClient CreateClient(IggyClientConfigurator options)
     {
@@ -80,6 +85,11 @@ public static class IggyClientFactory
         {
             throw new ArgumentOutOfRangeException(nameof(options), options.MaxResponseFrameSize,
                 $"MaxResponseFrameSize must be at least {VsrHeader.HEADER_SIZE} bytes.");
+        }
+
+        if (options.Protocol == Protocol.Tcp)
+        {
+            MutationLanes.ValidateLimits(options);
         }
 
         if (options.ReceiveBufferSize is <= 0)
@@ -115,10 +125,13 @@ public static class IggyClientFactory
             options.AllowAutoCommitWithEncryptor);
     }
 
-    private static HttpClient CreateHttpClient(IggyClientConfigurator options)
+    internal static HttpClient CreateHttpClient(IggyClientConfigurator options)
     {
-        var client = new HttpClient(new TransientHttpRetryHandler(new HttpClientHandler()));
-        client.BaseAddress = new Uri(options.BaseAddress);
-        return client;
+        // A deferred poll ends itself at its request timeout, so the client timeout must not end it first.
+        return new HttpClient(new TransientHttpRetryHandler(new HttpClientHandler()))
+        {
+            BaseAddress = new Uri(options.BaseAddress),
+            Timeout = DeferredPollOptions.MaxRequestTimeout + HttpTimeoutMargin
+        };
     }
 }

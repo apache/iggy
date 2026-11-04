@@ -25,9 +25,26 @@ import Testing
 struct ResponseVectorTests {
     let golden = GoldenFixture.shared
     let createdAt = IggyTimestamp(microseconds: 1_710_000_000_000_000)
+    /// `get_topic.rs` pins these bytes for its sample partition, so every SDK
+    /// decodes the same entry.
+    let pinnedPartition = [UInt8](
+        hex: "01000000004cf1238e0100000200000063000000000000000004000000000000640000000000000017000000000000000000000000000000650000000000000003010304020104"
+    )
 
     func body(_ name: String) -> ArraySlice<UInt8> {
         golden.bytes(name)[...]
+    }
+
+    /// The pinned partition's counters and context under `id`, then the two
+    /// node lists.
+    func partitionEntry(id: UInt32, members: [UInt8], inSyncMembers: [UInt8]) -> [UInt8] {
+        var entry = Array(pinnedPartition.prefix(64))
+        entry.replaceSubrange(0..<4, with: id.littleEndianBytes)
+        entry.append(UInt8(members.count))
+        entry += members
+        entry.append(UInt8(inSyncMembers.count))
+        entry += inSyncMembers
+        return entry
     }
 
     func expectSampleTopic(_ topic: Topic, id: UInt32, name: String) {
@@ -35,13 +52,16 @@ struct ResponseVectorTests {
         #expect(topic.name == name)
         #expect(topic.createdAt == createdAt)
         #expect(topic.partitionsCount == 3)
+        // The three settings the header used to carry come from the blocks.
         #expect(topic.messageExpiry == .after(.seconds(604_800)))
         #expect(topic.compressionAlgorithm == CompressionAlgorithm.none)
-        #expect(topic.maxTopicSize == .bytes(1_073_741_824))
+        #expect(topic.maxTopicSize == .unlimited)
         #expect(topic.sizeBytes == 4096)
         #expect(topic.messagesCount == 100)
         #expect(topic.options["durability"] == .explicit("persisted"))
+        #expect(topic.options["message_expiry"] == .explicit(.uint64(604_800_000_000)))
         #expect(topic.options["segment_size"] == .explicit(.uint64(1_073_741_824)))
+        #expect(topic.options["compression_algorithm"] == .derived("none"))
         #expect(topic.options["max_topic_size"] == .derived(.uint64(UInt64.max)))
     }
 
@@ -53,6 +73,10 @@ struct ResponseVectorTests {
         #expect(details.topicsCount == 2)
         #expect(details.sizeBytes == 2048)
         #expect(details.messagesCount == 200)
+        #expect(details.options.values.allSatisfy { !$0.explicit })
+        #expect(details.encryptionKeySource == .stream)
+        #expect(details.encryptionKeyFingerprint == golden.vectors["stream_key.fingerprint"])
+        #expect(details.encryptionKekFingerprints == ["39e4f0f95c3693c7", "d55d479829bc2936"])
         #expect(details.topics.count == 2)
         expectSampleTopic(details.topics[0], id: 1, name: "topic-a")
         expectSampleTopic(details.topics[1], id: 2, name: "topic-b")
@@ -60,7 +84,7 @@ struct ResponseVectorTests {
         let streams = try Responses.streams(body("response.get_streams"))
         #expect(streams.map(\.id) == [1, 2])
         #expect(streams.map(\.topicsCount) == [2, 0])
-        #expect(streams.allSatisfy { $0.options.isEmpty })
+        #expect(streams.allSatisfy { $0.options == details.options && $0.encryptionKeySource == .stream })
         #expect(try Responses.streams([]).isEmpty)
     }
 
@@ -68,26 +92,78 @@ struct ResponseVectorTests {
         let details = try Responses.topicDetails(body("response.get_topic"))
         expectSampleTopic(
             Topic(
-                id: details.id, createdAt: details.createdAt, name: details.name, sizeBytes: details.sizeBytes, messageExpiry: details.messageExpiry,
-                compressionAlgorithm: details.compressionAlgorithm, maxTopicSize: details.maxTopicSize, messagesCount: details.messagesCount,
+                id: details.id, createdAt: details.createdAt, name: details.name, sizeBytes: details.sizeBytes, messagesCount: details.messagesCount,
                 partitionsCount: details.partitionsCount, options: details.options), id: 1, name: "my-topic")
+        #expect(details.messageExpiry == .after(.seconds(604_800)))
+        #expect(details.maxTopicSize == .unlimited)
         #expect(details.partitions.map(\.id) == [0, 1, 2])
         #expect(details.partitions[0].currentOffset == 99)
         #expect(details.partitions[0].segmentsCount == 2)
         #expect(details.partitions[2].messagesCount == 8)
         #expect(details.partitions.map(\.context) == [.empty, .empty, .empty])
+        #expect(details.partitions.map(\.members) == [[0, 1, 2], [1, 2, 0], [2, 0, 1]])
+        #expect(details.partitions.map(\.inSyncMembers) == [[0, 1], [], [2]])
 
-        // The partitions are the body's tail, 64 bytes each, context last.
+        // The last partition ends with its context and then its node lists,
+        // [2, 0, 1] and [2], which take six bytes.
         var fenced = golden.bytes("response.get_topic")
         let context = PartitionContext(incarnation: 17, ownerGeneration: 9, metadataOp: 52)
-        fenced.replaceSubrange(fenced.count - 24..<fenced.count, with: golden.bytes("partition.context"))
+        let contextEnd = fenced.count - 6
+        fenced.replaceSubrange(contextEnd - 24..<contextEnd, with: golden.bytes("partition.context"))
         let fencedPartitions = try Responses.topicDetails(fenced[...]).partitions
         #expect(fencedPartitions.map(\.context) == [.empty, .empty, context])
         #expect(fencedPartitions[2].messagesCount == 8)
+        #expect(fencedPartitions[2].members == [2, 0, 1])
 
         let topics = try Responses.topics(body("response.get_topics"))
         #expect(topics.map(\.name) == ["events", "logs"])
         #expect(try Responses.topics(body("response.get_topics.empty")).isEmpty)
+    }
+
+    @Test func partitionNodeLists() throws {
+        #expect(pinnedPartition.count == 71)
+        var reader = ByteReader(pinnedPartition)
+        let partition = try Responses.partition(from: &reader)
+        #expect(reader.isAtEnd)
+        #expect(partition.id == 1)
+        #expect(partition.createdAt == IggyTimestamp(microseconds: 1_710_000_000_000))
+        #expect(partition.segmentsCount == 2)
+        #expect(partition.currentOffset == 99)
+        #expect(partition.sizeBytes == 1024)
+        #expect(partition.messagesCount == 100)
+        #expect(partition.context == PartitionContext(incarnation: 23, ownerGeneration: 0, metadataOp: 101))
+        #expect(partition.members == [1, 3, 4])
+        #expect(partition.inSyncMembers == [1, 4])
+
+        let unlisted = partitionEntry(id: 1, members: [], inSyncMembers: [])
+        #expect(unlisted.count == 66)
+        var unlistedReader = ByteReader(unlisted)
+        let bare = try Responses.partition(from: &unlistedReader)
+        #expect(unlistedReader.isAtEnd)
+        #expect(bare.context == partition.context)
+        #expect(bare.members.isEmpty)
+        #expect(bare.inSyncMembers.isEmpty)
+
+        for length in 0..<pinnedPartition.count {
+            var truncated = ByteReader(Array(pinnedPartition.prefix(length)))
+            #expect(throws: WireError.self, "\(length)") { try Responses.partition(from: &truncated) }
+        }
+    }
+
+    @Test func topicPartitionsAdvanceByTheirOwnLength() throws {
+        let entries = [
+            partitionEntry(id: 0, members: [0, 1, 2], inSyncMembers: [0, 1, 2]),
+            partitionEntry(id: 1, members: [], inSyncMembers: []),
+            partitionEntry(id: 2, members: [1, 3, 4], inSyncMembers: [1, 4]),
+        ]
+        #expect(entries.map(\.count) == [72, 66, 71])
+        let topic = golden.bytes("response.topic_header") + entries.joined()
+        let partitions = try Responses.topicDetails(topic[...]).partitions
+        #expect(partitions.map(\.id) == [0, 1, 2])
+        #expect(partitions.map(\.members) == [[0, 1, 2], [], [1, 3, 4]])
+        #expect(partitions.map(\.inSyncMembers) == [[0, 1, 2], [], [1, 4]])
+        #expect(partitions.allSatisfy { $0.messagesCount == 100 && $0.context.metadataOp == 101 })
+        #expect(throws: IggyError(.invalidCommand)) { try Responses.topicDetails(topic.dropLast()) }
     }
 
     @Test func consumerGroups() throws {
@@ -103,6 +179,47 @@ struct ResponseVectorTests {
 
         let assignment = try Responses.consumerGroupAssignment(body("response.sync_consumer_group"))
         #expect(assignment == ConsumerGroupAssignment(generation: 7, partitions: [0, 2, 4]))
+    }
+
+    @Test func fetchSections() throws {
+        let sections = try Responses.fetchSections(body("response.fetch_messages"))
+        #expect(sections.map(\.partitionID) == [1, 2])
+        let read = sections[0]
+        #expect(read.error == nil)
+        #expect(read.currentOffset == 41)
+        #expect(read.nextOffset == 42)
+        #expect(read.firstOffset == 41)
+        #expect(read.context == PartitionContext(incarnation: 3, ownerGeneration: 9, metadataOp: 12))
+        let polled = try read.decode()
+        #expect(polled.partitionID == 1)
+        #expect(polled.context == read.context)
+        #expect(polled.messages.map(\.offset) == [41])
+        #expect(polled.messages.map(\.payloadString) == ["hello"])
+        let refused = sections[1]
+        #expect(refused.error == IggyError(.notPrimary))
+        #expect(refused.records.isEmpty)
+        #expect(refused.firstOffset == nil)
+        #expect(throws: IggyError(.notPrimary)) { try refused.decode() }
+        #expect(try Responses.fetchSections(FakeVSRServer.fetchedBody([])[...]).isEmpty)
+    }
+
+    /// The decoder refuses each table that `FetchMessagesResponse::decode`
+    /// refuses in Rust.
+    @Test func fetchReplyValidation() throws {
+        let reply = golden.bytes("response.fetch_messages")
+        let statusOfFirst = 8
+        let recordsLengthOfSecond = 4 + Responses.fetchSectionHeaderSize + 52
+        var tooMany = reply
+        tooMany.replaceSubrange(0..<4, with: UInt32(1001).littleEndianBytes)
+        var tableTooLong = reply
+        tableTooLong.replaceSubrange(0..<4, with: UInt32(8).littleEndianBytes)
+        var errorWithRecords = reply
+        errorWithRecords.replaceSubrange(statusOfFirst..<statusOfFirst + 4, with: IggyErrorCode.notPrimary.rawValue.littleEndianBytes)
+        var recordsPastTheBody = reply
+        recordsPastTheBody.replaceSubrange(recordsLengthOfSecond..<recordsLengthOfSecond + 4, with: UInt32(1).littleEndianBytes)
+        for hostile in [[0, 0, 0], tooMany, tableTooLong, errorWithRecords, recordsPastTheBody, Array(reply.dropLast()), reply + [0]] {
+            #expect(throws: IggyError(.invalidCommand)) { try Responses.fetchSections(hostile[...]) }
+        }
     }
 
     @Test func consumerOffset() throws {
@@ -146,6 +263,7 @@ struct ResponseVectorTests {
         let users = try Responses.users(body("response.get_users"))
         #expect(users.map(\.username) == ["admin", "alice"])
         #expect(users.map(\.status) == [.active, .inactive])
+        #expect(users.allSatisfy { $0.options.isEmpty })
     }
 
     @Test func loginAndIdentity() throws {
@@ -196,17 +314,13 @@ struct ResponseVectorTests {
     }
 
     @Test func routes() async throws {
-        #expect(try Responses.partitionRoute(body("response.partition_route")) == PartitionContext(incarnation: 7, ownerGeneration: 0, metadataOp: 10))
+        let route = try Responses.partitionRoute(body("response.partition_route"))
+        #expect(route.context == PartitionContext(incarnation: 7, ownerGeneration: 0, metadataOp: 10))
+        // The view and the partition count sit between the context and the
+        // primary.
+        #expect(route.primaryReplica == 2)
         // A route of any other length comes from a mismatched build.
         await expectCode(.invalidCommand) { _ = try Responses.partitionRoute(body("response.partition_route") + [0]) }
-
-        let poll = try Responses.pollRoute(body("response.poll_routing"))
-        #expect(poll.consumerSession.clientID == UInt128Value(low: 0x090a_0b0c_0d0e_0f10, high: 0x0102_0304_0506_0708))
-        #expect(poll.consumerSession.session == 42)
-        #expect(poll.consumerSession.metadataWatermark == 120)
-        #expect(poll.context == PartitionContext(incarnation: 7, ownerGeneration: 3, metadataOp: 110))
-        #expect(poll.primary.replicaID == 2)
-        #expect(poll.primary.tcpAddress == "10.0.0.3:8092")
     }
 
     @Test func clusterMetadata() throws {
@@ -226,13 +340,42 @@ struct ResponseVectorTests {
 
     @Test func optionSpecs() throws {
         let specs = try Responses.optionSpecs(body("response.describe_options"))
-        #expect(specs.map(\.key) == ["segment_size", "durability"])
+        #expect(specs.map(\.key) == ["segment_size", "durability", "message_expiry", "encryption_key"])
+        #expect(specs.map(\.flags) == [[], [], [.updatable, .resettable], [.secret, .critical]])
+        #expect(specs[3].kind == .raw)
+        #expect(specs[3].defaultValue.isEmpty)
         #expect(specs[0].kind == .uint64)
         #expect(specs[0].defaultValue == UInt64(1_073_741_824).littleEndianBytes)
         #expect(specs[0].description == "Segment size")
         #expect(specs[1].kind == .string)
         #expect(specs[1].defaultValue == Array("replicated".utf8))
         #expect(specs[1].description.isEmpty)
+    }
+
+    @Test func metadataChanges() throws {
+        let page = try Responses.metadataChanges(body("response.get_metadata_changes"))
+        let cursor = MetadataChangeCursor(
+            logID: UInt128Value(0x0d4b_8f2a_6e1c_93d7), op: 4187, checksum: UInt128Value(0xf2a4_c6e8_b0d1_f359), ordinal: 1)
+        #expect(page.status == .ok)
+        #expect(page.phase == .changes)
+        #expect(page.logID == cursor.logID)
+        #expect(page.oldestOp == 3871)
+        #expect(page.retainedSince == .zero)
+        #expect(page.headOp == 4190)
+        #expect(page.next == cursor)
+        #expect(page.hasMore == false)
+        #expect(page.items.isEmpty)
+        #expect(page.currentPageToken == nil)
+        #expect(
+            page.records == [
+                MetadataChangeRecord(
+                    op: 4121, ordinal: 0, checksum: UInt128Value(0xa5c1_f703_8b9e_3d65), timestamp: IggyTimestamp(microseconds: 1_760_356_800_004_121),
+                    actorUserID: 0,
+                    change: .streamCreated(
+                        MetadataStreamChange(
+                            streamID: 3, streamCreatedOp: 4121, createdAt: IggyTimestamp(microseconds: 1_760_356_800_123_456), name: "telemetry",
+                            options: .readable([:]))))
+            ])
     }
 
     @Test func sendConfirmations() throws {
@@ -274,6 +417,13 @@ struct ResponseVectorTests {
 
         let empty = try Responses.polledMessages(body("response.poll_messages.empty"))
         #expect(empty.messages.isEmpty)
+
+        // A batch of an idempotent producer carries it in the header, under the checksum.
+        let produced = try Responses.polledMessages(body("response.poll_messages.producer"), verifyChecksums: true)
+        #expect(produced.messages.map(\.id) == [21])
+        #expect(produced.messages.map(\.payloadString) == ["k"])
+        let producedHeader = try Batch.Header.decode(golden.bytes("response.poll_messages.producer")[40...])
+        #expect(producedHeader.producer == Batch.Producer(producerID: 4_000, epoch: 3, baseSequence: 17))
 
         var corrupted = golden.bytes("response.poll_messages")
         corrupted[corrupted.count - 1] ^= 0xFF

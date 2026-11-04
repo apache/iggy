@@ -26,6 +26,14 @@ import java.time.Duration;
  *
  * <p>This class provides configuration for retry behavior including exponential backoff,
  * fixed delay, and no-retry strategies.
+ *
+ * <p>The TCP client uses it for the redials after a connection loss. It bounds one burst
+ * of redials, not the life of the client: a heartbeat that fails starts a new burst with a
+ * fresh budget, and each burst replays the last sign-in. If the session was lost and every
+ * sign-in of a burst lost its link, a heartbeat that the server answers signs in again
+ * with a fresh budget. A logout, a rejected sign-in and {@code close()} end the automatic
+ * sign-in, and an explicit sign-in replaces it. With {@link #noRetry()}, a session lost
+ * that way stays lost until the caller signs in again.
  */
 public final class RetryPolicy {
 
@@ -93,7 +101,7 @@ public final class RetryPolicy {
     }
 
     /**
-     * Gets the maximum number of retry attempts.
+     * Gets the maximum number of retry attempts in one burst.
      *
      * @return the maximum number of retries
      */

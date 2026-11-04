@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"time"
 
 	"github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/internal/batch"
@@ -176,22 +177,21 @@ type PollMessages struct {
 	Strategy    iggcon.PollingStrategy `json:"pollingStrategy"`
 	Count       uint32                 `json:"count"`
 	AutoCommit  bool                   `json:"autoCommit"`
+	// Deferred makes the poll a deferred poll, which the server holds until
+	// its limits are met.
+	Deferred *iggcon.DeferredPollOptions `json:"deferred"`
 }
 
 func (m *PollMessages) Code() Code {
+	if m.Deferred != nil {
+		return PollMessagesDeferredCode
+	}
 	return PollMessagesCode
 }
 
 func (m *PollMessages) AppendBinary(b []byte) ([]byte, error) {
-	b = append(b, byte(m.Consumer.Kind))
-	var err error
-	if b, err = m.Consumer.Id.AppendBinary(b); err != nil {
-		return nil, err
-	}
-	if b, err = m.StreamId.AppendBinary(b); err != nil {
-		return nil, err
-	}
-	if b, err = m.TopicId.AppendBinary(b); err != nil {
+	b, err := appendPollTarget(b, m.Consumer, m.StreamId, m.TopicId)
+	if err != nil {
 		return nil, err
 	}
 	if m.PartitionId != nil {
@@ -208,9 +208,98 @@ func (m *PollMessages) AppendBinary(b []byte) ([]byte, error) {
 	} else {
 		b = append(b, 0)
 	}
+	if m.Deferred != nil {
+		b = binary.LittleEndian.AppendUint64(b, Micros(m.Deferred.MaxWait))
+		b = binary.LittleEndian.AppendUint32(b, m.Deferred.MinCount)
+		b = binary.LittleEndian.AppendUint32(b, m.Deferred.MaxBytes)
+		b = binary.LittleEndian.AppendUint64(b, Micros(m.Deferred.RequestTimeout))
+	}
 	return b, nil
 }
 
 func (m *PollMessages) MarshalBinary() ([]byte, error) {
 	return m.AppendBinary(nil)
+}
+
+// FetchMessages reads the targets of one primary in one deferred request.
+// Each target carries its own cap and partition fence, so the request header
+// carries no partition context.
+type FetchMessages struct {
+	StreamId   iggcon.Identifier
+	TopicId    iggcon.Identifier
+	Consumer   iggcon.Consumer
+	Targets    []FetchTarget
+	Count      uint32
+	AutoCommit bool
+	Options    iggcon.DeferredPollOptions
+}
+
+// FetchTarget is a fetch target with its cap, the most record bytes that its
+// section holds. Its fence is Strategy.Context, zero without one.
+type FetchTarget struct {
+	iggcon.FetchMessagesTarget
+	MaxBytes uint32
+}
+
+func (m *FetchMessages) Code() Code {
+	return FetchMessagesCode
+}
+
+func (m *FetchMessages) AppendBinary(b []byte) ([]byte, error) {
+	b, err := appendPollTarget(b, m.Consumer, m.StreamId, m.TopicId)
+	if err != nil {
+		return nil, err
+	}
+	b = binary.LittleEndian.AppendUint64(b, Micros(m.Options.MaxWait))
+	b = binary.LittleEndian.AppendUint64(b, Micros(m.Options.RequestTimeout))
+	b = binary.LittleEndian.AppendUint32(b, m.Options.MinCount)
+	b = binary.LittleEndian.AppendUint32(b, m.Count)
+	b = binary.LittleEndian.AppendUint32(b, m.Options.MaxBytes)
+	if m.AutoCommit {
+		b = append(b, 1)
+	} else {
+		b = append(b, 0)
+	}
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(m.Targets)))
+	for _, target := range m.Targets {
+		var fence iggcon.PartitionContext
+		if target.Strategy.Context != nil {
+			fence = *target.Strategy.Context
+		}
+		b = binary.LittleEndian.AppendUint32(b, target.PartitionId)
+		b = append(b, byte(target.Strategy.Kind))
+		b = binary.LittleEndian.AppendUint64(b, target.Strategy.Value)
+		b = binary.LittleEndian.AppendUint32(b, target.MaxBytes)
+		b = binary.LittleEndian.AppendUint64(b, fence.Incarnation)
+		b = binary.LittleEndian.AppendUint64(b, fence.OwnerGeneration)
+	}
+	return b, nil
+}
+
+func (m *FetchMessages) MarshalBinary() ([]byte, error) {
+	return m.AppendBinary(nil)
+}
+
+// appendPollTarget writes the consumer, the stream and the topic that start a
+// poll and a fetch.
+func appendPollTarget(b []byte, consumer iggcon.Consumer, streamId, topicId iggcon.Identifier) ([]byte, error) {
+	b = append(b, byte(consumer.Kind))
+	var err error
+	if b, err = consumer.Id.AppendBinary(b); err != nil {
+		return nil, err
+	}
+	if b, err = streamId.AppendBinary(b); err != nil {
+		return nil, err
+	}
+	if b, err = topicId.AppendBinary(b); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// Micros is a duration of deferred poll options as the wire carries it. The
+// options are validated before they are encoded, so the duration is never
+// negative.
+func Micros(duration time.Duration) uint64 {
+	return uint64(duration / time.Microsecond)
 }

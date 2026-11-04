@@ -67,12 +67,12 @@ struct HostIdentity {
 impl HostIdentity {
     fn probe() -> Self {
         Self {
-            hostname: SysinfoSystem::host_name().unwrap_or_else(|| "unknown_hostname".to_owned()),
-            os_name: SysinfoSystem::name().unwrap_or_else(|| "unknown_os_name".to_owned()),
+            hostname: SysinfoSystem::host_name().unwrap_or_else(|_| "unknown_hostname".to_owned()),
+            os_name: SysinfoSystem::name().unwrap_or_else(|_| "unknown_os_name".to_owned()),
             os_version: SysinfoSystem::long_os_version()
-                .unwrap_or_else(|| "unknown_os_version".to_owned()),
+                .unwrap_or_else(|_| "unknown_os_version".to_owned()),
             kernel_version: SysinfoSystem::kernel_version()
-                .unwrap_or_else(|| "unknown_kernel_version".to_owned()),
+                .unwrap_or_else(|_| "unknown_kernel_version".to_owned()),
         }
     }
 }
@@ -107,7 +107,7 @@ pub fn start_system_stats_sampler(sysinfo_print_interval: Duration) -> io::Resul
     } else {
         sysinfo_print_interval.min(OPEN_FILES_SCAN_INTERVAL)
     };
-    let mut system = SysinfoSystem::new();
+    let mut system = SysinfoSystem::new().map_err(io::Error::other)?;
     let initial = SystemStats::capture(&mut system, 0, true);
     let mut open_files_count = initial.open_files_count;
     PUBLISHED_STATS.store(Arc::new(initial));
@@ -176,7 +176,7 @@ mod tests {
 
     #[test]
     fn given_completed_sample_when_reading_stats_should_reuse_it() {
-        let mut system = SysinfoSystem::new();
+        let mut system = SysinfoSystem::new().expect("sysinfo supports this platform");
         let sample = SystemStats::capture(&mut system, 0, true);
         assert_eq!(sample.process_id, std::process::id());
         assert!(sample.total_memory > 0);

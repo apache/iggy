@@ -32,7 +32,7 @@ use message_bus::replica::listener::MessageHandler;
 use message_bus::transports::tcp_tls::TcpTlsTransportConn;
 use message_bus::transports::tls::{install_default_crypto_provider, self_signed_for_loopback};
 use message_bus::transports::{ActorContext, TransportConn};
-use message_bus::{FusedShutdown, IggyMessageBus, MessageBus, Shutdown, framing};
+use message_bus::{FusedShutdown, IggyMessageBus, Shutdown, framing};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
 use server_common::Message;
@@ -52,14 +52,11 @@ async fn start_on_shard_zero_tcp_tls_round_trip() {
     let bus_for_handler = Rc::clone(&bus);
     let on_request: RequestHandler = Rc::new(move |client_id, msg| {
         assert_eq!(msg.header().command, Command::Request);
-        let bus = Rc::clone(&bus_for_handler);
-        compio::runtime::spawn(async move {
-            let reply = header_only(Command::Reply, CLUSTER, 0).into_frozen();
-            bus.send_to_client(client_id, reply)
-                .await
-                .expect("server send_to_client");
-        })
-        .detach();
+        let instance = bus_for_handler.client_instance(client_id);
+        let reply = header_only(Command::Reply, CLUSTER, 0).into_frozen();
+        bus_for_handler
+            .send_to_client_instance(client_id, instance, reply.into())
+            .expect("server send_to_client_instance");
     });
 
     set_replica_ctx(&bus, CLUSTER, 0, 1, None);

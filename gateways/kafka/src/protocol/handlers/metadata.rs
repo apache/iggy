@@ -17,20 +17,29 @@
 
 //! Metadata (API key 3).
 
+use std::sync::Arc;
+
 use bytes::Bytes;
+use iggy_kafka_wire::KafkaWireError;
 use kafka_protocol::messages::metadata_response::{
     MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
 };
 use kafka_protocol::messages::{BrokerId, MetadataRequest, MetadataResponse, TopicName};
 use kafka_protocol::protocol::{Encodable, StrBytes};
 
+use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::IggyBridge;
-use crate::error::{KafkaProtocolError, Result};
+use crate::bridge::topic_map::is_valid_kafka_topic_name;
+use crate::cluster_id::ClusterId;
+use crate::coordinator::Placement;
+use crate::error::Result;
 use crate::protocol::api::{
-    API_KEY_METADATA, ApiVersionRange, BrokerAdvertise, ConnectionState, ERROR_NONE,
-    ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome,
-    REQUEST_DEADLINE, is_supported_version, supported_max_version,
+    API_KEY_METADATA, ApiVersionRange, BrokerAdvertise, Brokers, ConnectionState, DEFAULT_NODE_ID,
+    ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_REQUEST_TIMED_OUT,
+    ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
+    HandleOutcome, REQUEST_DEADLINE, is_supported_version, supported_max_version,
 };
+use crate::protocol::auto_topic_creation::is_internal_topic_name;
 use crate::protocol::bounds_guard::validate_metadata_shape;
 use crate::protocol::dedup::dedup_first_seen;
 use crate::protocol::handlers::{decode_guarded, encode_message, respond_or_close};
@@ -50,6 +59,7 @@ const BLOCKING_ENCODE_PARTITION_THRESHOLD: u32 = 20_000;
 pub async fn handle(
     state: &GatewayState,
     connection: &ConnectionState,
+    principal: Option<&AuthenticatedPrincipal>,
     api_version: i16,
     body: Bytes,
 ) -> HandleOutcome {
@@ -66,36 +76,21 @@ pub async fn handle(
     }
 
     let Some(bridge) = &state.bridge else {
-        return match decode_topics(api_version, body, state.max_frame_size) {
-            Ok(topics) => respond_or_close(
-                encode_response(api_version, &topics, &connection.broker, ERROR_NONE),
-                "Metadata",
-            ),
+        return stub_response(state, connection, api_version, body);
+    };
+
+    let (requested, allow_auto_topic_creation) =
+        match decode_requested_topics(api_version, body, state.max_frame_size) {
+            Ok(requested) => requested,
             Err(error) => {
-                // Metadata has no top-level error field; a malformed body cannot carry
-                // INVALID_REQUEST in a version-correct way for every client. Close.
-                // debug!, not warn!: attacker-controlled, not operator-actionable.
                 tracing::debug!(
                     %error,
                     api_version,
                     "Failed to decode Metadata request; closing connection"
                 );
-                HandleOutcome::Close
+                return HandleOutcome::Close;
             }
         };
-    };
-
-    let requested = match decode_requested_topics(api_version, body, state.max_frame_size) {
-        Ok(requested) => requested,
-        Err(error) => {
-            tracing::debug!(
-                %error,
-                api_version,
-                "Failed to decode Metadata request; closing connection"
-            );
-            return HandleOutcome::Close;
-        }
-    };
 
     let per_partition_bytes = template_partition_bytes(api_version);
 
@@ -128,7 +123,13 @@ pub async fn handle(
                 return HandleOutcome::Close;
             }
         },
-        Some(names) => resolve_requested_named_topics(bridge, &names).await,
+        Some(names) => {
+            let mut results = resolve_requested_named_topics(bridge, &names).await;
+            if allow_auto_topic_creation {
+                auto_create_missing(state, bridge, principal, &mut results);
+            }
+            results
+        }
     };
 
     // `bounds_guard` cannot see this: it charges the projected response by *requested* element
@@ -166,17 +167,80 @@ pub async fn handle(
         // this shard for the duration. `spawn_blocking` moves that cost off the shard's own task
         // so ordinary requests keep their latency regardless of how large one all-topics response
         // gets.
-        let broker = connection.broker.clone();
-        tokio::task::spawn_blocking(move || encode_real_response(api_version, &results, &broker))
+        let answer = Answer::new(state, connection);
+        tokio::task::spawn_blocking(move || answer.encode(api_version, &results))
             .await
             .unwrap_or_else(|join_error| {
                 tracing::error!(%join_error, "Metadata all-topics encode task panicked");
-                Err(KafkaProtocolError::Malformed(join_error.to_string()))
+                Err(KafkaWireError::Malformed(join_error.to_string()).into())
             })
     } else {
-        encode_real_response(api_version, &results, &connection.broker)
+        Answer::new(state, connection).encode(api_version, &results)
     };
     respond_or_close(encoded, "Metadata")
+}
+
+/// What an answer names besides the topics, owned so a blocking task can encode it.
+struct Answer {
+    broker: BrokerAdvertise,
+    brokers: Arc<Brokers>,
+    cluster_id: ClusterId,
+    placement: Placement,
+}
+
+impl Answer {
+    fn new(state: &GatewayState, connection: &ConnectionState) -> Self {
+        Self {
+            broker: connection.broker.clone(),
+            brokers: Arc::clone(&connection.brokers),
+            cluster_id: state.cluster_id.clone(),
+            placement: state.placement(),
+        }
+    }
+
+    fn encode(&self, version: i16, results: &[TopicResult]) -> Result<Bytes> {
+        encode_real_response(
+            version,
+            results,
+            &self.broker,
+            &self.brokers,
+            &self.cluster_id,
+            &self.placement,
+        )
+    }
+}
+
+/// Metadata without a bridge: each requested name, `UNKNOWN_TOPIC_OR_PARTITION`.
+fn stub_response(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
+    match decode_topics(api_version, body, state.max_frame_size) {
+        Ok(topics) => respond_or_close(
+            encode_response(
+                api_version,
+                &topics,
+                &connection.broker,
+                &connection.brokers,
+                &state.cluster_id,
+                ERROR_NONE,
+            ),
+            "Metadata",
+        ),
+        Err(error) => {
+            // Metadata has no top-level error field; a malformed body cannot carry
+            // INVALID_REQUEST in a version-correct way for every client. Close.
+            // debug!, not warn!: attacker-controlled, not operator-actionable.
+            tracing::debug!(
+                %error,
+                api_version,
+                "Failed to decode Metadata request; closing connection"
+            );
+            HandleOutcome::Close
+        }
+    }
 }
 
 /// Resolves a named-lookup Metadata request's topics: dedupes first so the response is built from
@@ -207,8 +271,12 @@ async fn resolve_requested_named_topics(
                     name,
                     error_code: ERROR_NONE,
                     partitions_count: metadata.partitions_count,
+                    missing: false,
                 },
-                None => error_result(name, ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+                None => TopicResult {
+                    missing: true,
+                    ..error_result(name, ERROR_UNKNOWN_TOPIC_OR_PARTITION)
+                },
             })
             .collect(),
         Ok(Err(error)) => {
@@ -230,6 +298,54 @@ async fn resolve_requested_named_topics(
                 .into_iter()
                 .map(|name| error_result(name, ERROR_REQUEST_TIMED_OUT))
                 .collect()
+        }
+    }
+}
+
+/// Kafka's `auto.create.topics.enable` for the topics a named lookup found missing
+/// (`KafkaApis.getTopicMetadata`).
+///
+/// A principal that may not create topics gets `TOPIC_AUTHORIZATION_FAILED` for them, one whose
+/// permissions were never read gets `UNKNOWN_TOPIC_OR_PARTITION` and nothing is created, and an
+/// invalid name gets `INVALID_TOPIC_EXCEPTION`. A Kafka-internal name, or one that resolves onto
+/// an override's Iggy topic without being its key, is left `UNKNOWN_TOPIC_OR_PARTITION` and not
+/// created. Every other missing topic starts being
+/// created and is answered `UNKNOWN_TOPIC_OR_PARTITION`, so the client finds it on a later refresh.
+fn auto_create_missing(
+    state: &GatewayState,
+    bridge: &Arc<IggyBridge>,
+    principal: Option<&AuthenticatedPrincipal>,
+    results: &mut [TopicResult],
+) {
+    let Some(creator) = &state.auto_topic_creation else {
+        return;
+    };
+    if !results.iter().any(|result| result.missing) {
+        return;
+    }
+    let refusal = match principal {
+        None => None,
+        Some(principal) if !principal.permissions_known => {
+            tracing::warn!(
+                principal = %principal.username,
+                "Metadata asked to auto-create topics on a connection whose permissions were \
+                 never read; denying"
+            );
+            // Not 29: Java consumers, Streams and producers treat it as fatal, and an unread set
+            // would fail every refresh for the connection's life while Produce and Fetch work.
+            Some(ERROR_UNKNOWN_TOPIC_OR_PARTITION)
+        }
+        Some(principal) if principal.permissions.manage_topics => None,
+        Some(_) => Some(ERROR_TOPIC_AUTHORIZATION_FAILED),
+    };
+    for result in results.iter_mut().filter(|result| result.missing) {
+        let name = result.name.as_str();
+        if let Some(error_code) = refusal {
+            result.error_code = error_code;
+        } else if !is_valid_kafka_topic_name(name) {
+            result.error_code = ERROR_INVALID_TOPIC_EXCEPTION;
+        } else if !is_internal_topic_name(name) && !bridge.aliases_an_override(name) {
+            let _started = creator.start(bridge, name);
         }
     }
 }
@@ -270,7 +386,7 @@ const RESPONSE_BYTES_TOPIC_OVERHEAD: usize = 13;
 /// Estimated encoded byte cost of one [`TopicResult`]: the fixed per-topic overhead, the name's
 /// own bytes (compact string: length plus a short varint prefix, charged at a flat +2), and -
 /// only for a successful result, since `encode_real_response` sends an empty array otherwise -
-/// [`RESPONSE_BYTES_PER_PARTITION`] per partition.
+/// [`template_partition_bytes`] per partition.
 ///
 /// `bounds_guard` cannot see any of this: it charges the request by name count alone, with no way
 /// to know a name's length, a topic's per-entry overhead, or its partition count before this
@@ -339,6 +455,8 @@ struct TopicResult {
     name: StrBytes,
     error_code: i16,
     partitions_count: u32,
+    /// The lookup found no such topic, as opposed to failing.
+    missing: bool,
 }
 
 fn found_result(metadata: crate::bridge::KafkaTopicMetadata) -> TopicResult {
@@ -346,6 +464,7 @@ fn found_result(metadata: crate::bridge::KafkaTopicMetadata) -> TopicResult {
         name: StrBytes::from_string(metadata.kafka_topic),
         error_code: ERROR_NONE,
         partitions_count: metadata.partitions_count,
+        missing: false,
     }
 }
 
@@ -354,6 +473,7 @@ const fn error_result(name: StrBytes, error_code: i16) -> TopicResult {
         name,
         error_code,
         partitions_count: 0,
+        missing: false,
     }
 }
 
@@ -366,6 +486,8 @@ pub fn encode_response(
     response_version: i16,
     topics: &[StrBytes],
     broker: &BrokerAdvertise,
+    brokers: &Brokers,
+    cluster_id: &ClusterId,
     topic_error_override: i16,
 ) -> Result<Bytes> {
     // Stub has no topic catalog: echo requested names with UNKNOWN_TOPIC_OR_PARTITION,
@@ -385,14 +507,14 @@ pub fn encode_response(
         })
         .collect();
 
-    let broker_entry = MetadataResponseBroker::default()
-        .with_node_id(BrokerId(1))
-        .with_host(StrBytes::from_string(broker.host.clone()))
-        .with_port(broker.port);
-
     let resp = MetadataResponse::default()
-        .with_brokers(vec![broker_entry])
-        .with_controller_id(BrokerId(1))
+        .with_brokers(response_brokers(
+            broker,
+            brokers,
+            &Placement::alone(DEFAULT_NODE_ID),
+        ))
+        .with_cluster_id(Some(StrBytes::from_string(cluster_id.to_string())))
+        .with_controller_id(BrokerId(brokers.node_id))
         .with_topics(response_topics);
 
     encode_message(&resp, response_version, 256)
@@ -400,13 +522,19 @@ pub fn encode_response(
 
 /// Real (bridge-backed) response: unlike [`encode_response`], each topic carries its own
 /// resolved error code and, on success, one [`MetadataResponsePartition`] per partition with
-/// this gateway's single broker (node id 1) as leader/replica/ISR - there is only ever one
-/// broker behind this gateway, so that triple is never actually in question.
+/// this gateway as leader, replica and ISR. Every gateway can serve every partition, because the
+/// SDK sends each partition request to its Iggy primary. So a client of a gateway that stops, or
+/// crashes, goes on through another at its next Metadata, and a producer holds one Iggy session.
+/// `placement` names the controller and the live gateways.
 fn encode_real_response(
     response_version: i16,
     results: &[TopicResult],
     broker: &BrokerAdvertise,
+    brokers: &Brokers,
+    cluster_id: &ClusterId,
+    placement: &Placement,
 ) -> Result<Bytes> {
+    let own = BrokerId(brokers.node_id);
     let response_topics = results
         .iter()
         .map(|result| {
@@ -415,9 +543,9 @@ fn encode_real_response(
                     .map(|index| {
                         MetadataResponsePartition::default()
                             .with_partition_index(i32::try_from(index).unwrap_or(i32::MAX))
-                            .with_leader_id(BrokerId(1))
-                            .with_replica_nodes(vec![BrokerId(1)])
-                            .with_isr_nodes(vec![BrokerId(1)])
+                            .with_leader_id(own)
+                            .with_replica_nodes(vec![own])
+                            .with_isr_nodes(vec![own])
                     })
                     .collect()
             } else {
@@ -430,17 +558,31 @@ fn encode_real_response(
         })
         .collect();
 
-    let broker_entry = MetadataResponseBroker::default()
-        .with_node_id(BrokerId(1))
-        .with_host(StrBytes::from_string(broker.host.clone()))
-        .with_port(broker.port);
-
     let resp = MetadataResponse::default()
-        .with_brokers(vec![broker_entry])
-        .with_controller_id(BrokerId(1))
+        .with_brokers(response_brokers(broker, brokers, placement))
+        .with_cluster_id(Some(StrBytes::from_string(cluster_id.to_string())))
+        .with_controller_id(BrokerId(brokers.listed_or_own(placement.controller())))
         .with_topics(response_topics);
 
     encode_message(&resp, response_version, 256)
+}
+
+/// Every live gateway, with `broker` as this one's endpoint.
+fn response_brokers(
+    broker: &BrokerAdvertise,
+    brokers: &Brokers,
+    placement: &Placement,
+) -> Vec<MetadataResponseBroker> {
+    brokers
+        .live(broker, placement)
+        .into_iter()
+        .map(|(node, endpoint)| {
+            MetadataResponseBroker::default()
+                .with_node_id(BrokerId(node))
+                .with_host(StrBytes::from_string(endpoint.host.clone()))
+                .with_port(endpoint.port)
+        })
+        .collect()
 }
 
 /// Decodes a Metadata request body so the response can echo topic names.
@@ -459,7 +601,7 @@ fn decode_topics(api_version: i16, body: Bytes, max_frame_size: usize) -> Result
             topic
                 .name
                 .map(|name| name.0)
-                .ok_or(KafkaProtocolError::NullTopicName)
+                .ok_or_else(|| KafkaWireError::NullTopicName.into())
         })
         .collect()
 }
@@ -473,14 +615,17 @@ fn decode_topics(api_version: i16, body: Bytes, max_frame_size: usize) -> Result
 /// (`MetadataRequest.isAllTopics()`) is `topics == null || (topics.isEmpty() && version == 0)` -
 /// there is no v0 wire shape for "cluster info only, zero topics" (that distinct shape, KIP-4's
 /// `describeCluster()`, starts at v1), so an empty array at v0 can only mean "all topics."
+/// Also returns the request's `allow_auto_topic_creation`, which below v4 is always true, as in
+/// Kafka.
 fn decode_requested_topics(
     api_version: i16,
     body: Bytes,
     max_frame_size: usize,
-) -> Result<Option<Vec<StrBytes>>> {
+) -> Result<(Option<Vec<StrBytes>>, bool)> {
     let req = decode_guarded::<MetadataRequest>(api_version, body, |v, b| {
         validate_metadata_shape(v, b, max_frame_size)
     })?;
+    let allow_auto_topic_creation = req.allow_auto_topic_creation;
     let requested = req
         .topics
         .map(|topics| {
@@ -490,20 +635,27 @@ fn decode_requested_topics(
                     topic
                         .name
                         .map(|name| name.0)
-                        .ok_or(KafkaProtocolError::NullTopicName)
+                        .ok_or_else(|| KafkaWireError::NullTopicName.into())
                 })
                 .collect::<Result<Vec<_>>>()
         })
         .transpose()?;
-    Ok(match requested {
+    let requested = match requested {
         Some(topics) if topics.is_empty() && api_version == 0 => None,
         other => other,
-    })
+    };
+    Ok((requested, allow_auto_topic_creation))
 }
 
 #[cfg(test)]
 mod tests {
+    use kafka_protocol::protocol::Decodable;
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
+    use crate::error::KafkaProtocolError;
+    use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
+    use crate::protocol::auto_topic_creation::AutoTopicCreationConfig;
 
     const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
 
@@ -514,7 +666,10 @@ mod tests {
             0xff, 0xff, // null topic name
         ]);
         let err = decode_topics(0, body, TEST_MAX_FRAME_SIZE).unwrap_err();
-        assert!(matches!(err, KafkaProtocolError::NullTopicName));
+        assert!(matches!(
+            err,
+            KafkaProtocolError::Wire(KafkaWireError::NullTopicName)
+        ));
     }
 
     #[test]
@@ -544,7 +699,7 @@ mod tests {
         // None ("all topics"), not Some(vec![]) ("these zero topics").
         let body = Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]); // -1
         let requested = decode_requested_topics(0, body, TEST_MAX_FRAME_SIZE).unwrap();
-        assert_eq!(requested, None);
+        assert_eq!(requested.0, None);
     }
 
     #[test]
@@ -553,7 +708,7 @@ mod tests {
         // zero topics" (KIP-4's describeCluster() shape).
         let body = Bytes::from_static(&[0x00, 0x00, 0x00, 0x00]); // 0 topics, not -1
         let requested = decode_requested_topics(1, body, TEST_MAX_FRAME_SIZE).unwrap();
-        assert_eq!(requested, Some(Vec::new()));
+        assert_eq!(requested.0, Some(Vec::new()));
     }
 
     #[test]
@@ -562,7 +717,7 @@ mod tests {
         // client can express "cluster info only, zero topics" - that shape starts at v1.
         let body = Bytes::from_static(&[0x00, 0x00, 0x00, 0x00]); // 0 topics, not -1
         let requested = decode_requested_topics(0, body, TEST_MAX_FRAME_SIZE).unwrap();
-        assert_eq!(requested, None);
+        assert_eq!(requested.0, None);
     }
 
     #[test]
@@ -572,7 +727,7 @@ mod tests {
             0x00, 0x06, b'o', b'r', b'd', b'e', b'r', b's', // "orders"
         ]);
         let requested = decode_requested_topics(0, body, TEST_MAX_FRAME_SIZE).unwrap();
-        assert_eq!(requested, Some(vec![StrBytes::from_static_str("orders")]));
+        assert_eq!(requested.0, Some(vec![StrBytes::from_static_str("orders")]));
     }
 
     #[test]
@@ -585,11 +740,53 @@ mod tests {
         assert!(!response_would_exceed_frame_size(1024, 1024));
     }
 
+    /// Below v4 the request has no `allow_auto_topic_creation` field, and Kafka treats it as
+    /// allowed.
+    #[test]
+    fn given_a_v3_request_when_decoding_should_allow_auto_topic_creation() {
+        let body = Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x01, // one topic
+            0x00, 0x06, b'o', b'r', b'd', b'e', b'r', b's',
+        ]);
+        let (requested, allow) = decode_requested_topics(3, body, TEST_MAX_FRAME_SIZE).unwrap();
+        assert_eq!(requested, Some(vec![StrBytes::from_static_str("orders")]));
+        assert!(allow);
+    }
+
+    /// A lookup that failed tells nothing about whether the topic exists, so an Iggy outage must
+    /// not start creating every topic clients name while it lasts.
+    #[tokio::test]
+    async fn given_auto_creation_when_the_lookup_fails_should_not_start_creating() {
+        let bridge = Arc::new(IggyBridge::offline());
+        let state = GatewayState::new(
+            Some(Arc::clone(&bridge)),
+            TEST_MAX_FRAME_SIZE,
+            0,
+            GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
+        )
+        .with_auto_topic_creation(AutoTopicCreationConfig {
+            enabled: true,
+            partitions: 1,
+        })
+        .expect("a valid partition count");
+        let body = Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x01, // one topic
+            0x00, 0x06, b'o', b'r', b'd', b'e', b'r', b's',
+        ]);
+
+        let outcome = handle(&state, &ConnectionState::default(), None, 3, body).await;
+
+        let _ = outcome.expect_response("a failed lookup is still answered");
+        let creator = state.auto_topic_creation.as_ref().expect("creation is on");
+        assert_eq!(creator.in_flight(), 0);
+    }
+
     fn topic_result(name: &'static str, error_code: i16, partitions_count: u32) -> TopicResult {
         TopicResult {
             name: StrBytes::from_static_str(name),
             error_code,
             partitions_count,
+            missing: false,
         }
     }
 
@@ -661,6 +858,133 @@ mod tests {
                 template_partition_bytes(version) <= RESPONSE_BYTES_PER_PARTITION_FALLBACK,
                 "v{version} exceeded the conservative fallback"
             );
+        }
+    }
+
+    #[test]
+    fn given_a_bridged_response_should_report_the_cluster_id_from_v2() {
+        let cluster_id = ClusterId::random();
+        let broker = BrokerAdvertise {
+            host: "gateway.example".to_string(),
+            port: 9092,
+        };
+        let results = [topic_result("orders", ERROR_NONE, 1)];
+        for version in RANGE.min_version..=RANGE.max_version {
+            let mut body = encode_real_response(
+                version,
+                &results,
+                &broker,
+                &Brokers::default(),
+                &cluster_id,
+                &Placement::alone(DEFAULT_NODE_ID),
+            )
+            .expect("encode");
+            let response =
+                MetadataResponse::decode(&mut body, version).expect("a Metadata response");
+            let expected = (version >= 2).then_some(cluster_id.as_str());
+            assert_eq!(response.cluster_id.as_deref(), expected, "v{version}");
+        }
+    }
+
+    #[test]
+    fn given_other_gateways_when_answering_should_list_each_and_lead_every_partition_itself() {
+        let own = BrokerAdvertise {
+            host: "gateway-2.example".to_string(),
+            port: 9092,
+        };
+        let peer = |node: i32| {
+            let endpoint = BrokerAdvertise {
+                host: format!("gateway-{node}.example"),
+                port: 9092,
+            };
+            (node, endpoint)
+        };
+        let brokers = Brokers {
+            node_id: 2,
+            peers: vec![peer(1), peer(3)],
+        };
+        let results = [topic_result("orders", ERROR_NONE, 2)];
+        for version in RANGE.min_version..=RANGE.max_version {
+            let mut body = encode_real_response(
+                version,
+                &results,
+                &own,
+                &brokers,
+                &ClusterId::random(),
+                &Placement::alone(2),
+            )
+            .expect("encode");
+            let response =
+                MetadataResponse::decode(&mut body, version).expect("a Metadata response");
+            let listed: Vec<(i32, String)> = response
+                .brokers
+                .iter()
+                .map(|broker| (broker.node_id.0, broker.host.to_string()))
+                .collect();
+            assert_eq!(
+                listed,
+                [1, 2, 3].map(|node| (node, format!("gateway-{node}.example"))),
+                "v{version}"
+            );
+            if version >= 1 {
+                assert_eq!(response.controller_id, BrokerId(2), "v{version}");
+            }
+            let partitions = &response.topics[0].partitions;
+            assert_eq!(partitions.len(), 2, "v{version}");
+            for partition in partitions {
+                assert_eq!(partition.leader_id, BrokerId(2), "v{version}");
+                assert_eq!(partition.replica_nodes, [BrokerId(2)], "v{version}");
+                assert_eq!(partition.isr_nodes, [BrokerId(2)], "v{version}");
+            }
+        }
+    }
+
+    /// A gateway that crashed stays an owner until another claims its partitions. Leading every
+    /// partition here keeps its clients going through the others meanwhile.
+    #[test]
+    fn given_owned_coordinator_partitions_when_answering_should_list_live_gateways_and_lead_here() {
+        let own = BrokerAdvertise {
+            host: "gateway-2.example".to_string(),
+            port: 9092,
+        };
+        let peer = |node: i32| {
+            let endpoint = BrokerAdvertise {
+                host: format!("gateway-{node}.example"),
+                port: 9092,
+            };
+            (node, endpoint)
+        };
+        let brokers = Brokers {
+            node_id: 2,
+            peers: vec![peer(1), peer(3)],
+        };
+        // Gateway 3 owns no partition, so it is not live. Gateway 1 owns the even ones.
+        let owners = (0..crate::coordinator::PARTITIONS)
+            .map(|partition| Some(if partition % 2 == 0 { 1 } else { 2 }))
+            .collect();
+        let placement = Placement::with_owners(2, owners);
+        let results = [topic_result("orders", ERROR_NONE, 32)];
+        let version = RANGE.max_version;
+        let mut body = encode_real_response(
+            version,
+            &results,
+            &own,
+            &brokers,
+            &ClusterId::random(),
+            &placement,
+        )
+        .expect("encode");
+        let response = MetadataResponse::decode(&mut body, version).expect("a Metadata response");
+        let listed: Vec<i32> = response
+            .brokers
+            .iter()
+            .map(|broker| broker.node_id.0)
+            .collect();
+        assert_eq!(listed, [1, 2]);
+        assert_eq!(response.controller_id, BrokerId(1));
+        for partition in &response.topics[0].partitions {
+            assert_eq!(partition.leader_id, BrokerId(2));
+            assert_eq!(partition.replica_nodes, vec![BrokerId(2)]);
         }
     }
 }

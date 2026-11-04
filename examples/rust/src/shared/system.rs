@@ -81,7 +81,9 @@ pub async fn init_by_producer(args: &Args, client: &dyn Client) -> Result<(), Ig
     }
 
     info!("Stream does not exist, creating...");
-    client.create_stream(&args.stream_id).await?;
+    client
+        .create_stream(&args.stream_id, &StreamCreateOptions::default())
+        .await?;
     let compression_algorithm = CompressionAlgorithm::from_code(args.compression_algorithm)?;
     client
         .create_topic(
@@ -137,11 +139,14 @@ pub async fn consume_messages(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                Some(args.partition_id),
+                args.partition_id,
                 &consumer,
                 &PollingStrategy::next(),
-                args.messages_per_batch,
-                true,
+                PollOptions {
+                    count: args.messages_per_batch,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await?;
         if polled_messages.messages.is_empty() {

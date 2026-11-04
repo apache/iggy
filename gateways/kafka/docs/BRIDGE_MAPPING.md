@@ -203,22 +203,21 @@ builds one, so the answer does not depend on allocating a payload already known 
 
 ## Batch-level fields
 
-Per-record storage drops what the Kafka record batch header carries: producer id, producer
-epoch, base sequence, the transactional flag, compression and the batch CRC. Fetch synthesizes
-a batch with producer id `-1`, epoch `-1`, base sequence `-1`, no compression, `CreateTime`
+Per-record storage drops the transactional flag, the compression and the batch CRC of the Kafka
+record batch header. With `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, the producer id, the epoch and
+the base sequence of an idempotent batch go to the Iggy batch header, and the partition keeps them
+as producer state. Otherwise the gateway drops them. Fetch synthesizes a
+batch with producer id `-1`, epoch `-1`, base sequence `-1`, no compression, `CreateTime`
 timestamps, and a recomputed CRC32C.
 
 Two consequences worth stating before they surprise someone:
 
-- Idempotent-producer deduplication cannot be reconstructed from stored data later. If
-  [#3545](https://github.com/apache/iggy/issues/3545) ever grows past a stub, producer id,
-  epoch and sequence need their own tracking.
+- The partition writes each batch of an idempotent producer once, from the producer state that
+  it keeps. See [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 - The bytes a consumer receives are not the bytes the producer sent, so anything comparing
   batches byte for byte across the gateway will differ.
 
-Whether producer id `-1` is what Fetch actually sends depends on the InitProducerId decision in
-[`IDEMPOTENCE.md`](IDEMPOTENCE.md). Allocating producer ids does not change what is stored, only
-what Produce accepts, so this section holds under either answer.
+Fetch sends producer id `-1` whatever producer wrote the batch. A consumer does not need it.
 
 Produce refuses a control batch and a transactional batch. A stored message carries neither flag.
 A control record admitted here therefore reaches consumers as ordinary application data, and a
@@ -300,10 +299,67 @@ Produce takes the base offset from the send confirmation
 example for a request it classifies as a duplicate, in which case the response carries `-1`
 rather than a guessed offset; Kafka clients surface that as an unknown offset.
 
-ListOffsets LATEST is the high watermark from `IggyBridge::high_watermarks`. EARLIEST has no
+ListOffsets LATEST is the high watermark of the topic probe `IggyBridge::partition_probes` reads
+on the bridge's probe client. EARLIEST has no
 server-side field today (`Partition` carries no log start offset), so it answers `0`. The
 `(messages_count, current_offset) == (0, 0)` ambiguity documented on `high_watermark` in
 `src/bridge/iggy_bridge/offsets.rs` applies to LATEST.
+
+ListOffsets by timestamp ([#4516](https://github.com/apache/iggy/issues/4516)) polls one record
+by time and answers its offset and its timestamp as Fetch reports it: the producer timestamp when
+one was set, otherwise the append time.
+
+| Request | Answer |
+| --- | --- |
+| A timestamp | The first record Iggy appended at or after it |
+| A timestamp past the last record, or any time on a partition that retains no message | No error, offset and timestamp `-1`, as Kafka answers |
+| A lookup that polls empty without proof that no record matches (below) | `NOT_LEADER_OR_FOLLOWER` (6), which clients retry |
+| `MAX_TIMESTAMP` (`-3`, a v7 sentinel, answered at every version) | The last record |
+| A negative time other than the sentinels | The first record, as on a Kafka broker |
+
+Iggy searches by the time it appended each batch, not by the producer timestamp. A Kafka broker
+searches a `CreateTime` topic by producer timestamps, so the two differ when producer clocks
+disagree with Iggy's or records arrive late: a record stamped earlier by its producer but
+appended after the time is found here and skipped there. With clocks in step the difference is
+the delay between send and append. `MAX_TIMESTAMP` is the last record for the same reason, where
+Kafka would name the record with the largest producer timestamp.
+
+The timestamp answered is the producer timestamp when one was set, while the search runs on
+append time. So on a `CreateTime` topic the answer can carry a timestamp earlier than the one
+asked for, which a Kafka broker never sends. Clients seek by the offset, but
+`OffsetAndTimestamp.timestamp()` shows the timestamp to applications as it is.
+
+Iggy can poll empty while records remain: on a read fault, or before a partition seeds its commit
+point. In a cluster the polls can also reach a node behind the one the probe read, which serves a
+shorter tail. An empty lookup therefore answers `-1` only when:
+
+- a poll of the last record shows it was appended before the time and its offset + 1 reaches the
+  probed high watermark, so the polled node is not behind the probe; or
+- the probe counted no message and the poll of the last record comes back empty too.
+
+Otherwise it answers 6 and the client asks again, since a `-1` would make
+`kafka-consumer-groups --to-datetime` fall back to LATEST and skip the records.
+
+The server reports a message count of 0 both when retention removed every message and when it has
+no stats for the partition, with the high watermark above 0 in both. So a count of 0 alone answers
+nothing, and the lookup polls. When both polls come back empty as well, it answers `-1`, as Kafka
+does for a partition that retains nothing. A node that has no stats for a partition and also polls
+it empty while it holds records answers `-1` too: nothing the probe or the polls return tells the
+two apart, and answering 6 instead would never let a reset by time finish on an expired partition.
+
+A partition Iggy is still loading can read `(messages_count, current_offset) == (0, 0)`, the same
+as an empty one, and the probe cannot tell them apart without a server-side signal. A lookup by
+time in that window still polls, and answers `-1` only when the polls come back empty as well. A
+reset by time there then moves to LATEST.
+
+The lookups by time of one request share one Fetch read slot, however many partitions the request
+names, and up to 8 run at once. Each poll gets the time of a Fetch poll, 2 s or more for a
+partition whose pages took long. Lookups start only in the first 2 s after the request takes its
+slot. The request waits no longer for them, apart from a partition whose pages took long. A lookup
+with no answer by then answers `REQUEST_TIMED_OUT` (7). Clients retry 7. A poll with no
+answer in its time stalls its partition, as in Fetch. The lookups of a stalled partition answer
+`NOT_LEADER_OR_FOLLOWER` (6) with no poll until a re-check answers. Repeated entries for one
+partition and time are looked up once.
 
 ### Header order
 
@@ -341,6 +397,13 @@ producer resolves the partition itself before it builds the request, so every pa
 a `ProduceRequest` is a real one and `Partitioning::balanced()` has no trigger on this path. The
 `-1` that `SCOPE.md` refers to belongs to CreateTopics, where it means "use the broker default
 partition count", and it is handled there rather than here.
+
+`CreatePartitions` grows a topic through Iggy's `create_partitions`, which appends the new
+partitions after the current last index. Every existing index keeps naming the same Iggy
+partition and no stored record moves, so a key that hashed to partition 1 before the grow is
+still read from partition 1 afterwards. New records of that key may land elsewhere, as they do
+after a Kafka broker grows a topic: the producer's partitioner sees more partitions and Kafka
+makes no ordering promise across a grow either.
 
 Kafka consumer groups are not mapped onto Iggy consumer groups. The gateway assigns partitions
 to group members the way Kafka does, in the client, and polls every partition by explicit offset.

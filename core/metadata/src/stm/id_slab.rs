@@ -126,6 +126,16 @@ impl<T> IdSlab<T> {
         }
     }
 
+    /// Ascending by key, from `key` on. The seek costs no scan.
+    #[must_use]
+    pub fn iter_from(&self, key: usize) -> Iter<'_, T> {
+        let mut inner = self.entries.iter().enumerate();
+        if let Some(skipped) = key.checked_sub(1) {
+            inner.nth(skipped);
+        }
+        Iter { inner }
+    }
+
     /// Ascending by key.
     pub fn iter_mut(&mut self) -> IterMut<'_, T> {
         IterMut {
@@ -264,6 +274,23 @@ impl<T> IntoIterator for IdSlab<T> {
 #[cfg(test)]
 mod tests {
     use super::IdSlab;
+
+    #[test]
+    fn given_gaps_when_iterating_from_a_key_should_yield_occupied_keys_from_it() {
+        let mut slab: IdSlab<char> = IdSlab::new();
+        for value in ['a', 'b', 'c', 'd'] {
+            slab.insert(value);
+        }
+        slab.remove(2);
+
+        let keys = |from| slab.iter_from(from).map(|(key, _)| key).collect::<Vec<_>>();
+
+        assert_eq!(keys(0), [0, 1, 3]);
+        assert_eq!(keys(2), [3]);
+        assert_eq!(keys(3), [3]);
+        assert_eq!(keys(4), [] as [usize; 0]);
+        assert_eq!(keys(usize::MAX), [] as [usize; 0]);
+    }
 
     /// The property the type exists for. `Slab` fails it: LIFO reuse makes the
     /// head depend on delete order while a rebuild scans ascending, so

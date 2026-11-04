@@ -20,32 +20,32 @@
 use crate::session_owner::SessionOwner;
 use crate::vsr::{decode_reply, encode_request_header};
 use bytes::Bytes;
+use iggy_binary_protocol::MAX_RECORD_SIZE;
+use iggy_binary_protocol::WireDecode;
+use iggy_binary_protocol::codes::{FETCH_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE};
 use iggy_binary_protocol::consensus::{HEADER_SIZE, RequestHeader};
+use iggy_binary_protocol::requests::messages::{DeferredPollMessagesRequest, FetchMessagesRequest};
+use iggy_binary_protocol::responses::messages::FetchMessagesResponse;
+use iggy_binary_protocol::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
 #[cfg(test)]
 use iggy_common::DiagnosticEvent;
 use iggy_common::IggyError;
 use mux::MuxLink;
 use quic::QuicLink;
+use std::future::pending;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::time::{Instant, sleep};
 
 pub(crate) mod connect;
+mod dial;
 #[cfg(test)]
 pub(crate) mod fake_cluster;
-// Unused until the clients send through the driver.
-#[allow(dead_code)]
-mod dial;
 pub(crate) mod mux;
 pub(crate) mod quic;
-// Unused until the clients send through the driver.
-#[allow(dead_code)]
 mod replicas;
 
-// Unused until the clients send through the driver.
-#[allow(unused_imports)]
 pub(crate) use dial::Dialer;
-// Unused until the clients send through the driver.
-#[allow(unused_imports)]
 pub(crate) use replicas::{ReconnectPolicy, ReplicaLinks, Target};
 
 #[cfg(test)]
@@ -54,12 +54,39 @@ pub(crate) use crate::diagnostic_events::diagnostic_event_channel as event_chann
 
 /// The longest that one request waits, from its first attempt to its last
 /// reply.
-pub(crate) const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const OPERATION_TIMEOUT: Duration = iggy_common::BINARY_OPERATION_TIMEOUT;
 
 /// The pauses between the attempts of one request grow from the base to the
 /// cap, see [`backoff`].
 pub(crate) const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(50);
 pub(crate) const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// Takes the one reply of a cancelled committing request, or the error that ended its link.
+pub(crate) type LateReply = Box<dyn FnOnce(Result<Reply, IggyError>) + Send>;
+
+tokio::task_local! {
+    /// Turns true when the reader of the committing reads of this task closes. A committing
+    /// deferred request then sends its cancel and still takes its one reply, which tells whether
+    /// the server stored.
+    pub(crate) static CANCEL_COMMITTING: watch::Receiver<bool>;
+}
+
+/// Resolves once the committing reads of this task are to cancel. Never without the signal.
+pub(crate) async fn committing_cancelled() {
+    let Ok(mut cancel) = CANCEL_COMMITTING.try_with(Clone::clone) else {
+        return pending().await;
+    };
+    if cancel.wait_for(|cancelled| *cancelled).await.is_err() {
+        pending::<()>().await;
+    }
+}
+
+/// Whether the committing reads of this task are to cancel.
+pub(crate) fn committing_cancel_requested() -> bool {
+    CANCEL_COMMITTING
+        .try_with(|cancel| *cancel.borrow())
+        .unwrap_or(false)
+}
 
 /// A connection to one replica.
 #[derive(Debug)]
@@ -69,23 +96,49 @@ pub(crate) enum Link {
 }
 
 impl Link {
+    pub(crate) fn no_session_eviction(&self) -> bool {
+        match self {
+            Self::Mux(link) => link.no_session_eviction(),
+            Self::Quic(link) => link.no_session_eviction(),
+        }
+    }
+
     /// Sends `frame` and waits for its reply until `deadline`. `sent` turns
     /// true when the frame can reach the server, and `NotConnected` means
     /// that it cannot have. A frame never leaves at or after its deadline,
-    /// because its reply could only time out.
+    /// because its reply could only time out. A `StaleClient` eviction ends
+    /// the frame as `Disconnected`: it removed only the binding of the link,
+    /// so the session goes on over a new link.
     pub(crate) async fn send(
         &self,
         frame: Frame,
         deadline: Instant,
         sent: &mut bool,
     ) -> Result<Reply, IggyError> {
+        self.send_settled(frame, deadline, sent, None).await
+    }
+
+    /// [`Self::send`] of a committing deferred request. When its caller leaves after the send,
+    /// the link cancels it, and the one reply that the server sends for the cancel goes to
+    /// `late`, or the error that ends the link first.
+    pub(crate) async fn send_settled(
+        &self,
+        frame: Frame,
+        deadline: Instant,
+        sent: &mut bool,
+        late: Option<LateReply>,
+    ) -> Result<Reply, IggyError> {
         if Instant::now() >= deadline {
             return Err(IggyError::NotConnected);
         }
-        match self {
-            Self::Mux(link) => link.send(frame, deadline, sent).await,
-            Self::Quic(link) => link.send(frame, deadline, sent).await,
-        }
+        let result = match self {
+            Self::Mux(link) => link.send(frame, deadline, sent, late).await,
+            Self::Quic(link) => link.send(frame, deadline, sent, late).await,
+        };
+        result.map_err(|error| match error {
+            IggyError::StaleClient => IggyError::Disconnected,
+            error => error,
+        })
     }
 
     /// Returns when the link closes, for any reason.
@@ -138,14 +191,13 @@ pub(crate) fn read_reply(session: &SessionOwner, reply: Reply) -> Result<Bytes, 
 }
 
 /// Whether a request failed because its link went away. Another link, or
-/// the same one after a redial, can carry it again.
+/// the same one after a redial, can carry it again. A reply with
+/// `StaleClient` is not one: the link stands, but the server no longer
+/// attaches it to the session, for example because the session ended.
 pub(crate) fn lost_link(error: &IggyError) -> bool {
     matches!(
         error,
-        IggyError::Disconnected
-            | IggyError::EmptyResponse
-            | IggyError::NotConnected
-            | IggyError::StaleClient
+        IggyError::Disconnected | IggyError::EmptyResponse | IggyError::NotConnected
     )
 }
 
@@ -183,6 +235,29 @@ pub(crate) struct Frame {
     pub(crate) body: Bytes,
 }
 
+impl Frame {
+    pub(crate) fn response_body_limit(&self) -> Option<usize> {
+        let code = u32::from_le_bytes(self.header.reserved[..size_of::<u32>()].try_into().ok()?);
+        match code {
+            // The server returns a first record above `max_bytes` alone.
+            POLL_MESSAGES_DEFERRED_CODE => DeferredPollMessagesRequest::decode_from(&self.body)
+                .ok()
+                .map(|request| {
+                    (request.max_bytes as usize).max(POLL_RESPONSE_HEADER_SIZE + MAX_RECORD_SIZE)
+                }),
+            FETCH_MESSAGES_CODE => {
+                FetchMessagesRequest::decode_from(&self.body)
+                    .ok()
+                    .map(|request| {
+                        FetchMessagesResponse::head_size(request.targets.len())
+                            + (request.max_bytes as usize).max(MAX_RECORD_SIZE)
+                    })
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Reply {
     pub(crate) header: [u8; HEADER_SIZE],
@@ -196,21 +271,13 @@ pub(crate) mod test_support {
     use bytes::Bytes;
     use iggy_binary_protocol::codes::PING_CODE;
     use iggy_binary_protocol::consensus::{
-        Command, HEADER_SIZE, Operation, RESULT_COUNT_LEN, ReplyHeader, RequestHeader,
+        Command, HEADER_SIZE, Operation, ReplyHeader, RequestHeader,
     };
-    use iggy_binary_protocol::responses::users::LoginRegisterResponse;
-    use iggy_binary_protocol::{IGGY_PROTOCOL_VERSION, WireEncode, WireName};
-    use iggy_common::{Client, ClientState, Credentials, IggyError, VsrSessionControl};
+    use iggy_common::IggyError;
     use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::Arc;
-    use tokio::task::JoinHandle;
 
     pub(crate) const CLIENT: u128 = 7;
-    /// Enough turns of a current-thread test runtime for a spawned
-    /// `disconnect()` to reach the link that an exchange in flight holds.
-    pub(crate) const DISCONNECT_YIELDS: usize = 32;
-    pub(crate) const SIGNED_IN_USER_ID: u32 = 7;
     pub(crate) const LOCALHOST: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
     /// The buffer of each direction of an in-memory stream.
     pub(crate) const DUPLEX_CAPACITY: usize = 64 * 1024;
@@ -256,93 +323,6 @@ pub(crate) mod test_support {
 
     pub(crate) fn read_request_header(header: &[u8; HEADER_SIZE]) -> RequestHeader {
         bytemuck::checked::try_pod_read_unaligned(header).unwrap()
-    }
-
-    /// The reply to a login or to a session bind, for the user
-    /// [`SIGNED_IN_USER_ID`] and the session `session`.
-    pub(crate) fn sign_in_reply(session: u64) -> Bytes {
-        LoginRegisterResponse {
-            user_id: SIGNED_IN_USER_ID,
-            session,
-            server_protocol_version: IGGY_PROTOCOL_VERSION,
-            server_version: WireName::new("test").unwrap(),
-        }
-        .to_bytes()
-    }
-
-    /// The reply to a Register: a result section with no rejection, then
-    /// [`sign_in_reply`].
-    pub(crate) fn register_reply(session: u64) -> Vec<u8> {
-        let mut body = vec![0; RESULT_COUNT_LEN];
-        body.extend_from_slice(&sign_in_reply(session));
-        body
-    }
-
-    /// Disconnects `client`, then takes the steps that a sign-in takes after
-    /// its reply binds the session, and returns the state they leave.
-    pub(crate) async fn sign_in_steps_after_a_disconnect<C>(client: &C) -> ClientState
-    where
-        C: Client + VsrSessionControl,
-    {
-        Client::disconnect(client).await.unwrap();
-        client.set_state(ClientState::Authenticated).await;
-        client
-            .remember_session_credentials(
-                Credentials::UsernamePassword("iggy".to_string(), "iggy".into()),
-                SIGNED_IN_USER_ID,
-            )
-            .await;
-        client.get_state().await
-    }
-
-    /// Starts an explicit `disconnect()` of `client`, and returns once the
-    /// disconnect has raised the caller flag and waits for the link that an
-    /// exchange in flight holds. So the reply to that exchange arrives after
-    /// the caller disconnected.
-    pub(crate) async fn spawn_disconnect_behind_the_link<C: Client + 'static>(
-        client: &Arc<C>,
-        caller_disconnected: impl Fn(&C) -> bool,
-    ) -> JoinHandle<Result<(), IggyError>> {
-        let disconnect = tokio::spawn({
-            let client = Arc::clone(client);
-            async move { Client::disconnect(&*client).await }
-        });
-        wait_behind_the_link(client, caller_disconnected, &disconnect).await;
-        disconnect
-    }
-
-    /// [`spawn_disconnect_behind_the_link`], with a `connect()` right after
-    /// the disconnect returns, as a caller restarts a client.
-    pub(crate) async fn spawn_restart_behind_the_link<C: Client + 'static>(
-        client: &Arc<C>,
-        caller_disconnected: impl Fn(&C) -> bool,
-    ) -> JoinHandle<Result<(), IggyError>> {
-        let restart = tokio::spawn({
-            let client = Arc::clone(client);
-            async move {
-                Client::disconnect(&*client).await?;
-                Client::connect(&*client).await
-            }
-        });
-        wait_behind_the_link(client, caller_disconnected, &restart).await;
-        restart
-    }
-
-    async fn wait_behind_the_link<C>(
-        client: &Arc<C>,
-        caller_disconnected: impl Fn(&C) -> bool,
-        disconnecting: &JoinHandle<Result<(), IggyError>>,
-    ) {
-        while !caller_disconnected(client) {
-            tokio::task::yield_now().await;
-        }
-        for _ in 0..DISCONNECT_YIELDS {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            !disconnecting.is_finished(),
-            "the disconnect must wait for the exchange that holds the link"
-        );
     }
 
     /// A QUIC server on a free local port, and the certificate it presents.

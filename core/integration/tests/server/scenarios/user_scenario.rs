@@ -18,6 +18,7 @@
 use crate::server::scenarios::create_client;
 use iggy::prelude::Identifier;
 use iggy::prelude::PersonalAccessTokenExpiry;
+use iggy::prelude::UserCreateOptions;
 use iggy::prelude::UserStatus;
 use iggy::prelude::UserUpdateOptions;
 use iggy::prelude::defaults::DEFAULT_ROOT_USERNAME;
@@ -85,6 +86,7 @@ pub async fn run(harness: &TestHarness) {
                 },
                 streams: None,
             }),
+            &UserCreateOptions::default(),
         )
         .await
         .unwrap();
@@ -106,7 +108,13 @@ pub async fn run(harness: &TestHarness) {
 
     // 10. Trying to create a new user (or any other resource) without the appropriate permissions should fail
     let create_user_result = client
-        .create_user("user2", "secret", UserStatus::Active, None)
+        .create_user(
+            "user2",
+            "secret",
+            UserStatus::Active,
+            None,
+            &UserCreateOptions::default(),
+        )
         .await;
 
     assert!(create_user_result.is_err());
@@ -197,7 +205,13 @@ pub async fn run(harness: &TestHarness) {
 
     // 20. Trying to create a new user with the same username should fail
     let create_duplicated_user = client
-        .create_user(test_user, test_password, UserStatus::Active, None)
+        .create_user(
+            test_user,
+            test_password,
+            UserStatus::Active,
+            None,
+            &UserCreateOptions::default(),
+        )
         .await;
 
     assert!(create_duplicated_user.is_err());
@@ -208,9 +222,11 @@ pub async fn run(harness: &TestHarness) {
     client
         .update_user(
             &Identifier::named(test_user).unwrap(),
-            Some(updated_test_user),
-            Some(UserStatus::Inactive),
-            &UserUpdateOptions::default(),
+            &UserUpdateOptions {
+                username: Some(updated_test_user.to_owned()),
+                status: Some(UserStatus::Inactive),
+                ..UserUpdateOptions::default()
+            },
         )
         .await
         .unwrap();

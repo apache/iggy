@@ -118,6 +118,12 @@ impl<const ALIGN: usize> Owned<ALIGN> {
         &self.inner
     }
 
+    /// Capacity of the allocation retained when this buffer is frozen.
+    #[must_use]
+    pub fn backing_capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.inner
     }
@@ -287,6 +293,19 @@ impl<const ALIGN: usize> From<Owned<ALIGN>> for Frozen<ALIGN> {
 }
 
 impl<const ALIGN: usize> Frozen<ALIGN> {
+    /// Bytes pinned by this view, including its allocation's control block.
+    pub fn allocation_bytes(&self) -> usize {
+        self.backing_capacity()
+            .saturating_add(size_of::<ControlBlock>())
+    }
+
+    /// Identity of the backing allocation, equal for every view that
+    /// [`Self::shares_allocation`] with this one. A live view keeps the
+    /// allocation, so the identity cannot be reused while one exists.
+    pub fn allocation_id(&self) -> usize {
+        self.inner.ctrlb.as_ptr().addr()
+    }
+
     pub fn as_slice(&self) -> &[u8] {
         self.inner.as_slice()
     }

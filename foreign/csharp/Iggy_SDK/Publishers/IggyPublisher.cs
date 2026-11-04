@@ -229,11 +229,11 @@ public partial class IggyPublisher : IAsyncDisposable
 
         if (Config.StreamId.Kind is IdKind.String)
         {
-            await Client.CreateStreamAsync(Config.StreamId.GetString(), ct);
+            await Client.CreateStreamAsync(Config.StreamId.GetString(), token: ct);
         }
         else
         {
-            await Client.CreateStreamAsync(Config.StreamName, ct);
+            await Client.CreateStreamAsync(Config.StreamName, token: ct);
         }
 
         LogStreamCreated(Config.StreamId);
@@ -260,18 +260,16 @@ public partial class IggyPublisher : IAsyncDisposable
 
         LogCreatingTopic(Config.TopicId, Config.TopicName, Config.StreamId);
 
-        if (Config.TopicId.Kind is IdKind.String)
+        var options = new TopicOptions
         {
-            await Client.CreateTopicAsync(Config.StreamId, Config.TopicId.GetString(),
-                Config.TopicPartitionsCount, Config.TopicCompressionAlgorithm,
-                Config.TopicMessageExpiry, Config.TopicMaxTopicSize, token: ct);
-        }
-        else
-        {
-            await Client.CreateTopicAsync(Config.StreamId, Config.TopicName, Config.TopicPartitionsCount,
-                Config.TopicCompressionAlgorithm,
-                Config.TopicMessageExpiry, Config.TopicMaxTopicSize, token: ct);
-        }
+            CompressionAlgorithm = Config.TopicCompressionAlgorithm == CompressionAlgorithm.None
+                ? null
+                : Config.TopicCompressionAlgorithm,
+            MessageExpiry = Config.TopicMessageExpiry,
+            MaxTopicSize = Config.TopicMaxTopicSize
+        };
+        var topicName = Config.TopicId.Kind is IdKind.String ? Config.TopicId.GetString() : Config.TopicName;
+        await Client.CreateTopicAsync(Config.StreamId, topicName, Config.TopicPartitionsCount, options, ct);
 
         LogTopicCreated(Config.TopicId, Config.StreamId);
     }

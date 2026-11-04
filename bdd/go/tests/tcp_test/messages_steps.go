@@ -37,23 +37,27 @@ func createDefaultMessageHeaders() []iggcon.HeaderEntry {
 
 func createDefaultMessages() []iggcon.IggyMessage {
 	headers := createDefaultMessageHeaders()
-	msg1, _ := iggcon.NewIggyMessage([]byte(createRandomString(256)), iggcon.WithID(uuid.New()), iggcon.WithUserHeaders(headers))
-	msg2, _ := iggcon.NewIggyMessage([]byte(createRandomString(256)), iggcon.WithID(uuid.New()), iggcon.WithUserHeaders(headers))
+	msg1, err := iggcon.NewIggyMessage([]byte(createRandomString(256)), iggcon.WithID(uuid.New()), iggcon.WithUserHeaders(headers))
+	gomega.Expect(err).To(gomega.BeNil())
+	msg2, err := iggcon.NewIggyMessage([]byte(createRandomString(256)), iggcon.WithID(uuid.New()), iggcon.WithUserHeaders(headers))
+	gomega.Expect(err).To(gomega.BeNil())
 	return []iggcon.IggyMessage{msg1, msg2}
 }
 
 func itShouldSuccessfullyPublishMessages(streamId uint32, topicId uint32, messages []iggcon.IggyMessage, client iggcon.Client) {
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+	options := iggcon.DefaultPollOptions()
+	options.Count = uint32(len(messages))
+	options.Commit = iggcon.OnReadCommit()
 	result, err := client.PollMessages(
 		context.Background(),
 		streamIdentifier,
 		topicIdentifier,
+		0,
 		iggcon.NewSingleConsumer(randomU32Identifier()),
 		iggcon.FirstPollingStrategy(),
-		uint32(len(messages)),
-		true,
-		nil)
+		options)
 
 	ginkgo.It("It should not be nil", func() {
 		gomega.Expect(result).NotTo(gomega.BeNil())

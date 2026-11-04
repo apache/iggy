@@ -79,8 +79,6 @@ async def main() -> None:
         create_stream_if_not_exists=True,
         create_topic_if_not_exists=True,
         topic_partitions_count=3,
-        send_retries=3,
-        send_retry_interval=timedelta(seconds=1),
     )
 
     async with producer:

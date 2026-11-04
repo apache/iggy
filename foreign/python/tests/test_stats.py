@@ -19,7 +19,13 @@ import datetime
 
 import pytest
 
-from apache_iggy import CacheMetricsKey, GlobalPermissions, IggyClient, Permissions
+from apache_iggy import (
+    CacheMetricsKey,
+    GlobalPermissions,
+    IggyClient,
+    Permissions,
+    TopicOptions,
+)
 from apache_iggy import SendMessage as Message
 
 from .utils import (
@@ -54,9 +60,7 @@ class TestStats:
         stream_name = unique_name()
         topic_name = unique_name()
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
         await iggy_client.send_messages(
             stream=stream_name,
             topic=topic_name,
@@ -122,7 +126,7 @@ class TestStats:
                 await iggy_client.create_topic(
                     stream=stream_name,
                     name=topic_name,
-                    partitions_count=partitions_per_topic,
+                    options=TopicOptions(partitions_count=partitions_per_topic),
                 )
                 await iggy_client.create_consumer_group(
                     stream_name, topic_name, unique_name()

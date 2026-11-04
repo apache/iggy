@@ -22,11 +22,15 @@ package org.apache.iggy.client.async.tcp;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.util.AttributeKey;
+import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyNotConnectedException;
+import org.apache.iggy.exception.IggyServerException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 
 final class IggyAuthenticator {
@@ -75,6 +79,80 @@ final class IggyAuthenticator {
                 result.release();
             }
         });
+    }
+
+    static void attempt(
+            AsyncTcpConnection connection,
+            AsyncTcpConnection.Call call,
+            ByteBuf payload,
+            long requiredSessionGeneration) {
+        var state = call.state();
+        if (state.signedOut()) {
+            payload.release();
+            call.fail(state.lineageEnded(null));
+        } else if (connection.isAuthenticated()
+                || AsyncTcpConnection.isLoginCode(call.commandCode())
+                || connection.isAllowedBeforeAuthentication(call.commandCode())) {
+            connection.acquireForCall(call, payload, requiredSessionGeneration);
+        } else {
+            connection.awaitAuthentication(call.deadline(), state).whenComplete((ignored, error) -> {
+                if (error != null || call.over()) {
+                    payload.release();
+                    call.fail(error != null ? error : AsyncTcpConnection.notAccepted());
+                } else {
+                    attempt(connection, call, payload, requiredSessionGeneration);
+                }
+            });
+        }
+    }
+
+    static CompletableFuture<Void> awaitAuthentication(
+            AsyncTcpConnection connection,
+            long deadline,
+            AsyncTcpConnection.TransientFailoverState state,
+            BooleanSupplier signInOwed) {
+        if (connection.isAuthenticated()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        if (connection.sessionOwner().signingIn()) {
+            return CompletableFuture.failedFuture(new IggyServerException(IggyErrorCode.UNAUTHENTICATED.getCode()));
+        }
+        if (!signInOwed.getAsBoolean()) {
+            return CompletableFuture.failedFuture(notSignedIn(connection));
+        }
+        // Register binds the session before publishing the connection's authentication state.
+        return connection
+                .sessionOwner()
+                .awaitSession(state.lineage(), deadline, connection.eventLoop())
+                .thenRunAsync(() -> {}, connection.eventLoop());
+    }
+
+    static CompletableFuture<Void> authenticate(
+            AsyncTcpConnection connection,
+            Channel channel,
+            long deadline,
+            AsyncTcpConnection.TransientFailoverState state) {
+        var authentication = connection.authenticationSnapshot();
+        if (authentication.isEmpty()) {
+            return CompletableFuture.failedFuture(notSignedIn(connection));
+        }
+        var snapshot = authentication.get();
+        return ensureAuthenticated(
+                channel,
+                snapshot.payload(),
+                connection.authenticationGeneration(),
+                ignored -> connection.sendAuthenticationFrame(channel, snapshot, deadline, state));
+    }
+
+    /**
+     * The error of a call that needs a session while no sign-in can bring one: 40 once the caller began a sign-in,
+     * as in Rust, so after a logout, a refused automatic sign-in or a failed sign-in. Before that, the caller has to
+     * sign in first.
+     */
+    static RuntimeException notSignedIn(AsyncTcpConnection connection) {
+        return connection.sessionOwner().beganSignIn()
+                ? new IggyServerException(IggyErrorCode.UNAUTHENTICATED.getCode())
+                : new IggyNotConnectedException(AsyncTcpConnection.NOT_AUTHENTICATED);
     }
 
     static void setAuthGeneration(Channel channel, long generation) {
