@@ -18,8 +18,8 @@
 //! `DescribeConfigs` (API key 32).
 //!
 //! A topic reports every key of Kafka 4.4 except `cleanup.policy`: the three keys Iggy stores,
-//! and Kafka's default for each other one. A broker reports a fixed set for this gateway. See
-//! `topic_config::keys` and `docs/CONFIGS.md`.
+//! what the gateway applies for some others, and Kafka's default for the rest. A broker reports a
+//! fixed set for this gateway. See `topic_config::keys` and `docs/CONFIGS.md`.
 
 use std::collections::HashSet;
 
@@ -28,6 +28,7 @@ use kafka_protocol::messages::DescribeConfigsRequest;
 use kafka_protocol::messages::describe_configs_request::DescribeConfigsResource;
 use kafka_protocol::messages::describe_configs_response::{
     DescribeConfigsResourceResult, DescribeConfigsResponse, DescribeConfigsResult,
+    DescribeConfigsSynonym,
 };
 use kafka_protocol::protocol::StrBytes;
 use tokio::time::Instant;
@@ -42,11 +43,11 @@ use crate::protocol::api::{
 };
 use crate::protocol::bounds_guard::validate_describe_configs_shape;
 use crate::protocol::handlers::topic_config::keys::{
-    BrokerContext, ConfigEntry, broker_entries, topic_entries,
+    BrokerContext, ConfigContext, ConfigEntry, broker_entries, topic_entries,
 };
 use crate::protocol::handlers::topic_config::{
-    RESOURCE_TYPE_BROKER, RESOURCE_TYPE_TOPIC, bridge_failure, name_reason,
-    topic_cap_and_duplicates, topic_cap_message,
+    RESOURCE_TYPE_BROKER, RESOURCE_TYPE_TOPIC, bridge_failure, describe_cap_message,
+    exceeds_describe_cap, name_reason, topic_cap_and_duplicates,
 };
 use crate::protocol::handlers::{
     decode_guarded, encode_message, is_supported_version, respond_or_close,
@@ -84,10 +85,10 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     // Checked before the bridge-availability stub, not inside `describe_all`: the cap is a
     // request-shape policy, not a controller-availability one, and a check that only runs once
     // the bridge is up is never exercised by a serverless/stub test.
-    let (exceeds_cap, duplicate_names) = topic_cap_and_duplicates(&req.resources);
-    if exceeds_cap {
-        let message = StrBytes::from(topic_cap_message("DescribeConfigs"));
-        tracing::warn!("DescribeConfigs request addresses too many distinct topics; rejecting");
+    let (_, duplicate_names) = topic_cap_and_duplicates(&req.resources);
+    if exceeds_describe_cap(&req.resources) {
+        let message = StrBytes::from(describe_cap_message());
+        tracing::warn!("DescribeConfigs request asks for too many resources; rejecting");
         let results = req
             .resources
             .iter()
@@ -121,8 +122,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     let broker = BrokerContext {
         node_id: state.node_id,
         auto_create_topics: state.auto_topic_creation.is_some(),
-        defaults: bridge.topic_defaults(),
-        default_replication_factor: bridge.default_replication_factor(),
+        config: ConfigContext::of(bridge, state.max_frame_size),
     };
     let deadline = Instant::now() + REQUEST_DEADLINE;
     let results = describe_all(bridge, &broker, &req, &duplicate_names, deadline).await;
@@ -163,12 +163,16 @@ async fn describe_all(
     let mut cache = StreamTopicCache::default();
     let mut results = Vec::with_capacity(req.resources.len());
     let mut deadline_exceeded = false;
+    let shown = Shown {
+        documentation: req.include_documentation,
+        synonyms: req.include_synonyms,
+    };
     for resource in &req.resources {
         match resource.resource_type {
             RESOURCE_TYPE_TOPIC => {}
             // Answered from this gateway alone, so the deadline does not apply.
             RESOURCE_TYPE_BROKER => {
-                results.push(describe_broker(broker, resource, req.include_documentation));
+                results.push(describe_broker(broker, resource, shown));
                 continue;
             }
             _ => {
@@ -209,9 +213,10 @@ async fn describe_all(
 
         let result = describe_topic(
             bridge,
+            &broker.config,
             &mut cache,
             resource,
-            req.include_documentation,
+            shown,
             deadline,
         )
         .await;
@@ -223,11 +228,19 @@ async fn describe_all(
     results
 }
 
+/// What each entry carries beside its value, as the request asks.
+#[derive(Debug, Clone, Copy)]
+struct Shown {
+    documentation: bool,
+    synonyms: bool,
+}
+
 async fn describe_topic(
     bridge: &IggyBridge,
+    context: &ConfigContext<'_>,
     cache: &mut StreamTopicCache,
     resource: &DescribeConfigsResource,
-    include_documentation: bool,
+    shown: Shown,
     deadline: Instant,
 ) -> DescribeConfigsResult {
     let name = resource.resource_name.as_str();
@@ -257,15 +270,11 @@ async fn describe_topic(
         }
     };
 
-    let entries = topic_entries(
-        snapshot,
-        bridge.topic_defaults(),
-        resource.configuration_keys.as_deref(),
-    );
+    let entries = topic_entries(snapshot, context, resource.configuration_keys.as_deref());
     // Only a stored expiry that is not a whole number of milliseconds has no Kafka form. It is
     // still the expiry of the topic, so it is not reported as the never-expire default.
     let unrepresentable = entries.iter().any(|entry| entry.value.is_none());
-    let configs = described(entries, include_documentation);
+    let configs = described(entries, shown);
     if unrepresentable {
         return resource_error(
             resource,
@@ -285,7 +294,7 @@ async fn describe_topic(
 fn describe_broker(
     broker: &BrokerContext<'_>,
     resource: &DescribeConfigsResource,
-    include_documentation: bool,
+    shown: Shown,
 ) -> DescribeConfigsResult {
     let name = resource.resource_name.as_str();
     if name.is_empty() {
@@ -294,12 +303,7 @@ fn describe_broker(
     match name.parse::<i32>() {
         Ok(node_id) if node_id == broker.node_id => {
             let entries = broker_entries(broker, resource.configuration_keys.as_deref());
-            resource_error(
-                resource,
-                ERROR_NONE,
-                None,
-                described(entries, include_documentation),
-            )
+            resource_error(resource, ERROR_NONE, None, described(entries, shown))
         }
         Ok(_) => resource_error(
             resource,
@@ -321,24 +325,37 @@ fn describe_broker(
     }
 }
 
-/// `include_synonyms` has no effect: synonyms are always empty.
-fn described(
-    entries: Vec<ConfigEntry>,
-    include_documentation: bool,
-) -> Vec<DescribeConfigsResourceResult> {
+/// The wire form of `entries`. With `include_synonyms`, each entry lists itself as its one
+/// synonym, with its value and source, as Kafka lists at least the entry itself. Kafka also lists
+/// the broker keys the value falls back to, which the gateway does not.
+fn described(entries: Vec<ConfigEntry>, shown: Shown) -> Vec<DescribeConfigsResourceResult> {
     entries
         .into_iter()
         .map(|entry| {
+            let name = StrBytes::from_static_str(entry.name);
+            let value = entry.value.map(StrBytes::from);
+            let synonyms = if shown.synonyms {
+                vec![
+                    DescribeConfigsSynonym::default()
+                        .with_name(name.clone())
+                        .with_value(value.clone())
+                        .with_source(entry.source),
+                ]
+            } else {
+                Vec::new()
+            };
             DescribeConfigsResourceResult::default()
-                .with_name(StrBytes::from_static_str(entry.name))
-                .with_value(entry.value.map(StrBytes::from))
+                .with_name(name)
+                .with_value(value)
                 .with_read_only(entry.read_only)
                 .with_config_source(entry.source)
                 .with_is_sensitive(false)
-                .with_synonyms(Vec::new())
+                .with_synonyms(synonyms)
                 .with_config_type(entry.config_type.code())
                 .with_documentation(
-                    include_documentation.then(|| StrBytes::from_static_str(entry.documentation)),
+                    shown
+                        .documentation
+                        .then(|| StrBytes::from_static_str(entry.documentation)),
                 )
         })
         .collect()
@@ -378,15 +395,23 @@ mod tests {
         BrokerContext {
             node_id: 2,
             auto_create_topics: true,
-            defaults,
-            default_replication_factor: None,
+            config: ConfigContext {
+                defaults,
+                max_message_bytes: 8 * 1024 * 1024,
+                default_replication_factor: None,
+            },
         }
     }
+
+    const BARE: Shown = Shown {
+        documentation: false,
+        synonyms: false,
+    };
 
     #[test]
     fn given_this_gateway_id_should_describe_the_broker() {
         let defaults = TopicDefaults::default();
-        let result = describe_broker(&context(&defaults), &broker_resource("2", None), false);
+        let result = describe_broker(&context(&defaults), &broker_resource("2", None), BARE);
         assert_eq!(result.error_code, ERROR_NONE);
         let auto_create = result
             .configs
@@ -405,16 +430,46 @@ mod tests {
         );
         assert!(result.configs.iter().all(|config| config.read_only));
 
+        assert!(
+            result
+                .configs
+                .iter()
+                .all(|config| config.synonyms.is_empty())
+        );
+
         let asked = broker_resource("2", Some(vec!["min.insync.replicas"]));
-        let result = describe_broker(&context(&defaults), &asked, true);
+        let documented = Shown {
+            documentation: true,
+            ..BARE
+        };
+        let result = describe_broker(&context(&defaults), &asked, documented);
         assert_eq!(result.configs.len(), 1);
         assert!(result.configs[0].documentation.is_some());
     }
 
     #[test]
+    fn given_include_synonyms_should_list_each_entry_as_its_own_synonym() {
+        let defaults = TopicDefaults::default();
+        let asked = broker_resource("2", Some(vec!["auto.create.topics.enable"]));
+        let with_synonyms = Shown {
+            synonyms: true,
+            ..BARE
+        };
+        let result = describe_broker(&context(&defaults), &asked, with_synonyms);
+        let entry = &result.configs[0];
+        assert_eq!(
+            entry.synonyms,
+            [DescribeConfigsSynonym::default()
+                .with_name(entry.name.clone())
+                .with_value(entry.value.clone())
+                .with_source(entry.config_source)]
+        );
+    }
+
+    #[test]
     fn given_the_empty_broker_name_should_report_no_cluster_defaults() {
         let defaults = TopicDefaults::default();
-        let result = describe_broker(&context(&defaults), &broker_resource("", None), false);
+        let result = describe_broker(&context(&defaults), &broker_resource("", None), BARE);
         assert_eq!(result.error_code, ERROR_NONE);
         assert_eq!(result.configs, [] as [DescribeConfigsResourceResult; 0]);
     }
@@ -422,13 +477,13 @@ mod tests {
     #[test]
     fn given_another_broker_id_should_answer_kafkas_invalid_request() {
         let defaults = TopicDefaults::default();
-        let other = describe_broker(&context(&defaults), &broker_resource("7", None), false);
+        let other = describe_broker(&context(&defaults), &broker_resource("7", None), BARE);
         assert_eq!(other.error_code, ERROR_INVALID_REQUEST);
         assert_eq!(
             other.error_message.as_ref().map(StrBytes::as_str),
             Some("Unexpected broker id, expected 2 or empty string, but received 7")
         );
-        let named = describe_broker(&context(&defaults), &broker_resource("b1", None), false);
+        let named = describe_broker(&context(&defaults), &broker_resource("b1", None), BARE);
         assert_eq!(named.error_code, ERROR_INVALID_REQUEST);
         assert_eq!(
             named.error_message.as_ref().map(StrBytes::as_str),

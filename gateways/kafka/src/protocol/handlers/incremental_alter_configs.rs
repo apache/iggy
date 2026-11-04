@@ -26,18 +26,18 @@
 use std::collections::HashSet;
 
 use bytes::Bytes;
-use iggy::prelude::IggyError;
 use kafka_protocol::messages::IncrementalAlterConfigsRequest;
 use kafka_protocol::messages::incremental_alter_configs_request::AlterConfigsResource;
 use kafka_protocol::messages::incremental_alter_configs_response::{
     AlterConfigsResourceResponse, IncrementalAlterConfigsResponse,
 };
 use kafka_protocol::protocol::StrBytes;
+use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::topic_map::validate_kafka_topic_name;
-use crate::bridge::{BridgeError, IggyBridge, StreamTopicCache, TopicConfigUpdate, TopicLoad};
+use crate::bridge::{IggyBridge, StreamTopicCache, TopicLoad};
 use crate::protocol::api::{
     API_KEY_INCREMENTAL_ALTER_CONFIGS, ApiVersionRange, ERROR_INVALID_CONFIG,
     ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_NOT_CONTROLLER,
@@ -45,9 +45,10 @@ use crate::protocol::api::{
     ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome, REQUEST_DEADLINE,
 };
 use crate::protocol::bounds_guard::validate_incremental_alter_configs_shape;
+use crate::protocol::handlers::topic_config::keys::ConfigContext;
 use crate::protocol::handlers::topic_config::{
     ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, alter_denial, bridge_failure, incremental_ops,
-    log_compaction, name_reason, plan_incremental, topic_cap_and_duplicates, topic_cap_message,
+    name_reason, plan_incremental, topic_cap_and_duplicates, topic_cap_message, write_alter,
 };
 use crate::protocol::handlers::{
     decode_guarded, encode_message, is_supported_version, respond_or_close,
@@ -134,7 +135,13 @@ pub async fn handle(
     };
 
     let deadline = Instant::now() + REQUEST_DEADLINE;
-    let responses = alter_all(bridge, &req, &duplicate_names, deadline).await;
+    let alter = Alter {
+        bridge,
+        partition_growth: &state.partition_growth,
+        context: ConfigContext::of(bridge, state.max_frame_size),
+        deadline,
+    };
+    let responses = alter_all(&alter, &req, &duplicate_names).await;
     respond_or_close(
         encode_message(&response(responses), api_version, 256),
         API_NAME,
@@ -182,12 +189,20 @@ fn response(responses: Vec<AlterConfigsResourceResponse>) -> IncrementalAlterCon
         .with_responses(responses)
 }
 
+/// What every resource of one request alters through.
+struct Alter<'a> {
+    bridge: &'a IggyBridge,
+    partition_growth: &'a Mutex<()>,
+    context: ConfigContext<'a>,
+    deadline: Instant,
+}
+
 async fn alter_all(
-    bridge: &IggyBridge,
+    alter: &Alter<'_>,
     req: &IncrementalAlterConfigsRequest,
     duplicate_names: &HashSet<&str>,
-    deadline: Instant,
 ) -> Vec<AlterConfigsResourceResponse> {
+    let deadline = alter.deadline;
     let mut cache = StreamTopicCache::default();
     let mut responses = Vec::with_capacity(req.resources.len());
     let mut deadline_exceeded = false;
@@ -214,7 +229,7 @@ async fn alter_all(
             continue;
         }
 
-        let result = alter_one(bridge, &mut cache, resource, req.validate_only, deadline).await;
+        let result = alter_one(alter, &mut cache, resource, req.validate_only).await;
         if Instant::now() >= deadline {
             deadline_exceeded = true;
         }
@@ -224,12 +239,12 @@ async fn alter_all(
 }
 
 async fn alter_one(
-    bridge: &IggyBridge,
+    alter: &Alter<'_>,
     cache: &mut StreamTopicCache,
     resource: &AlterConfigsResource,
     validate_only: bool,
-    deadline: Instant,
 ) -> AlterConfigsResourceResponse {
+    let (bridge, deadline) = (alter.bridge, alter.deadline);
     if resource.resource_type != RESOURCE_TYPE_TOPIC {
         return resource_error(
             resource,
@@ -279,7 +294,7 @@ async fn alter_one(
         }
     };
 
-    let update = match plan_incremental(&ops, &topic, bridge.topic_defaults()) {
+    let update = match plan_incremental(&ops, &topic, &alter.context) {
         Ok(update) => update,
         Err(fault) => {
             return resource_error(
@@ -292,46 +307,17 @@ async fn alter_one(
     if validate_only {
         return resource_error(resource, ERROR_NONE, None);
     }
-    write_update(bridge, resource, &update, deadline).await
-}
-
-/// Writes `update`. An empty one writes nothing: Kafka answers an empty operation list, and a
-/// delete of an override that was never set, the same way.
-async fn write_update(
-    bridge: &IggyBridge,
-    resource: &AlterConfigsResource,
-    update: &TopicConfigUpdate,
-    deadline: Instant,
-) -> AlterConfigsResourceResponse {
-    let name = resource.resource_name.as_str();
-    if update.is_empty() {
-        if let Some(policy) = update.cleanup_policy {
-            log_compaction(name, policy, false);
-        }
-        return resource_error(resource, ERROR_NONE, None);
-    }
-    // Not started past the deadline and not wrapped in `timeout_at`: dropping the future does not
-    // abort the SDK call. The bridge bounds its own round trip with `with_request_timeout`, so a
-    // write can still commit after this handler answered REQUEST_TIMED_OUT.
-    if Instant::now() >= deadline {
-        tracing::warn!(
-            resource = name,
-            "IncrementalAlterConfigs deadline passed before update_topic; not starting the write"
-        );
-        return resource_error(resource, ERROR_REQUEST_TIMED_OUT, None);
-    }
-    match bridge.update_kafka_topic_config(name, update).await {
-        Ok(()) | Err(BridgeError::Iggy(IggyError::RequestAlreadyApplied)) => {
-            if let Some(policy) = update.cleanup_policy {
-                log_compaction(name, policy, true);
-            }
-            resource_error(resource, ERROR_NONE, None)
-        }
-        Err(error) => {
-            let (code, message) = bridge_failure(&error, API_NAME, "altering");
-            resource_error(resource, code, message)
-        }
-    }
+    let (code, message) = write_alter(
+        bridge,
+        alter.partition_growth,
+        name,
+        update,
+        |topic| plan_incremental(&ops, topic, &alter.context),
+        deadline,
+        API_NAME,
+    )
+    .await;
+    resource_error(resource, code, message)
 }
 
 fn resource_error(
@@ -348,10 +334,7 @@ fn resource_error(
 
 #[cfg(test)]
 mod tests {
-    use iggy::prelude::IggyExpiry;
-
     use super::*;
-    use crate::bridge::SettingChange;
     use crate::protocol::acl::PrincipalPermissions;
 
     fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
@@ -404,18 +387,5 @@ mod tests {
         let principal = principal(true, false);
         let responses = authorize(Some(&principal), &[resource("orders")]).expect("denied");
         assert_eq!(responses[0].error_code, ERROR_TOPIC_AUTHORIZATION_FAILED);
-    }
-
-    #[tokio::test]
-    async fn given_a_passed_deadline_when_writing_should_answer_timed_out_without_calling_iggy() {
-        let bridge = IggyBridge::offline();
-        let update = TopicConfigUpdate {
-            message_expiry: Some(SettingChange::Set(IggyExpiry::NeverExpire)),
-            ..TopicConfigUpdate::default()
-        };
-        let response = write_update(&bridge, &resource("orders"), &update, Instant::now()).await;
-        // A write started on the offline bridge fails fast as NOT_LEADER_OR_FOLLOWER instead.
-        assert_eq!(response.error_code, ERROR_REQUEST_TIMED_OUT);
-        assert!(response.error_message.is_none());
     }
 }

@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use iggy_common::MAX_REPLICATION_FACTOR;
 use iggy_kafka_wire::KafkaWireError;
 use kafka_protocol::messages::metadata_response::{
     MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
@@ -50,11 +51,12 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
     max_version: 9,
 };
 
-/// Above this many total partitions in an all-topics response, `encode_real_response` runs on a
-/// blocking-pool thread instead of inline (see the call site). Conservative relative to the one
-/// measured data point available (20-54ms at 131,000 partitions) rather than a profiled
-/// threshold - tune with a real benchmark if it proves too high or too low in practice.
-const BLOCKING_ENCODE_PARTITION_THRESHOLD: u32 = 20_000;
+/// Above this many partition replicas in a response, each partition counted once for each replica
+/// it lists, `encode_real_response` runs on a blocking-pool thread instead of inline (see the
+/// call site). Conservative relative to the one measured data point available (20-54ms at
+/// 131,000 partitions of one replica) rather than a profiled threshold - tune with a real
+/// benchmark if it proves too high or too low in practice.
+const BLOCKING_ENCODE_REPLICA_THRESHOLD: u64 = 20_000;
 
 pub async fn handle(
     state: &GatewayState,
@@ -154,13 +156,13 @@ pub async fn handle(
         return HandleOutcome::Close;
     }
 
-    let total_partitions: u64 = results
+    let total_replicas: u64 = results
         .iter()
         .filter(|result| result.error_code == ERROR_NONE)
-        .map(|result| u64::from(result.partitions_count))
+        .map(|result| u64::from(result.partitions_count) * u64::from(listed_replicas(result)))
         .sum();
 
-    let encoded = if total_partitions > u64::from(BLOCKING_ENCODE_PARTITION_THRESHOLD) {
+    let encoded = if total_replicas > BLOCKING_ENCODE_REPLICA_THRESHOLD {
         // Building `MetadataResponsePartition` once per partition and serializing the whole
         // response is measured at 20-54ms at 131,000 partitions - long enough, on a
         // shared-nothing shard's single executor, to stall every other connection's request on
@@ -400,14 +402,23 @@ fn estimated_response_bytes(result: &TopicResult, per_partition_bytes: usize) ->
     let name_bytes = result.name.as_str().len() + 2;
     let partition_bytes = if result.error_code == ERROR_NONE {
         // The template names one replica. Each further replica adds a node id to the replica list
-        // and one to the in-sync list. The factor can exceed the gateways, so this can overcount.
-        let extra_replicas = result.replication_factor.unwrap_or(1).saturating_sub(1) as usize;
+        // and one to the in-sync list. Both list lengths stay one varint byte up to 126 entries.
+        let extra_replicas = listed_replicas(result).saturating_sub(1) as usize;
         let per_partition = per_partition_bytes + extra_replicas * 2 * size_of::<i32>();
         (result.partitions_count as usize).saturating_mul(per_partition)
     } else {
         0
     };
     RESPONSE_BYTES_TOPIC_OVERHEAD + name_bytes + partition_bytes
+}
+
+/// How many replicas each partition of `result` lists: the factor Iggy stored, one for a topic
+/// created before Iggy stored one, and never more than Iggy keeps.
+fn listed_replicas(result: &TopicResult) -> u32 {
+    result
+        .replication_factor
+        .unwrap_or(1)
+        .clamp(1, MAX_REPLICATION_FACTOR)
 }
 
 const fn response_would_exceed_frame_size(total_bytes: usize, max_frame_size: usize) -> bool {
@@ -535,11 +546,13 @@ pub fn encode_response(
 /// partition request to its Iggy primary. So a client of a gateway that stops, or crashes, goes on
 /// through another at its next Metadata, and a producer holds one Iggy session.
 ///
-/// The replica list holds as many gateways as the topic's replication factor, this one first
-/// ([`Brokers::replicas`]), so tools read the factor that Iggy stored. The topic listing gives the
-/// factor but not the nodes of each partition, so the list names gateways, not the nodes that
-/// hold the partition, and each replica counts as in sync. A topic created before Iggy stored a
-/// factor names this gateway alone. `placement` names the controller and the live gateways.
+/// The replica list holds as many ids as the topic's replication factor ([`Brokers::replicas`]):
+/// this gateway first, then the other gateways, then stand-in ids when the factor is above the
+/// number of gateways. Tools such as the Strimzi Topic Operator and Terraform read the factor
+/// that Iggy stored from its length. The topic listing gives the factor but not the nodes of each
+/// partition, so the list names gateways, not the nodes that hold the partition, and each replica
+/// counts as in sync. A topic created before Iggy stored a factor names this gateway alone.
+/// `placement` names the controller and the live gateways.
 fn encode_real_response(
     response_version: i16,
     results: &[TopicResult],
@@ -554,7 +567,7 @@ fn encode_real_response(
         .map(|result| {
             let partitions = if result.error_code == ERROR_NONE {
                 let replicas: Vec<BrokerId> = brokers
-                    .replicas(result.replication_factor.unwrap_or(1))
+                    .replicas(listed_replicas(result))
                     .into_iter()
                     .map(BrokerId)
                     .collect();
@@ -1013,8 +1026,8 @@ mod tests {
             assert_eq!(replicas(0), [vec![2, 3], vec![2, 3]], "v{version}");
             assert_eq!(
                 replicas(1),
-                [vec![2, 3, 1]],
-                "at most every gateway, v{version}"
+                [vec![2, 3, 1, 65_536, 65_537]],
+                "every gateway, then stand-ins up to the factor, v{version}"
             );
             assert_eq!(replicas(2), [vec![2]], "no stored factor, v{version}");
         }
@@ -1032,6 +1045,40 @@ mod tests {
                 - estimated_response_bytes(&one, TEST_PER_PARTITION_BYTES),
             10 * 2 * 2 * size_of::<i32>()
         );
+    }
+
+    #[test]
+    fn given_one_gateway_and_a_larger_factor_the_estimate_should_match_the_encoded_partition() {
+        let alone = Brokers::default();
+        for factor in [1_u32, 3, 5, MAX_REPLICATION_FACTOR] {
+            let replicas: Vec<BrokerId> =
+                alone.replicas(factor).into_iter().map(BrokerId).collect();
+            assert_eq!(
+                replicas.len(),
+                factor as usize,
+                "the list carries the factor"
+            );
+            for version in RANGE.min_version..=RANGE.max_version {
+                let encoded = MetadataResponsePartition::default()
+                    .with_partition_index(0)
+                    .with_leader_id(BrokerId(1))
+                    .with_replica_nodes(replicas.clone())
+                    .with_isr_nodes(replicas.clone())
+                    .compute_size(version)
+                    .expect("a partition encodes");
+                let extra = (factor as usize - 1) * 2 * size_of::<i32>();
+                assert_eq!(
+                    encoded,
+                    template_partition_bytes(version) + extra,
+                    "factor {factor}, v{version}"
+                );
+            }
+        }
+        let over = TopicResult {
+            replication_factor: Some(1_000),
+            ..topic_result("orders", ERROR_NONE, 1)
+        };
+        assert_eq!(listed_replicas(&over), MAX_REPLICATION_FACTOR);
     }
 
     /// A gateway that crashed stays an owner until another claims its partitions. Leading every

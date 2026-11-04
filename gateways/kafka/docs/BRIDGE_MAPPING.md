@@ -503,8 +503,9 @@ Default: always emit uncompressed, and revisit when a benchmark says it matters.
 Topic configuration is not part of the record mapping. `CreateTopics` maps `retention.ms` onto
 Iggy's `message_expiry`, `retention.bytes` onto `max_topic_size` times the partition count, and
 `segment.bytes` onto `segment_size`. The Kafka replication factor is Iggy's `replication_factor`.
-A `cleanup.policy` without `delete` gives the topic no expiry and no size cap, because Iggy does
-not compact. See [`CONFIGS.md`](CONFIGS.md).
+`flush.messages=1` or `flush.ms=0` makes the messages `persisted`. A `cleanup.policy` without
+`delete` gives the topic no expiry and no size cap, because Iggy does not compact. See
+[`CONFIGS.md`](CONFIGS.md).
 
 ## References
 

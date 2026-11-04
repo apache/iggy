@@ -1407,27 +1407,53 @@ async fn given_kafka_topics_sh_when_creating_with_configs_should_store_them_per_
         "each new partition keeps the same retention.bytes, got: {described_after}"
     );
 
-    let refused = kafka_topics(
-        gateway,
-        &[
-            "--create",
-            "--topic",
-            "refused-topic",
-            "--config",
-            "retention.bytes=1048576",
-        ],
-    )
-    .text();
-    assert!(
-        refused.contains("Iggy keeps at least one segment of each partition"),
-        "a retention.bytes below one segment must be refused with its reason, got: {refused}"
-    );
-
     let under_min_isr = kafka_topics(gateway, &["--describe", "--under-min-isr-partitions"])
         .expect_ran("kafka-topics.sh --describe --under-min-isr-partitions");
     assert!(
         !under_min_isr.contains("Exception"),
         "the tool reads min.insync.replicas of every topic, got: {under_min_isr}"
+    );
+}
+
+/// Kafka accepts a `retention.bytes` below one segment, and so does the gateway. Iggy keeps the
+/// newest sealed segment of each partition and refuses a topic cap below one segment, so the
+/// topic of one partition reports one segment of 1 GiB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_topics_sh_when_creating_with_a_retention_below_one_segment_should_keep_one() {
+    const SMALL: &str = "small-retention-topic";
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let created = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            SMALL,
+            "--config",
+            "retention.bytes=1048576",
+        ],
+    )
+    .expect_ran("kafka-topics.sh --create --config retention.bytes=1048576");
+    assert!(
+        created.contains(&format!("Created topic {SMALL}.")),
+        "kafka-topics.sh must create the topic, got: {created}"
+    );
+    let described = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            SMALL,
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe");
+    assert!(
+        described.contains("retention.bytes=1073741824 sensitive=false"),
+        "Iggy keeps one segment of the partition, got: {described}"
     );
 }
 
@@ -1457,7 +1483,7 @@ async fn given_kafka_topics_sh_when_creating_a_compacted_topic_should_keep_every
             "--config",
             "retention.ms=60000",
             "--config",
-            "min.insync.replicas=2",
+            "min.insync.replicas=1",
             "--config",
             "compression.type=lz4",
         ],
@@ -1491,7 +1517,8 @@ async fn given_kafka_topics_sh_when_creating_a_compacted_topic_should_keep_every
     );
     assert!(
         !configs.contains("cleanup.policy") && !configs.contains("min.insync.replicas"),
-        "the policy is not stored, and an ignored key stays at its default, got: {configs}"
+        "the policy is not stored, and min.insync.replicas reports the majority as a default, \
+         got: {configs}"
     );
 
     let refused_factor = kafka_topics(
@@ -1523,6 +1550,21 @@ async fn given_kafka_topics_sh_when_creating_a_compacted_topic_should_keep_every
     assert!(
         refused_timestamps.contains("accepts only CreateTime"),
         "LogAppendTime must be refused with its reason, got: {refused_timestamps}"
+    );
+    let refused_min_isr = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            "refused-min-isr",
+            "--config",
+            "min.insync.replicas=2",
+        ],
+    )
+    .text();
+    assert!(
+        refused_min_isr.contains("accepts at most 1"),
+        "Iggy commits on a majority of one node, got: {refused_min_isr}"
     );
 }
 

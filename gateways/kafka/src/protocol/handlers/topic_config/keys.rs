@@ -19,16 +19,23 @@
 //! broker keys that tools read.
 //!
 //! Each value is checked as Kafka 4.4 checks it (`LogConfig`), with Kafka's own text. Past that,
-//! the gateway does one of four things with a topic key:
+//! the gateway does one of these things with a topic key:
 //!
 //! - It stores `retention.ms`, `retention.bytes` and `segment.bytes` on the Iggy topic.
 //! - It accepts any `cleanup.policy`, and a policy without `delete` keeps every record. The
 //!   policy is not stored, because Iggy has no option for it, so a describe leaves it out. Kafka
 //!   Connect starts when the entry is missing (`TopicAdmin.verifyTopicCleanupPolicyOnlyCompact`).
+//! - It reports `min.insync.replicas` as the majority of the replication factor, which Iggy needs
+//!   for every commit, and accepts a value up to that majority.
+//! - It maps `flush.messages=1` and `flush.ms=0`, a flush of every write, to `persisted`
+//!   durability, which Iggy sets only when it creates a topic. Any other value is accepted and not
+//!   applied.
+//! - It accepts a `max.message.bytes` from Kafka's default up to the largest batch that Produce
+//!   takes, and reports that largest batch.
 //! - It accepts any value of a key that changes nothing a client sees, such as a compression
 //!   level or a compaction setting, and reports the Kafka default.
-//! - It accepts only the Kafka default of `message.timestamp.type` and `max.message.bytes`,
-//!   because another value changes what clients get and Iggy cannot apply it.
+//! - It accepts only the Kafka default of `message.timestamp.type`, because another value changes
+//!   the timestamps that clients get and Iggy cannot apply it.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -37,13 +44,16 @@ use kafka_protocol::protocol::StrBytes;
 
 use super::{CONFIG_SOURCE_DEFAULT, CONFIG_SOURCE_STATIC_BROKER, CONFIG_SOURCE_TOPIC};
 use crate::bridge::topic_settings::retention_ms_of;
-use crate::bridge::{DEFAULT_TOPIC_PARTITIONS, TopicConfigSnapshot, TopicDefaults};
+use crate::bridge::{DEFAULT_TOPIC_PARTITIONS, IggyBridge, TopicConfigSnapshot, TopicDefaults};
 
 pub const RETENTION_MS: &str = "retention.ms";
 pub const RETENTION_BYTES: &str = "retention.bytes";
 pub const SEGMENT_BYTES: &str = "segment.bytes";
 pub const CLEANUP_POLICY: &str = "cleanup.policy";
 pub const MIN_INSYNC_REPLICAS: &str = "min.insync.replicas";
+pub const MAX_MESSAGE_BYTES: &str = "max.message.bytes";
+pub const FLUSH_MESSAGES: &str = "flush.messages";
+pub const FLUSH_MS: &str = "flush.ms";
 
 const RETENTION_MS_DOC: &str = "How long a sealed segment is kept, in milliseconds. The active \
                                 segment does not expire. -1 means sealed segments never expire.";
@@ -55,17 +65,27 @@ const SEGMENT_BYTES_DOC: &str = "The size at which a partition starts a new segm
 const IGNORED_DOC: &str = "Reported at the Kafka default. This gateway accepts any valid value \
                            and does not apply it.";
 const FIXED_DOC: &str = "Reported at the Kafka default. This gateway accepts only this value.";
+const MIN_INSYNC_REPLICAS_DOC: &str = "The majority of the replication factor, which Iggy needs \
+                                       for every commit. This gateway accepts a value up to it.";
+const FLUSH_DOC: &str = "A persisted topic flushes every write. Iggy sets durability only when it \
+                         creates a topic, so this gateway accepts other values and does not apply \
+                         them.";
+const MAX_MESSAGE_BYTES_DOC: &str = "The largest record batch that this gateway takes in every \
+                                     topic. It accepts a value from the Kafka default up to it.";
 const BROKER_DOC: &str = "Fixed for this gateway, which cannot change broker configuration.";
 const RETENTION_MS_DEFAULT_DOC: &str = "retention.ms of each topic the gateway creates without one. Set by \
      IGGY_KAFKA_TOPIC_RETENTION_MS.";
 const DEFAULT_REPLICATION_FACTOR_DOC: &str = "The replication factor Iggy gives a topic that names \
-                                              none. Read from Iggy.";
+                                              none. Read from Iggy. -1 until the gateway reads it.";
+const BROKER_MIN_INSYNC_REPLICAS_DOC: &str = "The majority of default.replication.factor, which \
+                                              Iggy needs for every commit.";
+const BROKER_MESSAGE_MAX_BYTES_DOC: &str = "The largest record batch that this gateway takes.";
 const RETENTION_BYTES_DEFAULT_DOC: &str = "retention.bytes of each topic the gateway creates without one. Set by \
      IGGY_KAFKA_TOPIC_RETENTION_BYTES.";
 
 /// Kafka's `max.message.bytes` and `message.max.bytes` default: 1 MiB plus the batch log
 /// overhead.
-const KAFKA_MAX_MESSAGE_BYTES: &str = "1048588";
+const KAFKA_MAX_MESSAGE_BYTES: i32 = 1_048_588;
 
 /// Kafka `Records.SOFT_MAX_ARRAY_LENGTH`, the default and ceiling of
 /// `max.decompressed.message.bytes`.
@@ -196,6 +216,15 @@ pub enum TopicKeyKind {
     SegmentBytes,
     /// Accepted at any value, and not reported: Iggy has no option for it.
     CleanupPolicy,
+    /// Reported as the majority of the replication factor, which Iggy needs for every commit,
+    /// and accepted up to it.
+    MinInsyncReplicas,
+    /// `flush.messages` or `flush.ms`. `every_write`, a flush of every write, is Iggy's
+    /// `persisted` durability. Any other value is accepted and not applied.
+    Flush { every_write: i64 },
+    /// Accepted from Kafka's default up to the largest batch that Produce takes, and reported as
+    /// that largest batch.
+    MaxMessageBytes,
     /// Accepted at any value and not applied, because no value changes what a client gets.
     /// Reported at Kafka's default.
     Ignored,
@@ -259,6 +288,8 @@ impl TopicKey {
     /// The value an `APPEND` (`append`) or a `SUBTRACT` of `values` leaves from this key's
     /// default, as the comma list Kafka then checks, or `None` for a key that is not a list. As in
     /// Kafka, `APPEND` adds the values not yet present, and `SUBTRACT` removes the ones present.
+    ///
+    /// Each lookup is a set lookup, so a value with many items costs time in proportion to them.
     #[must_use]
     pub fn default_list_after(&self, append: bool, values: &str) -> Option<String> {
         let ConfigValue::List(mut list) = self.config_type.parse(self.default).ok()? else {
@@ -268,13 +299,15 @@ impl TopicKey {
             return None;
         };
         if append {
+            let mut present: HashSet<String> = list.iter().cloned().collect();
             for value in values {
-                if !list.contains(&value) {
+                if present.insert(value.clone()) {
                     list.push(value);
                 }
             }
         } else {
-            list.retain(|item| !values.contains(item));
+            let removed: HashSet<String> = values.into_iter().collect();
+            list.retain(|item| !removed.contains(item));
         }
         Some(list.join(","))
     }
@@ -285,13 +318,15 @@ impl TopicKey {
     /// and a value equal to the gateway default as `STATIC_BROKER_CONFIG`, as Kafka reports a
     /// topic that inherits `log.retention.ms`. Iggy marks the stored default as set like any
     /// other, so an override equal to the default reports the same way: Kafka would report
-    /// `DYNAMIC_TOPIC_CONFIG` there.
+    /// `DYNAMIC_TOPIC_CONFIG` there. `flush.messages` and `flush.ms` of a persisted topic report
+    /// the same way against `IGGY_KAFKA_TOPIC_DURABILITY`.
     #[must_use]
     pub fn topic_entry(
         &self,
         topic: &TopicConfigSnapshot,
-        defaults: &TopicDefaults,
+        context: &ConfigContext<'_>,
     ) -> Option<ConfigEntry> {
+        let defaults = context.defaults;
         let entry = |value: Option<String>, read_only: bool, source: i8, documentation| {
             Some(ConfigEntry {
                 name: self.name,
@@ -305,13 +340,10 @@ impl TopicKey {
         match self.kind {
             TopicKeyKind::RetentionMs => {
                 let value = retention_ms_of(topic.message_expiry);
-                let source = if !topic.message_expiry_explicit {
-                    CONFIG_SOURCE_DEFAULT
-                } else if defaults.expiry() == Some(topic.message_expiry) {
-                    CONFIG_SOURCE_STATIC_BROKER
-                } else {
-                    CONFIG_SOURCE_TOPIC
-                };
+                let source = stored_source(
+                    topic.message_expiry_explicit,
+                    defaults.expiry() == Some(topic.message_expiry),
+                );
                 entry(
                     value.map(|millis| millis.to_string()),
                     false,
@@ -321,13 +353,10 @@ impl TopicKey {
             }
             TopicKeyKind::RetentionBytes => {
                 let retention = topic.retention_bytes();
-                let source = if !topic.max_topic_size_explicit {
-                    CONFIG_SOURCE_DEFAULT
-                } else if defaults.retention() == Some(retention) {
-                    CONFIG_SOURCE_STATIC_BROKER
-                } else {
-                    CONFIG_SOURCE_TOPIC
-                };
+                let source = stored_source(
+                    topic.max_topic_size_explicit,
+                    defaults.retention() == Some(retention),
+                );
                 entry(
                     Some(retention.kafka_value().to_string()),
                     false,
@@ -348,6 +377,33 @@ impl TopicKey {
                     SEGMENT_BYTES_DOC,
                 )
             }
+            TopicKeyKind::MinInsyncReplicas => {
+                let value = context.replication_factor_of(topic).map_or_else(
+                    || self.default.to_string(),
+                    |factor| majority(factor).to_string(),
+                );
+                entry(
+                    Some(value),
+                    false,
+                    CONFIG_SOURCE_DEFAULT,
+                    MIN_INSYNC_REPLICAS_DOC,
+                )
+            }
+            TopicKeyKind::Flush { every_write } => {
+                let (value, source) = if topic.durability.is_persisted() {
+                    let source = stored_source(true, defaults.durability.is_persisted());
+                    (every_write.to_string(), source)
+                } else {
+                    (self.default.to_string(), CONFIG_SOURCE_DEFAULT)
+                };
+                entry(Some(value), false, source, FLUSH_DOC)
+            }
+            TopicKeyKind::MaxMessageBytes => entry(
+                Some(context.max_message_bytes.to_string()),
+                false,
+                CONFIG_SOURCE_DEFAULT,
+                MAX_MESSAGE_BYTES_DOC,
+            ),
             TopicKeyKind::Ignored => entry(
                 Some(self.default.to_string()),
                 false,
@@ -437,6 +493,18 @@ impl TopicKey {
                 }
             }
         }
+    }
+}
+
+/// The source of a value a topic stores: `DEFAULT_CONFIG` when no client set it,
+/// `STATIC_BROKER_CONFIG` when it equals the gateway default, else `DYNAMIC_TOPIC_CONFIG`.
+const fn stored_source(explicit: bool, equals_default: bool) -> i8 {
+    if !explicit {
+        CONFIG_SOURCE_DEFAULT
+    } else if equals_default {
+        CONFIG_SOURCE_STATIC_BROKER
+    } else {
+        CONFIG_SOURCE_TOPIC
     }
 }
 
@@ -545,16 +613,18 @@ pub static TOPIC_KEYS: [TopicKey; 37] = [
         "60000",
         Rule::AtLeast(0),
     ),
-    ignored(
-        "flush.messages",
+    key(
+        FLUSH_MESSAGES,
         ConfigType::Long,
         "9223372036854775807",
+        TopicKeyKind::Flush { every_write: 1 },
         Rule::AtLeast(1),
     ),
-    ignored(
-        "flush.ms",
+    key(
+        FLUSH_MS,
         ConfigType::Long,
         "9223372036854775807",
+        TopicKeyKind::Flush { every_write: 0 },
         Rule::AtLeast(0),
     ),
     ignored(
@@ -600,12 +670,10 @@ pub static TOPIC_KEYS: [TopicKey; 37] = [
         Rule::Between(1, SOFT_MAX_ARRAY_LENGTH),
     ),
     key(
-        "max.message.bytes",
+        MAX_MESSAGE_BYTES,
         ConfigType::Int,
-        KAFKA_MAX_MESSAGE_BYTES,
-        TopicKeyKind::Fixed {
-            reason: "this gateway has no size limit for each topic, so it accepts only 1048588",
-        },
+        "1048588",
+        TopicKeyKind::MaxMessageBytes,
         Rule::AtLeast(0),
     ),
     ignored(
@@ -642,7 +710,13 @@ pub static TOPIC_KEYS: [TopicKey; 37] = [
         "0",
         Rule::AtLeast(0),
     ),
-    ignored(MIN_INSYNC_REPLICAS, ConfigType::Int, "1", Rule::AtLeast(1)),
+    key(
+        MIN_INSYNC_REPLICAS,
+        ConfigType::Int,
+        "1",
+        TopicKeyKind::MinInsyncReplicas,
+        Rule::AtLeast(1),
+    ),
     ignored("preallocate", ConfigType::Boolean, "false", Rule::Any),
     ignored(
         "remote.copy.lag.bytes",
@@ -737,13 +811,60 @@ pub struct ConfigEntry {
     pub documentation: &'static str,
 }
 
+/// The majority of `replication_factor` nodes, the count Iggy needs for each commit.
+#[must_use]
+pub const fn majority(replication_factor: u32) -> u32 {
+    replication_factor / 2 + 1
+}
+
+/// What some checks and reported values depend on beside the topic itself.
+#[derive(Debug, Clone, Copy)]
+pub struct ConfigContext<'a> {
+    pub defaults: &'a TopicDefaults,
+    /// The largest record batch that Produce takes, in bytes: the `max.message.bytes` of every
+    /// topic.
+    pub max_message_bytes: i32,
+    /// The replication factor Iggy gives a topic that names none, when the bridge read it.
+    pub default_replication_factor: Option<u32>,
+}
+
+impl<'a> ConfigContext<'a> {
+    /// The context of `bridge` behind a listener that takes frames of up to `max_frame_size`
+    /// bytes. A Produce batch must fit one frame and one Iggy send.
+    #[must_use]
+    pub fn of(bridge: &'a IggyBridge, max_frame_size: usize) -> Self {
+        let frame = u64::try_from(max_frame_size).unwrap_or(u64::MAX);
+        let largest = frame.min(bridge.max_send_bytes());
+        Self {
+            defaults: bridge.topic_defaults(),
+            max_message_bytes: i32::try_from(largest).unwrap_or(i32::MAX),
+            default_replication_factor: bridge.default_replication_factor(),
+        }
+    }
+
+    /// The replication factor of `topic`, or the default for a topic created before Iggy stored
+    /// one. `None` when neither is known.
+    #[must_use]
+    pub fn replication_factor_of(&self, topic: &TopicConfigSnapshot) -> Option<u32> {
+        topic.replication_factor.or(self.default_replication_factor)
+    }
+
+    /// The smallest `max.message.bytes` the gateway accepts: Kafka's default, or the largest
+    /// batch when that is smaller. A smaller value asks the topic to refuse batches that Produce
+    /// takes.
+    #[must_use]
+    pub fn min_message_bytes(&self) -> i32 {
+        KAFKA_MAX_MESSAGE_BYTES.min(self.max_message_bytes)
+    }
+}
+
 /// The entries of a topic that `configuration_keys` asks for: every reported key for a null or
 /// empty list, otherwise each reported key the list names, in request order and once each. A name
 /// the gateway does not report, `cleanup.policy` among them, is left out.
 #[must_use]
 pub fn topic_entries(
     topic: &TopicConfigSnapshot,
-    defaults: &TopicDefaults,
+    context: &ConfigContext<'_>,
     configuration_keys: Option<&[StrBytes]>,
 ) -> Vec<ConfigEntry> {
     configuration_keys
@@ -752,12 +873,12 @@ pub fn topic_entries(
             || {
                 TOPIC_KEYS
                     .iter()
-                    .filter_map(|key| key.topic_entry(topic, defaults))
+                    .filter_map(|key| key.topic_entry(topic, context))
                     .collect()
             },
             |names| {
                 distinct(names)
-                    .filter_map(|name| topic_key(name)?.topic_entry(topic, defaults))
+                    .filter_map(|name| topic_key(name)?.topic_entry(topic, context))
                     .collect()
             },
         )
@@ -768,9 +889,7 @@ pub fn topic_entries(
 pub struct BrokerContext<'a> {
     pub node_id: i32,
     pub auto_create_topics: bool,
-    pub defaults: &'a TopicDefaults,
-    /// The replication factor Iggy gives a topic that names none, when the bridge read it.
-    pub default_replication_factor: Option<u32>,
+    pub config: ConfigContext<'a>,
 }
 
 /// The broker entries `configuration_keys` asks for, by the same rule as [`topic_entries`].
@@ -792,8 +911,14 @@ pub fn broker_entries(
         .collect()
 }
 
+/// Every broker entry. A value the gateway has not read yet is reported as Kafka's default from
+/// `DEFAULT_CONFIG`, except `default.replication.factor`, which is -1 then. Debezium creates its
+/// schema history topic with the factor it reads there, and a factor of -1 takes the Iggy
+/// default, where a made-up 1 would keep one copy.
 fn all_broker_entries(context: &BrokerContext<'_>) -> Vec<ConfigEntry> {
     let node_id = context.node_id.to_string();
+    let defaults = context.config.defaults;
+    let default_replication_factor = context.config.default_replication_factor;
     vec![
         ConfigEntry {
             source: if context.auto_create_topics {
@@ -818,10 +943,8 @@ fn all_broker_entries(context: &BrokerContext<'_>) -> Vec<ConfigEntry> {
         broker_entry("compression.type", ConfigType::String, "producer"),
         configured_entry(
             ("default.replication.factor", ConfigType::Int),
-            context
-                .default_replication_factor
-                .map(|factor| factor.to_string()),
-            "1",
+            default_replication_factor.map(|factor| factor.to_string()),
+            "-1",
             DEFAULT_REPLICATION_FACTOR_DOC,
         ),
         broker_entry("delete.topic.enable", ConfigType::Boolean, "true"),
@@ -833,29 +956,31 @@ fn all_broker_entries(context: &BrokerContext<'_>) -> Vec<ConfigEntry> {
         ),
         configured_entry(
             ("log.retention.bytes", ConfigType::Long),
-            context
-                .defaults
-                .retention_bytes
-                .map(|bytes| bytes.to_string()),
+            defaults.retention_bytes.map(|bytes| bytes.to_string()),
             "-1",
             RETENTION_BYTES_DEFAULT_DOC,
         ),
         configured_entry(
             ("log.retention.ms", ConfigType::Long),
-            context
-                .defaults
-                .retention_ms
-                .map(|millis| millis.to_string()),
+            defaults.retention_ms.map(|millis| millis.to_string()),
             "-1",
             RETENTION_MS_DEFAULT_DOC,
         ),
         broker_entry("log.segment.bytes", ConfigType::Int, "1073741824"),
-        broker_entry(
-            "message.max.bytes",
-            ConfigType::Int,
-            KAFKA_MAX_MESSAGE_BYTES,
+        ConfigEntry {
+            documentation: BROKER_MESSAGE_MAX_BYTES_DOC,
+            ..broker_entry(
+                "message.max.bytes",
+                ConfigType::Int,
+                &context.config.max_message_bytes.to_string(),
+            )
+        },
+        configured_entry(
+            (MIN_INSYNC_REPLICAS, ConfigType::Int),
+            default_replication_factor.map(|factor| majority(factor).to_string()),
+            "1",
+            BROKER_MIN_INSYNC_REPLICAS_DOC,
         ),
-        broker_entry(MIN_INSYNC_REPLICAS, ConfigType::Int, "1"),
         ConfigEntry {
             source: CONFIG_SOURCE_STATIC_BROKER,
             ..broker_entry("node.id", ConfigType::Int, &node_id)
@@ -918,12 +1043,15 @@ fn distinct(names: &[StrBytes]) -> impl Iterator<Item = &str> {
 
 #[cfg(test)]
 mod tests {
-    use iggy::prelude::{IggyByteSize, IggyExpiry, MaxTopicSize};
+    use iggy::prelude::{Durability, IggyByteSize, IggyExpiry, MaxTopicSize};
 
     use super::*;
     use crate::bridge::topic_settings::expiry_from_retention_ms;
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// The largest batch of a gateway with the default 8 MiB frame.
+    const LARGEST_BATCH: i32 = 8 * 1024 * 1024;
 
     fn snapshot() -> TopicConfigSnapshot {
         TopicConfigSnapshot {
@@ -934,6 +1062,16 @@ mod tests {
             max_topic_size_explicit: false,
             segment_size: GIB,
             segment_size_explicit: false,
+            replication_factor: None,
+            durability: Durability::Replicated,
+        }
+    }
+
+    fn context(defaults: &TopicDefaults) -> ConfigContext<'_> {
+        ConfigContext {
+            defaults,
+            max_message_bytes: LARGEST_BATCH,
+            default_replication_factor: None,
         }
     }
 
@@ -973,13 +1111,24 @@ mod tests {
 
     #[test]
     fn given_a_null_key_list_should_report_every_key_but_cleanup_policy() {
-        let entries = topic_entries(&snapshot(), &TopicDefaults::default(), None);
+        let defaults = TopicDefaults::default();
+        let entries = topic_entries(&snapshot(), &context(&defaults), None);
         assert_eq!(entries.len(), TOPIC_KEYS.len() - 1);
         assert!(value_of(&entries, CLEANUP_POLICY).is_none());
         let min_isr = value_of(&entries, MIN_INSYNC_REPLICAS).expect("reported");
-        assert_eq!(min_isr.value.as_deref(), Some("1"));
+        assert_eq!(
+            min_isr.value.as_deref(),
+            Some("1"),
+            "Kafka's default while the factor is unknown"
+        );
         assert_eq!(min_isr.source, CONFIG_SOURCE_DEFAULT);
-        assert!(!min_isr.read_only, "accepted at any value");
+        assert!(!min_isr.read_only, "accepted up to the majority");
+        let largest = value_of(&entries, MAX_MESSAGE_BYTES).expect("reported");
+        assert_eq!(largest.value.as_deref(), Some("8388608"));
+        assert!(!largest.read_only, "accepted up to the largest batch");
+        let flush = value_of(&entries, FLUSH_MESSAGES).expect("reported");
+        assert_eq!(flush.value.as_deref(), Some("9223372036854775807"));
+        assert_eq!(flush.source, CONFIG_SOURCE_DEFAULT);
         let timestamps = value_of(&entries, "message.timestamp.type").expect("reported");
         assert!(timestamps.read_only, "accepted only at the default");
         let retention = value_of(&entries, RETENTION_MS).expect("reported");
@@ -1003,9 +1152,108 @@ mod tests {
             StrBytes::from_static_str(RETENTION_MS),
             StrBytes::from_static_str(SEGMENT_BYTES),
         ];
-        let entries = topic_entries(&snapshot(), &TopicDefaults::default(), Some(&asked));
+        let defaults = TopicDefaults::default();
+        let entries = topic_entries(&snapshot(), &context(&defaults), Some(&asked));
         let names: Vec<&str> = entries.iter().map(|entry| entry.name).collect();
         assert_eq!(names, [SEGMENT_BYTES, RETENTION_MS]);
+    }
+
+    #[test]
+    fn given_an_empty_key_list_should_report_every_key_as_a_null_one_does() {
+        let defaults = TopicDefaults::default();
+        let empty: [StrBytes; 0] = [];
+        assert_eq!(
+            topic_entries(&snapshot(), &context(&defaults), Some(&empty)),
+            topic_entries(&snapshot(), &context(&defaults), None)
+        );
+        let broker = BrokerContext {
+            node_id: 1,
+            auto_create_topics: false,
+            config: context(&defaults),
+        };
+        assert_eq!(
+            broker_entries(&broker, Some(&empty)),
+            broker_entries(&broker, None)
+        );
+    }
+
+    #[test]
+    fn given_a_replication_factor_should_report_its_majority_as_min_insync_replicas() {
+        let defaults = TopicDefaults::default();
+        let min_isr = |topic: &TopicConfigSnapshot, default_factor: Option<u32>| {
+            let context = ConfigContext {
+                default_replication_factor: default_factor,
+                ..context(&defaults)
+            };
+            let entries = topic_entries(topic, &context, None);
+            value_of(&entries, MIN_INSYNC_REPLICAS)
+                .expect("reported")
+                .value
+                .clone()
+        };
+        let stored = |factor| TopicConfigSnapshot {
+            replication_factor: Some(factor),
+            ..snapshot()
+        };
+        assert_eq!(min_isr(&stored(1), None).as_deref(), Some("1"));
+        assert_eq!(min_isr(&stored(2), None).as_deref(), Some("2"));
+        assert_eq!(min_isr(&stored(3), Some(5)).as_deref(), Some("2"));
+        assert_eq!(
+            min_isr(&snapshot(), Some(5)).as_deref(),
+            Some("3"),
+            "a topic without a stored factor has the default"
+        );
+        assert_eq!(
+            (1..=6).map(majority).collect::<Vec<_>>(),
+            [1, 2, 2, 3, 3, 4]
+        );
+    }
+
+    #[test]
+    fn given_a_persisted_topic_should_report_a_flush_of_every_write() {
+        let persisted = TopicConfigSnapshot {
+            durability: Durability::Persisted,
+            ..snapshot()
+        };
+        let replicated_default = TopicDefaults::default();
+        let entries = topic_entries(&persisted, &context(&replicated_default), None);
+        let messages = value_of(&entries, FLUSH_MESSAGES).expect("reported");
+        assert_eq!(messages.value.as_deref(), Some("1"));
+        assert_eq!(messages.source, CONFIG_SOURCE_TOPIC);
+        let millis = value_of(&entries, FLUSH_MS).expect("reported");
+        assert_eq!(millis.value.as_deref(), Some("0"));
+
+        let persisted_default = TopicDefaults {
+            durability: Durability::Persisted,
+            ..TopicDefaults::default()
+        };
+        let entries = topic_entries(&persisted, &context(&persisted_default), None);
+        let messages = value_of(&entries, FLUSH_MESSAGES).expect("reported");
+        assert_eq!(
+            messages.source, CONFIG_SOURCE_STATIC_BROKER,
+            "a topic that took the gateway default"
+        );
+    }
+
+    #[test]
+    fn given_the_largest_batch_should_report_it_and_take_kafkas_default_as_the_least() {
+        let defaults = TopicDefaults::default();
+        let entries = topic_entries(&snapshot(), &context(&defaults), None);
+        let largest = value_of(&entries, MAX_MESSAGE_BYTES).expect("reported");
+        assert_eq!(largest.value.as_deref(), Some("8388608"));
+        assert_eq!(
+            context(&defaults).min_message_bytes(),
+            KAFKA_MAX_MESSAGE_BYTES
+        );
+        let small_frames = ConfigContext {
+            max_message_bytes: 512 * 1024,
+            ..context(&defaults)
+        };
+        assert_eq!(small_frames.min_message_bytes(), 512 * 1024);
+        assert!(matches!(
+            refused(MAX_MESSAGE_BYTES, "-1"),
+            Refusal::Value { reason, .. } if reason == "Value must be at least 0"
+        ));
     }
 
     #[test]
@@ -1019,7 +1267,8 @@ mod tests {
             segment_size_explicit: true,
             ..snapshot()
         };
-        let entries = topic_entries(&topic, &TopicDefaults::default(), None);
+        let defaults = TopicDefaults::default();
+        let entries = topic_entries(&topic, &context(&defaults), None);
         let retention = value_of(&entries, RETENTION_MS).expect("reported");
         assert_eq!(retention.value.as_deref(), Some("120000"));
         assert_eq!(retention.source, CONFIG_SOURCE_TOPIC);
@@ -1045,7 +1294,7 @@ mod tests {
             max_topic_size_explicit: true,
             ..snapshot()
         };
-        let entries = topic_entries(&topic, &defaults, None);
+        let entries = topic_entries(&topic, &context(&defaults), None);
         let retention = value_of(&entries, RETENTION_MS).expect("reported");
         assert_eq!(retention.source, CONFIG_SOURCE_STATIC_BROKER);
         let bytes = value_of(&entries, RETENTION_BYTES).expect("reported");
@@ -1055,7 +1304,7 @@ mod tests {
             message_expiry: expiry_from_retention_ms(1_000),
             ..topic
         };
-        let entries = topic_entries(&other, &defaults, None);
+        let entries = topic_entries(&other, &context(&defaults), None);
         let retention = value_of(&entries, RETENTION_MS).expect("reported");
         assert_eq!(retention.source, CONFIG_SOURCE_TOPIC);
     }
@@ -1067,7 +1316,8 @@ mod tests {
             message_expiry_explicit: true,
             ..snapshot()
         };
-        let entries = topic_entries(&topic, &TopicDefaults::default(), None);
+        let defaults = TopicDefaults::default();
+        let entries = topic_entries(&topic, &context(&defaults), None);
         assert_eq!(
             value_of(&entries, RETENTION_MS).expect("reported").value,
             None
@@ -1193,15 +1443,6 @@ mod tests {
             refused("message.timestamp.type", "createtime"),
             Refusal::Value { reason, .. } if reason.starts_with("String must be one of")
         ));
-        assert!(known("max.message.bytes").check(" 1048588").is_ok());
-        assert!(matches!(
-            refused("max.message.bytes", "2097152"),
-            Refusal::Value { reason, .. } if reason.contains("accepts only 1048588")
-        ));
-        assert!(matches!(
-            refused("max.message.bytes", "-1"),
-            Refusal::Value { reason, .. } if reason == "Value must be at least 0"
-        ));
     }
 
     #[test]
@@ -1255,7 +1496,28 @@ mod tests {
                 .as_deref(),
             Some("0:1")
         );
+        assert_eq!(
+            known("leader.replication.throttled.replicas")
+                .default_list_after(true, "0:1, 1:2, 0:1, 1:2")
+                .as_deref(),
+            Some("0:1,1:2"),
+            "an item already present is not added again"
+        );
         assert!(known(RETENTION_MS).default_list_after(true, "1").is_none());
+    }
+
+    #[test]
+    fn given_an_append_of_many_items_should_keep_each_once_in_request_order() {
+        let items: Vec<String> = (0..20_000).map(|item| format!("{item}:1")).collect();
+        let appended = known("follower.replication.throttled.replicas")
+            .default_list_after(true, &items.join(","))
+            .expect("a list key");
+        assert_eq!(appended, items.join(","));
+        let doubled = format!("{appended},{appended}");
+        let subtracted = known("follower.replication.throttled.replicas")
+            .default_list_after(false, &doubled)
+            .expect("a list key");
+        assert_eq!(subtracted, "");
     }
 
     #[test]
@@ -1267,8 +1529,10 @@ mod tests {
         let context = BrokerContext {
             node_id: 3,
             auto_create_topics: false,
-            defaults: &defaults,
-            default_replication_factor: Some(3),
+            config: ConfigContext {
+                default_replication_factor: Some(3),
+                ..context(&defaults)
+            },
         };
         let entries = broker_entries(&context, None);
         for pair in entries.windows(2) {
@@ -1278,7 +1542,14 @@ mod tests {
         let auto_create = value_of(&entries, "auto.create.topics.enable").expect("reported");
         assert_eq!(auto_create.value.as_deref(), Some("false"));
         let min_isr = value_of(&entries, MIN_INSYNC_REPLICAS).expect("reported");
-        assert_eq!(min_isr.value.as_deref(), Some("1"));
+        assert_eq!(
+            min_isr.value.as_deref(),
+            Some("2"),
+            "the majority of the default factor"
+        );
+        assert_eq!(min_isr.source, CONFIG_SOURCE_STATIC_BROKER);
+        let largest = value_of(&entries, "message.max.bytes").expect("reported");
+        assert_eq!(largest.value.as_deref(), Some("8388608"));
         let node = value_of(&entries, "node.id").expect("reported");
         assert_eq!(node.value.as_deref(), Some("3"));
         let retention = value_of(&entries, "log.retention.ms").expect("reported");
@@ -1298,5 +1569,26 @@ mod tests {
         let entries = broker_entries(&context, Some(&asked));
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, MIN_INSYNC_REPLICAS);
+    }
+
+    #[test]
+    fn given_a_default_factor_not_read_yet_should_report_minus_one_not_a_made_up_one() {
+        let defaults = TopicDefaults::default();
+        let context = BrokerContext {
+            node_id: 1,
+            auto_create_topics: false,
+            config: context(&defaults),
+        };
+        let entries = broker_entries(&context, None);
+        let factor = value_of(&entries, "default.replication.factor").expect("reported");
+        assert_eq!(
+            factor.value.as_deref(),
+            Some("-1"),
+            "Debezium creates its history topic with the factor it reads here"
+        );
+        assert_eq!(factor.source, CONFIG_SOURCE_DEFAULT);
+        let min_isr = value_of(&entries, MIN_INSYNC_REPLICAS).expect("reported");
+        assert_eq!(min_isr.value.as_deref(), Some("1"));
+        assert_eq!(min_isr.source, CONFIG_SOURCE_DEFAULT);
     }
 }

@@ -20,11 +20,14 @@
 //! - `retention.ms` is `message_expiry`. Kafka counts milliseconds, Iggy microseconds.
 //! - `retention.bytes` caps one partition in Kafka. Iggy's `max_topic_size` caps the whole topic
 //!   and gives each partition an equal share, so the gateway stores `retention.bytes` times the
-//!   partition count, and reports the share back.
+//!   partition count, and reports the share back. Iggy refuses a topic cap below one segment, so a
+//!   smaller product is stored as one segment.
 //! - `segment.bytes` is `segment_size`, which Iggy fixes when it creates the topic.
 //! - `cleanup.policy` decides whether old records go. Kafka deletes them only under `delete`, so
 //!   a topic without it gets no expiry and no size cap. Iggy does not compact (#4521), and the
 //!   gateway does not store the policy: Iggy has no option for it yet.
+//! - `flush.messages=1` and `flush.ms=0` ask for a flush of every write, which a new topic gets as
+//!   `persisted` durability.
 //! - The Kafka replication factor is Iggy's `replication_factor` (#4692). -1 takes the server
 //!   default.
 
@@ -86,15 +89,22 @@ pub enum RetentionBytes {
 }
 
 impl RetentionBytes {
-    /// The Iggy `max_topic_size` that gives each of `partitions` partitions this cap. A product
-    /// past Iggy's byte counter caps nothing in practice, so it is stored as unlimited.
+    /// The Iggy `max_topic_size` that gives each of `partitions` partitions this cap, and at least
+    /// `floor`.
+    ///
+    /// The floor is the segment size of the topic, because Iggy refuses a topic cap below one
+    /// segment. Iggy keeps the newest sealed segment of each partition whatever the cap, so a
+    /// raise to the floor deletes nothing that a smaller cap would keep. It also keeps 0 off
+    /// Iggy's `ServerDefault` sentinel. A product past Iggy's byte counter caps nothing in
+    /// practice, so it is stored as unlimited.
     #[must_use]
-    pub fn topic_size(self, partitions: u32) -> MaxTopicSize {
+    pub fn topic_size(self, partitions: u32, floor: u64) -> MaxTopicSize {
         match self {
             Self::Unlimited => MaxTopicSize::Unlimited,
             Self::PerPartition(bytes) => bytes
                 .checked_mul(u64::from(partitions.max(1)))
-                .filter(|total| *total > 0 && *total < u64::MAX)
+                .map(|total| total.max(floor).max(1))
+                .filter(|total| *total < u64::MAX)
                 .map_or(MaxTopicSize::Unlimited, |total| {
                     MaxTopicSize::Custom(IggyByteSize::from(total))
                 }),
@@ -160,8 +170,8 @@ impl TopicDefaults {
     /// [`Self::from_env`] on the raw values.
     ///
     /// A retention of `-1` is the same as none. A byte cap below the largest Iggy segment would
-    /// refuse every create that leaves `segment.bytes` at a larger size, since Iggy keeps one
-    /// segment in each partition, so it is refused here.
+    /// not hold for a topic with larger segments, since Iggy keeps one segment of each partition,
+    /// so it is refused here.
     ///
     /// # Errors
     ///
@@ -273,15 +283,21 @@ pub struct KafkaTopicSettings {
     pub segment_size: Option<u64>,
     pub cleanup_policy: CleanupPolicy,
     pub replication_factor: Option<u32>,
+    /// The durability of the messages: `Persisted` when `flush.messages=1` or `flush.ms=0` asks
+    /// for a flush of every write.
+    pub durability: Option<Durability>,
 }
 
 impl KafkaTopicSettings {
     /// The Iggy options of a new topic of `partitions` partitions.
     ///
     /// A policy that keeps every record wins over `retention.ms`, `retention.bytes` and the
-    /// gateway defaults, as Kafka ignores retention without `delete`.
+    /// gateway defaults, as Kafka ignores retention without `delete`. A flush of every write
+    /// applies to the messages. The consumer offsets keep the gateway default, as Kafka flushes
+    /// `__consumer_offsets` by its own settings.
     #[must_use]
     pub fn create_options(&self, partitions: u32, defaults: &TopicDefaults) -> TopicCreateOptions {
+        let segment_size = self.segment_size.unwrap_or(DEFAULT_SEGMENT_SIZE);
         let (message_expiry, max_topic_size) = if self.cleanup_policy.keeps_every_record() {
             (Some(IggyExpiry::NeverExpire), Some(MaxTopicSize::Unlimited))
         } else {
@@ -289,7 +305,7 @@ impl KafkaTopicSettings {
                 self.message_expiry.or_else(|| defaults.expiry()),
                 self.retention_bytes
                     .or_else(|| defaults.retention())
-                    .map(|retention| retention.topic_size(partitions)),
+                    .map(|retention| retention.topic_size(partitions, segment_size)),
             )
         };
         TopicCreateOptions {
@@ -297,10 +313,27 @@ impl KafkaTopicSettings {
             message_expiry,
             max_topic_size,
             segment_size: self.segment_size.map(IggyByteSize::from),
-            durability: defaults.durability,
+            durability: self.durability.unwrap_or(defaults.durability),
             consumer_offset_durability: defaults.durability,
             replication_factor: self.replication_factor,
             ..TopicCreateOptions::default()
+        }
+    }
+
+    /// The `retention.bytes` the request names below one segment of the new topic, with the
+    /// segment size, or `None`. Iggy keeps the newest sealed segment of each partition, so it
+    /// cannot hold such a cap. A policy that keeps every record applies no retention.
+    #[must_use]
+    pub fn retention_below_segment(&self) -> Option<(u64, u64)> {
+        if self.cleanup_policy.keeps_every_record() {
+            return None;
+        }
+        let segment_size = self.segment_size.unwrap_or(DEFAULT_SEGMENT_SIZE);
+        match self.retention_bytes? {
+            RetentionBytes::PerPartition(bytes) if bytes < segment_size => {
+                Some((bytes, segment_size))
+            }
+            _ => None,
         }
     }
 }
@@ -316,6 +349,10 @@ pub struct TopicConfigSnapshot {
     pub max_topic_size_explicit: bool,
     pub segment_size: u64,
     pub segment_size_explicit: bool,
+    /// The replication factor Iggy stored, or `None` for a topic created before Iggy stored one.
+    pub replication_factor: Option<u32>,
+    /// The durability of the messages.
+    pub durability: Durability,
 }
 
 impl TopicConfigSnapshot {
@@ -331,6 +368,8 @@ impl TopicConfigSnapshot {
             max_topic_size_explicit: is_explicit(options, OptionKey::MaxTopicSize),
             segment_size: resolved.runtime.effective_segment_size().as_bytes_u64(),
             segment_size_explicit: is_explicit(options, OptionKey::SegmentSize),
+            replication_factor: replication_factor_of(options),
+            durability: resolved.runtime.durability,
         }
     }
 
@@ -348,6 +387,8 @@ impl TopicConfigSnapshot {
                 .segment_size
                 .map_or(DEFAULT_SEGMENT_SIZE, |size| size.as_bytes_u64()),
             segment_size_explicit: options.segment_size.is_some(),
+            replication_factor: options.replication_factor,
+            durability: options.durability,
         }
     }
 
@@ -355,6 +396,18 @@ impl TopicConfigSnapshot {
     #[must_use]
     pub fn retention_bytes(&self) -> RetentionBytes {
         RetentionBytes::share_of(self.max_topic_size, self.partitions_count)
+    }
+
+    /// Whether a client set the topic to keep every record: no expiry and no size cap, both
+    /// stored. A topic created or altered with `cleanup.policy=compact` gets both, and so does
+    /// one created with `retention.ms=-1` and `retention.bytes=-1`. The gateway does not store
+    /// the policy, so it cannot tell the two apart.
+    #[must_use]
+    pub fn keeps_every_record(&self) -> bool {
+        self.message_expiry_explicit
+            && self.message_expiry == IggyExpiry::NeverExpire
+            && self.max_topic_size_explicit
+            && self.max_topic_size == MaxTopicSize::Unlimited
     }
 }
 
@@ -389,6 +442,12 @@ pub struct TopicConfigUpdate {
     /// The `cleanup.policy` the alter leaves, when it names one. Iggy stores no policy, so the
     /// fields above already hold all it writes. The handler logs it.
     pub cleanup_policy: Option<CleanupPolicy>,
+    /// The `retention.bytes` the alter sets below one segment, with the segment size. Each
+    /// partition keeps more than that cap, and the handler logs it.
+    pub retention_below_segment: Option<(u64, u64)>,
+    /// The `segment.bytes` an `AlterConfigs` left out, which Iggy cannot reset. The handler logs
+    /// that the replace kept it.
+    pub kept_segment_size: Option<u64>,
 }
 
 impl TopicConfigUpdate {
@@ -469,19 +528,19 @@ mod tests {
     fn given_retention_bytes_should_store_the_share_times_the_partition_count() {
         let retention = RetentionBytes::PerPartition(2 * GIB);
         assert_eq!(
-            retention.topic_size(3),
+            retention.topic_size(3, GIB),
             MaxTopicSize::Custom(IggyByteSize::from(6 * GIB))
         );
         assert_eq!(
-            RetentionBytes::share_of(retention.topic_size(3), 3),
+            RetentionBytes::share_of(retention.topic_size(3, GIB), 3),
             retention
         );
         assert_eq!(
-            RetentionBytes::Unlimited.topic_size(3),
+            RetentionBytes::Unlimited.topic_size(3, GIB),
             MaxTopicSize::Unlimited
         );
         assert_eq!(
-            RetentionBytes::PerPartition(u64::MAX / 2).topic_size(3),
+            RetentionBytes::PerPartition(u64::MAX / 2).topic_size(3, GIB),
             MaxTopicSize::Unlimited
         );
         assert_eq!(
@@ -489,6 +548,25 @@ mod tests {
             RetentionBytes::Unlimited
         );
         assert_eq!(RetentionBytes::Unlimited.kafka_value(), -1);
+    }
+
+    #[test]
+    fn given_retention_bytes_below_one_segment_should_store_one_segment_and_never_no_cap() {
+        let small = RetentionBytes::PerPartition(1024 * 1024);
+        assert_eq!(
+            small.topic_size(3, GIB),
+            MaxTopicSize::Custom(IggyByteSize::from(GIB)),
+            "Iggy refuses a topic cap below one segment"
+        );
+        assert_eq!(
+            RetentionBytes::PerPartition(0).topic_size(3, GIB),
+            MaxTopicSize::Custom(IggyByteSize::from(GIB)),
+            "0 keeps one segment, and is not Iggy's no-cap or server-default sentinel"
+        );
+        assert_eq!(
+            RetentionBytes::PerPartition(0).topic_size(3, 0),
+            MaxTopicSize::Custom(IggyByteSize::from(1))
+        );
     }
 
     #[test]
@@ -560,6 +638,80 @@ mod tests {
         assert_eq!(bare.message_expiry, None);
         assert_eq!(bare.max_topic_size, None);
         assert_eq!(bare.replication_factor, None);
+        assert_eq!(bare.durability, Durability::Replicated);
+    }
+
+    #[test]
+    fn given_a_flush_of_every_write_should_persist_the_messages_and_keep_the_offset_default() {
+        let options = KafkaTopicSettings {
+            durability: Some(Durability::Persisted),
+            ..KafkaTopicSettings::default()
+        }
+        .create_options(1, &TopicDefaults::default());
+        assert_eq!(options.durability, Durability::Persisted);
+        assert_eq!(options.consumer_offset_durability, Durability::Replicated);
+        assert_eq!(
+            TopicConfigSnapshot::created_with(&options).durability,
+            Durability::Persisted
+        );
+    }
+
+    #[test]
+    fn given_a_create_retention_below_one_segment_should_name_it_unless_records_are_kept() {
+        let small = KafkaTopicSettings {
+            retention_bytes: Some(RetentionBytes::PerPartition(1024)),
+            ..KafkaTopicSettings::default()
+        };
+        assert_eq!(
+            small.retention_below_segment(),
+            Some((1024, DEFAULT_SEGMENT_SIZE))
+        );
+        let options = small.create_options(2, &TopicDefaults::default());
+        assert_eq!(
+            options.max_topic_size,
+            Some(MaxTopicSize::Custom(IggyByteSize::from(
+                DEFAULT_SEGMENT_SIZE
+            )))
+        );
+        let small_segments = KafkaTopicSettings {
+            segment_size: Some(1024 * 1024),
+            retention_bytes: Some(RetentionBytes::PerPartition(1024 * 1024)),
+            ..KafkaTopicSettings::default()
+        };
+        assert_eq!(small_segments.retention_below_segment(), None);
+        let compact = KafkaTopicSettings {
+            cleanup_policy: CleanupPolicy {
+                delete: false,
+                compact: true,
+            },
+            ..small
+        };
+        assert_eq!(compact.retention_below_segment(), None);
+    }
+
+    #[test]
+    fn given_both_retentions_stored_unlimited_should_keep_every_record() {
+        let compact = KafkaTopicSettings {
+            cleanup_policy: CleanupPolicy {
+                delete: false,
+                compact: true,
+            },
+            ..KafkaTopicSettings::default()
+        }
+        .create_options(1, &TopicDefaults::default());
+        assert!(TopicConfigSnapshot::created_with(&compact).keeps_every_record());
+        let bare = KafkaTopicSettings::default().create_options(1, &TopicDefaults::default());
+        assert!(
+            !TopicConfigSnapshot::created_with(&bare).keeps_every_record(),
+            "Iggy's own defaults are not a client asking to keep every record"
+        );
+        let expiring = KafkaTopicSettings {
+            message_expiry: Some(expiry_from_retention_ms(1_000)),
+            retention_bytes: Some(RetentionBytes::Unlimited),
+            ..KafkaTopicSettings::default()
+        }
+        .create_options(1, &TopicDefaults::default());
+        assert!(!TopicConfigSnapshot::created_with(&expiring).keeps_every_record());
     }
 
     #[test]
@@ -650,7 +802,7 @@ mod tests {
             max_topic_size: Some(SettingChange::Set(MaxTopicSize::Custom(
                 IggyByteSize::from(GIB),
             ))),
-            cleanup_policy: None,
+            ..TopicConfigUpdate::default()
         };
         let options = update.options();
         assert_eq!(options.message_expiry, None);

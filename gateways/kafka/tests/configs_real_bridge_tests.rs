@@ -39,7 +39,7 @@ use serial_test::serial;
 use tokio_util::sync::CancellationToken;
 
 use iggy::prelude::{Durability, Identifier, TopicClient, TopicCreateOptions};
-use iggy_gateway_kafka::bridge::{IggyBridge, IggyBridgeConfig, TopicDefaults};
+use iggy_gateway_kafka::bridge::{IggyBridge, IggyBridgeConfig, KafkaTopicSettings, TopicDefaults};
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
     ERROR_INVALID_CONFIG, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE,
@@ -282,7 +282,8 @@ fn entry<'a>(
 }
 
 /// Iggy does not compact, so a policy without `delete` keeps every record: the alter drops the
-/// expiry and the size cap, whatever the retention keys say. The policy itself is not stored.
+/// expiry and the size cap, whatever the retention keys say. The policy itself is not stored, so
+/// a later alter of the retention must name it.
 #[tokio::test]
 #[serial]
 async fn alters_to_compact_keep_every_record_and_accept_keys_iggy_ignores() {
@@ -309,7 +310,7 @@ async fn alters_to_compact_keep_every_record_and_accept_keys_iggy_ignores() {
             &[
                 ("cleanup.policy", "compact"),
                 ("retention.ms", "60000"),
-                ("min.insync.replicas", "2"),
+                ("min.insync.replicas", "1"),
                 ("compression.type", "lz4"),
             ],
         )],
@@ -350,13 +351,41 @@ async fn alters_to_compact_keep_every_record_and_accept_keys_iggy_ignores() {
             ("min.insync.replicas", Some("1")),
             ("compression.type", Some("producer"))
         ],
-        "the policy is not reported, and ignored keys report the Kafka default"
+        "the policy is not reported, min.insync.replicas reports the majority of one node, and \
+         ignored keys report the Kafka default"
     );
 
-    let set = alter(
+    let refused = alter(
         &state,
         ALTER_V2,
         vec![alter_resource("orders", TOPIC, &expiring)],
+        false,
+    )
+    .await;
+    assert_eq!(
+        refused.responses[0].error_code, ERROR_INVALID_CONFIG,
+        "the topic keeps every record, and the alter does not name the policy"
+    );
+    assert!(
+        refused.responses[0]
+            .error_message
+            .as_ref()
+            .is_some_and(|text| text.as_str().contains("names cleanup.policy")),
+        "{:?}",
+        refused.responses[0].error_message
+    );
+    assert_eq!(
+        stored(&state, "orders").await,
+        [
+            ("-1".to_string(), SOURCE_TOPIC),
+            ("-1".to_string(), SOURCE_TOPIC)
+        ]
+    );
+    let named = [("cleanup.policy", "delete"), expiring[0], expiring[1]];
+    let set = alter(
+        &state,
+        ALTER_V2,
+        vec![alter_resource("orders", TOPIC, &named)],
         false,
     )
     .await;
@@ -423,7 +452,14 @@ async fn describe_configs_returns_every_key_but_cleanup_and_alter_persists_reten
     assert!(!retention.read_only);
     assert!(!retention.is_sensitive);
     assert_eq!(retention.config_source, SOURCE_DEFAULT);
-    assert_eq!(retention.synonyms, [] as [DescribeConfigsSynonym; 0]);
+    assert_eq!(
+        retention.synonyms,
+        [DescribeConfigsSynonym::default()
+            .with_name(StrBytes::from_static_str("retention.ms"))
+            .with_value(Some(StrBytes::from_static_str("-1")))
+            .with_source(SOURCE_DEFAULT)],
+        "include_synonyms lists the entry itself"
+    );
     assert!(retention.documentation.is_some());
     let retention_bytes = entry(&result.configs, "retention.bytes");
     assert_eq!(
@@ -439,9 +475,20 @@ async fn describe_configs_returns_every_key_but_cleanup_and_alter_persists_reten
     );
     assert!(segment.read_only);
     let min_isr = entry(&result.configs, "min.insync.replicas");
-    assert_eq!(min_isr.value.as_ref().map(StrBytes::as_str), Some("1"));
-    assert!(!min_isr.read_only, "accepted at any value and not applied");
+    assert_eq!(
+        min_isr.value.as_ref().map(StrBytes::as_str),
+        Some("1"),
+        "the majority of the one node that stores the topic"
+    );
+    assert!(!min_isr.read_only, "accepted up to that majority");
     assert_eq!(min_isr.config_source, SOURCE_DEFAULT);
+    let largest = entry(&result.configs, "max.message.bytes");
+    assert_eq!(
+        largest.value.as_ref().map(StrBytes::as_str),
+        Some("8388608"),
+        "the largest batch that Produce takes, the 8 MiB frame"
+    );
+    assert!(!largest.read_only);
     let timestamps = entry(&result.configs, "message.timestamp.type");
     assert!(timestamps.read_only, "accepted only at the default");
     assert!(
@@ -1008,17 +1055,36 @@ async fn alter_configs_store_retention_bytes_per_partition_and_keep_the_segment_
         "the describe reports the cap of one partition, not of the topic"
     );
 
-    let (code, text) = incremental_one(
-        &state,
-        INCREMENTAL_V1,
-        "orders",
-        &[("retention.bytes", OP_SET, Some("1048576"))],
-    )
-    .await;
-    assert_eq!(code, ERROR_INVALID_CONFIG);
-    assert!(
-        text.contains("Iggy keeps at least one segment of each partition"),
-        "{text}"
+    assert_eq!(
+        incremental_one(
+            &state,
+            INCREMENTAL_V1,
+            "orders",
+            &[("retention.bytes", OP_SET, Some("1048576"))],
+        )
+        .await,
+        (ERROR_NONE, String::new()),
+        "Kafka accepts a cap below one segment"
+    );
+    assert_eq!(
+        stored(&state, "orders").await[1],
+        ("357913941".to_string(), SOURCE_TOPIC),
+        "Iggy refuses a topic cap below one segment, so the three partitions share one segment"
+    );
+    assert_eq!(
+        incremental_one(
+            &state,
+            INCREMENTAL_V1,
+            "orders",
+            &[("retention.bytes", OP_SET, Some("0"))],
+        )
+        .await,
+        (ERROR_NONE, String::new())
+    );
+    assert_eq!(
+        stored(&state, "orders").await[1],
+        ("357913941".to_string(), SOURCE_TOPIC),
+        "0 keeps one segment, and never lifts the cap"
     );
 
     let (code, text) = incremental_one(
@@ -1546,5 +1612,98 @@ async fn incremental_alter_configs_one_bad_resource_skips_only_that_resource() {
     assert_eq!(
         retention(&state, "changed").await,
         ("5000".to_string(), SOURCE_TOPIC)
+    );
+}
+
+/// A delete of a key that no client set changes nothing, as in Kafka, also once an operator sets a
+/// gateway default: the topic keeps the default it was created with. A legacy `AlterConfigs` that
+/// leaves out a segment size set at create keeps that size, so it can still change the retention.
+#[tokio::test]
+#[serial]
+async fn alters_leave_unset_keys_and_a_replace_keeps_a_segment_size_set_at_create() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+    create_topic(&state, "orders").await;
+    let with_defaults = state_with(IggyBridgeConfig {
+        topic_defaults: TopicDefaults {
+            retention_ms: Some(604_800_000),
+            retention_bytes: Some(2_147_483_648),
+            durability: Durability::Replicated,
+        },
+        ..server.test_config()
+    })
+    .await;
+
+    assert_eq!(
+        incremental_one(
+            &with_defaults,
+            INCREMENTAL_V1,
+            "orders",
+            &[
+                ("retention.ms", OP_DELETE, None),
+                ("retention.bytes", OP_DELETE, None)
+            ]
+        )
+        .await,
+        (ERROR_NONE, String::new())
+    );
+    let replaced = alter(
+        &with_defaults,
+        ALTER_V2,
+        vec![alter_resource("orders", TOPIC, &[])],
+        false,
+    )
+    .await;
+    assert_eq!(replaced.responses[0].error_code, ERROR_NONE);
+    assert_eq!(
+        stored(&with_defaults, "orders").await,
+        [
+            ("-1".to_string(), SOURCE_DEFAULT),
+            ("-1".to_string(), SOURCE_DEFAULT)
+        ],
+        "no client set them, so neither takes the new gateway default"
+    );
+
+    let segmented = KafkaTopicSettings {
+        segment_size: Some(64 * 1024 * 1024),
+        ..KafkaTopicSettings::default()
+    };
+    state
+        .bridge
+        .as_ref()
+        .expect("bridge")
+        .create_kafka_topic_with("segmented", 1, &segmented)
+        .await
+        .expect("create topic");
+    let replaced = alter(
+        &state,
+        ALTER_V2,
+        vec![alter_resource(
+            "segmented",
+            TOPIC,
+            &[("retention.ms", "60000")],
+        )],
+        false,
+    )
+    .await;
+    assert_eq!(
+        replaced.responses[0].error_code, ERROR_NONE,
+        "a replace keeps the segment size that Iggy cannot reset"
+    );
+    assert_eq!(
+        stored(&state, "segmented").await[0],
+        ("60000".to_string(), SOURCE_TOPIC)
+    );
+    let (code, _) = incremental_one(
+        &state,
+        INCREMENTAL_V1,
+        "segmented",
+        &[("segment.bytes", OP_DELETE, None)],
+    )
+    .await;
+    assert_eq!(
+        code, ERROR_INVALID_CONFIG,
+        "an explicit delete is still refused"
     );
 }

@@ -93,7 +93,7 @@ const RECONNECTION_RETRIES: u32 = 3;
 /// A reconnect dial runs in the caller's future, so this timeout cancels a hung dial too.
 ///
 /// Sends use the Produce deadline instead. See `send_records`.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Wraps a single Iggy client call in [`REQUEST_TIMEOUT`].
 ///

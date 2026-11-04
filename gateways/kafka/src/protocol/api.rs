@@ -131,6 +131,10 @@ impl Default for BrokerAdvertise {
 /// The node id of a gateway that `IGGY_KAFKA_NODE_ID` does not set.
 pub const DEFAULT_NODE_ID: u16 = 1;
 
+/// The first stand-in node id in a replica list: 65536, one past the largest node id a gateway can
+/// take, since `IGGY_KAFKA_NODE_ID` is a `u16`.
+pub const FIRST_STAND_IN_REPLICA: i32 = 1 << 16;
+
 /// The gateways that one listener lists in Metadata. A gateway alone lists itself, as node 1.
 #[derive(Debug, Clone)]
 pub struct Brokers {
@@ -163,11 +167,14 @@ impl Brokers {
         listed
     }
 
-    /// `count` gateway node ids for the replicas of a partition: this gateway first, then the
-    /// next ones in node id order, wrapping round. Never more than every gateway, and never fewer
-    /// than this one.
+    /// `count` node ids for the replicas of a partition, and never fewer than one: this gateway
+    /// first, then the next gateways in node id order, wrapping round. A factor above the number
+    /// of gateways is filled with stand-in ids from [`FIRST_STAND_IN_REPLICA`], which no gateway
+    /// can take. A client reads a stand-in as a replica on a broker that is not up, and reads the
+    /// factor from the length of the list.
     #[must_use]
     pub fn replicas(&self, count: u32) -> Vec<i32> {
+        let wanted = usize::try_from(count).unwrap_or(usize::MAX).max(1);
         let mut ids: Vec<i32> = self.peers.iter().map(|(node, _)| *node).collect();
         ids.push(self.node_id);
         ids.sort_unstable();
@@ -176,7 +183,9 @@ impl Brokers {
             .position(|node| *node == self.node_id)
             .unwrap_or(0);
         ids.rotate_left(own);
-        ids.truncate(usize::try_from(count).unwrap_or(usize::MAX).max(1));
+        ids.truncate(wanted);
+        let stand_ins = (FIRST_STAND_IN_REPLICA..).take(wanted.saturating_sub(ids.len()));
+        ids.extend(stand_ins);
         ids
     }
 

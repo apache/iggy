@@ -730,9 +730,9 @@ Limits:
 | `IGGY_KAFKA_PRODUCE_SESSIONS` | `256` | Producers that get an Iggy client of their own. The rest share one. `0`: all share one |
 | `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` | `600` | An unused Produce client closes after this long |
 | `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` | `false` | `true` passes the producer of an idempotent batch to Iggy, so each batch lands once. Turn it on after every Iggy node, gateway and consumer of the topics is upgraded. See [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) |
-| `IGGY_KAFKA_TOPIC_RETENTION_MS` | `-1` | Kafka's `log.retention.ms`: the `retention.ms` of each topic the gateway creates without one. `-1` never expires. Kafka's default is 7 days, `604800000`. See [docs/CONFIGS.md](docs/CONFIGS.md) |
-| `IGGY_KAFKA_TOPIC_RETENTION_BYTES` | `-1` | Kafka's `log.retention.bytes`: the `retention.bytes` of each partition of a topic the gateway creates without one. `-1` caps nothing. Otherwise at least `1073741824`, the largest Iggy segment |
-| `IGGY_KAFKA_TOPIC_DURABILITY` | `replicated` | Iggy durability of the messages and consumer offsets of each topic the gateway creates: `replicated` or `persisted` |
+| `IGGY_KAFKA_TOPIC_RETENTION_MS` | `-1` | Kafka's `log.retention.ms`: the `retention.ms` of each topic the gateway creates without one. `-1` never expires. Kafka's default is 7 days, `604800000`. Give every gateway the same value. See [docs/CONFIGS.md](docs/CONFIGS.md) |
+| `IGGY_KAFKA_TOPIC_RETENTION_BYTES` | `-1` | Kafka's `log.retention.bytes`: the `retention.bytes` of each partition of a topic the gateway creates without one. `-1` caps nothing. Otherwise at least `1073741824`, the largest Iggy segment. Give every gateway the same value |
+| `IGGY_KAFKA_TOPIC_DURABILITY` | `replicated` | Iggy durability of the messages and consumer offsets of each topic the gateway creates: `replicated` or `persisted`. `flush.messages=1` or `flush.ms=0` on a create makes the messages `persisted`. Give every gateway the same value |
 
 The initial connect retries a fixed, bounded number of times (`RECONNECTION_RETRIES = 3`, not the
 Iggy SDK client's own default of unlimited retries, one dial per second, forever), and the whole
@@ -807,7 +807,11 @@ topic ([docs/CONFIGS.md](docs/CONFIGS.md)).
 
 Iggy does not compact (#4521). A topic created with `cleanup.policy=compact`, as Kafka Connect and
 Schema Registry create theirs, keeps every record and grows without bound. The gateway logs a
-warning for it. The replication factor of the request is the number of Iggy nodes that store each
+warning for it. Iggy has no option for the policy, so the gateway does not store it, and a
+describe does not report it. Schema Registry then stops on its second start, unless
+`kafkastore.topic.skip.validation=true` is set. Apicurio Registry 3 does not start. An alter that
+changes the retention of a topic that keeps every record must name `cleanup.policy` in the same
+request. The replication factor of the request is the number of Iggy nodes that store each
 partition, and `-1` takes the Iggy default, which is every node.
 
 Its durability is `IGGY_KAFKA_TOPIC_DURABILITY`, by default Iggy's `Durability::Replicated`. That

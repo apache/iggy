@@ -31,7 +31,9 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use iggy::prelude::{Identifier, IggyExpiry, MaxTopicSize, StreamClient, TopicClient};
+use iggy::prelude::{
+    Durability, Identifier, IggyByteSize, IggyExpiry, MaxTopicSize, StreamClient, TopicClient,
+};
 use serial_test::serial;
 use tokio_util::sync::CancellationToken;
 
@@ -346,8 +348,10 @@ async fn create_topics_with_a_config_iggy_cannot_hold_returns_invalid_config_and
     for configs in [
         &[("message.timestamp.type", "LogAppendTime")][..],
         &[("cleanup.policy", "compact,")][..],
-        &[("retention.bytes", "1048576")][..],
         &[("segment.bytes", "1048577")][..],
+        &[("max.message.bytes", "1000")][..],
+        &[("max.message.bytes", "8388609")][..],
+        &[("min.insync.replicas", "2")][..],
         &[("no.such", "1")][..],
     ] {
         let topic = TopicSpec {
@@ -481,7 +485,7 @@ async fn create_topics_with_compact_keeps_every_record_and_leaves_the_policy_out
             ("cleanup.policy", "compact"),
             ("retention.ms", "60000"),
             ("retention.bytes", "1048576"),
-            ("min.insync.replicas", "2"),
+            ("min.insync.replicas", "1"),
         ],
         ..TopicSpec::new("connect-configs", 1)
     };
@@ -514,6 +518,62 @@ async fn create_topics_with_compact_keeps_every_record_and_leaves_the_policy_out
     let resolved = details.resolved_options();
     assert_eq!(resolved.message_expiry, IggyExpiry::NeverExpire);
     assert_eq!(resolved.max_topic_size, MaxTopicSize::Unlimited);
+}
+
+/// Kafka accepts a `retention.bytes` below one segment. Iggy keeps one segment of each partition
+/// and refuses a topic cap below one segment, so the topic gets one segment. A flush of every
+/// write makes the topic persisted, and a raised `max.message.bytes` within the largest batch is
+/// accepted.
+#[tokio::test]
+#[serial]
+async fn create_topics_with_a_small_retention_keeps_one_segment_and_a_flush_persists() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+
+    let topic = TopicSpec {
+        configs: &[
+            ("retention.bytes", "1048576"),
+            ("flush.messages", "1"),
+            ("max.message.bytes", "4194304"),
+        ],
+        ..TopicSpec::new("small-retention", 3)
+    };
+    let body = build_request(&[topic], false);
+    let outcome =
+        create_topics::handle(&state, &ConnectionState::default(), REQUEST_VERSION, body).await;
+    let (error_code, message, created) =
+        decode_first_in_full(outcome.expect_response("CreateTopics answers"));
+    assert_eq!(error_code, ERROR_NONE, "{message:?}");
+    let reported = |name: &str| {
+        created
+            .iter()
+            .find(|(key, _, _)| key == name)
+            .map(|(_, value, _)| value.clone())
+    };
+    assert_eq!(
+        reported("retention.bytes"),
+        Some(Some("357913941".to_string())),
+        "one segment of 1 GiB shared by three partitions"
+    );
+    assert_eq!(reported("flush.messages"), Some(Some("1".to_string())));
+    assert_eq!(reported("flush.ms"), Some(Some("0".to_string())));
+
+    let raw = raw_client(&server).await;
+    let details = raw
+        .get_topic(
+            &Identifier::named("kafka").expect("stream"),
+            &Identifier::named("small-retention").expect("topic"),
+        )
+        .await
+        .expect("get_topic call")
+        .expect("the topic exists");
+    let resolved = details.resolved_options();
+    assert_eq!(
+        resolved.max_topic_size,
+        MaxTopicSize::Custom(IggyByteSize::from(1_073_741_824))
+    );
+    assert_eq!(resolved.runtime.durability, Durability::Persisted);
 }
 
 /// Iggy stores the replication factor (#4692), from 1 to the node count. One node holds one copy,
