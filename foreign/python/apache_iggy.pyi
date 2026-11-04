@@ -2198,6 +2198,7 @@ class IggyClient:
         polling_retry_interval: datetime.timedelta | None = None,
         init_retries: builtins.int | None = None,
         init_retry_interval: datetime.timedelta | None = None,
+        offset_drain_timeout: datetime.timedelta | None = None,
         allow_replay: builtins.bool = False,
     ) -> collections.abc.Awaitable[IggyConsumer]:
         r"""
@@ -2213,9 +2214,12 @@ class IggyClient:
         each reply, and `CommitPolicy.Auto(...)` makes the consumer store counted positions.
         `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (the larger of 16,000 and
         the poll count by default) bound the requests in flight and the queued batches.
+        `offset_drain_timeout` controls how long shutdown waits for pending automatic offset
+        stores before closing the reader. It defaults to five seconds; zero skips that wait.
         Call `shutdown()` before dropping the consumer.
         Returns the consumer or raises `IggyError` on failure. Raises `ValueError` if
-        `polling_retry_interval` or `init_retry_interval` is negative or zero.
+        `polling_retry_interval` or `init_retry_interval` is negative or zero, or if
+        `offset_drain_timeout` is negative.
 
         Consumer groups are not available over HTTP: this call raises `FeatureUnavailable`.
         Use `Consumer.Single(...)` with `poll_messages(...)` or `reader(...)` there.
