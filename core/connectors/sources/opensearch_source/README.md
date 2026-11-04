@@ -47,7 +47,7 @@ query = { match_all = {} }
 | Field | Default | Behavior |
 | --- | --- | --- |
 | `url` | required | OpenSearch base URL. |
-| `index` | required | Index name or pattern. `open()` fails if it does not exist. |
+| `index` | required | Index name or pattern. `open()` fails for a name that does not exist. A pattern that matches nothing yet is accepted, and the connector waits for matching indices to appear. |
 | `timestamp_field` | required | Field used for sort order. It must be sortable in the index mapping. |
 | `username` / `password` | none | HTTP basic authentication, used only when both are set. |
 | `query` | `match_all` | Query DSL object, applied on every poll. |
@@ -69,6 +69,14 @@ sorted ascending by `timestamp_field`, `_id` and `_index`, with `search_after`
 set to the previous batch's last sort tuple. The `_id` and `_index` keys break
 ties between documents with the same timestamp, so none are skipped at a batch
 boundary, including across the indices of a pattern.
+
+Documents that lack `timestamp_field` are sorted first (`missing: "_first"`).
+OpenSearch would otherwise sort them last under a value larger than any real
+timestamp, and the cursor stored there would hide every document indexed later.
+They are published on the initial scan, but one indexed after the cursor has
+moved on is skipped, like any document with an older timestamp. If a hit ever
+comes back sorted on that last-place value, the poll fails with `SchemaMismatch`
+instead of storing it.
 
 For every hit:
 
@@ -140,7 +148,7 @@ again. A successful search resets it.
 | `Connection` | Network failure during a search. |
 | `HttpRequestFailed` | `429` or `5xx` after the retries are used up, or a search that timed out or failed on some shards. |
 | `PermanentHttpError` | Other `4xx`, or a search response that cannot be parsed. |
-| `SchemaMismatch` | A hit has no sort tuple. |
+| `SchemaMismatch` | A hit has no sort tuple, or sorted on the missing-value sentinel. |
 
 ## Limits
 
@@ -149,6 +157,11 @@ again. A successful search resets it.
 - Throughput is `batch_size` per `polling_interval`. The defaults give about 10
   documents per second, so a large first load needs tuning, for example
   `polling_interval = "100ms"` and `batch_size = 5000`.
+- Use one mapping for `timestamp_field` across all indices of a pattern. A `date`
+  index and a `date_nanos` index sort as raw numbers (milliseconds against
+  nanoseconds), so the order across them is wrong and the cursor can skip
+  documents. The sort does not set `numeric_type`, because OpenSearch rejects it
+  on a `keyword` timestamp.
 - The cursor only moves forward. Documents indexed later with a
   `timestamp_field` older than the cursor are not read until the state is reset.
 - Only the whole `_source` is published, as JSON. There is no field projection.

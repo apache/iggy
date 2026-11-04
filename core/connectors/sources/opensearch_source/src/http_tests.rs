@@ -608,19 +608,20 @@ async fn given_hit_without_sort_tuple_when_poll_should_fail_without_advancing_cu
 }
 
 #[tokio::test]
-async fn given_poll_when_search_sent_should_disable_total_hit_counting() {
-    let bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
-    let captured = bodies.clone();
+async fn given_poll_when_search_sent_should_request_safe_pagination() {
+    let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+    let captured = requests.clone();
     let app = mock_router(StatusCode::OK, move |request| {
         let captured = captured.clone();
         async move {
+            let query = request.uri().query().unwrap_or_default().to_string();
             let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
                 .await
                 .unwrap();
             captured
                 .lock()
                 .await
-                .push(serde_json::from_slice(&bytes).unwrap());
+                .push((query, serde_json::from_slice(&bytes).unwrap()));
             (StatusCode::OK, search_response(vec![]).to_string())
         }
     });
@@ -629,32 +630,38 @@ async fn given_poll_when_search_sent_should_disable_total_hit_counting() {
     source.open().await.unwrap();
     source.poll().await.unwrap();
 
-    assert_eq!(bodies.lock().await[0]["track_total_hits"], json!(false));
+    let requests = requests.lock().await;
+    let (query, body) = &requests[0];
+    assert_eq!(body["track_total_hits"], json!(false));
+    assert!(
+        query.contains("allow_partial_search_results=false"),
+        "partial results can hide documents behind the cursor"
+    );
+    assert_eq!(
+        body["sort"][0]["timestamp"]["missing"],
+        json!("_first"),
+        "documents without the timestamp must sort first, or they park the cursor at the end"
+    );
 }
 
 #[tokio::test]
-async fn given_poll_when_search_sent_should_forbid_partial_results() {
-    let queries = Arc::new(Mutex::new(Vec::<String>::new()));
-    let captured = queries.clone();
-    let app = mock_router(StatusCode::OK, move |request| {
-        let captured = captured.clone();
-        async move {
-            captured
-                .lock()
-                .await
-                .push(request.uri().query().unwrap_or_default().to_string());
-            (StatusCode::OK, search_response(vec![]).to_string())
-        }
+async fn given_hit_sorted_on_missing_value_sentinel_when_poll_should_fail_without_advancing_cursor()
+{
+    let mut sentinel = search_hit("doc-1", "2024-01-01T00:00:00Z", json!({}));
+    sentinel["sort"] = json!([i64::MAX, "doc-1", TEST_INDEX]);
+    let body = search_response(vec![sentinel]).to_string();
+    let app = mock_router(StatusCode::OK, move |_| {
+        let body = body.clone();
+        async move { (StatusCode::OK, body) }
     });
     let base = start_server(app).await;
     let mut source = OpenSearchSource::new(1, base_config(&base), None);
     source.open().await.unwrap();
-    source.poll().await.unwrap();
 
-    assert!(
-        queries.lock().await[0].contains("allow_partial_search_results=false"),
-        "partial results can hide documents behind the cursor"
-    );
+    let error = source.poll().await.expect_err("sentinel sort must fail");
+
+    assert!(matches!(error, Error::SchemaMismatch(_)), "got {error:?}");
+    assert!(source.test_search_after().await.is_none());
 }
 
 #[tokio::test]

@@ -133,6 +133,51 @@ async fn given_typed_fields_document_when_connector_polls_should_round_trip_payl
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
     seed = seeds::connector_stream
 )]
+async fn document_without_timestamp_source_keeps_delivering_later_documents(
+    harness: &TestHarness,
+    fixture: OpenSearchSourcePreCreatedFixture,
+) {
+    fixture
+        .insert_document(1, "dated_doc", 10)
+        .await
+        .expect("insert dated document");
+    fixture
+        .insert_document_without_timestamp(2, "undated_doc")
+        .await
+        .expect("insert undated document");
+    fixture.refresh_index().await.expect("refresh index");
+
+    let client = harness.root_client().await.unwrap();
+    let first = poll_next(&client, "undated_consumer", 2).await;
+    assert_eq!(
+        sorted_document_ids(&json_payloads(&first)),
+        expected_ids(1, 2),
+        "a document without the timestamp field is still published"
+    );
+
+    fixture
+        .insert_documents_from(3, 1)
+        .await
+        .expect("insert later document");
+
+    let later = poll_next(&client, "undated_consumer", 1).await;
+    assert_eq!(
+        sorted_document_ids(&json_payloads(&later)),
+        expected_ids(3, 1),
+        "a document without the timestamp field must not park the cursor ahead of later ones"
+    );
+
+    let on_stream = read_from_start(&client, "undated_audit", 3).await;
+    assert_eq!(
+        sorted_document_ids(&json_payloads(&on_stream)),
+        expected_ids(1, 3)
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
+    seed = seeds::connector_stream
+)]
 async fn given_documents_added_after_first_poll_when_connector_runs_should_deliver_only_new_ones(
     harness: &TestHarness,
     fixture: OpenSearchSourcePreCreatedFixture,

@@ -53,6 +53,9 @@ const DOCUMENT_ID_HEADER: &str = "opensearch.document_id";
 const INDEX_HEADER: &str = "opensearch.index";
 const MAX_HEADER_VALUE_LENGTH: usize = 255;
 const MAX_LAST_ERROR_CHARS: usize = 512;
+// What OpenSearch reports for a document missing the sort field when it sorts last. The sort
+// asks for missing values first, so seeing this means that request option was not honored.
+const MISSING_LAST_SORT_VALUE: i64 = i64::MAX;
 
 static DOCUMENT_ID_HEADER_KEY: std::sync::LazyLock<HeaderKey> = std::sync::LazyLock::new(|| {
     HeaderKey::try_from(DOCUMENT_ID_HEADER).expect("document id header key is a valid literal")
@@ -339,6 +342,14 @@ impl OpenSearchSource {
                     hit.get("_id").and_then(Value::as_str)
                 )));
             };
+
+            if sort.first().and_then(Value::as_i64) == Some(MISSING_LAST_SORT_VALUE) {
+                return Err(Error::SchemaMismatch(format!(
+                    "OpenSearch hit {:?} sorted on the missing-value sentinel; a cursor there \
+                     would skip every document indexed later",
+                    hit.get("_id").and_then(Value::as_str)
+                )));
+            }
 
             let Some(source) = hit.get("_source") else {
                 warn!(
@@ -687,7 +698,7 @@ impl Source for OpenSearchSource {
             "size": batch_size,
             "track_total_hits": false,
             "sort": [
-                { timestamp_field: { "order": "asc" } },
+                { timestamp_field: { "order": "asc", "missing": "_first" } },
                 { "_id": { "order": "asc" } },
                 { "_index": { "order": "asc" } }
             ]
