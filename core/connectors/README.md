@@ -27,6 +27,11 @@ Published to Docker Hub as [`apache/iggy-connect`](https://hub.docker.com/r/apac
 | `x.y.z`, `latest` | Runtime plus every bundled connector plugin (default) |
 | `x.y.z-slim`, `latest-slim` | Runtime binary only |
 
+> [!NOTE]
+> Up to and including 0.5.0, `latest` and `x.y.z` were the runtime-only image. From the first release that ships flavors, they are the full image with every bundled plugin, and the old runtime-only image is `latest-slim` / `x.y.z-slim`. To keep the old image, pin version 0.5.0 or earlier, or use a `-slim` tag from that release on.
+>
+> The `edge` tag is runtime-only and is no longer refreshed, because the connectors image is built only on release. There is no `edge-slim`.
+
 The default (fat) image bakes every connector plugin into `/usr/local/lib`, which is on the runtime's [plugin search path](#plugin-path-resolution). A connector config can therefore load a bundled plugin by library file name alone, with no directory and no extension:
 
 ```toml
