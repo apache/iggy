@@ -84,6 +84,9 @@ type fakeClient struct {
 	// caller stops waiting, as the client does.
 	holdsCommits bool
 	leaveErr     error
+	// refusedProbes holds the refusals of the next probes of each partition, one per probe.
+	refusedProbes map[uint32][]error
+	probes        []uint32
 }
 
 func newFakeClient() *fakeClient {
@@ -103,7 +106,15 @@ func (f *fakeClient) FetchMessages(ctx context.Context, _, _ iggcon.Identifier, 
 		return nil, err
 	}
 	if !autoCommit && count == 1 && len(targets) == 1 && targets[0].Strategy.Kind == iggcon.POLLING_NEXT {
-		return []iggcon.FetchMessagesSection{section(targets[0].PartitionId, f.starts[targets[0].PartitionId])}, nil
+		partition := targets[0].PartitionId
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.probes = append(f.probes, partition)
+		if refusals := f.refusedProbes[partition]; len(refusals) > 0 {
+			f.refusedProbes[partition] = refusals[1:]
+			return []iggcon.FetchMessagesSection{{PartitionId: partition, Err: refusals[0]}}, nil
+		}
+		return []iggcon.FetchMessagesSection{section(partition, f.starts[partition])}, nil
 	}
 	read := &fakeRead{targets: targets, count: count, commit: autoCommit, reply: make(chan fakeReply, 1)}
 	f.reads <- read
@@ -217,6 +228,12 @@ func (f *fakeClient) recordedAbandons() []uint64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]uint64(nil), f.abandoned...)
+}
+
+func (f *fakeClient) recordedProbes() []uint32 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]uint32(nil), f.probes...)
 }
 
 func (f *fakeClient) recordedGroupings() []time.Time {
@@ -927,6 +944,68 @@ func TestPartitionReader_ReportsAPartitionThatStaysRefusedAsNotOwned(t *testing.
 	assert.Equal(t, uint32(1), *readError.PartitionID)
 	client.nextRead(t).answer(section(1, 0))
 	assert.Equal(t, []uint64{0}, offsets(next(t, reader)), "the partition is read again after the report")
+}
+
+// Under OnRead the partitions of a group share a read, so a refusal of the
+// probe of one partition counts against that partition only.
+func TestPartitionReader_StopsOnlyThePartitionWhoseProbeStaysRefusedAndKeepsReadingItsGroupUnderOnRead(t *testing.T) {
+	client := newFakeClient()
+	client.refusedProbes = map[uint32][]error{2: slices.Repeat([]error{ierror.ErrUnauthorized}, lastingRefusalsBeforeStop)}
+	reader, err := NewPartitionReader(context.Background(), client, identifier(t, 1), identifier(t, 2),
+		iggcon.NewSingleConsumer(identifier(t, 3)), WithPartitions(1, 2),
+		WithPollOptions(withCommit(waitOneSecond, iggcon.OnReadCommit())), WithRetryInterval(time.Millisecond))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reader.Close(context.Background()) })
+
+	var refusal *ReadError
+	var delivered []uint64
+	reportedAfter := 0
+	for refusal == nil || len(delivered) == reportedAfter {
+		polled := nextInBackground(reader)
+		var result outcome
+		select {
+		case read := <-client.reads:
+			require.Equal(t, []uint32{1}, partitionsOf(read), "the refused partition holds back no read of its group")
+			read.answer(section(1, uint64(len(delivered))))
+			result = <-polled
+		case result = <-polled:
+		}
+		if result.err == nil {
+			delivered = append(delivered, offsets(result.polled)...)
+			continue
+		}
+		require.Nil(t, refusal, "only the refused partition is reported")
+		require.ErrorAs(t, result.err, &refusal)
+		require.Equal(t, uint32(2), *refusal.PartitionID, "only the refused partition stops")
+		reportedAfter = len(delivered)
+	}
+
+	require.ErrorIs(t, refusal, ierror.ErrUnauthorized)
+	probes := client.recordedProbes()
+	slices.Sort(probes)
+	assert.Equal(t, append([]uint32{1}, slices.Repeat([]uint32{2}, lastingRefusalsBeforeStop)...), probes)
+}
+
+// A probe refused as not the owner resets its own partition only, so the
+// other partitions of its group read on from their positions.
+func TestPartitionReader_KeepsThePositionsOfTheGroupOfAPartitionWhoseProbeIsRefusedAsNotOwned(t *testing.T) {
+	client := newFakeClient()
+	client.refusedProbes = map[uint32][]error{2: {ierror.ErrConsumerGroupPartitionNotOwned}}
+	reader := member(t, client, withCommit(waitOneSecond, iggcon.OnReadCommit()), 1)
+	polled := nextInBackground(reader)
+	client.nextRead(t).answer(section(1, 0))
+	require.NoError(t, (<-polled).err)
+	assign(t, client, reader, 1, 2)
+
+	polled = nextInBackground(reader)
+	read := client.nextRead(t)
+
+	assert.Equal(t, []uint32{1}, partitionsOf(read), "the refused partition holds back no read of its group")
+	assert.Equal(t, []uint32{1, 2}, client.recordedProbes(), "the other partition reads on without a new probe")
+	read.answer(section(1, 1))
+	result := <-polled
+	require.NoError(t, result.err)
+	assert.Equal(t, []uint64{1}, offsets(result.polled))
 }
 
 // A section that does not decode is read again one message at a time, so

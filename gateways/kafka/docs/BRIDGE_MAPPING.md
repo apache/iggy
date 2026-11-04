@@ -352,12 +352,14 @@ as an empty one, and the probe cannot tell them apart without a server-side sign
 time in that window still polls, and answers `-1` only when the polls come back empty as well. A
 reset by time there then moves to LATEST.
 
-Lookups by time run one partition at a time and reuse one Fetch read slot, however many
-partitions the request names. A poll that times out frees its slot as it stops, so for a moment
-the request can hold a second one. Each lookup gets a quarter of the request deadline, capped by
-the deadline itself. One whose time has already passed answers `REQUEST_TIMED_OUT` (7) without
-taking or using a slot, and one that does not finish in time answers 7 too. Clients retry 7.
-Repeated entries for one partition and time are looked up once.
+The lookups by time of one request share one Fetch read slot, however many partitions the request
+names, and up to 8 run at once. Each poll gets the time of a Fetch poll, 2 s or more for a
+partition whose pages took long. Lookups start only in the first 2 s after the request takes its
+slot. The request waits no longer for them, apart from a partition whose pages took long. A lookup
+with no answer by then answers `REQUEST_TIMED_OUT` (7). Clients retry 7. A poll with no
+answer in its time stalls its partition, as in Fetch. The lookups of a stalled partition answer
+`NOT_LEADER_OR_FOLLOWER` (6) with no poll until a re-check answers. Repeated entries for one
+partition and time are looked up once.
 
 ### Header order
 

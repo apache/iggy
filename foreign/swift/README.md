@@ -10,13 +10,13 @@
 
 Official Swift client SDK for [Apache Iggy](https://iggy.apache.org) message streaming.
 
-The SDK is built up in stages. The client is a TCP connection with optional TLS that
-speaks the consensus protocol, signs in, keeps the session alive with a heartbeat,
-reconnects, and follows the cluster leader. It manages streams, topics, partitions,
-segments, users, personal access tokens, and consumer groups, sends and polls messages,
-stores consumer offsets, produces with a batching producer, and consumes with a
-consumer that tracks and commits its position. Examples and BDD scenarios follow in
-later changes.
+The client is a TCP connection with optional TLS that speaks the consensus protocol,
+signs in, keeps the session alive with a heartbeat, reconnects, and follows the cluster
+leader. It manages streams, topics, partitions, segments, users, personal access tokens,
+and consumer groups, sends and polls messages, stores consumer offsets, produces with a
+batching producer, and consumes with a consumer that tracks and commits its position.
+A runnable producer and consumer live in [`examples/swift`](../../examples/swift), and the
+scenarios every SDK shares run against this one from [`bdd/swift`](../../bdd/swift).
 
 Swift supports the consensus wire protocol and checks commitment proof during
 automatic retries. It does not yet expose retained-operation resolve/abandon APIs,
@@ -36,28 +36,32 @@ The SDK depends on [SwiftNIO](https://github.com/apple/swift-nio),
 
 ## Installation
 
-Swift Package Manager fetches a package from the root of a git repository, so the SDK
-cannot be depended on straight from this monorepo's subdirectory. Add it through the
-package mirror, which carries every release as a `v<version>` tag:
+Swift Package Manager resolves a package from the root of a git repository, so the Iggy repository root carries a `Package.swift` that publishes this SDK. Depend on the Iggy repository itself.
+
+There is no stable Swift release yet. Until there is, pin a development snapshot exactly, replacing `0.1.10-edge.1` with the newest `vX.Y.Z-edge.N` tag:
 
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/apache/iggy-swift.git", from: "0.1.1")
+    .package(url: "https://github.com/apache/iggy.git", exact: "0.1.10-edge.1")
 ],
 targets: [
-    .target(name: "MyApp", dependencies: [.product(name: "Iggy", package: "iggy-swift")])
+    .target(name: "MyApp", dependencies: [.product(name: "Iggy", package: "iggy")])
 ]
 ```
 
-From a checkout of this repository, or a vendored copy, depend on it by path:
+Stable Swift releases use `vX.Y.Z` tags after PMC approval. An `X.Y.Z-edge.N` tag is a development snapshot of unreleased changes, not an Apache release, and a version range never selects one. Once a stable release exists, depend on it with `.upToNextMinor(from: "X.Y.Z")`: while the SDK is 0.x, `from:` would also take the next minor release. A requirement must start at the first stable `v0.1.x` tag, because the repository's `0.0.4` to `0.0.52` tags predate the Swift SDK and have no root manifest.
+
+The first resolve mirror-clones the whole Iggy repository, about 145 MiB with every pull request ref, and checks out its 67 MiB tree for a 0.8 MiB SDK. SwiftPM keeps the clone in its cache, so later resolves fetch only new commits.
+
+From a checkout of this repository, depend on its root by path. SwiftPM names a path dependency after its directory, so the package is `iggy` for a checkout in `../iggy`:
 
 ```swift
 dependencies: [
-    .package(name: "apache-iggy", path: "../iggy/foreign/swift")
+    .package(path: "../iggy")
 ],
 targets: [
-    .target(name: "MyApp", dependencies: [.product(name: "Iggy", package: "apache-iggy")])
+    .target(name: "MyApp", dependencies: [.product(name: "Iggy", package: "iggy")])
 ]
 ```
 
@@ -97,6 +101,40 @@ let client = IggyClient(configuration: configuration)
 
 The server certificate is verified against the system roots, or against `caFile` when
 set, and against the host of the address unless `TLSOptions.domain` names another one.
+
+### Connection strings
+
+A client can also take the connection string every Iggy SDK reads. The credentials
+become the auto-login, either `username:password` or a personal access token alone:
+
+```swift
+let client = try IggyClient(connectionString: "iggy://iggy:iggy@localhost:8090?tls=true&tls_ca_file=/etc/iggy/ca.pem")
+let configuration = try ClientConfiguration(connectionString: "iggy+tcp://\(token)@[::1]:8090?reconnection_retries=5")
+```
+
+The options are `tls`, `tls_domain`, `tls_ca_file`, `reconnection_retries` (a count or
+`unlimited`), `reconnection_interval`, `reestablish_after`, `heartbeat_interval`, `nodelay`,
+`max_pending_operations`, and `max_pending_operation_bytes`. Durations take the spellings
+of the Rust SDK, such as `500ms`, `5s`, or `1h 30m`. An unknown option or a malformed
+value fails with `invalidConnectionString`, and a bad retry count with
+`invalidNumberValue`, so a string is valid in every SDK or in none. Only the `iggy://`
+and `iggy+tcp://` schemes are accepted.
+
+Some options read differently than in Rust:
+
+- `tls` and `nodelay` take `true` or `false`, and any other value fails, where Rust
+  reads it as false.
+- Without `nodelay` the client keeps Nagle off, its own default.
+- `reconnection_interval` is the full pause between rounds over the endpoints. Rust
+  takes it as the base of a jittered backoff capped at 10 seconds.
+- `reestablish_after` is how long after the last successful connection the client
+  waits before redialing that endpoint. Rust takes it as the uptime that resets the
+  backoff.
+- A request that needs the connection waits for the redial, up to the request timeout
+  (30 seconds by default), and fails when the wait, or the `reconnection_interval`
+  pause, outlasts it. An explicit `connect()` waits it out.
+- The pending operation limits are checked and then ignored, since this client keeps
+  no operations to replay.
 
 ### Resource options
 
@@ -377,7 +415,11 @@ for try await received in consumer {
 
 A handler that throws leaves its message uncounted and ends `consumeMessages(_:)` with its error, so the message is read again by the next run. Under the other policies a handler that throws is logged and reading goes on.
 
-`pollingStrategy` says where a partition without a position starts. A failed read is thrown as a `ReadError` and leaves the consumer usable: a caller of `next()` can call it again, and `consumeMessages(_:)` logs it and keeps reading until the client cannot come back on its own. Without `allowReplay` a message at or below the last one handed over from the same partition history is skipped, unless `seek(partitionID:to:)` moved the partition back.
+`pollingStrategy` says where a partition without a position starts. A failed read is thrown as a `ReadError` and leaves the consumer usable: a caller of `next()` can call it again, and `consumeMessages(_:)` logs it and keeps reading.
+
+`consumeMessages(_:)` ends with the error once the client cannot come back on its own, and for a message that does not decode or `historyUnavailable`, which stop the partition until a seek.
+
+It also ends with `partitionLaneBlocked` under `.onRead`: a lost committing read of another caller blocks the partition until `abandonOperation(_:)` takes that operation, after which the reader reads it again by itself. Without `allowReplay` a message at or below the last one handed over from the same partition history is skipped, unless `seek(partitionID:to:)` moved the partition back.
 
 `shutdown()` counts the last message under `.processing` and closes the reader within `offsetDrainTimeout`: it stores the counted positions under `.auto`, moves the offset of each partition back to the last message handed over under `.onRead`, and leaves the group.
 
@@ -481,6 +523,13 @@ The resource options tests compare against `Tests/IggyTests/Fixtures/resource_op
 
 The metadata changes scenario that churns the change log past its capacity runs only when `IGGY_METADATA_CHANGE_LOG_RESOURCE_CAPACITY` is set for both the server and the test run, for example to 64.
 
+The shared scenarios in `bdd/scenarios` run through `bdd/swift/tests`, a package with a
+small Gherkin runner. CI runs it in Docker with `scripts/run-bdd-tests.sh swift`. Against a
+local server started as above with `IGGY_METADATA_CHANGE_LOG_RESOURCE_CAPACITY=64`, run one
+feature with `IGGY_TCP_ADDRESS=127.0.0.1:8090 IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy
+BDD_FEATURE=stream_options swift run iggy-bdd` from `bdd/swift/tests`. The examples run with
+`scripts/run-examples-from-readme.sh --language swift`.
+
 ## Contributing
 
 Format the sources with the toolchain's formatter before opening a pull request; CI runs it
@@ -491,3 +540,24 @@ swift format format --in-place --recursive Sources Tests Package.swift
 swift format lint --strict --recursive Sources Tests Package.swift
 swift build -Xswiftc -warnings-as-errors
 ```
+
+The same configuration covers the examples, the BDD runner and the root manifest, from the repository root:
+
+```bash
+for package in examples/swift/getting-started bdd/swift/tests; do
+  swift format lint --strict --recursive --configuration foreign/swift/.swift-format "$package/Sources" "$package/Package.swift"
+done
+swift format lint --strict --configuration foreign/swift/.swift-format Package.swift
+```
+
+### Releasing
+
+`IggyVersion.sdkVersion` in `Sources/Iggy/Iggy.swift` is the SDK version. Change it only with `scripts/bump-version.sh sdk-swift` from the repository root, which also regenerates the golden vectors that embed it: `--edge` for the next development snapshot, `--patch --edge` for the first snapshot after a stable release, `--strip-edge` for the version that goes to a release vote.
+
+After a merge to master, CI tags an untagged `X.Y.Z-edge.N` version as `vX.Y.Z-edge.N`.
+
+For a stable release, the PMC vote must cover the Swift version and source archive, including the root manifest. The release manager verifies the vote result and publishes the signed source release through Apache's release process. The workflow does not verify the vote automatically. Merging a plain `X.Y.Z` version to master does not publish a stable Swift tag.
+
+After that, run the Publish workflow on the voted commit with `publish_other=swift` and `create_edge_docker_tag=false`. Run with `dry_run=true` first, then `dry_run=false` and `skip_tag_creation=false` to publish the tag.
+
+The root `Package.swift` declares only the library. Its tools version, platforms, dependencies and `Iggy` target must match this package's manifest, and CI fails when they differ.

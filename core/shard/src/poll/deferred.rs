@@ -240,7 +240,7 @@ impl CommitGate {
 }
 
 /// One partition of a readiness wait, resolved and authorized by the origin.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReadinessTarget {
     pub namespace: IggyNamespace,
     pub partition_id: u32,
@@ -640,9 +640,39 @@ struct Mirror {
     used: u64,
     /// When this shard applied the last push.
     pushed: u64,
+    /// The pushes that this shard applied, so that a wait tells whether one
+    /// came after it started.
+    pushes: u64,
     /// The owner took the news that this shard holds a parked wait on the
     /// partition, so its commits come as pushes.
     interest: bool,
+    /// A wait found this mirror behind its partition without a parked wait
+    /// to refresh it, so the pushes go on while waits name the mirror.
+    held: bool,
+}
+
+/// What a mirror received since a wait read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorSince {
+    /// No push.
+    Unchanged,
+    /// A push, and the owner pushes each commit here, so the mirror is as
+    /// current as one that a parked wait refreshed.
+    Current,
+    /// A push that ended the pushes, because it found no parked wait.
+    Pushed,
+}
+
+/// How a wait evaluates a target that another shard owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorUse {
+    /// The owner evaluates it.
+    Owner,
+    /// The mirror evaluates it, and the owner pushes each commit here.
+    Current,
+    /// The mirror evaluates it from its last push, the `pushes`-th, which can
+    /// miss newer records.
+    Snapshot { pushes: u64 },
 }
 
 impl Mirror {
@@ -2282,7 +2312,7 @@ where
                         .entry(mirror.owner)
                         .or_default()
                         .push((namespace, mirror.seq));
-                } else if parked && !mirror.interest {
+                } else if (parked || mirror.held) && !mirror.interest {
                     // An owner whose inbox refused the news hears it again.
                     interested.push(namespace);
                 }
@@ -2370,12 +2400,13 @@ where
                 // the next wait can still read the mirror.
                 mirror.state = update.state;
                 mirror.pushed = now;
+                mirror.pushes = mirror.pushes.wrapping_add(1);
                 let parked = state.partitions.contains_key(&update.namespace);
                 if mirror.unused(now) && !parked {
                     unused.push((update.namespace, update.seq));
                     continue;
                 }
-                if !parked && mirror.interest {
+                if !parked && mirror.interest && !mirror.held {
                     idle.push(update.namespace);
                 }
                 signals.mark(update.namespace);
@@ -2467,27 +2498,84 @@ where
         }
     }
 
-    /// Whether this shard evaluates `target` against its mirror. A mirror
-    /// that finds an error in the partition, or that lags the install of a
-    /// group owner, sends the target to the owner, so that no wait gets a
-    /// stale error from a mirror.
-    pub(crate) fn mirror_serves(
+    /// How this shard evaluates `target` of `owner`. A mirror that finds an
+    /// error in the partition, or that lags the install of a group owner,
+    /// sends the target to the owner, so that no wait gets a stale error from
+    /// a mirror.
+    pub(crate) fn mirror_use(
         &self,
         owner: u16,
         target: &ReadinessTarget,
         primary: bool,
         now: u64,
-    ) -> bool {
+    ) -> MirrorUse {
         let mut mirrors = self.deferred_polls.mirrors.borrow_mut();
         let Some(mirror) = mirrors.entries.get_mut(&target.namespace) else {
-            return false;
+            return MirrorUse::Owner;
         };
         mirror.used = now;
-        mirror.owner == owner
+        let serves = mirror.owner == owner
             && mirror
                 .state
                 .as_ref()
-                .is_some_and(|state| matches!(state.check(primary, target), Ok(true)))
+                .is_some_and(|state| matches!(state.check(primary, target), Ok(true)));
+        if !serves {
+            MirrorUse::Owner
+        } else if mirror.interest {
+            MirrorUse::Current
+        } else {
+            MirrorUse::Snapshot {
+                pushes: mirror.pushes,
+            }
+        }
+    }
+
+    /// How the mirror of `namespace` changed since a wait read it after its
+    /// `pushes`-th push.
+    pub(crate) fn mirror_since(&self, namespace: IggyNamespace, pushes: u64) -> MirrorSince {
+        match self.deferred_polls.mirrors.borrow().entries.get(&namespace) {
+            Some(mirror) if mirror.pushes == pushes => MirrorSince::Unchanged,
+            Some(mirror) if mirror.interest => MirrorSince::Current,
+            Some(_) => MirrorSince::Pushed,
+            None => MirrorSince::Unchanged,
+        }
+    }
+
+    /// `target` as its mirror finds it now, if it holds messages. A wait reads
+    /// a mirror this way after the pushes that came while it waited, which no
+    /// evaluation of the wait saw.
+    pub(crate) fn mirror_ready(
+        &self,
+        primary: bool,
+        target: &ReadinessTarget,
+    ) -> Option<ReadyTarget>
+    where
+        M: StreamsFrontend,
+    {
+        let readiness = self.evaluate_readiness(primary, target).ok()?;
+        (readiness.available > 0).then_some(ReadyTarget {
+            partition_id: target.partition_id,
+            available: readiness.available,
+            known_bytes: None,
+        })
+    }
+
+    /// Asks the owners of the mirrors of `namespaces` to push each commit
+    /// here until no wait names the mirror, so the next waits on them need
+    /// no second evaluation.
+    pub(crate) fn hold_mirrors(&self, namespaces: Vec<IggyNamespace>)
+    where
+        M: StreamsFrontend,
+    {
+        {
+            let mut mirrors = self.deferred_polls.mirrors.borrow_mut();
+            for namespace in &namespaces {
+                if let Some(mirror) = mirrors.entries.get_mut(namespace) {
+                    mirror.held = true;
+                }
+            }
+        }
+        self.tell_mirror_owners(namespaces, true);
     }
 
     /// Mirrors `namespaces` under `seq`, after `owner` took the frame that
@@ -2508,11 +2596,14 @@ where
                 state: None,
                 used: now,
                 pushed: now,
+                pushes: 0,
                 interest: false,
+                held: false,
             });
             // A new owner holds no news of this shard's parked waits.
             if mirror.owner != owner {
                 mirror.interest = false;
+                mirror.held = false;
             }
             mirror.owner = owner;
             mirror.seq = seq;

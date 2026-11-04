@@ -18,9 +18,8 @@
 use serde::de::DeserializeOwned;
 use tokio::sync::watch;
 use tracing::{error, info};
-use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::log::{CallbackLayer, LogCallback};
+use crate::log::{LogCallback, init_plugin_logging};
 use crate::{
     ConsumedMessage, MessagesMetadata, Payload, RawMessages, Sink, TopicMetadata, get_runtime,
 };
@@ -66,10 +65,7 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
         C: DeserializeOwned,
     {
         unsafe {
-            _ = Registry::default()
-                .with(CallbackLayer::new(log_callback))
-                .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
-                .try_init();
+            init_plugin_logging(log_callback);
             let slice = std::slice::from_raw_parts(config_ptr, config_len);
             let Ok(config_str) = std::str::from_utf8(slice) else {
                 error!("Failed to read configuration for sink connector with ID: {id}");

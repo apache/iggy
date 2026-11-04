@@ -130,7 +130,7 @@ public class AsyncTcpConnection {
     private static final String EVENT_LOOP_THREAD_PREFIX = "iggy-tcp-io";
 
     private final IoEventLoopGroup eventLoopGroup;
-    private final boolean ownsEventLoopGroup;
+    private final Optional<EventLoopShutdown> ownedGroupShutdown;
     private final EventLoop eventLoop;
     private final FixedChannelPool channelPool;
     private final ChannelGroup channels = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE, true);
@@ -212,7 +212,8 @@ public class AsyncTcpConnection {
 
         this.consensusSession = new ConsensusSession();
         this.vsrEncoder = new VsrRequestEncoder(consensusSession);
-        this.ownsEventLoopGroup = sharedEventLoopGroup.isEmpty();
+        this.ownedGroupShutdown =
+                sharedEventLoopGroup.isEmpty() ? Optional.of(EventLoopShutdown.resolve(null, null)) : Optional.empty();
         this.eventLoopGroup = sharedEventLoopGroup.orElseGet(() -> newEventLoopGroup(ioThreads));
         this.eventLoop = eventLoopGroup.next();
         this.heartbeat = new ConnectionHeartbeat(
@@ -1710,13 +1711,11 @@ public class AsyncTcpConnection {
     private void closePool(CompletableFuture<Void> shutdownFuture) {
         try {
             channelPool.closeAsync().addListener(poolClosed -> {
-                if (!ownsEventLoopGroup) {
-                    completeShutdown(shutdownFuture, poolClosed);
-                    return;
-                }
-                eventLoopGroup
-                        .shutdownGracefully()
-                        .addListener(groupClosed -> completeShutdown(shutdownFuture, groupClosed));
+                // The caller shuts a supplied group down, so for one the close ends with the pool.
+                Future<?> closed = ownedGroupShutdown
+                        .<Future<?>>map(shutdown -> shutdown.shutdown(eventLoopGroup))
+                        .orElse(poolClosed);
+                closed.addListener(step -> completeShutdown(shutdownFuture, step));
             });
         } catch (RejectedExecutionException loopGone) {
             log.warn("Event loop rejected the pool close, channel already gone: {}", loopGone.getMessage());

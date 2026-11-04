@@ -2097,6 +2097,17 @@ async fn pump(shard: &TestShard, inbox: &Inbox) {
     shard.flush_readiness_pushes();
 }
 
+/// Applies the next push of `inbox` alone, without the service loop that
+/// [`pump`] runs after every frame.
+fn apply_next_push(shard: &TestShard, inbox: &Inbox) {
+    let Ok(ShardFrame::Lifecycle(LifecycleFrame::ReadinessUpdate { from, states })) =
+        inbox.replies.try_recv().or_else(|_| inbox.main.try_recv())
+    else {
+        panic!("a push is next in the inbox");
+    };
+    shard.apply_readiness_update(from, states);
+}
+
 /// A first wait for `partition` goes to the owner. The owner answers it and
 /// pushes the state, which the watcher then mirrors.
 async fn mirror(watcher: &TestShard, owner: &TestShard, inboxes: &[Inbox], partition: usize) {
@@ -2302,6 +2313,183 @@ async fn frames_from_before_a_renewed_watch_change_nothing() {
         [renewed],
         "a stale unwatch keeps the renewed watch"
     );
+}
+
+#[compio::test]
+async fn wait_that_ends_on_another_ready_target_asks_the_owner_of_a_mirror_without_pushes() {
+    let (watcher, owner, inboxes) = watched_pair(&[&["first"], &["first"]]).await;
+    mirror(&watcher, &owner, &inboxes, 1).await;
+    // No wait parks on the mirror, so the owner pushes nothing of this commit.
+    commit_to(&owner, 1, &["second"], 2).await;
+    pump(&owner, &inboxes[1]).await;
+    assert!(inboxes[0].replies.try_recv().is_err());
+    let targets = vec![
+        readiness_target(&watcher, 0, PollingStrategy::offset(0)),
+        readiness_target(&watcher, 1, PollingStrategy::offset(1)),
+    ];
+
+    let (ready, ()) = futures::join!(
+        watcher.wait_for_messages(
+            readiness_caller(),
+            targets,
+            PARTITION_READ_TIMEOUT,
+            ANY_MESSAGE
+        ),
+        async {
+            pump(&owner, &inboxes[1]).await;
+            yield_now().await;
+            pump(&owner, &inboxes[1]).await;
+        }
+    );
+
+    assert_eq!(
+        ids(&ready.unwrap()),
+        [0, 1],
+        "the answer names the mirrored partition that holds a record"
+    );
+}
+
+#[compio::test]
+async fn mirror_that_a_wait_found_behind_keeps_its_pushes_while_waits_name_it() {
+    let (watcher, owner, inboxes) = watched_pair(&[&["first"], &["first"]]).await;
+    mirror(&watcher, &owner, &inboxes, 1).await;
+    commit_to(&owner, 1, &["second"], 2).await;
+    pump(&owner, &inboxes[1]).await;
+    let behind = vec![
+        readiness_target(&watcher, 0, PollingStrategy::offset(0)),
+        readiness_target(&watcher, 1, PollingStrategy::offset(1)),
+    ];
+    let (ready, ()) = futures::join!(
+        watcher.wait_for_messages(
+            readiness_caller(),
+            behind,
+            PARTITION_READ_TIMEOUT,
+            ANY_MESSAGE
+        ),
+        async {
+            pump(&owner, &inboxes[1]).await;
+            yield_now().await;
+            pump(&owner, &inboxes[1]).await;
+        }
+    );
+    assert_eq!(ids(&ready.unwrap()), [0, 1]);
+    pump(&owner, &inboxes[1]).await;
+    pump(&watcher, &inboxes[0]).await;
+    // Without a parked wait, only the hold keeps these commits coming.
+    for request in [3, 4] {
+        commit_to(&owner, 1, &["more"], request).await;
+        pump(&owner, &inboxes[1]).await;
+        pump(&watcher, &inboxes[0]).await;
+    }
+    let current = vec![
+        readiness_target(&watcher, 0, PollingStrategy::offset(0)),
+        readiness_target(&watcher, 1, PollingStrategy::offset(3)),
+    ];
+
+    let (ready, ()) = futures::join!(
+        watcher.wait_for_messages(
+            readiness_caller(),
+            current,
+            PARTITION_READ_TIMEOUT,
+            ANY_MESSAGE
+        ),
+        async {
+            yield_now().await;
+            assert!(
+                inboxes[1].main.try_recv().is_err(),
+                "the wait asks the owner nothing"
+            );
+            pump(&owner, &inboxes[1]).await;
+        }
+    );
+
+    assert_eq!(ids(&ready.unwrap()), [0, 1]);
+}
+
+#[compio::test]
+async fn wait_whose_owner_refuses_the_second_evaluation_keeps_its_answer() {
+    let (watcher, owner, inboxes) = watched_pair(&[&["first"], &["first"]]).await;
+    mirror(&watcher, &owner, &inboxes, 1).await;
+    commit_to(&owner, 1, &["second"], 2).await;
+    pump(&owner, &inboxes[1]).await;
+    let targets = vec![
+        readiness_target(&watcher, 0, PollingStrategy::offset(0)),
+        readiness_target(&watcher, 1, PollingStrategy::offset(1)),
+    ];
+
+    let (ready, ()) = futures::join!(
+        watcher.wait_for_messages(
+            readiness_caller(),
+            targets,
+            PARTITION_READ_TIMEOUT,
+            ANY_MESSAGE
+        ),
+        async {
+            pump(&owner, &inboxes[1]).await;
+            // A full inbox refuses the frame that asks the owner again.
+            while watcher.senders[usize::from(OWNER)]
+                .try_send(ShardFrame::lifecycle(LifecycleFrame::ReadinessUnwatch {
+                    from: WATCHER,
+                    watches: Vec::new(),
+                }))
+                .is_ok()
+            {}
+            yield_now().await;
+        }
+    );
+
+    assert_eq!(
+        ids(&ready.unwrap()),
+        [0],
+        "the answer keeps the target that was ready"
+    );
+}
+
+#[compio::test]
+async fn wait_reads_a_mirror_that_a_push_refreshed_after_its_last_evaluation() {
+    let (watcher, owner, inboxes) = watched_pair(&[&["first"], &["first"]]).await;
+    mirror(&watcher, &owner, &inboxes, 0).await;
+    mirror(&watcher, &owner, &inboxes, 1).await;
+    let targets = (0..2)
+        .map(|partition| readiness_target(&watcher, partition, PollingStrategy::offset(1)))
+        .collect();
+
+    let (ready, ()) = futures::join!(
+        watcher.wait_for_messages(
+            readiness_caller(),
+            targets,
+            PARTITION_READ_TIMEOUT,
+            ANY_MESSAGE
+        ),
+        async {
+            // The park asks for pushes, and each commit then comes in a frame of its own.
+            pump(&owner, &inboxes[1]).await;
+            pump(&watcher, &inboxes[0]).await;
+            commit_to(&owner, 0, &["second"], 2).await;
+            pump(&owner, &inboxes[1]).await;
+            commit_to(&owner, 1, &["second"], 3).await;
+            pump(&owner, &inboxes[1]).await;
+            // The first push fires the wait, and the second lands before the wait reads its answer.
+            apply_next_push(&watcher, &inboxes[0]);
+            watcher.service_deferred_polls().await;
+            apply_next_push(&watcher, &inboxes[0]);
+        }
+    );
+
+    assert_eq!(
+        ids(&ready.unwrap()),
+        [0, 1],
+        "the answer names the partition whose push came after the wait fired"
+    );
+    while let Ok(frame) = inboxes[1].main.try_recv() {
+        assert!(
+            !matches!(
+                frame,
+                ShardFrame::Lifecycle(LifecycleFrame::ReadinessWait { .. })
+            ),
+            "the wait asks the owner nothing"
+        );
+    }
 }
 
 #[compio::test]

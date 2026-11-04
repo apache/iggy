@@ -136,3 +136,10 @@ components:
     registry: none
     version_file: "foreign/go/contracts/version.go"
     version_regex: 'const\s+Version\s*=\s*"([^"]+)"'
+
+  # ── Swift (tag only, SwiftPM resolves the root Package.swift) ──────────────
+  sdk-swift:
+    tag_pattern: "^v([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?)$"
+    registry: swiftpm
+    version_file: "foreign/swift/Sources/Iggy/Iggy.swift"
+    version_regex: 'sdkVersion\s*=\s*"([^"]+)"'
