@@ -57,10 +57,10 @@ func TestPersonalAccessTokenCommandsMarshalBinary(t *testing.T) {
 			want:    []byte{5, 't', 'o', 'k', 'e', 'n', 255, 255, 255, 255, 255, 255, 255, 255},
 		},
 		{
-			name:    "empty name",
-			request: &CreatePersonalAccessToken{Name: "", Expiry: 0x01020304},
+			name:    "create token with one-character name",
+			request: &CreatePersonalAccessToken{Name: "t", Expiry: 0x01020304},
 			code:    42,
-			want:    []byte{0, 4, 3, 2, 1, 0, 0, 0, 0},
+			want:    []byte{1, 't', 4, 3, 2, 1, 0, 0, 0, 0},
 		},
 		{
 			name:    "token with 255-byte name",
@@ -81,10 +81,10 @@ func TestPersonalAccessTokenCommandsMarshalBinary(t *testing.T) {
 			want:    []byte{5, 't', 'o', 'k', 'e', 'n'},
 		},
 		{
-			name:    "empty name",
-			request: &DeletePersonalAccessToken{Name: ""},
+			name:    "delete token with one-character name",
+			request: &DeletePersonalAccessToken{Name: "t"},
 			code:    43,
-			want:    []byte{0},
+			want:    []byte{1, 't'},
 		},
 		{
 			name:    "delete token with 255-byte name",
