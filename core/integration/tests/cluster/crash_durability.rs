@@ -62,28 +62,31 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// primary dies, so the surviving quorum has a meaningful prefix to preserve.
 const PRE_KILL_ACKS: usize = 50;
 
-async fn create_stream_and_topic(client: &IggyClient, eager_flush: bool) {
+async fn create_stream_and_topic(client: &IggyClient, eager_flush: bool, durability: Durability) {
     client
         .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
-    // `eager_flush` persists and fsyncs every committed batch on every
-    // replica before anything else happens on the partition; it is a topic
-    // creation option, so it travels with the topic to all nodes. The default
-    // shape leaves the 1024-message / 1 MiB thresholds in place, so small
-    // runs are acked from RAM only.
+    // `eager_flush` saves every committed batch to the segments on every
+    // replica before anything else happens on the partition. `persisted`
+    // durability also backs each ack with a stable-storage copy, where
+    // `replicated` acks on quorum commit alone. Both are topic creation
+    // options, so they travel with the topic to all nodes. The default shape
+    // leaves the 1024-message / 1 MiB thresholds in place, so small runs are
+    // acked from RAM only.
     let options = if eager_flush {
         TopicCreateOptions {
             partitions_count: Some(1),
             message_expiry: Some(IggyExpiry::NeverExpire),
             messages_required_to_save: Some(1),
-            durability: iggy_common::Durability::Persisted,
+            durability,
             ..TopicCreateOptions::default()
         }
     } else {
         TopicCreateOptions {
             partitions_count: Some(1),
             message_expiry: Some(IggyExpiry::NeverExpire),
+            durability,
             ..TopicCreateOptions::default()
         }
     };
@@ -173,8 +176,8 @@ async fn produce_acked_when_serving(client: &IggyClient, budget: Duration) -> (u
     }
 }
 
-/// The payloads of up to `count` messages from offset 0.
-async fn poll_payloads_from_start(client: &IggyClient, count: u32) -> Vec<String> {
+/// The `(offset, payload)` of up to `count` messages from offset 0.
+async fn poll_from_start(client: &IggyClient, count: u32) -> Vec<(u64, String)> {
     let polled = client
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -192,7 +195,12 @@ async fn poll_payloads_from_start(client: &IggyClient, count: u32) -> Vec<String
     polled
         .messages
         .iter()
-        .map(|message| String::from_utf8_lossy(&message.payload).into_owned())
+        .map(|message| {
+            (
+                message.header.offset,
+                String::from_utf8_lossy(&message.payload).into_owned(),
+            )
+        })
         .collect()
 }
 
@@ -408,7 +416,7 @@ async fn given_committed_sends_when_a_backup_is_killed_and_restarts_should_prese
     harness: &mut TestHarness,
 ) {
     let client = harness.tcp_root_client().await.unwrap();
-    create_stream_and_topic(&client, true).await;
+    create_stream_and_topic(&client, true, Durability::Persisted).await;
     let mut acked = produce_acked(&client, "pre-kill", 200).await;
 
     let leader = disk::leader_node_index(harness).await;
@@ -452,7 +460,7 @@ async fn given_mid_flight_produce_when_the_primary_is_killed_should_elect_and_pr
     harness: &mut TestHarness,
 ) {
     let setup_client = harness.tcp_root_client().await.unwrap();
-    create_stream_and_topic(&setup_client, false).await;
+    create_stream_and_topic(&setup_client, false, Durability::Replicated).await;
 
     let producer_client = harness.tcp_root_client().await.unwrap();
     let stop = Arc::new(AtomicBool::new(false));
@@ -548,7 +556,7 @@ async fn given_a_committed_consumer_offset_when_a_backup_is_killed_should_surviv
     harness: &mut TestHarness,
 ) {
     let client = harness.tcp_root_client().await.unwrap();
-    create_stream_and_topic(&client, false).await;
+    create_stream_and_topic(&client, false, Durability::Replicated).await;
     let acked = produce_acked(&client, "offset-fodder", 10).await;
     let stored_offset = acked.last().expect("ten acked sends").0;
 
@@ -591,7 +599,7 @@ async fn given_eager_flush_topic_when_the_whole_cluster_is_killed_should_recover
     harness: &mut TestHarness,
 ) {
     let client = harness.tcp_root_client().await.unwrap();
-    create_stream_and_topic(&client, true).await;
+    create_stream_and_topic(&client, true, Durability::Persisted).await;
     let acked = produce_acked(&client, "flushed", 30).await;
     let payloads: Vec<String> = acked.iter().map(|(_, payload)| payload.clone()).collect();
     wait_until_payloads_installed(harness, &payloads, FLUSH_INSTALL_TIMEOUT).await;
@@ -627,30 +635,33 @@ async fn given_replicated_eager_flush_topic_when_the_whole_cluster_is_killed_sho
     harness: &mut TestHarness,
 ) {
     let client = harness.tcp_root_client().await.unwrap();
-    client
-        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
-        .await
-        .expect("create stream");
-    client
-        .create_topic(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            TOPIC_NAME,
-            &TopicCreateOptions {
-                partitions_count: Some(1),
-                message_expiry: Some(IggyExpiry::NeverExpire),
-                messages_required_to_save: Some(1),
-                durability: Durability::Replicated,
-                ..TopicCreateOptions::default()
-            },
-        )
-        .await
-        .expect("create topic");
+    create_stream_and_topic(&client, true, Durability::Replicated).await;
     let acked = produce_acked(&client, "flushed", 30).await;
     let payloads: Vec<String> = acked.iter().map(|(_, payload)| payload.clone()).collect();
     wait_until_payloads_installed(harness, &payloads, FLUSH_INSTALL_TIMEOUT).await;
 
     // Same reason as above for keeping the producer's connection open.
     harness.kill_cluster().expect("SIGKILL every node");
+    // Read with every node down, so no publication can land after the read.
+    let frontiers: Vec<Option<u64>> = (0..harness.cluster_size())
+        .map(|node| disk::read_partition_wal_frontier(&harness.node(node).data_path()))
+        .collect();
+    // Whichever log the election picks, recovery then keeps the same prefix.
+    let frontier = frontiers[0].expect("node 0 published a partition WAL frontier");
+    assert!(
+        frontiers.iter().all(|other| *other == Some(frontier)),
+        "every node must publish the same WAL frontier: {frontiers:?}"
+    );
+    let (mut expected, discarded): (Vec<_>, Vec<_>) = acked
+        .iter()
+        .cloned()
+        .partition(|(offset, _)| *offset < frontier);
+    assert!(
+        !discarded.is_empty(),
+        "the published WAL frontier {frontier} covers all {} acks, so the crash pins no loss",
+        acked.len()
+    );
+
     harness
         .restart_cluster()
         .await
@@ -661,18 +672,21 @@ async fn given_replicated_eager_flush_topic_when_the_whole_cluster_is_killed_sho
     // A write that reads back proves the partition serves again, so the
     // missing acks below are discarded, not still recovering.
     let after_restart = produce_acked_when_serving(&client, CONVERGE_TIMEOUT).await;
-    wait_for_acked_readable(&client, &[after_restart], CONVERGE_TIMEOUT)
-        .await
-        .unwrap_or_else(|state| panic!("the partition should serve after the restart: {state}"));
-    let readable = poll_payloads_from_start(&client, acked.len() as u32 + 16).await;
-    let survived = payloads
-        .iter()
-        .filter(|payload| readable.contains(payload))
-        .count();
-    assert!(
-        survived < acked.len(),
-        "a whole-cluster SIGKILL discards replicated acks past the published WAL frontier, but \
-         all {survived} survived"
+    wait_for_acked_readable(
+        &client,
+        std::slice::from_ref(&after_restart),
+        CONVERGE_TIMEOUT,
+    )
+    .await
+    .unwrap_or_else(|state| panic!("the partition should serve after the restart: {state}"));
+    expected.push(after_restart);
+    let readable = poll_from_start(&client, acked.len() as u32 + 16).await;
+    assert_eq!(
+        readable,
+        expected,
+        "a whole-cluster SIGKILL must keep exactly the acks below the published WAL frontier \
+         {frontier} and discard the {} past it",
+        discarded.len()
     );
 }
 
@@ -1015,7 +1029,7 @@ async fn given_uninitialized_partitions_when_all_replicas_restart_should_elect_a
     harness: &mut TestHarness,
 ) {
     let client = harness.tcp_root_client().await.unwrap();
-    create_stream_and_topic(&client, true).await;
+    create_stream_and_topic(&client, true, Durability::Persisted).await;
     let stream = Identifier::named(STREAM_NAME).unwrap();
     let topic = Identifier::named(TOPIC_NAME).unwrap();
     let details = client.get_topic(&stream, &topic).await.unwrap().unwrap();
