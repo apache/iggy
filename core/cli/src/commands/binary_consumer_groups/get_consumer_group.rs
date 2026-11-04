@@ -129,8 +129,13 @@ impl CliCommand for GetConsumerGroupCmd {
 
         let mut partitions: Vec<_> = topic.partitions.iter().collect();
         partitions.sort_by_key(|partition| partition.id);
+        let mut offset_error = None;
         for partition in partitions {
             let partition_id = partition.id;
+            let member = owners
+                .get(&partition_id)
+                .map(|member_id| format!("{member_id}"))
+                .unwrap_or_else(|| "-".to_string());
             let consumer_offset = client
                 .get_consumer_offset(
                     &consumer,
@@ -144,15 +149,10 @@ impl CliCommand for GetConsumerGroupCmd {
                         "Problem getting consumer offset for consumer group with ID: {} for stream with ID: {} and topic with ID: {} and partition with ID: {}",
                         self.group_id, self.stream_id, self.topic_id, partition_id
                     )
-                })?;
-
-            let member = owners
-                .get(&partition_id)
-                .map(|member_id| format!("{member_id}"))
-                .unwrap_or_else(|| "-".to_string());
+                });
 
             let (current_offset, stored_offset, lag) = match consumer_offset {
-                Some(offset_info) => {
+                Ok(Some(offset_info)) => {
                     // Recovery keeps a stored offset above the commit head when
                     // acked messages were not flushed. Subtracting underflows.
                     let lag = offset_info
@@ -164,11 +164,17 @@ impl CliCommand for GetConsumerGroupCmd {
                         format!("{}", lag),
                     )
                 }
-                None => (
+                Ok(None) => (
                     format!("{}", partition.current_offset),
                     "-".to_string(),
                     format!("{}", partition.messages_count),
                 ),
+                Err(error) => {
+                    if offset_error.is_none() {
+                        offset_error = Some(error);
+                    }
+                    ("error".to_owned(), "error".to_owned(), "error".to_owned())
+                }
             };
 
             partitions_table.add_row(vec![
@@ -205,6 +211,9 @@ impl CliCommand for GetConsumerGroupCmd {
 
         event!(target: PRINT_TARGET, Level::INFO,"{table}");
 
+        if let Some(error) = offset_error {
+            return Err(error);
+        }
         Ok(())
     }
 }
@@ -249,6 +258,7 @@ mod tests {
         partitions_count: u32,
         topic: TopicReply,
         offset_fails: bool,
+        offset_fails_for: Option<u32>,
         /// `(current_offset, stored_offset)` returned for every partition.
         offset: Option<(u64, u64)>,
         members: Vec<ConsumerGroupMember>,
@@ -674,7 +684,11 @@ mod tests {
             _topic_id: &Identifier,
             _partition_id: Option<u32>,
         ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
-            if self.offset_fails {
+            if self.offset_fails
+                || self
+                    .offset_fails_for
+                    .is_some_and(|partition_id| Some(partition_id) == _partition_id)
+            {
                 Err(IggyError::Error)
             } else if let Some((current_offset, stored_offset)) = self.offset {
                 Ok(Some(ConsumerOffsetInfo {
@@ -803,6 +817,7 @@ mod tests {
             partitions_count: 1,
             topic: TopicReply::Error,
             offset_fails: false,
+            offset_fails_for: None,
             offset: None,
             members: Vec::new(),
         })
@@ -817,6 +832,7 @@ mod tests {
             partitions_count: 1,
             topic: TopicReply::Missing,
             offset_fails: false,
+            offset_fails_for: None,
             offset: None,
             members: Vec::new(),
         })
@@ -831,6 +847,7 @@ mod tests {
             partitions_count: 1,
             topic: TopicReply::Empty,
             offset_fails: false,
+            offset_fails_for: None,
             offset: None,
             members: Vec::new(),
         })
@@ -846,6 +863,7 @@ mod tests {
             partitions_count: 1,
             topic: TopicReply::Partitions(vec![partition(3)]),
             offset_fails: false,
+            offset_fails_for: None,
             offset: Some((20, 5)),
             members: vec![ConsumerGroupMember {
                 id: 17,
@@ -866,6 +884,7 @@ mod tests {
             partitions_count: 2,
             topic: TopicReply::Partitions(vec![partition(4), partition(3)]),
             offset_fails: false,
+            offset_fails_for: None,
             offset: Some((20, 5)),
             members: vec![ConsumerGroupMember {
                 id: 17,
@@ -890,6 +909,7 @@ mod tests {
             partitions_count: 1,
             topic: TopicReply::OnePartition,
             offset_fails: true,
+            offset_fails_for: None,
             offset: None,
             members: Vec::new(),
         })
@@ -902,6 +922,54 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn should_print_the_group_when_one_offset_read_fails() {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_level(false)
+            .with_writer(LogBuffer(Arc::clone(&logs)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let mut cmd = command();
+        let error = cmd
+            .execute_cmd(&ScriptedClient {
+                partitions_count: 2,
+                topic: TopicReply::Partitions(vec![partition(0), partition(1)]),
+                offset_fails: false,
+                offset_fails_for: Some(1),
+                offset: Some((20, 5)),
+                members: vec![ConsumerGroupMember {
+                    id: 17,
+                    partitions_count: 2,
+                    partitions: vec![0, 1],
+                }],
+            })
+            .await
+            .expect_err("one offset read fails");
+        drop(_guard);
+        let output =
+            String::from_utf8(logs.lock().expect("log buffer").clone()).expect("log is utf-8");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Problem getting consumer offset"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("partition with ID: 1"),
+            "{error}"
+        );
+        assert!(output.contains("group"), "{output}");
+        assert!(output.contains("17"), "{output}");
+        assert!(output.contains("20"), "{output}");
+        assert!(output.contains("error"), "{output}");
+    }
+
     #[tokio::test]
     async fn should_render_group_above_the_per_request_partition_limit() {
         let mut cmd = command();
@@ -909,6 +977,7 @@ mod tests {
             partitions_count: MAX_PARTITIONS_COUNT + 1,
             topic: TopicReply::Count(MAX_PARTITIONS_COUNT + 1),
             offset_fails: false,
+            offset_fails_for: None,
             offset: None,
             members: Vec::new(),
         })
@@ -934,6 +1003,7 @@ mod tests {
             partitions_count: 1,
             topic: TopicReply::OnePartition,
             offset_fails: false,
+            offset_fails_for: None,
             offset: Some((4, 10)),
             members: Vec::new(),
         })
