@@ -364,8 +364,9 @@ pub(crate) fn spawn_consume_tasks(
                     .set_error(&plugin_key, &error.to_string(), Some(&metrics))
                     .await;
             }
-            // The polls also committed the batches the consumer still holds,
-            // and only a shutdown moves the offsets back over them.
+            // At most once, the polls also committed the batches the consumer
+            // still holds, and only a shutdown moves the offsets back over them.
+            // At least once, the polls store no offset.
             if let Err(error) = consumer.shutdown().await {
                 error!(
                     "Failed to shut down the consumer of sink connector with ID: {plugin_id}: {error}"
@@ -1026,7 +1027,7 @@ pub(crate) async fn process_messages(
                 Ok(next) => current_message = next,
                 Err(error) => {
                     error!(
-                        "Transform '{:?}' failed for sink connector with ID: {plugin_id}, stream: {}, topic: {}: {error}",
+                        "Transform '{:?}' failed for sink connector with ID: {plugin_id}, stream: {}, topic: {}, offset: {message_offset}: {error}",
                         transform.r#type(),
                         topic_metadata.stream,
                         topic_metadata.topic

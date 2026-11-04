@@ -829,7 +829,7 @@ impl HttpSink {
             );
             // Count all successfully-serialized messages as errors (skipped already counted individually)
             self.errors_count.fetch_add(count, Ordering::Relaxed);
-            return Err(Error::HttpRequestFailed(format!(
+            return Err(Error::InvalidRecordValue(format!(
                 "NDJSON batch exceeds max size: {} bytes",
                 body.len()
             )));
@@ -928,7 +928,7 @@ impl HttpSink {
             );
             // Count all successfully-serialized messages as errors (skipped already counted individually)
             self.errors_count.fetch_add(count, Ordering::Relaxed);
-            return Err(Error::HttpRequestFailed(format!(
+            return Err(Error::InvalidRecordValue(format!(
                 "JSON array batch exceeds max size: {} bytes",
                 body.len()
             )));
@@ -1223,11 +1223,14 @@ impl Sink for HttpSink {
     /// mitigates this by aborting early, but a fail-succeed-fail pattern can bypass it.
     ///
     /// **Runtime note**: The FFI boundary in `sdk/src/sink.rs` maps `consume()`'s `Result` to
-    /// `i32` (0=ok, 1=err), but the runtime's `process_messages()` in `runtime/src/sink.rs`
-    /// logs and counts a nonzero code, records no processed messages for the run that
-    /// returned it, and continues polling. A batch that mixes payload variants is split
-    /// into one `consume()` call per run, so the other runs of that poll still count as
-    /// processed. Returning `Err` does not trigger a runtime retry.
+    /// an `i32` status: 0 for `Ok`, 2 for an error that `Error::is_permanent` reports and 1 for
+    /// any other error. At most once, the runtime's `process_messages()` in
+    /// `runtime/src/sink.rs` logs and counts a nonzero status, records no processed messages
+    /// for the run that returned it, and continues polling, so an `Err` is never retried. A
+    /// batch that mixes payload variants is split into one `consume()` call per run, so the
+    /// other runs of that poll still count as processed. At least once, a 1 hands the messages
+    /// to `consume()` again from the first one not yet flushed, after a backoff, while a 2, or
+    /// a 1 past `retry_max_attempts`, stops the delivery of the topic.
     async fn consume(
         &self,
         topic_metadata: &TopicMetadata,
@@ -2111,14 +2114,14 @@ mod tests {
         }
     }
 
-    /// A raw-mode sink pointed at a closed port, so every request that it sends fails at once
-    /// and `send_attempts` counts the requests.
-    async fn given_unreachable_raw_sink(at_least_once: bool) -> HttpSink {
+    /// A sink pointed at a closed port, so every request that it sends fails at once and
+    /// `send_attempts` counts the requests.
+    async fn given_unreachable_sink(batch_mode: BatchMode, at_least_once: bool) -> HttpSink {
         let mut sink = HttpSink::new(
             1,
             HttpSinkConfig {
                 url: "http://127.0.0.1:9/ingest".to_string(),
-                batch_mode: Some(BatchMode::Raw),
+                batch_mode: Some(batch_mode),
                 max_payload_size_bytes: Some(8),
                 max_retries: Some(1),
                 health_check_enabled: Some(false),
@@ -2135,7 +2138,7 @@ mod tests {
 
     #[tokio::test]
     async fn given_at_least_once_when_a_payload_is_too_large_should_fail_before_sending_the_rest() {
-        let sink = given_unreachable_raw_sink(true).await;
+        let sink = given_unreachable_sink(BatchMode::Raw, true).await;
 
         let result = sink
             .consume(
@@ -2154,7 +2157,7 @@ mod tests {
 
     #[tokio::test]
     async fn given_at_most_once_when_a_payload_is_too_large_should_skip_it_and_send_the_rest() {
-        let sink = given_unreachable_raw_sink(false).await;
+        let sink = given_unreachable_sink(BatchMode::Raw, false).await;
 
         let result = sink
             .consume(
@@ -2166,6 +2169,32 @@ mod tests {
 
         assert!(result.is_err(), "the skipped message still fails the call");
         assert_eq!(sink.send_attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn given_a_batch_mode_when_the_batch_is_too_large_should_fail_permanently_without_sending()
+     {
+        for batch_mode in [BatchMode::NdJson, BatchMode::JsonArray] {
+            let sink = given_unreachable_sink(batch_mode, true).await;
+
+            let result = sink
+                .consume(
+                    &given_topic_metadata(),
+                    given_messages_metadata(),
+                    vec![given_raw_message(0, 64)],
+                )
+                .await;
+
+            assert!(
+                matches!(&result, Err(error) if error.is_permanent()),
+                "{batch_mode}: got {result:?}"
+            );
+            assert_eq!(
+                sink.send_attempts.load(Ordering::Relaxed),
+                0,
+                "{batch_mode}"
+            );
+        }
     }
 
     #[test]
