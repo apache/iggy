@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
 
 use crate::components::{api_client, use_session};
@@ -37,14 +38,18 @@ pub fn DashboardLayout() -> Element {
         api_client(session).user(user_id).await.ok()
     });
 
-    let sign_out = move |_| async move {
-        // Logout does not revoke the bearer, so the token stays valid on the
-        // server until `expiry` whether or not this call succeeds.
-        let _ = api_client(session).logout().await;
+    let sign_out = move |_| {
+        let client = api_client(session);
         let signed_out = session.write().take();
         if let Some(signed_out) = signed_out {
             signed_out.forget();
         }
+        // Logout does not revoke the bearer, so the token stays valid on the
+        // server until `expiry` whether or not this call succeeds. The layout
+        // unmounts once the session is gone, so the task must outlive it.
+        spawn_forever(async move {
+            let _ = client.logout().await;
+        });
     };
 
     if session.read().is_none() {
