@@ -143,15 +143,6 @@ async fn given_missing_index_when_open_should_return_init_error() {
 }
 
 #[tokio::test]
-async fn given_invalid_url_when_open_should_fail() {
-    let mut config = base_config("http://127.0.0.1:1");
-    config.url = "not-a-valid-url".to_string();
-    let mut source = OpenSearchSource::new(1, config, None);
-    let error = source.open().await.expect_err("open should fail");
-    assert!(matches!(error, Error::InvalidConfigValue(_)));
-}
-
-#[tokio::test]
 async fn given_search_hits_when_poll_should_produce_json_messages() {
     let hits = vec![search_hit(
         "doc-1",
@@ -182,7 +173,7 @@ async fn given_search_hits_when_poll_should_produce_json_messages() {
 }
 
 #[tokio::test]
-async fn given_empty_search_when_poll_should_increment_empty_poll_count() {
+async fn given_empty_search_when_poll_should_count_empty_poll_and_stage_nothing() {
     let app = empty_search_router(StatusCode::OK);
     let base = start_server(app).await;
     let mut source = OpenSearchSource::new(1, base_config(&base), None);
@@ -190,6 +181,8 @@ async fn given_empty_search_when_poll_should_increment_empty_poll_count() {
 
     let produced = source.poll().await.expect("poll should succeed");
     assert!(produced.messages.is_empty());
+    assert!(produced.state.is_none());
+    assert!(source.pending_state.lock().await.is_none());
 
     let (_, _, _, empty_polls) = source.test_metrics().await;
     assert_eq!(empty_polls, 1);
@@ -401,21 +394,6 @@ async fn given_ack_when_batch_is_staged_should_commit_candidate_state() {
 }
 
 #[tokio::test]
-async fn given_empty_poll_should_return_no_state_and_stage_nothing() {
-    let app = mock_router(StatusCode::OK, |_| async {
-        (StatusCode::OK, search_response(vec![]).to_string())
-    });
-    let base = start_server(app).await;
-    let mut source = OpenSearchSource::new(1, base_config(&base), None);
-    source.open().await.unwrap();
-
-    let produced = source.poll().await.expect("poll should succeed");
-    assert!(produced.messages.is_empty());
-    assert!(produced.state.is_none());
-    assert!(source.pending_state.lock().await.is_none());
-}
-
-#[tokio::test]
 async fn given_custom_query_when_search_should_include_query_in_body() {
     let captured: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
     let cap = captured.clone();
@@ -485,38 +463,6 @@ async fn given_basic_auth_when_search_should_send_authorization_header() {
 
     let auth = captured.lock().await.clone();
     assert!(auth.starts_with("Basic "));
-}
-
-#[tokio::test]
-async fn given_batch_where_all_hits_lack_sort_when_poll_should_return_error() {
-    let hit = json!({
-        "_id": "doc-1",
-        "_source": { "id": 1, "timestamp": "2024-01-01T00:00:00Z" }
-    });
-    let body = search_response(vec![hit]).to_string();
-    let app = mock_router(StatusCode::OK, move |_| {
-        let body = body.clone();
-        async move { (StatusCode::OK, body) }
-    });
-    let base = start_server(app).await;
-    let mut source = OpenSearchSource::new(1, base_config(&base), None);
-    source.open().await.unwrap();
-
-    let error = source
-        .poll()
-        .await
-        .expect_err("all-no-sort batch must fail");
-    assert!(
-        matches!(error, Error::SchemaMismatch(_)),
-        "expected SchemaMismatch error, got {error:?}"
-    );
-
-    let (_, _, errors, _) = source.test_metrics().await;
-    assert_eq!(errors, 1, "error counter must be incremented");
-    assert!(
-        source.test_search_after().await.is_none(),
-        "cursor must not advance when batch errors"
-    );
 }
 
 #[tokio::test]
@@ -651,6 +597,8 @@ async fn given_hit_without_sort_tuple_when_poll_should_fail_without_advancing_cu
         .expect_err("missing sort tuple must fail");
     assert!(matches!(error, Error::SchemaMismatch(_)), "got {error:?}");
     assert!(source.test_search_after().await.is_none());
+    let (_, _, errors, _) = source.test_metrics().await;
+    assert_eq!(errors, 1, "error counter must be incremented");
 }
 
 #[tokio::test]
@@ -719,17 +667,6 @@ async fn given_epoch_seconds_timestamp_should_update_last_poll_timestamp() {
         last_ts.is_some(),
         "epoch-seconds timestamp must be parsed and stored in state"
     );
-}
-
-#[tokio::test]
-async fn given_verbose_logging_when_poll_should_succeed() {
-    let app = empty_search_router(StatusCode::OK);
-    let base = start_server(app).await;
-    let mut config = base_config(&base);
-    config.verbose_logging = true;
-    let mut source = OpenSearchSource::new(1, config, None);
-    source.open().await.unwrap();
-    source.poll().await.expect("verbose poll should succeed");
 }
 
 #[tokio::test]

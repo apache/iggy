@@ -33,11 +33,8 @@ const OPENSEARCH_TAG: &str = "2.19.1";
 const OPENSEARCH_PORT: u16 = 9200;
 const OPENSEARCH_HEALTH_ENDPOINT: &str = "/_cluster/health";
 // Fixed name + ReuseDirective::Always shares one container across nextest's
-// per-test processes: the first test creates it, every later test attaches by
-// name. Per-test isolation comes from a unique index per fixture (see
-// source.rs), not a fresh container; create_index/create_typed_fields_index
-// still delete any leftover index of the same name first as a defensive
-// cleanup against stale data in the shared instance.
+// per-test processes. Isolation comes from a unique index per fixture (see
+// source.rs); index creation also drops any leftover index of the same name.
 const OPENSEARCH_CONTAINER_NAME: &str = "iggy-test-opensearch";
 
 pub const DEFAULT_TEST_STREAM: &str = "test_stream";
@@ -70,35 +67,8 @@ pub const ENV_SOURCE_CIRCUIT_BREAKER_THRESHOLD: &str =
 pub const ENV_SOURCE_CIRCUIT_BREAKER_COOL_DOWN: &str =
     "IGGY_CONNECTORS_SOURCE_OPENSEARCH_PLUGIN_CONFIG_CIRCUIT_BREAKER_COOL_DOWN";
 
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-pub struct OpenSearchSearchResponse {
-    pub hits: OpenSearchHits,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-pub struct OpenSearchHits {
-    pub total: OpenSearchTotal,
-    pub hits: Vec<OpenSearchHit>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-pub struct OpenSearchTotal {
-    pub value: usize,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-pub struct OpenSearchHit {
-    #[serde(rename = "_source")]
-    pub source: serde_json::Value,
-}
-
 pub struct OpenSearchContainer {
-    #[allow(dead_code)]
-    container: ContainerAsync<GenericImage>,
+    _container: ContainerAsync<GenericImage>,
     pub base_url: String,
 }
 
@@ -146,7 +116,7 @@ impl OpenSearchContainer {
         info!("OpenSearch container available at {base_url}");
 
         Ok(Self {
-            container,
+            _container: container,
             base_url,
         })
     }
@@ -357,56 +327,6 @@ pub trait OpenSearchOps: Sync {
 
             info!("Refreshed OpenSearch index: {index_name}");
             Ok(())
-        }
-    }
-
-    #[allow(dead_code)]
-    fn search_all(
-        &self,
-        index_name: &str,
-    ) -> impl std::future::Future<Output = Result<OpenSearchSearchResponse, TestBinaryError>> + Send
-    {
-        async move {
-            let url = format!("{}/{}/_search", self.container().base_url, index_name);
-            let query = serde_json::json!({
-                "query": { "match_all": {} },
-                "size": 1000,
-                "_source": true
-            });
-
-            let response = self
-                .http_client()
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .json(&query)
-                .send()
-                .await
-                .map_err(|e| TestBinaryError::InvalidState {
-                    message: format!("Failed to search index: {e}"),
-                })?;
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                return Err(TestBinaryError::InvalidState {
-                    message: format!("Failed to search index: status={status}, body={body}"),
-                });
-            }
-
-            let text = response
-                .text()
-                .await
-                .map_err(|e| TestBinaryError::InvalidState {
-                    message: format!("Failed to get response text: {e}"),
-                })?;
-
-            info!("OpenSearch search response: {text}");
-
-            serde_json::from_str::<OpenSearchSearchResponse>(&text).map_err(|e| {
-                TestBinaryError::InvalidState {
-                    message: format!("Failed to parse search response: {e}, body: {text}"),
-                }
-            })
         }
     }
 

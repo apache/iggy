@@ -15,60 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS};
+use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, json_payloads, poll_next};
 use crate::connectors::fixtures::{
     OpenSearchSourceCircuitBreakerFixture, OpenSearchSourceTransientErrorFixture,
 };
-use iggy_common::MessageClient;
-use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
-use iggy_common::{CommitPolicy, Consumer, Identifier, PollOptions, PollingStrategy};
 use iggy_connector_sdk::api::ConnectorStatus;
 use integration::harness::seeds;
 use integration::iggy_harness;
 use reqwest::Client;
 use std::time::Duration;
 use tokio::time::sleep;
-
-async fn poll_json_messages(
-    client: &impl MessageClient,
-    consumer_id: &str,
-    min_messages: usize,
-) -> Vec<serde_json::Value> {
-    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
-    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
-    let consumer: Identifier = consumer_id.try_into().unwrap();
-    let mut received = Vec::new();
-
-    for _ in 0..POLL_ATTEMPTS {
-        if let Ok(polled) = client
-            .poll_messages(
-                &stream_id,
-                &topic_id,
-                DEFAULT_PARTITION_ID,
-                &Consumer::new(consumer.clone()),
-                &PollingStrategy::next(),
-                PollOptions {
-                    count: 10,
-                    commit: CommitPolicy::OnRead,
-                    ..PollOptions::default()
-                },
-            )
-            .await
-        {
-            for msg in polled.messages {
-                if let Ok(json) = serde_json::from_slice(&msg.payload) {
-                    received.push(json);
-                }
-            }
-            if received.len() >= min_messages {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-    }
-
-    received
-}
 
 async fn wait_for_source_status(
     http_client: &Client,
@@ -105,7 +61,7 @@ async fn given_transient_search_errors_when_connector_polls_should_retry_and_pro
     fixture: OpenSearchSourceTransientErrorFixture,
 ) {
     let client = harness.root_client().await.unwrap();
-    let received = poll_json_messages(&client, "resilience_retry_consumer", 1).await;
+    let received = json_payloads(&poll_next(&client, "resilience_retry_consumer", 1).await);
 
     assert_eq!(
         received.len(),
@@ -154,7 +110,7 @@ async fn given_persistent_search_errors_when_connector_polls_should_remain_runni
         "persistent search failures should not move source to Error"
     );
 
-    let received = poll_json_messages(&client, "resilience_cb_consumer", 1).await;
+    let received = json_payloads(&poll_next(&client, "resilience_cb_consumer", 1).await);
     assert!(
         received.is_empty(),
         "persistent failures should not produce messages, got {}",

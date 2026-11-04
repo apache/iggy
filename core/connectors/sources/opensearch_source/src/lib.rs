@@ -410,19 +410,15 @@ impl OpenSearchSource {
 
         let total_polls = state.processing_stats.successful_polls_count
             + state.processing_stats.empty_polls_count;
-        // total_polls >= 1 because one of the two counters was just incremented above,
-        // but use saturating_sub to make the invariant machine-checked.
-        state.processing_stats.avg_batch_processing_time_ms =
-            (state.processing_stats.avg_batch_processing_time_ms
-                * total_polls.saturating_sub(1) as f64
-                + processing_time_ms)
-                / total_polls as f64;
+        state.processing_stats.avg_batch_processing_time_ms += (processing_time_ms
+            - state.processing_stats.avg_batch_processing_time_ms)
+            / total_polls as f64;
 
         let produced_count = outcome.messages.len();
         let total_documents_published = state.total_documents_published;
         let messages = outcome.messages;
-        // An empty batch moves no cursor, so nothing can be lost by committing its
-        // counters directly and there is no batch result to wait for.
+        // Nothing to publish means no batch result will arrive, so commit directly. The
+        // cursor may still have moved past hits without `_source`; they have no body to lose.
         let persisted_state = if messages.is_empty() {
             *self.state.lock().await = state;
             None
@@ -945,34 +941,20 @@ mod tests {
     }
 
     #[test]
-    fn given_state_when_serialized_should_round_trip() {
-        let original = test_state();
-
-        let serialized = rmp_serde::to_vec(&original).expect("Failed to serialize");
-        let deserialized: State =
-            rmp_serde::from_slice(&serialized).expect("Failed to deserialize");
-
-        assert_eq!(
-            original.total_documents_published,
-            deserialized.total_documents_published
-        );
-        assert_eq!(original.poll_count, deserialized.poll_count);
-        assert_eq!(original.search_after, deserialized.search_after);
-        assert_eq!(original.error_count, deserialized.error_count);
-    }
-
-    #[test]
-    fn given_state_when_serialized_should_produce_connector_state() {
+    fn given_state_when_serialized_should_round_trip_through_connector_state() {
         let source = OpenSearchSource::new(1, test_config(), None);
         let state = test_state();
 
-        let connector_state = source.serialize_state(&state);
-        assert!(connector_state.is_some());
-
+        let connector_state = source
+            .serialize_state(&state)
+            .expect("state should serialize");
         let restored: State = connector_state
-            .unwrap()
             .deserialize(CONNECTOR_NAME, 1)
             .expect("Failed to deserialize state");
+
         assert_eq!(restored.total_documents_published, 500);
+        assert_eq!(restored.poll_count, state.poll_count);
+        assert_eq!(restored.search_after, state.search_after);
+        assert_eq!(restored.error_count, state.error_count);
     }
 }

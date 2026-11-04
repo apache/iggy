@@ -15,78 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
+use super::{
+    POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT, expected_ids, json_payloads, poll_next,
+    read_from_start, sorted_document_ids,
+};
 use crate::connectors::fixtures::{
     OpenSearchSourceMissingIndexFixture, OpenSearchSourcePreCreatedFixture,
     OpenSearchSourceSmallBatchFixture,
 };
-use iggy_common::MessageClient;
-use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
-use iggy_common::{CommitPolicy, Consumer, Identifier, PollOptions, PollingStrategy};
 use iggy_connector_sdk::api::{ConnectorStatus, SourceInfoResponse};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use reqwest::Client;
-use std::collections::HashSet;
 use std::time::Duration;
 use tokio::time::sleep;
-
-fn document_ids(messages: &[serde_json::Value]) -> HashSet<i64> {
-    messages
-        .iter()
-        .filter_map(|record| record.get("id").and_then(|value| value.as_i64()))
-        .collect()
-}
-
-fn assert_contains_document_ids(messages: &[serde_json::Value], expected_ids: &[i64]) {
-    let ids = document_ids(messages);
-    for expected_id in expected_ids {
-        assert!(
-            ids.contains(expected_id),
-            "expected document id {expected_id}, got ids {ids:?}"
-        );
-    }
-}
-
-async fn poll_all_messages_from_offset_zero(
-    client: &impl MessageClient,
-    consumer_id: &Identifier,
-    min_messages: usize,
-) -> Vec<serde_json::Value> {
-    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
-    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
-    let mut received = Vec::new();
-
-    for _ in 0..POLL_ATTEMPTS {
-        if let Ok(polled) = client
-            .poll_messages(
-                &stream_id,
-                &topic_id,
-                DEFAULT_PARTITION_ID,
-                &Consumer::new(consumer_id.clone()),
-                &PollingStrategy::offset(0),
-                PollOptions {
-                    count: 100,
-                    ..PollOptions::default()
-                },
-            )
-            .await
-        {
-            received.clear();
-            for msg in polled.messages {
-                if let Ok(json) = serde_json::from_slice(&msg.payload) {
-                    received.push(json);
-                }
-            }
-            if received.len() >= min_messages {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-    }
-
-    received
-}
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
@@ -102,64 +44,24 @@ async fn given_documents_in_index_when_connector_polls_should_produce_messages(
         .insert_documents(TEST_MESSAGE_COUNT)
         .await
         .expect("Failed to insert documents");
-
-    let doc_count = fixture
-        .get_document_count()
-        .await
-        .expect("Failed to get document count");
     assert_eq!(
-        doc_count, TEST_MESSAGE_COUNT,
-        "Expected {TEST_MESSAGE_COUNT} documents in OpenSearch"
+        fixture.get_document_count().await.unwrap(),
+        TEST_MESSAGE_COUNT
     );
 
-    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
-    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
-    let consumer_id: Identifier = "test_consumer".try_into().unwrap();
+    let messages = poll_next(&client, "test_consumer", TEST_MESSAGE_COUNT).await;
 
-    let mut received: Vec<serde_json::Value> = Vec::new();
-    for _ in 0..POLL_ATTEMPTS {
-        if let Ok(polled) = client
-            .poll_messages(
-                &stream_id,
-                &topic_id,
-                DEFAULT_PARTITION_ID,
-                &Consumer::new(consumer_id.clone()),
-                &PollingStrategy::next(),
-                PollOptions {
-                    count: 10,
-                    commit: CommitPolicy::OnRead,
-                    ..PollOptions::default()
-                },
-            )
-            .await
-        {
-            for msg in polled.messages {
-                if let Ok(json) = serde_json::from_slice(&msg.payload) {
-                    received.push(json);
-                }
-            }
-            if received.len() >= TEST_MESSAGE_COUNT {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-    }
-
-    assert!(
-        received.len() >= TEST_MESSAGE_COUNT,
-        "Expected at least {TEST_MESSAGE_COUNT} messages, got {}",
-        received.len()
+    assert_eq!(
+        sorted_document_ids(&json_payloads(&messages)),
+        expected_ids(1, TEST_MESSAGE_COUNT)
     );
-
-    let expected_ids: Vec<i64> = (1..=TEST_MESSAGE_COUNT as i64).collect();
-    assert_contains_document_ids(&received, &expected_ids);
 }
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn given_more_documents_than_batch_size_when_connector_polls_should_fetch_all(
+async fn given_more_documents_than_batch_size_when_connector_polls_should_fetch_each_once(
     harness: &TestHarness,
     fixture: OpenSearchSourceSmallBatchFixture,
 ) {
@@ -172,167 +74,20 @@ async fn given_more_documents_than_batch_size_when_connector_polls_should_fetch_
         .await
         .expect("Failed to insert documents");
 
-    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
-    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
-    let consumer_id: Identifier = "pagination_consumer".try_into().unwrap();
-
-    let mut received: Vec<serde_json::Value> = Vec::new();
-    for _ in 0..POLL_ATTEMPTS {
-        if let Ok(polled) = client
-            .poll_messages(
-                &stream_id,
-                &topic_id,
-                DEFAULT_PARTITION_ID,
-                &Consumer::new(consumer_id.clone()),
-                &PollingStrategy::next(),
-                PollOptions {
-                    count: 10,
-                    commit: CommitPolicy::OnRead,
-                    ..PollOptions::default()
-                },
-            )
-            .await
-        {
-            for msg in polled.messages {
-                if let Ok(json) = serde_json::from_slice(&msg.payload) {
-                    received.push(json);
-                }
-            }
-            if received.len() >= DOC_COUNT {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-    }
-
-    assert!(
-        received.len() >= DOC_COUNT,
-        "Expected at least {DOC_COUNT} messages across search_after pages, got {}",
-        received.len()
+    let received = poll_next(&client, "pagination_consumer", DOC_COUNT).await;
+    assert_eq!(
+        sorted_document_ids(&json_payloads(&received)),
+        expected_ids(1, DOC_COUNT)
     );
 
-    let expected_ids: Vec<i64> = (1..=DOC_COUNT as i64).collect();
-    assert_contains_document_ids(&received, &expected_ids);
-
-    // Wait for at least one empty poll to fire (connector catches up to end of index).
-    // A cursor-reset bug would cause the connector to re-fetch all docs on the next empty poll.
+    // Give the connector time to run an empty poll: a cursor reset would re-fetch everything.
     sleep(Duration::from_millis(POLL_INTERVAL_MS * 5)).await;
 
-    let audit_consumer: Identifier = "pagination_audit".try_into().unwrap();
-    let all_on_stream =
-        poll_all_messages_from_offset_zero(&client, &audit_consumer, DOC_COUNT).await;
-
-    let all_ids: Vec<i64> = all_on_stream
-        .iter()
-        .filter_map(|record| record.get("id").and_then(|v| v.as_i64()))
-        .collect();
-    let unique_count = document_ids(&all_on_stream).len();
+    let on_stream = read_from_start(&client, "pagination_audit", DOC_COUNT).await;
     assert_eq!(
-        all_ids.len(),
-        unique_count,
-        "stream contains duplicate document IDs after empty poll; cursor was reset"
-    );
-    assert_eq!(
-        unique_count, DOC_COUNT,
-        "expected exactly {DOC_COUNT} unique documents on stream, got {unique_count}"
-    );
-}
-
-#[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
-    seed = seeds::connector_stream
-)]
-async fn given_empty_index_when_connector_polls_should_not_fail(
-    harness: &TestHarness,
-    fixture: OpenSearchSourcePreCreatedFixture,
-) {
-    let client = harness.root_client().await.unwrap();
-
-    let doc_count = fixture
-        .get_document_count()
-        .await
-        .expect("Failed to get document count");
-    assert_eq!(doc_count, 0, "Expected empty index");
-
-    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
-    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
-    let consumer_id: Identifier = "test_consumer".try_into().unwrap();
-
-    sleep(Duration::from_millis(100)).await;
-
-    let polled = client
-        .poll_messages(
-            &stream_id,
-            &topic_id,
-            DEFAULT_PARTITION_ID,
-            &Consumer::new(consumer_id),
-            &PollingStrategy::next(),
-            PollOptions {
-                count: 10,
-                ..PollOptions::default()
-            },
-        )
-        .await;
-
-    assert!(
-        polled.is_ok(),
-        "Should be able to poll from topic even with empty source"
-    );
-}
-
-#[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
-    seed = seeds::connector_stream
-)]
-async fn given_bulk_documents_when_connector_polls_should_produce_all_messages(
-    harness: &TestHarness,
-    fixture: OpenSearchSourcePreCreatedFixture,
-) {
-    let client = harness.root_client().await.unwrap();
-    let bulk_count = 10;
-
-    fixture
-        .insert_documents(bulk_count)
-        .await
-        .expect("Failed to insert documents");
-
-    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
-    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
-    let consumer_id: Identifier = "test_consumer".try_into().unwrap();
-
-    let mut received: Vec<serde_json::Value> = Vec::new();
-    for _ in 0..POLL_ATTEMPTS {
-        if let Ok(polled) = client
-            .poll_messages(
-                &stream_id,
-                &topic_id,
-                DEFAULT_PARTITION_ID,
-                &Consumer::new(consumer_id.clone()),
-                &PollingStrategy::next(),
-                PollOptions {
-                    count: 100,
-                    commit: CommitPolicy::OnRead,
-                    ..PollOptions::default()
-                },
-            )
-            .await
-        {
-            for msg in polled.messages {
-                if let Ok(json) = serde_json::from_slice(&msg.payload) {
-                    received.push(json);
-                }
-            }
-            if received.len() >= bulk_count {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-    }
-
-    assert!(
-        received.len() >= bulk_count,
-        "Expected at least {bulk_count} messages, got {}",
-        received.len()
+        sorted_document_ids(&json_payloads(&on_stream)),
+        expected_ids(1, DOC_COUNT),
+        "every document must be on the stream exactly once"
     );
 }
 
@@ -349,98 +104,30 @@ async fn given_runtime_state_when_connector_restarts_should_resume_after_cursor(
         .await
         .expect("Failed to insert first batch");
 
-    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
-    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
-    let consumer_id: Identifier = "state_test_consumer".try_into().unwrap();
-
     let client = harness.root_client().await.unwrap();
-    let received_before = {
-        let mut received: Vec<serde_json::Value> = Vec::new();
-        for _ in 0..POLL_ATTEMPTS {
-            if let Ok(polled) = client
-                .poll_messages(
-                    &stream_id,
-                    &topic_id,
-                    DEFAULT_PARTITION_ID,
-                    &Consumer::new(consumer_id.clone()),
-                    &PollingStrategy::next(),
-                    PollOptions {
-                        count: 10,
-                        commit: CommitPolicy::OnRead,
-                        ..PollOptions::default()
-                    },
-                )
-                .await
-            {
-                for msg in polled.messages {
-                    if let Ok(json) = serde_json::from_slice(&msg.payload) {
-                        received.push(json);
-                    }
-                }
-                if received.len() >= TEST_MESSAGE_COUNT {
-                    break;
-                }
-            }
-            sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-        }
-        received
-    };
-    assert_eq!(received_before.len(), TEST_MESSAGE_COUNT);
+    let before_restart = read_from_start(&client, "state_before", TEST_MESSAGE_COUNT).await;
+    assert_eq!(before_restart.len(), TEST_MESSAGE_COUNT);
 
     harness
         .server_mut()
         .stop_dependents()
         .expect("Failed to stop connectors");
-
-    let second_batch_start_id = (TEST_MESSAGE_COUNT + 1) as i32;
-    for i in 0..TEST_MESSAGE_COUNT {
-        fixture
-            .insert_document(
-                second_batch_start_id + i as i32,
-                &format!("doc_batch2_{i}"),
-                (TEST_MESSAGE_COUNT + i) as i32 * 10,
-            )
-            .await
-            .expect("Failed to insert document");
-    }
     fixture
-        .refresh_index()
+        .insert_documents_from(TEST_MESSAGE_COUNT + 1, TEST_MESSAGE_COUNT)
         .await
-        .expect("Failed to refresh index");
-
+        .expect("Failed to insert second batch");
     harness
         .server_mut()
         .start_dependents()
         .await
         .expect("Failed to restart connectors");
-    sleep(Duration::from_millis(100)).await;
 
-    let audit_consumer: Identifier = "state_audit_consumer".try_into().unwrap();
-    let all_messages =
-        poll_all_messages_from_offset_zero(&client, &audit_consumer, TEST_MESSAGE_COUNT * 2).await;
+    let all_messages = read_from_start(&client, "state_audit", TEST_MESSAGE_COUNT * 2).await;
 
-    let batch1_ids: HashSet<i64> = (1..=TEST_MESSAGE_COUNT as i64).collect();
-    let batch1_occurrences = all_messages
-        .iter()
-        .filter_map(|record| record.get("id").and_then(|value| value.as_i64()))
-        .filter(|id| batch1_ids.contains(id))
-        .count();
     assert_eq!(
-        batch1_occurrences, TEST_MESSAGE_COUNT,
-        "batch 1 IDs must appear exactly once on the stream; duplicates mean cursor reset"
-    );
-
-    let batch2_ids: HashSet<i64> =
-        ((TEST_MESSAGE_COUNT + 1) as i64..=(TEST_MESSAGE_COUNT * 2) as i64).collect();
-    let batch2_seen: HashSet<i64> = all_messages
-        .iter()
-        .filter_map(|record| record.get("id").and_then(|value| value.as_i64()))
-        .filter(|id| batch2_ids.contains(id))
-        .collect();
-    assert_eq!(
-        batch2_seen.len(),
-        TEST_MESSAGE_COUNT,
-        "batch 2 IDs must be present after restart, got {batch2_seen:?}"
+        sorted_document_ids(&json_payloads(&all_messages)),
+        expected_ids(1, TEST_MESSAGE_COUNT * 2),
+        "first batch must not be re-read and second batch must arrive after restart"
     );
 }
 

@@ -79,7 +79,15 @@ impl OpenSearchSourceFixture {
     }
 
     pub async fn insert_documents(&self, count: usize) -> Result<(), TestBinaryError> {
-        for i in 1..=count {
+        self.insert_documents_from(1, count).await
+    }
+
+    pub async fn insert_documents_from(
+        &self,
+        first_id: usize,
+        count: usize,
+    ) -> Result<(), TestBinaryError> {
+        for i in first_id..first_id + count {
             self.insert_document(i as i32, &format!("doc_{i}"), (i * 10) as i32)
                 .await?;
         }
