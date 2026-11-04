@@ -23,8 +23,8 @@
 //! directory that belongs to another incarnation;
 //! [`build_partition_fresh`] materialises one for a namespace that has no
 //! directory yet. Both sit on the same namespace-bounds validation, and on
-//! the consumer-offset configuration and initial-segment provisioning in
-//! [`partitions::configure_consumer_offsets`] and
+//! the consumer-offset recovery and initial-segment provisioning in
+//! [`partitions::configure_consumer_offsets`], [`partitions::recover_consumer_offsets`] and
 //! [`partitions::ensure_initial_segment`].
 //!
 //! Boot runs the loader over every owned namespace. The reconciler picks
@@ -49,9 +49,10 @@ use metadata::stm::stream::Partition;
 use metadata::{IdentityField, ReplicaIdentity};
 use partitions::{
     IggyPartition, IggyPartitions, PartitionPersistence, PartitionRecoveryError,
-    PartitionRecoveryRefusal, PartitionsConfig, RecoveredSegment, configure_consumer_offsets,
-    create_partition_file_hierarchy, ensure_initial_segment, hydrate_partition_log,
-    load_persisted_segments, load_persisted_segments_with_checkpoint,
+    PartitionRecoveryRefusal, PartitionsConfig, RecoveredSegment, clamp_consumer_offsets,
+    configure_consumer_offsets, create_partition_file_hierarchy, ensure_initial_segment,
+    hydrate_partition_log, load_persisted_segments, load_persisted_segments_with_checkpoint,
+    recover_consumer_offsets,
 };
 use server_common::fatal::is_descriptor_exhaustion;
 use server_common::fs_utils::run_blocking;
@@ -791,10 +792,8 @@ async fn load_partition(
 
     partition.created_at = partition_metadata.created_at;
     restore_partition_offsets(&mut partition, recovered_state.as_ref(), segment_checkpoint);
-    let current_offset = partition.offset.load(Ordering::Acquire);
 
-    configure_consumer_offsets(&mut partition, partitions_config, namespace, current_offset)
-        .await?;
+    recover_consumer_offsets(&mut partition, partitions_config, namespace).await?;
     if !partition.log.has_segments() {
         ensure_initial_segment(
             &mut partition,
@@ -813,6 +812,10 @@ async fn load_partition(
             .await
             .map_err(|error| ServerError::Iggy(Box::new(error)))?;
     }
+    // Only now does the ceiling see the replayed data and the re-anchored reservation. An offset
+    // whose store the replay does not restore would otherwise stay clamped below its data.
+    let current_offset = partition.offset.load(Ordering::Acquire);
+    clamp_consumer_offsets(&partition, namespace, current_offset);
     if let Err(error) =
         record_partition_initialization(config, namespace, partition_metadata.created_revision)
             .await
@@ -1447,7 +1450,7 @@ mod tests {
     const REPLICA: u8 = 1;
     const REPLICAS: u8 = 3;
     const OFFSETS_MAGIC: &[u8; 4] = b"ICO1";
-    const OFFSETS_VERSION: u8 = 8;
+    const OFFSETS_VERSION: u8 = 9;
     const RETRY_CHECKPOINT_MAGIC: &[u8; 4] = b"IRP2";
 
     #[compio::test]
@@ -2482,6 +2485,8 @@ mod tests {
         protection.extend_from_slice(&0_u32.to_le_bytes());
         protection.push(0);
         protection.extend_from_slice(&0_u128.to_le_bytes());
+        protection.extend_from_slice(&0_u32.to_le_bytes());
+        protection.extend_from_slice(&0_u64.to_le_bytes());
         protection.extend_from_slice(&0_u32.to_le_bytes());
         protection
             .extend_from_slice(&consensus::state_artifact_checksum(&protection).to_le_bytes());

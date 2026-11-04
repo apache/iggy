@@ -4208,7 +4208,7 @@ fn record_summary(
 }
 
 fn run_metadata(config: &ChaosConfig) -> serde_json::Value {
-    let mut system = System::new();
+    let mut system = System::new().expect("sysinfo supports this platform");
     system.refresh_all();
     let recorded_unix_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -4251,8 +4251,8 @@ fn run_metadata(config: &ChaosConfig) -> serde_json::Value {
             "cleaner_interval": CLEANER_INTERVAL,
         },
         "host": {
-            "os": System::name(), "os_version": System::os_version(),
-            "kernel": System::kernel_version(), "arch": std::env::consts::ARCH,
+            "os": System::name().ok(), "os_version": System::os_version().ok(),
+            "kernel": System::kernel_version().ok(), "arch": std::env::consts::ARCH,
             "cpu": system.cpus().first().map(|cpu| cpu.brand()),
             "logical_cpus": system.cpus().len(),
             "available_parallelism": std::thread::available_parallelism().ok().map(|count| count.get()),

@@ -28,10 +28,20 @@ enum Batch {
     static let messageHeaderSize = 48
     static let checksumOffset = 40
     static let messageCountOffset = 48
-    static let reservedOffset = 52
+    /// A flags byte, then the producer fields. See `BATCH_PRODUCER_OFFSET`.
+    static let producerOffset = 52
+    static let reservedOffset = 72
     /// A message's timestamp delta is a `u32` of microseconds, so one batch
     /// spans at most about 71 minutes of producer clock.
     static let maxTimestampDelta = UInt64(UInt32.max)
+
+    /// The idempotent producer that wrote a batch. Mirrors
+    /// `BatchProducer` in `core/binary_protocol/src/batch.rs`.
+    struct Producer: Equatable {
+        var producerID: UInt64
+        var epoch: UInt16
+        var baseSequence: UInt32
+    }
 
     struct Header: Equatable {
         var partitionID: UInt64
@@ -42,6 +52,8 @@ enum Batch {
         var batchLength: UInt64
         var batchChecksum: UInt64
         var messageCount: UInt32
+        /// Set only for a batch of an idempotent producer.
+        var producer: Producer? = nil
 
         static func decode(_ bytes: ArraySlice<UInt8>) throws -> Header {
             guard bytes.count >= Batch.headerSize else {
@@ -64,7 +76,35 @@ enum Batch {
                 originTimestamp: UInt64(littleEndianBytes: bytes[start + 24..<start + 32]),
                 batchLength: batchLength,
                 batchChecksum: UInt64(littleEndianBytes: bytes[start + Batch.checksumOffset..<start + Batch.checksumOffset + 8]),
-                messageCount: UInt32(littleEndianBytes: bytes[start + Batch.messageCountOffset..<start + Batch.messageCountOffset + 4]))
+                messageCount: UInt32(littleEndianBytes: bytes[start + Batch.messageCountOffset..<start + Batch.messageCountOffset + 4]),
+                producer: try decodeProducer(bytes))
+        }
+
+        /// The producer section of a header that `decode` already bounds-checked.
+        private static func decodeProducer(_ bytes: ArraySlice<UInt8>) throws -> Producer? {
+            let start = bytes.startIndex + Batch.producerOffset
+            let section = bytes[start..<bytes.startIndex + Batch.reservedOffset]
+            let malformed = WireError.validation("batch header producer section is malformed")
+            switch bytes[start] {
+            case 0:
+                guard section.allSatisfy({ $0 == 0 }) else { throw malformed }
+                return nil
+            case 1:
+                guard bytes[start + 1..<start + 4].allSatisfy({ $0 == 0 }),
+                    bytes[start + 14..<start + 16].allSatisfy({ $0 == 0 })
+                else { throw malformed }
+                let producer = Producer(
+                    producerID: UInt64(littleEndianBytes: bytes[start + 4..<start + 12]),
+                    epoch: UInt16(littleEndianBytes: bytes[start + 12..<start + 14]),
+                    baseSequence: UInt32(littleEndianBytes: bytes[start + 16..<start + 20]))
+                guard producer.producerID <= UInt64(Int64.max),
+                    producer.epoch <= UInt16(Int16.max),
+                    producer.baseSequence <= UInt32(Int32.max)
+                else { throw malformed }
+                return producer
+            default:
+                throw malformed
+            }
         }
 
         func encode() -> [UInt8] {
@@ -76,6 +116,16 @@ enum Batch {
             writer.write(batchLength)
             writer.write(batchChecksum)
             writer.write(messageCount)
+            if let producer {
+                writer.write(UInt8(1))
+                writer.writeZeros(3)
+                writer.write(producer.producerID)
+                writer.write(producer.epoch)
+                writer.writeZeros(2)
+                writer.write(producer.baseSequence)
+            } else {
+                writer.writeZeros(Batch.reservedOffset - Batch.producerOffset)
+            }
             writer.writeZeros(Batch.headerSize - Batch.reservedOffset)
             return writer.bytes
         }
@@ -89,6 +139,13 @@ enum Batch {
             writer.write(originTimestamp)
             writer.write(batchLength)
             writer.write(messageCount)
+            // Hashed only when present, as the Rust checksum does.
+            if let producer {
+                writer.write(UInt8(1))
+                writer.write(producer.producerID)
+                writer.write(producer.epoch)
+                writer.write(producer.baseSequence)
+            }
             return writer.bytes
         }
     }

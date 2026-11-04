@@ -28,7 +28,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, SemaphorePermit, broadcast};
 use tokio::task::JoinSet;
-use tokio::time::{timeout, timeout_at};
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
@@ -39,8 +39,9 @@ use tracing_subscriber::filter::LevelFilter;
 use crate::auth::{
     AuthError, AuthenticatedPrincipal, FailedLoginThrottle, PrincipalResolver, SaslAuthenticator,
 };
-use crate::bridge::IggyBridge;
+use crate::bridge::{IggyBridge, PermissionBoard, UserAccess};
 use crate::cluster_id::ClusterId;
+use crate::coordinator::{Coordination, CoordinationConfig};
 use crate::error::{KafkaProtocolError, Result};
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::listener::{BrokerEntry, ListenerConfig, SecurityProtocol, check_brokers, peers_of};
@@ -64,6 +65,11 @@ use crate::tls::{IdentityError, TlsConfig, TlsState};
 
 const READ_CHUNK: usize = 65536;
 const GATEWAY_LOG_TARGET: &str = env!("CARGO_CRATE_NAME");
+
+/// How long a start tries again to set up the coordinator log while Iggy is not ready, and the
+/// pause between tries. The same as for the bridge's connect in `main.rs`.
+const COORDINATION_STARTUP_LIMIT: Duration = Duration::from_secs(60);
+const COORDINATION_STARTUP_RETRY: Duration = Duration::from_secs(1);
 
 /// Builds the log filter, forcing the Iggy SDK quiet unless the operator asked otherwise.
 ///
@@ -173,6 +179,13 @@ pub struct GatewayConfig {
     /// Every gateway in front of the Iggy cluster, this one included (`IGGY_KAFKA_BROKERS`).
     /// Empty for a gateway alone.
     pub brokers: Vec<BrokerEntry>,
+    /// Whether the gateways share the consumer groups through the coordinator log in Iggy
+    /// (`IGGY_KAFKA_COORDINATOR_LOG`). Off here by default. `load_config` in `main.rs` makes it
+    /// [`CoordinatorLog::Preferred`] when the bridge is on, `IGGY_KAFKA_BROKERS` lists the
+    /// gateways and the variable is unset.
+    pub coordinator_log: CoordinatorLog,
+    /// How the coordinator log behaves. No environment variable maps onto it yet.
+    pub coordination: CoordinationConfig,
 }
 
 impl Default for GatewayConfig {
@@ -196,8 +209,23 @@ impl Default for GatewayConfig {
             auto_topic_creation: AutoTopicCreationConfig::default(),
             node_id: DEFAULT_NODE_ID,
             brokers: Vec::new(),
+            coordinator_log: CoordinatorLog::Off,
+            coordination: CoordinationConfig::default(),
         }
     }
+}
+
+/// Whether the gateways share the consumer groups through the coordinator log. The log needs the
+/// bridge, and a bridge user that may read Iggy's metadata change log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinatorLog {
+    /// This gateway keeps its groups in memory alone.
+    Off,
+    /// On while the bridge can read the change log. Without it, the gateway runs as with
+    /// [`Self::Off`] and warns, so a bridge user that lacks `manage_servers` keeps working.
+    Preferred,
+    /// On. The gateway does not start when the bridge cannot read the change log.
+    Required,
 }
 
 impl GatewayConfig {
@@ -521,7 +549,7 @@ impl KafkaGateway {
         // otherwise hold the drain open for a full rebalance timeout.
         let cancel = CancellationToken::new();
         let cluster_id = self.cluster_id().await?;
-        let state = Arc::new(self.shared_state(cluster_id, &cancel)?);
+        let state = Arc::new(self.shared_state(cluster_id, &cancel).await?);
         let shared_auth = Arc::new(SharedAuth::new(
             self.authenticator.clone(),
             resolver,
@@ -571,9 +599,9 @@ impl KafkaGateway {
             },
         };
         // The accept loops stop first, so no connection is spawned after the drain starts waiting.
-        cancel.cancel();
+        // Aborted, not cancelled: the connections still answer while the drain hands groups over.
         accept_loops.shutdown().await;
-        drain(&tracker, &cancel, drain_timeout).await;
+        drain(&state, &tracker, &cancel, drain_timeout).await;
         // After the drain, so no connection starts one after it, and before `run` returns, so
         // none still runs when the bridge signs out.
         state
@@ -583,13 +611,13 @@ impl KafkaGateway {
     }
 
     /// The state every connection of [`Self::run`] shares. The group coordinator stops with
-    /// `cancel`.
-    fn shared_state(
+    /// `cancel`. With the coordinator log, the groups are shared with the other gateways.
+    async fn shared_state(
         &self,
         cluster_id: ClusterId,
         cancel: &CancellationToken,
     ) -> Result<GatewayState> {
-        GatewayState::new(
+        let mut state = GatewayState::new(
             self.bridge.clone(),
             self.config.max_frame_size,
             self.config.instance_id,
@@ -597,7 +625,68 @@ impl KafkaGateway {
         )
         .with_cluster_id(cluster_id)
         .with_node_id(self.config.node_id)
-        .with_auto_topic_creation(self.config.auto_topic_creation)
+        .with_auto_topic_creation(self.config.auto_topic_creation)?;
+        if let Some(coordination) = self.start_coordination(&state.groups).await? {
+            state = state.with_coordination(coordination);
+        }
+        Ok(state)
+    }
+
+    /// Starts coordinating `groups` with the other gateways, when the coordinator log is on. A
+    /// failure that a retry can fix is retried for up to [`COORDINATION_STARTUP_LIMIT`], as
+    /// `main.rs` retries the bridge's connect.
+    async fn start_coordination(
+        &self,
+        groups: &GroupCoordinator,
+    ) -> Result<Option<Arc<Coordination>>> {
+        if self.config.coordinator_log == CoordinatorLog::Off {
+            return Ok(None);
+        }
+        let Some(bridge) = &self.bridge else {
+            return Err(KafkaProtocolError::InvalidConfig(
+                "the coordinator log needs the bridge; set IGGY_KAFKA_BRIDGE_ENABLED=true, or \
+                 set IGGY_KAFKA_COORDINATOR_LOG=false"
+                    .into(),
+            ));
+        };
+        let give_up = Instant::now() + COORDINATION_STARTUP_LIMIT;
+        if self.config.coordinator_log == CoordinatorLog::Preferred
+            && bridge.follows_change_log(give_up).await == Some(false)
+        {
+            warn!(
+                "the bridge's Iggy user cannot read Iggy's metadata change log, so this gateway \
+                 runs without the coordinator log, as with IGGY_KAFKA_COORDINATOR_LOG=false: \
+                 the gateway with the lowest node id coordinates every group. To share the \
+                 groups, grant the bridge's Iggy user (IGGY_KAFKA_IGGY_USERNAME) the \
+                 manage_servers permission and restart every gateway"
+            );
+            return Ok(None);
+        }
+        loop {
+            // Its own token, not the drain's: the shutdown hands the groups over before the drain.
+            let started = Coordination::start(
+                bridge,
+                groups.clone(),
+                self.config.node_id,
+                self.config.coordination,
+                CancellationToken::new(),
+            )
+            .await;
+            match started {
+                Ok(coordination) => return Ok(Some(coordination)),
+                Err(error)
+                    if error.is_retriable()
+                        && Instant::now() + COORDINATION_STARTUP_RETRY < give_up =>
+                {
+                    warn!(
+                        "cannot set up the coordinator log yet, retrying in \
+                         {COORDINATION_STARTUP_RETRY:?}: {error}"
+                    );
+                    tokio::time::sleep(COORDINATION_STARTUP_RETRY).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     /// The id set by [`Self::with_cluster_id`], else the one stored in Iggy, else a random one.
@@ -917,17 +1006,32 @@ async fn serve_connection(stream: TcpStream, connection: Connection) {
     }
 }
 
-/// Cancel in-flight connections, close the tracker to new spawns, and wait for tasks to finish
-/// (bounded by `deadline`). Cancellation is what actually drops idle sockets; `tracker.wait`
-/// alone would leave tasks parked in `read_frame` until `idle_timeout`.
-async fn drain(tracker: &TaskTracker, cancel: &CancellationToken, deadline: Duration) {
+/// Hand the groups to the other gateways, cancel in-flight connections, close the tracker to new
+/// spawns, and wait for tasks to finish, all within `deadline`. The groups go first, so their
+/// requests in flight send their clients to the new coordinators. Cancellation is what actually
+/// drops idle sockets; `tracker.wait` alone would leave tasks parked in `read_frame` until
+/// `idle_timeout`.
+async fn drain(
+    state: &GatewayState,
+    tracker: &TaskTracker,
+    cancel: &CancellationToken,
+    deadline: Duration,
+) {
+    // One deadline for every step, so an Iggy node that does not answer the handover cannot keep
+    // the connections open past it.
+    let until = Instant::now() + deadline;
+    state.hand_over_groups(until).await;
     cancel.cancel();
     tracker.close();
-    if timeout(deadline, tracker.wait()).await.is_err() {
+    if timeout_at(until, tracker.wait()).await.is_err() {
         warn!(
             ?deadline,
             "shutdown drain deadline exceeded; remaining connection tasks will be dropped with the runtime"
         );
+    }
+    // Last, since no connection uses the coordinator log any more.
+    if timeout_at(until, state.close_coordination()).await.is_err() {
+        debug!("the coordinator log clients did not sign out within the shutdown drain deadline");
     }
 }
 
@@ -1165,6 +1269,8 @@ where
         peer: &peer,
         cancel: &cancel,
     };
+    let mut permissions =
+        PermissionFollow::new(state.bridge.as_deref(), certificate_name.is_some());
     let mut principal = if let Some(username) = certificate_name {
         let Some(resolved) = resolve_certificate_principal(&ctx, &username).await else {
             return Ok(());
@@ -1222,9 +1328,16 @@ where
         req.client_id = None;
         req.unknown_tagged_fields.clear();
 
+        let Some(revision) = permissions.apply(principal.as_mut(), &peer) else {
+            return Ok(());
+        };
+        let signed_in = principal.is_some();
         // `RequestHeader::decode` advances `body` past the header fields it consumed via
         // `Buf::advance`, so `body` is already exactly the request payload.
         let outcome = route_frame(&ctx, &mut sasl_state, &mut principal, &req, body).await;
+        if !signed_in && principal.is_some() {
+            permissions.signed_in(revision);
+        }
         if dispatch_outcome(
             &mut stream,
             &peer,
@@ -1238,6 +1351,66 @@ where
         {
             return Ok(());
         }
+    }
+}
+
+/// One connection's place on the bridge's [`PermissionBoard`], which the change log keeps.
+struct PermissionFollow<'a> {
+    board: Option<&'a PermissionBoard>,
+    /// The board's revision that the principal's permissions are as new as.
+    seen: u64,
+    /// Whether the principal is an Iggy user. `ANONYMOUS` names none, so no change applies to it.
+    follows: bool,
+}
+
+impl<'a> PermissionFollow<'a> {
+    fn new(bridge: Option<&'a IggyBridge>, follows: bool) -> Self {
+        let board = bridge.map(IggyBridge::permission_board);
+        Self {
+            board,
+            seen: board.map_or(0, PermissionBoard::revision),
+            follows,
+        }
+    }
+
+    /// Applies to `principal` what the change log said of its Iggy user since the last call. The
+    /// board's revision from before that. `None` when the user was deleted or is no longer
+    /// active: the connection then closes, as Iggy ends the sessions of such a user.
+    fn apply(
+        &mut self,
+        principal: Option<&mut AuthenticatedPrincipal>,
+        peer: &SocketAddr,
+    ) -> Option<u64> {
+        let Some(board) = self.board else {
+            return Some(0);
+        };
+        let revision = board.revision();
+        let Some(principal) = principal.filter(|_| self.follows) else {
+            return Some(revision);
+        };
+        match board.changed_since(principal.user, &principal.username, &mut self.seen) {
+            Some(UserAccess::Active(permissions)) => {
+                principal.permissions = permissions;
+                principal.permissions_known = true;
+            }
+            Some(UserAccess::Revoked) => {
+                info!(
+                    %peer,
+                    username = principal.username,
+                    "the Iggy user was deleted, deactivated or renamed; closing its connection"
+                );
+                return None;
+            }
+            None => {}
+        }
+        Some(revision)
+    }
+
+    /// A login set the principal. Changes after `revision`, from before the login, apply to it,
+    /// so a change while the login ran does too.
+    const fn signed_in(&mut self, revision: u64) {
+        self.follows = true;
+        self.seen = revision;
     }
 }
 

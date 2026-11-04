@@ -152,4 +152,7 @@ public class IggyConsumerConfig
     ///     See <see cref="IggyClientConfigurator.HeartbeatInterval" />.
     /// </summary>
     public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>The wait before a refused partition reads again. Null keeps the default of the reader.</summary>
+    internal TimeSpan? RetryInterval { get; set; }
 }

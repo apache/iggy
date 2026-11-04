@@ -40,8 +40,9 @@ use tokio::time::Instant;
 
 use iggy_gateway_kafka::auth::{IggyAuthenticator, SaslAuthenticator};
 use iggy_gateway_kafka::bridge::{
-    BridgeError, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls, KnownNodes,
-    OffsetCalls, ProduceSessionLimits, Producer, TopicCreationOutcome, TopicMapping, TopicOverride,
+    BridgeError, DEFAULT_FETCH_SLOTS, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig,
+    IggyTls, KnownNodes, OffsetCalls, PartitionBatch, ProduceSessionLimits, Producer,
+    TopicCreationOutcome, TopicMapping, TopicOverride,
 };
 use iggy_gateway_kafka::protocol::api::ERROR_REQUEST_TIMED_OUT;
 use iggy_gateway_kafka::protocol::sasl::PlainCredentials;
@@ -173,8 +174,11 @@ async fn given_timed_out_writes_when_writing_again_should_resolve_all_client_lan
                     turn,
                     (),
                     &target,
-                    0,
-                    vec![IggyMessage::from_str(payload).expect("message")],
+                    PartitionBatch {
+                        partition: 0,
+                        producer: None,
+                        messages: vec![IggyMessage::from_str(payload).expect("message")],
+                    },
                     deadline,
                 )
                 .await
@@ -616,8 +620,10 @@ async fn connect_to_unreachable_iggy_returns_err_not_panic() {
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("valid mapping for this test's fixture data"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        fetch_slots: DEFAULT_FETCH_SLOTS,
         tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
+        idempotent_producers: false,
         nodes: KnownNodes::default(),
     };
 
@@ -642,8 +648,10 @@ async fn connect_to_a_black_hole_address_times_out_instead_of_hanging() {
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("valid mapping for this test's fixture data"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        fetch_slots: DEFAULT_FETCH_SLOTS,
         tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
+        idempotent_producers: false,
         nodes: KnownNodes::default(),
     };
 
