@@ -34,6 +34,11 @@ with the destination or source system being integrated:
 - **Config knobs with drifting names.** `retry_max_delay` here,
   `max_retry_delay` there, `request_timeout` somewhere else, for the
   same concept.
+- **Sinks that quietly lose data.** The server stores a sink's consumer
+  offset when it answers the poll, so the runtime never redelivers a batch
+  after `consume()` fails. A sink has to keep trying inside the call, say
+  exactly what it gave up on, and write idempotently, and the first
+  version of most sinks does none of these.
 - **Missing canonical tests.** State restore/round-trip and ACK/NACK
   commit/discard behavior left untested because nobody had a reference
   test suite to copy.
@@ -59,18 +64,23 @@ passing `cargo test`:
   `iggy_common::serde_secret::serialize_secret`.
 - A retry-wrapped HTTP client plus a startup connectivity probe with
   its own backoff.
-- A `CircuitBreaker` that's actually consulted before each call and
-  updated once per `consume()`/`poll()`, not per chunk.
-- Sink: batching by a configurable size, and a `last_err` pattern that
+- A `CircuitBreaker` that's actually consulted before each attempt and
+  updated once per failed round, not per chunk.
+- Sink: batching by a configurable size and a delivery loop that matches
+  how the runtime really behaves. It retries a batch with backoff within
+  one time budget, waits out an open breaker instead of discarding the
+  batch, logs the exact offset range if it has to give up, and keys
+  writes on `stream:topic:partition:offset` so replays are harmless. It
   never swallows a failed batch into `Ok(())`.
 - Source: the full #3855 ACK/NACK contract — `poll()` stages a
   candidate cursor, `on_batch_result()` commits it on `Ack` or
   discards it on `Nack`, so a dropped batch gets re-polled instead of
   silently lost.
-- The canonical test suites: six tests for the sink, eight for the
-  source (four state tests — restore, no-state, invalid-state,
-  round-trip — plus the two ACK/NACK tests, plus config validation and
-  the circuit-breaker short-circuit path).
+- The canonical test suites. The source has the four state tests
+  (restore, no-state, invalid-state, round-trip) and the two ACK/NACK
+  tests. The sink has tests for the delivery loop (recovery, giving up,
+  bounded attempts, no calls while the breaker is open, permanent
+  errors) and for idempotent keys. Both cover config validation.
 
 What's left is marked `TODO(ConnectorDeveloper)` in each crate's `src/lib.rs`:
 one spot for a sink (`push_batch()`), two for a source

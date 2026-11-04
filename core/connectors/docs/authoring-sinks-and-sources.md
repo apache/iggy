@@ -35,7 +35,7 @@ Copy the closest existing plugin by shape:
 
 `sink_template` / `source_template` are compiling, tested starting
 points: config parsing, `SecretString`, retry loops, circuit breaker,
-`last_err` batch handling (sink), ACK/NACK cursor staging (source),
+the time-budgeted delivery loop (sink), ACK/NACK cursor staging (source),
 sleep-first poll, lock discipline, and unit-test stubs are already
 wired up. Copy the crate, rename the package, and fill in the
 `TODO(ConnectorDeveloper)` spots in `src/lib.rs` — see each crate's `README.md`.
@@ -67,7 +67,9 @@ Everything else should match siblings.
   (`PermanentHttpError`, `InitError`, `SchemaMismatch`).
 - Map network/5xx/retryable SQLSTATE to transient variants.
 - Do **not** decide retryability by substring-matching `err.to_string()`.
-- Cap backoff so a dead backend cannot stall shutdown.
+- Cap backoff so a dead backend cannot stall shutdown. A sink's whole
+  `consume()` call needs one time budget, because it blocks a runtime
+  worker thread and a stop waits for it (see below).
 
 ### Delivery semantics (document in README)
 
@@ -79,9 +81,19 @@ Every plugin README needs a short paragraph that answers:
 4. What is the dedup key (or “none”)?
 
 Do not claim “no data loss” or “exactly once” unless the backend unique
-key **and** the runtime path actually enforce it. Today’s runtime can
-still advance consumer offsets in ways that punish swallowed `Ok(())`
-after a failed sink batch — return `Err` for retryable failures.
+key **and** the runtime path actually enforce it.
+
+The two sides of a connector differ:
+
+- **Sources** are at-least-once. State is saved after the Iggy send, and a
+  failed batch is re-polled.
+- **Sinks** are at-most-once from Iggy. The server stores the consumer
+  offset when it answers the poll, before the plugin sees the messages.
+  The runtime logs and counts an `Err` from `consume()` and fetches the
+  next batch; it never redelivers the failed one. Return `Err` for a failed
+  batch so it is logged and counted, but do not expect it to be retried.
+  The only second chance a batch gets is the retrying the plugin does
+  itself.
 
 ### Source-specific
 
@@ -112,10 +124,34 @@ calls `on_batch_result(SourceBatchResult::Ack | Nack)`. Only
 ### Sink-specific
 
 - `async fn consume(&self, …)`.
-- Process all batches; keep `last_err`; never convert a failed batch into
-  bare `Ok(())`.
-- Prefer stable dedup keys (`stream:topic:partition:message_id` or a
-  natural backend key). No random UUIDs per emit.
+- Never convert a failed batch into bare `Ok(())`.
+- **Keep trying a batch within one time budget.** Retry transient errors
+  with jittered backoff until a per-call budget (`max_delivery_time`,
+  template default `20s`) runs out. Keep it well under a minute: the call
+  blocks a runtime worker thread (one per CPU core by default), and a stop
+  waits for it. Share the budget across the chunks of one call.
+- **Use the circuit breaker to pace attempts, not to discard batches.**
+  While it is open, wait for the cool-down instead of returning an error,
+  because a refused batch is gone for good. Record one failure per failed
+  round, and keep the cool-down shorter than the budget.
+- **When you give up, say what was lost.** Log the stream, topic,
+  partition and offset range, count the messages as failed, and stop
+  instead of attempting the rest of the call. An operator can replay that
+  range from Iggy.
+- Skip a permanent error's chunk without opening the breaker. A data
+  problem says nothing about whether the destination is up.
+- **Make the destination idempotent.** Retries, replays and a server
+  failover all repeat messages. Key writes on `stream:topic:partition:offset`
+  (or a natural backend key), which names a log position for good and never
+  collides across different messages. Use `message.id` only if your
+  producers guarantee unique ids, because producers can reuse one. No random
+  UUIDs per emit.
+- Batching comes from the sink's `[[streams]]` entry: `batch_length`,
+  `max_wait` (default `1s`) and `min_count` (default 1, at most
+  `batch_length`). The template waits for full batches (`min_count =
+  batch_length`, `max_wait = "2s"`) so the destination gets fewer, larger
+  writes. They replace `poll_interval`, and a sink that sets it fails to
+  start.
 - Use `payload.try_to_bytes()` — do not clone `Payload::Json`.
 
 ### Config canon
@@ -126,7 +162,10 @@ calls `on_batch_result(SourceBatchResult::Ack | Nack)`. Only
 | Retry attempts | `max_retries` |
 | Base backoff | `retry_delay` |
 | Backoff ceiling | `retry_max_delay` |
+| Breaker | `circuit_breaker_threshold`, `circuit_breaker_cool_down` |
+| Sink delivery budget | `max_delivery_time` |
 | Source cadence | `poll_interval` |
+| Sink batching (stream entry) | `max_wait`, `min_count` |
 | Verbosity | `verbose_logging` |
 
 Use `Option<T>` + humantime strings for durations, apply defaults in
@@ -168,13 +207,14 @@ touch unrelated foreign SDKs in the same PR.
 
 ```text
 [ ] SecretString on all credentials; no secret logs/state
-[ ] consume/poll never returns Ok(()) after a failed batch that should retry
+[ ] consume/poll never returns Ok(()) after a failed batch
 [ ] Transient vs permanent errors mapped (no Display substring matching)
-[ ] Stable message / dedup IDs (no random UUID per emit)
+[ ] Sinks: one delivery time budget per consume(); breaker paces attempts and never discards a batch; cool-down shorter than the budget; offset range logged when giving up
+[ ] Sinks: writes idempotent on stream:topic:partition:offset (or a natural key); no random UUID per emit
 [ ] README delivery semantics paragraph present and honest
 [ ] README defaults match code consts
 [ ] deny_unknown_fields on plugin config
-[ ] Canonical knob names (timeout, max_retries, retry_delay, poll_interval)
+[ ] Canonical knob names (timeout, max_retries, retry_delay, max_delivery_time for sinks, poll_interval for sources)
 [ ] Sources: 4 state tests (+2 ACK/NACK if on_batch_result overridden); sleep-first poll; state staged in poll, committed only in on_batch_result
 [ ] External backend: real-infra integration test (not a lying mock)
 [ ] example_config + sinks/sources README row

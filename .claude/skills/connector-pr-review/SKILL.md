@@ -48,14 +48,23 @@ Plain `String` for a credential is a review-blocker. Pattern:
 ### B2. Swallowing `Err` while offsets advance (sinks)
 
 - [ ] `consume()` must **not** catch a batch failure and return `Ok(())`.
-- [ ] Prefer `last_err` pattern: process all batches, return the last transient
-      error (see `connector-sink` Hard rules / TEMPLATE).
+- [ ] Transient failures are retried inside the call within one time budget
+      (template default `max_delivery_time = 20s`). When it runs out the sink
+      stops, counts every undelivered message as failed, logs the stream, topic,
+      partition and offset range, and returns the error (see `connector-sink`
+      Delivery budget). Permanent and unclassified errors only affect their own
+      chunk.
+- [ ] An open circuit breaker is waited out inside the budget, never answered
+      with an immediate error: the offset is already stored, so a refused batch
+      is lost.
 - [ ] README must not claim "no data loss" / strong idempotency unless the
       backend + runtime path actually enforce it.
 
-Today the runtime can commit consumer offsets even when plugin errors are
-poorly surfaced (#2927 / #2928 class issues). Authors must be honest about
-loss windows instead of overselling.
+Since #4629 the server stores a sink's consumer offset when it answers the
+poll, and the runtime logs and counts an `Err` from `consume()` without
+redelivering the batch. Returning `Err` makes a failure visible; it does not
+trigger a retry. Authors must be honest about that loss window instead of
+overselling.
 
 ### B3. Source cursor / side-effects staged for `on_batch_result`, not committed in `poll()`
 
@@ -89,12 +98,17 @@ that state on success, then calls `on_batch_result(Ack | Nack)`. Only
       (`HttpRequestFailed`, `Connection`, `CannotStoreData`).
 - [ ] Do **not** classify retryability by substring-matching `err.to_string()`.
 - [ ] `max_retries` means **total attempts** (default 3). README must match code.
-- [ ] Cap retry budget so a dead backend cannot delay shutdown unboundedly.
+- [ ] Cap retry budget so a dead backend cannot delay shutdown unboundedly. A
+      sink's `consume()` blocks a runtime worker thread and a stop waits for
+      it, so it needs one time budget for the whole call, well under a minute,
+      and a breaker cool-down shorter than that budget.
 
 ### B5. Idempotency claims must be real
 
 - [ ] Stable `ProducedMessage.id` / sink dedup key from natural IDs
-      (table+PK, document `_id`, `stream:topic:partition:message_id`) —
+      (table+PK, document `_id`, `stream:topic:partition:offset` — use
+      `message_id` instead only if producers guarantee unique ids, because two
+      messages sharing an id would overwrite each other) —
       never random UUIDs per emit.
 - [ ] If the backend PK / unique index is informational only (e.g. Redshift),
       do not advertise idempotency in README.
@@ -321,8 +335,11 @@ Every new connector README must answer in one short paragraph:
 
 1. **What happens on transient failure?** (retry N times, then Err)
 2. **What happens on permanent failure?** (drop/skip vs fail batch)
-3. **What is the duplication window?** (at-least-once because state saves
-   after Iggy send; or at-most-once if upstream ACK precedes send — say so)
+3. **What is the duplication window?** (sources: at-least-once because state
+   saves after Iggy send. Sinks: at-most-once from Iggy, because the server
+   stores the offset when it answers the poll and the runtime never redelivers
+   a failed batch, so say what a failed batch costs and where your own retries
+   can duplicate)
 4. **What is the dedup key?** (or "none — duplicates possible")
 
 If the answer is hand-wavy, the PR is not ready.
@@ -350,7 +367,7 @@ Paste into the PR description (or run mentally before `/ready`):
 [ ] README delivery semantics paragraph present and honest
 [ ] README defaults match code consts
 [ ] deny_unknown_fields on plugin config
-[ ] Canonical knob names (timeout, max_retries, retry_delay, poll_interval)
+[ ] Canonical knob names (timeout, max_retries, retry_delay, max_delivery_time for sinks, poll_interval for sources)
 [ ] Sources: 4 state tests (+2 ACK/NACK if on_batch_result overridden); sleep-first poll; state staged in poll, committed only in on_batch_result
 [ ] External backend: real-infra integration test (not a lying mock)
 [ ] example_config + sinks/sources README row

@@ -25,6 +25,13 @@
 //! are chunked by a configurable batch size instead of shipped as one
 //! unbounded request.
 //!
+//! Delivery follows the runtime's contract. The server stores the offset when
+//! it answers the poll, and the runtime never redelivers a batch after an
+//! error, so `consume()` keeps trying a batch for up to `max_delivery_time`
+//! before it gives up and logs the lost offset range. The circuit breaker only
+//! paces those attempts; it never discards a batch. Writes must be idempotent
+//! on `dedup_key()`, because replays and failovers can repeat a message.
+//!
 //! There is exactly **one** place you need to write code, marked
 //! `TODO(ConnectorDeveloper)`: `TemplateSink::push_batch()` — build the
 //! request/write that actually pushes one chunk of messages to your
@@ -50,6 +57,7 @@
 use async_trait::async_trait;
 use iggy_connector_sdk::retry::{
     CircuitBreaker, RetryPolicy, build_retry_client, check_connectivity_with_retry, parse_duration,
+    retry_backoff,
 };
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
@@ -58,10 +66,12 @@ use reqwest::Url;
 use reqwest_middleware::ClientWithMiddleware;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::{Instant, sleep};
 use tracing::{debug, error, info, warn};
 
 sink_connector!(TemplateSink);
@@ -75,8 +85,16 @@ const DEFAULT_RETRY_DELAY: &str = "500ms";
 const DEFAULT_RETRY_MAX_DELAY: &str = "5s";
 const DEFAULT_MAX_OPEN_RETRIES: u32 = 10;
 const DEFAULT_OPEN_RETRY_MAX_DELAY: &str = "60s";
-const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
-const DEFAULT_CIRCUIT_BREAKER_COOL_DOWN: &str = "30s";
+// Three failed rounds per cool-down cycle bound the attempts a struggling destination sees:
+// the SDK breaker closes completely after its cool-down, so it takes `threshold` new failures
+// to open again. The cool-down has to be shorter than the delivery budget, or a call that
+// finds the breaker open could never reach a retry.
+const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
+const DEFAULT_CIRCUIT_BREAKER_COOL_DOWN: &str = "10s";
+// Kept well under the runtime's close budget (the poll timeout plus 60 s): `consume()` blocks
+// a runtime worker thread and a stop waits for it to return.
+const DEFAULT_MAX_DELIVERY_TIME: &str = "20s";
+const BREAKER_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 // ── Configuration ───────────────────────────────────────────────────────────
 //
@@ -128,6 +146,10 @@ pub struct TemplateSinkConfig {
     pub circuit_breaker_threshold: Option<u32>,
     pub circuit_breaker_cool_down: Option<String>,
 
+    /// How long one `consume()` call may keep trying before it gives up on the
+    /// messages it still holds. Must be longer than `circuit_breaker_cool_down`.
+    pub max_delivery_time: Option<String>,
+
     /// Upgrades the per-batch log line from `debug!` to `info!`. Mirrors the
     /// runtime's own `verbose` flag; keep the field name `verbose_logging`
     /// (see `postgres_sink::PostgresSinkConfig::verbose_logging`).
@@ -167,6 +189,9 @@ pub struct TemplateSink {
     circuit_breaker: Arc<CircuitBreaker>,
     batch_size_limit: usize,
     retry_delay: Duration,
+    retry_max_delay: Duration,
+    cool_down: Duration,
+    max_delivery_time: Duration,
     verbose: bool,
     state: Mutex<State>,
     records_written_total: AtomicU64,
@@ -175,14 +200,21 @@ pub struct TemplateSink {
 impl TemplateSink {
     pub fn new(id: u32, config: TemplateSinkConfig) -> Self {
         let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
+        let retry_max_delay =
+            parse_duration(config.retry_max_delay.as_deref(), DEFAULT_RETRY_MAX_DELAY);
+        let cool_down = parse_duration(
+            config.circuit_breaker_cool_down.as_deref(),
+            DEFAULT_CIRCUIT_BREAKER_COOL_DOWN,
+        );
+        let max_delivery_time = parse_duration(
+            config.max_delivery_time.as_deref(),
+            DEFAULT_MAX_DELIVERY_TIME,
+        );
         let circuit_breaker = Arc::new(CircuitBreaker::new(
             config
                 .circuit_breaker_threshold
                 .unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD),
-            parse_duration(
-                config.circuit_breaker_cool_down.as_deref(),
-                DEFAULT_CIRCUIT_BREAKER_COOL_DOWN,
-            ),
+            cool_down,
         ));
         let batch_size_limit = config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
         let verbose = config.verbose_logging.unwrap_or(false);
@@ -194,6 +226,9 @@ impl TemplateSink {
             circuit_breaker,
             batch_size_limit,
             retry_delay,
+            retry_max_delay,
+            cool_down,
+            max_delivery_time,
             verbose,
             state: Mutex::new(State::default()),
             records_written_total: AtomicU64::new(0),
@@ -220,21 +255,29 @@ impl TemplateSink {
     /// TODO(ConnectorDeveloper): push one chunk of already-batched messages to your
     /// destination using `self.config.connection_string` and
     /// `self.config.target`, via `self.client` (already retry-wrapped).
-    /// Distinguish permanent failures (bad schema, destination rejects the
-    /// payload shape — will not succeed on retry) from transient ones
-    /// (network error, 5xx, timeout — should retry) by returning
-    /// `Error::PermanentHttpError` for the former; see the doc comment on
-    /// that variant in `iggy_connector_sdk::Error` for why the distinction
-    /// matters. `consume()` drops and counts a `PermanentHttpError` batch but
-    /// keeps processing the rest; any other error stops `consume()` and is
-    /// returned, which the runtime treats as fatal for the whole connector —
-    /// so a permanent classification is what keeps one bad message from
-    /// taking every future batch down with it.
     ///
-    /// Delivery is at-least-once: a retried batch can re-send rows your
-    /// destination already wrote from an earlier attempt that failed after
-    /// partially succeeding. Build a stable key with `dedup_key()` below for
-    /// every message you write, and make the write idempotent on it (upsert /
+    /// The error you return decides what `consume()` does next:
+    /// - `Error::HttpRequestFailed`, `Error::Connection` and
+    ///   `Error::CannotStoreData` (network error, 5xx, timeout) are transient.
+    ///   `consume()` retries the same chunk with backoff until
+    ///   `max_delivery_time` runs out, and each failed round counts toward the
+    ///   circuit breaker.
+    /// - `Error::PermanentHttpError` (bad schema, the destination rejects the
+    ///   payload shape) will never succeed. The chunk is skipped and counted,
+    ///   and the breaker is left alone, because a data problem says nothing
+    ///   about whether the destination is up. See the doc comment on that
+    ///   variant in `iggy_connector_sdk::Error`.
+    /// - Any other error is not retried. The chunk is counted as failed and
+    ///   the error is returned once every chunk has been tried.
+    ///
+    /// The runtime never redelivers a batch after an error, because the server
+    /// stored the offset when it answered the poll. The retries above are the
+    /// only second chance a batch gets, so from Iggy to this plugin delivery is
+    /// at-most-once. Duplicates come from those retries (a request that failed
+    /// part way through a write), from replaying an offset range after a
+    /// logged loss, and from a server failover before the stored offset
+    /// replicated. Build a stable key with `dedup_key()` below for every
+    /// message you write, and make the write idempotent on it (upsert /
     /// `ON CONFLICT` / unique index) — see `connector-pr-review` B5.
     ///
     /// If your destination's write call can succeed at the transport level
@@ -266,14 +309,80 @@ impl TemplateSink {
                 .to_string(),
         ))
     }
+
+    /// Runs `attempt` until it succeeds, fails for good, or `deadline` passes.
+    ///
+    /// A failed round counts once toward the circuit breaker, and the wait before the next
+    /// round is jittered exponential backoff. While the breaker is open nothing reaches the
+    /// destination, so a struggling destination sees at most `threshold` rounds per cool-down.
+    async fn deliver_chunk<F, Fut>(&self, deadline: Instant, mut attempt: F) -> Result<(), Error>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<(), Error>>,
+    {
+        let mut failed_rounds = 0;
+        let mut last_err: Option<Error> = None;
+        loop {
+            // Report the failure that opened the breaker, not the wait that ran out.
+            if let Err(still_open) = self.wait_for_closed_breaker(deadline).await {
+                return Err(last_err.unwrap_or(still_open));
+            }
+            match attempt().await {
+                Ok(()) => {
+                    self.circuit_breaker.record_success();
+                    return Ok(());
+                }
+                Err(err) if is_transient(&err) => {
+                    self.circuit_breaker.record_failure().await;
+                    failed_rounds += 1;
+                    let pause =
+                        retry_backoff(self.retry_delay, failed_rounds, self.retry_max_delay);
+                    if Instant::now() + pause >= deadline {
+                        return Err(err);
+                    }
+                    last_err = Some(err);
+                    sleep(pause).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Waits out an open breaker instead of refusing the batch. The runtime stored the offset
+    /// when it polled, so a refused batch would be gone for good.
+    async fn wait_for_closed_breaker(&self, deadline: Instant) -> Result<(), Error> {
+        let mut warned = false;
+        while self.circuit_breaker.is_open().await {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::CannotStoreData(
+                    "circuit breaker stayed open for the whole delivery budget".to_string(),
+                ));
+            }
+            if !warned {
+                warn!(
+                    "{CONNECTOR_NAME} connector with ID: {} circuit breaker is OPEN, holding the \
+                     batch for up to {remaining:?}",
+                    self.id
+                );
+                warned = true;
+            }
+            sleep(remaining.min(BREAKER_RECHECK_INTERVAL)).await;
+        }
+        Ok(())
+    }
 }
 
-/// Stable per-message dedup key: `stream:topic:partition:message_id`. Mirrors
+/// Stable per-message dedup key: `stream:topic:partition:offset`. Mirrors
 /// `mongodb_sink::build_composite_document_id` — copy this, not a random UUID,
-/// for whatever identity column/key your destination's upsert needs. Offset
-/// is deliberately excluded: it only identifies a message within one
-/// partition's log, not across the retries and redeliveries this key has to
-/// survive.
+/// for whatever identity column/key your destination's upsert needs.
+///
+/// Partition plus offset names one position in one partition's log for good, so a
+/// replayed or redelivered message always gets the same key and two distinct
+/// messages never share one. `message.id` is not a safe default: producers can set
+/// it, and two different messages with the same id would overwrite each other in the
+/// destination. Swap it in only when your producers guarantee unique ids and you want
+/// duplicates produced at different offsets collapsed too.
 fn dedup_key(
     topic_metadata: &TopicMetadata,
     messages_metadata: &MessagesMetadata,
@@ -281,8 +390,22 @@ fn dedup_key(
 ) -> String {
     format!(
         "{}:{}:{}:{}",
-        topic_metadata.stream, topic_metadata.topic, messages_metadata.partition_id, message.id
+        topic_metadata.stream, topic_metadata.topic, messages_metadata.partition_id, message.offset
     )
+}
+
+fn is_transient(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::HttpRequestFailed(_) | Error::Connection(_) | Error::CannotStoreData(_)
+    )
+}
+
+fn offset_range(messages: &[ConsumedMessage]) -> String {
+    match (messages.first(), messages.last()) {
+        (Some(first), Some(last)) => format!("{}..={}", first.offset, last.offset),
+        _ => "none".to_string(),
+    }
 }
 
 // ── Sink trait ────────────────────────────────────────────────────────────────
@@ -305,6 +428,13 @@ impl Sink for TemplateSink {
             ));
         }
         validate_identifier("target", &self.config.target)?;
+        if self.cool_down >= self.max_delivery_time {
+            return Err(Error::InvalidConfigValue(format!(
+                "circuit_breaker_cool_down ({:?}) must be shorter than max_delivery_time ({:?}), \
+                 or a batch that meets an open breaker could never be retried",
+                self.cool_down, self.max_delivery_time
+            )));
+        }
 
         info!(
             "Opening {CONNECTOR_NAME} connector with ID: {}, target: {}, batch_size: {}",
@@ -406,75 +536,67 @@ impl Sink for TemplateSink {
             );
         }
 
-        if self.circuit_breaker.is_open().await {
-            warn!(
-                "{CONNECTOR_NAME} connector with ID: {} — circuit breaker OPEN, refusing {} messages",
-                self.id,
-                messages.len()
-            );
-            return Err(Error::CannotStoreData(
-                "Circuit breaker is open".to_string(),
-            ));
-        }
-
         let client = self.client.as_ref().ok_or_else(|| {
             Error::Connection("client not initialized -- was open() called?".into())
         })?;
 
-        // Track the *last* transient error, not the first — an earlier chunk's
-        // failure may already be stale by the time later chunks run, and the
-        // circuit breaker below should react to the most recent signal. A
-        // `PermanentHttpError` batch (bad schema, will never succeed on retry)
-        // is dropped and counted here rather than kept as `last_err`: letting
-        // it propagate would return `Err` from `consume()`, and the runtime
-        // treats any `Err` here as fatal for the whole connector (see
-        // `runtime/src/sink.rs::consume_messages`), not just a retry of that
-        // one batch — so a single unprocessable message would take down every
-        // future batch instead of just being skipped.
+        // One budget for the whole call. With a dead destination every chunk would otherwise wait
+        // out a budget of its own, and the runtime is blocked on this call for all of them.
+        let deadline = Instant::now() + self.max_delivery_time;
         let mut last_err: Option<Error> = None;
         let mut written = 0u64;
         let mut failed = 0u64;
 
-        for batch in messages.chunks(self.batch_size_limit) {
-            match self
-                .push_batch(client, topic_metadata, &messages_metadata, batch)
-                .await
-            {
-                Ok(()) => written += batch.len() as u64,
+        for (index, chunk) in messages.chunks(self.batch_size_limit).enumerate() {
+            let result = self
+                .deliver_chunk(deadline, || {
+                    self.push_batch(client, topic_metadata, &messages_metadata, chunk)
+                })
+                .await;
+            match result {
+                Ok(()) => written += chunk.len() as u64,
                 Err(Error::PermanentHttpError(message)) => {
-                    failed += batch.len() as u64;
+                    failed += chunk.len() as u64;
                     error!(
-                        "{CONNECTOR_NAME} connector with ID: {} dropping a batch of {} \
-                         (permanent): {message}",
+                        "{CONNECTOR_NAME} connector with ID: {} skipping {} messages \
+                         (permanent), offsets {}: {message}",
                         self.id,
-                        batch.len()
+                        chunk.len(),
+                        offset_range(chunk)
                     );
                 }
-                Err(err) => {
-                    failed += batch.len() as u64;
+                // The budget is spent, so the chunks after this one are not attempted either.
+                Err(err) if is_transient(&err) => {
+                    let undelivered = &messages[index * self.batch_size_limit..];
+                    failed += undelivered.len() as u64;
                     error!(
-                        "{CONNECTOR_NAME} connector with ID: {} failed a batch of {}: {err}",
+                        "{CONNECTOR_NAME} connector with ID: {} gave up on {} messages after \
+                         {:?}, stream: {}, topic: {}, partition: {}, offsets {}. The runtime \
+                         does not redeliver them; replay that range from Iggy to recover \
+                         them. Cause: {err}",
                         self.id,
-                        batch.len()
+                        undelivered.len(),
+                        self.max_delivery_time,
+                        topic_metadata.stream,
+                        topic_metadata.topic,
+                        messages_metadata.partition_id,
+                        offset_range(undelivered)
+                    );
+                    last_err = Some(err);
+                    break;
+                }
+                Err(err) => {
+                    failed += chunk.len() as u64;
+                    error!(
+                        "{CONNECTOR_NAME} connector with ID: {} failed {} messages, offsets {}: \
+                         {err}",
+                        self.id,
+                        chunk.len(),
+                        offset_range(chunk)
                     );
                     last_err = Some(err);
                 }
             }
-        }
-
-        // Record the circuit breaker outcome once per `consume()` call, not
-        // once per chunk — recording success partway through would reset the
-        // failure counter mid-consume and prevent the breaker from opening on
-        // a batch with sustained, mixed-success chunks. A transient failure
-        // always trips it. A batch where every failure was permanent records
-        // neither success nor failure — nothing demonstrated the destination
-        // is reachable, but a schema/data problem isn't a connectivity signal
-        // either. A batch with at least one real write (or no messages at
-        // all) counts as success.
-        match &last_err {
-            Some(_) => self.circuit_breaker.record_failure().await,
-            None if written > 0 || messages.is_empty() => self.circuit_breaker.record_success(),
-            None => {}
         }
 
         let mut state = self.state.lock().await;
@@ -523,8 +645,20 @@ mod tests {
             open_retry_max_delay: Some("100ms".to_string()),
             circuit_breaker_threshold: Some(3),
             circuit_breaker_cool_down: Some("50ms".to_string()),
+            max_delivery_time: Some("1s".to_string()),
             verbose_logging: None,
         }
+    }
+
+    fn transient() -> Error {
+        Error::HttpRequestFailed("destination unavailable".to_string())
+    }
+
+    async fn trip_breaker(sink: &TemplateSink) {
+        for _ in 0..3 {
+            sink.circuit_breaker.record_failure().await;
+        }
+        assert!(sink.circuit_breaker.is_open().await);
     }
 
     #[test]
@@ -589,35 +723,183 @@ mod tests {
     }
 
     #[test]
-    fn dedup_key_should_join_stream_topic_partition_and_message_id() {
+    fn dedup_key_should_join_stream_topic_partition_and_offset() {
         let (topic_metadata, messages_metadata) = topic_and_messages_metadata();
-        let message = consumed_message();
+        let message = consumed_message(7);
         assert_eq!(
             dedup_key(&topic_metadata, &messages_metadata, &message),
-            "s:t:1:1"
+            "s:t:1:7"
         );
     }
 
-    #[tokio::test]
-    async fn given_open_circuit_breaker_should_short_circuit_consume() {
-        let sink = TemplateSink::new(1, test_config());
-        sink.circuit_breaker.record_failure().await;
-        sink.circuit_breaker.record_failure().await;
-        sink.circuit_breaker.record_failure().await;
-        assert!(sink.circuit_breaker.is_open().await);
-
+    #[test]
+    fn given_messages_sharing_an_id_should_get_distinct_dedup_keys() {
         let (topic_metadata, messages_metadata) = topic_and_messages_metadata();
-
-        let result = sink
-            .consume(&topic_metadata, messages_metadata, Vec::new())
-            .await;
-        assert!(matches!(result, Err(Error::CannotStoreData(_))));
+        let first = consumed_message(1);
+        let second = consumed_message(2);
+        assert_eq!(first.id, second.id);
+        assert_ne!(
+            dedup_key(&topic_metadata, &messages_metadata, &first),
+            dedup_key(&topic_metadata, &messages_metadata, &second)
+        );
     }
 
-    fn consumed_message() -> ConsumedMessage {
+    #[test]
+    fn given_same_batch_written_twice_should_leave_one_row_per_message() {
+        let (topic_metadata, messages_metadata) = topic_and_messages_metadata();
+        let batch: Vec<_> = (0..5).map(consumed_message).collect();
+        let mut destination = std::collections::HashMap::new();
+
+        for _ in 0..2 {
+            for message in &batch {
+                destination.insert(
+                    dedup_key(&topic_metadata, &messages_metadata, message),
+                    message.offset,
+                );
+            }
+        }
+
+        assert_eq!(destination.len(), batch.len());
+    }
+
+    #[test]
+    fn given_cool_down_not_shorter_than_budget_should_reject_open() {
+        let mut config = test_config();
+        config.circuit_breaker_cool_down = Some("2s".to_string());
+        config.max_delivery_time = Some("2s".to_string());
+        let mut sink = TemplateSink::new(1, config);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert!(matches!(
+            runtime.block_on(sink.open()),
+            Err(Error::InvalidConfigValue(_))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_destination_recovers_within_budget_should_deliver_after_breaker_opens() {
+        let sink = TemplateSink::new(1, test_config());
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+
+        let result = sink
+            .deliver_chunk(Instant::now() + sink.max_delivery_time, || async {
+                // Three failures open the breaker, so the fourth attempt has to wait it out.
+                if attempts.fetch_add(1, Ordering::SeqCst) < 3 {
+                    Err(transient())
+                } else {
+                    Ok(())
+                }
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        assert!(!sink.circuit_breaker.is_open().await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_destination_down_for_whole_budget_should_give_up_with_bounded_attempts() {
+        let mut config = test_config();
+        config.circuit_breaker_cool_down = Some("400ms".to_string());
+        let sink = TemplateSink::new(1, config);
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+
+        let result = sink
+            .deliver_chunk(Instant::now() + sink.max_delivery_time, || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(transient())
+            })
+            .await;
+
+        assert!(matches!(result, Err(Error::HttpRequestFailed(_))));
+        // The breaker closes completely after each 400 ms cool-down and needs three new
+        // failures to open again, and a 1 s budget fits at most three such cycles. Backoff
+        // alone would allow about thirteen attempts.
+        assert!(attempts.load(Ordering::SeqCst) <= 9);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_breaker_open_past_budget_should_give_up_without_calling_destination() {
+        let mut config = test_config();
+        config.circuit_breaker_cool_down = Some("10s".to_string());
+        let sink = TemplateSink::new(1, config);
+        trip_breaker(&sink).await;
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+
+        let result = sink
+            .deliver_chunk(Instant::now() + sink.max_delivery_time, || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+
+        assert!(matches!(result, Err(Error::CannotStoreData(_))));
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_permanent_error_should_not_retry_or_open_breaker() {
+        let sink = TemplateSink::new(1, test_config());
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+
+        for _ in 0..5 {
+            let result = sink
+                .deliver_chunk(Instant::now() + sink.max_delivery_time, || async {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err(Error::PermanentHttpError("bad schema".to_string()))
+                })
+                .await;
+            assert!(matches!(result, Err(Error::PermanentHttpError(_))));
+        }
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 5);
+        assert!(!sink.circuit_breaker.is_open().await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_unclassified_error_should_not_retry() {
+        let sink = TemplateSink::new(1, test_config());
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+
+        let result = sink
+            .deliver_chunk(Instant::now() + sink.max_delivery_time, || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(Error::InitError("not implemented".to_string()))
+            })
+            .await;
+
+        assert!(matches!(result, Err(Error::InitError(_))));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_breaker_open_past_budget_when_consuming_should_count_every_message_failed() {
+        let mut config = test_config();
+        config.circuit_breaker_cool_down = Some("10s".to_string());
+        let mut sink = TemplateSink::new(1, config);
+        sink.client = Some(build_retry_client(
+            reqwest::Client::new(),
+            1,
+            sink.retry_delay,
+            sink.retry_max_delay,
+            CONNECTOR_NAME,
+        ));
+        trip_breaker(&sink).await;
+        let (topic_metadata, messages_metadata) = topic_and_messages_metadata();
+        let messages: Vec<_> = (0..25).map(consumed_message).collect();
+
+        let result = sink
+            .consume(&topic_metadata, messages_metadata, messages)
+            .await;
+
+        assert!(matches!(result, Err(Error::CannotStoreData(_))));
+        assert_eq!(sink.state.lock().await.messages_failed, 25);
+        assert_eq!(sink.state.lock().await.messages_written, 0);
+    }
+
+    fn consumed_message(offset: u64) -> ConsumedMessage {
         ConsumedMessage {
             id: 1,
-            offset: 0,
+            offset,
             checksum: 0,
             timestamp: 0,
             origin_timestamp: 0,
@@ -641,10 +923,10 @@ mod tests {
     }
 
     // push_batch() is an unimplemented TODO(ConnectorDeveloper) stub that
-    // always returns Error::InitError — not a PermanentHttpError — so a
-    // non-empty consume() call exercises the "last_err" (retryable) branch
-    // of the chunking loop end to end, including the failed-count and
-    // circuit-breaker bookkeeping.
+    // always returns Error::InitError. That is neither transient nor a
+    // PermanentHttpError, so a non-empty consume() call exercises the
+    // "unclassified error" branch of the chunking loop end to end: the chunk
+    // is counted as failed, not retried, and the error is returned.
     #[tokio::test]
     async fn given_unimplemented_push_batch_should_return_err_and_count_failure() {
         let mut sink = TemplateSink::new(1, test_config());
@@ -652,7 +934,11 @@ mod tests {
         let (topic_metadata, messages_metadata) = topic_and_messages_metadata();
 
         let result = sink
-            .consume(&topic_metadata, messages_metadata, vec![consumed_message()])
+            .consume(
+                &topic_metadata,
+                messages_metadata,
+                vec![consumed_message(0)],
+            )
             .await;
 
         assert!(matches!(result, Err(Error::InitError(_))));

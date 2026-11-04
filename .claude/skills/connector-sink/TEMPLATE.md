@@ -12,8 +12,19 @@ Also read [SKILL.md](SKILL.md) and pre-flight with
 Prefer starting from a compiling crate over copying this prose kit:
 `core/connectors/sinks/sink_template/` implements the same shape as real,
 tested code you can `cargo build`/`cargo test` immediately, with the same
-`TODO(ConnectorDeveloper)` markers. Use this kit instead only when copying
-a whole crate is more scaffolding than you need.
+`TODO(ConnectorDeveloper)` markers. It also has the circuit breaker, which this
+kit leaves out to stay short. Use this kit instead only when copying a whole
+crate is more scaffolding than you need.
+
+## The delivery contract this kit is built on
+
+The server stores a sink's consumer offset when it answers the poll, before
+`consume()` runs, and the runtime never redelivers a batch after `consume()`
+returns an error. So delivery from Iggy is at-most-once, and the retrying the
+plugin does inside `consume()` is the only second chance a batch gets. The
+skeleton below therefore keeps trying a batch within one time budget
+(`max_delivery_time`), logs the offset range it gives up on, and leaves
+idempotent writes to you.
 
 ## Files to create
 
@@ -69,7 +80,6 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 async-trait = { workspace = true }
 dashmap = { workspace = true }
-humantime = { workspace = true }
 iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 once_cell = { workspace = true }
@@ -78,6 +88,9 @@ serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 # TODO(ConnectorDeveloper): add your client crate as a workspace dependency
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }  # for paused-time delivery tests
 ```
 
 Run `cargo sort --no-format --workspace` after edits. Keep `Cargo.lock`
@@ -87,21 +100,42 @@ churn limited to this crate's deps.
 
 ## config.toml (example)
 
-```toml
-# Plugin path matches sibling sinks (relative to connectors runtime cwd).
-path = "../../target/release/libiggy_connector_<name>_sink"
+A sink config has a connector header, one or more `[[streams]]` entries that
+tell the runtime what to consume and how to batch it, and a `[plugin_config]`
+table for your own settings. `sinks/sink_template/config.toml` is the working
+reference.
 
-[[sinks]]
+```toml
+type = "sink"
 key = "<name>"
 enabled = true
-# path is also set via IGGY_CONNECTORS_SINK_<NAME>_PATH in integration tests
+version = 0
+name = "<Name> sink"
+path = "../../target/release/libiggy_connector_<name>_sink"
+plugin_config_format = "toml"
+verbose = false
 
-[sinks.<name>.plugin_config]
+[[streams]]
+stream = "example_stream"
+topics = ["example_topic"]
+schema = "json"
+batch_length = 100
+# Long poll: a poll returns once `min_count` messages are ready or `max_wait`
+# expires. These replace `poll_interval`, which the runtime refuses for sinks.
+# `min_count` must not exceed `batch_length`; `max_wait` must be above zero.
+max_wait = "2s"
+min_count = 100
+consumer_group = "<name>_sink_connector"
+
+[plugin_config]
 # Never commit real secrets. Use env overrides in tests/ops.
 connection_string = "scheme://user:pass@host:port/db"
 batch_size = 100
-max_retries = 3
 retry_delay = "500ms"
+retry_max_delay = "5s"
+# One budget for a whole consume() call. Keep it well under a minute: the call
+# blocks a runtime worker thread, and a stop waits for it.
+max_delivery_time = "20s"
 verbose_logging = false
 ```
 
@@ -130,23 +164,26 @@ Replace `<Name>` / `<name>` and implement only the `TODO(ConnectorDeveloper)` bl
 // under the License.
 
 use async_trait::async_trait;
-use humantime::Duration as HumanDuration;
+use iggy_connector_sdk::retry::{parse_duration, retry_backoff};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::{Instant, sleep};
 use tracing::{debug, error, info, warn};
 
 sink_connector!(NameSink);
 
 const CONNECTOR_NAME: &str = "Name sink";
 const DEFAULT_BATCH_SIZE: u32 = 100;
-const DEFAULT_MAX_RETRIES: u32 = 3; // total attempts
 const DEFAULT_RETRY_DELAY: &str = "500ms";
+const DEFAULT_RETRY_MAX_DELAY: &str = "5s";
+// Well under the runtime's close budget (the poll timeout plus 60 s): consume() blocks a
+// runtime worker thread and a stop waits for it.
+const DEFAULT_MAX_DELIVERY_TIME: &str = "20s";
 
 /// Backend client. Replace with the real driver type.
 struct BackendClient {
@@ -159,8 +196,9 @@ pub struct NameSinkConfig {
     #[serde(serialize_with = "iggy_common::serde_secret::serialize_secret")]
     pub connection_string: SecretString,
     pub batch_size: Option<u32>,
-    pub max_retries: Option<u32>,
     pub retry_delay: Option<String>,
+    pub retry_max_delay: Option<String>,
+    pub max_delivery_time: Option<String>,
     pub verbose_logging: Option<bool>,
     // TODO(ConnectorDeveloper): optional non-secret knobs (table, index, batch_mode, ...)
 }
@@ -170,8 +208,9 @@ pub struct NameSink {
     id: u32,
     config: NameSinkConfig,
     batch_size: usize,
-    max_retries: u32,
     retry_delay: Duration,
+    retry_max_delay: Duration,
+    max_delivery_time: Duration,
     verbose: bool,
     client: Option<BackendClient>,
     state: Mutex<State>,
@@ -185,50 +224,56 @@ struct State {
 
 impl NameSink {
     pub fn new(id: u32, config: NameSinkConfig) -> Self {
-        let batch_size = config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE) as usize;
-        let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
-        let retry_delay = config
-            .retry_delay
-            .as_deref()
-            .and_then(|raw| HumanDuration::from_str(raw).ok().map(|d| *d))
-            .unwrap_or_else(|| {
-                warn!(
-                    "Invalid retry_delay for {CONNECTOR_NAME} ID: {id}, defaulting to {DEFAULT_RETRY_DELAY}"
-                );
-                Duration::from_millis(500)
-            });
+        let batch_size = config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1) as usize;
+        // `parse_duration` falls back to the default with a `warn!` on a bad value.
+        let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
+        let retry_max_delay =
+            parse_duration(config.retry_max_delay.as_deref(), DEFAULT_RETRY_MAX_DELAY);
+        let max_delivery_time = parse_duration(
+            config.max_delivery_time.as_deref(),
+            DEFAULT_MAX_DELIVERY_TIME,
+        );
         let verbose = config.verbose_logging.unwrap_or(false);
         Self {
             id,
             config,
             batch_size,
-            max_retries,
             retry_delay,
+            retry_max_delay,
+            max_delivery_time,
             verbose,
             client: None,
             state: Mutex::new(State::default()),
         }
     }
 
+    /// Retries transient failures with jittered backoff until `deadline`. The runtime never
+    /// redelivers a batch after an error, so this loop is the batch's only second chance.
     async fn send_batch_with_retry(
         &self,
         client: &BackendClient,
         topic_metadata: &TopicMetadata,
         batch: &[ConsumedMessage],
+        deadline: Instant,
     ) -> Result<(), Error> {
-        let mut attempt = 0u32;
+        let mut failed_rounds = 0u32;
         loop {
-            attempt += 1;
             match push_batch(client, topic_metadata, batch).await {
                 Ok(()) => return Ok(()),
-                Err(error) if is_permanent(&error) => return Err(error),
-                Err(error) if attempt >= self.max_retries => return Err(error),
+                Err(error) if !is_transient(&error) => return Err(error),
                 Err(error) => {
+                    failed_rounds += 1;
+                    let pause =
+                        retry_backoff(self.retry_delay, failed_rounds, self.retry_max_delay);
+                    if Instant::now() + pause >= deadline {
+                        return Err(error);
+                    }
                     warn!(
-                        "{CONNECTOR_NAME} ID: {} retry {attempt}/{}: {error}",
-                        self.id, self.max_retries
+                        "{CONNECTOR_NAME} ID: {} round {failed_rounds} failed, retrying in \
+                         {pause:?}: {error}",
+                        self.id
                     );
-                    tokio::time::sleep(self.retry_delay.saturating_mul(attempt)).await;
+                    sleep(pause).await;
                 }
             }
         }
@@ -281,32 +326,56 @@ impl Sink for NameSink {
             );
         }
 
-        // Never swallow a failed batch as Ok(()) — offsets may still advance.
+        // One budget for the whole call: with a dead backend every chunk would otherwise wait
+        // out a budget of its own, and the runtime is blocked on this call for all of them.
+        let deadline = Instant::now() + self.max_delivery_time;
         let mut last_err: Option<Error> = None;
-        for batch in messages.chunks(self.batch_size) {
+        for (index, chunk) in messages.chunks(self.batch_size).enumerate() {
             match self
-                .send_batch_with_retry(client, topic_metadata, batch)
+                .send_batch_with_retry(client, topic_metadata, chunk, deadline)
                 .await
             {
                 Ok(()) => {
                     let mut state = self.state.lock().await;
-                    state.messages_processed += batch.len() as u64;
+                    state.messages_processed += chunk.len() as u64;
                 }
                 Err(Error::PermanentHttpError(message)) => {
                     error!(
-                        "{CONNECTOR_NAME} ID: {} dropping batch (permanent): {message}",
-                        self.id
+                        "{CONNECTOR_NAME} ID: {} skipping {} messages (permanent), offsets {}: {message}",
+                        self.id,
+                        chunk.len(),
+                        offset_range(chunk)
                     );
                     let mut state = self.state.lock().await;
-                    state.errors += 1;
+                    state.errors += chunk.len() as u64;
+                }
+                // The budget is spent, so the chunks after this one are not attempted either.
+                Err(error) if is_transient(&error) => {
+                    let undelivered = &messages[index * self.batch_size..];
+                    error!(
+                        "{CONNECTOR_NAME} ID: {} gave up on {} messages, stream: {}, topic: {}, \
+                         partition: {}, offsets {}. The runtime does not redeliver them; replay \
+                         that range from Iggy. Cause: {error}",
+                        self.id,
+                        undelivered.len(),
+                        topic_metadata.stream,
+                        topic_metadata.topic,
+                        messages_metadata.partition_id,
+                        offset_range(undelivered)
+                    );
+                    let mut state = self.state.lock().await;
+                    state.errors += undelivered.len() as u64;
+                    last_err = Some(error);
+                    break;
                 }
                 Err(error) => {
                     let mut state = self.state.lock().await;
-                    state.errors += 1;
+                    state.errors += chunk.len() as u64;
                     last_err = Some(error);
                 }
             }
         }
+        // Never swallow a failed batch as Ok(()): the error is what gets it logged and counted.
         match last_err {
             Some(error) => Err(error),
             None => Ok(()),
@@ -339,9 +408,15 @@ async fn ping(_client: &BackendClient) -> Result<(), String> {
     Ok(())
 }
 
-/// TODO(ConnectorDeveloper): push one batch. Prefer a stable dedup key from
-/// `stream:topic:partition:message_id` (or backend natural key).
+/// TODO(ConnectorDeveloper): push one batch. Make the write idempotent on a key built
+/// from `stream:topic:partition:offset` (`message.offset`, with the partition from
+/// `MessagesMetadata`), or a natural backend key: retries, replays and a server failover
+/// all repeat messages. Do not key on `message.id` unless your producers guarantee unique
+/// ids, because two different messages with the same id would overwrite each other.
 /// Use `message.payload.try_to_bytes()` — do not clone Payload::Json.
+///
+/// Return a transient error (`HttpRequestFailed`, `Connection`, `CannotStoreData`) for what is
+/// worth retrying, `PermanentHttpError` for what never will succeed.
 async fn push_batch(
     _client: &BackendClient,
     _topic_metadata: &TopicMetadata,
@@ -351,11 +426,18 @@ async fn push_batch(
 }
 
 /// Map driver errors. Never classify via `err.to_string()` substrings.
-fn is_permanent(error: &Error) -> bool {
+fn is_transient(error: &Error) -> bool {
     matches!(
         error,
-        Error::PermanentHttpError(_) | Error::SchemaMismatch(_) | Error::InvalidRecordValue(_)
+        Error::HttpRequestFailed(_) | Error::Connection(_) | Error::CannotStoreData(_)
     )
+}
+
+fn offset_range(messages: &[ConsumedMessage]) -> String {
+    match (messages.first(), messages.last()) {
+        (Some(first), Some(last)) => format!("{}..={}", first.offset, last.offset),
+        _ => "none".to_string(),
+    }
 }
 
 async fn close_client(_client: BackendClient) {
@@ -370,8 +452,9 @@ mod tests {
         NameSinkConfig {
             connection_string: SecretString::from("scheme://localhost/db"),
             batch_size: Some(10),
-            max_retries: Some(2),
             retry_delay: Some("10ms".into()),
+            retry_max_delay: Some("100ms".into()),
+            max_delivery_time: Some("1s".into()),
             verbose_logging: Some(false),
         }
     }
@@ -383,13 +466,14 @@ mod tests {
             NameSinkConfig {
                 connection_string: SecretString::from("scheme://localhost/db"),
                 batch_size: None,
-                max_retries: None,
                 retry_delay: None,
+                retry_max_delay: None,
+                max_delivery_time: None,
                 verbose_logging: None,
             },
         );
         assert_eq!(sink.batch_size, DEFAULT_BATCH_SIZE as usize);
-        assert_eq!(sink.max_retries, DEFAULT_MAX_RETRIES);
+        assert_eq!(sink.max_delivery_time, Duration::from_secs(20));
     }
 
     #[test]
@@ -402,18 +486,31 @@ mod tests {
 }
 ```
 
+Add delivery tests once your `push_batch` returns real errors: recovery within the
+budget, giving up with a bounded number of attempts, and no retry of permanent
+errors. `sinks/sink_template/src/lib.rs` has all three. Its `deliver_chunk` takes the
+attempt as a closure, so they run without a backend; keep that shape if you want to
+copy them.
+
 ---
 
 ## README.md (required paragraphs)
 
 Your README must include a **Delivery semantics** section answering:
 
-1. Transient failure behavior (retry N times, then `Err`)
-2. Permanent failure behavior (drop/skip vs fail)
-3. Duplication window (usually at-least-once)
-4. Dedup key (or "none — duplicates possible")
+1. Transient failure behavior (retried with backoff within `max_delivery_time`,
+   then given up on, with the offset range logged)
+2. Permanent failure behavior (skip the chunk and count it, or fail)
+3. Duplication window (a sink is at-most-once from Iggy because the offset is
+   stored when the poll is answered; say where your own retries, replays and
+   failovers can duplicate)
+4. Dedup key (`stream:topic:partition:offset`, a natural backend key, or "none —
+   duplicates possible")
 
-Diff README defaults against the `DEFAULT_*` consts before opening the PR.
+Also document the `[[streams]]` settings you recommend (`batch_length`,
+`min_count`, `max_wait`) and the limits that follow from a blocking
+`consume()`. Diff README defaults against the `DEFAULT_*` consts before opening
+the PR.
 
 ---
 
