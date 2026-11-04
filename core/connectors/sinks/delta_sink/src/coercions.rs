@@ -19,7 +19,8 @@ use deltalake::kernel::Schema as DeltaSchema;
 use deltalake::kernel::{DataType, PrimitiveType};
 
 use chrono::prelude::*;
-use serde_json::Value;
+use simd_json::OwnedValue;
+use simd_json::prelude::*;
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -85,12 +86,12 @@ fn build_coercion_node(data_type: &DataType) -> Option<CoercionNode> {
     }
 }
 
-/// Applies all data coercions specified by the [`CoercionTree`] to the [`Value`].
+/// Applies all data coercions specified by the [`CoercionTree`] to the [`OwnedValue`].
 ///
 /// Returns an error if a string value in a timestamp field cannot be parsed as a timestamp.
 /// The caller should reject the record (or batch) on error rather than forwarding an
 /// unparsable string to Arrow, which would produce an opaque `ArrowError::JsonError`.
-pub(crate) fn coerce(value: &mut Value, coercion_tree: &CoercionTree) -> Result<(), String> {
+pub(crate) fn coerce(value: &mut OwnedValue, coercion_tree: &CoercionTree) -> Result<(), String> {
     if let Some(context) = value.as_object_mut() {
         for (field_name, coercion) in coercion_tree.root.iter() {
             if let Some(value) = context.get_mut(field_name) {
@@ -101,11 +102,11 @@ pub(crate) fn coerce(value: &mut Value, coercion_tree: &CoercionTree) -> Result<
     Ok(())
 }
 
-fn apply_coercion(value: &mut Value, node: &CoercionNode, path: &str) -> Result<(), String> {
+fn apply_coercion(value: &mut OwnedValue, node: &CoercionNode, path: &str) -> Result<(), String> {
     match node {
         CoercionNode::Coercion(Coercion::ToString) => {
-            if !value.is_null() && !value.is_string() {
-                *value = Value::String(value.to_string());
+            if !value.is_null() && !value.is_str() {
+                *value = OwnedValue::String(value.encode());
             }
         }
         CoercionNode::Coercion(Coercion::ToTimestamp) => {
@@ -152,10 +153,10 @@ fn apply_coercion(value: &mut Value, node: &CoercionNode, path: &str) -> Result<
     Ok(())
 }
 
-fn string_to_timestamp(string: &str, path: &str) -> Result<Value, String> {
+fn string_to_timestamp(string: &str, path: &str) -> Result<OwnedValue, String> {
     // Try strict RFC 3339 / ISO 8601 with T separator first.
     if let Ok(dt) = DateTime::<Utc>::from_str(string) {
-        return Ok(Value::Number(dt.timestamp_micros().into()));
+        return Ok(OwnedValue::from(dt.timestamp_micros()));
     }
 
     // Arrow's parser also accepts ' ' as a date/time separator (e.g. "2021-11-11 22:11:58").
@@ -164,7 +165,7 @@ fn string_to_timestamp(string: &str, path: &str) -> Result<Value, String> {
     let ndt = NaiveDateTime::parse_from_str(string, "%Y-%m-%d %H:%M:%S%.f")
         .or_else(|_| NaiveDateTime::parse_from_str(string, "%Y-%m-%d %H:%M:%S"));
     if let Ok(ndt) = ndt {
-        return Ok(Value::Number(ndt.and_utc().timestamp_micros().into()));
+        return Ok(OwnedValue::from(ndt.and_utc().timestamp_micros()));
     }
 
     Err(format!(
@@ -175,7 +176,7 @@ fn string_to_timestamp(string: &str, path: &str) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use simd_json::json;
     use std::sync::LazyLock;
 
     #[test]
@@ -196,8 +197,8 @@ mod tests {
         assert!(string_to_timestamp("1636668718000000", "field").is_err());
     }
 
-    static SCHEMA: LazyLock<Value> = LazyLock::new(|| {
-        json!({
+    static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
+        serde_json::json!({
                 "type": "struct",
                 "fields": [
                     { "name": "level1_string", "type": "string", "nullable": true, "metadata": {} },
@@ -494,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_empty_schema() {
-        let schema_json = json!({
+        let schema_json = serde_json::json!({
             "type": "struct",
             "fields": []
         });
