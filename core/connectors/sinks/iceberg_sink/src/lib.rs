@@ -17,6 +17,7 @@
 
 use crate::router::Router;
 use iggy_connector_sdk::{Error, sink_connector};
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use strum::Display as StrumDisplay;
 
@@ -50,7 +51,9 @@ pub struct IcebergSink {
     router: Option<Box<dyn Router>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+// `Deserialize` only: nothing re-serializes the config, and leaving `Serialize` off keeps the
+// store credentials unserializable.
+#[derive(Debug, Deserialize)]
 pub struct IcebergSinkConfig {
     #[serde(default)]
     pub tables: Vec<String>,
@@ -61,8 +64,8 @@ pub struct IcebergSinkConfig {
     #[serde(default)]
     pub dynamic_route_field: String,
     pub store_url: String,
-    pub store_access_key_id: Option<String>,
-    pub store_secret_access_key: Option<String>,
+    pub store_access_key_id: Option<SecretString>,
+    pub store_secret_access_key: Option<SecretString>,
     pub store_region: String,
     pub store_class: IcebergSinkStoreClass,
     /// Path-style S3 addressing (`http://host/bucket/key`). MinIO-style endpoints
