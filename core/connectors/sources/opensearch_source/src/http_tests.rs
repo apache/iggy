@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
 const TEST_INDEX: &str = "test_documents";
+const STALL: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn ack(source: &OpenSearchSource) {
     source
@@ -70,6 +71,7 @@ fn base_config(url: &str) -> OpenSearchSourceConfig {
         open_retry_max_delay: Some("10ms".to_string()),
         circuit_breaker_threshold: None,
         circuit_breaker_cool_down: None,
+        request_timeout: None,
     }
 }
 
@@ -418,6 +420,59 @@ async fn given_custom_query_when_search_should_include_query_in_body() {
 
     let body = captured.lock().await.clone().expect("search body captured");
     assert_eq!(body["query"]["term"]["status"], "active");
+}
+
+#[tokio::test]
+async fn given_stalled_response_when_poll_should_time_out_and_fail() {
+    let app = mock_router(StatusCode::OK, |_| async move {
+        tokio::time::sleep(STALL).await;
+        (StatusCode::OK, search_response(vec![]).to_string())
+    });
+    let base = start_server(app).await;
+    let mut config = base_config(&base);
+    config.request_timeout = Some("100ms".to_string());
+    let mut source = OpenSearchSource::new(1, config, None);
+    source.open().await.unwrap();
+
+    let started = std::time::Instant::now();
+    let error = source.poll().await.expect_err("stalled poll should fail");
+
+    assert!(matches!(error, Error::Connection(_)), "got {error:?}");
+    assert!(started.elapsed() < STALL);
+    let (_, _, errors, _) = source.test_metrics().await;
+    assert_eq!(errors, 1);
+}
+
+#[tokio::test]
+async fn given_stalled_first_response_when_poll_should_retry_and_succeed() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = mock_router(StatusCode::OK, {
+        let calls = calls.clone();
+        move |_| {
+            let calls = calls.clone();
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(STALL).await;
+                }
+                (
+                    StatusCode::OK,
+                    search_response(vec![search_hit("a", "2024-01-01T00:00:00Z", json!({}))])
+                        .to_string(),
+                )
+            }
+        }
+    });
+    let base = start_server(app).await;
+    let mut config = base_config(&base);
+    config.request_timeout = Some("100ms".to_string());
+    config.max_retries = Some(2);
+    let mut source = OpenSearchSource::new(1, config, None);
+    source.open().await.unwrap();
+
+    let produced = source.poll().await.expect("retry should recover the poll");
+
+    assert_eq!(produced.messages.len(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

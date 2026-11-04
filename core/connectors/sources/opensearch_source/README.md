@@ -53,6 +53,7 @@ query = { match_all = {} }
 | `query` | `match_all` | Query DSL object, applied on every poll. |
 | `polling_interval` | `10s` | Wait before each poll, so the first poll also waits. |
 | `batch_size` | `100` | Documents per search, `1` to `10000` (the OpenSearch default `max_result_window`). |
+| `request_timeout` | `30s` | Limit per HTTP request, from connecting to the last byte of the response. A timeout counts as a failed attempt and is retried. |
 | `max_retries` | `3` | Total HTTP attempts per search, not the number of retries. |
 | `retry_delay` | `1s` | Base delay for exponential backoff. |
 | `retry_max_delay` | `30s` | Backoff cap. |

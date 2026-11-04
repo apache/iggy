@@ -31,7 +31,6 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::{sync::Mutex, time::sleep};
 use tracing::{debug, error, info, warn};
@@ -47,6 +46,7 @@ source_connector!(OpenSearchSource);
 const CONNECTOR_NAME: &str = "OpenSearch source";
 const DEFAULT_POLLING_INTERVAL: &str = "10s";
 const DEFAULT_BATCH_SIZE: usize = 100;
+const DEFAULT_REQUEST_TIMEOUT: &str = "30s";
 // OpenSearch rejects `size` above the default `index.max_result_window` with HTTP 400.
 const MAX_BATCH_SIZE: usize = 10_000;
 const DOCUMENT_ID_HEADER: &str = "opensearch.document_id";
@@ -111,6 +111,8 @@ pub struct OpenSearchSourceConfig {
     pub polling_interval: Option<String>,
     pub batch_size: Option<usize>,
     pub timestamp_field: Option<String>,
+    /// Limit per HTTP request, from connecting to the last byte of the response body.
+    pub request_timeout: Option<String>,
     #[serde(default)]
     pub verbose_logging: bool,
     /// Total poll-phase attempt count (not retry count); 1 = no retries, 3 = 2 retries.
@@ -130,13 +132,14 @@ pub struct OpenSearchSource {
     config: OpenSearchSourceConfig,
     client: Option<OpenSearch>,
     polling_interval: Duration,
+    request_timeout: Duration,
     /// Pre-built query body (query + size + sort). Set once in `open()` after config validation.
     /// `None` before `open()` and after a failed `open()`.
     search_body_base: Option<Value>,
     verbose: bool,
     poll_retry_policy: RetryPolicy,
     open_retry_policy: RetryPolicy,
-    circuit_breaker: Arc<CircuitBreaker>,
+    circuit_breaker: CircuitBreaker,
     state: Mutex<State>,
     /// Candidate state of the batch in flight; committed on ACK, dropped on NACK.
     pending_state: Mutex<Option<State>>,
@@ -155,6 +158,8 @@ impl OpenSearchSource {
     pub fn new(id: u32, config: OpenSearchSourceConfig, state: Option<ConnectorState>) -> Self {
         let polling_interval =
             parse_duration(config.polling_interval.as_deref(), DEFAULT_POLLING_INTERVAL);
+        let request_timeout =
+            parse_duration(config.request_timeout.as_deref(), DEFAULT_REQUEST_TIMEOUT);
         let verbose = config.verbose_logging;
         let (restored_state, state_restore_error) = restore_state(id, state);
 
@@ -165,7 +170,7 @@ impl OpenSearchSource {
             config.circuit_breaker_cool_down.as_deref(),
             DEFAULT_CB_COOL_DOWN,
         );
-        let circuit_breaker = Arc::new(CircuitBreaker::new(cb_threshold, cb_cool_down));
+        let circuit_breaker = CircuitBreaker::new(cb_threshold, cb_cool_down);
         let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
         let poll_retry_policy = RetryPolicy {
             max_attempts: config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
@@ -191,6 +196,7 @@ impl OpenSearchSource {
             circuit_breaker,
             client: None,
             polling_interval,
+            request_timeout,
             search_body_base: None,
             verbose,
             state: Mutex::new(restored_state),
@@ -221,7 +227,9 @@ impl OpenSearchSource {
         })?;
 
         let conn_pool = opensearch::http::transport::SingleNodeConnectionPool::new(url);
-        let mut transport_builder = TransportBuilder::new(conn_pool);
+        // Without a timeout a stalled response never returns, so neither retry nor the circuit
+        // breaker would ever see a failure.
+        let mut transport_builder = TransportBuilder::new(conn_pool).timeout(self.request_timeout);
 
         if let (Some(username), Some(password)) = (&self.config.username, &self.config.password) {
             let credentials =
@@ -330,11 +338,12 @@ impl OpenSearchSource {
         let mut last_sort = None;
         let mut last_poll_timestamp = None;
 
-        for hit in &hits {
+        for mut hit in hits {
             let Some(sort) = hit
-                .get("sort")
-                .and_then(|s| s.as_array())
+                .get_mut("sort")
+                .and_then(Value::as_array_mut)
                 .filter(|a| !a.is_empty())
+                .map(std::mem::take)
             else {
                 return Err(Error::SchemaMismatch(format!(
                     "OpenSearch hit {:?} has no sort tuple; the cursor cannot move past it \
@@ -351,7 +360,7 @@ impl OpenSearchSource {
                 )));
             }
 
-            let Some(source) = hit.get("_source") else {
+            let Some(source) = hit.get_mut("_source").map(Value::take) else {
                 warn!(
                     connector_id = self.id,
                     hit_id = hit.get("_id").and_then(|v| v.as_str()),
@@ -369,7 +378,7 @@ impl OpenSearchSource {
                 last_poll_timestamp = Some(timestamp_utc);
             }
 
-            let payload = serde_json::to_vec(source)
+            let payload = serde_json::to_vec(&source)
                 .map_err(|e| Error::Serialization(format!("Failed to serialize document: {e}")))?;
             batch_bytes += payload.len() as u64;
 
@@ -393,7 +402,7 @@ impl OpenSearchSource {
 
         Ok(SearchOutcome {
             messages,
-            search_after: last_sort.map(ToOwned::to_owned),
+            search_after: last_sort,
             last_poll_timestamp,
             batch_bytes,
         })
@@ -804,6 +813,7 @@ mod tests {
             open_retry_max_delay: None,
             circuit_breaker_threshold: None,
             circuit_breaker_cool_down: None,
+            request_timeout: None,
         }
     }
 

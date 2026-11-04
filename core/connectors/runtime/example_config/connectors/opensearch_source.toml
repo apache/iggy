@@ -41,6 +41,7 @@ timestamp_field = "@timestamp"
 # verbose_logging = false
 
 # HTTP resilience (defaults shown).
+# request_timeout = "30s"
 # max_retries = 3
 # retry_delay = "1s"
 # retry_max_delay = "30s"
