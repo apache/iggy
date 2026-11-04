@@ -28,7 +28,9 @@ namespace Apache.Iggy.Tests.Integrations.Helpers;
 /// </summary>
 public static class ConsumerGroupAssignment
 {
-    private static readonly TimeSpan ConvergenceTimeout = TimeSpan.FromSeconds(10);
+    // The fence install runs off the reconciler of the shard that owns the partition, and on the metadata
+    // primary's shard 0 that lags by seconds under a full suite.
+    private static readonly TimeSpan ConvergenceTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(100);
 
     /// <summary>

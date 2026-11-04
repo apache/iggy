@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Enums;
 
@@ -48,13 +49,14 @@ public interface IIggyUsers
     /// <param name="password">The password for the user.</param>
     /// <param name="status">The initial status of the user (active or inactive).</param>
     /// <param name="permissions">The permissions granted to the user (optional).</param>
+    /// <param name="options">The user's options (optional). The catalog defines no user key yet.</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>
     ///     A task that represents the asynchronous operation and returns the created user information, or null if
     ///     creation failed.
     /// </returns>
     Task<UserResponse?> CreateUserAsync(string userName, string password, UserStatus status, Permissions? permissions = null,
-        CancellationToken token = default);
+        UserOptions? options = null, CancellationToken token = default);
 
     /// <summary>
     ///     Deletes an existing user from the system.
@@ -65,15 +67,17 @@ public interface IIggyUsers
     Task DeleteUserAsync(Identifier userId, CancellationToken token = default);
 
     /// <summary>
-    ///     Updates user properties such as username and status.
+    ///     Applies the changes in <paramref name="update" /> to a user, such as its username and status.
     /// </summary>
+    /// <remarks>
+    ///     Renaming the signed-in user also renames the credentials a reconnecting TCP client signs in with.
+    ///     Deactivating a user ends its sessions and refuses its next login.
+    /// </remarks>
     /// <param name="userId">The identifier of the user to update (numeric ID or username).</param>
-    /// <param name="userName">The new username (optional).</param>
-    /// <param name="status">The new status (optional).</param>
+    /// <param name="update">The keys to set and reset. At least one is required.</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task representing the asynchronous operation.</returns>
-    Task UpdateUserAsync(Identifier userId, string? userName = null, UserStatus? status = null,
-        CancellationToken token = default);
+    Task UpdateUserAsync(Identifier userId, UserUpdate update, CancellationToken token = default);
 
     /// <summary>
     ///     Updates the permissions for a specific user.

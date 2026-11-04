@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import type { CommandResponse } from '../../client/client.type.js';
-import { wrapCommand } from '../command.utils.js';
+import type { ClientProvider, CommandResponse } from '../../client/client.type.js';
 import { COMMAND_CODE } from '../command.code.js';
 import {
   serializeLoginUser,
@@ -43,4 +42,9 @@ export const LOGIN = {
 /**
  * Executable login command function.
  */
-export const login = wrapCommand<LoginCredentials, LoginResponse>(LOGIN);
+export const login = (getClient: ClientProvider) => async (credentials: LoginCredentials): Promise<LoginResponse> => {
+  const snapshot = { ...credentials };
+  const client = await getClient();
+  if (client._authWithPassword) return client._authWithPassword(snapshot);
+  return LOGIN.deserialize(await client.sendCommand(LOGIN.code, LOGIN.serialize(snapshot)));
+};

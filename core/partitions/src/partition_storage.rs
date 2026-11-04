@@ -22,8 +22,10 @@
 //! delete a partition from disk.
 
 use crate::offset_recovery::{
-    RecoveredOffsets, load_consumer_offsets_with_storage, load_group_offsets_with_storage,
+    RecoveredOffsets, load_consumer_offsets_with_storage, load_emptied_marker_with_storage,
+    load_group_offsets_with_storage,
 };
+use crate::offset_storage::persist_emptied_marker_with_storage;
 use crate::segment_recovery::{PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredSegment};
 use crate::{IggyIndexWriter, IggyPartition, MessagesWriter, PartitionsConfig, Segment};
 use compio::fs::create_dir_all;
@@ -184,12 +186,13 @@ pub async fn read_revision_record(directory: &str, name: &str) -> std::io::Resul
 ///
 /// # Errors
 ///
-/// Returns [`PartitionRecoveryError::ConsumerOffsetsLoad`] when an existing offset
-/// directory cannot be enumerated, and
+/// Returns [`PartitionRecoveryError::ConsumerOffsetsLoad`] when an offset directory
+/// cannot be checked or an existing one cannot be enumerated,
 /// [`PartitionRecoveryError::CreateOffsetsDirectory`] when the external group one
-/// cannot be created. A stored offset past the offset space is clamped to
-/// `current_offset` (with a warning), not an error. External group offsets are
-/// never clamped.
+/// cannot be created, and [`PartitionRecoveryError::Iggy`] when an unreadable or
+/// stale emptied-table marker cannot be removed. A stored offset past the offset
+/// space is clamped to `current_offset` (with a warning), not an error. External
+/// group offsets are never clamped.
 pub async fn configure_consumer_offsets<B: MessageBus>(
     partition: &mut IggyPartition<B>,
     config: &PartitionsConfig,
@@ -204,6 +207,20 @@ pub async fn configure_consumer_offsets<B: MessageBus>(
         current_offset,
     )
     .await
+}
+
+/// Populate `partition` with consumer and consumer group offset storage from disk without
+/// clamping the recovered offsets, see [`recover_consumer_offsets_with_storage`].
+///
+/// # Errors
+///
+/// The errors of [`recover_consumer_offsets_with_storage`].
+pub async fn recover_consumer_offsets<B: MessageBus>(
+    partition: &mut IggyPartition<B>,
+    config: &PartitionsConfig,
+    namespace: IggyNamespace,
+) -> Result<(), PartitionRecoveryError> {
+    recover_consumer_offsets_with_storage(&DiskStorage, partition, config, namespace).await
 }
 
 /// Recover consumer and group offsets from `storage` into a new partition.
@@ -221,17 +238,41 @@ pub async fn configure_consumer_offsets<B: MessageBus>(
 /// read from storage. External group offsets are never clamped.
 ///
 /// # Errors
-/// Returns [`PartitionRecoveryError::ConsumerOffsetsLoad`] if an existing offset directory
-/// cannot be enumerated, and [`PartitionRecoveryError::CreateOffsetsDirectory`] if the
-/// external group one cannot be created. Consumer recovery may already have seeded the
-/// partition when group recovery fails, so callers must discard a failed recovery.
-#[allow(clippy::too_many_lines)]
+/// Returns [`PartitionRecoveryError::ConsumerOffsetsLoad`] if an offset directory cannot
+/// be checked or an existing one cannot be enumerated,
+/// [`PartitionRecoveryError::CreateOffsetsDirectory`] if the external group one
+/// cannot be created, and [`PartitionRecoveryError::Iggy`] if an
+/// unreadable or stale emptied-table marker cannot be removed. Consumer recovery may
+/// already have seeded the partition when group recovery fails, so callers must
+/// discard a failed recovery.
 pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: MessageBus>(
     storage: &S,
     partition: &mut IggyPartition<B>,
     config: &PartitionsConfig,
     namespace: IggyNamespace,
     current_offset: u64,
+) -> Result<(), PartitionRecoveryError> {
+    recover_consumer_offsets_with_storage(storage, partition, config, namespace).await?;
+    clamp_consumer_offsets(partition, namespace, current_offset);
+    Ok(())
+}
+
+/// Recover consumer and group offsets from `storage` into a new partition, at the values read
+/// from storage.
+///
+/// For a boot that replays its WAL afterwards: before the replay, neither the replayed data nor
+/// the replayed offset stores bound the recovered offsets. Call [`clamp_consumer_offsets`] once
+/// the replay is done.
+///
+/// # Errors
+/// The errors of [`configure_consumer_offsets_with_storage`]. Consumer recovery may already have
+/// seeded the partition when group recovery fails, so callers must discard a failed recovery.
+#[allow(clippy::too_many_lines)]
+pub async fn recover_consumer_offsets_with_storage<S: DurableStorage, B: MessageBus>(
+    storage: &S,
+    partition: &mut IggyPartition<B>,
+    config: &PartitionsConfig,
+    namespace: IggyNamespace,
 ) -> Result<(), PartitionRecoveryError> {
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
@@ -241,17 +282,6 @@ pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: Messa
         config.get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
     let external_group_offsets_path =
         config.get_external_group_offsets_path(stream_id, topic_id, partition_id);
-    // The bound is the offset space this replica could have MINTED, not the data
-    // it can still serve. A boot re-anchor leaves the append point a lease block
-    // above the recovered chain, so on the restart after a crash that took
-    // acked-but-unflushed messages, a position stored before that crash names a
-    // real offset sitting under an empty chain -- confirmed to a client, and not
-    // "past the log" the way a torn offset file is. Bounding it by the data head
-    // instead walks a committed consumer position BACKWARD across the restart,
-    // which is the silent re-read the reservation exists to prevent.
-    // `mint_frontier` is one past the next mint, and reads 0 on the fresh-build
-    // path, where the max leaves `current_offset` in charge as before.
-    let offset_space_ceiling = current_offset.max(partition.mint_frontier().saturating_sub(1));
 
     let recovered_consumers = load_partition_consumer_offsets(
         storage,
@@ -266,14 +296,7 @@ pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: Messa
     {
         let guard = consumer_offsets.pin();
         for offset in recovered_consumers.entries {
-            seed_recovered_offset(
-                partition,
-                namespace,
-                ConsumerKind::Consumer,
-                &offset,
-                Some(offset_space_ceiling),
-                current_offset,
-            );
+            seed_recovered_offset(partition, ConsumerKind::Consumer, &offset);
             guard.insert(offset.consumer_id as usize, offset);
         }
     }
@@ -292,14 +315,7 @@ pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: Messa
     {
         let guard = consumer_group_offsets.pin();
         for (group_id, offset) in recovered_groups.entries {
-            seed_recovered_offset(
-                partition,
-                namespace,
-                ConsumerKind::ConsumerGroup,
-                &offset,
-                Some(offset_space_ceiling),
-                current_offset,
-            );
+            seed_recovered_offset(partition, ConsumerKind::ConsumerGroup, &offset);
             guard.insert(group_id, offset);
         }
     }
@@ -328,14 +344,7 @@ pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: Messa
     // Never clamped: the value belongs to the external system, and a Kafka commit sits one past
     // the last message. The durable table is the only store of an external offset.
     for (_, offset) in &recovered_external.entries {
-        seed_recovered_offset(
-            partition,
-            namespace,
-            ConsumerKind::ExternalGroup,
-            offset,
-            None,
-            current_offset,
-        );
+        seed_recovered_offset(partition, ConsumerKind::ExternalGroup, offset);
     }
 
     // Offset files have their own knob, not the topic's `persisted`: that
@@ -374,6 +383,7 @@ pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: Messa
             }
         }
     }
+    restore_emptied_marker(storage, partition).await?;
     for kind in ConsumerKind::ALL {
         let count = partition.occupied_consumer_offset_count(kind);
         let limit = partition.consumer_offset_capacity_for(kind).limit();
@@ -392,44 +402,120 @@ pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: Messa
     Ok(())
 }
 
-/// Seed the durable state of one recovered offset record. A record past
-/// `ceiling` is clamped to `current_offset` first, and `None` skips the clamp.
-/// The file high-water keeps the value read from storage.
+/// Load the emptied-table marker, or remove it when the recovered table is not
+/// empty.
+async fn restore_emptied_marker<S: DurableStorage, B: MessageBus>(
+    storage: &S,
+    partition: &IggyPartition<B>,
+) -> Result<(), IggyError> {
+    let Some(path) = partition.emptied_marker_path() else {
+        return Ok(());
+    };
+    let emptied_at = load_emptied_marker_with_storage(storage, &path).await?;
+    if emptied_at == 0 {
+        return Ok(());
+    }
+    // A crash that beats the directory sync can revive a file the emptying
+    // delete unlinked, so a loaded or stranded offset makes the marker stale.
+    if ConsumerKind::ALL
+        .into_iter()
+        .any(|kind| partition.occupied_consumer_offset_count(kind) > 0)
+    {
+        return persist_emptied_marker_with_storage(storage, &path, 0).await;
+    }
+    partition.seed_offsets_emptied_at(emptied_at);
+    Ok(())
+}
+
+/// Seed the durable state of one recovered offset record at the value read from storage.
 fn seed_recovered_offset<B: MessageBus>(
+    partition: &IggyPartition<B>,
+    kind: ConsumerKind,
+    offset: &ConsumerOffset,
+) {
+    let recovered_offset = offset.offset.load(Ordering::Relaxed);
+    partition.seed_recovered_consumer_offset(
+        kind,
+        offset.consumer_id,
+        recovered_offset,
+        recovered_offset,
+    );
+}
+
+/// Clamp the consumer and group offsets past the offset space `partition` could have minted.
+///
+/// A clamped offset moves to `current_offset`. Clamping changes the visible position without
+/// rewriting its file, and persistence tracking keeps the value read from storage. External
+/// group offsets are never clamped: the value belongs to the external system.
+pub fn clamp_consumer_offsets<B: MessageBus>(
+    partition: &IggyPartition<B>,
+    namespace: IggyNamespace,
+    current_offset: u64,
+) {
+    // The bound is the offset space this replica could have MINTED, not the data
+    // it can still serve. A boot re-anchor leaves the append point a lease block
+    // above the recovered chain, so on the restart after a crash that took
+    // acked-but-unflushed messages, a position stored before that crash names a
+    // real offset sitting under an empty chain -- confirmed to a client, and not
+    // "past the log" the way a torn offset file is. Bounding it by the data head
+    // instead walks a committed consumer position BACKWARD across the restart,
+    // which is the silent re-read the reservation exists to prevent.
+    // `mint_frontier` is one past the next mint, and reads 0 on the fresh-build
+    // path, where the max leaves `current_offset` in charge as before.
+    let ceiling = current_offset.max(partition.mint_frontier().saturating_sub(1));
+    let consumers = partition.consumer_offsets.pin();
+    for (_, offset) in &consumers {
+        clamp_recovered_offset(
+            partition,
+            namespace,
+            ConsumerKind::Consumer,
+            offset,
+            ceiling,
+            current_offset,
+        );
+    }
+    let groups = partition.consumer_group_offsets.pin();
+    for (_, offset) in &groups {
+        clamp_recovered_offset(
+            partition,
+            namespace,
+            ConsumerKind::ConsumerGroup,
+            offset,
+            ceiling,
+            current_offset,
+        );
+    }
+}
+
+fn clamp_recovered_offset<B: MessageBus>(
     partition: &IggyPartition<B>,
     namespace: IggyNamespace,
     kind: ConsumerKind,
     offset: &ConsumerOffset,
-    ceiling: Option<u64>,
+    ceiling: u64,
     current_offset: u64,
 ) {
     let recovered_offset = offset.offset.load(Ordering::Relaxed);
-    if let Some(ceiling) = ceiling
-        && recovered_offset > ceiling
-    {
-        // A crash can persist an offset ahead of the flushed data (offsets are
-        // stored eagerly, messages flush later). Clamp to the recovered head so
-        // the consumer resumes instead of being stuck polling past the log;
-        // mirrors the legacy contract.
-        warn!(
-            stream_id = namespace.stream_id(),
-            topic_id = namespace.topic_id(),
-            partition_id = namespace.partition_id(),
-            %kind,
-            consumer_id = offset.consumer_id,
-            recovered_offset,
-            current_offset,
-            offset_space_ceiling = ceiling,
-            "recovered offset ahead of partition data; clamping"
-        );
-        offset.offset.store(current_offset, Ordering::Relaxed);
+    if recovered_offset <= ceiling {
+        return;
     }
-    partition.seed_recovered_consumer_offset(
-        kind,
-        offset.consumer_id,
-        offset.offset.load(Ordering::Relaxed),
+    // A crash can persist an offset ahead of the flushed data (offsets are
+    // stored eagerly, messages flush later). Clamp to the recovered head so
+    // the consumer resumes instead of being stuck polling past the log;
+    // mirrors the legacy contract.
+    warn!(
+        stream_id = namespace.stream_id(),
+        topic_id = namespace.topic_id(),
+        partition_id = namespace.partition_id(),
+        %kind,
+        consumer_id = offset.consumer_id,
         recovered_offset,
+        current_offset,
+        offset_space_ceiling = ceiling,
+        "recovered offset ahead of partition data; clamping"
     );
+    offset.offset.store(current_offset, Ordering::Relaxed);
+    partition.clamp_recovered_consumer_offset(kind, offset.consumer_id, current_offset);
 }
 
 /// Provision an initial segment + writers for a partition that has none.
@@ -789,21 +875,21 @@ async fn load_partition_consumer_offsets<S: DurableStorage>(
     topic_id: usize,
     partition_id: usize,
 ) -> Result<RecoveredOffsets<iggy_common::ConsumerOffset>, PartitionRecoveryError> {
-    if !storage
-        .exists_following_links(Path::new(path))
-        .await
-        .unwrap_or(false)
-    {
-        return Ok(RecoveredOffsets::default());
-    }
-
-    match load_consumer_offsets_with_storage(storage, path).await {
+    let loaded = match storage.exists_following_links(Path::new(path)).await {
+        Ok(true) => load_consumer_offsets_with_storage(storage, path).await,
+        Ok(false) => return Ok(RecoveredOffsets::default()),
+        Err(error) => {
+            warn!(path, %error, "failed to check offset directory");
+            Err(IggyError::CannotReadConsumerOffsets(path.to_owned()))
+        }
+    };
+    match loaded {
         Ok(offsets) => Ok(offsets),
         Err(IggyError::CannotReadConsumerOffsets(_))
-            if !storage
-                .exists_following_links(Path::new(path))
-                .await
-                .unwrap_or(false) =>
+            if matches!(
+                storage.exists_following_links(Path::new(path)).await,
+                Ok(false)
+            ) =>
         {
             Ok(RecoveredOffsets::default())
         }
@@ -829,21 +915,21 @@ async fn load_partition_group_offsets<S: DurableStorage>(
     RecoveredOffsets<(iggy_common::ConsumerGroupId, iggy_common::ConsumerOffset)>,
     PartitionRecoveryError,
 > {
-    if !storage
-        .exists_following_links(Path::new(path))
-        .await
-        .unwrap_or(false)
-    {
-        return Ok(RecoveredOffsets::default());
-    }
-
-    match load_group_offsets_with_storage(storage, path, kind).await {
+    let loaded = match storage.exists_following_links(Path::new(path)).await {
+        Ok(true) => load_group_offsets_with_storage(storage, path, kind).await,
+        Ok(false) => return Ok(RecoveredOffsets::default()),
+        Err(error) => {
+            warn!(path, %error, "failed to check offset directory");
+            Err(IggyError::CannotReadConsumerOffsets(path.to_owned()))
+        }
+    };
+    match loaded {
         Ok(offsets) => Ok(offsets),
         Err(IggyError::CannotReadConsumerOffsets(_))
-            if !storage
-                .exists_following_links(Path::new(path))
-                .await
-                .unwrap_or(false) =>
+            if matches!(
+                storage.exists_following_links(Path::new(path)).await,
+                Ok(false)
+            ) =>
         {
             Ok(RecoveredOffsets::default())
         }

@@ -15,17 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use iggy_kafka_wire::KafkaWireError;
 use kafka_protocol::messages::RequestHeader;
 use kafka_protocol::protocol::Decodable;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, broadcast};
-use tokio::time::{timeout, timeout_at};
+use tokio::sync::{Semaphore, SemaphorePermit, broadcast};
+use tokio::task::JoinSet;
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
@@ -33,28 +36,40 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
-use crate::auth::{AuthError, AuthenticatedPrincipal, FailedLoginThrottle, SaslAuthenticator};
-use crate::bridge::IggyBridge;
+use crate::auth::{
+    AuthError, AuthenticatedPrincipal, FailedLoginThrottle, PrincipalResolver, SaslAuthenticator,
+};
+use crate::bridge::{IggyBridge, PermissionBoard, UserAccess};
+use crate::cluster_id::ClusterId;
+use crate::coordinator::{Coordination, CoordinationConfig};
 use crate::error::{KafkaProtocolError, Result};
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
+use crate::listener::{BrokerEntry, ListenerConfig, SecurityProtocol, check_brokers, peers_of};
 use crate::protocol::api::{
     API_KEY_DESCRIBE_ACLS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, BrokerAdvertise,
-    ConnectionState, DEFAULT_KAFKA_PORT, ERROR_ILLEGAL_SASL_STATE, ERROR_INVALID_REQUEST,
-    ERROR_NONE, ERROR_SASL_AUTHENTICATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNSUPPORTED_SASL_MECHANISM, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
-    SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS, decode_acl_filter, decode_sasl_auth_bytes,
-    decode_sasl_mechanism, describe_acls_outcome, encode_error_for_key, handle_connection_request,
-    respond_describe_acls_error, sasl_authenticate_outcome, sasl_handshake_outcome,
+    Brokers, ConnectionState, DEFAULT_KAFKA_PORT, DEFAULT_NODE_ID, ERROR_ILLEGAL_SASL_STATE,
+    ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_SASL_AUTHENTICATION_FAILED,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNSUPPORTED_SASL_MECHANISM, ERROR_UNSUPPORTED_VERSION,
+    GatewayState, HandleOutcome, SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS, decode_acl_filter,
+    decode_sasl_auth_bytes, decode_sasl_mechanism, describe_acls_outcome, encode_error_for_key,
+    handle_connection_request, respond_describe_acls_error, sasl_authenticate_outcome,
+    sasl_handshake_outcome,
 };
+use crate::protocol::auto_topic_creation::{self, AutoTopicCreationConfig};
+use crate::protocol::handlers::api_versions::Advertisement;
 use crate::protocol::header::{request_header_version, response_header_version};
 use crate::protocol::sasl::{
-    PlainCredentials, SASL_AUTHENTICATE_MAX_VERSION, SASL_HANDSHAKE_VERSION, SaslAction, SaslState,
-    parse_plain,
+    SASL_AUTHENTICATE_MAX_VERSION, SASL_HANDSHAKE_VERSION, SaslAction, SaslState, parse_plain,
 };
-use std::io;
+use crate::tls::{IdentityError, TlsConfig, TlsState};
 
 const READ_CHUNK: usize = 65536;
 const GATEWAY_LOG_TARGET: &str = env!("CARGO_CRATE_NAME");
+
+/// How long a start tries again to set up the coordinator log while Iggy is not ready, and the
+/// pause between tries. The same as for the bridge's connect in `main.rs`.
+const COORDINATION_STARTUP_LIMIT: Duration = Duration::from_secs(60);
+const COORDINATION_STARTUP_RETRY: Duration = Duration::from_secs(1);
 
 /// Builds the log filter, forcing the Iggy SDK quiet unless the operator asked otherwise.
 ///
@@ -99,14 +114,16 @@ fn sdk_quieted_filter(rust_log: Option<&str>) -> String {
 
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
-    pub bind_addr: String,
-    /// Hostname or IP advertised in Metadata (`IGGY_KAFKA_ADVERTISED_HOST`). Required when
-    /// `bind_addr` uses a wildcard address (`0.0.0.0` / `::`).
-    pub advertised_host: Option<String>,
-    /// Port advertised in Metadata (`IGGY_KAFKA_ADVERTISED_PORT`). Defaults to the bind port.
-    pub advertised_port: Option<u16>,
+    /// The listeners, one per security protocol (`IGGY_KAFKA_LISTENERS`, or the single-listener
+    /// `IGGY_KAFKA_BIND_ADDR` form). Which of them run SASL and which run TLS is what the
+    /// protocol says; `tls` holds the material the TLS ones share.
+    pub listeners: Vec<ListenerConfig>,
+    /// Certificate, key and client-authentication policy for every `SSL` and `SASL_SSL` listener.
+    /// Required exactly when one of those exists.
+    pub tls: Option<TlsConfig>,
     pub max_frame_size: usize,
-    /// Maximum concurrent connections accepted before new ones are rejected.
+    /// Maximum concurrent connections each listener accepts before rejecting new ones. Every
+    /// listener has its own allowance, so clients of one cannot use up another's.
     pub max_connections: usize,
     /// Bound on how long an accepted connection may sit idle before sending the next
     /// frame's length prefix. Kafka brokers default `connections.max.idle.ms` to 10 minutes;
@@ -127,18 +144,8 @@ pub struct GatewayConfig {
     /// `InitProducerId`, which Kafka requires to be cluster-unique; two gateways left on the
     /// same number hand out the same ids.
     pub instance_id: u16,
-    /// Require SASL authentication before serving any other API.
-    ///
-    /// Off by default, and switching it on is a breaking change for every client already talking
-    /// to this gateway: the two SASL keys only appear in the `ApiVersions` advertisement while it
-    /// is on, and unauthenticated clients stop being served.
-    ///
-    /// While it is off the keys are still answered, with `ILLEGAL_SASL_STATE` and an empty
-    /// mechanism list, because a well-formed response exists for them unlike a genuinely unknown
-    /// key. They are kept out of the advertisement so nothing is invited into an exchange that
-    /// cannot finish.
-    pub sasl_enabled: bool,
-    /// How long an unauthenticated connection may sit between frames.
+    /// How long an unauthenticated connection may sit between frames, and how long a TLS
+    /// handshake or a certificate identity lookup may take.
     ///
     /// Separate from `idle_timeout` because that one is sized for a well-behaved idle client (10
     /// minutes, matching a real broker) and applies to connections that have proven who they are.
@@ -160,15 +167,35 @@ pub struct GatewayConfig {
     /// Four by default, which stays under the shard count of any node with 16 or fewer physical
     /// cores. A default above that is no bound at all on the deployments most likely to run one
     /// gateway in front of one node; a larger node raises it deliberately.
+    ///
+    /// Client certificate user lookups get the same number of slots again, separate from these.
     pub max_concurrent_authentications: usize,
+    /// Whether a `Metadata` lookup of a missing topic creates it, and with how many partitions
+    /// (`IGGY_KAFKA_AUTO_CREATE_TOPICS_*`). Off by default.
+    pub auto_topic_creation: AutoTopicCreationConfig,
+    /// This gateway's node id among `brokers` (`IGGY_KAFKA_NODE_ID`). Metadata names it as the
+    /// leader of every partition.
+    pub node_id: u16,
+    /// Every gateway in front of the Iggy cluster, this one included (`IGGY_KAFKA_BROKERS`).
+    /// Empty for a gateway alone.
+    pub brokers: Vec<BrokerEntry>,
+    /// Whether the gateways share the consumer groups through the coordinator log in Iggy
+    /// (`IGGY_KAFKA_COORDINATOR_LOG`). Off here by default. `load_config` in `main.rs` makes it
+    /// [`CoordinatorLog::Preferred`] when the bridge is on, `IGGY_KAFKA_BROKERS` lists the
+    /// gateways and the variable is unset.
+    pub coordinator_log: CoordinatorLog,
+    /// How the coordinator log behaves. No environment variable maps onto it yet.
+    pub coordination: CoordinationConfig,
 }
 
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
-            bind_addr: format!("127.0.0.1:{DEFAULT_KAFKA_PORT}"),
-            advertised_host: None,
-            advertised_port: None,
+            listeners: vec![ListenerConfig::new(
+                SecurityProtocol::Plaintext,
+                format!("127.0.0.1:{DEFAULT_KAFKA_PORT}"),
+            )],
+            tls: None,
             max_frame_size: 8 * 1024 * 1024,
             max_connections: 1024,
             idle_timeout: Duration::from_mins(10),
@@ -177,53 +204,67 @@ impl Default for GatewayConfig {
             shutdown_drain_timeout: Duration::from_secs(25),
             group: GroupCoordinatorConfig::default(),
             instance_id: 0,
-            sasl_enabled: false,
             pre_auth_timeout: Duration::from_secs(15),
             max_concurrent_authentications: 4,
+            auto_topic_creation: AutoTopicCreationConfig::default(),
+            node_id: DEFAULT_NODE_ID,
+            brokers: Vec::new(),
+            coordinator_log: CoordinatorLog::Off,
+            coordination: CoordinationConfig::default(),
         }
     }
 }
 
-impl BrokerAdvertise {
-    /// Resolve the broker endpoint advertised in Metadata.
-    ///
-    /// `local_addr` is the address the listener is actually bound to (from `listener.local_addr()`).
-    ///
-    /// # Errors
-    ///
-    /// Returns `InvalidConfig` when `advertised_host` is empty or the listener binds to a wildcard
-    /// without an explicit advertised host.
-    pub fn from_server_config(config: &GatewayConfig, local_addr: SocketAddr) -> Result<Self> {
-        let port = config
-            .advertised_port
-            .map_or_else(|| i32::from(local_addr.port()), i32::from);
+/// Whether the gateways share the consumer groups through the coordinator log. The log needs the
+/// bridge, and a bridge user that may read Iggy's metadata change log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinatorLog {
+    /// This gateway keeps its groups in memory alone.
+    Off,
+    /// On while the bridge can read the change log. Without it, the gateway runs as with
+    /// [`Self::Off`] and warns, so a bridge user that lacks `manage_servers` keeps working.
+    Preferred,
+    /// On. The gateway does not start when the bridge cannot read the change log.
+    Required,
+}
 
-        let host = if let Some(ref advertised) = config.advertised_host {
-            let trimmed = advertised.trim();
-            if trimmed.is_empty() {
-                return Err(KafkaProtocolError::InvalidConfig(
-                    "IGGY_KAFKA_ADVERTISED_HOST must not be empty".into(),
-                ));
-            }
-            if trimmed.len() > i16::MAX as usize {
-                return Err(KafkaProtocolError::InvalidConfig(
-                    "IGGY_KAFKA_ADVERTISED_HOST exceeds Kafka nullable string limit (32767 bytes)"
-                        .into(),
-                ));
-            }
-            trimmed.to_string()
-        } else if local_addr.ip().is_unspecified() {
-            return Err(KafkaProtocolError::InvalidConfig(
-                "binding to a wildcard address (0.0.0.0 or ::) requires \
-                 IGGY_KAFKA_ADVERTISED_HOST to be set to a reachable hostname or IP for \
-                 Metadata broker advertisement"
-                    .into(),
-            ));
-        } else {
-            local_addr.ip().to_string()
-        };
+impl GatewayConfig {
+    /// Whether any listener runs the SASL exchange.
+    ///
+    /// Switching a listener to SASL is a breaking change for every client already talking to it:
+    /// the two SASL keys only appear in that listener's `ApiVersions` advertisement while it is
+    /// on, and unauthenticated clients stop being served there.
+    ///
+    /// On a listener without SASL the keys are still answered, with `ILLEGAL_SASL_STATE` and an
+    /// empty mechanism list, because a well-formed response exists for them unlike a genuinely
+    /// unknown key. They are kept out of the advertisement so nothing is invited into an exchange
+    /// that cannot finish.
+    #[must_use]
+    pub fn sasl_enabled(&self) -> bool {
+        self.listeners
+            .iter()
+            .any(|listener| listener.protocol.uses_sasl())
+    }
 
-        Ok(Self { host, port })
+    /// Whether any listener speaks TLS.
+    #[must_use]
+    pub fn tls_enabled(&self) -> bool {
+        self.listeners
+            .iter()
+            .any(|listener| listener.protocol.uses_tls())
+    }
+
+    /// Whether some listener turns client certificates into Iggy identities: an `SSL` listener
+    /// with client authentication on.
+    #[must_use]
+    pub fn maps_certificate_identities(&self) -> bool {
+        self.tls
+            .as_ref()
+            .is_some_and(|tls| tls.client_auth.is_enabled())
+            && self
+                .listeners
+                .iter()
+                .any(|listener| listener.protocol.authenticates_by_certificate())
     }
 }
 
@@ -264,25 +305,114 @@ pub fn bind_listener(addr: &str) -> Result<TcpListener> {
     Ok(TcpListener::from_std(std_listener)?)
 }
 
+/// A listener bound by the caller, paired with the configuration it was bound from.
+pub struct BoundListener {
+    pub config: ListenerConfig,
+    pub socket: TcpListener,
+}
+
+impl BoundListener {
+    #[must_use]
+    pub const fn new(config: ListenerConfig, socket: TcpListener) -> Self {
+        Self { config, socket }
+    }
+
+    /// The address the socket is actually bound to.
+    ///
+    /// # Errors
+    ///
+    /// Returns the socket's error when the address cannot be read.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+}
+
+/// Binds every listener in `config`, through [`bind_listener`].
+///
+/// # Errors
+///
+/// Returns the first bind failure, naming the listener's protocol and address.
+pub fn bind_listeners(config: &GatewayConfig) -> Result<Vec<BoundListener>> {
+    config
+        .listeners
+        .iter()
+        .map(|listener| {
+            let socket = bind_listener(&listener.bind_addr).map_err(|error| {
+                KafkaProtocolError::InvalidConfig(format!(
+                    "failed to bind the {} listener on {}: {error}",
+                    listener.protocol, listener.bind_addr
+                ))
+            })?;
+            Ok(BoundListener::new(listener.clone(), socket))
+        })
+        .collect()
+}
+
 pub struct KafkaGateway {
     config: Arc<GatewayConfig>,
     authenticator: Option<Arc<dyn SaslAuthenticator>>,
     bridge: Option<Arc<IggyBridge>>,
+    principal_resolver: Option<Arc<dyn PrincipalResolver>>,
+    cluster_id: Option<ClusterId>,
 }
 
 /// Owned by [`KafkaGateway::run`] and shared by every connection it serves.
 struct SharedAuth {
     authenticator: Option<Arc<dyn SaslAuthenticator>>,
+    /// Looks up the Iggy user a client certificate names. The bridge, unless a test swaps one in.
+    resolver: Option<Arc<dyn PrincipalResolver>>,
     slots: Semaphore,
+    /// Certificate user lookups, kept apart from `slots` so a burst of either kind cannot starve
+    /// the other of its budget.
+    lookup_slots: Semaphore,
     failed_logins: FailedLoginThrottle,
 }
 
 impl SharedAuth {
-    fn new(authenticator: Option<Arc<dyn SaslAuthenticator>>, max_concurrent: usize) -> Self {
+    fn new(
+        authenticator: Option<Arc<dyn SaslAuthenticator>>,
+        resolver: Option<Arc<dyn PrincipalResolver>>,
+        max_concurrent: usize,
+    ) -> Self {
         Self {
             authenticator,
+            resolver,
             slots: Semaphore::new(max_concurrent),
+            lookup_slots: Semaphore::new(max_concurrent),
             failed_logins: FailedLoginThrottle::default(),
+        }
+    }
+}
+
+/// One listener as its accept loop and its connections see it.
+struct Listener {
+    protocol: SecurityProtocol,
+    broker: BrokerAdvertise,
+    /// The gateways this listener lists in Metadata.
+    brokers: Arc<Brokers>,
+    /// Whether this listener names a principal, by SASL or by a verified client certificate.
+    /// Decides whether `DescribeAcls` is advertised and answered.
+    acls_enabled: bool,
+    /// Whether a connection here that names no principal is served as
+    /// [`AuthenticatedPrincipal::anonymous`]. True on every listener without SASL once any
+    /// listener of the gateway names principals, so the permission gates hold there too.
+    anonymous_without_principal: bool,
+}
+
+impl Listener {
+    fn connection_state(&self) -> ConnectionState {
+        ConnectionState::for_listener(
+            self.broker.clone(),
+            self.protocol.uses_sasl(),
+            self.acls_enabled,
+        )
+        .with_brokers(Arc::clone(&self.brokers))
+    }
+
+    const fn advertisement(&self) -> Advertisement {
+        Advertisement {
+            sasl: self.protocol.uses_sasl(),
+            acls: self.acls_enabled,
         }
     }
 }
@@ -294,21 +424,36 @@ impl KafkaGateway {
             config: Arc::new(config),
             authenticator: None,
             bridge: None,
+            principal_resolver: None,
+            cluster_id: None,
         }
     }
 
     /// Serve requests against `bridge` instead of the stub answers.
     ///
-    /// `None` is the default and keeps every handler on its stub.
+    /// `None` is the default and keeps every handler on its stub. The bridge also resolves the
+    /// Iggy user a client certificate names, unless [`Self::with_principal_resolver`] supplies
+    /// something else.
     #[must_use]
     pub fn with_bridge(mut self, bridge: Option<Arc<IggyBridge>>) -> Self {
         self.bridge = bridge;
         self
     }
 
+    /// Reports `cluster_id`, already loaded from Iggy, instead of loading it in [`Self::run`].
+    ///
+    /// `main` loads it before it binds the listeners, so a client is never queued behind the
+    /// calls to Iggy. Without a bridge or this, the id is random and lasts as long as the
+    /// process.
+    #[must_use]
+    pub fn with_cluster_id(mut self, cluster_id: ClusterId) -> Self {
+        self.cluster_id = Some(cluster_id);
+        self
+    }
+
     /// Supplies the verifier that SASL credentials are checked against.
     ///
-    /// Required when `sasl_enabled` is set: a gateway that demands authentication with nothing to
+    /// Required when a listener runs SASL: a gateway that demands authentication with nothing to
     /// authenticate against would refuse every client, so [`Self::run`] rejects that combination
     /// at startup rather than at the first login attempt.
     #[must_use]
@@ -317,173 +462,596 @@ impl KafkaGateway {
         self
     }
 
-    /// Accept Kafka wire connections until `shutdown` fires, then drain in-flight tasks.
+    /// Supplies the lookup that turns a client certificate's mapped name into an Iggy user.
     ///
-    /// `listener` must already be bound by the caller. This lets tests and `main` bind
-    /// the port before spawning the task, eliminating the TOCTOU race of bind-drop-rebind.
+    /// The bridge does this by default. A test drives the certificate path without an Iggy
+    /// server by supplying its own.
+    #[must_use]
+    pub fn with_principal_resolver(mut self, resolver: Arc<dyn PrincipalResolver>) -> Self {
+        self.principal_resolver = Some(resolver);
+        self
+    }
+
+    /// Accept Kafka wire connections on every listener until `shutdown` fires, then drain
+    /// in-flight tasks.
+    ///
+    /// The listeners must already be bound by the caller. This lets tests and `main` bind the
+    /// ports before spawning the task, eliminating the TOCTOU race of bind-drop-rebind.
     ///
     /// # Errors
     ///
-    /// Returns an error on invalid config or a non-transient `accept()` error.
+    /// Returns an error on invalid config, unusable TLS material, or a panic in the accept loop of
+    /// a listener. An `accept()` error ends nothing: the loop retries it. With a bridge and no
+    /// [`Self::with_cluster_id`], also returns the bridge's error when it cannot load the cluster
+    /// id from Iggy.
     pub async fn run(
         self,
-        listener: TcpListener,
+        listeners: Vec<BoundListener>,
         mut shutdown: broadcast::Receiver<()>,
     ) -> Result<()> {
-        self.check_sasl_wiring()?;
-        let local_addr = listener.local_addr()?;
-        let broker = BrokerAdvertise::from_server_config(&self.config, local_addr)?;
-        // instance_id is logged because it is the only way to tell from a running process which
-        // half of the producer-id space this gateway owns. Two gateways left on the default
-        // collide silently, and a config file cannot be diffed against a live deployment.
-        info!(
-            "kafka listener bound on {} (advertised as {}:{}, instance id {})",
-            local_addr, broker.host, broker.port, self.config.instance_id
-        );
+        self.check_sasl_wiring(&listeners)?;
+        let tls = self.check_tls_wiring(&listeners)?;
+        if listeners.is_empty() {
+            return Err(KafkaProtocolError::InvalidConfig(
+                "no listener is configured".into(),
+            ));
+        }
+        let resolver = self.principal_resolver.clone().or_else(|| {
+            self.bridge
+                .clone()
+                .map(|bridge| bridge as Arc<dyn PrincipalResolver>)
+        });
+        let acls_by_certificate = tls
+            .as_ref()
+            .is_some_and(|tls| tls.config().client_auth.is_enabled());
+        let names_principals = |protocol: SecurityProtocol| {
+            protocol.uses_sasl() || (protocol.authenticates_by_certificate() && acls_by_certificate)
+        };
+        let any_names_principals = listeners
+            .iter()
+            .any(|listener| names_principals(listener.config.protocol));
+        self.check_broker_list(&listeners)?;
+
+        let mut bound = Vec::with_capacity(listeners.len());
+        for BoundListener { config, socket } in listeners {
+            let local_addr = socket.local_addr()?;
+            let broker = BrokerAdvertise::for_listener(&config, local_addr)?;
+            // instance_id is logged because it is the only way to tell from a running process
+            // which half of the producer-id space this gateway owns. Two gateways left on the
+            // default collide silently, and a config file cannot be diffed against a live
+            // deployment.
+            info!(
+                "kafka {} listener bound on {} (advertised as {}:{}, node id {}, instance id {})",
+                config.protocol,
+                local_addr,
+                broker.host,
+                broker.port,
+                self.config.node_id,
+                self.config.instance_id
+            );
+            let protocol = config.protocol;
+            let brokers = self.brokers_of(protocol, &broker);
+            bound.push((
+                Arc::new(Listener {
+                    protocol,
+                    broker,
+                    brokers,
+                    acls_enabled: names_principals(protocol),
+                    anonymous_without_principal: any_names_principals && !protocol.uses_sasl(),
+                }),
+                socket,
+            ));
+        }
+
         // Cancelled on shutdown so connection tasks exit instead of sitting in idle waits until
         // `idle_timeout` (or forever if that is raised). Created before the state so the group
         // coordinator can take a child token: a parked JoinGroup or SyncGroup waiter would
         // otherwise hold the drain open for a full rebalance timeout.
         let cancel = CancellationToken::new();
-        let state = Arc::new(GatewayState::new(
-            broker,
-            self.bridge.clone(),
-            self.config.max_frame_size,
-            self.config.sasl_enabled,
-            self.config.instance_id,
-            GroupCoordinator::new(self.config.group.clone(), cancel.child_token()),
-        ));
-
+        let cluster_id = self.cluster_id().await?;
+        let state = Arc::new(self.shared_state(cluster_id, &cancel).await?);
         let shared_auth = Arc::new(SharedAuth::new(
             self.authenticator.clone(),
+            resolver,
             self.config.max_concurrent_authentications,
         ));
         let tracker = TaskTracker::new();
-        let conn_limiter = Arc::new(Semaphore::new(self.config.max_connections));
-
         let drain_timeout = self.config.shutdown_drain_timeout;
 
-        loop {
-            tokio::select! {
-                result = shutdown.recv() => {
-                    match result {
-                        Ok(()) => {
-                            info!("kafka listener shutdown requested");
-                            drain(&tracker, &cancel, drain_timeout).await;
-                            break;
-                        }
-                        // Capacity-1 channel: lagged means a signal was sent before we polled - treat as shutdown.
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            info!("kafka listener shutdown requested (lagged)");
-                            drain(&tracker, &cancel, drain_timeout).await;
-                            break;
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            drain(&tracker, &cancel, drain_timeout).await;
-                            break;
-                        }
-                    }
-                }
-                accept_result = listener.accept() => {
-                    match accept_result {
-                        Ok((stream, peer)) => {
-                            let Ok(permit) = Arc::clone(&conn_limiter).try_acquire_owned() else {
-                                warn!(%peer, max_connections = self.config.max_connections, "connection limit reached, rejecting");
-                                continue;
-                            };
-                            if let Err(e) = stream.set_nodelay(true) {
-                                warn!(%peer, "TCP_NODELAY failed: {e}");
-                            }
-                            if let Err(e) = enable_tcp_keepalive(&stream) {
-                                warn!(%peer, "TCP_KEEPALIVE failed: {e}");
-                            }
-                            let cfg = Arc::clone(&self.config);
-                            let state = Arc::clone(&state);
-                            let auth = Arc::clone(&shared_auth);
-                            let conn_cancel = cancel.child_token();
-                            tracker.spawn(async move {
-                                let _permit = permit;
-                                if let Err(err) =
-                                    handle_connection(stream, cfg, peer, state, auth, conn_cancel)
-                                        .await
-                                {
-                                    // debug!, not warn!: every `KafkaProtocolError` that can
-                                    // reach here is either a malformed/oversized frame from the
-                                    // client (attacker-controlled, not operator-actionable) or a
-                                    // plain TCP reset/EOF - never an internal gateway fault. A
-                                    // flood of either at warn! would drown real signal in logs
-                                    // under adversarial load (same reasoning as the decode-
-                                    // failure downgrades in `protocol/api.rs`).
-                                    debug!(%peer, "connection closed with error: {err}");
-                                }
-                            });
-                        }
-                        Err(e) if is_transient_accept_error(&e) => {
-                            // Brief backoff on fd exhaustion to avoid busy-spinning.
-                            if matches!(e.raw_os_error(), Some(23 | 24)) {
-                                tokio::time::sleep(Duration::from_millis(10)).await;
-                            }
-                            warn!(%e, "transient accept error, continuing");
-                        }
-                        Err(e) => {
-                            drain(&tracker, &cancel, drain_timeout).await;
-                            return Err(e.into());
-                        }
-                    }
-                }
+        if let Some(tls) = &tls {
+            // Not tracked: it ends on the cancel token, which the drain fires first.
+            tokio::spawn(Arc::clone(tls).reload_until_cancelled(cancel.child_token()));
+        }
 
+        let mut accept_loops = JoinSet::new();
+        for (listener, socket) in bound {
+            accept_loops.spawn(accept_loop(AcceptLoop {
+                socket,
+                listener,
+                config: Arc::clone(&self.config),
+                state: Arc::clone(&state),
+                auth: Arc::clone(&shared_auth),
+                tracker: tracker.clone(),
+                conn_limiter: Arc::new(Semaphore::new(self.config.max_connections)),
+                cancel: cancel.clone(),
+                tls: tls.clone(),
+            }));
+        }
+
+        let outcome = tokio::select! {
+            result = shutdown.recv() => {
+                match result {
+                    Ok(()) => info!("kafka listener shutdown requested"),
+                    // Capacity-1 channel: lagged means a signal was sent before we polled -
+                    // treat as shutdown.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        info!("kafka listener shutdown requested (lagged)");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {}
+                }
+                Ok(())
             }
+            // An accept loop ends early only by a panic, since shutdown is what the other branch
+            // is for.
+            Some(finished) = accept_loops.join_next() => match finished {
+                Ok(()) => Ok(()),
+                Err(join_error) => Err(io::Error::other(join_error).into()),
+            },
+        };
+        // The accept loops stop first, so no connection is spawned after the drain starts waiting.
+        // Aborted, not cancelled: the connections still answer while the drain hands groups over.
+        accept_loops.shutdown().await;
+        drain(&state, &tracker, &cancel, drain_timeout).await;
+        // After the drain, so no connection starts one after it, and before `run` returns, so
+        // none still runs when the bridge signs out.
+        state
+            .shutdown_auto_topic_creation(auto_topic_creation::SHUTDOWN_WAIT)
+            .await;
+        outcome
+    }
+
+    /// The state every connection of [`Self::run`] shares. The group coordinator stops with
+    /// `cancel`. With the coordinator log, the groups are shared with the other gateways.
+    async fn shared_state(
+        &self,
+        cluster_id: ClusterId,
+        cancel: &CancellationToken,
+    ) -> Result<GatewayState> {
+        let mut state = GatewayState::new(
+            self.bridge.clone(),
+            self.config.max_frame_size,
+            self.config.instance_id,
+            GroupCoordinator::new(self.config.group.clone(), cancel.child_token()),
+        )
+        .with_cluster_id(cluster_id)
+        .with_node_id(self.config.node_id)
+        .with_auto_topic_creation(self.config.auto_topic_creation)?;
+        if let Some(coordination) = self.start_coordination(&state.groups).await? {
+            state = state.with_coordination(coordination);
+        }
+        Ok(state)
+    }
+
+    /// Starts coordinating `groups` with the other gateways, when the coordinator log is on. A
+    /// failure that a retry can fix is retried for up to [`COORDINATION_STARTUP_LIMIT`], as
+    /// `main.rs` retries the bridge's connect.
+    async fn start_coordination(
+        &self,
+        groups: &GroupCoordinator,
+    ) -> Result<Option<Arc<Coordination>>> {
+        if self.config.coordinator_log == CoordinatorLog::Off {
+            return Ok(None);
+        }
+        let Some(bridge) = &self.bridge else {
+            return Err(KafkaProtocolError::InvalidConfig(
+                "the coordinator log needs the bridge; set IGGY_KAFKA_BRIDGE_ENABLED=true, or \
+                 set IGGY_KAFKA_COORDINATOR_LOG=false"
+                    .into(),
+            ));
+        };
+        let give_up = Instant::now() + COORDINATION_STARTUP_LIMIT;
+        if self.config.coordinator_log == CoordinatorLog::Preferred
+            && bridge.follows_change_log(give_up).await == Some(false)
+        {
+            warn!(
+                "the bridge's Iggy user cannot read Iggy's metadata change log, so this gateway \
+                 runs without the coordinator log, as with IGGY_KAFKA_COORDINATOR_LOG=false: \
+                 the gateway with the lowest node id coordinates every group. To share the \
+                 groups, grant the bridge's Iggy user (IGGY_KAFKA_IGGY_USERNAME) the \
+                 manage_servers permission and restart every gateway"
+            );
+            return Ok(None);
+        }
+        loop {
+            // Its own token, not the drain's: the shutdown hands the groups over before the drain.
+            let started = Coordination::start(
+                bridge,
+                groups.clone(),
+                self.config.node_id,
+                self.config.coordination,
+                CancellationToken::new(),
+            )
+            .await;
+            match started {
+                Ok(coordination) => return Ok(Some(coordination)),
+                Err(error)
+                    if error.is_retriable()
+                        && Instant::now() + COORDINATION_STARTUP_RETRY < give_up =>
+                {
+                    warn!(
+                        "cannot set up the coordinator log yet, retrying in \
+                         {COORDINATION_STARTUP_RETRY:?}: {error}"
+                    );
+                    tokio::time::sleep(COORDINATION_STARTUP_RETRY).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    /// The id set by [`Self::with_cluster_id`], else the one stored in Iggy, else a random one.
+    async fn cluster_id(&self) -> Result<ClusterId> {
+        if let Some(cluster_id) = &self.cluster_id {
+            return Ok(cluster_id.clone());
+        }
+        let Some(bridge) = &self.bridge else {
+            let cluster_id = ClusterId::random();
+            info!("no Iggy bridge, so cluster id {cluster_id} lasts only as long as this process");
+            return Ok(cluster_id);
+        };
+        Ok(bridge.load_cluster_id().await?)
+    }
+
+    /// Refuses to start when the SASL listeners and the configured authenticator disagree.
+    fn check_sasl_wiring(&self, listeners: &[BoundListener]) -> Result<()> {
+        let sasl_enabled = listeners
+            .iter()
+            .any(|listener| listener.config.protocol.uses_sasl());
+        if !sasl_enabled && self.authenticator.is_some() {
+            // The mirror of the guard below, and the quieter mistake: a verifier attached while no
+            // listener runs SASL means every connection is served unauthenticated, with nothing
+            // in the log to say so. Refusing to start is the only way that failure is visible.
+            return Err(KafkaProtocolError::InvalidConfig(
+                "an authenticator is configured but no listener runs SASL; every connection \
+                 would be served unauthenticated. Add a SASL_PLAINTEXT or SASL_SSL listener (or \
+                 set IGGY_KAFKA_SASL_ENABLED=true), or remove the authenticator"
+                    .into(),
+            ));
+        }
+        if sasl_enabled && self.authenticator.is_none() {
+            return Err(KafkaProtocolError::InvalidConfig(
+                "a listener runs SASL but no authenticator is configured; every client on it \
+                 would be rejected. Set IGGY_KAFKA_IGGY_ADDR to the Iggy server that credentials \
+                 are verified against, or drop the SASL listener"
+                    .into(),
+            ));
         }
         Ok(())
     }
 
-    /// Refuses to start when the SASL flag and the configured authenticator disagree.
-    fn check_sasl_wiring(&self) -> Result<()> {
-        if !self.config.sasl_enabled && self.authenticator.is_some() {
-            // The mirror of the guard below, and the quieter mistake: a verifier attached while the
-            // flag is off means every connection is served unauthenticated, with nothing in the log
-            // to say so. Refusing to start is the only way that failure is visible.
+    /// Loads the TLS material when a listener needs it, and refuses the combinations in which
+    /// something configured would silently go unused.
+    fn check_tls_wiring(&self, listeners: &[BoundListener]) -> Result<Option<Arc<TlsState>>> {
+        let tls_listener = listeners
+            .iter()
+            .find(|listener| listener.config.protocol.uses_tls());
+        let Some(tls_config) = self.config.tls.clone() else {
+            if let Some(listener) = tls_listener {
+                return Err(KafkaProtocolError::InvalidConfig(format!(
+                    "the {} listener needs a certificate; set IGGY_KAFKA_TLS_CERT_FILE and \
+                     IGGY_KAFKA_TLS_KEY_FILE",
+                    listener.config.protocol
+                )));
+            }
+            return Ok(None);
+        };
+        if tls_listener.is_none() {
+            // The same mistake the SASL guard catches: material configured and nothing serving
+            // it reads as an encrypted listener to whoever set it.
             return Err(KafkaProtocolError::InvalidConfig(
-                "an authenticator is configured but SASL is disabled; every connection would be \
-                 served unauthenticated. Set IGGY_KAFKA_SASL_ENABLED=true, or remove the \
-                 authenticator"
+                "TLS is configured but no listener uses it; add an SSL or SASL_SSL listener to \
+                 IGGY_KAFKA_LISTENERS, or remove the IGGY_KAFKA_TLS_* settings"
                     .into(),
             ));
         }
-        if self.config.sasl_enabled && self.authenticator.is_none() {
+        let has_ssl_listener = listeners
+            .iter()
+            .any(|listener| listener.config.protocol.authenticates_by_certificate());
+        if tls_config.client_auth.is_enabled() && !has_ssl_listener {
+            return Err(KafkaProtocolError::InvalidConfig(format!(
+                "client authentication is '{}' but no SSL listener is configured; it applies to \
+                 SSL listeners only, and a SASL_SSL listener asks for no client certificate",
+                tls_config.client_auth
+            )));
+        }
+        if tls_config.client_auth.is_enabled()
+            && self.principal_resolver.is_none()
+            && self.bridge.is_none()
+        {
+            // A certificate names an Iggy user, and only an Iggy session can say whether that
+            // user exists. Admitting the name unchecked would let any certificate from the CA
+            // claim any account.
             return Err(KafkaProtocolError::InvalidConfig(
-                "SASL is enabled but no authenticator is configured; every client would be \
-                 rejected. Set IGGY_KAFKA_IGGY_ADDR to the Iggy server that credentials are \
-                 verified against, or unset IGGY_KAFKA_SASL_ENABLED"
+                "the SSL listener maps client certificates to Iggy users, which needs the bridge \
+                 to look them up; set IGGY_KAFKA_BRIDGE_ENABLED=true, or set \
+                 IGGY_KAFKA_TLS_CLIENT_AUTH=none"
                     .into(),
             ));
         }
-        Ok(())
+        TlsState::load(tls_config).map(|state| Some(Arc::new(state)))
+    }
+
+    /// Checks `IGGY_KAFKA_BROKERS` against the listeners, when it lists any gateway.
+    fn check_broker_list(&self, listeners: &[BoundListener]) -> Result<()> {
+        if self.config.brokers.is_empty() {
+            return Ok(());
+        }
+        let configs: Vec<ListenerConfig> = listeners
+            .iter()
+            .map(|listener| listener.config.clone())
+            .collect();
+        check_brokers(&self.config.brokers, &configs, self.config.node_id)
+    }
+
+    /// The gateways that the `protocol` listener lists in Metadata, this one at `advertised`.
+    fn brokers_of(&self, protocol: SecurityProtocol, advertised: &BrokerAdvertise) -> Arc<Brokers> {
+        let node_id = self.config.node_id;
+        warn_on_own_entry(&self.config.brokers, protocol, node_id, advertised);
+        Arc::new(Brokers {
+            node_id: i32::from(node_id),
+            peers: peers_of(&self.config.brokers, protocol, node_id),
+        })
     }
 }
 
-/// Cancel in-flight connections, close the tracker to new spawns, and wait for tasks to finish
-/// (bounded by `deadline`). Cancellation is what actually drops idle sockets; `tracker.wait`
-/// alone would leave tasks parked in `read_frame` until `idle_timeout`.
-async fn drain(tracker: &TaskTracker, cancel: &CancellationToken, deadline: Duration) {
+/// Warns when the entry of `brokers` for this gateway's `protocol` listener names another
+/// address than the one the listener advertises. Each gateway lists itself at the address it
+/// advertises, so its clients and the clients of the other gateways would see two addresses.
+fn warn_on_own_entry(
+    brokers: &[BrokerEntry],
+    protocol: SecurityProtocol,
+    node_id: u16,
+    advertised: &BrokerAdvertise,
+) {
+    let Some(entry) = brokers
+        .iter()
+        .find(|entry| entry.node_id == node_id && entry.serves(protocol))
+    else {
+        return;
+    };
+    if entry.host != advertised.host || i32::from(entry.port) != advertised.port {
+        warn!(
+            "IGGY_KAFKA_BROKERS lists this gateway's {protocol} listener as {}:{}, but it \
+             advertises {}:{}",
+            entry.host, entry.port, advertised.host, advertised.port
+        );
+    }
+}
+
+/// Everything one listener's accept loop needs, bundled so the loop is one spawnable future.
+struct AcceptLoop {
+    socket: TcpListener,
+    listener: Arc<Listener>,
+    config: Arc<GatewayConfig>,
+    state: Arc<GatewayState>,
+    auth: Arc<SharedAuth>,
+    tracker: TaskTracker,
+    conn_limiter: Arc<Semaphore>,
+    cancel: CancellationToken,
+    tls: Option<Arc<TlsState>>,
+}
+
+/// Accepts on one listener until the cancel token fires. No `accept()` error ends it, because the
+/// listener cannot come back without a restart of the gateway, which ends every connection and
+/// all group state.
+async fn accept_loop(this: AcceptLoop) {
+    let mut backoff = AcceptBackoff::default();
+    loop {
+        let accepted = tokio::select! {
+            () = this.cancel.cancelled() => return,
+            accepted = this.socket.accept() => accepted,
+        };
+        if this.cancel.is_cancelled() {
+            return;
+        }
+        match accepted {
+            Ok((stream, peer)) => {
+                backoff.reset();
+                let Ok(permit) = Arc::clone(&this.conn_limiter).try_acquire_owned() else {
+                    warn!(%peer, protocol = %this.listener.protocol, max_connections = this.config.max_connections, "listener connection limit reached, rejecting");
+                    continue;
+                };
+                if let Err(e) = stream.set_nodelay(true) {
+                    warn!(%peer, "TCP_NODELAY failed: {e}");
+                }
+                if let Err(e) = enable_tcp_keepalive(&stream) {
+                    warn!(%peer, "TCP_KEEPALIVE failed: {e}");
+                }
+                let connection = Connection {
+                    peer,
+                    listener: Arc::clone(&this.listener),
+                    config: Arc::clone(&this.config),
+                    state: Arc::clone(&this.state),
+                    auth: Arc::clone(&this.auth),
+                    cancel: this.cancel.child_token(),
+                    tls: this.tls.clone(),
+                };
+                this.tracker.spawn(async move {
+                    let _permit = permit;
+                    serve_connection(stream, connection).await;
+                });
+            }
+            Err(e) => {
+                let Some(delay) = backoff.after(&e) else {
+                    debug!(%e, protocol = %this.listener.protocol, "accept failed for one connection, continuing");
+                    continue;
+                };
+                warn!(%e, protocol = %this.listener.protocol, ?delay, "accept failed, retrying");
+                tokio::select! {
+                    () = this.cancel.cancelled() => return,
+                    () = tokio::time::sleep(delay) => {}
+                }
+            }
+        }
+    }
+}
+
+/// The first wait of [`AcceptBackoff`].
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
+/// The longest wait of [`AcceptBackoff`], so the listener takes connections again soon after the
+/// error ends.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// The wait before the next `accept()` after an error.
+///
+/// An error of one pending connection retries at once. Any other error, such as no free file
+/// descriptor, waits, and the wait doubles while the errors continue. So an error that lasts
+/// neither spins a core nor floods the log.
+#[derive(Debug, Default)]
+struct AcceptBackoff {
+    /// `None` until an error waits, and again after an accept succeeds.
+    next: Option<Duration>,
+}
+
+impl AcceptBackoff {
+    /// How long to wait after `error`. `None` to accept again at once.
+    fn after(&mut self, error: &io::Error) -> Option<Duration> {
+        if is_connection_accept_error(error) {
+            return None;
+        }
+        let delay = self.next.unwrap_or(ACCEPT_BACKOFF_MIN);
+        self.next = Some((delay * 2).min(ACCEPT_BACKOFF_MAX));
+        Some(delay)
+    }
+
+    const fn reset(&mut self) {
+        self.next = None;
+    }
+}
+
+/// What an accepted socket carries into its own task.
+struct Connection {
+    peer: SocketAddr,
+    listener: Arc<Listener>,
+    config: Arc<GatewayConfig>,
+    state: Arc<GatewayState>,
+    auth: Arc<SharedAuth>,
+    cancel: CancellationToken,
+    tls: Option<Arc<TlsState>>,
+}
+
+/// Runs the TLS handshake when the listener calls for one, then the frame loop.
+async fn serve_connection(stream: TcpStream, connection: Connection) {
+    let peer = connection.peer;
+    let result = if connection.listener.protocol.uses_tls() {
+        let Some(tls) = connection.tls.clone() else {
+            // `check_tls_wiring` refuses to start a TLS listener without material.
+            error!(%peer, "TLS listener accepted a connection with no TLS material loaded");
+            return;
+        };
+        // Bounded like everything else a connection does before proving who it is: an
+        // unfinished handshake holds a `max_connections` permit.
+        let handshake = timeout(
+            connection.config.pre_auth_timeout,
+            tls.acceptor(connection.listener.protocol).accept(stream),
+        );
+        let handshake = tokio::select! {
+            () = connection.cancel.cancelled() => {
+                debug!(%peer, "TLS handshake abandoned by shutdown");
+                return;
+            }
+            handshake = handshake => handshake,
+        };
+        let tls_stream = match handshake {
+            Ok(Ok(tls_stream)) => tls_stream,
+            Ok(Err(error)) => {
+                // debug!, not warn!: a plaintext client on the TLS port, an untrusted client
+                // certificate or a scanner all end here, none of them operator-actionable.
+                debug!(%peer, %error, "TLS handshake failed");
+                return;
+            }
+            Err(_elapsed) => {
+                debug!(%peer, "TLS handshake did not finish within the pre-authentication budget");
+                return;
+            }
+        };
+        let certificate_name = if connection.listener.protocol.authenticates_by_certificate() {
+            match tls.principal_name(tls_stream.get_ref().1) {
+                Ok(name) => name,
+                // warn!: the CA signed this certificate, so a subject no rule maps is a mapping
+                // rule the operator has to fix.
+                Err(IdentityError::NoMatchingRule { subject }) => {
+                    warn!(%peer, subject, "client certificate subject matches no principal mapping rule; closing");
+                    return;
+                }
+                Err(error) => {
+                    debug!(%peer, %error, "client certificate names no principal; closing");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        handle_connection(tls_stream, connection, certificate_name).await
+    } else {
+        handle_connection(stream, connection, None).await
+    };
+    if let Err(err) = result {
+        // debug!, not warn!: every `KafkaProtocolError` that can reach here is either a
+        // malformed/oversized frame from the client (attacker-controlled, not
+        // operator-actionable) or a plain TCP reset/EOF - never an internal gateway fault. A
+        // flood of either at warn! would drown real signal in logs under adversarial load (same
+        // reasoning as the decode-failure downgrades in `protocol/api.rs`).
+        debug!(%peer, "connection closed with error: {err}");
+    }
+}
+
+/// Hand the groups to the other gateways, cancel in-flight connections, close the tracker to new
+/// spawns, and wait for tasks to finish, all within `deadline`. The groups go first, so their
+/// requests in flight send their clients to the new coordinators. Cancellation is what actually
+/// drops idle sockets; `tracker.wait` alone would leave tasks parked in `read_frame` until
+/// `idle_timeout`.
+async fn drain(
+    state: &GatewayState,
+    tracker: &TaskTracker,
+    cancel: &CancellationToken,
+    deadline: Duration,
+) {
+    // One deadline for every step, so an Iggy node that does not answer the handover cannot keep
+    // the connections open past it.
+    let until = Instant::now() + deadline;
+    state.hand_over_groups(until).await;
     cancel.cancel();
     tracker.close();
-    if timeout(deadline, tracker.wait()).await.is_err() {
+    if timeout_at(until, tracker.wait()).await.is_err() {
         warn!(
             ?deadline,
             "shutdown drain deadline exceeded; remaining connection tasks will be dropped with the runtime"
         );
     }
+    // Last, since no connection uses the coordinator log any more.
+    if timeout_at(until, state.close_coordination()).await.is_err() {
+        debug!("the coordinator log clients did not sign out within the shutdown drain deadline");
+    }
 }
 
-fn is_transient_accept_error(err: &std::io::Error) -> bool {
+/// Whether an `accept()` error belongs to one pending connection, not to the listener. Linux
+/// `accept(2)` returns the network errors of a pending connection, and its manual says to retry
+/// them like `EAGAIN`.
+fn is_connection_accept_error(error: &io::Error) -> bool {
     matches!(
-        err.kind(),
-        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted | io::ErrorKind::WouldBlock
+        error.kind(),
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
     ) || matches!(
-        err.raw_os_error(),
-        // EMFILE / ENFILE are common across Unix platforms when fd limits are hit.
-        Some(23 | 24)
+        error.raw_os_error(),
+        Some(libc::EPROTO | libc::ENOPROTOOPT | libc::EHOSTDOWN | libc::EOPNOTSUPP)
     )
 }
 
@@ -500,10 +1068,13 @@ fn enable_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
 /// for no gain in clarity.
 struct ConnectionContext<'a> {
     config: &'a GatewayConfig,
+    listener: &'a Listener,
     state: &'a GatewayState,
     connection: &'a ConnectionState,
     authenticator: Option<&'a dyn SaslAuthenticator>,
+    resolver: Option<&'a dyn PrincipalResolver>,
     auth_slots: &'a Semaphore,
+    lookup_slots: &'a Semaphore,
     failed_logins: &'a FailedLoginThrottle,
     peer: &'a SocketAddr,
     cancel: &'a CancellationToken,
@@ -538,13 +1109,14 @@ async fn route_frame(
     );
     match action {
         // Answered here rather than in the stateless dispatch, because it describes the principal
-        // this connection authenticated as, which only the connection knows. Gated on the feature
-        // as well as the key: with SASL off there is no principal, and the key is not advertised,
-        // so it falls through to ordinary dispatch and is refused as the unlisted key it is.
+        // this connection authenticated as, which only the connection knows. Gated on the
+        // listener naming principals as well as on the key: elsewhere there is no principal, and
+        // the key is not advertised, so it falls through to ordinary dispatch and is refused as
+        // the unlisted key it is.
         SaslAction::Dispatch
-            if ctx.config.sasl_enabled && req.request_api_key == API_KEY_DESCRIBE_ACLS =>
+            if ctx.listener.acls_enabled && req.request_api_key == API_KEY_DESCRIBE_ACLS =>
         {
-            describe_acls(principal.as_ref(), req.request_api_version, body, peer)
+            describe_acls(ctx, principal.as_ref(), req.request_api_version, body)
         }
         SaslAction::Dispatch => {
             handle_connection_request(
@@ -623,40 +1195,91 @@ async fn route_frame(
                 req.request_api_key,
                 req.request_api_version,
                 matches!(action, SaslAction::IllegalStateKeepOpen),
-                ctx.config.sasl_enabled,
+                ctx.listener.advertisement(),
             )
         }
     }
 }
 
-async fn handle_connection(
-    mut stream: TcpStream,
-    config: Arc<GatewayConfig>,
-    peer: SocketAddr,
-    state: Arc<GatewayState>,
-    shared_auth: Arc<SharedAuth>,
-    cancel: CancellationToken,
-) -> Result<()> {
-    debug!(%peer, "connection accepted");
+/// Serves one accepted connection, plain or TLS, then ends its producer session.
+async fn handle_connection<S>(
+    stream: S,
+    connection: Connection,
+    certificate_name: Option<String>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let connection_state = connection
+        .listener
+        .connection_state()
+        .with_peer(connection.peer);
+    let bridge = connection.state.bridge.clone();
+    let served = serve_frames(stream, connection, certificate_name, &connection_state).await;
+    // A producer without a producer id has its Produce session by connection, so it ends here.
+    if let Some(bridge) = bridge {
+        bridge.end_connection(connection_state.id());
+    }
+    served
+}
 
-    // A gateway with SASL off starts every connection already authenticated, so the dispatch path
-    // below has one question to ask rather than two.
-    let mut sasl_state = if config.sasl_enabled {
+/// The frame loop of one accepted connection.
+///
+/// `certificate_name` is the Iggy username the client certificate mapped to, on an `SSL`
+/// listener that verifies certificates. It is resolved against Iggy before the first frame, and
+/// a name that resolves to no user closes the connection, so a certificate from the trusted CA
+/// never admits a client as an account that does not exist.
+async fn serve_frames<S>(
+    mut stream: S,
+    connection: Connection,
+    certificate_name: Option<String>,
+    connection_state: &ConnectionState,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let Connection {
+        peer,
+        listener,
+        config,
+        state,
+        auth: shared_auth,
+        cancel,
+        tls: _,
+    } = connection;
+    debug!(%peer, protocol = %listener.protocol, "connection accepted");
+
+    // A listener without SASL starts every connection already authenticated, so the dispatch
+    // path below has one question to ask rather than two.
+    let mut sasl_state = if listener.protocol.uses_sasl() {
         SaslState::new()
     } else {
         SaslState::Authenticated
     };
-    let mut principal: Option<AuthenticatedPrincipal> = None;
-    let connection = ConnectionState::default();
     let ctx = ConnectionContext {
         config: &config,
+        listener: &listener,
         state: &state,
-        connection: &connection,
+        connection: connection_state,
         authenticator: shared_auth.authenticator.as_deref(),
+        resolver: shared_auth.resolver.as_deref(),
         auth_slots: &shared_auth.slots,
+        lookup_slots: &shared_auth.lookup_slots,
         failed_logins: &shared_auth.failed_logins,
         peer: &peer,
         cancel: &cancel,
+    };
+    let mut permissions =
+        PermissionFollow::new(state.bridge.as_deref(), certificate_name.is_some());
+    let mut principal = if let Some(username) = certificate_name {
+        let Some(resolved) = resolve_certificate_principal(&ctx, &username).await else {
+            return Ok(());
+        };
+        Some(resolved)
+    } else if listener.anonymous_without_principal {
+        Some(AuthenticatedPrincipal::anonymous())
+    } else {
+        None
     };
 
     loop {
@@ -672,10 +1295,11 @@ async fn handle_connection(
         };
 
         if frame.len() < 8 {
-            return Err(KafkaProtocolError::BufferUnderflow {
+            return Err(KafkaWireError::BufferUnderflow {
                 needed: 8,
                 remaining: frame.len(),
-            });
+            }
+            .into());
         }
         let api_key = i16::from_be_bytes([frame[0], frame[1]]);
         let api_version = i16::from_be_bytes([frame[2], frame[3]]);
@@ -687,7 +1311,7 @@ async fn handle_connection(
         // malformed header and closes the connection.
         let mut body = frame;
         let mut req = RequestHeader::decode(&mut body, req_hdr_ver)
-            .map_err(|e| KafkaProtocolError::Malformed(e.to_string()))?;
+            .map_err(|e| KafkaWireError::Malformed(e.to_string()))?;
 
         debug!(
             %peer,
@@ -697,15 +1321,23 @@ async fn handle_connection(
             client_id = req.client_id.as_deref().unwrap_or(""),
             "received request"
         );
+        connection_state.note_client_id(req.client_id.as_deref());
         // A group request can park for a whole rebalance timeout. `client_id` and the tagged
         // fields are views into the frame, so keeping them would pin the frame for that long
         // after the handler has let go of its own copy.
         req.client_id = None;
         req.unknown_tagged_fields.clear();
 
+        let Some(revision) = permissions.apply(principal.as_mut(), &peer) else {
+            return Ok(());
+        };
+        let signed_in = principal.is_some();
         // `RequestHeader::decode` advances `body` past the header fields it consumed via
         // `Buf::advance`, so `body` is already exactly the request payload.
         let outcome = route_frame(&ctx, &mut sasl_state, &mut principal, &req, body).await;
+        if !signed_in && principal.is_some() {
+            permissions.signed_in(revision);
+        }
         if dispatch_outcome(
             &mut stream,
             &peer,
@@ -718,6 +1350,118 @@ async fn handle_connection(
         .await?
         {
             return Ok(());
+        }
+    }
+}
+
+/// One connection's place on the bridge's [`PermissionBoard`], which the change log keeps.
+struct PermissionFollow<'a> {
+    board: Option<&'a PermissionBoard>,
+    /// The board's revision that the principal's permissions are as new as.
+    seen: u64,
+    /// Whether the principal is an Iggy user. `ANONYMOUS` names none, so no change applies to it.
+    follows: bool,
+}
+
+impl<'a> PermissionFollow<'a> {
+    fn new(bridge: Option<&'a IggyBridge>, follows: bool) -> Self {
+        let board = bridge.map(IggyBridge::permission_board);
+        Self {
+            board,
+            seen: board.map_or(0, PermissionBoard::revision),
+            follows,
+        }
+    }
+
+    /// Applies to `principal` what the change log said of its Iggy user since the last call. The
+    /// board's revision from before that. `None` when the user was deleted or is no longer
+    /// active: the connection then closes, as Iggy ends the sessions of such a user.
+    fn apply(
+        &mut self,
+        principal: Option<&mut AuthenticatedPrincipal>,
+        peer: &SocketAddr,
+    ) -> Option<u64> {
+        let Some(board) = self.board else {
+            return Some(0);
+        };
+        let revision = board.revision();
+        let Some(principal) = principal.filter(|_| self.follows) else {
+            return Some(revision);
+        };
+        match board.changed_since(principal.user, &principal.username, &mut self.seen) {
+            Some(UserAccess::Active(permissions)) => {
+                principal.permissions = permissions;
+                principal.permissions_known = true;
+            }
+            Some(UserAccess::Revoked) => {
+                info!(
+                    %peer,
+                    username = principal.username,
+                    "the Iggy user was deleted, deactivated or renamed; closing its connection"
+                );
+                return None;
+            }
+            None => {}
+        }
+        Some(revision)
+    }
+
+    /// A login set the principal. Changes after `revision`, from before the login, apply to it,
+    /// so a change while the login ran does too.
+    const fn signed_in(&mut self, revision: u64) {
+        self.follows = true;
+        self.seen = revision;
+    }
+}
+
+/// Looks up the Iggy user a client certificate named, within the pre-authentication budget.
+///
+/// `None` closes the connection. Unlike a SASL refusal there is no response to shape: the client
+/// has sent nothing yet, and a certificate the CA signed for an account that does not exist is a
+/// provisioning mistake the gateway's log reports, not something the client can correct.
+async fn resolve_certificate_principal(
+    ctx: &ConnectionContext<'_>,
+    username: &str,
+) -> Option<AuthenticatedPrincipal> {
+    let peer = ctx.peer;
+    let Some(resolver) = ctx.resolver else {
+        // Unreachable: `check_tls_wiring` refuses to start in this combination. Fail closed
+        // anyway, since the alternative is admitting an unverified identity.
+        error!(%peer, "a client certificate named a principal but nothing can look it up");
+        return None;
+    };
+    // The lookup is an Iggy call per handshake, so it is bounded like a SASL login, but in slots
+    // of its own: it costs no password hash.
+    let lookup = within_auth_budget(
+        ctx,
+        ctx.lookup_slots,
+        "certificate identity lookup",
+        |slot| async move {
+            let _slot = slot;
+            resolver.resolve(username).await
+        },
+    );
+    let outcome = tokio::select! {
+        () = ctx.cancel.cancelled() => {
+            debug!(%peer, "certificate identity lookup abandoned by shutdown");
+            return None;
+        }
+        outcome = lookup => outcome?,
+    };
+    match outcome {
+        Ok(principal) => {
+            debug!(%peer, username, "client certificate authenticated");
+            Some(principal)
+        }
+        Err(AuthError::Rejected) => {
+            // warn!, not debug!: the certificate chained to the trusted CA, so this is an account
+            // the operator meant to exist, or a mapping rule that produced the wrong name.
+            warn!(%peer, username, "client certificate names no active Iggy user; closing");
+            None
+        }
+        Err(AuthError::Unavailable) => {
+            warn!(%peer, username, "could not look up the certificate's Iggy user; closing");
+            None
         }
     }
 }
@@ -770,7 +1514,9 @@ async fn authenticate_token(
             debug!(%peer, "SASL authentication abandoned by shutdown");
             return (HandleOutcome::Close, None);
         }
-        verified = verify_within_budget(ctx, authenticator, &credentials) => verified,
+        verified = within_auth_budget(ctx, ctx.auth_slots, "SASL authentication", |slot| {
+            authenticator.authenticate(&credentials, slot)
+        }) => verified,
     };
 
     let Some(result) = verified else {
@@ -809,19 +1555,22 @@ async fn authenticate_token(
 
 /// Answers `DescribeAcls` from the permissions captured when this connection authenticated.
 ///
-/// Only reachable on an authenticated connection: the SASL gate refuses every key but one before a
-/// principal exists, and the caller additionally gates this on the feature being on, so a gateway
-/// with SASL off never routes here. The `None` arm is a fail-closed guard, not a reachable path.
+/// Only reachable on a listener that names principals: elsewhere the key is not advertised and
+/// falls through to ordinary dispatch, which refuses it. On a SASL listener the SASL gate refuses
+/// every key but one before a principal exists, and every other such listener starts each
+/// connection with a principal, anonymous when no certificate named one. A missing principal
+/// is therefore a gateway fault.
 fn describe_acls(
+    ctx: &ConnectionContext<'_>,
     principal: Option<&AuthenticatedPrincipal>,
     api_version: i16,
     body: Bytes,
-    peer: &SocketAddr,
 ) -> HandleOutcome {
+    let peer = ctx.peer;
     let Some(principal) = principal else {
-        // `error!` rather than `debug!` on purpose, unlike every other refusal here: reaching this
-        // means the routing guards above disagree with each other, which is a gateway fault and not
-        // something a client can provoke.
+        // `error!` rather than `debug!` on purpose, unlike every other refusal here: reaching
+        // this means the routing guards above disagree with each other, which is a gateway
+        // fault and not something a client can provoke.
         error!(%peer, "DescribeAcls reached a connection with no authenticated principal");
         // Not `encode_error_for_key`: key 29 is absent from `SUPPORTED_RANGES`, so that helper
         // always returns `Close` here and the code would read as if it answers when it cannot.
@@ -857,32 +1606,38 @@ fn describe_acls(
     }
 }
 
-/// Waits for an authentication slot, then verifies, each within the pre-authentication budget.
+/// Waits for one of `slots`, then runs `work` holding it, each within the pre-authentication
+/// budget. `None` means a budget ran out.
 ///
 /// Two budgets rather than one shared deadline. The wait needs its own bound so a queued
 /// connection cannot hold a `max_connections` permit for as long as the backlog takes to drain,
-/// which is the invariant `pre_auth_timeout` is documented to enforce. The verification's budget
-/// starts once the slot is held, because cutting a verification short does not stop the login it
-/// started inside Iggy: a verification that inherited whatever the queue left of a shared deadline
-/// would be abandoned mid-hash and hand its slot to the next one while Iggy is still working.
-async fn verify_within_budget(
-    ctx: &ConnectionContext<'_>,
-    authenticator: &dyn SaslAuthenticator,
-    credentials: &PlainCredentials,
-) -> Option<std::result::Result<AuthenticatedPrincipal, AuthError>> {
+/// which is the invariant `pre_auth_timeout` is documented to enforce. The work's budget starts
+/// once the slot is held, because cutting it short does not stop the call it started inside Iggy:
+/// work that inherited whatever the queue left of a shared deadline would be abandoned mid-hash
+/// and hand its slot to the next one while Iggy is still working.
+async fn within_auth_budget<'a, T, Work, Fut>(
+    ctx: &ConnectionContext<'a>,
+    slots: &'a Semaphore,
+    operation: &'static str,
+    work: Work,
+) -> Option<T>
+where
+    Work: FnOnce(SemaphorePermit<'a>) -> Fut,
+    Fut: Future<Output = T>,
+{
     let peer = ctx.peer;
     let budget = ctx.config.pre_auth_timeout;
-    let Ok(acquired) = timeout(budget, ctx.auth_slots.acquire()).await else {
-        warn!(%peer, "no authentication slot came free within the pre-authentication budget");
+    let Ok(acquired) = timeout(budget, slots.acquire()).await else {
+        warn!(%peer, operation, "no authentication slot came free within the pre-authentication budget");
         return None;
     };
     // Acquire fails only once the semaphore is closed, which this gateway never does.
     let Ok(slot) = acquired else {
-        error!(%peer, "authentication slots unavailable");
+        error!(%peer, operation, "authentication slots unavailable");
         return None;
     };
-    let Ok(result) = timeout(budget, authenticator.authenticate(credentials, slot)).await else {
-        warn!(%peer, "authentication did not complete within the pre-authentication budget");
+    let Ok(result) = timeout(budget, work(slot)).await else {
+        warn!(%peer, operation, "did not complete within the pre-authentication budget");
         return None;
     };
     Some(result)
@@ -901,7 +1656,7 @@ fn illegal_state_outcome(
     api_key: i16,
     api_version: i16,
     keep_open: bool,
-    sasl_enabled: bool,
+    advertisement: Advertisement,
 ) -> HandleOutcome {
     match api_key {
         API_KEY_SASL_HANDSHAKE if (0..=SASL_HANDSHAKE_VERSION).contains(&api_version) => {
@@ -914,19 +1669,25 @@ fn illegal_state_outcome(
         // from it, so routing through there would answer an unauthenticated client with a bodyless
         // close while the unreachable guard above is the one that speaks. Answer it directly.
         API_KEY_DESCRIBE_ACLS
-            if sasl_enabled && SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS.contains(&api_version) =>
+            if advertisement.acls
+                && SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS.contains(&api_version) =>
         {
             respond_describe_acls_error(api_version, ERROR_ILLEGAL_SASL_STATE, !keep_open)
         }
         API_KEY_SASL_HANDSHAKE | API_KEY_SASL_AUTHENTICATE => HandleOutcome::Close,
-        API_KEY_DESCRIBE_ACLS if sasl_enabled => HandleOutcome::Close,
-        _ => encode_error_for_key(api_key, api_version, ERROR_ILLEGAL_SASL_STATE, sasl_enabled),
+        API_KEY_DESCRIBE_ACLS if advertisement.acls => HandleOutcome::Close,
+        _ => encode_error_for_key(
+            api_key,
+            api_version,
+            ERROR_ILLEGAL_SASL_STATE,
+            advertisement,
+        ),
     }
 }
 
 /// Returns `Ok(None)` when shutdown cancellation wins; `Ok(Some(frame))` on a full frame.
-async fn read_next_frame(
-    stream: &mut TcpStream,
+async fn read_next_frame<S: AsyncRead + Unpin>(
+    stream: &mut S,
     config: &GatewayConfig,
     idle_timeout: Duration,
     peer: &SocketAddr,
@@ -957,8 +1718,8 @@ async fn read_next_frame(
 }
 
 /// Applies a [`HandleOutcome`]. Returns `true` when the connection should close.
-async fn dispatch_outcome(
-    stream: &mut TcpStream,
+async fn dispatch_outcome<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     peer: &SocketAddr,
     config: &GatewayConfig,
     req: &RequestHeader,
@@ -1024,13 +1785,18 @@ async fn dispatch_outcome(
 ///
 /// Dropping a socket with unread bytes in its receive queue makes Linux send RST instead of FIN,
 /// and an RST lets the peer discard the response this close follows before its client reads it.
-/// A real broker closes an authentication failure gracefully for the same reason.
-async fn close_gracefully(stream: &mut TcpStream, budget: Duration, cancel: &CancellationToken) {
-    if stream.shutdown().await.is_err() {
-        return;
-    }
+/// A real broker closes an authentication failure gracefully for the same reason. On a TLS
+/// stream the shutdown also sends `close_notify` first.
+async fn close_gracefully<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    budget: Duration,
+    cancel: &CancellationToken,
+) {
     let mut discard = [0u8; 4096];
     let drain_input = async {
+        if stream.shutdown().await.is_err() {
+            return;
+        }
         while let Ok(read) = stream.read(&mut discard).await {
             if read == 0 {
                 break;
@@ -1053,8 +1819,8 @@ const fn response_header_size(header_version: i16) -> usize {
 
 /// Write a single length-prefixed Kafka frame using one allocation.
 /// Avoids the separate header-encode + payload-concat + length-prefix allocations.
-async fn send_response(
-    stream: &mut TcpStream,
+async fn send_response<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     correlation_id: i32,
     header_version: i16,
     body: Bytes,
@@ -1063,7 +1829,7 @@ async fn send_response(
     let header_size = response_header_size(header_version);
     let payload_size = header_size + body.len();
     let payload_len_i32 =
-        i32::try_from(payload_size).map_err(|_| KafkaProtocolError::FrameTooLarge {
+        i32::try_from(payload_size).map_err(|_| KafkaWireError::FrameTooLarge {
             max_bytes: i32::MAX as usize,
             actual_bytes: payload_size,
         })?;
@@ -1074,7 +1840,13 @@ async fn send_response(
         prefix.put_u8(0); // empty tagged fields
     }
     let mut frame = prefix.freeze().chain(body);
-    timeout(write_timeout, stream.write_all_buf(&mut frame))
+    // The flush matters on TLS: the stream reports a write done once rustls holds the record,
+    // and the tail of a large response would otherwise sit unsent until the next write.
+    let write = async {
+        stream.write_all_buf(&mut frame).await?;
+        stream.flush().await
+    };
+    timeout(write_timeout, write)
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timeout"))??;
     Ok(())
@@ -1085,8 +1857,8 @@ async fn send_response(
 /// # Errors
 ///
 /// Returns an error on timeout, invalid length, or I/O failure.
-pub async fn read_frame(
-    stream: &mut TcpStream,
+pub async fn read_frame<S: AsyncRead + Unpin>(
+    stream: &mut S,
     max_frame_size: usize,
     idle_timeout: Duration,
     read_timeout: Duration,
@@ -1101,17 +1873,18 @@ pub async fn read_frame(
 
     let frame_len_i32 = i32::from_be_bytes(len_buf);
     if frame_len_i32 <= 0 {
-        return Err(KafkaProtocolError::InvalidFrameLength(frame_len_i32));
+        return Err(KafkaWireError::InvalidFrameLength(frame_len_i32).into());
     }
     // frame_len_i32 is validated > 0 above, so it always fits usize on every
     // platform this crate targets (32-bit and 64-bit).
     #[allow(clippy::cast_sign_loss)]
     let frame_len = frame_len_i32 as usize;
     if frame_len > max_frame_size {
-        return Err(KafkaProtocolError::FrameTooLarge {
+        return Err(KafkaWireError::FrameTooLarge {
             max_bytes: max_frame_size,
             actual_bytes: frame_len,
-        });
+        }
+        .into());
     }
 
     // In-flight: read_timeout applies only after the length prefix is complete.
@@ -1273,6 +2046,17 @@ mod tests {
         (client, server)
     }
 
+    /// One plaintext listener on an ephemeral port, the shape every test here runs.
+    async fn ephemeral_plaintext() -> (BoundListener, SocketAddr) {
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let listener = BoundListener::new(
+            ListenerConfig::new(SecurityProtocol::Plaintext, addr.to_string()),
+            socket,
+        );
+        (listener, addr)
+    }
+
     /// `listener_robustness_tests.rs::e2e_frame_exceeding_max_frame_size_closes_connection`
     /// exercises the oversized-frame-rejection *mechanism* with a small custom `max_frame_size`
     /// (sending an 8 MiB+ frame just to hit the real default would be slow for no extra
@@ -1284,24 +2068,57 @@ mod tests {
     }
 
     #[test]
-    fn transient_accept_error_classification_covers_all_branches() {
-        for kind in [
-            io::ErrorKind::Interrupted,
-            io::ErrorKind::ConnectionAborted,
-            io::ErrorKind::WouldBlock,
+    fn default_config_is_one_plaintext_listener_without_tls() {
+        let config = GatewayConfig::default();
+        assert_eq!(
+            config.listeners,
+            vec![ListenerConfig::new(
+                SecurityProtocol::Plaintext,
+                "127.0.0.1:9093"
+            )]
+        );
+        assert!(config.tls.is_none());
+        assert!(!config.sasl_enabled());
+        assert!(!config.tls_enabled());
+        assert!(!config.maps_certificate_identities());
+    }
+
+    #[test]
+    fn given_an_error_of_one_connection_when_accepting_should_retry_at_once() {
+        let mut backoff = AcceptBackoff::default();
+        for error in [
+            io::Error::from(io::ErrorKind::Interrupted),
+            io::Error::from(io::ErrorKind::ConnectionAborted),
+            io::Error::from(io::ErrorKind::ConnectionReset),
+            io::Error::from_raw_os_error(libc::ENETUNREACH),
+            io::Error::from_raw_os_error(libc::EHOSTUNREACH),
+            io::Error::from_raw_os_error(libc::EPROTO),
+            io::Error::from_raw_os_error(libc::EHOSTDOWN),
         ] {
-            assert!(is_transient_accept_error(&io::Error::from(kind)));
+            assert_eq!(backoff.after(&error), None, "{error}");
         }
+    }
 
-        #[cfg(unix)]
-        {
-            assert!(is_transient_accept_error(&io::Error::from_raw_os_error(23)));
-            assert!(is_transient_accept_error(&io::Error::from_raw_os_error(24)));
+    #[test]
+    fn given_errors_of_the_listener_when_accepting_should_retry_after_a_growing_wait() {
+        let mut backoff = AcceptBackoff::default();
+        let waits: Vec<_> = [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM]
+            .into_iter()
+            .map(|code| backoff.after(&io::Error::from_raw_os_error(code)))
+            .collect();
+        assert_eq!(
+            waits,
+            [10, 20, 40, 80].map(|millis| Some(Duration::from_millis(millis)))
+        );
+
+        let unknown = io::Error::other("an error no list names");
+        for _ in 0..10 {
+            backoff.after(&unknown);
         }
+        assert_eq!(backoff.after(&unknown), Some(ACCEPT_BACKOFF_MAX));
 
-        assert!(!is_transient_accept_error(&io::Error::from(
-            io::ErrorKind::ConnectionRefused,
-        )));
+        backoff.reset();
+        assert_eq!(backoff.after(&unknown), Some(ACCEPT_BACKOFF_MIN));
     }
 
     #[tokio::test]
@@ -1342,7 +2159,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, KafkaProtocolError::InvalidFrameLength(-1)));
+        assert!(matches!(
+            err,
+            KafkaProtocolError::Wire(KafkaWireError::InvalidFrameLength(-1))
+        ));
     }
 
     #[tokio::test]
@@ -1393,8 +2213,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_shutdown_does_not_stall_past_drain_timeout() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (listener, addr) = ephemeral_plaintext().await;
         let (tx, rx) = broadcast::channel(1);
         let server = KafkaGateway::new(GatewayConfig {
             // Idle timeout is intentionally long - cancellation + drain deadline, not the
@@ -1403,7 +2222,7 @@ mod tests {
             shutdown_drain_timeout: Duration::from_millis(200),
             ..GatewayConfig::default()
         });
-        let handle = tokio::spawn(async move { server.run(listener, rx).await });
+        let handle = tokio::spawn(async move { server.run(vec![listener], rx).await });
 
         // Held open, never sends a frame: without cancellation the task would park in
         // read_frame's idle wait for the full 600s idle_timeout.
@@ -1428,14 +2247,13 @@ mod tests {
 
     #[tokio::test]
     async fn server_rejects_connections_beyond_max_connections() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (listener, addr) = ephemeral_plaintext().await;
         let (tx, rx) = broadcast::channel(1);
         let server = KafkaGateway::new(GatewayConfig {
             max_connections: 1,
             ..GatewayConfig::default()
         });
-        let handle = tokio::spawn(async move { server.run(listener, rx).await });
+        let handle = tokio::spawn(async move { server.run(vec![listener], rx).await });
 
         // First connection holds the only permit by never sending a frame.
         let held = TcpStream::connect(addr).await.unwrap();
@@ -1458,35 +2276,73 @@ mod tests {
 
     #[tokio::test]
     async fn server_run_exits_when_shutdown_channel_closed() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (listener, _addr) = ephemeral_plaintext().await;
         let (tx, rx) = broadcast::channel(1);
         drop(tx);
         let server = KafkaGateway::new(GatewayConfig::default());
-        assert!(server.run(listener, rx).await.is_ok());
+        assert!(server.run(vec![listener], rx).await.is_ok());
     }
 
     #[tokio::test]
     async fn server_run_exits_when_shutdown_receiver_is_lagged() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (listener, _addr) = ephemeral_plaintext().await;
         let (tx, rx) = broadcast::channel(1);
         tx.send(()).unwrap();
         tx.send(()).unwrap();
         let server = KafkaGateway::new(GatewayConfig::default());
-        assert!(server.run(listener, rx).await.is_ok());
+        assert!(server.run(vec![listener], rx).await.is_ok());
     }
 
     #[tokio::test]
     async fn server_run_exits_on_shutdown_signal_ok() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (listener, addr) = ephemeral_plaintext().await;
         let (tx, rx) = broadcast::channel(1);
         let server = KafkaGateway::new(GatewayConfig::default());
-        let handle = tokio::spawn(async move { server.run(listener, rx).await });
+        let handle = tokio::spawn(async move { server.run(vec![listener], rx).await });
 
         let stream = TcpStream::connect(addr).await.unwrap();
         tx.send(()).unwrap();
         drop(stream);
         assert!(handle.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn server_run_refuses_an_empty_listener_list() {
+        let (_tx, rx) = broadcast::channel(1);
+        let server = KafkaGateway::new(GatewayConfig::default());
+        assert!(server.run(Vec::new(), rx).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn server_run_refuses_a_tls_listener_without_material() {
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = BoundListener::new(
+            ListenerConfig::new(SecurityProtocol::Ssl, "127.0.0.1:0"),
+            socket,
+        );
+        let (_tx, rx) = broadcast::channel(1);
+        let error = KafkaGateway::new(GatewayConfig::default())
+            .run(vec![listener], rx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("IGGY_KAFKA_TLS_CERT_FILE"), "got: {error}");
+    }
+
+    #[tokio::test]
+    async fn server_run_refuses_tls_material_without_a_tls_listener() {
+        let (listener, _addr) = ephemeral_plaintext().await;
+        let (_tx, rx) = broadcast::channel(1);
+        let config = GatewayConfig {
+            tls: Some(TlsConfig::new("unused.pem", "unused.pem")),
+            ..GatewayConfig::default()
+        };
+        let error = KafkaGateway::new(config)
+            .run(vec![listener], rx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no listener uses it"), "got: {error}");
     }
 
     #[tokio::test]
@@ -1551,10 +2407,10 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            KafkaProtocolError::FrameTooLarge {
+            KafkaProtocolError::Wire(KafkaWireError::FrameTooLarge {
                 max_bytes: 64,
                 actual_bytes: 65,
-            }
+            })
         ));
     }
 

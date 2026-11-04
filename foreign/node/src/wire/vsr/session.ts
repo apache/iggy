@@ -19,22 +19,24 @@ import { randomBytes } from 'node:crypto';
 import { BIND_SECRET_BYTES } from './register.js';
 
 const MAX_U64 = 0xFFFF_FFFF_FFFF_FFFFn;
+const CLIENT_ID_MASK = (1n << 127n) - 1n;
 
 /**
  * Consensus-level session state, ported from `core/sdk/src/session.rs`.
  *
  * Each client instance generates an ephemeral random `clientId` (u128).
  * After a Register commits, the server assigns a `session` number (commit op
- * number). Every replicated request (metadata and partition) advances a
- * monotonic request watermark; non-replicated requests reuse the current
- * value because they bypass server-side request sequencing.
+ * number). Every request in a bound session advances its shared counter, including
+ * reads and requests on auxiliary connections.
  */
 export class ConsensusSession {
   private _clientId: bigint;
   private _session: bigint | null;
   private requestCounter: bigint;
   private registerConsumed: boolean;
+  private sessionRequestStart = 1n;
   readonly bindSecret: Buffer;
+  readonly registerRequestIdentifier: Buffer;
 
   constructor(clientId?: bigint) {
     this._clientId = clientId ?? generateClientId();
@@ -42,6 +44,16 @@ export class ConsensusSession {
     this.requestCounter = 1n;
     this.registerConsumed = false;
     this.bindSecret = randomBytes(BIND_SECRET_BYTES);
+    this.registerRequestIdentifier = nonzeroIdentifier();
+  }
+
+  reset(): void {
+    this._clientId = generateClientId();
+    this._session = null;
+    this.registerConsumed = false;
+    this.sessionRequestStart = this.requestCounter;
+    randomBytes(BIND_SECRET_BYTES).copy(this.bindSecret);
+    nonzeroIdentifier().copy(this.registerRequestIdentifier);
   }
 
   get clientId(): bigint {
@@ -60,7 +72,7 @@ export class ConsensusSession {
   get hasActivity(): boolean {
     return this.registerConsumed ||
       this._session !== null ||
-      this.requestCounter > 1n;
+      this.requestCounter > this.sessionRequestStart;
   }
 
   /** Binds the session after Register commits through consensus. */
@@ -85,8 +97,8 @@ export class ConsensusSession {
    * Next application request id, advancing the counter: 1, 2, 3, ...
    * Request 0 is reserved for Register.
    */
-  nextRequestId(): bigint {
-    if (!this.isBound)
+  nextRequestId(requireBound = true): bigint {
+    if (requireBound && !this.isBound)
       throw new Error('nextRequestId called before bind');
     if (this.requestCounter === MAX_U64)
       throw new RangeError('VSR request counter exhausted');
@@ -94,18 +106,21 @@ export class ConsensusSession {
     this.requestCounter += 1n;
     return id;
   }
-
-  /** Current counter value without advancing it. */
-  currentRequestId(): bigint {
-    return this.requestCounter;
-  }
 }
 
-/** Ephemeral random u128, non-zero (retry on the astronomically unlikely 0). */
+function nonzeroIdentifier(): Buffer {
+  let identifier: Buffer;
+  do {
+    identifier = randomBytes(16);
+  } while (identifier.every(byte => byte === 0));
+  return identifier;
+}
+
+/** Keep the top bit clear so generated IDs cannot enter the server-only range. */
 const generateClientId = (): bigint => {
   for (;;) {
     const id = randomBytes(16).reduce(
-      (acc, byte) => (acc << 8n) | BigInt(byte), 0n);
+      (acc, byte) => (acc << 8n) | BigInt(byte), 0n) & CLIENT_ID_MASK;
     if (id !== 0n) return id;
   }
 };

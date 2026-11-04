@@ -34,7 +34,7 @@ pub async fn should_help_match() {
 Commands:
   create  Create topic with given name, number of partitions, compression algorithm and expiry time for given stream ID [alias: c]
   delete  Delete topic with given ID in given stream ID [alias: d]
-  update  Update topic name, compression algorithm and message expiry time for given topic ID in given stream ID [alias: u]
+  update  Update topic name, message expiry or max topic size for given topic ID in given stream ID [alias: u]
   get     Get topic detail for given topic ID and stream ID [alias: g]
   list    List all topics in given stream ID [alias: l]
   help    Print this message or the help of the given subcommand(s)

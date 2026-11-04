@@ -27,6 +27,8 @@
 //! which is precisely the input under test. The SDK is still used for setup and
 //! for reading the log back, where it is the more honest observer.
 
+use super::partition_primary_routing::{partition_route, pause_node};
+use super::register_forwarding::connect_without_login;
 use crate::server::raw_tcp::{self, TEST_BIND_SECRET};
 use bytes::{Bytes, BytesMut};
 use consensus::client_table::COMMITTED_WINDOW_BITS;
@@ -47,6 +49,7 @@ use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, WireConsumer, WireIdentifier,
     WireName, WirePartitioning,
 };
+use iggy_common::with_binary_deadline;
 use integration::harness::TestHarness;
 use integration::iggy_harness;
 use journal::partition_journal::{FRONTIER_FILE_NAME, PARTITION_WAL_BLOCK_SIZE};
@@ -185,11 +188,13 @@ async fn given_empty_partition_and_registration_churn_when_cluster_restarts_shou
             .poll_messages(
                 &stream,
                 &topic,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                10,
-                false,
+                PollOptions {
+                    count: 10,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -287,6 +292,143 @@ async fn verify_lost_reply_restart(harness: &mut TestHarness) {
         poll_all(&observer).await,
         2,
         "recovery must also preserve the next append position"
+    );
+}
+
+#[iggy_harness(cluster_nodes = 1, server(sharding.cpu_allocation = "0..1"))]
+async fn given_lost_send_reply_on_singleton_when_send_permission_is_revoked_should_deny_retries_until_regrant(
+    harness: &mut TestHarness,
+) {
+    verify_lost_reply_after_send_revocation(harness).await;
+}
+
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
+async fn given_lost_send_reply_on_cluster_when_send_permission_is_revoked_should_deny_retries_until_regrant(
+    harness: &mut TestHarness,
+) {
+    verify_lost_reply_after_send_revocation(harness).await;
+}
+
+/// The client retains a send whose reply was lost. While its user lacks the
+/// send permission, the partition primary denies each retry before its dedup
+/// reads the receipt, so the send stays uncertain. After a re-grant, the retry
+/// returns the original receipt. Node 0 is the metadata primary and the
+/// primary of the first topic's partition, so it applies a permission change
+/// before the root client sees it commit.
+async fn verify_lost_reply_after_send_revocation(harness: &mut TestHarness) {
+    const USERNAME: &str = "partition-dedup-producer";
+    const PASSWORD: &str = "partition-dedup-password";
+    // Long enough for the frame to reach the stopped node, far below the
+    // cluster heartbeat timeout.
+    const LOST_REPLY_DEADLINE: Duration = Duration::from_secs(1);
+    const DENIAL_MARKER: &str = "partition request denied by authorization";
+    let permissions = |send_messages| Permissions {
+        global: GlobalPermissions {
+            send_messages,
+            // The route lookup of a retry passes on this one alone.
+            poll_messages: true,
+            ..GlobalPermissions::default()
+        },
+        streams: None,
+    };
+    let observer = harness.root_client_for_node(0).await.unwrap();
+    seed_topic(&observer).await;
+    let route_client = connect_without_login(harness.node(0).tcp_addr().unwrap()).await;
+    route_client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    let route = partition_route(
+        &route_client,
+        &Identifier::named(STREAM_NAME).unwrap(),
+        &Identifier::named(TOPIC_NAME).unwrap(),
+        PARTITION_ID,
+    )
+    .await;
+    assert_eq!(
+        route.primary_replica, 0,
+        "the stopped node must own the partition whose reply is lost"
+    );
+    drop(route_client);
+    observer
+        .create_user(
+            USERNAME,
+            PASSWORD,
+            UserStatus::Active,
+            Some(permissions(true)),
+            &UserCreateOptions::default(),
+        )
+        .await
+        .expect("create the producer user");
+    let producer = harness.new_client().await.unwrap();
+    producer
+        .login_user(USERNAME, PASSWORD)
+        .await
+        .expect("sign in the producer");
+    // A committed send caches the route, so the next send needs no lookup.
+    send_one(&producer, b"before-lost-reply")
+        .await
+        .expect("send while every node runs");
+
+    pause_node(harness, 0, true);
+    let lost = with_binary_deadline(
+        Instant::now() + LOST_REPLY_DEADLINE,
+        send_one(&producer, b"lost-reply"),
+    )
+    .await;
+    pause_node(harness, 0, false);
+    let Err(IggyError::OperationUncertain(op)) = lost else {
+        panic!("a send without a reply must end uncertain, got {lost:?}");
+    };
+    let deadline = Instant::now() + COMMIT_BUDGET;
+    while poll_all(&observer).await != 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the unanswered send must commit after the node resumes"
+        );
+        sleep(RETRY_PAUSE).await;
+    }
+
+    let user = Identifier::named(USERNAME).unwrap();
+    observer
+        .update_permissions(&user, Some(permissions(false)))
+        .await
+        .expect("revoke the send permission");
+    assert_eq!(
+        producer
+            .resolve_operation(op, std::time::Instant::now() + REPLY_WAIT)
+            .await,
+        Err(IggyError::OperationUncertain(op)),
+        "a retry without the send permission must not return the receipt"
+    );
+    await_marker(harness, 0, DENIAL_MARKER).await;
+    let unauthorized = format!("status={}", IggyError::Unauthorized.as_code());
+    assert!(
+        harness
+            .node(0)
+            .stdout_plain()
+            .lines()
+            .any(|line| line.contains(DENIAL_MARKER) && line.contains(&unauthorized)),
+        "the partition primary must deny the retry with {unauthorized}"
+    );
+    assert_eq!(
+        send_one(&producer, b"behind-uncertain-send").await,
+        Err(IggyError::LaneBlocked(op)),
+        "the client must keep the uncertain send"
+    );
+
+    observer
+        .update_permissions(&user, Some(permissions(true)))
+        .await
+        .expect("grant the send permission again");
+    producer
+        .resolve_operation(op, std::time::Instant::now() + REPLY_WAIT)
+        .await
+        .expect("after a re-grant the retry must return the original receipt");
+    assert_eq!(
+        poll_all(&observer).await,
+        2,
+        "the resolved retry must not append again"
     );
 }
 
@@ -917,7 +1059,7 @@ async fn await_marker(harness: &TestHarness, node: usize, marker: &str) {
 
 async fn seed_topic(client: &IggyClient) -> PartitionContext {
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let stream_id = Identifier::named(STREAM_NAME).expect("stream identifier");
@@ -948,34 +1090,64 @@ async fn seed_topic(client: &IggyClient) -> PartitionContext {
     .await
 }
 
+async fn send_one(client: &IggyClient, payload: &'static [u8]) -> Result<(), IggyError> {
+    let mut messages = vec![
+        IggyMessage::builder()
+            .payload(Bytes::from_static(payload))
+            .build()
+            .expect("build one message"),
+    ];
+    client
+        .send_messages(
+            &Identifier::named(STREAM_NAME).expect("stream identifier"),
+            &Identifier::named(TOPIC_NAME).expect("topic identifier"),
+            &Partitioning::partition_id(PARTITION_ID),
+            &mut messages,
+        )
+        .await
+        .map(|_| ())
+}
+
 async fn poll_all(client: &IggyClient) -> u32 {
     poll_up_to(client, 100).await
 }
 
+/// Counts the messages from offset 0, up to `max`. One reply holds at most
+/// `max_bytes`, so the count reads on until an empty batch.
 async fn poll_up_to(client: &IggyClient, max: u32) -> u32 {
     let stream_id = Identifier::named(STREAM_NAME).expect("stream identifier");
     let topic_id = Identifier::named(TOPIC_NAME).expect("topic identifier");
+    let consumer = Consumer::new(Identifier::numeric(1).expect("consumer identifier"));
     let deadline = Instant::now() + COMMIT_BUDGET;
-    loop {
+    let mut strategy = PollingStrategy::offset(0);
+    let mut total = 0;
+    while total < max {
         match client
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                Some(PARTITION_ID),
-                &Consumer::new(Identifier::numeric(1).expect("consumer identifier")),
-                &PollingStrategy::offset(0),
-                max,
-                false,
+                PARTITION_ID,
+                &consumer,
+                &strategy,
+                PollOptions {
+                    count: max - total,
+                    ..PollOptions::default()
+                },
             )
             .await
         {
-            Ok(polled) => return polled.messages.len() as u32,
+            Ok(polled) if polled.messages.is_empty() => break,
+            Ok(polled) => {
+                total += polled.messages.len() as u32;
+                strategy = polled.continuation();
+            }
             Err(IggyError::TransientNotAccepted) if Instant::now() < deadline => {
                 sleep(RETRY_PAUSE).await;
             }
             Err(error) => panic!("poll messages after recovery: {error:?}"),
         }
     }
+    total
 }
 
 /// Full `SendMessages` body: metadata prefix, batch header, one message.
@@ -1290,4 +1462,5 @@ async fn login_on(stream: &mut TcpStream, client: u128) -> Option<u64> {
 fn is_transient(code: u32) -> bool {
     code == IggyError::TransientNotCommitted.as_code()
         || code == IggyError::TransientNotAccepted.as_code()
+        || code == IggyError::NotPrimary.as_code()
 }

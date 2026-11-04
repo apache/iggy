@@ -378,7 +378,7 @@ fn partition_config() -> PartitionsConfig {
         validate_checksum: true,
         segment_size: IggyByteSize::from(1024 * 1024),
         preallocate_segments: false,
-        encryptor: None,
+        key_context: Arc::default(),
         path_layout: PartitionPathLayout::default(),
     }
 }

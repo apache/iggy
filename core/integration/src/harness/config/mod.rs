@@ -26,7 +26,7 @@ mod server;
 pub use client::{AutoLoginConfig, ClientConfig};
 pub use common::{EncryptionConfig, IpAddrKind, TlsConfig};
 pub use connectors_runtime::ConnectorsRuntimeConfig;
-pub use jwks::JwksConfig;
+pub use jwks::{JWKS_ISSUER_USERNAME, JwksConfig};
 pub use mcp::McpConfig;
 pub use resolve::{resolve_config_paths, validate_env_var_names};
 pub use server::TestServerConfig;

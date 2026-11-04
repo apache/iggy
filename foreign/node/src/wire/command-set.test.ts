@@ -56,6 +56,14 @@ describe('CommandAPI.sendBinaryRequest', () => {
     });
   });
 
+  it('rejects the cancellation of a deferred request before reaching the client provider', async () => {
+    const client = new SimpleClient(mockRawClient());
+    await assert.rejects(
+      () => client.sendBinaryRequest(COMMAND_CODE.CancelDeferredRequest, Buffer.alloc(0)),
+      /code: 3, message: Invalid command/
+    );
+  });
+
   it('forwards a custom code and opaque payload to sendCommand', async () => {
     const customCode = 60_000;
     const payload = Buffer.from([0xAA, 0xBB, 0xCC]);
@@ -105,5 +113,34 @@ describe('CommandAPI.sendBinaryRequest', () => {
     );
 
     assert.deepEqual(response, Buffer.alloc(0));
+  });
+});
+
+describe('CommandAPI.sendBinaryRequestToReplica', () => {
+  it('rejects a session-control code before reaching the client provider', async () => {
+    const client = new SimpleClient(mockRawClient());
+    await assert.rejects(
+      () => client.sendBinaryRequestToReplica(COMMAND_CODE.LoginUser, Buffer.alloc(0), 1),
+      /code: 3, message: Invalid command/
+    );
+  });
+
+  it('forwards the code, payload and replica to sendCommand', async () => {
+    const payload = Buffer.from([0xAA, 0xBB]);
+    const expectedResponse = Buffer.from('replica stats');
+    const raw = mockRawClient();
+    raw.sendCommand = async (code, sentPayload, options) => {
+      assert.equal(code, COMMAND_CODE.GetStats);
+      assert.deepEqual(sentPayload, payload);
+      assert.deepEqual(options, { replica: 2 });
+      return {
+        status: 0,
+        length: expectedResponse.length,
+        data: expectedResponse,
+      };
+    };
+    const client = new SimpleClient(raw);
+    const response = await client.sendBinaryRequestToReplica(COMMAND_CODE.GetStats, payload, 2);
+    assert.deepEqual(response, expectedResponse);
   });
 });

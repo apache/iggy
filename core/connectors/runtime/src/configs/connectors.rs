@@ -176,8 +176,11 @@ impl CreateSinkConfig {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct SinkConfig {
+    // Identity comes from the file: an env KEY would rename the sink and move its consumer group.
+    #[config_env(skip)]
     pub key: String,
     pub enabled: bool,
+    #[config_env(skip)]
     pub version: u64,
     pub name: String,
     pub path: String,
@@ -207,6 +210,8 @@ pub struct CreateSourceConfig {
     pub verbose: bool,
     #[serde(default)]
     pub benchmark: bool,
+    #[serde(default)]
+    pub exactly_once: bool,
 }
 
 impl CreateSourceConfig {
@@ -223,14 +228,18 @@ impl CreateSourceConfig {
             plugin_config: self.plugin_config,
             verbose: self.verbose,
             benchmark: self.benchmark,
+            exactly_once: self.exactly_once,
         }
     }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct SourceConfig {
+    // Identity comes from the file: an env KEY would orphan saved state.
+    #[config_env(skip)]
     pub key: String,
     pub enabled: bool,
+    #[config_env(skip)]
     pub version: u64,
     pub name: String,
     pub path: String,
@@ -245,6 +254,10 @@ pub struct SourceConfig {
     pub verbose: bool,
     #[serde(default)]
     pub benchmark: bool,
+    /// Each batch goes to one partition with the source's producer, and lands once, also after a
+    /// crash of the runtime. Needs a plugin that produces the same batch again from its state.
+    #[serde(default)]
+    pub exactly_once: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -263,7 +276,11 @@ pub struct StreamConsumerConfig {
     #[config_env(leaf)]
     pub avro_schema_path: Option<PathBuf>,
     pub batch_length: Option<u32>,
+    /// Replaced by `max_wait` and `min_count`. Kept so that a sink that still
+    /// sets it fails to start: without the field, serde ignores the setting.
     pub poll_interval: Option<String>,
+    pub max_wait: Option<String>,
+    pub min_count: Option<u32>,
     pub consumer_group: Option<String>,
 }
 
@@ -278,6 +295,8 @@ pub struct StreamProducerConfig {
     pub avro_schema_path: Option<PathBuf>,
     pub batch_length: Option<u32>,
     pub linger_time: Option<String>,
+    /// The partition every message goes to. An exactly-once source uses 0 when it is unset.
+    pub partition_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -406,7 +425,7 @@ impl std::fmt::Display for SourceConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?}, verbose: {}, benchmark: {} }}",
+            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?}, verbose: {}, benchmark: {}, exactly_once: {} }}",
             self.enabled,
             self.name,
             self.path,
@@ -419,6 +438,7 @@ impl std::fmt::Display for SourceConfig {
             self.plugin_config_format,
             self.verbose,
             self.benchmark,
+            self.exactly_once,
         )
     }
 }
@@ -438,7 +458,7 @@ impl std::fmt::Display for StreamConsumerConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ stream: {}, topics: {}, schema: {:?}, avro_schema_json: {:?}, avro_schema_path: {:?}, batch_length: {:?}, poll_interval: {:?}, consumer_group: {:?} }}",
+            "{{ stream: {}, topics: {}, schema: {:?}, avro_schema_json: {:?}, avro_schema_path: {:?}, batch_length: {:?}, poll_interval: {:?}, max_wait: {:?}, min_count: {:?}, consumer_group: {:?} }}",
             self.stream,
             self.topics
                 .iter()
@@ -450,6 +470,8 @@ impl std::fmt::Display for StreamConsumerConfig {
             self.avro_schema_path,
             self.batch_length,
             self.poll_interval,
+            self.max_wait,
+            self.min_count,
             self.consumer_group
         )
     }
@@ -459,14 +481,15 @@ impl std::fmt::Display for StreamProducerConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ stream: {}, topic: {}, schema: {:?}, avro_schema_json: {:?}, avro_schema_path: {:?}, batch_length: {:?}, linger_time: {:?} }}",
+            "{{ stream: {}, topic: {}, schema: {:?}, avro_schema_json: {:?}, avro_schema_path: {:?}, batch_length: {:?}, linger_time: {:?}, partition_id: {:?} }}",
             self.stream,
             self.topic,
             self.schema,
             self.avro_schema_json,
             self.avro_schema_path,
             self.batch_length,
-            self.linger_time
+            self.linger_time,
+            self.partition_id
         )
     }
 }
@@ -488,6 +511,26 @@ impl ConnectorsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use configs::ConfigEnvMappings;
+
+    #[test]
+    fn given_sink_and_source_configs_when_mapped_should_exclude_key_and_version() {
+        for (name, mappings) in [
+            ("sink", SinkConfig::env_mappings()),
+            ("source", SourceConfig::env_mappings()),
+        ] {
+            assert!(
+                mappings.iter().any(|mapping| mapping.env_name == "ENABLED"),
+                "{name} should map ENABLED from the environment"
+            );
+            assert!(
+                mappings
+                    .iter()
+                    .all(|mapping| !matches!(mapping.env_name, "KEY" | "VERSION")),
+                "{name} maps key or version from the environment"
+            );
+        }
+    }
 
     #[test]
     fn given_single_component_key_when_parsed_should_succeed() {

@@ -107,17 +107,29 @@ where
             self.producer_config.message_size,
             self.producer_config.messages_per_batch,
         );
-        let rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
+        let mut rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
         if self.producer_config.warmup_time.get_duration() != Duration::from_millis(0) {
             self.log_warmup_info();
             let warmup_end = Instant::now() + self.producer_config.warmup_time.get_duration();
 
+            // Warmup sends under the same limiter as the measured phase, so the phase boundary
+            // is a step rather than a burst far above the rate being measured.
             while Instant::now() < warmup_end {
-                let _ = self.producer.produce_batch(&mut batch_generator).await;
-                let _ = self.consumer.consume_batch().await;
+                let mut user_data_bytes = 0;
+                if let Some(batch) = self.producer.produce_batch(&mut batch_generator).await? {
+                    user_data_bytes += batch.user_data_bytes;
+                }
+                if let Some(batch) = self.consumer.consume_batch().await? {
+                    user_data_bytes += batch.user_data_bytes;
+                }
+                if let Some(limiter) = &mut rate_limiter {
+                    limiter.wait_until_necessary(user_data_bytes).await;
+                }
             }
         }
 
+        // No offset reset here, unlike the standalone consumer: this kind reports the age of
+        // the message, so re-reading warmup messages would report the whole warmup as latency.
         self.log_setup_info();
         let max_capacity = self
             .send_finish_condition
@@ -125,7 +137,7 @@ where
             .max(self.poll_finish_condition.max_capacity());
         let mut records = Vec::with_capacity(max_capacity);
 
-        let mut rl_value = 0;
+        let mut uncharged_bytes = 0;
         let mut sent_user_bytes = 0;
         let mut sent_total_bytes = 0;
         let mut sent_messages = 0;
@@ -151,7 +163,7 @@ where
                 && (!require_reply || !awaiting_reply)
                 && let Some(batch) = self.producer.produce_batch(&mut batch_generator).await?
             {
-                rl_value += batch.user_data_bytes;
+                uncharged_bytes += batch.user_data_bytes;
                 sent_user_bytes += batch.user_data_bytes;
                 sent_total_bytes += batch.total_bytes;
                 sent_messages += u64::from(batch.messages);
@@ -179,7 +191,7 @@ where
                 && !self.poll_finish_condition.is_done()
                 && let Some(batch) = self.consumer.consume_batch().await?
             {
-                rl_value += batch.user_data_bytes;
+                uncharged_bytes += batch.user_data_bytes;
                 recv_user_bytes += batch.user_data_bytes;
                 recv_total_bytes += batch.total_bytes;
                 recv_messages += u64::from(batch.messages);
@@ -197,16 +209,20 @@ where
                     total_bytes: sent_total_bytes + recv_total_bytes,
                 });
 
-                if let Some(limiter) = &rate_limiter {
-                    limiter.wait_until_necessary(rl_value).await;
-                    rl_value = 0;
-                }
-
                 self.poll_finish_condition
                     .account_and_check(batch.user_data_bytes);
                 if require_reply {
                     awaiting_reply = false;
                 }
+            }
+
+            // Wait after the reply so pacing does not enter the latency measurement.
+            if uncharged_bytes > 0
+                && (!require_reply || !awaiting_reply)
+                && let Some(limiter) = &mut rate_limiter
+            {
+                limiter.wait_until_necessary(uncharged_bytes).await;
+                uncharged_bytes = 0;
             }
         }
 

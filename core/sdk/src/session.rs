@@ -17,7 +17,9 @@
 
 //! A logical session keeps its identity, bind secret, and request counter
 //! across transport reconnects. Registration retries recover the original
-//! committed session. Explicit logout starts a new logical session.
+//! committed session. A session reset, such as an explicit logout, starts a
+//! new identity and carries the request counter over, so a client never
+//! reuses a request id.
 //!
 //! # Lifecycle
 //!
@@ -46,9 +48,11 @@ pub struct ConsensusSession {
     /// through consensus. `None` until bound.
     session: Option<u64>,
     /// Monotonically increasing request counter for application requests.
-    /// Starts at 1 after registration. Register itself always uses request=0.
+    /// Starts at 1 for a new client, and a reset carries it over. Register
+    /// itself always uses request=0.
     request_counter: u64,
     bind_secret: BindSecret,
+    register_request_identifier: Option<u128>,
 }
 
 impl ConsensusSession {
@@ -66,6 +70,16 @@ impl ConsensusSession {
             session: None,
             request_counter: 1,
             bind_secret: BindSecret::new(Box::new(rand::random())),
+            register_request_identifier: None,
+        }
+    }
+
+    /// A new identity that continues the request counter of the session it
+    /// replaces.
+    pub(crate) fn with_next_request_id(next_request_id: u64) -> Self {
+        Self {
+            request_counter: next_request_id,
+            ..Self::new()
         }
     }
 
@@ -111,6 +125,23 @@ impl ConsensusSession {
     ///
     pub const fn register_request_id(&self) -> u64 {
         0
+    }
+
+    pub(crate) fn register_request_identifier(&mut self) -> Result<u128, IggyError> {
+        if let Some(identifier) = self.register_request_identifier {
+            return Ok(identifier);
+        }
+        let random = ring::rand::SystemRandom::new();
+        loop {
+            let mut bytes = [0u8; 16];
+            ring::rand::SecureRandom::fill(&random, &mut bytes)
+                .map_err(|_| IggyError::InvalidConfiguration)?;
+            let identifier = u128::from_le_bytes(bytes);
+            if identifier != 0 {
+                self.register_request_identifier = Some(identifier);
+                return Ok(identifier);
+            }
+        }
     }
 
     /// Get the next application request ID and advance the counter.

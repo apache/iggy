@@ -22,9 +22,9 @@ use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
 };
 use lapin::{
-    BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind,
+    BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, ExchangeKind,
+    PublisherConfirm,
     options::{ConfirmSelectOptions, ExchangeDeclareOptions},
-    publisher_confirm::{Confirmation, PublisherConfirm},
     types::{AMQPValue, ByteArray, FieldTable, ShortString},
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -264,8 +264,8 @@ impl RabbitMQSink {
                 let confirm = match timeout(
                     self.timeout,
                     channel.basic_publish(
-                        &self.exchange,
-                        &self.routing_key,
+                        self.exchange.as_str().into(),
+                        self.routing_key.as_str().into(),
                         lapin::options::BasicPublishOptions {
                             mandatory: true,
                             ..Default::default()
@@ -456,7 +456,7 @@ impl RabbitMQSink {
         let exchange_kind = self.exchange_kind()?;
         channel
             .exchange_declare(
-                &self.exchange,
+                self.exchange.as_str().into(),
                 exchange_kind,
                 ExchangeDeclareOptions {
                     durable: self.durable_exchange,
@@ -523,12 +523,12 @@ impl Sink for RabbitMQSink {
         if let Some(state) = self.state.get_mut().take() {
             state
                 .channel
-                .close(200, "OK")
+                .close(200, "OK".into())
                 .await
                 .map_err(|e| Error::Connection(e.to_string()))?;
             state
                 .connection
-                .close(200, "OK")
+                .close(200, "OK".into())
                 .await
                 .map_err(|e| Error::Connection(e.to_string()))?;
         }
@@ -537,13 +537,13 @@ impl Sink for RabbitMQSink {
 }
 
 fn is_lapin_error_retryable(error: &lapin::Error) -> bool {
-    match error {
-        lapin::Error::InvalidChannelState(_)
-        | lapin::Error::InvalidConnectionState(_)
-        | lapin::Error::IOError(_)
-        | lapin::Error::MissingHeartbeatError => true,
+    match error.kind() {
+        lapin::ErrorKind::InvalidChannelState(..)
+        | lapin::ErrorKind::InvalidConnectionState(_)
+        | lapin::ErrorKind::IOError(_)
+        | lapin::ErrorKind::MissingHeartbeatError => true,
         // AMQP soft channel errors: 405 RESOURCE_LOCKED, 320 CONNECTION_FORCED.
-        lapin::Error::ProtocolError(amqp_error) => matches!(amqp_error.get_id(), 320 | 405),
+        lapin::ErrorKind::ProtocolError(amqp_error) => matches!(amqp_error.get_id(), 320 | 405),
         _ => false,
     }
 }
@@ -683,14 +683,14 @@ mod tests {
     #[test]
     fn given_transient_lapin_error_when_is_lapin_error_retryable_should_return_true() {
         let errors = [
-            lapin::Error::InvalidChannelState(lapin::ChannelState::Closed),
-            lapin::Error::InvalidConnectionState(lapin::ConnectionState::Error),
-            lapin::Error::IOError(std::sync::Arc::new(std::io::Error::new(
+            lapin::ErrorKind::InvalidChannelState(lapin::ChannelState::Closed, "basic_publish"),
+            lapin::ErrorKind::InvalidConnectionState(lapin::ConnectionState::Error),
+            lapin::ErrorKind::IOError(std::sync::Arc::new(std::io::Error::new(
                 std::io::ErrorKind::ConnectionReset,
                 "reset by peer",
             ))),
-            lapin::Error::MissingHeartbeatError,
-            lapin::Error::ProtocolError(lapin::protocol::AMQPError::new(
+            lapin::ErrorKind::MissingHeartbeatError,
+            lapin::ErrorKind::ProtocolError(lapin::protocol::AMQPError::new(
                 lapin::protocol::AMQPErrorKind::Soft(
                     lapin::protocol::AMQPSoftError::RESOURCELOCKED,
                 ),
@@ -698,6 +698,7 @@ mod tests {
             )),
         ];
         for error in errors {
+            let error = error.into();
             assert!(
                 is_lapin_error_retryable(&error),
                 "expected {error:?} to be retryable"
@@ -708,15 +709,16 @@ mod tests {
     #[test]
     fn given_permanent_lapin_error_when_is_lapin_error_retryable_should_return_false() {
         let errors = [
-            lapin::Error::ProtocolError(lapin::protocol::AMQPError::new(
+            lapin::ErrorKind::ProtocolError(lapin::protocol::AMQPError::new(
                 lapin::protocol::AMQPErrorKind::Soft(
                     lapin::protocol::AMQPSoftError::PRECONDITIONFAILED,
                 ),
                 "PRECONDITION_FAILED".into(),
             )),
-            lapin::Error::InvalidChannel(0),
+            lapin::ErrorKind::InvalidChannel(0),
         ];
         for error in errors {
+            let error = error.into();
             assert!(
                 !is_lapin_error_retryable(&error),
                 "expected {error:?} to be permanent"

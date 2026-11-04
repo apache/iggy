@@ -132,6 +132,13 @@ pub trait Consensus: Sized {
     fn is_follower(&self) -> bool;
     fn is_normal(&self) -> bool;
     fn is_transferring(&self) -> bool;
+
+    /// A backup that serves its view: the primary of that view can take the
+    /// request at once, so the refusal is `NotPrimary`, not a retry later.
+    /// A ceded primary is still the primary of its view and stays out.
+    fn is_normal_backup(&self) -> bool {
+        self.is_normal() && !self.is_transferring() && self.is_follower()
+    }
 }
 
 /// Shared consensus lifecycle interface for control/data planes.
@@ -191,6 +198,11 @@ mod impls;
 pub use impls::*;
 mod plane_mux;
 pub use plane_mux::*;
+mod replication;
+pub use replication::{
+    BackupPrefix, REPLICATION_BATCH_BYTES_MAX, ReplicationProgress, ReplicationSend,
+    ReplicationStats, ReplicationWork,
+};
 mod plane_helpers;
 pub use plane_helpers::*;
 mod metadata_helpers;
@@ -203,7 +215,9 @@ pub use view_change_quorum::*;
 
 mod dvc_merge;
 pub use dvc_merge::*;
+mod replica_set;
+pub use replica_set::{ReplicaSet, ReplicaSetError};
 mod vsr_state;
-pub use vsr_state::{VsrState, VsrStateError};
+pub use vsr_state::{AdoptedView, HistoryCertificate, HistoryRecovery, VsrState, VsrStateError};
 mod vsr_timeout;
 pub use vsr_timeout::{TICK_INTERVAL, TimeoutManager};

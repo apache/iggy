@@ -33,17 +33,29 @@ pub mod offset_storage;
 mod partition_storage;
 mod persistence;
 mod poll_plan;
-#[cfg(feature = "simulator")]
-pub use persistence::CheckpointBarrier;
+pub mod producer_state;
+mod repair_memory;
+pub use persistence::FileSyncBarrier;
 pub(crate) use persistence::PersistenceDrain;
 pub use persistence::{
     PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
 };
+pub use repair_memory::RepairMemoryBudget;
 mod segment;
 pub mod segment_anchor;
 mod segment_recovery;
 pub mod state_transfer;
+mod stream_keyring;
 mod types;
+mod view_fence;
+#[cfg(feature = "simulator")]
+mod wal_storage;
+#[cfg(feature = "simulator")]
+pub use wal_storage::{InjectedFile, InjectedStorage, WalFile, WalStorage};
+
+/// The storage under every partition WAL.
+#[cfg(not(feature = "simulator"))]
+pub type WalStorage = ::journal::durable_storage::DiskStorage;
 
 pub use consumer_offset_capacity::{AutoCommitReservation, ConsumerOffsetCapacityError};
 use iggy_binary_protocol::PrepareHeader;
@@ -51,16 +63,21 @@ use iggy_common::IggyError;
 pub use iggy_index::IggyIndex;
 pub use iggy_index_reader::IggyIndexReader;
 pub use iggy_index_writer::IggyIndexWriter;
-pub use iggy_partition::{IggyPartition, SegmentRemoval};
+pub use iggy_partition::{IggyPartition, RetirementDebtStatus, SegmentRemoval};
 pub use iggy_partitions::IggyPartitions;
 pub(crate) use io::PartitionIoVerdict;
 pub use io::{
     CapturedPartitionIo, MaterializationIoJob, MaterializationIoResult, PARTITION_IO_DRAIN_TIMEOUT,
     PartitionIncarnation, PartitionIoContinuation, PartitionIoIdentity, PartitionIoJob,
     PartitionIoNotifier, PartitionIoPlan, PartitionIoQuiescence, PartitionIoResources,
-    PartitionIoResult, PartitionIoStep, PartitionTeardown, largest_legal_job_charge,
+    PartitionIoResult, PartitionIoStep, PartitionTeardown, PreparedPrimaryTransfer,
+    largest_legal_job_charge,
 };
-pub use journal::{EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY};
+pub use journal::{
+    BodyPosition, EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY, EvictedHeader, ReleasedBodies,
+    ReleasedRead,
+};
+pub use view_fence::ViewWindowVerdict;
 
 /// Offsets a partition claims in its superblock ahead of the mint counter
 /// before it will append, so a crash-restarted replica resumes above every
@@ -78,16 +95,20 @@ pub const DEFAULT_OFFSET_RESERVATION_LEASE: u32 = 64 * 1024;
 
 /// Shipped per-kind durable consumer-offset limit for one partition.
 pub const DEFAULT_CONSUMER_OFFSETS_MAX: usize = 4096;
-pub use iggy_partition::{PollCompletion, PollReplication};
+
+pub(crate) const FILE_SYNC_CONCURRENCY: usize = 16;
+
+pub use iggy_partition::{PollCompletion, PollReplication, PollVisibility};
 pub use messages_writer::MessagesWriter;
 pub use offset_storage::delete_persisted_offset;
 pub use partition_storage::{
-    CREATED_REVISION_FILE, configure_consumer_offsets, configure_consumer_offsets_with_storage,
-    create_partition_file_hierarchy, delete_partitions_from_disk, ensure_initial_segment,
-    hydrate_partition_log, read_created_revision, read_revision_record, write_created_revision,
-    write_revision_record,
+    CREATED_REVISION_FILE, clamp_consumer_offsets, configure_consumer_offsets,
+    configure_consumer_offsets_with_storage, create_partition_file_hierarchy,
+    delete_partitions_from_disk, ensure_initial_segment, hydrate_partition_log,
+    read_created_revision, read_revision_record, recover_consumer_offsets,
+    recover_consumer_offsets_with_storage, write_created_revision, write_revision_record,
 };
-pub use poll_plan::{PollPlan, PollReadResult};
+pub use poll_plan::{DISK_POLL_CHUNK_MAX, PollPlan, PollReadResult};
 pub use segment::Segment;
 pub use segment_recovery::{
     PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredSegment, load_persisted_segments,
@@ -96,11 +117,12 @@ pub use segment_recovery::{
 use server_common::Message;
 pub use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessages};
 pub use state_transfer::CONSUMER_OFFSETS_ENTRIES_MAX;
+pub use stream_keyring::{StreamKeyIdentity, StreamKeyring};
 pub use types::{
     AppendResult, COMMIT_WALK_OPS_MAX, FatalCommit, Fragment, PartitionOffsets,
     PartitionPathLayout, PartitionsConfig, PollFragments, PollQueryResult, PollingArgs,
-    PollingConsumer, REPAIR_MAX_STALL_RETRIES, REPAIR_RETRY_TICKS, RepairConclusion, RepairSession,
-    SendMessagesResult,
+    PollingConsumer, REPAIR_MAX_STALL_RETRIES, REPAIR_RETRY_TICKS, RepairConclusion, RepairIngest,
+    RepairSession, SendMessagesResult,
 };
 
 /// A partition's message log, named so a caller can carry one across a rebuild.
@@ -124,21 +146,22 @@ pub struct RetainedPartitionState {
     pub retry_capacity: Option<usize>,
     pub retry_protection: Vec<consensus::DedupWatermark>,
     pub required_metadata_frontier: u64,
+    pub retirement_paid_through: u64,
     /// Offset counter the previous incarnation had proved durable.
     pub durable_offset: u64,
     /// Highest offset it had written, durable or not.
     pub write_offset: u64,
-    /// Whether that incarnation ever stamped an offset, i.e. whether the two
-    /// numbers above describe an offset space at all.
-    pub offset_space_used: bool,
+    pub(crate) offset_space: iggy_partition::OffsetSpace,
     pub consumer_offsets: Vec<(u32, u64)>,
     pub consumer_group_offsets: Vec<(u32, u64)>,
     pub external_group_offsets: Vec<(u32, u64)>,
+    pub(crate) emptied_at: u64,
     pub(crate) consumer_group_owners:
         std::collections::BTreeMap<u64, iggy_partition::InstalledConsumerGroupOwner>,
     pub(crate) history_transition: Option<iggy_partition::InstalledPartitionHistory>,
     pub(crate) owner_retirement:
         Option<iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest>,
+    pub(crate) producers: producer_state::ProducerTable,
 }
 
 /// Partition-level data plane operations.

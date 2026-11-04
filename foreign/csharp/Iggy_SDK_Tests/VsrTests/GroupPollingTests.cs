@@ -169,6 +169,7 @@ public sealed class GroupPollingTests
         };
         var client = new TcpMessageStream(configuration, NullLoggerFactory.Instance);
         await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("user", "secret", TestContext.Current.CancellationToken);
 
         return client;
     }

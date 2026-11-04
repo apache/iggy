@@ -85,7 +85,7 @@ public sealed class HttpPartitionContextTests
         var client = Client(handler);
 
         await SendAsync(client);
-        await client.CreateStreamAsync("created", TestContext.Current.CancellationToken);
+        await client.CreateStreamAsync("created", token: TestContext.Current.CancellationToken);
         await client.CreateTopicAsync(Identifier.Numeric(1), "created", 1,
             token: TestContext.Current.CancellationToken);
         await SendAsync(client);
@@ -137,6 +137,23 @@ public sealed class HttpPartitionContextTests
             TestContext.Current.CancellationToken));
 
         Assert.Empty(handler.PollQuery);
+    }
+
+    /// <summary>A server older than the node lists omits them, which reads as empty.</summary>
+    [Fact]
+    public async Task given_topic_details_with_node_lists_when_reading_the_topic_should_map_them()
+    {
+        var handler = new TopicHandler(Original);
+        var client = Client(handler);
+
+        var topic = await client.GetTopicByIdAsync(Identifier.Numeric(1), Identifier.Numeric(2),
+            TestContext.Current.CancellationToken);
+
+        var partitions = topic!.Partitions!.ToList();
+        Assert.Empty(partitions[0].Members);
+        Assert.Empty(partitions[0].InSyncMembers);
+        Assert.Equal(new byte[] { 0, 1, 2 }, partitions[1].Members);
+        Assert.Equal(new byte[] { 0 }, partitions[1].InSyncMembers);
     }
 
     private static HttpMessageStream Client(TopicHandler handler)
@@ -242,7 +259,9 @@ public sealed class HttpPartitionContextTests
                            "current_offset": 0,
                            "size": "0 B",
                            "messages_count": 0,
-                           "context": {{ContextJson(context)}}
+                           "context": {{ContextJson(context)}},
+                           "members": [0, 1, 2],
+                           "in_sync_members": [0]
                          }
                        ]
                      }

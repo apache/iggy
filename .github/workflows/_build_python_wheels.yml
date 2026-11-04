@@ -83,7 +83,7 @@ jobs:
           /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
-        uses: actions/setup-python@v7.0.0
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: "3.11"
 
@@ -91,8 +91,8 @@ jobs:
         id: interpreters
         run: ./scripts/ci/wheel-interpreters.sh >> "$GITHUB_OUTPUT"
 
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
 
       - name: Generate third-party license manifest
         run: |
@@ -153,7 +153,7 @@ jobs:
           /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
-        uses: actions/setup-python@v7.0.0
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: "3.11"
 
@@ -162,12 +162,12 @@ jobs:
         run: ./scripts/ci/wheel-interpreters.sh >> "$GITHUB_OUTPUT"
 
       - name: Setup wheel Python versions
-        uses: actions/setup-python@v7.0.0
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: ${{ steps.interpreters.outputs.python_versions }}
 
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
 
       - name: Generate third-party license manifest
         run: |
@@ -235,13 +235,13 @@ jobs:
           /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
-        uses: actions/setup-python@v7.0.0
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
           architecture: x64
 
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
         with:
           shared-key: python-wheels-windows
 
@@ -336,7 +336,7 @@ jobs:
           ref: ${{ inputs.commit }}
 
       - name: Setup Python
-        uses: actions/setup-python@v7.0.0
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: "3.11"
 

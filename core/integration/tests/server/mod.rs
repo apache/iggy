@@ -29,6 +29,9 @@ mod legacy_login_vsr;
 // arm) must deny typed (InvalidCommand) at the read gate, and an undeclared
 // operation byte at the funnel, not stall or reply empty-ok.
 mod unknown_code_vsr;
+// A read held for the metadata frontier runs off the connection drain, so a
+// frame pipelined behind it gets its reply first.
+mod pipelined_frames_vsr;
 // A failed credential login must report the credential failure, not the
 // payload shape it fell through to.
 mod login_credentials_vsr;
@@ -78,6 +81,7 @@ mod concurrent_addition;
 // The node-wide cap on client sockets closes a socket past it at accept.
 mod connections_limit_vsr;
 mod consumer_offset_quota_vsr;
+mod consumer_offset_recovery;
 // A write that runs out of file descriptors flushes, then exits with status 4.
 mod descriptor_exhaustion_vsr;
 mod general;
@@ -92,6 +96,7 @@ mod message_retrieval;
 // The full restart matrix (consumer variants included) runs under the server:
 // a restarted replica rejoins via the view probe + journal repair.
 mod delete_segments;
+mod external_auth;
 pub(crate) mod scenarios;
 mod specific;
 mod telemetry;

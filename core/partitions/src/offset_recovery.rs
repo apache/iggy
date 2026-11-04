@@ -30,7 +30,9 @@
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 
-use crate::offset_storage::{OffsetRecord, decode_offset_record, offset_replacement_id};
+use crate::offset_storage::{
+    OffsetRecord, decode_offset_record, offset_replacement_id, persist_emptied_marker_with_storage,
+};
 use futures::StreamExt;
 use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyError};
 #[cfg(test)]
@@ -40,6 +42,7 @@ use server_common::fatal::{NoteDescriptorExhaustion, is_descriptor_exhaustion};
 use tracing::{error, trace, warn};
 
 const COMPONENT: &str = "STREAMING_PARTITIONS";
+const EMPTIED_MARKER_LABEL: &str = "emptied offsets marker";
 
 /// Offsets read back from one offset directory.
 pub struct RecoveredOffsets<T> {
@@ -114,6 +117,35 @@ pub async fn load_group_offsets_with_storage<S: DurableStorage>(
         (ConsumerGroupId(offset.consumer_id as usize), offset)
     })
     .await
+}
+
+/// Read the op that the emptied-table marker at `path` names, `0` when there is
+/// none. A marker that cannot be read is removed: dropping it only withdraws a
+/// claim, while one left behind could outlive a later store, which retires only
+/// a marker the partition knows of.
+///
+/// # Errors
+/// Returns [`IggyError::CannotReadConsumerOffsets`] if the marker's presence
+/// cannot be checked or no descriptor is free to read it, and the removal's
+/// error if an unreadable marker cannot be removed.
+pub async fn load_emptied_marker_with_storage<S: DurableStorage>(
+    storage: &S,
+    path: &str,
+) -> Result<u64, IggyError> {
+    if !storage
+        .exists(Path::new(path))
+        .await
+        .map_err(|_| IggyError::CannotReadConsumerOffsets(path.to_owned()))?
+    {
+        return Ok(0);
+    }
+    match read_offset_file(storage, path, EMPTIED_MARKER_LABEL).await? {
+        OffsetFileLoad::Loaded(op) => Ok(op.into_inner()),
+        OffsetFileLoad::Removed => Ok(0),
+        OffsetFileLoad::Stranded => persist_emptied_marker_with_storage(storage, path, 0)
+            .await
+            .map(|()| 0),
+    }
 }
 
 async fn load_offsets<S: DurableStorage, T>(
@@ -306,15 +338,15 @@ mod tests {
     use nix::errno::Errno;
     use std::io;
 
-    /// [`DiskStorage`] with no free descriptor for a read-only open.
-    struct NoReadDescriptorStorage;
+    /// [`DiskStorage`] whose read-only opens fail with the given error.
+    struct FailedReadStorage(Errno);
 
-    impl DurableStorage for NoReadDescriptorStorage {
+    impl DurableStorage for FailedReadStorage {
         type File = <DiskStorage as DurableStorage>::File;
 
         async fn open(&self, path: &Path, mode: OpenMode) -> io::Result<Self::File> {
             if mode == OpenMode::Read {
-                return Err(io::Error::from_raw_os_error(Errno::EMFILE as i32));
+                return Err(io::Error::from_raw_os_error(self.0 as i32));
             }
             DiskStorage.open(path, mode).await
         }
@@ -362,12 +394,12 @@ mod tests {
         std::fs::write(dir.path().join("9"), 12_u64.to_le_bytes()).unwrap();
         let path = dir.path().to_str().unwrap();
         assert!(matches!(
-            load_consumer_offsets_with_storage(&NoReadDescriptorStorage, path).await,
+            load_consumer_offsets_with_storage(&FailedReadStorage(Errno::EMFILE), path).await,
             Err(IggyError::CannotReadConsumerOffsets(_))
         ));
         assert!(matches!(
             load_group_offsets_with_storage(
-                &NoReadDescriptorStorage,
+                &FailedReadStorage(Errno::EMFILE),
                 path,
                 ConsumerKind::ConsumerGroup
             )
@@ -378,6 +410,22 @@ mod tests {
             dir.path().join("9").exists(),
             "a failed load must keep the record"
         );
+    }
+
+    #[compio::test]
+    async fn given_unreadable_emptied_marker_when_loading_should_remove_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(crate::offset_storage::EMPTIED_MARKER_FILE);
+        std::fs::write(&marker, crate::offset_storage::encode_offset_record(2)).unwrap();
+
+        let emptied_at = load_emptied_marker_with_storage(
+            &FailedReadStorage(Errno::EIO),
+            marker.to_str().unwrap(),
+        )
+        .await;
+
+        assert!(matches!(emptied_at, Ok(0)), "{emptied_at:?}");
+        assert!(!marker.exists());
     }
 
     #[compio::test]

@@ -17,7 +17,7 @@
 
 # Toolchain is pinned by rust-toolchain.toml. The base
 # image ships rustup, so the pin auto-resolves on first cargo invocation.
-ARG RUST_VERSION=1.99
+ARG RUST_VERSION=1.99.1
 FROM rust:${RUST_VERSION}-slim-trixie
 
 # Build + runtime dependencies mirror the production Dockerfile builder
@@ -40,7 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Pin Node.js to the major version CI uses to build the web UI
 # (.github/workflows/_build_rust_artifacts.yml). NodeSource ships nodejs
 # with a bundled npm, so Debian's unversioned packages are not used.
-ARG NODE_VERSION=22
+ARG NODE_VERSION=24
 RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*

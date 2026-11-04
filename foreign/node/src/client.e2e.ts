@@ -23,7 +23,6 @@ try {
 
   const credentials = { username: 'iggy', password: 'iggy' };
 
-  // pooled client
   const c = new Client({
     transport: 'TCP',
     options: { port: 8090, host: '127.0.0.1' },
@@ -35,8 +34,7 @@ try {
   console.log('R3' , await c.client.list());
   console.log('R4' , await c.system.getStats());
 
-  // serial call should keep socket pool to 1
-  assert.equal(c._pool.size, 1);
+  const raw = await c.clientProvider();
 
   const resp  = await Promise.all([
     c.user.list(),
@@ -52,8 +50,8 @@ try {
 
   console.log('parallel call resp', resp);
 
-  // serial call should raise socket pool to MAX_POOL
-  assert.equal(c._pool.size, 4);
+  assert.equal(await c.clientProvider(), raw);
+  await c.destroy();
 
 } catch (err) {
   console.error('FAILED', err);

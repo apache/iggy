@@ -74,7 +74,7 @@ impl QueryParser for RedshiftQueryParser {
         _client: &C,
         sql: &str,
         param_types: &[Option<PgWireType>],
-    ) -> PgWireResult<Self::Statement>
+    ) -> PgWireResult<Option<Self::Statement>>
     where
         C: ClientInfo + Send + Sync,
     {
@@ -83,6 +83,10 @@ impl QueryParser for RedshiftQueryParser {
 
         let mut asts = SqlParser::parse_sql(&dialect, sql)
             .map_err(|e| user_err(format!("sql parse error: {e}")))?;
+
+        if asts.is_empty() {
+            return Ok(None);
+        }
 
         if asts.len() != 1 {
             // Reject multi-statement Parse messages outright.
@@ -117,7 +121,7 @@ impl QueryParser for RedshiftQueryParser {
 
         tracing::debug!("Postgres rewrite, {}", p_stmt.raw_sql);
 
-        Ok(p_stmt)
+        Ok(Some(p_stmt))
     }
 
     fn get_parameter_types(&self, stmt: &Self::Statement) -> PgWireResult<Vec<PgWireType>> {

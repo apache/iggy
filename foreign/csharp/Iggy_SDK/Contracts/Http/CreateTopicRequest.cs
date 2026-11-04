@@ -15,43 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Diagnostics.CodeAnalysis;
-using Apache.Iggy.Enums;
+using System.Text.Json.Serialization;
 
 namespace Apache.Iggy.Contracts.Http;
 
-internal sealed class CreateTopicRequest
-{
-    public required string Name { get; set; }
-    public CompressionAlgorithm CompressionAlgorithm { get; set; } = CompressionAlgorithm.None;
-    public ulong MessageExpiry { get; set; }
-    public uint PartitionsCount { get; set; } = 1;
-    public ulong MaxTopicSize { get; set; }
-
-    /// <summary>
-    ///     Option keys with no property of their own, as strings the server parses by the same rules a
-    ///     config file value goes through. The REST body carries them this way; the binary transports
-    ///     send a typed TLV block.
-    /// </summary>
-    public Dictionary<string, string> Options { get; set; } = new();
-
-    public CreateTopicRequest()
-    {
-    }
-
-    [SetsRequiredMembers]
-    public CreateTopicRequest(string name,
-        CompressionAlgorithm compressionAlgorithm,
-        ulong messageExpiry,
-        uint partitionsCount,
-        ulong maxTopicSize,
-        Dictionary<string, string>? options = null)
-    {
-        Name = name;
-        CompressionAlgorithm = compressionAlgorithm;
-        MessageExpiry = messageExpiry;
-        PartitionsCount = partitionsCount;
-        MaxTopicSize = maxTopicSize;
-        Options = options ?? new Dictionary<string, string>();
-    }
-}
+/// <summary>
+///     A topic create over REST. Every setting, compression, expiry and size cap included, rides
+///     <paramref name="Options" /> as <see cref="OptionInputs" /> renders it.
+/// </summary>
+internal sealed record CreateTopicRequest(
+    string Name,
+    uint PartitionsCount,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    Dictionary<string, object>? Options);

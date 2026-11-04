@@ -15,12 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::FILE_SYNC_CONCURRENCY;
 use crate::offset_storage::{OffsetFilePermit, RetainedOffsetFile, RetainedOffsetFiles};
-use futures::TryStreamExt;
+use futures::future::Either;
+use futures::{FutureExt, TryStreamExt};
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::ConsumerKind;
 use journal::PartitionPrepareJournal;
-use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage};
+use journal::durable_storage::{DurableFile, DurableStorage};
 use journal::partition_journal::{PARTITION_WAL_BYTES_MAX, SegmentPosition, SegmentReference};
 use server_common::Message;
 use server_common::iobuf::Frozen;
@@ -91,19 +93,19 @@ pub type PersistenceNotifier = Rc<dyn Fn(PersistenceCompletion)>;
 
 /// A file durability barrier that keeps the original writer alive until sync.
 #[must_use]
-pub struct CheckpointBarrier {
+pub struct FileSyncBarrier {
     path: PathBuf,
     sync: Pin<Box<dyn Future<Output = io::Result<()>> + 'static>>,
 }
 
-impl CheckpointBarrier {
-    /// Retain a simulator file's original writer until checkpoint synchronizes it.
+impl FileSyncBarrier {
+    /// Retains a simulator file's original writer until its sync runs.
     #[cfg(feature = "simulator")]
     pub fn from_file<F: DurableFile + 'static>(path: impl Into<PathBuf>, file: F) -> Self {
         Self::from_future(path, async move { file.sync().await })
     }
 
-    fn from_future(
+    pub(crate) fn from_future(
         path: impl Into<PathBuf>,
         sync: impl Future<Output = io::Result<()>> + 'static,
     ) -> Self {
@@ -118,12 +120,14 @@ impl CheckpointBarrier {
     }
 
     async fn run(self) -> io::Result<PathBuf> {
-        self.sync.await?;
+        self.sync.await.map_err(|error| {
+            io::Error::new(error.kind(), format!("{}: {error}", self.path.display()))
+        })?;
         Ok(self.path)
     }
 }
 
-pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
+pub struct PartitionPersistence<S: DurableStorage = crate::WalStorage> {
     group: u64,
     instance: u64,
     recovered_frontier: bool,
@@ -200,7 +204,7 @@ static WRITERS: LazyLock<Mutex<HashMap<PathBuf, WriterRegistration>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl WriterLease {
-    async fn acquire(key: PathBuf) -> io::Result<Arc<Self>> {
+    async fn acquire<S: DurableStorage>(key: PathBuf, storage: &S) -> io::Result<Arc<Self>> {
         loop {
             let previous = {
                 let mut writers = WRITERS
@@ -247,32 +251,34 @@ impl WriterLease {
                     "partition WAL already has an active writer",
                 ));
             }
-            compio::runtime::time::timeout(
-                PERSISTENCE_DRAIN_TIMEOUT,
-                futures::future::poll_fn(|context| {
-                    let mut waiters = previous
-                        .waiters
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if !previous.running.load(Ordering::Acquire) {
-                        return std::task::Poll::Ready(());
-                    }
-                    if !waiters
-                        .iter()
-                        .any(|waiter| waiter.will_wake(context.waker()))
-                    {
-                        waiters.push(context.waker().clone());
-                    }
-                    std::task::Poll::Pending
-                }),
-            )
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "retired partition WAL writer did not stop",
-                )
-            })?;
+            let drained = futures::future::poll_fn(|context| {
+                let mut waiters = previous
+                    .waiters
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !previous.running.load(Ordering::Acquire) {
+                    return std::task::Poll::Ready(());
+                }
+                if !waiters
+                    .iter()
+                    .any(|waiter| waiter.will_wake(context.waker()))
+                {
+                    waiters.push(context.waker().clone());
+                }
+                std::task::Poll::Pending
+            })
+            .fuse();
+            let expired = storage.sleep(PERSISTENCE_DRAIN_TIMEOUT).fuse();
+            futures::pin_mut!(drained, expired);
+            futures::select_biased! {
+                () = drained => {}
+                () = expired => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "retired partition WAL writer did not stop",
+                    ));
+                }
+            }
             let mut writers = WRITERS
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -430,12 +436,17 @@ enum Mutation<S: DurableStorage> {
         epoch: u64,
         from_op: u64,
     },
+    Barrier {
+        epoch: u64,
+        barriers: Vec<FileSyncBarrier>,
+        offset_files: Vec<RetainedOffsetFile<S::File>>,
+    },
     Checkpoint {
         epoch: u64,
         through_op: u64,
         files: Vec<PathBuf>,
         directories: Vec<PathBuf>,
-        barriers: Vec<CheckpointBarrier>,
+        barriers: Vec<FileSyncBarrier>,
         offset_files: Vec<RetainedOffsetFile<S::File>>,
         synced_files: BTreeSet<PathBuf>,
     },
@@ -482,7 +493,7 @@ impl PartitionPersistence {
         group: u64,
         incarnation: u64,
     ) -> io::Result<(Rc<Self>, Vec<Message<PrepareHeader>>)> {
-        Self::open_with_storage(directory, group, incarnation, DiskStorage).await
+        Self::open_with_storage(directory, group, incarnation, crate::WalStorage::default()).await
     }
 }
 
@@ -523,7 +534,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             )
         })?;
         let lease = if let Some(key) = storage.writer_identity(partition_directory)? {
-            Some(WriterLease::acquire(key).await?)
+            Some(WriterLease::acquire(key, &storage).await?)
         } else {
             None
         };
@@ -673,6 +684,12 @@ impl<S: DurableStorage> PartitionPersistence<S> {
 
     pub fn is_written_through(&self, op: u64) -> bool {
         !self.retired.get() && self.failure.borrow().is_none() && op <= self.written_head.get()
+    }
+
+    /// Where the WAL wrote the body of `op` in a segment, while the WAL still
+    /// holds the op.
+    pub fn segment_reference(&self, op: u64) -> Option<SegmentReference> {
+        self.segment_references.borrow().get(&op).copied()
     }
 
     pub const fn segment_checkpoint(&self) -> Option<SegmentPosition> {
@@ -831,20 +848,31 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         }
     }
 
+    /// An injected file has no disk handle to lend, so it is checked out as absent.
     pub(crate) fn checkout_offset_file(
         &self,
         path: &str,
-    ) -> Option<(Option<S::File>, Rc<OffsetFilePermit>)> {
-        self.offset_files.checkout(path)
+    ) -> Option<(Option<compio::fs::File>, Rc<OffsetFilePermit>)>
+    where
+        compio::fs::File: TryFrom<S::File>,
+    {
+        self.offset_files.checkout(path).map(|(file, permit)| {
+            (
+                file.and_then(|file| compio::fs::File::try_from(file).ok()),
+                permit,
+            )
+        })
     }
 
     pub(crate) fn return_offset_file(
         &self,
         path: &str,
-        file: S::File,
+        file: compio::fs::File,
         permit: Rc<OffsetFilePermit>,
-    ) {
-        self.offset_files.put(path, file, permit);
+    ) where
+        S::File: From<compio::fs::File>,
+    {
+        self.offset_files.put(path, S::File::from(file), permit);
     }
 
     pub fn retire_offset_file(&self, path: &str) {
@@ -882,6 +910,8 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     }
 
     pub fn checkpoint(&self, through_op: u64) {
+        // This shorthand has no materialized paths, so
+        // [`FileSyncBarrier`] has no original writer to retain.
         self.checkpoint_files(through_op, Vec::new(), Vec::new(), Vec::new());
     }
 
@@ -890,7 +920,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         through_op: u64,
         files: Vec<PathBuf>,
         directories: Vec<PathBuf>,
-        barriers: Vec<CheckpointBarrier>,
+        barriers: Vec<FileSyncBarrier>,
     ) {
         if through_op <= self.checkpoint_requested.get() {
             return;
@@ -907,6 +937,20 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             offset_files,
             synced_files,
         });
+    }
+
+    /// Queue a durability barrier through retained original writers without
+    /// advancing [`PartitionPersistence::checkpoint_op`]. The returned paths
+    /// count as synced only after the queued barrier succeeds.
+    pub fn barrier_files(&self, barriers: Vec<FileSyncBarrier>) -> BTreeSet<PathBuf> {
+        let (offset_files, mut synced_files) = self.offset_files.take_checkpoint();
+        synced_files.extend(barriers.iter().map(|barrier| barrier.path.clone()));
+        self.queue.borrow_mut().push_back(Mutation::Barrier {
+            epoch: self.epoch.get(),
+            barriers,
+            offset_files,
+        });
+        synced_files
     }
 
     pub const fn checkpoint_pending(&self) -> bool {
@@ -958,6 +1002,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                         .set(self.checkpoint_requested.get().max(*through_op));
                     true
                 }
+                Mutation::Barrier { .. } => true,
                 _ => false,
             });
         self.accepted.borrow_mut().truncate_from(from_op);
@@ -1094,6 +1139,11 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         self.accepted_head.get()
     }
 
+    /// The WAL byte budget, `wal_bytes_max` in the server configuration.
+    pub const fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
     pub fn retire(&self) {
         self.retired.set(true);
         if let Some(lease) = &self.lease {
@@ -1172,12 +1222,23 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         .await
     }
 
+    /// Times out on the caller's clock, so a simulated owner drains in virtual time.
+    ///
     /// # Errors
     /// Returns a storage failure or a timeout without allowing a second writer.
-    pub async fn drain_with_timeout(&self) -> io::Result<()> {
-        compio::runtime::time::timeout(PERSISTENCE_DRAIN_TIMEOUT, self.drain())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "partition WAL drain timed out"))?
+    pub async fn drain_with_timeout<F>(&self, sleep: impl FnOnce(Duration) -> F) -> io::Result<()>
+    where
+        F: Future<Output = ()>,
+    {
+        let drain = std::pin::pin!(self.drain());
+        let timeout = std::pin::pin!(sleep(PERSISTENCE_DRAIN_TIMEOUT));
+        match futures::future::select(drain, timeout).await {
+            Either::Left((result, _)) => result,
+            Either::Right(((), _)) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "partition WAL drain timed out",
+            )),
+        }
     }
 
     /// Queue a barrier for preceding buffered writes; drain before claiming durability.
@@ -1248,6 +1309,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 | Mutation::EnableSegments { epoch, .. }
                 | Mutation::ReanchorSegments { epoch, .. }
                 | Mutation::Truncate { epoch, .. }
+                | Mutation::Barrier { epoch, .. }
                 | Mutation::Checkpoint { epoch, .. }
                 | Mutation::Reset { epoch, .. } => (*epoch, 0),
             };
@@ -1359,6 +1421,14 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             }
             Mutation::Sync { .. } => journal.sync().await,
             Mutation::Truncate { from_op, .. } => journal.truncate_from(from_op).await,
+            Mutation::Barrier {
+                barriers,
+                offset_files,
+                ..
+            } => {
+                Self::sync_files(offset_files, barriers).await?;
+                journal.sync().await
+            }
             Mutation::Checkpoint {
                 through_op,
                 files,
@@ -1370,14 +1440,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             } => {
                 self.checkpoint_running.set(true);
                 let result = async {
-                    futures::stream::iter(offset_files.iter().map(Ok::<_, io::Error>))
-                        .try_for_each_concurrent(16, |retained| retained.file.sync())
-                        .await?;
-                    let barrier_paths = futures::future::try_join_all(
-                        barriers.into_iter().map(CheckpointBarrier::run),
-                    )
-                    .await?;
-                    synced_files.extend(barrier_paths);
+                    synced_files.extend(Self::sync_files(offset_files, barriers).await?);
                     journal
                         .checkpoint_files(through_op, &files, &directories, &synced_files)
                         .await
@@ -1408,6 +1471,16 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 }
             }
         }
+    }
+
+    async fn sync_files(
+        offset_files: Vec<RetainedOffsetFile<S::File>>,
+        barriers: Vec<FileSyncBarrier>,
+    ) -> io::Result<Vec<PathBuf>> {
+        futures::stream::iter(offset_files.iter().map(Ok::<_, io::Error>))
+            .try_for_each_concurrent(FILE_SYNC_CONCURRENCY, |retained| retained.file.sync())
+            .await?;
+        futures::future::try_join_all(barriers.into_iter().map(FileSyncBarrier::run)).await
     }
 
     async fn append_batch(

@@ -25,23 +25,30 @@ import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Response;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyOperationException;
+import org.apache.iggy.exception.IggyValidationException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
 import org.apache.iggy.partition.PartitionContext;
+import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.io.IOException;
 import java.math.BigInteger;
 import java.net.InetAddress;
 import java.net.ServerSocket;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.time.Duration;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -50,29 +57,29 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
-import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientRawRequestTest.offsetTarget;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientRawRequestTest.rawDeleteOffset;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientRawRequestTest.rawStoreOffset;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.BIND_SESSION_CODE;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_CLUSTER_METADATA_CODE;
-import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_POLL_ROUTING_CODE;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_PARTITION_ROUTE_CODE;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GROUP_SYNC_CODE;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.OPERATION_NON_REPLICATED;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.OPERATION_REGISTER;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.POLL_CODE;
-import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.POLL_ON_PRIMARY_CODE;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.TRANSIENT_NOT_ACCEPTED;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.assertServerError;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.bindBody;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.client;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.clusterMetadata;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.emptyPoll;
-import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.partitionContext;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.partitionRoute;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.poll;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.pollRoute;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.registerBody;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.serve;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.singleNodeMetadata;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class AsyncIggyTcpClientPartitionContextTest {
     private static final int OPERATION_SEND_MESSAGES = 160;
@@ -80,12 +87,13 @@ class AsyncIggyTcpClientPartitionContextTest {
     private static final int OPERATION_DELETE_CONSUMER_OFFSET = 162;
     private static final int STORE_OFFSET_CODE = 121;
     private static final int DELETE_OFFSET_CODE = 122;
-    private static final int GET_SEND_CONTEXT_CODE = 105;
-    private static final int GET_OFFSET_ROUTING_CODE = 123;
+    private static final int GET_PARTITION_ROUTE_CODE = 105;
+    private static final int GET_OFFSET_ROUTING_CODE = 105;
     private static final int HISTORY_UNAVAILABLE = 87;
     private static final int LIFECYCLE_BUSY = IggyErrorCode.LIFECYCLE_BUSY.getCode();
     private static final int PARTITION_NOT_OWNED = 5009;
     private static final int ASSIGNED_PARTITION = 7;
+    private static final int DEFERRED_PARAMETERS_BYTES = 2 * Long.BYTES + 2 * Integer.BYTES;
     // An offset write status of the fake primary: the write is stored.
     private static final int STORED = 0;
     private static final long ROUTE_INCARNATION = 1;
@@ -107,7 +115,7 @@ class AsyncIggyTcpClientPartitionContextTest {
                     return Response.success(
                             OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
                 }
-                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                     routing.complete(null);
                     releaseRoute.join();
                     return Response.success(
@@ -138,7 +146,8 @@ class AsyncIggyTcpClientPartitionContextTest {
     }
 
     @Test
-    void shouldSendOnTheLeaderThatAnsweredAMovedContextDiscovery() throws Exception {
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
+    void shouldTryAnotherReadyReplicaWhenRouteDiscoveryIsRefused() throws Exception {
         InetAddress loopback = InetAddress.getLoopbackAddress();
         try (ServerSocket oldLeaderSocket = new ServerSocket(0, 1, loopback);
                 ServerSocket newLeaderSocket = new ServerSocket(0, 1, loopback)) {
@@ -155,9 +164,10 @@ class AsyncIggyTcpClientPartitionContextTest {
                 if (request.operation() == OPERATION_REGISTER) {
                     return Response.success(OPERATION_REGISTER, registerBody(1));
                 }
-                if (request.is(GET_SEND_CONTEXT_CODE, OPERATION_NON_REPLICATED)) {
-                    denials.incrementAndGet();
-                    return Response.error(OPERATION_NON_REPLICATED, TRANSIENT_NOT_ACCEPTED);
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
+                    return denials.incrementAndGet() == 1
+                            ? Response.error(OPERATION_NON_REPLICATED, TRANSIENT_NOT_ACCEPTED)
+                            : Response.success(OPERATION_NON_REPLICATED, pollRoute(request, 1, 1, newPort));
                 }
                 throw new IllegalStateException("Unexpected request to old leader: " + request);
             });
@@ -168,8 +178,11 @@ class AsyncIggyTcpClientPartitionContextTest {
                 if (request.operation() == OPERATION_REGISTER) {
                     return Response.success(OPERATION_REGISTER, registerBody(2));
                 }
-                if (request.is(GET_SEND_CONTEXT_CODE, OPERATION_NON_REPLICATED)) {
-                    return Response.success(OPERATION_NON_REPLICATED, partitionContext(Unpooled.buffer(), 1));
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(OPERATION_NON_REPLICATED, pollRoute(request, 1, 1, newPort));
+                }
+                if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(OPERATION_NON_REPLICATED, bindBody(request));
                 }
                 if (request.operation() == OPERATION_SEND_MESSAGES) {
                     sends.incrementAndGet();
@@ -187,8 +200,8 @@ class AsyncIggyTcpClientPartitionContextTest {
                 client.connect().get(5, TimeUnit.SECONDS);
                 client.login().get(5, TimeUnit.SECONDS);
                 send(client).get(10, TimeUnit.SECONDS);
-                assertThat(client.getConnectionInfo().port()).isEqualTo(newPort);
-                assertThat(denials).hasValueGreaterThan(1);
+                assertThat(client.getConnectionInfo().port()).isEqualTo(oldPort);
+                assertThat(denials).hasValue(1);
                 assertThat(sends).hasValue(1);
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
@@ -199,7 +212,7 @@ class AsyncIggyTcpClientPartitionContextTest {
     }
 
     @Test
-    void shouldReuseTheSendContextAndRefreshItOnceAfterAnIncarnationChange() throws Exception {
+    void shouldRefreshHistoryOnceAndReturnARepeatedRefusal() throws Exception {
         InetAddress loopback = InetAddress.getLoopbackAddress();
         try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback)) {
             AtomicLong incarnation = new AtomicLong(1);
@@ -214,10 +227,10 @@ class AsyncIggyTcpClientPartitionContextTest {
                     return Response.success(
                             OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
                 }
-                if (request.is(GET_SEND_CONTEXT_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                     discoveries.incrementAndGet();
                     return Response.success(
-                            OPERATION_NON_REPLICATED, partitionContext(Unpooled.buffer(), discovered.get()));
+                            OPERATION_NON_REPLICATED, partitionRoute(Unpooled.buffer(), discovered.get()));
                 }
                 if (request.operation() == OPERATION_SEND_MESSAGES) {
                     sentIncarnations.add(request.incarnation());
@@ -322,6 +335,7 @@ class AsyncIggyTcpClientPartitionContextTest {
             AtomicInteger discoveries = new AtomicInteger();
             AtomicInteger polls = new AtomicInteger();
             List<PartitionContext> stamped = new CopyOnWriteArrayList<>();
+            List<Long> requestIds = new CopyOnWriteArrayList<>();
             CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
                 if (request.operation() == OPERATION_REGISTER) {
                     return Response.success(OPERATION_REGISTER, registerBody(1));
@@ -330,7 +344,7 @@ class AsyncIggyTcpClientPartitionContextTest {
                     return Response.success(
                             OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
                 }
-                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                     discoveries.incrementAndGet();
                     return Response.success(
                             OPERATION_NON_REPLICATED,
@@ -338,6 +352,7 @@ class AsyncIggyTcpClientPartitionContextTest {
                 }
                 if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
                     stamped.add(stampedContext(request));
+                    requestIds.add(request.requestId());
                     // A refusal replays the same frame, a lifecycle refusal encodes a new one.
                     return switch (polls.incrementAndGet()) {
                         case 1 -> Response.error(OPERATION_NON_REPLICATED, TRANSIENT_NOT_ACCEPTED);
@@ -357,7 +372,9 @@ class AsyncIggyTcpClientPartitionContextTest {
                 assertThat(stamped)
                         .containsExactly(
                                 CALLER_CONTEXT, CALLER_CONTEXT, CALLER_CONTEXT, routeContext(ROUTE_INCARNATION));
-                assertThat(discoveries).hasValue(1);
+                assertThat(discoveries).hasValue(2);
+                assertThat(requestIds.get(1)).isEqualTo(requestIds.get(0));
+                assertThat(requestIds.get(2)).isGreaterThan(requestIds.get(1));
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
             }
@@ -379,7 +396,7 @@ class AsyncIggyTcpClientPartitionContextTest {
                     return Response.success(
                             OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
                 }
-                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                     discoveries.incrementAndGet();
                     return Response.success(
                             OPERATION_NON_REPLICATED,
@@ -434,7 +451,7 @@ class AsyncIggyTcpClientPartitionContextTest {
                                     primarySocket.getLocalPort(),
                                     coordinatorSocket.getLocalPort()));
                 }
-                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                     // Every route reports a newer incarnation, so the reroute offers another context.
                     return Response.success(
                             OPERATION_NON_REPLICATED,
@@ -444,9 +461,9 @@ class AsyncIggyTcpClientPartitionContextTest {
             });
             CompletableFuture<Void> primary = serve(primarySocket, request -> {
                 if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
-                    return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+                    return Response.success(OPERATION_NON_REPLICATED, bindBody(request));
                 }
-                if (request.is(POLL_ON_PRIMARY_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
                     stamped.add(stampedContext(request));
                     return polls.incrementAndGet() == 1
                             ? Response.error(OPERATION_NON_REPLICATED, TRANSIENT_NOT_ACCEPTED)
@@ -473,7 +490,7 @@ class AsyncIggyTcpClientPartitionContextTest {
     }
 
     @Test
-    void shouldReturnPartitionNotOwnedToAGroupPollWithACallerContextAndRetryOneWithout() throws Exception {
+    void shouldReturnPartitionNotOwnedWithoutRetryingAGroupPoll() throws Exception {
         InetAddress loopback = InetAddress.getLoopbackAddress();
         try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback)) {
             AtomicInteger syncs = new AtomicInteger();
@@ -493,7 +510,7 @@ class AsyncIggyTcpClientPartitionContextTest {
                             OPERATION_NON_REPLICATED,
                             Unpooled.buffer().writeLongLE(1).writeIntLE(1).writeIntLE(0));
                 }
-                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                     return Response.success(
                             OPERATION_NON_REPLICATED,
                             pollRoute(request, 1, 1, coordinatorSocket.getLocalPort(), ROUTE_INCARNATION));
@@ -513,12 +530,130 @@ class AsyncIggyTcpClientPartitionContextTest {
                 assertServerError(
                         pollGroup(client, PollingStrategy.next().withContext(CALLER_CONTEXT)), PARTITION_NOT_OWNED);
                 assertThat(polls).hasValue(1);
+                assertServerError(pollGroup(client, PollingStrategy.next()), PARTITION_NOT_OWNED);
+                assertThat(polls).hasValue(2);
                 pollGroup(client, PollingStrategy.next()).get(5, TimeUnit.SECONDS);
                 assertThat(polls).hasValue(3);
                 assertThat(syncs).hasValue(3);
                 assertThat(stamped)
                         .containsExactly(
                                 CALLER_CONTEXT, routeContext(ROUTE_INCARNATION), routeContext(ROUTE_INCARNATION));
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            coordinator.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(
+            value = IggyErrorCode.class,
+            names = {"TRANSIENT_NOT_ACCEPTED", "NOT_PRIMARY", "DEFERRED_POLL_CAPACITY_EXCEEDED"})
+    void shouldReduceDeferredRetryBudgetsWithoutChangingIdentity(IggyErrorCode refusal) throws Exception {
+        for (boolean progress : new boolean[] {false, true}) {
+            InetAddress loopback = InetAddress.getLoopbackAddress();
+            try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback)) {
+                AtomicInteger routes = new AtomicInteger();
+                List<Request> polls = new CopyOnWriteArrayList<>();
+                CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
+                    if (request.operation() == OPERATION_REGISTER) {
+                        return Response.success(OPERATION_REGISTER, registerBody(1));
+                    }
+                    if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                        return Response.success(
+                                OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
+                    }
+                    if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
+                        routes.incrementAndGet();
+                        return Response.success(
+                                OPERATION_NON_REPLICATED,
+                                pollRoute(request, 1, 1, coordinatorSocket.getLocalPort(), ROUTE_INCARNATION)
+                                        .setIntLE(2 * Long.BYTES, routes.get() - 1));
+                    }
+                    if (request.is(CommandCode.Messages.POLL_DEFERRED.getValue(), OPERATION_NON_REPLICATED)) {
+                        polls.add(request);
+                        return polls.size() == 1
+                                ? Response.error(OPERATION_NON_REPLICATED, refusal.getCode())
+                                : Response.success(OPERATION_NON_REPLICATED, emptyPoll(0));
+                    }
+                    throw new IllegalStateException("Unexpected coordinator request: " + request);
+                });
+                AsyncIggyTcpClient client = client(coordinatorSocket);
+                var options = DeferredPollOptions.defaults();
+                try {
+                    client.connect().get(5, TimeUnit.SECONDS);
+                    client.login().get(5, TimeUnit.SECONDS);
+                    client.messages()
+                            .pollMessagesDeferred(
+                                    StreamId.of(1L),
+                                    TopicId.of(1L),
+                                    Optional.of(0L),
+                                    Consumer.of(7L),
+                                    PollingStrategy.offset(BigInteger.ZERO),
+                                    1L,
+                                    progress,
+                                    options)
+                            .get(5, TimeUnit.SECONDS);
+                    assertThat(polls).hasSize(2);
+                    Request first = polls.get(0);
+                    Request second = polls.get(1);
+                    assertThat(second.requestId()).isEqualTo(first.requestId());
+                    assertThat(second.clientLow()).isEqualTo(first.clientLow());
+                    assertThat(second.clientHigh()).isEqualTo(first.clientHigh());
+                    assertThat(stampedContext(second)).isEqualTo(stampedContext(first));
+                    ByteBuffer firstBody = ByteBuffer.wrap(first.body()).order(ByteOrder.LITTLE_ENDIAN);
+                    ByteBuffer secondBody = ByteBuffer.wrap(second.body()).order(ByteOrder.LITTLE_ENDIAN);
+                    long firstWait = firstBody.getLong(firstBody.limit() - DEFERRED_PARAMETERS_BYTES);
+                    long secondWait = secondBody.getLong(secondBody.limit() - DEFERRED_PARAMETERS_BYTES);
+                    long firstBudget = firstBody.getLong(firstBody.limit() - Long.BYTES);
+                    long secondBudget = secondBody.getLong(secondBody.limit() - Long.BYTES);
+                    assertThat(secondWait).isLessThan(firstWait);
+                    assertThat(secondBudget).isLessThan(firstBudget);
+                    assertThat(secondBudget - secondWait)
+                            .isEqualTo(options.requestTimeoutMicros() - options.maxWaitMicros());
+                    assertThat(routes).hasValue(refusal == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED ? 1 : 2);
+                } finally {
+                    client.close().get(5, TimeUnit.SECONDS);
+                }
+                coordinator.get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    /** A 106 names one partition, so the client refuses a deferred group poll without one, as the server would. */
+    @Test
+    void shouldRefuseADeferredGroupPollWithoutAPartitionBeforeSendingIt() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback)) {
+            CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
+                }
+                throw new IllegalStateException("Unexpected coordinator request: " + request);
+            });
+            AsyncIggyTcpClient client = client(coordinatorSocket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+
+                assertThatThrownBy(() -> client.messages()
+                                .pollMessagesDeferred(
+                                        StreamId.of(1L),
+                                        TopicId.of(1L),
+                                        Optional.empty(),
+                                        Consumer.group(ConsumerId.of(7L)),
+                                        PollingStrategy.next(),
+                                        1L,
+                                        false,
+                                        DeferredPollOptions.defaults()))
+                        .isInstanceOfSatisfying(IggyValidationException.class, error -> {
+                            assertThat(error.getRawErrorCode()).isEqualTo(IggyErrorCode.INVALID_COMMAND.getCode());
+                            assertThat(error.getMessage()).contains("partition reader");
+                        });
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
             }
@@ -550,7 +685,7 @@ class AsyncIggyTcpClientPartitionContextTest {
                                             .writeIntLE(1)
                                             .writeIntLE(ASSIGNED_PARTITION));
                 }
-                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                     return Response.success(
                             OPERATION_NON_REPLICATED,
                             pollRoute(request, 1, 1, coordinatorSocket.getLocalPort(), ROUTE_INCARNATION));
@@ -582,9 +717,8 @@ class AsyncIggyTcpClientPartitionContextTest {
 
     @Test
     void shouldStoreOffsetsOnThePrimaryAndRouteAgainAfterARefusal() throws Exception {
-        for (int refusal : new int[] {HISTORY_UNAVAILABLE, PARTITION_NOT_OWNED, LIFECYCLE_BUSY}) {
-            // The client replaces its data connection after a refusal other than 58.
-            try (OffsetCluster cluster = new OffsetCluster(2, STORED, refusal, STORED)) {
+        for (int refusal : new int[] {HISTORY_UNAVAILABLE, PARTITION_NOT_OWNED}) {
+            try (OffsetCluster cluster = new OffsetCluster(1, STORED, refusal, STORED)) {
                 AsyncIggyTcpClient client = client(cluster.coordinatorSocket);
                 try {
                     client.connect().get(5, TimeUnit.SECONDS);
@@ -597,17 +731,63 @@ class AsyncIggyTcpClientPartitionContextTest {
                 }
                 cluster.awaitServed();
                 assertThat(cluster.coordinatorWrites).isEmpty();
-                assertThat(cluster.routings).hasSize(2);
+                assertThat(cluster.routings).hasSize(refusal == HISTORY_UNAVAILABLE ? 2 : 1);
                 assertThat(cluster.primaryWrites)
                         .extracting(AsyncIggyTcpClientPartitionContextTest::stampedContext)
-                        .containsExactly(routeContext(1), routeContext(1), routeContext(2));
-                assertThat(cluster.binds).extracting(Request::connection).containsExactly(0, 1);
-                byte[] store = cluster.primaryWrites.get(0).body();
-                // A route names the consumer, stream, topic and partition that the write leads with.
+                        .containsExactly(
+                                routeContext(1), routeContext(1), routeContext(refusal == HISTORY_UNAVAILABLE ? 2 : 1));
+                assertThat(cluster.binds).extracting(Request::connection).containsOnly(0);
                 assertThat(cluster.routings)
                         .allSatisfy(routing -> assertThat(routing.body())
-                                .isEqualTo(Arrays.copyOf(store, store.length - Long.BYTES - 1)));
+                                .isEqualTo(new byte[] {1, 4, 1, 0, 0, 0, 1, 4, 1, 0, 0, 0, 0, 0, 0, 0}));
             }
+        }
+    }
+
+    @Test
+    void shouldRetryPrimaryLifecycleRefusalsWithANewIdAndTheCapturedContext() throws Exception {
+        try (OffsetCluster cluster = new OffsetCluster(1, LIFECYCLE_BUSY, STORED)) {
+            AsyncIggyTcpClient client = client(cluster.coordinatorSocket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                storeOffset(client, 1, CALLER_CONTEXT).get(5, TimeUnit.SECONDS);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            cluster.awaitServed();
+            assertThat(cluster.primaryWrites)
+                    .extracting(AsyncIggyTcpClientPartitionContextTest::stampedContext)
+                    .containsExactly(CALLER_CONTEXT, CALLER_CONTEXT);
+            assertThat(cluster.primaryWrites.get(1).requestId())
+                    .isGreaterThan(cluster.primaryWrites.get(0).requestId());
+            assertThat(cluster.routings).hasSize(1);
+        }
+    }
+
+    @Test
+    void shouldRetainAfterAnUnprovedLifecycleRefusalAndResolveTheSameRequest() throws Exception {
+        try (OffsetCluster cluster =
+                new OffsetCluster(1, AsyncTcpConnection.TRANSIENT_NOT_COMMITTED, LIFECYCLE_BUSY, STORED)) {
+            AsyncIggyTcpClient client = client(cluster.coordinatorSocket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                assertThatThrownBy(() -> storeOffset(client, 1, CALLER_CONTEXT).join())
+                        .hasCauseInstanceOf(IggyOperationException.class);
+                assertThat(cluster.primaryWrites).hasSize(2);
+                client.resolveOperation(cluster.primaryWrites.get(0).requestId(), Duration.ofSeconds(2))
+                        .get(5, TimeUnit.SECONDS);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            cluster.awaitServed();
+            assertThat(cluster.primaryWrites)
+                    .hasSize(3)
+                    .extracting(Request::requestId)
+                    .containsOnly(cluster.primaryWrites.get(0).requestId());
+            assertThat(cluster.primaryWrites).extracting(Request::connection).containsOnly(0);
+            assertThat(cluster.routings).hasSize(1);
         }
     }
 
@@ -635,7 +815,7 @@ class AsyncIggyTcpClientPartitionContextTest {
 
     @Test
     void shouldNumberPrimaryOffsetWritesFromTheCoordinatorSession() throws Exception {
-        try (OffsetCluster cluster = new OffsetCluster(2, HISTORY_UNAVAILABLE, STORED)) {
+        try (OffsetCluster cluster = new OffsetCluster(1, HISTORY_UNAVAILABLE, STORED)) {
             AsyncIggyTcpClient client = client(cluster.coordinatorSocket);
             try {
                 client.connect().get(5, TimeUnit.SECONDS);
@@ -648,9 +828,14 @@ class AsyncIggyTcpClientPartitionContextTest {
             }
             cluster.awaitServed();
             // The partition deduplicates by client and request id, whichever connection carries them.
-            long sent = cluster.coordinatorWrites.get(0).requestId();
-            assertThat(cluster.primaryWrites).extracting(Request::connection).containsExactly(0, 1);
-            assertThat(cluster.primaryWrites).extracting(Request::requestId).containsExactly(sent + 1, sent + 2);
+            long sent = cluster.primarySends.get(0).requestId();
+            assertThat(cluster.coordinatorWrites).isEmpty();
+            assertThat(cluster.primaryWrites).extracting(Request::connection).containsOnly(0);
+            assertThat(cluster.primaryWrites)
+                    .extracting(Request::requestId)
+                    .isSorted()
+                    .doesNotHaveDuplicates();
+            assertThat(cluster.primaryWrites.get(0).requestId()).isGreaterThan(sent);
         }
     }
 
@@ -690,13 +875,44 @@ class AsyncIggyTcpClientPartitionContextTest {
             cluster.awaitServed();
             assertThat(cluster.routings)
                     .singleElement()
-                    .satisfies(routing -> assertThat(routing.body()).isEqualTo(ByteBufUtil.getBytes(offsetTarget())));
+                    .satisfies(routing -> assertThat(routing.body())
+                            .isEqualTo(ByteBufUtil.getBytes(Unpooled.buffer()
+                                    .writeByte(1)
+                                    .writeByte(4)
+                                    .writeIntLE(1)
+                                    .writeByte(1)
+                                    .writeByte(4)
+                                    .writeIntLE(2)
+                                    .writeIntLE(0))));
             assertThat(cluster.primaryWrites)
                     .extracting(Request::operation)
                     .containsExactly(OPERATION_STORE_CONSUMER_OFFSET, OPERATION_DELETE_CONSUMER_OFFSET);
             assertThat(cluster.primaryWrites)
                     .extracting(AsyncIggyTcpClientPartitionContextTest::stampedContext)
                     .containsOnly(routeContext(1));
+        }
+    }
+
+    @Test
+    void shouldDeleteTheReaderOffsetWithItsCapturedContext() throws Exception {
+        try (OffsetCluster cluster = new OffsetCluster(1, STORED)) {
+            AsyncIggyTcpClient client = client(cluster.coordinatorSocket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                ((ConsumerOffsetsTcpClient) client.consumerOffsets())
+                        .deleteConsumerOffset(StreamId.of(1L), TopicId.of(1L), 0L, Consumer.of(7L), CALLER_CONTEXT)
+                        .get(5, TimeUnit.SECONDS);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            cluster.awaitServed();
+            assertThat(cluster.primaryWrites)
+                    .extracting(Request::operation)
+                    .containsExactly(OPERATION_DELETE_CONSUMER_OFFSET);
+            assertThat(cluster.primaryWrites)
+                    .extracting(AsyncIggyTcpClientPartitionContextTest::stampedContext)
+                    .containsExactly(CALLER_CONTEXT);
         }
     }
 
@@ -726,7 +942,7 @@ class AsyncIggyTcpClientPartitionContextTest {
     }
 
     private static PartitionContext routeContext(long incarnation) {
-        return new PartitionContext(BigInteger.valueOf(incarnation), BigInteger.ZERO, BigInteger.ZERO);
+        return new PartitionContext(BigInteger.valueOf(incarnation), BigInteger.ZERO, BigInteger.ONE);
     }
 
     private static CompletableFuture<SendMessagesResponse> send(AsyncIggyTcpClient client) {
@@ -766,6 +982,7 @@ class AsyncIggyTcpClientPartitionContextTest {
         private final List<Request> routings = new CopyOnWriteArrayList<>();
         private final List<Request> coordinatorWrites = new CopyOnWriteArrayList<>();
         private final List<Request> primaryWrites = new CopyOnWriteArrayList<>();
+        private final List<Request> primarySends = new CopyOnWriteArrayList<>();
         private final List<Request> binds = new CopyOnWriteArrayList<>();
         private final int[] writeStatuses;
         private final CompletableFuture<Void> coordinator;
@@ -806,9 +1023,6 @@ class AsyncIggyTcpClientPartitionContextTest {
                                 primarySocket.getLocalPort(),
                                 coordinatorSocket.getLocalPort()));
             }
-            if (request.is(GET_SEND_CONTEXT_CODE, OPERATION_NON_REPLICATED)) {
-                return Response.success(OPERATION_NON_REPLICATED, partitionContext(Unpooled.buffer(), 1));
-            }
             if (request.is(GET_OFFSET_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
                 routings.add(request);
                 return routings.size() == 1 && firstRouteRefusal != STORED
@@ -831,7 +1045,11 @@ class AsyncIggyTcpClientPartitionContextTest {
         private Response answerOnPrimary(Request request) {
             if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
                 binds.add(request);
-                return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+                return Response.success(OPERATION_NON_REPLICATED, bindBody(request));
+            }
+            if (request.operation() == OPERATION_SEND_MESSAGES) {
+                primarySends.add(request);
+                return Response.success(OPERATION_SEND_MESSAGES, Unpooled.EMPTY_BUFFER);
             }
             if (!isOffsetWrite(request) || primaryWrites.size() == writeStatuses.length) {
                 throw new IllegalStateException("Unexpected primary request: " + request);

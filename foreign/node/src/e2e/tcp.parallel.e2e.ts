@@ -24,26 +24,21 @@ describe('e2e -> parallel', async () => {
   const c = getTestClient();
 
   const baseGetMe = await c.client.getMe();
-  const credentials = { username: 'iggy', password: 'iggy' };
-
 
   it('e2e -> parallel::mix calls', async () => {
     const resp  = await Promise.all([
       c.client.getMe(),
       c.system.getStats(),
       c.system.ping(),
-      c.session.login(credentials),
       c.client.getMe(),
       c.system.getStats(),
       c.system.ping(),
-      c.session.login(credentials),
       c.client.getMe(),
       c.system.getStats(),
       c.system.ping(),
-      c.session.login(credentials),
     ]);
 
-    assert.ok(resp.length === 12);
+    assert.equal(resp.length, 9);
     assert.deepEqual(resp[0], baseGetMe);
     assert.deepEqual(
       Object.keys(resp[1]),

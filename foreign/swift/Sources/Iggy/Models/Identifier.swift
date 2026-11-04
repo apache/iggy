@@ -115,4 +115,20 @@ extension Identifier {
         }
     }
 
+    /// Reads what ``encode(into:)`` writes, for a raw request the client
+    /// routes by the partition it names.
+    static func decode(from reader: inout ByteReader) throws -> Identifier {
+        switch try reader.readUInt8() {
+        case numericKindCode:
+            let length = try reader.readUInt8()
+            guard length == 4 else {
+                throw WireError.validation("numeric identifier is \(length) bytes, expected 4")
+            }
+            return Identifier(numeric: try reader.readUInt32())
+        case stringKindCode:
+            return try Identifier(named: try reader.readName())
+        case let kind:
+            throw WireError.validation("unknown identifier kind \(kind)")
+        }
+    }
 }

@@ -30,7 +30,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class UserInfoDetailsTest {
     @Test
     void constructorWithUserInfoCreatesUserInfoDetailsWithExpectedValues() {
-        var userInfo = new UserInfo(123L, BigInteger.TEN, UserStatus.Active, "foo");
+        var userInfo = new UserInfo(123L, BigInteger.TEN, UserStatus.Active, "foo", Map.of(), Map.of());
         var globalPermissions =
                 new GlobalPermissions(true, false, false, false, false, false, false, false, false, false);
         var permissions = Optional.of(new Permissions(globalPermissions, Map.of()));

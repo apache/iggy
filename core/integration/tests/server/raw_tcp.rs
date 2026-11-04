@@ -154,6 +154,12 @@ pub(crate) async fn exchange_raw(
     body: &[u8],
 ) -> ([u8; HEADER_SIZE], Vec<u8>) {
     write_raw_frame(stream, header, body).await;
+    read_reply(stream).await
+}
+
+/// Read the next server frame, which must be a Reply, with the body sized by
+/// the reply's size field.
+pub(crate) async fn read_reply(stream: &mut TcpStream) -> ([u8; HEADER_SIZE], Vec<u8>) {
     let reply_header = read_frame_header(stream).await;
     let command = frame_command(&reply_header);
     assert_eq!(
@@ -245,4 +251,5 @@ pub(crate) async fn register_root(stream: &mut TcpStream, client: u128) -> u64 {
 fn is_transient(code: u32) -> bool {
     code == IggyError::TransientNotCommitted.as_code()
         || code == IggyError::TransientNotAccepted.as_code()
+        || code == IggyError::NotPrimary.as_code()
 }

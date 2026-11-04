@@ -257,8 +257,9 @@ mod tests {
     use super::*;
     use iggy::prelude::{ClusterNode, ClusterNodeRole, ClusterNodeStatus, TransportEndpoints};
 
-    fn metadata_node(name: &str, role: ClusterNodeRole) -> ClusterNode {
+    fn metadata_node(replica_id: u8, name: &str, role: ClusterNodeRole) -> ClusterNode {
         ClusterNode {
+            replica_id,
             name: name.to_string(),
             ip: "127.0.0.1".to_string(),
             endpoints: TransportEndpoints::new(0, 0, 0, 0),
@@ -284,7 +285,7 @@ mod tests {
     fn given_single_node_metadata_when_classified_should_return_none() {
         let metadata = ClusterMetadata {
             name: SINGLE_NODE_CLUSTER_NAME.to_string(),
-            nodes: vec![metadata_node("iggy-node", ClusterNodeRole::Leader)],
+            nodes: vec![metadata_node(0, "iggy-node", ClusterNodeRole::Leader)],
         };
 
         assert!(cluster_info_from_metadata(metadata).is_none());
@@ -295,9 +296,9 @@ mod tests {
         let metadata = ClusterMetadata {
             name: "vsr".to_string(),
             nodes: vec![
-                metadata_node("node-1", ClusterNodeRole::Leader),
-                metadata_node("node-2", ClusterNodeRole::Follower),
-                metadata_node("node-3", ClusterNodeRole::Follower),
+                metadata_node(0, "node-1", ClusterNodeRole::Leader),
+                metadata_node(1, "node-2", ClusterNodeRole::Follower),
+                metadata_node(2, "node-3", ClusterNodeRole::Follower),
             ],
         };
 
@@ -317,7 +318,7 @@ mod tests {
     fn given_single_node_with_custom_name_when_classified_should_return_some() {
         let metadata = ClusterMetadata {
             name: "vsr".to_string(),
-            nodes: vec![metadata_node("node-1", ClusterNodeRole::Leader)],
+            nodes: vec![metadata_node(0, "node-1", ClusterNodeRole::Leader)],
         };
 
         let info = cluster_info_from_metadata(metadata).expect("named roster counts as cluster");

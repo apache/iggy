@@ -112,8 +112,11 @@ where
         self.inner.drain(ops)
     }
 
-    fn truncate_from(&self, from_op: u64) -> impl Future<Output = std::io::Result<usize>> {
-        self.inner.truncate_from(from_op)
+    fn remove_range(
+        &self,
+        ops: std::ops::RangeInclusive<u64>,
+    ) -> impl Future<Output = std::io::Result<usize>> {
+        self.inner.remove_range(ops)
     }
 
     fn last_op(&self) -> Option<u64> {
@@ -346,6 +349,16 @@ where
 
     pub const fn storages(&self) -> &Vec<SegmentStorage> {
         &self.storage
+    }
+
+    /// Path of the log file of the segment that starts at `start_offset`.
+    #[must_use]
+    pub fn messages_path(&self, start_offset: u64) -> Option<String> {
+        let slot = self
+            .segments
+            .binary_search_by_key(&start_offset, |segment| segment.start_offset)
+            .ok()?;
+        self.storage.get(slot)?.segment_and_index_paths().0
     }
 
     pub const fn messages_writers(&self) -> &Vec<Option<Rc<MessagesWriter>>> {

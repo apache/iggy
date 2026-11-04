@@ -38,9 +38,10 @@ use tokio_util::sync::CancellationToken;
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
-    BrokerAdvertise, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS,
+    ConnectionState, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS,
     ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION,
-    ERROR_NONE, ERROR_POLICY_VIOLATION, ERROR_TOPIC_ALREADY_EXISTS, GatewayState,
+    ERROR_NONE, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS,
+    GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::create_topics;
 
@@ -149,7 +150,8 @@ fn decode_all_results(body: Bytes) -> Vec<(Option<String>, i16)> {
 
 async fn send(state: &GatewayState, topics: &[TopicSpec<'_>], validate_only: bool) -> (i16, i32) {
     let body = build_request(topics, validate_only);
-    let outcome = create_topics::handle(state, REQUEST_VERSION, body).await;
+    let outcome =
+        create_topics::handle(state, &ConnectionState::default(), REQUEST_VERSION, body).await;
     let resp_body = outcome.expect_response("CreateTopics request always answers");
     decode_first_result(resp_body)
 }
@@ -160,7 +162,8 @@ async fn send_all(
     validate_only: bool,
 ) -> Vec<(Option<String>, i16)> {
     let body = build_request(topics, validate_only);
-    let outcome = create_topics::handle(state, REQUEST_VERSION, body).await;
+    let outcome =
+        create_topics::handle(state, &ConnectionState::default(), REQUEST_VERSION, body).await;
     let resp_body = outcome.expect_response("CreateTopics request always answers");
     decode_all_results(resp_body)
 }
@@ -170,10 +173,8 @@ async fn connected_state(server: &TestServer) -> GatewayState {
         .await
         .expect("bridge should connect to a ready server");
     GatewayState::new(
-        BrokerAdvertise::default(),
         Some(Arc::new(bridge)),
         TEST_MAX_FRAME_SIZE,
-        false,
         0,
         GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     )
@@ -331,6 +332,57 @@ async fn create_topics_with_a_config_against_an_existing_topic_answers_already_e
     assert_eq!(error_code, ERROR_TOPIC_ALREADY_EXISTS);
 }
 
+/// Builds a v3 `CreateTopics` request for one topic with no assignments and no configs. v3 is
+/// not flexible, so strings and arrays carry fixed-width lengths.
+fn build_v3_request(name: &str, num_partitions: i32, replication_factor: i16) -> Bytes {
+    let mut enc = Encoder::with_capacity(64);
+    enc.write_i32(1); // one topic
+    enc.write_nullable_string(Some(name))
+        .expect("topic name fits");
+    enc.write_i32(num_partitions);
+    enc.write_i16(replication_factor);
+    enc.write_i32(0); // no assignments
+    enc.write_i32(0); // no configs
+    enc.write_i32(5_000); // timeout_ms
+    enc.write_bool(false); // validate_only
+    enc.freeze()
+}
+
+/// `KafkaJS` `createTopics()` sends `-1` partitions and replication factor at v3. Kafka's
+/// controller accepts them at every version, so the topic is created with the default partition
+/// count.
+#[tokio::test]
+#[serial]
+async fn create_topics_v3_accepts_broker_default_sentinels() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+
+    let outcome = create_topics::handle(
+        &state,
+        &ConnectionState::default(),
+        3,
+        build_v3_request("orders", -1, -1),
+    )
+    .await;
+    let mut d = Decoder::new(outcome.expect_response("CreateTopics request always answers"));
+    let _throttle_time_ms = d.read_i32().expect("throttle_time_ms");
+    assert_eq!(d.read_i32().expect("topics array count"), 1);
+    assert_eq!(
+        d.read_nullable_string().expect("topic name").as_deref(),
+        Some("orders")
+    );
+    assert_eq!(d.read_i16().expect("error_code"), ERROR_NONE);
+
+    let raw = raw_client(&server).await;
+    let topics = raw
+        .get_topics(&Identifier::named("kafka").expect("valid stream name"))
+        .await
+        .expect("get_topics call");
+    assert_eq!(topics.len(), 1, "the handler must have actually created it");
+    assert_eq!(topics[0].partitions_count, 1);
+}
+
 /// A manual replica assignment resolves the created partition count from its own length, not
 /// from `num_partitions` (`-1` here, per KIP-464).
 #[tokio::test]
@@ -439,7 +491,8 @@ async fn create_topics_error_message_does_not_repeat_the_topic_name() {
     let bad_name = "has a space";
     let topic = TopicSpec::new(bad_name, 1);
     let body = build_request(&[topic], false);
-    let outcome = create_topics::handle(&state, REQUEST_VERSION, body).await;
+    let outcome =
+        create_topics::handle(&state, &ConnectionState::default(), REQUEST_VERSION, body).await;
     let resp_body = outcome.expect_response("CreateTopics request always answers");
 
     let mut d = Decoder::new(resp_body);
@@ -537,4 +590,29 @@ async fn create_topics_rejects_more_than_the_topic_cap() {
         streams.is_empty(),
         "an over-cap request must create nothing"
     );
+}
+
+/// A `CreatePartitions` reads a topic and then adds to it by name, so `CreateTopics` waits for its
+/// lock rather than create a topic under that name in between. Held past the request's 5 s
+/// deadline, the create answers retriable `REQUEST_TIMED_OUT` (7) and creates nothing.
+#[tokio::test]
+#[serial]
+async fn create_topics_waits_for_a_create_partitions_in_progress() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+
+    let held = state.hold_topic_changes().await;
+    let (error_code, _) = send(&state, &[TopicSpec::new("orders", 3)], false).await;
+    assert_eq!(error_code, ERROR_REQUEST_TIMED_OUT);
+    let raw = raw_client(&server).await;
+    let streams = raw.get_streams().await.expect("get_streams call");
+    assert!(
+        streams.is_empty(),
+        "nothing is created while the lock is held"
+    );
+
+    drop(held);
+    let (error_code, _) = send(&state, &[TopicSpec::new("orders", 3)], false).await;
+    assert_eq!(error_code, ERROR_NONE);
 }

@@ -75,7 +75,7 @@ changed() {
 for gate in "${GATES[@]}"; do
   case "$gate" in
     # .config holds the nextest and Cargo-Rail policy every Rust test run reads.
-    rust) paths=(core gateways Cargo.toml Cargo.lock rust-toolchain.toml .cargo .config) ;;
+    rust) paths=(core gateways bdd/rust bdd/scenarios ':(glob)bdd/docker-compose*.yml' examples/rust Cargo.toml Cargo.lock rust-toolchain.toml .cargo .config) ;;
     java) paths=(foreign/java) ;;
     csharp) paths=(foreign/csharp) ;;
     python) paths=(foreign/python) ;;

@@ -22,7 +22,7 @@ mod codec;
 
 use std::net::SocketAddr;
 
-use iggy_gateway_kafka::GatewayConfig;
+use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol};
 use iggy_gateway_kafka::protocol::api::{API_KEY_METADATA, BrokerAdvertise, handle_request};
 
 use codec::{Decoder, Encoder};
@@ -56,63 +56,48 @@ async fn metadata_reflects_broker_addr() {
 }
 
 #[test]
-fn from_server_config_uses_explicit_advertised_host_on_wildcard_bind() {
-    let config = GatewayConfig {
-        bind_addr: "0.0.0.0:9093".to_string(),
-        advertised_host: Some("kafka.internal".to_string()),
-        ..GatewayConfig::default()
-    };
+fn for_listener_uses_explicit_advertised_host_on_wildcard_bind() {
+    let mut listener = ListenerConfig::new(SecurityProtocol::Plaintext, "0.0.0.0:9093");
+    listener.advertised_host = Some("kafka.internal".to_string());
     let local_addr: SocketAddr = "0.0.0.0:9093".parse().unwrap();
-    let broker = BrokerAdvertise::from_server_config(&config, local_addr).expect("valid config");
+    let broker = BrokerAdvertise::for_listener(&listener, local_addr).expect("valid config");
     assert_eq!(broker.host, "kafka.internal");
     assert_eq!(broker.port, 9093);
 }
 
 #[test]
-fn from_server_config_rejects_wildcard_bind_without_advertised_host() {
-    let config = GatewayConfig {
-        bind_addr: "0.0.0.0:9093".to_string(),
-        ..GatewayConfig::default()
-    };
+fn for_listener_rejects_wildcard_bind_without_advertised_host() {
+    let listener = ListenerConfig::new(SecurityProtocol::Plaintext, "0.0.0.0:9093");
     let local_addr: SocketAddr = "0.0.0.0:9093".parse().unwrap();
-    let err = BrokerAdvertise::from_server_config(&config, local_addr).unwrap_err();
+    let err = BrokerAdvertise::for_listener(&listener, local_addr).unwrap_err();
     assert!(err.to_string().contains("IGGY_KAFKA_ADVERTISED_HOST"));
+    assert!(err.to_string().contains("IGGY_KAFKA_ADVERTISED_LISTENERS"));
 }
 
 #[test]
-fn from_server_config_uses_bind_ip_for_non_wildcard_listener() {
-    let config = GatewayConfig {
-        bind_addr: "192.168.1.10:19092".to_string(),
-        ..GatewayConfig::default()
-    };
+fn for_listener_uses_bind_ip_for_non_wildcard_listener() {
+    let listener = ListenerConfig::new(SecurityProtocol::Plaintext, "192.168.1.10:19092");
     let local_addr: SocketAddr = "192.168.1.10:19092".parse().unwrap();
-    let broker = BrokerAdvertise::from_server_config(&config, local_addr).expect("valid config");
+    let broker = BrokerAdvertise::for_listener(&listener, local_addr).expect("valid config");
     assert_eq!(broker.host, "192.168.1.10");
     assert_eq!(broker.port, 19092);
 }
 
 #[test]
-fn from_server_config_rejects_advertised_host_exceeding_kafka_string_limit() {
-    let config = GatewayConfig {
-        bind_addr: "127.0.0.1:9093".to_string(),
-        advertised_host: Some("x".repeat(i16::MAX as usize + 1)),
-        ..GatewayConfig::default()
-    };
+fn for_listener_rejects_advertised_host_exceeding_kafka_string_limit() {
+    let mut listener = ListenerConfig::new(SecurityProtocol::Plaintext, "127.0.0.1:9093");
+    listener.advertised_host = Some("x".repeat(i16::MAX as usize + 1));
     let local_addr: SocketAddr = "127.0.0.1:9093".parse().unwrap();
-    let err = BrokerAdvertise::from_server_config(&config, local_addr).unwrap_err();
+    let err = BrokerAdvertise::for_listener(&listener, local_addr).unwrap_err();
     assert!(err.to_string().contains("IGGY_KAFKA_ADVERTISED_HOST"));
 }
 
 #[test]
-fn from_server_config_honors_advertised_port_override() {
-    let config = GatewayConfig {
-        bind_addr: "127.0.0.1:9093".to_string(),
-        advertised_host: Some("broker.example.com".to_string()),
-        advertised_port: Some(19093),
-        ..GatewayConfig::default()
-    };
+fn for_listener_honors_advertised_port_override() {
+    let listener = ListenerConfig::new(SecurityProtocol::Plaintext, "127.0.0.1:9093")
+        .with_advertised("broker.example.com", 19093);
     let local_addr: SocketAddr = "127.0.0.1:9093".parse().unwrap();
-    let broker = BrokerAdvertise::from_server_config(&config, local_addr).expect("valid config");
+    let broker = BrokerAdvertise::for_listener(&listener, local_addr).expect("valid config");
     assert_eq!(broker.host, "broker.example.com");
     assert_eq!(broker.port, 19093);
 }

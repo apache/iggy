@@ -61,7 +61,7 @@ use twox_hash::XxHash3_64;
 const SUPERBLOCK_MAGIC: u32 = 0x5342_4C4B;
 /// On-disk record format version. Bump when the framing or payload contract
 /// changes; `read` rejects an unknown version rather than misparsing it.
-const SUPERBLOCK_VERSION: u16 = 1;
+const SUPERBLOCK_VERSION: u16 = 2;
 
 /// Fixed framing ahead of the payload (28 bytes): magic, version, a reserved
 /// half-word, sequence, parent checksum, and payload length.
@@ -71,15 +71,9 @@ const CHECKSUM_LEN: usize = 8;
 /// Smallest well-formed record (empty payload).
 const MIN_RECORD_LEN: usize = HEADER_LEN + CHECKSUM_LEN;
 
-/// Ceiling on a record's payload, bounding every allocation this module makes from
-/// a length it read off disk (`PrepareJournal::MAX_ENTRY_SIZE` bounds the WAL for the
-/// same reason). The only payload today is a [`consensus::VsrState`], 74 bytes now
-/// that it carries the offset reservation (66 before it, a length its decode still
-/// accepts); the headroom is for a payload that grows fields, not for bulk data.
-/// `read_slot` treats a longer file as corrupt WITHOUT reading it, and
-/// `build_record` refuses to write one, so a length this store could have
-/// produced is always in bounds.
-const MAX_PAYLOAD_LEN: usize = 4096;
+/// Bounds allocations before reading a slot. The VSR payload includes at most
+/// 128 exact 256-byte adopted headers, plus its fixed state and extension fields.
+const MAX_PAYLOAD_LEN: usize = 64 * 1024;
 /// Largest record `read_slot` will read into memory.
 const MAX_RECORD_LEN: usize = HEADER_LEN + MAX_PAYLOAD_LEN + CHECKSUM_LEN;
 
@@ -402,7 +396,7 @@ fn classify(bytes: &[u8]) -> SlotClass {
         return corrupt;
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    if version != SUPERBLOCK_VERSION {
+    if version != 1 && version != SUPERBLOCK_VERSION {
         // Magic matched, so a superblock writer produced this, but the framing past
         // the version field may differ, so neither the payload length nor the checksum
         // can validate it.
@@ -611,6 +605,39 @@ mod tests {
         // Writes alternate slots, so both files exist.
         assert!(dir.path().join(FILE_A).exists());
         assert!(dir.path().join(FILE_B).exists());
+    }
+
+    #[compio::test]
+    async fn given_a_legacy_slot_when_writing_recovery_evidence_should_upgrade_and_reopen() {
+        const LEGACY_VERSION: u16 = 1;
+        const LEGACY_LENGTHS: [usize; 2] = [66, 74];
+        for length in LEGACY_LENGTHS {
+            let directory = tempdir().unwrap();
+            let legacy_payload = vec![0x31; length];
+            let mut legacy = build_record(1, &legacy_payload).unwrap();
+            legacy[4..6].copy_from_slice(&LEGACY_VERSION.to_le_bytes());
+            let checksum_offset = legacy.len() - CHECKSUM_LEN;
+            let legacy_checksum = checksum(&legacy[..checksum_offset]);
+            legacy[checksum_offset..].copy_from_slice(&legacy_checksum.to_le_bytes());
+            std::fs::write(directory.path().join(FILE_A), legacy).unwrap();
+
+            let (store, latest) = PingPongSuperblock::open_with_latest(directory.path())
+                .await
+                .unwrap();
+            assert_eq!(latest, SuperblockContents::Present(legacy_payload));
+            let recovery_payload = vec![0x52; MAX_PAYLOAD_LEN];
+            store.write(&recovery_payload).await.unwrap();
+            drop(store);
+            let (_, latest) = PingPongSuperblock::open_with_latest(directory.path())
+                .await
+                .unwrap();
+            assert_eq!(latest, SuperblockContents::Present(recovery_payload));
+            let written = std::fs::read(directory.path().join(FILE_B)).unwrap();
+            assert_eq!(
+                u16::from_le_bytes([written[4], written[5]]),
+                SUPERBLOCK_VERSION
+            );
+        }
     }
 
     #[compio::test]

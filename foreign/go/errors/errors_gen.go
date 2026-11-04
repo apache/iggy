@@ -496,7 +496,7 @@ func (e InvalidPersonalAccessTokenExpiry) Is(target error) bool {
 
 type TransientNotCommitted struct{}
 
-func (e TransientNotCommitted) Error() string { return "request transiently not committed; retry" }
+func (e TransientNotCommitted) Error() string { return "request outcome unknown; it may have applied" }
 func (e TransientNotCommitted) Code() Code    { return 57 }
 func (e TransientNotCommitted) Is(target error) bool {
 	_, ok := target.(TransientNotCommitted)
@@ -752,6 +752,26 @@ func (e LifecycleBusy) Error() string {
 func (e LifecycleBusy) Code() Code { return 88 }
 func (e LifecycleBusy) Is(target error) bool {
 	_, ok := target.(LifecycleBusy)
+	return ok
+}
+
+type NotPrimary struct{}
+
+func (e NotPrimary) Error() string { return "the replica is not the primary of the target group" }
+func (e NotPrimary) Code() Code    { return 89 }
+func (e NotPrimary) Is(target error) bool {
+	_, ok := target.(NotPrimary)
+	return ok
+}
+
+type DeferredPollCapacityExceeded struct{}
+
+func (e DeferredPollCapacityExceeded) Error() string {
+	return "deferred poll capacity exceeded; retry after backoff on the same replica"
+}
+func (e DeferredPollCapacityExceeded) Code() Code { return 90 }
+func (e DeferredPollCapacityExceeded) Is(target error) bool {
+	_, ok := target.(DeferredPollCapacityExceeded)
 	return ok
 }
 
@@ -2263,6 +2283,78 @@ func (e SegmentSizeMismatchAtOpen) Is(target error) bool {
 	return ok
 }
 
+type OptionNotUpdatable struct {
+	Key string
+}
+
+func (e OptionNotUpdatable) Error() string {
+	return fmt.Sprintf("option cannot be updated after creation: %s", e.Key)
+}
+func (e OptionNotUpdatable) Code() Code { return 4103 }
+func (e OptionNotUpdatable) Is(target error) bool {
+	_, ok := target.(OptionNotUpdatable)
+	return ok
+}
+
+type OptionNotResettable struct {
+	Key string
+}
+
+func (e OptionNotResettable) Error() string {
+	return fmt.Sprintf("option cannot be reset: %s", e.Key)
+}
+func (e OptionNotResettable) Code() Code { return 4104 }
+func (e OptionNotResettable) Is(target error) bool {
+	_, ok := target.(OptionNotResettable)
+	return ok
+}
+
+type ReadOnlyOption struct {
+	Key string
+}
+
+func (e ReadOnlyOption) Error() string {
+	return fmt.Sprintf("option is read-only: %s", e.Key)
+}
+func (e ReadOnlyOption) Code() Code { return 4105 }
+func (e ReadOnlyOption) Is(target error) bool {
+	_, ok := target.(ReadOnlyOption)
+	return ok
+}
+
+type StreamEncryptionUnavailable struct{}
+
+func (e StreamEncryptionUnavailable) Error() string {
+	return "stream encryption key requires a server encryption key"
+}
+func (e StreamEncryptionUnavailable) Code() Code { return 4106 }
+func (e StreamEncryptionUnavailable) Is(target error) bool {
+	_, ok := target.(StreamEncryptionUnavailable)
+	return ok
+}
+
+type UnsupportedCriticalOption struct {
+	Key string
+}
+
+func (e UnsupportedCriticalOption) Error() string {
+	return fmt.Sprintf("unsupported critical option: %s", e.Key)
+}
+func (e UnsupportedCriticalOption) Code() Code { return 4107 }
+func (e UnsupportedCriticalOption) Is(target error) bool {
+	_, ok := target.(UnsupportedCriticalOption)
+	return ok
+}
+
+type CannotModifyRootUser struct{}
+
+func (e CannotModifyRootUser) Error() string { return "cannot modify root user" }
+func (e CannotModifyRootUser) Code() Code    { return 4108 }
+func (e CannotModifyRootUser) Is(target error) bool {
+	_, ok := target.(CannotModifyRootUser)
+	return ok
+}
+
 type ConsumerGroupIdNotFound struct {
 	GroupId uint32
 	TopicId uint32
@@ -2369,12 +2461,11 @@ func (e CannotDeleteConsumerGroupInfo) Is(target error) bool {
 }
 
 type ConsumerGroupPartitionNotOwned struct {
-	ClientId    uint32
 	PartitionId uint32
 }
 
 func (e ConsumerGroupPartitionNotOwned) Error() string {
-	return fmt.Sprintf("consumer group member with client id: %d does not own partition: %d at the current generation (rebalance in progress).", e.ClientId, e.PartitionId)
+	return fmt.Sprintf("consumer group member does not own partition: %d at the current generation (rebalance in progress).", e.PartitionId)
 }
 func (e ConsumerGroupPartitionNotOwned) Code() Code { return 5009 }
 func (e ConsumerGroupPartitionNotOwned) Is(target error) bool {
@@ -2752,6 +2843,72 @@ func (e RequestIdExhausted) Is(target error) bool {
 	return ok
 }
 
+type OperationUncertain struct {
+	OperationID uint64
+}
+
+func (e OperationUncertain) Error() string {
+	return fmt.Sprintf("operation %d has an uncertain outcome", e.OperationID)
+}
+func (e OperationUncertain) Code() Code { return 14006 }
+func (e OperationUncertain) Is(target error) bool {
+	_, ok := target.(OperationUncertain)
+	return ok
+}
+
+type LaneBlocked struct {
+	OperationID uint64
+}
+
+func (e LaneBlocked) Error() string {
+	return fmt.Sprintf("lane blocked by operation %d", e.OperationID)
+}
+func (e LaneBlocked) Code() Code { return 14007 }
+func (e LaneBlocked) Is(target error) bool {
+	_, ok := target.(LaneBlocked)
+	return ok
+}
+
+type OperationNotRetained struct {
+	OperationID uint64
+}
+
+func (e OperationNotRetained) Error() string {
+	return fmt.Sprintf("operation %d is not retained", e.OperationID)
+}
+func (e OperationNotRetained) Code() Code { return 14008 }
+func (e OperationNotRetained) Is(target error) bool {
+	_, ok := target.(OperationNotRetained)
+	return ok
+}
+
+type PartitionLaneBlocked struct {
+	PartitionID uint32
+	OperationID uint64
+}
+
+func (e PartitionLaneBlocked) Error() string {
+	return fmt.Sprintf("partition %d lane blocked by operation %d", e.PartitionID, e.OperationID)
+}
+func (e PartitionLaneBlocked) Code() Code { return 14009 }
+func (e PartitionLaneBlocked) Is(target error) bool {
+	_, ok := target.(PartitionLaneBlocked)
+	return ok
+}
+
+type FetchProgressUncertain struct {
+	OperationID uint64
+}
+
+func (e FetchProgressUncertain) Error() string {
+	return fmt.Sprintf("read %d has an unknown outcome: the server can have stored its offset", e.OperationID)
+}
+func (e FetchProgressUncertain) Code() Code { return 14010 }
+func (e FetchProgressUncertain) Is(target error) bool {
+	_, ok := target.(FetchProgressUncertain)
+	return ok
+}
+
 var (
 	ErrError                                      = Error{}
 	ErrInvalidConfiguration                       = InvalidConfiguration{}
@@ -2824,6 +2981,8 @@ var (
 	ErrRequestTooOld                              = RequestTooOld{}
 	ErrHistoryUnavailable                         = HistoryUnavailable{}
 	ErrLifecycleBusy                              = LifecycleBusy{}
+	ErrNotPrimary                                 = NotPrimary{}
+	ErrDeferredPollCapacityExceeded               = DeferredPollCapacityExceeded{}
 	ErrClientNotFound                             = ClientNotFound{}
 	ErrInvalidClientId                            = InvalidClientId{}
 	ErrConnectionClosed                           = ConnectionClosed{}
@@ -2955,6 +3114,12 @@ var (
 	ErrInvalidOffset                              = InvalidOffset{}
 	ErrInvalidReservedField                       = InvalidReservedField{}
 	ErrSegmentSizeMismatchAtOpen                  = SegmentSizeMismatchAtOpen{}
+	ErrOptionNotUpdatable                         = OptionNotUpdatable{}
+	ErrOptionNotResettable                        = OptionNotResettable{}
+	ErrReadOnlyOption                             = ReadOnlyOption{}
+	ErrStreamEncryptionUnavailable                = StreamEncryptionUnavailable{}
+	ErrUnsupportedCriticalOption                  = UnsupportedCriticalOption{}
+	ErrCannotModifyRootUser                       = CannotModifyRootUser{}
 	ErrConsumerGroupIdNotFound                    = ConsumerGroupIdNotFound{}
 	ErrInvalidConsumerGroupId                     = InvalidConsumerGroupId{}
 	ErrConsumerGroupNameNotFound                  = ConsumerGroupNameNotFound{}
@@ -3001,6 +3166,11 @@ var (
 	ErrIncompatibleProtocolVersion                = IncompatibleProtocolVersion{}
 	ErrSessionMismatch                            = SessionMismatch{}
 	ErrRequestIdExhausted                         = RequestIdExhausted{}
+	ErrOperationUncertain                         = OperationUncertain{}
+	ErrLaneBlocked                                = LaneBlocked{}
+	ErrOperationNotRetained                       = OperationNotRetained{}
+	ErrPartitionLaneBlocked                       = PartitionLaneBlocked{}
+	ErrFetchProgressUncertain                     = FetchProgressUncertain{}
 )
 
 type Code uint32
@@ -3077,6 +3247,8 @@ const (
 	RequestTooOldCode                              Code = 85
 	HistoryUnavailableCode                         Code = 87
 	LifecycleBusyCode                              Code = 88
+	NotPrimaryCode                                 Code = 89
+	DeferredPollCapacityExceededCode               Code = 90
 	ClientNotFoundCode                             Code = 100
 	InvalidClientIdCode                            Code = 101
 	ConnectionClosedCode                           Code = 206
@@ -3208,6 +3380,12 @@ const (
 	InvalidOffsetCode                              Code = 4100
 	InvalidReservedFieldCode                       Code = 4101
 	SegmentSizeMismatchAtOpenCode                  Code = 4102
+	OptionNotUpdatableCode                         Code = 4103
+	OptionNotResettableCode                        Code = 4104
+	ReadOnlyOptionCode                             Code = 4105
+	StreamEncryptionUnavailableCode                Code = 4106
+	UnsupportedCriticalOptionCode                  Code = 4107
+	CannotModifyRootUserCode                       Code = 4108
 	ConsumerGroupIdNotFoundCode                    Code = 5000
 	InvalidConsumerGroupIdCode                     Code = 5002
 	ConsumerGroupNameNotFoundCode                  Code = 5003
@@ -3254,6 +3432,11 @@ const (
 	IncompatibleProtocolVersionCode                Code = 14003
 	SessionMismatchCode                            Code = 14004
 	RequestIdExhaustedCode                         Code = 14005
+	OperationUncertainCode                         Code = 14006
+	LaneBlockedCode                                Code = 14007
+	OperationNotRetainedCode                       Code = 14008
+	PartitionLaneBlockedCode                       Code = 14009
+	FetchProgressUncertainCode                     Code = 14010
 )
 
 func (c Code) String() string {
@@ -3400,6 +3583,10 @@ func (c Code) String() string {
 		return "HistoryUnavailable"
 	case LifecycleBusyCode:
 		return "LifecycleBusy"
+	case NotPrimaryCode:
+		return "NotPrimary"
+	case DeferredPollCapacityExceededCode:
+		return "DeferredPollCapacityExceeded"
 	case ClientNotFoundCode:
 		return "ClientNotFound"
 	case InvalidClientIdCode:
@@ -3662,6 +3849,18 @@ func (c Code) String() string {
 		return "InvalidReservedField"
 	case SegmentSizeMismatchAtOpenCode:
 		return "SegmentSizeMismatchAtOpen"
+	case OptionNotUpdatableCode:
+		return "OptionNotUpdatable"
+	case OptionNotResettableCode:
+		return "OptionNotResettable"
+	case ReadOnlyOptionCode:
+		return "ReadOnlyOption"
+	case StreamEncryptionUnavailableCode:
+		return "StreamEncryptionUnavailable"
+	case UnsupportedCriticalOptionCode:
+		return "UnsupportedCriticalOption"
+	case CannotModifyRootUserCode:
+		return "CannotModifyRootUser"
 	case ConsumerGroupIdNotFoundCode:
 		return "ConsumerGroupIdNotFound"
 	case InvalidConsumerGroupIdCode:
@@ -3754,6 +3953,16 @@ func (c Code) String() string {
 		return "SessionMismatch"
 	case RequestIdExhaustedCode:
 		return "RequestIdExhausted"
+	case OperationUncertainCode:
+		return "OperationUncertain"
+	case LaneBlockedCode:
+		return "LaneBlocked"
+	case OperationNotRetainedCode:
+		return "OperationNotRetained"
+	case PartitionLaneBlockedCode:
+		return "PartitionLaneBlocked"
+	case FetchProgressUncertainCode:
+		return "FetchProgressUncertain"
 	default:
 		return "Unknown error code"
 	}
@@ -3903,6 +4112,10 @@ func FromCode(code Code) IggyError {
 		return ErrHistoryUnavailable
 	case LifecycleBusyCode:
 		return ErrLifecycleBusy
+	case NotPrimaryCode:
+		return ErrNotPrimary
+	case DeferredPollCapacityExceededCode:
+		return ErrDeferredPollCapacityExceeded
 	case ClientNotFoundCode:
 		return ErrClientNotFound
 	case InvalidClientIdCode:
@@ -4165,6 +4378,18 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidReservedField
 	case SegmentSizeMismatchAtOpenCode:
 		return ErrSegmentSizeMismatchAtOpen
+	case OptionNotUpdatableCode:
+		return ErrOptionNotUpdatable
+	case OptionNotResettableCode:
+		return ErrOptionNotResettable
+	case ReadOnlyOptionCode:
+		return ErrReadOnlyOption
+	case StreamEncryptionUnavailableCode:
+		return ErrStreamEncryptionUnavailable
+	case UnsupportedCriticalOptionCode:
+		return ErrUnsupportedCriticalOption
+	case CannotModifyRootUserCode:
+		return ErrCannotModifyRootUser
 	case ConsumerGroupIdNotFoundCode:
 		return ErrConsumerGroupIdNotFound
 	case InvalidConsumerGroupIdCode:
@@ -4257,6 +4482,16 @@ func FromCode(code Code) IggyError {
 		return ErrSessionMismatch
 	case RequestIdExhaustedCode:
 		return ErrRequestIdExhausted
+	case OperationUncertainCode:
+		return ErrOperationUncertain
+	case LaneBlockedCode:
+		return ErrLaneBlocked
+	case OperationNotRetainedCode:
+		return ErrOperationNotRetained
+	case PartitionLaneBlockedCode:
+		return ErrPartitionLaneBlocked
+	case FetchProgressUncertainCode:
+		return ErrFetchProgressUncertain
 	default:
 		return ErrError
 	}

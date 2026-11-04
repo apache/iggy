@@ -23,6 +23,9 @@ use crate::codec::{WireDecode, WireEncode, read_u64_le, read_u128_le};
 
 /// Captured before an operation is sent. Retries and delayed offset writes retain
 /// this value; discovering a newer incarnation or owner does not authorize old work.
+///
+/// A poll reply carries the context that served it in its body
+/// (`PollMessagesResponseHeader::context`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionContext {
     /// Metadata creation revision of the partition. It changes when the numeric
@@ -78,12 +81,14 @@ impl WireDecode for PartitionContext {
 
 /// Exact offset authority installed by a partition log.
 ///
-/// `generation` changes only when this partition's assignment changes.
 /// Zero client and session together install an unowned fence without discarding its generation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsumerGroupOwner {
     pub client_id: u128,
     pub session: u64,
+    /// The metadata op that decided this owner, so it changes only when this
+    /// partition's assignment changes. A recreated group restarts its own
+    /// counter but never an op, so its owners cannot match a deleted group's.
     pub generation: u64,
 }
 

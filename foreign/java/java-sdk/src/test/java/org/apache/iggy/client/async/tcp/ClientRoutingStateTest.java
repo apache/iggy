@@ -202,46 +202,6 @@ class ClientRoutingStateTest {
         }
     }
 
-    @Nested
-    class PartitionCounts {
-
-        @Test
-        void shouldCachePartitionCountWithFetchTimestamp() {
-            var topic = topic("s", "t");
-            assertThat(state.partitionCount(topic)).isEmpty();
-
-            state.setPartitionCount(topic, 4L, 42L);
-
-            assertThat(state.partitionCount(topic)).hasValueSatisfying(cached -> {
-                assertThat(cached.count()).isEqualTo(4L);
-                assertThat(cached.fetchedAtNanos()).isEqualTo(42L);
-            });
-        }
-
-        @Test
-        void shouldInvalidatePartitionCount() {
-            var topic = topic("s", "t");
-            state.setPartitionCount(topic, 4L, 0L);
-
-            state.invalidatePartitionCount(topic);
-
-            assertThat(state.partitionCount(topic)).isEmpty();
-        }
-
-        @Test
-        void shouldKeepCountsIndependentForFormerlyCollidingTopics() {
-            var numeric = ClientRoutingState.topicKey(StreamId.of(1L), TopicId.of(2L));
-            var named = ClientRoutingState.topicKey(StreamId.of("1"), TopicId.of("2"));
-            state.setPartitionCount(numeric, 4L, 0L);
-            state.setPartitionCount(named, 8L, 0L);
-
-            assertThat(state.partitionCount(numeric))
-                    .hasValueSatisfying(cached -> assertThat(cached.count()).isEqualTo(4L));
-            assertThat(state.partitionCount(named))
-                    .hasValueSatisfying(cached -> assertThat(cached.count()).isEqualTo(8L));
-        }
-    }
-
     private static ClientRoutingState.TopicKey topic(String stream, String topic) {
         return ClientRoutingState.topicKey(StreamId.of(stream), TopicId.of(topic));
     }

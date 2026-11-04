@@ -28,11 +28,16 @@ pub struct BenchmarkConsumerConfig {
     pub messages_per_batch: BenchmarkNumericParameter,
     pub warmup_time: IggyDuration,
     pub polling_kind: PollingKind,
+    pub poll_options: PollOptions,
     pub origin_timestamp_latency_calculation: bool,
     pub pretty: bool,
 }
 
 pub trait ConsumerClient: Send + Sync {
     async fn consume_batch(&mut self) -> Result<Option<BatchMetrics>, IggyError>;
+
+    /// Starts each partition at offset 0 after warmup. Explicit offsets avoid a race between
+    /// separate store and delete requests when a consumer group transfers a partition.
+    async fn reset_offsets(&mut self) -> Result<(), IggyError>;
 }
 pub trait BenchmarkConsumerClient: ConsumerClient + BenchmarkInit + ApiLabel + Send + Sync {}

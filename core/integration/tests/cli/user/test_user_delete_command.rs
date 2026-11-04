@@ -22,6 +22,7 @@ use crate::cli::common::{
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
+use iggy::prelude::UserCreateOptions;
 use iggy::prelude::UserStatus;
 use predicates::str::diff;
 use serial_test::parallel;
@@ -63,7 +64,13 @@ impl TestUserDeleteCmd {
 impl IggyCmdTestCase for TestUserDeleteCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         let user = client
-            .create_user(&self.username, &self.password, self.status, None)
+            .create_user(
+                &self.username,
+                &self.password,
+                self.status,
+                None,
+                &UserCreateOptions::default(),
+            )
             .await;
         assert!(user.is_ok());
     }

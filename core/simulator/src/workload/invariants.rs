@@ -23,6 +23,7 @@
 //! trace and the determinism baseline (`workload_replay_is_deterministic`)
 //! unchanged.
 
+use crate::workload::change_log_oracle::check_change_log_head;
 use crate::workload::state_checker::StateChecker;
 use crate::workload::{CLIENT_REQUEST_QUEUE_MAX, Workload};
 use crate::{CommitHoldKind, CommitPrefixHole, Simulator};
@@ -66,6 +67,13 @@ const COMMIT_PREFIX_APPLIED_HEAD_TICKS: u32 = 2_000;
 pub struct Invariants {
     commit_offset: HashMap<(u8, IggyNamespace), u64>,
     view: HashMap<(u8, IggyNamespace), u64>,
+    /// Metadata incarnation each replica ran under at the last check, so a
+    /// restart is told apart from a live regression of `view`.
+    replica_incarnation: HashMap<u8, u128>,
+    /// Partition incarnation the marks of each `(replica, namespace)` belong to. A
+    /// recreated topic keeps its namespaces and starts their offsets and views
+    /// afresh, so a new incarnation resets them.
+    incarnation: HashMap<(u8, IggyNamespace), u64>,
     /// Consecutive ticks a replica has been a `Normal` metadata primary still
     /// gated by its recovery barrier. Reset as soon as any of that stops holding.
     barrier_gated_ticks: HashMap<u8, u32>,
@@ -76,6 +84,9 @@ pub struct Invariants {
     /// Cross-replica committed-log agreement. Runs every tick like the rest, so a
     /// divergence is reported where it appears rather than at the next quiesce.
     state_checker: StateChecker,
+    /// Metadata incarnation and newest change record op each replica held at
+    /// the last check.
+    change_log_heads: HashMap<u8, (u128, u64)>,
 }
 
 impl Invariants {
@@ -88,19 +99,28 @@ impl Invariants {
     ///
     /// Per live `(replica, namespace)`:
     /// - partition `commit_offset` never regresses,
-    /// - consensus `view` never regresses (a view change only advances it).
+    /// - consensus `view` never regresses while the replica runs (a view change
+    ///   only advances it), and never falls below a view the replica sent a
+    ///   view-scoped message in.
+    ///
+    /// Per live replica, no metadata or partition log contradicted an op it applied.
     ///
     /// Globally:
     /// - total in-flight requests stay within the per-client queue ceiling,
     /// - no shard has shed a frame for an `unroutable` or `misrouted` reason,
     /// - live replicas agree on every committed metadata op they share, and the
     ///   committed chain stays hash-linked (see [`StateChecker`]).
+    /// - partition commits agree within each fixture incarnation, including
+    ///   history witnessed before a peer replaced that incarnation.
     ///
-    /// Crashed replicas are skipped and their last-seen marks retained, which
-    /// holds across a restart for both quantities: the superblock carries `view`,
-    /// and `Simulator::retain_partition_logs` carries each partition's log so a
+    /// Crashed replicas are skipped and their last-seen marks retained.
+    /// `Simulator::retain_partition_logs` carries each partition's log so a
     /// rebuilt partition recovers its offsets instead of reporting zero. Without
-    /// that the check trips on a discarded log and calls it a regression.
+    /// that the check trips on a discarded log and calls it a regression. A
+    /// restart recovers the view its superblock recorded, which the WAL gate can
+    /// hold below the view the replica entered, so across a restart only the
+    /// views it sent in bound the recovered one. A replica hosting a new
+    /// incarnation of a namespace starts its marks again.
     ///
     /// # Panics
     /// On any regression or in-flight overflow. The workload seed is in the
@@ -116,6 +136,16 @@ impl Invariants {
                 continue;
             }
             self.check_recovery_barrier(sim, seed, replica_idx);
+            check_applied_log_contradictions(sim, seed, replica_idx);
+            check_change_log_head(sim, replica_idx, &mut self.change_log_heads, seed);
+            let incarnation = sim.replicas[usize::from(replica_idx)].metadata_incarnation;
+            if self
+                .replica_incarnation
+                .insert(replica_idx, incarnation)
+                .is_some_and(|previous| previous != incarnation)
+            {
+                self.view.retain(|(replica, _), _| *replica != replica_idx);
+            }
             self.check_commit_prefix_contiguity(
                 seed,
                 replica_idx,
@@ -123,6 +153,9 @@ impl Invariants {
                 sim.metadata_commit_prefix_hole(usize::from(replica_idx)),
             );
             for &ns in &workload.options.namespaces {
+                self.reset_on_new_incarnation(sim, replica_idx, ns);
+                self.state_checker
+                    .check_partition(sim, replica_idx, ns, seed);
                 self.check_commit_prefix_contiguity(
                     seed,
                     replica_idx,
@@ -140,6 +173,21 @@ impl Invariants {
                     if let Some(&prev) = self.view.get(&(replica_idx, ns)) {
                         assert_no_regression(seed, "consensus view", replica_idx, ns, prev, view);
                     }
+                    if let Some(sent) = sim
+                        .partition_incarnation(usize::from(replica_idx), ns)
+                        .and_then(|incarnation| {
+                            sim.partition_sent_view(replica_idx, ns, incarnation)
+                        })
+                    {
+                        assert_no_regression(
+                            seed,
+                            "consensus view below one it sent in",
+                            replica_idx,
+                            ns,
+                            u64::from(sent),
+                            view,
+                        );
+                    }
                     self.view.insert((replica_idx, ns), view);
                 }
             }
@@ -156,6 +204,24 @@ impl Invariants {
         assert_no_bug_frame_drops(sim, seed);
 
         self.state_checker.check(sim, seed);
+    }
+
+    /// Drop the marks of `(replica_idx, ns)` when it hosts another incarnation than
+    /// the one they were taken on.
+    fn reset_on_new_incarnation(&mut self, sim: &Simulator, replica_idx: u8, ns: IggyNamespace) {
+        let Some(incarnation) = sim.partition_incarnation(usize::from(replica_idx), ns) else {
+            return;
+        };
+        let key = (replica_idx, ns);
+        if self
+            .incarnation
+            .insert(key, incarnation)
+            .is_some_and(|previous| previous != incarnation)
+        {
+            self.commit_offset.remove(&key);
+            self.view.remove(&key);
+            self.commit_hole_ticks.remove(&(replica_idx, Some(ns)));
+        }
     }
 
     /// Catch a metadata primary permanently shut behind its own recovery barrier.
@@ -280,6 +346,20 @@ impl Invariants {
     pub const fn state_checker(&self) -> &StateChecker {
         &self.state_checker
     }
+}
+
+/// Panic if a replica refused a log that names a different prepare at an op it
+/// applied (`VsrConsensus::contradicts_applied_log`).
+///
+/// Production refuses the log and keeps running. Here the refusal proves a quorum
+/// decided a log without a committed op, so the run fails where it happened.
+fn check_applied_log_contradictions(sim: &Simulator, seed: u64, replica_idx: u8) {
+    let contradictions = sim.applied_log_contradictions(usize::from(replica_idx));
+    assert_eq!(
+        contradictions, 0,
+        "replica {replica_idx} refused {contradictions} log(s) that contradict an op it \
+         applied: a quorum decided a log without a committed op (seed={seed:#x})"
+    );
 }
 
 /// Panic if any shard has shed a frame for a reason no fault can produce.

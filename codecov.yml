@@ -55,6 +55,9 @@ flag_management:
     - name: rust
       paths:
         - core/
+    - name: rust-bdd
+      paths:
+        - core/
     - name: java
       paths:
         - foreign/java/

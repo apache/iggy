@@ -25,7 +25,9 @@ import org.apache.iggy.user.IdentityInfo;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserInfo;
 import org.apache.iggy.user.UserInfoDetails;
+import org.apache.iggy.user.UserOptions;
 import org.apache.iggy.user.UserStatus;
+import org.apache.iggy.user.UserUpdate;
 
 import java.util.List;
 import java.util.Optional;
@@ -50,8 +52,12 @@ final class UsersTcpClient implements UsersClient {
 
     @Override
     public UserInfoDetails createUser(
-            String username, String password, UserStatus status, Optional<Permissions> permissions) {
-        return FutureUtil.resolve(delegate.createUser(username, password, status, permissions));
+            String username,
+            String password,
+            UserStatus status,
+            Optional<Permissions> permissions,
+            UserOptions options) {
+        return FutureUtil.resolve(delegate.createUser(username, password, status, permissions, options));
     }
 
     @Override
@@ -60,8 +66,8 @@ final class UsersTcpClient implements UsersClient {
     }
 
     @Override
-    public void updateUser(UserId userId, Optional<String> username, Optional<UserStatus> status) {
-        FutureUtil.resolve(delegate.updateUser(userId, username, status));
+    public void updateUser(UserId userId, UserUpdate update) {
+        FutureUtil.resolve(delegate.updateUser(userId, update));
     }
 
     @Override

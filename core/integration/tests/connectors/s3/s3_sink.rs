@@ -73,6 +73,7 @@ async fn s3_sink_initializes_and_runs(harness: &TestHarness, fixture: S3SinkFixt
             prefix: None,
             delimiter: None,
             key_marker: None,
+            upload_id_marker: None,
             max_uploads: None,
         },
     )

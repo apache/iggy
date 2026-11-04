@@ -26,7 +26,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time;
 
@@ -84,7 +84,7 @@ const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Read one length-prefixed response frame from the stream.
 ///
 /// Bounded by [`DEFAULT_RESPONSE_TIMEOUT`] so a dropped response fails fast instead of hanging.
-pub async fn read_response_frame(stream: &mut TcpStream, max_size: usize) -> Bytes {
+pub async fn read_response_frame<S: AsyncRead + Unpin>(stream: &mut S, max_size: usize) -> Bytes {
     time::timeout(
         DEFAULT_RESPONSE_TIMEOUT,
         read_response_frame_raw(stream, max_size),
@@ -97,7 +97,7 @@ pub async fn read_response_frame(stream: &mut TcpStream, max_size: usize) -> Byt
     })
 }
 
-async fn read_response_frame_raw(stream: &mut TcpStream, max_size: usize) -> Bytes {
+async fn read_response_frame_raw<S: AsyncRead + Unpin>(stream: &mut S, max_size: usize) -> Bytes {
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)
@@ -177,8 +177,8 @@ pub fn build_metadata_legacy_request(topic_names: &[&str]) -> Bytes {
 }
 
 /// Read one length-prefixed response frame, returning `None` on timeout.
-pub async fn read_response_frame_with_timeout(
-    stream: &mut TcpStream,
+pub async fn read_response_frame_with_timeout<S: AsyncRead + Unpin>(
+    stream: &mut S,
     max_size: usize,
     timeout: Duration,
 ) -> Option<Bytes> {
@@ -211,7 +211,10 @@ pub enum ByteRead {
 /// Read one byte, distinguishing a server-side close from an idle timeout so that
 /// "server must close the connection" tests can assert [`ByteRead::Closed`] explicitly
 /// instead of passing on a mere stall.
-pub async fn read_byte_with_timeout(stream: &mut TcpStream, timeout: Duration) -> ByteRead {
+pub async fn read_byte_with_timeout<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    timeout: Duration,
+) -> ByteRead {
     let mut buf = [0u8; 1];
     match time::timeout(timeout, stream.read(&mut buf)).await {
         // 0 bytes = clean EOF; a reset / broken pipe is still a closed connection here.

@@ -189,7 +189,9 @@ impl SimpleQueryHandler for RedshiftHandler {
             return Ok(vec![Response::EmptyQuery]);
         }
 
-        let stmt = self.query_parser.parse_sql(_client, query, &[]).await?;
+        let Some(stmt) = self.query_parser.parse_sql(_client, query, &[]).await? else {
+            return Ok(vec![Response::EmptyQuery]);
+        };
 
         let pg = self.pg_client().await?;
 

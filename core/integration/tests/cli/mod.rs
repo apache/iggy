@@ -22,6 +22,7 @@ mod consumer_offset;
 mod context;
 mod general;
 mod message;
+mod metadata;
 mod partition;
 mod personal_access_token;
 mod stream;

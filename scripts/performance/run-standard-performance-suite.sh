@@ -175,13 +175,8 @@ for suite in "${SINGLE_SUITES[@]}"; do
     echo "Starting iggy-server with command:"
 
     # Start iggy-server with appropriate configuration
-    if [[ -n "$ENV_VARS" ]]; then
-        echo "$ENV_VARS target/release/iggy-server"
-        eval "$ENV_VARS target/release/iggy-server" &>/dev/null &
-    else
-        echo "target/release/iggy-server"
-        IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy target/release/iggy-server &>/dev/null &
-    fi
+    echo "$ENV_VARS target/release/iggy-server"
+    eval "$ENV_VARS target/release/iggy-server" &>/dev/null &
     echo
     sleep 1
     IGGY_SERVER_PID=$(pgrep -x "iggy-server")
@@ -229,13 +224,8 @@ for ((i = 0; i < ${#DOUBLE_SUITES[@]}; i += 2)); do
     echo "Starting iggy-server with command:"
 
     # Start iggy-server with appropriate configuration
-    if [[ -n "$ENV_VARS" ]]; then
-        echo "$ENV_VARS target/release/iggy-server"
-        eval "$ENV_VARS target/release/iggy-server" &>/dev/null &
-    else
-        echo "target/release/iggy-server"
-        target/release/iggy-server &>/dev/null &
-    fi
+    echo "$ENV_VARS target/release/iggy-server"
+    eval "$ENV_VARS target/release/iggy-server" &>/dev/null &
     echo
     sleep 1
     IGGY_SERVER_PID=$(pgrep -x "iggy-server")

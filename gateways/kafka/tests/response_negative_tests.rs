@@ -129,9 +129,10 @@ fn create_topics_v5_flags_invalid_replication_factor() {
 }
 
 #[test]
-fn create_topics_v2_rejects_broker_default_sentinel() {
-    // KIP-464 defaults apply from v4; on v2 without assignments, -1 is INVALID_PARTITIONS.
-    let req = CreateTopicsRequest::default().with_topics(vec![creatable_topic("legacy", -1, 1)]);
+fn create_topics_v2_accepts_broker_default_sentinels() {
+    // Kafka's controller takes -1 at every version, and KafkaJS sends it at v3. The stub still
+    // answers NOT_CONTROLLER, not INVALID_PARTITIONS or INVALID_REPLICATION_FACTOR.
+    let req = CreateTopicsRequest::default().with_topics(vec![creatable_topic("legacy", -1, -1)]);
     let body = create_topics::encode_response(2, &req).unwrap();
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 0);
@@ -140,12 +141,12 @@ fn create_topics_v2_rejects_broker_default_sentinel() {
         d.read_nullable_string().unwrap(),
         Some("legacy".to_string())
     );
-    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_PARTITIONS);
+    assert_eq!(d.read_i16().unwrap(), ERROR_NOT_CONTROLLER);
 }
 
 #[test]
 fn create_topics_v2_with_assignments_allows_broker_default_sentinels() {
-    // KIP-464: on v2/v3, -1 partitions/replication are valid when assignments are present.
+    // KIP-464: -1 partitions/replication stay valid on v2 when assignments are present too.
     use kafka_protocol::messages::create_topics_request::CreatableReplicaAssignment;
 
     let assignment = CreatableReplicaAssignment::default()

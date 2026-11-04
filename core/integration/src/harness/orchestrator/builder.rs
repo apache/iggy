@@ -23,9 +23,11 @@ use crate::harness::config::{
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::handle::ServerHandle;
+use crate::harness::peer_relay::PeerRelays;
 use crate::harness::port_reserver::ClusterPortReserver;
 use crate::harness::traits::TestBinary;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -41,6 +43,7 @@ pub struct TestHarnessBuilder {
     clients: Vec<ClientConfig>,
     cleanup: bool,
     cluster_node_count: Option<usize>,
+    peer_relays: bool,
 }
 
 impl Default for TestHarnessBuilder {
@@ -56,6 +59,7 @@ impl Default for TestHarnessBuilder {
             clients: Vec::new(),
             cleanup: true,
             cluster_node_count: None,
+            peer_relays: false,
         }
     }
 }
@@ -199,13 +203,28 @@ impl TestHarnessBuilder {
         self
     }
 
+    /// Route every replica-to-replica link through a TCP relay the harness
+    /// owns, so a test can cut a node off from its peers with
+    /// [`TestHarness::isolate_node`] and restore it with
+    /// [`TestHarness::heal_node`]. Cluster-only: `build` fails for a single
+    /// node. Client ports are not relayed.
+    pub fn peer_relays(mut self) -> Self {
+        self.peer_relays = true;
+        self
+    }
+
     /// Build the TestHarness. Does NOT start any binaries.
     pub fn build(self) -> Result<TestHarness, TestBinaryError> {
         let mut context = TestContext::new(self.test_name, self.cleanup)?;
         context.ensure_created()?;
         let context = Arc::new(context);
 
-        let mut servers = build_servers(self.server_config, self.cluster_node_count, &context)?;
+        let (mut servers, peer_relays) = build_servers(
+            self.server_config,
+            self.cluster_node_count,
+            self.peer_relays,
+            &context,
+        )?;
 
         // Attach MCP and connectors runtime to the first server (primary)
         if let Some(server) = servers.first_mut() {
@@ -235,6 +254,7 @@ impl TestHarnessBuilder {
             jwks_config: self.jwks_config,
             jwks_server: None,
             started: false,
+            peer_relays,
         })
     }
 }
@@ -242,16 +262,31 @@ impl TestHarnessBuilder {
 fn build_servers(
     server_config: Option<TestServerConfig>,
     cluster_node_count: Option<usize>,
+    peer_relays: bool,
     context: &Arc<TestContext>,
-) -> Result<Vec<ServerHandle>, TestBinaryError> {
+) -> Result<(Vec<ServerHandle>, Option<PeerRelays>), TestBinaryError> {
     let Some(config) = server_config else {
-        return Ok(Vec::new());
+        if peer_relays {
+            return Err(TestBinaryError::InvalidState {
+                message: "peer_relays needs a cluster, but the harness has no server".to_string(),
+            });
+        }
+        return Ok((Vec::new(), None));
     };
 
     let node_count = cluster_node_count.unwrap_or_else(default_cluster_node_count);
 
     if node_count == 1 {
-        return Ok(vec![ServerHandle::with_config(config, context.clone())]);
+        if peer_relays {
+            return Err(TestBinaryError::InvalidState {
+                message: "peer_relays needs a cluster, but the harness has a single node"
+                    .to_string(),
+            });
+        }
+        return Ok((
+            vec![ServerHandle::with_config(config, context.clone())],
+            None,
+        ));
     }
 
     // The roster below names every node's ports before any node boots, which
@@ -268,6 +303,22 @@ fn build_servers(
     let cluster_ports = ClusterPortReserver::reserve(node_count, config.ip_kind, &config)?;
     let all_addrs = cluster_ports.all_addresses();
     let cluster_name = format!("test-cluster-{}", Uuid::new_v4());
+    let relays = if peer_relays {
+        let replica_addrs = all_addrs
+            .iter()
+            .enumerate()
+            .map(|(node, addrs)| {
+                addrs
+                    .tcp_replica
+                    .ok_or_else(|| TestBinaryError::InvalidState {
+                        message: format!("node {node} has no replica port to relay"),
+                    })
+            })
+            .collect::<Result<Vec<SocketAddr>, _>>()?;
+        Some(PeerRelays::bind(config.ip_kind.loopback(), &replica_addrs)?)
+    } else {
+        None
+    };
 
     let mut servers = Vec::with_capacity(node_count);
     for (i, (addrs, reserver)) in all_addrs
@@ -275,7 +326,13 @@ fn build_servers(
         .zip(cluster_ports.into_reservers())
         .enumerate()
     {
-        let mut cluster_envs = build_cluster_envs(i, &cluster_name, &all_addrs, config.ip_kind);
+        let mut cluster_envs = build_cluster_envs(
+            i,
+            &cluster_name,
+            &all_addrs,
+            config.ip_kind,
+            relays.as_ref(),
+        );
 
         // Inject the pre-reserved port addresses
         if let Some(tcp) = addrs.tcp {
@@ -301,7 +358,7 @@ fn build_servers(
         servers.push(server);
     }
 
-    Ok(servers)
+    Ok((servers, relays))
 }
 
 fn default_cluster_node_count() -> usize {
@@ -324,6 +381,7 @@ fn build_cluster_envs(
     cluster_name: &str,
     all_addrs: &[crate::harness::port_reserver::ProtocolAddresses],
     ip_kind: IpAddrKind,
+    peer_relays: Option<&PeerRelays>,
 ) -> HashMap<String, String> {
     let mut envs = HashMap::new();
 
@@ -335,13 +393,12 @@ fn build_cluster_envs(
         "IGGY_MESSAGE_BUS_RECONNECT_PERIOD".to_string(),
         "100ms".to_string(),
     );
-    // Node identity is supplied via `--replica-id` on the command line by
-    // ServerHandle::spawn; every cluster env var emitted here is identical
-    // across all spawned servers.
-    let _ = node_index;
 
-    // Emit the full roster at cluster.nodes[*]. Every node sees the same
-    // list; the per-node --replica-id CLI flag picks which entry is self.
+    // Emit the full roster at cluster.nodes[*]. Node identity comes from the
+    // per-node --replica-id CLI flag, which picks which entry is self. With
+    // peer relays, a peer's replica port is the relay this node dials it
+    // through, so the roster differs per node; the node's own entry keeps the
+    // port it binds.
     for (i, addrs) in all_addrs.iter().enumerate() {
         envs.insert(format!("IGGY_CLUSTER_NODES_{i}_NAME"), format!("node-{i}"));
         envs.insert(format!("IGGY_CLUSTER_NODES_{i}_IP"), loopback.to_string());
@@ -353,7 +410,10 @@ fn build_cluster_envs(
                 tcp.port().to_string(),
             );
         }
-        if let Some(tcp_replica) = addrs.tcp_replica {
+        let relayed = peer_relays
+            .filter(|_| i != node_index)
+            .and_then(|relays| relays.address(node_index, i));
+        if let Some(tcp_replica) = relayed.or(addrs.tcp_replica) {
             envs.insert(
                 format!("IGGY_CLUSTER_NODES_{i}_PORTS_TCP_REPLICA"),
                 tcp_replica.port().to_string(),

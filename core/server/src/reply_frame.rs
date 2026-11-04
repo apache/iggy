@@ -32,6 +32,9 @@ use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::responses::messages::poll_messages::{
     POLL_RESPONSE_HEADER_SIZE, PollMessagesResponseHeader,
 };
+use iggy_binary_protocol::responses::messages::{
+    FetchMessagesResponse, FetchMessagesSectionHeader,
+};
 use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
@@ -222,11 +225,12 @@ pub fn committed_reply_header(reply: &Message<GenericHeader>) -> Option<&ReplyHe
 
 /// The transient variant of a reply-shaped pre-consensus rejection frame
 /// (`[count=1][index=0][code]`, see `build_result_rejection_reply`), or `None`
-/// for a committed outcome. Either transient means the op did not commit, so
-/// the write path must replay the same request id rather than grade it as a
-/// committed result or advance the session gate. The two codes are kept
-/// distinct because they exhaust differently: `TransientNotAccepted` never
-/// entered the pipeline and is safe to re-issue anywhere, while
+/// for a committed outcome. Every transient means the op did not commit, so
+/// the write path must not grade it as a committed result or advance the
+/// session gate. The codes are kept distinct because they exhaust
+/// differently: `TransientNotAccepted` never entered the pipeline and is safe
+/// to re-issue anywhere, `NotPrimary` never entered it either and names a
+/// normal backup that a local replay cannot change, while
 /// `TransientNotCommitted` may still commit and only a same-session same-id
 /// replay is safe.
 ///
@@ -242,6 +246,7 @@ pub fn transient_code(reply: &Message<GenericHeader>) -> Option<IggyError> {
         Some(code) if code == IggyError::TransientNotAccepted.as_code() => {
             Some(IggyError::TransientNotAccepted)
         }
+        Some(code) if code == IggyError::NotPrimary.as_code() => Some(IggyError::NotPrimary),
         _ => None,
     }
 }
@@ -249,7 +254,7 @@ pub fn transient_code(reply: &Message<GenericHeader>) -> Option<IggyError> {
 /// If a raw PAT token was minted (`CreatePersonalAccessToken`) and the commit
 /// succeeded, replace the committed reply -- whose body is empty because the
 /// raw token never entered consensus -- with a `RawPersonalAccessTokenResponse`,
-/// reusing the confirmed commit position from the committed reply. Otherwise
+/// preserving the committed reply's receipt. Otherwise
 /// (no token, a committed business rejection, or an eviction frame) the
 /// committed reply passes through unchanged.
 pub fn build_raw_pat_reply(
@@ -266,18 +271,26 @@ pub fn build_raw_pat_reply(
     // through untouched, so the client decodes the typed outcome - or, for a
     // transient, replays - instead of having a raw token grafted onto a
     // rejection body whose hash never committed.
-    let Some(commit) = committed_reply_header(&committed).map(|header| header.commit) else {
+    let Some(committed_header) = committed_reply_header(&committed) else {
         return Ok(committed);
     };
     let token = WireName::new(raw.as_str()).map_err(|_| IggyError::InvalidFormat)?;
     let response = RawPersonalAccessTokenResponse { token };
-    let reply = build_result_framed_reply(
+    let mut reply = build_result_framed_reply(
         request_header,
         request_header.client,
         request_header.session,
-        commit,
+        committed_header.commit,
         &response,
     );
+    let header = ReplyHeader {
+        size: reply.header().size,
+        checksum: 0,
+        checksum_body: 0,
+        ..*committed_header
+    };
+    reply.as_mut_slice()[..std::mem::size_of::<ReplyHeader>()]
+        .copy_from_slice(bytemuck::bytes_of(&header));
     Ok(reply.into_generic())
 }
 
@@ -503,6 +516,97 @@ pub fn build_polled_messages_body(
     fragments: PollFragments,
     encryptor: Option<&EncryptorKind>,
 ) -> Result<Bytes, IggyError> {
+    // The head is written after the walk, which is what counts the messages.
+    let records_len: usize = fragments.iter().map(Fragment::len).sum();
+    let mut body: Vec<u8> = Vec::with_capacity(POLL_RESPONSE_HEADER_SIZE + records_len);
+    body.resize(POLL_RESPONSE_HEADER_SIZE, 0);
+    let count = walk_polled_records(fragments, encryptor, |record| {
+        body.extend_from_slice(record);
+    })?;
+    body[..POLL_RESPONSE_HEADER_SIZE].copy_from_slice(
+        &PollMessagesResponseHeader {
+            partition_id,
+            current_offset,
+            messages_count: count,
+            context,
+        }
+        .to_le_bytes(),
+    );
+    Ok(Bytes::from(body))
+}
+
+/// The records of one read section of a `FetchMessages` reply, as frames that
+/// follow the reply head, and their message count. Records go out as stored,
+/// except at-rest decryption, which copies them as a poll reply does.
+pub fn fetch_section_records(
+    fragments: PollFragments,
+    encryptor: Option<&EncryptorKind>,
+) -> Result<(Vec<Frozen<MESSAGE_ALIGN>>, u32), IggyError> {
+    let Some(encryptor) = encryptor else {
+        let frames: Vec<_> = fragments.into_iter().map(Fragment::into_frozen).collect();
+        let count = polled_message_count(&frames)?;
+        return Ok((frames, count));
+    };
+    let mut records =
+        Owned::<MESSAGE_ALIGN>::with_capacity(fragments.iter().map(Fragment::len).sum());
+    let count = walk_polled_records(fragments, Some(encryptor), |record| {
+        records.extend_from_slice(record);
+    })?;
+    Ok((vec![records.into()], count))
+}
+
+/// Build the `FetchMessages` reply as a vectored frame: one buffer holding
+/// the reply header, the section count and the table, then the records of
+/// each section in table order. `sections` pairs each table entry with its
+/// records.
+pub fn build_fetch_messages_reply(
+    request_header: &RoutedRequestHeader,
+    commit: u64,
+    sections: Vec<(FetchMessagesSectionHeader, Vec<Frozen<MESSAGE_ALIGN>>)>,
+) -> Result<BusMessage, IggyError> {
+    let headers: Vec<_> = sections.iter().map(|(header, _)| *header).collect();
+    let head_len = FetchMessagesResponse::head_size(headers.len());
+    let records_len: usize = sections
+        .iter()
+        .flat_map(|(_, records)| records)
+        .map(Frozen::len)
+        .sum();
+    let header_len = std::mem::size_of::<ReplyHeader>();
+    let size = u32::try_from(header_len + head_len + records_len)
+        .map_err(|_| IggyError::InvalidCommand)?;
+    let header = reply_header(
+        request_header,
+        request_header.client,
+        request_header.session,
+        commit,
+        size,
+    );
+    let mut head = Owned::<MESSAGE_ALIGN>::zeroed(header_len + head_len);
+    let (header_bytes, body_head) = head.as_mut_slice().split_at_mut(header_len);
+    header_bytes.copy_from_slice(bytemuck::bytes_of(&header));
+    FetchMessagesResponse::write_head(&headers, body_head)
+        .map_err(|_| IggyError::InvalidCommand)?;
+    let mut frames = ResponseFragments::with_capacity(
+        1 + sections
+            .iter()
+            .map(|(_, records)| records.len())
+            .sum::<usize>(),
+    );
+    frames.push(head.into());
+    frames.extend(sections.into_iter().flat_map(|(_, records)| records));
+    // Re-checks the header and that the frames cover `size`.
+    Message::<ReplyHeader, ResponseBacking>::try_from(frames)
+        .map(Message::into_inner)
+        .map_err(|_| IggyError::InvalidCommand)
+}
+
+/// Hands each batch record that spans `fragments` to `sink`, decrypted when
+/// `encryptor` is set, and returns the messages of all batches.
+fn walk_polled_records(
+    fragments: PollFragments,
+    encryptor: Option<&EncryptorKind>,
+    mut sink: impl FnMut(&[u8]),
+) -> Result<u32, IggyError> {
     // Batches may arrive split across fragments (rewritten batch header +
     // sliced blob); concatenate into one stream before walking records.
     let mut stream: Vec<u8> = Vec::new();
@@ -511,9 +615,6 @@ pub fn build_polled_messages_body(
         stream.extend_from_slice(frozen.as_slice());
     }
 
-    // The head is written after the walk, which is what counts the messages.
-    let mut body: Vec<u8> = Vec::with_capacity(POLL_RESPONSE_HEADER_SIZE + stream.len());
-    body.resize(POLL_RESPONSE_HEADER_SIZE, 0);
     let mut count: u32 = 0;
     let mut position = 0usize;
     while position < stream.len() {
@@ -527,27 +628,16 @@ pub fn build_polled_messages_body(
         }
         let record = &stream[position..batch_end];
         if let Some(encryptor) = encryptor {
-            let decrypted = send_messages::decrypt_batch_record(record, encryptor)?;
-            body.extend_from_slice(&decrypted);
+            sink(&send_messages::decrypt_batch_record(record, encryptor)?);
         } else {
-            body.extend_from_slice(record);
+            sink(record);
         }
         count = count
             .checked_add(batch.message_count)
             .ok_or(IggyError::InvalidCommand)?;
         position = batch_end;
     }
-
-    body[..POLL_RESPONSE_HEADER_SIZE].copy_from_slice(
-        &PollMessagesResponseHeader {
-            partition_id,
-            current_offset,
-            messages_count: count,
-            context,
-        }
-        .to_le_bytes(),
-    );
-    Ok(Bytes::from(body))
+    Ok(count)
 }
 
 /// Build the `ConsumerOffsetResponse` reply body:
@@ -567,13 +657,10 @@ pub fn build_consumer_offset_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::test_support::stored_batch_record;
     use iggy_binary_protocol::{Operation, WireDecode};
     use iggy_common::Aes256GcmEncryptor;
-    use server_common::send_messages::{
-        BatchHeader, COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages,
-        PREPARE_SPLIT_POINT, SendMessagesOwned, encrypt_batch_request, frozen_batch_header,
-    };
-    use server_common::sharding::IggyNamespace;
+    use server_common::send_messages::{BatchHeader, COMMAND_HEADER_SIZE, frozen_batch_header};
 
     fn pat_request_header() -> RoutedRequestHeader {
         let zeroed = [0u8; std::mem::size_of::<RoutedRequestHeader>()];
@@ -612,19 +699,25 @@ mod tests {
     /// (`[count][{index, result}]*`), as the commit path emits it.
     fn committed_reply(result_body: &[u8]) -> Message<GenericHeader> {
         let request_header = pat_request_header();
-        build_reply_from_bytes(
-            &request_header,
-            42,
-            7,
-            9,
-            &Bytes::copy_from_slice(result_body),
-        )
-        .into_generic()
+        let prepare = PrepareHeader {
+            client: request_header.client,
+            request: request_header.request,
+            operation: request_header.operation,
+            request_checksum: (1u128 << 80) | 0x002A,
+            op: 9,
+            view: 4,
+            replica: 2,
+            timestamp: 11,
+            ..PrepareHeader::default()
+        };
+        consensus::build_reply_message(&prepare, &Bytes::copy_from_slice(result_body))
+            .into_generic()
     }
 
     #[test]
     fn raw_pat_reply_splices_token_into_a_committed_success() {
         let success = committed_reply(&0u32.to_le_bytes());
+        let mut expected_header = *committed_reply_header(&success).expect("committed success");
         let reply =
             build_raw_pat_reply(&pat_request_header(), success, Some("raw-token".to_owned()))
                 .expect("splice succeeds");
@@ -636,6 +729,13 @@ mod tests {
         let response = RawPersonalAccessTokenResponse::decode_from(&body[RESULT_COUNT_LEN..])
             .expect("token body decodes");
         assert_eq!(response.token.as_str(), "raw-token");
+        let header = committed_reply_header(&reply).expect("committed token reply");
+        assert!(header.has_committed_result());
+        expected_header.size = header.size;
+        assert_eq!(
+            bytemuck::bytes_of(header),
+            bytemuck::bytes_of(&expected_header)
+        );
     }
 
     #[test]
@@ -844,52 +944,12 @@ mod tests {
         ));
     }
 
-    /// A stored record encrypted the way the primary encrypts at ingestion.
-    fn encrypted_record(encryptor: &EncryptorKind) -> Frozen<MESSAGE_ALIGN> {
-        let namespace = IggyNamespace::new(1, 1, 3);
-        let mut messages = IggyMessages::with_capacity(2);
-        for (id, payload) in [(7u128, &b"first-payload"[..]), (8, &b"second-payload"[..])] {
-            messages.push(IggyMessage {
-                header: IggyMessageHeader {
-                    id,
-                    origin_timestamp: 1_000,
-                    ..Default::default()
-                },
-                payload: Bytes::copy_from_slice(payload),
-                user_headers: None,
-            });
-        }
-        let owned = SendMessagesOwned::from_messages(namespace, &messages).expect("build batch");
-        let header_size = std::mem::size_of::<RoutedRequestHeader>();
-        let total = header_size + owned.header.total_size();
-        let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total);
-        {
-            let header: &mut RoutedRequestHeader =
-                bytemuck::checked::try_from_bytes_mut(&mut buffer.as_mut_slice()[..header_size])
-                    .expect("zeroed bytes form a valid RoutedRequestHeader");
-            header.command = Command::Request;
-            header.operation = Operation::SendMessages;
-            header.client = 1;
-            header.session = 1;
-            header.request = 1;
-            header.size = u32::try_from(total).expect("size fits u32");
-        }
-        let bytes = buffer.as_mut_slice();
-        owned
-            .header
-            .encode_into(&mut bytes[header_size..header_size + COMMAND_HEADER_SIZE]);
-        bytes[PREPARE_SPLIT_POINT..].copy_from_slice(&owned.blob);
-        let canonical = Message::try_from(buffer).expect("request message is valid");
-        let encrypted = encrypt_batch_request(canonical, encryptor).expect("encrypt batch");
-        let record = &encrypted.as_slice()[header_size..encrypted.header().size as usize];
-        Owned::<MESSAGE_ALIGN>::copy_from_slice(record).into()
-    }
-
     #[test]
     fn polled_reply_encrypted_records_take_the_flattening_path() {
         let encryptor =
             EncryptorKind::Aes256Gcm(Aes256GcmEncryptor::new(&[7u8; 32]).expect("valid 32B key"));
-        let fragments = PollFragments::from_iter([Fragment::whole(encrypted_record(&encryptor))]);
+        let fragments =
+            PollFragments::from_iter([Fragment::whole(stored_batch_record(Some(&encryptor)))]);
         let expected = flattened_reply(fragments.clone(), Some(&encryptor));
         let reply = vectored_reply(fragments, Some(&encryptor)).expect("decrypting reply");
         assert_eq!(reply.fragments().len(), 1);
