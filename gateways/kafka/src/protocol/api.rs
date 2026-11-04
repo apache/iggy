@@ -292,6 +292,11 @@ pub struct GatewayState {
     /// Per Kafka topic and partition, how long `ListOffsets` lookups by time poll empty without
     /// proof that no record matches. Only the first of a spell warns.
     pub(crate) unproven_empty: Mutex<fetch::Spells>,
+    /// Per Kafka topic and partition, what the Iggy polls of Fetch and `ListOffsets` showed: how
+    /// long the next poll may take, and whether the partition stalled. Shared, so the consumers
+    /// of a partition whose node stopped do not each spend a read slot waiting for it. In an
+    /// `Arc`, since a re-check reports after its request ended.
+    pub(crate) poll_records: Arc<Mutex<fetch::PollRecords>>,
     /// Topic probes that every Fetch shares.
     pub(crate) probe_board: ProbeBoard,
     /// Held by `CreatePartitions` from reading a topic's partition count until its write is
@@ -355,6 +360,7 @@ impl GatewayState {
             groups,
             loading: Mutex::default(),
             unproven_empty: Mutex::default(),
+            poll_records: Arc::default(),
             probe_board: ProbeBoard::default(),
             partition_growth: Arc::default(),
             cluster_id: ClusterId::random(),

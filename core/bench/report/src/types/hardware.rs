@@ -30,23 +30,21 @@ pub struct BenchmarkHardware {
 
 impl BenchmarkHardware {
     pub fn get_system_info_with_identifier(identifier: Option<String>) -> Self {
-        let mut sys = System::new();
-        sys.refresh_all();
-
-        let cpu = sys
-            .cpus()
-            .first()
-            .map(|cpu| (cpu.brand().to_string(), cpu.frequency()))
-            .unwrap_or_else(|| (String::from("unknown"), 0));
+        let sys = System::new().ok().map(|mut sys| {
+            sys.refresh_all();
+            sys
+        });
+        let cpus = sys.as_ref().map_or(&[][..], System::cpus);
 
         Self {
             identifier,
-            cpu_name: cpu.0,
-            cpu_cores: sys.cpus().len(),
-            total_memory_mb: sys.total_memory() / 1024 / 1024,
-            os_name: sysinfo::System::name().unwrap_or_else(|| String::from("unknown")),
-            os_version: sysinfo::System::kernel_version()
-                .unwrap_or_else(|| String::from("unknown")),
+            cpu_name: cpus
+                .first()
+                .map_or_else(|| String::from("unknown"), |cpu| cpu.brand().to_string()),
+            cpu_cores: cpus.len(),
+            total_memory_mb: sys.as_ref().map_or(0, System::total_memory) / 1024 / 1024,
+            os_name: System::name().unwrap_or_else(|_| String::from("unknown")),
+            os_version: System::kernel_version().unwrap_or_else(|_| String::from("unknown")),
         }
     }
 }

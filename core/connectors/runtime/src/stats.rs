@@ -27,10 +27,10 @@ use system_stats::SystemProbe;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSION);
 
-static SYSINFO: OnceLock<Mutex<System>> = OnceLock::new();
+static SYSINFO: OnceLock<Option<Mutex<System>>> = OnceLock::new();
 
 pub async fn get_runtime_stats(context: &Arc<RuntimeContext>) -> ConnectorRuntimeStats {
-    let system = probe_system();
+    let system = probe_system().unwrap_or_default();
 
     let sources = context.sources.get_all().await;
     let sinks = context.sinks.get_all().await;
@@ -115,10 +115,11 @@ pub async fn get_runtime_stats(context: &Arc<RuntimeContext>) -> ConnectorRuntim
     }
 }
 
-fn probe_system() -> SystemProbe {
-    let mut system = SYSINFO
-        .get_or_init(|| Mutex::new(System::new()))
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    SystemProbe::capture(&mut system)
+/// `None` where sysinfo does not support the platform.
+fn probe_system() -> Option<SystemProbe> {
+    let system = SYSINFO
+        .get_or_init(|| System::new().ok().map(Mutex::new))
+        .as_ref()?;
+    let mut system = system.lock().unwrap_or_else(PoisonError::into_inner);
+    Some(SystemProbe::capture(&mut system))
 }
