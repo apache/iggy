@@ -40,7 +40,7 @@ namespace Apache.Iggy.IggyClient.Implementations;
 ///     assignment the broker does not
 ///     resolve server-side. The command surface lives in <see cref="TcpMessageStream" />.
 /// </summary>
-public sealed partial class TcpMessageStream : ISessionGenerationProvider
+public sealed partial class TcpMessageStream : ISessionGenerationProvider, IConsumerGroupAssignmentProvider
 {
     /// <summary>
     ///     Admission, routing, and retries share one call deadline. Each link also bounds incomplete frame
@@ -519,6 +519,25 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
         return NoAssignedPartitionPolledMessages;
     }
 
+    /// <inheritdoc />
+    async Task<IReadOnlyList<uint>> IConsumerGroupAssignmentProvider.GetAssignedPartitionsAsync(Identifier streamId,
+        Identifier topicId, Identifier groupId, bool resync, CancellationToken token)
+    {
+        var generation = _consensusSession.Generation;
+        var key = new GroupKey(streamId, topicId, groupId);
+        if (resync)
+        {
+            _groupState.InvalidateAssignment(key);
+        }
+
+        if (!_groupState.HasAssignment(key))
+        {
+            await SyncGroupAssignmentAsync(streamId, topicId, groupId, token, startedUnder: generation);
+        }
+
+        return _groupState.AssignedPartitions(key);
+    }
+
     /// <summary>
     ///     Pulls the requesting member's assignment from the coordinator into the cache. An empty reply means the
     ///     client is not a member: the coordinator answers with an assignment header for any member, including
@@ -540,7 +559,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             if (responseBuffer.Memory.Length == 0)
             {
                 // Deregistering is the only thing that observes a server-side removal (group deleted, member
-                // evicted); without it membership latches true and every later poll returns empty.
+                // evicted). Without it membership latches true and every later poll returns empty.
                 _groupState.DeregisterGroup(key);
 
                 return;
@@ -554,7 +573,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
 
     /// <summary>
     ///     Re-syncs every joined group so a widened assignment (a partition-count change, say) is picked up
-    ///     without first hitting an ownership fence. Failed syncs are logged; all groups share the refresh
+    ///     without first hitting an ownership fence. Failed syncs are logged. All groups share the refresh
     ///     budget. A sync that outlasts <paramref name="deadline" /> fails as not accepted rather than canceled,
     ///     so it is logged like any other failure, and the groups after it wait for the next refresh. Only
     ///     <paramref name="token" /> cancels the refresh.

@@ -259,7 +259,7 @@ struct Entry {
 /// Map of live connections keyed by some transport-specific id.
 ///
 /// For clients `K = u128` (the minted client id); for replicas `K = u8`
-/// (the replica id carried in the Ping handshake).
+/// (the replica id carried in the replica handshake).
 #[derive(Debug)]
 pub struct ConnectionRegistry<K>
 where
@@ -934,6 +934,16 @@ impl ReplicaRegistry {
         });
         self.len.set(self.len.get() + 1);
         Ok(token)
+    }
+
+    /// Trigger the per-connection shutdown of the entry under `key` and
+    /// leave the entry in place: the connection's own exit path removes it
+    /// and reports the close. Returns whether an entry was present.
+    pub fn shutdown_connection(&self, key: u8) -> bool {
+        self.slots.borrow()[usize::from(key)]
+            .as_ref()
+            .map(|entry| entry.conn_shutdown.trigger())
+            .is_some()
     }
 
     /// See [`ConnectionRegistry::remove`].

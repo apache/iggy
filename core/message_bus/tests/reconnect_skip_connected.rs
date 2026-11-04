@@ -139,8 +139,8 @@ async fn periodic_reconnect_skips_dial_pending_peer() {
     let dialed_streams: Rc<std::cell::RefCell<Vec<compio::net::TcpStream>>> =
         Rc::new(std::cell::RefCell::new(Vec::new()));
     let dialed_streams_clone = Rc::clone(&dialed_streams);
-    let on_dialed: message_bus::DialedReplicaFn = Rc::new(move |stream, peer_id| {
-        bus0_for_dial.mark_dial_pending(peer_id);
+    let on_dialed: message_bus::DialedReplicaFn = Rc::new(move |stream, link, _owner| {
+        bus0_for_dial.mark_dial_pending(link.replica, link.link);
         dialed_streams_clone.borrow_mut().push(stream);
     });
 
@@ -158,7 +158,7 @@ async fn periodic_reconnect_skips_dial_pending_peer() {
 
     // Clearing the pending entry (the handshake-outcome ack) re-enables
     // the redial on the next sweep.
-    bus0.clear_dial_pending(1);
+    bus0.clear_dial_pending(1, 0);
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while accept_count.load(Ordering::SeqCst) < 2 {
         assert!(

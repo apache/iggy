@@ -32,9 +32,12 @@ import (
 
 func TestCreateTopic_DecodesTheCreatedTopic(t *testing.T) {
 	client, serverConn := newPipeClient(t)
+	body := append(resultSection(), topicDetailsBody(t, 3)...)
+	body = append(body, partitionDetailsBody(1, []uint8{0, 1, 2}, []uint8{0})...)
+	body = append(body, partitionDetailsBody(2, nil, nil)...)
+	body = append(body, partitionDetailsBody(3, []uint8{2, 0, 1}, []uint8{2, 0, 1})...)
 	serve(serverConn, func(_ int, _ request) []byte {
-		return replyFrame(vsr.OperationCreateTopic,
-			append(resultSection(), topicDetailsBody(t, 3)...))
+		return replyFrame(vsr.OperationCreateTopic, body)
 	})
 
 	partitions := uint32(3)
@@ -43,6 +46,14 @@ func TestCreateTopic_DecodesTheCreatedTopic(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, uint32(3), topic.PartitionsCount)
 	assert.Equal(t, "orders", topic.Name)
+	require.Len(t, topic.Partitions, 3)
+	assert.Equal(t, []uint8{0, 1, 2}, topic.Partitions[0].Members)
+	assert.Equal(t, []uint8{0}, topic.Partitions[0].InSyncMembers)
+	assert.Empty(t, topic.Partitions[1].Members)
+	assert.Empty(t, topic.Partitions[1].InSyncMembers)
+	assert.Equal(t, uint32(3), topic.Partitions[2].Id)
+	assert.Equal(t, []uint8{2, 0, 1}, topic.Partitions[2].Members)
+	assert.Equal(t, []uint8{2, 0, 1}, topic.Partitions[2].InSyncMembers)
 }
 
 func TestCreateTopic_RejectsInvalidArgumentsWithoutWriting(t *testing.T) {

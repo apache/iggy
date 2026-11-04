@@ -98,11 +98,13 @@ async fn consume_messages(client: &dyn Client) -> Result<(), Box<dyn Error>> {
             .poll_messages(
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &consumer,
                 &PollingStrategy::offset(offset),
-                messages_per_batch,
-                false,
+                PollOptions {
+                    count: messages_per_batch,
+                    ..PollOptions::default()
+                },
             )
             .await?;
 

@@ -212,7 +212,8 @@ class AsyncIggyTcpClientLoginRoutingTest {
                     false,
                     Optional.empty(),
                     Optional.empty(),
-                    AsyncTcpConnection.DEFAULT_IO_THREADS);
+                    AsyncTcpConnection.DEFAULT_IO_THREADS,
+                    EventLoopShutdown.resolve(null, null));
             // Successful login publication retains the carrier's credentials even when this fixture fakes Register.
             var carrier = new AsyncTcpConnection(
                     "localhost",

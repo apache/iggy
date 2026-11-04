@@ -75,8 +75,8 @@ use crate::http::handlers::{
     get_clients, get_cluster_metadata, get_consumer_offset, get_metadata_changes, get_pats,
     get_snapshot, get_stats, get_stream, get_streams, get_topic, get_topics, get_user, get_users,
     login_user, login_with_personal_access_token, logout_user, ping, poll_messages,
-    poll_messages_deferred, refresh_token, send_messages, store_consumer_offset,
-    update_permissions, update_stream, update_topic, update_user,
+    poll_messages_committing, poll_messages_deferred, refresh_token, send_messages,
+    store_consumer_offset, update_permissions, update_stream, update_topic, update_user,
 };
 use crate::http::jwt::JwtManager;
 use crate::http::session::RegistrationBarrier;
@@ -483,7 +483,7 @@ fn partition_routes(state: HttpState) -> Router<HttpState> {
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/messages/deferred",
-            get(poll_messages_deferred),
+            get(poll_messages_deferred).post(poll_messages_committing),
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/consumer-offsets",

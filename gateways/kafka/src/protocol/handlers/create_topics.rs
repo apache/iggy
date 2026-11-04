@@ -34,18 +34,18 @@ use crate::bridge::{
 };
 use crate::error::Result;
 use crate::protocol::api::{
-    API_KEY_CREATE_TOPICS, ApiVersionRange, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS,
-    ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST,
-    ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
-    ERROR_TOPIC_ALREADY_EXISTS, GatewayState, HandleOutcome,
+    API_KEY_CREATE_TOPICS, ApiVersionRange, ConnectionState, ERROR_INVALID_CONFIG,
+    ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REPLICATION_FACTOR,
+    ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION,
+    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_create_topics_shape;
 use crate::protocol::handlers::topic_config::{
     MAX_CONFIG_TOPICS, find_duplicate_names, topic_cap_message,
 };
 use crate::protocol::handlers::{
-    clamp_request_timeout, decode_guarded, encode_message, handle_versioned_request,
-    is_supported_version, respond_or_close, unsupported_version_response,
+    another_controller, clamp_request_timeout, decode_guarded, encode_message,
+    handle_versioned_request, is_supported_version, respond_or_close, unsupported_version_response,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -54,7 +54,12 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
     max_version: 5,
 };
 
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     let Some(bridge) = &state.bridge else {
         return handle_versioned_request(
             API_KEY_CREATE_TOPICS,
@@ -90,6 +95,12 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
             );
         }
     };
+    if another_controller(state, &connection.brokers) {
+        return respond_or_close(
+            encode_inner(api_version, &req.topics, ERROR_NOT_CONTROLLER),
+            "CreateTopics",
+        );
+    }
 
     let topic_names: Vec<&str> = req.topics.iter().map(|topic| topic.name.as_str()).collect();
     let duplicate_names = find_duplicate_names(topic_names.iter().copied());
@@ -130,6 +141,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         &duplicate_names,
         req.validate_only,
         deadline,
+        state.node_id,
     )
     .await;
     let resp = CreateTopicsResponse::default().with_topics(results);
@@ -160,6 +172,7 @@ async fn create_all_topics(
     duplicate_names: &HashSet<&str>,
     validate_only: bool,
     deadline: Instant,
+    node_id: i32,
 ) -> Vec<CreatableTopicResult> {
     let mut results = Vec::with_capacity(topics.len());
     let mut deadline_exceeded = false;
@@ -190,7 +203,7 @@ async fn create_all_topics(
             continue;
         }
 
-        let create = create_one_topic(bridge, partition_growth, topic, validate_only);
+        let create = create_one_topic(bridge, partition_growth, topic, validate_only, node_id);
         let result = match tokio::time::timeout_at(deadline, create).await {
             Ok(result) => result,
             Err(_elapsed) => {
@@ -235,13 +248,14 @@ async fn create_one_topic(
     partition_growth: &Mutex<()>,
     topic: &CreatableTopic,
     validate_only: bool,
+    node_id: i32,
 ) -> CreatableTopicResult {
     let result = CreatableTopicResult::default()
         .with_name(topic.name.clone())
         .with_error_message(None);
     let kafka_topic = topic.name.as_str();
 
-    let partition_count = match local_shape_error(topic) {
+    let partition_count = match local_shape_error(topic, node_id) {
         Ok(count) => count,
         Err((error_code, error_message)) => {
             return match bridge.get_kafka_topic(kafka_topic).await {
@@ -296,7 +310,10 @@ async fn create_one_topic(
 /// once, only on the rejection path. Returns `(error_code, error_message)` rather than a whole
 /// [`CreatableTopicResult`] to keep this `Result`'s `Err` arm small (`clippy::result_large_err`);
 /// the caller already holds the shared `name`/base fields to rebuild the full result from.
-fn local_shape_error(topic: &CreatableTopic) -> core::result::Result<u32, (i16, Option<StrBytes>)> {
+fn local_shape_error(
+    topic: &CreatableTopic,
+    node_id: i32,
+) -> core::result::Result<u32, (i16, Option<StrBytes>)> {
     if !topic.configs.is_empty() {
         return Err((
             ERROR_INVALID_CONFIG,
@@ -306,7 +323,7 @@ fn local_shape_error(topic: &CreatableTopic) -> core::result::Result<u32, (i16, 
             )),
         ));
     }
-    validate_create_topic_shape(topic).map_err(|code| (code, None))
+    validate_create_topic_shape(topic, node_id).map_err(|code| (code, None))
 }
 
 /// Maps a bridge failure to a Kafka result, logging the real cause server-side.
@@ -384,22 +401,25 @@ fn bridge_error_result(
 /// requires the key set to be exactly `0..assignments.len()`, each index appearing once, and
 /// rejects anything else - a duplicate or non-consecutive index (`{5: [...], 7: [...]}`) - with
 /// `INVALID_REPLICA_ASSIGNMENT` (39). Each entry's own replica list is checked too, not just the
-/// index: this gateway advertises exactly one broker (node id 1, `metadata.rs`'s `BrokerId(1)`),
-/// so the only legal replica list is `[1]` - never empty, never repeating it, never naming a
-/// broker Metadata never advertised. Real Kafka's `ReplicationControlManager` validates the whole
+/// index: Metadata names this gateway (`node_id`) as the one replica of every partition, so the
+/// only legal replica list is `[node_id]` - never empty, never repeating it, never naming another
+/// broker. Real Kafka's `ReplicationControlManager` validates the whole
 /// binding this way, not just the index.
 ///
 /// With no assignments, `num_partitions = -1` / `replication_factor = -1` mean "use the broker
 /// default" at every version. The Java client refuses to send them below v4, but Kafka's
 /// controller never checks the version (`ReplicationControlManager.createTopic`), and
 /// `KafkaJS` `createTopics()` sends both at v3.
-fn validate_create_topic_shape(topic: &CreatableTopic) -> core::result::Result<u32, i16> {
+fn validate_create_topic_shape(
+    topic: &CreatableTopic,
+    node_id: i32,
+) -> core::result::Result<u32, i16> {
     if !topic.assignments.is_empty() {
         if topic.num_partitions != -1 || topic.replication_factor != -1 {
             return Err(ERROR_INVALID_REQUEST);
         }
         if !assignment_indices_are_consecutive_from_zero(&topic.assignments)
-            || !assignment_replicas_are_valid(&topic.assignments)
+            || !assignment_replicas_are_valid(&topic.assignments, node_id)
         {
             return Err(ERROR_INVALID_REPLICA_ASSIGNMENT);
         }
@@ -421,8 +441,8 @@ fn validate_create_topic_shape(topic: &CreatableTopic) -> core::result::Result<u
         return Err(ERROR_INVALID_PARTITIONS);
     }
 
-    // Exactly 1, not merely positive: this gateway advertises exactly one broker (node id 1,
-    // `metadata.rs`'s `BrokerId(1)`), the same ceiling the manual-assignment branch above already
+    // Exactly 1, not merely positive: Metadata names one replica per partition, this gateway,
+    // the same ceiling the manual-assignment branch above already
     // enforces per partition (`assignment_replicas_are_valid`). A real single-broker Kafka
     // controller rejects `replication_factor > 1` the same way (`ReplicationControlManager`) -
     // accepting it here and silently reporting back `1` (`success()`, below) would tell the
@@ -459,17 +479,13 @@ fn assignment_indices_are_consecutive_from_zero(
         && indices.last().copied() == i32::try_from(last_index).ok()
 }
 
-/// The only legal replica list for any partition this gateway assigns: this gateway advertises
-/// exactly one broker (node id 1, `metadata.rs`'s `BrokerId(1)`), so `[1]` is the sole valid
-/// shape - length 1 rules out both empty and a duplicated id, and the value itself rules out a
-/// broker Metadata never advertised. `CreatePartitions` holds a manual assignment to the same
-/// list.
-pub(crate) const SINGLE_BROKER_ID: i32 = 1;
-
-fn assignment_replicas_are_valid(assignments: &[CreatableReplicaAssignment]) -> bool {
+/// Whether every partition names `[node_id]`, the one replica Metadata names for each partition:
+/// length 1 rules out both empty and a duplicated id, and the value rules out another broker.
+/// `CreatePartitions` holds a manual assignment to the same list.
+fn assignment_replicas_are_valid(assignments: &[CreatableReplicaAssignment], node_id: i32) -> bool {
     assignments
         .iter()
-        .all(|assignment| assignment.broker_ids == [BrokerId(SINGLE_BROKER_ID)])
+        .all(|assignment| assignment.broker_ids == [BrokerId(node_id)])
 }
 
 /// Well-formed `CreateTopics` response with a single placeholder topic.
@@ -534,6 +550,9 @@ mod tests {
 
     use super::*;
 
+    /// The node id of the gateway under test.
+    const NODE_ID: i32 = 1;
+
     fn topic_name(name: &str) -> TopicName {
         TopicName(StrBytes::from_string(name.to_string()))
     }
@@ -548,7 +567,7 @@ mod tests {
     fn assignment(partition_index: i32) -> CreatableReplicaAssignment {
         CreatableReplicaAssignment::default()
             .with_partition_index(partition_index)
-            .with_broker_ids(vec![SINGLE_BROKER_ID.into()])
+            .with_broker_ids(vec![BrokerId(NODE_ID)])
     }
 
     fn assignment_with_replicas(
@@ -563,26 +582,43 @@ mod tests {
     #[test]
     fn explicit_partitions_and_replication_resolve_as_given() {
         let topic = creatable_topic(3, 1);
-        assert_eq!(validate_create_topic_shape(&topic), Ok(3));
+        assert_eq!(validate_create_topic_shape(&topic, NODE_ID), Ok(3));
     }
 
     #[test]
     fn broker_default_sentinels_with_no_assignments_resolve_to_the_default_count() {
         assert_eq!(
-            validate_create_topic_shape(&creatable_topic(-1, -1)),
+            validate_create_topic_shape(&creatable_topic(-1, -1), NODE_ID),
             Ok(DEFAULT_TOPIC_PARTITIONS)
         );
         assert_eq!(
-            validate_create_topic_shape(&creatable_topic(-1, 1)),
+            validate_create_topic_shape(&creatable_topic(-1, 1), NODE_ID),
             Ok(DEFAULT_TOPIC_PARTITIONS)
         );
-        assert_eq!(validate_create_topic_shape(&creatable_topic(4, -1)), Ok(4));
+        assert_eq!(
+            validate_create_topic_shape(&creatable_topic(4, -1), NODE_ID),
+            Ok(4)
+        );
     }
 
     #[test]
     fn broker_default_sentinels_with_a_manual_assignment_take_its_length() {
         let topic = creatable_topic(-1, -1).with_assignments(vec![assignment(0), assignment(1)]);
-        assert_eq!(validate_create_topic_shape(&topic), Ok(2));
+        assert_eq!(validate_create_topic_shape(&topic, NODE_ID), Ok(2));
+    }
+
+    #[test]
+    fn given_another_node_id_when_assigning_replicas_should_accept_only_this_gateway() {
+        let own =
+            creatable_topic(-1, -1).with_assignments(vec![assignment_with_replicas(0, vec![2])]);
+        let other =
+            creatable_topic(-1, -1).with_assignments(vec![assignment_with_replicas(0, vec![1])]);
+
+        assert_eq!(validate_create_topic_shape(&own, 2), Ok(1));
+        assert_eq!(
+            validate_create_topic_shape(&other, 2),
+            Err(ERROR_INVALID_REPLICA_ASSIGNMENT)
+        );
     }
 
     #[test]
@@ -590,7 +626,7 @@ mod tests {
         let topic =
             creatable_topic(-1, -1).with_assignments(vec![assignment_with_replicas(0, vec![])]);
         assert_eq!(
-            validate_create_topic_shape(&topic),
+            validate_create_topic_shape(&topic, NODE_ID),
             Err(ERROR_INVALID_REPLICA_ASSIGNMENT)
         );
     }
@@ -600,7 +636,7 @@ mod tests {
         let topic =
             creatable_topic(-1, -1).with_assignments(vec![assignment_with_replicas(0, vec![1, 1])]);
         assert_eq!(
-            validate_create_topic_shape(&topic),
+            validate_create_topic_shape(&topic, NODE_ID),
             Err(ERROR_INVALID_REPLICA_ASSIGNMENT)
         );
     }
@@ -612,7 +648,7 @@ mod tests {
         let topic =
             creatable_topic(-1, -1).with_assignments(vec![assignment_with_replicas(0, vec![7])]);
         assert_eq!(
-            validate_create_topic_shape(&topic),
+            validate_create_topic_shape(&topic, NODE_ID),
             Err(ERROR_INVALID_REPLICA_ASSIGNMENT)
         );
     }
@@ -621,7 +657,7 @@ mod tests {
     fn zero_partitions_is_rejected_regardless_of_version() {
         let topic = creatable_topic(0, 1);
         assert_eq!(
-            validate_create_topic_shape(&topic),
+            validate_create_topic_shape(&topic, NODE_ID),
             Err(ERROR_INVALID_PARTITIONS)
         );
     }
@@ -630,7 +666,7 @@ mod tests {
     fn zero_replication_factor_is_rejected_regardless_of_version() {
         let topic = creatable_topic(1, 0);
         assert_eq!(
-            validate_create_topic_shape(&topic),
+            validate_create_topic_shape(&topic, NODE_ID),
             Err(ERROR_INVALID_REPLICATION_FACTOR)
         );
     }
@@ -643,7 +679,7 @@ mod tests {
         // accepted-and-silently-downgraded.
         let topic = creatable_topic(1, 3);
         assert_eq!(
-            validate_create_topic_shape(&topic),
+            validate_create_topic_shape(&topic, NODE_ID),
             Err(ERROR_INVALID_REPLICATION_FACTOR)
         );
     }
@@ -651,14 +687,14 @@ mod tests {
     #[test]
     fn replication_factor_of_exactly_one_is_accepted() {
         let topic = creatable_topic(1, 1);
-        assert_eq!(validate_create_topic_shape(&topic), Ok(1));
+        assert_eq!(validate_create_topic_shape(&topic, NODE_ID), Ok(1));
     }
 
     #[test]
     fn partition_count_at_the_cap_is_accepted() {
         let topic = creatable_topic(i32::try_from(MAX_TOPIC_PARTITIONS).unwrap(), 1);
         assert_eq!(
-            validate_create_topic_shape(&topic),
+            validate_create_topic_shape(&topic, NODE_ID),
             Ok(MAX_TOPIC_PARTITIONS)
         );
     }
@@ -671,7 +707,7 @@ mod tests {
         // (`bridge/error.rs::too_many_partitions_maps_to_invalid_request_not_invalid_partitions`).
         let topic = creatable_topic(i32::try_from(MAX_TOPIC_PARTITIONS).unwrap() + 1, 1);
         assert_eq!(
-            validate_create_topic_shape(&topic),
+            validate_create_topic_shape(&topic, NODE_ID),
             Err(ERROR_INVALID_REQUEST)
         );
     }
@@ -685,7 +721,7 @@ mod tests {
         // which one would win if it did.
         let topic = creatable_topic(2, 1).with_assignments(vec![assignment(0), assignment(1)]);
         assert_eq!(
-            validate_create_topic_shape(&topic),
+            validate_create_topic_shape(&topic, NODE_ID),
             Err(ERROR_INVALID_REQUEST)
         );
     }
@@ -694,7 +730,7 @@ mod tests {
     fn explicit_num_partitions_disagreeing_with_assignments_length_is_also_rejected() {
         let topic = creatable_topic(3, 1).with_assignments(vec![assignment(0), assignment(1)]);
         assert_eq!(
-            validate_create_topic_shape(&topic),
+            validate_create_topic_shape(&topic, NODE_ID),
             Err(ERROR_INVALID_REQUEST)
         );
     }
@@ -704,7 +740,7 @@ mod tests {
      {
         let topic = creatable_topic(-1, 1).with_assignments(vec![assignment(0), assignment(1)]);
         assert_eq!(
-            validate_create_topic_shape(&topic),
+            validate_create_topic_shape(&topic, NODE_ID),
             Err(ERROR_INVALID_REQUEST)
         );
     }

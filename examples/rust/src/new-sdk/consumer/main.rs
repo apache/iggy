@@ -47,29 +47,32 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
 
     let name = "new-sdk-consumer";
     let mut consumer = match ConsumerKind::from_code(args.consumer_kind)? {
-        ConsumerKind::Consumer => {
-            client.consumer(name, &args.stream_id, &args.topic_id, args.partition_id)?
-        }
+        ConsumerKind::Consumer => client
+            .consumer(name, &args.stream_id, &args.topic_id)?
+            .partitions([args.partition_id]),
         ConsumerKind::ConsumerGroup => {
             client.consumer_group(name, &args.stream_id, &args.topic_id)?
         }
         ConsumerKind::ExternalGroup => return Err("an external group cannot poll".into()),
     }
-    .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
     .create_consumer_group_if_not_exists()
-    .auto_join_consumer_group()
     .polling_strategy(PollingStrategy::next())
-    .batch_length(args.messages_per_batch)
+    .poll_options(PollOptions {
+        count: args.messages_per_batch,
+        commit: CommitPolicy::OnRead,
+        ..PollOptions::wait(IggyDuration::ONE_SECOND)
+    })
     .build();
 
     consumer.init().await?;
-    consume_messages(&args, &mut consumer).await?;
+    consume_messages(&args, &client, &mut consumer).await?;
 
     Ok(())
 }
 
 pub async fn consume_messages(
     args: &Args,
+    client: &IggyClient,
     consumer: &mut IggyConsumer,
 ) -> Result<(), Box<dyn Error>> {
     let mut consumed_messages = 0;
@@ -95,7 +98,7 @@ pub async fn consume_messages(
             }
         } else if let Err(error) = message {
             error!("Error while handling message: {error}");
-            continue;
+            resume_partition(client, consumer, error).await?;
         }
     }
 
@@ -104,6 +107,37 @@ pub async fn consume_messages(
         consumed_messages
     );
     Ok(())
+}
+
+/// The consumer stops a partition after a read with an unknown outcome, a message that does not
+/// decode, or a new partition history, and retries any other error by itself. Without a seek, a
+/// run on one partition would stall.
+async fn resume_partition(
+    client: &IggyClient,
+    consumer: &mut IggyConsumer,
+    error: ReadError,
+) -> Result<(), IggyError> {
+    let Some(partition_id) = error.partition_id else {
+        return Ok(());
+    };
+    let start = match (error.error, error.skip) {
+        (
+            IggyError::FetchProgressUncertain(operation)
+            | IggyError::PartitionLaneBlocked(_, operation),
+            _,
+        ) => {
+            match client.abandon_operation(operation).await {
+                // A lost fetch stops each of its partitions, and the first abandon frees them all.
+                Ok(()) | Err(IggyError::OperationNotRetained(_)) => {}
+                Err(abandon_error) => return Err(abandon_error),
+            }
+            PollingStrategy::next()
+        }
+        (_, Some(skip)) => skip,
+        (IggyError::HistoryUnavailable, None) => PollingStrategy::next(),
+        _ => return Ok(()),
+    };
+    consumer.seek(partition_id, start).await
 }
 
 fn handle_message(message: &ReceivedMessage) -> anyhow::Result<(), Box<dyn Error>> {

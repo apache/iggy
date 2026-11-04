@@ -686,6 +686,12 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         !self.retired.get() && self.failure.borrow().is_none() && op <= self.written_head.get()
     }
 
+    /// Where the WAL wrote the body of `op` in a segment, while the WAL still
+    /// holds the op.
+    pub fn segment_reference(&self, op: u64) -> Option<SegmentReference> {
+        self.segment_references.borrow().get(&op).copied()
+    }
+
     pub const fn segment_checkpoint(&self) -> Option<SegmentPosition> {
         self.segment_checkpoint.get()
     }
@@ -1131,6 +1137,11 @@ impl<S: DurableStorage> PartitionPersistence<S> {
 
     pub const fn head(&self) -> u64 {
         self.accepted_head.get()
+    }
+
+    /// The WAL byte budget, `wal_bytes_max` in the server configuration.
+    pub const fn capacity(&self) -> u64 {
+        self.capacity
     }
 
     pub fn retire(&self) {

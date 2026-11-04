@@ -21,6 +21,7 @@ use crate::configs::connectors::{ConfigFormat, ConnectorsConfigProvider, SourceC
 use crate::context::RuntimeContext;
 use crate::error::RuntimeError;
 use crate::metrics::Metrics;
+use crate::plugin_instance::PluginInstanceGuard;
 use crate::source;
 use dashmap::DashMap;
 use dlopen2::wrapper::Container;
@@ -253,21 +254,23 @@ impl SourceManager {
                 },
                 other => RuntimeError::ConnectorSdkError(other),
             })?;
+        // An exactly-once source keeps its producer around the plugin's bytes.
+        let stored = crate::exactly_once::StoredState::split(state)
+            .map_err(RuntimeError::ConnectorSdkError)?;
 
         source::init_source(
             &container,
             &config.plugin_config.clone().unwrap_or_default(),
             plugin_id,
-            state,
+            stored.plugin_state(),
         )?;
         info!("Source connector with ID: {plugin_id} for plugin: {key} initialized successfully.");
-        // Armed from here until the id is recorded below. `SourceInstanceGuard`
+        // Armed from here until the id is recorded below. `PluginInstanceGuard`
         // carries why that window strands the instance.
-        let instance_guard =
-            source::SourceInstanceGuard::for_container(container.clone(), plugin_id, key);
+        let instance_guard = PluginInstanceGuard::for_source(container.clone(), plugin_id, key);
 
         let (producer, transforms) =
-            match source::setup_source_producer(key, config, iggy_client).await {
+            match source::setup_source_producer(key, config, iggy_client, stored).await {
                 Ok(parts) => parts,
                 Err(error) => {
                     // Awaited rather than left to `drop`, so this error reaches

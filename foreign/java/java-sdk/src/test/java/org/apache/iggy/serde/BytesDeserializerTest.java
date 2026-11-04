@@ -26,9 +26,14 @@ import org.apache.iggy.cluster.ClusterNodeRole;
 import org.apache.iggy.cluster.ClusterNodeStatus;
 import org.apache.iggy.cluster.TransportEndpoints;
 import org.apache.iggy.exception.IggyMalformedResponseException;
+import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.message.FetchedMessages;
 import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.message.HeaderValue;
+import org.apache.iggy.message.PolledMessages;
+import org.apache.iggy.partition.Partition;
+import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.stream.EncryptionKeySource;
 import org.apache.iggy.system.CacheMetricsKey;
 import org.apache.iggy.user.UserStatus;
@@ -38,6 +43,7 @@ import org.junit.jupiter.api.Test;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 
 import static org.apache.iggy.serde.BytesDeserializer.readClientInfo;
@@ -49,6 +55,7 @@ import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroupDetails;
 import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroupInfo;
 import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroupMember;
 import static org.apache.iggy.serde.BytesDeserializer.readConsumerOffsetInfo;
+import static org.apache.iggy.serde.BytesDeserializer.readFetchedMessages;
 import static org.apache.iggy.serde.BytesDeserializer.readGlobalPermissions;
 import static org.apache.iggy.serde.BytesDeserializer.readPartition;
 import static org.apache.iggy.serde.BytesDeserializer.readPermissions;
@@ -67,6 +74,7 @@ import static org.apache.iggy.serde.BytesDeserializer.readUserInfo;
 import static org.apache.iggy.serde.BytesDeserializer.readUserInfoDetails;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 
 class BytesDeserializerTest {
 
@@ -81,9 +89,13 @@ class BytesDeserializerTest {
     }
 
     private static void writeTopicData(ByteBuf buffer) {
+        writeTopicData(buffer, 4);
+    }
+
+    private static void writeTopicData(ByteBuf buffer, int partitionsCount) {
         buffer.writeIntLE(10); // topic ID
         writeU64(buffer, BigInteger.valueOf(1000)); // created at
-        buffer.writeIntLE(4); // partitions count
+        buffer.writeIntLE(partitionsCount);
         writeU64(buffer, BigInteger.valueOf(500)); // size
         writeU64(buffer, BigInteger.valueOf(50)); // messages count
         buffer.writeByte(4); // name length
@@ -126,13 +138,22 @@ class BytesDeserializerTest {
     }
 
     private static void writePartitionData(ByteBuf buffer) {
-        buffer.writeIntLE(1); // partition ID
+        writePartitionData(buffer, 1, List.of(), List.of());
+    }
+
+    private static void writePartitionData(
+            ByteBuf buffer, int partitionId, List<Integer> members, List<Integer> inSyncMembers) {
+        buffer.writeIntLE(partitionId);
         writeU64(buffer, BigInteger.valueOf(1000)); // created at
         buffer.writeIntLE(5); // segments count
         writeU64(buffer, BigInteger.valueOf(99)); // current offset
         writeU64(buffer, BigInteger.valueOf(200)); // size
         writeU64(buffer, BigInteger.valueOf(20)); // messages count
         buffer.writeZero(24);
+        buffer.writeByte(members.size());
+        members.forEach(buffer::writeByte);
+        buffer.writeByte(inSyncMembers.size());
+        inSyncMembers.forEach(buffer::writeByte);
     }
 
     @Nested
@@ -276,8 +297,7 @@ class BytesDeserializerTest {
         void shouldDeserializeTopicDetails() {
             // given
             ByteBuf buffer = Unpooled.buffer();
-            writeTopicData(buffer);
-            // Write one partition
+            writeTopicData(buffer, 1);
             writePartitionData(buffer);
 
             // when
@@ -287,10 +307,51 @@ class BytesDeserializerTest {
             assertThat(topicDetails.id()).isEqualTo(10L);
             assertThat(topicDetails.partitions()).hasSize(1);
         }
+
+        @Test
+        void shouldAdvanceByEachPartitionsEncodedLength() {
+            ByteBuf buffer = Unpooled.buffer();
+            writeTopicData(buffer, 3);
+            buffer.writeBytes(HexFormat.of().parseHex(PartitionDeserialization.PINNED_PARTITION));
+            writePartitionData(buffer, 2, List.of(), List.of());
+            writePartitionData(buffer, 3, List.of(0, 1, 2), List.of(0));
+
+            var topicDetails = readTopicDetails(buffer);
+
+            assertThat(topicDetails.partitions())
+                    .extracting(Partition::id, Partition::members, Partition::inSyncMembers)
+                    .containsExactly(
+                            tuple(1L, List.of(1, 3, 4), List.of(1, 4)),
+                            tuple(2L, List.of(), List.of()),
+                            tuple(3L, List.of(0, 1, 2), List.of(0)));
+            assertThat(topicDetails.partitions())
+                    .extracting(Partition::segmentsCount)
+                    .containsExactly(2L, 5L, 5L);
+            assertThat(buffer.readableBytes()).isZero();
+        }
+
+        @Test
+        void shouldRejectPartitionsCountBeyondPayload() {
+            ByteBuf buffer = Unpooled.buffer();
+            writeTopicData(buffer, 2);
+            buffer.writeBytes(HexFormat.of().parseHex(PartitionDeserialization.PINNED_PARTITION));
+
+            assertThatThrownBy(() -> readTopicDetails(buffer))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("Topic partitions count 2");
+        }
     }
 
     @Nested
     class PartitionDeserialization {
+        // The pinned bytes of the Rust encoder's sample partition: id 1, context (23, 0, 101), members [1, 3, 4]
+        // and in-sync members [1, 4].
+        static final String PINNED_PARTITION =
+                "01000000004cf1238e0100000200000063000000000000000004000000000000640000000000000017000000000000000000"
+                        + "000000000000650000000000000003010304020104";
+        static final String EMPTY_LISTS_PARTITION =
+                "01000000004cf1238e0100000200000063000000000000000004000000000000640000000000000017000000000000000000"
+                        + "00000000000065000000000000000000";
 
         @Test
         void shouldDeserializePartition() {
@@ -305,6 +366,67 @@ class BytesDeserializerTest {
             assertThat(partition.id()).isEqualTo(1L);
             assertThat(partition.segmentsCount()).isEqualTo(5L);
             assertThat(partition.currentOffset()).isEqualTo(BigInteger.valueOf(99));
+        }
+
+        @Test
+        void shouldDecodeThePinnedPartition() {
+            byte[] pinned = HexFormat.of().parseHex(PINNED_PARTITION);
+            ByteBuf buffer = Unpooled.wrappedBuffer(pinned);
+
+            var partition = readPartition(buffer);
+
+            assertThat(pinned).hasSize(71);
+            assertThat(buffer.readableBytes()).isZero();
+            assertThat(partition.id()).isEqualTo(1L);
+            assertThat(partition.createdAt()).isEqualTo(BigInteger.valueOf(1_710_000_000_000L));
+            assertThat(partition.segmentsCount()).isEqualTo(2L);
+            assertThat(partition.currentOffset()).isEqualTo(BigInteger.valueOf(99));
+            assertThat(partition.size()).isEqualTo("1024");
+            assertThat(partition.messagesCount()).isEqualTo(BigInteger.valueOf(100));
+            assertThat(partition.context())
+                    .isEqualTo(new PartitionContext(BigInteger.valueOf(23), BigInteger.ZERO, BigInteger.valueOf(101)));
+            assertThat(partition.members()).containsExactly(1, 3, 4);
+            assertThat(partition.inSyncMembers()).containsExactly(1, 4);
+        }
+
+        @Test
+        void shouldDecodeEmptyNodeListsFromOneCountByteEach() {
+            byte[] empty = HexFormat.of().parseHex(EMPTY_LISTS_PARTITION);
+            ByteBuf buffer = Unpooled.wrappedBuffer(empty);
+
+            var partition = readPartition(buffer);
+
+            assertThat(empty).hasSize(66);
+            assertThat(buffer.readableBytes()).isZero();
+            assertThat(partition.messagesCount()).isEqualTo(BigInteger.valueOf(100));
+            assertThat(partition.members()).isEmpty();
+            assertThat(partition.inSyncMembers()).isEmpty();
+        }
+
+        @Test
+        void shouldDecodeNodeIdsAboveSignedByteRange() {
+            ByteBuf buffer = Unpooled.buffer();
+            buffer.writeBytes(HexFormat.of().parseHex(EMPTY_LISTS_PARTITION), 0, 64);
+            buffer.writeByte(1).writeByte(200);
+            buffer.writeByte(1).writeByte(255);
+
+            var partition = readPartition(buffer);
+
+            assertThat(partition.members()).containsExactly(200);
+            assertThat(partition.inSyncMembers()).containsExactly(255);
+        }
+
+        @Test
+        void shouldRejectTruncatedPartitions() {
+            byte[] pinned = HexFormat.of().parseHex(PINNED_PARTITION);
+            // Cut inside the counters, inside members, before the in-sync count and inside the in-sync list.
+            for (int length : new int[] {40, 66, 68, 69, 70}) {
+                ByteBuf buffer = Unpooled.wrappedBuffer(pinned, 0, length);
+
+                assertThatThrownBy(() -> readPartition(buffer))
+                        .as("partition cut at %d bytes", length)
+                        .isInstanceOf(IggyMalformedResponseException.class);
+            }
         }
     }
 
@@ -418,6 +540,137 @@ class BytesDeserializerTest {
             assertThatThrownBy(() -> readConsumerGroupAssignment(buffer))
                     .isInstanceOf(IggyMalformedResponseException.class)
                     .hasMessageContaining("partitions count");
+        }
+    }
+
+    @Nested
+    class FetchedMessagesDeserialization {
+        // The golden reply of the contract, made by the Rust encoder: partition 1 serves the message "hello" at offset
+        // 41 under the context (3, 9, 12), and partition 2 answers NOT_PRIMARY.
+        private static final String GOLDEN_REPLY =
+                "020000000100000000000000290000000000000001000000030000000000000009000000000000000c00000000000000"
+                        + "2a0000000000000035010000020000005900000000000000000000000000000000000000000000000000000000000000"
+                        + "00000000000000000000000000000000000000000100000000000000290000000000000064401e18240a060000401e18"
+                        + "240a06003501000000000000bd2d787d3cdb745c01000000000000000000000000000000000000000000000000000000"
+                        + "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+                        + "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+                        + "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+                        + "0000000000000000000000000000000000000000000000000000000000000000000000008e5ca59edbbdbfb901000000"
+                        + "00000000000000000000000000000000000000000000000005000000000000000000000068656c6c6f";
+        private static final int GOLDEN_RECORDS_BYTES = 309;
+        private static final int NOT_PRIMARY = 89;
+        private static final int MAX_SECTIONS = 1000;
+
+        @Test
+        void shouldDeserializeTheGoldenFetchReply() {
+            ByteBuf reply = Unpooled.wrappedBuffer(HexFormat.of().parseHex(GOLDEN_REPLY));
+
+            List<FetchedMessages> sections = readFetchedMessages(reply);
+
+            assertThat(reply.isReadable()).isFalse();
+            assertThat(sections).hasSize(2);
+            FetchedMessages served = sections.get(0);
+            assertThat(List.of(served.partitionId(), served.status(), served.count()))
+                    .containsExactly(1L, FetchedMessages.STATUS_OK, 1L);
+            assertThat(List.of(served.currentOffset(), served.nextOffset()))
+                    .containsExactly(BigInteger.valueOf(41), BigInteger.valueOf(42));
+            assertThat(served.context())
+                    .isEqualTo(
+                            new PartitionContext(BigInteger.valueOf(3), BigInteger.valueOf(9), BigInteger.valueOf(12)));
+            assertThat(served.records()).hasSize(GOLDEN_RECORDS_BYTES);
+            PolledMessages polled = served.decode();
+            assertThat(List.of(polled.partitionId(), polled.count())).containsExactly(1L, 1L);
+            assertThat(polled.context()).isEqualTo(served.context());
+            assertThat(polled.messages()).singleElement().satisfies(message -> {
+                assertThat(message.header().offset()).isEqualTo(BigInteger.valueOf(41));
+                assertThat(message.payload()).isEqualTo("hello".getBytes(StandardCharsets.UTF_8));
+            });
+            FetchedMessages refused = sections.get(1);
+            assertThat(List.of(refused.partitionId(), refused.status(), refused.count()))
+                    .containsExactly(2L, (long) NOT_PRIMARY, 0L);
+            assertThat(List.of(refused.currentOffset(), refused.nextOffset())).containsOnly(BigInteger.ZERO);
+            assertThat(refused.context()).isEqualTo(PartitionContext.EMPTY);
+            assertThat(refused.records()).isEmpty();
+            assertThatThrownBy(refused::decode)
+                    .isInstanceOf(IggyServerException.class)
+                    .extracting(error -> ((IggyServerException) error).getRawErrorCode())
+                    .isEqualTo(NOT_PRIMARY);
+        }
+
+        @Test
+        void shouldDeserializeAFetchThatServedNoTarget() {
+            assertThat(readFetchedMessages(Unpooled.buffer().writeIntLE(0))).isEmpty();
+        }
+
+        @Test
+        void shouldRejectAReplyWithoutItsCount() {
+            assertThatThrownBy(() -> readFetchedMessages(Unpooled.buffer().writeShortLE(0)))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("too few for its count");
+        }
+
+        @Test
+        void shouldRejectMoreSectionsThanARequestHasTargets() {
+            ByteBuf reply = Unpooled.buffer().writeIntLE(MAX_SECTIONS + 1);
+            reply.writeZero((MAX_SECTIONS + 1) * BytesDeserializer.FETCH_SECTION_BYTES);
+
+            assertThatThrownBy(() -> readFetchedMessages(reply))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("more than a request has targets");
+        }
+
+        @Test
+        void shouldRejectASectionTableThatDoesNotFitTheReply() {
+            byte[] golden = HexFormat.of().parseHex(GOLDEN_REPLY);
+            ByteBuf reply = Unpooled.wrappedBuffer(
+                    golden,
+                    0,
+                    BytesDeserializer.FETCH_SECTIONS_COUNT_BYTES + 2 * BytesDeserializer.FETCH_SECTION_BYTES - 1);
+
+            assertThatThrownBy(() -> readFetchedMessages(reply))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("ends inside its section table");
+        }
+
+        @Test
+        void shouldRejectAnErrorSectionWithRecords() {
+            ByteBuf reply = Unpooled.buffer().writeIntLE(1);
+            section(reply, NOT_PRIMARY, 1);
+            reply.writeByte(0);
+
+            assertThatThrownBy(() -> readFetchedMessages(reply))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("has status " + NOT_PRIMARY + " and records");
+        }
+
+        @Test
+        void shouldRejectRecordsThatRunPastTheReply() {
+            byte[] golden = HexFormat.of().parseHex(GOLDEN_REPLY);
+
+            assertThatThrownBy(() -> readFetchedMessages(Unpooled.wrappedBuffer(golden, 0, golden.length - 1)))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("run past the reply");
+        }
+
+        @Test
+        void shouldRejectBytesPastTheLastSection() {
+            ByteBuf reply = Unpooled.wrappedBuffer(
+                    Unpooled.wrappedBuffer(HexFormat.of().parseHex(GOLDEN_REPLY)),
+                    Unpooled.buffer().writeByte(0));
+
+            assertThatThrownBy(() -> readFetchedMessages(reply))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("1 bytes past its sections");
+        }
+
+        private static void section(ByteBuf reply, int status, int recordsLength) {
+            reply.writeIntLE(1)
+                    .writeIntLE(status)
+                    .writeLongLE(0)
+                    .writeIntLE(0)
+                    .writeZero(PartitionContext.ENCODED_SIZE)
+                    .writeLongLE(0)
+                    .writeIntLE(recordsLength);
         }
     }
 

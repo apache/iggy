@@ -172,6 +172,7 @@ fn record_sizes(replica: &mut Replica) {
                     partition_id,
                     consensus_group_id: 1 + u64::from(partition_id),
                     initial_view: 0,
+                    members: Vec::new(),
                 })
                 .collect(),
         },

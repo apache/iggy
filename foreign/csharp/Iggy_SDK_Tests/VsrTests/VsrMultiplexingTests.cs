@@ -78,6 +78,41 @@ public sealed class VsrMultiplexingTests
         Assert.Equal(0, pair.Dropped);
     }
 
+    /// <summary>
+    ///     The server answers neither a cancel nor the canceled request. The cancel names the parked request on its
+    ///     link, a late reply for it is dropped, and the silence watchdog does not wait for replies that never come.
+    /// </summary>
+    [Theory]
+    [InlineData(CommandCodes.POLL_MESSAGES_DEFERRED_CODE)]
+    public async Task given_a_parked_deferred_request_when_canceled_should_send_a_header_only_cancel_and_keep_the_link(
+        int code)
+    {
+        const int FrameDeadlineMs = 100;
+        using var pair = await LinkPair.ConnectAsync(frameTimeoutMs: FrameDeadlineMs);
+        using var canceled = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var parked = pair.SendAsync(code, canceled.Token);
+        var request = await pair.ReadAsync();
+
+        await canceled.CancelAsync();
+
+        Assert.IsType<OperationCanceledException>((await parked).Error);
+        var cancel = await pair.ReadAsync();
+        Assert.Equal(CommandCodes.CANCEL_DEFERRED_REQUEST_CODE, cancel.Code);
+        Assert.Equal(OPERATION_NON_REPLICATED, cancel.Operation);
+        Assert.Empty(cancel.Body);
+        Assert.Equal(request.RequestId, cancel.RequestId);
+        Assert.Equal(request.ClientId, cancel.ClientId);
+        Assert.Equal(request.Session, cancel.Session);
+        await Task.Delay(3 * FrameDeadlineMs, TestContext.Current.CancellationToken);
+        await pair.ReplyAsync(request, [1]);
+        var next = pair.SendAsync(token: TestContext.Current.CancellationToken);
+        await pair.ReplyAsync(await pair.ReadAsync(), [2]);
+        using var reply = (await next).Response;
+        Assert.NotNull(reply);
+        Assert.Equal([2], reply.Memory.ToArray());
+        Assert.Equal(0, pair.Dropped);
+    }
+
     [Theory]
     [InlineData((byte)0, false)]
     [InlineData((byte)1, true)]
@@ -410,7 +445,8 @@ public sealed class VsrMultiplexingTests
             {
                 Body = body,
                 ClientId = BinaryPrimitives.ReadUInt128LittleEndian(header.AsSpan(VsrHeader.REQUEST_CLIENT_OFFSET)),
-                RequestChecksum = BinaryPrimitives.ReadUInt128LittleEndian(header.AsSpan(VsrHeader.REQUEST_CHECKSUM_OFFSET))
+                RequestChecksum = BinaryPrimitives.ReadUInt128LittleEndian(header.AsSpan(VsrHeader.REQUEST_CHECKSUM_OFFSET)),
+                Session = BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(VsrHeader.REQUEST_SESSION_OFFSET))
             };
         }
 

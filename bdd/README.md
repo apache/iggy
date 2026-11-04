@@ -35,6 +35,9 @@ bdd/
 │   ├── Dockerfile              # PHP BDD test container
 │   ├── phpunit.xml.dist
 │   └── tests/
+├── swift/                      # Swift SDK BDD implementation
+│   ├── Dockerfile              # Swift BDD test container
+│   └── tests/                  # SwiftPM package with the Gherkin runner and steps
 ├── docker-compose.yml          # Base: SDK test clients (always included)
 ├── docker-compose.server.yml   # Single iggy-server test setup
 ├── docker-compose.cluster.yml  # Leader + follower test setup
@@ -50,7 +53,7 @@ bdd/
 
 ```bash
 # Usage: ../scripts/run-bdd-tests.sh [--coverage] <sdk> [feature]
-#   sdk:     rust | python | php | go | go-race | node | csharp | java | all | clean  (default: all)
+#   sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | swift | all | clean  (default: all)
 #   feature: basic_messaging | leader_redirection | raw_command | session_contract | stream_crud | all  (default: all)
 
 # Run all features for all SDKs
@@ -64,6 +67,7 @@ bdd/
 ../scripts/run-bdd-tests.sh csharp
 ../scripts/run-bdd-tests.sh java
 ../scripts/run-bdd-tests.sh php
+../scripts/run-bdd-tests.sh swift
 
 # Run only basic_messaging feature for Rust SDK
 ../scripts/run-bdd-tests.sh rust basic_messaging
@@ -134,6 +138,14 @@ The Java implementation is located in `java/src/test/`
 ### For PHP SDK
 
 The PHP implementation is located in `bdd/php/tests/` and runs through PHPUnit.
+
+### For Swift SDK
+
+The Swift implementation is located in `bdd/swift/tests/`, a SwiftPM package with a small Gherkin
+runner that walks the shared feature files and drives the SDK. It runs every feature but
+`leader_redirection` and `stream_crud`. Outside Docker, set `IGGY_TCP_ADDRESS`,
+`IGGY_TCP_ADDRESS_NO_QUORUM`, `IGGY_ROOT_USERNAME`, and `IGGY_ROOT_PASSWORD`, then run
+`swift run iggy-bdd`, with `BDD_FEATURE` to pick one feature.
 
 ### Adding New Scenarios
 

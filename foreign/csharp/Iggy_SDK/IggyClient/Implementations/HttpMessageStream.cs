@@ -17,6 +17,7 @@
 
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.IO.Hashing;
 using System.Net;
 using System.Net.Http.Headers;
@@ -50,10 +51,33 @@ namespace Apache.Iggy.IggyClient.Implementations;
 public class HttpMessageStream : IIggyClient
 {
     private const string Context = "csharp-sdk";
+    private const int DeferredRetryIntervalMs = 50;
+    private const int DeferredRetryMaxIntervalMs = 1_000;
+
+    /// <summary>A plain poll that stores its offset: no wait and no byte limit, as the plain poll has none.</summary>
+    private static readonly DeferredPollOptions CommittingPlainPoll = new()
+    {
+        MaxWait = TimeSpan.Zero,
+        MaxBytes = uint.MaxValue
+    };
 
     private readonly bool _allowAutoCommitWithEncryptor;
+    private readonly SemaphoreSlim _deferredRequests =
+        new(DeferredPollOptions.MAX_PARKED_REQUESTS, DeferredPollOptions.MAX_PARKED_REQUESTS);
     private readonly ConsumerGroupClientState _groupState = new();
     private readonly HttpClient _httpClient;
+    private readonly object _progressGate = new();
+
+    /// <summary>
+    ///     The partitions blocked by a committing poll whose outcome is unknown, by the local operation that
+    ///     <see cref="AbandonOperationAsync" /> takes.
+    /// </summary>
+    private readonly Dictionary<ulong, ProgressKey> _progressBlocks = [];
+
+    /// <summary>The progress polls of each spelled partition run one at a time, so a block check and its arm are one step.</summary>
+    private readonly Dictionary<ProgressKey, (SemaphoreSlim Lane, int Holders)> _progressLanes = [];
+
+    private long _progressOperations;
 
     //TODO - create mechanism for refreshing jwt token
     //TODO - replace the HttpClient with IHttpClientFactory, when implementing support for ASP.NET Core DI
@@ -284,9 +308,57 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+    public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint partitionId,
+        Consumer consumer, PollingStrategy strategy, PollOptions options, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        options.ValidatePoll(partitionId, strategy);
+        var polled = await PollAsync(streamId, topicId, partitionId, consumer, strategy, options.Count,
+            options.Commit.Mode == CommitMode.OnRead, options.Wire, token);
+        polled.RequestStart = strategy;
+        return polled;
+    }
+
+    /// <inheritdoc />
+    public async Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
+        uint partitionId, Consumer consumer, PollingStrategy strategy, PollOptions options,
+        CancellationToken token = default)
+    {
+        var messages = await PollMessagesAsync(streamId, topicId, partitionId, consumer, strategy, options, token);
+        return BinaryMapper.ToRentedMessages(messages);
+    }
+
+    /// <inheritdoc />
+    public Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
         Consumer consumer,
         PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
+    {
+        // The server refuses a GET that stores an offset, so a committing poll is a deferred POST without a wait.
+        return PollAsync(streamId, topicId, partitionId, consumer, pollingStrategy, count, autoCommit,
+            autoCommit ? CommittingPlainPoll : null, token);
+    }
+
+    internal Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+        Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit, DeferredPollOptions options,
+        CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        options.Validate(count);
+        return PollAsync(streamId, topicId, partitionId, consumer, pollingStrategy, count, autoCommit, options, token);
+    }
+
+    internal async Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
+        uint? partitionId, Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit,
+        DeferredPollOptions options, CancellationToken token = default)
+    {
+        var messages = await PollMessagesAsync(streamId, topicId, partitionId, consumer, pollingStrategy, count,
+            autoCommit, options, token);
+        return BinaryMapper.ToRentedMessages(messages);
+    }
+
+    private async Task<PolledMessages> PollAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+        Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit,
+        DeferredPollOptions? deferred, CancellationToken token)
     {
         if (autoCommit && MessageEncryptor is not null && !_allowAutoCommitWithEncryptor)
         {
@@ -297,17 +369,49 @@ public class HttpMessageStream : IIggyClient
                 "AutoCommit with a message encryptor risks silent message loss: the offset is committed before decryption. Poll with autoCommit false, or set AllowAutoCommitWithEncryptor.");
         }
 
+        if (partitionId is { } partition)
+        {
+            pollingStrategy.ValidatePartition(partition);
+        }
+
         var partitionIdParam = partitionId.HasValue ? $"&partition_id={partitionId.Value}" : string.Empty;
         var contextParam = pollingStrategy.Context is { } context
             ? $"&context={Uri.EscapeDataString(JsonSerializer.Serialize(context, _jsonSerializerOptions))}"
             : string.Empty;
-        var url = CreateUrl($"/streams/{streamId}/topics/{topicId}/messages?consumer_id={consumer.ConsumerId}" +
-                            $"{partitionIdParam}&kind={pollingStrategy.Kind}&value={pollingStrategy.Value}&count={count}&auto_commit={autoCommit}{contextParam}");
+        var deferredPath = deferred is null ? string.Empty : "/deferred";
+        var url = CreateUrl($"/streams/{streamId}/topics/{topicId}/messages{deferredPath}?consumer_id={consumer.ConsumerId}" +
+                            $"{partitionIdParam}&kind={pollingStrategy.Kind}&value={pollingStrategy.Value}&count={count}&auto_commit={(autoCommit ? "true" : "false")}{contextParam}");
 
-        var response = await _httpClient.GetAsync(url, token);
+        var progress = autoCommit || pollingStrategy.Kind == MessagePolling.Next;
+        var key = new ProgressKey(streamId.ToString(), topicId.ToString(), partitionId ?? 0,
+            pollingStrategy.Context?.Incarnation);
+        HttpResponseMessage response;
+        if (deferred is null)
+        {
+            response = await _httpClient.GetAsync(url, token);
+        }
+        else if (progress)
+        {
+            var lane = await EnterProgressLaneAsync(key, token);
+            try
+            {
+                response = await SendDeferredPollAsync(url, deferred, key, autoCommit, token);
+            }
+            finally
+            {
+                LeaveProgressLane(key, lane);
+            }
+        }
+        else
+        {
+            response = await SendDeferredPollAsync(url, deferred, null, false, token);
+        }
         if (response.IsSuccessStatusCode)
         {
-            var pollMessages = await response.Content.ReadFromJsonAsync<PolledMessages>(_jsonSerializerOptions, token)
+            // SendAsync buffered a deferred reply, so its decode does not wait on the server. If the poll moved an
+            // offset, a cancel here hides the batch that it moved past.
+            var pollMessages = await response.Content.ReadFromJsonAsync<PolledMessages>(_jsonSerializerOptions,
+                                   deferred is null ? token : CancellationToken.None)
                                ?? PolledMessages.Empty;
 
             if (MessageEncryptor is not null)
@@ -333,6 +437,220 @@ public class HttpMessageStream : IIggyClient
         return BinaryMapper.ToRentedMessages(messages);
     }
 
+    /// <summary>
+    ///     Sends a deferred poll until the server admits it or its request timeout passes. Every attempt asks for
+    ///     what is left of the wait and the request timeout, so the server always answers before the client gives
+    ///     up. Only a refusal that admitted nothing (58 or 90) is sent again.
+    /// </summary>
+    /// <remarks>
+    ///     A poll that stores its offset is a POST, which no client or proxy sends again. The server refuses a GET
+    ///     that asks for it.
+    /// </remarks>
+    /// <exception cref="VsrFetchProgressUncertainException">
+    ///     A committing poll whose outcome is unknown: the caller canceled or the request timeout passed while it was
+    ///     on the wire, the transport failed after the connect, or the server answered with an error that does not
+    ///     prove that it stored nothing. Its partition stays blocked until <see cref="AbandonOperationAsync" />.
+    /// </exception>
+    /// <exception cref="VsrPartitionLaneBlockedException">A committing poll of the partition has an unknown outcome.</exception>
+    /// <exception cref="VsrRequestOutcomeUnknownException">
+    ///     The caller canceled, or the request timeout passed, while a <see cref="MessagePolling.Next" /> poll was on
+    ///     the wire.
+    /// </exception>
+    private async Task<HttpResponseMessage> SendDeferredPollAsync(string url, DeferredPollOptions options,
+        ProgressKey? progress, bool commits, CancellationToken token)
+    {
+        // Before the lease wait, so a client full of waiting polls cannot hide the block behind status 58.
+        if (progress is { } partition)
+        {
+            ThrowIfProgressBlocked(partition);
+        }
+
+        var started = Stopwatch.GetTimestamp();
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(token);
+        budget.CancelAfter(options.RequestTimeout);
+        var sending = false;
+        try
+        {
+            await _deferredRequests.WaitAsync(budget.Token);
+            try
+            {
+                for (var retryDelayMs = DeferredRetryIntervalMs; ;
+                     retryDelayMs = Math.Min(retryDelayMs * 2, DeferredRetryMaxIntervalMs))
+                {
+                    // Another spelling of the partition can block it during the lease wait or a retry pause.
+                    if (progress is { } blocked)
+                    {
+                        ThrowIfProgressBlocked(blocked);
+                    }
+
+                    var remaining = options.Remaining(Stopwatch.GetElapsedTime(started));
+                    using var request = new HttpRequestMessage(commits ? HttpMethod.Post : HttpMethod.Get, CreateUrl(
+                        $"{url}&wait_us={remaining.MaxWaitUs}&min_count={remaining.MinCount}&max_bytes={remaining.MaxBytes}&request_timeout_us={remaining.RequestTimeoutUs}"));
+                    request.Options.Set(TransientHttpRetryHandler.SingleAttempt, true);
+                    sending = true;
+                    HttpResponseMessage response;
+                    try
+                    {
+                        response = await _httpClient.SendAsync(request, budget.Token);
+                    }
+                    catch (HttpRequestException error) when (commits
+                                                             && error.HttpRequestError != HttpRequestError.ConnectionError)
+                    {
+                        throw Lose(progress!.Value, error);
+                    }
+
+                    sending = false;
+                    try
+                    {
+                        await HandleResponseAsync(response, true);
+                        return response;
+                    }
+                    catch (IggyInvalidStatusCodeException error) when ((!commits || ProvesNothingStored(response, error))
+                        && error.StatusCode is VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.DEFERRED_POLL_CAPACITY_EXCEEDED
+                        && Stopwatch.GetElapsedTime(started).TotalMilliseconds + retryDelayMs
+                        < options.RequestTimeout.TotalMilliseconds)
+                    {
+                        response.Dispose();
+                    }
+                    catch (IggyInvalidStatusCodeException error) when (commits && !ProvesNothingStored(response, error))
+                    {
+                        // The server stores the offset before it answers, so the poll may have moved past a batch it
+                        // never sent.
+                        response.Dispose();
+                        throw Lose(progress!.Value, error);
+                    }
+                    catch (VsrRequestOutcomeUnknownException error) when (commits)
+                    {
+                        response.Dispose();
+                        throw Lose(progress!.Value, error.InnerException ?? error);
+                    }
+
+                    await Task.Delay(retryDelayMs, budget.Token);
+                }
+            }
+            finally
+            {
+                _deferredRequests.Release();
+            }
+        }
+        catch (OperationCanceledException error) when (sending && commits)
+        {
+            // The server can store the offset before it sees that the client gave up.
+            throw Lose(progress!.Value, error);
+        }
+        catch (OperationCanceledException error) when (sending && progress is not null)
+        {
+            // The server can move the offset before it sees that the client gave up.
+            throw new VsrRequestOutcomeUnknownException(error);
+        }
+        catch (OperationCanceledException) when (!token.IsCancellationRequested)
+        {
+            throw VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED, "The deferred poll spent its request timeout.");
+        }
+    }
+
+    /// <summary>
+    ///     A 503 refuses a poll before the server takes it, and the server sends a 404 only before the read. Another
+    ///     4xx proves that nothing was stored only with an error that the binary protocol takes as proof.
+    /// </summary>
+    private static bool ProvesNothingStored(HttpResponseMessage response, IggyInvalidStatusCodeException error)
+    {
+        return response.StatusCode is HttpStatusCode.ServiceUnavailable or HttpStatusCode.NotFound
+               || (int)response.StatusCode is >= 400 and < 500
+               && CommitErrorScope.Request.ProvesNothingStored(error.StatusCode);
+    }
+
+    /// <summary>Blocks the partition of a committing poll whose outcome is unknown until the caller abandons it.</summary>
+    private VsrFetchProgressUncertainException Lose(ProgressKey partition, Exception cause)
+    {
+        var operation = (ulong)Interlocked.Increment(ref _progressOperations);
+        lock (_progressGate)
+        {
+            _progressBlocks[operation] = partition;
+        }
+
+        return new VsrFetchProgressUncertainException(operation, cause);
+    }
+
+    private void ThrowIfProgressBlocked(ProgressKey call)
+    {
+        lock (_progressGate)
+        {
+            foreach (var (operation, blocked) in _progressBlocks)
+            {
+                if (blocked.Partition == call.Partition
+                    && (blocked.Stream == call.Stream && blocked.Topic == call.Topic
+                        || blocked.Incarnation is { } incarnation && incarnation == call.Incarnation))
+                {
+                    throw new VsrPartitionLaneBlockedException(operation, call.Partition);
+                }
+            }
+        }
+    }
+
+    private async Task<SemaphoreSlim> EnterProgressLaneAsync(ProgressKey partition, CancellationToken token)
+    {
+        var spelled = partition with { Incarnation = null };
+        SemaphoreSlim lane;
+        lock (_progressGate)
+        {
+            var (held, holders) = _progressLanes.TryGetValue(spelled, out var entry) ? entry : (new SemaphoreSlim(1, 1), 0);
+            lane = held;
+            _progressLanes[spelled] = (lane, holders + 1);
+        }
+
+        try
+        {
+            await lane.WaitAsync(token);
+            return lane;
+        }
+        catch
+        {
+            LeaveProgressLane(spelled, lane, false);
+            throw;
+        }
+    }
+
+    private void LeaveProgressLane(ProgressKey partition, SemaphoreSlim lane, bool entered = true)
+    {
+        if (entered)
+        {
+            lane.Release();
+        }
+
+        var spelled = partition with { Incarnation = null };
+        lock (_progressGate)
+        {
+            var (_, holders) = _progressLanes[spelled];
+            if (holders == 1)
+            {
+                _progressLanes.Remove(spelled);
+            }
+            else
+            {
+                _progressLanes[spelled] = (lane, holders - 1);
+            }
+        }
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    ///     Over HTTP the client keeps only committing polls with an unknown outcome. The abandon unblocks the partition
+    ///     of one, and the server may still store its offset.
+    /// </remarks>
+    public Task AbandonOperationAsync(ulong operationId)
+    {
+        lock (_progressGate)
+        {
+            if (!_progressBlocks.Remove(operationId))
+            {
+                return Task.FromException(new VsrOperationNotRetainedException(operationId));
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
     /// <inheritdoc />
     public Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset,
         uint? partitionId, CancellationToken token = default)
@@ -348,9 +666,20 @@ public class HttpMessageStream : IIggyClient
             new StoreOffsetRequest(consumer, partitionId, offset) { Context = context }, token);
     }
 
+    /// <inheritdoc />
+    public Task StoreConsumerPositionAsync(Consumer consumer, Identifier streamId, Identifier topicId,
+        Checkpoint checkpoint, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(checkpoint);
+        return StoreOffsetAsync(consumer, streamId, topicId, checkpoint.Offset, checkpoint.PartitionId,
+            checkpoint.Context, token);
+    }
+
     private async Task PutOffsetAsync(Identifier streamId, Identifier topicId, StoreOffsetRequest request,
         CancellationToken token)
     {
+        ThrowIfProgressBlocked(new ProgressKey(streamId.ToString(), topicId.ToString(), request.PartitionId ?? 0,
+            request.Context?.Incarnation));
         var json = JsonSerializer.Serialize(request, _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
@@ -383,10 +712,20 @@ public class HttpMessageStream : IIggyClient
     public async Task DeleteOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, uint? partitionId,
         CancellationToken token = default)
     {
+        ThrowIfProgressBlocked(new ProgressKey(streamId.ToString(), topicId.ToString(), partitionId ?? 0, null));
         var partitionIdParam = partitionId.HasValue ? $"?partition_id={partitionId.Value}" : string.Empty;
         var response = await _httpClient.DeleteAsync(
             $"/streams/{streamId}/topics/{topicId}/consumer-offsets/{consumer}{partitionIdParam}", token);
         await HandleResponseAsync(response);
+    }
+
+    /// <inheritdoc />
+    /// <remarks>HTTP sends no context with a delete, so the server deletes the offset of the history that it holds.</remarks>
+    public Task DeleteConsumerPositionAsync(Consumer consumer, Identifier streamId, Identifier topicId,
+        Checkpoint checkpoint, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(checkpoint);
+        return DeleteOffsetAsync(consumer, streamId, topicId, checkpoint.PartitionId, token);
     }
 
     /// <inheritdoc />
@@ -1157,7 +1496,7 @@ public class HttpMessageStream : IIggyClient
         }
         catch (JsonException)
         {
-            // A gateway or proxy error body is not the server's JSON schema; the raw text still travels in
+            // A gateway or proxy error body is not the server's JSON schema. The raw text still travels in
             // the exception message.
         }
 
@@ -1175,4 +1514,11 @@ public class HttpMessageStream : IIggyClient
     {
         return message.ToString();
     }
+
+    /// <summary>
+    ///     A partition as a call spells its stream and topic, with the incarnation of its context when it has one.
+    ///     HTTP has no id independent of the spelling, so a block covers a later call with the same spelling, or one
+    ///     whose context names the same incarnation.
+    /// </summary>
+    private readonly record struct ProgressKey(string Stream, string Topic, uint Partition, ulong? Incarnation);
 }

@@ -25,14 +25,21 @@
 pub mod config;
 pub mod error;
 pub mod iggy_bridge;
+pub mod nodes;
 pub mod topic_map;
 
-pub use config::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, ProduceSessionLimits};
+pub use config::{
+    DEFAULT_FETCH_SLOTS, DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, MAX_FETCH_SLOTS,
+    ProduceSessionLimits,
+};
 pub use error::BridgeError;
 pub use iggy_bridge::{
-    CLUSTER_ID_TOPIC, ClusterIdCall, DEFAULT_TOPIC_PARTITIONS, IggyBridge, KafkaTopicMetadata,
-    MAX_TOPIC_PARTITIONS, OFFSET_GROUP_PREFIX, OffsetCalls, OffsetGroups, ProduceTurn, Producer,
-    ScannedGroups, StreamTopicCache, TopicCreationOutcome, TopicLoad, TopicTarget,
-    cluster_id_stream,
+    CLUSTER_ID_TOPIC, COORDINATOR_LEASE_GROUP, COORDINATOR_LOG_TOPIC, COORDINATOR_OWNER_TOPIC,
+    ClusterIdCall, CoordinatorLink, DEFAULT_TOPIC_PARTITIONS, DeletedTopic, IggyBridge,
+    KafkaTopicMetadata, LoggedRecord, MAX_TOPIC_PARTITIONS, OFFSET_GROUP_PREFIX, OffsetCalls,
+    OffsetGroupSource, OffsetGroups, PartitionBatch, PermissionBoard, ProduceTurn, Producer,
+    ScannedGroups, StreamTopicCache, TopicCreationOutcome, TopicLoad, TopicShape, TopicShapes,
+    TopicTarget, UserAccess, cluster_id_stream, iggy_producer_id, kafka_producer_id,
 };
+pub use nodes::KnownNodes;
 pub use topic_map::{TopicMapping, TopicOverride};

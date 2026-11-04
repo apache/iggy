@@ -104,21 +104,20 @@ async fn execute_using_messages_key_key(client: &IggyClient) {
     }
 
     // 2. Poll the messages for the single client which has assigned all partitions in the consumer group
-    // Hash-based partitioning distributes messages unpredictably across partitions, and polling
-    // round-robins across partitions, so we verify completeness rather than order.
+    // Hash-based partitioning distributes messages unpredictably across partitions, and the
+    // test polls the partitions in turn, so we verify completeness rather than order.
     let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
     let mut received_entity_ids = HashSet::new();
 
-    for _ in 1..=PARTITIONS_COUNT * MESSAGES_COUNT {
+    for i in 1..=PARTITIONS_COUNT * MESSAGES_COUNT {
         let polled_messages = client
             .poll_messages(
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
-                None,
+                (i - 1) % PARTITIONS_COUNT,
                 &consumer,
                 &PollingStrategy::next(),
-                1,
-                true,
+                single_committed_message(),
             )
             .await
             .unwrap();
@@ -186,6 +185,8 @@ async fn execute_using_none_key(client: &IggyClient) {
     }
 
     // 2. Poll the messages for the single client which has assigned all partitions in the consumer group
+    // The balanced sends filled the partitions in turn, so polling them in the same turn
+    // reads the messages in send order.
     let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
     let mut partition_id = 1;
     let mut offset = 0;
@@ -194,11 +195,10 @@ async fn execute_using_none_key(client: &IggyClient) {
             .poll_messages(
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
-                None,
+                (i - 1) % PARTITIONS_COUNT,
                 &consumer,
                 &PollingStrategy::next(),
-                1,
-                true,
+                single_committed_message(),
             )
             .await
             .unwrap();
@@ -219,20 +219,27 @@ async fn execute_using_none_key(client: &IggyClient) {
         }
     }
 
-    for _ in 1..=PARTITIONS_COUNT {
+    for partition_id in 0..PARTITIONS_COUNT {
         let polled_messages = client
             .poll_messages(
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
-                None,
+                partition_id,
                 &consumer,
                 &PollingStrategy::next(),
-                1,
-                true,
+                single_committed_message(),
             )
             .await
             .unwrap();
         assert!(polled_messages.messages.is_empty());
+    }
+}
+
+fn single_committed_message() -> PollOptions {
+    PollOptions {
+        count: 1,
+        commit: CommitPolicy::OnRead,
+        ..PollOptions::default()
     }
 }
 

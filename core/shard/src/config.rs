@@ -23,28 +23,15 @@
 //! `configs` and `shard` share no dependency edge.
 
 /// Tunables for [`crate::coordinator::ShardZeroCoordinator`].
-#[derive(Debug, Clone)]
+///
+/// Replica links are placed by `message_bus::LinkLayout`, not here.
+#[derive(Debug, Clone, Default)]
 pub struct CoordinatorConfig {
-    /// When `total_shards > 1`, exclude shard 0 from replica placement.
-    /// Shard 0 already hosts the coordinator, the metadata writer, and
-    /// both listeners; replicas are long-lived steady flows, so offload
-    /// them to peer shards by default.
-    pub skip_shard_zero_for_replicas: bool,
-
     /// When `total_shards > 1`, exclude shard 0 from client placement.
     /// Default false: shard 0 continues to serve client traffic because
     /// client connections are short-lived and benefit from shard-0
     /// parallelism more than replicas do.
     pub skip_shard_zero_for_clients: bool,
-}
-
-impl Default for CoordinatorConfig {
-    fn default() -> Self {
-        Self {
-            skip_shard_zero_for_replicas: true,
-            skip_shard_zero_for_clients: false,
-        }
-    }
 }
 
 /// Owner-local deferred poll limits. Running reads retain their byte reservation

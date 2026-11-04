@@ -268,21 +268,15 @@ Topic Topic::FromFfi(ffi::Topic topic) {
                  ResourceOptions::FromFfi(std::move(topic.options), std::move(topic.derived_options)));
 }
 
-ffi::PartitionContext PartitionContext::ToFfi() const {
-    ffi::PartitionContext context{};
-    context.incarnation      = incarnation_;
-    context.owner_generation = owner_generation_;
-    context.metadata_op      = metadata_op_;
-    return context;
-}
-
 PartitionContext PartitionContext::FromFfi(ffi::PartitionContext context) {
     return PartitionContext(context.incarnation, context.owner_generation, context.metadata_op);
 }
 
 Partition Partition::FromFfi(ffi::Partition partition) {
     return Partition(partition.id, partition.created_at, partition.segments_count, partition.current_offset,
-                     partition.size_bytes, partition.messages_count, PartitionContext::FromFfi(partition.context));
+                     partition.size_bytes, partition.messages_count, PartitionContext::FromFfi(partition.context),
+                     std::vector<std::uint8_t>(partition.members.begin(), partition.members.end()),
+                     std::vector<std::uint8_t>(partition.in_sync_members.begin(), partition.in_sync_members.end()));
 }
 
 TopicDetails TopicDetails::FromFfi(ffi::TopicDetails topic) {

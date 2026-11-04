@@ -33,11 +33,14 @@ pub mod offset_storage;
 mod partition_storage;
 mod persistence;
 mod poll_plan;
+pub mod producer_state;
+mod repair_memory;
 pub use persistence::FileSyncBarrier;
 pub(crate) use persistence::PersistenceDrain;
 pub use persistence::{
     PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
 };
+pub use repair_memory::RepairMemoryBudget;
 mod segment;
 pub mod segment_anchor;
 mod segment_recovery;
@@ -60,7 +63,7 @@ use iggy_common::IggyError;
 pub use iggy_index::IggyIndex;
 pub use iggy_index_reader::IggyIndexReader;
 pub use iggy_index_writer::IggyIndexWriter;
-pub use iggy_partition::{IggyPartition, SegmentRemoval};
+pub use iggy_partition::{IggyPartition, RetirementDebtStatus, SegmentRemoval};
 pub use iggy_partitions::IggyPartitions;
 pub(crate) use io::PartitionIoVerdict;
 pub use io::{
@@ -70,7 +73,10 @@ pub use io::{
     PartitionIoResult, PartitionIoStep, PartitionTeardown, PreparedPrimaryTransfer,
     largest_legal_job_charge,
 };
-pub use journal::{EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY};
+pub use journal::{
+    BodyPosition, EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY, EvictedHeader, ReleasedBodies,
+    ReleasedRead,
+};
 pub use view_fence::ViewWindowVerdict;
 
 /// Offsets a partition claims in its superblock ahead of the mint counter
@@ -96,10 +102,11 @@ pub use iggy_partition::{PollCompletion, PollReplication, PollVisibility};
 pub use messages_writer::MessagesWriter;
 pub use offset_storage::delete_persisted_offset;
 pub use partition_storage::{
-    CREATED_REVISION_FILE, configure_consumer_offsets, configure_consumer_offsets_with_storage,
-    create_partition_file_hierarchy, delete_partitions_from_disk, ensure_initial_segment,
-    hydrate_partition_log, read_created_revision, read_revision_record, write_created_revision,
-    write_revision_record,
+    CREATED_REVISION_FILE, clamp_consumer_offsets, configure_consumer_offsets,
+    configure_consumer_offsets_with_storage, create_partition_file_hierarchy,
+    delete_partitions_from_disk, ensure_initial_segment, hydrate_partition_log,
+    read_created_revision, read_revision_record, recover_consumer_offsets,
+    recover_consumer_offsets_with_storage, write_created_revision, write_revision_record,
 };
 pub use poll_plan::{DISK_POLL_CHUNK_MAX, PollPlan, PollReadResult};
 pub use segment::Segment;
@@ -139,6 +146,7 @@ pub struct RetainedPartitionState {
     pub retry_capacity: Option<usize>,
     pub retry_protection: Vec<consensus::DedupWatermark>,
     pub required_metadata_frontier: u64,
+    pub retirement_paid_through: u64,
     /// Offset counter the previous incarnation had proved durable.
     pub durable_offset: u64,
     /// Highest offset it had written, durable or not.
@@ -153,6 +161,7 @@ pub struct RetainedPartitionState {
     pub(crate) history_transition: Option<iggy_partition::InstalledPartitionHistory>,
     pub(crate) owner_retirement:
         Option<iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest>,
+    pub(crate) producers: producer_state::ProducerTable,
 }
 
 /// Partition-level data plane operations.

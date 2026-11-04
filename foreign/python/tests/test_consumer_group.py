@@ -19,14 +19,21 @@
 # + consumer_group setup once test fixture is in place.
 
 import asyncio
+from collections.abc import AsyncIterator
 from datetime import timedelta
 
 import pytest
 
 from apache_iggy import (
     AutoCommit,
+    CommitAfter,
+    CommitEvery,
+    CommitPolicy,
+    Consumer,
     IggyClient,
+    IggyError,
     PollingStrategy,
+    PollOptions,
     ReceiveMessage,
     TopicOptions,
 )
@@ -34,10 +41,33 @@ from apache_iggy import SendMessage as Message
 
 from .utils import (
     get_server_config,
+    read_offsets_with_cancels,
     wait_for_consumer_group_assignment,
     wait_for_ping,
     wait_for_server,
 )
+
+# A consumer without a wait polls an idle topic in a busy loop.
+POLL_WAIT = timedelta(seconds=1)
+POLL_OPTIONS = PollOptions(count=10, max_wait=POLL_WAIT)
+# Stores the delivered position every 5 seconds and on shutdown.
+INTERVAL_COMMIT_OPTIONS = PollOptions(
+    count=10,
+    max_wait=POLL_WAIT,
+    commit=CommitPolicy.Auto(
+        AutoCommit(interval=timedelta(seconds=5), after=CommitAfter.Delivery)
+    ),
+)
+# One message per batch and one batch of prefetch, so most iterations wait for a reply.
+ONE_MESSAGE = 1
+CANCELLED_ITERATIONS_MESSAGES = 100
+RUN_TIMEOUT_SECONDS = 10
+INVALID_COMMAND = 3
+NO_EVENT_RUN_MESSAGES = 5
+
+
+async def _message_offset(iterator: AsyncIterator[ReceiveMessage]) -> list[int]:
+    return [(await anext(iterator)).offset()]
 
 
 async def _create_consumer_group_with_numeric_ids(
@@ -273,9 +303,8 @@ class TestGetConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.Next(),
-            10,
+            polling_strategy=PollingStrategy.Next(),
+            poll_options=POLL_OPTIONS,
         )
         await wait_for_consumer_group_assignment(
             iggy_client, stream_name, topic_name, consumer_name, members_count=1
@@ -785,10 +814,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.Next(),
-            10,
-            auto_commit=AutoCommit.Interval(timedelta(seconds=5)),
+            polling_strategy=PollingStrategy.Next(),
+            poll_options=INTERVAL_COMMIT_OPTIONS,
         )
 
         assert consumer.name() == consumer_name
@@ -819,10 +846,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.First(),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
         )
 
         async def take(received: ReceiveMessage) -> None:
@@ -875,10 +900,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.First(),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
         )
 
         async def take(received: ReceiveMessage) -> None:
@@ -928,10 +951,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.First(),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
         )
 
         assert consumer.get_last_consumed_offset(partition_id) is None
@@ -999,10 +1020,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.First(),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
         )
 
         assert consumer.get_last_stored_offset(partition_id) is None
@@ -1065,10 +1084,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.First(),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
         )
         await wait_for_consumer_group_assignment(
             iggy_client, stream_name, topic_name, consumer_name, members_count=1
@@ -1120,10 +1137,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.Next(),
-            10,
-            auto_commit=AutoCommit.Interval(timedelta(seconds=5)),
+            polling_strategy=PollingStrategy.Next(),
+            poll_options=INTERVAL_COMMIT_OPTIONS,
         )
 
         async def take(message: ReceiveMessage) -> None:
@@ -1166,10 +1181,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.Next(),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.Next(),
+            poll_options=POLL_OPTIONS,
         )
 
         async def take(message: ReceiveMessage) -> None:
@@ -1207,10 +1220,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.Next(),
-            10,
-            auto_commit=AutoCommit.Interval(timedelta(seconds=5)),
+            polling_strategy=PollingStrategy.Next(),
+            poll_options=INTERVAL_COMMIT_OPTIONS,
         )
 
         await iggy_client.send_messages(
@@ -1248,10 +1259,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.Next(),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.Next(),
+            poll_options=POLL_OPTIONS,
         )
 
         await iggy_client.send_messages(
@@ -1296,10 +1305,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.First(),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
         )
 
         iterator = consumer.iter_messages()
@@ -1335,10 +1342,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.Last(),
-            1,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.Last(),
+            poll_options=PollOptions(count=1, max_wait=POLL_WAIT),
         )
 
         iterator = consumer.iter_messages()
@@ -1354,10 +1359,10 @@ class TestConsumerGroup:
         )
 
     @pytest.mark.asyncio
-    async def test_iter_messages_with_last_and_batch_length_two_reads_last_two_messages(
+    async def test_iter_messages_with_last_and_count_two_reads_last_two_messages(
         self, iggy_client: IggyClient, unique_name
     ):
-        """Test iter_messages with Last and batch_length=2 reads the last two."""
+        """Test iter_messages with Last and count=2 reads the last two."""
         consumer_name = unique_name()
         stream_name = unique_name()
         topic_name = unique_name()
@@ -1379,10 +1384,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.Last(),
-            2,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.Last(),
+            poll_options=PollOptions(count=2, max_wait=POLL_WAIT),
         )
 
         iterator = consumer.iter_messages()
@@ -1419,10 +1422,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.Last(),
-            1,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.Last(),
+            poll_options=PollOptions(count=1, max_wait=POLL_WAIT),
         )
 
         async def take(message: ReceiveMessage) -> None:
@@ -1465,10 +1466,8 @@ class TestConsumerGroup:
             unique_name(),
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.First(),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
         )
 
         iterator = first_consumer.iter_messages()
@@ -1482,10 +1481,8 @@ class TestConsumerGroup:
             unique_name(),
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.Offset(value=start_offset),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.Offset(value=start_offset),
+            poll_options=POLL_OPTIONS,
         )
 
         iterator = offset_consumer.iter_messages()
@@ -1529,10 +1526,8 @@ class TestConsumerGroup:
             unique_name(),
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.First(),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
         )
 
         iterator = first_consumer.iter_messages()
@@ -1546,10 +1541,8 @@ class TestConsumerGroup:
             unique_name(),
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.Offset(value=start_offset),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.Offset(value=start_offset),
+            poll_options=POLL_OPTIONS,
         )
 
         async def take(message: ReceiveMessage) -> None:
@@ -1598,10 +1591,8 @@ class TestConsumerGroup:
             unique_name(),
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.First(),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
         )
 
         iterator = first_consumer.iter_messages()
@@ -1615,10 +1606,8 @@ class TestConsumerGroup:
             unique_name(),
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.Timestamp(value=start_timestamp),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.Timestamp(value=start_timestamp),
+            poll_options=POLL_OPTIONS,
         )
 
         iterator = timestamp_consumer.iter_messages()
@@ -1666,10 +1655,8 @@ class TestConsumerGroup:
             unique_name(),
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.First(),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
         )
 
         iterator = first_consumer.iter_messages()
@@ -1683,10 +1670,8 @@ class TestConsumerGroup:
             unique_name(),
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.Timestamp(value=start_timestamp),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.Timestamp(value=start_timestamp),
+            poll_options=POLL_OPTIONS,
         )
 
         async def take(message: ReceiveMessage) -> None:
@@ -1724,10 +1709,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.First(),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
         )
 
         assert consumer.get_last_consumed_offset(partition_id) is None
@@ -1762,7 +1745,7 @@ class TestConsumerGroup:
     async def test_iter_messages_reads_across_multiple_batches(
         self, iggy_client: IggyClient, unique_name
     ):
-        """Test iter_messages continues across polls when batch_length is small."""
+        """Test iter_messages continues across polls when count is small."""
         consumer_name = unique_name()
         stream_name = unique_name()
         topic_name = unique_name()
@@ -1784,10 +1767,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.First(),
-            2,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.First(),
+            poll_options=PollOptions(count=2, max_wait=POLL_WAIT),
         )
 
         iterator = consumer.iter_messages()
@@ -1799,18 +1780,18 @@ class TestConsumerGroup:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("allow_replay", [False, True])
-    async def test_store_offset_respects_allow_replay(
+    async def test_store_offset_moves_the_stored_offset_back(
         self,
         iggy_client: IggyClient,
         unique_name,
         allow_replay: bool,
     ):
-        """Test rewinding offsets only re-consumes when replay is enabled."""
+        """Test storing a lower offset rewinds the group, with or without replay."""
         consumer_name = unique_name()
         stream_name = unique_name()
         topic_name = unique_name()
         partition_id = 0
-        test_messages = [f"Replay test {i} - {unique_name()}" for i in range(3)]
+        test_messages = [f"Rewind test {i} - {unique_name()}" for i in range(3)]
         received_messages = []
         replayed_messages = []
 
@@ -1821,10 +1802,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.First(),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
             allow_replay=allow_replay,
         )
 
@@ -1846,30 +1825,78 @@ class TestConsumerGroup:
         assert consumer.get_last_stored_offset(partition_id) == offsets[-1]
 
         await consumer.store_offset(offsets[-2], partition_id)
-        expected_stored_offset = offsets[-2] if allow_replay else offsets[-1]
-        assert consumer.get_last_stored_offset(partition_id) == expected_stored_offset
+        assert consumer.get_last_stored_offset(partition_id) == offsets[-2]
 
         replay_consumer = await iggy_client.consumer_group(
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.Next(),
-            1,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.Next(),
+            poll_options=PollOptions(count=1, max_wait=POLL_WAIT),
             allow_replay=allow_replay,
         )
 
-        if allow_replay:
-            iterator = replay_consumer.iter_messages()
+        iterator = replay_consumer.iter_messages()
+        message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
+        replayed_messages.append(message.payload().decode())
+        assert replayed_messages == [test_messages[-1]]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("allow_replay", [False, True])
+    async def test_seek_back_reads_again_with_and_without_allow_replay(
+        self,
+        iggy_client: IggyClient,
+        unique_name,
+        allow_replay: bool,
+    ):
+        """Test a seek back reads the sought messages again with any allow_replay."""
+        consumer_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        test_messages = [f"Replay test {i} - {unique_name()}" for i in range(3)]
+        final_message = f"Replay test 3 - {unique_name()}"
+        received_messages = []
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
+
+        consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
+            allow_replay=allow_replay,
+        )
+
+        await iggy_client.send_messages(
+            stream_name,
+            topic_name,
+            partition_id,
+            [Message(message) for message in test_messages],
+        )
+
+        iterator = consumer.iter_messages()
+        for _ in range(len(test_messages)):
             message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
-            replayed_messages.append(message.payload().decode())
-            assert replayed_messages == [test_messages[-1]]
-        else:
-            with pytest.raises(asyncio.TimeoutError):
-                await asyncio.wait_for(
-                    replay_consumer.iter_messages().__anext__(), timeout=0.2
-                )
+            received_messages.append(message)
+
+        await consumer.seek(
+            partition_id,
+            PollingStrategy.Offset(value=received_messages[-1].offset()),
+        )
+        # The replay filter skips only deliveries of the generation that the seek
+        # ended, so both cases yield the sought message before the later one.
+        await iggy_client.send_messages(
+            stream_name,
+            topic_name,
+            partition_id,
+            [Message(final_message)],
+        )
+
+        message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
+        assert message.payload().decode() == test_messages[-1]
 
     @pytest.mark.asyncio
     async def test_consumer_group_retries_initialization_until_stream_and_topic_exist(
@@ -1885,10 +1912,8 @@ class TestConsumerGroup:
                 consumer_name,
                 stream_name,
                 topic_name,
-                0,
-                PollingStrategy.Next(),
-                10,
-                auto_commit=AutoCommit.Disabled(),
+                polling_strategy=PollingStrategy.Next(),
+                poll_options=POLL_OPTIONS,
                 init_retries=10,
                 init_retry_interval=timedelta(milliseconds=50),
             )
@@ -1906,10 +1931,10 @@ class TestConsumerGroup:
         assert consumer.topic() == topic_name
 
     @pytest.mark.asyncio
-    async def test_consumer_group_can_disable_auto_join(
+    async def test_consumer_group_joins_the_group_on_initialization(
         self, iggy_client: IggyClient, unique_name
     ):
-        """Test initialization can skip automatically joining the group."""
+        """Test initialization joins the group before the consumer is returned."""
         consumer_name = unique_name()
         stream_name = unique_name()
         topic_name = unique_name()
@@ -1922,17 +1947,19 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.Next(),
-            10,
-            auto_commit=AutoCommit.Disabled(),
-            auto_join_consumer_group=False,
+            polling_strategy=PollingStrategy.Next(),
+            poll_options=POLL_OPTIONS,
         )
 
         assert consumer.name() == consumer_name
         assert consumer.stream() == stream_name
         assert consumer.topic() == topic_name
         assert consumer.partition_id() == partition_id
+        group = await iggy_client.get_consumer_group(
+            stream_name, topic_name, consumer_name
+        )
+        assert group is not None
+        assert group.members_count == 1
 
     @pytest.mark.asyncio
     async def test_consumer_group_can_disable_auto_create_when_group_exists(
@@ -1950,20 +1977,16 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            0,
-            PollingStrategy.Next(),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.Next(),
+            poll_options=POLL_OPTIONS,
         )
 
         consumer = await iggy_client.consumer_group(
             consumer_name,
             stream_name,
             topic_name,
-            0,
-            PollingStrategy.Next(),
-            10,
-            auto_commit=AutoCommit.Disabled(),
+            polling_strategy=PollingStrategy.Next(),
+            poll_options=POLL_OPTIONS,
             create_consumer_group_if_not_exists=False,
         )
 
@@ -1997,10 +2020,8 @@ class TestConsumerGroup:
                 consumer_name,
                 stream_name,
                 topic_name,
-                0,
-                PollingStrategy.Next(),
-                10,
-                auto_commit=AutoCommit.Disabled(),
+                polling_strategy=PollingStrategy.Next(),
+                poll_options=POLL_OPTIONS,
             )
 
     @pytest.mark.asyncio
@@ -2019,10 +2040,8 @@ class TestConsumerGroup:
                 unique_name(),
                 stream_name,
                 topic_name,
-                0,
-                PollingStrategy.Next(),
-                10,
-                auto_commit=AutoCommit.Disabled(),
+                polling_strategy=PollingStrategy.Next(),
+                poll_options=POLL_OPTIONS,
                 create_consumer_group_if_not_exists=False,
             )
 
@@ -2055,10 +2074,8 @@ class TestConsumerGroup:
                 unique_name(),
                 stream_name,
                 topic_name,
-                0,
-                PollingStrategy.Next(),
-                10,
-                auto_commit=AutoCommit.Disabled(),
+                polling_strategy=PollingStrategy.Next(),
+                poll_options=POLL_OPTIONS,
                 **kwargs,
             )
 
@@ -2073,10 +2090,8 @@ class TestConsumerGroup:
                 unique_name(),
                 unique_name(),
                 unique_name(),
-                0,
-                PollingStrategy.Next(),
-                10,
-                auto_commit=AutoCommit.Disabled(),
+                polling_strategy=PollingStrategy.Next(),
+                poll_options=POLL_OPTIONS,
             )
 
     @pytest.mark.asyncio
@@ -2094,10 +2109,8 @@ class TestConsumerGroup:
                 unique_name(),
                 unique_name(),
                 unique_name(),
-                0,
-                PollingStrategy.Next(),
-                10,
-                auto_commit=AutoCommit.Disabled(),
+                polling_strategy=PollingStrategy.Next(),
+                poll_options=POLL_OPTIONS,
             )
 
     @pytest.mark.asyncio
@@ -2106,7 +2119,6 @@ class TestConsumerGroup:
         consumer_name = unique_name()
         stream_name = unique_name()
         topic_name = unique_name()
-        partition_id = 0
         shutdown_event = asyncio.Event()
 
         await iggy_client.create_stream(stream_name)
@@ -2116,10 +2128,8 @@ class TestConsumerGroup:
             consumer_name,
             stream_name,
             topic_name,
-            partition_id,
-            PollingStrategy.Next(),
-            10,
-            auto_commit=AutoCommit.Interval(timedelta(seconds=5)),
+            polling_strategy=PollingStrategy.Next(),
+            poll_options=INTERVAL_COMMIT_OPTIONS,
         )
 
         async def take(_: ReceiveMessage) -> None:
@@ -2128,3 +2138,531 @@ class TestConsumerGroup:
         shutdown_event.set()
 
         await consumer.consume_messages(take, shutdown_event)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_with_on_read_moves_the_offset_back(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test OnRead shutdown moves the offset back to the last yielded message."""
+        consumer_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        test_messages = [f"OnRead test {i} - {unique_name()}" for i in range(5)]
+        yielded_count = 2
+        yielded_messages = []
+        resumed_messages = []
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
+
+        await iggy_client.send_messages(
+            stream_name,
+            topic_name,
+            partition_id,
+            [Message(message) for message in test_messages],
+        )
+
+        consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            polling_strategy=PollingStrategy.Next(),
+            poll_options=PollOptions(
+                count=len(test_messages),
+                max_wait=POLL_WAIT,
+                commit=CommitPolicy.OnRead(),
+            ),
+        )
+
+        iterator = consumer.iter_messages()
+        for _ in range(yielded_count):
+            message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
+            yielded_messages.append(message)
+
+        # OnRead stored the batch end, so the shutdown has an offset to move back.
+        stored_offset = consumer.get_last_stored_offset(partition_id)
+        assert stored_offset is not None
+        assert stored_offset > yielded_messages[-1].offset()
+
+        await consumer.shutdown()
+
+        assert (
+            consumer.get_last_stored_offset(partition_id)
+            == yielded_messages[-1].offset()
+        )
+
+        resuming_consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            polling_strategy=PollingStrategy.Next(),
+            poll_options=POLL_OPTIONS,
+        )
+
+        iterator = resuming_consumer.iter_messages()
+        for _ in range(len(test_messages) - yielded_count):
+            message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
+            resumed_messages.append(message.payload().decode())
+
+        assert resumed_messages == test_messages[yielded_count:]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_iterations_lose_and_repeat_no_message(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test iterations cancelled at short deadlines yield each offset once."""
+        consumer_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
+        await iggy_client.send_messages(
+            stream_name,
+            topic_name,
+            partition_id,
+            [Message(f"Cancel test {i}") for i in range(CANCELLED_ITERATIONS_MESSAGES)],
+        )
+
+        consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            polling_strategy=PollingStrategy.First(),
+            poll_options=PollOptions(count=ONE_MESSAGE, max_wait=POLL_WAIT),
+            prefetch_messages=ONE_MESSAGE,
+        )
+        iterator = consumer.iter_messages()
+        try:
+            offsets = await read_offsets_with_cancels(
+                lambda: _message_offset(iterator), CANCELLED_ITERATIONS_MESSAGES - 1
+            )
+        finally:
+            await consumer.shutdown()
+
+        assert offsets == list(range(CANCELLED_ITERATIONS_MESSAGES))
+
+    @pytest.mark.asyncio
+    async def test_seek_from_the_consume_messages_callback_raises(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test seek() raises RuntimeError in consume_messages() and works after it."""
+        consumer_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        shutdown_event = asyncio.Event()
+        refusals: list[str] = []
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
+        await iggy_client.send_messages(
+            stream_name, topic_name, partition_id, [Message("Seek test")]
+        )
+
+        consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
+        )
+
+        async def take(_: ReceiveMessage) -> None:
+            try:
+                await consumer.seek(partition_id, PollingStrategy.First())
+            except RuntimeError as error:
+                refusals.append(str(error))
+            shutdown_event.set()
+
+        try:
+            await asyncio.wait_for(
+                consumer.consume_messages(take, shutdown_event),
+                timeout=RUN_TIMEOUT_SECONDS,
+            )
+            await consumer.seek(partition_id, PollingStrategy.First())
+        finally:
+            await consumer.shutdown()
+
+        assert refusals == ["seek() cannot run while consume_messages() runs"]
+
+    @pytest.mark.asyncio
+    async def test_consume_messages_without_an_event_runs_until_cancelled(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test consume_messages() without an event consumes until a cancel ends it."""
+        consumer_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        all_taken = asyncio.Event()
+        offsets: list[int] = []
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
+        await iggy_client.send_messages(
+            stream_name,
+            topic_name,
+            partition_id,
+            [Message(f"No event test {i}") for i in range(NO_EVENT_RUN_MESSAGES)],
+        )
+
+        consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
+        )
+
+        async def take(message: ReceiveMessage) -> None:
+            offsets.append(message.offset())
+            if len(offsets) == NO_EVENT_RUN_MESSAGES:
+                all_taken.set()
+
+        run = asyncio.ensure_future(consumer.consume_messages(take, None))
+        try:
+            await asyncio.wait_for(all_taken.wait(), timeout=RUN_TIMEOUT_SECONDS)
+            assert not run.done(), "The run ended without a cancel"
+        finally:
+            run.cancel()
+            # The run holds the consumer until the cancel ends it.
+            await asyncio.wait_for(consumer.shutdown(), timeout=RUN_TIMEOUT_SECONDS)
+
+        assert offsets == list(range(NO_EVENT_RUN_MESSAGES))
+
+    @pytest.mark.asyncio
+    async def test_auto_commit_after_delivery_stores_the_yielded_position_on_shutdown(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test CommitAfter.Delivery counts a message when it is yielded."""
+        stream_name, topic_name = unique_name(), unique_name()
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
+        await iggy_client.send_messages(
+            stream_name, topic_name, 0, [Message(f"Delivery {i}") for i in range(3)]
+        )
+        consumer = await iggy_client.consumer_group(
+            unique_name(),
+            stream_name,
+            topic_name,
+            polling_strategy=PollingStrategy.First(),
+            poll_options=PollOptions(
+                count=10,
+                max_wait=POLL_WAIT,
+                commit=CommitPolicy.Auto(
+                    AutoCommit(every=CommitEvery.Message(), after=CommitAfter.Delivery)
+                ),
+            ),
+        )
+        iterator = consumer.iter_messages()
+        first = await asyncio.wait_for(anext(iterator), timeout=RUN_TIMEOUT_SECONDS)
+        second = await asyncio.wait_for(anext(iterator), timeout=RUN_TIMEOUT_SECONDS)
+
+        await consumer.shutdown()
+
+        assert consumer.commit_policy == CommitPolicy.Auto(
+            AutoCommit(every=CommitEvery.Message(), after=CommitAfter.Delivery)
+        )
+        assert [first.offset(), second.offset()] == [0, 1]
+        assert consumer.get_last_stored_offset(0) == second.offset()
+
+    @pytest.mark.asyncio
+    async def test_auto_commit_after_processing_ends_the_run_on_a_raising_callback(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a raising callback ends the run and leaves its message uncounted."""
+        stream_name, topic_name = unique_name(), unique_name()
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
+        await iggy_client.send_messages(
+            stream_name, topic_name, 0, [Message(f"Processing {i}") for i in range(3)]
+        )
+        consumer = await iggy_client.consumer_group(
+            unique_name(),
+            stream_name,
+            topic_name,
+            polling_strategy=PollingStrategy.First(),
+            poll_options=PollOptions(
+                count=10,
+                max_wait=POLL_WAIT,
+                commit=CommitPolicy.Auto(AutoCommit(every=CommitEvery.Message())),
+            ),
+        )
+        handled: list[int] = []
+
+        async def take(message: ReceiveMessage) -> None:
+            if message.offset() == 1:
+                raise ValueError("handler failed at offset 1")
+            handled.append(message.offset())
+
+        try:
+            with pytest.raises(ValueError, match="handler failed at offset 1"):
+                await asyncio.wait_for(
+                    consumer.consume_messages(take, None), timeout=RUN_TIMEOUT_SECONDS
+                )
+        finally:
+            await consumer.shutdown()
+
+        assert handled == [0]
+        assert consumer.get_last_stored_offset(0) == 0
+
+    @pytest.mark.asyncio
+    async def test_auto_commit_after_marked_stores_only_the_marked_position(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test mark() counts under CommitAfter.Marked and is refused without Auto."""
+        stream_name, topic_name = unique_name(), unique_name()
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
+        await iggy_client.send_messages(
+            stream_name, topic_name, 0, [Message(f"Marked {i}") for i in range(3)]
+        )
+        marked = await iggy_client.consumer_group(
+            unique_name(),
+            stream_name,
+            topic_name,
+            polling_strategy=PollingStrategy.First(),
+            poll_options=PollOptions(
+                count=10,
+                max_wait=POLL_WAIT,
+                commit=CommitPolicy.Auto(
+                    AutoCommit(every=CommitEvery.Message(), after=CommitAfter.Marked)
+                ),
+            ),
+        )
+        manual = await iggy_client.consumer_group(
+            unique_name(),
+            stream_name,
+            topic_name,
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
+        )
+        try:
+            iterator = marked.iter_messages()
+            first = await asyncio.wait_for(anext(iterator), timeout=RUN_TIMEOUT_SECONDS)
+            await asyncio.wait_for(anext(iterator), timeout=RUN_TIMEOUT_SECONDS)
+            marked.mark(first.checkpoint())
+            unmarked = await asyncio.wait_for(
+                anext(manual.iter_messages()), timeout=RUN_TIMEOUT_SECONDS
+            )
+            with pytest.raises(IggyError) as refused:
+                manual.mark(unmarked.checkpoint())
+        finally:
+            await marked.shutdown()
+            await manual.shutdown()
+
+        assert marked.get_last_stored_offset(0) == first.offset()
+        assert refused.value.code == INVALID_COMMAND
+
+    @pytest.mark.asyncio
+    async def test_calls_that_wait_for_the_run_raise_in_its_callback(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test shutdown(), iteration and a nested run raise in a callback, not hang."""
+        consumer_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        shutdown_event = asyncio.Event()
+        refusals: list[str] = []
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
+        await iggy_client.send_messages(
+            stream_name, topic_name, partition_id, [Message("Callback test")]
+        )
+
+        consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
+        )
+
+        async def take(_: ReceiveMessage) -> None:
+            calls = [
+                consumer.shutdown,
+                lambda: anext(consumer.iter_messages()),
+                lambda: consumer.consume_messages(take, None),
+            ]
+            for call in calls:
+                try:
+                    await call()
+                except RuntimeError as error:
+                    refusals.append(str(error))
+            shutdown_event.set()
+
+        try:
+            await asyncio.wait_for(
+                consumer.consume_messages(take, shutdown_event),
+                timeout=RUN_TIMEOUT_SECONDS,
+            )
+        finally:
+            await asyncio.wait_for(consumer.shutdown(), timeout=RUN_TIMEOUT_SECONDS)
+
+        assert refusals == [
+            "shutdown() cannot run in a consume_messages() callback",
+            "Iterating the consumer cannot run in a consume_messages() callback",
+            "consume_messages() cannot run in a consume_messages() callback",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_shutdown_ends_a_parked_iteration(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test shutdown() from another task ends an iteration parked while idle."""
+        consumer_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
+
+        consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
+        )
+        parked = asyncio.ensure_future(anext(consumer.iter_messages()))
+        # Long enough for the iteration to take the consumer and wait for a message.
+        await asyncio.sleep(POLL_WAIT.total_seconds())
+        assert not parked.done()
+
+        await asyncio.wait_for(consumer.shutdown(), timeout=RUN_TIMEOUT_SECONDS)
+
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(parked, timeout=RUN_TIMEOUT_SECONDS)
+
+    @pytest.mark.asyncio
+    async def test_cancel_of_a_run_with_an_event_ends_the_run(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a cancel ends a run whose shutdown event is never set."""
+        consumer_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        taken = asyncio.Event()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
+        await iggy_client.send_messages(
+            stream_name, topic_name, partition_id, [Message("Cancel run test")]
+        )
+
+        consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
+        )
+
+        async def take(_: ReceiveMessage) -> None:
+            taken.set()
+
+        run = asyncio.ensure_future(consumer.consume_messages(take, asyncio.Event()))
+        await asyncio.wait_for(taken.wait(), timeout=RUN_TIMEOUT_SECONDS)
+        run.cancel()
+
+        # The run holds the consumer, so the shutdown waits for the cancel to end it.
+        await asyncio.wait_for(consumer.shutdown(), timeout=RUN_TIMEOUT_SECONDS)
+
+    @pytest.mark.asyncio
+    async def test_async_with_shuts_the_consumer_down_on_exit(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test async with yields the consumer and shuts it down when the block ends."""
+        consumer_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
+        await iggy_client.send_messages(
+            stream_name, topic_name, partition_id, [Message("Context test")]
+        )
+
+        consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            polling_strategy=PollingStrategy.First(),
+            poll_options=POLL_OPTIONS,
+        )
+        async with consumer as entered:
+            iterator = entered.iter_messages()
+            message = await asyncio.wait_for(anext(iterator), timeout=5)
+
+        assert entered is consumer
+        assert message.payload() == b"Context test"
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(anext(iterator), timeout=RUN_TIMEOUT_SECONDS)
+
+
+class TestStandaloneConsumer:
+    """Test the consumer of chosen partitions built by IggyClient.consumer()."""
+
+    @pytest.mark.asyncio
+    async def test_standalone_consumer_reads_its_partitions_and_stores_on_shutdown(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a consumer of two partitions reads both and stores each on shutdown."""
+        consumer_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partitions = [0, 1]
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            options=TopicOptions(partitions_count=len(partitions)),
+        )
+        for partition_id in partitions:
+            await iggy_client.send_messages(
+                stream_name,
+                topic_name,
+                partition_id,
+                [Message(f"Standalone {partition_id} {i}") for i in range(2)],
+            )
+
+        consumer = await iggy_client.consumer(
+            consumer_name,
+            stream_name,
+            topic_name,
+            partitions=partitions,
+            polling_strategy=PollingStrategy.First(),
+            poll_options=PollOptions(
+                count=10,
+                max_wait=POLL_WAIT,
+                commit=CommitPolicy.Auto(
+                    AutoCommit(every=CommitEvery.Message(), after=CommitAfter.Delivery)
+                ),
+            ),
+        )
+        async with consumer:
+            iterator = consumer.iter_messages()
+            received = [
+                await asyncio.wait_for(anext(iterator), timeout=RUN_TIMEOUT_SECONDS)
+                for _ in range(4)
+            ]
+
+        assert sorted(
+            (message.partition_id(), message.payload().decode()) for message in received
+        ) == [(p, f"Standalone {p} {i}") for p in partitions for i in range(2)]
+        for partition_id in partitions:
+            stored = await iggy_client.get_consumer_offset(
+                stream_name,
+                topic_name,
+                consumer=Consumer.Single(consumer_name),
+                partition_id=partition_id,
+            )
+            assert stored is not None
+            assert stored.stored_offset == 1
