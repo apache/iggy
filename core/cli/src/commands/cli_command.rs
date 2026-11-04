@@ -17,6 +17,7 @@
 
 use anyhow::{Error, Result};
 use async_trait::async_trait;
+use iggy::clients::client::IggyClient;
 use iggy_common::Client;
 
 pub static PRINT_TARGET: &str = "iggy::cli::output";
@@ -28,7 +29,8 @@ pub static PRINT_TARGET: &str = "iggy::cli::output";
 pub static DIAGNOSTIC_TARGET: &str = "iggy::cli::diagnostic";
 
 #[async_trait]
-pub trait CliCommand {
+/// Boxed commands are awaited across tasks, so they must be `Send`.
+pub trait CliCommand: Send {
     fn explain(&self) -> String;
     fn use_tracing(&self) -> bool {
         true
@@ -52,4 +54,7 @@ pub trait CliCommand {
         false
     }
     async fn execute_cmd(&mut self, client: &dyn Client) -> Result<(), Error>;
+    async fn execute_with_iggy_client(&mut self, client: &IggyClient) -> Result<(), Error> {
+        self.execute_cmd(client).await
+    }
 }

@@ -310,6 +310,8 @@ fn get_command(
                 poll_args.consumer.clone(),
                 poll_args.show_headers,
                 poll_args.output_file.clone(),
+                poll_args.consumer_group.clone(),
+                poll_args.follow,
             )),
         },
         Command::ConsumerOffset(command) => match command {
@@ -408,6 +410,12 @@ async fn run() -> Result<(), IggyCmdError> {
     let cli_options = merged_args.cli;
 
     validate_transport(&iggy_args.transport)?;
+    if let Command::Message(MessageAction::Poll(poll_args)) = &command {
+        poll_args.validate()?;
+        if poll_args.consumer_group.is_some() && iggy_args.transport == "http" {
+            return Err(anyhow::anyhow!("--consumer-group is not supported over HTTP").into());
+        }
+    }
     let server_address = iggy_args
         .get_server_address()
         .ok_or_else(|| ClientError::InvalidTransport(iggy_args.transport.clone()))?;
@@ -457,7 +465,7 @@ async fn run() -> Result<(), IggyCmdError> {
     } else {
         println!("Executing {}", command.explain());
     }
-    command.execute_cmd(&client).await?;
+    command.execute_with_iggy_client(&client).await?;
 
     credentials.logout_user().await?;
 

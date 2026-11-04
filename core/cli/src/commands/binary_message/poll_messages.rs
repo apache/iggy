@@ -19,6 +19,9 @@ use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::{Cell, CellAlignment, Row, Table};
+use futures_util::StreamExt;
+use iggy::clients::client::IggyClient;
+use iggy::prelude::{IggyConsumer, ReadError, ReceivedMessage};
 use iggy_binary_protocol::WireUserHeaders;
 use iggy_common::Client;
 use iggy_common::{
@@ -27,19 +30,27 @@ use iggy_common::{
     wire_conversions::user_headers_from_wire,
 };
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::time;
 use tracing::{Level, event};
+
+/// Idle time after which a group poll without `--follow` stops. A new group member can take
+/// several seconds to receive its first message.
+const GROUP_IDLE_WAIT: Duration = Duration::from_secs(5);
 
 pub struct PollMessagesCmd {
     stream_id: Identifier,
     topic_id: Identifier,
-    partition_id: u32,
+    partition_id: Option<u32>,
     consumer: Consumer,
     strategy: PollingStrategy,
     options: PollOptions,
     show_headers: bool,
     output_file: Option<String>,
+    consumer_group: Option<String>,
+    follow: bool,
 }
 
 impl PollMessagesCmd {
@@ -47,7 +58,7 @@ impl PollMessagesCmd {
     pub fn new(
         stream_id: Identifier,
         topic_id: Identifier,
-        partition_id: u32,
+        partition_id: Option<u32>,
         message_count: u32,
         auto_commit: bool,
         offset: Option<u64>,
@@ -57,6 +68,8 @@ impl PollMessagesCmd {
         consumer: Identifier,
         show_headers: bool,
         output_file: Option<String>,
+        consumer_group: Option<String>,
+        follow: bool,
     ) -> Self {
         let strategy = match (offset, first, last, next) {
             (Some(offset), false, false, false) => PollingStrategy::offset(offset),
@@ -70,6 +83,12 @@ impl PollMessagesCmd {
         } else {
             CommitPolicy::Manual
         };
+        // Follow mode keeps the SDK batch size, so a backlog is not read one message per trip.
+        let count = if follow {
+            PollOptions::default().count
+        } else {
+            message_count
+        };
         Self {
             stream_id,
             topic_id,
@@ -77,12 +96,148 @@ impl PollMessagesCmd {
             consumer: Consumer::new(consumer),
             strategy,
             options: PollOptions {
-                count: message_count,
+                count,
                 commit,
                 ..PollOptions::default()
             },
             show_headers,
             output_file,
+            consumer_group,
+            follow,
+        }
+    }
+
+    fn build_consumer_group(
+        &self,
+        client: &IggyClient,
+        group: &str,
+    ) -> anyhow::Result<IggyConsumer> {
+        // The builder takes names only; stream and topic are set after the placeholders.
+        let consumer = client
+            .consumer_group(group, group, group)
+            .with_context(|| format!("Invalid consumer group name: {group}"))?
+            .stream(self.stream_id.clone())
+            .topic(self.topic_id.clone())
+            .polling_strategy(self.strategy)
+            .poll_options(self.options)
+            .do_not_create_consumer_group_if_not_exists()
+            .build();
+        Ok(consumer)
+    }
+
+    async fn poll_consumer_group(&self, client: &IggyClient, group: &str) -> anyhow::Result<()> {
+        let mut consumer = self.build_consumer_group(client, group)?;
+        let polled = self.receive_group_messages(&mut consumer, group).await;
+        consumer
+            .shutdown()
+            .await
+            .with_context(|| format!("Problem leaving consumer group: {group}"))?;
+        polled
+    }
+
+    async fn receive_group_messages(
+        &self,
+        consumer: &mut IggyConsumer,
+        group: &str,
+    ) -> anyhow::Result<()> {
+        let interrupt = tokio::signal::ctrl_c();
+        tokio::pin!(interrupt);
+        tokio::select! {
+            _ = &mut interrupt => return Ok(()),
+            init = consumer.init() => init
+                .with_context(|| format!("Problem joining consumer group: {group}"))?,
+        }
+
+        let mut output = match self.output_file.as_deref() {
+            Some(path) => Some(OutputFile::open(path).await?),
+            None => None,
+        };
+        if self.follow && output.is_none() {
+            event!(target: PRINT_TARGET, Level::INFO, "Offset\tTimestamp\tID\tLength\tPayload");
+        }
+        let count = self.options.count as usize;
+        let idle = (!self.follow).then_some(GROUP_IDLE_WAIT);
+        let mut messages = Vec::with_capacity(count);
+        let start = Instant::now();
+        loop {
+            if !self.follow && messages.len() >= count {
+                break;
+            }
+            let next = tokio::select! {
+                _ = &mut interrupt => break,
+                next = Self::next_message(consumer, idle) => next,
+            };
+            let Some(received) = next else {
+                break;
+            };
+            let message = received
+                .with_context(|| format!("Problem polling consumer group: {group}"))?
+                .message;
+            if self.follow {
+                self.print_follow_message(&message, output.as_mut()).await?;
+            } else {
+                messages.push(message);
+            }
+        }
+
+        if !self.follow {
+            let elapsed = IggyDuration::new(start.elapsed());
+            self.print_batch(&messages, elapsed, output.as_mut())
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn print_follow_message(
+        &self,
+        message: &IggyMessage,
+        output: Option<&mut OutputFile<'_>>,
+    ) -> anyhow::Result<()> {
+        match output {
+            Some(output) => {
+                let output_file = output.path;
+                output
+                    .store(std::slice::from_ref(message))
+                    .await
+                    .with_context(|| format!("Problem writing message to file: {output_file}"))?;
+            }
+            None => {
+                let line = self.follow_line(message)?;
+                event!(target: PRINT_TARGET, Level::INFO, "{line}");
+            }
+        }
+        Ok(())
+    }
+
+    fn follow_line(&self, message: &IggyMessage) -> anyhow::Result<String> {
+        let timestamp =
+            IggyTimestamp::from(message.header.timestamp).to_local_string("%Y-%m-%d %H:%M:%S%.6f");
+        let mut fields = vec![
+            message.header.offset.to_string(),
+            timestamp,
+            message.header.id.to_string(),
+            message.payload.len().to_string(),
+            String::from_utf8_lossy(&message.payload).to_string(),
+        ];
+        if self.show_headers {
+            let headers = message
+                .user_headers_map()
+                .context("Failed to parse user headers")?
+                .unwrap_or_default();
+            fields.extend(headers.iter().map(|(key, value)| {
+                format!("{}={}", key.to_string_value(), value.to_string_value())
+            }));
+        }
+        Ok(fields.join("\t"))
+    }
+
+    async fn next_message(
+        consumer: &mut IggyConsumer,
+        idle: Option<Duration>,
+    ) -> Option<Result<ReceivedMessage, ReadError>> {
+        match idle {
+            None => consumer.next().await,
+            Some(idle) => time::timeout(idle, consumer.next()).await.ok().flatten(),
         }
     }
 
@@ -231,6 +386,9 @@ impl CliCommand for PollMessagesCmd {
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
+        let partition_id = self
+            .partition_id
+            .context("Partition ID is required without --consumer-group")?;
         // Before the first poll, so a file that does not open fails the command before
         // `--auto-commit` stores an offset.
         let mut output = match self.output_file.as_deref() {
@@ -247,7 +405,7 @@ impl CliCommand for PollMessagesCmd {
                 .poll_messages(
                     &self.stream_id,
                     &self.topic_id,
-                    self.partition_id,
+                    partition_id,
                     &self.consumer,
                     &strategy,
                     PollOptions {
@@ -285,6 +443,13 @@ impl CliCommand for PollMessagesCmd {
         }
 
         Ok(())
+    }
+
+    async fn execute_with_iggy_client(&mut self, client: &IggyClient) -> anyhow::Result<()> {
+        match self.consumer_group.clone() {
+            Some(group) => self.poll_consumer_group(client, &group).await,
+            None => self.execute_cmd(client).await,
+        }
     }
 }
 
@@ -357,6 +522,33 @@ mod tests {
             stored_bytes(&[&first, &second]),
             "each batch is in the file once it is stored"
         );
+    }
+
+    #[test]
+    fn given_follow_message_when_formatted_should_be_one_tab_separated_row() {
+        let cmd = PollMessagesCmd::new(
+            Identifier::numeric(1).unwrap(),
+            Identifier::numeric(1).unwrap(),
+            None,
+            1,
+            false,
+            None,
+            true,
+            false,
+            false,
+            Identifier::default(),
+            false,
+            None,
+            Some("group".to_owned()),
+            true,
+        );
+
+        let line = cmd.follow_line(&IggyMessage::from("hello")).unwrap();
+
+        let fields: Vec<&str> = line.split('\t').collect();
+        assert_eq!(fields.len(), 5);
+        assert_eq!(fields[3], "5");
+        assert_eq!(fields[4], "hello");
     }
 
     #[cfg(target_os = "linux")]
