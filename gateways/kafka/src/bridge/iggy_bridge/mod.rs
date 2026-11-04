@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::auth::{AuthError, AuthenticatedPrincipal, PrincipalResolver, resolve_principal};
-use crate::bridge::config::IggyBridgeConfig;
+use crate::bridge::config::{IggyBridgeConfig, MAX_FETCH_SLOTS};
 use crate::bridge::error::BridgeError;
 use crate::bridge::nodes::{KnownNodes, is_unreachable};
 use crate::bridge::topic_map::validate_kafka_topic_name;
@@ -54,8 +54,8 @@ pub use coordinator_log::{
     COORDINATOR_LEASE_GROUP, COORDINATOR_LOG_TOPIC, COORDINATOR_OWNER_TOPIC, CoordinatorLink,
     CoordinatorLogCall, LoggedRecord,
 };
+pub(crate) use fetch::{FetchClient, FetchSlot, ONE_MESSAGE_MAX_BYTES, PartitionProbe, TopicProbe};
 use fetch::{FetchPool, LazyClient};
-pub(crate) use fetch::{FetchSlot, ONE_MESSAGE_MAX_BYTES, PartitionProbe, TopicProbe};
 use group_index::GroupIndex;
 pub use group_index::{OffsetGroupSource, OffsetGroups, ScannedGroups};
 use group_offsets::OffsetPool;
@@ -122,6 +122,11 @@ async fn sign_out_and_shut_down(client: &IggyClient) -> Result<(), BridgeError> 
 /// How long a call may hold its slot: the SDK read deadline (30 s) plus a reconnect (15 s).
 const SLOT_LIMIT: Duration = Duration::from_secs(45);
 
+/// How much sooner than its caller the SDK stops a send or a poll. The SDK then ends the call
+/// itself: it learns whether a send went out, and it marks the route of a poll that got no answer
+/// as failed, before the caller gives up.
+const SDK_STOP_ROOM: Duration = Duration::from_millis(50);
+
 /// How often the bridge reads the roster again, so that new clients dial the current nodes.
 const ROSTER_REFRESH: Duration = Duration::from_mins(1);
 
@@ -130,9 +135,8 @@ const ROSTER_REFRESH: Duration = Duration::from_mins(1);
 ///
 /// A call given up on keeps its slot until it ends, so the next call waits for the slot, not in
 /// the SDK queue. A `call` that stops itself sooner frees the slot while the SDK can still hold
-/// its connection. A Fetch poll then drops that connection (`LazyClient::until`). An offset
-/// commit keeps it, so the next commit waits behind it in the SDK and commits stay in order. A
-/// Produce send closes it before the slot frees (`LazyClient::retire`).
+/// its connection. An offset commit keeps it, so the next commit waits behind it in the SDK and
+/// commits stay in order. A Produce send closes it before the slot frees (`LazyClient::retire`).
 pub(crate) async fn in_slot<S: Send + 'static, T: Send + 'static>(
     slot: S,
     deadline: Instant,
@@ -251,7 +255,8 @@ impl IggyBridge {
     ///
     /// # Errors
     ///
-    /// Returns [`BridgeError::InvalidConfig`] if `config.address` is empty. Returns
+    /// Returns [`BridgeError::InvalidConfig`] if `config.address` is empty, or if
+    /// `config.fetch_slots` is above [`MAX_FETCH_SLOTS`]. Returns
     /// [`BridgeError::Timeout`] if connecting takes longer than `REQUEST_TIMEOUT` (an
     /// unreachable-and-silently-dropping address, not just a refused one, is covered - see that
     /// constant's doc). Returns [`BridgeError::Iggy`] if the address is malformed, the TCP
@@ -260,6 +265,13 @@ impl IggyBridge {
     /// to a wire response, never panic or unwrap, since an unreachable Iggy backend is an
     /// expected runtime condition, not a bug.
     pub async fn connect(config: IggyBridgeConfig) -> Result<Self, BridgeError> {
+        // `from_env` checks the variable. A config built in code comes here unchecked.
+        if config.fetch_slots.get() > MAX_FETCH_SLOTS {
+            return Err(BridgeError::InvalidConfig(format!(
+                "fetch_slots {} is above {MAX_FETCH_SLOTS}",
+                config.fetch_slots
+            )));
+        }
         let client = Arc::new(connect_client(&config).await?);
         info!("Iggy bridge connected to {}", config.address);
         if let Err(error) = learn_roster(&client, &config.nodes).await {
@@ -271,9 +283,9 @@ impl IggyBridge {
 
         let bridge = Self {
             client,
+            fetch_pool: Arc::new(FetchPool::new(config.fetch_slots)),
             config,
             produce_pool,
-            fetch_pool: Arc::new(FetchPool::new()),
             probe_client: LazyClient::default(),
             lookup_client: LazyClient::default(),
             auto_create_client: LazyClient::default(),
@@ -555,7 +567,12 @@ async fn resolve_blocker(
 impl IggyBridge {
     /// A bridge that never dialed, so a test needs no server. Each Iggy call on it fails at once.
     pub(crate) fn offline() -> Self {
-        let address = "127.0.0.1:1".to_string();
+        Self::offline_at("127.0.0.1:1")
+    }
+
+    /// [`Self::offline`], with clients that connect later dialing `address`.
+    pub(crate) fn offline_at(address: &str) -> Self {
+        let address = address.to_string();
         let client = IggyClientBuilder::new()
             .with_tcp()
             .with_server_address(address.clone())
@@ -571,6 +588,7 @@ impl IggyBridge {
             )
             .expect("a valid mapping"),
             max_message_size: crate::bridge::DEFAULT_MAX_MESSAGE_SIZE,
+            fetch_slots: crate::bridge::DEFAULT_FETCH_SLOTS,
             produce_sessions: crate::bridge::ProduceSessionLimits::default(),
             tls: crate::bridge::IggyTls::default(),
             idempotent_producers: false,
@@ -584,8 +602,8 @@ impl IggyBridge {
             scan_client: LazyClient::holding(Arc::clone(&client)),
             client,
             produce_pool: Arc::new(ProducePool::new(config.produce_sessions)),
+            fetch_pool: Arc::new(FetchPool::new(config.fetch_slots)),
             config,
-            fetch_pool: Arc::new(FetchPool::new()),
             probe_client: LazyClient::default(),
             lookup_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
