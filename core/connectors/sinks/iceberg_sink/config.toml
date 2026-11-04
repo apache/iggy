@@ -27,7 +27,7 @@ verbose = true
 stream = "test_stream"
 topics = ["test_topic"]
 schema = "json"
-batch_length = 100
+batch_length = 1000
 consumer_group = "iceberg_sink_connector"
 
 [plugin_config]

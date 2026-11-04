@@ -20,5 +20,5 @@ public enum IggyVersion {
     /// Name of this SDK as reported to the server.
     public static let sdkName = "swift-sdk"
     /// Version of this SDK as reported to the server and named by its `v<version>` release tag.
-    public static let sdkVersion = "0.1.10-edge.1"
+    public static let sdkVersion = "0.2.0"
 }

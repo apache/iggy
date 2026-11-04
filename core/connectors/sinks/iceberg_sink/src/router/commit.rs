@@ -40,8 +40,11 @@ pub(crate) async fn commit_data_files(
 ) -> Result<(), Error> {
     let commit_id = Uuid::new_v4().to_string();
     let transaction = Transaction::new(table);
+    // The check reads every manifest of the table at once on each commit, and the data files
+    // carry fresh UUID names it could never match.
     let action = transaction
         .fast_append()
+        .with_check_duplicate(false)
         .set_snapshot_properties(HashMap::from([(
             COMMIT_ID_PROPERTY.to_owned(),
             commit_id.clone(),

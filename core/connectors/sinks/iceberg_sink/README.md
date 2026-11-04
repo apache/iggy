@@ -76,8 +76,8 @@ The Iggy Iceberg Connector will skip messages in the following cases:
 - The table name has no namespace or contains an empty name component.
 - The message does not contain the field specified in the `dynamic_route_field` configuration option, or is not a JSON object.
 
-A lookup failure skips the affected message without failing the batch. Each batch loads its
-destination tables again. The route field remains in the row, but the writer ignores it if the
+A lookup failure skips the affected message without failing the batch, and every skipped
+message is logged as a warning with its offset. Each batch loads its destination tables again. The route field remains in the row, but the writer ignores it if the
 target schema has no matching column.
 
 ### Dynamic routing configuration example
@@ -142,6 +142,31 @@ still be appended twice.
 
 When the attempts run out, the batch fails and is lost, because the runtime stored its offset when
 it read the batch. Raise `max_retries` or `max_retry_delay` to ride out a longer catalog outage.
+
+## Commit Rate and Table Maintenance
+
+Each batch that the runtime hands to the sink becomes one append commit per destination table,
+which adds a snapshot and a manifest to the table. Commits slow down as the table metadata grows,
+so fewer, larger batches keep both the commit latency and the metadata small. Set the batch size on
+the stream:
+
+```toml
+[[streams]]
+stream = "events"
+topics = ["users"]
+schema = "json"
+batch_length = 1000 # most messages in one batch
+min_count = 1000    # wait until this many messages are ready,
+max_wait = "5s"     # or this long, whichever comes first
+```
+
+At 2,000 messages per second, `batch_length = 100` creates about 20 snapshots per second, and the
+values above about 2. A poll also returns once its reply reaches 1 MiB, and `max_wait` bounds how
+long a message waits for its batch.
+
+The sink does not expire snapshots or rewrite manifests. Run that maintenance from an engine that
+supports it, for example Spark's `expire_snapshots` and `rewrite_manifests` procedures, on a
+schedule that keeps the time travel you need. Some managed catalogs run it automatically.
 
 ## Source Compatibility
 

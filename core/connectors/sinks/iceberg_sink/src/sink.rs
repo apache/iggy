@@ -42,12 +42,9 @@ impl Sink for IcebergSink {
             &self.config.store_access_key_id,
             &self.config.store_secret_access_key,
         ) {
-            (Some(store_access_key_id), Some(store_secret_access_key)) => {
-                let redacted_store_key = store_access_key_id.chars().take(3).collect::<String>();
-                let redacted_store_secret =
-                    store_secret_access_key.chars().take(3).collect::<String>();
+            (Some(_), Some(_)) => {
                 info!(
-                    "Opened Iceberg sink connector with ID: {} for URL: {}, store access key ID: {redacted_store_key}***  store secret: {redacted_store_secret}***",
+                    "Opened Iceberg sink connector with ID: {} for URL: {} with the configured store credentials",
                     self.id, self.config.uri
                 );
             }
