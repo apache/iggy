@@ -106,9 +106,27 @@ At least once, the runtime behaves as follows:
   the first message not yet flushed, after a capped exponential backoff. A
   message can arrive more than once, but none is skipped.
 - A permanent failure, or a transient one past `retry_max_attempts`, stops the
-  sink with an error naming the partition and the offset. The stored offset
-  stays below the message, so a restart, for example
-  `POST /sinks/{key}/restart`, delivers it again.
+  delivery of that topic with an error naming the stream, the topic, the
+  partitions and the offset. The sink reports the error, while its other
+  topics keep delivering. Before it stops, the topic flushes its other
+  partitions once and stores what the flush proved. The stored offset stays
+  below the message, so a restart, for example `POST /sinks/{key}/restart`,
+  delivers it again.
+- A restart helps once the destination recovers. A message that the plugin
+  rejects permanently stops the sink again at the same message, and
+  `invalid_messages = "skip"` does not cover it, since it covers only the
+  messages that the runtime cannot hand over. The error names the first offset
+  of the failed call, and the plugin's log names the rejected message. To move
+  past it, store its offset for the consumer group of the sink, then restart
+  the sink:
+
+  ```sh
+  iggy consumer-offset set <group> <stream> <topic> <partition> <offset> --kind consumer-group
+  ```
+
+  `<group>` is the `consumer_group` of the stream, or `iggy-connect-sink-<key>`
+  when it is unset. The stored offset marks the message and every one before
+  it as delivered.
 - A message that the runtime cannot decode, transform or serialize also stops
   the sink, unless `invalid_messages = "skip"`, which skips it with an error
   count and its offset in the log. A message that a transform filters counts as
@@ -124,6 +142,10 @@ with a plugin that does not refuses to start. Of the bundled sinks, `http`
 supports it. It covers only messages the server still holds: use topic
 `durability = "persisted"` and a retention longer than the longest expected
 sink outage.
+
+An older runtime ignores the `[delivery]` table, so after a rollback the server
+stores the offset of each sink poll when it answers it again, and the sink
+delivers at most once.
 
 ## State storage
 

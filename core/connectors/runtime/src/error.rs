@@ -32,20 +32,24 @@ pub enum RuntimeError {
     UnsupportedPollInterval(String),
     #[error("Sink plugin: {0} cannot deliver at least once: {1}")]
     AtLeastOnceUnsupported(String, String),
-    /// An at-least-once sink stopped at a message it cannot deliver, so that its offset is not
-    /// stored past it. A restart resumes at the stored offset.
+    /// The delivery of one topic of an at-least-once sink stopped at a message it cannot deliver,
+    /// so that its offset is not stored past it. The other topics of the sink keep delivering,
+    /// and a restart resumes this one at the stored offsets.
     #[error(
-        "Delivery of partition: {partition_id} stopped before a message it could not deliver, which keeps the stored offset below it. {reason}"
+        "Delivery of stream: {stream}, topic: {topic}, partitions: {partitions:?} stopped before a message it could not deliver, which keeps the stored offsets below it. {reason}"
     )]
-    DeliveryStopped { partition_id: u32, reason: String },
+    DeliveryStopped {
+        stream: String,
+        topic: String,
+        partitions: Vec<u32>,
+        reason: String,
+    },
     #[error("Failed to serialize topic metadata")]
     FailedToSerializeTopicMetadata,
     #[error("Failed to serialize messages metadata")]
     FailedToSerializeMessagesMetadata,
     #[error("Failed to serialize raw messages")]
     FailedToSerializeRawMessages,
-    #[error("Failed to serialize the partitions of a flush")]
-    FailedToSerializeFlushPartitions,
     #[error(transparent)]
     ConnectorSdkError(#[from] iggy_connector_sdk::Error),
     /// A classified state-store failure while loading an enabled source's

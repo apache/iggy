@@ -273,7 +273,8 @@ With the guarantee enabled:
 
 - A message that `ndjson` or `json_array` mode would skip for a serialization error fails the call instead.
 - `individual` and `raw` modes stop at the first message that fails, after the retries above, and at a payload above `max_payload_size_bytes`, so a later message is not sent before an earlier one is delivered.
-- A failure after retries with a non-transient status, such as 400 or 404, stops the sink. A transient one is retried by the runtime, which hands the batch over again, so the receiver can see a message more than once and should deduplicate by `iggy_offset`, `iggy_partition_id` and `iggy_topic`.
+- A failure after retries with a non-transient status, such as 400 or 404, stops the sink. A transient one is retried by the runtime, which hands over again every message of the partition since its last flush. Without `flush_interval` that is the failed batch. With it, the batches accepted before the failure go again too, although the receiver already has them.
+- The receiver can therefore see a message more than once, and should deduplicate by `iggy_stream`, `iggy_topic`, `iggy_partition_id` and `iggy_offset`. `raw` mode and `include_metadata = false` send none of these fields, so the receiver has no key to deduplicate by.
 
 ## Use Cases
 

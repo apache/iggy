@@ -102,7 +102,7 @@ async fn given_at_least_once_when_a_stopped_sink_restarts_should_deliver_the_rej
         .expect("a stopped sink reports its error")
         .message;
     assert!(
-        error.contains("Delivery of partition"),
+        error.contains("Delivery of stream:"),
         "the error should name the stopped delivery: {error}"
     );
 

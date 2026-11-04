@@ -175,6 +175,15 @@ pub trait Sink: Send + Sync {
     /// each listed offset, durable at the destination. The runtime stores consumer offsets only
     /// after this returns `Ok`, and only calls it after [`Sink::enable_at_least_once`] succeeded.
     ///
+    /// The runtime hands over again only the partitions of a failed call: the listed partitions
+    /// after a failed flush, and the partition of its messages after a failed `consume`. A sink
+    /// may drop what it buffered for those partitions, but must keep the
+    /// buffers of every other partition. Clearing them all would let a later flush prove
+    /// messages that were never written, and the runtime would store offsets past them.
+    ///
+    /// Every topic of the sink has a task of its own that calls the same instance, so `consume`
+    /// and `flush` of different topics run concurrently. Key buffers by topic and partition.
+    ///
     /// A sink that writes inside `consume` keeps the default, which has nothing left to do.
     async fn flush(
         &self,

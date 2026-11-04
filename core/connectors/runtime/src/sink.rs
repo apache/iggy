@@ -29,11 +29,13 @@ use crate::{
     SinkConnectorPlugin, SinkConnectorWrapper, close_plugin_instance, resolve_plugin_path,
     transform,
 };
+use bytes::Bytes;
 use dlopen2::wrapper::Container;
 use futures::{Stream, StreamExt};
 use iggy::prelude::{
-    Checkpoint, Client, CommitPolicy, IggyClient, IggyConsumer, IggyDuration, IggyError,
-    IggyMessage, NonZeroIggyDuration, PollOptions, PollingStrategy, ReadError, UserClient,
+    Checkpoint, Client, CommitPolicy, IggyClient, IggyConsumer, IggyConsumerState, IggyDuration,
+    IggyError, IggyMessage, NonZeroIggyDuration, PollOptions, PollingStrategy, ReadError,
+    UserClient,
 };
 use iggy_connector_sdk::decoders::avro::{AvroConfig, AvroStreamDecoder};
 use iggy_connector_sdk::{
@@ -44,6 +46,7 @@ use iggy_connector_sdk::{
 };
 use std::{
     collections::HashMap,
+    future::Future,
     pin::Pin,
     str::FromStr,
     sync::{Arc, atomic::Ordering},
@@ -170,13 +173,19 @@ pub async fn init(
         let delivery =
             sink_delivery::enable(&connector.container, plugin_id, &key, &config.delivery);
         let setup = async {
-            let delivery = delivery?;
-            let client = iggy_clients.connect_sink_client().await?;
+            // A delivery refusal names its own cause, so it is not reported as a consumer failure.
+            let delivery = delivery.map_err(|error| error.to_string())?;
+            let consumers_failed =
+                |error: RuntimeError| format!("Failed to set up sink consumers: {error}");
+            let client = iggy_clients
+                .connect_sink_client()
+                .await
+                .map_err(consumers_failed)?;
             match setup_sink_consumers(&key, &config, &client).await {
                 Ok(consumers) => Ok((client, consumers, delivery)),
                 Err(error) => {
                     release_sink_client(client, plugin_id).await;
-                    Err(error)
+                    Err(consumers_failed(error))
                 }
             }
         };
@@ -204,8 +213,7 @@ pub async fn init(
                     "Sink container with name: {name} ({key}) initialized successfully with ID: {plugin_id}."
                 );
             }
-            Err(error) => {
-                let message = format!("Failed to set up sink consumers: {error}");
+            Err(message) => {
                 error!("Sink: {name} ({key}) - {message}");
                 let connector = sink_connectors
                     .get_mut(&path)
@@ -322,45 +330,30 @@ pub(crate) fn spawn_consume_tasks(
                 consumer: &mut consumer,
                 client: &client,
             };
-            let result = match delivery {
-                Some(delivery) => {
-                    sink_delivery::deliver_messages(
-                        plugin_id,
-                        decoder,
-                        batch_size,
-                        callback,
-                        delivery,
-                        transforms,
-                        topic_metadata,
-                        &mut messages,
-                        verbose,
-                        benchmark,
-                        &plugin_key,
-                        &metrics,
-                        &labels,
-                        shutdown_rx,
-                    )
-                    .await
+            let result = async {
+                let task = SinkTask {
+                    plugin_id,
+                    plugin_key: plugin_key.clone(),
+                    consume: callback,
+                    decoder,
+                    batch_size: batch_size as usize,
+                    transforms,
+                    topic_meta: serialize_topic_metadata(plugin_id, &topic_metadata)?,
+                    topic_metadata,
+                    verbose,
+                    benchmark,
+                    metrics: metrics.clone(),
+                    labels: labels.clone(),
+                };
+                match delivery {
+                    Some(delivery) => {
+                        sink_delivery::deliver_messages(&task, delivery, &mut messages, shutdown_rx)
+                            .await
+                    }
+                    None => consume_messages(&task, &mut messages, shutdown_rx).await,
                 }
-                None => {
-                    consume_messages(
-                        plugin_id,
-                        decoder,
-                        batch_size,
-                        callback,
-                        transforms,
-                        topic_metadata,
-                        &mut messages,
-                        verbose,
-                        benchmark,
-                        &plugin_key,
-                        &metrics,
-                        &labels,
-                        shutdown_rx,
-                    )
-                    .await
-                }
-            };
+            }
+            .await;
             if let Err(error) = result {
                 error!(
                     "Failed to consume messages for sink connector with ID: {plugin_id}: {error}"
@@ -407,44 +400,42 @@ pub(crate) async fn release_sink_client(client: Arc<IggyClient>, plugin_id: u32)
 pub(crate) trait SinkMessages:
     Stream<Item = Result<iggy::prelude::ReceivedMessage, ReadError>> + Unpin
 {
+    type Offsets: SinkOffsets;
+
     async fn abandon_operation(&mut self, operation: u64) -> Result<(), IggyError>;
 
     async fn seek(&mut self, partition_id: u32, start: PollingStrategy) -> Result<(), IggyError>;
 
-    /// Stores the offset of a checkpoint that the reads yielded.
-    async fn commit(&mut self, checkpoint: Checkpoint) -> Result<(), IggyError>;
+    /// A handle that stores the offsets of checkpoints that the reads yielded, from a task of
+    /// its own while the reads go on.
+    fn offsets(&self) -> Self::Offsets;
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Stores the offsets of checkpoints that the reads of a sink task yielded.
+pub(crate) trait SinkOffsets: Clone + Send + 'static {
+    fn store(&self, checkpoint: Checkpoint) -> impl Future<Output = Result<(), IggyError>> + Send;
+}
+
+impl SinkOffsets for IggyConsumerState {
+    fn store(&self, checkpoint: Checkpoint) -> impl Future<Output = Result<(), IggyError>> + Send {
+        self.commit(checkpoint)
+    }
+}
+
 pub(crate) async fn consume_messages(
-    plugin_id: u32,
-    decoder: Arc<dyn StreamDecoder>,
-    batch_size: u32,
-    consume: ConsumeCallback,
-    transforms: Vec<Arc<dyn Transform>>,
-    topic_metadata: TopicMetadata,
+    task: &SinkTask,
     messages: &mut impl SinkMessages,
-    verbose: bool,
-    benchmark: bool,
-    plugin_key: &str,
-    metrics: &Arc<Metrics>,
-    labels: &SinkLabels,
     mut shutdown_rx: watch::Receiver<()>,
 ) -> Result<(), RuntimeError> {
-    info!("Started consuming messages for sink connector with ID: {plugin_id}");
-    let task = SinkTask {
+    let SinkTask {
         plugin_id,
-        plugin_key,
-        consume,
-        decoder: &decoder,
-        transforms: &transforms,
-        topic_metadata: &topic_metadata,
-        verbose,
-        benchmark,
-        metrics,
-        labels,
-    };
-    let batch_size = batch_size as usize;
+        batch_size,
+        ref topic_metadata,
+        ref metrics,
+        ref labels,
+        ..
+    } = *task;
+    info!("Started consuming messages for sink connector with ID: {plugin_id}");
     let mut batch = Vec::with_capacity(batch_size);
     // The partition of the batch and its current offset at the last poll. The
     // plugin learns one partition per batch, so another partition flushes it.
@@ -466,7 +457,7 @@ pub(crate) async fn consume_messages(
                     Some(Ok(message)) => Some(message),
                     Some(Err(error)) => {
                         metrics.inc_errors_with_labels(&labels.counter);
-                        handle_read_error(messages, error, plugin_id, &topic_metadata).await;
+                        handle_read_error(messages, error, plugin_id, topic_metadata).await;
                         continue;
                     }
                     None => None,
@@ -513,20 +504,37 @@ pub(crate) async fn consume_messages(
 }
 
 /// What every batch of one consume task shares.
-pub(crate) struct SinkTask<'a> {
+pub(crate) struct SinkTask {
     pub(crate) plugin_id: u32,
-    pub(crate) plugin_key: &'a str,
+    pub(crate) plugin_key: String,
     pub(crate) consume: ConsumeCallback,
-    pub(crate) decoder: &'a Arc<dyn StreamDecoder>,
-    pub(crate) transforms: &'a Vec<Arc<dyn Transform>>,
-    pub(crate) topic_metadata: &'a TopicMetadata,
+    pub(crate) decoder: Arc<dyn StreamDecoder>,
+    pub(crate) batch_size: usize,
+    pub(crate) transforms: Vec<Arc<dyn Transform>>,
+    pub(crate) topic_metadata: TopicMetadata,
+    /// `topic_metadata` as every plugin call of the task carries it, serialized once.
+    pub(crate) topic_meta: Bytes,
     pub(crate) verbose: bool,
     pub(crate) benchmark: bool,
-    pub(crate) metrics: &'a Arc<Metrics>,
-    pub(crate) labels: &'a SinkLabels,
+    pub(crate) metrics: Arc<Metrics>,
+    pub(crate) labels: Arc<SinkLabels>,
 }
 
-impl SinkTask<'_> {
+pub(crate) fn serialize_topic_metadata(
+    plugin_id: u32,
+    topic_metadata: &TopicMetadata,
+) -> Result<Bytes, RuntimeError> {
+    postcard::to_allocvec(topic_metadata)
+        .map(Bytes::from)
+        .map_err(|error| {
+            error!(
+                "Failed to serialize topic metadata for sink connector with ID: {plugin_id}. {error}"
+            );
+            RuntimeError::FailedToSerializeTopicMetadata
+        })
+}
+
+impl SinkTask {
     /// Hands one batch of a partition to the plugin and records its metrics and benchmark
     /// event.
     pub(crate) async fn send_batch(
@@ -550,14 +558,15 @@ impl SinkTask<'_> {
             plugin_id,
             partition_id,
             current_offset,
-            self.topic_metadata,
+            &self.topic_metadata,
+            &self.topic_meta,
             messages,
             &self.consume,
-            self.transforms,
-            self.decoder,
+            &self.transforms,
+            &self.decoder,
             policy,
-            self.metrics,
-            self.labels,
+            &self.metrics,
+            &self.labels,
         )
         .await;
         let elapsed = start.elapsed();
@@ -589,7 +598,7 @@ impl SinkTask<'_> {
 
         if self.benchmark {
             benchmark::emit_sink_event(
-                self.plugin_key,
+                &self.plugin_key,
                 &self.topic_metadata.stream,
                 &self.topic_metadata.topic,
                 partition_id,
@@ -642,7 +651,61 @@ async fn handle_read_error(
     topic_metadata: &TopicMetadata,
 ) {
     let TopicMetadata { stream, topic } = topic_metadata;
-    let (partition_id, start) = match (error.partition_id, &error.error, error.skip) {
+    let (partition_id, start) = match stopped_read(messages, &error, plugin_id, topic_metadata)
+        .await
+    {
+        Some(StoppedRead::Abandoned(partition_id) | StoppedRead::Refused(partition_id)) => {
+            (partition_id, PollingStrategy::next())
+        }
+        Some(StoppedRead::Undecodable { partition_id, skip }) => {
+            warn!(
+                "Skipping a message that does not decode in partition: {partition_id} of sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic}. {}",
+                error.error
+            );
+            (partition_id, skip)
+        }
+        Some(StoppedRead::NewHistory(partition_id)) => {
+            warn!(
+                "Partition: {partition_id} of sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic} has a new history. It resumes after its stored offset. {}",
+                error.error
+            );
+            (partition_id, PollingStrategy::next())
+        }
+        None => return,
+    };
+    if let Err(seek_error) = messages.seek(partition_id, start).await {
+        error!(
+            "Failed to resume partition: {partition_id} of sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic}: {seek_error}"
+        );
+    }
+}
+
+/// A partition that the reader stopped, as [`stopped_read`] found it.
+pub(crate) enum StoppedRead {
+    /// A read with an unknown outcome blocked the partition, and its operation was abandoned.
+    Abandoned(u32),
+    /// The reader stopped at a message that does not decode, and `skip` reads on after it.
+    Undecodable {
+        partition_id: u32,
+        skip: PollingStrategy,
+    },
+    /// The partition has a new history, so messages after its stored offset may be gone.
+    NewHistory(u32),
+    /// The reader stopped the partition after refusals in a row.
+    Refused(u32),
+}
+
+/// Finds the partition that a read error stopped, for either delivery guarantee. It abandons
+/// the operation that blocks a partition and logs what needs no decision of the caller. `None`
+/// is an error that the reader retries by itself.
+pub(crate) async fn stopped_read(
+    messages: &mut impl SinkMessages,
+    error: &ReadError,
+    plugin_id: u32,
+    topic_metadata: &TopicMetadata,
+) -> Option<StoppedRead> {
+    let TopicMetadata { stream, topic } = topic_metadata;
+    match (error.partition_id, &error.error, error.skip) {
         (
             Some(partition_id),
             IggyError::FetchProgressUncertain(operation)
@@ -661,41 +724,28 @@ async fn handle_read_error(
                     "Failed to abandon operation: {operation} of sink connector with ID: {plugin_id}: {abandon_error}"
                 ),
             }
-            (partition_id, PollingStrategy::next())
+            Some(StoppedRead::Abandoned(partition_id))
         }
         (Some(partition_id), _, Some(skip)) => {
-            warn!(
-                "Skipping a message that does not decode in partition: {partition_id} of sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic}. {}",
-                error.error
-            );
-            (partition_id, skip)
+            Some(StoppedRead::Undecodable { partition_id, skip })
         }
         (Some(partition_id), IggyError::HistoryUnavailable, None) => {
-            warn!(
-                "Partition: {partition_id} of sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic} has a new history. It resumes after its stored offset. {}",
-                error.error
-            );
-            (partition_id, PollingStrategy::next())
+            Some(StoppedRead::NewHistory(partition_id))
         }
         (Some(partition_id), _, None) if error.is_lasting_refusal() => {
             warn!(
                 "Partition: {partition_id} of sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic} was stopped by the reader after refusals in a row. It resumes after its stored offset. {}",
                 error.error
             );
-            (partition_id, PollingStrategy::next())
+            Some(StoppedRead::Refused(partition_id))
         }
         _ => {
             error!(
                 "Failed to receive message for sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic}. {}",
                 error.error
             );
-            return;
+            None
         }
-    };
-    if let Err(seek_error) = messages.seek(partition_id, start).await {
-        error!(
-            "Failed to resume partition: {partition_id} of sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic}: {seek_error}"
-        );
     }
 }
 
@@ -714,6 +764,8 @@ impl Stream for ConsumerMessages<'_> {
 }
 
 impl SinkMessages for ConsumerMessages<'_> {
+    type Offsets = IggyConsumerState;
+
     async fn abandon_operation(&mut self, operation: u64) -> Result<(), IggyError> {
         self.client.abandon_operation(operation).await
     }
@@ -722,8 +774,8 @@ impl SinkMessages for ConsumerMessages<'_> {
         self.consumer.seek(partition_id, start).await
     }
 
-    async fn commit(&mut self, checkpoint: Checkpoint) -> Result<(), IggyError> {
-        self.consumer.commit(checkpoint).await
+    fn offsets(&self) -> IggyConsumerState {
+        self.consumer.state()
     }
 }
 
@@ -884,6 +936,7 @@ pub(crate) async fn process_messages(
     partition_id: u32,
     current_offset: u64,
     topic_metadata: &TopicMetadata,
+    topic_meta: &[u8],
     messages: Vec<IggyMessage>,
     consume: &ConsumeCallback,
     transforms: &Vec<Arc<dyn Transform>>,
@@ -1058,13 +1111,6 @@ pub(crate) async fn process_messages(
 
     let mut calls = 0usize;
     let mut processed_count = 0usize;
-
-    let topic_meta = postcard::to_allocvec(topic_metadata).map_err(|error| {
-        error!(
-            "Failed to serialize topic metadata for sink connector with ID: {plugin_id}. {error}"
-        );
-        RuntimeError::FailedToSerializeTopicMetadata
-    })?;
 
     let mut ffi_elapsed = Duration::ZERO;
     for (schema, run) in runs {
@@ -1490,11 +1536,15 @@ mod tests {
             topic: "test_topic".to_owned(),
         };
 
+        let topic_meta = serialize_topic_metadata(plugin_id, &topic_metadata)
+            .expect("the topic metadata should serialize");
+
         let timing = process_messages(
             plugin_id,
             0,
             TEST_CURRENT_OFFSET,
             &topic_metadata,
+            &topic_meta,
             messages,
             &consume,
             &transforms,
@@ -1538,8 +1588,6 @@ mod tests {
     enum Recovery {
         Abandon(u64),
         Seek(u32, PollingStrategy),
-        /// The partition and offset of a stored checkpoint.
-        Commit(u32, u64),
     }
 
     /// Counts the warnings logged under its subscriber.
@@ -1557,8 +1605,6 @@ mod tests {
     struct FakeMessages<S> {
         reads: S,
         abandon: Result<(), IggyError>,
-        /// Failures the next commits return, in order. A commit after they ran out succeeds.
-        commit_failures: Vec<IggyError>,
         calls: Vec<Recovery>,
     }
 
@@ -1567,9 +1613,21 @@ mod tests {
             Self {
                 reads,
                 abandon: Ok(()),
-                commit_failures: Vec::new(),
                 calls: Vec::new(),
             }
+        }
+    }
+
+    /// The at-most-once loop stores no offset, since the polls store them.
+    #[derive(Clone)]
+    struct NoOffsets;
+
+    impl SinkOffsets for NoOffsets {
+        fn store(
+            &self,
+            _checkpoint: Checkpoint,
+        ) -> impl Future<Output = Result<(), IggyError>> + Send {
+            std::future::ready(Err(IggyError::InvalidCommand))
         }
     }
 
@@ -1588,6 +1646,8 @@ mod tests {
     where
         S: Stream<Item = Result<iggy::prelude::ReceivedMessage, ReadError>> + Unpin,
     {
+        type Offsets = NoOffsets;
+
         /// As the client does, the first abandon frees `operation`.
         async fn abandon_operation(&mut self, operation: u64) -> Result<(), IggyError> {
             let abandoned = self.calls.contains(&Recovery::Abandon(operation));
@@ -1607,15 +1667,33 @@ mod tests {
             Ok(())
         }
 
-        async fn commit(&mut self, checkpoint: Checkpoint) -> Result<(), IggyError> {
-            if !self.commit_failures.is_empty() {
-                return Err(self.commit_failures.remove(0));
-            }
-            self.calls.push(Recovery::Commit(
-                checkpoint.partition_id(),
-                checkpoint.offset(),
-            ));
-            Ok(())
+        fn offsets(&self) -> NoOffsets {
+            NoOffsets
+        }
+    }
+
+    /// A consume task of the stub sink `consume` over a JSON stream without transforms.
+    fn test_task(plugin_id: u32, consume: ConsumeCallback, metrics: &Arc<Metrics>) -> SinkTask {
+        // Larger than any batch here, so only a partition head or another partition sends one.
+        const BATCH_SIZE: usize = 16;
+        let topic_metadata = TopicMetadata {
+            stream: "test_stream".to_owned(),
+            topic: "test_topic".to_owned(),
+        };
+        SinkTask {
+            plugin_id,
+            plugin_key: "test_sink".to_owned(),
+            consume,
+            decoder: Schema::Json.decoder(),
+            batch_size: BATCH_SIZE,
+            transforms: Vec::new(),
+            topic_meta: serialize_topic_metadata(plugin_id, &topic_metadata)
+                .expect("the topic metadata should serialize"),
+            topic_metadata,
+            verbose: false,
+            benchmark: false,
+            metrics: metrics.clone(),
+            labels: Arc::new(SinkLabels::new("test_sink")),
         }
     }
 
@@ -1625,24 +1703,10 @@ mod tests {
         messages: &mut impl SinkMessages,
         metrics: &Arc<Metrics>,
     ) {
-        const BATCH_SIZE: u32 = 16;
         let (_shutdown, shutdown_rx) = watch::channel(());
         consume_messages(
-            plugin_id,
-            Schema::Json.decoder(),
-            BATCH_SIZE,
-            capturing_consume,
-            Vec::new(),
-            TopicMetadata {
-                stream: "test_stream".to_owned(),
-                topic: "test_topic".to_owned(),
-            },
+            &test_task(plugin_id, capturing_consume, metrics),
             messages,
-            false,
-            false,
-            "test_sink",
-            metrics,
-            &SinkLabels::new("test_sink"),
             shutdown_rx,
         )
         .await
@@ -1700,9 +1764,6 @@ mod tests {
     #[tokio::test]
     async fn given_replies_of_two_partitions_when_consumed_should_send_each_partition_in_its_own_batch()
      {
-        // Larger than any batch here, so only a partition head or another
-        // partition flushes one.
-        const BATCH_SIZE: u32 = 16;
         let plugin_id = next_plugin_id();
         let received = |partition_id, offset, current_offset| {
             iggy::prelude::ReceivedMessage::new(
@@ -1724,21 +1785,8 @@ mod tests {
         let (_shutdown, shutdown_rx) = watch::channel(());
 
         consume_messages(
-            plugin_id,
-            Schema::Json.decoder(),
-            BATCH_SIZE,
-            capturing_consume,
-            Vec::new(),
-            TopicMetadata {
-                stream: "test_stream".to_owned(),
-                topic: "test_topic".to_owned(),
-            },
+            &test_task(plugin_id, capturing_consume, &Arc::new(Metrics::init())),
             &mut FakeMessages::new(messages),
-            false,
-            false,
-            "test_sink",
-            &Arc::new(Metrics::init()),
-            &SinkLabels::new("test_sink"),
             shutdown_rx,
         )
         .await
@@ -1757,7 +1805,6 @@ mod tests {
     #[tokio::test]
     async fn given_a_batch_short_of_the_partition_head_when_shutdown_arrives_should_still_send_it()
     {
-        const BATCH_SIZE: u32 = 16;
         const PARTITION_ID: u32 = 1;
         let plugin_id = next_plugin_id();
         let (shutdown_tx, shutdown_rx) = watch::channel(());
@@ -1783,21 +1830,8 @@ mod tests {
         );
 
         consume_messages(
-            plugin_id,
-            Schema::Json.decoder(),
-            BATCH_SIZE,
-            capturing_consume,
-            Vec::new(),
-            TopicMetadata {
-                stream: "test_stream".to_owned(),
-                topic: "test_topic".to_owned(),
-            },
+            &test_task(plugin_id, capturing_consume, &Arc::new(Metrics::init())),
             &mut FakeMessages::new(messages),
-            false,
-            false,
-            "test_sink",
-            &Arc::new(Metrics::init()),
-            &SinkLabels::new("test_sink"),
             shutdown_rx,
         )
         .await

@@ -22,7 +22,7 @@ use bytes::Bytes;
 use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
-    convert::owned_value_into_serde_json, retry::is_transient_status, sink_connector,
+    convert::owned_value_into_serde_json, sink_connector,
 };
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{
@@ -558,7 +558,7 @@ impl HttpSink {
         );
         self.errors_count.fetch_add(1, Ordering::Relaxed);
         let failure = format!("HTTP {} — status: {}", self.log_url, status.as_u16());
-        if is_transient_status(status) {
+        if is_retried_status(status.as_u16()) {
             Err(Error::HttpRequestFailed(failure))
         } else {
             Err(Error::PermanentHttpError(failure))
@@ -988,14 +988,21 @@ impl RetryableStrategy for HttpSinkRetryStrategy {
                         status, header_str,
                     );
                 }
-                match status {
-                    429 | 500 | 502 | 503 | 504 => Some(Retryable::Transient),
-                    _ => Some(Retryable::Fatal),
+                if is_retried_status(status) {
+                    Some(Retryable::Transient)
+                } else {
+                    Some(Retryable::Fatal)
                 }
             }
             Err(_) => Some(Retryable::Transient),
         }
     }
+}
+
+/// The statuses that the middleware retries. A request that still ends on one of them fails
+/// transiently, and on any other status permanently, so the runtime and the middleware agree.
+fn is_retried_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
 /// Map an `HttpMethod` to a `reqwest_middleware::RequestBuilder` for the given URL.
@@ -2159,6 +2166,17 @@ mod tests {
 
         assert!(result.is_err(), "the skipped message still fails the call");
         assert_eq!(sink.send_attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn given_a_final_status_when_classified_should_be_transient_only_where_the_middleware_retries()
+    {
+        for status in [429, 500, 502, 503, 504] {
+            assert!(is_retried_status(status), "{status} is retried");
+        }
+        for status in [400, 404, 501, 505, 599] {
+            assert!(!is_retried_status(status), "{status} is fatal");
+        }
     }
 
     fn given_topic_metadata() -> TopicMetadata {

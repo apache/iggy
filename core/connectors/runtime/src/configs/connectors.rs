@@ -30,6 +30,7 @@ use iggy_connector_sdk::transforms::TransformType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Formatter;
+use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -87,14 +88,16 @@ pub struct SinkDeliveryConfig {
     pub guarantee: DeliveryGuarantee,
     /// Attempts of a batch that fails transiently before the delivery stops. Unset retries until
     /// the destination recovers.
-    pub retry_max_attempts: Option<u32>,
+    #[config_env(leaf)]
+    pub retry_max_attempts: Option<NonZeroU32>,
     pub retry_initial_backoff: String,
     pub retry_max_backoff: String,
     /// The longest that accepted messages wait for a flush. Unset flushes after every batch.
     pub flush_interval: Option<String>,
     /// The most messages that a partition holds accepted but unflushed. Reaching it flushes at
     /// once, before `flush_interval` runs out.
-    pub flush_max_messages: u32,
+    #[config_env(leaf)]
+    pub flush_max_messages: NonZeroU32,
     #[config_env(leaf)]
     pub invalid_messages: InvalidMessages,
 }
@@ -107,11 +110,13 @@ impl Default for SinkDeliveryConfig {
             retry_initial_backoff: "1s".to_owned(),
             retry_max_backoff: "30s".to_owned(),
             flush_interval: None,
-            flush_max_messages: 10_000,
+            flush_max_messages: DEFAULT_FLUSH_MAX_MESSAGES,
             invalid_messages: InvalidMessages::default(),
         }
     }
 }
+
+const DEFAULT_FLUSH_MAX_MESSAGES: NonZeroU32 = NonZeroU32::new(10_000).unwrap();
 
 /// A connector key becomes part of a filename under the local provider's
 /// `config_dir` and of a URL under the HTTP provider, so it must stay a single
@@ -627,10 +632,10 @@ invalid_messages = "skip"
             config.delivery,
             SinkDeliveryConfig {
                 guarantee: DeliveryGuarantee::AtLeastOnce,
-                retry_max_attempts: Some(5),
+                retry_max_attempts: NonZeroU32::new(5),
                 retry_max_backoff: "1m".to_owned(),
                 flush_interval: Some("10s".to_owned()),
-                flush_max_messages: 500,
+                flush_max_messages: NonZeroU32::new(500).expect("500 is not zero"),
                 invalid_messages: InvalidMessages::Skip,
                 ..SinkDeliveryConfig::default()
             }
@@ -645,6 +650,18 @@ invalid_messages = "skip"
                 .any(|mapping| mapping.env_name == "DELIVERY_GUARANTEE"),
             "the delivery guarantee should be settable from the environment"
         );
+    }
+
+    #[test]
+    fn given_a_zero_attempt_limit_or_message_cap_when_parsed_should_refuse_it() {
+        for setting in ["retry_max_attempts = 0", "flush_max_messages = 0"] {
+            let toml = format!("{SINK_TOML}\n[delivery]\n{setting}\n");
+
+            assert!(
+                toml::from_str::<SinkConfig>(&toml).is_err(),
+                "{setting} must be refused"
+            );
+        }
     }
 
     const SINK_TOML: &str = r#"

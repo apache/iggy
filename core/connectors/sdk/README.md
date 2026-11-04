@@ -83,8 +83,9 @@ across calls writes its buffers in `flush()`.
 A failed call reports its class across the FFI boundary: `Error::is_permanent()` decides
 between a transient failure, which the runtime retries by handing the unflushed messages over
 again, and a permanent one, which stops the sink. A plugin built before this contract reports
-every failure as transient, lacks the `iggy_sink_enable_at_least_once` and `iggy_sink_flush`
-exports, and keeps loading for at-most-once sinks.
+a failed `consume()` as `1`, which reads as transient, and a call it cannot dispatch or decode
+as `-1`, which reads as permanent. It lacks the `iggy_sink_enable_at_least_once` and
+`iggy_sink_flush` exports, and keeps loading for at-most-once sinks.
 
 SDK 0.5.1-edge.3 adds `Sink::enable_at_least_once()` and `Sink::flush()` with default
 implementations, so an existing sink needs no code change when rebuilt.

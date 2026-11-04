@@ -39,8 +39,6 @@ pub type ConsumeCallback = extern "C" fn(
     messages_len: usize,
 ) -> i32;
 
-pub type EnableAtLeastOnceCallback = extern "C" fn(plugin_id: u32, version: u32) -> i32;
-
 pub type FlushCallback = extern "C" fn(
     plugin_id: u32,
     topic_meta_ptr: *const u8,
@@ -54,13 +52,18 @@ pub type FlushCallback = extern "C" fn(
 pub enum SinkCallStatus {
     Succeeded,
     /// Retrying the same messages may succeed. A plugin built before the delivery contract
-    /// reports every failure this way.
+    /// reports a failed `consume` this way, and a call it cannot dispatch or decode as
+    /// [`SinkCallStatus::DISPATCH_FAILURE`], which reads as permanent.
     TransientFailure,
     /// Retrying the same messages cannot succeed.
     PermanentFailure,
 }
 
 impl SinkCallStatus {
+    /// The code of a call that the plugin cannot dispatch, such as one for an unknown instance
+    /// or with arguments that do not decode. It reads as [`SinkCallStatus::PermanentFailure`].
+    pub const DISPATCH_FAILURE: i32 = -1;
+
     pub const fn code(self) -> i32 {
         match self {
             SinkCallStatus::Succeeded => 0,
@@ -85,12 +88,11 @@ impl From<&Error> for SinkCallStatus {
 }
 
 impl From<i32> for SinkCallStatus {
-    /// `-1` is what the macro returns for a call it cannot dispatch, such as an unknown
-    /// instance, which no retry fixes.
+    /// A call that the plugin cannot dispatch is one that no retry fixes.
     fn from(code: i32) -> Self {
         match code {
             0 => SinkCallStatus::Succeeded,
-            2 | -1 => SinkCallStatus::PermanentFailure,
+            2 | SinkCallStatus::DISPATCH_FAILURE => SinkCallStatus::PermanentFailure,
             _ => SinkCallStatus::TransientFailure,
         }
     }
@@ -122,7 +124,7 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
                 "Sink connector with ID: {} is not initialized - cannot enable at-least-once delivery.",
                 self.id
             );
-            return -1;
+            return SinkCallStatus::DISPATCH_FAILURE;
         };
         if version != DELIVERY_CONTRACT_VERSION {
             error!(
@@ -164,7 +166,7 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
                 "Sink connector with ID: {} is not initialized - cannot flush.",
                 self.id
             );
-            return -1;
+            return SinkCallStatus::DISPATCH_FAILURE;
         };
         if !self.at_least_once {
             error!(
@@ -186,7 +188,7 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
                     "Failed to decode topic metadata of a flush by sink connector with ID: {}. {err}",
                     self.id
                 );
-                return -1;
+                return SinkCallStatus::DISPATCH_FAILURE;
             }
         };
         let partitions = match postcard::from_bytes::<Vec<FlushPartition>>(partitions_slice) {
@@ -196,7 +198,7 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
                     "Failed to decode the partitions of a flush by sink connector with ID: {}. {err}",
                     self.id
                 );
-                return -1;
+                return SinkCallStatus::DISPATCH_FAILURE;
             }
         };
         match get_runtime().block_on(sink.flush(&topic_metadata, &partitions)) {
@@ -482,7 +484,7 @@ macro_rules! sink_connector {
                 tracing::error!(
                     "Sink connector with ID: {id} was not found and at-least-once delivery cannot be enabled."
                 );
-                return -1;
+                return $crate::sink::SinkCallStatus::DISPATCH_FAILURE;
             };
             instance.enable_at_least_once(version)
         }
@@ -498,7 +500,7 @@ macro_rules! sink_connector {
         ) -> i32 {
             let Some(instance) = INSTANCES.get(&id) else {
                 tracing::error!("Sink connector with ID: {id} was not found and cannot be flushed.");
-                return -1;
+                return $crate::sink::SinkCallStatus::DISPATCH_FAILURE;
             };
             instance.flush(topic_meta_ptr, topic_meta_len, partitions_ptr, partitions_len)
         }
