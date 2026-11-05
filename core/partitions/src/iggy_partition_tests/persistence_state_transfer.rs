@@ -13,6 +13,7 @@
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
+// under the License.
 
 /// An offer whose frontier sits below this replica's own offset counter is
 /// refused: installing it would rewind the counter, and the next replicated
@@ -588,4 +589,3 @@ impl PersistFixture {
         self.partition.log.active_segment().size.as_bytes_u64()
     }
 }
-

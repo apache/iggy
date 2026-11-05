@@ -13,6 +13,7 @@
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
+// under the License.
 
 /// One pass of the shard loop over a mounted partition: the maintenance
 /// tick, the I/O lane, the WAL writer and its completion frames.
@@ -679,4 +680,3 @@ async fn given_durable_and_stranded_offsets_when_install_cleans_old_offsets_shou
         );
     }
 }
-

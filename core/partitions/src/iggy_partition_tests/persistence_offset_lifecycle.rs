@@ -13,6 +13,7 @@
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
+// under the License.
 
 /// A replica applies the delete fence from its partition log, and its
 /// metadata can apply the delete later. Until then reads planned before or
@@ -1181,4 +1182,3 @@ async fn given_solo_persisted_offset_when_wal_is_pending_should_withhold_reply()
         Some(0)
     );
 }
-

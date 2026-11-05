@@ -13,6 +13,7 @@
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
+// under the License.
 
 /// A kind directory whose presence boot cannot check may hold offsets, so
 /// the load fails instead of starting that kind empty.
@@ -1730,4 +1731,3 @@ async fn shutdown_fences_a_failed_flush_already_requested_by_transfer() {
     settle_partition_io(&mut partition, &config).await;
     assert!(partition.shutdown_io_complete());
 }
-

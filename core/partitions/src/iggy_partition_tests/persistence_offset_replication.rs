@@ -13,6 +13,7 @@
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
+// under the License.
 
 // A two-replica primary whose WAL refused its own prepare for op 1, which
 // is journaled and pipelined with no WAL entry and no armed self-ack.
@@ -573,4 +574,3 @@ async fn on_request_delete_on_stale_backup_replies_routing_denial_before_not_fou
 // a lower offset than an earlier one; the file must keep the max or a
 // restart reloads the rewound value and re-delivers. An explicit client
 // store still overwrites, so a deliberate offset reset holds.
-

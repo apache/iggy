@@ -13,6 +13,7 @@
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
+// under the License.
 
 /// One-message segment record in on-disk layout `[256B command header][blob]`
 /// stamped at `base_offset`, with a valid batch checksum so it decodes
@@ -796,4 +797,3 @@ async fn read_disk_resolves_oversized_index_without_materializing() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
-

@@ -13,6 +13,7 @@
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
+// under the License.
 
 /// Journaled entry in the shape the persist path expects: a `PrepareHeader`
 /// prefix it strips, followed by the bytes that reach the segment file.
