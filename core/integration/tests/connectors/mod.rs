@@ -38,6 +38,7 @@ mod runtime;
 mod s3;
 mod stdout;
 mod surrealdb;
+
 use iggy_common::IggyTimestamp;
 use serde::{Deserialize, Serialize};
 

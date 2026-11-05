@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::fmt::Write;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -43,6 +44,8 @@ const MESSAGE_OFFSET_COLUMN_NAME: &str = "iggy_offset";
 const STREAM_COLUMN_NAME: &str = "iggy_stream";
 const TOPIC_COLUMN_NAME: &str = "iggy_topic";
 const PARTITION_ID_COLUMN_NAME: &str = "iggy_partition_id";
+/// A u128 message ID rendered as zero-padded lowercase hex.
+const MESSAGE_ID_LEN: usize = 32;
 const PAYLOAD_COLUMN_NAME: &str = "payload";
 const UNSIGNED_64_DECIMAL_PRECISION: u8 = 20;
 const TIMESTAMP_PRECISION: u32 = 6;
@@ -249,17 +252,38 @@ impl<'a> StaticTableBatchBuilder<'a> {
         payload_format: PayloadFormat,
         context: RowContext<'a>,
         layout: &'a StaticTableLayout,
+        message_count: usize,
     ) -> Self {
+        let capacity = |kind: ColumnKind| {
+            if layout.columns.contains(&TableColumn::Metadata(kind)) {
+                message_count
+            } else {
+                0
+            }
+        };
+        let (binary_capacity, string_capacity) = match payload_format {
+            PayloadFormat::Bytea => (message_count, 0),
+            PayloadFormat::Json | PayloadFormat::Text => (0, message_count),
+        };
+        let id_capacity = capacity(ColumnKind::MessageId);
         Self {
-            id_builder: StringBuilder::new(),
-            checksum_builder: Decimal128Builder::new()
+            id_builder: StringBuilder::with_capacity(id_capacity, id_capacity * MESSAGE_ID_LEN),
+            checksum_builder: Decimal128Builder::with_capacity(capacity(ColumnKind::Checksum))
                 .with_data_type(DataType::Decimal128(UNSIGNED_64_DECIMAL_PRECISION, 0)),
-            message_offset_builder: Decimal128Builder::new()
-                .with_data_type(DataType::Decimal128(UNSIGNED_64_DECIMAL_PRECISION, 0)),
-            message_timestamp_builder: TimestampMicrosecondBuilder::new().with_timezone("UTC"),
-            origin_timestamp_builder: TimestampMicrosecondBuilder::new().with_timezone("UTC"),
-            payload_binary_builder: BinaryBuilder::new(),
-            payload_string_builder: StringBuilder::new(),
+            message_offset_builder: Decimal128Builder::with_capacity(capacity(
+                ColumnKind::MessageOffset,
+            ))
+            .with_data_type(DataType::Decimal128(UNSIGNED_64_DECIMAL_PRECISION, 0)),
+            message_timestamp_builder: TimestampMicrosecondBuilder::with_capacity(capacity(
+                ColumnKind::MessageTimestamp,
+            ))
+            .with_timezone("UTC"),
+            origin_timestamp_builder: TimestampMicrosecondBuilder::with_capacity(capacity(
+                ColumnKind::OriginTimestamp,
+            ))
+            .with_timezone("UTC"),
+            payload_binary_builder: BinaryBuilder::with_capacity(binary_capacity, 0),
+            payload_string_builder: StringBuilder::with_capacity(string_capacity, 0),
             payload_format,
             context,
             layout,
@@ -306,7 +330,9 @@ impl<'a> StaticTableBatchBuilder<'a> {
         for column in &self.layout.columns {
             match column {
                 TableColumn::Metadata(ColumnKind::MessageId) => {
-                    self.id_builder.append_value(string_from_id(message_id))
+                    write!(self.id_builder, "{message_id:032x}")
+                        .expect("writing into an in-memory Arrow string builder cannot fail");
+                    self.id_builder.append_value("");
                 }
                 TableColumn::Metadata(ColumnKind::Checksum) => {
                     self.checksum_builder.append_value(i128::from(checksum))
@@ -451,10 +477,6 @@ fn to_timestamp(message_id: u128, field: &'static str, value: u64) -> Result<i64
     })
 }
 
-fn string_from_id(id: u128) -> String {
-    format!("{:032x}", id)
-}
-
 pub(crate) fn create_extra_columns(
     include_metadata: bool,
     include_checksum: bool,
@@ -586,7 +608,8 @@ mod tests {
         let columns = extra_columns(config);
         let context = test_context();
         let layout = layout(config.payload_format, &columns);
-        let mut builder = StaticTableBatchBuilder::new(config.payload_format, context, &layout);
+        let mut builder =
+            StaticTableBatchBuilder::new(config.payload_format, context, &layout, messages.len());
         for message in messages {
             builder.append(message).expect("Message should append");
         }
@@ -718,7 +741,7 @@ mod tests {
         let context = test_context();
         let layout = layout(config.payload_format, &columns);
 
-        let mut builder = StaticTableBatchBuilder::new(config.payload_format, context, &layout);
+        let mut builder = StaticTableBatchBuilder::new(config.payload_format, context, &layout, 2);
         let mut valid_message = test_message(Payload::Text("valid".to_string()));
         valid_message.id = 102;
         let messages = [test_message(Payload::Raw(vec![0xff])), valid_message];
@@ -753,7 +776,7 @@ mod tests {
         let config = test_config(PayloadFormat::Text);
         let layout = layout(config.payload_format, &extra_columns(&config));
         let mut builder =
-            StaticTableBatchBuilder::new(config.payload_format, test_context(), &layout);
+            StaticTableBatchBuilder::new(config.payload_format, test_context(), &layout, 1);
 
         let error = builder
             .append(message)
@@ -845,7 +868,7 @@ mod tests {
         let layout = StaticTableLayout::new(schema, PayloadFormat::Text)
             .expect("Reordered table should match the static layout");
         let mut builder =
-            StaticTableBatchBuilder::new(PayloadFormat::Text, test_context(), &layout);
+            StaticTableBatchBuilder::new(PayloadFormat::Text, test_context(), &layout, 1);
 
         builder
             .append(test_message(Payload::Text("hello".to_string())))
@@ -1093,7 +1116,7 @@ mod tests {
         let config = test_config(PayloadFormat::Text);
         let layout = layout(config.payload_format, &extra_columns(&config));
         let mut builder =
-            StaticTableBatchBuilder::new(config.payload_format, test_context(), &layout);
+            StaticTableBatchBuilder::new(config.payload_format, test_context(), &layout, 1);
 
         let error = builder
             .append(message)

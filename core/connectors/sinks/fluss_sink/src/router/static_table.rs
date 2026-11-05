@@ -143,7 +143,8 @@ impl StaticTableRouter {
             };
         };
 
-        let mut builder = StaticTableBatchBuilder::new(self.payload_format, context, layout);
+        let mut builder =
+            StaticTableBatchBuilder::new(self.payload_format, context, layout, message_count);
         for message in messages {
             if let Err(error) = builder.append(message) {
                 error!(
