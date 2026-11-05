@@ -41,7 +41,7 @@ pub(crate) use persistence::PersistenceDrain;
 pub use persistence::{
     PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
 };
-pub use repair_memory::RepairMemoryBudget;
+pub use repair_memory::{RepairMemoryBudget, RepairRingBudget};
 mod remote_segments;
 pub use remote_segments::{RemoteObjects, RemoteRange, RemoteSegments};
 mod object_delete;
@@ -140,10 +140,10 @@ pub use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessa
 pub use state_transfer::CONSUMER_OFFSETS_ENTRIES_MAX;
 pub use stream_keyring::{StreamKeyIdentity, StreamKeyring};
 pub use types::{
-    AppendResult, COMMIT_WALK_OPS_MAX, FatalCommit, Fragment, PartitionOffsets,
-    PartitionPathLayout, PartitionsConfig, PollFragments, PollQueryResult, PollingArgs,
-    PollingConsumer, REPAIR_MAX_STALL_RETRIES, REPAIR_RETRY_TICKS, RepairConclusion, RepairIngest,
-    RepairSession, SendMessagesResult,
+    AppendResult, COMMIT_WALK_OPS_MAX, ConsumerGroupOffsets, ConsumerOffsets, FatalCommit,
+    Fragment, PartitionOffsets, PartitionPathLayout, PartitionsConfig, PollFragments,
+    PollQueryResult, PollingArgs, PollingConsumer, REPAIR_MAX_STALL_RETRIES, REPAIR_RETRY_TICKS,
+    RepairConclusion, RepairIngest, RepairSession, SendMessagesResult,
 };
 
 /// A partition's message log, named so a caller can carry one across a rebuild.

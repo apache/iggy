@@ -17,7 +17,7 @@
 
 use std::fmt::{Display, Formatter};
 
-#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Copy, Clone)]
 pub struct ConsumerGroupId(pub usize);
 
 impl Display for ConsumerGroupId {
