@@ -31,6 +31,9 @@ store_region = "us-east-1"
 store_class = "s3"
 store_path_style_access = true
 invalid_rows = "fail"
+max_retries = 5
+retry_delay = "1s"
+max_retry_delay = "30s"
 ```
 
 ## Configuration Options
@@ -48,8 +51,11 @@ invalid_rows = "fail"
 - **store_class**: The storage class to use. **Currently, only S3-compatible storage is supported.**
 - **store_path_style_access**: Use path-style S3 URLs (`http://host/bucket/key`). Defaults to `true`, which MinIO-style endpoints require; set to `false` for stores that only accept virtual-hosted-style URLs.
 - **invalid_rows**: What to do with a row that does not match the table schema. `fail`, the default, fails the whole batch. `skip` writes the rows that match and logs each skipped row as a warning with its offset.
+- **max_retries**: Total attempts per catalog commit, including the first. Defaults to `5`. See [Commit Retries](#commit-retries).
+- **retry_delay**: Delay before the first commit retry, doubled for each further retry. Defaults to `1s`.
+- **max_retry_delay**: Upper bound for one delay between commit attempts. Defaults to `30s`.
 
-All options above are required except the credential pair, `store_path_style_access`, `invalid_rows`, and the unused routing field.
+All options above are required except the credential pair, `store_path_style_access`, `invalid_rows`, the retry settings, and the unused routing field.
 Static routing requires a non-empty `tables` list; dynamic routing requires a non-empty `dynamic_route_field`.
 
 ## Static Routing
@@ -114,10 +120,28 @@ over into multiple files, including for unpartitioned tables.
 
 Each destination table has its own append transaction. Fan-out is not atomic across tables:
 a write or commit error stops work on the remaining tables, while earlier commits remain.
-The Iceberg library refreshes metadata before committing and retries eligible commit errors
-according to the table's retry properties. The plugin does not replay failed batches. The
-runtime records a plugin error and continues polling with consumer auto-commit, so messages
-can be lost after failed or skipped writes. Replaying committed rows can create duplicates.
+The Iceberg library refreshes metadata before committing and retries commit conflicts
+according to the table's retry properties, and the sink retries other transient commit errors.
+Once those retries run out, the runtime records a plugin error and continues polling with consumer
+auto-commit, so messages can be lost after failed or skipped writes. Replaying committed rows can
+create duplicates.
+
+## Commit Retries
+
+The sink writes the data files of a batch once, then retries the catalog commit when the catalog
+cannot be reached, fails with a 5xx, or throttles the sink with a 429. It makes up to
+`max_retries` attempts in total and waits about `retry_delay` before the first retry, doubling the
+wait up to `max_retry_delay`. A commit that the catalog refuses for good, such as one rejected with
+another 4xx or one to a table that no longer exists, fails without a retry.
+
+Each commit tags its snapshot with an `iggy.commit-id` summary property. Before a retry, the sink
+reloads the table and stops if a snapshot with that id is already there, so a commit whose response
+was lost is not appended twice. A commit request that the catalog applies only after the sink has
+checked for it, for example behind a gateway that timed out while the catalog kept working, can
+still be appended twice.
+
+When the attempts run out, the batch fails and is lost, because the runtime stored its offset when
+it read the batch. Raise `max_retries` or `max_retry_delay` to ride out a longer catalog outage.
 
 ## Commit Rate and Table Maintenance
 

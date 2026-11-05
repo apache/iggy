@@ -77,10 +77,17 @@ impl Sink for IcebergSink {
                 catalog,
                 self.config.dynamic_route_field.clone(),
                 invalid_rows,
+                self.commit_retry,
             )))
         } else {
             self.router = Some(Box::new(
-                StaticRouter::new(catalog, &self.config.tables, invalid_rows).await?,
+                StaticRouter::new(
+                    catalog,
+                    &self.config.tables,
+                    invalid_rows,
+                    self.commit_retry,
+                )
+                .await?,
             ));
         }
 

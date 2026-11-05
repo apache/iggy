@@ -40,6 +40,8 @@ arrow-json = { workspace = true }
 arrow-schema = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
+http = { workspace = true }
+humantime = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-storage-opendal = { workspace = true }

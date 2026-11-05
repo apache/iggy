@@ -47,6 +47,9 @@ store_secret_access_key = "password"
 store_region = "us-east-1"
 store_class = "s3"
 invalid_rows = "fail"
+max_retries = 5
+retry_delay = "1s"
+max_retry_delay = "30s"
 
 [transforms.add_fields]
 enabled = true
