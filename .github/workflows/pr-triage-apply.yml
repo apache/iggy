@@ -21,13 +21,25 @@ name: PR Triage Apply
 # rust-lang/triagebot UX.
 #
 # Two-stage design to defeat the fork-PR token restriction:
-#   pr-triage-collect.yml runs on issue_comment / pull_request_review with
-#   a read-only GITHUB_TOKEN (forced for cross-fork events) and uploads
-#   the raw event payload as artifact `triage-event`. This workflow then
-#   fires via workflow_run on the base ref, where the GITHUB_TOKEN has
-#   write perms, downloads the artifact, and applies the labels.
-#   pull_request_target lifecycle is handled directly here without going
-#   through the collector — it already gets a write token by design.
+#   pr-triage-collect.yml runs on issue_comment / pull_request_review /
+#   pull_request with a read-only GITHUB_TOKEN (forced for cross-fork
+#   events) and uploads the raw event payload as artifact `triage-event`.
+#   This workflow then fires via workflow_run on the base ref, where the
+#   GITHUB_TOKEN has write perms, downloads the artifact, and applies the
+#   labels. This is the pattern ASF Infra requires in place of
+#   pull_request_target (https://infra.apache.org/github-actions-policy.html).
+#
+# Two jobs:
+#   resolve  reads the numeric ids out of the artifact, checks the collect
+#            run really belongs to the claimed PR, and outputs the PR number
+#            and the trigger ids. A comment or review with no command and no
+#            changes_requested state stops here. One run per collect run,
+#            never serialised.
+#   apply    is serialised per PR through a job-level concurrency group
+#            keyed on the resolved PR number. It re-fetches the trigger
+#            object and the PR's live state from the API and applies the
+#            labels, so two runs for the same PR can never interleave their
+#            reads and writes.
 #
 # Comment commands (parsed line-by-line in PR comments and review bodies):
 #   /request-review @u [@u2 ...]   — request review from one or more
@@ -61,7 +73,8 @@ name: PR Triage Apply
 #   one-line reply naming the rejected handles. Review-triggered actions
 #   have no comment to react to and stay log-only.
 #
-# Lifecycle (pull_request_target):
+# Lifecycle. On `opened` the issue check runs first, because it applies to
+# drafts too:
 #   opened (draft or not)  -> comment and close the PR if its description
 #                             has no `Closes #N`, `Fixes #N`, `Resolves #N`
 #                             or `Relates to #N` line naming an issue, or if
@@ -74,35 +87,44 @@ name: PR Triage Apply
 #                             manual triage. A good first issue PR that passes
 #                             gets a note for maintainers if its author has
 #                             other PRs open
-#   opened (non-draft)     -> add S-waiting-on-review (only if no S-* present);
-#                             unless the author has repo write access, post
+# Then every apply run, whatever triggered it, converges the PR's S-*
+# labels on its live state:
+#   closed or draft        -> remove both S-* labels, then stop
+#   open, no S-* present   -> add S-waiting-on-review
+# so a run that arrives after the PR changed, or one that displaced a
+# pending run in the per-PR concurrency group, still leaves the labels
+# right. The pull_request action from the collector then only selects:
+#   opened (non-draft)     -> unless the author has repo write access, post
 #                             a one-time welcome comment listing the triage
 #                             commands (marker-guarded, best-effort)
-#   ready_for_review       -> add S-waiting-on-review (only if no S-* present)
-#   converted_to_draft     -> remove both S-* labels
-#   closed (merged or not) -> remove both S-* labels
+#   ready_for_review, converted_to_draft, closed
+#                          -> nothing beyond the convergence above
+# pull_request workflows do not run while a PR has a merge conflict, so
+# pr-triage-reconcile.yml repeats the convergence on a schedule for the
+# PRs the collector never saw.
 #
 # SECURITY:
-# - workflow_run, pull_request_target are the ONLY triggers here.
+# - workflow_run is the ONLY trigger here.
 # - No actions/checkout of any ref. PR-controlled code is never executed.
 # - The default GITHUB_TOKEN is never written to outputs, env files, or
 #   passed to user-supplied programs. The workflow only calls the GitHub
 #   REST API via actions/github-script.
-# - pull_request_target runs the base-repo workflow with a write token so
-#   fork-PR lifecycle labels can be applied. workflow_run also runs against
-#   base ref. Both are safe because we never run fork code: no checkout,
-#   no exec of PR contents, no token export.
+# - workflow_run runs against the base ref with a write token. It is safe
+#   because we never run fork code: no checkout, no exec of PR contents, no
+#   token export.
 # - The artifact from pr-triage-collect.yml is NOT trusted for identity. On
-#   the pull_request_review path collect runs the PR head's own copy of
-#   itself, so a fork can upload any payload. The resolve step reads only a
-#   numeric id from it and re-fetches the author, association, PR number,
-#   review state and body from the API, which a fork cannot forge. The body
-#   stays in a file and is parsed only by the command regex. See
+#   the pull_request_review and pull_request paths collect runs the PR
+#   head's own copy of itself, so a fork can upload any payload. The
+#   resolve job reads only numeric ids and the event action from it. On
+#   the pull_request path it checks the claimed PR's head repository and
+#   branch against the ones GitHub recorded for the collect run; on the
+#   pull_request_review path the review must belong to the claimed PR and
+#   be as new as the run. The apply job re-fetches the author, association,
+#   body, review state and PR state from the API, which a fork cannot
+#   forge. See
 #   https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
 
 on:
-  pull_request_target:
-    types: [opened, ready_for_review, converted_to_draft, closed]
   workflow_run:
     workflows: ["PR Triage Collect"]
     types: [completed]
@@ -125,16 +147,18 @@ concurrency:
   queue: max
 
 jobs:
-  apply:
-    if: |
-      github.event_name == 'pull_request_target'
-      || (github.event_name == 'workflow_run'
-          && github.event.workflow_run.conclusion == 'success')
+  resolve:
+    if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-slim
     timeout-minutes: 5
+    outputs:
+      skip: ${{ steps.resolve.outputs.skip }}
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
+      comment_id: ${{ steps.resolve.outputs.comment_id }}
+      review_id: ${{ steps.resolve.outputs.review_id }}
+      lifecycle_action: ${{ steps.resolve.outputs.lifecycle_action }}
     steps:
       - name: Download triage event artifact
-        if: github.event_name == 'workflow_run'
         uses: actions/download-artifact@v8
         with:
           name: triage-event
@@ -144,10 +168,10 @@ jobs:
 
       - name: Resolve the trigger from the API
         id: resolve
-        if: github.event_name == 'workflow_run'
         env:
           UPSTREAM_EVENT: ${{ github.event.workflow_run.event }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           RUN_CREATED: ${{ github.event.workflow_run.created_at }}
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -155,22 +179,35 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           # The collect workflow runs the PR head's own copy of itself on the
-          # pull_request_review path, so a fork can upload any payload it likes.
-          # Nothing in the artifact is trusted for identity. It is read only for
-          # the numeric trigger id, and every field the gate depends on - author,
-          # association, PR number, body, review state - is re-fetched from the
-          # API below, which a fork cannot forge. A forged id resolves to a real
-          # object (whose real properties are used) or 404s; it cannot invent a
-          # committer command. The collect run's commit must also belong to the
-          # claimed PR and the review must be as new as the run, so an old review
-          # cannot be replayed onto another PR or onto the fork's own.
-          # The case below routes on UPSTREAM_EVENT, which GitHub sets from the
-          # collect run itself, not from the artifact. GitHub only runs
+          # pull_request_review and pull_request paths, so a fork can upload
+          # any payload it likes. Nothing in the artifact is trusted for
+          # identity. It is read only for the numeric trigger ids and the
+          # event action, and the apply job re-fetches every field the gate
+          # depends on - author, association, PR number, body, review state -
+          # from the API, which a fork cannot forge. A forged id resolves to a
+          # real object (whose real properties are used) or 404s; it cannot
+          # invent a committer command.
+          #
+          # HEAD_REPO and HEAD_BRANCH are set by GitHub from the collect run,
+          # not from the artifact. On a pull_request run they are the fork
+          # and branch the run fired on, and requiring them to be the
+          # claimed PR's head confines a forged payload to the fork's own
+          # PR, since no other PR has that fork and branch as its head. That
+          # identity survives a force-push, unlike the commit the run fired
+          # on, and does not depend on the commits endpoint, which stops at
+          # 250 commits. On a pull_request_review run GitHub records the
+          # base repository as head_repository and the branch name is the
+          # fork's to choose, so neither is checked there; the review must
+          # instead belong to the claimed PR and be as new as the run.
+          #
+          # The case below routes on UPSTREAM_EVENT, which GitHub sets from
+          # the collect run itself, not from the artifact. GitHub only runs
           # issue_comment workflows from the default branch, so a fork's copy
           # of collect can never fire on that event: a fork's run always
-          # arrives as pull_request_review and takes the checked path, while
-          # the issue_comment path only ever sees an artifact written by the
-          # default branch's collect. Any other event is rejected.
+          # arrives as pull_request_review or pull_request and takes a checked
+          # path, while the issue_comment path only ever sees an artifact
+          # written by the default branch's collect. Any other event is
+          # rejected.
           payload=( payload/*.json )
           f="${payload[0]:-}"
           if [[ -z "$f" ]]; then
@@ -213,17 +250,41 @@ jobs:
             return 1
           }
 
-          author=""; assoc=""; state=""; pr=""; cid=""
-          : > payload/body.txt
+          # The claimed PR's head must be the repository and branch the
+          # collect run fired on. .head.repo is null once a fork is deleted,
+          # which fails the comparison, as it should.
+          require_head() {
+            local cpr="$1" p head_repo head_ref
+            p="$(gh_api "repos/${REPO}/pulls/${cpr}")"
+            head_repo="$(jq -r '.head.repo.full_name // ""' <<<"$p")"
+            head_ref="$(jq -r '.head.ref // ""' <<<"$p")"
+            if [[ -z "$HEAD_REPO" || -z "$HEAD_BRANCH" \
+                  || "$head_repo" != "$HEAD_REPO" || "$head_ref" != "$HEAD_BRANCH" ]]; then
+              echo "collect ran on ${HEAD_REPO}:${HEAD_BRANCH}, which is not the head of PR ${cpr} (${head_repo}:${head_ref})" >&2
+              exit 1
+            fi
+          }
+
+          # Mirrors COMMAND_RE in the Dispatch step; keep the two in sync.
+          has_command() {
+            grep -qE '^[ \t]*/(request-review|ready|author|unpin|pin)([[:space:]]|$)' <<<"$1"
+          }
+
+          pr=""; cid=""; rid=""; lifecycle=""
 
           case "$UPSTREAM_EVENT" in
             issue_comment)
               cid="$(jq -r '.comment.id // ""' "$f")"
               require_num "$cid" comment_id
               c="$(gh_api "repos/${REPO}/issues/comments/${cid}")"
-              author="$(jq -r '.user.login // ""' <<<"$c")"
-              assoc="$(jq -r '.author_association' <<<"$c")"
-              jq -r '.body // ""' <<<"$c" > payload/body.txt
+              # Most PR comments carry no command. Stop them here rather
+              # than start the serialised job: a run that never enters the
+              # per-PR group cannot displace a pending lifecycle run.
+              if ! has_command "$(jq -r '.body // ""' <<<"$c")"; then
+                echo "comment ${cid} has no command, skipping"
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
               # issue_url ends in the PR (issue) number.
               pr="$(jq -r '.issue_url' <<<"$c" | grep -oE '[0-9]+$' || true)"
               ;;
@@ -235,7 +296,7 @@ jobs:
               # Fetching the review under the claimed PR verifies the pair: a
               # review id that does not belong to that PR 404s here, so the
               # claimed PR number cannot be steered to another PR. Skip it
-              # rather than fail the run, as the PR lookup below does.
+              # rather than fail the run, as the PR lookup in apply does.
               rc=0
               r="$(gh_api "repos/${REPO}/pulls/${cpr}/reviews/${rid}")" || rc=$?
               if (( rc == 44 )); then
@@ -245,20 +306,12 @@ jobs:
               elif (( rc != 0 )); then
                 exit "$rc"
               fi
-              # The pair is real but may be someone else's old review on any
-              # PR. HEAD_SHA is set by GitHub, not the fork, and is the head
-              # the collect run fired on. Requiring it to be one of the claimed
-              # PR's commits is what confines a forged payload to the fork's
-              # own PR: a forged run fires on the fork's own commit, which is
-              # in no other PR's commit list.
-              shas="$(gh_api --paginate "repos/${REPO}/pulls/${cpr}/commits" --jq '.[].sha')"
-              if ! grep -qxF "$HEAD_SHA" <<<"$shas"; then
-                echo "collect ran on ${HEAD_SHA}, which is not a commit of PR ${cpr}" >&2
-                exit 1
-              fi
-              # That leaves a fork replaying an old review on its own PR, for
-              # example a committer's /pin. RUN_CREATED is set by GitHub, and a
-              # real run is created seconds after its review is submitted.
+              # The pair is real but may be someone else's review on any PR
+              # the fork can name. RUN_CREATED is set by GitHub, and a real
+              # run is created seconds after its review is submitted, so
+              # requiring the two to be close means a forged run can only
+              # repeat the fresh review that PR's own collect run already
+              # delivered, which is idempotent, and cannot replay an old one.
               sub="$(jq -r '.submitted_at // ""' <<<"$r")"
               if [[ -z "$sub" ]]; then
                 echo "review ${rid} has no submitted_at" >&2
@@ -269,13 +322,35 @@ jobs:
                 echo "review ${rid} was submitted at ${sub} and the collect run created at ${RUN_CREATED}, outside the allowed window" >&2
                 exit 1
               fi
-              author="$(jq -r '.user.login // ""' <<<"$r")"
-              assoc="$(jq -r '.author_association' <<<"$r")"
-              state="$(jq -r '.state' <<<"$r" | tr '[:upper:]' '[:lower:]')"
-              jq -r '.body // ""' <<<"$r" > payload/body.txt
+              # An approve or comment-only review with no command has nothing
+              # to apply; see the issue_comment path.
+              if ! has_command "$(jq -r '.body // ""' <<<"$r")" \
+                 && [[ "$(jq -r '.state // ""' <<<"$r")" != CHANGES_REQUESTED ]]; then
+                echo "review ${rid} has no command and does not request changes, skipping"
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
               pr="$cpr"
-              # Reviews carry no issue-comment id, so reactions stay skipped
-              # for them, as before.
+              ;;
+            pull_request)
+              # PR lifecycle. The action comes from the artifact, which a fork
+              # can forge, so it is checked against a fixed list and only
+              # selects whether the welcome comment is considered; the apply
+              # job acts on the PR's live state from the API, not on the
+              # action.
+              cpr="$(jq -r '.pull_request.number // ""' "$f")"
+              lifecycle="$(jq -r '.action // ""' "$f")"
+              require_num "$cpr" pr_number
+              case "$lifecycle" in
+                opened|ready_for_review|converted_to_draft|closed) ;;
+                *)
+                  echo "pull_request action '${lifecycle}' is not handled here, skipping"
+                  echo "skip=true" >> "$GITHUB_OUTPUT"
+                  exit 0
+                  ;;
+              esac
+              require_head "$cpr"
+              pr="$cpr"
               ;;
             *)
               echo "unexpected upstream event: ${UPSTREAM_EVENT}" >&2
@@ -284,49 +359,44 @@ jobs:
           esac
 
           require_num "$pr" resolved_pr
-          # Constrain the API-derived scalars before they leave this step. The
-          # API cannot return a newline in a login or an association; this is
-          # defence in depth on top of the source already being trusted.
-          # A bash match tests the whole string. grep tests each line, so a
-          # value with a newline in it would pass on any one matching line.
-          login_re='^[A-Za-z0-9-]+(\[bot\])?$'
-          if [[ ! "$author" =~ $login_re ]]; then
-            echo "unexpected login: '${author}'" >&2
-            exit 1
-          fi
-          case "$assoc" in
-            OWNER|MEMBER|COLLABORATOR|CONTRIBUTOR|FIRST_TIME_CONTRIBUTOR|FIRST_TIMER|MANNEQUIN|NONE) ;;
-            *) echo "unexpected association: '${assoc}'" >&2; exit 1 ;;
-          esac
-          # Empty on the issue_comment path. A newline here could add a second
-          # pr_number line to the outputs below.
-          case "$state" in
-            ''|approved|changes_requested|commented|dismissed|pending) ;;
-            *) echo "unexpected review state: '${state}'" >&2; exit 1 ;;
-          esac
-          # Step outputs, not $GITHUB_ENV: an output is read only through a
-          # steps.*.outputs.* expression and never becomes a process env var in
-          # a later step, so it cannot smuggle NODE_OPTIONS or BASH_ENV even if
-          # a value slipped the checks above. The values are single-line here.
+          # Job outputs, not $GITHUB_ENV: an output is read only through an
+          # expression and never becomes a process env var on its own, so it
+          # cannot smuggle NODE_OPTIONS or BASH_ENV. Every value here is a
+          # checked number, a value from a fixed list, or set by GitHub.
           {
-            echo "comment_author=${author}"
-            echo "comment_assoc=${assoc}"
             echo "comment_id=${cid}"
+            echo "lifecycle_action=${lifecycle}"
             echo "pr_number=${pr}"
-            echo "review_state=${state}"
-            echo "triage_event_name=${UPSTREAM_EVENT}"
+            echo "review_id=${rid}"
           } >> "$GITHUB_OUTPUT"
 
+  apply:
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    # Serialised per PR. The group is keyed on the PR number the resolve job
+    # verified against the collect run's head, so a forged payload cannot
+    # park a run in another PR's group. cancel-in-progress: false keeps the
+    # active run; GitHub still replaces a pending run with the latest
+    # arrival, so under N rapid triggers on one PR the active run and the
+    # latest land and anything queued between them is dropped. That is safe
+    # because every run first converges the S-* labels on the PR's live
+    # state and /ready and /author are idempotent. /request-review is the
+    # only non-idempotent command: a three-comment burst inside one run's
+    # lifetime lands at most two of them.
+    concurrency:
+      group: pr-triage-apply-pr-${{ needs.resolve.outputs.pr_number }}
+      cancel-in-progress: false
+    steps:
       - name: Dispatch
-        if: steps.resolve.outputs.skip != 'true'
         uses: actions/github-script@v9
         env:
-          COMMENT_AUTHOR: ${{ steps.resolve.outputs.comment_author }}
-          COMMENT_ASSOC: ${{ steps.resolve.outputs.comment_assoc }}
-          COMMENT_ID: ${{ steps.resolve.outputs.comment_id }}
-          PR_NUMBER: ${{ steps.resolve.outputs.pr_number || github.event.pull_request.number }}
-          REVIEW_STATE: ${{ steps.resolve.outputs.review_state }}
-          TRIAGE_EVENT_NAME: ${{ steps.resolve.outputs.triage_event_name || github.event_name }}
+          COMMENT_ID: ${{ needs.resolve.outputs.comment_id }}
+          REVIEW_ID: ${{ needs.resolve.outputs.review_id }}
+          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+          LIFECYCLE_ACTION: ${{ needs.resolve.outputs.lifecycle_action }}
+          TRIAGE_EVENT_NAME: ${{ github.event.workflow_run.event }}
         with:
           script: |
             const LABEL_REVIEW = 'S-waiting-on-review';
@@ -354,12 +424,9 @@ jobs:
               return;
             }
 
-            // Effective event name. On the workflow_run leg the trigger was
-            // issue_comment / pull_request_review, and the upstream event name
-            // was preserved into the env by the resolve step. On the
-            // pull_request_target leg we read the GH-provided context.eventName
-            // directly.
-            const eventName = process.env.TRIAGE_EVENT_NAME || context.eventName;
+            // The upstream trigger: issue_comment, pull_request_review or
+            // pull_request, from GitHub's own workflow_run context.
+            const eventName = process.env.TRIAGE_EVENT_NAME;
 
             // Welcome comment posted once when a non-draft PR is opened.
             // The leading HTML marker is invisible in rendered Markdown
@@ -456,12 +523,30 @@ jobs:
               }
             };
 
-            // The shared workflow queue serializes this snapshot and PUT
-            // with other triage runs, review posting and prolific labeling.
-            // Replace both S-* labels together; null clears the state.
-            // Pagination preserves unrelated labels beyond the first page.
-            const replaceStateLabel = async (add) => {
-              const live = await withRetry(() => github.paginate(
+            // Atomic replace-all on the S-* slot: list current labels,
+            // drop both S-* siblings, optionally push the target, single
+            // setLabels PUT. Used by both the command leg (add = the
+            // target state) and the closed/draft convergence (add = null
+            // -> just clear both S-*). One primitive for both so a label
+            // DELETE pair can never resurrect a cleared S-* on a closed PR.
+            //
+            // The apply job is serialised per PR, so two runs for one PR
+            // never interleave. The single PUT still matters: it cannot be
+            // observed half-done and cannot fabricate a both-labels state.
+            //
+            // The list+setLabels pair is not atomic against unrelated
+            // mutators, so a label added by another workflow between our
+            // list and our setLabels would be overwritten. Acceptable: the
+            // other label writers (pr-triage-reconcile.yml, the stale bot)
+            // converge on the same live state, so a lost add is redone on
+            // their next pass.
+            //
+            // Pagination is mandatory: an unpaginated per_page: 100 fetch
+            // on a PR carrying more than 100 labels would silently drop
+            // every label beyond page 1 on the setLabels PUT. A caller
+            // that has just read the labels passes them as `known`.
+            const replaceStateLabel = async (add, known) => {
+              const names = known ?? (await withRetry(() => github.paginate(
                 github.rest.issues.listLabelsOnIssue,
                 {
                   owner: context.repo.owner,
@@ -469,9 +554,8 @@ jobs:
                   issue_number: prNumber,
                   per_page: 100,
                 },
-              ), 'listLabelsOnIssue (replaceStateLabel)');
-              const next = live
-                .map(l => l.name)
+              ), 'listLabelsOnIssue (replaceStateLabel)')).map(l => l.name);
+              const next = names
                 .filter(n => n !== LABEL_REVIEW && n !== LABEL_AUTHOR);
               if (add) next.push(add);
               await withRetry(() => github.rest.issues.setLabels({
@@ -762,135 +846,185 @@ jobs:
               }
             };
 
-            // ----- pull_request_target lifecycle -----
-            if (eventName === 'pull_request_target') {
-              const action = context.payload.action;
-              const pr = context.payload.pull_request;
-
-              core.info(`lifecycle event=${action} draft=${pr.draft}`);
-
-              if (action === 'closed' || action === 'converted_to_draft') {
-                await replaceStateLabel(null);
-                core.info(`lifecycle: cleared S-* labels (${action})`);
+            // ----- live state -----
+            // The trigger may be minutes old by the time this run gets the
+            // per-PR slot, and the lifecycle action came from a forgeable
+            // artifact, so every run reads the PR's live state and acts on
+            // that. The S-* labels are converged first, whatever the
+            // trigger: a run that displaced a pending close or draft run in
+            // the concurrency group still leaves them right.
+            let pr;
+            try {
+              ({ data: pr } = await withRetry(() => github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              }), 'pulls.get'));
+            } catch (e) {
+              if (e.status === 404) {
+                core.info('PR not found (deleted or transferred), skipping');
                 return;
               }
+              throw e;
+            }
+            // Paginated so a PR with more than 100 labels still reports
+            // hasState correctly.
+            const liveLabels = await withRetry(() => github.paginate(
+              github.rest.issues.listLabelsOnIssue,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                per_page: 100,
+              },
+            ), 'listLabelsOnIssue');
+            const liveNames = liveLabels.map(l => l.name);
+            const hasState = liveNames.includes(LABEL_REVIEW)
+                          || liveNames.includes(LABEL_AUTHOR);
+            core.info(`event=${eventName} state=${pr.state} draft=${pr.draft} has_state=${hasState}`);
 
-              if (action === 'opened' || action === 'ready_for_review') {
-                const author = pr.user && pr.user.login;
-                const authorIsBot = (pr.user && pr.user.type === 'Bot')
-                  || (author && /\[bot\]$/.test(author));
-                // A human author's write access, checked once on open for
-                // both the issue check and the welcome: true, false, or
-                // null when the lookup failed.
-                const access = action === 'opened' && author && !authorIsBot
-                  ? await writeAccess(author)
-                  : null;
-                // Runs on drafts too: opening a draft still claims the
-                // issue. ready_for_review is not checked, so the issue
-                // line and assignment are judged only as the PR opened.
-                // Only a confirmed contributor is checked: closing a
-                // maintainer's PR on a failed lookup is worse than
-                // missing one.
-                if (access === false && await closeIfIssueCheckFails(author, pr.body, pr.title)) {
-                  return;
-                }
-                if (pr.draft) {
-                  core.info('lifecycle: draft PR, no label');
-                  return;
-                }
-                // Welcome comment only on the initial non-draft open,
-                // and only for authors without repo write access -- the
-                // core team already knows the triage commands, the
-                // comment is contributor onboarding. ready_for_review is
-                // excluded: a PR opened as a draft and later marked ready
-                // gets no welcome, keeping scope at "non-draft open".
-                // Bots (dependabot, renovate, ...) are skipped: the
-                // welcome targets human contributor onboarding and bots
-                // cannot drive triage commands anyway (gated by isBot).
-                if (action === 'opened') {
-                  if (!author) {
-                    core.info('welcome: skipped, PR has no author');
-                  } else if (authorIsBot) {
-                    core.info(`welcome: skipped, ${author} is a bot`);
-                  } else if (access === true) {
-                    core.info(`welcome: skipped, ${author} has write access`);
-                  } else {
-                    await postWelcomeOnce();
-                  }
-                }
-                // A queued run can reach here after another run closed
-                // the PR, such as the issue check above. Read the live
-                // state rather than the webhook payload.
-                const { data: livePr } = await withRetry(() => github.rest.pulls.get({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  pull_number: prNumber,
-                }), 'pulls.get');
-                if (livePr.state !== 'open') {
-                  core.info('lifecycle: PR is closed, no label');
-                  return;
-                }
-                // Read live labels rather than the webhook-frozen
-                // pr.labels — a comment-driven /author or /ready may have
-                // landed between the lifecycle event and this run. Paginated
-                // so a PR with more than 100 labels still reports hasState
-                // correctly.
-                const live = await withRetry(() => github.paginate(
-                  github.rest.issues.listLabelsOnIssue,
-                  {
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    issue_number: prNumber,
-                    per_page: 100,
-                  },
-                ), 'listLabelsOnIssue');
-                const liveNames = live.map(l => l.name);
-                const hasState = liveNames.includes(LABEL_REVIEW)
-                              || liveNames.includes(LABEL_AUTHOR);
-                core.info(`lifecycle: has_state=${hasState}`);
-                if (hasState) {
-                  core.info('lifecycle: S-* label already present, no change');
-                  return;
-                }
-                await withRetry(() => github.rest.issues.addLabels({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: prNumber,
-                  labels: [LABEL_REVIEW],
-                }), `lifecycle addLabels ${LABEL_REVIEW}`);
-                core.info(`lifecycle: added ${LABEL_REVIEW}`);
-                return;
+            // pr.user can be null for deleted GitHub accounts; treat the
+            // PR as having no recognized author rather than crashing.
+            const prAuthor = (pr.user && pr.user.login) || null;
+            const prAuthorIsBot = (pr.user && pr.user.type === 'Bot')
+              || (prAuthor && /\[bot\]$/.test(prAuthor));
+
+            // ----- issue check on open -----
+            // Runs before the convergence because it applies to drafts too:
+            // opening a draft still claims the issue. ready_for_review is
+            // not checked, so the issue line and assignment are judged only
+            // as the PR opened. Only a confirmed contributor is checked:
+            // closing a maintainer's PR on a failed lookup is worse than
+            // missing one. A close made with GITHUB_TOKEN never reaches the
+            // collector, so closeIfIssueCheckFails clears the S-* labels
+            // itself.
+            const lifecycleAction = eventName === 'pull_request'
+              ? process.env.LIFECYCLE_ACTION : '';
+            // A human author's write access, checked once on open for both
+            // the issue check and the welcome: true, false, or null when
+            // the lookup failed.
+            const access = lifecycleAction === 'opened' && pr.state === 'open'
+                && prAuthor && !prAuthorIsBot
+              ? await writeAccess(prAuthor)
+              : null;
+            if (access === false && await closeIfIssueCheckFails(prAuthor, pr.body, pr.title)) {
+              return;
+            }
+
+            if (pr.state === 'closed' || pr.draft) {
+              // Atomic clear via replaceStateLabel(null): a single
+              // setLabels PUT that drops both S-* in one call. Commands
+              // are not applied to a closed or draft PR either, so a /ready
+              // posted just before a close cannot re-queue it.
+              const why = pr.state === 'closed' ? 'closed' : 'draft';
+              if (hasState) {
+                await replaceStateLabel(null, liveNames);
+                core.info(`cleared S-* labels, PR is ${why}`);
+              } else {
+                core.info(`PR is ${why}, nothing to do`);
               }
+              return;
+            }
 
-              core.info(`lifecycle: unhandled action ${action}`);
+            if (!hasState) {
+              await withRetry(() => github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                labels: [LABEL_REVIEW],
+              }), `addLabels ${LABEL_REVIEW}`);
+              core.info(`added ${LABEL_REVIEW}`);
+            }
+
+            // ----- pull_request lifecycle -----
+            if (eventName === 'pull_request') {
+              const action = process.env.LIFECYCLE_ACTION;
+              // Welcome comment only on the initial non-draft open,
+              // and only for authors without repo write access -- the
+              // core team already knows the triage commands, the
+              // comment is contributor onboarding. ready_for_review is
+              // excluded: a PR opened as a draft and later marked ready
+              // gets no welcome, keeping scope at "non-draft open".
+              // Bots (dependabot, renovate, ...) are skipped: the
+              // welcome targets human contributor onboarding and bots
+              // cannot drive triage commands anyway (gated by isBot).
+              if (action === 'opened') {
+                if (!prAuthor) {
+                  core.info('welcome: skipped, PR has no author');
+                } else if (prAuthorIsBot) {
+                  core.info(`welcome: skipped, ${prAuthor} is a bot`);
+                } else if (access === true) {
+                  core.info(`welcome: skipped, ${prAuthor} has write access`);
+                } else {
+                  await postWelcomeOnce();
+                }
+              } else {
+                core.info(`lifecycle: ${action} needs nothing beyond the label convergence`);
+              }
               return;
             }
 
             // ----- issue_comment / pull_request_review commands -----
-            // Both event types feed the same path: COMMENT_AUTHOR/_ASSOC/
-            // _ID, PR_NUMBER, REVIEW_STATE and body were re-fetched from the
-            // API by the resolve step above, not taken from the fork-supplied
-            // artifact. body stays in a file (payload/body.txt) rather than a
-            // step output: it is multi-line text its author controls, and a
-            // multi-line output needs a delimiter the body could forge. The file
-            // is absent on the pull_request_target leg (no resolve step), and
-            // lifecycle returned above, so falling back to '' is safe.
-            const fs = require('fs');
-            const body = fs.existsSync('payload/body.txt')
-              ? fs.readFileSync('payload/body.txt', 'utf8')
-              : '';
+            // Both event types feed the same path. The resolve job passed
+            // only the numeric ids, so the author, association, body and
+            // review state are all read from the API here, never from the
+            // fork-supplied artifact. A 404 means the comment or review was
+            // deleted since the collect run; there is nothing to apply.
+            // The resolve job rejects every other event, so what is not a
+            // comment here is a review.
+            const reviewId = Number(process.env.REVIEW_ID) || null;
+            let trigger;
+            try {
+              if (eventName === 'issue_comment') {
+                if (!commentId) {
+                  core.setFailed(`invalid COMMENT_ID: ${process.env.COMMENT_ID}`);
+                  return;
+                }
+                ({ data: trigger } = await withRetry(() => github.rest.issues.getComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: commentId,
+                }), 'issues.getComment'));
+              } else {
+                if (!reviewId) {
+                  core.setFailed(`invalid REVIEW_ID: ${process.env.REVIEW_ID}`);
+                  return;
+                }
+                ({ data: trigger } = await withRetry(() => github.rest.pulls.getReview({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: prNumber,
+                  review_id: reviewId,
+                }), 'pulls.getReview'));
+              }
+            } catch (e) {
+              if (e.status === 404) {
+                core.info('comment or review not found (deleted), skipping');
+                return;
+              }
+              throw e;
+            }
+            const body = trigger.body || '';
+            // user is null for a deleted account; nothing can be authorised.
+            const commentAuthor = (trigger.user && trigger.user.login) || '';
+            if (!commentAuthor) {
+              core.info('trigger has no author, skipping');
+              return;
+            }
+            const commentAssoc = trigger.author_association || 'NONE';
 
             // A changes_requested review is an implicit /author: the ball
             // is back with the author. Gated by REVIEW_AUTHOR_ASSOCS
             // (checked below) -- wider than the /author command. An
             // explicit command in the review body still takes precedence.
-            // REVIEW_STATE is empty for issue_comment.
-            const reviewState = process.env.REVIEW_STATE || '';
+            // Reviews report state in upper case; a comment has none.
+            const reviewState = (trigger.state || '').toLowerCase();
             const reviewWantsAuthor = reviewState === 'changes_requested';
 
             // Skip everything if there is neither a command line nor an
-            // actionable review state. Avoids a pulls.get on every
-            // drive-by comment and every approve/comment-only review.
+            // actionable review state. The resolve job already applied the
+            // same test (has_command) before starting this job; this is the
+            // copy that decides the reaction, and the two must stay in sync.
             // Leading whitespace is tolerated so that "  /ready" matches
             // the same way the line-by-line dispatch (which trims) does.
             // The trailing `(?:\s|$)` rejects suffixed prose like
@@ -902,15 +1036,13 @@ jobs:
               return;
             }
 
-            const commentAuthor = process.env.COMMENT_AUTHOR;
-            const commentAssoc = process.env.COMMENT_ASSOC;
             // Bot-suffixed accounts (e.g. dependabot[bot]) cannot drive
             // commands as committer or PR author — would let bots
             // self-flip review state.
             const isBot = /\[bot\]$/.test(commentAuthor);
-            // The resolve step reads the association through this token,
-            // which cannot see a private org membership, so a committer can
-            // read as CONTRIBUTOR or NONE. Write access admits them.
+            // The association is read through this token, which cannot see
+            // a private org membership, so a committer can read as
+            // CONTRIBUTOR or NONE. Write access admits them.
             const isCommitter = !isBot && (COMMITTER_ASSOCS.has(commentAssoc)
               || await hasWriteAccess(commentAuthor));
             // Permitted to drive the implicit changes_requested flip;
@@ -918,45 +1050,6 @@ jobs:
             const isReviewFlipper = isCommitter
               || (REVIEW_AUTHOR_ASSOCS.has(commentAssoc) && !isBot);
 
-            // Live state read. The artifact carries the webhook-frozen
-            // payload at delivery time, plus we now have ~30s of
-            // artifact-handoff latency on top; comment-while-open +
-            // close-arriving-later would otherwise re-label a now-closed
-            // PR. Run on both committer and non-committer paths --
-            // correctness over the single API call saved on the
-            // committer fast-path.
-            let prData;
-            try {
-              prData = await withRetry(() => github.rest.pulls.get({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: prNumber,
-              }), 'pulls.get');
-            } catch (e) {
-              if (e.status === 404) {
-                core.info('PR not found (deleted or transferred), skipping');
-                return;
-              }
-              throw e;
-            }
-
-            if (prData.data.state === 'closed') {
-              core.info('PR is closed, skipping');
-              return;
-            }
-            // Reject command runs against a PR that turned draft after
-            // the comment was posted. The pull_request_target lifecycle
-            // clears S-* on converted_to_draft; without this gate the
-            // ~30-90s artifact-handoff window lets a stale command
-            // re-add S-waiting-on-review onto a now-draft PR.
-            if (prData.data.draft) {
-              core.info('PR is draft, skipping');
-              return;
-            }
-
-            // pr.user can be null for deleted GitHub accounts; treat the
-            // PR as having no recognized author rather than crashing.
-            const prAuthor = (prData.data.user && prData.data.user.login) || null;
             const isPrAuthor = !!prAuthor && commentAuthor === prAuthor && !isBot;
 
             core.info(`comment_author=${commentAuthor} assoc=${commentAssoc} ` +
@@ -1142,7 +1235,9 @@ jobs:
             }
 
       - name: Label prolific author on open
-        if: github.event_name == 'pull_request_target' && github.event.action == 'opened'
+        if: needs.resolve.outputs.lifecycle_action == 'opened'
+        env:
+          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
         uses: actions/github-script@v9
         with:
           script: |
@@ -1155,7 +1250,12 @@ jobs:
             const REPOSITORY_THRESHOLD = 20;
             const EXEMPT_MERGED_PRS = 10;
             const MAX_REPOSITORIES = 100;
-            const author = context.payload.pull_request.user;
+            const prNumber = Number(process.env.PR_NUMBER);
+            const { data: opened } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: prNumber,
+            });
+            const author = opened.user;
             if (author?.type !== 'User') return;
 
             const until = new Date();
@@ -1197,7 +1297,7 @@ jobs:
             // find the label already applied.
             const { data: pr } = await github.rest.pulls.get({
               ...context.repo,
-              pull_number: context.payload.pull_request.number,
+              pull_number: prNumber,
             });
             if (pr.state !== 'open' || pr.labels.some(label => label.name === LABEL_NAME)) return;
 
