@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import contextlib
 import time
 
 import pytest
@@ -119,3 +120,28 @@ class TestPersonalAccessTokens:
                 unique_name(min_bytes=16, max_bytes=30)
             )
         assert refusal.value.code == RESOURCE_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_delete_name_with_query_character_deletes_only_that_token(
+        self, transport_client: IggyClient, iggy_client: IggyClient, unique_name
+    ):
+        """Test a name containing `?` deletes only that token on every transport."""
+        kept = unique_name(min_bytes=16, max_bytes=20)
+        deleted = f"{kept}?x"
+        http_host, http_port = get_http_server_config()
+        api = f"http://{http_host}:{http_port}"
+        _create_personal_access_token(api, "iggy", "iggy", kept, NEVER_EXPIRE)
+        _create_personal_access_token(api, "iggy", "iggy", deleted, NEVER_EXPIRE)
+
+        try:
+            await transport_client.delete_personal_access_token(deleted)
+
+            names = {
+                token.name for token in await iggy_client.get_personal_access_tokens()
+            }
+            assert kept in names
+            assert deleted not in names
+        finally:
+            for name in (kept, deleted):
+                with contextlib.suppress(IggyError):
+                    await iggy_client.delete_personal_access_token(name)
