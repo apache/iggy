@@ -24,7 +24,12 @@ use lapin::{
     options::{BasicGetOptions, BasicPublishOptions, ConfirmSelectOptions},
 };
 
-use super::container::{DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, RabbitMqContainer};
+use super::container::{
+    DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SOURCE_AMQP_URL, ENV_SOURCE_BATCH_SIZE,
+    ENV_SOURCE_BATCH_TIMEOUT, ENV_SOURCE_INCLUDE_METADATA, ENV_SOURCE_PATH, ENV_SOURCE_QUEUE,
+    ENV_SOURCE_STREAMS_0_SCHEMA, ENV_SOURCE_STREAMS_0_STREAM, ENV_SOURCE_STREAMS_0_TOPIC,
+    RabbitMqContainer,
+};
 
 pub struct RabbitMqSourceFixture {
     container: RabbitMqContainer,
@@ -193,32 +198,26 @@ impl RabbitMqSourceFixture {
 
     fn envs(&self) -> HashMap<String, String> {
         HashMap::from([
+            (ENV_SOURCE_AMQP_URL.into(), self.container.amqp_url.clone()),
             (
-                "IGGY_CONNECTORS_SOURCE_RABBITMQ_PLUGIN_CONFIG_AMQP_URL".into(),
-                self.container.amqp_url.clone(),
-            ),
-            (
-                "IGGY_CONNECTORS_SOURCE_RABBITMQ_PLUGIN_CONFIG_QUEUE".into(),
+                ENV_SOURCE_QUEUE.into(),
                 self.container.queue_names[0].clone(),
             ),
             (
-                "IGGY_CONNECTORS_SOURCE_RABBITMQ_PLUGIN_CONFIG_INCLUDE_METADATA".into(),
+                ENV_SOURCE_INCLUDE_METADATA.into(),
                 self.metadata.to_string(),
             ),
             (
-                "IGGY_CONNECTORS_SOURCE_RABBITMQ_STREAMS_0_STREAM".into(),
+                ENV_SOURCE_STREAMS_0_STREAM.into(),
                 DEFAULT_TEST_STREAM.into(),
             ),
+            (ENV_SOURCE_STREAMS_0_TOPIC.into(), DEFAULT_TEST_TOPIC.into()),
             (
-                "IGGY_CONNECTORS_SOURCE_RABBITMQ_STREAMS_0_TOPIC".into(),
-                DEFAULT_TEST_TOPIC.into(),
-            ),
-            (
-                "IGGY_CONNECTORS_SOURCE_RABBITMQ_STREAMS_0_SCHEMA".into(),
+                ENV_SOURCE_STREAMS_0_SCHEMA.into(),
                 if self.metadata { "json" } else { "raw" }.into(),
             ),
             (
-                "IGGY_CONNECTORS_SOURCE_RABBITMQ_PATH".into(),
+                ENV_SOURCE_PATH.into(),
                 "../../target/debug/libiggy_connector_rabbitmq_source".into(),
             ),
         ])
@@ -293,14 +292,8 @@ impl TestFixture for RabbitMqSourceBatchFixture {
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
         let mut envs = self.0.envs();
-        envs.insert(
-            "IGGY_CONNECTORS_SOURCE_RABBITMQ_PLUGIN_CONFIG_BATCH_SIZE".into(),
-            "3".into(),
-        );
-        envs.insert(
-            "IGGY_CONNECTORS_SOURCE_RABBITMQ_PLUGIN_CONFIG_BATCH_TIMEOUT".into(),
-            "5s".into(),
-        );
+        envs.insert(ENV_SOURCE_BATCH_SIZE.into(), "3".into());
+        envs.insert(ENV_SOURCE_BATCH_TIMEOUT.into(), "5s".into());
         envs
     }
 }

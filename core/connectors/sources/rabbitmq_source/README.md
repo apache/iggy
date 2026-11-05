@@ -37,7 +37,7 @@ This can cause message loss. The runtime currently accepts `exactly_once = true`
 | :--- | :---: | :--- | :--- |
 | `amqp_url` | Yes | None | RabbitMQ URL with the `amqp://` or `amqps://` scheme. |
 | `queue` | Yes | None | Name of an existing queue. The name must contain 1 to 255 bytes. |
-| `batch_size` | No | `100` | Maximum messages in a batch. RabbitMQ prefetch uses this value. It must be greater than zero. |
+| `batch_size` | No | `100` | Maximum messages in a batch. It must be greater than zero. RabbitMQ prefetch is capped at 65,535. |
 | `batch_timeout` | No | `"10ms"` | Maximum wait after the first delivery before the connector returns a batch. It must be greater than zero. |
 | `include_metadata` | No | `false` | Set to `true` to emit the JSON envelope. Use the `json` destination schema. |
 | `timeout_secs` | No | `30` | Timeout for connection setup, consumer setup, and acknowledgements. It must be greater than zero. |
@@ -45,6 +45,9 @@ This can cause message loss. The runtime currently accepts `exactly_once = true`
 | `tls.ca_file` | No | None | Optional PEM file for a custom CA. |
 | `tls.client_cert_file` | No | None | Optional PEM client certificate for mutual TLS. Set it with `tls.client_key_file`. |
 | `tls.client_key_file` | No | None | Optional PEM client key for mutual TLS. Set it with `tls.client_cert_file`. |
+
+When `batch_size` exceeds 65,535, RabbitMQ prefetch limits the number of unacknowledged deliveries.
+The source returns a partial batch when `batch_timeout` expires, so it can acknowledge those deliveries.
 
 Each batch contains at most 64,000,000 bytes of prepared payloads. The source keeps
 one copy for retry and makes another copy for the runtime, for up to 128,000,000
@@ -229,12 +232,12 @@ delivery. Consumers must handle duplicates.
 | RabbitMQ disconnects after startup | The source waits for a random delay from 1 to 5 seconds, then retries connection and consume operations. |
 | Iggy rejects a batch | The source retains and retries the batch. RabbitMQ deliveries remain unacknowledged. |
 | A broker acknowledgement fails | The source attempts to close its AMQP connection and stops with an error. After restart, RabbitMQ can redeliver unacknowledged messages. |
-| Empty body in raw mode | The connector logs, acknowledges, and drops the delivery. |
-| Payload exceeds 64,000,000 bytes | The connector logs, acknowledges, and drops the delivery. |
+| Empty body in raw mode | The connector logs and rejects the delivery without requeuing it. RabbitMQ dead-letters it if a route exists. Otherwise, RabbitMQ drops it. |
+| Payload exceeds 64,000,000 bytes | The connector logs and rejects the delivery without requeuing it. RabbitMQ dead-letters it if a route exists. Otherwise, RabbitMQ drops it. |
 | Delivery preparation fails | The connector logs and rejects the delivery without requeuing it. RabbitMQ dead-letters it if a route exists. Otherwise, RabbitMQ drops it. |
 | Empty body in metadata mode | The connector can encode the empty body in the JSON envelope. |
 
-The 64,000,000-byte limit applies to the emitted payload, including the JSON envelope in metadata mode. The connector does not limit the total bytes in a batch.
+The 64,000,000-byte limit applies to each emitted payload and to the combined payloads in a batch. In metadata mode, the payload includes the JSON envelope.
 
 ## Operations
 

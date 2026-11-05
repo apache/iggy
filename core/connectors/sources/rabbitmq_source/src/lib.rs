@@ -232,9 +232,7 @@ use iggy_connector_sdk::{
     source::SourceBatchResult, source_connector,
 };
 use lapin::{
-    Acker, Connection, ConnectionProperties,
-    options::{BasicAckOptions, BasicRejectOptions},
-    tcp::OwnedTLSConfig,
+    Acker, Connection, ConnectionProperties, options::BasicRejectOptions, tcp::OwnedTLSConfig,
 };
 use secrecy::ExposeSecret;
 use tokio::{
@@ -350,7 +348,11 @@ impl RabbitMqSource {
         .map_err(|error| Failure::lapin("connect", error))?;
         timeout(
             duration,
-            RabbitMqDriver::consume(connection, &self.config.queue, self.config.batch_size),
+            RabbitMqDriver::consume(
+                connection,
+                &self.config.queue,
+                u16::try_from(self.config.batch_size).unwrap_or(u16::MAX),
+            ),
         )
         .await
         .map_err(|_| Failure::simple("consumer_setup", "RabbitMQ consumer setup timed out"))?
@@ -430,7 +432,8 @@ impl Source for RabbitMqSource {
                 }
             },
         };
-        let mut deliveries = Vec::with_capacity(usize::from(self.config.batch_size));
+        let batch_size = usize::try_from(self.config.batch_size).unwrap_or(usize::MAX);
+        let mut deliveries = Vec::with_capacity(batch_size.min(usize::from(u16::MAX)));
         let mut payload_bytes = 0;
         let mut deadline = None;
         if let Some((message, acker, received_at)) = self.overflow.lock().await.take() {
@@ -439,9 +442,7 @@ impl Source for RabbitMqSource {
             deadline = Some(received_at + self.batch_timeout);
         }
         loop {
-            if deliveries.len() >= usize::from(self.config.batch_size)
-                || payload_bytes == MAX_PAYLOAD_BYTES
-            {
+            if deliveries.len() >= batch_size || payload_bytes == MAX_PAYLOAD_BYTES {
                 break;
             }
             let wait = deadline.map_or(Duration::from_secs(1), |deadline: Instant| {
@@ -503,32 +504,28 @@ impl Source for RabbitMqSource {
                 payload_bytes += message.payload.len();
                 deliveries.push((message, delivery.acker));
                 deadline.get_or_insert(received_at + self.batch_timeout);
-                if deliveries.len() >= usize::from(self.config.batch_size) {
+                if deliveries.len() >= batch_size {
                     break;
                 }
             } else {
-                warn!(connector_id = self.id, queue = %self.config.queue, "Dropping unsupported RabbitMQ delivery");
-                // Unsupported payloads cannot be forwarded, so redelivery would repeat the failure.
-                match timeout(
+                warn!(connector_id = self.id, queue = %self.config.queue, "Rejecting unsupported RabbitMQ delivery");
+                let result = timeout(
                     Duration::from_secs(self.config.timeout_secs),
-                    delivery.acker.ack(BasicAckOptions::default()),
+                    delivery.acker.reject(BasicRejectOptions { requeue: false }),
                 )
-                .await
-                {
-                    Ok(Ok(true)) => {}
-                    result => {
-                        let failure = match result {
-                            Ok(Err(error)) => Failure::lapin("poison_ack", error),
-                            _ => Failure::simple(
-                                "poison_ack",
-                                "RabbitMQ poison acknowledgement failed",
-                            ),
-                        };
-                        self.close_driver(driver).await;
-                        self.wait_before_retry(&failure).await;
-                        return Err(failure.error);
-                    }
+                .await;
+                let failure = match result {
+                    Ok(Ok(true)) => continue,
+                    Ok(Err(error)) => Failure::lapin("poison_reject", error),
+                    _ => Failure::simple("poison_reject", "RabbitMQ poison rejection failed"),
+                };
+                if !deliveries.is_empty() {
+                    *self.deferred_failure.lock().await = Some(failure);
+                    break;
                 }
+                self.close_driver(driver).await;
+                self.wait_before_retry(&failure).await;
+                return Err(failure.error);
             }
         }
         *self.driver.lock().await = Some(driver);

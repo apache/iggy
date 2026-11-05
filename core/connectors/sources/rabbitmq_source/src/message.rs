@@ -155,7 +155,7 @@ fn format_float(value: f64) -> String {
     }
 }
 
-pub(crate) const MAX_PAYLOAD_BYTES: usize = 64_000_000;
+pub(crate) const MAX_PAYLOAD_BYTES: usize = iggy_common::MAX_PAYLOAD_SIZE as usize;
 // The envelope needs space beyond the padded Base64 body.
 const MAX_METADATA_BODY_BYTES: usize = (MAX_PAYLOAD_BYTES / 4 - 1) * 3;
 

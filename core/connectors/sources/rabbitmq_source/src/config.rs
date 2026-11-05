@@ -26,7 +26,7 @@ pub struct RabbitMqSourceConfig {
     pub amqp_url: SecretString,
     pub queue: String,
     #[serde(default = "default_batch_size")]
-    pub batch_size: u16,
+    pub batch_size: u32,
     #[serde(default = "default_batch_timeout")]
     pub batch_timeout: String,
     #[serde(default)]
@@ -48,14 +48,19 @@ pub struct RabbitMqTlsConfig {
 
 impl RabbitMqSourceConfig {
     pub fn validate(&self) -> Result<Duration, Error> {
-        let url = Url::parse(self.amqp_url.expose_secret())
-            .map_err(|_| Error::InvalidConfigValue("invalid AMQP URL".into()))?;
+        let url = Url::parse(self.amqp_url.expose_secret()).map_err(|_| {
+            Error::InvalidConfigValue(
+                "amqp_url must be a valid amqp or amqps URL with a host".into(),
+            )
+        })?;
         if !matches!(url.scheme(), "amqp" | "amqps") || url.host_str().is_none() {
-            return Err(Error::InvalidConfigValue("invalid AMQP URL".into()));
+            return Err(Error::InvalidConfigValue(
+                "amqp_url must be a valid amqp or amqps URL with a host".into(),
+            ));
         }
         if self.queue.trim().is_empty() || self.queue.len() > 255 {
             return Err(Error::InvalidConfigValue(
-                "queue must contain 1 to 255 bytes".into(),
+                "queue must contain 1 to 255 bytes and not be whitespace-only".into(),
             ));
         }
         if self.batch_size == 0 {
@@ -63,28 +68,42 @@ impl RabbitMqSourceConfig {
                 "batch_size must be positive".into(),
             ));
         }
-        let timeout = humantime::parse_duration(&self.batch_timeout)
-            .map_err(|_| Error::InvalidConfigValue("invalid batch_timeout".into()))?;
-        if timeout.is_zero() || self.timeout_secs == 0 {
+        let timeout = humantime::parse_duration(&self.batch_timeout).map_err(|_| {
+            Error::InvalidConfigValue("batch_timeout must be a duration such as 10ms or 1s".into())
+        })?;
+        if timeout.is_zero() {
             return Err(Error::InvalidConfigValue(
-                "timeouts must be positive".into(),
+                "batch_timeout must be greater than zero".into(),
+            ));
+        }
+        if self.timeout_secs == 0 {
+            return Err(Error::InvalidConfigValue(
+                "timeout_secs must be greater than zero".into(),
             ));
         }
         let now = Instant::now();
-        if now.checked_add(timeout).is_none()
-            || now
-                .checked_add(Duration::from_secs(self.timeout_secs))
-                .is_none()
+        if now.checked_add(timeout).is_none() {
+            return Err(Error::InvalidConfigValue(
+                "batch_timeout is too large; use a smaller duration".into(),
+            ));
+        }
+        if now
+            .checked_add(Duration::from_secs(self.timeout_secs))
+            .is_none()
         {
-            return Err(Error::InvalidConfigValue("timeouts are too large".into()));
+            return Err(Error::InvalidConfigValue(
+                "timeout_secs is too large; use a smaller value".into(),
+            ));
         }
         if let Some(tls) = &self.tls {
             if url.scheme() != "amqps" {
-                return Err(Error::InvalidConfigValue("TLS requires amqps".into()));
+                return Err(Error::InvalidConfigValue(
+                    "tls requires an amqps URL in amqp_url".into(),
+                ));
             }
             if tls.client_cert_file.is_some() != tls.client_key_file.is_some() {
                 return Err(Error::InvalidConfigValue(
-                    "client certificate and key must be supplied together".into(),
+                    "tls.client_cert_file and tls.client_key_file must be supplied together".into(),
                 ));
             }
         }
@@ -92,7 +111,7 @@ impl RabbitMqSourceConfig {
     }
 }
 
-fn default_batch_size() -> u16 {
+fn default_batch_size() -> u32 {
     100
 }
 
