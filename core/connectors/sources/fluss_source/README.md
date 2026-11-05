@@ -73,6 +73,8 @@ Temporal values keep every fractional digit the column holds, so the default `TI
 
 Rows are decoded with the table schema read when the connector starts. A row written before a column was added carries `null` for it, and a column added after startup stays out of the output until the connector restarts.
 
+Rows the cluster has already moved to remote storage are read from there, with the credentials the cluster hands out. The client reads remote storage on a local file system, S3 or OSS. Reading from a cluster that tiers to another store, such as HDFS, fails.
+
 Every message carries an `id` derived from its bucket and offset, so a consumer can spot a record replayed after an at-least-once redelivery (the Apache Iggy server does not deduplicate on it). The offset fills the low 64 bits, the bucket the next 32, and the top bit is always set, since a zero id would be replaced with a random one when the message is sent.
 
 The connector also hands the runtime the Fluss record timestamp as `origin_timestamp`, but the runtime does not pass it on, so Apache Iggy stamps each message with its own time. Turn on `include_metadata` to keep the record timestamp in the payload as `_fluss_timestamp`.
