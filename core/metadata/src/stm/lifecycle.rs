@@ -836,11 +836,17 @@ pub(crate) fn apply_with_lifecycle_completion<R: StateHandler<State = StreamsInn
     state.apply_context.metadata_op += 1;
     let op = state.apply_context.metadata_op;
     let reply = request.apply(state, timestamp);
-    if reply.code != 0 {
-        return reply;
+    if reply.code == 0 {
+        complete_lifecycle(op, state, timestamp);
     }
+    reply
+}
+
+/// Completes every partition of the intent pending at `op`, if there is one.
+#[cfg(test)]
+pub(crate) fn complete_lifecycle(op: u64, state: &mut StreamsInner, timestamp: IggyTimestamp) {
     let Some(intent) = state.lifecycle_intents.get(&op).cloned() else {
-        return reply;
+        return;
     };
     for (index, partition) in intent.partitions.iter().enumerate() {
         state.apply_context.metadata_op += 1;
@@ -858,7 +864,6 @@ pub(crate) fn apply_with_lifecycle_completion<R: StateHandler<State = StreamsInn
         );
     }
     assert!(!state.lifecycle_intents.contains_key(&op));
-    reply
 }
 
 #[cfg(test)]
