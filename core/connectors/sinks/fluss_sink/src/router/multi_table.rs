@@ -28,7 +28,7 @@ use crate::{
     ResolvedFlussSinkConfig,
     router::RouteOutcome,
     schema_catalog::{SchemaCatalog, SchemaEntry},
-    writer::{Stat, TableWriter},
+    writer::{Stat, TableWriter, WriterError},
 };
 
 #[derive(Debug)]
@@ -133,6 +133,14 @@ impl MultiTableRouter {
                 {
                     Ok(stat) => result += stat,
                     Err(error) => {
+                        if matches!(error, WriterError::TableNotFound { .. }) {
+                            self.schema_catalog.evict(&table);
+                            warn!(
+                                "Fluss sink ID {}:  Table cache evited '{table}' because of TableNotFound. The table could have been dropped after the creation.",
+                                self.connector_id
+                            );
+                        }
+
                         result.errors += batch_len as u64;
                         warn!(
                             "Fluss sink ID {}: Skipping {batch_len} rows for table '{table}', write failed: {error}",
@@ -341,6 +349,18 @@ mod tests {
             if self.failing_writes.contains(table_path) {
                 return Err(WriterError::ConnectionNotInitialized);
             }
+
+            if !self
+                .existing
+                .lock()
+                .expect("existing tables lock should not be poisoned")
+                .contains_key(table_path)
+            {
+                return Err(WriterError::TableNotFound {
+                    table_path: table_path.clone(),
+                });
+            }
+
             let rows = batch.num_rows();
             self.writes
                 .lock()
@@ -748,5 +768,42 @@ mod tests {
         assert!(last_error.is_none());
         assert_eq!(writes.len(), 1);
         assert!(writes[0].has_primary_key);
+    }
+
+    #[test]
+    fn given_dropped_table_when_routing_should_recreate_it_on_next_batch() {
+        let router = MultiTableRouter::new(1, &auto_create_config());
+        let writer = RecordingWriter::default();
+        let table = TablePath::new("fluss", "orders");
+        let message = |id| json_message(id, r#"{"table":"fluss.orders","id":1}"#);
+
+        run_async(router.route(&writer, vec![message(1)]));
+
+        writer
+            .existing
+            .lock()
+            .expect("existing tables lock should not be poisoned")
+            .remove(&table);
+
+        let RouteOutcome { stat, last_error } = run_async(router.route(&writer, vec![message(2)]));
+        assert_eq!(stat.errors, 1);
+
+        assert!(matches!(
+            last_error,
+            Some(Error::WriterError(WriterError::TableNotFound { .. }))
+        ));
+
+        let RouteOutcome { stat, last_error } = run_async(router.route(&writer, vec![message(3)]));
+        assert_eq!(stat.appended, 1);
+        assert!(last_error.is_none());
+
+        assert_eq!(
+            writer
+                .created
+                .lock()
+                .expect("created tables should not be poisoned")
+                .len(),
+            2
+        );
     }
 }

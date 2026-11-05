@@ -144,6 +144,13 @@ impl SchemaCatalog {
             .insert(table.to_owned(), entry);
     }
 
+    pub(crate) fn evict(&self, table: &TablePath) {
+        self.table_to_entry
+            .lock()
+            .expect("schema catalog mutex poisoned")
+            .remove(table);
+    }
+
     pub(crate) async fn infer_and_create_table(
         &self,
         table: &TablePath,
