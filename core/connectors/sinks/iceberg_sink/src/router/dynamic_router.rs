@@ -107,11 +107,11 @@ impl Router for DynamicRouter {
             entry.insert((table, vec![message]));
         }
 
-        for (table_name, (table, batch_messages)) in &tables {
+        for (table_name, (table, batch_messages)) in tables {
             let committed_rows = write_data(
                 origin,
-                batch_messages,
-                table,
+                &batch_messages,
+                &table,
                 self.catalog.as_ref(),
                 messages_schema,
                 self.invalid_rows,
