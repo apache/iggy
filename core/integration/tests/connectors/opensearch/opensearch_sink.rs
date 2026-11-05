@@ -389,3 +389,60 @@ async fn given_date_like_header_value_when_later_value_is_text_should_index_both
     assert!(observed.contains(&"2024-01-01"));
     assert!(observed.contains(&"not a date"));
 }
+
+// Keys that stringify alike share one JSON field name, so the live server has
+// to accept the kind-suffixed name for both headers to survive.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/opensearch/sink.toml")),
+    seed = seeds::connector_multi_topic_stream
+)]
+async fn given_keys_that_stringify_alike_when_sink_consumes_should_index_both(
+    harness: &TestHarness,
+    fixture: OpenSearchSinkFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+
+    let mut messages = vec![
+        IggyMessage::builder()
+            .id(1)
+            .payload(Bytes::from(
+                serde_json::to_vec(&serde_json::json!({ "order_id": "K-1" })).expect("serialize"),
+            ))
+            .user_headers(BTreeMap::from([
+                (
+                    HeaderKey::try_from("1").expect("string key"),
+                    HeaderValue::try_from("from-string-key").expect("header value"),
+                ),
+                (
+                    HeaderKey::from(1i32),
+                    HeaderValue::try_from("from-integer-key").expect("header value"),
+                ),
+            ]))
+            .build()
+            .expect("build message"),
+    ];
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("send message with colliding header keys");
+
+    fixture
+        .wait_for_document_count(1)
+        .await
+        .expect("the document should be indexed");
+
+    let documents = fixture
+        .search_all(fixture.index())
+        .await
+        .expect("search index");
+    let headers = &documents["hits"]["hits"][0]["_source"]["iggy_headers"];
+    assert_eq!(headers["1"]["data"], "from-string-key");
+    assert_eq!(headers["1~int32"]["data"], "from-integer-key");
+}

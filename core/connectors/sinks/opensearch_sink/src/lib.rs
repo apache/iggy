@@ -1355,30 +1355,33 @@ fn inject_metadata(
 /// on the map directly fails with "key must be a string", so the keys and raw
 /// binary values are converted explicitly instead.
 fn headers_to_json(headers: &BTreeMap<HeaderKey, HeaderValue>) -> Value {
-    let map: Map<String, Value> = headers
-        .iter()
-        .map(|(key, value)| {
-            // A per-kind shape would pin iggy_headers.<key> to text or object on
-            // first use, so the other kind then fails to index under that key.
-            let (data, encoding) = match value.as_raw() {
-                Ok(raw) => (general_purpose::STANDARD.encode(raw), ENCODING_BASE64),
-                Err(_) => (value.to_string_value(), ENCODING_UTF8),
-            };
-            (
-                key.to_string_value(),
-                // Built directly rather than via `json!`: that macro routes
-                // through `Serialize`, which only ever sees `&str` and so
-                // must copy `data` again even though it's already owned here.
-                Value::Object(Map::from_iter([
-                    ("data".to_string(), Value::String(data)),
-                    (
-                        "data_encoding".to_string(),
-                        Value::String(encoding.to_string()),
-                    ),
-                ])),
-            )
-        })
-        .collect();
+    let mut map = Map::new();
+    for (key, value) in headers {
+        // A per-kind shape would pin iggy_headers.<key> to text or object on
+        // first use, so the other kind then fails to index under that key.
+        let (data, encoding) = match value.as_raw() {
+            Ok(raw) => (general_purpose::STANDARD.encode(raw), ENCODING_BASE64),
+            Err(_) => (value.to_string_value(), ENCODING_UTF8),
+        };
+        // Keys such as 1 and "1" are distinct in Iggy but would share one JSON field name.
+        let mut field = key.to_string_value();
+        while map.contains_key(&field) {
+            field = format!("{field}~{}", key.kind());
+        }
+        map.insert(
+            field,
+            // Built directly rather than via `json!`: that macro routes
+            // through `Serialize`, which only ever sees `&str` and so
+            // must copy `data` again even though it's already owned here.
+            Value::Object(Map::from_iter([
+                ("data".to_string(), Value::String(data)),
+                (
+                    "data_encoding".to_string(),
+                    Value::String(encoding.to_string()),
+                ),
+            ])),
+        );
+    }
     Value::Object(map)
 }
 
@@ -2018,6 +2021,74 @@ mod tests {
         assert_eq!(entries["x-text"]["data_encoding"], ENCODING_UTF8);
         assert_eq!(entries["x-number"]["data_encoding"], ENCODING_UTF8);
         assert_eq!(entries["x-raw"]["data_encoding"], ENCODING_BASE64);
+    }
+
+    #[test]
+    fn given_keys_that_stringify_alike_should_keep_every_header() {
+        let headers = headers_to_json(&BTreeMap::from([
+            (
+                HeaderKey::from(1i32),
+                HeaderValue::try_from("integer").unwrap(),
+            ),
+            (
+                HeaderKey::from(1u32),
+                HeaderValue::try_from("unsigned").unwrap(),
+            ),
+            (
+                HeaderKey::try_from("1").unwrap(),
+                HeaderValue::try_from("string").unwrap(),
+            ),
+            (
+                HeaderKey::try_from([1u8, 2, 3].as_slice()).unwrap(),
+                HeaderValue::try_from("raw").unwrap(),
+            ),
+            (
+                HeaderKey::try_from(r#"b"\x01\x02\x03""#).unwrap(),
+                HeaderValue::try_from("text").unwrap(),
+            ),
+        ]));
+
+        let entries = headers.as_object().expect("headers should be an object");
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries["1"]["data"], "string");
+        assert_eq!(entries["1~int32"]["data"], "integer");
+        assert_eq!(entries["1~uint32"]["data"], "unsigned");
+        assert_eq!(entries[r#"b"\x01\x02\x03""#]["data"], "raw");
+        assert_eq!(entries[r#"b"\x01\x02\x03"~string"#]["data"], "text");
+    }
+
+    #[test]
+    fn given_string_key_matching_the_suffixed_name_should_keep_every_header() {
+        let headers = headers_to_json(&BTreeMap::from([
+            (
+                HeaderKey::from(1i32),
+                HeaderValue::try_from("integer").unwrap(),
+            ),
+            (
+                HeaderKey::try_from("1").unwrap(),
+                HeaderValue::try_from("string").unwrap(),
+            ),
+            (
+                HeaderKey::try_from("1~int32").unwrap(),
+                HeaderValue::try_from("lookalike").unwrap(),
+            ),
+        ]));
+
+        let entries = headers.as_object().expect("headers should be an object");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries["1"]["data"], "string");
+        assert_eq!(entries["1~int32"]["data"], "lookalike");
+        assert_eq!(entries["1~int32~int32"]["data"], "integer");
+    }
+
+    #[test]
+    fn given_typed_key_without_collision_should_use_its_plain_name() {
+        let headers = headers_to_json(&BTreeMap::from([(
+            HeaderKey::from(1i32),
+            HeaderValue::try_from("integer").unwrap(),
+        )]));
+
+        assert_eq!(headers["1"]["data"], "integer");
     }
 
     #[test]

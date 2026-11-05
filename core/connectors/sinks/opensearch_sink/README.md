@@ -158,6 +158,11 @@ pins `iggy_headers.<key>` to whatever type the first indexed document uses, so
 a per-kind shape would make every later message using the other kind fail with
 a `mapper_parsing_exception` and be dropped.
 
+Non-string keys are named after their string form, so integer `1` is stored at
+`iggy_headers.1`. If keys in one message stringify alike, one keeps the name and
+each other gets a kind suffix such as `1~int32`, so a query for that key can
+miss that message.
+
 The sink also adds a dynamic template to the index it creates, mapping
 `iggy_headers.*.data` as `keyword`. Without it, OpenSearch's date detection
 would map the first date-like header value (such as `2024-01-01`) as `date`
