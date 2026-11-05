@@ -37,6 +37,7 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 arrow-array = { workspace = true }
 arrow-json = { workspace = true }
+arrow-schema = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
 iceberg = { workspace = true }

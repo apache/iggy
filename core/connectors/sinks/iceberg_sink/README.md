@@ -30,6 +30,7 @@ store_secret_access_key = "password"
 store_region = "us-east-1"
 store_class = "s3"
 store_path_style_access = true
+invalid_rows = "fail"
 ```
 
 ## Configuration Options
@@ -46,8 +47,9 @@ store_path_style_access = true
 - **store_region**: The region of the object storage. Required, including for S3-compatible stores that ignore it.
 - **store_class**: The storage class to use. **Currently, only S3-compatible storage is supported.**
 - **store_path_style_access**: Use path-style S3 URLs (`http://host/bucket/key`). Defaults to `true`, which MinIO-style endpoints require; set to `false` for stores that only accept virtual-hosted-style URLs.
+- **invalid_rows**: What to do with a row that does not match the table schema. `fail`, the default, fails the whole batch. `skip` writes the rows that match and logs each skipped row as a warning with its offset.
 
-All options above are required except the credential pair, `store_path_style_access`, and the unused routing field.
+All options above are required except the credential pair, `store_path_style_access`, `invalid_rows`, and the unused routing field.
 Static routing requires a non-empty `tables` list; dynamic routing requires a non-empty `dynamic_route_field`.
 
 ## Static Routing
@@ -146,7 +148,8 @@ schedule that keeps the time travel you need. Some managed catalogs run it autom
 
 Use `schema = "json"` on the stream. Each JSON object represents a table row; nested objects
 and arrays are supported when they match the table schema. Unknown fields are ignored. Missing
-nullable fields become null; missing required fields or incompatible values fail the table write.
+nullable fields become null. A missing required field or an incompatible value fails the table
+write for the whole batch, unless `invalid_rows = "skip"` leaves out only that row.
 
 Sources that wrap row data in an envelope need a transform when the table schema describes the
 inner row. Otherwise, the Arrow JSON reader maps envelope keys to table columns, producing nulls

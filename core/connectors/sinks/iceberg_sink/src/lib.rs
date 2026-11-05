@@ -26,6 +26,18 @@ mod props;
 mod router;
 mod sink;
 
+/// What the sink does with a row that does not match the table schema.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, StrumDisplay)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum InvalidRows {
+    /// Fail the whole batch.
+    #[default]
+    Fail,
+    /// Write the rows that match, and log each skipped row with its offset.
+    Skip,
+}
+
 #[derive(Debug, Serialize, Deserialize, StrumDisplay)]
 #[serde(rename_all = "lowercase")]
 pub enum IcebergSinkTypes {
@@ -72,6 +84,8 @@ pub struct IcebergSinkConfig {
     /// need it; iceberg 0.10 defaults to the virtual-host style otherwise.
     #[serde(default = "default_true")]
     pub store_path_style_access: bool,
+    #[serde(default)]
+    pub invalid_rows: Option<InvalidRows>,
 }
 
 fn default_true() -> bool {
