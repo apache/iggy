@@ -19,434 +19,624 @@ package tcp
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"log/slog"
-	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
-	"github.com/apache/iggy/foreign/go/internal/util"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 )
 
+const consumerSessionSize = 32
+
+type consumerSession struct {
+	client    vsr.ClientID
+	session   uint64
+	watermark uint64
+}
+
+func (s consumerSession) bytes() []byte {
+	body := make([]byte, consumerSessionSize)
+	binary.LittleEndian.PutUint64(body, s.client.Lo)
+	binary.LittleEndian.PutUint64(body[8:], s.client.Hi)
+	binary.LittleEndian.PutUint64(body[16:], s.session)
+	binary.LittleEndian.PutUint64(body[24:], s.watermark)
+	return body
+}
+
 func (c *IggyTcpClient) LoginUser(ctx context.Context, username string, password string) (*iggcon.IdentityInfo, error) {
-	secret := vsr.NewBindSecret()
-	body, err := vsr.SerializeLoginRegister(username, password, iggcon.Version, secret)
-	if err != nil {
-		return nil, err
-	}
-	return c.register(
-		ctx,
-		uint32(command.LoginRegisterCode),
-		body,
-		secret,
-		NewUsernamePasswordCredentials(username, password),
-	)
+	return c.register(ctx, command.LoginRegisterCode, NewUsernamePasswordCredentials(username, password))
 }
 
 func (c *IggyTcpClient) LoginWithPersonalAccessToken(ctx context.Context, token string) (*iggcon.IdentityInfo, error) {
-	secret := vsr.NewBindSecret()
-	body, err := vsr.SerializeLoginRegisterWithToken(token, iggcon.Version, secret)
-	if err != nil {
-		return nil, err
-	}
-	return c.register(
-		ctx,
-		uint32(command.LoginRegisterWithPATCode),
-		body,
-		secret,
-		NewPersonalAccessTokenCredentials(token),
-	)
+	return c.register(ctx, command.LoginRegisterWithPATCode, NewPersonalAccessTokenCredentials(token))
 }
 
-// register runs the sign-in handshake, binds the session the server assigned,
-// settles the connection on the cluster leader, and remembers the credentials
-// it succeeded with so a reconnect can re-establish the session.
-//
-// The credentials are remembered here rather than by the callers because this
-// is what holds registerMtx: remembered outside it, two concurrent sign-ins
-// could leave A remembered while the session is B, and the next reconnect
-// would sign in as A.
-func (c *IggyTcpClient) register(
-	ctx context.Context,
-	code uint32,
-	body []byte,
-	secret [vsr.BindSecretBytes]byte,
-	credentials Credentials,
-) (*iggcon.IdentityInfo, error) {
-	// One sign-in at a time. BeginRegister runs inside the exchange lock but
-	// Bind runs after it, so two interleaved sign-ins would let the second
-	// BeginRegister reset the identity the first is about to bind: one
-	// committed Register would be orphaned in the server's client table and
-	// the losing caller would see ErrSessionAlreadyBound.
-	c.registerMtx.Lock()
-	defer c.registerMtx.Unlock()
-
-	c.mtx.Lock()
-	clientAddress := c.clientAddress
-	c.mtx.Unlock()
-	c.logger.Info("Iggy client is signing in...", slog.String("client_address", clientAddress))
-
-	if err := c.endBoundSession(ctx); err != nil {
-		return nil, err
+func (c *IggyTcpClient) acquireSignIn(ctx context.Context) error {
+	if ctx == nil {
+		return ierror.ErrNilContext
 	}
-
-	identity, err := c.signIn(ctx, code, body, secret)
-	if err != nil {
-		return nil, err
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-
-	settled, err := c.settleOnLeader(ctx, code, body, secret)
-	if err != nil {
-		return nil, err
+	select {
+	case c.registerGate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.closed:
+		return ierror.ErrClientShutdown
 	}
-	c.rememberLogin(credentials)
-	if settled != nil {
-		return settled, nil
-	}
-	return identity, nil
 }
 
-// signIn runs one sign-in exchange on the current connection and binds the
-// session the server assigned.
-//
-// A failed sign-in never writes the session state: a server-side reject leaves
-// the existing session untouched, and a connection that dies mid-attempt is
-// already reset by invalidateConnLocked.
-func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte, secret [vsr.BindSecretBytes]byte) (*iggcon.IdentityInfo, error) {
-	bp := acquireRequestBuf()
-	defer releaseRequestBuf(bp)
-	frame := append(reserveHeader(*bp), body...)
-	*bp = frame
-
-	response, err := c.exchange(ctx, code, frame)
-	if err != nil {
-		return nil, err
-	}
-
-	registered, err := vsr.DecodeLoginRegister(response)
-	if err != nil {
-		return nil, err
-	}
-
+func (c *IggyTcpClient) register(ctx context.Context, code command.Code, credentials Credentials) (identity *iggcon.IdentityInfo, err error) {
+	// Even an invalid or cancelled explicit attempt leaves the previous owner.
 	c.mtx.Lock()
-	err = c.session.Bind(registered.Session)
-	if err == nil {
-		c.session.SetBindSecret(secret)
-		c.sessionState = iggcon.SessionStateAuthenticated
-		c.sessionUserID = registered.UserID
-		c.clearPollSession()
-		c.loggedOut = false
-	} else {
-		// The server committed a Register this client failed to adopt, so the
-		// connection carries a session the local state does not track. It is
-		// unusable; drop it like any other terminal session failure.
-		c.invalidateConnLocked()
-	}
-	c.mtx.Unlock()
-	if err != nil {
-		return nil, err
-	}
-
-	c.mtx.Lock()
-	signedInAddress := c.clientAddress
-	c.mtx.Unlock()
-	c.logger.Info("Iggy client has signed in successfully.",
-		slog.String("client_address", signedInAddress),
-		slog.String("server_version", registered.ServerVersion))
-	return &iggcon.IdentityInfo{UserId: registered.UserID}, nil
-}
-
-// settleOnLeader moves a freshly signed-in session to the cluster leader.
-//
-// Only the leader accepts replicated commands, and the roster read is
-// auth-gated, so the topology cannot be inspected before a login binds a
-// session. A login dialed at a backup still succeeds (the server forwards the
-// register to the primary); this settlement decides where later requests
-// land, not whether the sign-in works. The redirect retains the session and
-// binds its proof on the leader. Leadership can move between the
-// roster read and the bind, so each authenticated hop rechecks the roster
-// under the shared redirect budget.
-//
-// Returns nil when the client stays where it is.
-func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []byte, secret [vsr.BindSecretBytes]byte) (*iggcon.IdentityInfo, error) {
-	// A roster walk stays on the endpoint it dialed: the settlement below
-	// would put the connection straight back on the node whose partition
-	// replica keeps refusing the walked request. The marker is scoped to the
-	// Connect that owns this sign-in, so a failed walk cannot leak into another.
-	if ctx.Value(skipLeaderSettlement{}) != nil {
-		c.logger.Info("Staying on the dialed node for a partition failover.")
-		return nil, nil
-	}
-
-	var settled *iggcon.IdentityInfo
-	for {
-		// The roster read runs while register holds the sign-in lock, so it must
-		// not enter the reconnect path: the reconnect's automatic sign-in would
-		// deadlock on that lock. The connect scope fails it fast instead.
-		c.mtx.Lock()
-		generation := c.connGeneration
+	select {
+	case <-c.closed:
 		c.mtx.Unlock()
-		redirect, err := c.redirectToLeader(
-			context.WithValue(ctx, connectScoped{}, struct{}{}), generation)
-		if err != nil || !redirect {
-			return settled, err
+		return nil, ierror.ErrClientShutdown
+	default:
+	}
+	c.endRecoveryLocked()
+	c.endSignInEpochLocked(nil)
+	epoch := c.epoch.Load()
+	c.autoLoginBlocked = true
+	c.rememberedLogin = AutoLogin{}
+	c.loggedOut = true
+	c.invalidateSessionLocked()
+	var stopped func(bool)
+	if len(c.registerGate) != 0 {
+		c.session.Reset()
+		stopped = c.links.detach()
+	}
+	c.mtx.Unlock()
+	if stopped != nil {
+		stopped(false)
+	}
+	callerCtx := ctx
+	defer func() {
+		if err == nil {
+			return
 		}
-
-		// The replayed sign-in below owns the session; the redirected Connect
-		// must not sign in on its own, or the replay commits a second Register.
-		if err := c.Connect(suppressAutoLogin(ctx)); err != nil {
-			return nil, err
+		if ended := epoch.err(); ended != nil {
+			err = ended
+		} else if callerCtx != nil && callerCtx.Err() != nil && unanswered(err) {
+			err = callerCtx.Err()
+		} else if callerCtx != nil && callerCtx.Err() == nil && (errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(err, ierror.ErrTransientNotCommitted) && errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+			err = ierror.ErrTransientNotAccepted
 		}
-		settled, err = c.resumeSession(ctx)
-		if err == nil && settled == nil {
-			if code == uint32(command.BindSessionCode) {
-				return nil, ierror.ErrUnauthenticated
-			}
-			settled, err = c.signIn(ctx, code, body, secret)
+		c.mtx.Lock()
+		var stopped func(bool)
+		if c.epoch.Load() == epoch {
+			c.session.Reset()
+			c.invalidateSessionLocked()
+			c.rememberedLogin = AutoLogin{}
+			c.loggedOut = true
+			stopped = c.links.detach()
 		}
+		c.mtx.Unlock()
+		if stopped != nil {
+			stopped(false)
+		}
+	}()
+	if ctx == nil {
+		return nil, ierror.ErrNilContext
+	}
+	ctx, cancel := signInContext(ctx, epoch)
+	defer cancel()
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
+	secret := vsr.NewBindSecret()
+	var body []byte
+	if code == command.LoginRegisterWithPATCode {
+		body, err = vsr.SerializeLoginRegisterWithToken(credentials.personalAccessToken, iggcon.Version, secret)
+	} else {
+		body, err = vsr.SerializeLoginRegister(credentials.username, credentials.password, iggcon.Version, secret)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err = c.acquireSignIn(ctx); err != nil {
+		return nil, err
+	}
+	defer func() { <-c.registerGate }()
+	if err = epoch.err(); err != nil {
+		return nil, err
+	}
+	link := c.links.any()
+	if link == nil {
+		link, err = c.links.connect(ctx)
 		if err != nil {
 			return nil, err
 		}
 	}
-}
-
-// resumeSession preserves the request sequence while authenticating a replacement socket.
-// Only a terminal bind refusal permits a new registration.
-func (c *IggyTcpClient) resumeSession(ctx context.Context) (*iggcon.IdentityInfo, error) {
 	c.mtx.Lock()
-	if !c.session.Bound() {
-		c.mtx.Unlock()
-		return nil, nil
-	}
-	identity := consumerSession{client: c.session.ClientID(), session: c.session.SessionID(), watermark: c.metadataWatermark.Load()}
-	secret := c.session.BindSecret()
+	bound := c.session.Bound()
 	c.mtx.Unlock()
-	body, err := vsr.SerializeBindSession(identity.bytes(), iggcon.Version, secret)
-	if err != nil {
-		return nil, err
-	}
-	frame := append(reserveHeader(nil), body...)
-	response, _, err := c.sendFrame(ctx, uint32(command.BindSessionCode), frame)
-	if errors.Is(err, ierror.ErrUnauthenticated) || errors.Is(err, ierror.ErrStaleClient) {
+	if bound {
+		_, _ = c.readOnLink(ctx, link, command.LogoutUserCode, nil, nil)
 		c.mtx.Lock()
-		c.session.Reset()
+		if err = epoch.err(); err == nil {
+			err = ctx.Err()
+		}
+		var stopped func(bool)
+		if err == nil {
+			c.session.Reset()
+			c.invalidateSessionLocked()
+			stopped = c.links.detach()
+		}
 		c.mtx.Unlock()
-		return nil, nil
+		if stopped != nil {
+			stopped(false)
+		}
+		if err != nil {
+			return nil, err
+		}
+		link, err = c.links.connect(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
+	identity, err = c.signIn(ctx, link, uint32(code), body, secret, credentials, false)
 	if err != nil {
+		var refusal *signInRefusal
+		if errors.As(err, &refusal) {
+			err = refusal.err
+		}
 		return nil, err
 	}
-	bound, err := vsr.DecodeLoginRegister(response)
-	if err != nil {
+	if err = c.refreshRoster(ctx, link); err != nil {
 		return nil, err
 	}
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
-	if bound.Session != identity.session || c.session.ClientID() != identity.client || c.session.SessionID() != identity.session {
-		return nil, ierror.ErrSessionMismatch
+	select {
+	case <-c.closed:
+		return nil, ierror.ErrClientShutdown
+	default:
 	}
-	c.sessionState = iggcon.SessionStateAuthenticated
-	c.sessionUserID = bound.UserID
-	c.loggedOut = false
-	c.publishPollSession()
-	return &iggcon.IdentityInfo{UserId: bound.UserID}, nil
+	if err = epoch.err(); err != nil {
+		return nil, err
+	}
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
+	c.autoLoginBlocked = false
+	c.links.startHeartbeat()
+	return identity, nil
 }
 
-// endBoundSession logs out a live session before a re-login, so the server
-// drops its client-table entry instead of leaving it to be fenced.
-//
-// The logout runs connect-scoped, and a failure it could recover from is
-// swallowed. Both because this call holds registerMtx: a logout that entered
-// the reconnect path would reconnect, sign in with the remembered credentials,
-// and deadlock on that lock. There is nothing to salvage either way -- a
-// session whose logout cannot be delivered died with its socket, and the
-// server fences what it left behind -- and the sign-in that follows replays
-// through its own reconnect.
-func (c *IggyTcpClient) endBoundSession(ctx context.Context) error {
-	c.mtx.Lock()
-	bound := c.session.Bound()
-	c.mtx.Unlock()
-	if !bound {
-		return nil
-	}
+// Registration waits follow their caller owner, including an initial Connect.
+func signInContext(ctx context.Context, epoch *signInEpoch) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(ctx, responseReadTimeout)
+	stop := context.AfterFunc(epoch.ctx, cancel)
+	return context.WithValue(ctx, operationScope{}, epoch), func() { stop(); cancel() }
+}
 
-	err := c.LogoutUser(context.WithValue(ctx, connectScoped{}, struct{}{}))
-	if err == nil {
-		return nil
+func (c *IggyTcpClient) signIn(ctx context.Context, link *tcpLink, code uint32, body []byte, secret [vsr.BindSecretBytes]byte, credentials Credentials, automatic bool) (*iggcon.IdentityInfo, error) {
+	frame := append(reserveHeader(nil), body...)
+	epoch := c.callEpoch(ctx)
+	c.mtx.Lock()
+	if err := epoch.err(); err != nil {
+		c.mtx.Unlock()
+		return nil, err
 	}
-	if !isReconnectable(err) {
+	if err := ctx.Err(); err != nil {
+		c.mtx.Unlock()
+		return nil, err
+	}
+	c.invalidateSessionLocked()
+	err := vsr.StampRequestHeader(c.session, code, frame)
+	fence := c.sessionFence
+	c.mtx.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	request := newOperationFrame(frame, nil)
+	defer request.release()
+	for {
+		reply, sent := link.exchange(ctx, request)
+		if reply.err != nil {
+			if !sent {
+				return nil, ierror.ErrTransientNotAccepted
+			}
+			var eviction *vsr.EvictionError
+			if errors.As(reply.err, &eviction) {
+				return nil, &signInRefusal{err: reply.err}
+			}
+			return nil, reply.err
+		}
+		outcome, decodeErr := vsr.DecodeReplyFor((*[vsr.HeaderSize]byte)(frame), &reply.header, reply.body)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		if errors.Is(outcome.Err, ierror.ErrTransientNotCommitted) || errors.Is(outcome.Err, ierror.ErrTransientNotAccepted) || errors.Is(outcome.Err, ierror.ErrNotPrimary) {
+			if err := c.pause(ctx, replayInterval); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if outcome.Err != nil {
+			return nil, &signInRefusal{err: outcome.Err}
+		}
+		registered, err := vsr.DecodeLoginRegister(outcome.Body)
+		if err != nil {
+			return nil, err
+		}
+		c.mtx.Lock()
+		if c.sessionFence != fence || epoch.over() {
+			c.mtx.Unlock()
+			return nil, ierror.ErrUnauthenticated
+		}
+		if err = ctx.Err(); err != nil {
+			c.mtx.Unlock()
+			return nil, err
+		}
+		if automatic {
+			// A committed password change may have updated this same owner
+			// while its Register was in flight.
+			credentials, _ = c.signInCredentialsLocked()
+		}
+		err = c.session.Bind(registered.Session)
+		if err == nil {
+			c.session.SetBindSecret(secret)
+			c.sessionUserID = registered.UserID
+			c.rememberedLogin = NewAutoLogin(credentials)
+			c.loggedOut = false
+			c.observeMetadata(&reply.header)
+		}
+		c.mtx.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		link.markBound(fence)
+		return &iggcon.IdentityInfo{UserId: registered.UserID}, nil
+	}
+}
+
+func (c *IggyTcpClient) establishSession(ctx context.Context, link *tcpLink) error {
+	if err := c.acquireSignIn(ctx); err != nil {
 		return err
 	}
-
-	c.logger.Debug("The bound session's logout was not delivered; its socket ended it.",
-		slog.Any("error", err))
+	defer func() { <-c.registerGate }()
+	epoch := c.callEpoch(ctx)
 	c.mtx.Lock()
-	c.sessionState = iggcon.SessionStateUnauthenticated
+	if err := epoch.err(); err != nil {
+		c.mtx.Unlock()
+		return err
+	}
+	bound := c.session.Bound()
+	fence := c.sessionFence
+	blocked := c.loggedOut || c.autoLoginBlocked
+	c.mtx.Unlock()
+	if blocked {
+		return nil
+	}
+	if bound {
+		if !link.isBound(fence) {
+			if err := c.bindLink(ctx, link); err != nil {
+				return err
+			}
+		}
+	} else {
+		for {
+			credentials, enabled := c.signInCredentials()
+			if !enabled {
+				return nil
+			}
+			secret := vsr.NewBindSecret()
+			var body []byte
+			var err error
+			code := command.LoginRegisterCode
+			if credentials.personalAccessToken != "" {
+				code = command.LoginRegisterWithPATCode
+				body, err = vsr.SerializeLoginRegisterWithToken(credentials.personalAccessToken, iggcon.Version, secret)
+			} else {
+				body, err = vsr.SerializeLoginRegister(credentials.username, credentials.password, iggcon.Version, secret)
+			}
+			if err != nil {
+				return err
+			}
+			if _, err = c.signIn(ctx, link, uint32(code), body, secret, credentials, true); err == nil {
+				break
+			}
+			var refusal *signInRefusal
+			if errors.As(err, &refusal) {
+				err = refusal.err
+				retry, refused := c.endRefusedSignIn(epoch, credentials, err)
+				if retry {
+					link.close(err)
+					link, err = c.links.connect(ctx)
+					if err != nil {
+						return err
+					}
+					continue
+				}
+				if refused {
+					// Connect returns its own refusal, also when it ended the epoch.
+					link.close(err)
+					return refusal
+				}
+			}
+			link.close(err)
+			return err
+		}
+	}
+	if err := c.refreshRoster(ctx, link); err != nil {
+		return err
+	}
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if err := epoch.err(); err != nil {
+		return err
+	}
+	c.links.startHeartbeat()
+	return nil
+}
+
+func (c *IggyTcpClient) bindLink(ctx context.Context, link *tcpLink) error {
+	select {
+	case link.bindGate <- struct{}{}:
+	case <-ctx.Done():
+		return ierror.ErrTransientNotAccepted
+	case <-link.closed:
+		return ierror.ErrTransientNotAccepted
+	}
+	defer func() { <-link.bindGate }()
+	c.mtx.Lock()
+	if !c.session.Bound() {
+		c.mtx.Unlock()
+		return ierror.ErrUnauthenticated
+	}
+	identity := consumerSession{client: c.session.ClientID(), session: c.session.SessionID(), watermark: c.metadataWatermark.Load()}
+	secret := c.session.BindSecret()
+	fence := c.sessionFence
+	c.mtx.Unlock()
+	if link.isBound(fence) {
+		return nil
+	}
+	body, err := vsr.SerializeBindSession(identity.bytes(), iggcon.Version, secret)
+	if err != nil {
+		return err
+	}
+	for {
+		response, err := c.readOnLink(ctx, link, command.BindSessionCode, body, nil)
+		if errors.Is(err, ierror.ErrTransientNotAccepted) || errors.Is(err, ierror.ErrNotPrimary) {
+			if err = c.pause(ctx, reconnectDelay(replayInterval, 0)); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		bound, err := vsr.DecodeLoginRegister(response)
+		if err != nil {
+			return err
+		}
+		c.mtx.Lock()
+		current := c.sessionFence == fence
+		valid := c.session.ClientID() == identity.client && c.session.SessionID() == identity.session && bound.Session == identity.session
+		c.mtx.Unlock()
+		// A session change during the bind ends the call like one during any
+		// other exchange, so a recovery can restart it.
+		if !current {
+			return ierror.ErrUnauthenticated
+		}
+		if !valid {
+			return ierror.ErrSessionMismatch
+		}
+		link.markBound(fence)
+		return nil
+	}
+}
+
+// resetSession ends the session for a logout or disconnect of the caller.
+func (c *IggyTcpClient) resetSession(forget bool) *signInEpoch {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	c.resetSessionLocked(forget)
+	return c.epoch.Load()
+}
+
+func (c *IggyTcpClient) resetSessionLocked(forget bool) {
+	c.links.stopHeartbeat()
+	c.endRecoveryLocked()
+	c.endSignInEpochLocked(nil)
 	c.session.Reset()
-	c.clearPollSession()
+	c.invalidateSessionLocked()
+	if forget {
+		c.rememberedLogin = AutoLogin{}
+		c.loggedOut = true
+	}
+}
+
+func (c *IggyTcpClient) invalidateSessionLocked() {
+	c.sessionFence++
+	c.operations.reset()
+	c.polls.reset()
 	c.groups.clear()
 	c.topics.clearCounts()
+}
+
+// signInEpoch lasts from one sign-in, logout or disconnect of the caller, or
+// one refusal of the credentials of an automatic sign-in, to the next. A call keeps its
+// starting epoch, so only the SDK's own recovery continues it, and no call goes out
+// under a later sign-in. The client replaces its epoch only under mtx, and a
+// call reads it without the lock as it starts.
+type signInEpoch struct {
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	ended  <-chan struct{}
+}
+
+func newSignInEpoch() *signInEpoch {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	return &signInEpoch{ctx: ctx, cancel: cancel, ended: ctx.Done()}
+}
+
+func (e *signInEpoch) over() bool { return e.err() != nil }
+
+func (e *signInEpoch) err() error { return context.Cause(e.ctx) }
+
+// endSignInEpochLocked also cancels registration waits of the old owner.
+func (c *IggyTcpClient) endSignInEpochLocked(cause error) {
+	epoch := c.epoch.Swap(newSignInEpoch())
+	var failure error = ierror.ErrUnauthenticated
+	if cause != nil {
+		failure = fmt.Errorf("%w: %w", ierror.ErrUnauthenticated, cause)
+	}
+	epoch.cancel(failure)
+}
+
+// endRecoveryLocked stops the automatic sign-in that follows a session loss.
+func (c *IggyTcpClient) endRecoveryLocked() {
+	if c.recoveryCancel != nil {
+		c.recoveryCancel()
+		c.recovery, c.recoveryCancel = nil, nil
+	}
+}
+
+func (c *IggyTcpClient) recoverSession(expected uint64) {
+	c.mtx.Lock()
+	if c.sessionFence != expected || !c.session.Bound() {
+		c.mtx.Unlock()
+		return
+	}
+	if c.recoveryCancel != nil {
+		c.recoveryCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.recovery, c.recoveryCancel = ctx, cancel
+	c.session.Reset()
+	c.invalidateSessionLocked()
 	c.mtx.Unlock()
-	// The session this sign-in belonged to is over either way, so the
-	// credentials that established it go with it. Kept, a sign-in that then
-	// fails would leave them behind for the next dropped request to replay --
-	// signing the old user back in after the caller asked for another one.
-	c.forgetLogin()
-	return nil
+	c.links.disconnect(false)
+	go func() {
+		defer cancel()
+		c.connectMu.Lock()
+		attempt := c.connectionAttempt
+		c.connectMu.Unlock()
+		if attempt != nil {
+			select {
+			case <-attempt.done:
+			case <-ctx.Done():
+				return
+			}
+		}
+		// The session loss stopped every link and the heartbeat, so only
+		// this task brings the client back. A sign-in that the server never
+		// answered, or refused for a reason other than its credentials, goes
+		// again, until a session, a refusal of the credentials, a sign-in by
+		// the caller or a disconnect ends the recovery.
+		for retry := uint32(0); ; retry++ {
+			signInCtx, endSignIn := context.WithTimeout(ctx, responseReadTimeout)
+			err := c.connect(signInCtx)
+			endSignIn()
+			var refusal *signInRefusal
+			owed := unanswered(err) || errors.As(err, &refusal) && !credentialRefused(refusal.err)
+			if err == nil || !c.config.reconnection.enabled || !owed ||
+				c.pause(ctx, reconnectDelay(c.config.reconnection.interval, retry)) != nil {
+				return
+			}
+		}
+	}()
+}
+
+// signInRefusal wraps the refusal of a sign-in by the server, an eviction or a
+// status. It tells the refusal apart from the local errors of signIn, such as
+// the 40 of a sign-in that a newer one overtook.
+type signInRefusal struct{ err error }
+
+func (r *signInRefusal) Error() string { return r.err.Error() }
+func (r *signInRefusal) Unwrap() error { return r.err }
+
+// endRefusedSignIn retries only credentials updated by this same owner.
+// A refusal of its current credentials ends the epoch and blocks fallback until
+// an explicit login. Any other refusal keeps the epoch, so the session stays
+// owed. refused reports whether the refusal answers the current epoch. It is
+// false when a newer owner ended the epoch first.
+func (c *IggyTcpClient) endRefusedSignIn(epoch *signInEpoch, attempted Credentials, refusal error) (retry, refused bool) {
+	c.logger.Error("The server refused the automatic sign-in", slog.Any("error", refusal))
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if c.epoch.Load() != epoch {
+		return false, false
+	}
+	if !credentialRefused(refusal) {
+		return false, true
+	}
+	current, enabled := c.signInCredentialsLocked()
+	if enabled && current != attempted {
+		return true, false
+	}
+	c.rememberedLogin = AutoLogin{}
+	c.autoLoginBlocked = true
+	c.loggedOut = true
+	c.endSignInEpochLocked(refusal)
+	return false, true
+}
+
+func credentialRefused(refusal error) bool {
+	return errors.Is(refusal, ierror.ErrInvalidCredentials) || errors.Is(refusal, ierror.ErrInvalidUsername) ||
+		errors.Is(refusal, ierror.ErrInvalidPassword) || errors.Is(refusal, ierror.ErrUnauthenticated) ||
+		errors.Is(refusal, ierror.ErrUserInactive) || errors.Is(refusal, ierror.ErrInvalidPersonalAccessToken) ||
+		errors.Is(refusal, ierror.ErrPersonalAccessTokenExpired) || errors.Is(refusal, ierror.ErrInvalidFormat)
+}
+
+// unanswered reports whether a sign-in failed before the server answered it,
+// so trying it again can succeed.
+func unanswered(err error) bool {
+	return retryBeforeAdmission(err) || errors.Is(err, ierror.ErrCannotEstablishConnection) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func (c *IggyTcpClient) LogoutUser(ctx context.Context) error {
+	if ctx == nil {
+		return ierror.ErrNilContext
+	}
+	ctx, cancel := c.operationContext(ctx)
+	defer cancel()
 	if _, err := c.do(ctx, &command.LogoutUser{}); err != nil {
 		return err
 	}
-	c.mtx.Lock()
-	c.sessionState = iggcon.SessionStateUnauthenticated
-	c.session.Reset()
-	c.clearPollSession()
-	// The sign-out is caller intent: it suppresses the automatic sign-in on
-	// the reconnect path until the caller explicitly signs in again.
-	c.loggedOut = true
-	c.groups.clear()
-	c.topics.clearCounts()
-	c.mtx.Unlock()
-	c.forgetLogin()
+	c.finishLogout(c.callEpoch(ctx))
 	return nil
 }
 
-// HandleLeaderRedirection moves the client to the leader the cluster roster
-// names, tearing down whichever connection it is on.
-func (c *IggyTcpClient) HandleLeaderRedirection(ctx context.Context) (bool, error) {
+func (c *IggyTcpClient) finishLogout(epoch *signInEpoch) {
 	c.mtx.Lock()
-	generation := c.connGeneration
-	c.mtx.Unlock()
-	return c.redirectToLeader(ctx, generation)
-}
-
-// redirectToLeader moves the client to the leader, tearing down the
-// connection generation the redirect was decided on.
-//
-// A caller whose connection was replaced while the roster was being read has
-// nothing left to redirect: closing the replacement would strand the requests
-// running on it, and reporting a redirect would have the caller replay on a
-// node it never chose. It is told no redirect happened, and its re-attempt
-// reads the roster over the connection it now has.
-func (c *IggyTcpClient) redirectToLeader(ctx context.Context, generation uint64) (bool, error) {
-	// Clone current address
-	c.mtx.Lock()
-	currentAddress := c.currentServerAddress
-	c.mtx.Unlock()
-
-	leaderAddress, serverAddresses, err := util.CheckAndRedirectToLeader(
-		ctx,
-		c,
-		currentAddress,
-		iggcon.Tcp,
-		c.logger,
-	)
-	if err != nil {
-		return false, err
-	}
-	if len(serverAddresses) > 0 {
-		c.mtx.Lock()
-		c.knownServerAddresses = serverAddresses
+	if c.epoch.Load() != epoch {
 		c.mtx.Unlock()
+		return
 	}
-
-	if leaderAddress == "" {
-		// No leader redirection
-		c.mtx.Lock()
-		c.leaderRedirectionState.Reset()
-		c.mtx.Unlock()
-
-		return false, nil
-	}
-
-	c.mtx.Lock()
-	if !c.leaderRedirectionState.CanRedirect() {
-		c.mtx.Unlock()
-		c.logger.Warn("Maximum leader redirections reached, continuing with current connection")
-		return false, nil
-	}
+	c.resetSessionLocked(true)
+	stopped := c.links.detach()
 	c.mtx.Unlock()
-
-	torn, err := c.disconnectGeneration(generation)
-	if err != nil {
-		return false, err
-	}
-	if !torn {
-		c.logger.Debug("Dropping a redirect decided on a replaced connection.")
-		return false, nil
-	}
-
-	c.mtx.Lock()
-	c.leaderRedirectionState.IncrementRedirect(leaderAddress)
-	// Clear connectedAt to avoid reestablish delay during redirection
-	c.connectedAt = time.Time{}
-	c.currentServerAddress = leaderAddress
-	c.mtx.Unlock()
-
-	return true, nil
+	stopped(true)
 }
 
-// settleOnNextEndpoint moves the connection to the roster endpoint after the
-// current one, for a request the current node keeps refusing to admit.
-// Metadata and partition consensus groups elect independently, so the
-// metadata leader can hold a follower replica of the partition a request
-// targets, and only walking the roster reaches that group's primary. The
-// refusal marks the request as never admitted and safe to re-issue anywhere;
-// the caller's request budget bounds the walk.
-func (c *IggyTcpClient) settleOnNextEndpoint(visited map[string]struct{}) (bool, error) {
+// signInCredentials are the last sign-in, else the configured AutoLogin. A
+// client recovers as whoever it last signed in as, so its calls never
+// continue as another user.
+func (c *IggyTcpClient) signInCredentials() (Credentials, bool) {
 	c.mtx.Lock()
-	current := c.currentServerAddress
-	roster := append([]string(nil), c.knownServerAddresses...)
-	c.mtx.Unlock()
-
-	next := nextRosterEndpoint(current, roster, visited)
-	if next == "" {
-		return false, nil
-	}
-
-	c.logger.Info(
-		"The request keeps being refused while the roster names this node the metadata leader; trying the next cluster node.",
-		slog.String("current", current),
-		slog.String("next", next),
-	)
-	if err := c.disconnect(); err != nil {
-		return false, err
-	}
-
-	c.mtx.Lock()
-	c.connectedAt = time.Time{}
-	c.currentServerAddress = next
-	c.mtx.Unlock()
-	return true, nil
+	defer c.mtx.Unlock()
+	return c.signInCredentialsLocked()
 }
 
-func nextRosterEndpoint(current string, roster []string, visited map[string]struct{}) string {
-	currentIndex := -1
-	for index, endpoint := range roster {
-		if endpoint == current {
-			currentIndex = index
-			visited[endpoint] = struct{}{}
-			break
-		}
+func (c *IggyTcpClient) signInCredentialsLocked() (Credentials, bool) {
+	if c.autoLoginBlocked {
+		return Credentials{}, false
 	}
-
-	next := ""
-	for offset := 1; offset <= len(roster); offset++ {
-		index := (currentIndex + offset) % len(roster)
-		candidate := roster[index]
-		if _, seen := visited[candidate]; seen || candidate == current {
-			continue
-		}
-		next = candidate
-		break
+	if c.rememberedLogin.enabled {
+		return c.rememberedLogin.credentials, true
 	}
-	if next == "" || next == current {
-		return ""
-	}
-	visited[next] = struct{}{}
-	return next
+	return c.config.autoLogin.credentials, c.config.autoLogin.enabled
 }
+func (c *IggyTcpClient) forgetLogin() { c.mtx.Lock(); c.rememberedLogin = AutoLogin{}; c.mtx.Unlock() }

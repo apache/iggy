@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::{
-    AutoLogin, IggyDuration, IggyError, NonZeroIggyDuration, QuicClientConfig,
-    validate_server_address,
+    AutoLogin, IggyDuration, IggyError, NonZeroIggyDuration, PendingOperationsConfig,
+    QuicClientConfig, validate_server_address,
 };
 
 /// Builder for the QUIC client configuration.
@@ -28,7 +28,7 @@ use crate::{
 /// - `server_name`: Default is "localhost".
 /// - `auto_login`: Default is AutoLogin::Disabled.
 /// - `reconnection`: Default is enabled unlimited retries and 1 second interval.
-/// - `response_buffer_size`: Default is 10MB (10,000,000 bytes).
+/// - `response_buffer_size`: Default is a reply that holds the largest message, about 64 MB.
 /// - `max_concurrent_bidi_streams`: Default is 10,000 streams.
 /// - `datagram_send_buffer_size`: Default is 100,000 bytes.
 /// - `initial_mtu`: Default is 1200 bytes.
@@ -60,6 +60,12 @@ impl QuicClientConfigBuilder {
         self
     }
 
+    /// Sets client-wide active and retained mutation limits.
+    pub fn with_pending_operations(mut self, pending_operations: PendingOperationsConfig) -> Self {
+        self.config.pending_operations = pending_operations;
+        self
+    }
+
     /// Sets the auto sign in during connection.
     pub fn with_auto_sign_in(mut self, auto_sign_in: AutoLogin) -> Self {
         self.config.auto_login = auto_sign_in;
@@ -83,13 +89,13 @@ impl QuicClientConfigBuilder {
         self
     }
 
-    /// Sets the interval between retries when connecting to the server.
+    /// Sets the full-jitter exponential backoff base, capped at 10 seconds.
     pub fn with_reconnection_interval(mut self, interval: NonZeroIggyDuration) -> Self {
         self.config.reconnection.interval = interval;
         self
     }
 
-    /// Sets the cooldown before reconnecting after a previously successful connection.
+    /// Sets the stable connection duration that resets the retry count and backoff.
     pub fn with_reestablish_after(mut self, reestablish_after: IggyDuration) -> Self {
         self.config.reconnection.reestablish_after = reestablish_after;
         self

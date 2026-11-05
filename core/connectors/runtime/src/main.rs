@@ -32,7 +32,7 @@ use dlopen2::wrapper::{Container, WrapperApi};
 use dotenvy::dotenv;
 use error::RuntimeError;
 use figlet_rs::FIGlet;
-use iggy::prelude::{Client, IggyConsumer, IggyProducer};
+use iggy::prelude::{Client, IggyClient, IggyConsumer, IggyProducer};
 use iggy_connector_sdk::{
     StreamDecoder, StreamEncoder,
     api::ConnectorStatus,
@@ -57,10 +57,13 @@ mod benchmark;
 pub(crate) mod configs;
 pub(crate) mod context;
 pub(crate) mod error;
+mod exactly_once;
 mod log;
 mod manager;
 pub(crate) mod metrics;
+mod plugin_instance;
 mod sink;
+mod sink_delivery;
 mod source;
 mod state;
 pub(crate) mod stats;
@@ -137,6 +140,17 @@ pub(crate) struct SinkApi {
     ) -> i32,
     iggy_sink_close: extern "C" fn(id: u32) -> i32,
     iggy_sink_version: extern "C" fn() -> *const std::ffi::c_char,
+    // Optional, so that plugins built before the delivery contract still load.
+    iggy_sink_enable_at_least_once: Option<extern "C" fn(id: u32, version: u32) -> i32>,
+    iggy_sink_flush: Option<
+        extern "C" fn(
+            id: u32,
+            topic_meta_ptr: *const u8,
+            topic_meta_len: usize,
+            partitions_ptr: *const u8,
+            partitions_len: usize,
+        ) -> i32,
+    >,
 }
 
 fn print_ascii_art(text: &str) {
@@ -185,7 +199,6 @@ fn print_config_env_vars() -> std::io::Result<()> {
         let plugin_config = format!("{prefix}{PLUGIN_CONFIG_ENV_SEGMENT}<FIELD>");
         templates
             .iter()
-            .filter(|template| !matches!(template.env_name, "KEY" | "VERSION"))
             .map(move |template| format!("{prefix}{}", template.env_name))
             .chain(std::iter::once(plugin_config))
     });
@@ -248,7 +261,7 @@ async fn run() -> Result<(), RuntimeError> {
     .await?;
 
     let sinks_config = connectors_config.sinks();
-    let (sinks, failed_sinks) = sink::init(sinks_config.clone(), &iggy_clients.consumer).await?;
+    let (sinks, failed_sinks) = sink::init(sinks_config.clone(), &iggy_clients).await?;
 
     let mut sink_wrappers = vec![];
     let mut sink_containers_by_key: HashMap<String, Arc<Container<SinkApi>>> = HashMap::new();
@@ -387,7 +400,6 @@ async fn run() -> Result<(), RuntimeError> {
     }
 
     iggy_clients.producer.shutdown().await?;
-    iggy_clients.consumer.shutdown().await?;
     info!("All connectors closed. Runtime shutdown complete.");
     Ok(())
 }
@@ -522,9 +534,11 @@ struct SinkConnectorPlugin {
     version: String,
     config_format: Option<ConfigFormat>,
     consumers: Vec<SinkConnectorConsumer>,
+    client: Option<Arc<IggyClient>>,
     error: Option<String>,
     verbose: bool,
     benchmark: bool,
+    delivery: Option<sink_delivery::Delivery>,
 }
 
 struct SinkConnectorConsumer {
@@ -584,6 +598,8 @@ struct SourceConnectorPlugin {
 struct SourceConnectorProducer {
     encoder: Arc<dyn StreamEncoder>,
     producer: IggyProducer,
+    /// Set when the source delivers exactly once. See `exactly_once`.
+    exactly_once: Option<exactly_once::ExactlyOnce>,
 }
 
 struct SourceConnectorWrapper {

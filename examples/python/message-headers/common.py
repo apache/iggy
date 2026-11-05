@@ -25,11 +25,13 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from apache_iggy import (
+    CommitPolicy,
     Consumer,
     HeaderKey,
     HeaderValue,
     IggyClient,
     PollingStrategy,
+    PollOptions,
     ReceiveMessage,
     StreamDetails,
     TopicDetails,
@@ -129,11 +131,7 @@ async def init_system(client: IggyClient) -> None:
     logger.info(f"Creating topic {TOPIC_NAME} in stream {STREAM_NAME}")
     topic: TopicDetails | None = await client.get_topic(STREAM_NAME, TOPIC_NAME)
     if topic is None:
-        await client.create_topic(
-            stream=STREAM_NAME,
-            partitions_count=1,
-            name=TOPIC_NAME,
-        )
+        await client.create_topic(stream=STREAM_NAME, name=TOPIC_NAME)
         logger.info("Topic was created successfully.")
     else:
         logger.warning(f"Topic {topic.name} already exists with ID {topic.id}")
@@ -192,25 +190,27 @@ async def consume_messages(
     while consumed_batches < BATCHES_LIMIT:
         try:
             logger.debug("Polling for messages...")
-            polled_messages = await client.poll_messages(
+            polled = await client.poll_messages(
                 stream=STREAM_NAME,
                 topic=TOPIC_NAME,
-                consumer=Consumer.Single(consumer_name),
                 partition_id=PARTITION_ID,
+                consumer=Consumer.Single(consumer_name),
                 polling_strategy=PollingStrategy.Next(),
-                count=MESSAGES_PER_BATCH,
-                auto_commit=True,
+                options=PollOptions(
+                    count=MESSAGES_PER_BATCH,
+                    commit=CommitPolicy.OnRead(),
+                ),
             )
-            if not polled_messages:
+            if not polled.messages:
                 logger.info("No messages found in current poll")
                 await asyncio.sleep(interval)
                 continue
 
-            for message in polled_messages:
+            for message in polled.messages:
                 handle_message(message)
 
             consumed_batches += 1
-            logger.info(f"Consumed {len(polled_messages)} message(s).")
+            logger.info(f"Consumed {len(polled.messages)} message(s).")
             await asyncio.sleep(interval)
         except Exception as error:
             logger.exception(f"Exception occurred while consuming messages: {error}")

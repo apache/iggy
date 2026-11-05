@@ -17,8 +17,7 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
-use iggy_common::SegmentClient;
-use iggy_common::{Identifier, IggyError};
+use iggy_common::{Identifier, IggyError, SegmentClient};
 
 #[async_trait]
 impl SegmentClient for ClientWrapper {
@@ -29,32 +28,10 @@ impl SegmentClient for ClientWrapper {
         partition_id: u32,
         segments_count: u32,
     ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .delete_segments(stream_id, topic_id, partition_id, segments_count)
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .delete_segments(stream_id, topic_id, partition_id, segments_count)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .delete_segments(stream_id, topic_id, partition_id, segments_count)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .delete_segments(stream_id, topic_id, partition_id, segments_count)
-                    .await
-            }
-            ClientWrapper::WebSocket(client) => {
-                client
-                    .delete_segments(stream_id, topic_id, partition_id, segments_count)
-                    .await
-            }
-        }
+        super::dispatch_client!(
+            self,
+            SegmentClient::delete_segments(stream_id, topic_id, partition_id, segments_count)
+        )
+        .await
     }
 }

@@ -20,10 +20,14 @@
 package org.apache.iggy.client.async;
 
 import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
+import org.apache.iggy.stream.StreamOptions;
+import org.apache.iggy.stream.StreamUpdate;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
@@ -88,40 +92,68 @@ public interface StreamsClient {
     CompletableFuture<List<StreamBase>> getStreams();
 
     /**
-     * Creates a new stream with the given name.
+     * Creates a new stream with the given name and no options.
      *
      * <p>The stream ID is assigned by the server. Stream names must be unique across
-     * the server.
+     * the server. A server with encryption enabled generates the stream's own data key.
      *
      * @param name the name for the new stream
      * @return a {@link CompletableFuture} that completes with the created {@link StreamDetails}
      * @throws org.apache.iggy.exception.IggyException if a stream with the same name
      *         already exists
      */
-    CompletableFuture<StreamDetails> createStream(String name);
+    default CompletableFuture<StreamDetails> createStream(String name) {
+        return createStream(name, StreamOptions.empty());
+    }
 
     /**
-     * Updates the name of an existing stream identified by its numeric ID.
+     * Creates a new stream with typed options, such as its own encryption key of 32 random bytes.
+     *
+     * <p>The key travels inside the request over this client's transport, so protecting it on the
+     * network is the job of TLS. The server never returns it, only its source and fingerprints.
+     *
+     * @param name    the name for the new stream
+     * @param options the stream's options
+     * @return a {@link CompletableFuture} that completes with the created {@link StreamDetails}
+     */
+    default CompletableFuture<StreamDetails> createStream(String name, StreamOptions options) {
+        return createStream(name, options.entries());
+    }
+
+    /**
+     * Creates a new stream with options keyed by option name, for keys newer than this build.
+     *
+     * <p>The server refuses a key outside its catalog by name. Prefer {@link StreamOptions} for the
+     * keys this build knows.
+     *
+     * @param name    the name for the new stream
+     * @param options option values keyed by option name
+     * @return a {@link CompletableFuture} that completes with the created {@link StreamDetails}
+     */
+    CompletableFuture<StreamDetails> createStream(String name, Map<String, HeaderValue> options);
+
+    /**
+     * Updates an existing stream identified by its numeric ID.
      *
      * <p>This is a convenience overload that wraps the numeric ID into a {@link StreamId}.
      *
      * @param streamId the numeric stream identifier
-     * @param name     the new name for the stream
+     * @param update   what to change, every key left out keeps its value
      * @return a {@link CompletableFuture} that completes when the update is done
      */
-    default CompletableFuture<Void> updateStream(Long streamId, String name) {
-        return updateStream(StreamId.of(streamId), name);
+    default CompletableFuture<Void> updateStream(Long streamId, StreamUpdate update) {
+        return updateStream(StreamId.of(streamId), update);
     }
 
     /**
-     * Updates the name of an existing stream.
+     * Updates an existing stream: renames it. Its encryption key cannot change or be reset.
      *
      * @param streamId the stream identifier (numeric or string-based)
-     * @param name     the new name for the stream
+     * @param update   what to change, every key left out keeps its value
      * @return a {@link CompletableFuture} that completes when the update is done
      * @throws org.apache.iggy.exception.IggyException if the stream does not exist
      */
-    CompletableFuture<Void> updateStream(StreamId streamId, String name);
+    CompletableFuture<Void> updateStream(StreamId streamId, StreamUpdate update);
 
     /**
      * Deletes a stream and all of its topics, partitions, and messages by numeric ID.

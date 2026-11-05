@@ -24,6 +24,9 @@ services:
       dockerfile: core/server/Dockerfile
     container_name: iggy-server
     restart: unless-stopped
+    environment:
+      - IGGY_ROOT_USERNAME=iggy
+      - IGGY_ROOT_PASSWORD=iggy
     networks:
       - iggy
     ports:

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
 
@@ -23,7 +24,9 @@ use secrecy::SecretString;
 use tracing::warn;
 
 use crate::bridge::error::BridgeError;
+use crate::bridge::nodes::KnownNodes;
 use crate::bridge::topic_map::{TopicMapping, validate_identifier_name};
+use crate::env::parse_bool;
 
 /// Iggy address used when `IGGY_KAFKA_IGGY_ADDR` is unset.
 ///
@@ -37,6 +40,69 @@ pub(crate) const DEFAULT_IGGY_ADDR: &str = "127.0.0.1:8090";
 const DEFAULT_IGGY_USERNAME: &str = "iggy";
 /// Iggy's default `message_bus.max_message_size`.
 pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 64 * 1024 * 1024;
+/// Fetch requests that read from Iggy at once, when `IGGY_KAFKA_FETCH_SLOTS` is unset.
+pub const DEFAULT_FETCH_SLOTS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+/// Most read slots. Each opens an Iggy session at startup, and Iggy holds 8192 for every client
+/// of the cluster, so a typo cannot take them or the memory of their clients.
+pub const MAX_FETCH_SLOTS: usize = 256;
+
+/// How the gateway reaches Iggy: the bridge's own clients and the SASL credential check alike.
+///
+/// Separate from the gateway's own listener security. A deployment can terminate TLS on the Kafka
+/// side and still speak plain TCP to a co-located Iggy, or the reverse, and the two are configured
+/// independently because they protect different hops.
+#[derive(Debug, Clone, Default)]
+pub struct IggyTls {
+    pub enabled: bool,
+    /// Name checked against the server certificate. Empty means derive it from the address.
+    pub domain: String,
+    /// PEM roots to trust. Unset uses the SDK's bundled roots, not the system trust store.
+    pub ca_file: Option<String>,
+}
+
+impl IggyTls {
+    /// The `IGGY_KAFKA_*` vars [`Self::from_env`] reads.
+    pub const KNOWN_ENV_VARS: &'static [&'static str] = &[
+        "IGGY_KAFKA_IGGY_TLS_ENABLED",
+        "IGGY_KAFKA_IGGY_TLS_DOMAIN",
+        "IGGY_KAFKA_IGGY_TLS_CA_FILE",
+    ];
+
+    /// Reads the transport security of the Iggy hop from the environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the offending variable when `IGGY_KAFKA_IGGY_TLS_ENABLED` is set
+    /// to anything but `true` or `false`, or when material is configured with the switch off.
+    /// Defaulting a mistyped security switch to off is how a deployment ends up sending
+    /// passwords in the clear while believing it does not.
+    pub fn from_env() -> Result<Self, String> {
+        // Unset reads as off; only a value that is set and unrecognised is an error, which is
+        // what `parse_bool` decides for every switch in this gateway.
+        let enabled = match std::env::var("IGGY_KAFKA_IGGY_TLS_ENABLED") {
+            Ok(raw) => parse_bool("IGGY_KAFKA_IGGY_TLS_ENABLED", &raw)?,
+            Err(_) => false,
+        };
+        let domain = std::env::var("IGGY_KAFKA_IGGY_TLS_DOMAIN").unwrap_or_default();
+        let ca_file = std::env::var("IGGY_KAFKA_IGGY_TLS_CA_FILE").ok();
+        // Configuring TLS material and leaving the switch off is the same "believes TLS is on"
+        // mistake the value check above exists to catch, reached through the unset path instead of
+        // a typo. Silently ignoring it would send credentials in the clear.
+        if !enabled && (!domain.is_empty() || ca_file.is_some()) {
+            return Err(
+                "IGGY_KAFKA_IGGY_TLS_DOMAIN or IGGY_KAFKA_IGGY_TLS_CA_FILE is set but \
+                 IGGY_KAFKA_IGGY_TLS_ENABLED is not true; the connection to Iggy would be in the \
+                 clear despite the TLS configuration"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            enabled,
+            domain,
+            ca_file,
+        })
+    }
+}
 
 /// How many producers get an Iggy session of their own, and how long one stays open unused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +123,36 @@ impl Default for ProduceSessionLimits {
     }
 }
 
+impl ProduceSessionLimits {
+    /// The defaults, with `IGGY_KAFKA_PRODUCE_SESSIONS` and `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS`
+    /// applied.
+    ///
+    /// # Errors
+    ///
+    /// [`BridgeError::InvalidConfig`] if either does not parse.
+    pub fn from_env() -> Result<Self, BridgeError> {
+        let mut limits = Self::default();
+        if let Ok(value) = std::env::var("IGGY_KAFKA_PRODUCE_SESSIONS") {
+            limits.max = value.parse().map_err(|_| {
+                BridgeError::InvalidConfig(format!(
+                    "IGGY_KAFKA_PRODUCE_SESSIONS '{value}' is not a count, for example 256"
+                ))
+            })?;
+        }
+        if let Ok(value) = std::env::var("IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS") {
+            // 0 would close a session between two requests of a busy producer.
+            let seconds = value.parse().ok().filter(|seconds| *seconds > 0);
+            limits.idle = seconds.map(Duration::from_secs).ok_or_else(|| {
+                BridgeError::InvalidConfig(format!(
+                    "IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS '{value}' is not a number of seconds \
+                     above 0, for example 600"
+                ))
+            })?;
+        }
+        Ok(limits)
+    }
+}
+
 /// Connection + topic-mapping config for [`IggyBridge`](crate::bridge::iggy_bridge::IggyBridge).
 ///
 /// `Debug` is safe to derive: `password` is `SecretString`, which redacts on `Debug` by design
@@ -70,7 +166,20 @@ pub struct IggyBridgeConfig {
     pub topic_mapping: TopicMapping,
     /// Iggy's `message_bus.max_message_size`, in bytes. Larger partitions answer 10.
     pub max_message_size: u64,
+    /// Fetch requests that read from Iggy at once, each on an Iggy client of its own. At most
+    /// [`MAX_FETCH_SLOTS`], which [`IggyBridge::connect`](crate::bridge::IggyBridge::connect)
+    /// checks too.
+    pub fetch_slots: NonZeroUsize,
+    /// Transport security of every client the bridge opens.
+    pub tls: IggyTls,
     pub produce_sessions: ProduceSessionLimits,
+    /// Pass the producer of an idempotent Kafka batch to Iggy, so the partition writes the batch
+    /// once. Off by default, because released consumers cannot read such batches. When off, a
+    /// retry of an idempotent producer can write its records twice.
+    pub idempotent_producers: bool,
+    /// The nodes of the last roster the bridge read, which each new client dials after `address`.
+    /// No variable sets it: the bridge fills it, and every clone of this config shares it.
+    pub nodes: KnownNodes,
 }
 
 impl IggyBridgeConfig {
@@ -89,8 +198,13 @@ impl IggyBridgeConfig {
         "IGGY_KAFKA_IGGY_STREAM",
         "IGGY_KAFKA_TOPIC_MAP_PATH",
         "IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE",
+        "IGGY_KAFKA_IGGY_TLS_ENABLED",
+        "IGGY_KAFKA_IGGY_TLS_DOMAIN",
+        "IGGY_KAFKA_IGGY_TLS_CA_FILE",
+        "IGGY_KAFKA_FETCH_SLOTS",
         "IGGY_KAFKA_PRODUCE_SESSIONS",
         "IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS",
+        "IGGY_KAFKA_IDEMPOTENT_PRODUCERS",
     ];
 
     /// Builds config from `IGGY_KAFKA_*` env vars, defaulting to the Iggy server's own
@@ -99,8 +213,8 @@ impl IggyBridgeConfig {
     /// `IGGY_KAFKA_IGGY_PASSWORD` has no default and must be set explicitly. `iggy-server` only
     /// provisions the well-known `iggy`/`iggy` root credentials when started with
     /// `--with-default-root-credentials` (`args.rs`, itself documented "INSECURE - FOR DEVELOPMENT
-    /// ONLY!"); without that flag it generates a random password (`boot/credentials.rs`) that no
-    /// constant here could ever guess. Defaulting the password to `"iggy"` would make this bridge
+    /// ONLY!"). Otherwise the operator supplies `IGGY_ROOT_PASSWORD`, which no constant here could
+    /// ever guess. Defaulting the password to `"iggy"` would make this bridge
     /// silently authenticate as root, with the credential in no config file and no log, on any
     /// server that does happen to run dev-flagged - the failure mode of getting it wrong is a
     /// loud, immediate auth rejection instead.
@@ -117,7 +231,8 @@ impl IggyBridgeConfig {
     /// `IGGY_KAFKA_IGGY_USERNAME` is set but empty, or if `IGGY_KAFKA_TOPIC_MAP_PATH` is set but
     /// the file is missing, fails to parse, or fails validation (e.g. a malformed mapping key or
     /// an empty `default_stream`), or if `IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE`,
-    /// `IGGY_KAFKA_PRODUCE_SESSIONS` or `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` does not parse.
+    /// `IGGY_KAFKA_FETCH_SLOTS`, `IGGY_KAFKA_PRODUCE_SESSIONS`,
+    /// `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` or `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` does not parse.
     pub fn from_env() -> Result<Self, BridgeError> {
         let address =
             std::env::var("IGGY_KAFKA_IGGY_ADDR").unwrap_or_else(|_| DEFAULT_IGGY_ADDR.to_string());
@@ -133,9 +248,9 @@ impl IggyBridgeConfig {
         }
         let password = std::env::var("IGGY_KAFKA_IGGY_PASSWORD").map_err(|_| {
             BridgeError::InvalidConfig(
-                "IGGY_KAFKA_IGGY_PASSWORD must be set - iggy-server generates a random root \
-                 password unless started with --with-default-root-credentials, so there is no \
-                 safe default to fall back to"
+                "IGGY_KAFKA_IGGY_PASSWORD must be set: the iggy-server root password is the \
+                 operator's own unless started with --with-default-root-credentials, so there is \
+                 no safe default to fall back to"
                     .to_string(),
             )
         })?;
@@ -186,24 +301,29 @@ impl IggyBridgeConfig {
                 })?,
         };
 
-        let mut produce_sessions = ProduceSessionLimits::default();
-        if let Ok(value) = std::env::var("IGGY_KAFKA_PRODUCE_SESSIONS") {
-            produce_sessions.max = value.parse().map_err(|_| {
-                BridgeError::InvalidConfig(format!(
-                    "IGGY_KAFKA_PRODUCE_SESSIONS '{value}' is not a count, for example 256"
-                ))
-            })?;
-        }
-        if let Ok(value) = std::env::var("IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS") {
-            // 0 would close a session between two requests of a busy producer.
-            let seconds = value.parse().ok().filter(|seconds| *seconds > 0);
-            produce_sessions.idle = seconds.map(Duration::from_secs).ok_or_else(|| {
-                BridgeError::InvalidConfig(format!(
-                    "IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS '{value}' is not a number of seconds \
-                     above 0, for example 600"
-                ))
-            })?;
-        }
+        let fetch_slots = match std::env::var("IGGY_KAFKA_FETCH_SLOTS") {
+            Err(_) => DEFAULT_FETCH_SLOTS,
+            // With 0, no Fetch could read.
+            Ok(value) => value
+                .parse::<NonZeroUsize>()
+                .ok()
+                .filter(|slots| slots.get() <= MAX_FETCH_SLOTS)
+                .ok_or_else(|| {
+                    BridgeError::InvalidConfig(format!(
+                        "IGGY_KAFKA_FETCH_SLOTS '{value}' is not a count from 1 to \
+                         {MAX_FETCH_SLOTS}, for example 4"
+                    ))
+                })?,
+        };
+
+        let tls = IggyTls::from_env().map_err(BridgeError::InvalidConfig)?;
+        let produce_sessions = ProduceSessionLimits::from_env()?;
+
+        let idempotent_producers = match std::env::var("IGGY_KAFKA_IDEMPOTENT_PRODUCERS") {
+            Ok(raw) => parse_bool("IGGY_KAFKA_IDEMPOTENT_PRODUCERS", &raw)
+                .map_err(BridgeError::InvalidConfig)?,
+            Err(_) => false,
+        };
 
         Ok(Self {
             address,
@@ -211,7 +331,11 @@ impl IggyBridgeConfig {
             password: SecretString::from(password),
             topic_mapping,
             max_message_size,
+            fetch_slots,
+            tls,
             produce_sessions,
+            idempotent_producers,
+            nodes: KnownNodes::default(),
         })
     }
 }
@@ -221,6 +345,21 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+    use crate::auth::IggyAuthenticator;
+
+    #[test]
+    fn given_the_iggy_tls_variables_should_be_listed_by_every_reader() {
+        for var in IggyTls::KNOWN_ENV_VARS {
+            assert!(
+                IggyBridgeConfig::KNOWN_ENV_VARS.contains(var),
+                "{var} is read by the bridge and must be in its list"
+            );
+            assert!(
+                IggyAuthenticator::KNOWN_ENV_VARS.contains(var),
+                "{var} is read by the SASL credential check and must be in its list"
+            );
+        }
+    }
 
     fn test_config() -> IggyBridgeConfig {
         IggyBridgeConfig {
@@ -230,7 +369,11 @@ mod tests {
             topic_mapping: TopicMapping::new("kafka".to_string(), std::collections::HashMap::new())
                 .expect("valid mapping for this test's fixture data"),
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            fetch_slots: DEFAULT_FETCH_SLOTS,
+            tls: IggyTls::default(),
             produce_sessions: ProduceSessionLimits::default(),
+            idempotent_producers: false,
+            nodes: KnownNodes::default(),
         }
     }
 
@@ -265,6 +408,10 @@ mod tests {
             std::env::remove_var("IGGY_KAFKA_IGGY_STREAM");
             std::env::remove_var("IGGY_KAFKA_TOPIC_MAP_PATH");
             std::env::remove_var("IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE");
+            std::env::remove_var("IGGY_KAFKA_IGGY_TLS_ENABLED");
+            std::env::remove_var("IGGY_KAFKA_IGGY_TLS_DOMAIN");
+            std::env::remove_var("IGGY_KAFKA_IGGY_TLS_CA_FILE");
+            std::env::remove_var("IGGY_KAFKA_FETCH_SLOTS");
             std::env::remove_var("IGGY_KAFKA_PRODUCE_SESSIONS");
             std::env::remove_var("IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS");
         }
@@ -275,6 +422,11 @@ mod tests {
 
         let config = result.expect("valid config from documented defaults alone");
         assert_eq!(config.max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
+        assert_eq!(config.fetch_slots, DEFAULT_FETCH_SLOTS);
+        assert!(
+            !config.tls.enabled,
+            "the Iggy hop is in the clear unless switched on"
+        );
         assert_eq!(config.produce_sessions, ProduceSessionLimits::default());
         assert_eq!(config.address, "127.0.0.1:8090");
         assert_eq!(config.username, "iggy");
@@ -308,6 +460,50 @@ mod tests {
 
         assert_eq!(one_mebibyte.unwrap().max_message_size, 1024 * 1024);
         assert!(matches!(garbage, Err(BridgeError::InvalidConfig(_))));
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_reads_the_fetch_slot_count() {
+        // Safety: process-wide, not per-variable - see the note on
+        // from_env_uses_documented_defaults_when_only_password_is_set above.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_PASSWORD", "iggy");
+            std::env::set_var("IGGY_KAFKA_FETCH_SLOTS", "16");
+        }
+        let sixteen = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_FETCH_SLOTS", MAX_FETCH_SLOTS.to_string());
+        }
+        let most = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_FETCH_SLOTS", (MAX_FETCH_SLOTS + 1).to_string());
+        }
+        let too_many = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_FETCH_SLOTS", "0");
+        }
+        let none = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_FETCH_SLOTS", "some");
+        }
+        let garbage = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_PASSWORD");
+            std::env::remove_var("IGGY_KAFKA_FETCH_SLOTS");
+        }
+
+        assert_eq!(sixteen.unwrap().fetch_slots.get(), 16);
+        assert_eq!(most.unwrap().fetch_slots.get(), MAX_FETCH_SLOTS);
+        for refused in [too_many, none, garbage] {
+            assert!(
+                matches!(
+                    &refused,
+                    Err(BridgeError::InvalidConfig(message)) if message.contains("IGGY_KAFKA_FETCH_SLOTS")
+                ),
+                "{refused:?}"
+            );
+        }
     }
 
     #[test]
@@ -346,6 +542,33 @@ mod tests {
         );
         assert!(matches!(bad_count, Err(BridgeError::InvalidConfig(_))));
         assert!(matches!(no_idle, Err(BridgeError::InvalidConfig(_))));
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_reads_the_idempotent_producers_switch() {
+        // Safety: process-wide, not per-variable - see the note on
+        // from_env_uses_documented_defaults_when_only_password_is_set above.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_PASSWORD", "iggy");
+        }
+        let unset = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IDEMPOTENT_PRODUCERS", "true");
+        }
+        let on = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IDEMPOTENT_PRODUCERS", "yes");
+        }
+        let garbage = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_PASSWORD");
+            std::env::remove_var("IGGY_KAFKA_IDEMPOTENT_PRODUCERS");
+        }
+
+        assert!(!unset.unwrap().idempotent_producers, "off by default");
+        assert!(on.unwrap().idempotent_producers);
+        assert!(matches!(garbage, Err(BridgeError::InvalidConfig(_))));
     }
 
     #[test]

@@ -24,7 +24,6 @@ stream = "example_stream"
 topics = ["example_topic"]
 schema = "json"
 batch_length = 1000
-poll_interval = "5ms"
 consumer_group = "clickhouse_sink_connector"
 
 [plugin_config]
@@ -112,7 +111,6 @@ stream = "events"
 topics = ["user_events"]
 schema = "json"
 batch_length = 500
-poll_interval = "10ms"
 consumer_group = "clickhouse_sink"
 
 [plugin_config]
@@ -130,7 +128,6 @@ stream = "metrics"
 topics = ["app_metrics"]
 schema = "json"
 batch_length = 5000
-poll_interval = "5ms"
 consumer_group = "clickhouse_sink"
 
 [plugin_config]
@@ -151,7 +148,6 @@ stream = "exports"
 topics = ["csv_data"]
 schema = "text"
 batch_length = 1000
-poll_interval = "50ms"
 consumer_group = "clickhouse_sink"
 
 [plugin_config]

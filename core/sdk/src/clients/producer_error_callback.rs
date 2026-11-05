@@ -41,6 +41,11 @@ use tracing::error;
 /// Encryption mutates messages before the write, so this tail contains encrypted messages when the
 /// producer uses an encryptor. Passing them back through the same producer would encrypt them again.
 ///
+/// When the cause is [`IggyError::OperationUncertain`], `messages` were one request that may have
+/// committed. [`Client::resolve_operation`] on the producer's client returns its proved outcome,
+/// also after the worker's next batch resolved it first, because the client keeps proved outcomes.
+/// `Ok(())` means that every message of `messages` committed, so none of them needs a resend.
+///
 /// [`stream`](Self::stream) and [`topic`](Self::topic) identify the destination.
 /// [`partitioning`](Self::partitioning) contains only the per-send override passed to the dispatcher.
 /// `None` means the producer's configured or default partitioning was used, not that the request had
@@ -51,6 +56,7 @@ use tracing::error;
 /// [`background()`]: crate::clients::producer_builder::IggyProducerBuilder::background
 /// [`send()`]: crate::clients::producer::IggyProducer::send
 /// [`BackgroundConfig::error_callback`]: crate::clients::producer_config::BackgroundConfig::error_callback
+/// [`Client::resolve_operation`]: iggy_common::Client::resolve_operation
 /// [`Shard`]: crate::clients::producer_sharding::Shard
 #[derive(Debug)]
 pub struct ErrorCtx {

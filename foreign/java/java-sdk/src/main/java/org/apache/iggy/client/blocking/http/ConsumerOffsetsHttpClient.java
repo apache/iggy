@@ -75,6 +75,8 @@ class ConsumerOffsetsHttpClient implements ConsumerOffsetsClient {
     }
 
     private void store(StreamId streamId, TopicId topicId, StoreConsumerOffset command) {
+        httpClient.checkProgress(
+                InternalHttpClient.ProgressKey.of(streamId, topicId, command.partitionId(), command.context()));
         httpClient.execute(httpClient.preparePutRequest(path(streamId, topicId), command));
     }
 

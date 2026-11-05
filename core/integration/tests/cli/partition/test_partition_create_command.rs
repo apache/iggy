@@ -23,6 +23,7 @@ use async_trait::async_trait;
 use iggy::prelude::Client;
 use iggy::prelude::CompressionAlgorithm;
 use iggy::prelude::IggyExpiry;
+use iggy::prelude::StreamCreateOptions;
 use iggy::prelude::TopicCreateOptions;
 use predicates::str::diff;
 use serial_test::parallel;
@@ -83,7 +84,9 @@ impl TestPartitionCreateCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestPartitionCreateCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name).await;
+        let stream = client
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
         self.actual_stream_id = Some(stream.unwrap().id);
 

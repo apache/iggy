@@ -21,10 +21,13 @@ package org.apache.iggy.client.blocking.tcp;
 
 import org.apache.iggy.client.blocking.StreamsClient;
 import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
+import org.apache.iggy.stream.StreamUpdate;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 final class StreamsTcpClient implements StreamsClient {
@@ -46,13 +49,13 @@ final class StreamsTcpClient implements StreamsClient {
     }
 
     @Override
-    public StreamDetails createStream(String name) {
-        return FutureUtil.resolve(delegate.createStream(name));
+    public StreamDetails createStream(String name, Map<String, HeaderValue> options) {
+        return FutureUtil.resolve(delegate.createStream(name, options));
     }
 
     @Override
-    public void updateStream(StreamId streamId, String name) {
-        FutureUtil.resolve(delegate.updateStream(streamId, name));
+    public void updateStream(StreamId streamId, StreamUpdate update) {
+        FutureUtil.resolve(delegate.updateStream(streamId, update));
     }
 
     @Override

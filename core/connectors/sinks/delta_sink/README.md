@@ -56,9 +56,10 @@ The configuration is usually written individually for every connector and consis
   stream = "your_stream"
   topics = ["topic_inside_of_your_stream"]
   schema = "json"
-  # important: read about batch and poll interval settings below
+  # important: read about the batch and wait settings below
   batch_length = 10000
-  poll_interval = "3s"
+  max_wait = "3s"
+  min_count = 10000
   consumer_group = "delta_sink_connector"
 
   # these settings are specific to each plugin, and in case of Delta sink, to the type of storage used
@@ -73,8 +74,9 @@ The configuration is usually written individually for every connector and consis
 ### `[[streams]]` section
 
 - Find a topic that you need and the corresponding stream that this topic is in and add it into the configuration.
-- `batch_length` and `poll_interval` have to be carefully set for Delta tables. `poll_interval` sets the minimum gap between polls. Each poll returns immediately with whatever messages are currently available, up to `batch_length`. The Delta sink writes and commits exactly what one poll returns, so each Delta commit holds at most `batch_length` rows, and topic intake is capped at roughly `batch_length` messages per `poll_interval` per topic.
-  `batch_length` is a ceiling: it only produces large files when messages arrive fast enough between polls to fill it, so a low-throughput topic produces small, frequent commits regardless of how high `batch_length` is set. For Delta, writing means creating a log entry and a separate Parquet file, so a low `batch_length` (roughly < 1000) or a low-throughput topic results in lots of small files.
+- `batch_length`, `max_wait` and `min_count` have to be carefully set for Delta tables. A poll waits up to `max_wait` until `min_count` messages are ready, and returns earlier when its reply reaches 1 MiB. The runtime keeps polling while the partition holds more messages and the batch holds fewer than `batch_length` messages.
+  Then the Delta sink writes and commits the batch, so each Delta commit holds at most `batch_length` rows. With `min_count` equal to `batch_length`, a low-throughput topic produces one commit per `max_wait`.
+  `batch_length` is a ceiling: it only produces large files when messages arrive fast enough within `max_wait` to fill it, so a low-throughput topic produces small commits regardless of how high `batch_length` is set. For Delta, writing means creating a log entry and a separate Parquet file, so a low `batch_length` (roughly < 1000) or a low-throughput topic results in lots of small files.
   This is highly undesirable for the reader as it will have to read from many small files instead of a few larger ones. For query performance optimization, the system consuming these files will have to apply `OPTIMIZE` query in order to consolidate the files. We recommend setting `batch_length` pretty high based on your workload so that ideally the files are already optimized for reading.
   The guideline recommended by the developers of Delta is to keep individual file sizes between 128 MB and 1 GB. In the context of this document, it means that ideally `batch_length` should be tuned so that each commit's file size falls within the suggested range, assuming your topic has enough throughput to fill it. The given range is only a rough guideline and you need to find a good setting based on the patterns of reading and writing in your systems.
   A larger `batch_length` means a failed write loses more data: offsets commit at poll time, so if the Delta write or commit fails afterward, that whole batch is lost with no retry. It also sits in memory longer and in multiple copies — raw messages, coerced JSON, and the writer's internal buffer — until the commit succeeds.

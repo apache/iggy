@@ -75,6 +75,64 @@ public sealed class VsrReplyDecoderTests
         Assert.True(exception.FromServer);
     }
 
+    [Theory]
+    [InlineData((byte)0, false)]
+    [InlineData((byte)1, true)]
+    [InlineData((byte)2, false)]
+    public void given_a_business_rejection_when_decoding_should_require_the_exact_commit_marker(byte marker, bool committed)
+    {
+        var body = VsrTestPayloads.Rejection(VsrError.UNAUTHENTICATED);
+        var header = ReplyHeader(VsrOperation.StoreConsumerOffset, body.Length);
+        header[VsrHeader.REPLY_COMMITTED_OFFSET] = marker;
+
+        var error = Assert.Throws<IggyInvalidStatusCodeException>(() => VsrReplyDecoder.Decode(header, body));
+
+        Assert.Equal(committed, error.Committed);
+        Assert.Equal(VsrError.UNAUTHENTICATED, error.StatusCode);
+    }
+
+    [Fact]
+    public void given_a_truncated_rejection_when_marked_committed_should_not_prove_a_business_result()
+    {
+        var body = VsrTestPayloads.Rejection(VsrError.UNAUTHENTICATED);
+        BinaryPrimitives.WriteUInt32LittleEndian(body, 2);
+        var header = ReplyHeader(VsrOperation.StoreConsumerOffset, body.Length);
+        header[VsrHeader.REPLY_COMMITTED_OFFSET] = VsrHeader.COMMITTED_RESULT_MARKER;
+
+        var error = Assert.Throws<IggyInvalidStatusCodeException>(() => VsrReplyDecoder.Decode(header, body));
+
+        Assert.False(error.Committed);
+        Assert.False(error.FromServer);
+    }
+
+    [Theory]
+    [InlineData(VsrError.TRANSIENT_NOT_COMMITTED)]
+    [InlineData(VsrError.TRANSIENT_NOT_ACCEPTED)]
+    [InlineData(VsrError.NOT_PRIMARY)]
+    public void given_a_transient_result_when_marked_committed_should_not_resolve_uncertainty(int status)
+    {
+        var body = VsrTestPayloads.Rejection(status);
+        var header = ReplyHeader(VsrOperation.StoreConsumerOffset, body.Length);
+        header[VsrHeader.REPLY_COMMITTED_OFFSET] = VsrHeader.COMMITTED_RESULT_MARKER;
+
+        var error = Assert.Throws<IggyInvalidStatusCodeException>(() => VsrReplyDecoder.Decode(header, body));
+
+        Assert.False(error.Committed);
+        Assert.Equal(status, error.StatusCode);
+    }
+
+    [Fact]
+    public void given_a_header_denial_when_marked_committed_should_not_prove_commit()
+    {
+        var header = ReplyHeader(VsrOperation.SendMessages, 0, VsrError.UNAUTHENTICATED);
+        header[VsrHeader.REPLY_COMMITTED_OFFSET] = VsrHeader.COMMITTED_RESULT_MARKER;
+
+        var error = Assert.Throws<IggyInvalidStatusCodeException>(() => VsrReplyDecoder.Decode(header, ReadOnlyMemory<byte>.Empty));
+
+        Assert.False(error.Committed);
+        Assert.False(VsrHeader.ReadCommitted(header));
+    }
+
     /// <summary>
     ///     Retry and failover key off the transient status codes, and a locally raised code says nothing about
     ///     what the cluster did, so the two origins have to stay distinguishable.

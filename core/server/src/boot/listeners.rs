@@ -18,7 +18,8 @@
 //! Shard 0 listener start-up and the accept-fn factories.
 
 use crate::boot::credentials::{
-    load_quic_server_credentials, load_tcp_tls_server_credentials, load_wss_server_credentials,
+    RootCredentials, initialize_root_user, load_quic_server_credentials,
+    load_tcp_tls_server_credentials, load_wss_server_credentials,
 };
 use crate::boot::topology::{
     TcpTopology, client_listeners, derived_address_misses_listener, derived_bind_ip,
@@ -39,7 +40,7 @@ use message_bus::transports::quic::server_config_with_cert;
 use message_bus::{
     AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
     AcceptedWsClientFn, AcceptedWssClientFn, ConnectionCap, DialedReplicaFn, IggyMessageBus,
-    MAX_INFLIGHT_REPLICA_HANDSHAKES, connector, installer,
+    connector, installer,
 };
 use shard::metrics::ShardMetrics;
 use std::net::SocketAddr;
@@ -55,7 +56,7 @@ pub(in crate::boot) struct LocalClientAcceptFns {
     wss: AcceptedWssClientFn,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(in crate::boot) async fn start_tcp_runtime(
     shard: &Rc<ServerShard>,
     session_liveness: Rc<std::cell::RefCell<crate::consumer_group::lease::ConsumerGroupLiveness>>,
@@ -67,7 +68,20 @@ pub(in crate::boot) async fn start_tcp_runtime(
     accepted_clients: LocalClientAcceptFns,
     connections: &Rc<ConnectionCap>,
     shard_metrics_all: &[ShardMetrics],
+    root_credentials: Option<&RootCredentials>,
 ) -> Result<(), ServerError> {
+    if topology.replica_count == 1 {
+        initialize_root_user(
+            shard,
+            root_credentials,
+            shard.bus.token(),
+            compio::time::sleep,
+        )
+        .await?;
+        if shard.bus.token().is_triggered() {
+            return Ok(());
+        }
+    }
     // HTTP is served over TCP but sits outside the replica_io / manual client
     // reactor, so it binds on its own. Config first, so a bad `[http.*]`
     // section fails boot before any listener accepts. Socket only after the
@@ -154,12 +168,22 @@ pub(in crate::boot) async fn start_tcp_runtime(
             session_liveness,
             &config.http,
             config.metadata.clients_table_max,
-            config.personal_access_token.max_tokens_per_user,
             Arc::new(config.clone()),
             roster,
             connections,
             shard_metrics_all,
         )?;
+    }
+
+    initialize_root_user(
+        shard,
+        root_credentials,
+        shard.bus.token(),
+        compio::time::sleep,
+    )
+    .await?;
+    if !shard.bus.token().is_triggered() {
+        info!("Root user initialization complete.");
     }
 
     Ok(())
@@ -347,15 +371,15 @@ async fn start_manual_runtime(
 
 /// Replica delegation callbacks for shard 0's listener and connector.
 ///
-/// Inbound: acquire a slot in the shard-0-global in-flight handshake cap
-/// (drop the connection when full), then blind-delegate the raw fd
-/// through the coordinator's round-robin. The fd lands on the target
-/// shard's inbox as a [`shard::LifecycleFrame::ReplicaInboundSetup`]
-/// frame; the owning shard runs the acceptor handshake and acks the
-/// slot back. A failed delegation releases the slot immediately.
+/// Inbound: [`replica_listener::admit_inbound`] takes a slot in the
+/// shard-0-global in-flight handshake cap and reads the placement
+/// preamble, then the fd goes to the shard that owns the link as a
+/// [`shard::LifecycleFrame::ReplicaInboundSetup`] frame; the owning shard
+/// runs the acceptor handshake and acks the slot back. A failed delegation
+/// releases the slot immediately.
 ///
-/// Outbound: delegate the dialed fd as
-/// [`shard::LifecycleFrame::ReplicaOutboundSetup`] and mark the peer
+/// Outbound: delegate the dialed fd to the shard that owns the link as
+/// [`shard::LifecycleFrame::ReplicaOutboundSetup`] and mark the link
 /// dial-pending so the reconnect sweep skips it until the owning
 /// shard's handshake outcome arrives (or the entry expires).
 pub(in crate::boot) fn make_replica_delegation_fns(
@@ -365,44 +389,56 @@ pub(in crate::boot) fn make_replica_delegation_fns(
     let inbound_bus = Rc::clone(bus);
     let inbound_coord = Rc::clone(&coord);
     let accepted: AcceptedReplicaFn = Rc::new(move |stream| {
-        let Some(slot) = inbound_bus.try_acquire_replica_handshake_slot() else {
-            warn!(
-                cap = MAX_INFLIGHT_REPLICA_HANDSHAKES,
-                "replica handshake in-flight cap reached; dropping inbound"
-            );
-            return;
-        };
-        match inbound_coord.delegate_replica_inbound(stream, slot) {
-            Ok(target) => {
-                info!(slot, target, "inbound replica connection delegated");
-            }
-            Err(error) => {
-                inbound_bus.release_replica_handshake_slot(slot);
-                warn!(
-                    error = ?error,
-                    "delegate_replica_inbound failed; dropping inbound replica connection"
-                );
-            }
-        }
-    });
-
-    let outbound_bus = Rc::clone(bus);
-    let dialed: DialedReplicaFn =
-        Rc::new(
-            move |stream, peer_id| match coord.delegate_replica_outbound(stream, peer_id) {
-                Ok(target) => {
-                    outbound_bus.mark_dial_pending(peer_id);
-                    info!(peer_id, target, "outbound replica connection delegated");
-                }
+        let coord = Rc::clone(&inbound_coord);
+        let bus = Rc::clone(&inbound_bus);
+        replica_listener::admit_inbound(
+            &inbound_bus,
+            stream,
+            move |stream, link, owner, slot, deadline| match coord
+                .delegate_replica_inbound(stream, link, owner, slot, deadline)
+            {
+                Ok(()) => info!(
+                    replica = link.replica,
+                    link = link.link,
+                    owner,
+                    slot,
+                    "inbound replica link delegated"
+                ),
                 Err(error) => {
+                    bus.release_replica_handshake_slot(slot);
                     warn!(
-                        peer_id,
+                        replica = link.replica,
+                        link = link.link,
+                        owner,
                         error = ?error,
-                        "delegate_replica_outbound failed; dropping dialed replica connection"
+                        "delegate_replica_inbound failed; dropping inbound replica link"
                     );
                 }
             },
         );
+    });
+
+    let outbound_bus = Rc::clone(bus);
+    let dialed: DialedReplicaFn = Rc::new(move |stream, link, owner| {
+        match coord.delegate_replica_outbound(stream, link, owner) {
+            Ok(()) => {
+                outbound_bus.mark_dial_pending(link.replica, link.link);
+                info!(
+                    replica = link.replica,
+                    link = link.link,
+                    owner,
+                    "outbound replica link delegated"
+                );
+            }
+            Err(error) => warn!(
+                replica = link.replica,
+                link = link.link,
+                owner,
+                error = ?error,
+                "delegate_replica_outbound failed; dropping dialed replica link"
+            ),
+        }
+    });
 
     (accepted, dialed)
 }

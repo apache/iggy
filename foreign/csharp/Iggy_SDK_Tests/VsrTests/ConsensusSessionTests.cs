@@ -16,6 +16,7 @@
 // under the License.
 
 using System.Reflection;
+using System.Buffers.Binary;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Vsr;
 
@@ -37,6 +38,18 @@ public sealed class ConsensusSessionTests
     public void NewSession_MintsUniqueClientIds()
     {
         Assert.NotEqual(new ConsensusSession().ClientId, new ConsensusSession().ClientId);
+    }
+
+    [Fact]
+    public void NewAndResetSessions_KeepClientIdsOutsideServerRange()
+    {
+        const int samples = 64;
+        var session = new ConsensusSession();
+        for (var sample = 0; sample < samples; sample++)
+        {
+            Assert.InRange(session.ClientId, UInt128.One, (UInt128)Int128.MaxValue);
+            session.Reset();
+        }
     }
 
     [Fact]
@@ -77,7 +90,7 @@ public sealed class ConsensusSessionTests
         Assert.Equal(0UL, session.Resolve(VsrOperation.Register).RequestId);
         Assert.NotEqual((UInt128)7, session.ClientId);
         Assert.False(session.IsBound);
-        Assert.Equal(1UL, session.RequestCounter);
+        Assert.Equal(2UL, session.RequestCounter);
     }
 
     /// <summary>
@@ -110,6 +123,26 @@ public sealed class ConsensusSessionTests
     }
 
     [Fact]
+    public void MetadataRequestIdentifier_IsUniqueAndStableAcrossReencoding()
+    {
+        var session = new ConsensusSession(1);
+        session.Resolve(VsrOperation.Register);
+        session.Bind(10, new byte[LoginRegister.BIND_SECRET_BYTES]);
+        var first = session.Resolve(VsrOperation.CreateStream);
+        var second = session.Resolve(VsrOperation.CreateStream);
+        Assert.NotEqual(UInt128.Zero, first.RequestChecksum);
+        Assert.NotEqual(first.RequestChecksum, second.RequestChecksum);
+
+        var original = new byte[VsrHeader.HEADER_SIZE];
+        var retry = new byte[VsrHeader.HEADER_SIZE];
+        VsrHeader.EncodeRequestHeader(original, session, 202, Array.Empty<byte>(), retainedFrame: first);
+        VsrHeader.EncodeRequestHeader(retry, session, 202, Array.Empty<byte>(), retainedFrame: first);
+        Assert.Equal(first.RequestChecksum,
+            BinaryPrimitives.ReadUInt128LittleEndian(original.AsSpan(VsrHeader.REQUEST_CHECKSUM_OFFSET)));
+        Assert.Equal(original, retry);
+    }
+
+    [Fact]
     public void NextRequestId_BeforeBindThrows()
     {
         var session = new ConsensusSession(1);
@@ -135,7 +168,11 @@ public sealed class ConsensusSessionTests
         counter.SetValue(session, ulong.MaxValue - 1);
 
         var lastFrame = session.Resolve((VsrOperation)operation);
-        Assert.Equal(new SessionFrame(clientId, ulong.MaxValue - 1, 10), lastFrame);
+        Assert.Equal(clientId, lastFrame.ClientId);
+        Assert.Equal(ulong.MaxValue - 1, lastFrame.RequestId);
+        Assert.Equal(10UL, lastFrame.SessionId);
+        Assert.Equal(operation == (byte)VsrOperation.CreateStream,
+            lastFrame.RequestChecksum != UInt128.Zero);
         Assert.Equal(ulong.MaxValue, session.RequestCounter);
 
         for (var attempt = 0; attempt < 2; attempt++)
@@ -156,19 +193,21 @@ public sealed class ConsensusSessionTests
             Assert.Equal(bindSecret, session.BindSecret);
         }
 
-        Assert.Equal(new SessionFrame(clientId, ulong.MaxValue, 10), session.Resolve(VsrOperation.NonReplicated));
+        var exhausted = Assert.Throws<IggyInvalidStatusCodeException>(() => session.Resolve(VsrOperation.NonReplicated));
+        Assert.Equal(VsrError.REQUEST_ID_EXHAUSTED, exhausted.StatusCode);
         Assert.Equal(ulong.MaxValue, session.RequestCounter);
     }
 
     [Fact]
-    public void Resolve_DoesNotConsumeAnIdForNonReplicatedOps()
+    public void Resolve_ConsumesDistinctIdsForNonReplicatedOps()
     {
         var session = new ConsensusSession(1);
         session.Resolve(VsrOperation.Register);
         session.Bind(10, new byte[LoginRegister.BIND_SECRET_BYTES]);
 
         Assert.Equal(1UL, session.Resolve(VsrOperation.NonReplicated).RequestId);
-        Assert.Equal(1UL, session.RequestCounter);
+        Assert.Equal(2UL, session.Resolve(VsrOperation.NonReplicated).RequestId);
+        Assert.Equal(3UL, session.RequestCounter);
     }
 
     [Fact]
@@ -259,7 +298,7 @@ public sealed class ConsensusSessionTests
     }
 
     [Fact]
-    public void Reset_ClearsBindingAndCounter()
+    public void Reset_ClearsBindingAndPreservesCounter()
     {
         var session = new ConsensusSession(1);
         session.Resolve(VsrOperation.Register);
@@ -269,27 +308,30 @@ public sealed class ConsensusSessionTests
         session.Reset();
 
         Assert.False(session.IsBound);
-        Assert.Equal(1UL, session.RequestCounter);
+        Assert.Equal(2UL, session.RequestCounter);
         Assert.NotEqual((UInt128)1, session.ClientId);
     }
 
     [Fact]
-    public void Generation_AdvancesOnEveryReArmAndNotOnBind()
+    public void Generation_AdvancesOnEveryReArmAndOnEveryBindTheCallerSignedInFor()
     {
         var session = new ConsensusSession(1);
         var initialGeneration = session.Generation;
 
         session.Resolve(VsrOperation.Register);
         session.Bind(10, new byte[LoginRegister.BIND_SECRET_BYTES]);
-        Assert.Equal(initialGeneration, session.Generation);
-
-        session.Reset();
         Assert.Equal(initialGeneration + 1, session.Generation);
+
+        session.Reset(continues: true);
+        Assert.Equal(initialGeneration + 2, session.Generation);
+
+        // The client's own sign-in goes on in the generation that its re-arm opened.
+        session.Resolve(VsrOperation.Register);
+        session.Bind(11, new byte[LoginRegister.BIND_SECRET_BYTES], continues: true);
+        Assert.Equal(initialGeneration + 2, session.Generation);
 
         // A register on a previously bound session re-arms the identity, which is a new generation too.
         session.Resolve(VsrOperation.Register);
-        session.Bind(11, new byte[LoginRegister.BIND_SECRET_BYTES]);
-        session.Resolve(VsrOperation.Register);
-        Assert.Equal(initialGeneration + 2, session.Generation);
+        Assert.Equal(initialGeneration + 3, session.Generation);
     }
 }

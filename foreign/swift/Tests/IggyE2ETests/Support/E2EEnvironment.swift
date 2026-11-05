@@ -27,6 +27,7 @@ import Testing
 /// cargo build --bin iggy-server
 /// IGGY_PATH=/tmp/iggy-swift IGGY_TCP_ADDRESS=127.0.0.1:8090 \
 /// IGGY_HTTP_ENABLED=false IGGY_QUIC_ENABLED=false IGGY_WEBSOCKET_ENABLED=false \
+/// IGGY_ENCRYPTION_ENABLED=true IGGY_ENCRYPTION_KEY=/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE= \
 /// IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy target/debug/iggy-server
 ///
 /// IGGY_TCP_ADDRESS=127.0.0.1:8090 swift test --filter IggyE2ETests
@@ -34,6 +35,8 @@ import Testing
 ///
 /// Set `IGGY_TCP_TLS_ENABLED=true` to run against a server started with
 /// `IGGY_TCP_TLS_ENABLED=true` and the certificate pair in `core/certs`.
+/// The resource options suite needs server encryption enabled, so a stream
+/// created without a key gets one the server generates.
 enum E2EEnvironment {
     static let rootUsername = ProcessInfo.processInfo.environment["IGGY_ROOT_USERNAME"] ?? "iggy"
     static let rootPassword = ProcessInfo.processInfo.environment["IGGY_ROOT_PASSWORD"] ?? "iggy"
@@ -198,6 +201,27 @@ func expectIggyError(_ code: IggyErrorCode, sourceLocation: SourceLocation = #_s
         Issue.record("expected \(code), got \(error)", sourceLocation: sourceLocation)
     }
 }
+
+/// ``expectIggyError(_:sourceLocation:_:)`` for a replicated request. The
+/// server refuses one with `transientNotCommitted` while it applies another
+/// test's op, and the SDK then reports every later refusal of that request the
+/// same way. Only a fresh request, a new run of `body`, gets a definite answer.
+func expectReplicatedIggyError(_ code: IggyErrorCode, sourceLocation: SourceLocation = #_sourceLocation, _ body: () async throws -> Void) async {
+    await expectIggyError(code, sourceLocation: sourceLocation) {
+        for _ in 1..<uncertainOutcomeAttempts {
+            do {
+                return try await body()
+            } catch let error as IggyError where error.code == .transientNotCommitted {
+                continue
+            }
+        }
+        try await body()
+    }
+}
+
+/// Runs of `body` in ``expectReplicatedIggyError(_:sourceLocation:_:)``. Each
+/// uncertain run waits out the request timeout.
+private let uncertainOutcomeAttempts = 3
 
 extension IggyClient {
     /// ``sendMessages(streamID:topicID:partitioning:messages:)`` for a batch

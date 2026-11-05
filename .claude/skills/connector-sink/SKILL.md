@@ -67,15 +67,17 @@ for getting them to the external system reliably and efficiently.
 
 ### Errors
 
-| Scenario                                   | SDK variant                                                                 | Retry?                                   |
-| ------------------------------------------ | --------------------------------------------------------------------------- | ---------------------------------------- |
-| Init / connectivity failure                | `Error::InitError`                                                          | n/a (fails open)                         |
-| Bad config value                           | `Error::InvalidConfigValue(field)`                                          | n/a                                      |
-| Single-message validation failure          | `Error::InvalidRecordValue(reason)`                                         | no - skip + log                          |
-| Transient backend (5xx, conn reset, ...)   | `Error::HttpRequestFailed` / `Error::Connection` / `Error::CannotStoreData` | yes                                      |
-| Permanent 4xx, schema mismatch, constraint | `Error::PermanentHttpError` / `Error::SchemaMismatch`                       | **no** - retrying trips circuit breakers |
-| I/O failure mid-write (parquet/iceberg)    | `Error::WriteFailure`                                                       | caller decides                           |
-| Catalog commit failure (Iceberg)           | `Error::CatalogCommitError`                                                 | **no - not idempotent**                  |
+| Scenario                                   | SDK variant                                                                 | Retry?                                                                   |
+| ------------------------------------------ | --------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| Init / connectivity failure                | `Error::InitError`                                                          | n/a (fails open)                                                         |
+| Bad config value                           | `Error::InvalidConfigValue(field)`                                          | n/a                                                                      |
+| Single-message validation failure          | `Error::InvalidRecordValue(reason)`                                         | no - skip + log; under at-least-once, fail the call (stops the sink)     |
+| Transient backend (5xx, conn reset, ...)   | `Error::HttpRequestFailed` / `Error::Connection` / `Error::CannotStoreData` | yes                                                                      |
+| Permanent 4xx, schema mismatch, constraint | `Error::PermanentHttpError` / `Error::SchemaMismatch`                       | **no** - retrying trips circuit breakers                                 |
+| I/O failure mid-write (parquet/iceberg)    | `Error::WriteFailure`                                                       | caller decides                                                           |
+| Catalog commit failure (Iceberg)           | `Error::CatalogCommitError`                                                 | not in place (txn consumed); under at-least-once, the runtime redelivers |
+
+`Error::is_permanent()` (`sdk/src/lib.rs`) is the class the runtime acts on for an at-least-once sink: a permanent error stops the delivery, a transient one hands the messages over again. `CatalogCommitError` is transient there, because the redelivered messages rebuild the transaction, and a commit that did land shows up as a duplicate, which at-least-once allows.
 
 ### Retry
 

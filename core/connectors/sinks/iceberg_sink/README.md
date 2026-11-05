@@ -30,6 +30,10 @@ store_secret_access_key = "password"
 store_region = "us-east-1"
 store_class = "s3"
 store_path_style_access = true
+invalid_rows = "fail"
+max_retries = 5
+retry_delay = "1s"
+max_retry_delay = "30s"
 ```
 
 ## Configuration Options
@@ -46,8 +50,12 @@ store_path_style_access = true
 - **store_region**: The region of the object storage. Required, including for S3-compatible stores that ignore it.
 - **store_class**: The storage class to use. **Currently, only S3-compatible storage is supported.**
 - **store_path_style_access**: Use path-style S3 URLs (`http://host/bucket/key`). Defaults to `true`, which MinIO-style endpoints require; set to `false` for stores that only accept virtual-hosted-style URLs.
+- **invalid_rows**: What to do with a row that does not match the table schema. `fail`, the default, fails the whole batch. `skip` writes the rows that match and logs each skipped row as a warning with its offset.
+- **max_retries**: Total attempts per catalog commit, including the first. Defaults to `5`. See [Commit Retries](#commit-retries).
+- **retry_delay**: Delay before the first commit retry, doubled for each further retry. Defaults to `1s`.
+- **max_retry_delay**: Upper bound for one delay between commit attempts. Defaults to `30s`.
 
-All options above are required except the credential pair, `store_path_style_access`, and the unused routing field.
+All options above are required except the credential pair, `store_path_style_access`, `invalid_rows`, the retry settings, and the unused routing field.
 Static routing requires a non-empty `tables` list; dynamic routing requires a non-empty `dynamic_route_field`.
 
 ## Static Routing
@@ -68,8 +76,8 @@ The Iggy Iceberg Connector will skip messages in the following cases:
 - The table name has no namespace or contains an empty name component.
 - The message does not contain the field specified in the `dynamic_route_field` configuration option, or is not a JSON object.
 
-A lookup failure skips the affected message without failing the batch. Each batch loads its
-destination tables again. The route field remains in the row, but the writer ignores it if the
+A lookup failure skips the affected message without failing the batch, and every skipped
+message is logged as a warning with its offset. Each batch loads its destination tables again. The route field remains in the row, but the writer ignores it if the
 target schema has no matching column.
 
 ### Dynamic routing configuration example
@@ -112,16 +120,60 @@ over into multiple files, including for unpartitioned tables.
 
 Each destination table has its own append transaction. Fan-out is not atomic across tables:
 a write or commit error stops work on the remaining tables, while earlier commits remain.
-The Iceberg library refreshes metadata before committing and retries eligible commit errors
-according to the table's retry properties. The plugin does not replay failed batches. The
-runtime records a plugin error and continues polling with consumer auto-commit, so messages
-can be lost after failed or skipped writes. Replaying committed rows can create duplicates.
+The Iceberg library refreshes metadata before committing and retries commit conflicts
+according to the table's retry properties, and the sink retries other transient commit errors.
+Once those retries run out, the runtime records a plugin error and continues polling with consumer
+auto-commit, so messages can be lost after failed or skipped writes. Replaying committed rows can
+create duplicates.
+
+## Commit Retries
+
+The sink writes the data files of a batch once, then retries the catalog commit when the catalog
+cannot be reached, fails with a 5xx, or throttles the sink with a 429. It makes up to
+`max_retries` attempts in total and waits about `retry_delay` before the first retry, doubling the
+wait up to `max_retry_delay`. A commit that the catalog refuses for good, such as one rejected with
+another 4xx or one to a table that no longer exists, fails without a retry.
+
+Each commit tags its snapshot with an `iggy.commit-id` summary property. Before a retry, the sink
+reloads the table and stops if a snapshot with that id is already there, so a commit whose response
+was lost is not appended twice. A commit request that the catalog applies only after the sink has
+checked for it, for example behind a gateway that timed out while the catalog kept working, can
+still be appended twice.
+
+When the attempts run out, the batch fails and is lost, because the runtime stored its offset when
+it read the batch. Raise `max_retries` or `max_retry_delay` to ride out a longer catalog outage.
+
+## Commit Rate and Table Maintenance
+
+Each batch that the runtime hands to the sink becomes one append commit per destination table,
+which adds a snapshot and a manifest to the table. Commits slow down as the table metadata grows,
+so fewer, larger batches keep both the commit latency and the metadata small. Set the batch size on
+the stream:
+
+```toml
+[[streams]]
+stream = "events"
+topics = ["users"]
+schema = "json"
+batch_length = 1000 # most messages in one batch
+min_count = 1000    # wait until this many messages are ready,
+max_wait = "5s"     # or this long, whichever comes first
+```
+
+At 2,000 messages per second, `batch_length = 100` creates about 20 snapshots per second, and the
+values above about 2. A poll also returns once its reply reaches 1 MiB, and `max_wait` bounds how
+long a message waits for its batch.
+
+The sink does not expire snapshots or rewrite manifests. Run that maintenance from an engine that
+supports it, for example Spark's `expire_snapshots` and `rewrite_manifests` procedures, on a
+schedule that keeps the time travel you need. Some managed catalogs run it automatically.
 
 ## Source Compatibility
 
 Use `schema = "json"` on the stream. Each JSON object represents a table row; nested objects
 and arrays are supported when they match the table schema. Unknown fields are ignored. Missing
-nullable fields become null; missing required fields or incompatible values fail the table write.
+nullable fields become null. A missing required field or an incompatible value fails the table
+write for the whole batch, unless `invalid_rows = "skip"` leaves out only that row.
 
 Sources that wrap row data in an envelope need a transform when the table schema describes the
 inner row. Otherwise, the Arrow JSON reader maps envelope keys to table columns, producing nulls

@@ -20,11 +20,12 @@ use crate::SinkState;
 use crate::coercions::{coerce, create_coercion_tree};
 use crate::storage::build_storage_options;
 use async_trait::async_trait;
-use deltalake::writer::{DeltaWriter, JsonWriter};
-use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
-    owned_value_into_serde_json,
-};
+use deltalake::arrow::datatypes::SchemaRef;
+use deltalake::arrow::json::ReaderBuilder;
+use deltalake::arrow::record_batch::RecordBatch;
+use deltalake::writer::{DeltaWriter, RecordBatchWriter};
+use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata};
+use simd_json::OwnedValue;
 use tracing::{debug, error, info};
 
 // TODO: Expose metrics for observability purposes
@@ -100,9 +101,9 @@ impl Sink for DeltaSink {
         // leading to opaque errors downstream.
         let coercion_tree = create_coercion_tree(&kernel_schema);
 
-        let writer = JsonWriter::for_table(&table).map_err(|e| {
-            error!("Failed to create JsonWriter: {e}");
-            Error::InitError(format!("Failed to create JsonWriter: {e}"))
+        let writer = RecordBatchWriter::for_table(&table).map_err(|e| {
+            error!("Failed to create RecordBatchWriter: {e}");
+            Error::InitError(format!("Failed to create RecordBatchWriter: {e}"))
         })?;
 
         *self.state.lock().await = Some(SinkState {
@@ -153,9 +154,11 @@ impl Sink for DeltaSink {
             coerce(value, &state.coercion_tree).map_err(Error::InvalidRecordValue)?;
         }
 
-        // Write JSON values to internal Parquet buffers
+        let batch = record_batch(&json_values, state.writer.arrow_schema())?;
+
+        // Write the batch to internal Parquet buffers
         // TODO: Add retry mechanism if write fails.
-        if let Err(e) = state.writer.write(json_values).await {
+        if let Err(e) = state.writer.write(batch).await {
             state.writer.reset();
             error!("Failed to write to Delta writer: {e}");
             return Err(Error::Storage(format!(
@@ -196,15 +199,30 @@ impl Sink for DeltaSink {
     }
 }
 
-/// Every message's JSON document as a serde value, or the batch error for a
+fn record_batch(values: &[OwnedValue], schema: SchemaRef) -> Result<RecordBatch, Error> {
+    let mut decoder = ReaderBuilder::new(schema)
+        .with_batch_size(values.len())
+        .build_decoder()
+        .map_err(|e| Error::InvalidRecordValue(e.to_string()))?;
+    // OwnedValue emits primitive numbers, independent of serde_json's features.
+    decoder
+        .serialize(values)
+        .map_err(|e| Error::InvalidRecordValue(e.to_string()))?;
+    decoder
+        .flush()
+        .map_err(|e| Error::InvalidRecordValue(e.to_string()))?
+        .ok_or(Error::InvalidRecord)
+}
+
+/// Every message's JSON document as a simd-json value, or the batch error for a
 /// payload that has none. Proto text holding JSON is the descriptor-less
 /// `proto_convert` fallback and is written as the document it holds; proto
 /// text that is not JSON fails the batch like any other non-JSON payload.
-fn json_values(messages: Vec<ConsumedMessage>) -> Result<Vec<serde_json::Value>, Error> {
+fn json_values(messages: Vec<ConsumedMessage>) -> Result<Vec<OwnedValue>, Error> {
     let mut json_values = Vec::with_capacity(messages.len());
     for message in messages {
         match message.payload.into_json_document() {
-            Payload::Json(document) => json_values.push(owned_value_into_serde_json(document)),
+            Payload::Json(document) => json_values.push(document),
             payload => {
                 error!(
                     "Unsupported payload type: {payload}. Delta sink only supports JSON payloads."
@@ -218,8 +236,35 @@ fn json_values(messages: Vec<ConsumedMessage>) -> Result<Vec<serde_json::Value>,
 
 #[cfg(test)]
 mod tests {
-    use super::json_values;
+    use super::{json_values, record_batch};
+    use deltalake::arrow::array::{ArrayRef, Float64Array, Int64Array};
+    use deltalake::arrow::datatypes::{DataType, Field, Schema};
+    use deltalake::arrow::record_batch::RecordBatch;
     use iggy_connector_sdk::{ConsumedMessage, Error, Payload};
+    use std::sync::Arc;
+
+    #[test]
+    fn given_json_numbers_when_decoding_should_preserve_numeric_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Float64, true),
+        ]));
+        let identifier = 9_007_199_254_740_993i64;
+        let values = vec![
+            simd_json::json!({"id": identifier, "value": 1.5}),
+            simd_json::json!({"id": 2, "value": null}),
+        ];
+        let batch = record_batch(&values, schema.clone()).expect("decode JSON numbers");
+        let expected = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![identifier, 2])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![Some(1.5), None])),
+            ],
+        )
+        .expect("numeric columns");
+        assert_eq!(batch, expected);
+    }
 
     fn message(payload: Payload) -> ConsumedMessage {
         ConsumedMessage {
@@ -244,7 +289,7 @@ mod tests {
 
         assert_eq!(
             values,
-            vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})]
+            vec![simd_json::json!({"id": 1}), simd_json::json!({"id": 2})]
         );
     }
 

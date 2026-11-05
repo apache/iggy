@@ -17,18 +17,11 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
-use iggy_common::ClusterClient;
-use iggy_common::{ClusterMetadata, IggyError};
+use iggy_common::{ClusterClient, ClusterMetadata, IggyError};
 
 #[async_trait]
 impl ClusterClient for ClientWrapper {
     async fn get_cluster_metadata(&self) -> Result<ClusterMetadata, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.get_cluster_metadata().await,
-            ClientWrapper::Http(client) => client.get_cluster_metadata().await,
-            ClientWrapper::Quic(client) => client.get_cluster_metadata().await,
-            ClientWrapper::Tcp(client) => client.get_cluster_metadata().await,
-            ClientWrapper::WebSocket(client) => client.get_cluster_metadata().await,
-        }
+        super::dispatch_client!(self, ClusterClient::get_cluster_metadata()).await
     }
 }

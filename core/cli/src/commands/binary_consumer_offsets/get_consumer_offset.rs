@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::commands::binary_consumer_offsets::consumer_info;
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -50,13 +51,7 @@ impl GetConsumerOffsetCmd {
     }
 
     pub fn get_consumer_info(&self) -> String {
-        match self.consumer.kind {
-            ConsumerKind::Consumer => {
-                format!("consumer with ID: {}", self.consumer.id)
-            }
-            ConsumerKind::ConsumerGroup => format!("consumer group with ID: {}", self.consumer.id),
-            ConsumerKind::ExternalGroup => format!("external group with ID: {}", self.consumer.id),
-        }
+        consumer_info(&self.consumer)
     }
 }
 

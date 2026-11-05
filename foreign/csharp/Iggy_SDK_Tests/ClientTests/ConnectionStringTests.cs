@@ -41,6 +41,8 @@ public sealed class ConnectionStringTests
         Assert.Equal("127.0.0.1", config.TlsSettings.Hostname);
         Assert.Empty(config.TlsSettings.CertificatePath);
         Assert.Equal(TimeSpan.FromSeconds(5), config.HeartbeatInterval);
+        Assert.Equal(256, config.MaxPendingOperations);
+        Assert.Equal(64L * 1024 * 1024, config.MaxPendingOperationBytes);
 
         Assert.True(config.ReconnectionSettings.Enabled);
         Assert.Equal(0, config.ReconnectionSettings.MaxRetries);
@@ -105,6 +107,74 @@ public sealed class ConnectionStringTests
         Assert.Equal(TimeSpan.FromSeconds(1), retriesOnly.ReconnectionSettings.InitialDelay);
         Assert.Equal(0, intervalOnly.ReconnectionSettings.MaxRetries);
         Assert.Equal(TimeSpan.FromSeconds(5), intervalOnly.ReconnectionSettings.InitialDelay);
+    }
+
+    [Theory]
+    [InlineData(1, 256L)]
+    [InlineData(1, 1L)]
+    [InlineData(512, 134217728L)]
+    [InlineData(int.MaxValue, long.MaxValue)]
+    public void FromConnectionString_WithPendingOperationLimits_MapsBoth(int operations, long bytes)
+    {
+        var config = IggyClientConfigurator.FromConnectionString(
+            $"iggy://iggy:secret@localhost:8090?max_pending_operations={operations}&max_pending_operation_bytes={bytes}");
+
+        Assert.Equal(operations, config.MaxPendingOperations);
+        Assert.Equal(bytes, config.MaxPendingOperationBytes);
+    }
+
+    [Fact]
+    public void FromConnectionString_WithPartialPendingOperationLimits_KeepsTheOtherDefault()
+    {
+        var countOnly = IggyClientConfigurator.FromConnectionString(
+            "iggy://iggy:secret@localhost:8090?max_pending_operations=1");
+        var bytesOnly = IggyClientConfigurator.FromConnectionString(
+            "iggy://iggy:secret@localhost:8090?max_pending_operation_bytes=256");
+
+        Assert.Equal(1, countOnly.MaxPendingOperations);
+        Assert.Equal(64L * 1024 * 1024, countOnly.MaxPendingOperationBytes);
+        Assert.Equal(256, bytesOnly.MaxPendingOperations);
+        Assert.Equal(256L, bytesOnly.MaxPendingOperationBytes);
+    }
+
+    [Fact]
+    public void FromConnectionString_WithRepeatedPendingOperationLimits_UsesTheLastValue()
+    {
+        var config = IggyClientConfigurator.FromConnectionString(
+            "iggy://iggy:secret@localhost:8090?max_pending_operations=1&max_pending_operations=512" +
+            "&max_pending_operation_bytes=256&max_pending_operation_bytes=134217728");
+
+        Assert.Equal(512, config.MaxPendingOperations);
+        Assert.Equal(134217728L, config.MaxPendingOperationBytes);
+    }
+
+    [Theory]
+    [InlineData("max_pending_operations", "0")]
+    [InlineData("max_pending_operations", "-1")]
+    [InlineData("max_pending_operations", "+1")]
+    [InlineData("max_pending_operations", "2147483648")]
+    [InlineData("max_pending_operations", "18446744073709551616")]
+    [InlineData("max_pending_operations", "1.5")]
+    [InlineData("max_pending_operations", " 1")]
+    [InlineData("max_pending_operations", "1 ")]
+    [InlineData("max_pending_operations", "unlimited")]
+    [InlineData("max_pending_operations", "")]
+    [InlineData("max_pending_operation_bytes", "0")]
+    [InlineData("max_pending_operation_bytes", "-256")]
+    [InlineData("max_pending_operation_bytes", "+256")]
+    [InlineData("max_pending_operation_bytes", "9223372036854775808")]
+    [InlineData("max_pending_operation_bytes", "18446744073709551616")]
+    [InlineData("max_pending_operation_bytes", "256.5")]
+    [InlineData("max_pending_operation_bytes", " 256")]
+    [InlineData("max_pending_operation_bytes", "256 ")]
+    [InlineData("max_pending_operation_bytes", "unlimited")]
+    [InlineData("max_pending_operation_bytes", "")]
+    public void FromConnectionString_WithInvalidPendingOperationLimits_Throws(string option, string value)
+    {
+        var exception = Assert.Throws<FormatException>(() => IggyClientConfigurator.FromConnectionString(
+            $"iggy://iggy:secret@localhost:8090?{option}={value}"));
+
+        Assert.Contains($"Option \"{option}\" must be", exception.Message);
     }
 
     [Fact]
@@ -393,6 +463,8 @@ public sealed class ConnectionStringTests
     [InlineData("iggy://iggy:hunter2@localhost:8090?reconnection_retries=three")]
     [InlineData("iggy://iggy:hunter2@localhost:8090?reconnection_interval=0")]
     [InlineData("iggy://iggy:hunter2@localhost:8090?heartbeat_interval=garbage")]
+    [InlineData("iggy://iggy:hunter2@localhost:8090?max_pending_operations=hunter2")]
+    [InlineData("iggy://iggy:hunter2@localhost:8090?max_pending_operation_bytes=hunter2")]
     [InlineData("iggy://iggy:hunter2@localhost:70000")]
     [InlineData("iggy+quic://iggy:hunter2@localhost:8090")]
     public void FromConnectionString_ErrorMessages_NeverContainCredentials(string connectionString)

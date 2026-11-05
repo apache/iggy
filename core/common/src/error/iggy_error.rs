@@ -127,7 +127,7 @@ pub enum IggyError {
     UsersLimitReached = 55,
     #[error("Invalid personal access token expiry")]
     InvalidPersonalAccessTokenExpiry = 56,
-    #[error("Request transiently not committed; retry")]
+    #[error("Request outcome unknown; it may have applied")]
     TransientNotCommitted = 57,
     #[error("Request transiently not accepted; retry, on any replica")]
     TransientNotAccepted = 58,
@@ -194,6 +194,32 @@ pub enum IggyError {
     LifecycleBusy = 88,
     #[error("Request not accepted by a backup replica; retry on the primary of its group")]
     NotPrimary = 89,
+    /// No poll progress was applied. Back off without invalidating the partition route.
+    #[error("Deferred poll capacity exceeded; retry after backoff on the same replica")]
+    DeferredPollCapacityExceeded = 90,
+    /// This client handed out every producer id of its session. Another
+    /// client, or this one after it signs in again, gets new ids.
+    #[error("This client has no producer ids left in its session")]
+    ProducerIdsExhausted = 91,
+    /// The batch does not follow the last batch that the partition holds for
+    /// its producer. Nothing was written.
+    #[error("The producer batch does not follow the last batch of its producer")]
+    ProducerSequenceOutOfOrder = 92,
+    /// A newer epoch of the producer wrote to the partition. Nothing was
+    /// written.
+    #[error("A newer epoch of the producer fenced this batch")]
+    ProducerEpochFenced = 93,
+    /// The partition holds no state for the producer, and the batch does not
+    /// start at sequence 0. Nothing was written. The producer starts a new
+    /// epoch at sequence 0.
+    #[error(
+        "The partition does not know this producer, and the batch does not start at sequence 0"
+    )]
+    ProducerUnknown = 94,
+    /// A batch of an idempotent producer names no partition. Its sequence
+    /// counts per partition, so `Balanced` and a messages key cannot pick one.
+    #[error("A producer batch must name its partition")]
+    ProducerPartitionRequired = 95,
     #[error("Client with ID: {0} was not found.")]
     ClientNotFound(u32) = 100,
     #[error("Invalid client ID")]
@@ -475,11 +501,15 @@ pub enum IggyError {
     ProducerSendFailed {
         cause: Box<IggyError>,
         failed: Arc<Vec<IggyMessage>>,
+        /// How many messages at the head of `failed` the request of an
+        /// `OperationUncertain` or `TransientNotCommitted` cause carried, which
+        /// may have committed. Zero for any other cause.
+        uncertain: usize,
         /// Confirmations of the chunks that committed before `cause`; the
         /// durable prefix of a send that was split into several requests.
         committed: Arc<Vec<SendMessagesConfirmationResponse>>,
-        stream_name: String,
-        topic_name: String,
+        stream_name: Box<str>,
+        topic_name: Box<str>,
     } = 4056,
     #[error("Producer closed")]
     ProducerClosed = 4057,
@@ -492,6 +522,25 @@ pub enum IggyError {
     /// open fails instead. Field order: `(on_disk, expected)`.
     #[error("Segment file size on disk: {0} does not match expected size: {1}")]
     SegmentSizeMismatchAtOpen(u64, u64) = 4102,
+    /// A create-only option key in an update's set or reset list.
+    #[error("Option cannot be updated after creation: {0}")]
+    OptionNotUpdatable(String) = 4103,
+    /// A reset of a key without a default, or of a fixed resource column.
+    #[error("Option cannot be reset: {0}")]
+    OptionNotResettable(String) = 4104,
+    /// A client sent a server-maintained or read-only option key.
+    #[error("Option is read-only: {0}")]
+    ReadOnlyOption(String) = 4105,
+    /// A stream brought its own encryption key but the server has no
+    /// encryption key configured to wrap it with.
+    #[error("Stream encryption key requires a server encryption key")]
+    StreamEncryptionUnavailable = 4106,
+    /// A resource holds a critical option this build does not understand, so
+    /// serving it could ignore a security setting.
+    #[error("Unsupported critical option: {0}")]
+    UnsupportedCriticalOption(String) = 4107,
+    #[error("Cannot modify root user")]
+    CannotModifyRootUser = 4108,
     #[error("Consumer group with ID: {0} for topic with ID: {1} was not found.")]
     ConsumerGroupIdNotFound(Identifier, Identifier) = 5000,
     #[error("Invalid consumer group ID")]
@@ -515,9 +564,9 @@ pub enum IggyError {
     )]
     CannotDeleteConsumerGroupInfo(usize, Identifier, Identifier) = 5008,
     #[error(
-        "Consumer group member with client ID: {0} does not own partition: {1} at the current generation (rebalance in progress)."
+        "Consumer group member with VSR client ID: {0} does not own partition: {1} at the current generation (rebalance in progress)."
     )]
-    ConsumerGroupPartitionNotOwned(u32, u32) = 5009,
+    ConsumerGroupPartitionNotOwned(u128, u32) = 5009,
     #[error(
         "Too many consumer groups in this topic (limit {max})",
         max = CONSUMER_GROUP_OWNERS_MAX
@@ -613,6 +662,17 @@ pub enum IggyError {
     LaneBlocked(u64) = 14007,
     #[error("Operation {0} is not retained")]
     OperationNotRetained(u64) = 14008,
+    /// Names the blocked partition of a multi-target request, or of any progress
+    /// call prevented by the retained unknown outcome of a committing read: a
+    /// fetch or a poll with `CommitPolicy::OnRead`.
+    /// Field order: `(partition_id, operation_id)`.
+    #[error("Lane of partition {0} blocked by operation {1} with an unknown outcome")]
+    PartitionLaneBlocked(u32, u64) = 14009,
+    /// A committing read, a fetch or a poll with `CommitPolicy::OnRead`,
+    /// has no replayable receipt. Its local recovery ID survives session
+    /// replacement. Only explicit abandonment frees progress.
+    #[error("Read {0} has unknown progress, explicit abandonment is required")]
+    FetchProgressUncertain(u64) = 14010,
 }
 
 impl IggyError {
@@ -624,6 +684,20 @@ impl IggyError {
 
     pub fn as_string(&self) -> &'static str {
         self.into()
+    }
+
+    /// The retained operation that an `OperationUncertain`, `LaneBlocked`,
+    /// `OperationNotRetained`, `PartitionLaneBlocked` or `FetchProgressUncertain`
+    /// error names. A fetch identity supports abandonment only, never replay.
+    pub fn operation_id(&self) -> Option<u64> {
+        match self {
+            IggyError::OperationUncertain(operation_id)
+            | IggyError::LaneBlocked(operation_id)
+            | IggyError::OperationNotRetained(operation_id)
+            | IggyError::FetchProgressUncertain(operation_id)
+            | IggyError::PartitionLaneBlocked(_, operation_id) => Some(*operation_id),
+            _ => None,
+        }
     }
 
     pub fn from_code(code: u32) -> Self {
@@ -649,6 +723,26 @@ mod tests {
 
     const GROUP_NAME_ERROR_CODE: u32 = 5005;
     const RETAINED_OPERATION: u64 = 7;
+    const BLOCKED_PARTITION: u32 = 3;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn error_and_result_layout_on_x86_64() {
+        const ERROR_SIZE: usize = 80;
+        const ERROR_ALIGNMENT: usize = 16;
+        assert_eq!(std::mem::size_of::<IggyError>(), ERROR_SIZE);
+        assert_eq!(std::mem::align_of::<IggyError>(), ERROR_ALIGNMENT);
+        assert_eq!(std::mem::size_of::<Result<(), IggyError>>(), ERROR_SIZE);
+        assert_eq!(
+            std::mem::align_of::<Result<(), IggyError>>(),
+            ERROR_ALIGNMENT
+        );
+        assert_eq!(std::mem::size_of::<Result<usize, IggyError>>(), ERROR_SIZE);
+        assert_eq!(
+            std::mem::align_of::<Result<usize, IggyError>>(),
+            ERROR_ALIGNMENT
+        );
+    }
 
     #[test]
     fn derived_sdk_error_discriminant_keeps_codes() {
@@ -715,6 +809,11 @@ mod tests {
         let cases = [
             (IggyError::NotPrimary, 89, "not_primary"),
             (
+                IggyError::DeferredPollCapacityExceeded,
+                90,
+                "deferred_poll_capacity_exceeded",
+            ),
+            (
                 IggyError::OperationUncertain(RETAINED_OPERATION),
                 14006,
                 "operation_uncertain",
@@ -729,6 +828,16 @@ mod tests {
                 14008,
                 "operation_not_retained",
             ),
+            (
+                IggyError::PartitionLaneBlocked(BLOCKED_PARTITION, RETAINED_OPERATION),
+                14009,
+                "partition_lane_blocked",
+            ),
+            (
+                IggyError::FetchProgressUncertain(RETAINED_OPERATION),
+                14010,
+                "fetch_progress_uncertain",
+            ),
         ];
         for (error, code, name) in cases {
             assert_eq!(error.as_code(), code);
@@ -738,6 +847,10 @@ mod tests {
 
         // `PartialEq` compares codes only, so the payload needs a pattern.
         assert!(matches!(IggyError::from_code(89), IggyError::NotPrimary));
+        assert!(matches!(
+            IggyError::from_code(90),
+            IggyError::DeferredPollCapacityExceeded
+        ));
         assert!(matches!(
             IggyError::from_code(14006),
             IggyError::OperationUncertain(0)
@@ -750,6 +863,52 @@ mod tests {
             IggyError::from_code(14008),
             IggyError::OperationNotRetained(0)
         ));
+        assert!(matches!(
+            IggyError::from_code(14009),
+            IggyError::PartitionLaneBlocked(0, 0)
+        ));
+        assert!(matches!(
+            IggyError::from_code(14010),
+            IggyError::FetchProgressUncertain(0)
+        ));
+    }
+
+    #[test]
+    fn given_recovery_errors_when_reading_operation_id_should_return_the_named_operation() {
+        let cases = [
+            (
+                IggyError::OperationUncertain(RETAINED_OPERATION),
+                Some(RETAINED_OPERATION),
+            ),
+            (IggyError::LaneBlocked(u64::MAX), Some(u64::MAX)),
+            (IggyError::OperationNotRetained(0), Some(0)),
+            (
+                IggyError::FetchProgressUncertain(RETAINED_OPERATION),
+                Some(RETAINED_OPERATION),
+            ),
+            (
+                IggyError::PartitionLaneBlocked(BLOCKED_PARTITION, RETAINED_OPERATION),
+                Some(RETAINED_OPERATION),
+            ),
+            (IggyError::NotPrimary, None),
+        ];
+        for (error, operation_id) in cases {
+            assert_eq!(error.operation_id(), operation_id, "{error}");
+        }
+    }
+
+    #[test]
+    fn given_a_blocked_partition_lane_when_displayed_should_name_the_partition_and_the_operation() {
+        let message =
+            IggyError::PartitionLaneBlocked(BLOCKED_PARTITION, RETAINED_OPERATION).to_string();
+        assert!(
+            message.contains(&format!("partition {BLOCKED_PARTITION}")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("operation {RETAINED_OPERATION}")),
+            "{message}"
+        );
     }
 
     #[test]
@@ -760,5 +919,14 @@ mod tests {
             message.contains(&CONSUMER_GROUP_OWNERS_MAX.to_string()),
             "{message}"
         );
+    }
+
+    #[test]
+    fn given_partition_not_owned_when_displayed_should_name_the_full_client_id() {
+        const CLIENT_ID: u128 = (1 << 64) + 41;
+        const PARTITION_ID: u32 = 3;
+        let message =
+            IggyError::ConsumerGroupPartitionNotOwned(CLIENT_ID, PARTITION_ID).to_string();
+        assert!(message.contains(&CLIENT_ID.to_string()), "{message}");
     }
 }

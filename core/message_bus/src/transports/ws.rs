@@ -233,6 +233,10 @@ async fn run_pump(ws: &mut WebSocketStream<TcpStream>, ctx: ActorContext) {
                     }
                 }
                 let drained = batch.len();
+                let write_receipts: Vec<_> = batch
+                    .iter_mut()
+                    .filter_map(BusMessage::take_write_receipt)
+                    .collect();
                 #[allow(clippy::iter_with_drain)]
                 // One WS frame per message: tungstenite takes a single payload
                 // buffer, so a multi-fragment frame is joined here (the only
@@ -247,6 +251,9 @@ async fn run_pump(ws: &mut WebSocketStream<TcpStream>, ctx: ActorContext) {
                 if let Err(e) = ws.flush().await {
                     warn!(%label, %peer, error = ?e, batch_len = drained, "ws writer: flush failed");
                     return;
+                }
+                for receipt in write_receipts {
+                    receipt.complete();
                 }
             }
             PumpAction::Recv(Ok(msg)) => match msg {

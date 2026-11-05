@@ -33,6 +33,15 @@ java {
     targetCompatibility = JavaVersion.VERSION_17
 }
 
+// Build timestamps change between CI's test and coverage invocations.
+normalization {
+    runtimeClasspath {
+        properties("iggy-version.properties") {
+            ignoreProperty("buildTime")
+        }
+    }
+}
+
 tasks.withType<JavaCompile> {
     options.encoding = "UTF-8"
     options.compilerArgs.add("-parameters")
@@ -52,6 +61,9 @@ jacoco {
 
 tasks.withType<Test> {
     useJUnitPlatform()
+    // Most tests close the clients they create, and Netty's default 2 second
+    // quiet period would hold every such close for that long.
+    systemProperty("iggy.tcp.shutdownQuietPeriodMillis", "0")
     finalizedBy(tasks.jacocoTestReport)
 }
 

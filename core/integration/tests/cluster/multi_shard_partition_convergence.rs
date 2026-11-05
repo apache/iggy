@@ -104,11 +104,13 @@ async fn poll_payloads(
         .poll_messages(
             stream,
             topic,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            16,
-            false,
+            PollOptions {
+                count: 16,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap_or_else(|error| panic!("poll_messages: {error}"))
@@ -149,7 +151,10 @@ async fn given_two_shards_when_producing_right_after_create_topic_should_round_t
         .await
         .unwrap();
     let stream = Identifier::named(STREAM).unwrap();
-    client.create_stream(STREAM).await.unwrap();
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     for index in 0..TOPICS {
         create_topic(&client, &stream, &topic_name(index)).await;
@@ -193,7 +198,10 @@ async fn given_two_shards_when_recreating_a_topic_should_serve_only_the_new_inca
         .await
         .unwrap();
     let stream = Identifier::named(STREAM).unwrap();
-    client.create_stream(STREAM).await.unwrap();
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     for index in 0..TOPICS {
         let name = topic_name(index);

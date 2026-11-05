@@ -70,6 +70,7 @@ pub async fn handle(
             &request.group_id.0,
             request.generation_id,
             &request.member_id,
+            request.group_instance_id.as_ref(),
         )
         .await;
     connection.note_heartbeat(GroupMember::from(&request));
