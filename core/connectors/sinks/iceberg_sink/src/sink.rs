@@ -18,7 +18,7 @@
 use crate::{
     IcebergSink,
     catalog::init_catalog,
-    router::{dynamic_router::DynamicRouter, static_router::StaticRouter},
+    router::{BatchOrigin, dynamic_router::DynamicRouter, static_router::StaticRouter},
 };
 use async_trait::async_trait;
 use iceberg::Catalog;
@@ -96,7 +96,7 @@ impl Sink for IcebergSink {
 
     async fn consume(
         &self,
-        _topic_metadata: &TopicMetadata,
+        topic_metadata: &TopicMetadata,
         messages_metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
@@ -107,8 +107,18 @@ impl Sink for IcebergSink {
             messages_metadata.schema
         );
 
+        let origin = BatchOrigin {
+            connector_id: self.id,
+            stream: &topic_metadata.stream,
+            topic: &topic_metadata.topic,
+            partition_id: messages_metadata.partition_id,
+        };
         match &self.router {
-            Some(router) => router.route_data(messages_metadata, messages).await?,
+            Some(router) => {
+                router
+                    .route_data(&origin, messages_metadata.schema, messages)
+                    .await?
+            }
             None => {
                 error!("Iceberg connector has no router configured");
                 return Err(Error::InvalidConfig);
