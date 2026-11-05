@@ -60,10 +60,12 @@ example `max_wait = "3s"` with `min_count` equal to `batch_length`. `min_count`
 must not exceed `batch_length`. `max_wait` must be above zero and at most 10
 minutes, and the server shortens a wait above its `deferred_poll_max_wait`.
 Use `max_wait` and `min_count` in place of `poll_interval`. If a sink
-`[[streams]]` entry sets `poll_interval`, that sink fails to start. The server
-commits the offset of each sink poll when it answers the poll, before the
-plugin consumes the messages. Sinks need a server that supports deferred polls
-(binary commands 106 and 109 in protocol 0.12.1).
+`[[streams]]` entry sets `poll_interval`, that sink fails to start. By default
+the server commits the offset of each sink poll when it answers the poll,
+before the plugin consumes the messages. [Sink delivery
+guarantees](#sink-delivery-guarantees) describes the alternative. Sinks need a
+server that supports deferred polls (binary commands 106 and 109 in protocol
+0.12.1).
 
 At each start, a sink connects an Iggy client of its own. After the last
 consumer of that start stops, the sink logs the client out and shuts it down.
@@ -72,6 +74,78 @@ offset stores of another sink. The consumers inside one sink share its client.
 They share the progress lane of each partition, which orders their polls and
 offset calls. They also share the limit of 64 deferred requests per client.
 The [SDK README](../../sdk/README.md) describes both.
+
+## Sink delivery guarantees
+
+A sink delivers at most once by default: the offset of a poll is stored when the
+server answers it, so a batch that the plugin fails to write is lost. A
+`[delivery]` table makes a sink deliver at least once:
+
+```toml
+[delivery]
+guarantee = "at_least_once"  # default "at_most_once"
+retry_max_attempts = 10      # unset retries until the destination recovers
+retry_initial_backoff = "1s"
+retry_max_backoff = "30s"
+flush_interval = "5s"        # unset flushes after every batch
+flush_max_messages = 10000   # a partition with this many unflushed messages flushes at once
+invalid_messages = "stop"    # or "skip"
+```
+
+Every field is also an environment override, for example
+`IGGY_CONNECTORS_SINK_<KEY>_DELIVERY_GUARANTEE=at_least_once`.
+
+At least once, the runtime behaves as follows:
+
+- Polls store no offset. The plugin accepts each batch in `consume`, and the
+  runtime stores the offset of a partition only after the plugin's flush proved
+  the messages up to it delivered. A flush runs after every batch, or, with
+  `flush_interval`, when the interval runs out or a partition holds
+  `flush_max_messages` unflushed messages, whichever comes first.
+- A batch or flush that fails transiently is handed to the plugin again from
+  the first message not yet flushed, after a capped exponential backoff. A
+  message can arrive more than once, but none is skipped.
+- A permanent failure, or a transient one past `retry_max_attempts`, stops the
+  delivery of that topic with an error naming the stream, the topic, the
+  partitions and the offset. The sink reports the error, while its other
+  topics keep delivering. Before it stops, the topic flushes its other
+  partitions once and stores what the flush proved. The stored offset stays
+  below the message, so a restart, for example `POST /sinks/{key}/restart`,
+  delivers it again.
+- A restart helps once the destination recovers. A message that the plugin
+  rejects permanently stops the sink again at the same message, and
+  `invalid_messages = "skip"` does not cover it, since it covers only the
+  messages that the runtime cannot hand over. The error names the first offset
+  of the failed call, and the plugin's log names the rejected message. To move
+  past it, store its offset for the consumer group of the sink, then restart
+  the sink:
+
+  ```sh
+  iggy consumer-offset set <group> <stream> <topic> <partition> <offset> --kind consumer-group
+  ```
+
+  `<group>` is the `consumer_group` of the stream, or `iggy-connect-sink-<key>`
+  when it is unset. The stored offset marks the message and every one before
+  it as delivered.
+- A message that the runtime cannot decode, transform or serialize also stops
+  the sink, unless `invalid_messages = "skip"`, which skips it with an error
+  count and its offset in the log. A message that a transform filters counts as
+  delivered.
+- A partition whose next message no longer exists, after a new partition
+  history, stops the sink instead of skipping ahead. Move the stored offset to
+  resume.
+- A shutdown flushes once and stores what the flush proved. What it did not
+  prove is delivered again at the next start.
+
+The guarantee needs a plugin that supports it, and a sink configured for it
+with a plugin that does not refuses to start. Of the bundled sinks, `http`
+supports it. It covers only messages the server still holds: use topic
+`durability = "persisted"` and a retention longer than the longest expected
+sink outage.
+
+An older runtime ignores the `[delivery]` table, so after a rollback the server
+stores the offset of each sink poll when it answers it again, and the sink
+delivers at most once.
 
 ## State storage
 

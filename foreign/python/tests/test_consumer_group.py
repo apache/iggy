@@ -2114,8 +2114,19 @@ class TestConsumerGroup:
             )
 
     @pytest.mark.asyncio
-    async def test_shutdown(self, iggy_client: IggyClient, unique_name):
-        """Test that the consumer group can be signaled to shutdown."""
+    @pytest.mark.parametrize(
+        "timeout_options",
+        [
+            pytest.param({}, id="omitted"),
+            pytest.param({"offset_drain_timeout": None}, id="none"),
+            pytest.param({"offset_drain_timeout": timedelta(seconds=2)}, id="custom"),
+            pytest.param({"offset_drain_timeout": timedelta(0)}, id="zero"),
+        ],
+    )
+    async def test_shutdown(
+        self, iggy_client: IggyClient, unique_name, timeout_options
+    ):
+        """Test shutdown accepts the default and configured offset drain timeout."""
         consumer_name = unique_name()
         stream_name = unique_name()
         topic_name = unique_name()
@@ -2130,6 +2141,7 @@ class TestConsumerGroup:
             topic_name,
             polling_strategy=PollingStrategy.Next(),
             poll_options=INTERVAL_COMMIT_OPTIONS,
+            **timeout_options,
         )
 
         async def take(_: ReceiveMessage) -> None:
@@ -2138,6 +2150,26 @@ class TestConsumerGroup:
         shutdown_event.set()
 
         await consumer.consume_messages(take, shutdown_event)
+        await consumer.shutdown()
+
+        group = await iggy_client.get_consumer_group(
+            stream_name, topic_name, consumer_name
+        )
+        assert group is not None
+        assert group.members_count == 0
+
+    @pytest.mark.asyncio
+    async def test_negative_offset_drain_timeout_fails(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a negative offset drain timeout is rejected before initialization."""
+        with pytest.raises(ValueError, match="duration must not be negative"):
+            await iggy_client.consumer_group(
+                unique_name(),
+                unique_name(),
+                unique_name(),
+                offset_drain_timeout=timedelta(microseconds=-1),
+            )
 
     @pytest.mark.asyncio
     async def test_shutdown_with_on_read_moves_the_offset_back(

@@ -19,9 +19,11 @@ mod container;
 mod sink;
 mod source;
 
+pub use container::HttpSinkWireMockContainer;
 pub use sink::{
-    HttpSinkIndividualFixture, HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture,
-    HttpSinkNdjsonFixture, HttpSinkNoMetadataFixture, HttpSinkRawFixture,
+    HttpSinkAtLeastOnceFixture, HttpSinkAtLeastOnceStopFixture, HttpSinkIndividualFixture,
+    HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture, HttpSinkNdjsonFixture,
+    HttpSinkNoMetadataFixture, HttpSinkRawFixture,
 };
 pub use source::{
     GITHUB_ENDPOINT_ID, GITHUB_HMAC_HEADER, GITHUB_INSTANCE, HttpSourceFixture, MANAGEMENT_TOKEN,

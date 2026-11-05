@@ -149,6 +149,40 @@ python message-headers/typed-headers/producer.py
 python message-headers/typed-headers/consumer.py
 ```
 
+### Sink Data Producer
+
+Populates an Iggy topic with JSON records so that sink connectors have data to consume.
+The producer generates 100 batches of 100 to 499 records each.
+
+Each record contains: `user_id`, `user_type`, `email`, `source`, `state`, `created_at`,
+and `message`.
+
+Default stream: `qw` | Default topic: `records`
+
+Environment variables:
+
+- `IGGY_STREAM` - stream name (default: `qw`)
+- `IGGY_TOPIC` - topic name (default: `records`)
+- `IGGY_ADDRESS` - server address (default: `127.0.0.1:8090`)
+- `IGGY_USERNAME` - authentication username (default: `iggy`)
+- `IGGY_PASSWORD` - authentication password (default: `iggy`)
+
+When a connection string is provided through the command line, it takes precedence over and replaces the `IGGY_ADDRESS`, `IGGY_USERNAME`, and `IGGY_PASSWORD` environment variables.
+
+The producer checks for and creates the stream and topic if they are missing. It
+retains the stream and topic after execution and does not delete them.
+
+```bash
+# Using uv
+uv run sink-data-producer/producer.py
+
+# Without using uv
+python sink-data-producer/producer.py
+
+# With custom stream and topic
+IGGY_STREAM=test-stream IGGY_TOPIC=test-topic uv run sink-data-producer/producer.py
+```
+
 ## TLS Examples
 
 To test with a TLS-enabled server, start the server with TLS configured (see main README), then run:
