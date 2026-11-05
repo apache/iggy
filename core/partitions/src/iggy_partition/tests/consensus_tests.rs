@@ -597,6 +597,31 @@ async fn given_a_dispatcher_when_flushing_should_leave_the_flush_to_the_owner() 
 }
 
 #[compio::test]
+async fn given_a_dispatched_flush_when_the_lane_settles_should_free_the_maintenance_box() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut partition, _replies, config, _parent) =
+        partition_with_committed_send(root.path(), iggy_common::Durability::Replicated, 3).await;
+    partition.set_io_notifier(
+        Rc::new(|_, _| {}),
+        crate::largest_legal_job_charge().unwrap(),
+    );
+
+    assert!(!partition.flush_committed_messages(&config).await.unwrap());
+    assert!(partition.maintenance.0.is_some());
+    settle_partition_io(&mut partition, &config).await;
+
+    assert!(
+        partition.maintenance.0.is_none(),
+        "a finished flush must not keep the maintenance box"
+    );
+    assert!(
+        partition.flush_committed_messages(&config).await.unwrap(),
+        "the finished flush must still satisfy the next request"
+    );
+    assert!(partition.maintenance.0.is_none());
+}
+
+#[compio::test]
 async fn given_rebuilt_replicated_prepare_above_a_wal_hole_when_acknowledging_should_wait() {
     let directory = tempfile::tempdir().unwrap();
     let (mut backup, _) = recording_partition_at(1, 3);
@@ -871,7 +896,7 @@ async fn live_retransmits_fill_an_announced_gap_only_after_the_matching_prefix()
             .consensus()
             .handle_start_view(PlaneKind::Partitions, start.header(), &[]);
         assert!(!partition.consensus().view_log_is_pending());
-        partition.repair = Some(armed_fetch_session(0, 3, 0));
+        partition.repair = Some(Box::new(armed_fetch_session(0, 3, 0)));
         partition.apply_repaired_prepare(first.clone()).await;
         assert!(
             !partition.log.journal().inner.holds_op(1),

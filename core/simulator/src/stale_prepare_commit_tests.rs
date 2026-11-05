@@ -503,6 +503,8 @@ fn repair_session(
         .get_by_ns(&namespace)
         .expect("replica hosts the group")
         .repair
+        .as_deref()
+        .copied()
 }
 
 pub fn primary_of(sim: &Simulator, replica: u8, namespace: IggyNamespace, view: u32) -> u8 {

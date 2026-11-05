@@ -553,7 +553,7 @@ async fn given_foreign_session_retirement_when_replicated_or_repaired_should_pre
         let (mut backup, _) = recording_partition_at(1, 3);
         backup.set_created_revision(INCARNATION);
         if repaired {
-            backup.repair = Some(armed_session(NEXT_OP, 0));
+            backup.repair = Some(Box::new(armed_session(NEXT_OP, 0)));
         }
         for foreign in [0, INCARNATION - 1, INCARNATION + 1] {
             for commit in [0, COMMITTED_ELSEWHERE] {
