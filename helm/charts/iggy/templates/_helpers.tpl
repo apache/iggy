@@ -319,8 +319,11 @@ Secret owns it.
     {{- $configVersion := $server.encryption.configVersion | default "auto" }}
     {{- if eq $configVersion "auto" }}
       {{- $imageTag := $server.image.tag | default .Chart.AppVersion }}
-      {{- if and (regexMatch "^v?[0-9]+\\.[0-9]+\\.[0-9]+([+-].*)?$" $imageTag) (semverCompare "<=0.9.0-edge.7" $imageTag) }}
+      {{- $versioned := regexMatch "^v?[0-9]+\\.[0-9]+\\.[0-9]+([+-].*)?$" $imageTag }}
+      {{- if and $versioned (semverCompare "<=0.9.0-edge.7" $imageTag) }}
         {{- $configVersion = "legacy" }}
+      {{- else if $versioned }}
+        {{- $configVersion = "flat" }}
       {{- else }}
         {{- fail "Cannot determine the encryption config layout for this server image. Set server.encryption.configVersion to flat for builds using [encryption], or legacy for builds using [system.encryption]." }}
       {{- end }}
