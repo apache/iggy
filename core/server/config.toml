@@ -1156,12 +1156,21 @@ evicted_ring_capacity = 65536
 # ops go, but the newest entry stays even if it alone exceeds this budget. Must
 # be > 0 and <= "256 MiB". The ops whose batches left memory take up to
 # 4.5 MiB more. Allocation capacity, alignment and index overhead are
-# additional memory, especially for small offset commits. There is no node-wide
-# budget.
+# additional memory, especially for small offset commits.
+# evicted_ring_node_bytes_max bounds the sum across all partitions.
 # partition_repair_ring_bytes reports these bytes plus 288 bytes for each
 # released op, summed across a shard's partitions, not their allocated memory
 # or RSS.
 evicted_ring_bytes_max = "64 MiB"
+
+# Node-wide budget for the evicted rings of all partitions: the batches they
+# hold in memory plus 288 bytes for each op whose batch they released to its
+# segment. Each shard gets an equal share, because a shard can shed only its
+# own rings. Past its share, a shard first releases the oldest batches across
+# its partitions to their segments, then drops the oldest released ops. Every
+# ring keeps its newest entry, so a shard with many written partitions can
+# stay above its share by those entries. Must be > 0.
+evicted_ring_node_bytes_max = "4 GiB"
 
 # Byte budget for segment payloads a SERVING shard keeps resident to answer
 # state-transfer chunk requests. PER SHARD, and shard count defaults to core

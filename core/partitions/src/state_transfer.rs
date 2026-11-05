@@ -3113,11 +3113,11 @@ where
     /// store commits them, so neither can be promoted by state transfer.
     fn offsets_wire_snapshot(&self) -> Result<ConsumerOffsetsWire, PartitionTransferUnavailable> {
         self.validate_consumer_offset_transfer_counts()?;
-        let consumer_map = self.consumer_offsets.pin();
+        let consumer_map = self.consumer_offsets.borrow();
         let consumers = self.snapshot_offset_kind(ConsumerKind::Consumer, |id| {
             consumer_map.contains_key(&(id as usize))
         })?;
-        let group_map = self.consumer_group_offsets.pin();
+        let group_map = self.consumer_group_offsets.borrow();
         let groups = self.snapshot_offset_kind(ConsumerKind::ConsumerGroup, |id| {
             group_map.contains_key(&ConsumerGroupId(id as usize))
         })?;
@@ -4456,9 +4456,9 @@ where
 
     /// Clear the offset table for the installed one, which keeps `emptied_at`.
     fn clear_install_offsets(&mut self, emptied_at: u64) {
-        self.consumer_offsets.pin().clear();
-        self.consumer_group_offsets.pin().clear();
-        self.last_polled_offsets.pin().clear();
+        self.consumer_offsets.get_mut().clear();
+        self.consumer_group_offsets.get_mut().clear();
+        self.last_polled_offsets.get_mut().clear();
         self.durable_consumer_offsets.clear();
         self.durable_consumer_offsets.set_emptied_at(emptied_at);
         self.explicit_offset_stores
@@ -4482,11 +4482,13 @@ where
         let entry = ConsumerOffset::new(kind, id, value, path);
         match kind {
             ConsumerKind::Consumer => {
-                self.consumer_offsets.pin().insert(id as usize, entry);
+                self.consumer_offsets
+                    .borrow_mut()
+                    .insert(id as usize, entry);
             }
             ConsumerKind::ConsumerGroup => {
                 self.consumer_group_offsets
-                    .pin()
+                    .borrow_mut()
                     .insert(ConsumerGroupId(id as usize), entry);
             }
             // Recorded below: the durable table is the only store of an external offset.

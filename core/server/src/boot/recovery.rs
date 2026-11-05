@@ -43,7 +43,7 @@ use message_bus::IggyMessageBus;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
-use partitions::{IggyPartitions, PartitionsConfig, StreamKeyIdentity};
+use partitions::{IggyPartitions, PartitionsConfig, RepairRingBudget, StreamKeyIdentity};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use shard::builder::IggyShardBuilder;
 use shard::config::DeferredPollConfig;
@@ -190,7 +190,12 @@ pub(in crate::boot) async fn build_shard_for_thread(
         },
         owned_partitions_capacity,
         repair_memory,
-    );
+    )
+    .with_repair_rings(Rc::new(RepairRingBudget::new(
+        // A shard can shed only its own rings, so each takes an equal share.
+        config.partition.evicted_ring_node_bytes_max.as_bytes_u64()
+            / u64::from(total_shards).max(1),
+    )));
     let shards_table = PapayaShardsTable::with_capacity(total_partitions);
 
     // Stream-filter inside the `read()` closure: only partitions owned by

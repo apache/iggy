@@ -26,6 +26,7 @@ use server_common::{
     send_messages::{
         self, BatchRef, COMMAND_HEADER_SIZE, decode_prepare_slice, decode_prepare_slice_trusted,
     },
+    sharding::IggyNamespace,
 };
 use std::io;
 use std::{
@@ -38,7 +39,7 @@ use std::{
 use tracing::warn;
 
 use crate::log::SegmentedLog;
-use crate::repair_memory::RepairMemoryReservation;
+use crate::repair_memory::{RepairMemoryReservation, RepairRingBudget, RingCharge, RingTicket};
 use crate::state_machine::{COMMANDS_RETAINED_BYTES_MAX, COMMANDS_RETAINED_MAX, StateMachineLog};
 use crate::{Fragment, PollFragments, PollQueryResult};
 
@@ -125,7 +126,7 @@ pub struct EvictedHeader {
 
 /// What one released entry costs the evicted ring: 288 bytes, so
 /// [`EVICTED_HEADERS_MAX`] of them take 4.5 MiB per partition.
-const EVICTED_HEADER_BYTES: u64 = size_of::<EvictedHeader>() as u64;
+pub const EVICTED_HEADER_BYTES: u64 = size_of::<EvictedHeader>() as u64;
 const _: () = assert!(EVICTED_HEADER_BYTES == 288);
 
 impl EvictedHeader {
@@ -484,6 +485,12 @@ impl RingEntry {
     }
 }
 
+/// What a ring charges to the shard's repair ring budget: its bodies in
+/// memory plus one [`EvictedHeader`] per released body.
+fn charged_bytes(body_bytes: u64, headers: &VecDeque<EvictedHeader>) -> u64 {
+    body_bytes + headers.len() as u64 * EVICTED_HEADER_BYTES
+}
+
 /// Drops the oldest entry of either tier of the evicted ring, so the ops it
 /// keeps stay one run. Returns the body bytes it frees.
 fn drop_oldest_evicted(
@@ -649,6 +656,9 @@ where
     /// Single-replica groups have nobody to repair; retaining evicted
     /// entries for them is pure memory waste.
     repair_retention: Cell<bool>,
+    /// This ring's share of the shard's repair ring budget, once the shard
+    /// holds the partition.
+    ring_charge: RefCell<Option<RingCharge>>,
     /// Resident entries that are not `SendMessages` (consumer offset stores
     /// and deletes). They carry no segment bytes, so the message-count and
     /// byte flush thresholds never see them, yet the flush is the only
@@ -810,6 +820,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         unsafe { &mut *self.evicted_headers.get() }.clear();
         self.evicted_ring_bytes.set(0);
         self.released_through.set(0);
+        self.sync_ring_charge(false);
     }
 
     pub(crate) fn retain_repair_from(
@@ -840,6 +851,37 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     pub fn set_ring_caps(&self, capacity: usize, bytes_max: u64) {
         self.evicted_ring_capacity.set(capacity);
         self.evicted_ring_bytes_max.set(bytes_max);
+    }
+
+    /// Charges this ring to the shard's `budget` from now on, so the shard
+    /// can shed it. Replaces an earlier charge, which returns its bytes.
+    pub(crate) fn attach_ring_budget(
+        &self,
+        budget: Rc<RepairRingBudget>,
+        namespace: IggyNamespace,
+    ) {
+        *self.ring_charge.borrow_mut() = Some(RingCharge::new(budget, namespace));
+        self.sync_ring_charge(self.ring_entries() > 1);
+    }
+
+    /// Whether this ring still carries the charge that `ticket` names.
+    pub(crate) fn charged_by(&self, ticket: RingTicket) -> bool {
+        self.ring_charge
+            .borrow()
+            .as_ref()
+            .is_some_and(|charge| charge.ticket() == ticket)
+    }
+
+    /// Brings the charge in line with the ring after a change. `sheddable`
+    /// queues a ring that holds more than its newest entry for the shard.
+    fn sync_ring_charge(&self, sheddable: bool) {
+        if let Some(charge) = self.ring_charge.borrow().as_ref() {
+            let headers = unsafe { &*self.evicted_headers.get() };
+            charge.update(
+                charged_bytes(self.evicted_ring_bytes.get(), headers),
+                sheddable,
+            );
+        }
     }
 
     /// Entries the repair ring retains and the bytes they pin, for the shard
@@ -912,6 +954,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
                 body: None,
             },
         );
+        self.sync_ring_charge(false);
     }
 
     /// Entry bytes for `op`, from the resident journal or the evicted ring.
@@ -1186,6 +1229,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             headers.pop_front();
         }
         self.evicted_ring_bytes.set(bytes);
+        self.sync_ring_charge(false);
     }
 
     /// Synchronous resident-range poll read. Never awaits (mem storage reads
@@ -1376,6 +1420,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         }
         self.evicted_ring_bytes.set(ring_bytes);
         self.trim_evicted_ring();
+        self.sync_ring_charge(self.ring_entries() > 1);
     }
 
     /// Whether an op in the `count` front entries has a copy behind them. The
@@ -1478,30 +1523,112 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         let headers = unsafe { &mut *self.evicted_headers.get() };
         let mut bytes = self.evicted_ring_bytes.get();
         let bytes_max = self.evicted_ring_bytes_max.get();
-        let newest = ring.last_key_value().map(|(op, _)| *op);
         while bytes > bytes_max {
-            let Some((&op, entry)) = ring
-                .range(self.released_through.get().saturating_add(1)..)
-                .next()
-                .filter(|(op, _)| Some(**op) != newest)
+            let Some(freed) = self.release_next_body(ring, headers, &mut retained, retained_from)
             else {
                 break;
             };
-            self.released_through.set(op);
-            if let Some(evicted) = entry.evicted_header() {
-                bytes -= entry.prepare.len() as u64;
-                ring.remove(&op);
-                while headers.len() >= EVICTED_HEADERS_MAX {
-                    bytes -= drop_oldest_evicted(ring, headers, &mut retained, retained_from);
-                }
-                headers.push_back(evicted);
-            }
+            bytes -= freed;
         }
         while ring.len() > self.evicted_ring_capacity.get() || (bytes > bytes_max && ring.len() > 1)
         {
             bytes -= drop_oldest_evicted(ring, headers, &mut retained, retained_from);
         }
         self.evicted_ring_bytes.set(bytes);
+    }
+
+    /// Releases the oldest bodies that a segment holds, for the shard's
+    /// repair ring budget, until this ring's charge falls by `excess`. Keeps
+    /// the newest entry. Returns whether a body is left to release.
+    pub(crate) fn release_ring_bodies(&self, excess: u64) -> bool {
+        let left = {
+            let mut retained = self.repair_tail.borrow_mut();
+            let retained_from = retained.prune();
+            let ring = unsafe { &mut *self.evicted_ring.get() };
+            let headers = unsafe { &mut *self.evicted_headers.get() };
+            let mut bytes = self.evicted_ring_bytes.get();
+            let target = charged_bytes(bytes, headers).saturating_sub(excess);
+            let mut drained = false;
+            while !drained && charged_bytes(bytes, headers) > target {
+                match self.release_next_body(ring, headers, &mut retained, retained_from) {
+                    Some(freed) => bytes -= freed,
+                    None => drained = true,
+                }
+            }
+            self.evicted_ring_bytes.set(bytes);
+            !drained && self.next_releasable(ring).is_some()
+        };
+        self.sync_ring_charge(false);
+        if !left && let Some(charge) = self.ring_charge.borrow().as_ref() {
+            charge.bodies_released(self.ring_entries() > 1);
+        }
+        left
+    }
+
+    /// Drops the oldest entries, for the shard's repair ring budget, until
+    /// this ring's charge falls by `excess`. Keeps the newest entry. Returns
+    /// whether more than the newest entry is left.
+    pub(crate) fn drop_ring_entries(&self, excess: u64) -> bool {
+        {
+            let mut retained = self.repair_tail.borrow_mut();
+            let retained_from = retained.prune();
+            let ring = unsafe { &mut *self.evicted_ring.get() };
+            let headers = unsafe { &mut *self.evicted_headers.get() };
+            let mut bytes = self.evicted_ring_bytes.get();
+            let target = charged_bytes(bytes, headers).saturating_sub(excess);
+            while charged_bytes(bytes, headers) > target && ring.len() + headers.len() > 1 {
+                bytes -= drop_oldest_evicted(ring, headers, &mut retained, retained_from);
+            }
+            self.evicted_ring_bytes.set(bytes);
+        }
+        self.sync_ring_charge(false);
+        let droppable = self.ring_entries() > 1;
+        if !droppable && let Some(charge) = self.ring_charge.borrow().as_ref() {
+            charge.entries_dropped();
+        }
+        droppable
+    }
+
+    /// Releases the body of the oldest entry above `released_through` that a
+    /// segment holds, and passes over the ones no segment holds. Never takes
+    /// the newest entry. Returns the body bytes freed, or `None` when no body
+    /// is left to release.
+    fn release_next_body(
+        &self,
+        ring: &mut BTreeMap<u64, RingEntry>,
+        headers: &mut VecDeque<EvictedHeader>,
+        retained: &mut RepairTail,
+        retained_from: Option<u64>,
+    ) -> Option<u64> {
+        loop {
+            let op = self.next_releasable(ring)?;
+            self.released_through.set(op);
+            let Some(evicted) = ring.get(&op).and_then(RingEntry::evicted_header) else {
+                continue;
+            };
+            let mut freed = ring
+                .remove(&op)
+                .map_or(0, |entry| entry.prepare.len() as u64);
+            while headers.len() >= EVICTED_HEADERS_MAX {
+                freed += drop_oldest_evicted(ring, headers, retained, retained_from);
+            }
+            headers.push_back(evicted);
+            return Some(freed);
+        }
+    }
+
+    /// The oldest entry above `released_through` other than the newest one.
+    fn next_releasable(&self, ring: &BTreeMap<u64, RingEntry>) -> Option<u64> {
+        let newest = ring.last_key_value().map(|(op, _)| *op);
+        ring.range(self.released_through.get().saturating_add(1)..)
+            .map(|(op, _)| *op)
+            .find(|op| Some(*op) != newest)
+    }
+
+    fn ring_entries(&self) -> usize {
+        let ring = unsafe { &*self.evicted_ring.get() };
+        let headers = unsafe { &*self.evicted_headers.get() };
+        ring.len() + headers.len()
     }
 
     /// INVARIANT (length-lock): the header is pushed before `storage.write_at`,
@@ -1639,6 +1766,7 @@ where
             evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
             evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
+            ring_charge: RefCell::new(None),
             resident_control_ops: Cell::new(0),
             evicted_through: Cell::new(0),
             out_of_order: Cell::new(false),

@@ -681,7 +681,7 @@ fn given_recorded_last_polled_when_retirement_prunes_the_group_should_clear_it()
     };
     partition.apply_consumer_group_owner(fence, 1).unwrap();
     // The fence install clears the entry, so the test seeds it after.
-    partition.last_polled_offsets.pin().insert(
+    partition.last_polled_offsets.borrow_mut().insert(
         ConsumerGroupId(GROUP_ID as usize),
         ConsumerOffset::new(
             ConsumerKind::ConsumerGroup,

@@ -396,7 +396,7 @@ async fn given_a_deleted_group_when_reconciling_should_list_its_external_offset(
     let (partition, _) = recording_partition();
     partition.seed_recovered_consumer_offset(ConsumerKind::ExternalGroup, 7, 11, 11);
     partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, 9, 11, 11);
-    partition.consumer_group_offsets.pin().insert(
+    partition.consumer_group_offsets.borrow_mut().insert(
         ConsumerGroupId(9),
         ConsumerOffset::new(ConsumerKind::ConsumerGroup, 9, 11, String::new()),
     );
@@ -552,7 +552,7 @@ async fn given_a_clamped_offset_of_a_kind_without_a_directory_when_clamping_shou
     let consumer_file = dir.path().join("7").to_string_lossy().into_owned();
     persist_offset(&consumer_file, 1_000, true).await.unwrap();
     let (partition, _) = recording_partition();
-    partition.consumer_offsets.pin().insert(
+    partition.consumer_offsets.borrow_mut().insert(
         7,
         ConsumerOffset::new(ConsumerKind::Consumer, 7, 1_000, consumer_file.clone()),
     );
@@ -599,7 +599,7 @@ async fn recover_offsets_at(
 fn consumer_offset(partition: &IggyPartition<RecordingBus>, consumer_id: usize) -> Option<u64> {
     partition
         .consumer_offsets
-        .pin()
+        .borrow()
         .get(&consumer_id)
         .map(|offset| offset.offset.load(Ordering::Relaxed))
 }
@@ -607,7 +607,7 @@ fn consumer_offset(partition: &IggyPartition<RecordingBus>, consumer_id: usize) 
 fn group_offset(partition: &IggyPartition<RecordingBus>, group_id: usize) -> Option<u64> {
     partition
         .consumer_group_offsets
-        .pin()
+        .borrow()
         .get(&ConsumerGroupId(group_id))
         .map(|offset| offset.offset.load(Ordering::Relaxed))
 }

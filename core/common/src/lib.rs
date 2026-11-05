@@ -142,11 +142,9 @@ pub use types::configuration::websocket_config::websocket_client_reconnection_co
 pub use types::configuration::websocket_config::websocket_connection_string_options::*;
 pub use types::consumer::consumer_group::*;
 pub use types::consumer::consumer_group_id::*;
-pub use types::consumer::consumer_group_offsets::*;
 pub use types::consumer::consumer_kind::*;
 pub use types::consumer::consumer_offset::*;
 pub use types::consumer::consumer_offset_info::*;
-pub use types::consumer::consumer_offsets::*;
 pub use types::diagnostic::diagnostic_event::DiagnosticEvent;
 pub use types::either::Either;
 pub use types::http::HttpMethod;

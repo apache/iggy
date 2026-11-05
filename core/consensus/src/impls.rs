@@ -617,9 +617,11 @@ impl LocalPipeline {
              than a DoViewChange can address (max {})",
             DVC_HEADERS_MAX - 1,
         );
+        // Grown on first use: most partitions of a large node stay idle, and
+        // reserving both queues up front costs about 14 KB per partition.
         Self {
-            prepare_queue: VecDeque::with_capacity(prepare_queue_max),
-            request_queue: VecDeque::with_capacity(request_queue_max),
+            prepare_queue: VecDeque::new(),
+            request_queue: VecDeque::new(),
             prepare_queue_max,
             request_queue_max,
         }
