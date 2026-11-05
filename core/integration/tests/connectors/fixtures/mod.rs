@@ -73,7 +73,7 @@ pub use http::{
 };
 pub use iceberg::{
     DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergEnvAuthFixture, IcebergOps,
-    IcebergPartitionedTableFixture, IcebergPreCreatedFixture,
+    IcebergPartitionedTableFixture, IcebergPreCreatedFixture, IcebergSkipInvalidRowsFixture,
 };
 pub use influxdb::{
     InfluxDb3SinkFixture, InfluxDb3SourceFixture, InfluxDbSinkBase64Fixture, InfluxDbSinkFixture,
