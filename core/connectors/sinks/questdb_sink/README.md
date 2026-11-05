@@ -109,7 +109,15 @@ connection_string = "ws::addr=localhost:9000;sf_dir=/var/lib/iggy/questdb-sf;sen
 Use it in production. The connectors runtime commits offsets before
 `consume()` runs ([#2928](https://github.com/apache/iggy/issues/2928)) and does
 not replay a failed batch ([#2927](https://github.com/apache/iggy/issues/2927)),
-so rows lost in the sink cannot be read again from Iggy.
+so the runtime does not replay rows that the sink lost.
+
+`sf_dir` keeps frames across a process crash or restart, but not across a host
+failure. By default the client does not fsync the frames, so a power loss or a
+kernel crash can lose frames that `consume()` already reported. Add
+`sf_durability=periodic` to fsync them every `sf_sync_interval_millis` (5000 ms
+by default). A host failure can then lose only the frames of the last interval.
+To recover rows lost this way, see
+[Recovery after a host failure](#recovery-after-a-host-failure).
 
 - The parent directory of `sf_dir` must exist. `~` is not expanded.
 - Give each connector instance its own `sender_id` or its own `sf_dir`.
@@ -233,7 +241,7 @@ a failover or a replay of queued frames can send the same rows again. Declare
 tables that must not have duplicates.
 
 The client queues unacknowledged frames in memory, or on disk when `sf_dir` is
-set. Rows can still be lost in three cases:
+set. Rows can still be lost in four cases:
 
 - With `ack_level = "ok"` on a cluster, a primary that fails before it ships
   its write-ahead log can lose rows it accepted. See
@@ -241,6 +249,8 @@ set. Rows can still be lost in three cases:
 - Without `sf_dir`, a crash, or a shutdown that outlasts
   `close_flush_timeout_millis` in the connect string, loses the queue even
   though `consume()` already reported success.
+- With `sf_dir`, a host failure loses the frames that the client did not fsync.
+  See [Store-and-forward](#store-and-forward).
 - Rows the sink does not write, such as a rejected record or a failed chunk,
   are lost, as the rest of this section describes.
 
@@ -292,6 +302,29 @@ A record is rejected when:
 
 Set `log_rejected_payload = true` to add a truncated payload to these log lines.
 This writes user data to the log.
+
+### Recovery after a host failure
+
+Rows that a host failure lost are still in Iggy while the topic retains them.
+To write them again, rewind the consumer group of the sink. Its name is the
+`consumer_group` of the stream, or `iggy-connect-sink-<key>` when that is not
+set. With `include_offset_column = true`, the highest `offset` for each
+`partition_id` in the table shows where QuestDB stopped.
+
+1. Stop the connectors runtime.
+2. For each partition, find the first offset to write again.
+3. Set the stored offset to one less than that offset. Iggy resumes after the
+   stored offset.
+
+   ```sh
+   iggy consumer-offset set questdb_sink events questdb_events <partition> <offset> --kind consumer-group
+   ```
+
+4. Start the connectors runtime.
+
+The sink writes some rows a second time. Declare `DEDUP UPSERT KEYS` on the
+table to keep one copy of each row. This does not work with
+`timestamp_source = "server"`, because the second copy gets a new timestamp.
 
 ### Reserved column names
 

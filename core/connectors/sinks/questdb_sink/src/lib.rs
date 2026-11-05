@@ -987,7 +987,7 @@ struct BatchOutcome {
     rejected_rows: usize,
     /// Flushes whose acknowledgement had not arrived before the timeout. The
     /// rows stay queued and are still being delivered, so this is lag, not
-    /// loss. The queue survives a crash only when `sf_dir` is set.
+    /// loss. The queue survives a process crash only when `sf_dir` is set.
     pending_acks: usize,
     last_rejection: Option<String>,
 }

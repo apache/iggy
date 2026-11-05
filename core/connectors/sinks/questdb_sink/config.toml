@@ -37,7 +37,8 @@ consumer_group = "questdb_sink"
 connection_string = "ws::addr=localhost:9000;"
 # Set `sf_dir` to keep unacknowledged frames on disk across disconnects and
 # restarts. Its parent directory must exist. Give each connector instance its
-# own `sender_id` or `sf_dir`.
+# own `sender_id` or `sf_dir`. Add `sf_durability=periodic` to fsync the frames,
+# so that a host failure loses only the last `sf_sync_interval_millis`.
 # connection_string = "ws::addr=localhost:9000;sf_dir=/var/lib/iggy/questdb-sf;sender_id=iggy;"
 table = "iggy_events"
 
