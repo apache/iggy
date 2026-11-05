@@ -1656,7 +1656,8 @@ pub(crate) enum TransferPlanSlot {
     /// A request waits for the flush that has to come before the capture.
     Wanted,
     Pinned(Rc<TransferPlan>),
-    Failed(PartitionTransferUnavailable),
+    /// Boxed: the error takes 80 bytes, and every partition holds a slot.
+    Failed(Box<PartitionTransferUnavailable>),
 }
 
 /// Why a partition cannot serve a state transfer right now.

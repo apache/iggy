@@ -967,7 +967,7 @@ fn given_partition_probe_when_local_history_is_not_ready_should_refuse() {
                 .consensus()
                 .set_state_transfer_stage(StateTransferStage::AwaitingTarget),
             "repair" => {
-                partition.repair = Some(partitions::RepairSession {
+                partition.repair = Some(Box::new(partitions::RepairSession {
                     nonce: NONCE,
                     view: PARTITION_VIEW,
                     from_op: COMMITTED + 1,
@@ -978,7 +978,7 @@ fn given_partition_probe_when_local_history_is_not_ready_should_refuse() {
                     idle_ticks: 0,
                     floor_pulled_from: 0,
                     requested_from: None,
-                });
+                }));
             }
             "ceded" => partition.consensus().init_as_backup(),
             "recovery barrier" => partition.consensus().set_recovery_barrier(COMMITTED + 1),

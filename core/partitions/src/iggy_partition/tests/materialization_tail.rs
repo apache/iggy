@@ -317,7 +317,7 @@ async fn given_a_fenced_window_when_flushing_should_write_nothing_above_commit_m
     .await;
     let partition = &mut fixture.partition;
     partition.log.journal().inner.set_repair_retention(true);
-    partition.repair = Some(armed_session(3, 0));
+    partition.repair = Some(Box::new(armed_session(3, 0)));
     for op in 1..=3 {
         partition
             .apply_repaired_prepare(repaired_send_prepare(
@@ -402,7 +402,7 @@ async fn given_flushed_repair_ahead_of_commit_min_when_replayed_should_persist_o
     .await;
     let partition = &mut fixture.partition;
     partition.log.journal().inner.set_repair_retention(true);
-    partition.repair = Some(armed_session(4, 0));
+    partition.repair = Some(Box::new(armed_session(4, 0)));
     let prepares: Vec<_> = (1..=4)
         .map(|op| repaired_send_prepare(op, u128::from(op - 1), u128::from(op)).into_frozen())
         .collect();
@@ -481,7 +481,7 @@ async fn given_repaired_op_above_a_hole_when_flushing_should_hold_it_until_the_h
     )
     .await;
     let partition = &mut fixture.partition;
-    partition.repair = Some(armed_session(6, 0));
+    partition.repair = Some(Box::new(armed_session(6, 0)));
     for op in [1, 2, 3, 6] {
         partition
             .apply_repaired_prepare(repaired_send_prepare(
@@ -535,7 +535,7 @@ async fn given_out_of_order_repair_when_the_io_owner_flushes_should_write_in_op_
         Rc::new(|_, _| {}),
         crate::largest_legal_job_charge().unwrap(),
     );
-    partition.repair = Some(armed_session(6, 0));
+    partition.repair = Some(Box::new(armed_session(6, 0)));
     for op in [1, 2, 3, 6, 4, 5] {
         partition
             .apply_repaired_prepare(repaired_send_prepare(
@@ -749,7 +749,7 @@ async fn given_offsets_already_persisted_when_flushed_again_should_not_append_a_
     let mut partition = test_partition();
     let record_len = build_segment_record(IggyNamespace::new(1, 1, 0), 1).len() as u64;
     let chained = |op: u64| if op == 1 { 0 } else { CHECKSUM };
-    partition.repair = Some(armed_session(OPS, 0));
+    partition.repair = Some(Box::new(armed_session(OPS, 0)));
 
     for op in 1..=OPS {
         partition
@@ -786,7 +786,7 @@ async fn given_offsets_already_persisted_when_flushed_again_should_not_append_a_
              is what lets the repair ingest re-deliver it"
     );
 
-    partition.repair = Some(armed_session(OPS, 0));
+    partition.repair = Some(Box::new(armed_session(OPS, 0)));
     partition
         .apply_repaired_prepare(repaired_send_prepare(OPS, chained(OPS), CHECKSUM))
         .await;

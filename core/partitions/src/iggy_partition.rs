@@ -102,6 +102,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, btree_map};
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -214,8 +215,10 @@ where
     pub(crate) acknowledged_op: Cell<u64>,
     /// In-flight journal repair:
     /// set when the recovery handshake finds this replica behind the group's
-    /// commit frontier, cleared when `RepairDone` completes the walk.
-    pub repair: Option<RepairSession>,
+    /// commit frontier, cleared when `RepairDone` completes the walk. Boxed like
+    /// the other session state of this struct, because idle partitions hold
+    /// none of it.
+    pub repair: Option<Box<RepairSession>>,
     /// Consecutive shard-sweep ticks this partition has been seen gap-stopped
     /// (committed ops it cannot walk to, because the op at its commit frontier
     /// plus one is missing). Debounces the sweep's level-triggered repair arm,
@@ -270,8 +273,11 @@ where
     pending_commit: Option<PendingCommit>,
     local_request_order: Cell<u64>,
     no_ack: VecDeque<PendingNoAck>,
-    materialization: Option<PendingMaterialization>,
-    maintenance: PendingPartitionMaintenance,
+    materialization: Option<Box<PendingMaterialization>>,
+    maintenance: LazyMaintenance,
+    /// The op the last finished flush covered. Outside `maintenance`, because
+    /// it outlives the flush and would keep that box allocated.
+    flush_completed_through: Option<u64>,
     io_notifier: RefCell<Option<crate::PartitionIoNotifier>>,
     io_bytes_max: Cell<usize>,
     io_sequence: Cell<u64>,
@@ -281,7 +287,7 @@ where
     pub(crate) pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
     /// Entries journaled before this replica adopted the current view, held back
     /// from commit and acknowledgement until proven. See [`Self::fence_view_window`].
-    view_fence: Option<ViewFence>,
+    view_fence: Option<Box<ViewFence>>,
     /// Set at boot when the WAL replayed history: the first view adoption after a
     /// restart fences it even though `log_view` came back unchanged.
     recovered_unproven: bool,
@@ -391,7 +397,7 @@ where
     /// In-flight state transfer for this group (rejoin whose repair floor was
     /// refused); tail repair takes over at install. See
     /// [`PartitionTransferSession`].
-    pub transfer: Option<PartitionTransferSession>,
+    pub transfer: Option<Box<PartitionTransferSession>>,
     /// Consecutive transfer stall rounds WITHIN one recovery attempt. NOT in the
     /// session: three of four metadata arming sites re-minted their session, so
     /// a per-session counter bounded nothing and a permanent failure cycled
@@ -743,17 +749,85 @@ struct PendingMaterializationSave {
     written: u64,
 }
 
-#[derive(Default)]
 struct PendingPartitionMaintenance {
     flush_through: Option<u64>,
     flush_drain: Option<crate::PersistenceDrain>,
-    flush_completed_through: Option<u64>,
     transfer_flush: bool,
     shutdown: Option<PartitionShutdownPhase>,
     shutdown_drain: Option<crate::PersistenceDrain>,
     checkpoint: Option<PendingCheckpoint>,
     retention: Option<u64>,
     removing: Option<Segment>,
+}
+
+impl PendingPartitionMaintenance {
+    const IDLE: Self = Self {
+        flush_through: None,
+        flush_drain: None,
+        transfer_flush: false,
+        shutdown: None,
+        shutdown_drain: None,
+        checkpoint: None,
+        retention: None,
+        removing: None,
+    };
+
+    /// Destructured, so a new field fails to compile here instead of being
+    /// freed while it still holds work.
+    const fn is_idle(&self) -> bool {
+        let Self {
+            flush_through,
+            flush_drain,
+            transfer_flush,
+            shutdown,
+            shutdown_drain,
+            checkpoint,
+            retention,
+            removing,
+        } = self;
+        flush_through.is_none()
+            && flush_drain.is_none()
+            && !*transfer_flush
+            && shutdown.is_none()
+            && shutdown_drain.is_none()
+            && checkpoint.is_none()
+            && retention.is_none()
+            && removing.is_none()
+    }
+}
+
+/// Maintenance state, boxed only while an operation in it is pending. A read of
+/// an unboxed state sees [`PendingPartitionMaintenance::IDLE`], and the first
+/// write boxes it. [`Self::release_if_idle`] frees it again.
+#[derive(Default)]
+struct LazyMaintenance(Option<Box<PendingPartitionMaintenance>>);
+
+impl LazyMaintenance {
+    fn release_if_idle(&mut self) {
+        if self
+            .0
+            .as_deref()
+            .is_some_and(PendingPartitionMaintenance::is_idle)
+        {
+            self.0 = None;
+        }
+    }
+}
+
+impl Deref for LazyMaintenance {
+    type Target = PendingPartitionMaintenance;
+
+    fn deref(&self) -> &PendingPartitionMaintenance {
+        static IDLE: PendingPartitionMaintenance = PendingPartitionMaintenance::IDLE;
+        self.0.as_deref().unwrap_or(&IDLE)
+    }
+}
+
+impl DerefMut for LazyMaintenance {
+    fn deref_mut(&mut self) -> &mut PendingPartitionMaintenance {
+        self.0
+            .get_or_insert_with(|| Box::new(PendingPartitionMaintenance::IDLE))
+    }
 }
 
 struct PendingWireActions {
@@ -969,7 +1043,8 @@ where
             local_request_order: Cell::new(0),
             no_ack: VecDeque::new(),
             materialization: None,
-            maintenance: PendingPartitionMaintenance::default(),
+            maintenance: LazyMaintenance::default(),
+            flush_completed_through: None,
             io_notifier: RefCell::new(None),
             io_bytes_max: Cell::new(isize::MAX as usize),
             io_sequence: Cell::new(0),
@@ -2479,7 +2554,12 @@ where
             return false;
         }
         self.persist_repaired_prefix();
-        let (op, checksum) = if let Some(fence) = self.view_fence.filter(|_| self.view_fenced()) {
+        let (op, checksum) = if let Some(fence) = self
+            .view_fence
+            .as_deref()
+            .copied()
+            .filter(|_| self.view_fenced())
+        {
             // The certificate covers the whole WAL, so while fenced it may only
             // vouch for a WAL holding nothing above `commit_min`, and only when
             // the window sits below the suffix a `DoViewChange` reports.
@@ -6317,7 +6397,7 @@ where
 
     /// One complete owner mutation per call. File execution is always separate.
     pub async fn resume_io(&mut self, config: &PartitionsConfig) -> crate::PartitionIoStep {
-        match self.resume_io_inner(config).await {
+        let step = match self.resume_io_inner(config).await {
             Ok(step) => step,
             Err(error) => {
                 self.cancel_primary_transfer();
@@ -6327,7 +6407,11 @@ where
                 }
                 crate::PartitionIoStep::Pending
             }
-        }
+        };
+        // Maintenance work outside this lane notifies it, so the last call of
+        // a run sees the finished state here.
+        self.maintenance.release_if_idle();
+        step
     }
 
     #[allow(clippy::too_many_lines)]
@@ -6948,7 +7032,7 @@ where
 
     /// Shutdown closes admission while previously accepted work drains.
     #[must_use]
-    pub const fn is_shutting_down(&self) -> bool {
+    pub fn is_shutting_down(&self) -> bool {
         self.maintenance.shutdown.is_some()
     }
 
@@ -6960,7 +7044,6 @@ where
                     || self.materialization_missing
                     || self.io_active.is_retiring()
                     || self
-                        .maintenance
                         .flush_completed_through
                         .is_some_and(|through| through >= self.shutdown_flush_target())))
                 || (self.io_active.is_deleting()
@@ -6981,12 +7064,12 @@ where
         {
             self.materialization = None;
             self.finish_flush();
-            self.maintenance.flush_completed_through = None;
+            self.flush_completed_through = None;
             let mut plan = self.transfer_plan.borrow_mut();
             if matches!(*plan, Some(TransferPlanSlot::Wanted)) {
-                *plan = Some(TransferPlanSlot::Failed(
+                *plan = Some(TransferPlanSlot::Failed(Box::new(
                     PartitionTransferUnavailable::FlushFailed(error.clone()),
-                ));
+                )));
             }
         } else {
             self.fail_pending_commit(error);
@@ -7029,7 +7112,7 @@ where
 
     fn finish_flush(&mut self) {
         if let Some(through) = self.maintenance.flush_through.take() {
-            self.maintenance.flush_completed_through = Some(through);
+            self.flush_completed_through = Some(through);
         }
         self.maintenance.transfer_flush = false;
         if let Some(drain) = self.maintenance.flush_drain.take()
@@ -7083,7 +7166,7 @@ where
                 *self.transfer_plan.borrow_mut() = Some(TransferPlanSlot::Pinned(Rc::clone(&plan)));
                 Ok(Some(plan))
             }
-            Some(TransferPlanSlot::Failed(error)) => Err(error),
+            Some(TransferPlanSlot::Failed(error)) => Err(*error),
             Some(TransferPlanSlot::Wanted) | None => {
                 *self.transfer_plan.borrow_mut() = Some(TransferPlanSlot::Wanted);
                 self.notify_io();
@@ -7119,7 +7202,7 @@ where
         }
         let slot = match self.capture_transfer_plan() {
             Ok(plan) => TransferPlanSlot::Pinned(Rc::new(plan)),
-            Err(error) => TransferPlanSlot::Failed(error),
+            Err(error) => TransferPlanSlot::Failed(Box::new(error)),
         };
         *self.transfer_plan.borrow_mut() = Some(slot);
         true
@@ -7136,7 +7219,6 @@ where
                 )
             )
             && self
-                .maintenance
                 .flush_completed_through
                 .is_none_or(|through| through < self.shutdown_flush_target())
         {
@@ -9732,6 +9814,8 @@ where
         let view = self.consensus.view();
         let previous = self
             .view_fence
+            .as_deref()
+            .copied()
             .filter(|fence| fence.view == view && fence.through == through);
         let anchor = anchor
             .filter(PrepareHeader::anchors_chain)
@@ -9748,13 +9832,13 @@ where
                 "holding partition entries journaled before this view until its log proves them"
             );
         }
-        self.view_fence = Some(ViewFence {
+        self.view_fence = Some(Box::new(ViewFence {
             view,
             through,
             anchor,
             hole: previous.and_then(|fence| fence.hole),
             unanchored_ticks: previous.map_or(0, |fence| fence.unanchored_ticks),
-        });
+        }));
     }
 
     /// Highest op through which this replica holds every entry above its commit
@@ -9937,7 +10021,7 @@ where
     /// I/O lane, or left for the next proof while other history work holds the
     /// lane, and the entries stay resident until the lane runs it.
     pub async fn prove_view_window(&mut self) -> Option<ViewWindowVerdict> {
-        let fence = self.view_fence?;
+        let fence = self.view_fence.as_deref().copied()?;
         let floor = self.fence_floor();
         if fence.through <= floor {
             self.view_fence = None;
@@ -10297,7 +10381,6 @@ where
             }
             let through = self.consensus.commit_max();
             if self
-                .maintenance
                 .flush_completed_through
                 .is_some_and(|completed| completed >= through)
                 && self.materializable_prefix_len(through) == 0
@@ -10416,7 +10499,7 @@ where
         if !self.materialization_prefix_is_ready(prefix_len, through_op)? {
             return Ok(false);
         }
-        self.materialization = Some(PendingMaterialization {
+        self.materialization = Some(Box::new(PendingMaterialization {
             index_span_limit,
             incarnation: self.incarnation,
             poll_history: self.poll_history,
@@ -10427,7 +10510,7 @@ where
             phase: MaterializationPhase::Inspect,
             save: None,
             checksum: None,
-        });
+        }));
         Ok(true)
     }
 
@@ -12622,6 +12705,7 @@ where
         }
         removal.budget_spent = self.retention_is_ready(up_to_offset);
         self.maintenance.retention = None;
+        self.maintenance.release_if_idle();
         removal
     }
 
@@ -13148,7 +13232,7 @@ where
         if self.unproven_drop_from.is_some() {
             return RepairIngest::Handled;
         }
-        let Some(session) = self.repair else {
+        let Some(session) = self.repair.as_deref().copied() else {
             return RepairIngest::Handled;
         };
         let consensus = self.consensus();
@@ -13282,7 +13366,7 @@ where
         if self.history_is_busy() {
             return RepairConclusion::InProgress;
         }
-        let Some(mut session) = self.repair else {
+        let Some(mut session) = self.repair.as_deref().copied() else {
             return RepairConclusion::Done;
         };
         if !consensus::repair_session_live(self.consensus())
@@ -13546,7 +13630,7 @@ where
             || self.consensus.has_untrusted_log()
             || self.consensus.view_log_unproven()
             || self.consensus.commit_min() >= self.consensus.commit_max()
-            || self.repair.is_some_and(|session| {
+            || self.repair.as_deref().is_some_and(|session| {
                 session
                     .floor
                     .is_some_and(|floor| floor > self.consensus.commit_min())

@@ -4957,7 +4957,7 @@ mod tests {
             let partition = partitions
                 .get_mut_by_ns(&ns)
                 .expect("partition is materialised");
-            partition.repair = Some(RepairSession {
+            partition.repair = Some(Box::new(RepairSession {
                 nonce: NONCE,
                 view: 0,
                 from_op: 1,
@@ -4968,7 +4968,7 @@ mod tests {
                 idle_ticks: 0,
                 floor_pulled_from: 0,
                 requested_from: Some(1),
-            });
+            }));
             for op in 1..=8 {
                 let parent = partition.consensus().last_prepare_checksum();
                 let group = partition.consensus().group();
