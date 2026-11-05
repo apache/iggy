@@ -432,13 +432,14 @@ where
 
     /// Takes the namespaces whose consumer group offsets need a sweep. A
     /// partition records itself when it is inserted, installs a group owner,
-    /// creates or deletes a group-keyed offset, or enters a new view.
+    /// creates or deletes a group-keyed offset, and at the first operation
+    /// that sees a new view.
     #[must_use]
     pub fn take_consumer_group_offsets_dirty(&self) -> BTreeSet<IggyNamespace> {
         self.consumer_group_offsets_dirty.take()
     }
 
-    pub fn note_consumer_group_offsets_reconcile_needed(&self, namespace: IggyNamespace) {
+    pub fn mark_consumer_group_offsets_dirty(&self, namespace: IggyNamespace) {
         self.consumer_group_offsets_dirty
             .borrow_mut()
             .insert(namespace);

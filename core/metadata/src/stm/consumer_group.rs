@@ -1948,18 +1948,21 @@ mod tests {
         assert_eq!(apply.code, 0);
 
         let changes: Vec<_> = state
-            .partition_changes_since(before)
+            .recent_partition_changes
+            .since(before)
             .expect("the feed holds the delete")
             .copied()
             .collect();
         assert_eq!(
             changes,
-            [PartitionChange {
-                revision: state.revision,
-                namespace: IggyNamespace::new(0, 0, 0),
-                created_revision: state.items[0].topics[0].partitions[0].created_revision,
-                kind: PartitionChangeKind::ConsumerGroupDeleted,
-            }]
+            [(
+                state.revision,
+                PartitionChange {
+                    namespace: IggyNamespace::new(0, 0, 0),
+                    created_revision: state.items[0].topics[0].partitions[0].created_revision,
+                    kind: PartitionChangeKind::ConsumerGroupDeleted,
+                }
+            )]
         );
     }
 

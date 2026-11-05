@@ -1903,8 +1903,7 @@ where
     /// runs without `.await` inside the borrow.
     reconcile_queue: RefCell<VecDeque<ReconcileOp<B, SB>>>,
     /// Namespaces the reconciler must check again for a local change that no
-    /// metadata commit announces. Ordered, so the simulator replays one
-    /// order.
+    /// metadata commit announces.
     reconcile_needed: RefCell<BTreeSet<IggyNamespace>>,
     shutting_down: Cell<bool>,
 
@@ -3321,7 +3320,7 @@ where
     /// this record names.
     #[must_use]
     pub fn take_reconcile_needed(&self) -> BTreeSet<IggyNamespace> {
-        std::mem::take(&mut *self.reconcile_needed.borrow_mut())
+        self.reconcile_needed.take()
     }
 
     /// Whether `namespace` is recorded and not yet taken.
