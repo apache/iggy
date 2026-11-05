@@ -19,13 +19,14 @@
 
 use crate::poll_plan::{PollPlan, PollReadResult};
 use crate::repair_memory::RingTicket;
+use crate::state_transfer::TransferSlot;
 use crate::stream_keyring::{StreamKeyIdentity, StreamKeyring};
 use crate::types::PartitionsConfig;
 use crate::{IggyPartition, Partition, PollingArgs, PollingConsumer};
 use crate::{PollCompletion, PollReplication};
 use ahash::AHashMap;
 use consensus::{
-    Consensus, Plane, PlaneIdentity, VsrConsensus, build_deny_reply_from_request_header,
+    Consensus, Plane, PlaneIdentity, TickClock, VsrConsensus, build_deny_reply_from_request_header,
 };
 use iggy_binary_protocol::{
     Command, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader,
@@ -47,8 +48,8 @@ use tracing::warn;
 
 /// RAII counter for live [`IggyPartitions::with_partition`] borrows. The
 /// decrement runs on `Drop`, so a panic inside the closure still restores the
-/// count instead of poisoning the `insert` / `remove` tripwire for the rest of
-/// the process.
+/// count instead of poisoning the `remove` tripwire for the rest of the
+/// process.
 #[cfg(debug_assertions)]
 struct BorrowGuard<'a>(&'a Cell<u32>);
 
@@ -72,46 +73,40 @@ impl Drop for BorrowGuard<'_> {
 /// This struct manages ALL partitions assigned to a single shard, regardless
 /// of which stream/topic they belong to.
 ///
-/// Note: The `partition_id` within `IggyNamespace` may NOT equal the Vec index.
-/// For example, shard 0 might have `partition_ids` [0, 2, 4] while shard 1
-/// has `partition_ids` [1, 3, 5]. The `LocalIdx` provides the actual index
-/// into the `partitions` Vec.
+/// The partitions live in a slab. A partition keeps its slot, its
+/// [`LocalIdx`], from insert to removal, and a removal frees the slot for a
+/// later insert. The slot is NOT the `partition_id` within `IggyNamespace`:
+/// shard 0 might hold `partition_ids` [0, 2, 4] in slots [0, 1, 2].
 pub struct IggyPartitions<B, SB = PingPongSuperblock>
 where
     B: MessageBus,
 {
     shard_id: ShardId,
     config: PartitionsConfig,
-    /// Index is `LocalIdx`, not `partition_id`.
+    /// The slab, indexed by `LocalIdx`. A removed partition leaves `None`.
     ///
     /// # Safety invariant
     ///
-    /// Container-level mutation (`Vec::push` / `swap_remove`) must run
-    /// only on the shard's pump task. Reconciler routes mutations
-    /// through `ReconcileOp` + `ReconcileApply`. Cross-task
-    /// access would be UB under cooperative `.await` interleaving.
-    partitions: UnsafeCell<Vec<IggyPartition<B, SB>>>,
-    /// Same single-pump invariant as `partitions`.
-    ///
-    /// `BTreeMap`, not `HashMap`: iteration order via [`Self::namespaces`] must
-    /// be a deterministic function of the key set. The shard pump fans out over
-    /// it (`tick_partitions`, `process_loopback`), and the simulator hashes that
-    /// fan-out order into its schedule; `HashMap`'s per-process `RandomState`
-    /// would make the order, and the hash, non-reproducible across runs.
-    ///
-    /// Perf: this makes `get_by_ns` O(log n) rather than O(1). Not expected to
-    /// bite, but revisit for high-partition-count shards if it shows up in
-    /// profiling.
-    namespace_to_local: UnsafeCell<BTreeMap<IggyNamespace, LocalIdx>>,
+    /// Only [`Self::insert`] and [`Self::remove`] take a `&mut` to the array,
+    /// and they run only on the shard's pump task, never during a walk over
+    /// the slots. Reconciler routes mutations through `ReconcileOp` +
+    /// `ReconcileApply`. Cross-task access would be UB under cooperative
+    /// `.await` interleaving.
+    slots: UnsafeCell<Vec<Option<Slot<B, SB>>>>,
+    /// Vacant slots, reused last freed first.
+    free_slots: RefCell<Vec<LocalIdx>>,
+    /// Slot of each namespace. Never iterated, so its per-process hash order
+    /// cannot reach the simulator schedule: every walk follows the slots.
+    namespace_to_local: RefCell<AHashMap<IggyNamespace, LocalIdx>>,
     /// Tombstone gate: reconciler sets it synchronously before awaiting
     /// disk delete; pump clears on `ConfirmRemove`. Pump's `Plane::on_*`
     /// short-circuits frames hitting a tombstoned namespace.
     ///
     /// `RefCell` (not `UnsafeCell`) because both the reconciler task and
     /// the pump task mutate it, so the single-pump invariant protecting
-    /// `partitions` / `namespace_to_local` does NOT hold here. Compio's
-    /// per-shard runtime is single-threaded, so runtime borrow checks
-    /// suffice; callers must not hold a borrow across `.await`.
+    /// `slots` does NOT hold here. Compio's per-shard runtime is
+    /// single-threaded, so runtime borrow checks suffice; callers must not
+    /// hold a borrow across `.await`.
     tombstoned: RefCell<AHashMap<IggyNamespace, Option<u64>>>,
     /// Stream encryptors by stream incarnation, opened with this node's keys.
     /// Same single-threaded borrow rules as `tombstoned`.
@@ -126,15 +121,74 @@ where
     io_notifier: RefCell<Option<(crate::PartitionIoNotifier, usize)>>,
     repair_memory: Option<Arc<crate::RepairMemoryBudget>>,
     repair_rings: Option<Rc<crate::RepairRingBudget>>,
+    /// Receiving-side transfer sessions alive on this shard. Each holds a
+    /// [`TransferSlot`] on this count.
+    transfers_inflight: Rc<Cell<usize>>,
+    /// The consensus timers of every partition here run on this clock.
+    /// [`Self::insert`] installs it.
+    tick_clock: TickClock,
     loopback_ready: Rc<LoopbackReady>,
     /// Debug-only tripwire: counts live [`Self::with_partition`] borrows so
-    /// `insert` / `remove` can assert the partitions vec is never mutated
-    /// while a sanctioned non-pump read borrow is outstanding. Cannot fire for
-    /// correct code: the closure is `FnOnce` (so it cannot span an `.await`)
-    /// and [`BorrowGuard`] decrements on unwind, so a panic inside it does not
-    /// leave the count stuck.
+    /// `remove` can assert no partition leaves while a sanctioned non-pump
+    /// read borrow is outstanding. Cannot fire for correct code: the closure
+    /// is `FnOnce` (so it cannot span an `.await`) and [`BorrowGuard`]
+    /// decrements on unwind, so a panic inside it does not leave the count
+    /// stuck.
     #[cfg(debug_assertions)]
     borrow_active: Cell<u32>,
+}
+
+/// A live slot of [`IggyPartitions`].
+///
+/// The `Box` keeps the partition at one address while the slot array grows.
+/// The `UnsafeCell` lets a `&mut` to the partition come from a shared borrow
+/// of the array, so a walk over the slots stays valid while the pump mutates
+/// the partitions it visits.
+struct Slot<B, SB>
+where
+    B: MessageBus,
+{
+    namespace: IggyNamespace,
+    partition: Box<UnsafeCell<IggyPartition<B, SB>>>,
+    sent_report: Cell<SentReport>,
+}
+
+/// What the shard last sent shard 0 about one partition, so it reports again
+/// only on a change.
+///
+/// The slot holds it, not [`IggyPartition`], which fills its allocator size
+/// class. A removal drops it with the slot, and a reused slot starts from the
+/// default, which owes a first report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SentReport {
+    /// The view of the last placement report, and of the last status.
+    pub view: u32,
+    /// The in-sync nodes of the last status, 0 after a retraction.
+    pub in_sync_nodes: u32,
+    /// A hash of the counters of the last status. The counters themselves
+    /// would cost 24 B more per partition. A change that keeps the hash, at
+    /// odds of 2^-64 per check, waits for the next change.
+    pub counters: u64,
+    /// The shard tick that last checked the counters.
+    pub checked_at: u64,
+    /// A placement report went out.
+    pub placed: bool,
+    /// The last status went out from the acting primary, not as a retraction.
+    pub primary: bool,
+    /// The partition waits in the shard's report queue.
+    pub queued: bool,
+}
+
+impl<B, SB> Slot<B, SB>
+where
+    B: MessageBus,
+{
+    fn partition(&self) -> &IggyPartition<B, SB> {
+        // SAFETY: a shared borrow, sound while no `&mut` from
+        // `IggyPartitions::get_mut` to this partition is live: the same pump
+        // discipline that `&mut` relies on.
+        unsafe { &*self.partition.get() }
+    }
 }
 
 #[derive(Default)]
@@ -159,36 +213,19 @@ where
 {
     #[must_use]
     pub fn new(shard_id: ShardId, config: PartitionsConfig) -> Self {
-        let keyring = RefCell::new(StreamKeyring::new(Arc::clone(&config.key_context)));
-        Self {
-            shard_id,
-            config,
-            partitions: UnsafeCell::new(Vec::new()),
-            namespace_to_local: UnsafeCell::new(BTreeMap::new()),
-            tombstoned: RefCell::new(AHashMap::new()),
-            keyring,
-            teardown: RefCell::new(AHashMap::new()),
-            consumer_group_offsets_dirty: Rc::default(),
-            fence_published: Rc::default(),
-            persistence_notifier: RefCell::new(None),
-            io_notifier: RefCell::new(None),
-            repair_memory: None,
-            repair_rings: None,
-            loopback_ready: Rc::default(),
-            #[cfg(debug_assertions)]
-            borrow_active: Cell::new(0),
-        }
+        Self::with_capacity(shard_id, config, 0)
     }
 
+    /// Reserves slots and index entries for `capacity` partitions.
     #[must_use]
     pub fn with_capacity(shard_id: ShardId, config: PartitionsConfig, capacity: usize) -> Self {
         let keyring = RefCell::new(StreamKeyring::new(Arc::clone(&config.key_context)));
         Self {
             shard_id,
             config,
-            partitions: UnsafeCell::new(Vec::with_capacity(capacity)),
-            // BTreeMap has no capacity hint; the Vec above absorbs the sizing.
-            namespace_to_local: UnsafeCell::new(BTreeMap::new()),
+            slots: UnsafeCell::new(Vec::with_capacity(capacity)),
+            free_slots: RefCell::new(Vec::new()),
+            namespace_to_local: RefCell::new(AHashMap::with_capacity(capacity)),
             tombstoned: RefCell::new(AHashMap::new()),
             keyring,
             teardown: RefCell::new(AHashMap::new()),
@@ -198,6 +235,8 @@ where
             io_notifier: RefCell::new(None),
             repair_memory: None,
             repair_rings: None,
+            transfers_inflight: Rc::default(),
+            tick_clock: TickClock::default(),
             loopback_ready: Rc::default(),
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
@@ -223,6 +262,25 @@ where
     pub fn with_repair_rings(mut self, budget: Rc<crate::RepairRingBudget>) -> Self {
         self.repair_rings = Some(budget);
         self
+    }
+
+    /// Receiving-side transfer sessions alive on this shard. A partition
+    /// removed or tombstoned during its transfer counts until it drops.
+    #[must_use]
+    pub fn transfers_inflight(&self) -> usize {
+        self.transfers_inflight.get()
+    }
+
+    #[must_use]
+    pub fn transfer_slot(&self) -> TransferSlot {
+        TransferSlot::new(&self.transfers_inflight)
+    }
+
+    /// The clock of the partition timers on this shard. The shard tick
+    /// advances it once per tick, and the shard reads its tick count from it.
+    #[must_use]
+    pub const fn tick_clock(&self) -> &TickClock {
+        &self.tick_clock
     }
 
     /// Sheds repair ring memory until the shard is within its ring budget:
@@ -315,8 +373,7 @@ where
     /// shutdown, fault scans, and ticks. Admission must use the live lookup.
     #[allow(clippy::mut_from_ref)]
     pub fn get_io_owner(&self, namespace: &IggyNamespace) -> Option<&mut IggyPartition<B, SB>> {
-        let local = self.namespace_map().get(namespace).copied()?;
-        self.get_mut(local)
+        self.get_mut(self.local_idx(namespace)?)
     }
 
     /// Capture writer ownership even when a previous teardown already tombstoned it.
@@ -375,56 +432,57 @@ where
         &self.config
     }
 
-    fn partitions(&self) -> &Vec<IggyPartition<B, SB>> {
-        // SAFETY: see the `partitions` field doc. The returned `&` is sound only
+    fn slots(&self) -> &Vec<Option<Slot<B, SB>>> {
+        // SAFETY: see the `slots` field doc. No `&mut` to the array is live
+        // while a walk or lookup reads it. The returned `&` is sound only
         // while not held across an `.await` on a non-pump task (a sibling
-        // reconcile could realloc); single-threadedness alone is not enough.
-        unsafe { &*self.partitions.get() }
+        // reconcile could insert or remove); single-threadedness alone is not
+        // enough.
+        unsafe { &*self.slots.get() }
     }
 
-    fn namespace_map(&self) -> &BTreeMap<IggyNamespace, LocalIdx> {
-        // SAFETY: shared read, same borrow rule as `partitions` above.
-        unsafe { &*self.namespace_to_local.get() }
-    }
-
-    #[allow(clippy::mut_from_ref)]
-    fn namespace_map_mut(&self) -> &mut BTreeMap<IggyNamespace, LocalIdx> {
-        // SAFETY: `&mut` is sound because map mutation runs only on the pump
-        // task, the sole mutator; single-threadedness alone is not enough.
-        unsafe { &mut *self.namespace_to_local.get() }
+    /// Every partition on this shard, in slot order, tombstoned ones too.
+    fn partitions(&self) -> impl Iterator<Item = &IggyPartition<B, SB>> {
+        self.slots().iter().flatten().map(Slot::partition)
     }
 
     pub const fn shard_id(&self) -> ShardId {
         self.shard_id
     }
 
+    /// Live partitions, not slots.
     pub fn len(&self) -> usize {
-        self.partitions().len()
+        self.namespace_to_local.borrow().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.partitions().is_empty()
+        self.namespace_to_local.borrow().is_empty()
     }
 
     /// Get partition by local index.
     pub fn get(&self, local_idx: LocalIdx) -> Option<&IggyPartition<B, SB>> {
-        self.partitions().get(*local_idx)
+        self.slots().get(*local_idx)?.as_ref().map(Slot::partition)
     }
 
     /// Get mutable partition by local index.
     #[allow(clippy::mut_from_ref)]
     fn get_mut(&self, local_idx: LocalIdx) -> Option<&mut IggyPartition<B, SB>> {
-        // SAFETY: `&mut` is sound on the pump task only (the sole mutator); see
-        // `namespace_map_mut`. Single-threadedness alone is not enough.
-        unsafe { (&mut *self.partitions.get()).get_mut(*local_idx) }
+        let slot = self.slots().get(*local_idx)?.as_ref()?;
+        // SAFETY: the slot array is only read, so a walk over it stays valid.
+        // The `&mut` covers this one partition, through its own `UnsafeCell`,
+        // and is sound on the pump task only (the sole mutator).
+        // Single-threadedness alone is not enough.
+        Some(unsafe { &mut *slot.partition.get() })
     }
 
     /// Lookup local index by namespace.
     pub fn local_idx(&self, namespace: &IggyNamespace) -> Option<LocalIdx> {
-        self.namespace_map().get(namespace).copied()
+        self.namespace_to_local.borrow().get(namespace).copied()
     }
 
-    /// Insert a new partition and return its local index.
+    /// Insert a new partition and return its slot: the last vacant slot
+    /// freed, otherwise a new one at the end. A namespace that is already
+    /// here leaves first, through [`Self::remove`].
     ///
     /// Insertion is the moment a build becomes the addressable incarnation,
     /// so this is also where its offset counter is published into the shared
@@ -436,33 +494,29 @@ where
     /// # Safety discipline (compiler cannot enforce)
     ///
     /// Must only be called from the shard's pump task (i.e. inside
-    /// `IggyShard::apply_reconcile_ops`). `Vec::push` may reallocate +
-    /// invalidate any live `&mut IggyPartition` returned by
-    /// [`Self::get_mut_by_ns`] / [`Self::get_mut`] held by a sibling
-    /// task across an `.await`. New external call sites MUST route
-    /// through `ReconcileOp::InsertOwned` instead.
-    ///
-    /// The debug tripwire tracks the `&` borrows handed out by
-    /// [`Self::with_partition`]; the `&mut` path above is uncounted (it is
-    /// pump-only, so it cannot alias this same-task mutation).
+    /// `IggyShard::apply_reconcile_ops`), and not during a walk over
+    /// [`Self::namespaces`]. A growth of the slot array moves only the `Box`
+    /// pointers, with a raw copy and no retag, so a live `&mut IggyPartition`
+    /// from [`Self::get_mut_by_ns`] survives it. New external call sites MUST
+    /// route through `ReconcileOp::InsertOwned` instead.
     #[doc(hidden)]
     pub fn insert(
         &self,
         namespace: IggyNamespace,
         mut partition: IggyPartition<B, SB>,
     ) -> LocalIdx {
-        #[cfg(debug_assertions)]
-        debug_assert_eq!(
-            self.borrow_active.get(),
-            0,
-            "IggyPartitions::insert while a with_partition borrow is live"
-        );
+        if self.contains(&namespace) {
+            drop(self.remove(&namespace));
+        }
         if let Some(notifier) = self.persistence_notifier.borrow().as_ref() {
             partition.set_persistence_notifier(Rc::clone(notifier));
         }
         if let Some((notifier, bytes_max)) = self.io_notifier.borrow().as_ref() {
             partition.set_io_notifier(Rc::clone(notifier), *bytes_max);
         }
+        partition
+            .consensus()
+            .install_tick_clock(self.tick_clock.clone());
         if let Some(budget) = &self.repair_memory {
             partition.proof_walk_memory = Some(budget.reservation());
         }
@@ -480,11 +534,24 @@ where
         self.teardown
             .borrow_mut()
             .insert(namespace, partition.teardown_handle());
-        // Safety: pump-only invariant, caller responsibility.
-        let partitions = unsafe { &mut *self.partitions.get() };
-        let local_idx = LocalIdx::new(partitions.len());
-        partitions.push(partition);
-        self.namespace_map_mut().insert(namespace, local_idx);
+        let slot = Some(Slot {
+            namespace,
+            partition: Box::new(UnsafeCell::new(partition)),
+            sent_report: Cell::default(),
+        });
+        // SAFETY: see the `slots` field doc: pump-only, outside any walk, so
+        // no other borrow of the array is live. Caller responsibility.
+        let slots = unsafe { &mut *self.slots.get() };
+        let local_idx = if let Some(local_idx) = self.free_slots.borrow_mut().pop() {
+            slots[*local_idx] = slot;
+            local_idx
+        } else {
+            slots.push(slot);
+            LocalIdx::new(slots.len() - 1)
+        };
+        self.namespace_to_local
+            .borrow_mut()
+            .insert(namespace, local_idx);
         local_idx
     }
 
@@ -510,7 +577,7 @@ where
 
     /// Check if a namespace exists.
     pub fn contains(&self, namespace: &IggyNamespace) -> bool {
-        self.namespace_map().contains_key(namespace)
+        self.namespace_to_local.borrow().contains_key(namespace)
     }
 
     /// Get partition by namespace directly.
@@ -521,27 +588,26 @@ where
     /// already fenced for delete.
     ///
     /// A pump-task caller MAY hold the returned reference across an `.await`:
-    /// the vec mutators (`apply_reconcile_ops`) run on the same task and so
-    /// cannot interleave and reallocate while the pump is suspended.
+    /// the slab mutators (`apply_reconcile_ops`) run on the same task and so
+    /// cannot remove the partition while the pump is suspended.
     /// `tick_partitions` is such a caller (it holds the partition across the
     /// VSR action dispatch await) and still relies on the tombstone gate above.
     /// A non-pump caller must instead use [`Self::with_partition`], which scopes
     /// the borrow to a synchronous closure, and must never hold the reference
-    /// across an `.await` (a sibling task's reconcile could reallocate the vec
-    /// mid-await).
+    /// across an `.await` (a sibling task's reconcile could remove the
+    /// partition mid-await).
     pub fn get_by_ns(&self, namespace: &IggyNamespace) -> Option<&IggyPartition<B, SB>> {
         if self.is_tombstoned(namespace) {
             return None;
         }
-        let idx = self.namespace_map().get(namespace)?;
-        self.partitions().get(**idx)
+        self.get(self.local_idx(namespace)?)
     }
 
     /// Run `f` against the partition for `namespace`, returning its result.
     ///
     /// Sanctioned non-pump read path: unlike [`Self::get_by_ns`], the borrow
     /// cannot escape `f`, so it cannot be held across an `.await` while the
-    /// pump task mutates the partitions vec. Returns `None` for a missing or
+    /// pump task removes the partition. Returns `None` for a missing or
     /// tombstoned namespace.
     pub fn with_partition<R>(
         &self,
@@ -561,10 +627,10 @@ where
     ///
     /// Exists only so the simulator's deterministic dispatch shell can prove
     /// its detector for that async-concurrency class: parked here (borrow
-    /// live), a concurrent [`Self::insert`] / [`Self::remove`] on a sibling
-    /// task trips the debug borrow tripwire, exactly as a real reconcile
-    /// reallocating the vec under a stale read would. The `simulator` feature
-    /// / `cfg(test)` gate excludes it from every production build.
+    /// live), a concurrent [`Self::remove`] on a sibling task trips the debug
+    /// borrow tripwire, exactly as a real reconcile dropping the partition
+    /// under a stale read would. The `simulator` feature / `cfg(test)` gate
+    /// excludes it from every production build.
     #[cfg(any(test, feature = "simulator"))]
     pub async fn hold_borrow_across_await(&self, suspend: impl std::future::Future<Output = ()>) {
         // The guard IS the borrow the tripwire counts; holding it across the
@@ -574,27 +640,6 @@ where
         suspend.await;
     }
 
-    /// TEST / SIMULATOR ONLY. Address of the partitions vec's heap buffer.
-    ///
-    /// Lets a test prove that an [`Self::insert`] actually REALLOCATED rather
-    /// than landing in spare capacity. The distinction is the whole point of the
-    /// realloc half of PR #3557: `swap_remove` invalidates one slot's reference,
-    /// while a growing `push` moves every element and invalidates all of them. A
-    /// test that only checked "insert happened" would pass on a push into spare
-    /// capacity, which moves nothing and proves nothing.
-    #[cfg(any(test, feature = "simulator"))]
-    #[must_use]
-    pub fn buffer_addr(&self) -> usize {
-        // SAFETY: forms a shared reference into the `UnsafeCell` for this expression.
-        // Read-only-ness is not what makes that sound, since a shared reborrow
-        // aliasing a live `&mut` is UB whether or not it reads. What makes it sound
-        // is that no
-        // `&mut` from `get_mut_by_ns` / `namespace_map_mut` is live across the call:
-        // those are pump-only, and these callers run on the pump. Only the pointer
-        // value escapes.
-        unsafe { (*self.partitions.get()).as_ptr() as usize }
-    }
-
     /// Get mutable partition by namespace directly. Tombstone-gated like
     /// [`Self::get_by_ns`].
     #[allow(clippy::mut_from_ref)]
@@ -602,27 +647,26 @@ where
         if self.is_tombstoned(namespace) {
             return None;
         }
-        let idx = self.namespace_map().get(namespace)?;
-        // SAFETY: `&mut` is sound on the pump task only (the sole mutator); see
-        // `namespace_map_mut`. Single-threadedness alone is not enough.
-        unsafe { (&mut *self.partitions.get()).get_mut(**idx) }
+        self.get_mut(self.local_idx(namespace)?)
     }
 
-    /// Remove a partition by namespace.
+    /// Remove a partition by namespace. Its slot turns vacant for a later
+    /// [`Self::insert`], and every other partition keeps its slot.
     ///
     /// # Safety discipline (compiler cannot enforce)
     ///
-    /// Must only be called from the shard's pump task. `Vec::swap_remove`
-    /// invalidates any live `&mut IggyPartition` returned by
-    /// [`Self::get_mut_by_ns`] / [`Self::get_mut`] held by a sibling
-    /// task across an `.await`. New external call sites MUST route
-    /// through `ReconcileOp::ConfirmRemove` instead.
+    /// Must only be called from the shard's pump task, and not during a walk
+    /// over [`Self::namespaces`]. Removing a partition while any reference to
+    /// it is live is UB, for example a `&mut` from [`Self::get_mut_by_ns`]
+    /// that a sibling task holds across an `.await`. Other partitions do not
+    /// move. New external call sites MUST route through
+    /// `ReconcileOp::ConfirmRemove` instead.
     ///
     /// # Panics
     ///
-    /// Panics if the stored `LocalIdx` is past `partitions.len()`, an
-    /// invariant violation. Silent `None` would leave the map half-mutated
-    /// and prime the next `insert` for a colliding index.
+    /// Panics if the namespace maps to a missing or vacant slot, an invariant
+    /// violation. Going on would put that slot on the free list twice and hand
+    /// it to two partitions.
     ///
     /// The debug tripwire tracks the `&` borrows handed out by
     /// [`Self::with_partition`]; the `&mut` path above is uncounted (it is
@@ -635,18 +679,16 @@ where
             0,
             "IggyPartitions::remove while a with_partition borrow is live"
         );
-        let local_idx = self.namespace_map_mut().remove(namespace)?;
-        let idx = *local_idx;
-        let partitions = unsafe { &mut *self.partitions.get() };
-
-        assert!(
-            idx < partitions.len(),
-            "IggyPartitions invariant: LocalIdx({idx}) >= len {len}",
-            idx = idx,
-            len = partitions.len(),
-        );
-
-        let partition = partitions.swap_remove(idx);
+        let local_idx = self.namespace_to_local.borrow_mut().remove(namespace)?;
+        // SAFETY: see the `slots` field doc: pump-only, outside any walk, so
+        // no other borrow of the array is live. Caller responsibility.
+        let slots = unsafe { &mut *self.slots.get() };
+        let slot = slots
+            .get_mut(*local_idx)
+            .and_then(Option::take)
+            .expect("IggyPartitions invariant: a namespace maps to no live slot");
+        self.free_slots.borrow_mut().push(local_idx);
+        let partition = UnsafeCell::into_inner(*slot.partition);
         self.teardown.borrow_mut().remove(namespace);
         partition.invalidate_workerless_offset_files();
         partition.consensus().set_loopback_notifier(None);
@@ -654,19 +696,6 @@ where
             .partitions
             .borrow_mut()
             .remove(namespace);
-
-        if idx < partitions.len() {
-            // `swap_remove` moved the tail entry into `idx`. Update the map
-            // by the moved partition's namespace key in O(1); the previous
-            // linear value-scan turned bulk DeleteStream into O(K²) on the
-            // pump task, stalling client traffic for ~10k-partition topics.
-            let moved_ns = IggyNamespace::from_raw(partitions[idx].consensus().group());
-            let entry = self.namespace_map_mut().get_mut(&moved_ns).expect(
-                "IggyPartitions invariant: swapped-in partition missing namespace_to_local entry",
-            );
-            *entry = LocalIdx::new(idx);
-        }
-
         Some(partition)
     }
 
@@ -678,9 +707,32 @@ where
         namespaces.iter().filter_map(|ns| self.remove(ns)).collect()
     }
 
-    /// Iterate over all namespaces owned by this shard.
+    /// Iterate over all namespaces owned by this shard, in slot order. That
+    /// order follows the inserts and removes, so it is deterministic, but a
+    /// reused slot puts a namespace out of numeric order.
     pub fn namespaces(&self) -> impl Iterator<Item = &IggyNamespace> {
-        self.namespace_map().keys()
+        self.slots().iter().flatten().map(|slot| &slot.namespace)
+    }
+
+    /// Every partition with what its shard last reported of it, in slot
+    /// order. Tombstoned ones too, so the shard can retract their reports.
+    pub fn sent_reports(
+        &self,
+    ) -> impl Iterator<Item = (&IggyNamespace, &IggyPartition<B, SB>, &Cell<SentReport>)> {
+        self.slots()
+            .iter()
+            .flatten()
+            .map(|slot| (&slot.namespace, slot.partition(), &slot.sent_report))
+    }
+
+    /// The partition of `namespace`, tombstoned or not, with what its shard
+    /// last reported of it.
+    pub fn sent_report(
+        &self,
+        namespace: &IggyNamespace,
+    ) -> Option<(&IggyPartition<B, SB>, &Cell<SentReport>)> {
+        let slot = self.slots().get(*self.local_idx(namespace)?)?.as_ref()?;
+        Some((slot.partition(), &slot.sent_report))
     }
 
     pub fn is_tombstoned(&self, namespace: &IggyNamespace) -> bool {
@@ -741,7 +793,7 @@ where
     ) -> Option<PollPlan> {
         // `build_poll_plan` touches the partition's sealed-read-handle LRU, so it
         // needs `&mut`. Sound on the pump: it is fully synchronous (no `.await`
-        // inside), so no sibling task can realloc the partitions vec under it.
+        // inside), so no sibling task can remove the partition under it.
         // Read the knob first: the `&mut` borrow below covers `self.config` too.
         let validate_checksum = self.config.validate_checksum;
         let partition = self.get_mut_by_ns(namespace)?;
@@ -1569,16 +1621,7 @@ mod tests {
         bytes_max: u64,
         namespaces: &[IggyNamespace],
     ) -> IggyPartitions<IggyMessageBus> {
-        let config = PartitionsConfig {
-            messages_required_to_save: 100,
-            size_of_messages_required_to_save: IggyByteSize::from(1024 * 1024_u64),
-            validate_checksum: true,
-            segment_size: IggyByteSize::from(1024 * 1024_u64),
-            preallocate_segments: false,
-            key_context: Arc::default(),
-            path_layout: crate::PartitionPathLayout::default(),
-        };
-        let partitions = IggyPartitions::new(ShardId::new(0), config)
+        let partitions = IggyPartitions::new(ShardId::new(0), shard_config())
             .with_repair_rings(Rc::new(RepairRingBudget::new(bytes_max)));
         for namespace in namespaces {
             partitions.insert(*namespace, build_replicated_partition(*namespace));
@@ -1714,5 +1757,139 @@ mod tests {
 
         assert_eq!(ring_layout(&partitions, other, RING_OPS), "HBBB");
         assert_eq!(ring_layout(&partitions, recreated, RING_OPS), "BBBB");
+    }
+
+    fn shard_config() -> PartitionsConfig {
+        PartitionsConfig {
+            messages_required_to_save: 100,
+            size_of_messages_required_to_save: IggyByteSize::from(1024 * 1024_u64),
+            validate_checksum: true,
+            segment_size: IggyByteSize::from(1024 * 1024_u64),
+            preallocate_segments: false,
+            key_context: Arc::default(),
+            path_layout: crate::PartitionPathLayout::default(),
+        }
+    }
+
+    /// A shard holding a replicated partition for each of `namespaces`,
+    /// inserted in that order.
+    fn shard_with(namespaces: &[IggyNamespace]) -> IggyPartitions<IggyMessageBus> {
+        let partitions = IggyPartitions::new(ShardId::new(0), shard_config());
+        for namespace in namespaces {
+            partitions.insert(*namespace, build_replicated_partition(*namespace));
+        }
+        partitions
+    }
+
+    /// The partition ids of a walk over the shard.
+    fn walk(partitions: &IggyPartitions<IggyMessageBus>) -> Vec<usize> {
+        partitions
+            .namespaces()
+            .map(IggyNamespace::partition_id)
+            .collect()
+    }
+
+    /// A removal frees only its own slot: the other partitions keep theirs,
+    /// and the next insert takes the freed one.
+    #[test]
+    fn given_a_removed_partition_when_inserting_should_reuse_its_slot() {
+        let [first, removed, last, newcomer] = [0, 1, 2, 3].map(|id| IggyNamespace::new(1, 1, id));
+        let partitions = shard_with(&[first, removed, last]);
+        let (first_slot, last_slot) = (partitions.local_idx(&first), partitions.local_idx(&last));
+        let freed = partitions.local_idx(&removed);
+        let (_, sent) = partitions.sent_report(&removed).unwrap();
+        sent.set(SentReport {
+            view: 3,
+            placed: true,
+            primary: true,
+            queued: true,
+            ..SentReport::default()
+        });
+
+        drop(partitions.remove(&removed));
+        assert_eq!(partitions.len(), 2, "len counts live partitions, not slots");
+        assert_eq!(partitions.local_idx(&first), first_slot);
+        assert_eq!(partitions.local_idx(&last), last_slot);
+
+        let newcomer_slot = partitions.insert(newcomer, build_replicated_partition(newcomer));
+        assert_eq!(Some(newcomer_slot), freed);
+        assert_eq!(partitions.len(), 3);
+        assert!(partitions.get_by_ns(&removed).is_none());
+        assert_eq!(
+            partitions
+                .get_by_ns(&newcomer)
+                .map(|partition| partition.consensus().group()),
+            Some(newcomer.inner()),
+            "a lookup after the reuse finds the new partition"
+        );
+        assert_eq!(
+            partitions.sent_report(&newcomer).unwrap().1.get(),
+            SentReport::default(),
+            "a reused slot owes a first report, not the removed partition's"
+        );
+    }
+
+    /// Walks follow the slots and skip the vacant ones, so the same inserts
+    /// and removes always give the same order, even out of numeric order.
+    #[test]
+    fn given_vacant_and_reused_slots_when_walking_should_follow_slot_order() {
+        let replay = || {
+            let [five, six, seven, one] = [5, 6, 7, 1].map(|id| IggyNamespace::new(1, 1, id));
+            let partitions = shard_with(&[five, six, seven]);
+            drop(partitions.remove(&six));
+            let with_hole = walk(&partitions);
+            partitions.insert(one, build_replicated_partition(one));
+            (with_hole, walk(&partitions))
+        };
+
+        let (with_hole, reused) = replay();
+        assert_eq!(with_hole, [5, 7], "a vacant slot is skipped");
+        assert_eq!(reused, [5, 1, 7], "the reused slot keeps its place");
+        assert_eq!(replay(), (with_hole, reused));
+    }
+
+    /// The slot array holds boxes, so its growth moves pointers and never a
+    /// partition.
+    #[test]
+    fn given_a_mutably_borrowed_partition_when_inserts_grow_the_slots_should_keep_its_address() {
+        const INSERTS_MAX: usize = 64;
+        let first = IggyNamespace::new(1, 1, 0);
+        let partitions = shard_with(&[first]);
+        let borrowed: *const IggyPartition<IggyMessageBus> =
+            partitions.get_mut_by_ns(&first).unwrap();
+        let slots_before = partitions.slots().as_ptr();
+
+        let mut id = 1;
+        while partitions.slots().as_ptr() == slots_before {
+            assert!(id <= INSERTS_MAX, "the slot array never moved");
+            let namespace = IggyNamespace::new(1, 1, id);
+            partitions.insert(namespace, build_replicated_partition(namespace));
+            id += 1;
+        }
+        assert!(std::ptr::eq(
+            partitions.get_mut_by_ns(&first).unwrap(),
+            borrowed
+        ));
+    }
+
+    /// A second insert of a namespace replaces its partition in the same
+    /// slot, so a walk still meets the namespace once.
+    #[test]
+    fn given_a_live_namespace_when_inserting_it_again_should_replace_its_partition() {
+        let [replaced, other] = [0, 1].map(|id| IggyNamespace::new(1, 1, id));
+        let partitions = shard_with(&[replaced, other]);
+        let slot = partitions.local_idx(&replaced);
+        let replacement = build_replicated_partition(replaced);
+        let incarnation = replacement.incarnation();
+
+        assert_eq!(Some(partitions.insert(replaced, replacement)), slot);
+        assert_eq!(partitions.len(), 2);
+        assert_eq!(walk(&partitions), [0, 1]);
+        assert_eq!(
+            partitions
+                .get_by_ns(&replaced)
+                .map(IggyPartition::incarnation),
+            Some(incarnation)
+        );
     }
 }

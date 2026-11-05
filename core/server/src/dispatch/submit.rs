@@ -1114,6 +1114,7 @@ mod tests {
             .as_ref()
             .expect("shard 0 holds the metadata consensus");
         for _ in 0..TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+            consensus.tick_clock().advance();
             consensus.tick(PlaneKind::Metadata);
         }
         let vote = Message::<StartViewChangeHeader>::new(HEADER_SIZE).transmute_header(

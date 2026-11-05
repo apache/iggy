@@ -353,8 +353,8 @@ where
         // Consensus timer driver, folded into the pump: running the tick as a
         // select! arm (not a sibling task) serializes it with frame processing,
         // so `tick_partitions` can no longer hold a partition reference across
-        // an `.await` while `apply_reconcile_ops` reallocates the partitions
-        // vec on this same task. The timer is created once and pinned, then
+        // an `.await` while `apply_reconcile_ops` removes that partition on
+        // this same task. The timer is created once and pinned, then
         // re-armed only after it fires, so a busy inbox cannot drop-and-reset
         // it (which would stall heartbeats / prepare retransmit).
         // Single source for the timer, so the re-arm below cannot drift from the
@@ -1099,8 +1099,7 @@ where
             LifecycleFrame::PartitionPlacementViews(reports, statuses) => {
                 if self.id == 0 {
                     self.plane.metadata().observe_partition_views(&reports);
-                    self.partition_status_outbox
-                        .record(&statuses, self.bus.monotonic_now());
+                    self.partition_status_outbox.record(&statuses);
                     self.record_partition_statuses(&statuses);
                 } else {
                     self.metrics.record_frame_drop(

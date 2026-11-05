@@ -20,98 +20,110 @@
 //! wall-clock time, enabling:
 //! - Deterministic testing
 //! - Predictable behavior in consensus
-//! - Per-replica PRNG seeding for jitter
+//! - Jitter that is a pure function of the group, the replica, the attempt and the tick
 //!
-//! Two-phase tick model:
-//!
-//! 1. Phase 1 (tick): All timeouts are advanced by one tick
-//! 2. Phase 2 (check & handle): Check which timeouts fired and invoke handlers
+//! Each timeout stores an absolute deadline on a [`TickClock`]. The driver
+//! advances the clock once per tick, then checks which timeouts fired and
+//! invokes their handlers. A group that is not visited keeps its deadlines.
 
-/// A deterministic, tick-based timeout.
-///
-/// Timeouts count down from an initial duration (`after`) and fire when
-/// reaching zero. They support exponential backoff with jitter for retries.
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
-use rand::RngExt;
-use rand_xoshiro::Xoshiro256Plus;
-use rand_xoshiro::rand_core::SeedableRng;
+use twox_hash::XxHash3_64;
 
 /// Wall-clock length of one consensus tick.
 ///
 /// Every tick count in this module is a multiple of this unit: a timeout of N
-/// ticks fires after N * `TICK_INTERVAL`, provided the owner drives
-/// [`TimeoutManager::tick`] at this cadence.
+/// ticks fires after N * `TICK_INTERVAL`, provided the driver advances the
+/// [`TickClock`] at this cadence.
 pub const TICK_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Deadline of a stopped timeout. No tick reaches it.
+const STOPPED: u64 = u64::MAX;
+
+/// A prepare backoff doubles the period at most this many times, so a
+/// retransmit waits at most 16 periods plus jitter.
+const PREPARE_BACKOFF_SHIFT_MAX: u32 = 4;
+
+/// Consensus ticks so far. Clones share one count, so every group of one
+/// driver reads the same time.
+#[derive(Debug, Clone, Default)]
+pub struct TickClock(Rc<Cell<u64>>);
+
+impl TickClock {
+    #[must_use]
+    pub fn now(&self) -> u64 {
+        self.0.get()
+    }
+
+    /// Only the driver of the groups on this clock calls it, once per tick.
+    pub fn advance(&self) {
+        self.0.set(self.0.get().wrapping_add(1));
+    }
+}
+
+/// A timeout of `after` ticks with an absolute deadline on the clock of its
+/// [`TimeoutManager`]. It fires once the clock reaches the deadline and stays
+/// fired until it is started, reset, backed off or stopped.
 #[derive(Debug, Clone)]
-#[allow(unused)]
 pub struct Timeout {
-    pub id: u128,
     after: u64,
-    ticks_remaining: u64,
-    pub ticking: bool,
-    pub attempts: u32,
+    deadline: u64,
 }
 
 impl Timeout {
     #[must_use]
-    pub const fn new(id: u128, after: u64) -> Self {
+    pub const fn new(after: u64) -> Self {
         Self {
-            id,
             after,
-            ticks_remaining: 0,
-            ticking: false,
-            attempts: 0,
+            deadline: STOPPED,
         }
     }
 
-    pub const fn start(&mut self) {
-        self.ticks_remaining = self.after;
-        self.ticking = true;
-        self.attempts = 0;
+    pub fn start(&mut self, now: u64) {
+        self.deadline = deadline_after(now, self.after);
     }
 
     pub const fn stop(&mut self) {
-        self.ticking = false;
-        self.ticks_remaining = 0;
-        self.attempts = 0;
+        self.deadline = STOPPED;
     }
 
-    /// Restart a running timer's interval, clearing any accumulated backoff.
+    /// Restart a running timer's interval.
     ///
     /// # Panics
-    /// In debug builds, if the timer is not ticking. `reset` leaves `ticking` alone,
-    /// so on a stopped timer it yields an armed-but-dead state that never fires and
-    /// reads as healthy. Callers that cannot prove the timer is running want
-    /// [`Self::start`], identical to this on a running one.
-    pub const fn reset(&mut self) {
-        debug_assert!(
-            self.ticking,
-            "reset on a stopped timeout leaves it armed-but-dead; use start"
-        );
-        self.ticks_remaining = self.after;
-        self.attempts = 0;
-    }
-
-    pub const fn tick(&mut self) {
-        if self.ticking {
-            self.ticks_remaining = self.ticks_remaining.saturating_sub(1);
-        }
+    /// In debug builds, if the timer is stopped. A stopped timer stays stopped,
+    /// so callers that cannot prove the timer is running want [`Self::start`].
+    pub fn reset(&mut self, now: u64) {
+        self.rearm(now, self.after);
     }
 
     #[must_use]
-    pub const fn fired(&self) -> bool {
-        self.ticking && self.ticks_remaining == 0
+    pub const fn is_ticking(&self) -> bool {
+        self.deadline != STOPPED
     }
 
-    pub fn backoff(&mut self, prng: &mut Xoshiro256Plus) {
-        self.attempts = self.attempts.wrapping_add(1);
-        let max_backoff = self.after.saturating_mul(16);
-        let shift = self.attempts.min(4);
-        let backoff = self.after.saturating_mul(1 << shift).min(max_backoff);
-        let jitter = prng.random_range(0..=backoff);
-        self.ticks_remaining = backoff.saturating_add(jitter);
+    #[must_use]
+    pub const fn fired(&self, now: u64) -> bool {
+        self.deadline <= now
+    }
+
+    fn rearm(&mut self, now: u64, ticks: u64) {
+        debug_assert!(
+            self.is_ticking(),
+            "re-arming a stopped timeout leaves it stopped; use start"
+        );
+        if self.is_ticking() {
+            self.deadline = deadline_after(now, ticks);
+        }
+    }
+
+    /// Keep the ticks left on a clock that reads `old_now` for one that reads
+    /// `new_now`. A fired timer stays fired.
+    fn rebase(&mut self, old_now: u64, new_now: u64) {
+        if self.is_ticking() {
+            self.deadline = deadline_after(new_now, self.deadline.saturating_sub(old_now));
+        }
     }
 }
 
@@ -132,9 +144,9 @@ pub enum TimeoutKind {
 }
 
 /// Manager for all VSR timeouts of a replica.
-#[allow(unused)]
 #[derive(Debug)]
 pub struct TimeoutManager {
+    clock: TickClock,
     prepare: Timeout,
     commit_message: Timeout,
     check_quorum: Timeout,
@@ -143,10 +155,11 @@ pub struct TimeoutManager {
     do_view_change_message: Timeout,
     view_change_status: Timeout,
     request_start_view_message: Timeout,
-    prng: Xoshiro256Plus,
+    /// Prepare backoffs since the prepare timeout last started, reset or
+    /// stopped. Only Prepare backs off, so one counter serves.
+    prepare_attempts: u32,
 }
 
-#[allow(unused)]
 impl TimeoutManager {
     // Timeout durations in ticks of [`TICK_INTERVAL`].
     /// Public so the runtime can pin its `[cluster] prepare_retransmit_interval`
@@ -177,25 +190,18 @@ impl TimeoutManager {
     pub const REQUEST_START_VIEW_MESSAGE_TICKS: u64 = 100;
 
     #[must_use]
-    pub fn new(replica_id: u128) -> Self {
+    pub const fn new(clock: TickClock) -> Self {
         Self {
-            prepare: Timeout::new(replica_id, Self::PREPARE_TICKS),
-            commit_message: Timeout::new(replica_id, Self::COMMIT_MESSAGE_TICKS),
-            check_quorum: Timeout::new(replica_id, Self::NORMAL_HEARTBEAT_TICKS),
-            normal_heartbeat: Timeout::new(replica_id, Self::NORMAL_HEARTBEAT_TICKS),
-            start_view_change_message: Timeout::new(
-                replica_id,
-                Self::START_VIEW_CHANGE_MESSAGE_TICKS,
-            ),
-            do_view_change_message: Timeout::new(replica_id, Self::DO_VIEW_CHANGE_MESSAGE_TICKS),
-            view_change_status: Timeout::new(replica_id, Self::VIEW_CHANGE_STATUS_TICKS),
-            request_start_view_message: Timeout::new(
-                replica_id,
-                Self::REQUEST_START_VIEW_MESSAGE_TICKS,
-            ),
-            // Upper bits of replica_id are not critical for PRNG seed diversity.
-            #[allow(clippy::cast_possible_truncation)]
-            prng: Xoshiro256Plus::seed_from_u64(replica_id as u64),
+            clock,
+            prepare: Timeout::new(Self::PREPARE_TICKS),
+            commit_message: Timeout::new(Self::COMMIT_MESSAGE_TICKS),
+            check_quorum: Timeout::new(Self::NORMAL_HEARTBEAT_TICKS),
+            normal_heartbeat: Timeout::new(Self::NORMAL_HEARTBEAT_TICKS),
+            start_view_change_message: Timeout::new(Self::START_VIEW_CHANGE_MESSAGE_TICKS),
+            do_view_change_message: Timeout::new(Self::DO_VIEW_CHANGE_MESSAGE_TICKS),
+            view_change_status: Timeout::new(Self::VIEW_CHANGE_STATUS_TICKS),
+            request_start_view_message: Timeout::new(Self::REQUEST_START_VIEW_MESSAGE_TICKS),
+            prepare_attempts: 0,
         }
     }
 
@@ -204,8 +210,8 @@ impl TimeoutManager {
     /// already in flight is discarded: call before the replica starts
     /// ticking (i.e. before `init` / `init_as_backup`).
     pub const fn set_normal_heartbeat_ticks(&mut self, ticks: u64) {
-        self.normal_heartbeat = Timeout::new(self.normal_heartbeat.id, ticks);
-        self.check_quorum = Timeout::new(self.check_quorum.id, ticks);
+        self.normal_heartbeat = Timeout::new(ticks);
+        self.check_quorum = Timeout::new(ticks);
     }
 
     /// Override the primary's commit-broadcast interval (`[cluster]
@@ -213,7 +219,7 @@ impl TimeoutManager {
     /// countdown already in flight is discarded: call before the replica
     /// starts ticking (i.e. before `init`).
     pub const fn set_commit_message_ticks(&mut self, ticks: u64) {
-        self.commit_message = Timeout::new(self.commit_message.id, ticks);
+        self.commit_message = Timeout::new(ticks);
     }
 
     /// Override the primary's prepare-retransmit interval (`[cluster]
@@ -221,7 +227,8 @@ impl TimeoutManager {
     /// countdown already in flight is discarded: call before the replica
     /// starts ticking (i.e. before `init`).
     pub const fn set_prepare_ticks(&mut self, ticks: u64) {
-        self.prepare = Timeout::new(self.prepare.id, ticks);
+        self.prepare = Timeout::new(ticks);
+        self.prepare_attempts = 0;
     }
 
     /// Override the view-change retransmit interval (`[cluster]
@@ -231,8 +238,8 @@ impl TimeoutManager {
     /// Replaces the timeout objects, so any countdown already in flight is
     /// discarded: call before the replica starts ticking (i.e. before `init`).
     pub const fn set_view_change_retransmit_ticks(&mut self, ticks: u64) {
-        self.start_view_change_message = Timeout::new(self.start_view_change_message.id, ticks);
-        self.do_view_change_message = Timeout::new(self.do_view_change_message.id, ticks);
+        self.start_view_change_message = Timeout::new(ticks);
+        self.do_view_change_message = Timeout::new(ticks);
     }
 
     /// Override the view-change status backstop (`[cluster]
@@ -241,7 +248,7 @@ impl TimeoutManager {
     /// timeout object, so any countdown already in flight is discarded: call
     /// before the replica starts ticking (i.e. before `init`).
     pub const fn set_view_change_status_ticks(&mut self, ticks: u64) {
-        self.view_change_status = Timeout::new(self.view_change_status.id, ticks);
+        self.view_change_status = Timeout::new(ticks);
     }
 
     /// Override the request-start-view retransmit interval (`[cluster]
@@ -251,30 +258,39 @@ impl TimeoutManager {
     /// flight is discarded: call before the replica starts ticking (i.e. before
     /// `init`).
     pub const fn set_request_start_view_ticks(&mut self, ticks: u64) {
-        self.request_start_view_message = Timeout::new(self.request_start_view_message.id, ticks);
-    }
-
-    /// Tick all timeouts
-    /// This is the first phase of the two-phase tick-based timeout mechanism.
-    /// 2nd phase is checking which timeouts have fired and calling the appropriate handlers.
-    pub const fn tick(&mut self) {
-        self.prepare.tick();
-        self.commit_message.tick();
-        self.check_quorum.tick();
-        self.normal_heartbeat.tick();
-        self.start_view_change_message.tick();
-        self.do_view_change_message.tick();
-        self.request_start_view_message.tick();
-        self.view_change_status.tick();
+        self.request_start_view_message = Timeout::new(ticks);
     }
 
     #[must_use]
-    pub const fn fired(&self, kind: TimeoutKind) -> bool {
-        self.get(kind).fired()
+    pub const fn clock(&self) -> &TickClock {
+        &self.clock
+    }
+
+    /// Move every running timeout onto `clock` with the ticks it has left.
+    /// Stopped timeouts stay stopped.
+    pub fn install_clock(&mut self, clock: TickClock) {
+        let (old_now, new_now) = (self.clock.now(), clock.now());
+        for timeout in [
+            &mut self.prepare,
+            &mut self.commit_message,
+            &mut self.check_quorum,
+            &mut self.normal_heartbeat,
+            &mut self.start_view_change_message,
+            &mut self.do_view_change_message,
+            &mut self.view_change_status,
+            &mut self.request_start_view_message,
+        ] {
+            timeout.rebase(old_now, new_now);
+        }
+        self.clock = clock;
     }
 
     #[must_use]
-    pub const fn get(&self, kind: TimeoutKind) -> &Timeout {
+    pub fn fired(&self, kind: TimeoutKind) -> bool {
+        self.get(kind).fired(self.clock.now())
+    }
+
+    const fn get(&self, kind: TimeoutKind) -> &Timeout {
         match kind {
             TimeoutKind::Prepare => &self.prepare,
             TimeoutKind::CommitMessage => &self.commit_message,
@@ -287,7 +303,9 @@ impl TimeoutManager {
         }
     }
 
-    pub const fn get_mut(&mut self, kind: TimeoutKind) -> &mut Timeout {
+    /// Private: a caller that starts the prepare timeout through it skips
+    /// the reset of `prepare_attempts`.
+    const fn get_mut(&mut self, kind: TimeoutKind) -> &mut Timeout {
         match kind {
             TimeoutKind::Prepare => &mut self.prepare,
             TimeoutKind::CommitMessage => &mut self.commit_message,
@@ -300,110 +318,271 @@ impl TimeoutManager {
         }
     }
 
-    pub const fn start(&mut self, kind: TimeoutKind) {
-        self.get_mut(kind).start();
+    pub fn start(&mut self, kind: TimeoutKind) {
+        let now = self.clock.now();
+        self.get_mut(kind).start(now);
+        self.clear_backoff(kind);
     }
 
     pub const fn stop(&mut self, kind: TimeoutKind) {
         self.get_mut(kind).stop();
+        self.clear_backoff(kind);
     }
 
-    pub const fn reset(&mut self, kind: TimeoutKind) {
-        self.get_mut(kind).reset();
+    /// Restart the interval of the running timer of `kind`.
+    ///
+    /// # Panics
+    /// In debug builds, if that timer is stopped. A stopped timer stays
+    /// stopped, so callers that cannot prove it runs want [`Self::start`].
+    pub fn reset(&mut self, kind: TimeoutKind) {
+        let now = self.clock.now();
+        self.get_mut(kind).reset(now);
+        self.clear_backoff(kind);
     }
 
-    pub fn backoff(&mut self, kind: TimeoutKind) {
-        let timeout = match kind {
-            TimeoutKind::Prepare => &mut self.prepare,
-            TimeoutKind::CommitMessage => &mut self.commit_message,
-            TimeoutKind::CheckQuorum => &mut self.check_quorum,
-            TimeoutKind::NormalHeartbeat => &mut self.normal_heartbeat,
-            TimeoutKind::StartViewChangeMessage => &mut self.start_view_change_message,
-            TimeoutKind::ViewChangeStatus => &mut self.view_change_status,
-            TimeoutKind::DoViewChangeMessage => &mut self.do_view_change_message,
-            TimeoutKind::RequestStartViewMessage => &mut self.request_start_view_message,
-        };
-        timeout.backoff(&mut self.prng);
+    /// Re-arm the running prepare timeout after the backoff of its next
+    /// attempt, plus jitter drawn with `salt` (see `jitter_salt`).
+    ///
+    /// # Panics
+    /// In debug builds, if the prepare timeout is stopped.
+    pub fn backoff_prepare(&mut self, salt: u64) {
+        self.prepare_attempts = self.prepare_attempts.wrapping_add(1);
+        let shift = self.prepare_attempts.min(PREPARE_BACKOFF_SHIFT_MAX);
+        let backoff = self.prepare.after.saturating_mul(1 << shift);
+        let now = self.clock.now();
+        let jitter = jitter(salt, self.prepare_attempts, now, backoff);
+        self.prepare.rearm(now, backoff.saturating_add(jitter));
     }
 
     #[must_use]
     pub const fn is_ticking(&self, kind: TimeoutKind) -> bool {
-        self.get(kind).ticking
+        self.get(kind).is_ticking()
     }
+
+    const fn clear_backoff(&mut self, kind: TimeoutKind) {
+        if matches!(kind, TimeoutKind::Prepare) {
+            self.prepare_attempts = 0;
+        }
+    }
+}
+
+/// Salt of the prepare jitter of member `replica` in `group`. The XOR cannot
+/// collide where it matters: the replicas of one group differ in it, and so
+/// do the groups of one replica.
+#[must_use]
+pub fn jitter_salt(group: u64, replica: u8) -> u64 {
+    group ^ u64::from(replica)
+}
+
+/// Jitter in `0..=span`. A pure function of its inputs, so a seeded run
+/// replays it, which a per-process hasher would not.
+fn jitter(salt: u64, attempt: u32, now: u64, span: u64) -> u64 {
+    let input = ((u128::from(attempt) << u64::BITS) | u128::from(now)).to_le_bytes();
+    let hash = XxHash3_64::oneshot_with_seed(salt, &input);
+    span.checked_add(1).map_or(hash, |range| hash % range)
+}
+
+/// Below [`STOPPED`], so a deadline past the end of the clock still runs.
+fn deadline_after(now: u64, ticks: u64) -> u64 {
+    now.saturating_add(ticks).min(STOPPED - 1)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_timeout_lifecycle() {
-        let mut timeout = Timeout::new(0, 10);
+    const AFTER: u64 = 10;
+    const GROUP: u64 = 0x0001_0001_0000_0007;
+    const REPLICA: u8 = 1;
+    /// Far beyond what any test here waits for.
+    const WAIT_MAX: u64 = 1 << 16;
 
-        assert!(!timeout.ticking);
-        assert!(!timeout.fired());
+    fn manager() -> (TickClock, TimeoutManager) {
+        let clock = TickClock::default();
+        let mut timeouts = TimeoutManager::new(clock.clone());
+        timeouts.set_prepare_ticks(AFTER);
+        (clock, timeouts)
+    }
 
-        timeout.start();
-        assert!(timeout.ticking);
-
-        for _ in 0..9 {
-            timeout.tick();
-            assert!(!timeout.fired());
+    fn advance(clock: &TickClock, ticks: u64) {
+        for _ in 0..ticks {
+            clock.advance();
         }
+    }
 
-        timeout.tick();
-        assert!(timeout.fired());
+    /// Advances `clock` until `kind` fires, and returns how many ticks that took.
+    fn ticks_until_fired(clock: &TickClock, timeouts: &TimeoutManager, kind: TimeoutKind) -> u64 {
+        let mut waited = 0;
+        while !timeouts.fired(kind) {
+            assert!(waited < WAIT_MAX, "{kind:?} never fired");
+            clock.advance();
+            waited += 1;
+        }
+        waited
     }
 
     #[test]
-    fn test_timeout_reset() {
-        let mut timeout = Timeout::new(0, 10);
-        timeout.start();
+    fn given_a_started_timeout_when_the_clock_reaches_its_deadline_should_fire_and_not_before() {
+        let (clock, mut timeouts) = manager();
+        advance(&clock, 3);
+        assert!(!timeouts.is_ticking(TimeoutKind::Prepare));
+        assert!(!timeouts.fired(TimeoutKind::Prepare));
 
-        for _ in 0..5 {
-            timeout.tick();
+        timeouts.start(TimeoutKind::Prepare);
+        assert!(timeouts.is_ticking(TimeoutKind::Prepare));
+        for _ in 1..AFTER {
+            clock.advance();
+            assert!(!timeouts.fired(TimeoutKind::Prepare));
         }
-
-        timeout.reset();
-        assert!(timeout.ticking);
-
-        for _ in 0..9 {
-            timeout.tick();
-            assert!(!timeout.fired());
-        }
-
-        timeout.tick();
-        assert!(timeout.fired());
+        clock.advance();
+        assert!(timeouts.fired(TimeoutKind::Prepare));
+        clock.advance();
+        assert!(
+            timeouts.fired(TimeoutKind::Prepare),
+            "a fired timeout stays fired until handled"
+        );
     }
 
     #[test]
-    fn test_timeout_stop() {
-        let mut timeout = Timeout::new(0, 10);
-        timeout.start();
+    fn given_a_running_timeout_when_reset_should_wait_a_full_period_from_the_reset() {
+        let (clock, mut timeouts) = manager();
+        timeouts.start(TimeoutKind::Prepare);
+        advance(&clock, AFTER / 2);
 
-        for _ in 0..5 {
-            timeout.tick();
-        }
+        timeouts.reset(TimeoutKind::Prepare);
 
-        timeout.stop();
-        assert!(!timeout.ticking);
-
-        for _ in 0..10 {
-            timeout.tick();
-        }
-        assert!(!timeout.fired());
+        assert_eq!(
+            ticks_until_fired(&clock, &timeouts, TimeoutKind::Prepare),
+            AFTER
+        );
     }
 
     #[test]
-    fn test_backoff_increases() {
-        let mut timeout = Timeout::new(0, 10);
-        let mut prng = Xoshiro256Plus::seed_from_u64(42);
+    fn given_a_running_timeout_when_stopped_should_never_fire() {
+        let (clock, mut timeouts) = manager();
+        timeouts.start(TimeoutKind::Prepare);
+        advance(&clock, AFTER / 2);
 
-        timeout.start();
-        let initial = timeout.ticks_remaining;
+        timeouts.stop(TimeoutKind::Prepare);
+        advance(&clock, 10 * AFTER);
 
-        timeout.backoff(&mut prng);
-        // After backoff, ticks_remaining should be larger than initial with some jitter.
-        assert!(timeout.ticks_remaining >= initial);
+        assert!(!timeouts.is_ticking(TimeoutKind::Prepare));
+        assert!(!timeouts.fired(TimeoutKind::Prepare));
+    }
+
+    #[test]
+    fn given_a_period_past_the_end_of_the_clock_when_started_should_run_and_never_fire() {
+        let (clock, mut timeouts) = manager();
+        timeouts.set_commit_message_ticks(u64::MAX);
+        advance(&clock, 1);
+
+        timeouts.start(TimeoutKind::CommitMessage);
+        advance(&clock, AFTER);
+
+        assert!(timeouts.is_ticking(TimeoutKind::CommitMessage));
+        assert!(!timeouts.fired(TimeoutKind::CommitMessage));
+    }
+
+    #[test]
+    fn given_repeated_prepare_backoffs_should_grow_the_wait_until_the_cap() {
+        let (clock, mut timeouts) = manager();
+        timeouts.start(TimeoutKind::Prepare);
+        let salt = jitter_salt(GROUP, REPLICA);
+        for attempt in 1..=PREPARE_BACKOFF_SHIFT_MAX + 2 {
+            let backoff = AFTER << attempt.min(PREPARE_BACKOFF_SHIFT_MAX);
+            timeouts.backoff_prepare(salt);
+            let waited = ticks_until_fired(&clock, &timeouts, TimeoutKind::Prepare);
+            assert!(
+                (backoff..=2 * backoff).contains(&waited),
+                "attempt {attempt} waited {waited} ticks, outside {backoff}..={}",
+                2 * backoff
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_backed_off_prepare_timeout_when_only_it_restarts_should_drop_its_backoff() {
+        let (clock, mut timeouts) = manager();
+        timeouts.start(TimeoutKind::Prepare);
+        let salt = jitter_salt(GROUP, REPLICA);
+        timeouts.backoff_prepare(salt);
+        timeouts.backoff_prepare(salt);
+
+        timeouts.start(TimeoutKind::CommitMessage);
+        timeouts.reset(TimeoutKind::CommitMessage);
+        timeouts.stop(TimeoutKind::CommitMessage);
+        timeouts.backoff_prepare(salt);
+        let third = AFTER << 3;
+        let waited = ticks_until_fired(&clock, &timeouts, TimeoutKind::Prepare);
+        assert!(
+            (third..=2 * third).contains(&waited),
+            "another timer cleared the prepare backoff: waited {waited} ticks"
+        );
+
+        timeouts.start(TimeoutKind::Prepare);
+        assert_eq!(
+            ticks_until_fired(&clock, &timeouts, TimeoutKind::Prepare),
+            AFTER
+        );
+    }
+
+    #[test]
+    fn given_the_same_inputs_when_drawing_jitter_should_repeat_it_within_its_span() {
+        let salt = jitter_salt(GROUP, REPLICA);
+        for span in [0, 1, AFTER, u64::MAX] {
+            for now in 0..64 {
+                let drawn = jitter(salt, 1, now, span);
+                assert!(drawn <= span, "{drawn} above {span}");
+                assert_eq!(drawn, jitter(salt, 1, now, span));
+            }
+        }
+    }
+
+    #[test]
+    fn given_two_groups_or_two_replicas_when_drawing_jitter_should_draw_apart() {
+        const SPAN: u64 = 1 << 20;
+        let draws = |group: u64, replica: u8| {
+            (0..16)
+                .map(|now| jitter(jitter_salt(group, replica), 1, now, SPAN))
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(draws(GROUP, REPLICA), draws(GROUP + 1, REPLICA));
+        assert_ne!(draws(GROUP, REPLICA), draws(GROUP, REPLICA + 1));
+    }
+
+    #[test]
+    fn given_timeouts_on_one_clock_when_moved_to_another_should_keep_the_ticks_left() {
+        const ELAPSED: u64 = 3;
+        let (clock, mut timeouts) = manager();
+        timeouts.set_commit_message_ticks(1);
+        timeouts.start(TimeoutKind::CommitMessage);
+        timeouts.start(TimeoutKind::Prepare);
+        timeouts.start(TimeoutKind::NormalHeartbeat);
+        timeouts.stop(TimeoutKind::NormalHeartbeat);
+        advance(&clock, ELAPSED);
+        assert!(timeouts.fired(TimeoutKind::CommitMessage));
+        assert!(!timeouts.fired(TimeoutKind::Prepare));
+
+        let ahead = TickClock::default();
+        advance(&ahead, WAIT_MAX);
+        timeouts.install_clock(ahead.clone());
+
+        assert!(
+            timeouts.fired(TimeoutKind::CommitMessage),
+            "a fired timeout stays fired"
+        );
+        assert!(
+            !timeouts.is_ticking(TimeoutKind::NormalHeartbeat),
+            "a stopped timeout stays stopped"
+        );
+        advance(&clock, AFTER);
+        assert!(
+            !timeouts.fired(TimeoutKind::Prepare),
+            "the old clock no longer drives the timeouts"
+        );
+        assert_eq!(
+            ticks_until_fired(&ahead, &timeouts, TimeoutKind::Prepare),
+            AFTER - ELAPSED
+        );
     }
 }

@@ -36,10 +36,14 @@ const PARTITIONS: usize = 1024;
 const REPLICAS: u8 = 3;
 /// `[partition] prepare_queue_depth` as shipped.
 const PREPARE_QUEUE_DEPTH: usize = 32;
-/// Measured at 8.4 KB: the 5.4 KB `IggyPartition` slot of the shard plus
-/// 3 KB of heap. The headroom stays below the 1.2 KB of boxed session state
-/// and the 3 KB view-change table, so either one held inline fails this test.
+/// Measured at 8.1 KB: the 5.1 KB `IggyPartition` box, 50 B of slot and
+/// index entry in the shard, and 3 KB of heap. The headroom stays below the
+/// 1.2 KB of boxed session state and the 3 KB view-change table, so either one
+/// held inline fails this test.
 const IDLE_PARTITION_BYTES_MAX: usize = 9 * 1024;
+/// A partition in its own `Box` takes a whole mimalloc size class: 5,120 B is
+/// one, and one byte more falls into the 6,144 B class.
+const BOXED_PARTITION_BYTES_MAX: usize = 5 * 1024;
 
 #[global_allocator]
 static ALLOCATOR: LiveBytes = LiveBytes;
@@ -70,6 +74,15 @@ fn given_idle_partitions_on_a_shard_when_counting_heap_should_stay_within_the_id
     assert!(
         per_partition <= IDLE_PARTITION_BYTES_MAX,
         "an idle partition holds {per_partition} bytes, above {IDLE_PARTITION_BYTES_MAX}"
+    );
+}
+
+#[test]
+fn given_a_partition_when_boxed_should_fit_one_mimalloc_size_class() {
+    let size = size_of::<IggyPartition<Rc<IggyMessageBus>>>();
+    assert!(
+        size <= BOXED_PARTITION_BYTES_MAX,
+        "a partition takes {size} bytes, above {BOXED_PARTITION_BYTES_MAX}"
     );
 }
 

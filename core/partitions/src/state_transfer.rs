@@ -179,6 +179,27 @@ pub struct PartitionTransferSession {
     pub seed: Option<PrefixSeed>,
     /// Chunk payload bytes that crossed the network in this session.
     pub pulled_len: u64,
+    pub slot: TransferSlot,
+}
+
+/// Counts one live transfer session against the shard's transfer cap. The
+/// session owns it, so every path that drops a session frees the slot, a
+/// partition dropped during its transfer included.
+#[derive(Debug)]
+pub struct TransferSlot(Rc<Cell<usize>>);
+
+impl TransferSlot {
+    #[must_use]
+    pub fn new(inflight: &Rc<Cell<usize>>) -> Self {
+        inflight.set(inflight.get() + 1);
+        Self(Rc::clone(inflight))
+    }
+}
+
+impl Drop for TransferSlot {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
 }
 
 /// The local copy of the leading bytes of one offered segment artifact.

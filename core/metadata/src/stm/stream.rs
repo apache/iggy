@@ -213,10 +213,32 @@ pub struct PartitionReplication {
 
 /// When each committed partition, by namespace and incarnation, was first
 /// found without a report, kept by the metadata primary from one
-/// [`Streams::partition_replication`] scan to the next.
+/// [`Streams::partition_replication`] pass to the next.
 #[derive(Debug, Default)]
-pub struct UnreportedPartitions {
+struct UnreportedPartitions {
     since: AHashMap<(u64, u64), Instant>,
+    /// The last pass's entries this pass has not found without a report yet.
+    /// The end of the pass drops the rest, of partitions deleted or reported.
+    previous: AHashMap<(u64, u64), Instant>,
+}
+
+/// A [`Streams::partition_replication`] pass, kept by the metadata primary
+/// from one call to the next.
+#[derive(Debug, Default)]
+pub struct PartitionReplicationPass {
+    /// Stream key, topic key and partition index where the next call starts,
+    /// `None` between passes.
+    cursor: Option<(usize, usize, usize)>,
+    counts: PartitionReplication,
+    unreported: UnreportedPartitions,
+}
+
+impl PartitionReplicationPass {
+    /// Whether a pass started and has partitions left to visit.
+    #[must_use]
+    pub const fn in_progress(&self) -> bool {
+        self.cursor.is_some()
+    }
 }
 
 /// Node id of the primary `view` assigns among `members`, or among nodes
@@ -2674,8 +2696,8 @@ impl Streams {
     }
 
     /// How many committed partitions run short of their factor, and how many
-    /// cannot commit, counted once for the whole cluster at `now`. A partition
-    /// whose primary, as last reported or created before any report, is `live`
+    /// cannot commit, counted once for the whole cluster. A partition whose
+    /// primary, as last reported or created before any report, is `live`
     /// counts the members of its last report that are live too. One whose
     /// primary is not live counts its live members, which must elect a primary
     /// before anything commits.
@@ -2685,23 +2707,46 @@ impl Streams {
     /// on this node. A partition with no report counts the same way once it
     /// was first found without one before `stale_before`, and is left out
     /// until then.
+    ///
+    /// One call visits at most `limit` partitions in tree order, from where
+    /// the last call of `pass` stopped, and returns the counts once the pass
+    /// reaches the end. The next call starts a new pass. A partition deleted
+    /// before the pass reaches it is not counted, and one created behind the
+    /// cursor counts in the next pass.
     #[must_use]
     pub fn partition_replication(
         &self,
         live: &[bool],
         now: Instant,
         stale_before: Option<Instant>,
-        unreported: &mut UnreportedPartitions,
-    ) -> PartitionReplication {
+        pass: &mut PartitionReplicationPass,
+        limit: usize,
+    ) -> Option<PartitionReplication> {
         let nodes = u8::try_from(live.len()).unwrap_or(u8::MAX);
         let is_live = |node: u8| live.get(usize::from(node)).copied().unwrap_or(false);
-        let mut previous = std::mem::take(&mut unreported.since);
-        self.inner.read(|inner| {
+        let (first_stream, first_topic, first_partition) = pass.cursor.unwrap_or_else(|| {
+            pass.unreported.previous = std::mem::take(&mut pass.unreported.since);
+            (0, 0, 0)
+        });
+        pass.cursor = self.inner.read(|inner| {
             let directory = inner.stats_registry.directory();
-            let mut counts = PartitionReplication::default();
-            for (stream_id, stream) in &inner.items {
-                for (topic_id, topic) in &stream.topics {
-                    for partition in &topic.partitions {
+            let mut visits_left = limit;
+            for (stream_id, stream) in inner.items.iter_from(first_stream) {
+                let same_stream = stream_id == first_stream;
+                let topics = stream
+                    .topics
+                    .iter_from(if same_stream { first_topic } else { 0 });
+                for (topic_id, topic) in topics {
+                    let skipped = if same_stream && topic_id == first_topic {
+                        first_partition
+                    } else {
+                        0
+                    };
+                    for (index, partition) in topic.partitions.iter().enumerate().skip(skipped) {
+                        if visits_left == 0 {
+                            return Some((stream_id, topic_id, index));
+                        }
+                        visits_left -= 1;
                         let members = partition.replica_set(nodes);
                         let namespace = IggyNamespace::new(stream_id, topic_id, partition.id);
                         let report = directory.expire_and_get(
@@ -2711,8 +2756,8 @@ impl Streams {
                         );
                         let unreported_long = report.is_none() && {
                             let key = (namespace.inner(), partition.created_revision);
-                            let since = previous.remove(&key).unwrap_or(now);
-                            unreported.since.insert(key, since);
+                            let since = pass.unreported.previous.remove(&key).unwrap_or(now);
+                            pass.unreported.since.insert(key, since);
                             stale_before.is_some_and(|before| since < before)
                         };
                         let view = report.map_or(partition.created_view, |status| status.view);
@@ -2741,14 +2786,19 @@ impl Streams {
                                     .count();
                                 (live_members, consensus::quorum_view_change(members.len()))
                             };
-                        counts.under_replicated +=
+                        pass.counts.under_replicated +=
                             usize::from(holding < usize::from(members.len()));
-                        counts.below_write_quorum += usize::from(holding < quorum);
+                        pass.counts.below_write_quorum += usize::from(holding < quorum);
                     }
                 }
             }
-            counts
-        })
+            None
+        });
+        if pass.in_progress() {
+            return None;
+        }
+        pass.unreported.previous = AHashMap::default();
+        Some(std::mem::take(&mut pass.counts))
     }
 
     /// The committed partition's member list, `Some(None)` when every node
@@ -7430,6 +7480,29 @@ mod tests {
         );
     }
 
+    /// More calls than any pass over a test tree takes, so a pass that never
+    /// ends fails instead of hanging.
+    const PASS_CALLS_MAX: usize = 64;
+
+    /// Runs `pass` to its end, `limit` partitions per call, and returns its
+    /// counts with the number of calls it took.
+    fn full_pass(
+        streams: &Streams,
+        live: &[bool],
+        now: Instant,
+        stale_before: Option<Instant>,
+        pass: &mut PartitionReplicationPass,
+        limit: usize,
+    ) -> (PartitionReplication, usize) {
+        (1..=PASS_CALLS_MAX)
+            .find_map(|calls| {
+                streams
+                    .partition_replication(live, now, stale_before, pass, limit)
+                    .map(|counts| (counts, calls))
+            })
+            .expect("a pass over a test tree ends")
+    }
+
     #[test]
     fn given_members_down_when_counting_partitions_without_a_ready_quorum_should_leave_those_with_a_ready_primary()
      {
@@ -7468,12 +7541,15 @@ mod tests {
             Instant::now(),
         );
         let counts = |live: &[bool]| {
-            streams.partition_replication(
+            full_pass(
+                &streams,
                 live,
                 Instant::now(),
                 None,
-                &mut UnreportedPartitions::default(),
+                &mut PartitionReplicationPass::default(),
+                1,
             )
+            .0
         };
         assert_eq!(
             counts(&[false, true, true]).below_write_quorum,
@@ -7508,9 +7584,9 @@ mod tests {
         let cutoff = received + Duration::from_secs(1);
         let later = received + Duration::from_secs(10);
         streams.record_partition_statuses(&[healthy], 2, 3, received);
-        let mut unreported = UnreportedPartitions::default();
+        let mut pass = PartitionReplicationPass::default();
         let mut counts = |now: Instant, stale_before: Option<Instant>| {
-            streams.partition_replication(&[true; 3], now, stale_before, &mut unreported)
+            full_pass(&streams, &[true; 3], now, stale_before, &mut pass, 1).0
         };
         assert_eq!(
             counts(received, None),
@@ -7564,12 +7640,15 @@ mod tests {
             &[0, 1, 2, 3],
         );
         let counts = |live: &[bool]| {
-            streams.partition_replication(
+            full_pass(
+                &streams,
                 live,
                 Instant::now(),
                 None,
-                &mut UnreportedPartitions::default(),
+                &mut PartitionReplicationPass::default(),
+                1,
             )
+            .0
         };
         assert_eq!(
             counts(&[false, false, true, true]),
@@ -7587,6 +7666,232 @@ mod tests {
             counts(&[true, false, false, true]),
             PartitionReplication::default(),
             "a live primary that has not reported yet is not counted"
+        );
+    }
+
+    /// Each call resumes where the last one stopped, past empty streams and
+    /// topics, so a pass in chunks counts what a pass in one chunk counts. A
+    /// chunk as large as the tree ends the pass in one call.
+    #[test]
+    fn given_a_pass_in_chunks_when_counting_should_match_a_pass_in_one_chunk() {
+        const PARTITIONS: usize = 6;
+        let streams = Streams::default();
+        let persisted = iggy_common::Durability::Persisted;
+        let reported = IggyNamespace::new(0, 0, 0);
+        let every_node = IggyNamespace::new(2, 0, 0);
+        // Topic 0/1 and stream 1 are empty fillers. Node 2 leads topic 0/2.
+        streams.seed_namespace_on(IggyNamespace::new(0, 0, 2), 1, 0, persisted, &[0, 1, 2]);
+        streams.seed_namespace_on(IggyNamespace::new(0, 2, 1), 2, 1, persisted, &[1, 2]);
+        streams.seed_namespace_on(every_node, 3, 0, persisted, &[]);
+        let seen = Instant::now();
+        let later = seen + Duration::from_secs(10);
+        let report = |namespace: IggyNamespace, in_sync_nodes| PartitionStatusEntry {
+            namespace: namespace.inner(),
+            created_revision: streams.created_revision_for_namespace(namespace).unwrap(),
+            view: 0,
+            commit: 0,
+            current_offset: 0,
+            messages_count: 0,
+            size_bytes: 0,
+            segments_count: 1,
+            in_sync_nodes,
+        };
+        streams.record_partition_statuses(
+            &[report(reported, 0b011), report(every_node, 0b111)],
+            0,
+            3,
+            later,
+        );
+        let live = [true, true, false];
+        for limit in [1, 2, 4, 5, PARTITIONS, usize::MAX] {
+            let mut pass = PartitionReplicationPass::default();
+            assert_eq!(
+                full_pass(&streams, &live, seen, None, &mut pass, limit),
+                (
+                    PartitionReplication {
+                        under_replicated: 3,
+                        below_write_quorum: 2,
+                    },
+                    PARTITIONS.div_ceil(limit)
+                ),
+                "limit {limit}: the short report and topic 0/2, whose primary is down"
+            );
+            assert_eq!(
+                full_pass(
+                    &streams,
+                    &live,
+                    later,
+                    Some(seen + Duration::from_secs(1)),
+                    &mut pass,
+                    limit
+                )
+                .0,
+                PartitionReplication {
+                    under_replicated: 5,
+                    below_write_quorum: 4,
+                },
+                "limit {limit}: and the two the first pass found without a report"
+            );
+        }
+    }
+
+    /// A partition keeps the time it was first found without a report while
+    /// every pass finds it so, and counts once that time is before the stale
+    /// cutoff. The end of a pass forgets one that reported meanwhile.
+    #[test]
+    fn given_partitions_without_reports_when_passes_run_in_chunks_should_keep_each_first_sighting_until_a_report()
+     {
+        let streams = Streams::default();
+        let reporting = IggyNamespace::new(0, 0, 0);
+        let silent = IggyNamespace::new(0, 0, 1);
+        streams.seed_namespace_on(silent, 1, 0, iggy_common::Durability::Persisted, &[0, 1]);
+        let incarnation = |namespace: IggyNamespace| {
+            (
+                namespace.inner(),
+                streams.created_revision_for_namespace(namespace).unwrap(),
+            )
+        };
+        let seen = Instant::now();
+        let later = seen + Duration::from_secs(10);
+        let live = [true; 2];
+        let mut pass = PartitionReplicationPass::default();
+        assert_eq!(
+            full_pass(&streams, &live, seen, None, &mut pass, 1).0,
+            PartitionReplication::default()
+        );
+        assert_eq!(
+            full_pass(&streams, &live, later, Some(seen), &mut pass, 1).0,
+            PartitionReplication::default(),
+            "both were first found at the cutoff, not before it"
+        );
+        streams.record_partition_statuses(
+            &[PartitionStatusEntry {
+                namespace: reporting.inner(),
+                created_revision: incarnation(reporting).1,
+                view: 0,
+                commit: 0,
+                current_offset: 0,
+                messages_count: 0,
+                size_bytes: 0,
+                segments_count: 1,
+                in_sync_nodes: 0b11,
+            }],
+            0,
+            2,
+            later,
+        );
+        assert_eq!(
+            full_pass(
+                &streams,
+                &live,
+                later,
+                Some(seen + Duration::from_millis(1)),
+                &mut pass,
+                1
+            )
+            .0,
+            PartitionReplication {
+                under_replicated: 1,
+                below_write_quorum: 1,
+            },
+            "only the silent one"
+        );
+        assert_eq!(
+            pass.unreported.since.len(),
+            1,
+            "the reported one is forgotten"
+        );
+        assert_eq!(pass.unreported.since.get(&incarnation(silent)), Some(&seen));
+        assert!(pass.unreported.previous.is_empty());
+    }
+
+    /// A pass resumes by position. Partitions deleted ahead of its cursor are
+    /// not counted, ones created behind it wait for the next pass, and the end
+    /// of each pass forgets the deleted ones.
+    #[test]
+    fn given_a_delete_and_a_create_during_a_pass_when_counting_should_skip_the_deleted_and_count_the_created_next_pass()
+     {
+        const LIMIT: usize = 3;
+        let seeded = Streams::default();
+        seeded.seed_namespace(IggyNamespace::new(0, 0, 1), 1, 0);
+        seeded.seed_namespace(IggyNamespace::new(1, 0, 2), 2, 0);
+        seeded.seed_namespace(IggyNamespace::new(1, 1, 0), 3, 0);
+        let mut inner = seeded.read(StreamsInner::clone);
+        // Node 0 leads every partition and is down, so each one counts.
+        let live = [false, false, true];
+        let counted = |partitions| PartitionReplication {
+            under_replicated: partitions,
+            below_write_quorum: partitions,
+        };
+        let call = |inner: &StreamsInner, pass: &mut PartitionReplicationPass| {
+            Streams::from(inner.clone()).partition_replication(
+                &live,
+                Instant::now(),
+                None,
+                pass,
+                LIMIT,
+            )
+        };
+        let mut pass = PartitionReplicationPass::default();
+        assert_eq!(call(&inner, &mut pass), None);
+        assert_eq!(call(&inner, &mut pass), Some(counted(6)));
+        assert_eq!(
+            call(&inner, &mut pass),
+            None,
+            "the next pass stops inside topic 1/0"
+        );
+
+        let delete = DeleteTopicRequest {
+            stream_id: WireIdentifier::numeric(1),
+            topic_id: WireIdentifier::numeric(0),
+        };
+        let deleted = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(deleted.code, 0);
+        let create = CreatePartitionsWithAssignmentsRequest {
+            request: WireCreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partitions_count: 2,
+            },
+            partitions: (0..2)
+                .map(|partition_id| CreatedPartitionAssignment {
+                    initial_view: 0,
+                    partition_id,
+                    consensus_group_id: u64::from(partition_id) + 1,
+                    members: Vec::new(),
+                })
+                .collect(),
+        };
+        assert_eq!(
+            StateHandler::apply(&create, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+
+        assert_eq!(
+            call(&inner, &mut pass),
+            Some(counted(4)),
+            "three before the delete, then topic 1/1, and not the two created behind"
+        );
+        assert!(pass.unreported.previous.is_empty());
+        assert_eq!(
+            pass.unreported.since.len(),
+            4,
+            "the deleted partitions the pass did not reach are forgotten"
+        );
+        assert_eq!(call(&inner, &mut pass), None);
+        assert_eq!(
+            call(&inner, &mut pass),
+            Some(counted(5)),
+            "the next pass counts the created ones"
+        );
+        assert_eq!(
+            pass.unreported.since.len(),
+            5,
+            "and forgets the deleted one it counted before"
         );
     }
 

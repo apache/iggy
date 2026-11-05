@@ -43,14 +43,14 @@ use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use metadata::impls::metadata::PartitionPrimaryTransfer;
-use metadata::stm::stream::{PartitionReplication, UnreportedPartitions};
+use metadata::stm::stream::{PartitionReplication, PartitionReplicationPass};
 use partitions::{IggyPartition, PreparedPrimaryTransfer};
 use server_common::Message;
 use server_common::MessageBag;
 use server_common::sharding::IggyNamespace;
 use server_common::sharding::METADATA_GROUP;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ops::Bound;
 use std::time::{Duration, Instant};
 
@@ -75,52 +75,127 @@ const STATUS_ENTRIES_PER_FRAME: usize = 512;
 const STATUS_ENTRIES_SCANNED_PER_FRAME: usize = 4 * STATUS_ENTRIES_PER_FRAME;
 /// Directory reports one retain pass checks under the directory lock.
 const DIRECTORY_RETAIN_CHUNK: usize = 1024;
-/// An outbox report not refreshed for this long names a partition this node
-/// no longer leads. Each led partition is reported once per probe interval.
-const OUTBOX_REPORT_MAX_AGE: Duration = Duration::from_secs(2 * PROBE_INTERVAL.as_secs());
+/// Partitions one tick of the replication count visits, so its read stays
+/// short at any cluster size.
+const PARTITION_REPLICATION_CHUNK: usize = 1024;
 
-/// Shard 0: this node's own partition reports awaiting metadata replies, with
-/// when each was last refreshed.
+/// Shard 0: this node's own partition reports for its metadata replies. Its
+/// shards report each change and retract each partition they stop leading,
+/// so a report stays until it changes or a reply carries its retraction.
 #[derive(Debug, Default)]
 pub struct PartitionStatusOutbox {
-    entries: RefCell<BTreeMap<u64, (PartitionStatusEntry, Instant)>>,
+    entries: RefCell<BTreeMap<u64, OutboxEntry>>,
+    /// Namespaces whose incarnation, view or in-sync nodes changed since a
+    /// reply last carried them, oldest first, each once.
+    changes: RefCell<VecDeque<u64>>,
     cursor: Cell<Option<u64>>,
 }
 
+#[derive(Debug)]
+struct OutboxEntry {
+    status: PartitionStatusEntry,
+    /// Waits in `changes`.
+    changed: bool,
+}
+
+/// Where the outbox stood before a reply that may not leave this node.
+#[derive(Debug, Clone, Copy)]
+pub struct OutboxUnsent {
+    /// How many changes lead the reply.
+    changes_sent: usize,
+    cursor: Option<u64>,
+}
+
 impl PartitionStatusOutbox {
-    pub fn record(&self, statuses: &[PartitionStatusEntry], now: Instant) {
+    pub fn record(&self, statuses: &[PartitionStatusEntry]) {
         let mut entries = self.entries.borrow_mut();
+        let mut changes = self.changes.borrow_mut();
         for status in statuses {
-            entries.insert(status.namespace, (*status, now));
+            let mut moved = true;
+            let entry = entries
+                .entry(status.namespace)
+                .and_modify(|held| {
+                    moved = (
+                        held.status.created_revision,
+                        held.status.view,
+                        held.status.in_sync_nodes,
+                    ) != (status.created_revision, status.view, status.in_sync_nodes);
+                })
+                .or_insert(OutboxEntry {
+                    status: *status,
+                    changed: false,
+                });
+            entry.status = *status;
+            if moved && !entry.changed {
+                entry.changed = true;
+                changes.push_back(status.namespace);
+            }
         }
     }
 
-    /// Drop reports no publish refreshed within [`OUTBOX_REPORT_MAX_AGE`].
-    pub fn evict_stale(&self, now: Instant) {
-        self.entries.borrow_mut().retain(|_, (_, refreshed)| {
-            now.saturating_duration_since(*refreshed) < OUTBOX_REPORT_MAX_AGE
-        });
-    }
-
-    /// Up to `limit` reports after the cursor, wrapping, advancing it.
-    pub fn next_batch(&self, limit: usize) -> Vec<PartitionStatusEntry> {
-        let entries = self.entries.borrow();
+    /// Up to `limit` reports: the changes first, oldest first, then the cycle
+    /// after the cursor, wrapping, advancing it. A retraction leaves once it
+    /// goes out as a change. Returns where the outbox stood before, for a
+    /// reply that does not leave this node.
+    pub fn next_batch(&self, limit: usize) -> (Vec<PartitionStatusEntry>, OutboxUnsent) {
+        let mut entries = self.entries.borrow_mut();
+        let mut changes = self.changes.borrow_mut();
+        let mut batch = Vec::new();
+        while batch.len() < limit
+            && let Some(namespace) = changes.pop_front()
+        {
+            let Some(entry) = entries.get_mut(&namespace) else {
+                continue;
+            };
+            entry.changed = false;
+            batch.push(entry.status);
+            if entry.status.in_sync_nodes == 0 {
+                entries.remove(&namespace);
+            }
+        }
+        let changes_sent = batch.len();
         let after = self.cursor.get();
         let start = after.map_or(Bound::Unbounded, Bound::Excluded);
         let end = after.map_or(Bound::Excluded(0), Bound::Included);
-        let batch: Vec<_> = entries
-            .range((start, Bound::Unbounded))
-            .chain(entries.range((Bound::Unbounded, end)))
-            .take(limit.min(entries.len()))
-            .map(|(_, (status, _))| *status)
-            .collect();
-        if let Some(last) = batch.last() {
+        batch.extend(
+            entries
+                .range((start, Bound::Unbounded))
+                .chain(entries.range((Bound::Unbounded, end)))
+                .take((limit - changes_sent).min(entries.len()))
+                .map(|(_, entry)| entry.status),
+        );
+        if batch.len() > changes_sent
+            && let Some(last) = batch.last()
+        {
             self.cursor.set(Some(last.namespace));
         }
-        batch
+        let unsent = OutboxUnsent {
+            changes_sent,
+            cursor: after,
+        };
+        (batch, unsent)
     }
 
-    /// The partitions this node leads, as its shards last reported them.
+    /// Undo a `batch` that did not leave this node: its changes lead the next
+    /// batch again, and the cycle resumes where it stood.
+    pub fn forget_unsent(&self, batch: &[PartitionStatusEntry], unsent: OutboxUnsent) {
+        let mut entries = self.entries.borrow_mut();
+        let mut changes = self.changes.borrow_mut();
+        for status in batch.iter().take(unsent.changes_sent).rev() {
+            let entry = entries.entry(status.namespace).or_insert(OutboxEntry {
+                status: *status,
+                changed: false,
+            });
+            if !entry.changed {
+                entry.changed = true;
+                changes.push_front(status.namespace);
+            }
+        }
+        self.cursor.set(unsent.cursor);
+    }
+
+    /// The partitions this node leads, as its shards last reported them, and
+    /// those whose retraction no reply carried yet.
     pub fn namespaces(&self) -> Vec<u64> {
         self.entries.borrow().keys().copied().collect()
     }
@@ -137,11 +212,11 @@ pub struct PrimaryRebalance {
     /// rather than no evidence.
     readiness_known: bool,
     /// The cluster's partitions short of their factor or of a write quorum,
-    /// as of the last scan.
+    /// as of the last finished pass.
     replication: PartitionReplication,
     /// The nodes the directory last narrowed in-sync reports to.
     live_nodes: u32,
-    unreported: UnreportedPartitions,
+    replication_pass: PartitionReplicationPass,
     /// When this node started coordinating `view`.
     view_since: Instant,
     next_quorum_scan: Instant,
@@ -245,8 +320,9 @@ pub enum LocalRebalance {
 
 impl PrimaryRebalance {
     /// On the metadata primary's first shard, the cluster's partitions short
-    /// of their factor or of a write quorum. Zero elsewhere, and until every
-    /// peer was heard from in this view.
+    /// of their factor or of a write quorum. Zero elsewhere, and until the
+    /// first pass of this view ends, which waits until every peer was heard
+    /// from.
     pub(crate) const fn partition_replication(&self) -> PartitionReplication {
         self.replication
     }
@@ -376,7 +452,7 @@ impl Default for PrimaryRebalance {
             readiness_known: false,
             replication: PartitionReplication::default(),
             live_nodes: u32::MAX,
-            unreported: UnreportedPartitions::default(),
+            replication_pass: PartitionReplicationPass::default(),
             view_since: Instant::now(),
             next_quorum_scan: Instant::now(),
             stable_since: Instant::now(),
@@ -440,6 +516,7 @@ where
             state.reset_authority();
             state.live_nodes = u32::MAX;
             state.replication = PartitionReplication::default();
+            state.replication_pass = PartitionReplicationPass::default();
             drop(state);
             metadata.observe_replica_readiness(&[]);
             if self.id == 0 {
@@ -572,8 +649,14 @@ where
                     .streams()
                     .set_partition_directory_ready_nodes(live_nodes);
             }
-            if readiness_known && now >= state.next_quorum_scan {
-                state.next_quorum_scan = now + PROBE_INTERVAL;
+            // A pass spans ticks and takes each tick's liveness and stale
+            // cutoff. Only the gauges read its counts, so churn skews them for
+            // one pass at most.
+            let continues = state.replication_pass.in_progress();
+            if readiness_known && (continues || now >= state.next_quorum_scan) {
+                if !continues {
+                    state.next_quorum_scan = now + PROBE_INTERVAL;
+                }
                 let streams = metadata.mux_stm.streams();
                 // Reports from before this view came through the last metadata
                 // primary, so they get as long as this view's own to come round.
@@ -582,10 +665,18 @@ where
                     .filter(|cutoff| *cutoff >= state.view_since);
                 let PrimaryRebalance {
                     replication,
-                    unreported,
+                    replication_pass,
                     ..
                 } = &mut *state;
-                *replication = streams.partition_replication(&live, now, stale_before, unreported);
+                if let Some(counts) = streams.partition_replication(
+                    &live,
+                    now,
+                    stale_before,
+                    replication_pass,
+                    PARTITION_REPLICATION_CHUNK,
+                ) {
+                    *replication = counts;
+                }
             }
             if let Some(pending) = state.pending.as_ref() {
                 let elapsed = now.duration_since(pending.since);
@@ -736,9 +827,13 @@ where
         metadata::stm::stream::primary_of(members, view, nodes)
     }
 
-    /// Once per probe interval, drop the reports this node no longer leads,
-    /// and check one chunk of the directory for deleted partitions. The cross
-    /// shard directory lock is held for one chunk only.
+    /// Once per probe interval, check one chunk of the directory for deleted
+    /// partitions. The cross shard directory lock is held for one chunk only.
+    ///
+    /// The metadata primary also feeds a reply's worth of its own reports into
+    /// its directory. It never probes itself, so no reply refreshes them, and
+    /// its quiet partitions send no new report: without the feed they would
+    /// age out of the directory.
     fn retain_partition_directories(&self, now: Instant) {
         if self
             .partition_directory_retained_at
@@ -758,7 +853,18 @@ where
                 DIRECTORY_RETAIN_CHUNK,
             );
         self.partition_directory_retain_cursor.set(next);
-        self.partition_status_outbox.evict_stale(now);
+        // Only a coordinator holds a view. Its start marks the outbox's reports
+        // as changed, retractions included, so the feed waits for it.
+        if self
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .is_some_and(|consensus| self.primary_rebalance.borrow().view == Some(consensus.view()))
+        {
+            let (own, _) = self.next_reported_statuses();
+            self.record_partition_statuses(&own);
+        }
     }
 
     /// Take in partition reports, this node's own or a peer's.
@@ -841,12 +947,15 @@ where
                             .applied_frontier()
                             .has_partition_recovery(),
                 );
-                let statuses = if header.kind == PrimaryRebalanceKind::MetadataProbe {
-                    self.next_reported_statuses()
+                if header.kind == PrimaryRebalanceKind::MetadataProbe {
+                    let (statuses, unsent) = self.next_reported_statuses();
+                    if !self.send_rebalance(header.replica, reply, &statuses).await {
+                        self.partition_status_outbox
+                            .forget_unsent(&statuses, unsent);
+                    }
                 } else {
-                    Vec::new()
-                };
-                self.send_rebalance(header.replica, reply, &statuses).await;
+                    self.send_rebalance(header.replica, reply, &[]).await;
+                }
             }
             PrimaryRebalanceKind::MetadataReply => {
                 if consensus.is_primary() && consensus_ready(consensus) {
@@ -1217,7 +1326,7 @@ where
     }
 
     /// The next run of this node's own partition reports for a metadata reply.
-    fn next_reported_statuses(&self) -> Vec<PartitionStatusEntry> {
+    fn next_reported_statuses(&self) -> (Vec<PartitionStatusEntry>, OutboxUnsent) {
         self.partition_status_outbox
             .next_batch(STATUS_ENTRIES_PER_FRAME)
     }
@@ -1227,7 +1336,8 @@ where
 /// counts as no longer leading. A node sends the reports of what it leads one
 /// frame per probe and leads at most the `reports` held here, so one it keeps
 /// sending comes round within that many frames. Twice that, a probe and a
-/// probe timeout cover the shards' own pass and a lost reply.
+/// probe timeout cover the changes each frame sends ahead of that cycle and a
+/// lost reply.
 fn report_stale_after(reports: usize) -> Duration {
     let passes = u32::try_from(reports.div_ceil(STATUS_ENTRIES_PER_FRAME)).unwrap_or(u32::MAX);
     PROBE_INTERVAL

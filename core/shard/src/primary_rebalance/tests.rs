@@ -1427,33 +1427,119 @@ async fn given_an_overdue_probe_when_probing_again_should_withhold_evidence_unti
     assert!(carries_evidence(4), "the reply restores the evidence");
 }
 
-#[test]
-fn given_outbox_reports_when_a_partition_stops_being_refreshed_should_evict_only_it() {
-    let status = |namespace| PartitionStatusEntry {
+fn own_status(namespace: u64, view: u32, in_sync_nodes: u32) -> PartitionStatusEntry {
+    PartitionStatusEntry {
         namespace,
         created_revision: 1,
-        view: 0,
+        view,
         commit: 0,
         current_offset: 0,
         messages_count: 0,
         size_bytes: 0,
         segments_count: 1,
-        in_sync_nodes: 0,
-    };
+        in_sync_nodes,
+    }
+}
+
+/// Shards report a partition only when its report changes, so a quiet one is
+/// never refreshed and must stay.
+#[test]
+fn given_outbox_reports_when_no_shard_refreshes_them_should_keep_cycling_them() {
     let outbox = PartitionStatusOutbox::default();
-    let start = Instant::now();
-    outbox.record(&[status(1), status(2)], start);
-    outbox.record(&[status(2)], start + PROBE_INTERVAL);
-    outbox.evict_stale(start + OUTBOX_REPORT_MAX_AGE);
+    let reports = [own_status(1, 0, 0b11), own_status(2, 0, 0b11)];
+    outbox.record(&reports);
+    assert_eq!(outbox.next_batch(2).0, reports, "first reports are changes");
+    for _ in 0..STATUS_ENTRIES_PER_FRAME {
+        assert_eq!(outbox.next_batch(1).0, [reports[0]]);
+        assert_eq!(outbox.next_batch(1).0, [reports[1]], "the cursor wraps");
+    }
+    assert_eq!(outbox.namespaces(), [1, 2]);
+}
+
+#[test]
+fn given_a_retraction_when_a_batch_carries_it_should_leave_the_outbox() {
+    let outbox = PartitionStatusOutbox::default();
+    let kept = own_status(2, 0, 0b11);
+    outbox.record(&[own_status(1, 0, 0b11), kept]);
+    outbox.next_batch(2);
+    let retraction = own_status(1, 0, 0);
+    outbox.record(&[retraction]);
+    assert_eq!(outbox.namespaces(), [1, 2], "it waits for one send");
+
+    assert_eq!(outbox.next_batch(1).0, [retraction]);
+    assert_eq!(outbox.namespaces(), [2]);
     assert_eq!(
-        outbox.namespaces(),
-        [2],
-        "a report no publish refreshed names a partition this node stopped leading"
+        outbox.next_batch(STATUS_ENTRIES_PER_FRAME).0,
+        [kept],
+        "the cycle no longer carries it"
     );
-    assert_eq!(outbox.next_batch(4), [status(2)]);
-    outbox.record(&[status(3)], start + OUTBOX_REPORT_MAX_AGE);
-    assert_eq!(outbox.next_batch(1), [status(3)]);
-    assert_eq!(outbox.next_batch(1), [status(2)], "the cursor wraps");
+}
+
+#[test]
+fn given_changes_and_a_cycle_when_batching_should_send_the_changes_first() {
+    let outbox = PartitionStatusOutbox::default();
+    let reports: Vec<_> = (1..=4)
+        .map(|namespace| own_status(namespace, 0, 0b11))
+        .collect();
+    outbox.record(&reports);
+    outbox.next_batch(reports.len());
+    assert_eq!(outbox.next_batch(1).0, [reports[0]]);
+
+    let moved = own_status(3, 1, 0b11);
+    let counted = PartitionStatusEntry {
+        commit: COMMITTED,
+        ..reports[3]
+    };
+    outbox.record(&[counted, moved]);
+    assert_eq!(
+        outbox.next_batch(2).0,
+        [moved, reports[1]],
+        "the change, then the cycle after its cursor"
+    );
+    assert_eq!(
+        outbox.next_batch(2).0,
+        [moved, counted],
+        "new counters wait for the cycle"
+    );
+}
+
+#[test]
+fn given_a_refused_batch_when_forgetting_it_should_send_it_again() {
+    let outbox = PartitionStatusOutbox::default();
+    let reports: Vec<_> = (1..=3)
+        .map(|namespace| own_status(namespace, 0, 0b11))
+        .collect();
+    outbox.record(&reports);
+    outbox.next_batch(reports.len());
+    outbox.next_batch(1);
+    let retraction = own_status(2, 0, 0);
+    let moved = own_status(3, 1, 0b11);
+    outbox.record(&[retraction, moved]);
+
+    let (batch, unsent) = outbox.next_batch(3);
+    assert_eq!(batch, [retraction, moved, moved]);
+    outbox.forget_unsent(&batch, unsent);
+    assert_eq!(outbox.namespaces(), [1, 2, 3], "the retraction is back");
+    assert_eq!(outbox.next_batch(3).0, batch);
+}
+
+/// The bus refused the reply, so the metadata primary never got its reports.
+#[compio::test]
+async fn given_a_refused_reply_when_the_next_probe_arrives_should_carry_its_changes_again() {
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 1, 3, 0);
+    let consensus = shard.plane.metadata().consensus.as_ref().unwrap();
+    let outbox = &shard.partition_status_outbox;
+    outbox.record(&[own_status(1, 0, 0b11), own_status(2, 0, 0b11)]);
+    outbox.next_batch(2);
+    let retraction = own_status(1, 0, 0);
+    outbox.record(&[retraction]);
+    let mut probe = probe_header(consensus, NONCE);
+    probe.replica = 0;
+
+    shard.bus.disconnected.set(true);
+    shard.on_primary_rebalance(probe, Vec::new()).await;
+    assert_eq!(outbox.namespaces(), [1, 2]);
+    assert_eq!(outbox.next_batch(1).0, [retraction]);
 }
 
 /// A peer that does not store a partition routes from what the metadata
@@ -1576,7 +1662,7 @@ async fn given_own_reports_from_before_the_metadata_view_when_it_starts_should_s
     streams.record_partition_statuses(&reports, 0, REPLICAS, now);
     // As the router takes in this node's own report while it is a backup.
     let taken_over = [status(TAKEN_OVER, 1)];
-    shard.partition_status_outbox.record(&taken_over, now);
+    shard.partition_status_outbox.record(&taken_over);
     streams.record_partition_statuses(&taken_over, 0, REPLICAS, now);
     shard.primary_rebalance.borrow_mut().view = None;
     // The probes this tick sends fail, so the cursors stay where the view
@@ -1700,4 +1786,105 @@ async fn given_a_report_no_primary_refreshes_when_the_coordinator_scans_should_c
         streams.partition_status(namespace).unwrap().in_sync_nodes,
         0
     );
+}
+
+/// The metadata primary never probes itself, so no reply refreshes its own
+/// reports, and its shards report a quiet partition only once.
+#[compio::test]
+async fn given_a_quiet_own_partition_when_the_metadata_primary_scans_past_the_wait_should_keep_it_in_sync()
+ {
+    let (shard, _inbox) = owner();
+    let streams = shard.plane.metadata().mux_stm.streams();
+    let namespace = IggyNamespace::new(1, 1, 0);
+    streams.seed_namespace(namespace, 1, 0);
+    let own = [PartitionStatusEntry {
+        namespace: namespace.inner(),
+        created_revision: streams.created_revision_for_namespace(namespace).unwrap(),
+        view: 0,
+        commit: 0,
+        current_offset: 0,
+        messages_count: 0,
+        size_bytes: 0,
+        segments_count: 1,
+        in_sync_nodes: 0b111,
+    }];
+    // As the router takes in the one report its shards send.
+    shard.partition_status_outbox.record(&own);
+    shard.record_partition_statuses(&own);
+    // The probes carry reports, which the recording bus does not take.
+    shard.bus.disconnected.set(true);
+    shard.primary_rebalance.borrow_mut().view = None;
+    shard.tick_primary_rebalance().await;
+
+    let start = shard.bus.monotonic_now();
+    let aged = start + report_stale_after(1) + PROBE_INTERVAL;
+    let mut at = start;
+    while at < aged {
+        at += PROBE_INTERVAL;
+        for peer in &mut shard.primary_rebalance.borrow_mut().peers {
+            peer.heard = true;
+            peer.live_at = Some(at);
+        }
+        shard.bus.now.set(Some(at));
+        shard.tick_primary_rebalance().await;
+    }
+    assert_eq!(
+        shard.primary_rebalance.borrow().partition_replication(),
+        PartitionReplication::default()
+    );
+    assert_eq!(
+        streams.partition_status(namespace).unwrap().in_sync_nodes,
+        0b111
+    );
+}
+
+/// A tree larger than a chunk takes a tick per chunk and publishes its counts
+/// when the pass ends. The next pass waits for the probe interval.
+#[compio::test]
+async fn given_more_partitions_than_a_chunk_when_scanning_should_publish_each_pass_when_it_ends() {
+    let (shard, _inbox) = owner();
+    let streams = shard.plane.metadata().mux_stm.streams();
+    // Created in view 1, so node 1 leads them, and no peer ever answers.
+    streams.seed_namespace(IggyNamespace::new(1, 1, PARTITION_REPLICATION_CHUNK), 1, 1);
+    shard.bus.disconnected.set(true);
+    shard.primary_rebalance.borrow_mut().view = None;
+    shard.tick_primary_rebalance().await;
+    let start = shard.bus.monotonic_now();
+    let tick = async |at: Instant| {
+        for peer in &mut shard.primary_rebalance.borrow_mut().peers {
+            peer.heard = true;
+        }
+        shard.bus.now.set(Some(at));
+        shard.tick_primary_rebalance().await;
+        shard.primary_rebalance.borrow().partition_replication()
+    };
+    let counted = |partitions| PartitionReplication {
+        under_replicated: partitions,
+        below_write_quorum: partitions,
+    };
+    let first_pass = PARTITION_REPLICATION_CHUNK + 1;
+
+    assert_eq!(
+        tick(start).await,
+        PartitionReplication::default(),
+        "the first chunk publishes nothing"
+    );
+    assert_eq!(
+        tick(start).await,
+        counted(first_pass),
+        "the second chunk ends the pass"
+    );
+    streams.seed_namespace(IggyNamespace::new(1, 2, 0), 2, 1);
+    assert_eq!(tick(start).await, counted(first_pass));
+    assert!(
+        !shard
+            .primary_rebalance
+            .borrow()
+            .replication_pass
+            .in_progress(),
+        "no pass starts before the probe interval"
+    );
+    let next = start + PROBE_INTERVAL;
+    assert_eq!(tick(next).await, counted(first_pass));
+    assert_eq!(tick(next).await, counted(first_pass + 1));
 }
