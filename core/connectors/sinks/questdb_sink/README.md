@@ -360,8 +360,9 @@ cargo build --bin iggy-server --bin iggy-connectors
 cargo test -p integration -- connectors::questdb::
 ```
 
-If the plugin is missing or older than its sources, the tests fail at once with
-the build command to run.
+If the plugin is missing, the tests fail at once with the build command to run.
+Rebuild it after every change to the sink, because the tests do not detect a
+stale build.
 
 ### Enterprise
 

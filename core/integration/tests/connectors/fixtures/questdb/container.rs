@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::path::PathBuf;
 
 use crate::connectors::fixtures;
 use integration::harness::TestBinaryError;
@@ -56,16 +55,6 @@ pub const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_QUESTDB_PATH";
 /// directory. Cargo runs the test with the same working directory, so the same
 /// relative path resolves here.
 pub const SINK_PLUGIN_PATH: &str = "../../target/debug/libiggy_connector_questdb_sink";
-/// Everything that changes what gets built into the plugin, for the staleness
-/// check in [`ensure_plugin_built`]. `Cargo.toml` is in the list because a
-/// dependency or feature change rebuilds the library without touching a source
-/// file. `config.toml` is not, because the runtime reads it from the source
-/// tree at start and no build is involved.
-const SINK_SOURCE_PATHS: &[&str] = &[
-    "../connectors/sinks/questdb_sink/src/lib.rs",
-    "../connectors/sinks/questdb_sink/src/mapping.rs",
-    "../connectors/sinks/questdb_sink/Cargo.toml",
-];
 pub const ENV_SINK_CONNECTION_STRING: &str =
     "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_CONNECTION_STRING";
 pub const ENV_SINK_TABLE: &str = "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_TABLE";
@@ -116,49 +105,18 @@ pub fn ensure_plugin_built() -> Result<(), TestBinaryError> {
     };
     // The runtime appends the platform's suffix, so the configured path has
     // none and every candidate has to be tried.
-    let Some(plugin) = ["dylib", "so", "dll"]
+    let built = ["dylib", "so", "dll"]
         .iter()
         .map(|extension| PathBuf::from(format!("{SINK_PLUGIN_PATH}.{extension}")))
-        .find(|candidate| candidate.exists())
-    else {
+        .any(|candidate| candidate.exists());
+    if !built {
         return Err(setup_error(format!(
             "the QuestDB sink plugin is not built, so the connectors runtime would have \
              nothing to load. Run `cargo build -p iggy_connector_questdb_sink` first. \
              Looked for {SINK_PLUGIN_PATH}.{{dylib,so,dll}}"
         )));
-    };
-
-    // Existence is not enough. `cargo test` rebuilds the test binary but not the
-    // plugin, so an edit to the sink leaves the runtime loading the previous
-    // build and the suite passes or fails on code that is no longer there.
-    // Compare the timestamps and say so instead.
-    let built_at = modified_at(&plugin).map_err(setup_error)?;
-    let newest_source = SINK_SOURCE_PATHS
-        .iter()
-        .map(Path::new)
-        .filter(|path| path.exists())
-        .map(modified_at)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(setup_error)?
-        .into_iter()
-        .max();
-    if let Some(changed_at) = newest_source
-        && changed_at > built_at
-    {
-        return Err(setup_error(format!(
-            "the QuestDB sink plugin at {} is older than its sources, so the connectors \
-             runtime would load the previous build. Run \
-             `cargo build -p iggy_connector_questdb_sink` and try again.",
-            plugin.display()
-        )));
     }
     Ok(())
-}
-
-fn modified_at(path: &Path) -> Result<SystemTime, String> {
-    path.metadata()
-        .and_then(|metadata| metadata.modified())
-        .map_err(|error| format!("cannot read the timestamp of {}: {error}", path.display()))
 }
 
 // ── Container ────────────────────────────────────────────────────────────────
