@@ -34,7 +34,7 @@ pub async fn should_help_match() {
 Commands:
   create  Create consumer group with given name for given stream ID and topic ID. [alias: c]
   delete  Delete consumer group with given ID for given stream ID and topic ID [alias: d]
-  get     Get details of a single consumer group with given ID for given stream ID and topic ID [alias: g]
+  get     Get details of a single consumer group with given ID for given stream ID and topic ID, and print each partition, its current offset, its stored offset, and its lag [alias: g]
   list    List all consumer groups for given stream ID and topic ID [alias: l]
   help    Print this message or the help of the given subcommand(s)
 

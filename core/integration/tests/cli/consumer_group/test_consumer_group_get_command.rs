@@ -569,7 +569,7 @@ pub async fn should_help_match() {
         .execute_test_for_help_command(TestHelpCmd::new(
             vec!["consumer-group", "get", "--help"],
             format!(
-                r#"Get details of a single consumer group with given ID for given stream ID and topic ID
+                r#"Get details of a single consumer group with given ID for given stream ID and topic ID, and print each partition, its current offset, its stored offset, and its lag
 
 Stream ID can be specified as a stream name or ID
 Topic ID can be specified as a topic name or ID
@@ -621,7 +621,7 @@ pub async fn should_short_help_match() {
         .execute_test_for_help_command(TestHelpCmd::new(
             vec!["consumer-group", "get", "-h"],
             format!(
-                r#"Get details of a single consumer group with given ID for given stream ID and topic ID
+                r#"Get details of a single consumer group with given ID for given stream ID and topic ID, and print each partition, its current offset, its stored offset, and its lag
 
 {USAGE_PREFIX} consumer-group get <STREAM_ID> <TOPIC_ID> <GROUP_ID>
 

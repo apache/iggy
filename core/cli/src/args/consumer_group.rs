@@ -50,7 +50,7 @@ pub(crate) enum ConsumerGroupAction {
     ///  iggy consumer-group delete stream topic group
     #[clap(verbatim_doc_comment, visible_alias = "d")]
     Delete(ConsumerGroupDeleteArgs),
-    /// Get details of a single consumer group with given ID for given stream ID and topic ID
+    /// Get details of a single consumer group with given ID for given stream ID and topic ID, and print each partition, its current offset, its stored offset, and its lag
     ///
     /// Stream ID can be specified as a stream name or ID
     /// Topic ID can be specified as a topic name or ID
