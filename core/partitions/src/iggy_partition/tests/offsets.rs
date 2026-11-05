@@ -795,7 +795,7 @@ async fn given_counter_zero_replica_that_missed_an_evicted_offset_delete_when_tr
 
     // No peer retains the delete any more, so repair cannot reach it.
     receiver.consensus().advance_commit_max(2);
-    receiver.repair = Some(armed_session(2, 2));
+    receiver.repair = Some(Box::new(armed_session(2, 2)));
     assert_eq!(
         receiver.complete_repair(&repair_config()).await,
         RepairConclusion::FloorRefused { floor: 2, to_op: 2 }

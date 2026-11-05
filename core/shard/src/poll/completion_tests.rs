@@ -2166,7 +2166,7 @@ fn arm_lagging_transfer<B, S>(partition: &mut IggyPartition<B, S>, peer: u8)
 where
     B: message_bus::MessageBus,
 {
-    partition.transfer = Some(PartitionTransferSession {
+    partition.transfer = Some(Box::new(PartitionTransferSession {
         nonce: LAGGING_NONCE,
         peer,
         commit_op: 0,
@@ -2177,7 +2177,7 @@ where
         scan: None,
         seed: None,
         pulled_len: 0,
-    });
+    }));
 }
 
 /// A descriptor from `GROUP_PRIMARY` at `GROUP_VIEW`: an offer at
@@ -2643,6 +2643,7 @@ async fn tick_until_repair_peer_changes(
             .get_by_ns(&namespace)
             .expect("the partition stays registered")
             .repair
+            .as_ref()
             .map(|session| session.peer);
         if let Some(peer) = peer
             && Some(peer) != previous
@@ -2868,7 +2869,7 @@ async fn given_a_floor_holding_the_walk_when_a_chunk_without_messages_lands_shou
         let partition = partitions
             .get_mut_by_ns(&namespace)
             .expect("the fixture registers the partition");
-        partition.repair = Some(RepairSession {
+        partition.repair = Some(Box::new(RepairSession {
             nonce: NONCE,
             view: partition.consensus().view(),
             from_op: partition.consensus().commit_min() + 1,
@@ -2879,7 +2880,7 @@ async fn given_a_floor_holding_the_walk_when_a_chunk_without_messages_lands_shou
             idle_ticks: 0,
             floor_pulled_from: 0,
             requested_from: Some(partition.consensus().commit_min() + 1),
-        });
+        }));
         for op in FLOOR + 1..=FIRST_CHUNK_LAST {
             partition
                 .log
@@ -2964,7 +2965,7 @@ async fn resident_window_backup_with(
         let partition = partitions
             .get_mut_by_ns(&namespace)
             .expect("the fixture registers the partition");
-        partition.repair = Some(RepairSession {
+        partition.repair = Some(Box::new(RepairSession {
             nonce,
             view: partition.consensus().view(),
             from_op: partition.consensus().commit_min() + 1,
@@ -2975,7 +2976,7 @@ async fn resident_window_backup_with(
             idle_ticks: 0,
             floor_pulled_from: 0,
             requested_from: Some(partition.consensus().commit_min() + 1),
-        });
+        }));
         for op in floor + 1..=to_op {
             partition
                 .log

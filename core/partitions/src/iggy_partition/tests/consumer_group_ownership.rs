@@ -559,7 +559,7 @@ async fn given_install_repaired_ahead_of_lower_op_when_view_starts_should_refuse
     let head = origin.consensus.sequencer().current_sequence();
     assert_eq!(head, installed_op + 2);
 
-    partition.repair = Some(armed_session(head, installed_op));
+    partition.repair = Some(Box::new(armed_session(head, installed_op)));
     for op in [head, head - 1] {
         partition
             .apply_repaired_prepare(retained_prepare(&origin, op))

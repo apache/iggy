@@ -36,10 +36,10 @@ const PARTITIONS: usize = 1024;
 const REPLICAS: u8 = 3;
 /// `[partition] prepare_queue_depth` as shipped.
 const PREPARE_QUEUE_DEPTH: usize = 32;
-/// Measured at 12.7 KB: the 9.7 KB `IggyPartition` slot of the shard plus
-/// 3 KB of heap. The headroom stays below the 13.8 KB that pipeline queues
-/// allocated up front would add, so their return fails this test.
-const IDLE_PARTITION_BYTES_MAX: usize = 16 * 1024;
+/// Measured at 8.4 KB: the 5.4 KB `IggyPartition` slot of the shard plus
+/// 3 KB of heap. The headroom stays below the 1.2 KB of boxed session state
+/// and the 3 KB view-change table, so either one held inline fails this test.
+const IDLE_PARTITION_BYTES_MAX: usize = 9 * 1024;
 
 #[global_allocator]
 static ALLOCATOR: LiveBytes = LiveBytes;

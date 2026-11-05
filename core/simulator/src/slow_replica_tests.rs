@@ -235,7 +235,7 @@ fn given_a_missed_committed_prepare_when_pull_repair_is_unavailable_should_rejoi
                 partition.held_through(),
                 partition.replication_progress(),
                 partition.view_fenced(),
-                partition.repair
+                partition.repair.as_deref().copied()
             )),
     );
     assert!(sim.network.delivered_any(Command::PrepareProgress));
