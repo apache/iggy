@@ -26,7 +26,7 @@ use crate::{
     PayloadFormat, ResolvedFlussSinkConfig,
     config::TableConfig,
     router::RouteOutcome,
-    schema_catalog::SchemaCatalog,
+    schema_catalog::{SchemaCatalog, SchemaEntry},
     static_schema::{
         self, ColumnKind, RowContext, StaticTableBatchBuilder, StaticTableDescriptorBuilder,
         StaticTableLayout, create_extra_columns,
@@ -37,24 +37,22 @@ use crate::{
 #[derive(Debug)]
 pub(crate) struct StaticTableRouter {
     connector_id: u32,
-    schema_catalog: SchemaCatalog,
     table_path: TablePath,
     auto_create_table: bool,
     extra_columns: Vec<ColumnKind>,
     payload_format: PayloadFormat,
     table_config: Option<TableConfig>,
     layout: Option<StaticTableLayout>,
+    entry: Option<Arc<SchemaEntry>>,
 }
 
 impl StaticTableRouter {
     pub(crate) fn new(connector_id: u32, config: &ResolvedFlussSinkConfig) -> Self {
         let table_path =
             TablePath::new(config.target_database.clone(), config.target_table.clone());
-        let schema_catalog = SchemaCatalog::default();
         let table_config = config.tables.get(&table_path.to_string()).cloned();
         Self {
             connector_id,
-            schema_catalog,
             table_path,
             auto_create_table: config.auto_create_table,
             extra_columns: create_extra_columns(
@@ -65,12 +63,14 @@ impl StaticTableRouter {
             payload_format: config.payload_format,
             table_config,
             layout: None,
+            entry: None,
         }
     }
 
     pub(crate) async fn init(&mut self, writer: &impl TableWriter) -> Result<(), Error> {
-        let entry = match self
-            .schema_catalog
+        let schema_catalog = SchemaCatalog::default();
+
+        let entry = match schema_catalog
             .load_from_table(&self.table_path, writer)
             .await?
         {
@@ -84,7 +84,7 @@ impl StaticTableRouter {
                     .create_table_if_not_exists(&self.table_path, &table_descriptor)
                     .await?;
                 // Another sink can win the create with a different schema, so use what Fluss has.
-                self.schema_catalog
+                schema_catalog
                     .load_from_table(&self.table_path, writer)
                     .await?
                     .ok_or_else(|| Error::Init {
@@ -112,6 +112,7 @@ impl StaticTableRouter {
                 ),
             })?;
         self.layout = Some(layout);
+        self.entry = Some(entry);
         Ok(())
     }
 
@@ -132,10 +133,7 @@ impl StaticTableRouter {
         let message_count = messages.len();
 
         let mut stat = Stat::default();
-        let (Some(schema_entry), Some(layout)) = (
-            self.schema_catalog.get_schema_entry(&self.table_path),
-            self.layout.as_ref(),
-        ) else {
+        let (Some(schema_entry), Some(layout)) = (self.entry.as_ref(), self.layout.as_ref()) else {
             stat.errors += message_count as u64;
             return RouteOutcome {
                 stat,

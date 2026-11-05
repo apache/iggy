@@ -29,16 +29,14 @@ pub(crate) use static_table::StaticTableRouter;
 
 #[derive(Debug)]
 pub(crate) enum Router {
-    StaticTable(Box<StaticTableRouter>),
+    StaticTable(StaticTableRouter),
     MultiTable(MultiTableRouter),
 }
 
 impl Router {
     pub(crate) fn from_config(connector_id: u32, config: &ResolvedFlussSinkConfig) -> Router {
         match config.router_type {
-            RouterType::Static => {
-                Router::StaticTable(Box::new(StaticTableRouter::new(connector_id, config)))
-            }
+            RouterType::Static => Router::StaticTable(StaticTableRouter::new(connector_id, config)),
             RouterType::Multi => Router::MultiTable(MultiTableRouter::new(connector_id, config)),
         }
     }
