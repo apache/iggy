@@ -17,7 +17,7 @@
 
 mod mapping;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Once};
@@ -795,10 +795,12 @@ impl Sink for QuestDbSink {
         // handler counts each of them on the client's thread, so each has to
         // be retired or it goes on to fail a later healthy batch.
         let mut rejections_to_retire = 0i64;
-        let mut messages = VecDeque::from(messages);
-        while !messages.is_empty() {
-            let take = self.batch_size.min(messages.len());
-            let chunk: Vec<ConsumedMessage> = messages.drain(..take).collect();
+        let mut messages = messages.into_iter();
+        loop {
+            let chunk: Vec<ConsumedMessage> = messages.by_ref().take(self.batch_size).collect();
+            if chunk.is_empty() {
+                break;
+            }
             let chunk_len = chunk.len();
             match self
                 .write_batch(
@@ -848,7 +850,7 @@ impl Sink for QuestDbSink {
                             topic_metadata,
                             messages_metadata.partition_id,
                             "abandoned without a write attempt after a connection failure",
-                            MessageRange::of(messages.make_contiguous()),
+                            MessageRange::of(messages.as_slice()),
                             &error,
                         );
                         failure.get_or_insert(error);
@@ -2154,8 +2156,8 @@ mod tests {
 
     #[test]
     fn given_zero_batch_size_when_constructed_should_fall_back_to_default() {
-        // Zero would make the chunking loop drain nothing on every pass, so
-        // `consume` would never return and the FFI call would never complete.
+        // Zero would make the first chunk empty, so the chunking loop would
+        // stop at once and `consume` would drop the whole batch unwritten.
         let mut config = config();
         config.batch_size = Some(0);
         let sink = QuestDbSink::new(1, config);
