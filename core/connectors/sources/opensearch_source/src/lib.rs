@@ -50,6 +50,7 @@ const DEFAULT_REQUEST_TIMEOUT: &str = "30s";
 const DEFAULT_TIEBREAKER_FIELD: &str = "_id";
 // Sort clause length: timestamp, tie-breaker, `_index`.
 const SORT_KEY_COUNT: usize = 3;
+const TIEBREAKER_SORT_POSITION: usize = 1;
 // Bounds the persisted state when many documents share the newest timestamp.
 const MAX_WATERMARK_HITS: usize = 10_000;
 // OpenSearch rejects `size` above the default `index.max_result_window` with HTTP 400.
@@ -514,7 +515,7 @@ impl OpenSearchSource {
                 )));
             }
 
-            let key = hit_key(&hit, &self.config.index)?;
+            let key = hit_key(&hit, &sort, &self.config.index, self.tiebreaker_field())?;
             let already_published = watermark == sort.first() && published.contains(&key);
             if !already_published {
                 page.fresh.push(page.sorts.len());
@@ -561,12 +562,11 @@ impl OpenSearchSource {
             headers: document_headers(
                 self.id,
                 hit.get("_index").and_then(Value::as_str),
-                Some(&key.id),
+                hit.get("_id").and_then(Value::as_str),
             ),
             checksum: None,
             timestamp: None,
-            origin_timestamp: document_timestamp
-                .and_then(|timestamp| u64::try_from(timestamp.timestamp_micros()).ok()),
+            origin_timestamp: None,
             payload,
         });
         Ok(())
@@ -726,12 +726,25 @@ fn ensure_keyword_with_doc_values(mappings: &Value, field: &str) -> Result<(), E
     Ok(())
 }
 
-fn hit_key(hit: &Value, default_index: &str) -> Result<HitKey, Error> {
-    let id = hit.get("_id").and_then(Value::as_str).ok_or_else(|| {
-        Error::SchemaMismatch(
-            "OpenSearch hit has no _id; it cannot be told apart from published documents"
-                .to_string(),
-        )
+/// Identifies a hit by the value it is ordered on, so documents that share an `_id` (custom
+/// routing does not make `_id` unique across shards) stay distinct once `tiebreaker_field`
+/// names a unique field.
+fn hit_key(
+    hit: &Value,
+    sort: &[Value],
+    default_index: &str,
+    tiebreaker_field: &str,
+) -> Result<HitKey, Error> {
+    let value = if tiebreaker_field == DEFAULT_TIEBREAKER_FIELD {
+        hit.get("_id")
+    } else {
+        sort.get(TIEBREAKER_SORT_POSITION)
+    };
+    let id = value.and_then(Value::as_str).ok_or_else(|| {
+        Error::SchemaMismatch(format!(
+            "OpenSearch hit has no {tiebreaker_field} value; it cannot be told apart from \
+             published documents"
+        ))
     })?;
     let index = hit
         .get("_index")

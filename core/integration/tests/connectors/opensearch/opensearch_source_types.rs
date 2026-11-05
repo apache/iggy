@@ -22,13 +22,12 @@ use super::{
 use crate::connectors::fixtures::{
     OpenSearchSourcePreCreatedFixture, OpenSearchSourceTypedFieldsFixture,
 };
-use iggy_common::{HeaderKey, IggyTimestamp};
+use iggy_common::HeaderKey;
 use integration::harness::seeds;
 use integration::iggy_harness;
 
 const DOCUMENT_ID_HEADER: &str = "opensearch.document_id";
 const INDEX_HEADER: &str = "opensearch.index";
-const ORIGIN_TIMESTAMP_TOLERANCE_MICROS: u64 = 3_600_000_000;
 
 // Mirrors the connector's id derivation on purpose: the id is a contract consumers dedupe on.
 fn expected_message_id(index: &str, document_id: &str) -> u128 {
@@ -46,7 +45,7 @@ fn expected_message_id(index: &str, document_id: &str) -> u128 {
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn given_document_in_index_when_connector_polls_should_publish_payload_id_headers_and_timestamp(
+async fn given_document_in_index_when_connector_polls_should_publish_payload_id_and_headers(
     harness: &TestHarness,
     fixture: OpenSearchSourcePreCreatedFixture,
 ) {
@@ -75,13 +74,6 @@ async fn given_document_in_index_when_connector_polls_should_publish_payload_id_
         message.header.id,
         expected_message_id(fixture.index_name(), "1")
     );
-    let now_micros = IggyTimestamp::now().as_micros();
-    assert!(
-        message.header.origin_timestamp.abs_diff(now_micros) < ORIGIN_TIMESTAMP_TOLERANCE_MICROS,
-        "origin_timestamp {} must be the document timestamp in microseconds (now: {now_micros})",
-        message.header.origin_timestamp
-    );
-
     let headers = message
         .user_headers_map()
         .expect("headers decode")

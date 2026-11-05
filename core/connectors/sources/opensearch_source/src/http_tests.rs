@@ -243,25 +243,6 @@ async fn given_search_after_cursor_when_second_poll_should_request_next_page() {
 }
 
 #[tokio::test]
-async fn given_document_timestamp_when_poll_should_set_origin_timestamp_in_micros() {
-    let body =
-        search_response(vec![search_hit("doc-1", "2024-01-01T00:00:00Z", json!({}))]).to_string();
-    let app = mock_router(StatusCode::OK, move |_| {
-        let body = body.clone();
-        async move { (StatusCode::OK, body) }
-    });
-    let base = start_server(app).await;
-    let mut source = OpenSearchSource::new(1, base_config(&base), None);
-    source.open().await.unwrap();
-
-    let produced = source.poll().await.expect("poll should succeed");
-    assert_eq!(
-        produced.messages[0].origin_timestamp,
-        Some(1_704_067_200_000_000)
-    );
-}
-
-#[tokio::test]
 async fn given_hit_when_poll_should_set_stable_message_id_and_document_id_header() {
     let body =
         search_response(vec![search_hit("doc-1", "2024-01-01T00:00:00Z", json!({}))]).to_string();
@@ -480,7 +461,7 @@ async fn given_stalled_first_response_when_poll_should_retry_and_succeed() {
 }
 
 #[tokio::test]
-async fn given_nested_timestamp_field_when_poll_should_set_origin_timestamp() {
+async fn given_nested_timestamp_field_when_poll_should_record_last_poll_timestamp() {
     let hit = search_hit(
         "doc-1",
         "2024-01-01T00:00:00Z",
@@ -499,9 +480,17 @@ async fn given_nested_timestamp_field_when_poll_should_set_origin_timestamp() {
 
     let produced = source.poll().await.expect("poll should succeed");
 
+    assert_eq!(produced.messages[0].origin_timestamp, None);
+    let state: State = produced
+        .state
+        .expect("moved cursor stages state")
+        .deserialize(crate::CONNECTOR_NAME, 1)
+        .expect("state deserializes");
     assert_eq!(
-        produced.messages[0].origin_timestamp,
-        Some(1_704_067_200_000_000)
+        state
+            .last_poll_timestamp
+            .map(|timestamp| timestamp.timestamp()),
+        Some(1_704_067_200)
     );
 }
 
@@ -1177,8 +1166,12 @@ async fn given_too_many_hits_at_one_timestamp_when_polling_should_fail_without_m
     assert_eq!(source.test_last_sort().await, cursor_before);
 }
 
-fn keyword_mapping_router(field: &str, mapping: Value) -> (Router, Arc<Mutex<Vec<Value>>>) {
-    let (router, bodies) = scripted_router(vec![search_response(vec![])]);
+fn keyword_mapping_router(
+    field: &str,
+    mapping: Value,
+    pages: Vec<Value>,
+) -> (Router, Arc<Mutex<Vec<Value>>>) {
+    let (router, bodies) = scripted_router(pages);
     let body = json!({
         TEST_INDEX: { "mappings": { field: { "full_name": field, "mapping": { field: mapping } } } }
     });
@@ -1194,7 +1187,11 @@ fn keyword_mapping_router(field: &str, mapping: Value) -> (Router, Arc<Mutex<Vec
 
 #[tokio::test]
 async fn given_keyword_tiebreaker_when_polling_should_sort_on_it_instead_of_id() {
-    let (app, bodies) = keyword_mapping_router("event_id", json!({ "type": "keyword" }));
+    let (app, bodies) = keyword_mapping_router(
+        "event_id",
+        json!({ "type": "keyword" }),
+        vec![search_response(vec![])],
+    );
     let base = start_server(app).await;
     let mut config = base_config(&base);
     config.tiebreaker_field = Some("event_id".to_string());
@@ -1208,6 +1205,73 @@ async fn given_keyword_tiebreaker_when_polling_should_sort_on_it_instead_of_id()
 
     let sort = bodies.lock().await[0]["sort"].clone();
     assert_eq!(sort[1], json!({ "event_id": { "order": "asc" } }));
+}
+
+#[tokio::test]
+async fn given_documents_sharing_an_id_when_keyword_tiebreaker_set_should_keep_both() {
+    let routed_hit = |event_id: &str| {
+        json!({
+            "_index": TEST_INDEX,
+            "_id": "routed",
+            "_source": { "timestamp": SAME_TIMESTAMP },
+            "sort": [SAME_TIMESTAMP, event_id, TEST_INDEX]
+        })
+    };
+    let (app, _) = keyword_mapping_router(
+        "event_id",
+        json!({ "type": "keyword" }),
+        vec![search_response(vec![
+            routed_hit("event-a"),
+            routed_hit("event-b"),
+        ])],
+    );
+    let base = start_server(app).await;
+    let mut config = base_config(&base);
+    config.tiebreaker_field = Some("event_id".to_string());
+    let mut source = OpenSearchSource::new(1, config, None);
+    source.open().await.unwrap();
+
+    let produced = source.poll().await.expect("poll");
+
+    let ids: Vec<_> = produced.messages.iter().map(|message| message.id).collect();
+    assert_eq!(
+        ids,
+        vec![
+            Some(crate::message_id(TEST_INDEX, "event-a")),
+            Some(crate::message_id(TEST_INDEX, "event-b")),
+        ]
+    );
+    for message in &produced.messages {
+        let headers = message.headers.as_ref().expect("headers");
+        let document_id = headers
+            .get(&*crate::DOCUMENT_ID_HEADER_KEY)
+            .expect("document id header");
+        assert_eq!(document_id.as_str().expect("string header"), "routed");
+    }
+}
+
+#[tokio::test]
+async fn given_keyword_tiebreaker_when_hit_lacks_its_value_should_fail_with_schema_mismatch() {
+    let hit = json!({
+        "_index": TEST_INDEX,
+        "_id": "a",
+        "_source": { "timestamp": SAME_TIMESTAMP },
+        "sort": [SAME_TIMESTAMP]
+    });
+    let (app, _) = keyword_mapping_router(
+        "event_id",
+        json!({ "type": "keyword" }),
+        vec![search_response(vec![hit])],
+    );
+    let base = start_server(app).await;
+    let mut config = base_config(&base);
+    config.tiebreaker_field = Some("event_id".to_string());
+    let mut source = OpenSearchSource::new(1, config, None);
+    source.open().await.unwrap();
+
+    let error = source.poll().await.expect_err("hit without tie-breaker");
+
+    assert!(matches!(error, Error::SchemaMismatch(_)), "got {error:?}");
 }
 
 #[tokio::test]
@@ -1225,7 +1289,7 @@ async fn given_default_tiebreaker_when_polling_should_sort_on_id() {
 
 #[tokio::test]
 async fn given_non_keyword_tiebreaker_when_open_should_return_invalid_config() {
-    let (app, _) = keyword_mapping_router("event_id", json!({ "type": "text" }));
+    let (app, _) = keyword_mapping_router("event_id", json!({ "type": "text" }), vec![]);
     let base = start_server(app).await;
     let mut config = base_config(&base);
     config.tiebreaker_field = Some("event_id".to_string());

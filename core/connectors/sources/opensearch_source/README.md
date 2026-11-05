@@ -54,7 +54,7 @@ query = { match_all = {} }
 | `username` / `password` | none | HTTP basic authentication, used only when both are set. |
 | `query` | `match_all` | Query DSL object, applied on every poll. |
 | `polling_interval` | `10s` | Wait before each poll, so the first poll also waits. |
-| `tiebreaker_field` | `_id` | Unique `keyword` field with doc values that orders documents with the same timestamp. Message ids and the `opensearch.document_id` header always come from `_id`. |
+| `tiebreaker_field` | `_id` | Unique `keyword` field with doc values that orders documents with the same timestamp and, when set, identifies them in message ids and in the state. The `opensearch.document_id` header always carries `_id`. |
 | `batch_size` | `100` | Documents per search, `1` to `10000` (the OpenSearch default `max_result_window`). |
 | `request_timeout` | `30s` | Limit per HTTP request, from connecting to the last byte of the response. A timeout counts as a failed attempt and is retried. |
 | `max_retries` | `3` | Total HTTP attempts per search, not the number of retries. |
@@ -81,7 +81,7 @@ the newest published timestamp (the watermark) and skips the hits it already
 published there. A document that becomes searchable after the scan passed it
 (another shard refreshed later, or a bulk request still being indexed) is
 therefore found when it has the same timestamp as the newest published document,
-even if its `_id` sorts before the ones already read.
+even if its tie-breaker value sorts before the ones already read.
 
 `_id` has no doc values, so OpenSearch sorts on it through heap-backed fielddata,
 and a cluster with `indices.id_field_data.enabled=false` rejects the sort. Set
@@ -90,6 +90,12 @@ event id) to avoid that. `open()` reads its mapping and fails with
 `InvalidConfigValue` when the field is missing from a matched index, is not a
 `keyword`, or has `doc_values` disabled. It cannot check that the values are
 unique, and documents that share a value can still be skipped.
+
+`_id` is only unique within a shard. An index that uses custom routing can hold two
+documents with the same `_id` on different shards, and they then tie on every sort
+key and get the same message id. Set `tiebreaker_field` to a field that is unique
+across the index in that case. Changing it later makes the first scan treat the
+documents at the watermark as new, so they are published again.
 
 Documents that lack `timestamp_field` are sorted first (`missing: "_first"`).
 OpenSearch would otherwise sort them last under a value larger than any real
@@ -102,21 +108,23 @@ instead of storing it.
 For every hit:
 
 - The `_source` becomes the JSON payload.
-- The message `id` is a 128-bit BLAKE3 hash of `_index` and `_id`. It names the
-  document, not a version of it: an update that is fetched again keeps the same
+- The message `id` is a 128-bit BLAKE3 hash of `_index` and the tie-breaker value
+  (`_id` unless `tiebreaker_field` is set). It names the document, not a version
+  of it: an update that is fetched again keeps the same
   id, so a consumer that drops repeated ids also drops the updated body. Read
   the id from the message instead of recomputing it.
 - The headers `opensearch.document_id` and `opensearch.index` carry the raw
   values. A header over 255 bytes is dropped with a warning.
-- `origin_timestamp` is taken from `timestamp_field` when it parses as an RFC
-  3339 string or an integer (above `1e12` means milliseconds, otherwise
-  seconds, so milliseconds before September 2001 are misread). Anything else
-  leaves it unset and the document is still published.
+- `origin_timestamp` is left unset, so Iggy records the ingestion time. The
+  document timestamp only feeds `last_poll_timestamp` in the state, and only when
+  `timestamp_field` (a dotted path is followed through nested objects) holds an
+  RFC 3339 string or an integer (above `1e12` means milliseconds, otherwise
+  seconds).
 
 Two cases do not produce a message. A hit without `_source` (for example an
 index mapped with `"_source": false`) is skipped with a warning and counted as
 published, so later scans do not warn about it again. A hit without a sort tuple
-or `_id` fails the poll with `SchemaMismatch` and the state stays put, since
+or tie-breaker value (`_id` by default) fails the poll with `SchemaMismatch` and the state stays put, since
 that means the results cannot be paginated or told apart.
 
 ## Delivery and state
@@ -134,7 +142,7 @@ by the runtime. A poll that finds nothing new (no hits, or only hits published
 before) leaves the watermark alone and is counted directly.
 
 The state holds the sort tuple of the newest published hit (its first element is
-the watermark), the `(index, _id)` of every published hit at that watermark,
+the watermark), the `(index, tie-breaker value)` of every published hit at that watermark,
 `last_poll_timestamp` (informational only), document and poll counters, the last
 error, and processing stats. The list of hits at the watermark is capped at
 10,000. If more documents than that share the newest timestamp, the poll fails
@@ -175,7 +183,7 @@ again. A successful search resets it.
 | `Connection` | Network failure during a search. |
 | `HttpRequestFailed` | `429` or `5xx` after the retries are used up, or a search that timed out or failed on some shards. |
 | `PermanentHttpError` | Other `4xx`, or a search response that cannot be parsed. |
-| `SchemaMismatch` | A hit has no sort tuple or `_id`, sorted on the missing-value sentinel, or more than 10,000 documents share the newest timestamp. |
+| `SchemaMismatch` | A hit has no sort tuple or tie-breaker value, sorted on the missing-value sentinel, or more than 10,000 documents share the newest timestamp. |
 
 ## Limits
 
