@@ -20,6 +20,7 @@ use crate::router::{BatchOrigin, Router, is_valid_namespaced_table, table_exists
 use async_trait::async_trait;
 use iceberg::Catalog;
 use iceberg::table::Table;
+use iggy_connector_sdk::retry::RetryPolicy;
 use iggy_connector_sdk::{ConsumedMessage, Error, Schema};
 use tracing::{error, info, warn};
 
@@ -28,6 +29,7 @@ pub(crate) struct StaticRouter {
     tables: Vec<Table>,
     catalog: Box<dyn Catalog>,
     invalid_rows: InvalidRows,
+    commit_retry: RetryPolicy,
 }
 
 impl StaticRouter {
@@ -35,6 +37,7 @@ impl StaticRouter {
         catalog: Box<dyn Catalog>,
         declared_tables: &Vec<String>,
         invalid_rows: InvalidRows,
+        commit_retry: RetryPolicy,
     ) -> Result<Self, Error> {
         let mut tables: Vec<Table> = Vec::with_capacity(declared_tables.len());
         for declared_table in declared_tables {
@@ -71,6 +74,7 @@ impl StaticRouter {
             tables,
             catalog,
             invalid_rows,
+            commit_retry,
         })
     }
 }
@@ -91,6 +95,7 @@ impl Router for StaticRouter {
                 self.catalog.as_ref(),
                 messages_schema,
                 self.invalid_rows,
+                self.commit_retry,
             )
             .await?;
             info!(

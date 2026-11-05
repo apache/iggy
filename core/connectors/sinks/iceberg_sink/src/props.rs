@@ -75,6 +75,9 @@ mod tests {
             store_class: IcebergSinkStoreClass::S3,
             store_path_style_access: true,
             invalid_rows: None,
+            max_retries: None,
+            retry_delay: None,
+            max_retry_delay: None,
         }
     }
 

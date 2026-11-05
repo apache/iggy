@@ -17,6 +17,7 @@
 
 use crate::InvalidRows;
 use crate::router::arrow_streamer::JsonArrowReader;
+use crate::router::commit::commit_data_files;
 use crate::slice_user_table;
 use arrow_array::RecordBatch;
 use arrow_json::ReaderBuilder;
@@ -27,7 +28,6 @@ use iceberg::arrow::{RecordBatchPartitionSplitter, schema_to_arrow_schema};
 use iceberg::io::FileIO;
 use iceberg::spec::{DataFile, PartitionKey, Struct};
 use iceberg::table::Table;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::{DataFileWriter, DataFileWriterBuilder};
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
@@ -36,6 +36,7 @@ use iceberg::{
     Catalog,
     writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
 };
+use iggy_connector_sdk::retry::RetryPolicy;
 use iggy_connector_sdk::{ConsumedMessage, Error, Schema};
 use parquet::file::properties::WriterProperties;
 use std::borrow::Cow;
@@ -84,6 +85,7 @@ fn format_error_chain(err: &dyn std::error::Error) -> String {
 }
 
 mod arrow_streamer;
+mod commit;
 pub mod dynamic_router;
 pub mod static_router;
 
@@ -107,6 +109,7 @@ async fn write_data(
     catalog: &dyn Catalog,
     messages_schema: Schema,
     invalid_rows: InvalidRows,
+    commit_retry: RetryPolicy,
 ) -> Result<u64, Error> {
     let data_files =
         write_data_files(origin, messages, table, messages_schema, invalid_rows).await?;
@@ -115,38 +118,7 @@ async fn write_data(
         return Ok(0);
     }
     let committed_rows = data_files.iter().map(DataFile::record_count).sum();
-
-    // Data files are kept on commit failure: the catalog may have applied the
-    // commit before the error surfaced, and deleting files referenced by a
-    // committed snapshot would corrupt the table.
-    let table_commit = Transaction::new(table);
-
-    // The check reads every manifest of the table at once on each commit, and the data files
-    // carry fresh UUID names it could never match.
-    let action = table_commit
-        .fast_append()
-        .with_check_duplicate(false)
-        .add_data_files(data_files);
-
-    let tx = action.apply(table_commit).map_err(|err| {
-        let chain = format_error_chain(&err);
-        error!(
-            "Failed to apply transaction on table with UUID: {}, Error: {}",
-            table.metadata().uuid(),
-            chain
-        );
-        Error::TransactionApplyError(chain)
-    })?;
-
-    tx.commit(catalog).await.map_err(|err| {
-        let chain = format_error_chain(&err);
-        error!(
-            "Failed to commit transaction on table with UUID: {}, Error: {}",
-            table.metadata().uuid(),
-            chain
-        );
-        Error::CatalogCommitError(chain)
-    })?;
+    commit_data_files(table, catalog, data_files, commit_retry).await?;
     Ok(committed_rows)
 }
 

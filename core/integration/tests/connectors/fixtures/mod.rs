@@ -72,8 +72,9 @@ pub use http::{
     PARTNER_BEARER_TOKEN, PARTNER_ENDPOINT_ID, PARTNER_INSTANCE,
 };
 pub use iceberg::{
-    DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergEnvAuthFixture, IcebergOps,
-    IcebergPartitionedTableFixture, IcebergPreCreatedFixture, IcebergSkipInvalidRowsFixture,
+    DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergCatalogRestartFixture, IcebergEnvAuthFixture,
+    IcebergOps, IcebergPartitionedTableFixture, IcebergPreCreatedFixture,
+    IcebergSkipInvalidRowsFixture,
 };
 pub use influxdb::{
     InfluxDb3SinkFixture, InfluxDb3SourceFixture, InfluxDbSinkBase64Fixture, InfluxDbSinkFixture,
