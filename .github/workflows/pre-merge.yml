@@ -36,6 +36,11 @@ permissions:
   security-events: write
   pull-requests: write
 
+# ASF Infra caps a workflow at 20 concurrent jobs and asks for 15 or fewer
+# (https://infra.apache.org/github-actions-policy.html). GitHub can only cap
+# jobs per matrix, so the test matrices wait for the common checks (15 short
+# jobs) and their max-parallel values add up to 18. The larger caps go to the
+# matrices with the most runner minutes: Rust, BDD and Examples.
 jobs:
   # Common checks - always run
   common:
@@ -74,7 +79,7 @@ jobs:
   # Rust components
   test-rust:
     name: Rust
-    needs: detect
+    needs: [detect, common]
     if: needs.detect.outputs.rust_plan != ''
     uses: ./.github/workflows/_rust.yml
     with:
@@ -90,7 +95,7 @@ jobs:
 
   test-rust-runtime-checks:
     name: Rust runtime checks
-    needs: [detect, runtime]
+    needs: [detect, common, runtime]
     if: ${{ !cancelled() && !failure() && needs.detect.outputs.rust_runtime_plan != '' && fromJSON(needs.detect.outputs.rust_runtime_plan).checks[0] != null }}
     uses: ./.github/workflows/_rust.yml
     with:
@@ -99,7 +104,7 @@ jobs:
   # Python SDK
   test-python:
     name: Python
-    needs: [detect, runtime]
+    needs: [detect, common, runtime]
     if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.python_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -110,7 +115,7 @@ jobs:
   # PHP SDK
   test-php:
     name: PHP
-    needs: [detect, runtime]
+    needs: [detect, common, runtime]
     if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.php_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -122,7 +127,7 @@ jobs:
   # Node SDK
   test-node:
     name: Node
-    needs: [detect, runtime]
+    needs: [detect, common, runtime]
     if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.node_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -133,7 +138,7 @@ jobs:
   # Go SDK
   test-go:
     name: Go
-    needs: [detect, runtime]
+    needs: [detect, common, runtime]
     if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.go_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -144,7 +149,7 @@ jobs:
   # Java SDK
   test-java:
     name: Java
-    needs: [detect, runtime]
+    needs: [detect, common, runtime]
     if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.java_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -155,7 +160,7 @@ jobs:
   # C# SDK
   test-csharp:
     name: C#
-    needs: [detect, runtime]
+    needs: [detect, common, runtime]
     if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.csharp_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -166,7 +171,7 @@ jobs:
   # C++ SDK
   test-cpp:
     name: C++
-    needs: [detect, runtime]
+    needs: [detect, common, runtime]
     if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.cpp_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -177,7 +182,7 @@ jobs:
   # Swift SDK
   test-swift:
     name: Swift
-    needs: [detect, runtime]
+    needs: [detect, common, runtime]
     if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.swift_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -186,7 +191,7 @@ jobs:
   # Other components
   test-other:
     name: Other
-    needs: detect
+    needs: [detect, common]
     if: ${{ fromJson(needs.detect.outputs.other_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -195,7 +200,7 @@ jobs:
   # BDD Tests
   test-bdd:
     name: BDD
-    needs: [detect, runtime]
+    needs: [detect, common, runtime]
     if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.bdd_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test_bdd.yml
     with:
@@ -206,7 +211,7 @@ jobs:
   # Examples Tests
   test-examples:
     name: Examples
-    needs: [detect, runtime]
+    needs: [detect, common, runtime]
     if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.examples_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test_examples.yml
     with:

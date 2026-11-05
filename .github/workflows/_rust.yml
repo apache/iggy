@@ -34,6 +34,7 @@ jobs:
     if: ${{ fromJSON(inputs.plan).checks[0] != null }}
     strategy:
       fail-fast: true
+      max-parallel: 4
       matrix:
         include: ${{ fromJSON(inputs.plan).checks }}
     runs-on: ${{
