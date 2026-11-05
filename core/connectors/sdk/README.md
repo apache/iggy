@@ -72,7 +72,8 @@ returns an error. The default refuses with `Error::Unsupported`. Returning `Ok` 
 things:
 
 1. A successful `consume()` never drops a message without failing the call. A message that
-   cannot be written fails the call instead of being skipped.
+   cannot be written fails the call instead of being skipped, unless the sink's configuration
+   explicitly asks to skip such messages and the sink logs each one with its offset.
 2. A successful `Sink::flush()` proves that the destination acknowledged every message of the
    listed partitions that `consume()` accepted, up to and including each listed offset.
 

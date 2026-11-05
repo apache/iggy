@@ -18,6 +18,7 @@
 use crate::InvalidRows;
 use crate::router::arrow_streamer::JsonArrowReader;
 use crate::router::commit::commit_data_files;
+use crate::router::redelivery::{HeldMessages, LastMessage, snapshot_properties};
 use crate::slice_user_table;
 use arrow_array::RecordBatch;
 use arrow_json::ReaderBuilder;
@@ -87,6 +88,7 @@ fn format_error_chain(err: &dyn std::error::Error) -> String {
 mod arrow_streamer;
 mod commit;
 pub mod dynamic_router;
+mod redelivery;
 pub mod static_router;
 
 pub fn is_valid_namespaced_table(input: &str) -> bool {
@@ -94,43 +96,117 @@ pub fn is_valid_namespaced_table(input: &str) -> bool {
     parts.len() >= 2 && parts.iter().all(|part| !part.is_empty())
 }
 
-async fn table_exists(route_field_val: &str, catalog: &dyn Catalog) -> Option<Table> {
-    let sliced_table = slice_user_table(route_field_val);
-    let table_ident = TableIdent::from_strs(&sliced_table).ok()?;
-
-    catalog.load_table(&table_ident).await.ok()
+async fn load_table(route_field_val: &str, catalog: &dyn Catalog) -> iceberg::Result<Table> {
+    let table_ident = TableIdent::from_strs(slice_user_table(route_field_val))?;
+    catalog.load_table(&table_ident).await
 }
 
-/// Returns the number of rows committed, which leaves out the rows the sink skipped.
+/// A message that a table rejects with `invalid_rows = "fail"`. Every message of the call before
+/// it is committed, so that storing its offset, as an operator does to move past it, gives up
+/// this message alone.
+#[derive(Debug)]
+pub(crate) struct Rejection {
+    pub(crate) offset: u64,
+    pub(crate) error: Error,
+}
+
+/// What a write of a call's messages to one table did.
+#[derive(Debug, Default)]
+pub(crate) struct Written {
+    /// The rows committed, which leaves out the rows the sink skipped.
+    pub(crate) committed_rows: u64,
+    pub(crate) rejection: Option<Rejection>,
+}
+
+/// Rejections of several tables stop the call at the first rejected message.
+fn first_rejection(rejection: Option<Rejection>, other: Option<Rejection>) -> Option<Rejection> {
+    match (rejection, other) {
+        (Some(rejection), Some(other)) if other.offset < rejection.offset => Some(other),
+        (rejection, other) => rejection.or(other),
+    }
+}
+
+/// The messages before `rejection`, which a call still has to deliver.
+fn before<'m>(
+    messages: &'m [ConsumedMessage],
+    rejection: Option<&Rejection>,
+) -> &'m [ConsumedMessage] {
+    match rejection {
+        Some(rejection) => {
+            &messages[..messages.partition_point(|message| message.offset < rejection.offset)]
+        }
+        None => messages,
+    }
+}
+
+/// Writes and commits `messages` to `table`. With `held`, the sink delivers at least once: the
+/// messages that `table` already holds are not appended again, and the commit records the last
+/// message it holds. `current` is a copy of `table` just loaded from the catalog.
+#[allow(clippy::too_many_arguments)]
 async fn write_data(
     origin: &BatchOrigin<'_>,
     messages: &[ConsumedMessage],
     table: &Table,
+    current: Option<&Table>,
     catalog: &dyn Catalog,
     messages_schema: Schema,
     invalid_rows: InvalidRows,
     commit_retry: RetryPolicy,
-) -> Result<u64, Error> {
-    let data_files =
-        write_data_files(origin, messages, table, messages_schema, invalid_rows).await?;
-    if data_files.is_empty() {
-        // Every row was skipped, and an empty append would still add a snapshot.
-        return Ok(0);
+    held: Option<&HeldMessages>,
+) -> Result<Written, Error> {
+    if messages.is_empty() {
+        return Ok(Written::default());
     }
+    let messages = match held {
+        Some(held) => {
+            held.unheld(origin, table, current, catalog, messages)
+                .await?
+        }
+        None => messages,
+    };
+    if messages.is_empty() {
+        return Ok(Written::default());
+    }
+    let (data_files, rejection) =
+        write_data_files(origin, messages, table, messages_schema, invalid_rows).await?;
+    let handled = before(messages, rejection.as_ref());
+    let (Some(last), false) = (handled.last(), data_files.is_empty()) else {
+        // Every row was skipped or rejected, and an empty append would still add a snapshot.
+        return Ok(Written {
+            committed_rows: 0,
+            rejection,
+        });
+    };
     let committed_rows = data_files.iter().map(DataFile::record_count).sum();
-    commit_data_files(table, catalog, data_files, commit_retry).await?;
-    Ok(committed_rows)
+    let recorded = held.map(|held| held.last_to_record(origin, table, LastMessage::from(last)));
+    let properties = recorded
+        .map(|last| snapshot_properties(origin, last))
+        .unwrap_or_default();
+    let committed = commit_data_files(table, catalog, data_files, properties, commit_retry).await;
+    if let (Some(held), Some(recorded)) = (held, recorded) {
+        match &committed {
+            Ok(()) => held.committed(origin, table, recorded),
+            Err(_) => held.forget(origin, table),
+        }
+    }
+    committed?;
+    Ok(Written {
+        committed_rows,
+        rejection,
+    })
 }
 
 /// Writes the JSON payloads as Parquet data files under the table location,
-/// laid out by the table's default partition spec. Nothing is committed here.
+/// laid out by the table's default partition spec. Nothing is committed here. With
+/// `invalid_rows = "fail"`, the first message that the table cannot take ends the write, and the
+/// data files hold the messages before it.
 async fn write_data_files(
     origin: &BatchOrigin<'_>,
     messages: &[ConsumedMessage],
     table: &Table,
     messages_schema: Schema,
     invalid_rows: InvalidRows,
-) -> Result<Vec<DataFile>, Error> {
+) -> Result<(Vec<DataFile>, Option<Rejection>), Error> {
     let location = DefaultLocationGenerator::new(table.metadata()).map_err(|err| {
         error!(
             "Failed to get location on table: {}. Error: {}",
@@ -161,28 +237,35 @@ async fn write_data_files(
     let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
 
     // Proto text holding JSON is the descriptor-less `proto_convert` fallback
-    // and is written as the document it holds. Proto text that is not JSON is
-    // skipped like any other payload without a document.
-    let documents: Vec<(u64, Cow<'_, simd_json::OwnedValue>)> = messages
-        .iter()
-        .filter_map(|message| {
-            let document = message.payload.json_document();
-            if document.is_none() {
-                warn!(
-                    "Unsupported type of payload, expected JSON, got {}",
-                    messages_schema.to_string()
-                );
-            }
-            document.map(|document| (message.offset, document))
-        })
-        .collect();
+    // and is written as the document it holds. Proto text that is not JSON holds
+    // no document, so it is an invalid row like any other payload without one.
+    let mut rejection = None;
+    let mut documents: Vec<(u64, Cow<'_, simd_json::OwnedValue>)> =
+        Vec::with_capacity(messages.len());
+    for message in messages {
+        if let Some(document) = message.payload.json_document() {
+            documents.push((message.offset, document));
+            continue;
+        }
+        let reason = format!(
+            "The message at offset: {} ({origin}) holds no JSON document for table: {}, and the Iceberg sink requires schema = json, got {messages_schema}",
+            message.offset,
+            table.identifier()
+        );
+        if invalid_rows == InvalidRows::Skip {
+            warn!("Skipping a row. {reason}");
+            continue;
+        }
+        error!("{reason}");
+        rejection = Some(Rejection {
+            offset: message.offset,
+            error: Error::InvalidRecordValue(reason),
+        });
+        break;
+    }
 
     if documents.is_empty() {
-        error!(
-            "Batch of {} messages has no JSON payloads, the Iceberg sink requires schema = json",
-            messages.len()
-        );
-        return Err(Error::InvalidPayloadType);
+        return Ok((Vec::new(), rejection));
     }
 
     let arrow_schema = Arc::new(
@@ -197,22 +280,29 @@ async fn write_data_files(
         })?,
     );
 
+    // The table's partition spec does not change between attempts, so a writer that cannot be
+    // built fails the same way every time.
     let mut writer = TableWriter::new(table, data_file_writer_builder).map_err(|err| {
         let chain = format_error_chain(&err);
         error!("Error while constructing data file writer: {}", chain);
-        Error::InitError(chain)
+        Error::SchemaMismatch(chain)
     })?;
 
     let write_result: Result<(), Error> = async {
         for chunk in documents.chunks(ROWS_PER_BATCH) {
-            if let Some(batch) = decode_rows(
+            let (batch, rejected) = decode_rows(
                 origin,
                 table.identifier(),
                 &arrow_schema,
                 chunk,
                 invalid_rows,
-            )? {
+            )?;
+            if let Some(batch) = batch {
                 writer.write(batch).await?;
+            }
+            if rejected.is_some() {
+                rejection = first_rejection(rejection.take(), rejected);
+                break;
             }
         }
         Ok(())
@@ -228,47 +318,59 @@ async fn write_data_files(
         delete_uncommitted_files(table.file_io(), &data_files).await;
         return Err(err);
     }
-    Ok(data_files)
+    Ok((data_files, rejection))
 }
 
-/// Decodes the JSON documents into a record batch of `schema`. A row that does not match fails
-/// the whole batch, unless `invalid_rows` skips it: then each such row is logged with its offset,
-/// origin and table and left out, and the others are decoded. `None` when every row is skipped.
+/// Decodes the JSON documents into a record batch of `schema`. A row that does not match is
+/// logged with its offset, origin and table. `invalid_rows = "skip"` leaves it out and decodes
+/// the others. `invalid_rows = "fail"` decodes the rows before it and rejects it. The batch is
+/// `None` when no row is left.
 fn decode_rows(
     origin: &BatchOrigin<'_>,
     table: &TableIdent,
     schema: &SchemaRef,
     documents: &[(u64, Cow<'_, simd_json::OwnedValue>)],
     invalid_rows: InvalidRows,
-) -> Result<Option<RecordBatch>, Error> {
+) -> Result<(Option<RecordBatch>, Option<Rejection>), Error> {
     let rows: Vec<&simd_json::OwnedValue> = documents
         .iter()
         .map(|(_, document)| document.as_ref())
         .collect();
-    let error = match read_batch(schema, &rows) {
-        Ok(batch) => return Ok(batch),
-        Err(error) => error,
-    };
-    if invalid_rows == InvalidRows::Fail {
-        error!("Error while getting record batch: {error}");
-        return Err(error);
+    if let Ok(batch) = read_batch(schema, &rows) {
+        return Ok((batch, None));
     }
     // The batch read only says that some row does not match, so each row is read on its own.
     let mut valid = Vec::with_capacity(rows.len());
+    let mut rejection = None;
     for (offset, document) in documents {
-        match read_batch(schema, &[document.as_ref()]) {
-            Ok(_) => valid.push(document.as_ref()),
-            Err(row_error) => warn!(
-                "Skipping the row at offset: {offset} ({origin}) for table: {table}, which does not match the table schema. {row_error}"
-            ),
+        let row_error = match read_batch(schema, &[document.as_ref()]) {
+            Ok(_) => {
+                valid.push(document.as_ref());
+                continue;
+            }
+            Err(row_error) => row_error,
+        };
+        let reason = format!(
+            "The row at offset: {offset} ({origin}) does not match the schema of table: {table}. {row_error}"
+        );
+        if invalid_rows == InvalidRows::Skip {
+            warn!("Skipping a row. {reason}");
+            continue;
         }
+        error!("{reason}");
+        rejection = Some(Rejection {
+            offset: *offset,
+            error: Error::InvalidRecordValue(reason),
+        });
+        break;
     }
     if valid.is_empty() {
-        return Ok(None);
+        return Ok((None, rejection));
     }
-    read_batch(schema, &valid).inspect_err(|error| {
+    let batch = read_batch(schema, &valid).inspect_err(|error| {
         error!("Error while getting record batch: {error}");
-    })
+    })?;
+    Ok((batch, rejection))
 }
 
 /// The reader allocates its buffers for a full batch, so the batch size is the row count: a row
@@ -282,8 +384,9 @@ fn read_batch(
         .with_batch_size(rows.len())
         .build(JsonArrowReader::new(rows))
         .map_err(|err| {
+            // The reader is built from the table schema alone, so it fails the same way every time.
             error!("Error while building Iceberg reader from message payload: {err}");
-            Error::InitError(err.to_string())
+            Error::SchemaMismatch(err.to_string())
         })?;
     reader
         .next()
@@ -435,6 +538,11 @@ pub trait Router: std::fmt::Debug + Sync + Send {
         messages_schema: Schema,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), crate::Error>;
+
+    /// From now on, fails a batch instead of dropping a message it cannot route or a table that
+    /// does not load, and appends only the messages a table does not hold yet when a batch is
+    /// delivered again. Refuses when the configuration cannot keep that promise.
+    fn enable_at_least_once(&mut self) -> Result<(), Error>;
 }
 
 #[cfg(test)]
@@ -527,7 +635,7 @@ mod tests {
         table: &Table,
         payloads: &[Payload],
         invalid_rows: InvalidRows,
-    ) -> Result<Vec<DataFile>, Error> {
+    ) -> Result<(Vec<DataFile>, Option<Rejection>), Error> {
         test_runtime().block_on(write_data_files(
             &ORIGIN,
             &messages(payloads),
@@ -538,7 +646,14 @@ mod tests {
     }
 
     fn write(table: &Table, payloads: &[Payload]) -> Vec<DataFile> {
-        write_with(table, payloads, InvalidRows::Fail).expect("Failed to write data files")
+        let (data_files, rejection) =
+            write_with(table, payloads, InvalidRows::Fail).expect("Failed to write data files");
+        assert!(rejection.is_none(), "{rejection:?}");
+        data_files
+    }
+
+    fn rows(data_files: &[DataFile]) -> u64 {
+        data_files.iter().map(DataFile::record_count).sum()
     }
 
     /// Two rows that match the table and two that do not: a wrong type and a missing required
@@ -574,11 +689,11 @@ mod tests {
     }
 
     #[test]
-    fn given_only_proto_text_that_is_not_json_should_fail_with_invalid_payload_type() {
+    fn given_only_proto_text_that_is_not_json_when_failing_rows_should_reject_its_message() {
         let table = in_memory_table(UnboundPartitionSpec::builder().build());
         let payloads = vec![Payload::Proto("id: 1".to_owned())];
 
-        let error = test_runtime()
+        let (data_files, rejection) = test_runtime()
             .block_on(write_data_files(
                 &ORIGIN,
                 &messages(&payloads),
@@ -586,9 +701,12 @@ mod tests {
                 Schema::Proto,
                 InvalidRows::Fail,
             ))
-            .expect_err("proto text that is not JSON has no document to write");
+            .expect("a rejected message is not a failed write");
 
-        assert_eq!(error, Error::InvalidPayloadType);
+        assert!(data_files.is_empty());
+        let rejection = rejection.expect("proto text that is not JSON has no document to write");
+        assert_eq!(rejection.offset, 0);
+        assert!(rejection.error.is_permanent(), "{}", rejection.error);
     }
 
     #[test]
@@ -660,30 +778,40 @@ mod tests {
     }
 
     #[test]
-    fn given_batch_without_json_payloads_should_fail_with_invalid_payload_type() {
+    fn given_a_text_payload_when_skipping_rows_should_write_nothing_and_reject_nothing() {
         let table = in_memory_table(UnboundPartitionSpec::builder().build());
         let payloads = vec![Payload::Text("not json".to_string())];
 
-        let result = test_runtime().block_on(write_data_files(
-            &ORIGIN,
-            &messages(&payloads),
-            &table,
-            Schema::Text,
-            InvalidRows::Fail,
-        ));
+        let (data_files, rejection) = test_runtime()
+            .block_on(write_data_files(
+                &ORIGIN,
+                &messages(&payloads),
+                &table,
+                Schema::Text,
+                InvalidRows::Skip,
+            ))
+            .expect("skipping every row is not an error");
 
-        assert!(matches!(result, Err(Error::InvalidPayloadType)));
+        assert!(data_files.is_empty());
+        assert!(rejection.is_none());
     }
 
     #[test]
-    fn given_rows_that_do_not_match_when_invalid_rows_fail_should_fail_the_batch() {
+    fn given_rows_that_do_not_match_when_invalid_rows_fail_should_write_the_rows_before_the_first()
+    {
         let table = in_memory_table(UnboundPartitionSpec::builder().build());
 
-        let result = write_with(&table, &rows_with_two_invalid(), InvalidRows::Fail);
+        let (data_files, rejection) =
+            write_with(&table, &rows_with_two_invalid(), InvalidRows::Fail)
+                .expect("a rejected row is not a failed write");
 
+        assert_eq!(rows(&data_files), 1);
+        let rejection = rejection.expect("the first row that does not match is rejected");
+        assert_eq!(rejection.offset, 1);
         assert!(
-            matches!(result, Err(Error::InvalidRecordValue(_))),
-            "got {result:?}"
+            matches!(rejection.error, Error::InvalidRecordValue(_)),
+            "got {:?}",
+            rejection.error
         );
     }
 
@@ -691,11 +819,12 @@ mod tests {
     fn given_rows_that_do_not_match_when_invalid_rows_skip_should_write_the_other_rows() {
         let table = in_memory_table(UnboundPartitionSpec::builder().build());
 
-        let data_files = write_with(&table, &rows_with_two_invalid(), InvalidRows::Skip)
-            .expect("the matching rows should be written");
+        let (data_files, rejection) =
+            write_with(&table, &rows_with_two_invalid(), InvalidRows::Skip)
+                .expect("the matching rows should be written");
 
-        let written: u64 = data_files.iter().map(DataFile::record_count).sum();
-        assert_eq!(written, 2);
+        assert_eq!(rows(&data_files), 2);
+        assert!(rejection.is_none());
     }
 
     #[test]
@@ -705,10 +834,11 @@ mod tests {
             simd_json::json!({ "id": "not a number", "region": "eu" }),
         )];
 
-        let data_files = write_with(&table, &payloads, InvalidRows::Skip)
+        let (data_files, rejection) = write_with(&table, &payloads, InvalidRows::Skip)
             .expect("skipping every row is not an error");
 
         assert!(data_files.is_empty());
+        assert!(rejection.is_none());
     }
 
     #[test]
@@ -717,24 +847,26 @@ mod tests {
         let mut payloads = json_payloads(&[(1, "eu"); ROWS_PER_BATCH + 10]);
         payloads[ROWS_PER_BATCH + 5] = Payload::Json(simd_json::json!({ "id": "not a number" }));
 
-        let data_files = write_with(&table, &payloads, InvalidRows::Skip)
+        let (data_files, _) = write_with(&table, &payloads, InvalidRows::Skip)
             .expect("the matching rows should be written");
 
-        let written: u64 = data_files.iter().map(DataFile::record_count).sum();
-        assert_eq!(written, (ROWS_PER_BATCH + 9) as u64);
+        assert_eq!(rows(&data_files), (ROWS_PER_BATCH + 9) as u64);
     }
 
     #[test]
-    fn given_an_invalid_row_in_a_later_batch_when_invalid_rows_fail_should_fail_the_batch() {
+    fn given_an_invalid_row_in_a_later_batch_when_invalid_rows_fail_should_write_the_rows_before_it()
+     {
         let table = in_memory_table(UnboundPartitionSpec::builder().build());
         let mut payloads = json_payloads(&[(1, "eu"); ROWS_PER_BATCH + 10]);
         payloads[ROWS_PER_BATCH + 5] = Payload::Json(simd_json::json!({ "id": "not a number" }));
 
-        let result = write_with(&table, &payloads, InvalidRows::Fail);
+        let (data_files, rejection) = write_with(&table, &payloads, InvalidRows::Fail)
+            .expect("a rejected row is not a failed write");
 
-        assert!(
-            matches!(result, Err(Error::InvalidRecordValue(_))),
-            "got {result:?}"
+        assert_eq!(rows(&data_files), (ROWS_PER_BATCH + 5) as u64);
+        assert_eq!(
+            rejection.map(|rejection| rejection.offset),
+            Some((ROWS_PER_BATCH + 5) as u64)
         );
     }
 }

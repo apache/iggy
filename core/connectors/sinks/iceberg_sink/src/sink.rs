@@ -130,6 +130,15 @@ impl Sink for IcebergSink {
         Ok(())
     }
 
+    /// The sink commits every batch inside `consume`, so the default flush has nothing left to
+    /// prove.
+    fn enable_at_least_once(&mut self) -> Result<(), Error> {
+        let Some(router) = self.router.as_mut() else {
+            return Err(Error::InvalidState);
+        };
+        router.enable_at_least_once()
+    }
+
     async fn close(&mut self) -> Result<(), Error> {
         info!("Iceberg sink connector with ID: {} is closed.", self.id);
         Ok(())
