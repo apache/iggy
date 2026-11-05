@@ -24,7 +24,6 @@ use iceberg::{Catalog, ErrorKind, TableIdent};
 use iggy_connector_sdk::Error;
 use iggy_connector_sdk::retry::{RetryPolicy, is_transient_status, retry_async};
 use std::collections::HashMap;
-use std::fmt;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -76,7 +75,7 @@ pub(crate) async fn commit_data_files(
     })
     .await
     .map_err(|failure| {
-        let chain = format_error_chain(&failure.error.error);
+        let chain = format_error_chain(&failure.error);
         error!(
             "Failed to commit transaction on table with UUID: {} after {} attempts, Error: {}",
             table.metadata().uuid(),
@@ -87,31 +86,11 @@ pub(crate) async fn commit_data_files(
     })
 }
 
-/// A failed catalog call, with the HTTP status of the catalog's answer when it gave one.
-#[derive(Debug)]
-struct CatalogFailure {
-    error: iceberg::Error,
-    status: Option<StatusCode>,
-}
-
-impl From<iceberg::Error> for CatalogFailure {
-    fn from(error: iceberg::Error) -> Self {
-        let status = response_status(&error);
-        Self { error, status }
-    }
-}
-
-impl fmt::Display for CatalogFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.error.fmt(f)
-    }
-}
-
 /// A commit that could not reach the catalog, or that the catalog failed or throttled, can pass
 /// on another attempt. A conflict is not retried here: `Transaction::commit` has already retried
 /// it as far as the table's `commit.retry.*` properties allow.
-fn is_transient(failure: &CatalogFailure) -> bool {
-    failure.error.kind() == ErrorKind::Unexpected && failure.status.is_none_or(is_transient_status)
+fn is_transient(error: &iceberg::Error) -> bool {
+    error.kind() == ErrorKind::Unexpected && response_status(error).is_none_or(is_transient_status)
 }
 
 /// `iceberg-catalog-rest` keeps the status of an answer it did not expect only in the error's
@@ -132,7 +111,7 @@ async fn commit_once(
     transaction: &Transaction,
     commit_id: &str,
     retrying: bool,
-) -> Result<(), CatalogFailure> {
+) -> Result<(), iceberg::Error> {
     if retrying {
         let current = catalog.load_table(identifier).await?;
         if holds_commit(&current, commit_id) {
@@ -503,10 +482,8 @@ mod tests {
                 .await
                 .expect_err("The catalog should reject the call");
 
-            let failure = CatalogFailure::from(error);
-
-            assert_eq!(failure.status, Some(status), "{failure}");
-            assert_eq!(is_transient(&failure), transient, "{failure}");
+            assert_eq!(response_status(&error), Some(status), "{error}");
+            assert_eq!(is_transient(&error), transient, "{error}");
         }
     }
 

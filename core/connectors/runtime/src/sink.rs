@@ -26,6 +26,7 @@ use crate::{
     SinkConnectorPlugin, SinkConnectorWrapper, close_plugin_instance, resolve_plugin_path,
     transform,
 };
+use bytes::Bytes;
 use dlopen2::wrapper::Container;
 use futures::{Stream, StreamExt};
 use iggy::prelude::{
@@ -46,7 +47,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, spawn_blocking};
 use tracing::{debug, error, info, warn};
 
 const DEFAULT_BATCH_LENGTH: u32 = 1000;
@@ -967,13 +968,14 @@ async fn process_messages(
     let run_count = runs.len();
     let mut processed_count = 0usize;
 
-    let topic_meta = postcard::to_allocvec(topic_metadata).map_err(|error| {
+    let topic_meta = Bytes::from(postcard::to_allocvec(topic_metadata).map_err(|error| {
         error!(
             "Failed to serialize topic metadata for sink connector with ID: {plugin_id}. {error}"
         );
         RuntimeError::FailedToSerializeTopicMetadata
-    })?;
+    })?);
 
+    let consume = *consume;
     let mut ffi_elapsed = Duration::ZERO;
     for (schema, run) in runs {
         let messages_metadata = MessagesMetadata {
@@ -999,15 +1001,27 @@ async fn process_messages(
         })?;
 
         let ffi_start = Instant::now();
-        let result = (consume)(
-            plugin_id,
-            topic_meta.as_ptr(),
-            topic_meta.len(),
-            messages_meta.as_ptr(),
-            messages_meta.len(),
-            messages.as_ptr(),
-            messages.len(),
-        );
+        let topic_meta = topic_meta.clone();
+        // The call holds its thread until the plugin returns, its own retries included, so it
+        // runs on the blocking pool rather than on a worker that other connectors share.
+        let result = spawn_blocking(move || {
+            (consume)(
+                plugin_id,
+                topic_meta.as_ptr(),
+                topic_meta.len(),
+                messages_meta.as_ptr(),
+                messages_meta.len(),
+                messages.as_ptr(),
+                messages.len(),
+            )
+        })
+        .await
+        .unwrap_or_else(|error| {
+            error!(
+                "The consume call of sink connector with ID: {plugin_id} did not complete. {error}"
+            );
+            -1
+        });
         ffi_elapsed += ffi_start.elapsed();
         if result == 0 {
             processed_count += run_len;
@@ -1045,7 +1059,7 @@ struct SinkBatchTiming {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dashmap::DashMap;
+    use dashmap::{DashMap, DashSet};
     use iggy::prelude::{Identifier, IggyMessageHeader};
     use iggy_connector_sdk::transforms::TransformType;
     use iggy_connector_sdk::transforms::{ProtoConvert, ProtoConvertConfig};
@@ -1171,6 +1185,30 @@ mod tests {
             messages_ptr,
             messages_len,
         );
+        1
+    }
+
+    /// Plugin ids whose `blocking_consume` call a task on the runtime has released.
+    static RELEASED: LazyLock<DashSet<u32>> = LazyLock::new(DashSet::new);
+
+    /// Holds its thread until a task on the runtime releases the plugin id, and fails after two
+    /// seconds without it, so a call made on the runtime's only worker never sees the release.
+    extern "C" fn blocking_consume(
+        plugin_id: u32,
+        _topic_meta_ptr: *const u8,
+        _topic_meta_len: usize,
+        _messages_meta_ptr: *const u8,
+        _messages_meta_len: usize,
+        _messages_ptr: *const u8,
+        _messages_len: usize,
+    ) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if RELEASED.contains(&plugin_id) {
+                return 0;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         1
     }
 
@@ -1423,6 +1461,29 @@ mod tests {
         )
         .await
         .expect("consuming the stream should succeed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_a_sink_call_that_blocks_when_consumed_should_leave_the_worker_to_other_tasks() {
+        let plugin_id = next_plugin_id();
+        let release = tokio::spawn(async move {
+            RELEASED.insert(plugin_id);
+        });
+
+        let (timing, _) = run_with(
+            plugin_id,
+            blocking_consume,
+            Schema::Json.decoder(),
+            Vec::new(),
+            vec![test_message(0, br#"{"id":1}"#.to_vec())],
+        )
+        .await;
+
+        release.await.expect("the release task should finish");
+        assert_eq!(
+            timing.processed_count, 1,
+            "the blocked call should see the release made by another task on the same worker"
+        );
     }
 
     #[tokio::test]
