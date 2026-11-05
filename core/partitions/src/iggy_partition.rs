@@ -1364,7 +1364,7 @@ where
         self.last_polled_offsets
             .pin()
             .remove(&ConsumerGroupId(group_id as usize));
-        self.mark_consumer_group_offsets_need_reconcile();
+        self.mark_consumer_group_offsets_dirty();
         self.fence_published.set(true);
         self.publish_poll_visibility();
         Ok(())
@@ -4382,7 +4382,7 @@ where
                 );
             }
             if keyed_by_group(pending.kind) && created {
-                self.mark_consumer_group_offsets_need_reconcile();
+                self.mark_consumer_group_offsets_dirty();
             }
         } else {
             self.durable_consumer_offsets
@@ -5001,7 +5001,7 @@ where
         if keyed_by_group(pending.kind)
             && matches!(pending.mutation, PendingConsumerOffsetMutation::Delete)
         {
-            self.mark_consumer_group_offsets_need_reconcile();
+            self.mark_consumer_group_offsets_dirty();
         }
         let id = pending.consumer_id;
         if !pending.auto_commit {
@@ -5156,14 +5156,14 @@ where
         dirty: Rc<RefCell<BTreeSet<IggyNamespace>>>,
     ) {
         self.consumer_group_offsets_dirty = dirty;
-        self.mark_consumer_group_offsets_need_reconcile();
+        self.mark_consumer_group_offsets_dirty();
     }
 
     pub(crate) fn set_fence_published_flag(&mut self, flag: Rc<Cell<bool>>) {
         self.fence_published = flag;
     }
 
-    fn mark_consumer_group_offsets_need_reconcile(&self) {
+    fn mark_consumer_group_offsets_dirty(&self) {
         self.consumer_group_offsets_dirty
             .borrow_mut()
             .insert(self.namespace());
@@ -5658,7 +5658,7 @@ where
             self.pending_owner_install.set(None);
             self.pending_history_transition.set(None);
             self.discard_queued_auto_commits();
-            self.mark_consumer_group_offsets_need_reconcile();
+            self.mark_consumer_group_offsets_dirty();
         } else if truncated {
             // A dropped install never publishes, so a latch on it refuses every
             // later install. A truncation follows a view change, which empties
