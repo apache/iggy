@@ -27,7 +27,7 @@ use tokio::time::sleep;
 use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::connectors::fixtures::{
     QuestDbOps, QuestDbSinkCoercionFixture, QuestDbSinkDedupFixture, QuestDbSinkFixture,
-    QuestDbSinkHeadersFixture, QuestDbSinkOriginTimestampFixture,
+    QuestDbSinkHeadersFixture, QuestDbSinkOriginTimestampFixture, QuestDbSinkOutageFixture,
     QuestDbSinkPayloadTimestampFixture, QuestDbSinkRawFixture, QuestDbSinkServerTimestampFixture,
     QuestDbSinkSmallBatchFixture, QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture,
     QuestDbSinkTypedFixture, QuestDbSinkTypedNumbersFixture,
@@ -645,7 +645,7 @@ async fn given_store_and_forward_when_consumed_should_persist_a_slot_and_write_r
 )]
 async fn given_questdb_outage_when_consumed_should_buffer_and_replay_on_recovery(
     harness: &TestHarness,
-    fixture: QuestDbSinkStoreAndForwardFixture,
+    fixture: QuestDbSinkOutageFixture,
 ) {
     let fixture = &fixture.0;
     let client = harness.root_client().await.unwrap();

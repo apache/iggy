@@ -360,6 +360,11 @@ cargo build --bin iggy-server --bin iggy-connectors
 cargo test -p integration -- connectors::questdb::
 ```
 
+The tests share one QuestDB container, `iggy-test-questdb`, and each test
+writes to its own table. The container stays up after the run so the next run
+can reuse it. Remove it with `docker rm -f iggy-test-questdb`. The outage test
+pauses QuestDB, so it runs on a container of its own.
+
 If the plugin is missing, the tests fail at once with the build command to run.
 Rebuild it after every change to the sink, because the tests do not detect a
 stale build.

@@ -16,13 +16,14 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
 use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use tokio::time::sleep;
-use tracing::info;
+use tracing::{info, warn};
+use uuid::Uuid;
 
 use super::container::{
     DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_BATCH_SIZE, ENV_SINK_CONNECTION_STRING,
@@ -40,7 +41,14 @@ use super::container::{
 const POLL_ATTEMPTS: usize = 120;
 const POLL_INTERVAL_MS: u64 = 100;
 
-pub const SINK_TABLE: &str = "iggy_events";
+/// Every fixture writes to its own `iggy_events_<millis>_<id>` table, because
+/// the tests share one QuestDB server. The creation time in the name is what
+/// lets [`QuestDbSinkFixture::drop_stale_tables`] find leftovers from earlier
+/// runs.
+const TABLE_PREFIX: &str = "iggy_events_";
+/// Tables older than this are leftovers. A live test's table is seconds old,
+/// so the sweep never races a test that is still running.
+const STALE_TABLE_MAX_AGE_MS: u128 = 30 * 60 * 1000;
 
 /// Knobs the individual tests vary. Everything not set here falls back to the
 /// connector's own defaults, so a default fixture also exercises those.
@@ -67,16 +75,21 @@ pub struct QuestDbSinkOptions {
     /// fixture. The sink runs in the connectors-runtime process on the host,
     /// so this is a plain host path rather than a container volume.
     pub store_and_forward: bool,
-    /// DDL executed once the container is healthy and before the connectors
-    /// runtime starts, for tests that need the table to exist with settings
-    /// QWP cannot infer, such as `DEDUP UPSERT KEYS`.
-    pub pre_create_ddl: Option<String>,
+    /// Builds DDL from the fixture's table name. It runs once the container is
+    /// healthy and before the connectors runtime starts, for tests that need
+    /// the table to exist with settings QWP cannot infer, such as
+    /// `DEDUP UPSERT KEYS`.
+    pub pre_create_ddl: Option<fn(&str) -> String>,
+    /// Run on a QuestDB server of its own instead of the shared one, for a
+    /// test that pauses the server.
+    pub dedicated_container: bool,
 }
 
 pub struct QuestDbSinkFixture {
     container: QuestDbContainer,
     http_client: HttpClient,
     pub options: QuestDbSinkOptions,
+    table: String,
     /// Kept alive for the test's lifetime so the slot directory survives.
     sf_dir: Option<tempfile::TempDir>,
 }
@@ -92,7 +105,7 @@ impl QuestDbOps for QuestDbSinkFixture {
 
 impl QuestDbSinkFixture {
     pub fn table(&self) -> String {
-        SINK_TABLE.to_string()
+        self.table.clone()
     }
 
     /// Poll until `table` holds exactly `expected` rows. The table does not
@@ -262,8 +275,17 @@ impl QuestDbSinkFixture {
         // Check before pulling or starting anything: a missing plugin should cost
         // a second and name its own fix, not a container start and a timeout.
         ensure_plugin_built()?;
-        let container = QuestDbContainer::start().await?;
+        let container = if options.dedicated_container {
+            QuestDbContainer::start_dedicated().await?
+        } else {
+            QuestDbContainer::start().await?
+        };
         let http_client = create_http_client();
+        let table = format!(
+            "{TABLE_PREFIX}{}_{}",
+            unix_millis(),
+            Uuid::new_v4().simple()
+        );
         let sf_dir = if options.store_and_forward {
             Some(
                 tempfile::tempdir().map_err(|e| TestBinaryError::FixtureSetup {
@@ -278,6 +300,7 @@ impl QuestDbSinkFixture {
             container,
             http_client,
             options,
+            table,
             sf_dir,
         };
 
@@ -286,8 +309,9 @@ impl QuestDbSinkFixture {
             match fixture.http_client.get(&url).send().await {
                 Ok(response) if response.status().as_u16() == 204 => {
                     info!("QuestDB /ping OK after {} attempts", attempt + 1);
-                    if let Some(ddl) = fixture.options.pre_create_ddl.clone() {
-                        let result = fixture.exec(&ddl).await?;
+                    fixture.drop_stale_tables().await;
+                    if let Some(build_ddl) = fixture.options.pre_create_ddl {
+                        let result = fixture.exec(&build_ddl(&fixture.table)).await?;
                         if let Some(error) = result.get("error") {
                             return Err(TestBinaryError::FixtureSetup {
                                 fixture_type: "QuestDbSink".to_string(),
@@ -314,6 +338,47 @@ impl QuestDbSinkFixture {
             ),
         })
     }
+
+    /// Drop test tables that earlier runs left on the shared server, so they do
+    /// not pile up in a container that outlives every run. Best effort: a
+    /// failure is logged and never fails the fixture.
+    async fn drop_stale_tables(&self) {
+        let query =
+            format!("select table_name from tables() where table_name like '{TABLE_PREFIX}%'");
+        let names = match self.exec(&query).await {
+            Ok(value) => value
+                .get("dataset")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            Err(error) => {
+                warn!("Skipping the stale QuestDB table sweep: {error}");
+                return;
+            }
+        };
+        let now = unix_millis();
+        for row in names {
+            let Some(name) = row.get(0).and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let created = name
+                .strip_prefix(TABLE_PREFIX)
+                .and_then(|rest| rest.split('_').next())
+                .and_then(|millis| millis.parse::<u128>().ok());
+            if created.is_some_and(|created| now.saturating_sub(created) > STALE_TABLE_MAX_AGE_MS)
+                && let Err(error) = self.exec(&format!("drop table if exists '{name}'")).await
+            {
+                warn!("Failed to drop stale QuestDB table {name}: {error}");
+            }
+        }
+    }
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default()
 }
 
 #[async_trait]
@@ -328,7 +393,13 @@ impl TestFixture for QuestDbSinkFixture {
         // key, so it is appended here rather than exposed as its own env var.
         let mut connection_string = self.container.connection_string();
         if let Some(dir) = self.sf_dir() {
-            connection_string.push_str(&format!("sf_dir={};sender_id=iggy_test;", dir.display()));
+            // A sender id per fixture, so tests sharing one server never
+            // present the same sender identity to it.
+            connection_string.push_str(&format!(
+                "sf_dir={};sender_id={};",
+                dir.display(),
+                self.table
+            ));
         }
         envs.insert(ENV_SINK_CONNECTION_STRING.to_string(), connection_string);
         envs.insert(ENV_SINK_TABLE.to_string(), self.table());
@@ -462,11 +533,13 @@ delegate_fixture!(
         integer_columns: Some(vec!["measured".to_string()]),
         include_stream_column: Some(false),
         include_topic_column: Some(false),
-        pre_create_ddl: Some(format!(
-            "create table {SINK_TABLE} (measured DOUBLE, counted LONG, \
-             big LONG, timestamp TIMESTAMP) \
-             timestamp(timestamp) partition by DAY WAL"
-        )),
+        pre_create_ddl: Some(|table| {
+            format!(
+                "create table {table} (measured DOUBLE, counted LONG, \
+                 big LONG, timestamp TIMESTAMP) \
+                 timestamp(timestamp) partition by DAY WAL"
+            )
+        }),
         ..Default::default()
     }
 );
@@ -491,6 +564,19 @@ delegate_fixture!(
     QuestDbSinkOptions {
         store_and_forward: true,
         flush_timeout: Some("5s".to_string()),
+        ..Default::default()
+    }
+);
+
+delegate_fixture!(
+    /// Store-and-forward on a QuestDB server of its own, because the outage
+    /// test pauses the server and a paused shared one would stall every other
+    /// test.
+    QuestDbSinkOutageFixture,
+    QuestDbSinkOptions {
+        store_and_forward: true,
+        flush_timeout: Some("5s".to_string()),
+        dedicated_container: true,
         ..Default::default()
     }
 );
@@ -551,14 +637,16 @@ delegate_fixture!(
         timestamp_unit: Some("micros".to_string()),
         include_stream_column: Some(false),
         include_topic_column: Some(false),
-        pre_create_ddl: Some(format!(
+        pre_create_ddl: Some(|table| {
             // `revision` is deliberately outside the dedup keys: a second
             // delivery carrying a higher revision proves it reached the
             // table, which a row count alone cannot show.
-            "create table {SINK_TABLE} (seq LONG, revision LONG, timestamp TIMESTAMP_NS) \
-             timestamp(timestamp) partition by DAY WAL \
-             DEDUP UPSERT KEYS(timestamp, seq)"
-        )),
+            format!(
+                "create table {table} (seq LONG, revision LONG, timestamp TIMESTAMP_NS) \
+                 timestamp(timestamp) partition by DAY WAL \
+                 DEDUP UPSERT KEYS(timestamp, seq)"
+            )
+        }),
         ..Default::default()
     }
 );

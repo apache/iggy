@@ -103,7 +103,7 @@ pub use postgres::{
 };
 pub use questdb::{
     QuestDbOps, QuestDbSinkCoercionFixture, QuestDbSinkDedupFixture, QuestDbSinkFixture,
-    QuestDbSinkHeadersFixture, QuestDbSinkOriginTimestampFixture,
+    QuestDbSinkHeadersFixture, QuestDbSinkOriginTimestampFixture, QuestDbSinkOutageFixture,
     QuestDbSinkPayloadTimestampFixture, QuestDbSinkRawFixture, QuestDbSinkServerTimestampFixture,
     QuestDbSinkSmallBatchFixture, QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture,
     QuestDbSinkTypedFixture, QuestDbSinkTypedNumbersFixture,

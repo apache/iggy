@@ -24,10 +24,21 @@ use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers_modules::testcontainers::{
+    ContainerAsync, ContainerRequest, GenericImage, ImageExt, ReuseDirective,
+};
 use tracing::info;
 
 const QUESTDB_IMAGE: &str = "docker.io/questdb/questdb";
+/// Fixed name plus `ReuseDirective::Always` shares one server across every
+/// QuestDB test process on the Docker daemon, as the Elasticsearch and Doris
+/// fixtures do. Tests stay isolated through a table per fixture. The container
+/// outlives the run: `docker rm -f iggy-test-questdb` forces a fresh one.
+const QUESTDB_SHARED_CONTAINER_NAME: &str = "iggy-test-questdb";
+/// Bounds the create-or-attach race in [`start_shared_container`], with the
+/// same values as the Doris and Elasticsearch fixtures.
+const CONTAINER_START_ATTEMPTS: u32 = 30;
+const CONTAINER_START_RETRY_DELAY_MS: u64 = 1_000;
 /// QWP over WebSocket requires QuestDB 10.0 or newer, so this tag cannot be
 /// rolled back to a 9.x line without disabling the whole suite.
 const QUESTDB_TAG: &str = "10.0.1";
@@ -122,31 +133,100 @@ pub fn ensure_plugin_built() -> Result<(), TestBinaryError> {
 // ── Container ────────────────────────────────────────────────────────────────
 
 pub struct QuestDbContainer {
+    // With `ReuseDirective::Always`, dropping this handle leaves the shared
+    // container running for the next test to attach to.
     container: ContainerAsync<GenericImage>,
+    shared: bool,
     pub base_url: String,
     pub host_port: u16,
 }
 
+/// The container request both start paths use.
+///
+/// It waits on the startup log rather than an HTTP probe. An HTTP wait has to
+/// resolve the mapped host port while the container is still starting, and
+/// Docker occasionally has not published the mapping yet, which fails the whole
+/// fixture with "does not expose port 9000/tcp". The log line needs no port,
+/// and readiness is confirmed by the `/ping` poll in the sink fixture anyway.
+/// That poll also covers an attach to the shared container, which skips this
+/// wait.
+fn container_request(name: &str) -> ContainerRequest<GenericImage> {
+    GenericImage::new(QUESTDB_IMAGE, QUESTDB_TAG)
+        .with_exposed_port(QUESTDB_HTTP_PORT.tcp())
+        .with_wait_for(WaitFor::message_on_stdout(QUESTDB_READY_LOG))
+        .with_mapped_port(0, QUESTDB_HTTP_PORT.tcp())
+        .with_container_name(name)
+}
+
+/// Creates the shared QuestDB container, or attaches to it if another test won
+/// the race.
+///
+/// `ReuseDirective::Always` inspects the daemon and then creates when nothing
+/// matches, with no lock across the two steps. On a cold daemon with several
+/// QuestDB tests in flight, one creates the container and the rest get
+/// `409 Conflict: name already in use`. Retrying turns those into attaches.
+async fn start_shared_container() -> Result<ContainerAsync<GenericImage>, TestBinaryError> {
+    let mut conflict = String::new();
+    for attempt in 1..=CONTAINER_START_ATTEMPTS {
+        // Rebuilt per attempt because `start` consumes the request.
+        let result = container_request(QUESTDB_SHARED_CONTAINER_NAME)
+            .with_reuse(ReuseDirective::Always)
+            .start()
+            .await;
+        match result {
+            Ok(container) => return Ok(container),
+            Err(error) => {
+                let message = error.to_string();
+                if !message.contains("is already in use") {
+                    return Err(TestBinaryError::FixtureSetup {
+                        fixture_type: "QuestDbContainer".to_string(),
+                        message: format!("Failed to start container: {message}"),
+                    });
+                }
+                info!(
+                    "QuestDB container name taken by another test (attempt {attempt}), retrying to attach"
+                );
+                conflict = message;
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    CONTAINER_START_RETRY_DELAY_MS,
+                ))
+                .await;
+            }
+        }
+    }
+    Err(TestBinaryError::FixtureSetup {
+        fixture_type: "QuestDbContainer".to_string(),
+        message: format!(
+            "Failed to attach to container '{QUESTDB_SHARED_CONTAINER_NAME}' after \
+             {CONTAINER_START_ATTEMPTS} attempts: {conflict}"
+        ),
+    })
+}
+
 impl QuestDbContainer {
+    /// Attaches to the QuestDB server that every test shares.
     pub async fn start() -> Result<Self, TestBinaryError> {
-        // Wait on the startup log rather than an HTTP probe. An HTTP wait has
-        // to resolve the mapped host port while the container is still
-        // starting, and Docker occasionally has not published the mapping yet,
-        // which fails the whole fixture with "does not expose port 9000/tcp".
-        // The log line needs no port, and readiness is confirmed by the `/ping`
-        // poll in the sink fixture anyway.
-        let container: ContainerAsync<GenericImage> = GenericImage::new(QUESTDB_IMAGE, QUESTDB_TAG)
-            .with_exposed_port(QUESTDB_HTTP_PORT.tcp())
-            .with_wait_for(WaitFor::message_on_stdout(QUESTDB_READY_LOG))
-            .with_mapped_port(0, QUESTDB_HTTP_PORT.tcp())
-            .with_container_name(fixtures::unique_container_name("questdb"))
+        let container = start_shared_container().await?;
+        Self::from_container(container, true).await
+    }
+
+    /// Starts a server of its own, for a test that pauses QuestDB and would
+    /// otherwise freeze every other test on the shared one.
+    pub async fn start_dedicated() -> Result<Self, TestBinaryError> {
+        let container = container_request(&fixtures::unique_container_name("questdb"))
             .start()
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
                 fixture_type: "QuestDbContainer".to_string(),
                 message: format!("Failed to start container: {e}"),
             })?;
+        Self::from_container(container, false).await
+    }
 
+    async fn from_container(
+        container: ContainerAsync<GenericImage>,
+        shared: bool,
+    ) -> Result<Self, TestBinaryError> {
         // The mapping can lag the container being up, so this retries rather
         // than failing the fixture on the first miss.
         let mut host_port = None;
@@ -173,6 +253,7 @@ impl QuestDbContainer {
 
         Ok(Self {
             container,
+            shared,
             base_url,
             host_port,
         })
@@ -192,6 +273,13 @@ impl QuestDbContainer {
     /// untouched, so the port survives and the sink reconnects to the same
     /// endpoint.
     pub async fn simulate_outage(&self) -> Result<(), TestBinaryError> {
+        if self.shared {
+            return Err(TestBinaryError::InvalidState {
+                message: "refusing to pause the shared QuestDB container, which other tests \
+                          use concurrently; start the fixture with a dedicated container"
+                    .to_string(),
+            });
+        }
         self.container
             .pause()
             .await
