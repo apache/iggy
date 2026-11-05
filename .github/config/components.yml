@@ -609,6 +609,8 @@ components:
       - ".github/config/components.yml"
       - "scripts/ci/restore-runtime.sh"
       - "scripts/ci/test-runtime-artifacts.py"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
       - ".github/workflows/**/*.yml"
       - ".github/actions/**/*.yml"
       - ".github/ci/**/*.yml"

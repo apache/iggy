@@ -344,6 +344,72 @@ class RuntimeConsumers(unittest.TestCase):
                 if SERVER_START in uses:
                     self.assertIn(DOWNLOAD_RUNTIME, uses[:uses.index(SERVER_START)], path.relative_to(REPO_ROOT))
 
+    def test_readme_timeout_fails_and_stops_remaining_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text("sleep 30\nprintf 'unexpected execution'\n")
+            result = run(
+                "bash", "-c",
+                'source "$1"; EXAMPLES_EXIT_CODE=0; '
+                'run_readme_commands README.md "." 1; exit "$EXAMPLES_EXIT_CODE"',
+                "bash", str(REPO_ROOT / "scripts/utils.sh"), cwd=root,
+            )
+            self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
+            self.assertNotIn("unexpected execution", result.stdout)
+
+    def test_python_examples_reuse_synced_environment_for_plain_and_tls(self):
+        result, events = self.run_python_examples()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(events, [
+            "sync --frozen", "server-start", "run --no-sync example.py", "example",
+            "server-start", "run --no-sync example.py --tls", "example --tls",
+        ])
+
+    def test_python_sync_failure_stops_before_starting_server_or_examples(self):
+        result, events = self.run_python_examples(sync_exit=23)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(events, ["sync --frozen"])
+
+    def run_python_examples(self, *, sync_exit=0):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            examples = root / "examples/python"
+            binaries = root / "target/debug"
+            examples.mkdir(parents=True)
+            binaries.mkdir(parents=True)
+            (examples / "README.md").write_text(
+                "uv run example.py\nuv run example.py --tls\n"
+            )
+            (examples / "example.py").write_text(
+                'import os, sys\n'
+                'with open(os.environ["EXAMPLE_EVENTS"], "a") as events:\n'
+                '    events.write(" ".join(["example", *sys.argv[1:]]) + "\\n")\n'
+            )
+            server = binaries / "iggy-server"
+            server.write_text(
+                '#!/usr/bin/env bash\n'
+                'echo server-start >> "$EXAMPLE_EVENTS"\n'
+                'echo "client listeners started"\n'
+                'exec sleep 60\n'
+            )
+            server.chmod(0o755)
+            uv = binaries / "uv"
+            uv.write_text(
+                '#!/usr/bin/env bash\n'
+                'echo "$*" >> "$EXAMPLE_EVENTS"\n'
+                'if [ "$1" = sync ]; then exit "$SYNC_EXIT"; fi\n'
+                'if [ "$1" != run ] || [ "$2" != --no-sync ]; then exit 1; fi\n'
+                'shift 2\n'
+                'exec python3 "$@"\n'
+            )
+            uv.chmod(0o755)
+            events = root / "events"
+            env = {**os.environ, "PATH": f'{binaries}:{os.environ["PATH"]}',
+                   "EXAMPLE_EVENTS": str(events), "SYNC_EXIT": str(sync_exit)}
+            result = run("bash", str(REPO_ROOT / "scripts/run-examples-from-readme.sh"),
+                         "--language", "python", cwd=root, env=env)
+            return result, events.read_text().splitlines()
+
 
 class PublishSelection(unittest.TestCase):
     def setUp(self):
