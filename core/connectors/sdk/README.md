@@ -64,6 +64,32 @@ key = "message"
 value.static = "hello"
 ```
 
+## Sink delivery acknowledgment
+
+A sink configured with `guarantee = "at_least_once"` must opt in. The runtime calls
+`Sink::enable_at_least_once()` once after `open()`, and refuses to start the sink when it
+returns an error. The default refuses with `Error::Unsupported`. Returning `Ok` promises two
+things:
+
+1. A successful `consume()` never drops a message without failing the call. A message that
+   cannot be written fails the call instead of being skipped.
+2. A successful `Sink::flush()` proves that the destination acknowledged every message of the
+   listed partitions that `consume()` accepted, up to and including each listed offset.
+
+The runtime stores consumer offsets only after a flush succeeds. A sink that writes inside
+`consume()` keeps the default `flush()`, which has nothing left to do. A sink that buffers
+across calls writes its buffers in `flush()`.
+
+A failed call reports its class across the FFI boundary: `Error::is_permanent()` decides
+between a transient failure, which the runtime retries by handing the unflushed messages over
+again, and a permanent one, which stops the sink. A plugin built before this contract reports
+a failed `consume()` as `1`, which reads as transient, and a call it cannot dispatch or decode
+as `-1`, which reads as permanent. It lacks the `iggy_sink_enable_at_least_once` and
+`iggy_sink_flush` exports, and keeps loading for at-most-once sinks.
+
+SDK 0.5.1-edge.3 adds `Sink::enable_at_least_once()` and `Sink::flush()` with default
+implementations, so an existing sink needs no code change when rebuilt.
+
 ## Retry helpers
 
 `retry_async` runs an operation that fails with `Err` and retries it while `should_retry` accepts the error. It owns attempt counting, backoff and the per-retry log, and returns `RetryFailure { error, attempts, exhausted }` so the caller logs the terminal failure. `retry_backoff` computes a single delay for a loop that cannot use `retry_async`, such as `HttpRetryMiddleware`, which retries on an `Ok` response rather than an `Err`. Its `retry` argument is 1-based.
