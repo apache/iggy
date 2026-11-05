@@ -1,0 +1,67 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: PR Description
+
+# Flags a contributor PR whose description leaves out a linked issue, a
+# description of the change, or how it was tested, the three things
+# PULL_REQUEST_TEMPLATE.md asks for. The check is
+# scripts/ci/pr-description-check.sh, which maintainers can also run by hand
+# on any PR. A gap fails this check and the job summary names each missing
+# part. Plain pattern checks, no model.
+#
+# Skipped for bots, drafts, and authors with write access (OWNER, MEMBER,
+# COLLABORATOR).
+#
+# SECURITY: checks out only the check script and lib/init.sh, from the base
+# commit, without persisted credentials. PR code is never checked out or
+# executed. Read-only token.
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, edited, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-description:
+    name: PR Description
+    if: |
+      github.event.pull_request.draft == false
+      && github.event.pull_request.user.type != 'Bot'
+      && !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+      && (github.event.action != 'edited' || github.event.changes.body)
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: |
+            scripts/ci/pr-description-check.sh
+            scripts/ci/lib/init.sh
+            scripts/ci/lib/github.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Check issue, description and test notes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: scripts/ci/pr-description-check.sh --pr "$PR_NUMBER"

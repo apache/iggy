@@ -17,11 +17,19 @@
 
 name: Issue Labeler / Assigner
 
-# Three add-only triage steps that run when a reporter opens or edits an issue:
+# Add-only triage steps that run when a reporter opens or edits an issue:
 #
-# 1. Label: maps the "Affected area / component" dropdown from the bug/feature
-#    issue forms (.github/ISSUE_TEMPLATE/) onto real repo labels, so reporters
-#    who lack triage permission still get their issue categorized at creation.
+# 1. Label: scripts/ci/issue-labeler.sh maps the "Affected area / component"
+#    dropdown from the bug/feature issue forms (.github/ISSUE_TEMPLATE/) onto
+#    real repo labels, so reporters who lack triage permission still get their
+#    issue categorized at creation. When the form gives no area, such as on a
+#    blank issue or "Other / not sure", a self-hosted model on ASF
+#    infrastructure (LLMAO) suggests up to three area labels, plus `bug` or
+#    `enhancement` when the issue has no type label. The model part needs the
+#    LLMAO_API_KEY secret and the LLMAO_BASE_URL variable (the
+#    OpenAI-compatible base, ending in /v1); without both it does nothing. Any
+#    model or network error is a warning, never a failed run. The script's
+#    header has usage for running it by hand, including --dry-run.
 #
 # 2. Assign: if the reporter ticked the "Contribution" checkbox ("I'm willing
 #    to submit a pull request ..."), assign the issue to its author so the
@@ -37,11 +45,14 @@ name: Issue Labeler / Assigner
 # call is idempotent, so re-running on `edited` is harmless.
 #
 # SECURITY: the issue body is attacker-controlled text. The label step parses
-# it only for exact matches against the fixed AREA_LABELS allowlist below. The
-# assign and good-first-issue steps use the body only as a boolean gate; the
-# assignee comes from the trusted `payload.issue.user.login` and the label is a
-# fixed constant, never body-derived, so the body cannot inject either. No
-# checkout, no exec of issue contents, no token export.
+# it only for exact matches against the fixed area allowlist in the script,
+# and keeps only model answers that exactly match that allowlist, so a prompt
+# injection can at worst pick a wrong label from that list. The assign and
+# good-first-issue steps use the body only as a boolean gate; the assignee
+# comes from the trusted `payload.issue.user.login` and the label is a fixed
+# constant, never body-derived, so the body cannot inject either. The only
+# checkout is the labeler script and lib/init.sh, from the default branch,
+# without persisted credentials. Issue contents are never executed.
 
 on:
   issues:
@@ -56,66 +67,23 @@ jobs:
     runs-on: ubuntu-slim
     timeout-minutes: 5
     steps:
-      - name: Apply area labels from issue form
-        uses: actions/github-script@v9
+      - uses: actions/checkout@v7.0.1
         with:
-          script: |
-            // Dropdown option text -> repo label. Keep in sync with the
-            // `Affected area / component` options in
-            // .github/ISSUE_TEMPLATE/{bug_report,feature_request}.yml.
-            const AREA_LABELS = {
-              'Iggy server': 'server',
-              'Rust SDK': 'rust',
-              'Go SDK': 'go',
-              'Java SDK': 'java',
-              'Python SDK': 'python',
-              'C# SDK': 'csharp',
-              'Node.js SDK': 'javascript',
-              'C++ SDK': 'cpp',
-              'PHP SDK': 'php',
-              'CLI': 'tui',
-              'Web UI': 'web',
-              'Connectors': 'connectors',
-              'MCP server': 'mcp',
-              'Configuration': 'config',
-              'Wire protocol / API': 'api',
-              'Metadata': 'metadata',
-              'Clustering / replication': 'cluster',
-              'Performance': 'performance',
-              'Documentation': 'docs',
-              'CI / build / tooling': 'CI/CD',
-              // 'Other / not sure' intentionally maps to no label.
-            };
-            const HEADING = 'Affected area / component';
+          sparse-checkout: |
+            scripts/ci/issue-labeler.sh
+            scripts/ci/lib/init.sh
+            scripts/ci/lib/github.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
 
-            const body = context.payload.issue.body || '';
-            // Issue-form bodies render as `### <label>\n\n<value>`; capture
-            // the dropdown's value block, up to the next `###` or the end.
-            const esc = HEADING.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            const section = body.match(
-              new RegExp('###[ \\t]+' + esc + '[ \\t]*\\n+([\\s\\S]*?)(?:\\n###|$)'),
-            );
-            // Multi-select renders the picks comma-separated on one line.
-            // Option text never contains a comma, so split on it safely.
-            const picks = (section ? section[1] : '')
-              .split(',')
-              .map(s => s.trim())
-              .filter(Boolean);
-            const labels = [...new Set(
-              picks.map(p => AREA_LABELS[p]).filter(Boolean),
-            )];
-
-            if (labels.length === 0) {
-              core.info('no mappable area selected, nothing to label');
-              return;
-            }
-            core.info(`applying labels: ${labels.join(', ')}`);
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.issue.number,
-              labels,
-            });
+      - name: Add area labels from the issue form or a model
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          LLMAO_API_KEY: ${{ secrets.LLMAO_API_KEY }}
+          LLMAO_BASE_URL: ${{ vars.LLMAO_BASE_URL }}
+          LLMAO_MODEL: ${{ vars.LLMAO_MODEL }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: scripts/ci/issue-labeler.sh --issue "$ISSUE_NUMBER"
 
       - name: Assign author who volunteered to contribute
         uses: actions/github-script@v9
@@ -169,3 +137,4 @@ jobs:
               issue_number: context.payload.issue.number,
               labels: ['good first issue'],
             });
+
