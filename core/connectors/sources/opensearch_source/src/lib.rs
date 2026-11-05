@@ -25,7 +25,7 @@ use iggy_connector_sdk::{
 use opensearch::{
     OpenSearch, SearchParts,
     auth::Credentials,
-    http::{StatusCode, Url, response::Response, transport::TransportBuilder},
+    http::{StatusCode, Url, transport::TransportBuilder},
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -326,7 +326,7 @@ impl OpenSearchSource {
             return Ok(());
         }
         let index = &self.config.index;
-        let response = retry_async(
+        let body = retry_async(
             self.open_retry_policy,
             &format!("{CONNECTOR_NAME} ID {} tiebreaker mapping check", self.id),
             RequestFailure::is_transient,
@@ -342,7 +342,7 @@ impl OpenSearchSource {
                     .send()
                     .await
                     .map_err(RequestFailure::transport)?;
-                RequestFailure::check(response).await
+                RequestFailure::read_text(response).await
             },
         )
         .await
@@ -352,7 +352,7 @@ impl OpenSearchSource {
                 failure.into_error()
             ))
         })?;
-        let mapping: Value = response.json().await.map_err(|error| {
+        let mapping: Value = serde_json::from_str(&body).map_err(|error| {
             Error::InitError(format!("Failed to parse the mapping of '{field}': {error}"))
         })?;
         ensure_keyword_with_doc_values(&mapping, field)
@@ -362,7 +362,7 @@ impl OpenSearchSource {
         &self,
         client: &OpenSearch,
         search_body: &Value,
-    ) -> Result<Response, Error> {
+    ) -> Result<String, Error> {
         retry_async(
             self.poll_retry_policy,
             &format!("{CONNECTOR_NAME} ID {} search", self.id),
@@ -375,7 +375,7 @@ impl OpenSearchSource {
                     .send()
                     .await
                     .map_err(RequestFailure::transport)?;
-                RequestFailure::check(response).await
+                RequestFailure::read_text(response).await
             },
         )
         .await
@@ -396,7 +396,7 @@ impl OpenSearchSource {
         let mut cursor = scan_cursor.or_else(|| watermark.map(restart_cursor));
 
         let page = loop {
-            let hits = self.fetch_hits(client, cursor.as_deref()).await?;
+            let hits = self.fetch_hits(client, cursor.take()).await?;
             let page = self.read_page(hits, watermark, &published)?;
             if !page.fresh.is_empty() || !page.full {
                 break page;
@@ -448,7 +448,7 @@ impl OpenSearchSource {
     async fn fetch_hits(
         &self,
         client: &OpenSearch,
-        cursor: Option<&[Value]>,
+        cursor: Option<Vec<Value>>,
     ) -> Result<Vec<Value>, Error> {
         let mut search_body = self
             .search_body_base
@@ -458,11 +458,11 @@ impl OpenSearchSource {
             })?
             .clone();
         if let Some(cursor) = cursor {
-            search_body["search_after"] = json!(cursor);
+            search_body["search_after"] = Value::Array(cursor);
         }
 
-        let response = self.send_search_with_retry(client, &search_body).await?;
-        let mut response_body: Value = response.json().await.map_err(|e| {
+        let body = self.send_search_with_retry(client, &search_body).await?;
+        let mut response_body: Value = serde_json::from_str(&body).map_err(|e| {
             Error::PermanentHttpError(format!("Failed to parse search response: {e}"))
         })?;
         ensure_complete_response(&response_body)?;
@@ -544,9 +544,8 @@ impl OpenSearchSource {
         source: &Value,
         timestamp_field: &str,
     ) -> Result<(), Error> {
-        let document_timestamp = source
-            .get(timestamp_field)
-            .and_then(parse_document_timestamp);
+        let document_timestamp =
+            field_value(source, timestamp_field).and_then(parse_document_timestamp);
         if let Some(timestamp_utc) = document_timestamp {
             page.last_poll_timestamp = Some(timestamp_utc);
         }
@@ -890,6 +889,15 @@ fn document_headers(
         }
     }
     (!headers.is_empty()).then_some(headers)
+}
+
+/// OpenSearch addresses nested fields by dotted path, while `_source` may hold the value
+/// under that literal key or under nested objects.
+fn field_value<'a>(source: &'a Value, path: &str) -> Option<&'a Value> {
+    source.get(path).or_else(|| {
+        path.split('.')
+            .try_fold(source, |value, segment| value.get(segment))
+    })
 }
 
 fn parse_document_timestamp(value: &Value) -> Option<DateTime<Utc>> {
@@ -1297,6 +1305,18 @@ mod tests {
 
         config.batch_size = Some(MAX_BATCH_SIZE);
         validate_open_config(&config).expect("max batch_size is allowed");
+    }
+
+    #[test]
+    fn given_dotted_path_when_resolved_should_find_nested_or_literal_key() {
+        let nested = json!({ "event": { "created": "2024-01-01T00:00:00Z" } });
+        let literal = json!({ "event.created": "2024-01-01T00:00:00Z" });
+        let expected = json!("2024-01-01T00:00:00Z");
+
+        assert_eq!(field_value(&nested, "event.created"), Some(&expected));
+        assert_eq!(field_value(&literal, "event.created"), Some(&expected));
+        assert_eq!(field_value(&nested, "event.missing"), None);
+        assert_eq!(field_value(&nested, "event"), nested.get("event"));
     }
 
     #[test]

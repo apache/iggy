@@ -54,6 +54,16 @@ impl RequestFailure {
         Err(Self::Status { status, body })
     }
 
+    /// Like `check`, but also reads the body so a transport failure while receiving it is
+    /// classified as transient and retried together with the request.
+    pub(crate) async fn read_text(response: Response) -> Result<String, Self> {
+        Self::check(response)
+            .await?
+            .text()
+            .await
+            .map_err(Self::transport)
+    }
+
     /// Network errors, 429 and 5xx are worth another attempt; other statuses are permanent.
     pub(crate) fn is_transient(&self) -> bool {
         match self {

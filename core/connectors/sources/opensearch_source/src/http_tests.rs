@@ -480,6 +480,120 @@ async fn given_stalled_first_response_when_poll_should_retry_and_succeed() {
 }
 
 #[tokio::test]
+async fn given_nested_timestamp_field_when_poll_should_set_origin_timestamp() {
+    let hit = search_hit(
+        "doc-1",
+        "2024-01-01T00:00:00Z",
+        json!({ "event": { "created": "2024-01-01T00:00:00Z" } }),
+    );
+    let body = search_response(vec![hit]).to_string();
+    let app = mock_router(StatusCode::OK, move |_| {
+        let body = body.clone();
+        async move { (StatusCode::OK, body) }
+    });
+    let base = start_server(app).await;
+    let mut config = base_config(&base);
+    config.timestamp_field = Some("event.created".to_string());
+    let mut source = OpenSearchSource::new(1, config, None);
+    source.open().await.unwrap();
+
+    let produced = source.poll().await.expect("poll should succeed");
+
+    assert_eq!(
+        produced.messages[0].origin_timestamp,
+        Some(1_704_067_200_000_000)
+    );
+}
+
+/// Answers `HEAD` with 200 and the first `stalled_attempts` searches with headers plus a
+/// partial body that never completes. Later searches get `body` in full.
+async fn start_body_stalling_server(
+    stalled_attempts: usize,
+    body: String,
+    searches: Arc<AtomicUsize>,
+) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let body = body.clone();
+            let searches = searches.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                let response = if request.starts_with(b"HEAD") {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else if searches.fetch_add(1, Ordering::SeqCst) < stalled_attempts {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{{",
+                        body.len() + 2
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+                tokio::time::sleep(STALL).await;
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+#[tokio::test]
+async fn given_body_stalled_after_headers_when_poll_should_fail_as_connection_error() {
+    let searches = Arc::new(AtomicUsize::new(0));
+    let base = start_body_stalling_server(usize::MAX, String::new(), searches.clone()).await;
+    let mut config = base_config(&base);
+    config.request_timeout = Some("100ms".to_string());
+    config.max_retries = Some(2);
+    let mut source = OpenSearchSource::new(1, config, None);
+    source.open().await.unwrap();
+
+    let error = source.poll().await.expect_err("stalled body should fail");
+
+    assert!(matches!(error, Error::Connection(_)), "got {error:?}");
+    assert_eq!(
+        searches.load(Ordering::SeqCst),
+        2,
+        "body timeout must retry"
+    );
+}
+
+#[tokio::test]
+async fn given_body_stalled_on_first_attempt_when_poll_should_retry_and_succeed() {
+    let searches = Arc::new(AtomicUsize::new(0));
+    let body =
+        search_response(vec![search_hit("a", "2024-01-01T00:00:00Z", json!({}))]).to_string();
+    let base = start_body_stalling_server(1, body, searches.clone()).await;
+    let mut config = base_config(&base);
+    config.request_timeout = Some("100ms".to_string());
+    config.max_retries = Some(2);
+    let mut source = OpenSearchSource::new(1, config, None);
+    source.open().await.unwrap();
+
+    let produced = source.poll().await.expect("retry should recover the poll");
+
+    assert_eq!(produced.messages.len(), 1);
+    assert_eq!(searches.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn given_search_failure_when_poll_should_increment_error_count() {
     let app = mock_router(StatusCode::OK, |_| async move {
         (StatusCode::INTERNAL_SERVER_ERROR, "boom".to_string())

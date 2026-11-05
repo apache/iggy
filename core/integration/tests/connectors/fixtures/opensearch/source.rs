@@ -206,16 +206,6 @@ impl std::ops::Deref for OpenSearchSourceTypedFieldsFixture {
     }
 }
 
-impl OpenSearchOps for OpenSearchSourceTypedFieldsFixture {
-    fn container(&self) -> &OpenSearchContainer {
-        &self.inner.container
-    }
-
-    fn http_client(&self) -> &HttpClient {
-        &self.inner.http_client
-    }
-}
-
 #[async_trait]
 impl TestFixture for OpenSearchSourceTypedFieldsFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
@@ -238,16 +228,6 @@ impl std::ops::Deref for OpenSearchSourcePreCreatedFixture {
     type Target = OpenSearchSourceFixture;
     fn deref(&self) -> &Self::Target {
         &self.inner
-    }
-}
-
-impl OpenSearchOps for OpenSearchSourcePreCreatedFixture {
-    fn container(&self) -> &OpenSearchContainer {
-        &self.inner.container
-    }
-
-    fn http_client(&self) -> &HttpClient {
-        &self.inner.http_client
     }
 }
 
@@ -276,16 +256,6 @@ impl std::ops::Deref for OpenSearchSourceSmallBatchFixture {
     type Target = OpenSearchSourceFixture;
     fn deref(&self) -> &Self::Target {
         &self.inner
-    }
-}
-
-impl OpenSearchOps for OpenSearchSourceSmallBatchFixture {
-    fn container(&self) -> &OpenSearchContainer {
-        &self.inner.container
-    }
-
-    fn http_client(&self) -> &HttpClient {
-        &self.inner.http_client
     }
 }
 
