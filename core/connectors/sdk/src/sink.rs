@@ -21,8 +21,13 @@ use tracing::{error, info};
 
 use crate::log::{LogCallback, init_plugin_logging};
 use crate::{
-    ConsumedMessage, MessagesMetadata, Payload, RawMessages, Sink, TopicMetadata, get_runtime,
+    ConsumedMessage, Error, FlushPartition, MessagesMetadata, Payload, RawMessages, Sink,
+    TopicMetadata, get_runtime,
 };
+
+/// The version of the sink delivery contract that this SDK implements. The runtime passes the
+/// version it requires to `iggy_sink_enable_at_least_once`.
+pub const DELIVERY_CONTRACT_VERSION: u32 = 1;
 
 pub type ConsumeCallback = extern "C" fn(
     plugin_id: u32,
@@ -34,11 +39,71 @@ pub type ConsumeCallback = extern "C" fn(
     messages_len: usize,
 ) -> i32;
 
+pub type FlushCallback = extern "C" fn(
+    plugin_id: u32,
+    topic_meta_ptr: *const u8,
+    topic_meta_len: usize,
+    partitions_ptr: *const u8,
+    partitions_len: usize,
+) -> i32;
+
+/// The result of a sink call as it crosses the FFI boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkCallStatus {
+    Succeeded,
+    /// Retrying the same messages may succeed. A plugin built before the delivery contract
+    /// reports a failed `consume` this way, and a call it cannot dispatch or decode as
+    /// [`SinkCallStatus::DISPATCH_FAILURE`], which reads as permanent.
+    TransientFailure,
+    /// Retrying the same messages cannot succeed.
+    PermanentFailure,
+}
+
+impl SinkCallStatus {
+    /// The code of a call that the plugin cannot dispatch, such as one for an unknown instance
+    /// or with arguments that do not decode. It reads as [`SinkCallStatus::PermanentFailure`].
+    pub const DISPATCH_FAILURE: i32 = -1;
+
+    pub const fn code(self) -> i32 {
+        match self {
+            SinkCallStatus::Succeeded => 0,
+            SinkCallStatus::TransientFailure => 1,
+            SinkCallStatus::PermanentFailure => 2,
+        }
+    }
+
+    pub const fn is_success(self) -> bool {
+        matches!(self, SinkCallStatus::Succeeded)
+    }
+}
+
+impl From<&Error> for SinkCallStatus {
+    fn from(error: &Error) -> Self {
+        if error.is_permanent() {
+            SinkCallStatus::PermanentFailure
+        } else {
+            SinkCallStatus::TransientFailure
+        }
+    }
+}
+
+impl From<i32> for SinkCallStatus {
+    /// A call that the plugin cannot dispatch is one that no retry fixes.
+    fn from(code: i32) -> Self {
+        match code {
+            0 => SinkCallStatus::Succeeded,
+            2 | SinkCallStatus::DISPATCH_FAILURE => SinkCallStatus::PermanentFailure,
+            _ => SinkCallStatus::TransientFailure,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SinkContainer<T: Sink + std::fmt::Debug> {
     id: u32,
     sink: Option<T>,
     shutdown: Option<watch::Sender<()>>,
+    at_least_once: bool,
 }
 
 impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
@@ -47,6 +112,104 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
             id,
             sink: None,
             shutdown: None,
+            at_least_once: false,
+        }
+    }
+
+    /// Turns on at-least-once delivery when the plugin implements `version` of the contract and
+    /// the sink accepts it for its configuration. Returns the [`SinkCallStatus`] code.
+    pub fn enable_at_least_once(&mut self, version: u32) -> i32 {
+        let Some(sink) = self.sink.as_mut() else {
+            error!(
+                "Sink connector with ID: {} is not initialized - cannot enable at-least-once delivery.",
+                self.id
+            );
+            return SinkCallStatus::DISPATCH_FAILURE;
+        };
+        if version != DELIVERY_CONTRACT_VERSION {
+            error!(
+                "Sink connector with ID: {} implements delivery contract version {DELIVERY_CONTRACT_VERSION}, but version {version} was requested.",
+                self.id
+            );
+            return SinkCallStatus::PermanentFailure.code();
+        }
+        match sink.enable_at_least_once() {
+            Ok(()) => {
+                self.at_least_once = true;
+                info!(
+                    "Sink connector with ID: {} delivers at least once.",
+                    self.id
+                );
+                SinkCallStatus::Succeeded.code()
+            }
+            Err(err) => {
+                error!(
+                    "Sink connector with ID: {} cannot deliver at least once. {err}",
+                    self.id
+                );
+                SinkCallStatus::from(&err).code()
+            }
+        }
+    }
+
+    /// # Safety
+    /// Do not copy the pointers to the topic metadata or the partitions.
+    pub unsafe fn flush(
+        &self,
+        topic_meta_ptr: *const u8,
+        topic_meta_len: usize,
+        partitions_ptr: *const u8,
+        partitions_len: usize,
+    ) -> i32 {
+        let Some(sink) = self.sink.as_ref() else {
+            error!(
+                "Sink connector with ID: {} is not initialized - cannot flush.",
+                self.id
+            );
+            return SinkCallStatus::DISPATCH_FAILURE;
+        };
+        if !self.at_least_once {
+            error!(
+                "Sink connector with ID: {} was asked to flush without at-least-once delivery enabled.",
+                self.id
+            );
+            return SinkCallStatus::PermanentFailure.code();
+        }
+        let (topic_meta_slice, partitions_slice) = unsafe {
+            (
+                std::slice::from_raw_parts(topic_meta_ptr, topic_meta_len),
+                std::slice::from_raw_parts(partitions_ptr, partitions_len),
+            )
+        };
+        let topic_metadata = match postcard::from_bytes::<TopicMetadata>(topic_meta_slice) {
+            Ok(meta) => meta,
+            Err(err) => {
+                error!(
+                    "Failed to decode topic metadata of a flush by sink connector with ID: {}. {err}",
+                    self.id
+                );
+                return SinkCallStatus::DISPATCH_FAILURE;
+            }
+        };
+        let partitions = match postcard::from_bytes::<Vec<FlushPartition>>(partitions_slice) {
+            Ok(partitions) => partitions,
+            Err(err) => {
+                error!(
+                    "Failed to decode the partitions of a flush by sink connector with ID: {}. {err}",
+                    self.id
+                );
+                return SinkCallStatus::DISPATCH_FAILURE;
+            }
+        };
+        match get_runtime().block_on(sink.flush(&topic_metadata, &partitions)) {
+            Ok(()) => SinkCallStatus::Succeeded.code(),
+            Err(err) => {
+                error!(
+                    "Failed to flush sink connector with ID: {} for stream: {}, topic: {}. {err}",
+                    self.id, topic_metadata.stream, topic_metadata.topic
+                );
+                SinkCallStatus::from(&err).code()
+            }
         }
     }
 
@@ -189,6 +352,9 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
                                 "Failed to decode message headers by sink connector with ID: {} from stream: {}, topic: {}. {err}",
                                 self.id, topic_metadata.stream, topic_metadata.topic
                             );
+                            if self.at_least_once {
+                                return SinkCallStatus::PermanentFailure.code();
+                            }
                             continue;
                         }
                     }
@@ -206,6 +372,9 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
                             "Failed to decode message payload by sink connector with ID: {} from stream: {}, topic: {}. {err}",
                             self.id, topic_metadata.stream, topic_metadata.topic
                         );
+                        if self.at_least_once {
+                            return SinkCallStatus::PermanentFailure.code();
+                        }
                         continue;
                     }
                 };
@@ -225,13 +394,13 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
             let result =
                 runtime.block_on(sink.consume(&topic_metadata, messages_metadata, messages));
             match result {
-                Ok(()) => 0,
+                Ok(()) => SinkCallStatus::Succeeded.code(),
                 Err(err) => {
                     error!(
                         "Failed to consume messages by sink connector with ID: {} from stream: {}, topic: {}. {err}",
                         self.id, topic_metadata.stream, topic_metadata.topic
                     );
-                    1
+                    SinkCallStatus::from(&err).code()
                 }
             }
         }
@@ -310,6 +479,34 @@ macro_rules! sink_connector {
 
         #[cfg(not(test))]
         #[unsafe(no_mangle)]
+        extern "C" fn iggy_sink_enable_at_least_once(id: u32, version: u32) -> i32 {
+            let Some(mut instance) = INSTANCES.get_mut(&id) else {
+                tracing::error!(
+                    "Sink connector with ID: {id} was not found and at-least-once delivery cannot be enabled."
+                );
+                return $crate::sink::SinkCallStatus::DISPATCH_FAILURE;
+            };
+            instance.enable_at_least_once(version)
+        }
+
+        #[cfg(not(test))]
+        #[unsafe(no_mangle)]
+        unsafe extern "C" fn iggy_sink_flush(
+            id: u32,
+            topic_meta_ptr: *const u8,
+            topic_meta_len: usize,
+            partitions_ptr: *const u8,
+            partitions_len: usize,
+        ) -> i32 {
+            let Some(instance) = INSTANCES.get(&id) else {
+                tracing::error!("Sink connector with ID: {id} was not found and cannot be flushed.");
+                return $crate::sink::SinkCallStatus::DISPATCH_FAILURE;
+            };
+            instance.flush(topic_meta_ptr, topic_meta_len, partitions_ptr, partitions_len)
+        }
+
+        #[cfg(not(test))]
+        #[unsafe(no_mangle)]
         unsafe extern "C" fn iggy_sink_close(id: u32) -> i32 {
             let Some(mut instance) = INSTANCES.remove(&id) else {
                 tracing::error!("Sink connector with ID: {id} was not found and cannot be closed.");
@@ -329,10 +526,10 @@ macro_rules! sink_connector {
 
 #[cfg(test)]
 mod tests {
-    use crate::sink::SinkContainer;
+    use crate::sink::{DELIVERY_CONTRACT_VERSION, SinkCallStatus, SinkContainer};
     use crate::{
-        ConsumedMessage, Error, MessagesMetadata, Payload, RawMessage, RawMessages, Schema, Sink,
-        TopicMetadata,
+        ConsumedMessage, Error, FlushPartition, MessagesMetadata, Payload, RawMessage, RawMessages,
+        Schema, Sink, TopicMetadata,
     };
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
@@ -376,6 +573,7 @@ mod tests {
                 consumed: Arc::clone(&consumed),
             }),
             shutdown: None,
+            at_least_once: false,
         };
 
         let topic_meta = postcard::to_allocvec(&TopicMetadata {
@@ -462,5 +660,328 @@ mod tests {
             panic!("expected a raw payload, got {}", recorded[0]);
         };
         assert_eq!(bytes, &[0xff, 0x00, 0x01]);
+    }
+
+    /// A sink whose delivery support and failures a test chooses, recording what it flushed.
+    #[derive(Debug, Default)]
+    struct DeliveringSink {
+        supports_at_least_once: bool,
+        consume_error: Option<Error>,
+        flush_error: Option<Error>,
+        flushed: Arc<Mutex<Vec<FlushPartition>>>,
+    }
+
+    #[async_trait]
+    impl Sink for DeliveringSink {
+        async fn open(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn consume(
+            &self,
+            _topic_metadata: &TopicMetadata,
+            _messages_metadata: MessagesMetadata,
+            _messages: Vec<ConsumedMessage>,
+        ) -> Result<(), Error> {
+            self.consume_error.clone().map_or(Ok(()), Err)
+        }
+
+        fn enable_at_least_once(&mut self) -> Result<(), Error> {
+            if self.supports_at_least_once {
+                Ok(())
+            } else {
+                Err(Error::Unsupported("not in this configuration".to_owned()))
+            }
+        }
+
+        async fn flush(
+            &self,
+            _topic_metadata: &TopicMetadata,
+            partitions: &[FlushPartition],
+        ) -> Result<(), Error> {
+            if let Some(error) = &self.flush_error {
+                return Err(error.clone());
+            }
+            self.flushed
+                .lock()
+                .expect("recorder was poisoned")
+                .extend_from_slice(partitions);
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn delivering_container(sink: DeliveringSink) -> SinkContainer<DeliveringSink> {
+        SinkContainer {
+            id: 1,
+            sink: Some(sink),
+            shutdown: None,
+            at_least_once: false,
+        }
+    }
+
+    fn topic_meta() -> Vec<u8> {
+        postcard::to_allocvec(&TopicMetadata {
+            stream: "test_stream".to_owned(),
+            topic: "test_topic".to_owned(),
+        })
+        .expect("failed to serialize topic metadata")
+    }
+
+    /// Sends one message carrying `payload` under `schema` and returns the status code.
+    fn consume_status<T: Sink + std::fmt::Debug>(
+        container: &SinkContainer<T>,
+        schema: Schema,
+        payload: Vec<u8>,
+    ) -> i32 {
+        let topic_meta = topic_meta();
+        let messages_meta = postcard::to_allocvec(&MessagesMetadata {
+            partition_id: 0,
+            current_offset: 10_000,
+            schema,
+        })
+        .expect("failed to serialize messages metadata");
+        let messages = postcard::to_allocvec(&RawMessages {
+            schema,
+            messages: vec![RawMessage {
+                id: 1,
+                offset: 0,
+                checksum: 0,
+                timestamp: 0,
+                origin_timestamp: 0,
+                headers: Vec::new(),
+                payload,
+            }],
+        })
+        .expect("failed to serialize messages");
+        unsafe {
+            container.consume(
+                topic_meta.as_ptr(),
+                topic_meta.len(),
+                messages_meta.as_ptr(),
+                messages_meta.len(),
+                messages.as_ptr(),
+                messages.len(),
+            )
+        }
+    }
+
+    fn flush_status<T: Sink + std::fmt::Debug>(
+        container: &SinkContainer<T>,
+        partitions: &[FlushPartition],
+    ) -> i32 {
+        let topic_meta = topic_meta();
+        let partitions =
+            postcard::to_allocvec(&partitions.to_vec()).expect("failed to serialize partitions");
+        unsafe {
+            container.flush(
+                topic_meta.as_ptr(),
+                topic_meta.len(),
+                partitions.as_ptr(),
+                partitions.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn given_a_sink_without_support_when_enabling_at_least_once_should_refuse_permanently() {
+        let mut container = delivering_container(DeliveringSink::default());
+
+        let status = container.enable_at_least_once(DELIVERY_CONTRACT_VERSION);
+
+        assert_eq!(
+            SinkCallStatus::from(status),
+            SinkCallStatus::PermanentFailure
+        );
+        assert!(!container.at_least_once);
+    }
+
+    #[test]
+    fn given_another_contract_version_when_enabling_at_least_once_should_refuse_it() {
+        let mut container = delivering_container(DeliveringSink {
+            supports_at_least_once: true,
+            ..DeliveringSink::default()
+        });
+
+        let status = container.enable_at_least_once(DELIVERY_CONTRACT_VERSION + 1);
+
+        assert_eq!(
+            SinkCallStatus::from(status),
+            SinkCallStatus::PermanentFailure
+        );
+        assert!(!container.at_least_once);
+    }
+
+    #[test]
+    fn given_at_least_once_enabled_when_flushed_should_hand_the_sink_the_partitions() {
+        let flushed = Arc::new(Mutex::new(Vec::new()));
+        let mut container = delivering_container(DeliveringSink {
+            supports_at_least_once: true,
+            flushed: Arc::clone(&flushed),
+            ..DeliveringSink::default()
+        });
+        let partitions = [
+            FlushPartition {
+                partition_id: 0,
+                offset: 7,
+            },
+            FlushPartition {
+                partition_id: 3,
+                offset: 41,
+            },
+        ];
+
+        assert_eq!(container.enable_at_least_once(DELIVERY_CONTRACT_VERSION), 0);
+        let status = flush_status(&container, &partitions);
+
+        assert_eq!(status, 0);
+        assert_eq!(*flushed.lock().expect("recorder was poisoned"), partitions);
+    }
+
+    #[test]
+    fn given_at_least_once_not_enabled_when_flushed_should_refuse_without_calling_the_sink() {
+        let flushed = Arc::new(Mutex::new(Vec::new()));
+        let container = delivering_container(DeliveringSink {
+            supports_at_least_once: true,
+            flushed: Arc::clone(&flushed),
+            ..DeliveringSink::default()
+        });
+
+        let status = flush_status(
+            &container,
+            &[FlushPartition {
+                partition_id: 0,
+                offset: 1,
+            }],
+        );
+
+        assert_eq!(
+            SinkCallStatus::from(status),
+            SinkCallStatus::PermanentFailure
+        );
+        assert!(flushed.lock().expect("recorder was poisoned").is_empty());
+    }
+
+    #[test]
+    fn given_a_closed_instance_when_flushed_should_refuse_the_stale_flush() {
+        let flushed = Arc::new(Mutex::new(Vec::new()));
+        let mut container = delivering_container(DeliveringSink {
+            supports_at_least_once: true,
+            flushed: Arc::clone(&flushed),
+            ..DeliveringSink::default()
+        });
+        assert_eq!(container.enable_at_least_once(DELIVERY_CONTRACT_VERSION), 0);
+        assert_eq!(unsafe { container.close() }, 0);
+
+        let status = flush_status(
+            &container,
+            &[FlushPartition {
+                partition_id: 0,
+                offset: 1,
+            }],
+        );
+
+        assert_eq!(
+            SinkCallStatus::from(status),
+            SinkCallStatus::PermanentFailure
+        );
+        assert!(flushed.lock().expect("recorder was poisoned").is_empty());
+    }
+
+    #[test]
+    fn given_a_failing_flush_when_flushed_should_report_the_error_class() {
+        for (error, expected) in [
+            (
+                Error::Connection("refused".to_owned()),
+                SinkCallStatus::TransientFailure,
+            ),
+            (
+                Error::PermanentHttpError("400".to_owned()),
+                SinkCallStatus::PermanentFailure,
+            ),
+        ] {
+            let mut container = delivering_container(DeliveringSink {
+                supports_at_least_once: true,
+                flush_error: Some(error),
+                ..DeliveringSink::default()
+            });
+            assert_eq!(container.enable_at_least_once(DELIVERY_CONTRACT_VERSION), 0);
+
+            let status = flush_status(
+                &container,
+                &[FlushPartition {
+                    partition_id: 0,
+                    offset: 1,
+                }],
+            );
+
+            assert_eq!(SinkCallStatus::from(status), expected);
+        }
+    }
+
+    #[test]
+    fn given_a_failing_consume_when_consumed_should_report_the_error_class() {
+        for (error, expected) in [
+            (
+                Error::HttpRequestFailed("503".to_owned()),
+                SinkCallStatus::TransientFailure,
+            ),
+            (
+                Error::SchemaMismatch("no such column".to_owned()),
+                SinkCallStatus::PermanentFailure,
+            ),
+        ] {
+            let container = delivering_container(DeliveringSink {
+                consume_error: Some(error),
+                ..DeliveringSink::default()
+            });
+
+            let status = consume_status(&container, Schema::Raw, vec![1]);
+
+            assert_eq!(SinkCallStatus::from(status), expected);
+        }
+    }
+
+    #[test]
+    fn given_a_payload_that_does_not_decode_when_consumed_should_fail_only_at_least_once() {
+        let mut container = delivering_container(DeliveringSink {
+            supports_at_least_once: true,
+            ..DeliveringSink::default()
+        });
+        let undecodable = b"{not json".to_vec();
+
+        assert_eq!(
+            consume_status(&container, Schema::Json, undecodable.clone()),
+            0,
+            "without at-least-once the container skips the message as before"
+        );
+        assert_eq!(container.enable_at_least_once(DELIVERY_CONTRACT_VERSION), 0);
+        assert_eq!(
+            SinkCallStatus::from(consume_status(&container, Schema::Json, undecodable)),
+            SinkCallStatus::PermanentFailure
+        );
+    }
+
+    #[test]
+    fn given_status_codes_when_read_back_should_map_legacy_failures_to_transient() {
+        for (code, expected) in [
+            (0, SinkCallStatus::Succeeded),
+            (1, SinkCallStatus::TransientFailure),
+            (2, SinkCallStatus::PermanentFailure),
+            (-1, SinkCallStatus::PermanentFailure),
+            (7, SinkCallStatus::TransientFailure),
+        ] {
+            assert_eq!(SinkCallStatus::from(code), expected, "code {code}");
+        }
+        for status in [
+            SinkCallStatus::Succeeded,
+            SinkCallStatus::TransientFailure,
+            SinkCallStatus::PermanentFailure,
+        ] {
+            assert_eq!(SinkCallStatus::from(status.code()), status);
+        }
     }
 }

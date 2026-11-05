@@ -16,14 +16,16 @@
 // under the License.
 
 use crate::connectors::create_test_messages;
+use async_trait::async_trait;
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::Identifier;
 use iggy_common::MessageClient;
 use iggy_connector_sdk::api::{ConnectorRuntimeStats, ConnectorStatus, SinkInfoResponse};
-use integration::harness::seeds;
+use integration::harness::{TestBinaryError, TestFixture, seeds};
 use integration::iggy_harness;
 use reqwest::Client;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -202,4 +204,61 @@ async fn stdout_sink_handles_bulk_messages(harness: &TestHarness) {
     assert_eq!(sinks.len(), 1);
     assert_eq!(sinks[0].status, ConnectorStatus::Running);
     assert!(sinks[0].last_error.is_none());
+}
+
+/// Asks for at-least-once delivery from the stdout sink, which does not support it.
+pub struct StdoutAtLeastOnceFixture;
+
+#[async_trait]
+impl TestFixture for StdoutAtLeastOnceFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self)
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "IGGY_CONNECTORS_SINK_STDOUT_DELIVERY_GUARANTEE".to_owned(),
+                "at_least_once".to_owned(),
+            ),
+            (
+                "IGGY_CONNECTORS_SINK_STDOUT_PATH".to_owned(),
+                "../../target/debug/libiggy_connector_stdout_sink".to_owned(),
+            ),
+        ])
+    }
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/stdout/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_at_least_once_when_the_plugin_does_not_support_it_should_refuse_to_start(
+    harness: &TestHarness,
+    _fixture: StdoutAtLeastOnceFixture,
+) {
+    let api_address = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .http_url();
+
+    let sink: SinkInfoResponse = Client::new()
+        .get(format!("{api_address}/sinks/stdout"))
+        .header("api-key", API_KEY)
+        .send()
+        .await
+        .expect("sink request should complete")
+        .json()
+        .await
+        .expect("sink response should decode");
+
+    assert_eq!(sink.status, ConnectorStatus::Error);
+    let error = sink
+        .last_error
+        .expect("the refusal should be reported")
+        .message;
+    assert!(
+        error.contains("cannot deliver at least once"),
+        "the error should name the missing guarantee: {error}"
+    );
 }
