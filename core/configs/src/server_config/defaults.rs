@@ -214,6 +214,10 @@ impl Default for PartitionConfig {
                 .expect("the embedded config.toml carries a nonzero offset_reservation_lease"),
             evicted_ring_capacity: partition.evicted_ring_capacity as usize,
             evicted_ring_bytes_max: partition.evicted_ring_bytes_max.parse().unwrap(),
+            evicted_ring_node_bytes_max: partition
+                .evicted_ring_node_bytes_max
+                .parse()
+                .expect("embedded node-wide repair ring budget is valid"),
             transfer_served_cache_bytes_max: partition
                 .transfer_served_cache_bytes_max
                 .parse()

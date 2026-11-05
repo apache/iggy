@@ -817,8 +817,8 @@ mod tests {
         WireOptions,
     };
     use iggy_common::{
-        ConsumerGroupOffsets, ConsumerKind, ConsumerOffsets, Durability, IggyByteSize,
-        IggyTimestamp, PartitionStats, TopicRuntimeOptions, variadic,
+        ConsumerKind, Durability, IggyByteSize, IggyTimestamp, PartitionStats, TopicRuntimeOptions,
+        variadic,
     };
     use journal::Journal;
     use journal::prepare_journal::PrepareJournal;
@@ -832,8 +832,9 @@ mod tests {
         StagedSegmentMeta, TransferArtifact,
     };
     use partitions::{
-        IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionPathLayout,
-        PartitionsConfig, REPAIR_MAX_STALL_RETRIES, RepairConclusion, RepairSession, Segment,
+        ConsumerGroupOffsets, ConsumerOffsets, IggyIndexWriter, IggyPartition, IggyPartitions,
+        MessagesWriter, PartitionPathLayout, PartitionsConfig, REPAIR_MAX_STALL_RETRIES,
+        RepairConclusion, RepairSession, Segment,
     };
     use prometheus_client::registry::Registry;
     use server_common::iobuf::Owned;
@@ -2041,8 +2042,8 @@ mod tests {
         }
         partition.configure_consumer_offset_storage(
             dirs,
-            ConsumerOffsets::with_capacity(1),
-            ConsumerGroupOffsets::with_capacity(1),
+            ConsumerOffsets::new(),
+            ConsumerGroupOffsets::new(),
         );
         partition.stats.increment_messages_count(1);
         partition.set_runtime_options(TopicRuntimeOptions {
@@ -2252,8 +2253,8 @@ mod tests {
             }
             partition.configure_consumer_offset_storage(
                 dirs,
-                ConsumerOffsets::with_capacity(1),
-                ConsumerGroupOffsets::with_capacity(1),
+                ConsumerOffsets::new(),
+                ConsumerGroupOffsets::new(),
             );
             partition.stats.increment_messages_count(1);
             store_request(namespace, AckLevel::NoAck)

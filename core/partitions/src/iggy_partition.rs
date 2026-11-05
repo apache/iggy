@@ -37,7 +37,8 @@ use crate::state_transfer::{
     PartitionTransferSession, PartitionTransferUnavailable, PendingTransferRearm, TransferPlanSlot,
 };
 use crate::types::{
-    COMMIT_WALK_OPS_MAX, FatalCommit, RepairConclusion, RepairIngest, RepairSession,
+    COMMIT_WALK_OPS_MAX, ConsumerGroupOffsets, ConsumerOffsets, FatalCommit, RepairConclusion,
+    RepairIngest, RepairSession,
 };
 use crate::view_fence::{ViewFence, ViewWindowVerdict, view_window_verdict};
 use crate::{
@@ -76,9 +77,8 @@ use iggy_binary_protocol::{
 };
 use iggy_binary_protocol::{PrepareOkHeader, ReplyHeader, RoutedRequestHeader};
 use iggy_common::{
-    ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
-    EncryptorKind, IggyByteSize, IggyError, IggyExpiry, IggyTimestamp, PartitionStats, PollingKind,
-    TopicRuntimeOptions,
+    ConsumerGroupId, ConsumerKind, ConsumerOffset, EncryptorKind, IggyByteSize, IggyError,
+    IggyExpiry, IggyTimestamp, PartitionStats, PollingKind, TopicRuntimeOptions,
 };
 use journal::Journal as _;
 use journal::local_gate::LocalGate;
@@ -98,9 +98,8 @@ use server_common::{
     sharding::IggyNamespace,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, btree_map};
 use std::fmt;
-use std::hash::Hash;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -153,14 +152,14 @@ where
     pub offset: Arc<AtomicU64>,
     /// Highest offset assigned to prepares that may still only live in the in-memory journal.
     pub dirty_offset: AtomicU64,
-    pub consumer_offsets: Arc<ConsumerOffsets>,
-    pub consumer_group_offsets: Arc<ConsumerGroupOffsets>,
+    pub consumer_offsets: RefCell<ConsumerOffsets>,
+    pub consumer_group_offsets: RefCell<ConsumerGroupOffsets>,
     /// Highest offset this partition has served (polled) to each consumer group.
     /// The cooperative-rebalance reconciler completes a pending revocation once
     /// the source group has committed up to what it was polled
     /// (`committed >= last_polled`), i.e. nothing is in flight. Ephemeral (not
     /// persisted): recovery or a view change leaves prior progress unknown.
-    pub last_polled_offsets: Arc<ConsumerGroupOffsets>,
+    pub last_polled_offsets: RefCell<ConsumerGroupOffsets>,
     pub(crate) consumer_group_owners: BTreeMap<u64, InstalledConsumerGroupOwner>,
     // The flag proves that the owner installed in this view has served nothing.
     pub(crate) consumer_group_polls: BTreeMap<u64, Arc<AtomicBool>>,
@@ -916,9 +915,9 @@ where
             log: SegmentedLog::default(),
             offset: Arc::new(AtomicU64::new(0)),
             dirty_offset: AtomicU64::new(0),
-            consumer_offsets: Arc::new(ConsumerOffsets::with_capacity(1)),
-            consumer_group_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(1)),
-            last_polled_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(1)),
+            consumer_offsets: RefCell::default(),
+            consumer_group_offsets: RefCell::default(),
+            last_polled_offsets: RefCell::default(),
             consumer_group_owners: BTreeMap::new(),
             consumer_group_polls: BTreeMap::new(),
             owner_retirement: None,
@@ -1255,7 +1254,7 @@ where
             return false;
         };
         self.last_polled_offsets
-            .pin()
+            .borrow()
             .get(&ConsumerGroupId(id as usize))
             .is_some_and(|polled| {
                 self.durable_consumer_offsets
@@ -1358,7 +1357,7 @@ where
         self.consumer_group_polls
             .insert(installation.group_id, Arc::new(AtomicBool::new(true)));
         self.last_polled_offsets
-            .pin()
+            .borrow_mut()
             .remove(&ConsumerGroupId(group_id as usize));
         self.mark_consumer_group_offsets_dirty();
         self.fence_published.set(true);
@@ -1475,7 +1474,7 @@ where
             // Last-polled keys come from u32 group ids only.
             if let Ok(id) = u32::try_from(group_id) {
                 self.last_polled_offsets
-                    .pin()
+                    .borrow_mut()
                     .remove(&ConsumerGroupId(id as usize));
             }
         }
@@ -3165,7 +3164,7 @@ where
         self.required_metadata_frontier = required_metadata_frontier;
         self.retirement_paid_through = retirement_paid_through;
         for (consumer_id, offset) in consumer_offsets {
-            self.consumer_offsets.pin().insert(
+            self.consumer_offsets.borrow_mut().insert(
                 consumer_id as usize,
                 ConsumerOffset::new(ConsumerKind::Consumer, consumer_id, offset, String::new()),
             );
@@ -3177,7 +3176,7 @@ where
             );
         }
         for (group_id, offset) in consumer_group_offsets {
-            self.consumer_group_offsets.pin().insert(
+            self.consumer_group_offsets.borrow_mut().insert(
                 ConsumerGroupId(group_id as usize),
                 ConsumerOffset::new(ConsumerKind::ConsumerGroup, group_id, offset, String::new()),
             );
@@ -3892,8 +3891,8 @@ where
         consumer_group_offsets: ConsumerGroupOffsets,
     ) {
         self.invalidate_poll_history();
-        self.consumer_offsets = Arc::new(consumer_offsets);
-        self.consumer_group_offsets = Arc::new(consumer_group_offsets);
+        *self.consumer_offsets.get_mut() = consumer_offsets;
+        *self.consumer_group_offsets.get_mut() = consumer_group_offsets;
         self.consumer_offset_dirs = dirs.map(Some);
     }
 
@@ -3961,8 +3960,8 @@ where
     #[must_use]
     pub fn consumer_offset_map_count(&self, kind: ConsumerKind) -> usize {
         match kind {
-            ConsumerKind::Consumer => self.consumer_offsets.len(),
-            ConsumerKind::ConsumerGroup => self.consumer_group_offsets.len(),
+            ConsumerKind::Consumer => self.consumer_offsets.borrow().len(),
+            ConsumerKind::ConsumerGroup => self.consumer_group_offsets.borrow().len(),
             ConsumerKind::ExternalGroup => self.durable_consumer_offsets.count(kind),
         }
     }
@@ -5036,11 +5035,11 @@ where
             // the key present. Deletion is idempotent on every replica, while
             // admission still rejects a request for an already absent key.
             (ConsumerKind::Consumer, PendingConsumerOffsetMutation::Delete) => {
-                self.consumer_offsets.pin().remove(&key);
+                self.consumer_offsets.borrow_mut().remove(&key);
             }
             (ConsumerKind::ConsumerGroup, PendingConsumerOffsetMutation::Delete) => {
                 self.consumer_group_offsets
-                    .pin()
+                    .borrow_mut()
                     .remove(&ConsumerGroupId(key));
             }
             // `persist_consumer_offset_commit` already updated the durable
@@ -5079,7 +5078,7 @@ where
     #[allow(clippy::cast_possible_truncation)]
     pub fn consumer_group_offset_ids(&self) -> Vec<u64> {
         self.consumer_group_offsets
-            .pin()
+            .borrow()
             .keys()
             .map(|key| key.0 as u64)
             .collect()
@@ -5158,8 +5157,8 @@ where
     pub fn group_offset_state(&self, group_id: u64) -> (Option<u64>, Option<u64>) {
         let key = ConsumerGroupId(group_id as usize);
         let load = |offset: &ConsumerOffset| offset.offset.load(Ordering::Relaxed);
-        let last_polled = self.last_polled_offsets.pin().get(&key).map(load);
-        let committed = self.consumer_group_offsets.pin().get(&key).map(load);
+        let last_polled = self.last_polled_offsets.borrow().get(&key).map(load);
+        let committed = self.consumer_group_offsets.borrow().get(&key).map(load);
         (last_polled, committed)
     }
 
@@ -5460,10 +5459,10 @@ where
     fn offset_key_exists(&self, kind: ConsumerKind, consumer_id: u32) -> bool {
         let key = || usize::try_from(consumer_id).expect("u32 consumer id must fit usize");
         match kind {
-            ConsumerKind::Consumer => self.consumer_offsets.pin().contains_key(&key()),
+            ConsumerKind::Consumer => self.consumer_offsets.borrow().contains_key(&key()),
             ConsumerKind::ConsumerGroup => self
                 .consumer_group_offsets
-                .pin()
+                .borrow()
                 .contains_key(&ConsumerGroupId(key())),
             ConsumerKind::ExternalGroup => {
                 self.durable_consumer_offsets.contains(kind, consumer_id)
@@ -5626,7 +5625,7 @@ where
         }
 
         if current_view != self.observed_view {
-            self.last_polled_offsets.pin().clear();
+            self.last_polled_offsets.borrow_mut().clear();
             self.consumer_group_polls.clear();
             self.pending_owner_install.set(None);
             self.pending_history_transition.set(None);
@@ -5765,39 +5764,37 @@ where
         }
     }
 
-    fn reclaim_phantom_offset_keys<K: Hash + Eq>(
+    fn reclaim_phantom_offset_keys<K: Ord>(
         &self,
-        offsets: &papaya::HashMap<K, ConsumerOffset>,
+        offsets: &RefCell<BTreeMap<K, ConsumerOffset>>,
         kind: ConsumerKind,
         mut remaining: usize,
         consumer_id: impl Fn(&K) -> Option<u32>,
     ) {
         let capacity = self.consumer_offset_capacity_for(kind);
-        let map = offsets.pin();
-        for (key, _) in &map {
-            if let Some(id) = consumer_id(key)
-                && !capacity.holds(id, &self.durable_consumer_offsets)
-                && map.remove(key).is_some()
-            {
-                capacity.forget_inactive_provisional(id);
-                // This cursor was never durable, so the consumer's next `Next`
-                // poll restarts from offset 0 and redelivers. At-least-once
-                // permits it; an operator should still see it happen.
-                warn!(
-                    target: "iggy.partitions.diag",
-                    plane = "partitions",
-                    namespace_raw = self.namespace().inner(),
-                    ?kind,
-                    consumer_id = id,
-                    "reclaimed a local consumer offset cursor with no durable backing; its next \
-                     poll restarts from offset 0"
-                );
-                remaining -= 1;
-                if remaining == 0 {
-                    break;
-                }
+        offsets.borrow_mut().retain(|key, _| {
+            let Some(id) = consumer_id(key) else {
+                return true;
+            };
+            if remaining == 0 || capacity.holds(id, &self.durable_consumer_offsets) {
+                return true;
             }
-        }
+            capacity.forget_inactive_provisional(id);
+            // This cursor was never durable, so the consumer's next `Next`
+            // poll restarts from offset 0 and redelivers. At-least-once
+            // permits it; an operator should still see it happen.
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = self.namespace().inner(),
+                ?kind,
+                consumer_id = id,
+                "reclaimed a local consumer offset cursor with no durable backing; its next \
+                 poll restarts from offset 0"
+            );
+            remaining -= 1;
+            false
+        });
     }
 
     /// Snapshot read resources synchronously on the partition owner.
@@ -5998,12 +5995,12 @@ where
         match consumer {
             PollingConsumer::Consumer(id, _) => self
                 .consumer_offsets
-                .pin()
+                .borrow()
                 .get(&id)
                 .map(|co| co.offset.load(Ordering::Relaxed)),
             PollingConsumer::ConsumerGroup(group_id, _) => self
                 .consumer_group_offsets
-                .pin()
+                .borrow()
                 .get(&ConsumerGroupId(group_id))
                 .map(|co| co.offset.load(Ordering::Relaxed)),
         }
@@ -12452,16 +12449,16 @@ where
     /// the holder's identity. `None` when nothing has been committed, in which
     /// case there is no deletion barrier. External groups never hold retention.
     fn min_committed_offset(&self) -> Option<(u64, ConsumerKind, u32)> {
-        let consumer_guard = self.consumer_offsets.pin();
-        let group_guard = self.consumer_group_offsets.pin();
-        let consumers = consumer_guard.iter().map(|(_, offset)| {
+        let consumer_guard = self.consumer_offsets.borrow();
+        let group_guard = self.consumer_group_offsets.borrow();
+        let consumers = consumer_guard.values().map(|offset| {
             (
                 offset.offset.load(Ordering::Relaxed),
                 offset.kind,
                 offset.consumer_id,
             )
         });
-        let groups = group_guard.iter().map(|(_, offset)| {
+        let groups = group_guard.values().map(|offset| {
             (
                 offset.offset.load(Ordering::Relaxed),
                 offset.kind,
@@ -13803,15 +13800,13 @@ pub fn next_consumer_kind(kind: ConsumerKind) -> Option<ConsumerKind> {
 
 /// Automatic commits remain monotone because an earlier poll can commit after
 /// a later one. Explicit stores may intentionally rewind the cursor.
-fn upsert_committed_offset<K>(
-    map: &papaya::HashMap<K, ConsumerOffset>,
+fn upsert_committed_offset<K: Ord>(
+    map: &RefCell<BTreeMap<K, ConsumerOffset>>,
     key: K,
     offset: u64,
     auto_commit: bool,
     create_on_miss: impl FnOnce() -> ConsumerOffset,
-) where
-    K: Hash + Eq + Clone + Send + Sync,
-{
+) {
     if auto_commit {
         upsert_offset_max(map, key, offset, create_on_miss);
     } else {
@@ -13819,22 +13814,17 @@ fn upsert_committed_offset<K>(
     }
 }
 
-fn upsert_offset<K>(
-    map: &papaya::HashMap<K, ConsumerOffset>,
+fn upsert_offset<K: Ord>(
+    map: &RefCell<BTreeMap<K, ConsumerOffset>>,
     key: K,
     offset: u64,
     create_on_miss: impl FnOnce() -> ConsumerOffset,
-) where
-    K: Hash + Eq + Clone + Send + Sync,
-{
-    let guard = map.pin();
-    if let Some(existing) = guard.get(&key) {
-        existing.offset.store(offset, Ordering::Relaxed);
-    } else {
-        let created = create_on_miss();
-        created.offset.store(offset, Ordering::Relaxed);
-        guard.insert(key, created);
-    }
+) {
+    map.borrow_mut()
+        .entry(key)
+        .or_insert_with(create_on_miss)
+        .offset
+        .store(offset, Ordering::Relaxed);
 }
 
 /// Kinds keyed by consumer group, whose offsets go when the group is deleted.
@@ -13845,21 +13835,21 @@ const fn keyed_by_group(kind: ConsumerKind) -> bool {
     }
 }
 
-fn upsert_offset_max<K>(
-    map: &papaya::HashMap<K, ConsumerOffset>,
+fn upsert_offset_max<K: Ord>(
+    map: &RefCell<BTreeMap<K, ConsumerOffset>>,
     key: K,
     offset: u64,
     create_on_miss: impl FnOnce() -> ConsumerOffset,
-) where
-    K: Hash + Eq + Clone + Send + Sync,
-{
-    let guard = map.pin();
-    if let Some(existing) = guard.get(&key) {
-        existing.offset.fetch_max(offset, Ordering::Relaxed);
-    } else {
-        let created = create_on_miss();
-        created.offset.store(offset, Ordering::Relaxed);
-        guard.insert(key, created);
+) {
+    let mut map = map.borrow_mut();
+    match map.entry(key) {
+        btree_map::Entry::Occupied(existing) => {
+            existing.get().offset.fetch_max(offset, Ordering::Relaxed);
+        }
+        btree_map::Entry::Vacant(slot) => {
+            let created = slot.insert(create_on_miss());
+            created.offset.store(offset, Ordering::Relaxed);
+        }
     }
 }
 
@@ -18327,8 +18317,8 @@ mod tests {
         partition.configure_consumer_offset_storage(
             [&consumer_path, &group_path, &external_path]
                 .map(|path| path.to_string_lossy().into_owned()),
-            ConsumerOffsets::with_capacity(1),
-            ConsumerGroupOffsets::with_capacity(1),
+            ConsumerOffsets::new(),
+            ConsumerGroupOffsets::new(),
         );
         (directory, partition)
     }
@@ -20975,12 +20965,12 @@ mod tests {
         partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
         std::fs::create_dir(directory.path().join("prepares-0")).unwrap();
         partition.seed_recovered_consumer_offset(ConsumerKind::Consumer, CONSUMER_ID, 10, 10);
-        partition.consumer_offsets.pin().insert(
+        partition.consumer_offsets.borrow_mut().insert(
             CONSUMER_ID as usize,
             ConsumerOffset::new(ConsumerKind::Consumer, CONSUMER_ID, 10, String::new()),
         );
         partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, CONSUMER_ID, 11, 11);
-        partition.consumer_group_offsets.pin().insert(
+        partition.consumer_group_offsets.borrow_mut().insert(
             ConsumerGroupId(CONSUMER_ID as usize),
             ConsumerOffset::new(ConsumerKind::ConsumerGroup, CONSUMER_ID, 11, String::new()),
         );
@@ -22876,7 +22866,7 @@ mod tests {
         };
         partition.apply_consumer_group_owner(fence, 1).unwrap();
         // The fence install clears the entry, so the test seeds it after.
-        partition.last_polled_offsets.pin().insert(
+        partition.last_polled_offsets.borrow_mut().insert(
             ConsumerGroupId(GROUP_ID as usize),
             ConsumerOffset::new(
                 ConsumerKind::ConsumerGroup,
@@ -26206,8 +26196,8 @@ mod tests {
         partition.configure_consumer_offset_storage(
             ["consumers", "groups", "external_groups"]
                 .map(|name| directory.path().join(name).to_str().unwrap().to_owned()),
-            ConsumerOffsets::with_capacity(1),
-            ConsumerGroupOffsets::with_capacity(1),
+            ConsumerOffsets::new(),
+            ConsumerGroupOffsets::new(),
         );
         partition.set_io_notifier(
             Rc::new(|_, _| {}),
@@ -26319,8 +26309,8 @@ mod tests {
             }
             partition.configure_consumer_offset_storage(
                 dirs,
-                ConsumerOffsets::with_capacity(1),
-                ConsumerGroupOffsets::with_capacity(1),
+                ConsumerOffsets::new(),
+                ConsumerGroupOffsets::new(),
             );
             partition.materialization_missing = true;
             let marker = directory.path().join(MARKER);
@@ -26377,8 +26367,8 @@ mod tests {
         }
         partition.configure_consumer_offset_storage(
             dirs,
-            ConsumerOffsets::with_capacity(1),
-            ConsumerGroupOffsets::with_capacity(1),
+            ConsumerOffsets::new(),
+            ConsumerGroupOffsets::new(),
         );
         let prepare = checksummed_segment_prepare(1, 0, 8, b"installed");
         let wire = crate::state_transfer::ConsumerOffsetsWire {
@@ -26455,8 +26445,8 @@ mod tests {
         let consumers = dirs[0].clone();
         partition.configure_consumer_offset_storage(
             dirs,
-            ConsumerOffsets::with_capacity(1),
-            ConsumerGroupOffsets::with_capacity(1),
+            ConsumerOffsets::new(),
+            ConsumerGroupOffsets::new(),
         );
         let old = PendingConsumerOffsetCommit::upsert(ConsumerKind::Consumer, OLD_CONSUMER, 4);
         partition.persist_consumer_offset_commit(old).await.unwrap();
@@ -26705,7 +26695,7 @@ mod tests {
                 assert!(
                     !partition
                         .consumer_offsets
-                        .pin()
+                        .borrow()
                         .contains_key(&(CONSUMER as usize))
                 );
                 assert!(matches!(
@@ -26724,7 +26714,7 @@ mod tests {
                 assert_eq!(
                     partition
                         .consumer_offsets
-                        .pin()
+                        .borrow()
                         .contains_key(&(CONSUMER as usize)),
                     !fail_write
                 );
@@ -26783,7 +26773,7 @@ mod tests {
                 assert!(
                     !partition
                         .consumer_offsets
-                        .pin()
+                        .borrow()
                         .contains_key(&(CONSUMER as usize))
                 );
                 assert_eq!(
@@ -27316,7 +27306,7 @@ mod tests {
             partition.durable_consumer_offset_count(ConsumerKind::ExternalGroup),
             1
         );
-        assert!(partition.consumer_group_offsets.pin().is_empty());
+        assert!(partition.consumer_group_offsets.borrow().is_empty());
     }
 
     /// Kafka never lets a committed offset block retention, and neither does its gateway.
@@ -27378,7 +27368,7 @@ mod tests {
         assert_eq!(partition.external_group_offset(9), Some(1_000));
         let group = partition
             .consumer_group_offsets
-            .pin()
+            .borrow()
             .get(&ConsumerGroupId(8))
             .map(|offset| offset.offset.load(Ordering::Relaxed));
         assert_eq!(group, Some(10));
@@ -27389,7 +27379,7 @@ mod tests {
         let (partition, _) = recording_partition();
         partition.seed_recovered_consumer_offset(ConsumerKind::ExternalGroup, 7, 11, 11);
         partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, 9, 11, 11);
-        partition.consumer_group_offsets.pin().insert(
+        partition.consumer_group_offsets.borrow_mut().insert(
             ConsumerGroupId(9),
             ConsumerOffset::new(ConsumerKind::ConsumerGroup, 9, 11, String::new()),
         );
@@ -27412,7 +27402,7 @@ mod tests {
         let (partition, _) = recording_partition();
         for group_id in [1, 2, 3] {
             partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, group_id, 11, 11);
-            partition.consumer_group_offsets.pin().insert(
+            partition.consumer_group_offsets.borrow_mut().insert(
                 ConsumerGroupId(group_id as usize),
                 ConsumerOffset::new(ConsumerKind::ConsumerGroup, group_id, 11, String::new()),
             );
@@ -29225,7 +29215,7 @@ mod tests {
         let (mut partition, _) = recording_partition_at(0, 3);
         partition.set_consumer_offsets_max(1);
         partition.seed_recovered_consumer_offset(ConsumerKind::Consumer, 7, 0, 0);
-        partition.consumer_offsets.pin().insert(
+        partition.consumer_offsets.borrow_mut().insert(
             7,
             ConsumerOffset::new(ConsumerKind::Consumer, 7, 0, String::new()),
         );
@@ -29371,7 +29361,7 @@ mod tests {
         let (mut partition, sent) = recording_partition_at(0, 3);
         partition.set_consumer_offsets_max(1);
         partition.seed_recovered_consumer_offset(ConsumerKind::Consumer, 7, 0, 0);
-        partition.consumer_offsets.pin().insert(
+        partition.consumer_offsets.borrow_mut().insert(
             7,
             ConsumerOffset::new(ConsumerKind::Consumer, 7, 0, String::new()),
         );
@@ -29446,7 +29436,7 @@ mod tests {
     #[compio::test]
     async fn given_repeated_admitted_deletes_when_committed_should_be_idempotent() {
         let (mut partition, _) = recording_partition();
-        partition.consumer_offsets.pin().insert(
+        partition.consumer_offsets.borrow_mut().insert(
             7,
             ConsumerOffset::new(ConsumerKind::Consumer, 7, 0, String::new()),
         );
@@ -29693,7 +29683,7 @@ mod tests {
             .await
             .unwrap();
         assert!(dirty.borrow().is_empty());
-        partition.consumer_group_offsets.pin().insert(
+        partition.consumer_group_offsets.borrow_mut().insert(
             ConsumerGroupId(8),
             ConsumerOffset::new(ConsumerKind::ConsumerGroup, 8, 3, String::new()),
         );
@@ -29727,19 +29717,19 @@ mod tests {
             .reserve_provisional(9, &partition.durable_consumer_offsets)
             .unwrap();
         for id in 7..=10 {
-            partition.consumer_offsets.pin().insert(
+            partition.consumer_offsets.borrow_mut().insert(
                 id as usize,
                 ConsumerOffset::new(ConsumerKind::Consumer, id, 0, String::new()),
             );
         }
         partition.consensus.set_view(3);
         partition.resynchronize_consumer_offset_reservations();
-        assert_eq!(partition.consumer_offsets.len(), 4);
+        assert_eq!(partition.consumer_offsets.borrow().len(), 4);
         partition.reclaim_phantom_offsets(ConsumerKind::Consumer, 4);
-        assert_eq!(partition.consumer_offsets.len(), 3);
-        assert!(!partition.consumer_offsets.pin().contains_key(&10));
+        assert_eq!(partition.consumer_offsets.borrow().len(), 3);
+        assert!(!partition.consumer_offsets.borrow().contains_key(&10));
         for id in 7..=9 {
-            assert!(partition.consumer_offsets.pin().contains_key(&id));
+            assert!(partition.consumer_offsets.borrow().contains_key(&id));
         }
         drop(held);
     }
@@ -30127,7 +30117,7 @@ mod tests {
                     &replies[0].1.as_slice()[..size_of::<ReplyHeader>()],
                 );
                 assert_eq!(reply.status, IggyError::TransientNotAccepted.as_code());
-                assert!(partition.consumer_offsets.pin().is_empty());
+                assert!(partition.consumer_offsets.borrow().is_empty());
                 assert_eq!(
                     partition.occupied_consumer_offset_count(ConsumerKind::Consumer),
                     0
@@ -31342,17 +31332,17 @@ mod tests {
         partition.offset_space.committed_seeded = true;
         partition.seed_recovered_consumer_offset(ConsumerKind::Consumer, 7, 0, 0);
         for id in 7..=8 {
-            partition.consumer_offsets.pin().insert(
+            partition.consumer_offsets.borrow_mut().insert(
                 id as usize,
                 ConsumerOffset::new(ConsumerKind::Consumer, id, 0, String::new()),
             );
         }
         let args = PollingArgs::new(iggy_common::PollingStrategy::first(), 1, true);
         let _ = partition.build_poll_plan(PollingConsumer::Consumer(7, 0), &args, false);
-        assert_eq!(partition.consumer_offsets.len(), 2);
+        assert_eq!(partition.consumer_offsets.borrow().len(), 2);
         let _ = partition.build_poll_plan(PollingConsumer::Consumer(9, 0), &args, false);
-        assert_eq!(partition.consumer_offsets.len(), 1);
-        assert!(partition.consumer_offsets.pin().contains_key(&7));
+        assert_eq!(partition.consumer_offsets.borrow().len(), 1);
+        assert!(partition.consumer_offsets.borrow().contains_key(&7));
     }
 
     #[compio::test]
@@ -31460,8 +31450,8 @@ mod tests {
         }
         let args = PollingArgs::new(iggy_common::PollingStrategy::first(), 1, true);
         let _ = partition.build_poll_plan(PollingConsumer::Consumer(3, 0), &args, false);
-        assert_eq!(partition.consumer_offsets.len(), 1);
-        let retained_id = *partition.consumer_offsets.pin().keys().next().unwrap();
+        assert_eq!(partition.consumer_offsets.borrow().len(), 1);
+        let retained_id = *partition.consumer_offsets.borrow().keys().next().unwrap();
         assert!(retained_id == 1 || retained_id == 2);
         assert!(
             partition
@@ -31469,8 +31459,13 @@ mod tests {
                 .is_ok()
         );
         partition.apply_local_poll_offset(ConsumerKind::Consumer, 3, 0);
-        assert!(partition.consumer_offsets.pin().contains_key(&retained_id));
-        assert_eq!(partition.consumer_offsets.len(), 2);
+        assert!(
+            partition
+                .consumer_offsets
+                .borrow()
+                .contains_key(&retained_id)
+        );
+        assert_eq!(partition.consumer_offsets.borrow().len(), 2);
         assert!(!partition.consensus.is_primary());
     }
 
@@ -31514,7 +31509,7 @@ mod tests {
             .expect("capacity denial reply");
         assert_eq!(denied.status, IggyError::TooManyConsumerOffsets.as_code());
         assert_eq!(denied.op, 0);
-        assert!(partition.consumer_offsets.pin().get(&8).is_none());
+        assert!(partition.consumer_offsets.borrow().get(&8).is_none());
         assert_eq!(partition.consensus().pipeline_len(), 0);
     }
 
@@ -31546,7 +31541,7 @@ mod tests {
             partition.durable_consumer_offset_count(ConsumerKind::Consumer),
             1
         );
-        assert_eq!(partition.consumer_offsets.pin().len(), 1);
+        assert_eq!(partition.consumer_offsets.borrow().len(), 1);
     }
 
     #[compio::test]
@@ -31932,11 +31927,11 @@ mod tests {
     fn given_phantom_and_eager_offsets_when_snapshotting_should_export_committed_durable_value_only()
      {
         let (partition, _) = recording_partition();
-        partition.consumer_offsets.pin().insert(
+        partition.consumer_offsets.borrow_mut().insert(
             7,
             ConsumerOffset::new(ConsumerKind::Consumer, 7, 9, String::new()),
         );
-        partition.consumer_offsets.pin().insert(
+        partition.consumer_offsets.borrow_mut().insert(
             8,
             ConsumerOffset::new(ConsumerKind::Consumer, 8, 11, String::new()),
         );
@@ -32103,7 +32098,7 @@ mod tests {
         assert!(partition.pending_consumer_offset_commits.is_empty());
 
         // Existing offset: the gate passes and the delete enters the pipeline.
-        partition.consumer_offsets.pin().insert(
+        partition.consumer_offsets.borrow_mut().insert(
             consumer_id as usize,
             ConsumerOffset::new(ConsumerKind::Consumer, consumer_id, 3, String::new()),
         );
@@ -32469,7 +32464,7 @@ mod tests {
     #[compio::test]
     async fn given_dead_group_when_reclaimed_should_keep_capacity_until_replicated_delete() {
         let (mut partition, _) = recording_partition();
-        partition.consumer_group_offsets.pin().insert(
+        partition.consumer_group_offsets.borrow_mut().insert(
             ConsumerGroupId(7),
             ConsumerOffset::new(ConsumerKind::ConsumerGroup, 7, 11, String::new()),
         );
@@ -32506,7 +32501,7 @@ mod tests {
         // In the live map, so the reclaim walk actually meets the key and the
         // stranded filter is what keeps it out of the delete log.
         partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, 7, 11, 11);
-        partition.consumer_group_offsets.pin().insert(
+        partition.consumer_group_offsets.borrow_mut().insert(
             ConsumerGroupId(7),
             ConsumerOffset::new(ConsumerKind::ConsumerGroup, 7, 11, String::new()),
         );
@@ -32547,7 +32542,7 @@ mod tests {
                 .is_err(),
             "a stranded file is not a replicated key"
         );
-        partition.consumer_group_offsets.pin().insert(
+        partition.consumer_group_offsets.borrow_mut().insert(
             ConsumerGroupId(8),
             ConsumerOffset::new(ConsumerKind::ConsumerGroup, 8, 0, String::new()),
         );
@@ -32589,7 +32584,7 @@ mod tests {
         let (mut partition, _) = recording_partition();
         partition.consumer_offset_dirs[ConsumerKind::ConsumerGroup.index()] =
             Some(group_dir.to_string_lossy().into_owned());
-        partition.consumer_group_offsets.pin().insert(
+        partition.consumer_group_offsets.borrow_mut().insert(
             ConsumerGroupId(7),
             ConsumerOffset::new(ConsumerKind::ConsumerGroup, 7, 11, String::new()),
         );
@@ -32640,7 +32635,7 @@ mod tests {
             .await;
         commit_recorded_loopback(&mut partition).await;
 
-        assert!(partition.consumer_offsets.pin().contains_key(&7));
+        assert!(partition.consumer_offsets.borrow().contains_key(&7));
         assert!(
             partition
                 .durable_consumer_offsets
@@ -32904,7 +32899,7 @@ mod tests {
     #[test]
     fn given_follower_when_group_is_deleted_should_wait_for_ordered_reclamation() {
         let (partition, _) = recording_partition_at(1, 3);
-        partition.consumer_group_offsets.pin().insert(
+        partition.consumer_group_offsets.borrow_mut().insert(
             ConsumerGroupId(7),
             ConsumerOffset::new(ConsumerKind::ConsumerGroup, 7, 11, String::new()),
         );

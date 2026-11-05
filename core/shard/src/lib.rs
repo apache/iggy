@@ -9518,6 +9518,7 @@ where
                 }
             }
         }
+        partitions.shed_repair_rings();
         self.drive_replication(namespace_scratch).await;
         self.metrics.record_persistence(&persistence_metrics);
         self.partition_io.record_metrics(&self.metrics);
