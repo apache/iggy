@@ -815,15 +815,15 @@ async fn given_small_message_tail_when_offset_ops_reach_the_bound_should_flush_i
 #[compio::test]
 async fn given_new_external_group_offset_when_committed_should_request_reconciliation() {
     let (mut partition, _) = recording_partition();
-    let epoch = partition.consumer_group_offsets_reconcile_epoch.clone();
-    let initial = epoch.get();
+    let dirty = Rc::clone(&partition.consumer_group_offsets_dirty);
     partition.stage_consumer_offset_upsert(1, ConsumerKind::ExternalGroup, 7, 1, false);
     partition
         .apply_staged_consumer_offset_commit(1)
         .await
         .unwrap();
-    assert!(
-        epoch.get() > initial,
+    assert_eq!(
+        dirty.take(),
+        BTreeSet::from([partition.namespace()]),
         "a new external group key must be reconciled against deleted groups"
     );
 }
@@ -831,23 +831,22 @@ async fn given_new_external_group_offset_when_committed_should_request_reconcili
 #[compio::test]
 async fn given_group_offset_updates_when_key_already_exists_should_keep_reconciliation_idle() {
     let (mut partition, _) = recording_partition();
-    let epoch = partition.consumer_group_offsets_reconcile_epoch.clone();
-    let initial = epoch.get();
+    let dirty = Rc::clone(&partition.consumer_group_offsets_dirty);
+    let marked = BTreeSet::from([partition.namespace()]);
     partition.stage_consumer_offset_upsert(1, ConsumerKind::ConsumerGroup, 7, 1, true);
     partition
         .apply_staged_consumer_offset_commit(1)
         .await
         .unwrap();
-    assert!(epoch.get() > initial);
-    let after_create = epoch.get();
+    assert_eq!(dirty.take(), marked);
     assert_eq!(partition.dead_group_offset_keys(|_| true), []);
-    assert_eq!(epoch.get(), after_create);
+    assert!(dirty.borrow().is_empty());
     partition.stage_consumer_offset_upsert(2, ConsumerKind::ConsumerGroup, 7, 2, true);
     partition
         .apply_staged_consumer_offset_commit(2)
         .await
         .unwrap();
-    assert_eq!(epoch.get(), after_create);
+    assert!(dirty.borrow().is_empty());
     partition.consumer_group_offsets.pin().insert(
         ConsumerGroupId(8),
         ConsumerOffset::new(ConsumerKind::ConsumerGroup, 8, 3, String::new()),
@@ -857,8 +856,9 @@ async fn given_group_offset_updates_when_key_already_exists_should_keep_reconcil
         .apply_staged_consumer_offset_commit(3)
         .await
         .unwrap();
-    assert!(
-        epoch.get() > after_create,
+    assert_eq!(
+        dirty.take(),
+        marked,
         "first durable commit must discover an eager map key"
     );
 }

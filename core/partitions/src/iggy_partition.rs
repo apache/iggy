@@ -322,7 +322,7 @@ where
     /// the latch, so this flag makes that scan rebuild it.
     truncated_since_scan: Cell<bool>,
     offset_reservations_scan_state: Option<(u64, u64, u64, Option<u64>)>,
-    consumer_group_offsets_reconcile_epoch: Rc<Cell<u64>>,
+    consumer_group_offsets_dirty: Rc<RefCell<BTreeSet<IggyNamespace>>>,
     /// Shared by the partitions of a shard. Set when a fence publishes, so the
     /// pump wakes the reconciler that reports it to metadata.
     fence_published: Rc<Cell<bool>>,
@@ -989,7 +989,7 @@ where
             offset_reservations_need_resync: Cell::new(false),
             truncated_since_scan: Cell::new(false),
             offset_reservations_scan_state: None,
-            consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
+            consumer_group_offsets_dirty: Rc::default(),
             fence_published: Rc::default(),
             consumer_offset_dirs_dirty: std::array::from_fn(|_| Cell::new(false)),
             consumer_offset_dirs_touched: std::array::from_fn(|_| Cell::new(None)),
@@ -5151,8 +5151,11 @@ where
         dead
     }
 
-    pub(crate) fn set_consumer_group_offsets_reconcile_epoch(&mut self, epoch: Rc<Cell<u64>>) {
-        self.consumer_group_offsets_reconcile_epoch = epoch;
+    pub(crate) fn set_consumer_group_offsets_dirty(
+        &mut self,
+        dirty: Rc<RefCell<BTreeSet<IggyNamespace>>>,
+    ) {
+        self.consumer_group_offsets_dirty = dirty;
         self.mark_consumer_group_offsets_need_reconcile();
     }
 
@@ -5161,11 +5164,9 @@ where
     }
 
     fn mark_consumer_group_offsets_need_reconcile(&self) {
-        self.consumer_group_offsets_reconcile_epoch.set(
-            self.consumer_group_offsets_reconcile_epoch
-                .get()
-                .wrapping_add(1),
-        );
+        self.consumer_group_offsets_dirty
+            .borrow_mut()
+            .insert(self.namespace());
     }
 
     /// The stored offset of external group `group_id`, if any.

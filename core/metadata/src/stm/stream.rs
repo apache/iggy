@@ -89,9 +89,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-/// Removals [`RemovedPartitions`] keeps. A reader that falls further behind
-/// rebuilds from the tree, which a delete of this many partitions costs anyway.
-pub(crate) const REMOVED_PARTITIONS_RETAINED: usize = 4096;
+/// Changes [`RecentPartitionChanges`] keeps. A reader that falls further behind
+/// rebuilds from the tree, which a commit of this many changes costs anyway.
+pub const RECENT_PARTITION_CHANGES_RETAINED: usize = 65_536;
 
 /// Partition snapshot representation for serialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -984,11 +984,13 @@ define_state! {
     Streams {
         pub(crate) index: AHashMap<Arc<str>, usize>,
         pub items: IdSlab<Stream>,
-        // Monotonic counter bumped on every partition-shaping commit
-        // (create/delete topic, create/delete partitions, delete stream).
-        // Reconciler uses it for a fast-skip when nothing changed and stamps
-        // it onto each new Partition::created_revision. Deterministic across
-        // replicas: same ops, same order.
+        // Monotonic counter bumped by every commit that creates, removes or
+        // truncates partitions, by the final consumer group delete, and by a
+        // few ownership and lifecycle commits. Each new partition takes it as
+        // `Partition::created_revision`, which peers compare as the partition
+        // incarnation, so no bump may move or go away. Readers of
+        // `recent_partition_changes` use it as their cursor. Deterministic
+        // across replicas: same ops, same order.
         pub revision: u64,
         // Retirement proofs survive truncation, but not a changed set of
         // partition incarnations.
@@ -1010,9 +1012,9 @@ define_state! {
         // Locations are (stream, topic, group, member); never persisted.
         pub(crate) consumer_group_members: AHashMap<u128, Vec<(usize, usize, u64, usize)>>,
         pub(crate) placement_index: PlacementIndex,
-        // Partitions the newest commits removed, so placement retires what it
-        // observed of them without a walk. A restore starts it empty.
-        pub(crate) removed_partitions: RemovedPartitions,
+        // Partition changes of the newest commits, so placement and the
+        // reconcilers catch up without a walk. A restore starts it empty.
+        pub(crate) recent_partition_changes: RecentPartitionChanges,
         // Shared aggregate stats, one `Arc` per stream/topic across both
         // left-right buffers (see `StatsRegistry`). Not snapshotted -- rebuilt
         // as streams/topics restore.
@@ -1058,45 +1060,74 @@ impl RecentRetirementDebts {
     }
 }
 
-/// Partitions that recent commits removed, oldest first, each stamped with
-/// the `namespace_revision` its commit set. Only the newest entries stay, so a
-/// reader that last looked before [`Self::since`] can answer must start over.
+/// What one commit did to a partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionChangeKind {
+    Created,
+    Removed,
+    Truncated,
+    /// A consumer group of the partition's topic was deleted, so the group's
+    /// offsets on the partition are now dead.
+    ConsumerGroupDeleted,
+}
+
+/// One partition change, stamped with the `revision` its commit set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionChange {
+    pub revision: u64,
+    pub namespace: IggyNamespace,
+    pub created_revision: u64,
+    pub kind: PartitionChangeKind,
+}
+
+/// Partition changes of recent commits, oldest first. Only the newest
+/// entries stay, so a reader that last looked before [`Self::since`] can
+/// answer must start over.
+///
+/// The applies that bump `revision` push here. Creates, removals, truncates
+/// and the final consumer group delete push one entry per partition they
+/// touch. `begin_lifecycle`, `RemoveConsumerGroupMembers` and
+/// `CompleteConsumerGroupRevocation` push nothing: what they change is read by
+/// reconciler duties that run on every wake.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct RemovedPartitions {
-    entries: VecDeque<RemovedPartition>,
+pub(crate) struct RecentPartitionChanges {
+    entries: VecDeque<PartitionChange>,
     /// Newest stamp whose entries are gone, evicted or never recorded.
     forgotten_through: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RemovedPartition {
-    pub namespace_revision: u64,
-    pub namespace: IggyNamespace,
-    pub created_revision: u64,
-}
-
-impl RemovedPartitions {
-    /// Every partition removed after `namespace_revision`, or `None` when some
-    /// of those removals are no longer recorded.
-    pub(crate) fn since(
-        &self,
-        namespace_revision: u64,
-    ) -> Option<impl Iterator<Item = &RemovedPartition>> {
-        (self.forgotten_through <= namespace_revision).then(|| {
+impl RecentPartitionChanges {
+    /// Every change after `revision`, or `None` when some of them are no
+    /// longer recorded.
+    fn since(&self, revision: u64) -> Option<impl Iterator<Item = &PartitionChange>> {
+        (self.forgotten_through <= revision).then(|| {
             let first = self
                 .entries
-                .partition_point(|removed| removed.namespace_revision <= namespace_revision);
+                .partition_point(|change| change.revision <= revision);
             self.entries.range(first..)
         })
     }
 
-    fn push(&mut self, removed: RemovedPartition) {
-        if self.entries.len() == REMOVED_PARTITIONS_RETAINED
+    /// Records one change at `revision`, which must be the value its commit
+    /// bumped `StreamsInner::revision` to.
+    fn record(
+        &mut self,
+        revision: u64,
+        namespace: IggyNamespace,
+        created_revision: u64,
+        kind: PartitionChangeKind,
+    ) {
+        if self.entries.len() == RECENT_PARTITION_CHANGES_RETAINED
             && let Some(evicted) = self.entries.pop_front()
         {
-            self.forgotten_through = evicted.namespace_revision;
+            self.forgotten_through = evicted.revision;
         }
-        self.entries.push_back(removed);
+        self.entries.push_back(PartitionChange {
+            revision,
+            namespace,
+            created_revision,
+            kind,
+        });
     }
 }
 
@@ -1193,7 +1224,7 @@ impl StateHandler for TruncatePartitionRequest {
         // target commits as a rejection, so the outcome is recorded against
         // the client's request id (its retry dedups) while surfacing the
         // typed error an empty ack would swallow.
-        {
+        let (namespace, created_revision) = {
             let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
                 return ApplyReply::err(TruncatePartitionResult::StreamNotFound);
             };
@@ -1227,15 +1258,25 @@ impl StateHandler for TruncatePartitionRequest {
             if self.up_to_offset > partition.deleted_up_to_offset {
                 partition.deleted_up_to_offset = self.up_to_offset;
             }
-        }
-        // Bump on every applied truncate (partition resolved), even when the
-        // watermark did not advance. A client `DeleteSegments` re-resolving to
-        // an already-committed offset must still re-drive the reconciler so
-        // segments the consumer barrier has since released are removed -- legacy
-        // `delete_segments` re-evaluates the barrier on every call. The
-        // watermark itself stays monotonic (set above); only the
+            (
+                IggyNamespace::new(stream_id, topic_id, partition.id),
+                partition.created_revision,
+            )
+        };
+        // Bump and record on every applied truncate (partition resolved), even
+        // when the watermark did not advance. A client `DeleteSegments`
+        // re-resolving to an already-committed offset must still re-drive the
+        // reconciler so segments the consumer barrier has since released are
+        // removed -- legacy `delete_segments` re-evaluates the barrier on every
+        // call. The watermark itself stays monotonic (set above); only the
         // reconcile-trigger fires unconditionally.
         state.revision = state.revision.wrapping_add(1);
+        state.recent_partition_changes.record(
+            state.revision,
+            namespace,
+            created_revision,
+            PartitionChangeKind::Truncated,
+        );
         ApplyReply::ok(Bytes::new())
     }
 }
@@ -1332,16 +1373,55 @@ impl StreamsInner {
     }
 
     /// Takes partitions a commit removed out of the placement indexes, after
-    /// that commit set `namespace_revision`.
+    /// that commit bumped `revision`.
     fn retire_partitions(&mut self, stream_id: usize, topic_id: usize, partitions: &[Partition]) {
         for partition in partitions {
             self.placement_index.remove(partition);
-            self.removed_partitions.push(RemovedPartition {
-                namespace_revision: self.namespace_revision,
-                namespace: IggyNamespace::new(stream_id, topic_id, partition.id),
-                created_revision: partition.created_revision,
-            });
+            self.recent_partition_changes.record(
+                self.revision,
+                IggyNamespace::new(stream_id, topic_id, partition.id),
+                partition.created_revision,
+                PartitionChangeKind::Removed,
+            );
         }
+    }
+
+    /// Records `kind` for every partition of one topic, after its commit
+    /// bumped `revision`.
+    pub(crate) fn record_topic_partition_changes(
+        &mut self,
+        stream_id: usize,
+        topic_id: usize,
+        kind: PartitionChangeKind,
+    ) {
+        let Some(topic) = self
+            .items
+            .get(stream_id)
+            .and_then(|stream| stream.topics.get(topic_id))
+        else {
+            return;
+        };
+        for partition in &topic.partitions {
+            self.recent_partition_changes.record(
+                self.revision,
+                IggyNamespace::new(stream_id, topic_id, partition.id),
+                partition.created_revision,
+                kind,
+            );
+        }
+    }
+
+    /// Every partition change after `revision`. `None` when the feed no
+    /// longer holds all of them, or when `revision` is ahead of this state, so
+    /// the reader must rebuild what it derived from the tree.
+    pub fn partition_changes_since(
+        &self,
+        revision: u64,
+    ) -> Option<impl Iterator<Item = &PartitionChange>> {
+        if revision > self.revision {
+            return None;
+        }
+        self.recent_partition_changes.since(revision)
     }
 
     /// Resolve a wire stream identifier to its committed slab id, `None` when
@@ -2694,7 +2774,9 @@ impl Streams {
         self.with_committed_partition(namespace, |partition| partition.members)
     }
 
-    fn with_committed_partition<T>(
+    /// Reads the committed partition the `namespace` tuple denotes, resolved
+    /// like [`Self::created_revision_for_namespace`].
+    pub fn with_committed_partition<T>(
         &self,
         namespace: IggyNamespace,
         read: impl FnOnce(&Partition) -> T,
@@ -3346,6 +3428,12 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
                     retirement_debt_op: 0,
                 };
                 state.placement_index.insert(&partition);
+                state.recent_partition_changes.record(
+                    new_revision,
+                    IggyNamespace::new(stream_id, inserted, partition.id),
+                    new_revision,
+                    PartitionChangeKind::Created,
+                );
                 topic.partitions.push(partition);
             }
         }
@@ -3724,6 +3812,7 @@ impl StateHandler for DeleteTopicRequest {
 
 impl StateHandler for CreatePartitionsWithAssignmentsRequest {
     type State = StreamsInner;
+    #[allow(clippy::too_many_lines)]
     fn apply(&self, state: &mut StreamsInner, timestamp: IggyTimestamp) -> ApplyReply {
         let Some(stream_id) = state.resolve_stream_id(&self.request.stream_id) else {
             return ApplyReply::err(CreatePartitionsResult::StreamNotFound);
@@ -3820,6 +3909,12 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
                 retirement_debt_op: 0,
             };
             state.placement_index.insert(&partition);
+            state.recent_partition_changes.record(
+                new_revision,
+                IggyNamespace::new(stream_id, topic_id, partition.id),
+                new_revision,
+                PartitionChangeKind::Created,
+            );
             topic.partitions.push(partition);
         }
         // Added partitions are unassigned until the groups rebalance.
@@ -4224,9 +4319,9 @@ impl StreamsInner {
             pending_revocations: BTreeMap::new(),
             consumer_group_members: AHashMap::new(),
             placement_index,
-            removed_partitions: RemovedPartitions {
+            recent_partition_changes: RecentPartitionChanges {
                 entries: VecDeque::new(),
-                forgotten_through: snapshot.namespace_revision,
+                forgotten_through: snapshot.revision,
             },
             last_result: None,
             apply_context: ApplyContext::default(),
@@ -5900,6 +5995,139 @@ mod tests {
             inner.items[0].topics[0].partitions[0].deleted_up_to_offset,
             500
         );
+    }
+
+    fn changes_since(inner: &StreamsInner, revision: u64) -> Vec<PartitionChange> {
+        inner
+            .partition_changes_since(revision)
+            .expect("the feed holds every change after the cursor")
+            .copied()
+            .collect()
+    }
+
+    fn create_topic_with_partitions(inner: &mut StreamsInner, partitions_count: u32) {
+        let create_topic = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, partitions_count, "topic"),
+            derived_options: WireOptions::empty(),
+            partitions: (0..partitions_count)
+                .map(|partition_id| CreatedPartitionAssignment {
+                    initial_view: 0,
+                    partition_id,
+                    consensus_group_id: u64::from(partition_id) + 1,
+                    members: Vec::new(),
+                })
+                .collect(),
+        };
+        let apply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &create_topic,
+            inner,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(apply.code, 0);
+    }
+
+    /// Readers act on every partition a commit touched, so each applied
+    /// create, truncate and removal records one change per partition at the
+    /// revision its commit bumped to.
+    #[test]
+    fn given_partition_commits_when_reading_changes_should_list_each_partition_at_its_revision() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let start = inner.revision;
+        create_topic_with_partitions(&mut inner, 2);
+        let created = inner.revision;
+        let first = IggyNamespace::new(0, 0, 0);
+        let second = IggyNamespace::new(0, 0, 1);
+        let change = |revision, namespace, kind| PartitionChange {
+            revision,
+            namespace,
+            created_revision: created,
+            kind,
+        };
+        assert_eq!(
+            changes_since(&inner, start),
+            [
+                change(created, first, PartitionChangeKind::Created),
+                change(created, second, PartitionChangeKind::Created),
+            ]
+        );
+
+        let truncate = TruncatePartitionRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: 0,
+            up_to_offset: 10,
+            expected_history: Some(created),
+        };
+        // The second truncate leaves the watermark where it is and records too.
+        for _ in 0..2 {
+            let apply = StateHandler::apply(&truncate, &mut inner, IggyTimestamp::now());
+            assert_eq!(apply.code, 0);
+        }
+        let truncated = inner.revision;
+        assert_eq!(
+            changes_since(&inner, created),
+            [
+                change(truncated - 1, first, PartitionChangeKind::Truncated),
+                change(truncated, first, PartitionChangeKind::Truncated),
+            ]
+        );
+
+        let delete_topic = DeleteTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+        };
+        let apply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete_topic,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(apply.code, 0);
+        let removed = inner.revision;
+        assert_eq!(
+            changes_since(&inner, truncated),
+            [
+                change(removed, first, PartitionChangeKind::Removed),
+                change(removed, second, PartitionChangeKind::Removed),
+            ]
+        );
+    }
+
+    /// A reader the feed cannot serve must rebuild from the tree: after an
+    /// eviction, after a restore, and with a cursor from a newer state.
+    #[test]
+    fn given_cursor_the_feed_cannot_serve_when_reading_changes_should_return_none() {
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let mut changes = RecentPartitionChanges::default();
+        let mut revision = 0;
+        for _ in 0..=RECENT_PARTITION_CHANGES_RETAINED {
+            revision += 1;
+            changes.record(revision, namespace, 1, PartitionChangeKind::Truncated);
+        }
+        assert!(changes.since(0).is_none(), "the oldest change was evicted");
+        assert_eq!(
+            changes.since(1).map(Iterator::count),
+            Some(RECENT_PARTITION_CHANGES_RETAINED)
+        );
+
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        create_topic_with_partitions(&mut inner, 1);
+        let revision = inner.revision;
+        assert!(
+            inner.partition_changes_since(revision + 1).is_none(),
+            "a cursor from a newer state"
+        );
+        let restored =
+            Streams::from_snapshot(Streams::from(inner).to_snapshot()).expect("restore snapshot");
+        let (served, forgotten) = restored.read(|inner| {
+            (
+                inner.partition_changes_since(revision).map(Iterator::count),
+                inner.partition_changes_since(revision - 1).is_none(),
+            )
+        });
+        assert_eq!(served, Some(0));
+        assert!(forgotten, "a restore forgets the changes before it");
     }
 
     /// Deleting a partition has to roll its bytes out of the topic and stream
