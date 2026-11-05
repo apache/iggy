@@ -933,17 +933,17 @@ fn given_full_live_map_when_polling_existing_key_should_reclaim_only_for_new_key
     partition.offset_space.committed_seeded = true;
     partition.seed_recovered_consumer_offset(ConsumerKind::Consumer, 7, 0, 0);
     for id in 7..=8 {
-        partition.consumer_offsets.pin().insert(
+        partition.consumer_offsets.borrow_mut().insert(
             id as usize,
             ConsumerOffset::new(ConsumerKind::Consumer, id, 0, String::new()),
         );
     }
     let args = PollingArgs::new(iggy_common::PollingStrategy::first(), 1, true);
     let _ = partition.build_poll_plan(PollingConsumer::Consumer(7, 0), &args, false);
-    assert_eq!(partition.consumer_offsets.len(), 2);
+    assert_eq!(partition.consumer_offsets.borrow().len(), 2);
     let _ = partition.build_poll_plan(PollingConsumer::Consumer(9, 0), &args, false);
-    assert_eq!(partition.consumer_offsets.len(), 1);
-    assert!(partition.consumer_offsets.pin().contains_key(&7));
+    assert_eq!(partition.consumer_offsets.borrow().len(), 1);
+    assert!(partition.consumer_offsets.borrow().contains_key(&7));
 }
 
 #[compio::test]
@@ -1049,8 +1049,8 @@ fn given_full_backup_phantom_map_when_new_consumer_polls_should_reclaim_without_
     }
     let args = PollingArgs::new(iggy_common::PollingStrategy::first(), 1, true);
     let _ = partition.build_poll_plan(PollingConsumer::Consumer(3, 0), &args, false);
-    assert_eq!(partition.consumer_offsets.len(), 1);
-    let retained_id = *partition.consumer_offsets.pin().keys().next().unwrap();
+    assert_eq!(partition.consumer_offsets.borrow().len(), 1);
+    let retained_id = *partition.consumer_offsets.borrow().keys().next().unwrap();
     assert!(retained_id == 1 || retained_id == 2);
     assert!(
         partition
@@ -1058,8 +1058,13 @@ fn given_full_backup_phantom_map_when_new_consumer_polls_should_reclaim_without_
             .is_ok()
     );
     partition.apply_local_poll_offset(ConsumerKind::Consumer, 3, 0);
-    assert!(partition.consumer_offsets.pin().contains_key(&retained_id));
-    assert_eq!(partition.consumer_offsets.len(), 2);
+    assert!(
+        partition
+            .consumer_offsets
+            .borrow()
+            .contains_key(&retained_id)
+    );
+    assert_eq!(partition.consumer_offsets.borrow().len(), 2);
     assert!(!partition.consensus.is_primary());
 }
 
@@ -1103,7 +1108,7 @@ async fn given_full_offset_table_when_storing_new_id_should_reject_before_replic
         .expect("capacity denial reply");
     assert_eq!(denied.status, IggyError::TooManyConsumerOffsets.as_code());
     assert_eq!(denied.op, 0);
-    assert!(partition.consumer_offsets.pin().get(&8).is_none());
+    assert!(partition.consumer_offsets.borrow().get(&8).is_none());
     assert_eq!(partition.consensus().pipeline_len(), 0);
 }
 
@@ -1135,7 +1140,7 @@ async fn given_full_offset_table_when_updating_existing_id_should_succeed() {
         partition.durable_consumer_offset_count(ConsumerKind::Consumer),
         1
     );
-    assert_eq!(partition.consumer_offsets.pin().len(), 1);
+    assert_eq!(partition.consumer_offsets.borrow().len(), 1);
 }
 
 #[compio::test]

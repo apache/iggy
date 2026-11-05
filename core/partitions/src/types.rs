@@ -16,10 +16,20 @@
 // under the License.
 
 use iggy_binary_protocol::Operation;
-use iggy_common::{IggyByteSize, PollingKind, PollingStrategy, ServerKeyContext};
+use iggy_common::{
+    ConsumerGroupId, ConsumerOffset, IggyByteSize, PollingKind, PollingStrategy, ServerKeyContext,
+};
 use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// Offset cursors of one partition, keyed by consumer id. Only the owner shard
+/// reads them, and a `BTreeMap` keeps the iteration order the same in every run.
+pub type ConsumerOffsets = BTreeMap<usize, ConsumerOffset>;
+
+/// Offset cursors of one partition, keyed by consumer group.
+pub type ConsumerGroupOffsets = BTreeMap<ConsumerGroupId, ConsumerOffset>;
 
 /// A local commit that failed for an op the cluster had already committed.
 ///

@@ -980,8 +980,8 @@ async fn disk_poll_partition_with_replicas(
     partition.configure_consumer_offset_storage(
         [&consumer_path, &group_path, &external_path]
             .map(|path| path.to_string_lossy().into_owned()),
-        ConsumerOffsets::with_capacity(1),
-        ConsumerGroupOffsets::with_capacity(1),
+        ConsumerOffsets::new(),
+        ConsumerGroupOffsets::new(),
     );
     (directory, partition)
 }

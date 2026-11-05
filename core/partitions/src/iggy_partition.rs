@@ -38,7 +38,8 @@ use crate::state_transfer::{
     PartitionTransferSession, PartitionTransferUnavailable, PendingTransferRearm, TransferPlanSlot,
 };
 use crate::types::{
-    COMMIT_WALK_OPS_MAX, FatalCommit, RepairConclusion, RepairIngest, RepairSession,
+    COMMIT_WALK_OPS_MAX, ConsumerGroupOffsets, ConsumerOffsets, FatalCommit, RepairConclusion,
+    RepairIngest, RepairSession,
 };
 use crate::view_fence::{ViewFence, ViewWindowVerdict, view_window_verdict};
 use crate::{
@@ -77,9 +78,8 @@ use iggy_binary_protocol::{
 };
 use iggy_binary_protocol::{PrepareOkHeader, ReplyHeader, RoutedRequestHeader};
 use iggy_common::{
-    ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
-    EncryptorKind, IggyByteSize, IggyError, IggyExpiry, IggyTimestamp, PartitionStats, PollingKind,
-    TopicRuntimeOptions,
+    ConsumerGroupId, ConsumerKind, ConsumerOffset, EncryptorKind, IggyByteSize, IggyError,
+    IggyExpiry, IggyTimestamp, PartitionStats, PollingKind, TopicRuntimeOptions,
 };
 use journal::Journal as _;
 use journal::local_gate::LocalGate;
@@ -99,9 +99,8 @@ use server_common::{
     sharding::IggyNamespace,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, btree_map};
 use std::fmt;
-use std::hash::Hash;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -154,14 +153,14 @@ where
     pub offset: Arc<AtomicU64>,
     /// Highest offset assigned to prepares that may still only live in the in-memory journal.
     pub dirty_offset: AtomicU64,
-    pub consumer_offsets: Arc<ConsumerOffsets>,
-    pub consumer_group_offsets: Arc<ConsumerGroupOffsets>,
+    pub consumer_offsets: RefCell<ConsumerOffsets>,
+    pub consumer_group_offsets: RefCell<ConsumerGroupOffsets>,
     /// Highest offset this partition has served (polled) to each consumer group.
     /// The cooperative-rebalance reconciler completes a pending revocation once
     /// the source group has committed up to what it was polled
     /// (`committed >= last_polled`), i.e. nothing is in flight. Ephemeral (not
     /// persisted): recovery or a view change leaves prior progress unknown.
-    pub last_polled_offsets: Arc<ConsumerGroupOffsets>,
+    pub last_polled_offsets: RefCell<ConsumerGroupOffsets>,
     pub(crate) consumer_group_owners: BTreeMap<u64, InstalledConsumerGroupOwner>,
     // The flag proves that the owner installed in this view has served nothing.
     pub(crate) consumer_group_polls: BTreeMap<u64, Arc<AtomicBool>>,
@@ -919,9 +918,9 @@ where
             log: SegmentedLog::default(),
             offset: Arc::new(AtomicU64::new(0)),
             dirty_offset: AtomicU64::new(0),
-            consumer_offsets: Arc::new(ConsumerOffsets::with_capacity(1)),
-            consumer_group_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(1)),
-            last_polled_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(1)),
+            consumer_offsets: RefCell::default(),
+            consumer_group_offsets: RefCell::default(),
+            last_polled_offsets: RefCell::default(),
             consumer_group_owners: BTreeMap::new(),
             consumer_group_polls: BTreeMap::new(),
             owner_retirement: None,
@@ -1259,7 +1258,7 @@ where
             return false;
         };
         self.last_polled_offsets
-            .pin()
+            .borrow()
             .get(&ConsumerGroupId(id as usize))
             .is_some_and(|polled| {
                 self.durable_consumer_offsets
@@ -1362,7 +1361,7 @@ where
         self.consumer_group_polls
             .insert(installation.group_id, Arc::new(AtomicBool::new(true)));
         self.last_polled_offsets
-            .pin()
+            .borrow_mut()
             .remove(&ConsumerGroupId(group_id as usize));
         self.mark_consumer_group_offsets_dirty();
         self.fence_published.set(true);
@@ -1479,7 +1478,7 @@ where
             // Last-polled keys come from u32 group ids only.
             if let Ok(id) = u32::try_from(group_id) {
                 self.last_polled_offsets
-                    .pin()
+                    .borrow_mut()
                     .remove(&ConsumerGroupId(id as usize));
             }
         }
@@ -3192,7 +3191,7 @@ where
         self.required_metadata_frontier = required_metadata_frontier;
         self.retirement_paid_through = retirement_paid_through;
         for (consumer_id, offset) in consumer_offsets {
-            self.consumer_offsets.pin().insert(
+            self.consumer_offsets.borrow_mut().insert(
                 consumer_id as usize,
                 ConsumerOffset::new(ConsumerKind::Consumer, consumer_id, offset, String::new()),
             );
@@ -3204,7 +3203,7 @@ where
             );
         }
         for (group_id, offset) in consumer_group_offsets {
-            self.consumer_group_offsets.pin().insert(
+            self.consumer_group_offsets.borrow_mut().insert(
                 ConsumerGroupId(group_id as usize),
                 ConsumerOffset::new(ConsumerKind::ConsumerGroup, group_id, offset, String::new()),
             );
@@ -3919,8 +3918,8 @@ where
         consumer_group_offsets: ConsumerGroupOffsets,
     ) {
         self.invalidate_poll_history();
-        self.consumer_offsets = Arc::new(consumer_offsets);
-        self.consumer_group_offsets = Arc::new(consumer_group_offsets);
+        *self.consumer_offsets.get_mut() = consumer_offsets;
+        *self.consumer_group_offsets.get_mut() = consumer_group_offsets;
         self.consumer_offset_dirs = dirs.map(Some);
     }
 
@@ -3988,8 +3987,8 @@ where
     #[must_use]
     pub fn consumer_offset_map_count(&self, kind: ConsumerKind) -> usize {
         match kind {
-            ConsumerKind::Consumer => self.consumer_offsets.len(),
-            ConsumerKind::ConsumerGroup => self.consumer_group_offsets.len(),
+            ConsumerKind::Consumer => self.consumer_offsets.borrow().len(),
+            ConsumerKind::ConsumerGroup => self.consumer_group_offsets.borrow().len(),
             ConsumerKind::ExternalGroup => self.durable_consumer_offsets.count(kind),
         }
     }
@@ -5063,11 +5062,11 @@ where
             // the key present. Deletion is idempotent on every replica, while
             // admission still rejects a request for an already absent key.
             (ConsumerKind::Consumer, PendingConsumerOffsetMutation::Delete) => {
-                self.consumer_offsets.pin().remove(&key);
+                self.consumer_offsets.borrow_mut().remove(&key);
             }
             (ConsumerKind::ConsumerGroup, PendingConsumerOffsetMutation::Delete) => {
                 self.consumer_group_offsets
-                    .pin()
+                    .borrow_mut()
                     .remove(&ConsumerGroupId(key));
             }
             // `persist_consumer_offset_commit` already updated the durable
@@ -5106,7 +5105,7 @@ where
     #[allow(clippy::cast_possible_truncation)]
     pub fn consumer_group_offset_ids(&self) -> Vec<u64> {
         self.consumer_group_offsets
-            .pin()
+            .borrow()
             .keys()
             .map(|key| key.0 as u64)
             .collect()
@@ -5185,8 +5184,8 @@ where
     pub fn group_offset_state(&self, group_id: u64) -> (Option<u64>, Option<u64>) {
         let key = ConsumerGroupId(group_id as usize);
         let load = |offset: &ConsumerOffset| offset.offset.load(Ordering::Relaxed);
-        let last_polled = self.last_polled_offsets.pin().get(&key).map(load);
-        let committed = self.consumer_group_offsets.pin().get(&key).map(load);
+        let last_polled = self.last_polled_offsets.borrow().get(&key).map(load);
+        let committed = self.consumer_group_offsets.borrow().get(&key).map(load);
         (last_polled, committed)
     }
 
@@ -5487,10 +5486,10 @@ where
     fn offset_key_exists(&self, kind: ConsumerKind, consumer_id: u32) -> bool {
         let key = || usize::try_from(consumer_id).expect("u32 consumer id must fit usize");
         match kind {
-            ConsumerKind::Consumer => self.consumer_offsets.pin().contains_key(&key()),
+            ConsumerKind::Consumer => self.consumer_offsets.borrow().contains_key(&key()),
             ConsumerKind::ConsumerGroup => self
                 .consumer_group_offsets
-                .pin()
+                .borrow()
                 .contains_key(&ConsumerGroupId(key())),
             ConsumerKind::ExternalGroup => {
                 self.durable_consumer_offsets.contains(kind, consumer_id)
@@ -5653,7 +5652,7 @@ where
         }
 
         if current_view != self.observed_view {
-            self.last_polled_offsets.pin().clear();
+            self.last_polled_offsets.borrow_mut().clear();
             self.consumer_group_polls.clear();
             self.pending_owner_install.set(None);
             self.pending_history_transition.set(None);
@@ -5792,39 +5791,37 @@ where
         }
     }
 
-    fn reclaim_phantom_offset_keys<K: Hash + Eq>(
+    fn reclaim_phantom_offset_keys<K: Ord>(
         &self,
-        offsets: &papaya::HashMap<K, ConsumerOffset>,
+        offsets: &RefCell<BTreeMap<K, ConsumerOffset>>,
         kind: ConsumerKind,
         mut remaining: usize,
         consumer_id: impl Fn(&K) -> Option<u32>,
     ) {
         let capacity = self.consumer_offset_capacity_for(kind);
-        let map = offsets.pin();
-        for (key, _) in &map {
-            if let Some(id) = consumer_id(key)
-                && !capacity.holds(id, &self.durable_consumer_offsets)
-                && map.remove(key).is_some()
-            {
-                capacity.forget_inactive_provisional(id);
-                // This cursor was never durable, so the consumer's next `Next`
-                // poll restarts from offset 0 and redelivers. At-least-once
-                // permits it; an operator should still see it happen.
-                warn!(
-                    target: "iggy.partitions.diag",
-                    plane = "partitions",
-                    namespace_raw = self.namespace().inner(),
-                    ?kind,
-                    consumer_id = id,
-                    "reclaimed a local consumer offset cursor with no durable backing; its next \
-                     poll restarts from offset 0"
-                );
-                remaining -= 1;
-                if remaining == 0 {
-                    break;
-                }
+        offsets.borrow_mut().retain(|key, _| {
+            let Some(id) = consumer_id(key) else {
+                return true;
+            };
+            if remaining == 0 || capacity.holds(id, &self.durable_consumer_offsets) {
+                return true;
             }
-        }
+            capacity.forget_inactive_provisional(id);
+            // This cursor was never durable, so the consumer's next `Next`
+            // poll restarts from offset 0 and redelivers. At-least-once
+            // permits it; an operator should still see it happen.
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = self.namespace().inner(),
+                ?kind,
+                consumer_id = id,
+                "reclaimed a local consumer offset cursor with no durable backing; its next \
+                 poll restarts from offset 0"
+            );
+            remaining -= 1;
+            false
+        });
     }
 
     /// Snapshot read resources synchronously on the partition owner.
@@ -6025,12 +6022,12 @@ where
         match consumer {
             PollingConsumer::Consumer(id, _) => self
                 .consumer_offsets
-                .pin()
+                .borrow()
                 .get(&id)
                 .map(|co| co.offset.load(Ordering::Relaxed)),
             PollingConsumer::ConsumerGroup(group_id, _) => self
                 .consumer_group_offsets
-                .pin()
+                .borrow()
                 .get(&ConsumerGroupId(group_id))
                 .map(|co| co.offset.load(Ordering::Relaxed)),
         }
@@ -12541,16 +12538,16 @@ where
     /// the holder's identity. `None` when nothing has been committed, in which
     /// case there is no deletion barrier. External groups never hold retention.
     fn min_committed_offset(&self) -> Option<(u64, ConsumerKind, u32)> {
-        let consumer_guard = self.consumer_offsets.pin();
-        let group_guard = self.consumer_group_offsets.pin();
-        let consumers = consumer_guard.iter().map(|(_, offset)| {
+        let consumer_guard = self.consumer_offsets.borrow();
+        let group_guard = self.consumer_group_offsets.borrow();
+        let consumers = consumer_guard.values().map(|offset| {
             (
                 offset.offset.load(Ordering::Relaxed),
                 offset.kind,
                 offset.consumer_id,
             )
         });
-        let groups = group_guard.iter().map(|(_, offset)| {
+        let groups = group_guard.values().map(|offset| {
             (
                 offset.offset.load(Ordering::Relaxed),
                 offset.kind,
@@ -13894,15 +13891,13 @@ pub fn next_consumer_kind(kind: ConsumerKind) -> Option<ConsumerKind> {
 
 /// Automatic commits remain monotone because an earlier poll can commit after
 /// a later one. Explicit stores may intentionally rewind the cursor.
-fn upsert_committed_offset<K>(
-    map: &papaya::HashMap<K, ConsumerOffset>,
+fn upsert_committed_offset<K: Ord>(
+    map: &RefCell<BTreeMap<K, ConsumerOffset>>,
     key: K,
     offset: u64,
     auto_commit: bool,
     create_on_miss: impl FnOnce() -> ConsumerOffset,
-) where
-    K: Hash + Eq + Clone + Send + Sync,
-{
+) {
     if auto_commit {
         upsert_offset_max(map, key, offset, create_on_miss);
     } else {
@@ -13910,22 +13905,17 @@ fn upsert_committed_offset<K>(
     }
 }
 
-fn upsert_offset<K>(
-    map: &papaya::HashMap<K, ConsumerOffset>,
+fn upsert_offset<K: Ord>(
+    map: &RefCell<BTreeMap<K, ConsumerOffset>>,
     key: K,
     offset: u64,
     create_on_miss: impl FnOnce() -> ConsumerOffset,
-) where
-    K: Hash + Eq + Clone + Send + Sync,
-{
-    let guard = map.pin();
-    if let Some(existing) = guard.get(&key) {
-        existing.offset.store(offset, Ordering::Relaxed);
-    } else {
-        let created = create_on_miss();
-        created.offset.store(offset, Ordering::Relaxed);
-        guard.insert(key, created);
-    }
+) {
+    map.borrow_mut()
+        .entry(key)
+        .or_insert_with(create_on_miss)
+        .offset
+        .store(offset, Ordering::Relaxed);
 }
 
 /// Kinds keyed by consumer group, whose offsets go when the group is deleted.
@@ -13936,21 +13926,21 @@ const fn keyed_by_group(kind: ConsumerKind) -> bool {
     }
 }
 
-fn upsert_offset_max<K>(
-    map: &papaya::HashMap<K, ConsumerOffset>,
+fn upsert_offset_max<K: Ord>(
+    map: &RefCell<BTreeMap<K, ConsumerOffset>>,
     key: K,
     offset: u64,
     create_on_miss: impl FnOnce() -> ConsumerOffset,
-) where
-    K: Hash + Eq + Clone + Send + Sync,
-{
-    let guard = map.pin();
-    if let Some(existing) = guard.get(&key) {
-        existing.offset.fetch_max(offset, Ordering::Relaxed);
-    } else {
-        let created = create_on_miss();
-        created.offset.store(offset, Ordering::Relaxed);
-        guard.insert(key, created);
+) {
+    let mut map = map.borrow_mut();
+    match map.entry(key) {
+        btree_map::Entry::Occupied(existing) => {
+            existing.get().offset.fetch_max(offset, Ordering::Relaxed);
+        }
+        btree_map::Entry::Vacant(slot) => {
+            let created = slot.insert(create_on_miss());
+            created.offset.store(offset, Ordering::Relaxed);
+        }
     }
 }
 

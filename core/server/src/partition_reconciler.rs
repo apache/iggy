@@ -5972,7 +5972,7 @@ mod tests {
                     0,
                     0,
                 );
-                partition.consumer_group_offsets.pin().insert(
+                partition.consumer_group_offsets.borrow_mut().insert(
                     iggy_common::ConsumerGroupId(0),
                     iggy_common::ConsumerOffset::new(
                         iggy_common::ConsumerKind::ConsumerGroup,
@@ -6235,7 +6235,7 @@ mod tests {
                     0,
                     0,
                 );
-                partition.consumer_group_offsets.pin().insert(
+                partition.consumer_group_offsets.borrow_mut().insert(
                     iggy_common::ConsumerGroupId(0),
                     iggy_common::ConsumerOffset::new(
                         iggy_common::ConsumerKind::ConsumerGroup,
@@ -6861,7 +6861,7 @@ mod tests {
             .plane
             .partitions()
             .with_partition(&IggyNamespace::new(0, 0, 0), |partition| {
-                partition.consumer_group_offsets.pin().insert(
+                partition.consumer_group_offsets.borrow_mut().insert(
                     iggy_common::ConsumerGroupId(0),
                     iggy_common::ConsumerOffset::new(
                         iggy_common::ConsumerKind::ConsumerGroup,
@@ -6909,11 +6909,11 @@ mod tests {
             let partition = partitions.get_by_ns(&ns).expect("partition materialised");
             partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, dead_key, 7, 7);
             partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, live_key, 9, 9);
-            partition.consumer_group_offsets.pin().insert(
+            partition.consumer_group_offsets.borrow_mut().insert(
                 ConsumerGroupId(dead_key as usize),
                 ConsumerOffset::new(ConsumerKind::ConsumerGroup, dead_key, 7, String::new()),
             );
-            partition.consumer_group_offsets.pin().insert(
+            partition.consumer_group_offsets.borrow_mut().insert(
                 ConsumerGroupId(live_key as usize),
                 ConsumerOffset::new(ConsumerKind::ConsumerGroup, live_key, 9, String::new()),
             );

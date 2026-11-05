@@ -396,7 +396,7 @@ async fn given_a_deleted_group_when_reconciling_should_list_its_external_offset(
     let (partition, _) = recording_partition();
     partition.seed_recovered_consumer_offset(ConsumerKind::ExternalGroup, 7, 11, 11);
     partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, 9, 11, 11);
-    partition.consumer_group_offsets.pin().insert(
+    partition.consumer_group_offsets.borrow_mut().insert(
         ConsumerGroupId(9),
         ConsumerOffset::new(ConsumerKind::ConsumerGroup, 9, 11, String::new()),
     );
@@ -469,7 +469,7 @@ async fn given_offsets_past_the_partition_end_when_recovered_should_clamp_only_i
     assert_eq!(partition.external_group_offset(9), Some(1_000));
     let group = partition
         .consumer_group_offsets
-        .pin()
+        .borrow()
         .get(&ConsumerGroupId(8))
         .map(|offset| offset.offset.load(Ordering::Relaxed));
     assert_eq!(group, Some(10));
