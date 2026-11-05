@@ -1209,9 +1209,9 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// writer carries the freshest view and the durable view cannot regress.
     ///
     /// Held across the write `.await`, so it uses the same single-threaded,
-    /// cancel-safe [`LocalGate`] as `journal_gate`, which has no atomics: this
-    /// shard is never `Sync`, so a `tokio::sync::Mutex` would only add an
-    /// atomic RMW per gated send for exclusion that `Cell` state already provides.
+    /// cancel-safe [`LocalGate`] as `journal_gate`, a `Cell` flag with no atomics:
+    /// this shard is never `Sync`, so a `tokio::sync::Mutex` would only add an
+    /// atomic RMW per gated send for exclusion the `Cell` already provides.
     superblock_lock: LocalGate,
     /// Serializes whole checkpoints against each other: `persist_snapshot` renames
     /// over the single `snapshot.bin` and `drain` rewrites the WAL through a shared
@@ -1240,9 +1240,8 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// Snapshot coordinator - present when persistent checkpointing is configured.
     pub coordinator: Option<SnapshotCoordinator<M>>,
     /// Serializes `on_replicate`'s journal-mutation section (forced
-    /// checkpoint + WAL append) across concurrent drivers (the pump loop
-    /// and the detached per-client submit tasks). Waiters take it in arrival
-    /// order, so a primary appends in op order. Ungated they race
+    /// checkpoint + WAL append) across concurrent drivers (the pump loop,
+    /// detached per-client submit tasks, repair). Ungated they race
     /// `SnapshotCoordinator::checkpoint`: every driver crossing the
     /// `remaining_capacity <= CHECKPOINT_MARGIN` boundary runs a full
     /// checkpoint, and the concurrent `journal.drain()` calls collide on the
@@ -2019,10 +2018,6 @@ where
         // No such file or directory`) — the single-node "metadata prepare
         // queue is full" wedge. Held through the append so a drain can never
         // rewrite the WAL out from under a racing append either.
-        //
-        // On the primary, every submit claims its op and reaches this acquire
-        // with no await in between. The gate goes to its waiters in arrival
-        // order, so the appends below follow the op order.
         let journal_gate = self.journal_gate.acquire().await;
 
         // Best-effort WAL reclamation. A failed checkpoint must NOT drop the
@@ -2101,7 +2096,7 @@ where
         // Journal append first; sequencer + checksum after successful append
         // so a failed write doesn't leave state pointing at a phantom entry.
         //
-        // Durability BEFORE replicate / PrepareOk: sending an
+        // Durability BEFORE chain-replicate / PrepareOk: forwarding an
         // un-persisted prepare advertises an op the WAL doesn't hold,
         // violates VSR tail-ahead-of-head, recoverable only via hash-chain
         // fence + view change (burns a view).
@@ -2149,11 +2144,9 @@ where
         consensus.extend_history_certificate(header.op, header.checksum);
 
         // Journal mutation done; wire traffic below must not hold the gate.
-        // The sends still leave in op order: the next submit runs only after
-        // this task yields, and `replicate` queues every copy without yielding.
         drop(journal_gate);
 
-        // Durable; replicate. `replicate` borrows + freezes; we keep
+        // Durable; chain-replicate. `replicate` borrows + freezes; we keep
         // message for the sequencer/checksum bookkeeping below.
         self.replicate(&message).await;
 
@@ -5175,14 +5168,16 @@ where
         Ok(prepare)
     }
 
-    /// Replicate a prepare message to the backups.
+    /// Replicate a prepare message to the next replica in the chain.
     ///
-    /// Only the acting primary sends: it enqueues one copy for every backup
-    /// (`replicate_prepare`). Backups never forward a prepare.
+    /// Chain replication pattern:
+    /// - Primary sends to first backup
+    /// - Each backup forwards to the next
+    /// - Stops when we would forward back to primary
     ///
     /// Caller must have already appended `message` to the local journal
-    /// before invoking this helper (VSR tail-ahead-of-head). Sending
-    /// an un-persisted prepare would leave backup WALs with an op
+    /// before invoking this helper (VSR tail-ahead-of-head). Forwarding
+    /// an un-persisted prepare would leave downstream WALs with an op
     /// this replica's journal does not hold.
     #[allow(clippy::future_not_send)]
     async fn replicate(&self, message: &Message<PrepareHeader>) {
@@ -5196,7 +5191,7 @@ where
         assert_eq!(header.command, Command::Prepare);
         assert!(
             journal.handle().header(op).is_some(),
-            "replicate: prepare must be durable in local journal before the send"
+            "replicate: prepare must be durable in local journal before chain-forward"
         );
         if let Err(e) = replicate_prepare(consensus, message).await {
             tracing::warn!(op = header.op, error = ?e, "prepare replication enqueue failed");
@@ -9668,22 +9663,6 @@ mod tests {
             .collect()
     }
 
-    /// The ops of the prepares sent to `replica`, in send order.
-    fn sent_prepare_ops(bus: &ReplicaSendSpyBus, replica: u8) -> Vec<u64> {
-        bus.replica_sends
-            .borrow()
-            .iter()
-            .filter(|(target, _)| *target == replica)
-            .filter_map(|(_, frame)| {
-                let header = frame.as_slice().get(..size_of::<PrepareHeader>())?;
-                bytemuck::checked::try_from_bytes::<PrepareHeader>(header)
-                    .ok()
-                    .filter(|header| header.command == Command::Prepare)
-                    .map(|header| header.op)
-            })
-            .collect()
-    }
-
     /// A backup re-acks the retransmit of an op it already applied.
     ///
     /// A `DoViewChange` caps its commit at the sender's head, so a backup that
@@ -10284,90 +10263,6 @@ mod tests {
             is_caught_up_primary(consensus),
             "caught-up gate must reopen after the boundary"
         );
-    }
-
-    /// Lets the spawned tasks run once.
-    async fn yield_now() {
-        let mut yielded = false;
-        std::future::poll_fn(|context| {
-            if yielded {
-                return std::task::Poll::Ready(());
-            }
-            yielded = true;
-            context.waker().wake_by_ref();
-            std::task::Poll::Pending
-        })
-        .await;
-    }
-
-    /// Each submit claims its op and then waits on `journal_gate`. A submit that
-    /// arrives after a release must not take the gate ahead of the submits that
-    /// wait for it: a backup takes only the next op, so it drops a prepare that
-    /// comes early, and the op waits for a retransmit. The test holds the gate,
-    /// as a slow WAL append does. The submits run in spawned tasks, as in the
-    /// server, because a `join!` driver polls its futures in arrival order and
-    /// hides the overtake.
-    #[compio::test]
-    async fn given_a_submit_waiting_on_the_journal_gate_when_another_submit_arrives_should_send_in_op_order()
-     {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = PrepareJournal::open(&dir.path().join("journal.wal"), 0)
-            .await
-            .unwrap();
-        let consensus = VsrConsensus::new(
-            1,
-            0,
-            3,
-            server_common::sharding::METADATA_GROUP,
-            ReplicaSendSpyBus::default(),
-            LocalPipeline::new(),
-        );
-        consensus.init();
-        let metadata: Rc<IggyMetadata<_, _, (), TestMux>> = Rc::new(IggyMetadata::new(
-            Some(consensus),
-            Some(journal),
-            None,
-            None,
-            TestMux::default(),
-            None,
-        ));
-        for client in 1..=2 {
-            metadata
-                .client_table
-                .borrow_mut()
-                .commit_register(client, 0, [0x5a; 32], register_reply(client, 1))
-                .unwrap();
-        }
-        let submit = |client: u128| {
-            let metadata = Rc::clone(&metadata);
-            compio::runtime::spawn(async move {
-                metadata
-                    .on_request(create_stream_request(client, 1, &format!("s{client}")))
-                    .await;
-            })
-        };
-        let consensus = metadata.consensus.as_ref().unwrap();
-
-        let held = metadata.journal_gate.try_acquire().unwrap();
-        let waiting = submit(1);
-        yield_now().await;
-        assert_eq!(
-            consensus.pipeline_len(),
-            1,
-            "the first submit claims op 1 and waits on the gate"
-        );
-        let late = submit(2);
-        drop(held);
-        waiting.await.unwrap();
-        late.await.unwrap();
-
-        for backup in 1..=2 {
-            assert_eq!(
-                sent_prepare_ops(consensus.message_bus(), backup),
-                [1, 2],
-                "backup {backup} takes only the next op"
-            );
-        }
     }
 
     #[compio::test]

@@ -22,19 +22,20 @@
 //! `broker`-feature-only: request `Decodable` and response `Encodable`, not the reverse).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use iggy::prelude::{DEFAULT_POLL_MAX_BYTES, Identifier, IggyMessage, MessageClient, Partitioning};
 use serial_test::serial;
-use tokio::time::Instant;
+use tokio::io::copy_bidirectional;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
-    ERROR_NONE, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_REQUEST_TIMED_OUT,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
+    ERROR_NONE, ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::list_offsets;
 
@@ -42,12 +43,9 @@ use iggy_gateway_kafka::protocol::handlers::list_offsets;
 mod codec;
 #[path = "common/iggy_server.rs"]
 mod iggy_server;
-#[path = "common/poll_relay.rs"]
-mod poll_relay;
 
 use codec::{Decoder, Encoder};
 use iggy_server::TestServer;
-use poll_relay::PollRelay;
 
 const REQUEST_VERSION: i16 = 6;
 const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
@@ -56,12 +54,6 @@ const EARLIEST_TIMESTAMP: i64 = -2;
 const MAX_TIMESTAMP: i64 = -3;
 /// The first version that may ask for [`MAX_TIMESTAMP`]. Its request and response share v6's shape.
 const MAX_TIMESTAMP_VERSION: i16 = 7;
-/// The handler's time for one Iggy poll, and for a request to start its lookups.
-const POLL_DEADLINE: Duration = Duration::from_secs(2);
-/// Room for a request that makes no Iggy call that waits.
-const AT_ONCE: Duration = Duration::from_millis(500);
-/// How much sooner than the gateway the SDK stops a poll, with room for the timer.
-const SDK_STOP_ROOM: Duration = Duration::from_millis(100);
 
 /// Builds a v6 flexible `ListOffsets` request body for one topic/partition.
 fn build_request(topic: &str, partition_index: i32, timestamp: i64) -> Bytes {
@@ -450,16 +442,64 @@ async fn a_record_past_the_default_poll_cap_resolves_by_time_and_as_the_last_rec
     assert_eq!((error_code, offset), (ERROR_NONE, 0), "as the last record");
 }
 
-/// The lookups of a request run at once, each for one poll time, so two partitions whose polls go
-/// unanswered take one poll time between them, and the third answers. Each then stalls and
-/// answers 6 at once, with no lookup. One by one, each would take a poll time of its own.
+/// A TCP relay to `server` that leaves the next connections [`Self::stall_next`] counts
+/// unanswered, so a client on one waits in its handshake until it gives up.
+struct StallingRelay {
+    address: String,
+    stall: Arc<AtomicUsize>,
+}
+
+impl StallingRelay {
+    async fn start(server: &TestServer) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the relay");
+        let address = listener.local_addr().expect("relay address").to_string();
+        let upstream = server.test_config().address;
+        let stall = Arc::new(AtomicUsize::new(0));
+        let stall_count = Arc::clone(&stall);
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                if stall_count
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    tokio::spawn(async move {
+                        std::future::pending::<()>().await;
+                        drop(inbound);
+                    });
+                    continue;
+                }
+                let upstream = upstream.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) = TcpStream::connect(&upstream).await {
+                        let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+        Self { address, stall }
+    }
+
+    fn stall_next(&self, connections: usize) {
+        self.stall.store(connections, Ordering::SeqCst);
+    }
+}
+
+/// The first two lookups' read clients connect through a relay that never answers. Each lookup's
+/// own budget ends it, and the lookup after them still answers. With only the request deadline
+/// bounding them, the second stall would run the request out and the last lookup would answer 7.
 #[tokio::test]
 #[serial]
 async fn a_stalled_lookup_leaves_the_later_partitions_of_the_request_their_answers() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
-    let relay = PollRelay::start(&server, &[0, 1]).await;
-    let bridge = IggyBridge::connect(relay.config(&server))
+    let relay = StallingRelay::start(&server).await;
+    let mut config = server.test_config();
+    config.address.clone_from(&relay.address);
+    let bridge = IggyBridge::connect(config)
         .await
         .expect("bridge should connect through the relay");
     let state = GatewayState::new(
@@ -477,22 +517,20 @@ async fn a_stalled_lookup_leaves_the_later_partitions_of_the_request_their_answe
     for partition in 0..3 {
         produce_batch_to(&server, partition, &["a", "b"]).await;
     }
-    relay.stall(true);
+    // Connects the probe client now, so the stalled connection is the first read slot's.
+    let (error_code, _) = send(&state, "orders", 0, LATEST_TIMESTAMP).await;
+    assert_eq!(error_code, ERROR_NONE);
+
+    relay.stall_next(2);
     let topics = [TopicRequest {
         name: "orders",
         partitions: &[(0, 0), (1, 0), (2, 0)],
     }];
-    let lookup = async || {
-        let started = Instant::now();
-        let answers: Vec<(i32, i16, i64)> = send_multi(&state, &topics)
-            .await
-            .iter()
-            .map(|(_, partition, error_code, offset)| (*partition, *error_code, *offset))
-            .collect();
-        (answers, started.elapsed())
-    };
-
-    let (answers, took) = lookup().await;
+    let answers: Vec<(i32, i16, i64)> = send_multi(&state, &topics)
+        .await
+        .iter()
+        .map(|(_, partition, error_code, offset)| (*partition, *error_code, *offset))
+        .collect();
     assert_eq!(
         answers,
         vec![
@@ -500,24 +538,6 @@ async fn a_stalled_lookup_leaves_the_later_partitions_of_the_request_their_answe
             (1, ERROR_REQUEST_TIMED_OUT, -1),
             (2, ERROR_NONE, 0),
         ]
-    );
-    assert!(
-        took >= POLL_DEADLINE.saturating_sub(SDK_STOP_ROOM) && took < POLL_DEADLINE + AT_ONCE,
-        "the unanswered polls end together: {took:?}"
-    );
-
-    let (answers, took) = lookup().await;
-    assert_eq!(
-        answers,
-        vec![
-            (0, ERROR_NOT_LEADER_OR_FOLLOWER, -1),
-            (1, ERROR_NOT_LEADER_OR_FOLLOWER, -1),
-            (2, ERROR_NONE, 0),
-        ]
-    );
-    assert!(
-        took < AT_ONCE,
-        "a stalled partition needs no lookup: {took:?}"
     );
 }
 

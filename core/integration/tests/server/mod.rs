@@ -81,7 +81,6 @@ mod concurrent_addition;
 // The node-wide cap on client sockets closes a socket past it at accept.
 mod connections_limit_vsr;
 mod consumer_offset_quota_vsr;
-mod consumer_offset_recovery;
 // A write that runs out of file descriptors flushes, then exits with status 4.
 mod descriptor_exhaustion_vsr;
 mod general;

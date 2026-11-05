@@ -478,11 +478,9 @@ below it are still open for the issues that build on top of it.
     (`ListOffsets` carries no `timeout_ms` field in any version this gateway supports, so this is a
     fixed ceiling, not a client-honored one), applied per topic rather than once around the whole
     batch: a topic already resolved when the deadline arrives keeps its real answer, and the
-    not-yet-started topics answer `REQUEST_TIMED_OUT`. The record lookups by time run up to 8 at
-    once, each with the time of a Fetch poll. They start only in the first 2 s, and the request
-    waits no longer for them. One with no answer by then answers `REQUEST_TIMED_OUT`, so stalled
-    partitions leave time for the rest. A partition that stalls answers `NOT_LEADER_OR_FOLLOWER`
-    with no lookup, as in Fetch.
+    not-yet-started topics answer `REQUEST_TIMED_OUT`. Each record lookup by time also gets at
+    most a quarter of that deadline, and answers `REQUEST_TIMED_OUT` past it, so one stalled
+    partition leaves time for the rest.
 - [x] Fetch → `poll_messages` ([#3536](https://github.com/apache/iggy/issues/3536)): with
       `IGGY_KAFKA_BRIDGE_ENABLED=true`, shared topic probes, paged polls per partition with
       records, and a wait of up to `max_wait_ms` (max 18 s) when there are none. Only codes the

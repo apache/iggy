@@ -1002,7 +1002,6 @@ change_log_activity_capacity = 16384
 # Persistence barriers can also persist co-batched messages.
 # Persisted prepares are limited to 64 MiB including the consensus header. Oversized operations are rejected permanently.
 # Both policies write data to storage. "replicated" waits for VSR commit and application without an additional stable-storage barrier.
-# After a crash, a "replicated" partition recovers up to the last WAL frontier it published: at checkpoints, durable operations and graceful shutdown.
 # "persisted" also requires recoverable stable-storage copies at the replication quorum before explicit success.
 # A singleton quorum is one replica. Its persisted completion follows recoverable local persistence.
 # Poll auto-commit remains asynchronous. A successful poll does not confirm that its submitted offset operation committed or became durable.

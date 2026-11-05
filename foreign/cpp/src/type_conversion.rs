@@ -56,13 +56,12 @@ use iggy_common::{
     ConsumerGroup as RustConsumerGroup, ConsumerGroupInfo as RustConsumerGroupInfo,
     ConsumerGroupMember as RustConsumerGroupMember, ConsumerOffsetInfo as RustConsumerOffsetInfo,
     GlobalPermissions as RustGlobalPermissions, HeaderEntry as RustHeaderEntry,
-    HeaderField as RustHeaderField, HeaderFieldMarker, HeaderKind as RustHeaderKind,
-    IdentityInfo as RustIdentityInfo, IggyError, IggyTimestamp, MetadataChange,
-    MetadataChangeCursor, MetadataChangeGroup, MetadataChangeRecord, MetadataChangeStart,
-    MetadataChanges, MetadataChangesQuery, MetadataConsumerGroupCreated,
-    MetadataConsumerGroupDeleted, MetadataConsumerGroupItem, MetadataCurrentItem,
-    MetadataCurrentPageToken, MetadataMemberItem, MetadataMemberJoined, MetadataMemberLeft,
-    MetadataOptions, MetadataPartitionHandedOver, MetadataPartitionsChanged,
+    HeaderField as RustHeaderField, HeaderKind as RustHeaderKind, IdentityInfo as RustIdentityInfo,
+    IggyError, IggyTimestamp, MetadataChange, MetadataChangeCursor, MetadataChangeGroup,
+    MetadataChangeRecord, MetadataChangeStart, MetadataChanges, MetadataChangesQuery,
+    MetadataConsumerGroupCreated, MetadataConsumerGroupDeleted, MetadataConsumerGroupItem,
+    MetadataCurrentItem, MetadataCurrentPageToken, MetadataMemberItem, MetadataMemberJoined,
+    MetadataMemberLeft, MetadataOptions, MetadataPartitionHandedOver, MetadataPartitionsChanged,
     MetadataPartitionsItem, MetadataSession, MetadataSessionClosed, MetadataStreamChange,
     MetadataStreamDeleted, MetadataTokenChange, MetadataTokenDeleted, MetadataTopicChange,
     MetadataTopicDeleted, MetadataTopicItem, MetadataUserChange, MetadataUserIdentity,
@@ -1026,10 +1025,7 @@ impl TryFrom<ffi::HeaderEntry> for RustHeaderEntry {
     }
 }
 
-fn decode_field<T: HeaderFieldMarker>(
-    kind: u8,
-    value: Vec<u8>,
-) -> Result<RustHeaderField<T>, String> {
+fn decode_field<T>(kind: u8, value: Vec<u8>) -> Result<RustHeaderField<T>, String> {
     let kind = RustHeaderKind::from_code(kind)
         .map_err(|error| format!("Could not convert header field: {error}"))?;
 

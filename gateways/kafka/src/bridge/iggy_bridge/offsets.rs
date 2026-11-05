@@ -17,11 +17,13 @@
 
 //! Offset and high-watermark lookups.
 
-use iggy::prelude::{IggyMessage, IggyTimestamp, Partition, PollOptions, PollingStrategy};
+use std::sync::Arc;
+
+use iggy::prelude::{IggyMessage, IggyTimestamp, Partition, PollingStrategy};
 use tokio::time::Instant;
 
 use super::IggyBridge;
-use super::fetch::{FetchClient, ONE_MESSAGE_MAX_BYTES, PartitionProbe};
+use super::fetch::{FetchSlot, PartitionProbe};
 use crate::bridge::error::BridgeError;
 use crate::records::record_timestamp;
 
@@ -130,40 +132,33 @@ impl IggyBridge {
             .collect())
     }
 
-    /// Finds the record `lookup` names in `partition`, with `client`, a Fetch read slot's.
-    /// `Ok(None)` when the poll comes back empty, which Iggy also answers on a read fault or
-    /// before the partition seeds its commit point, so it proves no miss alone.
+    /// Finds the record `lookup` names in `partition`, with the client of `slot`, and hands the
+    /// slot back. `Ok(None)` when the poll comes back empty, which Iggy also answers on a read
+    /// fault or before the partition seeds its commit point, so it proves no miss alone. `None` if
+    /// no answer comes by `deadline`.
     ///
     /// Iggy matches a time against the broker append time of each batch, so a record is found by
     /// when Iggy stored it, not by the producer timestamp a Kafka broker searches on a
     /// `CreateTime` topic. The timestamp reported back is the one Fetch shows.
-    ///
-    /// # Errors
-    ///
-    /// The errors of [`Self::poll_in`], [`BridgeError::Timeout`] if no answer comes by `deadline`.
     pub(crate) async fn locate_record(
-        &self,
-        client: &FetchClient,
+        self: &Arc<Self>,
+        slot: FetchSlot,
         kafka_topic: &str,
         partition: u32,
         lookup: RecordLookup,
         deadline: Instant,
-    ) -> Result<Option<LocatedRecord>, BridgeError> {
+    ) -> Option<(Result<Option<LocatedRecord>, BridgeError>, FetchSlot)> {
         let strategy = match lookup {
             RecordLookup::AppendedAtOrAfter(millis) => {
                 PollingStrategy::timestamp(IggyTimestamp::from(kafka_millis_to_micros(millis)))
             }
             RecordLookup::Last => PollingStrategy::last(),
         };
-        let options = PollOptions {
-            count: 1,
-            max_bytes: ONE_MESSAGE_MAX_BYTES,
-            ..PollOptions::default()
-        };
-        let polled = self
-            .poll_in(client, kafka_topic, partition, strategy, options, deadline)
+        let (polled, slot) = self
+            .poll_by(slot, kafka_topic, partition, strategy, deadline)
             .await?;
-        Ok(polled.messages.first().map(LocatedRecord::from))
+        let located = polled.map(|polled| polled.messages.first().map(LocatedRecord::from));
+        Some((located, slot))
     }
 
     /// [`Self::high_watermarks`] for one partition.

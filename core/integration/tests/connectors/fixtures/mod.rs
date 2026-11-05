@@ -65,16 +65,14 @@ pub use doris::{
 };
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
 pub use http::{
-    GITHUB_ENDPOINT_ID, GITHUB_HMAC_HEADER, GITHUB_INSTANCE, HttpSinkAtLeastOnceFixture,
-    HttpSinkAtLeastOnceStopFixture, HttpSinkIndividualFixture, HttpSinkJsonArrayFixture,
-    HttpSinkMultiTopicFixture, HttpSinkNdjsonFixture, HttpSinkNoMetadataFixture,
-    HttpSinkRawFixture, HttpSinkWireMockContainer, HttpSourceFixture, MANAGEMENT_TOKEN,
+    GITHUB_ENDPOINT_ID, GITHUB_HMAC_HEADER, GITHUB_INSTANCE, HttpSinkIndividualFixture,
+    HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture, HttpSinkNdjsonFixture,
+    HttpSinkNoMetadataFixture, HttpSinkRawFixture, HttpSourceFixture, MANAGEMENT_TOKEN,
     PARTNER_BEARER_TOKEN, PARTNER_ENDPOINT_ID, PARTNER_INSTANCE,
 };
 pub use iceberg::{
-    DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergCatalogRestartFixture, IcebergEnvAuthFixture,
-    IcebergOps, IcebergPartitionedTableFixture, IcebergPreCreatedFixture,
-    IcebergSkipInvalidRowsFixture,
+    DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergEnvAuthFixture, IcebergOps,
+    IcebergPartitionedTableFixture, IcebergPreCreatedFixture,
 };
 pub use influxdb::{
     InfluxDb3SinkFixture, InfluxDb3SourceFixture, InfluxDbSinkBase64Fixture, InfluxDbSinkFixture,

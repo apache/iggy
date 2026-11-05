@@ -101,7 +101,7 @@ async def consume_messages(client: IggyClient):
             await asyncio.sleep(interval)
         except Exception as error:
             logger.exception(f"Exception occurred while consuming messages: {error}")
-            raise
+            break
 
     logger.info(f"Consumed {n_consumed_batches} batches of messages, exiting.")
 

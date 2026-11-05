@@ -18,7 +18,7 @@
 use crate::{
     IcebergSink,
     catalog::init_catalog,
-    router::{BatchOrigin, dynamic_router::DynamicRouter, static_router::StaticRouter},
+    router::{dynamic_router::DynamicRouter, static_router::StaticRouter},
 };
 use async_trait::async_trait;
 use iceberg::Catalog;
@@ -42,9 +42,12 @@ impl Sink for IcebergSink {
             &self.config.store_access_key_id,
             &self.config.store_secret_access_key,
         ) {
-            (Some(_), Some(_)) => {
+            (Some(store_access_key_id), Some(store_secret_access_key)) => {
+                let redacted_store_key = store_access_key_id.chars().take(3).collect::<String>();
+                let redacted_store_secret =
+                    store_secret_access_key.chars().take(3).collect::<String>();
                 info!(
-                    "Opened Iceberg sink connector with ID: {} for URL: {} with the configured store credentials",
+                    "Opened Iceberg sink connector with ID: {} for URL: {}, store access key ID: {redacted_store_key}***  store secret: {redacted_store_secret}***",
                     self.id, self.config.uri
                 );
             }
@@ -70,24 +73,15 @@ impl Sink for IcebergSink {
         );
 
         let catalog: Box<dyn Catalog> = init_catalog(&self.config).await?;
-        let invalid_rows = self.config.invalid_rows.unwrap_or_default();
 
         if self.config.dynamic_routing {
             self.router = Some(Box::new(DynamicRouter::new(
                 catalog,
                 self.config.dynamic_route_field.clone(),
-                invalid_rows,
-                self.commit_retry,
             )))
         } else {
             self.router = Some(Box::new(
-                StaticRouter::new(
-                    catalog,
-                    &self.config.tables,
-                    invalid_rows,
-                    self.commit_retry,
-                )
-                .await?,
+                StaticRouter::new(catalog, &self.config.tables).await?,
             ));
         }
 
@@ -96,7 +90,7 @@ impl Sink for IcebergSink {
 
     async fn consume(
         &self,
-        topic_metadata: &TopicMetadata,
+        _topic_metadata: &TopicMetadata,
         messages_metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
@@ -107,18 +101,8 @@ impl Sink for IcebergSink {
             messages_metadata.schema
         );
 
-        let origin = BatchOrigin {
-            connector_id: self.id,
-            stream: &topic_metadata.stream,
-            topic: &topic_metadata.topic,
-            partition_id: messages_metadata.partition_id,
-        };
         match &self.router {
-            Some(router) => {
-                router
-                    .route_data(&origin, messages_metadata.schema, messages)
-                    .await?
-            }
+            Some(router) => router.route_data(messages_metadata, messages).await?,
             None => {
                 error!("Iceberg connector has no router configured");
                 return Err(Error::InvalidConfig);

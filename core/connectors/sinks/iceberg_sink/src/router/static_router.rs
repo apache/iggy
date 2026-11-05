@@ -15,29 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::InvalidRows;
-use crate::router::{BatchOrigin, Router, is_valid_namespaced_table, table_exists, write_data};
+use crate::router::{Router, is_valid_namespaced_table, table_exists, write_data};
 use async_trait::async_trait;
 use iceberg::Catalog;
 use iceberg::table::Table;
-use iggy_connector_sdk::retry::RetryPolicy;
-use iggy_connector_sdk::{ConsumedMessage, Error, Schema};
+use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload};
 use tracing::{error, info, warn};
 
 #[derive(Debug)]
 pub(crate) struct StaticRouter {
     tables: Vec<Table>,
     catalog: Box<dyn Catalog>,
-    invalid_rows: InvalidRows,
-    commit_retry: RetryPolicy,
 }
 
 impl StaticRouter {
     pub async fn new(
         catalog: Box<dyn Catalog>,
         declared_tables: &Vec<String>,
-        invalid_rows: InvalidRows,
-        commit_retry: RetryPolicy,
     ) -> Result<Self, Error> {
         let mut tables: Vec<Table> = Vec::with_capacity(declared_tables.len());
         for declared_table in declared_tables {
@@ -70,12 +64,7 @@ impl StaticRouter {
             error!("No valid tables found. Can't initiate Iceberg connector");
             return Err(Error::InvalidConfig);
         }
-        Ok(StaticRouter {
-            tables,
-            catalog,
-            invalid_rows,
-            commit_retry,
-        })
+        Ok(StaticRouter { tables, catalog })
     }
 }
 
@@ -83,24 +72,25 @@ impl StaticRouter {
 impl Router for StaticRouter {
     async fn route_data(
         &self,
-        origin: &BatchOrigin<'_>,
-        messages_schema: Schema,
+        messages_metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), crate::Error> {
+        let data: Vec<Payload> = messages
+            .into_iter()
+            .map(|m: ConsumedMessage| m.payload)
+            .collect();
+
         for table in &self.tables {
-            let committed_rows = write_data(
-                origin,
-                &messages,
+            write_data(
+                &data,
                 table,
                 self.catalog.as_ref(),
-                messages_schema,
-                self.invalid_rows,
-                self.commit_retry,
+                messages_metadata.schema,
             )
             .await?;
             info!(
-                "Routed {} input rows to iceberg table {}, committed {committed_rows}",
-                messages.len(),
+                "Routed {} messages to iceberg table {} successfully",
+                data.len(),
                 table.identifier().name()
             );
         }

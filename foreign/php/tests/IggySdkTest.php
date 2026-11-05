@@ -595,10 +595,6 @@ final class IggySdkTest extends TestCase
             create_stream_and_topic($client, $streamName, $topicName, 1);
             // A parked poll holds its connection, so it runs on a client of its own.
             $owner = new_client();
-            // A fetch that is still in the client at the disconnect fails with Unauthenticated. The
-            // route lookup of a new partition can retry for longer than the wait below, so a plain
-            // poll routes the partition first.
-            $owner->pollMessages($streamName, $topicName, 0, self::CONSUMER_ID, PollingStrategy::next());
             $poll = $owner->startPollMessages(
                 $streamName,
                 $topicName,

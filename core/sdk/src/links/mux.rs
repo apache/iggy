@@ -977,7 +977,6 @@ mod tests {
         for websocket in [false, true] {
             let (client, server) = duplex(DUPLEX_CAPACITY);
             let (resume, paused) = oneshot::channel();
-            let (queued, queue) = oneshot::channel();
             let (link, mut peer) = if websocket {
                 let (client, server) = tokio::join!(
                     client_async("ws://localhost/", client),
@@ -988,8 +987,7 @@ mod tests {
                     MuxLink::start(
                         LOCALHOST,
                         |frames, shared| async move {
-                            queued.send(frames).unwrap();
-                            let frames = paused.await.unwrap();
+                            paused.await.unwrap();
                             write_websocket(sink, frames, shared).await;
                         },
                         |shared| read_websocket(stream, shared),
@@ -1002,8 +1000,7 @@ mod tests {
                     MuxLink::start(
                         LOCALHOST,
                         |frames, shared| async move {
-                            queued.send(frames).unwrap();
-                            let frames = paused.await.unwrap();
+                            paused.await.unwrap();
                             write_tcp(BufWriter::new(writer), frames, shared).await;
                         },
                         |shared| read_tcp(BufReader::new(reader), shared),
@@ -1011,7 +1008,6 @@ mod tests {
                     Peer::Tcp(server),
                 )
             };
-            let frames = queue.await.unwrap();
             let deadline = Instant::now() + TEST_BUDGET;
             let poll = |id| {
                 let mut frame = request(id, BOUND_SESSION);
@@ -1019,16 +1015,11 @@ mod tests {
                     iggy_binary_protocol::codes::POLL_MESSAGES_DEFERRED_CODE.to_le_bytes();
                 send(&link, frame, deadline)
             };
-            // Since tokio 1.54 a send can take its queue permit and still yield
-            // to the coop budget, so the capacity check below would pass before
-            // every poll reached the FIFO. Unconstrained, one poll sends them all.
-            let mut abandoned = Box::pin(tokio::task::unconstrained(futures::future::join_all(
+            let mut abandoned = Box::pin(futures::future::join_all(
                 (1..=LINK_WRITE_QUEUE as u64).map(poll),
-            )));
+            ));
             timeout(TEST_BUDGET, async {
-                // Reservations consume capacity before the send finishes.
-                // Wait for the original frames themselves before dropping callers.
-                while frames.len() != LINK_WRITE_QUEUE {
+                while link.queue.capacity() != MAX_PENDING_PER_LINK - LINK_WRITE_QUEUE {
                     assert!(futures::poll!(&mut abandoned).is_pending());
                     tokio::task::yield_now().await;
                 }
@@ -1064,7 +1055,7 @@ mod tests {
                 "cancels and reservations fill the FIFO"
             );
             assert_eq!(link.shared.write_permits.available_permits(), 0);
-            resume.send(frames).unwrap();
+            resume.send(()).unwrap();
 
             let mut pending_cancels = BTreeSet::new();
             tokio::select! {

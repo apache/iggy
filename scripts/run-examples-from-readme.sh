@@ -283,11 +283,7 @@ run_python_examples() {
     # against the VSR server, started fresh by cleanup_server_state wiping
     # local_data rather than by passing --fresh.
     resolve_server_binary "${TARGET}" iggy-server
-
-    TRANSFORM_COMMAND() {
-        local command="$1"
-        printf '%s\n' "${command/#uv run /uv run --no-sync }"
-    }
+    unset -f TRANSFORM_COMMAND 2>/dev/null || true
 
     echo ""
     echo "============================================================"
@@ -297,15 +293,15 @@ run_python_examples() {
 
     EXAMPLES_EXIT_CODE=0
 
-    echo "Syncing Python dependencies with uv..."
-    (cd examples/python && uv sync --frozen) || return $?
-
     # --- Non-TLS pass ---
     cleanup_server_state
     start_plain_server
     wait_for_server_ready "Python"
 
     cd examples/python || exit 1
+    echo "Syncing Python dependencies with uv..."
+    uv sync --frozen
+
     run_readme_commands "README.md" "^uv run " 10 "--tls"
 
     cd "${ROOT_WORKDIR}"

@@ -29,8 +29,8 @@
 @message_2_payload_base64 = d29ybGQ=
 @header_key_1_base64 = a2V5XzE=
 @header_value_1_base64 = dmFsdWUgMQ==
-@header_key_2_base64 = KgAAAA==
-@header_value_2_base64 = AAAAAA==
+@header_key_2_base64 = Kg==
+@header_value_2_base64 = AAAA
 @root_username = iggy
 @root_password = iggy
 @user1_username = user1
@@ -261,11 +261,9 @@ Content-Type: application/json
 {
   "name": "topic1",
   "partitions_count": 1,
-  "options": {
-    "compression_algorithm": "none",
-    "message_expiry": "7 days",
-    "max_topic_size": "1 GiB"
-  }
+  "compression_algorithm": "none",
+  "max_topic_size": 0,
+  "message_expiry": 0
 }
 
 ###
@@ -275,8 +273,9 @@ Content-Type: application/json
 
 {
   "name": "topic1",
-  "message_expiry": "1 day",
-  "max_topic_size": "2 GiB"
+  "compression_algorithm": "none",
+  "max_topic_size": 0,
+  "message_expiry": 0
 }
 
 ###

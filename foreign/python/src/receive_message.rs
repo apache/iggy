@@ -35,7 +35,7 @@ use crate::user_headers::{UserHeaders, rust_user_headers_to_py};
 /// consumer group owner changed, instead of applying an offset to the new partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[gen_stub_pyclass]
-#[pyclass(eq, frozen, hash)]
+#[pyclass(eq, frozen, hash, skip_from_py_object)]
 pub struct PartitionContext {
     /// Identifies one creation of the partition. It changes when a deleted partition id is
     /// created again.
@@ -90,7 +90,7 @@ impl PartitionContext {
 /// landing on the new partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[gen_stub_pyclass]
-#[pyclass(eq, frozen)]
+#[pyclass(eq, frozen, skip_from_py_object)]
 pub struct Checkpoint {
     pub(crate) inner: RustCheckpoint,
 }

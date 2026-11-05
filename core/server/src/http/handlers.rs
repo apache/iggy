@@ -105,8 +105,8 @@ use iggy_common::{
     ConsumerOffsetInfo, DEFAULT_MAX_TOPIC_SIZE, Identifier, IdentityInfo, IggyError, IggyTimestamp,
     MetadataChanges, MetadataChangesQuery, OptionSpec, OptionStorage, OptionsScope, Partitioning,
     PersonalAccessTokenInfo, PollMessages, PolledMessages, PollingStrategy, RawPersonalAccessToken,
-    SendMessagesConfirmations, Stats, Stream, StreamDetails, TokenInfo, Topic, TopicDetails,
-    UserInfo, UserInfoDetails, Validatable, descriptors_for, erase_buffer,
+    SendMessages, SendMessagesConfirmations, Stats, Stream, StreamDetails, TokenInfo, Topic,
+    TopicDetails, UserInfo, UserInfoDetails, Validatable, descriptors_for, erase_buffer,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
@@ -129,9 +129,7 @@ use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
     ReadError, WriteError,
 };
-use crate::http::extractor::{
-    Authenticated, Credential, Identity, JsonMembers, JsonSendMessages, JsonUpdate,
-};
+use crate::http::extractor::{Authenticated, Credential, Identity, JsonMembers, JsonUpdate};
 use crate::http::forward::{
     FirstAttempt, PartitionEffect, PartitionHop, PartitionRequest, require_local_primary,
     serve_partition,
@@ -1679,7 +1677,7 @@ pub(in crate::http) async fn send_messages(
     Path((stream_id, topic_id)): Path<(String, String)>,
     Query(query): Query<ProduceQuery>,
     Extension(request): Extension<Arc<PartitionRequest>>,
-    JsonSendMessages(mut command): JsonSendMessages,
+    Json(mut command): Json<SendMessages>,
 ) -> Result<Response, PartitionWriteError> {
     let stream_id =
         Identifier::from_str_value(&stream_id).map_err(PartitionWriteError::Rejected)?;
@@ -2363,7 +2361,7 @@ mod tests {
     use iggy_binary_protocol::responses::messages::{
         SendMessagesConfirmationResponse, SendMessagesResponse,
     };
-    use iggy_common::{OptionInputMap, OptionInputValue, OptionKey, SendMessages};
+    use iggy_common::{OptionInputMap, OptionInputValue, OptionKey};
     use serde_json::Value;
 
     use crate::http::reply::classify_partition_reply;

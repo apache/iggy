@@ -95,6 +95,19 @@ IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
 cargo run --bin iggy-server
 ```
 
+## Multi-Tenant Examples
+
+The multi-tenant examples create three tenants. Each tenant has a stream and a user with access limited to that stream.
+The producer sends messages as each tenant and checks that tenants cannot access another tenant's stream.
+The consumer reads each tenant's messages with that tenant's user.
+
+Run the producer before the consumer:
+
+```bash
+dotnet run --project examples/csharp/src/MultiTenant/Iggy_SDK.Examples.MultiTenant.Producer
+dotnet run --project examples/csharp/src/MultiTenant/Iggy_SDK.Examples.MultiTenant.Consumer
+```
+
 ## Example Structure
 
 All examples can be executed directly from the repository. Follow these steps:

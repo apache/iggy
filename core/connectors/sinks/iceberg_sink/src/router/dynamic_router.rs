@@ -15,38 +15,70 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::InvalidRows;
-use crate::router::{BatchOrigin, Router, is_valid_namespaced_table, table_exists, write_data};
+use crate::router::{Router, is_valid_namespaced_table, table_exists, write_data};
 use async_trait::async_trait;
 use iceberg::Catalog;
 use iceberg::table::Table;
-use iggy_connector_sdk::retry::RetryPolicy;
-use iggy_connector_sdk::{ConsumedMessage, Payload, Schema};
+use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload};
 use simd_json::base::ValueAsObject;
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use tracing::{info, warn};
 
 #[derive(Debug)]
 pub struct DynamicRouter {
     catalog: Box<dyn Catalog>,
     route_field: String,
-    invalid_rows: InvalidRows,
-    commit_retry: RetryPolicy,
+}
+
+pub struct DynamicWriter {
+    pub tables_to_write: HashMap<String, Table>,
+    pub table_to_message: HashMap<String, Vec<ConsumedMessage>>,
+}
+
+impl DynamicWriter {
+    pub fn new() -> Self {
+        let tables_to_write = HashMap::new();
+        let table_to_message = HashMap::new();
+        Self {
+            tables_to_write,
+            table_to_message,
+        }
+    }
+
+    fn push_to_existing(
+        &mut self,
+        route_field_val: &str,
+        message: ConsumedMessage,
+    ) -> Option<ConsumedMessage> {
+        if let Some(message_vec) = self.table_to_message.get_mut(route_field_val) {
+            message_vec.push(message);
+            None
+        } else {
+            Some(message)
+        }
+    }
+
+    async fn load_table_if_exists(
+        &mut self,
+        route_field_val: &str,
+        catalog: &dyn Catalog,
+    ) -> Result<(), Error> {
+        let table = table_exists(route_field_val, catalog)
+            .await
+            .ok_or(Error::InvalidState)?;
+
+        self.tables_to_write
+            .insert(route_field_val.to_string(), table);
+
+        Ok(())
+    }
 }
 
 impl DynamicRouter {
-    pub fn new(
-        catalog: Box<dyn Catalog>,
-        route_field: String,
-        invalid_rows: InvalidRows,
-        commit_retry: RetryPolicy,
-    ) -> Self {
+    pub fn new(catalog: Box<dyn Catalog>, route_field: String) -> Self {
         Self {
             catalog,
             route_field,
-            invalid_rows,
-            commit_retry,
         }
     }
 
@@ -60,7 +92,10 @@ impl DynamicRouter {
 /// holding JSON arrives here as `Payload::Json`; proto text that is not JSON
 /// holds no document and does not route, and neither does any other variant.
 fn route_value(payload: &Payload, route_field: &str) -> Option<String> {
-    let document = payload.json_document()?;
+    let Some(document) = payload.json_document() else {
+        warn!("Unsupported format for iceberg connector");
+        return None;
+    };
     document
         .as_object()
         .and_then(|obj| obj.get(route_field))
@@ -71,64 +106,68 @@ fn route_value(payload: &Payload, route_field: &str) -> Option<String> {
 impl Router for DynamicRouter {
     async fn route_data(
         &self,
-        origin: &BatchOrigin<'_>,
-        messages_schema: Schema,
+        messages_metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), crate::Error> {
-        let mut tables: HashMap<String, (Table, Vec<ConsumedMessage>)> = HashMap::new();
+        let mut writer = DynamicWriter::new();
         for mut message in messages {
             // Normalised once here so the routing read and the later write both
             // work off the document, rather than parsing the same proto text twice.
             message.payload = message.payload.into_json_document();
-            let Some(route_field_val) = self.extract_route_field(&message) else {
-                warn!(
-                    "Dropping the message at offset {}: it is not a JSON object with the route field: {}",
-                    message.offset, self.route_field
-                );
-                continue;
+            let route_field_val = match self.extract_route_field(&message) {
+                Some(val) => val,
+                None => continue,
             };
 
-            let entry = match tables.entry(route_field_val) {
-                Entry::Occupied(mut entry) => {
-                    entry.get_mut().1.push(message);
-                    continue;
-                }
-                Entry::Vacant(entry) => entry,
+            let message = match writer.push_to_existing(&route_field_val, message) {
+                Some(msg) => msg,
+                None => continue,
             };
-            let route_field_val = entry.key();
 
-            if !is_valid_namespaced_table(route_field_val) {
+            if !is_valid_namespaced_table(&route_field_val) {
                 warn!(
-                    "Dropping the message at offset {}: its route field value: {route_field_val} names no table. It needs at least one namespace before the table, separated by '.'",
-                    message.offset
+                    "Found invalid route field name on message: {route_field_val}. Route fields should have at least 1 namespace separated by '.' character before the table"
                 );
                 continue;
             }
 
-            let Some(table) = table_exists(route_field_val, self.catalog.as_ref()).await else {
-                warn!(
-                    "Dropping the message at offset {}: table: {route_field_val} does not load from the catalog",
-                    message.offset
-                );
-                continue;
-            };
-            entry.insert((table, vec![message]));
+            let route_field_val_cloned = route_field_val.clone();
+
+            if writer
+                .load_table_if_exists(&route_field_val_cloned, self.catalog.as_ref())
+                .await
+                .is_ok()
+            {
+                if let Some(msgs) = writer.table_to_message.get_mut(&route_field_val_cloned) {
+                    msgs.push(message);
+                } else {
+                    let message_vec: Vec<ConsumedMessage> = vec![message];
+                    writer
+                        .table_to_message
+                        .insert(route_field_val_cloned, message_vec);
+                }
+            }
         }
 
-        for (table_name, (table, batch_messages)) in tables {
-            let committed_rows = write_data(
-                origin,
-                &batch_messages,
-                &table,
+        for (table_name, table_obj) in &writer.tables_to_write {
+            let batch_messages = match writer.table_to_message.remove(table_name) {
+                Some(m) => m,
+                None => continue,
+            };
+
+            let data: Vec<Payload> = batch_messages.into_iter().map(|m| m.payload).collect();
+
+            write_data(
+                &data,
+                table_obj,
                 self.catalog.as_ref(),
-                messages_schema,
-                self.invalid_rows,
-                self.commit_retry,
+                messages_metadata.schema,
             )
             .await?;
             info!(
-                "Dynamically routed {} input rows to iceberg table {table_name}, committed {committed_rows}",
-                batch_messages.len()
+                "Dynamically routed {} messages to {} iceberg table",
+                data.len(),
+                table_name
             );
         }
 

@@ -873,8 +873,8 @@ class TestMessageOperations:
     @pytest.mark.parametrize(
         ("headers", "error"),
         [
-            ({"": "value"}, "Invalid header key"),
-            ({"x" * 256: "value"}, "Invalid header key"),
+            ({"": "value"}, "Invalid header value"),
+            ({"x" * 256: "value"}, "Invalid header value"),
             ({"key": ""}, "Invalid header value"),
             ({"key": b""}, "Invalid header value"),
             ({"key": "x" * 256}, "Invalid header value"),

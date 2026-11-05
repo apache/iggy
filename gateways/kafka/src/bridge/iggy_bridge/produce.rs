@@ -35,14 +35,16 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout, timeout_at};
 
 use super::fetch::LazyClient;
-use super::{
-    IggyBridge, SDK_STOP_ROOM, SLOT_LIMIT, TopicTarget, in_slot, permit_by, resolve_blocker,
-};
+use super::{IggyBridge, SLOT_LIMIT, TopicTarget, in_slot, permit_by, resolve_blocker};
 use crate::bridge::config::{IggyBridgeConfig, ProduceSessionLimits};
 use crate::bridge::error::BridgeError;
 
 /// Frame bytes besides the messages: request header, batch header and ids.
 const SEND_FRAME_ROOM: u64 = 4 * 1024;
+
+/// How much sooner than its request the SDK stops a send. The SDK's own answer then tells whether
+/// the send went out, before the request gives up on it with 7.
+const SDK_STOP_ROOM: Duration = Duration::from_millis(50);
 
 /// Sessions that connect and sign in at once. A sign-in costs Iggy a password hash on a shard
 /// thread, so a burst of new producers must not start them all together.

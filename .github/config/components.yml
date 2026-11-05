@@ -357,8 +357,6 @@ components:
       - "foreign/swift/**"
       - "bdd/swift/**"
       - "examples/swift/**"
-      - "Package.swift"
-      - ".spi.yml"
     tasks: ["lint", "test", "build", "build-macos", "golden", "e2e"]
 
   # Shared BDD infrastructure that affects all BDD tests
@@ -609,8 +607,6 @@ components:
       - ".github/config/components.yml"
       - "scripts/ci/restore-runtime.sh"
       - "scripts/ci/test-runtime-artifacts.py"
-      - "scripts/run-examples-from-readme.sh"
-      - "scripts/utils.sh"
       - ".github/workflows/**/*.yml"
       - ".github/actions/**/*.yml"
       - ".github/ci/**/*.yml"

@@ -23,7 +23,6 @@ use crate::error::RuntimeError;
 use crate::metrics::Metrics;
 use crate::plugin_instance::PluginInstanceGuard;
 use crate::sink;
-use crate::sink_delivery;
 use dashmap::DashMap;
 use dlopen2::wrapper::Container;
 use futures::future::join_all;
@@ -221,15 +220,6 @@ impl SinkManager {
         // carries why that window strands the instance.
         let instance_guard = PluginInstanceGuard::for_sink(container.clone(), plugin_id, key);
 
-        let delivery = match sink_delivery::enable(&container, plugin_id, key, &config.delivery) {
-            Ok(delivery) => delivery,
-            Err(error) => {
-                sink::release_sink_client(client, plugin_id).await;
-                instance_guard.close().await;
-                return Err(error);
-            }
-        };
-
         let consumers = match sink::setup_sink_consumers(key, config, &client).await {
             Ok(consumers) => consumers,
             Err(error) => {
@@ -251,7 +241,6 @@ impl SinkManager {
                 consumers,
                 client,
                 callback,
-                delivery,
                 config.verbose,
                 config.benchmark,
                 metrics,

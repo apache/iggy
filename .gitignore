@@ -27,10 +27,6 @@ foreign/java/**/out
 foreign/node/**/dist
 foreign/swift/.build
 foreign/swift/.swiftpm
-# The root manifest publishes the Swift SDK. Consumers resolve their own pins.
-/.build
-/.swiftpm
-/Package.resolved
 examples/swift/.build
 examples/swift/**/.build
 examples/swift/**/.swiftpm

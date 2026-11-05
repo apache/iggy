@@ -102,11 +102,10 @@ pub use iggy_partition::{PollCompletion, PollReplication, PollVisibility};
 pub use messages_writer::MessagesWriter;
 pub use offset_storage::delete_persisted_offset;
 pub use partition_storage::{
-    CREATED_REVISION_FILE, clamp_consumer_offsets, configure_consumer_offsets,
-    configure_consumer_offsets_with_storage, create_partition_file_hierarchy,
-    delete_partitions_from_disk, ensure_initial_segment, hydrate_partition_log,
-    read_created_revision, read_revision_record, recover_consumer_offsets,
-    recover_consumer_offsets_with_storage, write_created_revision, write_revision_record,
+    CREATED_REVISION_FILE, configure_consumer_offsets, configure_consumer_offsets_with_storage,
+    create_partition_file_hierarchy, delete_partitions_from_disk, ensure_initial_segment,
+    hydrate_partition_log, read_created_revision, read_revision_record, write_created_revision,
+    write_revision_record,
 };
 pub use poll_plan::{DISK_POLL_CHUNK_MAX, PollPlan, PollReadResult};
 pub use segment::Segment;

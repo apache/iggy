@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::log::{LogCallback, init_plugin_logging};
+use crate::log::{CallbackLayer, LogCallback};
 use crate::retry::exponential_backoff;
 use crate::{ConnectorState, ProducedMessages, Source, get_runtime};
 use serde::de::DeserializeOwned;
@@ -30,6 +30,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tracing::{error, info, warn};
+use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[repr(C)]
 pub struct RawMessage {
@@ -255,7 +256,10 @@ impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
         C: DeserializeOwned,
     {
         unsafe {
-            init_plugin_logging(log_callback);
+            _ = Registry::default()
+                .with(CallbackLayer::new(log_callback))
+                .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
+                .try_init();
             let slice = std::slice::from_raw_parts(config_ptr, config_len);
             let Ok(config_str) = std::str::from_utf8(slice) else {
                 error!("Failed to read configuration for source connector with ID: {id}");
