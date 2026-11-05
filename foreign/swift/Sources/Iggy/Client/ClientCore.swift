@@ -380,7 +380,24 @@ actor ClientCore {
     }
 
     private func stamp(code: UInt32, payload: [UInt8], context: PartitionContext) throws -> VSRFrame.EncodedRequest {
-        try VSRFrame.encodeRequest(session: &session, code: code, payload: payload, partitionContext: context)
+        try VSRFrame.encodeRequest(session: &session, code: code, payload: payload, partitionContext: sentContext(context, code: code, payload: payload))
+    }
+
+    /// The context that `code` goes out with. The server binds a group offset
+    /// write with owner generation 0 to the owner of the session only when it
+    /// installed that owner at or before the metadata op of the write. The
+    /// register or the join that installs it raises the watermark with its
+    /// reply, and no frame of a session is stamped before its register reply,
+    /// so such a write takes the newer of its op and the watermark. The
+    /// incarnation stays, so a write of an earlier history is still refused.
+    private func sentContext(_ context: PartitionContext, code: UInt32, payload: [UInt8]) -> PartitionContext {
+        let writesOffset = code == CommandCode.storeConsumerOffset.rawValue || code == CommandCode.deleteConsumerOffset.rawValue
+        guard writesOffset, context.ownerGeneration == 0,
+            (try? RawRequest.consumerTarget(payload))?.consumerKind == Consumer.Kind.consumerGroup.rawValue
+        else {
+            return context
+        }
+        return PartitionContext(incarnation: context.incarnation, ownerGeneration: 0, metadataOp: max(context.metadataOp, metadataWatermark))
     }
 
     /// Whether the client comes back on its own: it is signed in, or a

@@ -23,9 +23,8 @@ use std::time::Duration;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     Client, CommitPolicy, Consumer, ConsumerKind, EncryptorKind, Identifier, IggyDuration,
-    IggyError, PollOptions, PollingStrategy, group_cache_key,
+    IggyError, PollOptions, PollingKind, PollingStrategy, group_cache_key,
 };
-use tokio::sync::Notify;
 use tracing::error;
 
 use super::reader::membership::Membership;
@@ -36,6 +35,9 @@ use crate::driver::MAX_DEFERRED_REQUESTS_PER_CONSUMER;
 
 pub(crate) const DEFAULT_PREFETCH_BYTES: u32 = 16 * 1024 * 1024;
 pub(crate) const DEFAULT_PREFETCH_MESSAGES: u32 = 16_000;
+/// The fewest slots of a reader: one for each request that the driver admits for one consumer,
+/// so the fetches that wait on quiet primaries leave slots for the busy ones.
+const MIN_PREFETCH_SLOTS: usize = MAX_DEFERRED_REQUESTS_PER_CONSUMER;
 pub(crate) const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -109,6 +111,9 @@ impl ReaderBuilder {
 
     /// The start of a partition without a position. Default `PollingStrategy::next()`.
     /// `build()` refuses a continuation, because it belongs to one partition.
+    ///
+    /// With [`CommitPolicy::OnRead`], the start applies only to a partition without a stored
+    /// offset. A partition with one resumes after it, so `First` reads as `Next`.
     pub fn start(self, start: PollingStrategy) -> Self {
         Self { start, ..self }
     }
@@ -119,7 +124,10 @@ impl ReaderBuilder {
         Self { options, ..self }
     }
 
-    /// The encoded bytes of the requests in flight and the queued batches. Default 16 MiB.
+    /// The requested encoded-byte budget for requests in flight and queued batches. Default
+    /// 16 MiB. The effective budget holds at least 32 full batches of `max_bytes`, 32 MiB with
+    /// the default options, so primary groups can wait independently. Larger byte and message
+    /// budgets allow more queued batches.
     pub fn prefetch_bytes(self, bytes: u32) -> Self {
         Self {
             prefetch_bytes: bytes,
@@ -127,8 +135,9 @@ impl ReaderBuilder {
         }
     }
 
-    /// The messages of the requests in flight and the queued batches. Default: the larger of
-    /// 16,000 and `count`.
+    /// The requested message budget for requests in flight and queued batches. Default 16,000.
+    /// The effective budget holds at least 32 full batches of `count`, 32,000 messages with the
+    /// default options.
     pub fn prefetch_messages(self, messages: u32) -> Self {
         Self {
             prefetch_messages: Some(messages),
@@ -269,11 +278,17 @@ impl ReaderBuilder {
             );
             return Err(IggyError::InvalidConfiguration);
         }
-        let prefetch_messages = self
-            .prefetch_messages
-            .unwrap_or(DEFAULT_PREFETCH_MESSAGES.max(self.options.count));
+        let prefetch_messages = self.prefetch_messages.unwrap_or(DEFAULT_PREFETCH_MESSAGES);
         let slots = budget_slots(prefetch_messages, self.prefetch_bytes, self.options);
-        let start = first_as_offset(self.start);
+        // Without a stored offset the server answers `Next` from offset 0, so under `OnRead`
+        // `First` needs no lookup.
+        let start = if self.options.commit == CommitPolicy::OnRead
+            && self.start.kind == PollingKind::First
+        {
+            PollingStrategy::next()
+        } else {
+            first_as_offset(self.start.without_zero_context())
+        };
         let stream = Arc::new(self.stream);
         let topic = Arc::new(self.topic);
         let consumer = Arc::new(self.consumer);
@@ -284,6 +299,7 @@ impl ReaderBuilder {
                 Arc::clone(&stream),
                 Arc::clone(&topic),
                 self.options.commit,
+                self.retry_interval,
             ))
         });
         // Only `IggyConsumer` creates a missing group, through the membership that it passes.
@@ -299,9 +315,9 @@ impl ReaderBuilder {
             })
         });
         let shared = Shared {
+            wake: progress.wake(),
             progress,
             epoch: AtomicU64::new(0),
-            wake: Arc::new(Notify::new()),
             demand: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             can_poll: AtomicBool::new(true),
@@ -326,8 +342,9 @@ impl ReaderBuilder {
 }
 
 /// The requests in flight and the queued replies, each of which reserves `count` messages and
-/// `max_bytes` bytes. One fits even when the prefetch limits are lower, and the driver admits at
-/// most 16 waiting requests of one consumer.
+/// `max_bytes` bytes. At least [`MIN_PREFETCH_SLOTS`] fit even when the prefetch limits are
+/// lower, and a larger budget grows the queue. The worker starts no more requests than the
+/// driver admits for one consumer.
 fn budget_slots(prefetch_messages: u32, prefetch_bytes: u32, options: PollOptions) -> usize {
     let messages = prefetch_messages
         .checked_div(options.count)
@@ -337,5 +354,5 @@ fn budget_slots(prefetch_messages: u32, prefetch_bytes: u32, options: PollOption
         .unwrap_or_default();
     usize::try_from(messages.min(bytes))
         .unwrap_or(usize::MAX)
-        .clamp(1, MAX_DEFERRED_REQUESTS_PER_CONSUMER)
+        .max(MIN_PREFETCH_SLOTS)
 }

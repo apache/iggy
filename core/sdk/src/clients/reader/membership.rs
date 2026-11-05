@@ -40,7 +40,8 @@ pub(crate) struct Membership {
     joined: AtomicBool,
     /// Rises at each `forget`, so a join that a forget overtook does not count as joined.
     forgets: AtomicU64,
-    /// A create or a join whose outcome is unknown, resolved before the next join.
+    /// A create or a join whose outcome is unknown, resolved before the next join or abandoned
+    /// by the leave.
     uncertain: Mutex<Option<u64>>,
 }
 
@@ -150,18 +151,26 @@ impl Membership {
 
     /// Lets the server give the partitions to the other members at once, instead of after the
     /// connection times out. It leaves also when a reconnect forgot the join, because the
-    /// session that joined can still hold the member.
+    /// session that joined can still hold the member. No later join resolves an unknown outcome
+    /// of a create, a join or this leave, so it abandons each one, which frees the metadata
+    /// writes of the client.
     pub(crate) async fn leave(&self) {
         self.joined.store(false, ORDERING);
         let (stream_id, topic_id, group_id) = (&self.stream, &self.topic, &self.group);
+        let mut uncertain_operation = self.uncertain.lock().await;
+        let client = self.client.read().await;
+        if let Some(op) = uncertain_operation.take() {
+            // An operation that the client no longer retains is already free.
+            let _ = client.abandon_operation(op).await;
+        }
         trace!("Leaving consumer group: {group_id} for stream: {stream_id}, topic: {topic_id}");
-        if let Err(error) = self
-            .client
-            .read()
-            .await
+        if let Err(error) = client
             .leave_consumer_group(stream_id, topic_id, group_id)
             .await
         {
+            if let IggyError::OperationUncertain(op) = &error {
+                let _ = client.abandon_operation(*op).await;
+            }
             // Expected for a member that the server already dropped, and for a deleted group.
             debug!(
                 "Failed to leave consumer group: {group_id} for stream: {stream_id}, topic: {topic_id}. {error}"

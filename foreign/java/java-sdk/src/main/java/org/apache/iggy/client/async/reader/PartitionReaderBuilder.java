@@ -31,8 +31,9 @@ import java.time.Duration;
 import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+
+import static org.apache.iggy.client.async.reader.ReaderSupport.invalid;
 
 /** Builds a {@link PartitionReader}. Get one from the {@code reader} method of a client. */
 public final class PartitionReaderBuilder {
@@ -42,6 +43,7 @@ public final class PartitionReaderBuilder {
     public static final long DEFAULT_PREFETCH_MESSAGES = 16_000;
     public static final long DEFAULT_PREFETCH_BYTES = 16L * 1024 * 1024;
     public static final Duration DEFAULT_RETRY_INTERVAL = Duration.ofSeconds(1);
+    public static final int MIN_PREFETCH_SLOTS = 32;
 
     private final ReaderTransport transport;
     private List<Long> partitions;
@@ -65,8 +67,9 @@ public final class PartitionReaderBuilder {
     }
 
     /**
-     * The start of a partition without a position. Default {@link PollingStrategy#next()}. {@link #build()} refuses a
-     * continuation, because it belongs to one partition.
+     * The start of a partition without a position. Default {@link PollingStrategy#next()}. With {@code OnRead}, the
+     * start applies only to a partition without a stored offset. A partition with one resumes after it.
+     * {@link #build()} refuses a continuation, because it belongs to one partition.
      */
     public PartitionReaderBuilder start(PollingStrategy start) {
         this.start = Objects.requireNonNull(start, "start");
@@ -82,13 +85,26 @@ public final class PartitionReaderBuilder {
         return this;
     }
 
-    /** The messages of the reads in flight and the queued batches. Default the larger of 16,000 and the count. */
+    /**
+     * The messages of the reads in flight and the queued batches. Default 16,000, which 0 keeps. The effective message
+     * and byte budgets each hold at least {@value #MIN_PREFETCH_SLOTS} full batches, also when smaller limits are
+     * requested, so with the default options a reader reads ahead up to 32,000 messages and 32 MiB. At most 32 reads
+     * of one reader run at once.
+     *
+     * <p>With {@code OnRead}, the server stores the offset of each read before the application takes its batch. A
+     * crash, or a reader that stops without {@link PartitionReader#closeAsync()}, loses the batches that the reader
+     * held: up to the effective budget, which holds at least {@value #MIN_PREFETCH_SLOTS} batches. {@code Auto} or
+     * {@code Manual} commit stores offsets after delivery instead.
+     */
     public PartitionReaderBuilder prefetchMessages(long messages) {
         this.prefetchMessages = messages;
         return this;
     }
 
-    /** The bytes of the reads in flight and the queued batches. Default 16 MiB. */
+    /**
+     * The bytes of the reads in flight and the queued batches. Default 16 MiB. The effective budget holds at least
+     * {@value #MIN_PREFETCH_SLOTS} times the maximum bytes of a read, see {@link #prefetchMessages(long)}.
+     */
     public PartitionReaderBuilder prefetchBytes(long bytes) {
         this.prefetchBytes = bytes;
         return this;
@@ -106,6 +122,7 @@ public final class PartitionReaderBuilder {
      * @return the reader, or the error of the join
      * @throws IggyValidationException with {@link IggyErrorCode#INVALID_COMMAND} for partitions of a group, no
      *                                 partitions of a standalone consumer, or a continuation as the start
+     * @throws IggyInvalidArgumentException for a negative prefetch budget or a retry interval that is not positive
      */
     public CompletableFuture<PartitionReader> build() {
         options.validate();
@@ -118,26 +135,25 @@ public final class PartitionReaderBuilder {
                             ? "A consumer group reads the assignment of its member, not chosen partitions"
                             : "A standalone consumer needs its partitions");
         }
-        if (prefetchBytes < options.maxBytes() || retryInterval.isNegative() || retryInterval.isZero()) {
+        if (Math.min(prefetchMessages, prefetchBytes) < 0 || retryInterval.isNegative() || retryInterval.isZero()) {
             throw new IggyInvalidArgumentException(
-                    "A reader needs room for one read in its prefetch and a positive retry interval");
+                    "A reader needs nonnegative prefetch budgets and a positive retry interval");
         }
-        long messages = prefetchMessages > 0 ? prefetchMessages : Math.max(DEFAULT_PREFETCH_MESSAGES, options.count());
-        int slots = (int) Math.max(1, Math.min(messages / options.count(), prefetchBytes / options.maxBytes()));
-        PollingStrategy first = start.kind() == PollingKind.First
-                ? new PollingStrategy(PollingKind.Offset, BigInteger.ZERO, start.context())
-                : start;
+        long messages = prefetchMessages > 0 ? prefetchMessages : DEFAULT_PREFETCH_MESSAGES;
+        int slots = (int) Math.min(
+                Integer.MAX_VALUE,
+                Math.max(MIN_PREFETCH_SLOTS, Math.min(messages / options.count(), prefetchBytes / options.maxBytes())));
         var reader = new PartitionReader(
-                transport, partitions == null ? List.of() : partitions, first, options, slots, retryInterval);
+                transport, partitions == null ? List.of() : partitions, startPosition(), options, slots, retryInterval);
         return reader.start();
     }
 
-    private static IggyValidationException invalid(String reason) {
-        return new IggyValidationException(
-                IggyErrorCode.INVALID_COMMAND,
-                IggyErrorCode.INVALID_COMMAND.getCode(),
-                reason,
-                Optional.empty(),
-                Optional.empty());
+    /** Under OnRead the start applies only without a stored offset, and then the server answers Next from offset 0. */
+    private PollingStrategy startPosition() {
+        if (start.kind() != PollingKind.First) {
+            return start;
+        }
+        PollingKind kind = options.commitsOnRead() ? PollingKind.Next : PollingKind.Offset;
+        return new PollingStrategy(kind, BigInteger.ZERO, start.context());
     }
 }

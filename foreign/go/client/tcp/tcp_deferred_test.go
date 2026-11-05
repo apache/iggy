@@ -1083,7 +1083,10 @@ func TestFetchMessages_UnknownCommitBlocksProgressWithAnExplicitZeroContext(t *t
 	assert.Zero(t, requestCount(server.recorded(), command.PollMessagesDeferredCode))
 }
 
-func TestFetchMessages_ExplicitZeroContextKeepsItsWireFenceAcrossAStaleRoute(t *testing.T) {
+// A store whose context names no history takes the history of its route. A
+// stale route names a history that the server refuses, so the store cannot
+// commit past an unknown fetch of the newer history.
+func TestFetchMessages_ExplicitZeroContextTakesTheHistoryOfAStaleRoute(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	var applied atomic.Bool
 	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
@@ -1107,10 +1110,10 @@ func TestFetchMessages_ExplicitZeroContextKeepsItsWireFenceAcrossAStaleRoute(t *
 	position := iggcon.ConsumerPosition{PartitionId: 1, Offset: 7, Context: iggcon.PartitionContext{OwnerGeneration: 9, MetadataOp: 100}}
 	err := client.StoreConsumerPosition(context.Background(), calls.consumer, calls.stream, calls.topic, position)
 	require.ErrorIs(t, err, ierror.ErrHistoryUnavailable)
-	assert.False(t, applied.Load(), "the server rejects a zero header incarnation before progress admission")
+	assert.False(t, applied.Load(), "the server refuses the history of the stale route")
 	stores := requestsFor(server.recorded(), vsr.OperationForCode(uint32(command.StoreOffsetCode)))
 	require.Len(t, stores, 1)
-	assert.Zero(t, stores[0].incarnation(), "local lane normalization preserves the caller's explicit wire fence")
+	assert.Equal(t, uint64(routedIncarnation), stores[0].incarnation(), "the store names the history of its route")
 	assert.Equal(t, position.Context.OwnerGeneration, binary.LittleEndian.Uint64(stores[0].header[frameOffsetContext+8:]))
 	assert.Equal(t, position.Context.MetadataOp, binary.LittleEndian.Uint64(stores[0].header[frameOffsetContext+16:]))
 	position.Context.Incarnation = 18

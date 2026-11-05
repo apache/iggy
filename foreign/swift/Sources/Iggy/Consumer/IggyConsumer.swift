@@ -156,9 +156,10 @@ public actor IggyConsumer: AsyncSequence {
     /// Stops reading, counts the last message under
     /// ``CommitAfter/processing``, and closes the reader, which stores the
     /// counted positions, moves an `onRead` offset back to the last message
-    /// handed over, and leaves the group, within
-    /// ``ConsumerConfiguration/offsetDrainTimeout``. Every caller waits for
-    /// the same shutdown. Failures are logged.
+    /// handed over, and leaves the group. At
+    /// ``ConsumerConfiguration/offsetDrainTimeout``, it cancels the close and
+    /// waits for its end, as ``PartitionReader/close()`` describes. Every
+    /// caller waits for the same shutdown. Failures are logged.
     public func shutdown() async {
         if let shutdownTask {
             await shutdownTask.value

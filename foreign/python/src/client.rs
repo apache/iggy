@@ -2013,8 +2013,10 @@ impl IggyClient {
     /// by default. A continuation is refused, because it belongs to one partition. `options`
     /// sets each request, and defaults to `PollOptions(max_wait=timedelta(seconds=5))`: a
     /// reader without a wait polls an idle topic in a busy loop. `prefetch_bytes` (16 MiB by
-    /// default) and `prefetch_messages` (the larger of 16,000 and `options.count` by default)
-    /// bound the requests in flight and the queued batches.
+    /// default) and `prefetch_messages` (16,000 by default) request budgets for reads in flight
+    /// and queued batches. Each effective budget holds at least 32 reads at the configured
+    /// count and byte limit, even if a smaller budget is requested. Larger budgets allow more
+    /// queued batches; network requests have a separate per-consumer limit of 32.
     ///
     /// Raises `IggyError` with `InvalidCommand` (3) for partitions of a group, a
     /// `Consumer.Single` without partitions or a continuation as `start`,
@@ -2090,8 +2092,11 @@ impl IggyClient {
     /// the default, stores none, so commit checkpoints after processing, or each restart reads
     /// the same messages again. `CommitPolicy.OnRead()` makes the server store the offset of
     /// each reply, and `CommitPolicy.Auto(...)` makes the consumer store counted positions.
-    /// `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (the larger of 16,000 and
-    /// the poll count by default) bound the requests in flight and the queued batches.
+    /// `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (16,000 by default) request
+    /// budgets for reads in flight and queued batches. Each effective budget holds at least
+    /// 32 reads at the configured poll count and byte limit, even if a smaller budget is
+    /// requested. Larger budgets allow more queued batches; network requests have a separate
+    /// per-consumer limit of 32.
     /// `offset_drain_timeout` controls how long shutdown waits for pending automatic offset
     /// stores before closing the reader. It defaults to five seconds; zero skips that wait.
     /// Call `shutdown()` before dropping the consumer.
@@ -2524,6 +2529,7 @@ mod tests {
                         skip: Some(RustPollingStrategy::offset(11)),
                         offset,
                         record: record.clone(),
+                        lost: None,
                     });
                     let value = error.value(py);
                     assert_eq!(
@@ -2564,6 +2570,7 @@ mod tests {
                 skip: Some(RustPollingStrategy::offset(SKIP_OFFSET)),
                 offset: None,
                 record: None,
+                lost: None,
             };
             let message = read_error.to_string();
 
@@ -2623,6 +2630,7 @@ mod tests {
                     skip: None,
                     offset: None,
                     record: None,
+                    lost: None,
                 });
 
                 let value = error.value(py);
@@ -2649,6 +2657,7 @@ mod tests {
                 skip: None,
                 offset: None,
                 record: None,
+                lost: None,
             });
 
             let value = error.value(py);
@@ -2678,6 +2687,7 @@ mod tests {
                         skip: None,
                         offset: None,
                         record: None,
+                        lost: None,
                     }),
                 );
                 let _ = built.send(errors);

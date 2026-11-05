@@ -20,10 +20,12 @@ using Apache.Iggy.Consumers;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.IggyClient;
 using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Vsr;
 using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
 
 namespace Apache.Iggy.Tests.ConsumerTests;
 
@@ -85,7 +87,7 @@ public sealed class ConsumerOnReaderTests
         Assert.False(cluster.Stored.ContainsKey(1));
         Assert.True(await messages.MoveNextAsync());
         await UntilAsync(() => cluster.Stored.TryGetValue(1, out var stored) && stored == 0);
-        await consumer.ShutdownAsync();
+        await consumer.ShutdownAsync(Token);
 
         Assert.Equal(1ul, cluster.Stored[1]);
     }
@@ -116,7 +118,7 @@ public sealed class ConsumerOnReaderTests
 
         var error = await Assert.ThrowsAsync<InvalidOperationException>(() => consumer.ConsumeAsync(
             (message, _) => message.CurrentOffset == 1 ? Task.FromException(failure) : Task.CompletedTask, Token));
-        await consumer.ShutdownAsync();
+        await consumer.ShutdownAsync(Token);
 
         Assert.Same(failure, error);
         Assert.Equal(0ul, cluster.Stored[1]);
@@ -147,7 +149,7 @@ public sealed class ConsumerOnReaderTests
         }, Token);
         await handling.Task.WaitAsync(PromptLimit, Token);
 
-        var shutdown = consumer.ShutdownAsync();
+        var shutdown = consumer.ShutdownAsync(Token);
         await Task.WhenAny(shutdown, Task.Delay(TimeSpan.FromMilliseconds(200), Token));
         var waited = !shutdown.IsCompleted;
         release.SetResult();
@@ -180,9 +182,9 @@ public sealed class ConsumerOnReaderTests
             }
         }, Token);
         await handling.Task.WaitAsync(PromptLimit, Token);
-        var first = consumer.ShutdownAsync();
+        var first = consumer.ShutdownAsync(Token);
 
-        var second = consumer.ShutdownAsync();
+        var second = consumer.ShutdownAsync(Token);
         await Task.WhenAny(second, Task.Delay(TimeSpan.FromMilliseconds(200), Token));
         var waited = !second.IsCompleted;
         release.SetResult();
@@ -208,9 +210,37 @@ public sealed class ConsumerOnReaderTests
         Assert.True(await messages.MoveNextAsync());
         Assert.Equal(1ul, cluster.Stored[1]);
 
-        await consumer.ShutdownAsync();
+        await consumer.ShutdownAsync(Token);
 
         Assert.Equal(0ul, cluster.Stored[1]);
+    }
+
+    /// <summary>
+    ///     The server refuses the store of the shutdown as not owned, and then every read for the owner for its poll
+    ///     quota. A cancel of the token of the shutdown ends those reads, and the shutdown fails with the refusal of
+    ///     the store, which leaves the offset where the server stored it.
+    /// </summary>
+    [Fact]
+    public async Task given_on_read_when_every_read_for_the_owner_of_a_refused_shutdown_store_hits_the_poll_quota_should_end_the_shutdown_at_a_cancel()
+    {
+        using var cluster = new ReaderCluster(1);
+        using var client = await cluster.ConnectAsync();
+        var consumer = await StartAsync(client, CommitPolicy.OnRead, 1);
+        await using var messages = consumer.ReceiveAsync(Token).GetAsyncEnumerator(Token);
+        Assert.True(await messages.MoveNextAsync());
+        cluster.NextStoreNotOwned = true;
+        cluster.ProbeRefusal = VsrError.DEFERRED_POLL_CAPACITY_EXCEEDED;
+        var probes = cluster.Probes;
+        using var canceling = CancellationTokenSource.CreateLinkedTokenSource(Token);
+
+        var shutdown = consumer.ShutdownAsync(canceling.Token);
+        await UntilAsync(() => cluster.Probes > probes);
+        await canceling.CancelAsync();
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
+            shutdown.WaitAsync(PromptLimit, Token));
+        Assert.Equal(VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED, error.StatusCode);
+        Assert.Equal(1ul, cluster.Stored[1]);
     }
 
     [Fact]
@@ -304,6 +334,31 @@ public sealed class ConsumerOnReaderTests
     }
 
     /// <summary>
+    ///     The create of a missing group lands, but its reply is lost. The init fails with the unknown outcome and
+    ///     releases the create in the client, so the later metadata writes of the client go out.
+    /// </summary>
+    [Fact]
+    public async Task given_a_missing_group_when_its_create_has_an_unknown_outcome_should_release_it()
+    {
+        const ulong operation = 7;
+        var client = new Mock<IIggyClient>();
+        client.Setup(mock => mock.CreateConsumerGroupAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
+                It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new VsrRequestOutcomeUnknownException(new IOException("The reply was lost."), operation));
+        await using var consumer = new IggyConsumer(client.Object, new IggyConsumerConfig
+        {
+            StreamId = Stream,
+            TopicId = Topic,
+            Consumer = Consumer.Group("readers"),
+            CreateConsumerGroupIfNotExists = true
+        }, NullLoggerFactory.Instance);
+
+        await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => consumer.InitAsync(Token));
+
+        client.Verify(mock => mock.AbandonOperationAsync(operation), Times.Once());
+    }
+
+    /// <summary>
     ///     The first message of a last start is above the byte limit of a read, so the reader stops the partition
     ///     until a seek that only the application can choose. The stream ends with the error, as it does for a message
     ///     that does not decode, instead of waiting on a partition that never reads again.
@@ -373,14 +428,14 @@ public sealed class ConsumerOnReaderTests
             received.Add(message.CurrentOffset);
             if (shutdown)
             {
-                await consumer.ShutdownAsync();
+                await consumer.ShutdownAsync(Token);
             }
             else
             {
                 await cancellation.CancelAsync();
             }
         }, cancellation.Token);
-        await consumer.ShutdownAsync();
+        await consumer.ShutdownAsync(Token);
 
         Assert.Equal([0ul], received);
         Assert.Equal(0ul, cluster.Stored[1]);

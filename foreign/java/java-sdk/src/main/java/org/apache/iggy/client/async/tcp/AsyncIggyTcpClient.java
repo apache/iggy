@@ -567,6 +567,11 @@ public class AsyncIggyTcpClient {
         }
     }
 
+    /** The highest metadata op that a reply of the client reported as committed, as an unsigned value. */
+    long metadataWatermark() {
+        return session.metadataWatermark();
+    }
+
     /**
      * Releases local recovery state and frees the pending operation slot at once. This does not prove that the
      * operation was uncommitted. A replay of the operation that is already running keeps its lane until the replay

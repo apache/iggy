@@ -34,6 +34,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::task::{Context, Poll};
+use std::time::Duration;
 use std::vec;
 use tokio::time;
 use tracing::{error, info, warn};
@@ -80,6 +81,7 @@ impl IggyConsumerState {
         stream_id: Arc<Identifier>,
         topic_id: Arc<Identifier>,
         commit: CommitPolicy,
+        retry_interval: Duration,
     ) -> Self {
         let progress = Arc::new(Progress::new(
             client,
@@ -87,6 +89,7 @@ impl IggyConsumerState {
             Arc::clone(&stream_id),
             Arc::clone(&topic_id),
             commit,
+            retry_interval,
         ));
         Self {
             progress,
@@ -135,23 +138,36 @@ impl IggyConsumerState {
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
         let partition_id = partition_id.unwrap_or_else(|| self.partition_id());
-        let stored = match self.progress.last_delivered(partition_id) {
-            Some(last) => {
-                let stored = Checkpoint::new(partition_id, offset, last.context());
-                self.progress.store(stored).await?;
-                stored
+        let on_read = self.commit == CommitPolicy::OnRead;
+        let progress = Arc::clone(&self.progress);
+        let store = async move {
+            let stored = match progress.last_delivered(partition_id) {
+                Some(last) => {
+                    let stored = Checkpoint::new(partition_id, offset, last.context());
+                    progress.store(stored).await?;
+                    stored
+                }
+                // Nothing was consumed from this partition, so there is no captured context to
+                // keep.
+                None => {
+                    progress.store_offset(partition_id, offset).await?;
+                    Checkpoint::new(partition_id, offset, PartitionContext::default())
+                }
+            };
+            // The batches that the reader holds and its close would undo the store.
+            if on_read {
+                progress.read_after(stored);
             }
-            // Nothing was consumed from this partition, so there is no captured context to keep.
-            None => {
-                self.progress.store_offset(partition_id, offset).await?;
-                Checkpoint::new(partition_id, offset, PartitionContext::default())
-            }
+            Ok(())
         };
-        // The batches that the reader holds and its close would undo the store.
-        if self.commit == CommitPolicy::OnRead {
-            self.progress.read_after(stored);
+        if !on_read {
+            return store.await;
         }
-        Ok(())
+        // A committing read in flight would store its end over the offset, so the store holds
+        // the reads of the partition as a seek does.
+        let mut hold = self.progress.hold(partition_id).await?;
+        hold.look_up_before().await?;
+        hold.finish(store).await
     }
 
     /// Deletes the stored offset either for the current partition or the provided partition ID,
@@ -207,9 +223,13 @@ impl IggyConsumerState {
 /// - `OnRead` has the server store the offset of each batch that it reads, so the reader reads
 ///   only when the application asks for a message and nothing is queued, and then fills its
 ///   prefetch budget: one fetch per primary that may wait for messages, and the partitions with
-///   messages left behind spread over the other slots.
+///   messages left behind spread over the other slots. The start of the builder applies only to
+///   a partition without a stored offset. A partition with one resumes after it.
 ///   [`shutdown`](Self::shutdown) moves the offset back to the last message that the consumer
-///   yielded.
+///   yielded. The consumer still yields the messages that the server stored for a partition
+///   that left the assignment. `shutdown` does not move the offset back over them, also when
+///   the partition comes back, so the ones that the consumer did not yield before `shutdown`
+///   are lost for the group.
 /// - `Auto` stores the latest counted message of each partition at the interval or the event of
 ///   the policy, before a rebalance takes a partition away, and at shutdown. It never stores
 ///   the end of a prefetched batch. With [`CommitAfter::Processing`], a message that the stream
@@ -350,6 +370,7 @@ impl IggyConsumer {
             Arc::clone(&stream_id),
             Arc::clone(&topic_id),
             poll_options.commit,
+            polling_retry_interval.get_duration(),
         );
         let membership = (consumer.kind == ConsumerKind::ConsumerGroup).then(|| {
             Arc::new(Membership::new(
@@ -479,11 +500,15 @@ impl IggyConsumer {
     /// refusal of the captured context, such as [`IggyError::HistoryUnavailable`] after the
     /// partition was recreated, repeats until a message is consumed under the new context.
     ///
-    /// With [`CommitPolicy::OnRead`], a stored offset also moves the reading position: the
+    /// With [`CommitPolicy::OnRead`], a stored offset also moves the reading position. The store
+    /// holds the reads of the partition as a [`seek`](Self::seek) does: it waits for the read of
+    /// the partition in flight, and no read of it starts until the store ends. On success the
     /// consumer drops the messages of the partition that it holds and reads on from the message
-    /// after `offset`, as a [`seek`](Self::seek) there does, and the offset counts as the last
-    /// consumed message, so [`shutdown()`](Self::shutdown) keeps it. A skip past a message is
-    /// therefore never delivered again.
+    /// after `offset`, and the offset counts as the last consumed message, so
+    /// [`shutdown()`](Self::shutdown) keeps it. A skip past a message is therefore never
+    /// delivered again. A failed store moves nothing, and a dropped store finishes as a dropped
+    /// seek does. A store that starts after [`shutdown()`](Self::shutdown) waited for the stores
+    /// in progress fails with [`IggyError::InvalidConfiguration`], so none lands beside the close.
     ///
     /// On binary transports, a retained operation blocking this partition is resolved before
     /// the requested store. Recovery and the new store share one operation deadline. The store
@@ -516,7 +541,8 @@ impl IggyConsumer {
     ///
     /// [`IggyError::InvalidCommand`] with [`CommitPolicy::OnRead`], and for a checkpoint that
     /// this consumer did not yield. Otherwise the recovery and error contract of
-    /// [`Self::store_offset`].
+    /// [`Self::store_offset`], except that the consumer abandons a commit with an unknown
+    /// outcome on the client, so a later commit of the partition goes out.
     pub async fn commit(&self, checkpoint: Checkpoint) -> Result<(), IggyError> {
         self.state.commit(checkpoint).await
     }
@@ -574,7 +600,8 @@ impl IggyConsumer {
     /// Sets the next read position of `partition`, as [`PartitionReader::seek`] does, and drops
     /// the rest of the batch of `partition` that the consumer yields from. With
     /// [`CommitPolicy::OnRead`], a seek to an offset above 0 first stores the offset before it,
-    /// so a restart resumes at the new position. Every other seek stores nothing.
+    /// so a restart resumes at the new position. A seek to a timestamp moves the stored offset
+    /// before the first message at the timestamp.
     ///
     /// # Errors
     ///
@@ -934,10 +961,12 @@ impl IggyConsumer {
     /// - The reader closes with [`PartitionReader::close`]: with [`CommitPolicy::OnRead`] it
     ///   moves the offset back to the last message that the consumer yielded, and a group
     ///   member leaves its group, so the server gives its partitions to the remaining members
-    ///   at once instead of after the connection times out. The close cancels each `OnRead`
-    ///   read in flight and takes its one reply, which tells whether the server stored, so a
-    ///   read that waits on the server ends at once. Over HTTP, which has no cancel, it waits
-    ///   until the deadline of that read.
+    ///   at once instead of after the connection times out. The offset of a partition does not
+    ///   move back over the messages that the server stored before the partition left the
+    ///   assignment, so the ones that the consumer did not yield are lost for the group. The
+    ///   close cancels each `OnRead` read in flight and takes its one reply, which tells
+    ///   whether the server stored, so a read that waits on the server ends at once. Over HTTP,
+    ///   which has no cancel, it waits until the deadline of that read.
     ///
     /// # Errors
     ///

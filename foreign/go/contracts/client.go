@@ -202,6 +202,8 @@ type Client interface {
 	// StoreConsumerPosition stores a polled position under the partition context of its poll.
 	// A store that outlives an incarnation or owner change fails with ErrHistoryUnavailable or
 	// ErrConsumerGroupPartitionNotOwned instead of committing into the new incarnation.
+	// A zero context takes the context of the route, as in StoreConsumerOffset. Another context that
+	// names no incarnation takes the incarnation of the route and keeps its owner and op.
 	// Authentication is required, and the permission to poll the messages.
 	StoreConsumerPosition(
 		ctx context.Context,
@@ -241,6 +243,9 @@ type Client interface {
 		partitionId *uint32,
 	) error
 
+	// DeleteConsumerPosition deletes the stored offset of position.PartitionId under the partition
+	// context of position. A zero context takes the context of the route. Another context that
+	// names no incarnation takes the incarnation of the route and keeps its owner and op.
 	DeleteConsumerPosition(ctx context.Context, consumer Consumer, streamId Identifier, topicId Identifier, position ConsumerPosition) error
 
 	// GetConsumerGroup get the info about a specific consumer group by unique ID or name for the given stream and topic by unique IDs or names.

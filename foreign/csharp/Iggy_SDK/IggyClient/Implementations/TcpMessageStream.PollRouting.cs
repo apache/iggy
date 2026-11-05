@@ -242,6 +242,23 @@ public sealed partial class TcpMessageStream
         return query;
     }
 
+    /// <summary>
+    ///     The context of a request of one partition history. The server refuses incarnation 0 with
+    ///     HistoryUnavailable. A fully zero context carries nothing, so it takes the context of the route, as a
+    ///     request without one does. Any other context of incarnation 0 takes only the incarnation of the route and
+    ///     keeps its owner generation and metadata op, so the owner check of the server still applies. A named
+    ///     context stays as it is, so every later attempt of a request names the same history.
+    /// </summary>
+    private static PartitionContext HistoryContext(PartitionContext? caller, PartitionContext route)
+    {
+        if (caller is not { } context || context == default)
+        {
+            return route;
+        }
+
+        return context.Incarnation == 0 ? context with { Incarnation = route.Incarnation } : context;
+    }
+
     private Task<IMemoryOwner<byte>> SendRoutedAsync(int code, SendTarget target,
         ReadOnlyMemory<byte> payload, PartitionContext? context, CancellationToken token, TimeSpan? timeout = null,
         ulong? startedUnder = null) =>
@@ -344,7 +361,9 @@ public sealed partial class TcpMessageStream
                     {
                         if (operation is null && fetchLanes is null && (retainable || progress))
                         {
-                            PartitionContext? known = captured;
+                            // A context of incarnation 0 takes the incarnation of the route, so only the route names
+                            // its lane. Lane (0, 0) is the metadata lane.
+                            PartitionContext? known = captured is { Incarnation: not 0 } ? captured : null;
                             lock (_pollRoutingGate)
                             {
                                 if (known is null && _partitionRoutes.TryGetValue(partition.Key, out var cachedRoute)
@@ -362,7 +381,10 @@ public sealed partial class TcpMessageStream
                         route = await GetPartitionRouteAsync(partition.Key, partition.Query, deadline, cancellation.Token,
                             askMetadataPrimaryFirst);
                         askMetadataPrimaryFirst = false;
-                        captured ??= route.Route.Context;
+                        // A fetch names the history of each target in its body, so its own context stays zero.
+                        captured = code == CommandCodes.FETCH_MESSAGES_CODE
+                            ? captured ?? route.Route.Context
+                            : HistoryContext(captured, route.Route.Context);
                     }
                     else
                     {
@@ -371,11 +393,8 @@ public sealed partial class TcpMessageStream
                     EnsureOperationSession(code, generation);
                     if (operation is null && (retainable || progress))
                     {
-                        // A caller's zero wire fence must not bypass the resolved history's local recovery block.
-                        var laneContext = captured.Value.Incarnation == 0 && route is not null
-                            ? route.Route.Context : captured.Value;
                         var lane = target is { } selected
-                            ? new MutationLane(laneContext.Incarnation, selected.Key.PartitionId, progress)
+                            ? new MutationLane(captured.Value.Incarnation, selected.Key.PartitionId, progress)
                             : MutationLane.Metadata;
                         operation = await (fetchLanes is null
                             ? _mutations.EnterAsync(lane, code, payload, captured.Value, retainable, generation,
@@ -897,11 +916,11 @@ public sealed partial class TcpMessageStream
     ];
 
     /// <summary>
-    ///     Sends one fetch to the primary of the first target. A target without a fence, or with incarnation zero as
-    ///     the Rust SDK reads it, takes the context of its route, and each target gets the whole byte limit. A
-    ///     section or a refusal as not primary, or with a lost history, marks the routes of its partitions stale, so
-    ///     the next grouping looks them up again. So does a refusal as not owned, whose route names an old owner
-    ///     generation. A refusal of the whole fetch does not name its partition, so it marks all of them.
+    ///     Sends one fetch to the primary of the first target. A target without an incarnation takes it from its
+    ///     route as <see cref="HistoryContext" /> says, and each target gets the whole byte limit. A section or a
+    ///     refusal as not primary, or with a lost history, marks the routes of its partitions stale, so the next
+    ///     grouping looks them up again. So does a refusal as not owned, whose route names an old owner generation. A
+    ///     refusal of the whole fetch does not name its partition, so it marks all of them.
     /// </summary>
     private async Task<FetchedMessages> FetchMessagesCoreAsync(Identifier streamId, Identifier topicId,
         IReadOnlyList<(uint PartitionId, PollingStrategy Strategy)> targets, Consumer consumer, uint count,
@@ -925,7 +944,7 @@ public sealed partial class TcpMessageStream
             {
                 var key = new PartitionRouteKey(streamId, topicId, partitionId);
                 var route = await GetPartitionRouteAsync(key, RouteQuery(key), deadline, token);
-                strategy = strategy.WithContext(route.Route.Context);
+                strategy = strategy.WithContext(HistoryContext(strategy.Context, route.Route.Context));
             }
 
             fenced[index] = (partitionId, strategy);
@@ -1073,6 +1092,12 @@ public sealed partial class TcpMessageStream
             }
             using var response = attempt.Response!;
             var route = BinaryMapper.MapPartitionRoute(response.Memory.Span);
+            // A partition without an incarnation is not ready, and every request that named it would be refused with
+            // HistoryUnavailable, so the lookup goes on as after a transient refusal.
+            if (route.Incarnation == 0)
+            {
+                continue;
+            }
             bool knownReplica;
             lock (_pollRoutingGate)
             {

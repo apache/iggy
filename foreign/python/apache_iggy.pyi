@@ -2174,8 +2174,10 @@ class IggyClient:
         by default. A continuation is refused, because it belongs to one partition. `options`
         sets each request, and defaults to `PollOptions(max_wait=timedelta(seconds=5))`: a
         reader without a wait polls an idle topic in a busy loop. `prefetch_bytes` (16 MiB by
-        default) and `prefetch_messages` (the larger of 16,000 and `options.count` by default)
-        bound the requests in flight and the queued batches.
+        default) and `prefetch_messages` (16,000 by default) request budgets for reads in flight
+        and queued batches. Each effective budget holds at least 32 reads at the configured
+        count and byte limit, even if a smaller budget is requested. Larger budgets allow more
+        queued batches; network requests have a separate per-consumer limit of 32.
 
         Raises `IggyError` with `InvalidCommand` (3) for partitions of a group, a
         `Consumer.Single` without partitions or a continuation as `start`,
@@ -2212,8 +2214,11 @@ class IggyClient:
         the default, stores none, so commit checkpoints after processing, or each restart reads
         the same messages again. `CommitPolicy.OnRead()` makes the server store the offset of
         each reply, and `CommitPolicy.Auto(...)` makes the consumer store counted positions.
-        `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (the larger of 16,000 and
-        the poll count by default) bound the requests in flight and the queued batches.
+        `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (16,000 by default) request
+        budgets for reads in flight and queued batches. Each effective budget holds at least
+        32 reads at the configured poll count and byte limit, even if a smaller budget is
+        requested. Larger budgets allow more queued batches; network requests have a separate
+        per-consumer limit of 32.
         `offset_drain_timeout` controls how long shutdown waits for pending automatic offset
         stores before closing the reader. It defaults to five seconds; zero skips that wait.
         Call `shutdown()` before dropping the consumer.
@@ -3890,7 +3895,9 @@ class PartitionReader:
       while `next()` waits and then fills its budget (one fetch per primary that may wait for
       messages, the partitions with messages left behind spread over the other slots), a `seek()`
       to an offset stores the offset before it, and `close()` moves the offset back to the last
-      delivered message.
+      delivered message. A crash, or a reader dropped without `close()`, loses the batches that
+      the server stored before the application took them, up to the effective budget, which
+      holds at least 32 batches.
     - The reader stays usable after a `ReadError` and retries by itself. `HistoryUnavailable`
       (87) stops its partition until `seek()`. With `OnRead`, an unknown outcome stops its
       partition until `IggyClient.abandon_operation()` and `seek()`.

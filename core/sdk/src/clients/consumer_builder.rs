@@ -99,7 +99,8 @@ impl IggyConsumerBuilder {
 
     /// Sets the start of a partition without a position. Defaults to
     /// [`PollingStrategy::next()`]. `init()` refuses a continuation, because it belongs to one
-    /// partition.
+    /// partition. With [`CommitPolicy::OnRead`](iggy_common::CommitPolicy::OnRead), the start
+    /// applies only to a partition without a stored offset. A partition with one resumes after it.
     pub fn polling_strategy(self, polling_strategy: PollingStrategy) -> Self {
         Self {
             polling_strategy,
@@ -118,7 +119,9 @@ impl IggyConsumerBuilder {
         }
     }
 
-    /// Caps encoded bytes reserved for in-flight and buffered replies. Default: 16 MiB.
+    /// The requested encoded bytes for in-flight and buffered replies. Default: 16 MiB. The
+    /// reader raises the effective budget to at least 32 full batches of `max_bytes`, 32 MiB with
+    /// the default poll options.
     pub fn prefetch_bytes(self, prefetch_bytes: u32) -> Self {
         Self {
             prefetch_bytes,
@@ -126,8 +129,8 @@ impl IggyConsumerBuilder {
         }
     }
 
-    /// Caps messages reserved for in-flight and buffered replies. Default: 16,000, or the
-    /// `count` of the poll options when that is larger.
+    /// The requested messages for in-flight and buffered replies. Default: 16,000. The reader
+    /// raises the effective budget to at least 32 full batches of `count`.
     pub fn prefetch_messages(self, prefetch_messages: u32) -> Self {
         Self {
             prefetch_messages: Some(prefetch_messages),

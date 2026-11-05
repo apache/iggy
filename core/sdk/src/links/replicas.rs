@@ -51,7 +51,7 @@ use iggy_common::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::AbortHandle;
 use tokio::time::{Instant, sleep, timeout_at};
 use tracing::{info, warn};
@@ -153,6 +153,9 @@ struct LinksShared {
     /// shutdown stops it. Notified under the table lock, together with the
     /// state change, so a woken pause always finds the state that stopped it.
     sweep_stop: Notify,
+    /// Changes each time a link starts to serve requests, so a request without a link goes out
+    /// once one is ready instead of after its whole backoff.
+    ready_links: watch::Sender<u64>,
     events: Sender<DiagnosticEvent>,
     /// Never read. Each subscriber is a clone, so it replays the backlog.
     subscribers: Receiver<DiagnosticEvent>,
@@ -179,6 +182,17 @@ struct Slot {
     /// `None` after the task stopped. Only the task of this handle changes
     /// the slot.
     task: Option<AbortHandle>,
+}
+
+/// How the task of a slot gets its first link.
+enum SlotStart {
+    /// The slot takes over a link that is up, such as the bootstrap link.
+    Adopt(Arc<Link>),
+    /// A replica that a new roster names.
+    Dial,
+    /// A slot that ran out of retries. Its first dial waits the jitter, so
+    /// clients that restart their slots together spread their dials.
+    Restart,
 }
 
 /// The link that the sweep signed in on, until a slot takes it over or the
@@ -252,6 +266,7 @@ impl ReplicaLinks {
                 dial_permits: Semaphore::new(MAX_CONCURRENT_DIALS),
                 coordinator: ConnectCoordinator::new(),
                 sweep_stop: Notify::new(),
+                ready_links: watch::Sender::new(0),
                 events,
                 subscribers,
             }),
@@ -386,6 +401,17 @@ impl ReplicaLinks {
             ClientState::Disconnected => self.shared.keepalive_restarts(epoch),
             _ => true,
         }
+    }
+
+    /// The link for `target`, or a receiver that changes once a link starts to
+    /// serve requests. A link changes the table before it wakes the requests,
+    /// so the second look finds a link that was ready before the subscription.
+    pub(crate) fn link_or_wait(&self, target: Target) -> Result<Arc<Link>, watch::Receiver<u64>> {
+        if let Ok(link) = self.link(target) {
+            return Ok(link);
+        }
+        let ready_links = self.shared.ready_links.subscribe();
+        self.link(target).map_err(|_| ready_links)
     }
 
     /// The link for `target`. A request never dials, so a target without a
@@ -1034,11 +1060,10 @@ impl LinksShared {
                 }
                 _ => None,
             };
-            let task = self.spawn_slot(
-                *id,
-                endpoint.clone(),
-                adopted.as_ref().map(|ready| Arc::clone(&ready.link)),
-            );
+            let start = adopted.as_ref().map_or(SlotStart::Dial, |ready| {
+                SlotStart::Adopt(Arc::clone(&ready.link))
+            });
+            let task = self.spawn_slot(*id, endpoint.clone(), start);
             table.slots.insert(
                 *id,
                 Slot {
@@ -1077,13 +1102,8 @@ impl LinksShared {
         None
     }
 
-    fn spawn_slot(
-        self: &Arc<Self>,
-        id: u8,
-        endpoint: String,
-        adopted: Option<Arc<Link>>,
-    ) -> AbortHandle {
-        tokio::spawn(Arc::clone(self).run_slot(id, endpoint, adopted)).abort_handle()
+    fn spawn_slot(self: &Arc<Self>, id: u8, endpoint: String, start: SlotStart) -> AbortHandle {
+        tokio::spawn(Arc::clone(self).run_slot(id, endpoint, start)).abort_handle()
     }
 
     /// Restarts each slot without a link using its initial reconnect jitter.
@@ -1096,15 +1116,21 @@ impl LinksShared {
             if let Some(task) = slot.task.take() {
                 task.abort();
             }
-            slot.task = Some(self.spawn_slot(*id, slot.endpoint.clone(), None));
+            slot.task = Some(self.spawn_slot(*id, slot.endpoint.clone(), SlotStart::Restart));
         }
     }
 
-    /// Every background dial waits its jitter, including the first attempt
-    /// after a stable link resets the backoff.
-    async fn run_slot(self: Arc<Self>, id: u8, endpoint: String, mut adopted: Option<Arc<Link>>) {
+    /// A new slot dials at once, because requests wait for its link. Every
+    /// later dial waits its jitter, including the first redial after a stable
+    /// link resets the backoff.
+    async fn run_slot(self: Arc<Self>, id: u8, endpoint: String, start: SlotStart) {
         let mut signs_in_at = None;
         let mut retry = 0_u32;
+        let (mut adopted, mut jitter) = match start {
+            SlotStart::Adopt(link) => (Some(link), true),
+            SlotStart::Dial => (None, false),
+            SlotStart::Restart => (None, true),
+        };
         loop {
             let link = match adopted.take() {
                 Some(link) => link,
@@ -1112,7 +1138,10 @@ impl LinksShared {
                     if retry > 0 && !self.policy.allows(retry) {
                         break;
                     }
-                    sleep(self.policy.pause(retry)).await;
+                    if jitter {
+                        sleep(self.policy.pause(retry)).await;
+                    }
+                    jitter = true;
                     match self.open(id, &endpoint, &mut signs_in_at).await {
                         Some(link) => link,
                         None => {
@@ -1227,8 +1256,15 @@ impl LinksShared {
         }
         drop(table);
         drop(retired);
+        self.wake_requests();
         info!("The link to replica {id} is ready.");
         Some(link)
+    }
+
+    /// Wakes the requests that wait for a link.
+    fn wake_requests(&self) {
+        self.ready_links
+            .send_modify(|changes| *changes = changes.wrapping_add(1));
     }
 
     fn slot_down(&self, id: u8, link: &Arc<Link>) {
@@ -1294,9 +1330,13 @@ impl LinksShared {
     }
 
     fn mark_bound(&self, link: &Arc<Link>, fence: u64) {
-        if let Some(ready) = self.table().find_mut(link) {
-            ready.bound_fence = Some(fence);
-        }
+        let mut table = self.table();
+        let Some(ready) = table.find_mut(link) else {
+            return;
+        };
+        ready.bound_fence = Some(fence);
+        drop(table);
+        self.wake_requests();
     }
 
     /// Sets the state for a sign-in on `link`, unless a disconnect or a
@@ -1683,6 +1723,27 @@ mod tests {
         links.connect().await.unwrap();
 
         assert_eq!(cluster.dials_to(&endpoint(0)), [started]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_new_roster_when_connecting_should_dial_each_replica_at_once() {
+        let cluster = FakeCluster::new(3);
+        let links = links(&cluster, &endpoint(0), policy());
+        let started = Instant::now();
+
+        links.connect().await.unwrap();
+        eventually("every replica is ready", || {
+            links.ready_replicas().len() == 3
+        })
+        .await;
+
+        for replica in 1..3 {
+            assert_eq!(
+                cluster.dials_to(&endpoint(replica)),
+                [started],
+                "replica {replica}"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

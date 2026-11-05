@@ -411,8 +411,10 @@ namespace Iggy {
          * offset, PollingStrategy::next() when null, and a continuation is refused. `options`
          * defaults to a wait of 5 seconds for up to 1000 messages per request: a reader that waits
          * 0 polls an idle topic in a busy loop. `prefetch_bytes`, 16 MiB when null, and
-         * `prefetch_messages`, the larger of 16000 and `count` when null, bound the requests in
-         * flight and the queued batches.
+         * `prefetch_messages`, 16000 when null, set the requested budgets for requests in flight and
+         * queued batches. Each effective budget holds at least 32 full batches so primary groups can
+         * wait independently: 32 MiB and 32000 messages with the default options. Larger budgets
+         * allow more queued batches.
          *
          * @param mixed $stream
          * @param mixed $topic
@@ -2157,7 +2159,9 @@ namespace Iggy {
      * budget (one fetch per primary that may wait for messages, the partitions with messages left
      * behind spread over the other slots), a seek() to an offset stores the offset before it, and
      * close() moves the offset back to the last delivered message. Destroying the reader without
-     * close() stops it without waiting, moves no offset back and does not leave the group.
+     * close() stops it without waiting, moves no offset back and does not leave the group. Under
+     * onRead(), such a reader or a crash loses the batches that the server stored before the
+     * application took them, up to the effective budget, which holds at least 32 batches.
      */
     class PartitionReader {
         public function __construct() {}

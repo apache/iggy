@@ -310,9 +310,7 @@ final class PollRouter {
             AsyncTcpConnection.TransientFailoverState state) {
         try {
             byte[] query = partitionQuery(command, payload);
-            Poll poll = new Poll(query, command, payload, deadline, context);
-            poll.state = state;
-            return send(poll);
+            return send(new Poll(query, command, payload, deadline, context, state));
         } catch (RuntimeException error) {
             payload.release();
             return CompletableFuture.failedFuture(error);
@@ -334,10 +332,9 @@ final class PollRouter {
     }
 
     /**
-     * Sends one fetch to the primary of its first partition, {@code partition}, using its route.
-     * Each target of a fetch carries its own fence, so the request header carries none.
-     *
-     * @param topic the encoded stream and topic identifiers
+     * Fetches from the primary of {@code partition} using the encoded stream and topic in {@code topic}.
+     * Attempts stop {@link DeferredPollOptions#REPLY_MARGIN} before {@code deadline}, preserving the last capacity
+     * refusal when no retry fits. In-flight replies keep the full deadline.
      */
     CompletableFuture<ByteBuf> fetchRequest(
             ByteBuf payload,
@@ -363,12 +360,11 @@ final class PollRouter {
             AsyncTcpConnection.TransientFailoverState state) {
         Poll poll;
         try {
-            poll = new Poll(target, command, payload, deadline, context);
+            poll = new Poll(target, command, payload, deadline, context, state);
         } catch (RuntimeException error) {
             payload.release();
             return CompletableFuture.failedFuture(error);
         }
-        poll.state = state;
         return send(poll);
     }
 
@@ -540,8 +536,8 @@ final class PollRouter {
                 CommandCode.Messages.GET_PARTITION_ROUTE.getValue(),
                 Unpooled.wrappedBuffer(target),
                 deadline,
-                Optional.empty());
-        lookup.state = state;
+                Optional.empty(),
+                state);
         return AsyncTcpConnection.mapResponse(send(lookup), response -> {
             response.release();
             return answer.apply(lookup.route);
@@ -617,9 +613,8 @@ final class PollRouter {
                     }
                 });
             } else {
-                Poll poll =
-                        new Poll(ticket.routingBody(), ticket.commandCode(), payload, deadline, Optional.of(context));
-                poll.state = state;
+                Poll poll = new Poll(
+                        ticket.routingBody(), ticket.commandCode(), payload, deadline, Optional.of(context), state);
                 poll.payloadLease = ticket;
                 replayed = send(poll);
             }
@@ -1038,7 +1033,7 @@ final class PollRouter {
         if (poll.result.isDone()) {
             return;
         }
-        if (poll.deadline - System.nanoTime() <= 0) {
+        if (poll.attemptDeadline - System.nanoTime() <= 0) {
             poll.endPending();
             return;
         }
@@ -1101,7 +1096,7 @@ final class PollRouter {
                 && (lostLink
                         || (refusal != null
                                 && refusal.getRawErrorCode() == AsyncTcpConnection.TRANSIENT_NOT_COMMITTED))) {
-            if (poll.deadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(RETRY_INTERVAL_MILLIS)) {
+            if (poll.attemptDeadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(RETRY_INTERVAL_MILLIS)) {
                 // A mutation that an attempt can have applied keeps that in its ticket, which fail() retains.
                 poll.fail(lostLink && (poll.isMutation() || !poll.dataSent) ? notAccepted() : uncommitted());
             } else {
@@ -1174,7 +1169,7 @@ final class PollRouter {
 
     private void retryLifecycle(Poll poll, IggyServerException refusal) {
         long delay = poll.lifecycleRetryMillis;
-        if (poll.deadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(delay)) {
+        if (poll.attemptDeadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(delay)) {
             poll.fail(refusal);
             return;
         }
@@ -1185,7 +1180,10 @@ final class PollRouter {
     }
 
     private void retry(Poll poll, boolean notPrimary, IggyServerException refusal) {
-        long delay = notPrimary ? poll.notPrimarySeen ? poll.notPrimaryRetryMillis : 0 : RETRY_INTERVAL_MILLIS;
+        long delay = notPrimary
+                ? poll.notPrimarySeen ? poll.notPrimaryRetryMillis : 0
+                : TimeUnit.NANOSECONDS.toMillis(
+                        poll.state.retryPauseNanos(ThreadLocalRandom.current().nextDouble()));
         if (!poll.retryRefusal(delay, refusal)) {
             return;
         }
@@ -1460,7 +1458,7 @@ final class PollRouter {
             return CompletableFuture.completedFuture(Unpooled.EMPTY_BUFFER);
         }
         poll.routed();
-        poll.context.compareAndSet(null, route.context);
+        poll.context.updateAndGet(caller -> RoutedContext.of(poll.dataCommand, caller, route.context));
         poll.state.setContext(poll.context.get());
         poll.state.setRoutingBody(poll.routingBody);
         if (poll.requiresLane) {
@@ -1690,7 +1688,6 @@ final class PollRouter {
         }
     }
 
-    /** One poll or offset write, routed by the routing command and sent as the data command. */
     private static final class Poll {
         private final TargetKey key;
         private final byte[] routingBody;
@@ -1699,9 +1696,10 @@ final class PollRouter {
         private ConsensusSession.Ticket payloadLease;
         private final CompletableFuture<ByteBuf> result = new CompletableFuture<>();
         private final long deadline;
+        private long attemptDeadline;
         private volatile CompletableFuture<ByteBuf> activeExchange;
         private boolean deferredAdmitted;
-        // The caller's context, or else the first route's, stays fixed within one operation.
+        // Fixed within one operation once the first route filled it, see RoutedContext.
         private final AtomicReference<PartitionContext> context;
         private final boolean hasCallerContext;
         // Read once, since the deadline timer can run after the payload was released.
@@ -1711,38 +1709,39 @@ final class PollRouter {
         private final boolean commits;
         private boolean historyRefreshed;
         private boolean retryingRefusal;
-        // The last capacity refusal, which the call reports when its deadline ends the retries. A budget too short
-        // for another attempt also ends them with 58, which would hide it.
         private IggyServerException capacityRefusal;
         private boolean notPrimarySeen;
         private long notPrimaryRetryMillis = RETRY_INTERVAL_MILLIS;
         private boolean terminalRoutingRefusal;
         private boolean dataSent;
-        // The lookups until a route is used start at the metadata primary, which a backup that missed the namespace
-        // lags behind.
+        // Start lookups at the metadata primary, ahead of backups that missed the namespace.
         private boolean backupMiss;
         private long lifecycleRetryMillis = RETRY_INTERVAL_MILLIS;
         private IggyServerException lifecycleRefusal;
         private Route route;
         private final Set<ConnectionInfo> lookupVisited = new HashSet<>();
-        private AsyncTcpConnection.TransientFailoverState state = new AsyncTcpConnection.TransientFailoverState();
+        private AsyncTcpConnection.TransientFailoverState state;
 
         private Poll(
                 byte[] routingBody,
                 int dataCommand,
                 ByteBuf payload,
                 long deadline,
-                Optional<PartitionContext> callerContext) {
+                Optional<PartitionContext> callerContext,
+                AsyncTcpConnection.TransientFailoverState state) {
             this.key = TargetKey.of(routingBody);
             this.routingBody = routingBody;
             this.dataCommand = dataCommand;
             this.payload = payload;
             this.deadline = deadline;
+            this.state = state;
             this.context = new AtomicReference<>(callerContext.orElse(null));
             this.hasCallerContext = callerContext.isPresent();
             int pollEnd = payload.writerIndex()
                     - (dataCommand == CommandCode.Messages.POLL_DEFERRED.getValue() ? DEFERRED_PARAMETERS_BYTES : 0);
             boolean fetch = dataCommand == CommandCode.Messages.FETCH_MESSAGES.getValue();
+            // Mirrors FetchMessages.keepsReplyMargin, which also applies to a fetch with zero wait.
+            this.attemptDeadline = fetch ? deadline - DeferredPollOptions.REPLY_MARGIN.toNanos() : deadline;
             this.fetchLanes = fetch ? FetchMessages.progressLanes(payload) : List.of();
             this.commits = CommittingRead.commits(dataCommand, payload);
             this.requiresLane = isMutation()
@@ -1816,8 +1815,7 @@ final class PollRouter {
             }
         }
 
-        // A refusal leaves nothing in flight on a primary until the next route is known,
-        // so the flag must survive the route lookup that follows it.
+        // A refusal survives route lookup; enqueue clears it before preparing the next exchange.
         private synchronized void routed() {
             retryingRefusal = false;
             lifecycleRefusal = null;
@@ -1825,11 +1823,13 @@ final class PollRouter {
 
         private synchronized boolean retryRefusal(long delayMillis, IggyServerException refusal) {
             retryingRefusal = true;
-            if (refusal != null
-                    && refusal.getRawErrorCode() == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode()) {
+            if (dataCommand == CommandCode.Messages.POLL_DEFERRED.getValue()) {
+                attemptDeadline = deadline - DeferredPollOptions.REPLY_MARGIN.toNanos();
+            }
+            if (refusal != null && refusal.getErrorCode() == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED) {
                 capacityRefusal = refusal;
             }
-            if (deadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(delayMillis)) {
+            if (attemptDeadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(delayMillis)) {
                 fail(deadlineRefusal());
                 return false;
             }

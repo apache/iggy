@@ -31,9 +31,16 @@ use async_trait::async_trait;
 /// (5009) for a consumer group. The failed route is dropped, so the next call routes again and
 /// takes the new context. [`Self::store_consumer_position`] and [`Self::delete_consumer_position`]
 /// carry the caller's context, so they keep getting the refusal for that context.
+///
+/// The server refuses incarnation 0, which names no history. So a client sends a checkpoint with
+/// a zero context as a write without a context. A binary client gives any other context with
+/// incarnation 0 the incarnation of the route at the first attempt and keeps its owner and op,
+/// and every retry and replay names that history. HTTP has no route, so it sends such a context
+/// as it is, and the server refuses it.
 #[async_trait]
 pub trait ConsumerOffsetClient {
-    /// Commit a checkpoint without substituting a newer incarnation or owner.
+    /// Commit a checkpoint without substituting a newer incarnation or owner for the ones that
+    /// it names. A binary client fills incarnation 0 from the route, see the trait docs.
     /// Authentication and permission to poll messages are required.
     /// Returns [`IggyError::HistoryUnavailable`] (87) for a deleted or replaced incarnation,
     /// [`IggyError::ConsumerGroupPartitionNotOwned`] (5009) for a lost owner,
@@ -89,7 +96,8 @@ pub trait ConsumerOffsetClient {
     ) -> Result<(), IggyError>;
 
     /// Delete the offset of the partition of a checkpoint without substituting a newer
-    /// incarnation or owner. The offset of the checkpoint is not used.
+    /// incarnation or owner for the ones that it names. A binary client fills incarnation 0
+    /// from the route, see the trait docs. The offset of the checkpoint is not used.
     /// Authentication and permission to poll messages are required.
     /// Returns [`IggyError::HistoryUnavailable`] (87) for a deleted or replaced incarnation,
     /// [`IggyError::ConsumerGroupPartitionNotOwned`] (5009) for a lost owner,

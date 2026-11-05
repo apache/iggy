@@ -409,8 +409,9 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   it on a client that sends nothing else meanwhile.
 - The default options of a reader or a consumer wait 5 seconds for up to 1000
   messages. A wait of 0 polls an idle topic in a busy loop. `prefetch_bytes`
-  (16 MiB) and `prefetch_messages` bound the requests in flight and the queued
-  batches.
+  (16 MiB) and `prefetch_messages` (16000) are the requested budgets for the
+  requests in flight and the queued batches. Each effective budget holds at
+  least 32 full batches: 32 MiB and 32000 messages with the default options.
 - With `CommitPolicy::manual()`, the consumer stores no offset. Commit checkpoints
   after processing, or each restart reads the same messages again.
 - Under `CommitPolicy::auto()`, `consumeMessages()` counts a message after its callback
@@ -441,7 +442,8 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   Under `CommitPolicy::auto()`, they store the latest counted position first. Under
   `CommitPolicy::onRead()`, they move the offset back to the last delivered
   message, so the next run reads the prefetched messages again. Destroying the object
-  without them skips those messages.
+  without them, or a crash, skips those messages. The loss is at most the effective
+  budget, which holds at least 32 batches.
 - A poll with a fresh strategy, or an offset write without a checkpoint, uses the
   context of its route. It can fail once with `HistoryUnavailable` (87), or
   `ConsumerGroupPartitionNotOwned` (5009) for a consumer group, after another client

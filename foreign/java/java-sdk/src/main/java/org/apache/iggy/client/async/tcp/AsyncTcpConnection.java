@@ -123,8 +123,7 @@ public class AsyncTcpConnection {
     // the transient interval up to this cap; mirrors LIFECYCLE_RETRY_MAX_INTERVAL
     // in core/sdk/src/vsr.rs.
     private static final Duration TRANSIENT_RETRY_BUDGET = Duration.ofSeconds(30);
-    // The pause before a leader recheck that follows NOT_PRIMARY in a row grows from the base to the cap with full
-    // jitter; mirrors RETRY_BACKOFF_BASE and RETRY_BACKOFF_MAX in core/sdk/src/links/mod.rs.
+    // Full-jitter refusal retries mirror core/sdk/src/links/mod.rs.
     private static final Duration RETRY_BACKOFF_BASE = Duration.ofMillis(50);
     private static final Duration RETRY_BACKOFF_MAX = Duration.ofSeconds(1);
     private static final String EVENT_LOOP_THREAD_PREFIX = "iggy-tcp-io";
@@ -830,14 +829,10 @@ public class AsyncTcpConnection {
                         || serverError.getRawErrorCode() == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode());
     }
 
-    /**
-     * Paces lost-link and non-admission retries with full jitter and a doubling ceiling. First NOT_PRIMARY retries
-     * immediately; a pause that would reach the deadline ends the call.
-     */
+    /** Paces lost-link and non-admission retries; a pause that reaches the deadline ends the call. */
     private void pauseBeforeRecheck(Call call, Throwable rejection) {
         TransientFailoverState state = call.state();
-        long pause = ThreadLocalRandom.current().nextLong(state.pauseCeilingNanos + 1);
-        state.pauseCeilingNanos = Math.min(state.pauseCeilingNanos * 2, RETRY_BACKOFF_MAX.toNanos());
+        long pause = state.retryPauseNanos(ThreadLocalRandom.current().nextDouble());
         if (call.deadline() - System.nanoTime() - pause <= 0) {
             call.end(notAccepted());
         } else {
@@ -1824,6 +1819,12 @@ public class AsyncTcpConnection {
 
         TransientFailoverState(PartitionContext context) {
             this.context = context;
+        }
+
+        synchronized long retryPauseNanos(double draw) {
+            long ceiling = pauseCeilingNanos;
+            pauseCeilingNanos = Math.min(ceiling * 2, RETRY_BACKOFF_MAX.toNanos());
+            return (long) (ceiling * draw);
         }
 
         long lineage() {

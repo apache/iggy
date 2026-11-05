@@ -272,7 +272,8 @@ The SDK reads in three ways. Each one takes `PollOptions` and starts from a `Pol
 - `PartitionReader` reads many partitions and returns batches. Build one with
   `client.reader(stream, topic, consumer)`. A standalone `Consumer` reads the partitions of
   `.partitions(...)`. A consumer group member reads its assignment: the reader joins the group,
-  joins again after a session loss, and leaves the group in `close()`.
+  joins again after a session loss, and leaves the group in `close()`. The close abandons a join or
+  a leave with an unknown outcome, so the later metadata writes of the client go out.
 - `IggyConsumer` is a `Stream` of messages over one `PartitionReader`, with commit policies, group
   creation, init retries and a replay filter. A standalone consumer needs `.partitions(...)`.
 
@@ -397,7 +398,9 @@ picks one of three policies:
 - `Manual`: commit explicitly, after processing and in partition order: `store_consumer_position(...)`
   after `poll_messages`, `reader.commit(checkpoint)` or `consumer.commit(received.checkpoint())`.
   This gives at-least-once delivery. The reader skips a checkpoint at or below its last commit. It
-  also skips a checkpoint from before a `seek` or a new assignment of its partition.
+  also skips a checkpoint from before a `seek` or a new assignment of its partition. A commit with
+  an unknown outcome returns `OperationUncertain`, and the reader abandons it on the client, so a
+  retry goes out.
 - `Auto(AutoCommit { interval, every, after })`: the reader and the consumer store the latest
   counted position on an `interval`, on an event (`every`: each message, `Messages(n)` counted
   messages of a partition since its last store, or each batch), or both. `after` decides when a
@@ -406,17 +409,44 @@ picks one of three policies:
   after `mark(checkpoint)`, for concurrent processing. A handler that fails under `Processing` ends
   `consume_messages()` without counting its message. Stores only move forward, drop positions of an
   older generation, and also happen on close, on shutdown and before a rebalance takes a partition
-  away. `AutoCommit::default()` stores every 10,000 messages or 5 s after processing. A one-shot
+  away. A store with an unknown outcome is abandoned on the client, so the next store goes out.
+  `AutoCommit::default()` stores every 10,000 messages or 5 s after processing. A one-shot
   `poll_messages` refuses `Auto` with `InvalidConfiguration`, because it has nothing to count.
 - `OnRead`: the server stores the offset of the last message of each read as part of the read, in
   one round trip. While the primary stays up a message is delivered at most once. A failover before
   the store replicates can deliver the last batch again. The reader reads only when the application
   asks for a batch and none is queued, and then fills its prefetch budget: one fetch per primary that
-  may wait for messages, and the partitions with messages left behind spread over the other slots. A
-  `seek` to an offset above 0 first stores the offset before it, so a restart resumes at the new
-  position. `commit` and `mark` return `InvalidCommand`. An encryptor is refused, because the server stores the offset before the
+  may wait for messages, and the partitions with messages left behind spread over the other slots.
+  The start applies only to a partition without a stored offset. A partition with one resumes after
+  it. A `Last` start reads the last `count` messages. A `seek` to an offset above 0 first stores the offset before it, so a restart resumes at the
+  new position. A `seek` to offset 0 deletes the stored offset when the server holds one, because the
+  commit of a read never moves the offset back. A `seek` to a timestamp first reads one message at
+  the timestamp without a commit, and then moves the stored offset before it. Such a `seek` waits
+  for the read in flight of its partition. Until the new position takes effect or the `seek` fails,
+  the reader starts no read of the partition, on every transport. So no read from the old position
+  commits after the store or the delete. A failed `seek` moves nothing. A `seek` dropped before its
+  store or delete changes nothing. Once that write starts, the `seek` finishes in the background, and
+  a later `seek` of the partition and `close()` wait for it. A write with an unknown outcome fails
+  the `seek` and keeps the old position. HTTP reports such a write as `TransientNotCommitted`. The
+  reader then abandons its operation, if the client retains one, and reads again what the write may
+  have skipped. If the position of the partition names no offset, such as a start before the first
+  read, a `seek` looks the stored offset up first. If the reader delivered no message of the
+  partition since its last assignment, the `seek` also does so. After an unknown
+  outcome, a position that names no offset reads on after that offset. A `close()` before any batch
+  of the partition arrived puts that offset back as it was, or deletes the offset when the server
+  held none. A group member skips this for a partition that left it since the write.
+  `commit` and `mark` return
+  `InvalidCommand`. An encryptor is refused, because the server stores the offset before the
   client decrypts the batch. `close()` and `shutdown()` move the offset back to the last delivered
-  message.
+  message, or before the first batch that the application did not take. A partition that leaves
+  the assignment still hands over the batches that the server stored for it. `close()` does not
+  move the offset back over these batches, also when the partition comes back. So the ones that
+  the application did not take before `close()` are lost for the group. A store or delete of the
+  close with an unknown outcome fails the close, and the close abandons it on the client, so a later
+  reader of the partition can write. A crash, or a reader
+  dropped without `close()`, loses the batches that the server stored before the application took
+  them. The loss is at most the effective prefetch budget, which holds
+  at least 32 batches. `Auto` and `Manual` store offsets after delivery instead.
 
 A consumer that delivered messages but stored no offset logs a warning at shutdown. With the default
 policy and `next`, `consume_messages()` also warns at its start, because its handler cannot commit.
@@ -439,9 +469,20 @@ for an error of the whole reader), `error` and `skip`. The reader stays usable a
   the other partitions.
 - `HistoryUnavailable` (87) stops its partition until `seek(partition, start)`, because an old
   offset names no position in the new history. The other partitions go on.
+- `ConsumerGroupPartitionNotOwned` (5009) on a read is no leave. The reader asks for a new
+  assignment and reads the partition again after a wait that doubles each time. Each sixth
+  refusal in a row comes out as one error, and the reader reads on.
 - A message that does not decode or decrypt comes out as an error after the batch of the messages
   before it. Its `skip` is the continuation after the message. The reader reads the message again
   until `seek(partition, skip)` moves past it.
+
+A group member whose store or delete gets `ConsumerGroupPartitionNotOwned` (5009) for a partition
+that it still has asks for a new assignment at once. It reads the partition once without a commit,
+for the owner that the server installed, and sends the write once more under that owner. It retries
+a transient refusal of that read until the caller of the write cancels it. For a `seek` that its
+caller dropped and for an `Auto` store, `close()` ends that retry, and the reader logs the first
+error. If the read gets another refusal or shows another history of the partition, the write fails
+with its first error. So does a write for a partition that left.
 
 A read without `OnRead` stores nothing, so a retry after a lost reply is safe. The binary transport
 sends such a poll again, with less wait and time left, unless it starts from `next`. A one-shot poll
@@ -468,12 +509,16 @@ offset store or delete with an unknown outcome, and `resolve_operation` can prov
 partition from its stored offset, so the server refuses the commit of an older read once the offset
 moved. For a lost reply they abandon the operation, and while they hold it, a next read that starts
 past the last delivered message makes them read the skipped messages again by offset without a
-commit and hand them over first. A later read that stores from the expected offset ends that,
+commit and hand them over first. A later `Next` read that returns the expected offset ends that,
 because its store fences out the lost read. A read that starts past the last delivered message
 without a lost read goes on from there: the application or another session stored that offset. Under
-`OnRead`, `IggyConsumer::store_offset` also moves the reader to the message after the stored offset.
+`OnRead`, `IggyConsumer::store_offset` also moves the reader to the message after the stored offset,
+and it holds the reads of the partition as a `seek` does. Once `shutdown()` waited for the stores
+in progress, such a store fails with `InvalidConfiguration`.
 Only a rebalance that moves the partition to another member before the catch-up loses messages that
-a lost read stored. `close()` and `shutdown()` cancel each `OnRead` read in flight on TCP, QUIC and
+a lost read stored. The reader then returns one `FetchProgressUncertain` error for that partition,
+with the first and last offset of those messages in `lost`.
+`close()` and `shutdown()` cancel each `OnRead` read in flight on TCP, QUIC and
 WebSocket and take its one reply, which tells what the server stored, so a read that waits on the
 server ends at once. Over HTTP, which has no cancel, they wait until the deadline of the read. Then
 they move the offset of a partition with a lost reply back to its last delivered message. A
@@ -486,17 +531,20 @@ refreshes, retries and server forwarding. If the deadline passes before the requ
 client, the call returns `TransientNotAccepted` (58), and a retry is safe. A proxy between the
 client and the server must allow more than `max_wait` plus 10 s for one request.
 
-A client admits at most 64 waiting reads, and each reader at most 16 of them. A read that waits for
-admission spends its own deadline. On TCP, QUIC and WebSocket, reads share the multiplexed
+A client admits at most 64 waiting reads, and each reader at most 32 of them. Two readers whose
+reads all wait can fill one client. A reader starts no more reads than its own limit. A read that
+waits for client admission spends its own deadline. On TCP, QUIC and WebSocket, reads share the multiplexed
 connections with other traffic. There, a read with `OnRead` also holds a slot of a pending pool (see
 [mutation recovery](#mutation-recovery)). A dropped binary read sends command 108, which stops a
 request that still waits on the server. The server turns a cancelled QUIC stream into the same
 command.
 
 The reader keeps reads in flight and batches queued within a budget of encoded bytes and messages:
-`prefetch_bytes` (default 16 MiB) and `prefetch_messages` (default: the larger of 16,000 and
-`count`). Each request reserves `count` messages and `max_bytes` bytes until `next()` hands its
-batch over, and one request always fits. A full budget stops new requests. A batch that the
+`prefetch_bytes` (default 16 MiB) and `prefetch_messages` (default 16,000). Each request reserves
+`count` messages and `max_bytes` bytes until `next()` hands its batch over. The effective budget
+holds at least 32 such batches, so the fetches that wait on quiet primaries leave room for busy
+ones. With the default options, that is 32 MiB and 32,000 messages. With larger replies, it is 32
+times `max_bytes`. A larger budget allows more queued batches. A full budget stops new requests. A batch that the
 application holds is outside the budget, but `IggyConsumer` keeps the batch that it yields from
 until its last message. The budget counts encoded bytes, not process memory: decoded metadata and
 HTTP JSON overhead come on top. Routing, reconnection and cancellation go on while the application
@@ -512,8 +560,8 @@ starts them only when the application waits for a batch, and the waiting fetch o
 its end before the next one starts. After a
 rebalance, a partition that stays with the member continues after its last delivered message. A
 newly assigned partition starts at the start of the builder: `.start(...)` on the reader,
-`.polling_strategy(...)` on the consumer. In a new session, a group member starts every partition
-there again. `last` and `timestamp` starts read with single polls until the first message.
+`.polling_strategy(...)` on the consumer. With `OnRead`, it resumes after its stored offset instead
+when the server holds one. In a new session, a group member starts every partition there again. `last` and `timestamp` starts read with single polls until the first message.
 
 On these transports, progress calls of one partition share a progress lane: polls and fetches from
 `next` or with `OnRead`, and offset reads, stores and deletes. Sends use a separate mutation lane,

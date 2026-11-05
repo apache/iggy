@@ -49,7 +49,7 @@ import {
 } from '../wire/message/fetch-messages.command.js';
 import {
   EvictionReason, HEADER_SIZE, REPLY_OFFSET, hasCommittedResult, type PartitionContext,
-  EMPTY_PARTITION_CONTEXT, readReplyOperation
+  EMPTY_PARTITION_CONTEXT, readReplyOperation, sameContext
 } from '../wire/vsr/header.js';
 import { Operation, isMetadata, operationForCode } from '../wire/vsr/operation.js';
 import {
@@ -398,7 +398,17 @@ export class CommandResponseStream extends EventEmitter {
     /** The frame of the operation belongs to a replaced session, or an 88 spent its request id. */
     let staleFrame = false;
     let frame: Buffer | undefined;
-    let context = options.context ? { ...options.context } : undefined;
+    // The server fences the history that a poll or an offset call names, and no partition has history 0.
+    const fencesHistory = isPoll(command) || OFFSET_COMMANDS.has(command);
+    /**
+     * The context of the caller. A fully zero context names nothing, so it counts as none, as in the Rust SDK. Only a
+     * fetch keeps it, as its header, because each target of a fetch carries its own fence. A fenced call of history 0
+     * takes the history of its first route, so every attempt names the same history and keeps the owner and op of the
+     * caller.
+     */
+    let callerContext = !fetch && options.context && sameContext(options.context, EMPTY_PARTITION_CONTEXT)
+      ? undefined : options.context;
+    let context = callerContext ? { ...callerContext } : undefined;
     let selected: CachedRoute | undefined;
     let historyRefreshed = false;
     let lifecycleDelay = RETRY_INTERVAL_MS;
@@ -430,7 +440,7 @@ export class CommandResponseStream extends EventEmitter {
           frame = undefined;
           // A frame of the new session carries the context of the route that
           // the new session looks up.
-          context = options.context ? { ...options.context } : undefined;
+          context = callerContext ? { ...callerContext } : undefined;
           if (operation) {
             if (frameLease) operation.frame.release();
             frameLease = false;
@@ -446,9 +456,29 @@ export class CommandResponseStream extends EventEmitter {
             if (restartable && generation !== this.routingGeneration && !isSessionFailure(error)) continue;
             throw error;
           }
+          if (fencesHistory && (callerContext?.incarnation ?? 0n) === 0n) {
+            if (selected.route.context.incarnation === 0n) {
+              // The route has no history yet, so its lookup goes again, as after a transient refusal.
+              this.invalidateRoute(selected, false);
+              selected = undefined;
+              lastRefusal = responseError(command, TRANSIENT_NOT_ACCEPTED);
+              lastRefusal.fromServer = true;
+              retryDelay = await backOff(retryDelay, deadline, signal);
+              continue;
+            }
+            if (callerContext) {
+              callerContext = { ...callerContext, incarnation: selected.route.context.incarnation };
+              context = { ...callerContext };
+            }
+          }
           context ??= { ...selected.route.context };
         }
         context ??= { ...EMPTY_PARTITION_CONTEXT, metadataOp: this.metadataWatermark };
+        // Raised here, past the sign-in of a new session, whose Register installs the owners again at its op.
+        if (callerContext && body[0] === ConsumerKind.Group && context.ownerGeneration === 0n &&
+            (command === COMMAND_CODE.StoreOffset || command === COMMAND_CODE.DeleteConsumerOffset) &&
+            context.metadataOp < this.metadataWatermark)
+          context = { ...context, metadataOp: this.metadataWatermark };
         this.ensureLineage(lineage, command);
         // A caller's zero wire fence must not bypass the resolved history's local recovery block.
         const laneContext = context.incarnation === 0n && selected ? selected.route.context : context;
@@ -585,8 +615,7 @@ export class CommandResponseStream extends EventEmitter {
             throw new OperationUncertainError(operation.id, new Error('reply does not prove the retained result'));
           if (command === COMMAND_CODE.GetPartitionRoute &&
               !this.rememberRoute({ query: body, key: body.toString('hex') }, attempt.response!)) {
-            await waitWithin(pause(Math.floor(Math.random() * (retryDelay + 1)), signal), deadline, signal);
-            retryDelay = Math.min(retryDelay * 2, MAX_RETRY_INTERVAL_MS);
+            retryDelay = await backOff(retryDelay, deadline, signal);
             continue;
           }
           if (lineage === this.lineage) this._rememberCredentials(command, body);
@@ -627,7 +656,7 @@ export class CommandResponseStream extends EventEmitter {
           if (code === NOT_PRIMARY && !repeatedNotPrimary) continue;
         } else if (code === HISTORY_UNAVAILABLE && !operation?.uncertain) {
           if (selected) this.invalidateRoute(selected, false);
-          if (target && command === COMMAND_CODE.SendMessages && !options.context && !historyRefreshed) {
+          if (target && command === COMMAND_CODE.SendMessages && !callerContext && !historyRefreshed) {
             historyRefreshed = true;
             if (operation) {
               this.lanes.complete(operation);
@@ -650,7 +679,7 @@ export class CommandResponseStream extends EventEmitter {
           }
           frame = undefined;
           selected = undefined;
-          context = options.context ? { ...options.context } : undefined;
+          context = callerContext ? { ...callerContext } : undefined;
           await waitWithin(pause(lifecycleDelay, signal), deadline, signal);
           lifecycleDelay = Math.min(lifecycleDelay * 2, MAX_LIFECYCLE_INTERVAL_MS);
           continue;
@@ -686,8 +715,7 @@ export class CommandResponseStream extends EventEmitter {
             throw error;
           refresh = true;
         }
-        await waitWithin(pause(Math.floor(Math.random() * (retryDelay + 1)), signal), deadline, signal);
-        retryDelay = Math.min(retryDelay * 2, MAX_RETRY_INTERVAL_MS);
+        retryDelay = await backOff(retryDelay, deadline, signal);
       }
     } catch (error) {
       if (operation?.fetchProgress && mayHaveCommitted) {
@@ -713,8 +741,11 @@ export class CommandResponseStream extends EventEmitter {
 
   /**
    * A fetch goes to the primary of its targets.
-   * Each target carries its own fence, so the header carries context zero,
-   * and a target without a fence takes the incarnation of its route. A
+   * Each target carries its own fence, so the header carries context zero.
+   * A target of history 0 takes the incarnation of its route once, before
+   * the first attempt, and keeps its owner. A route names no owner, so a
+   * fully zero target ends with the route context. A route of history 0
+   * goes stale and is looked up again, as after a transient refusal. A
    * refusal of the fetch as not the primary, or for a history or an owner
    * that changed, does not say which partition it is about, so the routes of
    * all targets go stale. A section refused so names its partition, so only
@@ -725,11 +756,23 @@ export class CommandResponseStream extends EventEmitter {
     const command = COMMAND_CODE.FetchMessages;
     const { topic, targets } = readFetch(body);
     const unfenced = targets.filter((target) => target.readBigUInt64LE(FETCH_TARGET_FIELD.incarnation) === 0n);
-    const routes = await this.routesOf(command, topic, unfenced, deadline, signal, lineage);
-    unfenced.forEach((target, index) => {
-      target.writeBigUInt64LE(routes[index].route.context.incarnation, FETCH_TARGET_FIELD.incarnation);
-      target.writeBigUInt64LE(routes[index].route.context.ownerGeneration, FETCH_TARGET_FIELD.ownerGeneration);
-    });
+    let retryDelay = RETRY_INTERVAL_MS;
+    for (;;) {
+      const routes = await this.routesOf(command, topic, unfenced, deadline, signal, lineage);
+      const historyless = routes.filter(({ route }) => route.context.incarnation === 0n);
+      if (historyless.length === 0) {
+        unfenced.forEach((target, index) =>
+          target.writeBigUInt64LE(routes[index].route.context.incarnation, FETCH_TARGET_FIELD.incarnation));
+        break;
+      }
+      for (const route of historyless) this.invalidateRoute(route, false);
+      try {
+        retryDelay = await backOff(retryDelay, deadline, signal);
+      } catch (error) {
+        // No request of these targets went out.
+        throw error instanceof VsrResponseTimeoutError ? responseError(command, TRANSIENT_NOT_ACCEPTED) : error;
+      }
+    }
     let response: CommandResponse;
     try {
       response = await this.drive(command, body, { ...options, context: EMPTY_PARTITION_CONTEXT },
@@ -1604,6 +1647,12 @@ const groupKey = (context: PartitionContext, target: PartitionTarget): string =>
 const progressLaneOf = (lane: string): string => `progress:${lane}`;
 const isPoll = (command: number): boolean =>
   command === COMMAND_CODE.PollMessages || command === COMMAND_CODE.PollMessagesDeferred;
+
+/** Waits a random part of `delay`, so the retries of many clients spread out, and gives the next delay. */
+const backOff = async (delay: number, deadline: number, signal: AbortSignal): Promise<number> => {
+  await waitWithin(pause(Math.floor(Math.random() * (delay + 1)), signal), deadline, signal);
+  return Math.min(delay * 2, MAX_RETRY_INTERVAL_MS);
+};
 
 /** `error` as the refusal of `command`, also when a step for it failed, such as a route lookup. */
 const refusalOf = (command: number, error: unknown): unknown => {

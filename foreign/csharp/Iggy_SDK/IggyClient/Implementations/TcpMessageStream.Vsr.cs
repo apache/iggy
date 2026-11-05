@@ -84,23 +84,12 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider, ICons
     /// <summary>
     ///     Shared empty poll result for a group member that currently owns no partition, carrying
     ///     <see cref="PolledMessages.NoAssignedPartition" /> so a consumer can back off instead of re-polling at
-    ///     once. Same ownership rules as <see cref="EmptyPolledMessages" />.
+    ///     once. The instance owns no rented buffer - <see cref="EmptyMemoryOwner" /> disposes to nothing - so it is
+    ///     safe to hand out repeatedly even after a caller disposes it.
     /// </summary>
     private static readonly PolledMessagesRental NoAssignedPartitionPolledMessages = new(EmptyMemoryOwner.Instance)
     {
         PartitionId = PolledMessages.NoAssignedPartition,
-        CurrentOffset = 0,
-        Messages = []
-    };
-
-    /// <summary>
-    ///     Shared empty poll result. An idle consumer loop returns one on every iteration, and the instance owns
-    ///     no rented buffer - <see cref="EmptyMemoryOwner" /> disposes to nothing - so it is safe to hand out
-    ///     repeatedly even after a caller disposes it.
-    /// </summary>
-    private static readonly PolledMessagesRental EmptyPolledMessages = new(EmptyMemoryOwner.Instance)
-    {
-        PartitionId = 0,
         CurrentOffset = 0,
         Messages = []
     };
@@ -110,6 +99,18 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider, ICons
 
     /// <inheritdoc />
     ulong ISessionGenerationProvider.SessionGeneration => _consensusSession.Generation;
+
+    /// <inheritdoc />
+    ulong IConsumerGroupAssignmentProvider.MetadataWatermark
+    {
+        get
+        {
+            lock (_pollRoutingGate)
+            {
+                return _metadataWatermark;
+            }
+        }
+    }
 
     private ulong BeginExplicitSignIn()
     {
@@ -491,8 +492,8 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider, ICons
             {
                 // Both fence shapes - the typed error and the sentinel an empty poll carries - land on the same
                 // re-sync below. A caller context names the owner the poll was meant for, so the caller gets the
-                // fence instead of a poll of another partition.
-                if (pollingStrategy.Context is not null)
+                // fence instead of a poll of another partition. A fully zero context counts as none.
+                if (pollingStrategy.Context is { } context && context != default)
                 {
                     _groupState.InvalidateAssignment(key);
                     await SyncGroupAssignmentAsync(streamId, topicId, consumer.ConsumerId, token, startedUnder: generation);

@@ -284,6 +284,7 @@ mod tests {
             skip: Some(skip),
             offset: None,
             record: None,
+            lost: None,
         });
         assert!(info.has_partition_id);
         assert_eq!(info.partition_id, PARTITION);
@@ -301,6 +302,7 @@ mod tests {
             skip: None,
             offset: None,
             record: None,
+            lost: None,
         });
         assert!(!info.has_partition_id);
         assert!(

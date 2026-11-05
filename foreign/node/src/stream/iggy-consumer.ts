@@ -40,7 +40,11 @@ export type ConsumerRequest = {
   streamId: Id,
   topicId: Id,
   partitions: number[],
-  /** Where a partition without a position starts, Next by default. */
+  /**
+   * Where a partition without a position starts, Next by default. With
+   * `CommitPolicy.OnRead` the start applies only to a partition without a
+   * stored offset. A partition with one resumes after it.
+   */
   start?: PollingStrategy,
   /** The limits of each read and the commit policy. A read waits up to 5 s by default. */
   options?: Partial<PollOptions>,
@@ -55,8 +59,10 @@ export type ConsumerGroupRequest = Omit<ConsumerRequest, 'partitions'>;
  * Hands over the messages of a topic one at a time, on a `PartitionReader`.
  * With `CommitPolicy.Manual` the application commits checkpoints. With
  * `CommitPolicy.OnRead` the server stores the offset of each read and
- * `shutdown()` moves it back to the last message handed over. With
- * `CommitPolicy.Auto` a message counts when it is handed over
+ * `shutdown()` moves it back to the last message handed over. It does not
+ * move the offset of a partition that left the assignment, so the group
+ * loses the messages of that partition that the consumer did not hand over.
+ * With `CommitPolicy.Auto` a message counts when it is handed over
  * (`after: delivery`), once the iterator is read again or the handler of
  * `consume()` returns with success (`after: processing`), or on `mark()`,
  * and the latest counted position is stored at the interval or event of the
@@ -123,9 +129,13 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
     }
   }
 
-  /** Stores the offset of a checkpoint that this consumer handed over. */
-  commit(checkpoint: Checkpoint): Promise<void> {
-    return this.reader.commit(checkpoint);
+  /**
+   * Stores the offset of a checkpoint that this consumer handed over, as
+   * `PartitionReader.commit` does. `signal` ends the read for the owner of a
+   * store that the server refuses as not owned.
+   */
+  commit(checkpoint: Checkpoint, { signal }: { signal?: AbortSignal } = {}): Promise<void> {
+    return this.reader.commit(checkpoint, { signal });
   }
 
   /** Counts a checkpoint under `CommitPolicy.Auto` with `after: marked`. */
@@ -146,14 +156,16 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
   /**
    * Stops the consumer: counts the last message under `after: processing`,
    * closes the reader, which stores or rewinds the offsets, and leaves the group.
-   * A later call waits for the first one and ends as it does.
+   * `signal` of the first call ends the reads for the owner of the writes of
+   * the close, as `PartitionReader.close` describes. A later call waits for the
+   * first one and ends as it does. Its signal does not end the shutdown.
    */
-  async shutdown(): Promise<void> {
+  async shutdown({ signal }: { signal?: AbortSignal } = {}): Promise<void> {
     if (!this.stopped) {
       this.stopped = true;
       this.countProcessed();
     }
-    await this.reader.close();
+    await this.reader.close({ signal });
   }
 
   /**
@@ -221,7 +233,13 @@ export const openConsumer = (getClient: ClientProvider) =>
 /** Opens a member of the consumer group `name`, created when it is missing. */
 export const openConsumerGroup = (getClient: ClientProvider) =>
   async ({ name, streamId, topicId, start, options, onError }: ConsumerGroupRequest): Promise<IggyConsumer> => {
-    await ensureConsumerGroup(getClient)(streamId, topicId, String(name));
+    try {
+      await ensureConsumerGroup(getClient)(streamId, topicId, String(name));
+    } catch (error) {
+      // No later step takes this create on, so nobody resolves it.
+      await PartitionReader.abandonUnknown(getClient, error);
+      throw error;
+    }
     return new IggyConsumer(await PartitionReader.open(getClient, {
       streamId, topicId, consumer: { kind: ConsumerKind.Group, id: name }, start, options
     }), afterOf(options), onError);

@@ -37,4 +37,10 @@ internal interface IConsumerGroupAssignmentProvider
     /// <param name="token">The cancellation token to cancel the operation.</param>
     Task<IReadOnlyList<uint>> GetAssignedPartitionsAsync(Identifier streamId, Identifier topicId, Identifier groupId,
         bool resync, CancellationToken token = default);
+
+    /// <summary>
+    ///     The highest metadata commit that a reply showed. The server answers a join after its op commits, so the
+    ///     watermark is at or after the op of every join that returned.
+    /// </summary>
+    ulong MetadataWatermark { get; }
 }

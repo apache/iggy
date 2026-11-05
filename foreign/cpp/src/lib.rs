@@ -337,11 +337,11 @@ mod ffi {
         has_poll_options: bool,
         poll_options: PollOptions,
         /// The encoded bytes of the requests in flight and the queued
-        /// batches. Default 16 MiB.
+        /// batches. Default 16 MiB, raised to at least 32 full batches.
         has_prefetch_bytes: bool,
         prefetch_bytes: u32,
         /// The messages of the requests in flight and the queued batches.
-        /// Default: the larger of 16,000 and `count`.
+        /// Default 16,000, raised to at least 32 full batches.
         has_prefetch_messages: bool,
         prefetch_messages: u32,
     }

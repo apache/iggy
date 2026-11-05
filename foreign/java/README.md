@@ -476,10 +476,25 @@ Every later poll with `OnRead` and every offset store or delete of that partitio
 ### Partition reader
 
 A `PartitionReader` reads the partitions of a topic in batches. It groups the partitions by their primary and reads each group with one request, puts the partitions that a read served last at the end of the next one so a busy partition does not starve the others, regroups after a primary moves, keeps a prefetch, and stays usable after an error.
+The reads go on with the last good groups while a regroup runs and after it fails, and a failed regroup runs again after the retry interval. A partition whose read a primary refused with `NOT_PRIMARY` waits for the next regroup.
+
+The effective `prefetchMessages` and `prefetchBytes` budgets each hold at least 32 full batches. With the default options, a reader reads ahead up to 32,000 messages and 32 MiB. At most 32 reads of one reader run at once, probes included.
 
 The prefetch slots that the groups leave free spread the partitions whose last read ended before their head over reads of their own, each with the whole `count` and `maxBytes`, while the quiet partitions of a group share the one read that may wait. Under `OnRead` every read stores, so a group holds one read that may wait at a time, and a waiting `next()` fills the free slots with the backlogged partitions, one committing read per partition.
 
-A standalone consumer names its partitions. A consumer group reader joins its group, follows its assignment, and leaves the group on close.
+A standalone consumer names its partitions. A consumer group reader joins its group, follows its assignment, and leaves the group on close. If a join or the leave ends with an unknown outcome, the reader abandons it, so the later metadata writes of the client go on.
+
+If the group loses the member, for example with a lost session, the reader joins again. This is not a new assignment, so a partition that stays assigned keeps its state. Until a read names the new owner, each store of the reader names owner generation 0, which the server binds to the installed owner.
+The server binds owner generation 0 only to an owner that it installed at or below the metadata op of the write. So such a store keeps the incarnation of its read and names at least the op that the client saw committed.
+
+The server refuses a poll, offset store, delete, or lookup with incarnation 0 with `HistoryUnavailable`. So the client sends a poll, store, or delete whose context has incarnation 0 with the incarnation of the partition route. It fills the incarnation once and keeps the owner and op of the context, so every attempt names the same history.
+A request without a context takes the whole context of the route, and so does a lookup. A context that is all zero counts as no context, for example in a seek before the first read of a partition.
+
+The server can refuse a store or delete because another member owns the partition. If the partition is still assigned, the reader then reads it once, without a store and without a wait. That read uses only the context of its reply, so a message that does not decode cannot fail it. If that read serves the incarnation of the write, the write goes once more with the owner and op of that read. Otherwise, and for a partition that left the assignment, the refusal stands.
+The reader retries a transient refusal of that read after the retry interval. If such a read goes over the poll quota of the server, the server refuses the whole request, and the reader retries that refusal too.
+
+A seek write and an automatic store run in the background, so `closeAsync()` ends the retry of their read, and their refusal stands. A `commit()` and the writes of `closeAsync()` itself retry until their caller cancels. A cancel of the future of `commit()`, or of the first `closeAsync()`, ends that retry, and the refusal stands. A read in flight at that point can still get an answer, but that answer leads to no write.
+The leave and the stop of the reader still run. A later `closeAsync()` waits for the end of the close, and a cancel of it does not end the close. The blocking reader turns an interrupt into such a cancel, and so does `close()` of the async reader. A cancel of `IggyConsumer.shutdown()` cancels its close.
 
 ```java
 PartitionReader reader = client.reader(streamId, topicId, Consumer.of(1L))
@@ -493,15 +508,33 @@ reader.commit(batch.checkpoint().orElseThrow()).get();
 reader.closeAsync().get();
 ```
 
-`next()` returns the next batch of one partition, never empty, in offset order within one generation of the partition: from its first read, from each `seek`, and from each new assignment. A cancelled `next()` leaves its batch in the reader. The default wait of a reader is 5 s. The futures of a reader complete on its own thread, so a callback must not block.
+`next()` returns the next batch of one partition, never empty, in offset order within one generation of the partition: from its first read, from each `seek`, and from each new assignment. A cancelled `next()` leaves its batch in the reader. Once the reader is closed, `next()` fails at once.
+A fetch takes only an offset or `Next`. So the reader first polls a timestamp or `Last` position without a store, for one message or for the count of the reader, and then reads from the first message of that poll. Without a message, it polls again after the retry interval. The default wait of a reader is 5 s. The futures of a reader complete on its own thread, so a callback must not block.
 
-- `Manual`: `commit(checkpoint)` stores the offset of a delivered checkpoint, forward only within a generation.
+- `Manual`: `commit(checkpoint)` stores the offset of a delivered checkpoint, forward only within a generation. A store whose outcome stays unknown fails the commit, and the reader releases it in the client, so a retry can store.
 - `OnRead`: the server stores each read, and the reader reads only for a waiting `next()`. After a read whose reply was lost, the reader abandons it and reads that partition again after its retry interval. That read starts after what the lost read stored, so the reader reads those messages again without a store and delivers them first.
 
-  Only a lost read explains a read that starts past the expected offset: without one, the application or another session stored that offset, and the reader delivers from there. A partition that leaves the assignment still hands over the reads that the server stored for it. `closeAsync()` moves the offset of each partition with undelivered batches, or with a lost or undecoded read, back to its last delivered message.
+  Only a lost read explains a read that starts past the expected offset: without one, the application or another session stored that offset, and the reader delivers from there. A partition that leaves the assignment still hands over the reads that the server stored for it.
+  The close never moves back the offset of a partition that left. After the handoff, the server refuses that store, and during the handoff, a stored offset below the last served one blocks the handoff. So the batches of a left partition that the application did not take before the close are lost for the group.
 
-  `seek` to an offset above 0 stores the offset before it, which moves the server position, and the other strategies store nothing. A seek that waits for a read in flight applies after that read ends, also when `closeAsync()` starts first: its store then runs before the rewind, and a refused store fails the seek, or the close. `commit` and `mark` are refused.
-- `Auto(AutoCommit)`: the reader counts each batch as `CommitAfter` says (`PROCESSING` at the next `next()` or the close, `DELIVERY` when `next()` returns it, `MARKED` on `mark(checkpoint)`), and stores the latest counted position at its `interval`, on its `every` event, before a rebalance takes a partition away, and on close. `AutoCommit.defaults()` stores every 10,000 messages or 5 s after processing.
+  `closeAsync()` moves the offset of each partition with undelivered batches, or with a lost or undecoded read, back to its last delivered message. A partition that delivered none moves before its first undelivered batch. If that batch starts at offset 0 and the server holds an offset, the close deletes it.
+
+  After a seek write with an unknown outcome, the close restores the offset from before that write until a batch arrives. It stores that offset again, or deletes the offset when there was none. A delivered message or a lost read from before that write decides instead, also a read that the close cancels.
+  But if the partition took its start without a stored offset, only a delivered message or such a cancelled read decides, and otherwise the close deletes the offset, so a restart takes the start again. A batch of an earlier assignment decides nothing. A store or delete of the close whose outcome stays unknown fails the close, which releases it in the client for a later reader.
+
+  With `OnRead`, the start applies only to a partition without a stored offset. A partition with one resumes after it, also at each new assignment of a group member. `First` then reads as `Next`. A seek moves the stored offset.
+
+  With `OnRead`, the server stores the offset of each read before the application takes its batch. A crash, or a reader that stops without `closeAsync()`, loses the batches that the reader held: up to the effective budget, which holds at least 32 batches. `Auto` or `Manual` commit stores offsets after delivery instead.
+
+  `seek` to an offset above 0 stores the offset before it, which moves the server position. A read never moves the stored offset back. So if the server holds an offset, a seek to offset 0, also by `First`, deletes it. A seek to a timestamp first reads its first message without a store, then seeks to the offset of that message. Without such a message, it stores nothing. `Last` and `Next` store nothing.
+
+  A seek waits for each committing read in flight of its partition, also one of an earlier assignment, until the client released it. It also waits for an earlier seek of the partition.
+  A cancel before the first write stops the seek, and a seek cancelled while it waits sends no request. After that write, the seek ends in the background, and a later seek and `closeAsync()` wait for it. A failed write there is logged as a warning. A write whose outcome stays unknown fails the seek, and the next read reads again what that write could skip.
+
+  If the partition has not read yet, the seek first looks up the stored offset, so the next read still starts after it. It writes first and moves the partition only once its writes succeed, and the partition starts no read meanwhile. A failed write fails the seek and leaves the position and the queued batches of the partition as they were.
+  A seek that waits when `closeAsync()` starts still runs, unless its caller cancelled it: its writes then go before the rewind, and a refused write fails the seek, or the close. `commit` and `mark` are refused.
+- `Auto(AutoCommit)`: the reader counts each batch as `CommitAfter` says (`PROCESSING` at the next `next()` or the close, `DELIVERY` when `next()` returns it, `MARKED` on `mark(checkpoint)`), and stores the latest counted position at its `interval`, on its `every` event, before a rebalance takes a partition away, and on close.
+  A store whose outcome stays unknown is released in the client, so the next store of the partition goes through. `AutoCommit.defaults()` stores every 10,000 messages or 5 s after processing.
 
 A `ReadException` names its partition. `HISTORY_UNAVAILABLE` (87) stops a partition until `seek` when its position came from an earlier read of a history that is gone.
 
@@ -511,13 +544,15 @@ The exception carries the bytes the server served for it: `record()` is the mess
 
 `offset()` is the offset of the message when its frame decoded and a later check failed, empty for malformed framing.
 
-A refusal that a retry does not change is retried with a doubling wait and stops its partition after six in a row. A partition that another member owns (`CONSUMER_GROUP_PARTITION_NOT_OWNED`, 5009) drops its position and resolves its start again after the next assignment, and six such refusals in a row are reported once without a stop.
+A refusal that a retry does not change is retried with a doubling wait and stops its partition after six in a row.
+The server can refuse a read because another member owns the partition (`CONSUMER_GROUP_PARTITION_NOT_OWNED`, 5009). This is no leave, because a new session and a move away and back look the same.
+The partition keeps its position and what the close needs, and asks for its assignment. From then on, it names owner generation 0 instead of each owner that it saw up to that refusal. It reads again after the retry interval. Only a leave that the assignment shows drops that state. Six such refusals in a row are reported once without a stop.
 
 The blocking client builds a blocking reader with `org.apache.iggy.client.blocking.reader.PartitionReader.build(client.reader(...))`, whose `next(Duration)` returns empty at its timeout and keeps the batch for the next call.
 
 ### Consumer
 
-An `IggyConsumer` hands over one message at a time from a reader. Under `Auto` with `PROCESSING`, a message counts when the next one is asked for, or after its handler succeeds in `consume`. A handler that fails leaves its message uncounted and ends `consume` with its error.
+An `IggyConsumer` hands over one message at a time from a reader. Under `Auto` with `PROCESSING`, a message counts when the next one is asked for, or after its handler succeeds in `consume`. A handler that fails leaves its message uncounted and ends `consume` with its error. During a `seek`, the consumer holds the messages of its partition back. A seek that moves drops them, and a failed one hands them over.
 
 ```java
 IggyConsumer consumer = IggyConsumer.build(client.reader(streamId, topicId, Consumer.group(groupId))
@@ -542,6 +577,8 @@ Every later poll that stores its offset or starts at it (`Next`), and every offs
 A call that spells the stream or topic differently and carries no context does not see it. Such polls of one partition take turns, so a second one waits for the first and then meets its block. A timeout or transport failure before the request can be sent reports `TRANSIENT_NOT_ACCEPTED` (58).
 
 The HTTP client accepts a plain consumer only, because the server refuses a consumer group over HTTP. An interrupt of the calling thread ends a poll that stores nothing, also while it waits for the reply headers.
+
+The HTTP client sends a poll or an offset store whose context is all zero without a context. It sends any other context as it is, so the server refuses a context with incarnation 0 with `HISTORY_UNAVAILABLE` (87).
 
 ## Exception Handling
 

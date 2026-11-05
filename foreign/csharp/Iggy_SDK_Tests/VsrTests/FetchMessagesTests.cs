@@ -114,6 +114,38 @@ public sealed class FetchMessagesTests
     }
 
     /// <summary>
+    ///     Each target follows the history rule of its own partition. A fully zero fence takes the context of its
+    ///     route, and a fence of incarnation 0 with an owner generation takes only the incarnation of the route.
+    /// </summary>
+    [Fact]
+    public async Task given_fences_without_an_incarnation_when_fetched_should_take_only_the_incarnation_that_they_miss()
+    {
+        const ulong owner = 9;
+        using var node = new MockNode();
+        var fetches = new ConcurrentQueue<MockRequest>();
+        node.Serve(request =>
+        {
+            if (request.Code != FetchCode)
+            {
+                return Standalone(node, request);
+            }
+
+            fetches.Enqueue(request);
+            return Reply(request.Operation, FetchBody(EmptySection(1, 0, Served), EmptySection(2, 0, Served)));
+        });
+        using var client = await ConnectAsync(node);
+
+        using var reply = await client.FetchMessagesAsync(Stream, Topic,
+            [
+                (1, PollingStrategy.Offset(0).WithContext(new PartitionContext(0, owner, 0))),
+                (2, PollingStrategy.Offset(0).WithContext(default))
+            ], Consumer.Group(3), 10, false, LongWait, TestContext.Current.CancellationToken);
+
+        Assert.Equal([(Route.Incarnation, owner), (Route.Incarnation, Route.OwnerGeneration)],
+            ReadFetch(Assert.Single(fetches)).Targets.Select(target => (target.Incarnation, target.OwnerGeneration)));
+    }
+
+    /// <summary>
     ///     The reply holds the section table and the records, so the records of each target may fill the frame limit
     ///     less the table. The client applies the limit before it sends the fetch.
     /// </summary>
@@ -553,7 +585,8 @@ public sealed class FetchMessagesTests
         node.Serve(request => request.Code switch
         {
             FetchCode => Reply(request.Operation, [], VsrError.TRANSIENT_NOT_COMMITTED),
-            _ when request.Operation == (byte)VsrOperation.StoreConsumerOffset && request.Context.Incarnation == 0 =>
+            _ when request.Operation == (byte)VsrOperation.StoreConsumerOffset
+                   && request.Context.Incarnation != route.Incarnation =>
                 Reply(request.Operation, [], VsrError.HISTORY_UNAVAILABLE),
             CommandCodes.GET_PARTITION_ROUTE_CODE => RouteReply(request, route, 0, TopicPartitions),
             _ => Standalone(node, request)

@@ -45,7 +45,9 @@ use crate::receive_message::{Checkpoint, PolledBatch, PollingStrategy};
 ///   while `next()` waits and then fills its budget (one fetch per primary that may wait for
 ///   messages, the partitions with messages left behind spread over the other slots), a `seek()`
 ///   to an offset stores the offset before it, and `close()` moves the offset back to the last
-///   delivered message.
+///   delivered message. A crash, or a reader dropped without `close()`, loses the batches that
+///   the server stored before the application took them, up to the effective budget, which
+///   holds at least 32 batches.
 /// - The reader stays usable after a `ReadError` and retries by itself. `HistoryUnavailable`
 ///   (87) stops its partition until `seek()`. With `OnRead`, an unknown outcome stops its
 ///   partition until `IggyClient.abandon_operation()` and `seek()`.

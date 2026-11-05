@@ -60,6 +60,12 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 	}()
 	historyRefreshed := false
 	keptContext := exact
+	// A zero context carries nothing, so it counts as none and takes the
+	// context of the route. A fetch keeps its zero header, since each of its
+	// targets names its own history.
+	if exact != nil && *exact == (iggcon.PartitionContext{}) && fencedByHistory(code) {
+		keptContext = nil
+	}
 	lifecycleDelay := replayInterval
 	lookupDelay := replayInterval
 	var ticket *laneTicket
@@ -102,21 +108,29 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 			captured.MetadataOp = c.metadataWatermark.Load()
 		}
 		if keptContext != nil {
+			if keptContext.Incarnation == 0 && fencedByHistory(code) {
+				// A caller context without a history takes the incarnation of
+				// the route, once, so every attempt names the same history. It
+				// keeps its owner and op, so the owner check still applies.
+				filled := *keptContext
+				filled.Incarnation = route.context.Incarnation
+				keptContext = &filled
+			}
 			captured = *keptContext
 		} else if query != nil {
 			saved := captured
 			keptContext = &saved
 		}
+		// A route without a history is not ready yet. The next call looks it
+		// up again.
+		if captured.Incarnation == 0 && fencedByHistory(code) {
+			c.polls.invalidate(route, false)
+			return nil, ierror.ErrTransientNotAccepted
+		}
 		if ticket == nil && (mutation || progressLane) {
 			key := laneKey{}
 			if query != nil {
 				key = laneKey{incarnation: captured.Incarnation, partition: route.key.partition}
-				if progressLane && code != command.FetchMessagesCode && key.incarnation == 0 {
-					key.incarnation = route.context.Incarnation
-					if key.incarnation == 0 {
-						return nil, ierror.ErrTransientNotAccepted
-					}
-				}
 			}
 			var err error
 			switch {
@@ -311,6 +325,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 		}
 		var link *tcpLink
 		var route pollRoute
+		readyLink := c.links.nextReadyLink()
 		if operation.query != nil {
 			route, err = c.consumerRoute(ctx, operation.query)
 			if err == nil {
@@ -349,7 +364,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				}
 				return nil, err
 			}
-			if waitErr := c.pause(ctx, nextLookupBackoff(&lookupDelay)); waitErr != nil {
+			if waitErr := c.pauseUntil(ctx, nextLookupBackoff(&lookupDelay), readyLink); waitErr != nil {
 				if uncertain && mutation {
 					return nil, finishUncertain()
 				}
@@ -633,6 +648,19 @@ func isProgressPoll(code command.Code, body []byte) bool {
 	return parameters[0] == byte(iggcon.POLLING_NEXT) || parameters[len(parameters)-1] != 0
 }
 
+// fencedByHistory reports whether the server refuses a request of code with
+// HistoryUnavailable when its header names a partition history other than
+// the current one, which is never 0.
+func fencedByHistory(code command.Code) bool {
+	switch code {
+	case command.PollMessagesCode, command.PollMessagesDeferredCode, command.GetOffsetCode,
+		command.StoreOffsetCode, command.DeleteConsumerOffsetCode:
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *IggyTcpClient) readOnLink(ctx context.Context, link *tcpLink, code command.Code, body []byte, captured *iggcon.PartitionContext) ([]byte, error) {
 	if link == nil {
 		return nil, ierror.ErrTransientNotAccepted
@@ -728,6 +756,14 @@ func (c *IggyTcpClient) observeMetadata(header *[vsr.HeaderSize]byte) {
 			return
 		}
 	}
+}
+
+// MetadataWatermark returns the highest metadata op that the replies of the
+// client reported as committed: the reply that bound its session and every
+// reply of a replicated metadata command. A request without a partition
+// context names it as its minimum metadata op.
+func (c *IggyTcpClient) MetadataWatermark() uint64 {
+	return c.metadataWatermark.Load()
 }
 
 func (c *IggyTcpClient) waitBeforeReplay(ctx context.Context, deadline time.Time) error {

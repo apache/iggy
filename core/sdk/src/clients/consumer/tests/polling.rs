@@ -40,7 +40,7 @@ use iggy_common::{
     EncryptorKind, Identifier, IggyError, NonZeroIggyDuration, PollOptions, PollingKind,
     PollingStrategy, TcpClientReconnectionConfig, group_cache_key,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio::time::{Instant, sleep, timeout};
 
 use super::{
@@ -53,7 +53,7 @@ use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::clients::consumer::{IggyConsumer, ReceivedMessage};
 use crate::clients::consumer_builder::IggyConsumerBuilder;
 use crate::clients::reader::ReadError;
-use crate::clients::reader::fixtures::{refused, served};
+use crate::clients::reader::fixtures::{CONTEXT, refused, served};
 use crate::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
 use crate::links::fake_cluster::{Answer, FakeCluster, TEST_BUDGET, endpoint, eventually};
 use crate::links::{OPERATION_TIMEOUT, ReconnectPolicy};
@@ -195,16 +195,19 @@ async fn given_a_blocked_poll_when_consuming_callbacks_should_return_the_retaine
     assert_eq!(handler.offsets(), [DELIVERED]);
 }
 
-/// `HistoryUnavailable` stops its partition until a `seek`, which the loop cannot make.
+/// `HistoryUnavailable` of the history that served a batch stops its partition until a `seek`,
+/// which the loop cannot make.
 #[tokio::test(start_paused = true)]
 async fn given_history_unavailable_when_consuming_callbacks_should_end_with_its_partition() {
     let (client, cluster) = connect_to_three_replicas().await;
     answer_lookups(&cluster);
+    let (mut section, records) = served(POLLED_PARTITION, &BATCH, BATCH.last().unwrap() + 1);
+    section.context = CONTEXT;
     script_primary(
         &cluster,
         FETCH_MESSAGES_CODE,
         [
-            reply_of(&BATCH),
+            fetch_of(&[(section, records)]),
             fetch_of(&[refused(POLLED_PARTITION, &IggyError::HistoryUnavailable)]),
         ],
     );
@@ -265,7 +268,8 @@ async fn given_a_message_that_does_not_decode_when_consuming_callbacks_should_en
             error: IggyError::InvalidMessagesCount,
             skip: Some(skip),
             offset: None,
-            record: Some(Bytes::from_static(b"\0"))
+            record: Some(Bytes::from_static(b"\0")),
+            lost: None,
         }))
     );
     assert_eq!(handler.offsets(), BATCH);
@@ -323,6 +327,7 @@ async fn given_a_committing_next_continuation_that_does_not_decode_when_consumin
             )),
             offset: None,
             record: None,
+            lost: None,
         }))
     );
 }
@@ -555,18 +560,15 @@ async fn given_a_reply_of_several_partitions_when_polling_should_hand_over_every
         sleep(POLL_RETRY_INTERVAL).await;
         assert_eq!(
             cluster.count(FETCH_MESSAGES_CODE),
-            1,
-            "the reply holds the only slot until its last message"
+            2,
+            "a queued reply leaves capacity for the next fetch"
         );
     }
     let last = next_message(&mut consumer).await;
     handed_over.push((last.partition_id, last.message.header.offset));
 
     assert_eq!(handed_over, HANDED_OVER);
-    eventually("the last message returns the slot", || {
-        cluster.count(FETCH_MESSAGES_CODE) == 2
-    })
-    .await;
+    assert_eq!(cluster.count(FETCH_MESSAGES_CODE), 2);
 }
 
 #[tokio::test(start_paused = true)]
@@ -968,13 +970,12 @@ async fn given_a_seek_when_polled_should_drop_the_rest_of_the_batch_and_read_fro
     const SOUGHT: u64 = 30;
     let (client, cluster) = connect_to_three_replicas().await;
     answer_lookups(&cluster);
+    let (release, read_ahead) = held_reply(&[BATCH[BATCH.len() - 1] + 1]);
     script_primary(
         &cluster,
         FETCH_MESSAGES_CODE,
-        [reply_of(&BATCH), reply_of(&[SOUGHT]), Answer::Silence],
+        [reply_of(&BATCH), read_ahead],
     );
-    // One slot, so the reader reads nothing while the batch is current, and the seek starts
-    // the next read.
     let mut consumer = standalone_reader(client)
         .prefetch_messages(ONE_SLOT)
         .build();
@@ -983,11 +984,21 @@ async fn given_a_seek_when_polled_should_drop_the_rest_of_the_batch_and_read_fro
         next_message(&mut consumer).await.message.header.offset,
         BATCH[0]
     );
+    eventually("the read-ahead fetch is waiting", || {
+        cluster.count(FETCH_MESSAGES_CODE) == 2
+    })
+    .await;
+    script_primary(
+        &cluster,
+        FETCH_MESSAGES_CODE,
+        [reply_of(&[SOUGHT]), Answer::Silence],
+    );
 
     consumer
         .seek(POLLED_PARTITION, PollingStrategy::offset(SOUGHT))
         .await
         .unwrap();
+    release.notify_one();
 
     assert!(consumer.current.is_none());
     assert_eq!(
@@ -996,7 +1007,7 @@ async fn given_a_seek_when_polled_should_drop_the_rest_of_the_batch_and_read_fro
         "the rest of the batch before the seek is dropped"
     );
     let fetch =
-        FetchMessagesRequest::decode_from(&cluster.received(FETCH_MESSAGES_CODE)[1].body).unwrap();
+        FetchMessagesRequest::decode_from(&cluster.received(FETCH_MESSAGES_CODE)[2].body).unwrap();
     assert_eq!(
         fetch.targets[0].strategy,
         WirePollingStrategy::offset(SOUGHT)
@@ -1007,10 +1018,11 @@ async fn given_a_seek_when_polled_should_drop_the_rest_of_the_batch_and_read_fro
 async fn given_a_backward_seek_when_polled_should_hand_over_the_earlier_messages_again() {
     let (client, cluster) = connect_to_three_replicas().await;
     answer_lookups(&cluster);
+    let (release, read_ahead) = held_reply(&[BATCH[BATCH.len() - 1] + 1]);
     script_primary(
         &cluster,
         FETCH_MESSAGES_CODE,
-        [reply_of(&BATCH), reply_of(&BATCH), Answer::Silence],
+        [reply_of(&BATCH), read_ahead],
     );
     let mut consumer = standalone_reader(client)
         .prefetch_messages(ONE_SLOT)
@@ -1022,11 +1034,21 @@ async fn given_a_backward_seek_when_polled_should_hand_over_the_earlier_messages
             offset
         );
     }
+    eventually("the read-ahead fetch is waiting", || {
+        cluster.count(FETCH_MESSAGES_CODE) == 2
+    })
+    .await;
+    script_primary(
+        &cluster,
+        FETCH_MESSAGES_CODE,
+        [reply_of(&BATCH), Answer::Silence],
+    );
 
     consumer
         .seek(POLLED_PARTITION, PollingStrategy::offset(BATCH[0]))
         .await
         .unwrap();
+    release.notify_one();
 
     for offset in BATCH {
         assert_eq!(
@@ -1256,4 +1278,18 @@ async fn consume_three_messages(
     assert_eq!(consumed, Ok(Ok(())));
     assert_eq!(handler.offsets(), OFFSETS);
     recorder.events.lock().unwrap().clone()
+}
+
+/// A reply held across a seek exercises generation filtering without a connection timeout.
+fn held_reply(offsets: &[u64]) -> (Arc<Notify>, Answer) {
+    let release = Arc::new(Notify::new());
+    let Answer::Body(body) = reply_of(offsets) else {
+        panic!("a message reply has a body");
+    };
+    let answer = Answer::GatedBody {
+        release: Arc::clone(&release),
+        completed: Arc::default(),
+        body,
+    };
+    (release, answer)
 }

@@ -417,7 +417,9 @@ extension IggyClient {
     /// it. A plain consumer's poll and an offset read without a partition go
     /// to partition 0. A group poll, a store, and a delete must name one. A
     /// `deferred` poll sends its own body, `payload` only routes it, and its
-    /// request timeout is its deadline.
+    /// request timeout is its deadline. Every attempt names the context that
+    /// ``PollRouter/historyContext(_:context:lineage:coordinator:deadline:)``
+    /// gives for `context`.
     func routedPartitionRequest(
         _ code: CommandCode, payload: [UInt8], deferred: PollRouter.Deferred? = nil, context: PartitionContext?, lineage: UInt64
     ) async throws -> [UInt8] {
@@ -435,16 +437,8 @@ extension IggyClient {
         let deadline = deferred?.deadline ?? ContinuousClock.now + PollRouter.pollTimeout
         let router = core.pollRouter
         let progress = try code == .storeConsumerOffset || code == .deleteConsumerOffset || (poll && RawRequest.pollChangesProgress(payload))
-        let captured: PartitionContext?
-        let keys: [PollRouter.ProgressKey]
-        if progress {
-            let resolved = try await router.progressContext(key, context: context, lineage: lineage, coordinator: core, deadline: deadline)
-            captured = resolved
-            keys = [PollRouter.ProgressKey(partitionID: partitionID, incarnation: resolved.incarnation)]
-        } else {
-            captured = context
-            keys = []
-        }
+        let captured = try await router.historyContext(key, context: context, lineage: lineage, coordinator: core, deadline: deadline)
+        let keys = progress ? [PollRouter.ProgressKey(partitionID: partitionID, incarnation: captured.incarnation)] : []
         return try await router.withProgress(keys, deadline: deadline) {
             let attempt = deferred?.commits == true ? try router.reserveFetch(keys) : nil
             defer {

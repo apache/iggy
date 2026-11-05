@@ -55,6 +55,7 @@ import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 import static org.apache.iggy.serde.BytesSerializer.encodeMessagesBatchInto;
@@ -187,6 +188,34 @@ public class MessagesTcpClient implements MessagesClient {
         return pollMessagesImpl(streamId, topicId, partitionId, consumer, strategy, count, autoCommit, options);
     }
 
+    /**
+     * A deferred poll of one partition that stores nothing and reads only the context of its reply. It decodes no
+     * message, so a message that does not decode cannot fail it.
+     */
+    CompletableFuture<PartitionContext> pollContext(
+            StreamId streamId,
+            TopicId topicId,
+            long partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            long count,
+            DeferredPollOptions options) {
+        options.validate(count);
+        long deadline = System.nanoTime() + options.requestTimeout().toNanos();
+        return pollRouter.onClientLoop(pollPartition(
+                streamId,
+                topicId,
+                Optional.of(partitionId),
+                consumer,
+                strategy,
+                count,
+                false,
+                options,
+                deadline,
+                pollRouter.startCall(),
+                BytesDeserializer::readPolledContext));
+    }
+
     @SuppressWarnings("checkstyle:ParameterNumber")
     private CompletableFuture<PolledMessages> pollMessagesImpl(
             StreamId streamId,
@@ -225,11 +254,21 @@ public class MessagesTcpClient implements MessagesClient {
             return pollRouter.onClientLoop(result);
         }
         return pollRouter.onClientLoop(pollPartition(
-                streamId, topicId, partitionId, consumer, strategy, count, autoCommit, options, deadline, state));
+                streamId,
+                topicId,
+                partitionId,
+                consumer,
+                strategy,
+                count,
+                autoCommit,
+                options,
+                deadline,
+                state,
+                BytesDeserializer::readPolledMessages));
     }
 
     @SuppressWarnings("checkstyle:ParameterNumber")
-    private CompletableFuture<PolledMessages> pollPartition(
+    private <T> CompletableFuture<T> pollPartition(
             StreamId streamId,
             TopicId topicId,
             Optional<Long> partitionId,
@@ -239,7 +278,8 @@ public class MessagesTcpClient implements MessagesClient {
             boolean autoCommit,
             DeferredPollOptions options,
             long deadline,
-            AsyncTcpConnection.TransientFailoverState state) {
+            AsyncTcpConnection.TransientFailoverState state,
+            Function<ByteBuf, T> decode) {
         var payload = pollBody(streamId, topicId, partitionId, consumer, strategy, count, autoCommit, options);
         CompletableFuture<ByteBuf> sent = pollRouter.partitionRequest(
                 options == null
@@ -249,14 +289,13 @@ public class MessagesTcpClient implements MessagesClient {
                 strategy.context(),
                 deadline,
                 state.nextHistory());
-        CompletableFuture<PolledMessages> result = AsyncTcpConnection.mapResponse(sent, response -> {
+        return AsyncTcpConnection.mapResponse(sent, response -> {
             try {
-                return BytesDeserializer.readPolledMessages(response);
+                return decode.apply(response);
             } finally {
                 response.release();
             }
         });
-        return result;
     }
 
     /** The body of a poll, and of a deferred poll when {@code options} is set. */
@@ -544,7 +583,8 @@ public class MessagesTcpClient implements MessagesClient {
                             autoCommit,
                             null,
                             deadline,
-                            state);
+                            state,
+                            BytesDeserializer::readPolledMessages);
                     cancellation.track(polledPartition);
                     return polledPartition
                             .thenCompose(polled -> {

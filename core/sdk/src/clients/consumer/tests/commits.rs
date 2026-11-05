@@ -24,7 +24,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use iggy_binary_protocol::codes::{
     CANCEL_DEFERRED_REQUEST_CODE, DELETE_CONSUMER_OFFSET_CODE, FETCH_MESSAGES_CODE,
-    POLL_MESSAGES_DEFERRED_CODE, STORE_CONSUMER_OFFSET_CODE,
+    GET_CONSUMER_OFFSET_CODE, POLL_MESSAGES_DEFERRED_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
 use iggy_binary_protocol::requests::messages::FetchMessagesRequest;
 use iggy_binary_protocol::{PartitionContext, WireDecode, WirePollingStrategy};
@@ -36,14 +36,15 @@ use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep, timeout};
 
 use super::{
-    PARTITION_PRIMARY, POLL_RETRY_INTERVAL, POLLED_PARTITION, ROUTE_INCARNATION, answer_lookups,
-    builder_on, committing_consumer, connect_to_three_replicas, deleted_partitions, next_message,
-    poll_reply_of, reading_consumer, reply_of, script_primary, standalone, start_fetch,
-    stored_offsets,
+    PARTITION_PRIMARY, POLL_RETRY_INTERVAL, POLL_TIMEOUT, POLLED_PARTITION, ROUTE_INCARNATION,
+    answer_lookups, builder_on, committing_consumer, connect_to_three_replicas, deleted_partitions,
+    next_message, poll_reply_of, reading_consumer, reply_of, script_primary, standalone,
+    start_fetch, stored_offsets,
 };
 use crate::clients::consumer::{IggyConsumer, IggyConsumerState, ReceivedMessage};
 use crate::clients::consumer_builder::IggyConsumerBuilder;
 use crate::clients::reader::ReadError;
+use crate::clients::reader::fixtures::lookup_answer;
 use crate::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
 use crate::links::fake_cluster::{Answer, FakeCluster, TEST_BUDGET, endpoint, eventually};
 
@@ -373,24 +374,66 @@ async fn given_a_rejected_delete_when_committing_the_same_position_should_refres
     );
 }
 
+/// A commit with an unknown outcome returns its error, and the consumer abandons its store on
+/// the client, so the delete goes out at once.
 #[tokio::test(start_paused = true)]
-async fn given_an_uncertain_store_when_deleting_should_resolve_before_sending_the_delete() {
+async fn given_a_commit_with_an_unknown_outcome_when_deleting_should_send_the_delete_at_once() {
+    let (consumer, cluster) = consumer_without_reader(&[POLLED_PARTITION], identity).await;
+    script_primary(&cluster, STORE_CONSUMER_OFFSET_CODE, [Answer::Silence]);
+    let committed = consumer
+        .commit(captured_checkpoint(
+            &consumer,
+            POLLED_PARTITION,
+            LOWER_OFFSET,
+        ))
+        .await;
+
+    let deleted = consumer.delete_offset(Some(POLLED_PARTITION)).await;
+
+    assert!(
+        matches!(committed, Err(IggyError::OperationUncertain(_))),
+        "{committed:?}"
+    );
+    assert!(deleted.is_ok(), "{deleted:?}");
+    let mutations: Vec<_> = cluster
+        .codes(&endpoint(PARTITION_PRIMARY))
+        .into_iter()
+        .filter(|code| {
+            matches!(
+                *code,
+                STORE_CONSUMER_OFFSET_CODE | DELETE_CONSUMER_OFFSET_CODE
+            )
+        })
+        .collect();
+    assert_eq!(
+        mutations,
+        [STORE_CONSUMER_OFFSET_CODE, DELETE_CONSUMER_OFFSET_CODE]
+    );
+}
+
+/// A dropped commit leaves its store open on the client, so the delete resolves it first.
+#[tokio::test(start_paused = true)]
+async fn given_a_dropped_commit_when_deleting_should_resolve_its_store_before_sending_the_delete() {
+    /// Ends the commit long before any operation deadline.
+    const CANCEL_AFTER: Duration = Duration::from_millis(10);
     let (consumer, cluster) = consumer_without_reader(&[POLLED_PARTITION], identity).await;
     script_primary(
         &cluster,
         STORE_CONSUMER_OFFSET_CODE,
         [Answer::Silence, Answer::Commit(FIRST_COMMIT)],
     );
-    assert!(matches!(
-        consumer
-            .commit(captured_checkpoint(
+    assert!(
+        timeout(
+            CANCEL_AFTER,
+            consumer.commit(captured_checkpoint(
                 &consumer,
                 POLLED_PARTITION,
                 LOWER_OFFSET
             ))
-            .await,
-        Err(IggyError::OperationUncertain(_))
-    ));
+        )
+        .await
+        .is_err()
+    );
 
     consumer
         .delete_offset(Some(POLLED_PARTITION))
@@ -701,6 +744,22 @@ async fn given_on_read_when_the_application_stores_an_offset_ahead_should_read_o
     );
 }
 
+/// The close rewinds after the stores that it waited for, so a store that starts later fails as
+/// a store of a closed consumer and writes nothing beside the rewind.
+#[tokio::test(start_paused = true)]
+async fn given_on_read_when_a_store_starts_after_the_shutdown_should_fail_and_send_nothing() {
+    let (mut consumer, cluster) = committing_consumer(0).await;
+    let state = consumer.state();
+    consumer.shutdown().await.unwrap();
+
+    let stored = state
+        .store_offset(STORED_OFFSET, Some(POLLED_PARTITION))
+        .await;
+
+    assert_eq!(stored, Err(IggyError::InvalidConfiguration));
+    assert!(stored_offsets(&cluster).is_empty());
+}
+
 /// A restart resumes at the sought offset, because the seek stored the one before it.
 #[tokio::test(start_paused = true)]
 async fn given_on_read_when_seeking_to_an_offset_should_store_the_offset_before_it_and_read_from_it()
@@ -800,6 +859,12 @@ async fn given_on_read_when_shutting_down_before_a_yield_should_rewind_before_th
             [reply_of(&[first, first + 1])],
         );
         start_fetch(&mut consumer, &cluster).await;
+        // The server stored the offset of the queued batch.
+        script_primary(
+            &cluster,
+            GET_CONSUMER_OFFSET_CODE,
+            [lookup_answer(POLLED_PARTITION, Some(first + 1))],
+        );
 
         consumer.shutdown().await.unwrap();
 
@@ -938,6 +1003,67 @@ async fn consumer_without_reader(
         configure(builder_on(client, standalone()).partitions(partitions.iter().copied())).build();
     start_generations(&consumer, partitions);
     (consumer, cluster)
+}
+
+/// A read from the old position would store its end over the stored offset, so no read of the
+/// partition starts while the store is on the wire, and the first read after it starts after the
+/// stored offset.
+#[tokio::test(start_paused = true)]
+async fn given_on_read_and_demand_when_the_application_stores_an_offset_should_start_no_read_until_the_store_ends()
+ {
+    const READ: [u64; 1] = [0];
+    const STORED: u64 = 7;
+    let (mut consumer, cluster) = committing_consumer(READ[0]).await;
+    script_primary(
+        &cluster,
+        FETCH_MESSAGES_CODE,
+        [reply_of(&READ), reply_of(&[STORED + 1])],
+    );
+    assert_eq!(
+        next_message(&mut consumer).await.message.header.offset,
+        READ[0]
+    );
+    cluster.hold(STORE_CONSUMER_OFFSET_CODE);
+    let reads_before = cluster.count(FETCH_MESSAGES_CODE);
+    let state = consumer.state();
+    let store =
+        tokio::spawn(async move { state.store_offset(STORED, Some(POLLED_PARTITION)).await });
+    eventually("the store arrives", || {
+        cluster.count(STORE_CONSUMER_OFFSET_CODE) == 1
+    })
+    .await;
+
+    // The cancelled call leaves demand behind, which the hold keeps from reading.
+    let waited = timeout(POLL_TIMEOUT, consumer.next()).await;
+    assert!(
+        waited.is_err(),
+        "no message arrives while the store is on the wire"
+    );
+    assert_eq!(
+        cluster.count(FETCH_MESSAGES_CODE),
+        reads_before,
+        "no read of the partition starts while the store is on the wire"
+    );
+    cluster.release(STORE_CONSUMER_OFFSET_CODE);
+    assert_eq!(store.await.unwrap(), Ok(()));
+    eventually("a read follows the store", || {
+        cluster.count(FETCH_MESSAGES_CODE) > reads_before
+    })
+    .await;
+    let after_store = FetchMessagesRequest::decode_from(
+        &cluster.received(FETCH_MESSAGES_CODE)[reads_before].body,
+    )
+    .unwrap();
+    assert_eq!(
+        after_store.targets[0].strategy,
+        WirePollingStrategy::offset(STORED + 1),
+        "the first read after the store starts after the stored offset"
+    );
+    assert_eq!(
+        next_message(&mut consumer).await.message.header.offset,
+        STORED + 1
+    );
+    consumer.shutdown().await.unwrap();
 }
 
 /// Starts a generation of each of the sorted `partitions`, as a reader of them does.

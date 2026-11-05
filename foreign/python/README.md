@@ -642,7 +642,11 @@ async def read_batches(client: IggyClient):
 yields its messages one at a time. The `commit` of its `poll_options` says when
 offsets are stored. `CommitPolicy.Manual()`, the default, stores none: commit the
 checkpoint of a message after you process it. `CommitPolicy.OnRead()` makes the
-server store the offset of each read. `CommitPolicy.Auto(AutoCommit(...))` makes
+server store the offset of each read. A reader or a consumer with `OnRead` reads
+ahead. A crash, or an exit without `close()` or `shutdown()`, loses the batches
+that the server stored before the application took them. The loss is at most the
+effective prefetch budget, which holds at least 32 batches.
+`CommitPolicy.Auto(AutoCommit(...))` makes
 the consumer store the latest counted position at an `interval` or on a
 `CommitEvery` event, and on shutdown. A message counts after its processing with
 `CommitAfter.Processing`, when it is handed over with `CommitAfter.Delivery`, or

@@ -20,13 +20,17 @@
 package org.apache.iggy.client.async.reader;
 
 import org.apache.iggy.client.async.reader.FakeTransport.Store;
+import org.apache.iggy.consumergroup.ConsumerGroupAssignment;
 import org.apache.iggy.exception.IggyClientException;
+import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.message.AutoCommit;
 import org.apache.iggy.message.CommitAfter;
 import org.apache.iggy.message.CommitEvery;
 import org.apache.iggy.message.CommitPolicy;
+import org.apache.iggy.message.FetchedMessages;
 import org.apache.iggy.message.PollOptions;
 import org.apache.iggy.message.PollingStrategy;
+import org.apache.iggy.partition.PartitionContext;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
@@ -39,6 +43,12 @@ import java.util.concurrent.TimeUnit;
 
 import static org.apache.iggy.client.async.reader.FakeTransport.TIMEOUT;
 import static org.apache.iggy.client.async.reader.FakeTransport.section;
+import static org.apache.iggy.client.async.reader.PartitionReaderCancelTest.TRANSIENT_REFUSAL;
+import static org.apache.iggy.client.async.reader.PartitionReaderStoredOffsetTest.INSTALLED;
+import static org.apache.iggy.client.async.reader.PartitionReaderStoredOffsetTest.await;
+import static org.apache.iggy.client.async.reader.PartitionReaderTest.QUIET;
+import static org.apache.iggy.client.async.reader.PartitionReaderTest.RETRY_INTERVAL;
+import static org.apache.iggy.client.async.reader.PartitionReaderTest.assignment;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -168,6 +178,113 @@ class IggyConsumerTest {
         } finally {
             consumer.shutdown().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
         }
+    }
+
+    /**
+     * A seek holds the messages of its partition back. A failed one hands them over, also a batch that the reader hands
+     * over during the seek, so it loses no message.
+     */
+    @Test
+    void shouldHandOverTheHeldMessagesAfterAFailedSeekUnderOnRead() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        IggyConsumer consumer = consumer(transport, WAIT.withCommit(CommitPolicy.onRead()));
+        try {
+            CompletableFuture<ReceivedMessage> first = consumer.next();
+            transport.nextRead().answer(section(1, 0, 1));
+            assertThat(offset(first)).isZero();
+            transport.storeFailures.add(new IggyClientException("The connection dropped"));
+            assertThatThrownBy(() -> consumer.seek(1L, PollingStrategy.offset(BigInteger.TEN))
+                            .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                    .hasCauseInstanceOf(IggyClientException.class);
+            assertThat(offset(consumer.next())).isEqualTo(1);
+
+            CompletableFuture<ReceivedMessage> cancelled = consumer.next();
+            FakeTransport.Read read = transport.nextRead();
+            assertThat(cancelled.cancel(false)).isTrue();
+            read.answer(section(1, 2, 3));
+            transport.storeReply = new CompletableFuture<>();
+            transport.storeFailures.add(new IggyClientException("The connection dropped"));
+            CompletableFuture<Void> sought = consumer.seek(1L, PollingStrategy.offset(BigInteger.TEN));
+            CompletableFuture<ReceivedMessage> held = consumer.next();
+            assertThat(transport.readsNothingFor(QUIET)).isTrue();
+            assertThat(held).isNotDone();
+            transport.storeReply.complete(null);
+
+            assertThatThrownBy(() -> sought.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                    .hasCauseInstanceOf(IggyClientException.class);
+            assertThat(offset(held)).isEqualTo(2);
+            assertThat(offset(consumer.next())).isEqualTo(3);
+        } finally {
+            transport.storeReply.complete(null);
+            consumer.shutdown().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * A message of a batch from an earlier assignment of its partition decides nothing at the shutdown: another member
+     * can have moved the offset since. So the shutdown moves the offset back before the first batch of the current
+     * assignment.
+     */
+    @Test
+    void shouldMoveBackOnShutdownOnlyForTheCurrentAssignmentUnderOnRead() throws Exception {
+        FakeTransport transport = new FakeTransport(true);
+        transport.starts.put(1L, 10L);
+        IggyConsumer consumer = IggyConsumer.build(PartitionReader.builder(transport)
+                        .options(WAIT.withCommit(CommitPolicy.onRead()))
+                        .retryInterval(Duration.ofMillis(100)))
+                .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        PartitionContext nextOwner = new PartitionContext(BigInteger.valueOf(7), BigInteger.TWO, BigInteger.TWO);
+        assignment(transport, 1L);
+        queue(consumer, transport, section(1, 10, 11));
+        assignment(transport);
+        assignment(transport, 1L);
+        await(() -> consumer.partitions().contains(1L));
+        assertThat(offset(consumer.next())).isEqualTo(10);
+        assertThat(offset(consumer.next())).isEqualTo(11);
+        transport.probes.put(1L, section(1, nextOwner, 30));
+        queue(consumer, transport, section(1, nextOwner, 30, 31));
+
+        CompletableFuture<Void> shutdown = consumer.shutdown();
+        transport.assignments.forEach(sync -> sync.complete(Optional.of(new ConsumerGroupAssignment(1, List.of(1L)))));
+        shutdown.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+        assertThat(transport.events).containsExactly("store 1 29");
+    }
+
+    /** A cancel of the shutdown cancels its close, which ends the owner read of the move back. A later one waits. */
+    @Test
+    void shouldEndTheShutdownWhenItsCallerCancelsUnderALastingTransientRefusal() throws Exception {
+        FakeTransport transport = new FakeTransport(true);
+        IggyConsumer consumer = IggyConsumer.build(PartitionReader.builder(transport)
+                        .options(WAIT.withCommit(CommitPolicy.onRead()))
+                        .retryInterval(RETRY_INTERVAL))
+                .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        assignment(transport, 1L);
+        CompletableFuture<ReceivedMessage> first = consumer.next();
+        transport.nextRead().answer(section(1, 0, 1));
+        offset(first);
+        transport.installOwner(INSTALLED.ownerGeneration(), INSTALLED.metadataOp());
+
+        CompletableFuture<Void> shutdown = consumer.shutdown();
+        transport.nextRead().answer(TRANSIENT_REFUSAL);
+        FakeTransport.Read retried = transport.nextRead();
+        assertThat(shutdown.cancel(false)).isTrue();
+        retried.answer(TRANSIENT_REFUSAL);
+
+        assertThat(transport.readsNothingFor(RETRY_INTERVAL.multipliedBy(2))).isTrue();
+        assertThatThrownBy(() -> consumer.shutdown().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                .hasCauseInstanceOf(IggyServerException.class);
+        assertThat(transport.membership).containsExactly("join", "leave");
+        assertThat(transport.events).isEmpty();
+    }
+
+    /** Leaves a batch queued in the reader: its read answers a {@code next()} that the caller cancelled. */
+    private static void queue(IggyConsumer consumer, FakeTransport transport, FetchedMessages section)
+            throws InterruptedException {
+        CompletableFuture<ReceivedMessage> cancelled = consumer.next();
+        FakeTransport.Read read = transport.nextRead();
+        assertThat(cancelled.cancel(false)).isTrue();
+        read.answer(section);
     }
 
     private static PollOptions auto(CommitAfter after) {

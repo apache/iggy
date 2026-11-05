@@ -39,7 +39,9 @@ const CLOSED: &str = "the reader is closed";
 /// budget (one fetch per primary that may wait for messages, the partitions with messages left
 /// behind spread over the other slots), a seek() to an offset stores the offset before it, and
 /// close() moves the offset back to the last delivered message. Destroying the reader without
-/// close() stops it without waiting, moves no offset back and does not leave the group.
+/// close() stops it without waiting, moves no offset back and does not leave the group. Under
+/// onRead(), such a reader or a crash loses the batches that the server stored before the
+/// application took them, up to the effective budget, which holds at least 32 batches.
 #[php_class]
 #[php(name = "Iggy\\PartitionReader")]
 pub struct PartitionReader {

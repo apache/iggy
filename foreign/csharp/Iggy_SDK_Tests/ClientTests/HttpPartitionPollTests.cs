@@ -55,6 +55,16 @@ public sealed class HttpPartitionPollTests
         }
         """;
 
+    /// <summary>A reply without messages under the context 17, 9, 52.</summary>
+    private const string EmptyBatch = """
+        {
+          "partition_id": 1,
+          "current_offset": 42,
+          "context": { "incarnation": 17, "owner_generation": 9, "metadata_op": 52 },
+          "messages": []
+        }
+        """;
+
     private static readonly Identifier Stream = Identifier.Numeric(1);
     private static readonly Identifier Topic = Identifier.Numeric(2);
 
@@ -104,6 +114,18 @@ public sealed class HttpPartitionPollTests
         }
     }
 
+    /// <summary>A poll without options keeps the start of its request for an empty batch too.</summary>
+    [Fact]
+    public async Task given_a_plain_poll_by_offset_when_its_batch_is_empty_should_continue_from_that_offset()
+    {
+        var polled = await Client(new RecordingHandler(EmptyBatch)).PollMessagesAsync(Stream, Topic, 1,
+            Consumer.New(1), PollingStrategy.Offset(7), 10, false, TestContext.Current.CancellationToken);
+
+        Assert.Empty(polled.Messages);
+        Assert.Equal((MessagePolling.Offset, 7ul, new PartitionContext(17, 9, 52)),
+            (polled.Continuation.Kind, polled.Continuation.Value, polled.Continuation.Context));
+    }
+
     [Fact]
     public async Task given_auto_commit_when_polling_should_refuse_it_before_sending()
     {
@@ -145,8 +167,8 @@ public sealed class HttpPartitionPollTests
 
     private sealed record RecordedRequest(HttpMethod Method, string Path, System.Collections.Specialized.NameValueCollection Query);
 
-    /// <summary>Answers every poll with <see cref="Batch" /> and records its method, path and query.</summary>
-    private sealed class RecordingHandler : HttpMessageHandler
+    /// <summary>Answers every poll with <paramref name="reply" /> and records its method, path and query.</summary>
+    private sealed class RecordingHandler(string reply = Batch) : HttpMessageHandler
     {
         internal ConcurrentQueue<RecordedRequest> Requests { get; } = new();
 
@@ -158,7 +180,7 @@ public sealed class HttpPartitionPollTests
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
             {
                 RequestMessage = request,
-                Content = new StringContent(Batch.Replace("\"partition_id\": 1", $"\"partition_id\": {partition}"),
+                Content = new StringContent(reply.Replace("\"partition_id\": 1", $"\"partition_id\": {partition}"),
                     Encoding.UTF8, "application/json")
             });
         }

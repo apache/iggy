@@ -104,11 +104,7 @@ macro_rules! impl_binary_client {
                 context: iggy_common::PartitionContext,
             ) -> Result<bytes::Bytes, iggy_common::IggyError> {
                 self.driver
-                    .send_raw(
-                        code,
-                        payload,
-                        (context != iggy_common::PartitionContext::default()).then_some(context),
-                    )
+                    .send_raw(code, payload, context.non_zero())
                     .await
             }
 

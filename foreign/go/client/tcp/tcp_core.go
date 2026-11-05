@@ -75,6 +75,9 @@ type IggyTcpClient struct {
 	// Close waits for them. Each Add happens under mtx before the close of
 	// closed, or not at all.
 	commits sync.WaitGroup
+	// testHookPause, when set, turns the drawn length of each pause into the
+	// length the client waits, so a test sees a pause start and can hold it.
+	testHookPause func(drawn time.Duration) time.Duration
 }
 
 type config struct {
@@ -670,6 +673,14 @@ func (c *IggyTcpClient) startCommit() bool {
 }
 
 func (c *IggyTcpClient) pause(ctx context.Context, interval time.Duration) error {
+	return c.pauseUntil(ctx, interval, nil)
+}
+
+// pauseUntil is pause that also ends once wake closes.
+func (c *IggyTcpClient) pauseUntil(ctx context.Context, interval time.Duration, wake <-chan struct{}) error {
+	if c.testHookPause != nil {
+		interval = c.testHookPause(interval)
+	}
 	if interval <= 0 {
 		return ctx.Err()
 	}
@@ -681,6 +692,8 @@ func (c *IggyTcpClient) pause(ctx context.Context, interval time.Duration) error
 	case <-c.closed:
 		return ierror.ErrClientShutdown
 	case <-timer.C:
+		return nil
+	case <-wake:
 		return nil
 	}
 }
