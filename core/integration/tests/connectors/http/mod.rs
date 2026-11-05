@@ -16,6 +16,7 @@
 // under the License.
 
 mod http_sink;
+mod http_sink_delivery;
 mod http_source;
 
 const TEST_MESSAGE_COUNT: usize = 3;
