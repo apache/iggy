@@ -74,6 +74,7 @@ mod tests {
             store_region: "us-east-1".to_string(),
             store_class: IcebergSinkStoreClass::S3,
             store_path_style_access: true,
+            invalid_rows: None,
         }
     }
 

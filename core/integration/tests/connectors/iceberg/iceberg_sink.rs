@@ -18,7 +18,7 @@
 use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
     DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergEnvAuthFixture, IcebergOps,
-    IcebergPartitionedTableFixture, IcebergPreCreatedFixture,
+    IcebergPartitionedTableFixture, IcebergPreCreatedFixture, IcebergSkipInvalidRowsFixture,
 };
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
@@ -336,4 +336,73 @@ async fn iceberg_sink_uses_default_credential_chain(
         .expect("Data should be written to Iceberg table");
     assert!(snapshot_count >= 1);
     drop(fixture);
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/iceberg/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_invalid_rows_skip_when_a_batch_holds_a_row_that_does_not_match_should_write_the_other_rows(
+    harness: &TestHarness,
+    fixture: IcebergSkipInvalidRowsFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+
+    let valid_rows = create_test_messages(4);
+    let mut payloads: Vec<Vec<u8>> = valid_rows
+        .iter()
+        .map(|row| serde_json::to_vec(row).expect("Failed to serialize message"))
+        .collect();
+    // `id` is a required long column, so this row does not match the table.
+    payloads.insert(
+        2,
+        serde_json::to_vec(&serde_json::json!({ "id": "not a number", "name": "invalid" }))
+            .expect("Failed to serialize message"),
+    );
+    let mut messages: Vec<IggyMessage> = payloads
+        .into_iter()
+        .enumerate()
+        .map(|(i, payload)| {
+            IggyMessage::builder()
+                .id((i + 1) as u128)
+                .payload(Bytes::from(payload))
+                .build()
+                .expect("Failed to build message")
+        })
+        .collect();
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("Failed to send messages");
+
+    fixture
+        .wait_for_snapshots(
+            DEFAULT_NAMESPACE,
+            DEFAULT_TABLE,
+            1,
+            SNAPSHOT_POLL_ATTEMPTS,
+            SNAPSHOT_POLL_INTERVAL_MS,
+        )
+        .await
+        .expect("The matching rows should be written to Iceberg");
+    let metadata = fixture
+        .get_table_metadata(DEFAULT_NAMESPACE, DEFAULT_TABLE)
+        .await
+        .expect("Failed to get table metadata");
+    let written: u64 = metadata
+        .metadata
+        .snapshots
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|snapshot| snapshot.summary.as_ref()?.added_records.as_deref())
+        .map(|records| records.parse::<u64>().expect("added-records is a count"))
+        .sum();
+    assert_eq!(written, valid_rows.len() as u64);
 }
