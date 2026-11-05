@@ -137,12 +137,12 @@ impl Serialize for JsonField<'_> {
             DataType::BigInt(_) => {
                 serializer.serialize_i64(row.get_long(position).map_err(read_error)?)
             }
-            DataType::Float(_) => serialize_float(
-                serializer,
-                f64::from(row.get_float(position).map_err(read_error)?),
-            ),
+            // serde_json writes NaN and infinity as null, since JSON has no encoding for them.
+            DataType::Float(_) => {
+                serializer.serialize_f64(f64::from(row.get_float(position).map_err(read_error)?))
+            }
             DataType::Double(_) => {
-                serialize_float(serializer, row.get_double(position).map_err(read_error)?)
+                serializer.serialize_f64(row.get_double(position).map_err(read_error)?)
             }
             DataType::Char(inner) => serializer.serialize_str(
                 row.get_char(position, inner.length() as usize)
@@ -203,16 +203,6 @@ impl Serialize for JsonField<'_> {
                 )))
             }
         }
-    }
-}
-
-/// JSON has no encoding for NaN or infinity, so those collapse to null rather than
-/// failing the whole batch over one degenerate float.
-fn serialize_float<S: Serializer>(serializer: S, value: f64) -> Result<S::Ok, S::Error> {
-    if value.is_finite() {
-        serializer.serialize_f64(value)
-    } else {
-        serializer.serialize_none()
     }
 }
 
