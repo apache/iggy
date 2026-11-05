@@ -13,6 +13,7 @@
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
+// under the License.
 
 #[compio::test]
 async fn given_wal_lane_published_persisted_runs_when_idle_should_leave_the_tick_retry_set() {

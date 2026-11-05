@@ -13,6 +13,7 @@
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
+// under the License.
 
 #[compio::test]
 async fn given_storeless_partition_when_persist_gate_runs_should_mark_current_view_durable() {

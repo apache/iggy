@@ -13,6 +13,7 @@
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
+// under the License.
 
 #[test]
 fn given_topic_durability_when_installed_should_tell_consensus_whether_restarts_keep_acks() {

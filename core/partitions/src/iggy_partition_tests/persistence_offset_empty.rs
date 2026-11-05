@@ -13,6 +13,7 @@
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
+// under the License.
 
 #[compio::test]
 async fn given_empty_transfer_frontier_when_incoming_offsets_are_clamped_out_should_remove_old_files()

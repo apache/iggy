@@ -13,6 +13,7 @@
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
+// under the License.
 
 fn armed_session(to_op: u64, floor: u64) -> RepairSession {
     armed_fetch_session(to_op, to_op, floor)
