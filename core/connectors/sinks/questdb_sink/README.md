@@ -162,9 +162,8 @@ connection_string = "ws::addr=localhost:9000;sender_pool_max=16;"
 write-ahead log is shipped. With `ok`, a primary that fails before shipping can
 lose rows it already acknowledged. Use `durable` when losing that tail matters.
 
-`durable` costs one round trip per flush, so larger batches reduce the cost. In
-one test that flushed 10 rows every 250 ms, `durable` reached about 8 rows/s and
-`ok` about 40 rows/s.
+`durable` adds one wait for log shipping to every flush, whatever the batch
+size, so throughput grows with rows per batch.
 
 ## Types
 

@@ -292,7 +292,7 @@ prost = "0.14.4"
 prost-types = "0.14.4"
 protox = "0.10.0"
 protox-parse = "0.10.0"
-questdb-rs = { version = "7.0.0", default-features = false, features = [
+questdb-rs = { version = "7.2.1", default-features = false, features = [
     "sync-sender-qwp-ws",
     "tls-webpki-certs",
     "tls-native-certs",
