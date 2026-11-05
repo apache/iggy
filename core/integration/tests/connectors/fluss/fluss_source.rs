@@ -66,6 +66,14 @@ struct FlussRecord {
 struct SavedState {
     bucket_offsets: HashMap<i32, i64>,
     messages_produced: u64,
+    table: Option<SavedTable>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SavedTable {
+    database: String,
+    table: String,
+    table_id: i64,
 }
 
 /// An Apache Iggy message reduced to what the tests check.
@@ -270,6 +278,62 @@ async fn given_acknowledged_rows_when_runtime_restarts_should_resume_after_them(
         "Rows acknowledged before the restart should not be read again"
     );
     assert_rows_delivered(&received, &second_payloads, TEST_ROW_COUNT as i64);
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/fluss/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_table_created_again_under_the_same_name_when_runtime_restarts_should_refuse_its_offsets(
+    harness: &mut TestHarness,
+    fixture: FlussSourceFixture,
+) {
+    fixture
+        .append_rows(&test_payloads())
+        .await
+        .expect("Failed to append rows");
+    let state_path = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .state_path()
+        .join(STATE_FILE);
+    let saved = wait_for_saved_offset(&state_path, 0, TEST_ROW_COUNT as i64).await;
+    let saved_table = saved
+        .table
+        .expect("The saved state should name the table its offsets came from");
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors runtime");
+    let saved_bytes = std::fs::read(&state_path).expect("Failed to read the state file");
+    // The new table starts empty, so the saved offset would start it past its first rows.
+    fixture
+        .recreate_table()
+        .await
+        .expect("Failed to create the table again");
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors runtime");
+
+    let runtime = harness.connectors_runtime().expect("connectors runtime");
+    wait_for_source_status(&Client::new(), &runtime.http_url(), ConnectorStatus::Error).await;
+    let (stdout, _) = runtime.collect_logs();
+    let saved_name = format!(
+        "the saved state was read from table '{}.{}' (id {})",
+        saved_table.database, saved_table.table, saved_table.table_id
+    );
+    assert!(
+        stdout.contains(&saved_name),
+        "The source should log that the saved offsets belong to the dropped table"
+    );
+    assert_eq!(
+        std::fs::read(&state_path).expect("Failed to read the state file"),
+        saved_bytes,
+        "The state of the dropped table should be left in place"
+    );
 }
 
 #[iggy_harness(

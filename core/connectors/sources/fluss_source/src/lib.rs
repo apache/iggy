@@ -89,11 +89,43 @@ struct State {
     /// Next offset to read per bucket. Absent buckets fall back to the configured start.
     bucket_offsets: HashMap<i32, i64>,
     messages_produced: u64,
+    /// The table the offsets were read from, set by `open()` before anything is saved.
+    table: Option<TableIdentity>,
     /// Unconvertible rows this run dropped, reported when the connector closes. It moves with
     /// the offsets on ACK, so rows read again after a NACK are not counted twice, and it is
     /// not persisted.
     #[serde(skip)]
     rows_skipped: u64,
+}
+
+/// Offsets only mean something for the table they were read from. A table dropped and created
+/// again under the same name gets a new id, while ids start over in every cluster, so the name
+/// and the id are kept together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TableIdentity {
+    database: String,
+    table: String,
+    table_id: i64,
+}
+
+impl TableIdentity {
+    fn new(table_path: &TablePath, table_id: i64) -> Self {
+        Self {
+            database: table_path.database().to_owned(),
+            table: table_path.table().to_owned(),
+            table_id,
+        }
+    }
+}
+
+impl std::fmt::Display for TableIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "'{}.{}' (id {})",
+            self.database, self.table, self.table_id
+        )
+    }
 }
 
 /// A batch handed to the runtime and not acknowledged yet, kept with the records it was built
@@ -540,7 +572,7 @@ impl FlussSource {
         // The scanner aligns every row to the schema it was created with, so the columns used to
         // decode rows come from the same table snapshot rather than from a second lookup that a
         // schema change could land between.
-        let (scanner, fields, bucket_count) = {
+        let (scanner, fields, bucket_count, table) = {
             let table = connection
                 .get_table(&self.table_path)
                 .await
@@ -596,10 +628,15 @@ impl FlussSource {
                 scanner,
                 row_type.fields().clone(),
                 table_info.get_num_buckets(),
+                TableIdentity::new(&self.table_path, table_info.get_table_id()),
             )
         };
 
-        let restored = { self.state.lock().await.bucket_offsets.clone() };
+        let (restored, restored_table) = {
+            let state = self.state.lock().await;
+            (state.bucket_offsets.clone(), state.table.clone())
+        };
+        ensure_same_table(restored_table.as_ref(), &table)?;
         let mut stale: Vec<i32> = restored
             .keys()
             .copied()
@@ -630,11 +667,14 @@ impl FlussSource {
             .await
             .map_err(connection_error)?;
 
-        self.start_offsets_unsaved
-            .store(offsets != restored, Ordering::Release);
+        self.start_offsets_unsaved.store(
+            offsets != restored || restored_table.is_none(),
+            Ordering::Release,
+        );
         {
             let mut state = self.state.lock().await;
             state.bucket_offsets = offsets;
+            state.table = Some(table);
         }
 
         // The scanner holds its own handles to the client, so the connection is not kept.
@@ -803,6 +843,20 @@ fn projection_indices(
         .collect()
 }
 
+/// Offsets saved for another table, or for a table dropped and created again under the same
+/// name, would start this one past rows it never delivered, so they are refused before any
+/// bucket is subscribed. A state without a table has not been saved yet.
+fn ensure_same_table(saved: Option<&TableIdentity>, current: &TableIdentity) -> Result<(), Error> {
+    match saved {
+        Some(saved) if saved != current => Err(Error::InitError(format!(
+            "the saved state was read from table {saved}, not from table {current}. Its offsets \
+             could skip rows of this table, so remove the state file to start again from \
+             starting_offset"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// `include_metadata` writes its fields into the same object as the columns, so a column under
 /// the reserved prefix would be overwritten.
 fn ensure_no_metadata_collision(fields: &[DataField]) -> Result<(), Error> {
@@ -890,10 +944,15 @@ mod tests {
         ScanRecords::new(HashMap::from([(TableBucket::new(1, bucket), records)]))
     }
 
+    fn events_table(table_id: i64) -> TableIdentity {
+        TableIdentity::new(&TablePath::new("analytics", "events"), table_id)
+    }
+
     #[test]
     fn given_persisted_state_should_restore_bucket_offsets() {
-        let serialized = rmp_serde::to_vec(&state_with(&[(0, 42), (1, 7)], 500))
-            .expect("Failed to serialize state");
+        let mut state = state_with(&[(0, 42), (1, 7)], 500);
+        state.table = Some(events_table(3));
+        let serialized = rmp_serde::to_vec(&state).expect("Failed to serialize state");
 
         let source = FlussSource::new(1, test_config(), Some(ConnectorState(serialized)));
 
@@ -903,6 +962,7 @@ mod tests {
             assert_eq!(restored.messages_produced, 500);
             assert_eq!(restored.bucket_offsets.get(&0), Some(&42));
             assert_eq!(restored.bucket_offsets.get(&1), Some(&7));
+            assert_eq!(restored.table, Some(events_table(3)));
         });
     }
 
@@ -941,7 +1001,8 @@ mod tests {
 
     #[test]
     fn state_should_be_serializable_and_deserializable() {
-        let original = state_with(&[(0, 100), (3, 250)], 1000);
+        let mut original = state_with(&[(0, 100), (3, 250)], 1000);
+        original.table = Some(events_table(7));
 
         let serialized = rmp_serde::to_vec(&original).expect("Failed to serialize");
         let deserialized: State =
@@ -949,6 +1010,43 @@ mod tests {
 
         assert_eq!(original.messages_produced, deserialized.messages_produced);
         assert_eq!(original.bucket_offsets, deserialized.bucket_offsets);
+        assert_eq!(original.table, deserialized.table);
+    }
+
+    #[test]
+    fn given_state_saved_for_the_same_table_should_accept_it() {
+        assert!(ensure_same_table(Some(&events_table(3)), &events_table(3)).is_ok());
+    }
+
+    #[test]
+    fn given_state_not_saved_yet_should_accept_any_table() {
+        assert!(ensure_same_table(None, &events_table(3)).is_ok());
+    }
+
+    #[test]
+    fn given_state_saved_for_a_table_created_again_under_the_same_name_should_refuse_it() {
+        let error = ensure_same_table(Some(&events_table(3)), &events_table(4))
+            .expect_err("Offsets of the dropped table should be refused");
+
+        assert!(
+            matches!(&error, Error::InitError(message)
+                if message.contains("'analytics.events' (id 3)")
+                    && message.contains("'analytics.events' (id 4)")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn given_state_saved_for_another_table_should_refuse_it() {
+        let other = TableIdentity::new(&TablePath::new("analytics", "orders"), 3);
+
+        let error = ensure_same_table(Some(&other), &events_table(3))
+            .expect_err("Offsets of another table should be refused");
+
+        assert!(
+            matches!(&error, Error::InitError(message) if message.contains("'analytics.orders'")),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

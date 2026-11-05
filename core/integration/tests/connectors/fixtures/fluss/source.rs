@@ -67,6 +67,17 @@ impl FlussSourceFixture {
         self.append(&rows).await
     }
 
+    /// Drops the table and creates it again under the same name, which gives it a new table id.
+    pub async fn recreate_table(&self) -> Result<(), TestBinaryError> {
+        let connection = self.connect().await?;
+        let admin = connection.get_admin().map_err(|error| self.error(error))?;
+        admin
+            .drop_table(&Self::table_path(), false)
+            .await
+            .map_err(|error| self.error(error))?;
+        self.create_table_when_ready(events_schema).await
+    }
+
     /// Starts a cluster and creates the table the connector reads, with the given schema.
     async fn start(schema: fn() -> fluss::error::Result<Schema>) -> Result<Self, TestBinaryError> {
         let fixture = Self {
