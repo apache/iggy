@@ -1209,9 +1209,9 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// writer carries the freshest view and the durable view cannot regress.
     ///
     /// Held across the write `.await`, so it uses the same single-threaded,
-    /// cancel-safe [`LocalGate`] as `journal_gate`, a `Cell` flag with no atomics:
-    /// this shard is never `Sync`, so a `tokio::sync::Mutex` would only add an
-    /// atomic RMW per gated send for exclusion the `Cell` already provides.
+    /// cancel-safe [`LocalGate`] as `journal_gate`, which has no atomics: this
+    /// shard is never `Sync`, so a `tokio::sync::Mutex` would only add an
+    /// atomic RMW per gated send for exclusion that `Cell` state already provides.
     superblock_lock: LocalGate,
     /// Serializes whole checkpoints against each other: `persist_snapshot` renames
     /// over the single `snapshot.bin` and `drain` rewrites the WAL through a shared
@@ -1240,10 +1240,9 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// Snapshot coordinator - present when persistent checkpointing is configured.
     pub coordinator: Option<SnapshotCoordinator<M>>,
     /// Serializes `on_replicate`'s journal-mutation section (forced
-    /// checkpoint + WAL append) and the send to the backups across concurrent
-    /// drivers (the pump loop, detached per-client submit tasks, repair).
-    /// Waiters take it in arrival order, so a primary appends and sends in op
-    /// order. Ungated they race
+    /// checkpoint + WAL append) across concurrent drivers (the pump loop
+    /// and the detached per-client submit tasks). Waiters take it in arrival
+    /// order, so a primary appends in op order. Ungated they race
     /// `SnapshotCoordinator::checkpoint`: every driver crossing the
     /// `remaining_capacity <= CHECKPOINT_MARGIN` boundary runs a full
     /// checkpoint, and the concurrent `journal.drain()` calls collide on the
@@ -2023,7 +2022,7 @@ where
         //
         // On the primary, every submit claims its op and reaches this acquire
         // with no await in between. The gate goes to its waiters in arrival
-        // order, so the appends and the sends below follow the op order.
+        // order, so the appends below follow the op order.
         let journal_gate = self.journal_gate.acquire().await;
 
         // Best-effort WAL reclamation. A failed checkpoint must NOT drop the
@@ -2149,13 +2148,14 @@ where
         consensus.note_journal_mutation();
         consensus.extend_history_certificate(header.op, header.checksum);
 
-        // Durable; replicate under the gate. A backup takes only the next op, so
-        // every backup must get the prepares in op order. The bus only queues
-        // the frame, so the gate never waits for the network. `replicate`
-        // borrows + freezes; we keep message for the sequencer/checksum
-        // bookkeeping below.
-        self.replicate(&message).await;
+        // Journal mutation done; wire traffic below must not hold the gate.
+        // The sends still leave in op order: the next submit runs only after
+        // this task yields, and `replicate` queues every copy without yielding.
         drop(journal_gate);
+
+        // Durable; replicate. `replicate` borrows + freezes; we keep
+        // message for the sequencer/checksum bookkeeping below.
+        self.replicate(&message).await;
 
         self.observe_prepare_runtime_state(&message);
         // Backup only: advance sequencer + checksum post-append. Primary
