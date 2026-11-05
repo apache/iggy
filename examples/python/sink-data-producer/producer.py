@@ -104,8 +104,22 @@ def random_record() -> dict:
     }
 
 
+def validate_connection_string(connection_string: str | None) -> None:
+    if connection_string is not None and connection_string.startswith(
+        ("iggy+http://", "iggy+https://", "http://", "https://")
+    ):
+        raise ValueError(
+            "HTTP connection strings are not supported by this example. "
+            "Use a TCP connection string (e.g. 'iggy+tcp://iggy:iggy@127.0.0.1:8090') "
+            "or set IGGY_ADDRESS, IGGY_USERNAME, and IGGY_PASSWORD "
+            "environment variables instead."
+        )
+
+
 async def main() -> None:
     args = parse_args()
+
+    validate_connection_string(args.connection_string)
 
     if args.connection_string:
         client = IggyClient.from_connection_string(args.connection_string)

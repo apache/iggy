@@ -152,7 +152,7 @@ python message-headers/typed-headers/consumer.py
 ### Sink Data Producer
 
 Populates an Iggy topic with JSON records so that sink connectors have data to consume.
-The producer generates 100 batches of 100 to 500 records each.
+The producer generates 100 batches of 100 to 499 records each.
 
 Each record contains: `user_id`, `user_type`, `email`, `source`, `state`, `created_at`,
 and `message`.
