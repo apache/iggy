@@ -650,11 +650,16 @@ when you call `mark(checkpoint)` with `CommitAfter.Marked`.
 `AutoCommit.default()` stores every 10,000 messages or 5 seconds after
 processing. With `CommitAfter.Processing`, a `consume_messages()` callback that
 raises ends the run with its exception, and its message is read again by the
-next run. A reader takes the same `commit`. Call `shutdown()` before you drop the consumer, or use it in
-`async with`, which shuts it down. `shutdown()` also ends an `async for` that
-waits for a message. In a `consume_messages()` callback, `shutdown()`, iterating
-the consumer and a nested `consume_messages()` raise `RuntimeError`, because the
-run waits for the callback: set the shutdown event instead.
+next run. A reader takes the same `commit`. Call `shutdown()` before you drop the
+consumer, or use it in `async with`, which shuts it down. Shutdown waits up to
+five seconds for pending automatic offset stores by default. Pass
+`offset_drain_timeout` to `consumer_group()` to change that wait; zero skips it.
+Closing the reader and leaving the group still run after the wait expires.
+This timeout is not a deadline for the entire shutdown. `shutdown()` also ends
+an `async for` that waits for a message. In a
+`consume_messages()` callback, `shutdown()`, iterating the consumer and a nested
+`consume_messages()` raise `RuntimeError`, because the run waits for the
+callback: set the shutdown event instead.
 
 ```python
 from apache_iggy import IggyClient
