@@ -74,21 +74,12 @@ async fn create_stream_and_topic(client: &IggyClient, eager_flush: bool, durabil
     // options, so they travel with the topic to all nodes. The default shape
     // leaves the 1024-message / 1 MiB thresholds in place, so small runs are
     // acked from RAM only.
-    let options = if eager_flush {
-        TopicCreateOptions {
-            partitions_count: Some(1),
-            message_expiry: Some(IggyExpiry::NeverExpire),
-            messages_required_to_save: Some(1),
-            durability,
-            ..TopicCreateOptions::default()
-        }
-    } else {
-        TopicCreateOptions {
-            partitions_count: Some(1),
-            message_expiry: Some(IggyExpiry::NeverExpire),
-            durability,
-            ..TopicCreateOptions::default()
-        }
+    let options = TopicCreateOptions {
+        partitions_count: Some(1),
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        messages_required_to_save: eager_flush.then_some(1),
+        durability,
+        ..TopicCreateOptions::default()
     };
     client
         .create_topic(
@@ -672,14 +663,10 @@ async fn given_replicated_eager_flush_topic_when_the_whole_cluster_is_killed_sho
     // A write that reads back proves the partition serves again, so the
     // missing acks below are discarded, not still recovering.
     let after_restart = produce_acked_when_serving(&client, CONVERGE_TIMEOUT).await;
-    wait_for_acked_readable(
-        &client,
-        std::slice::from_ref(&after_restart),
-        CONVERGE_TIMEOUT,
-    )
-    .await
-    .unwrap_or_else(|state| panic!("the partition should serve after the restart: {state}"));
     expected.push(after_restart);
+    wait_for_acked_readable(&client, &expected, CONVERGE_TIMEOUT)
+        .await
+        .unwrap_or_else(|state| panic!("the partition should serve after the restart: {state}"));
     let readable = poll_from_start(&client, acked.len() as u32 + 16).await;
     assert_eq!(
         readable,
