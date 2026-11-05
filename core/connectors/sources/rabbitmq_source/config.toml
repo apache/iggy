@@ -22,6 +22,8 @@ version = 1
 name = "RabbitMQ source"
 path = "target/release/libiggy_connector_rabbitmq_source"
 plugin_config_format = "json"
+# Do not enable exactly_once. The source cannot reliably replay batches after a restart.
+exactly_once = false
 
 [[streams]]
 stream = "events"

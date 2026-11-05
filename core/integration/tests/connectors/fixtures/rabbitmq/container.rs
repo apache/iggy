@@ -78,24 +78,6 @@ pub struct RabbitMqContainer {
 }
 
 impl RabbitMqContainer {
-    pub(super) async fn pause(&self) -> Result<(), TestBinaryError> {
-        self.container
-            .pause()
-            .await
-            .map_err(|error| TestBinaryError::InvalidState {
-                message: format!("Failed to pause RabbitMQ container: {error}"),
-            })
-    }
-
-    pub(super) async fn resume(&self) -> Result<(), TestBinaryError> {
-        self.container
-            .unpause()
-            .await
-            .map_err(|error| TestBinaryError::InvalidState {
-                message: format!("Failed to resume RabbitMQ container: {error}"),
-            })
-    }
-
     async fn start_container()
     -> Result<(ContainerAsync<GenericImage>, String, String), TestBinaryError> {
         let container = GenericImage::new(RABBITMQ_IMAGE, RABBITMQ_TAG)

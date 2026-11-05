@@ -67,20 +67,17 @@ pub mod batch {
         }
 
         pub async fn acknowledge(&self) -> Result<(), Error> {
-            for (_, acker) in &self.deliveries {
-                match acker.ack(BasicAckOptions::default()).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return Err(Error::Connection(
-                            "RabbitMQ acknowledgement was refused".into(),
-                        ));
-                    }
-                    Err(_) => {
-                        return Err(Error::Connection("RabbitMQ acknowledgement failed".into()));
-                    }
-                }
+            let Some((_, acker)) = self.deliveries.last() else {
+                return Ok(());
+            };
+            // The source processes one batch at a time on a dedicated channel.
+            match acker.ack(BasicAckOptions { multiple: true }).await {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(Error::Connection(
+                    "RabbitMQ acknowledgement was refused".into(),
+                )),
+                Err(_) => Err(Error::Connection("RabbitMQ acknowledgement failed".into())),
             }
-            Ok(())
         }
     }
 }

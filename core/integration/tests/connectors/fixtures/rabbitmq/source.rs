@@ -32,12 +32,109 @@ pub struct RabbitMqSourceFixture {
 }
 
 impl RabbitMqSourceFixture {
-    pub async fn pause_broker(&self) -> Result<(), TestBinaryError> {
-        self.container.pause().await
+    pub async fn acknowledged_messages(&self) -> Result<Option<u64>, String> {
+        let queue = &self.container.queue_names[0];
+        let response: serde_json::Value = reqwest::Client::new()
+            .get(format!(
+                "{}/api/queues/%2F/{queue}",
+                self.container.management_url
+            ))
+            .basic_auth("iggy_test", Some("iggy_test_password"))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?
+            .error_for_status()
+            .map_err(|error| error.to_string())?
+            .json()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !response.is_object() {
+            return Err(format!(
+                "RabbitMQ returned unexpected queue data: {response}"
+            ));
+        }
+        match response.pointer("/message_stats/ack") {
+            Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+                format!("RabbitMQ returned an invalid acknowledgement count: {value}")
+            }),
+            None => Ok(None),
+        }
     }
 
-    pub async fn resume_broker(&self) -> Result<(), TestBinaryError> {
-        self.container.resume().await
+    pub async fn consumer_connections(&self) -> Result<Vec<String>, String> {
+        let consumers: Vec<serde_json::Value> = reqwest::Client::new()
+            .get(format!(
+                "{}/api/consumers/%2F",
+                self.container.management_url
+            ))
+            .basic_auth("iggy_test", Some("iggy_test_password"))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?
+            .error_for_status()
+            .map_err(|error| error.to_string())?
+            .json()
+            .await
+            .map_err(|error| error.to_string())?;
+        consumers
+            .iter()
+            .filter(|consumer| {
+                consumer["queue"]["name"].as_str() == Some(&self.container.queue_names[0])
+            })
+            .map(|consumer| {
+                consumer["channel_details"]["connection_name"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        format!("RabbitMQ returned unexpected consumer data: {consumer}")
+                    })
+            })
+            .collect()
+    }
+
+    pub async fn close_connection(&self, connection: &str) -> Result<(), String> {
+        let mut url = reqwest::Url::parse(&self.container.management_url)
+            .map_err(|error| error.to_string())?;
+        url.path_segments_mut()
+            .map_err(|()| "RabbitMQ management URL cannot be a base URL".to_string())?
+            .extend(["api", "connections", connection]);
+        reqwest::Client::new()
+            .delete(url)
+            .basic_auth("iggy_test", Some("iggy_test_password"))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?
+            .error_for_status()
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub async fn consumer_count(&self) -> Result<usize, String> {
+        let consumers: Vec<serde_json::Value> = reqwest::Client::new()
+            .get(format!(
+                "{}/api/consumers/%2F",
+                self.container.management_url
+            ))
+            .basic_auth("iggy_test", Some("iggy_test_password"))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?
+            .error_for_status()
+            .map_err(|error| error.to_string())?
+            .json()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut count = 0;
+        for consumer in consumers {
+            let queue = consumer
+                .pointer("/queue/name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("RabbitMQ returned unexpected consumer data: {consumer}"))?;
+            if queue == self.container.queue_names[0] {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     pub async fn unacknowledged_messages(&self) -> Result<u32, String> {

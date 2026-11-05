@@ -37,10 +37,26 @@ pub fn encode_delivery(delivery: &Delivery) -> Result<Vec<u8>, serde_json::Error
         ("content_encoding", delivery.properties.content_encoding()),
         ("correlation_id", delivery.properties.correlation_id()),
         ("reply_to", delivery.properties.reply_to()),
+        ("expiration", delivery.properties.expiration()),
+        ("type", delivery.properties.kind()),
+        ("user_id", delivery.properties.user_id()),
+        ("app_id", delivery.properties.app_id()),
+        ("cluster_id", delivery.properties.cluster_id()),
     ] {
         if let Some(value) = value {
             properties.insert(name.to_owned(), Value::String(value.as_str().to_owned()));
         }
+    }
+    for (name, value) in [
+        ("delivery_mode", delivery.properties.delivery_mode()),
+        ("priority", delivery.properties.priority()),
+    ] {
+        if let Some(value) = value {
+            properties.insert(name.to_owned(), json!(value));
+        }
+    }
+    if let Some(timestamp) = delivery.properties.timestamp() {
+        properties.insert("timestamp".to_owned(), Value::String(timestamp.to_string()));
     }
     let headers = delivery
         .properties
@@ -140,7 +156,6 @@ fn format_float(value: f64) -> String {
 }
 
 const MAX_PAYLOAD_BYTES: usize = 64_000_000;
-const MAX_HEADER_BYTES: usize = 100_000;
 
 pub fn prepare_delivery(
     delivery: &mut Delivery,
@@ -184,33 +199,28 @@ fn raw_headers(
     connector_id: u32,
 ) -> Result<BTreeMap<HeaderKey, HeaderValue>, Error> {
     let mut headers = BTreeMap::new();
-    let mut size = 0;
     for (key, value) in [
         ("amqp.exchange", delivery.exchange.as_str()),
         ("amqp.routing_key", delivery.routing_key.as_str()),
     ] {
         if !value.is_empty() {
-            insert_string(&mut headers, &mut size, key, value)?;
+            insert_string(&mut headers, key, value)?;
         }
     }
     let key = HeaderKey::try_from("amqp.redelivered")
         .map_err(|error| Error::Serialization(error.to_string()))?;
-    size += 10 + key.as_bytes().len() + 1;
     headers.insert(key, HeaderValue::from(delivery.redelivered));
     if let Some(value) = delivery.properties.message_id() {
         let key = "amqp.message_id";
         let value = value.as_str();
-        if value.is_empty()
-            || value.len() > 255
-            || size + 10 + key.len() + value.len() > MAX_HEADER_BYTES
-        {
+        if value.is_empty() || value.len() > 255 {
             warn!(
                 connector_id,
                 header = key,
                 "RabbitMQ source omitted a property from Iggy headers"
             );
         } else {
-            insert_string(&mut headers, &mut size, key, value)?;
+            insert_string(&mut headers, key, value)?;
         }
     }
     Ok(headers)
@@ -218,7 +228,6 @@ fn raw_headers(
 
 fn insert_string(
     headers: &mut BTreeMap<HeaderKey, HeaderValue>,
-    size: &mut usize,
     key: &str,
     value: &str,
 ) -> Result<(), Error> {
@@ -226,7 +235,6 @@ fn insert_string(
         HeaderKey::try_from(key).map_err(|error| Error::Serialization(error.to_string()))?;
     let header_value =
         HeaderValue::try_from(value).map_err(|error| Error::Serialization(error.to_string()))?;
-    *size += 10 + key.len() + value.len();
     headers.insert(header_key, header_value);
     Ok(())
 }
@@ -396,6 +404,43 @@ mod envelope_tests {
                 "delivery": {"exchange": "", "routing_key": "events", "redelivered": false},
             })
         );
+    }
+
+    #[test]
+    fn given_all_basic_properties_should_preserve_them_in_the_envelope() {
+        let mut delivery = Delivery::mock(1, "".into(), "events".into(), false, vec![]);
+        delivery.properties = BasicProperties::default()
+            .with_content_type("application/json".into())
+            .with_content_encoding("utf-8".into())
+            .with_delivery_mode(2)
+            .with_priority(0)
+            .with_correlation_id("correlation".into())
+            .with_reply_to("replies".into())
+            .with_expiration("1000".into())
+            .with_message_id("id-1".into())
+            .with_timestamp(u64::MAX)
+            .with_type("order.created".into())
+            .with_user_id("user".into())
+            .with_app_id("app".into())
+            .with_cluster_id("cluster".into());
+        let encoded = encode_delivery(&delivery).expect("envelope must serialize");
+        let actual: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("envelope must be JSON");
+        assert_eq!(
+            actual["properties"],
+            json!({
+                "content_type": "application/json", "content_encoding": "utf-8",
+                "delivery_mode": 2, "priority": 0, "correlation_id": "correlation",
+                "reply_to": "replies", "expiration": "1000", "message_id": "id-1",
+                "timestamp": "18446744073709551615", "type": "order.created",
+                "user_id": "user", "app_id": "app", "cluster_id": "cluster"
+            })
+        );
+        delivery.properties = BasicProperties::default();
+        let encoded = encode_delivery(&delivery).expect("envelope must serialize");
+        let actual: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("envelope must be JSON");
+        assert_eq!(actual["properties"], json!({}));
     }
 
     #[test]

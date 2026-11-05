@@ -25,6 +25,12 @@ The runtime configuration defines the plugin, its path, and the Iggy destination
 
 The runtime converts `[plugin_config]` to JSON and passes it to the plugin. See the complete [runtime example](../../runtime/example_config/connectors/rabbitmq_source.toml) and the plugin [sample configuration](config.toml).
 
+Keep the top-level runtime setting `exactly_once` set to `false`, its default value. The RabbitMQ source does not support `exactly_once = true`.
+The source keeps pending batches in memory and does not persist them. After a restart, RabbitMQ can redeliver unacknowledged messages, but the source cannot reliably restore the same batch.
+If you enable `exactly_once`, the runtime can reuse an earlier producer sequence for new messages after a restart.
+Iggy can treat those messages as duplicates without writing them, and the source can acknowledge them to RabbitMQ.
+This can cause message loss. The runtime currently accepts `exactly_once = true` and does not reject it for this source.
+
 ## Configuration Options
 
 | Field | Required | Default | Description |
@@ -161,6 +167,8 @@ Raw mode does not copy user-defined AMQP headers. It omits `amqp.message_id` whe
 The connector leaves Iggy's message ID unset. Iggy assigns its own ID. The RabbitMQ `message_id` remains in AMQP metadata. Consumers can use that value to recognize duplicates after redelivery. The connector does not remove duplicates automatically.
 
 Metadata mode sets the `json` schema and wraps the body as Base64. The envelope contains `version`, `body_base64`, `properties`, `headers`, and `delivery`. AMQP header values include their type. Binary header values use Base64.
+
+The `properties` object contains each AMQP basic property that the publisher set, except `headers`, which has its own envelope field. String properties retain their values. `delivery_mode` and `priority` are JSON numbers. `timestamp` is a decimal string representing seconds since the Unix epoch. The AMQP message type uses the `type` key. Properties that the publisher did not set are omitted.
 
 ```json
 {

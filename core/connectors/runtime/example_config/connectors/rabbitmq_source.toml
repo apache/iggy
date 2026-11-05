@@ -25,6 +25,9 @@ plugin_config_format = "json"
 verbose = false
 benchmark = false
 
+# Do not enable exactly_once. The source cannot reliably replay batches after a restart.
+exactly_once = false
+
 [[streams]]
 stream = "example_stream"
 topic = "example_topic"
