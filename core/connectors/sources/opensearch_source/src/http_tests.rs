@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::{HitKey, MAX_WATERMARK_HITS, State};
 use crate::{OpenSearchSource, OpenSearchSourceConfig};
 use axum::Router;
 use axum::extract::Request;
 use axum::http::StatusCode;
-use axum::routing::{head, post};
-use iggy_connector_sdk::{Error, ProducedMessages, Source, source::SourceBatchResult};
+use axum::routing::{get, head, post};
+use iggy_connector_sdk::{
+    ConnectorState, Error, ProducedMessages, Source, source::SourceBatchResult,
+};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -72,6 +75,7 @@ fn base_config(url: &str) -> OpenSearchSourceConfig {
         circuit_breaker_threshold: None,
         circuit_breaker_cool_down: None,
         request_timeout: None,
+        tiebreaker_field: None,
     }
 }
 
@@ -325,7 +329,7 @@ async fn given_nack_when_batch_is_staged_should_keep_committed_state() {
 
     let (fetched, polls, _, _) = source.test_metrics().await;
     assert_eq!((fetched, polls), (0, 0));
-    assert!(source.test_search_after().await.is_none());
+    assert!(source.test_last_sort().await.is_none());
     assert!(source.pending_state.lock().await.is_none());
 }
 
@@ -384,14 +388,14 @@ async fn given_ack_when_batch_is_staged_should_commit_candidate_state() {
 
     source.poll().await.expect("poll should succeed");
     assert!(
-        source.test_search_after().await.is_none(),
+        source.test_last_sort().await.is_none(),
         "cursor must not move before the batch result"
     );
     ack(&source).await;
 
     let (fetched, polls, _, _) = source.test_metrics().await;
     assert_eq!((fetched, polls), (1, 1));
-    assert!(source.test_search_after().await.is_some());
+    assert!(source.test_last_sort().await.is_some());
     assert!(source.pending_state.lock().await.is_none());
 }
 
@@ -544,14 +548,14 @@ async fn given_cursor_set_when_empty_poll_should_preserve_cursor() {
 
     source.poll().await.expect("first poll");
     ack(&source).await;
-    let cursor_after_first = source.test_search_after().await;
+    let cursor_after_first = source.test_last_sort().await;
     assert!(
         cursor_after_first.is_some(),
         "cursor must be set after non-empty poll"
     );
 
     source.poll().await.expect("empty poll");
-    let cursor_after_empty = source.test_search_after().await;
+    let cursor_after_empty = source.test_last_sort().await;
     assert_eq!(
         cursor_after_empty, cursor_after_first,
         "empty poll must not reset cursor to None"
@@ -591,9 +595,9 @@ async fn given_all_hits_missing_source_when_poll_should_skip_them_and_advance_cu
         produced.state.is_some(),
         "a moved cursor must be handed to the runtime for persistence"
     );
-    assert!(source.test_search_after().await.is_none());
+    assert!(source.test_last_sort().await.is_none());
     ack(&source).await;
-    let cursor = source.test_search_after().await.expect("cursor advanced");
+    let cursor = source.test_last_sort().await.expect("cursor advanced");
     assert_eq!(
         cursor[1].as_str(),
         Some("doc-2"),
@@ -611,7 +615,7 @@ async fn given_trailing_hit_missing_source_when_poll_should_publish_prefix_and_a
 
     assert_eq!(produced.messages.len(), 1);
     ack(&source).await;
-    let cursor = source.test_search_after().await.expect("cursor set");
+    let cursor = source.test_last_sort().await.expect("cursor set");
     assert_eq!(cursor[1].as_str(), Some("doc-2"));
 }
 
@@ -631,7 +635,7 @@ async fn given_middle_hit_missing_source_when_poll_should_publish_other_hits() {
         .collect();
     assert_eq!(names, vec![json!("a"), json!("c")]);
     ack(&source).await;
-    let cursor = source.test_search_after().await.expect("cursor set");
+    let cursor = source.test_last_sort().await.expect("cursor set");
     assert_eq!(cursor[1].as_str(), Some("doc-c"));
 }
 
@@ -657,7 +661,7 @@ async fn given_hit_without_sort_tuple_when_poll_should_fail_without_advancing_cu
         .await
         .expect_err("missing sort tuple must fail");
     assert!(matches!(error, Error::SchemaMismatch(_)), "got {error:?}");
-    assert!(source.test_search_after().await.is_none());
+    assert!(source.test_last_sort().await.is_none());
     let (_, _, errors, _) = source.test_metrics().await;
     assert_eq!(errors, 1, "error counter must be incremented");
 }
@@ -716,7 +720,7 @@ async fn given_hit_sorted_on_missing_value_sentinel_when_poll_should_fail_withou
     let error = source.poll().await.expect_err("sentinel sort must fail");
 
     assert!(matches!(error, Error::SchemaMismatch(_)), "got {error:?}");
-    assert!(source.test_search_after().await.is_none());
+    assert!(source.test_last_sort().await.is_none());
 }
 
 #[tokio::test]
@@ -855,7 +859,7 @@ async fn given_partial_search_response_when_poll_should_fail_without_moving_curs
             matches!(error, Error::HttpRequestFailed(_)),
             "got {error:?}"
         );
-        assert!(source.test_search_after().await.is_none());
+        assert!(source.test_last_sort().await.is_none());
     }
 }
 
@@ -909,4 +913,214 @@ async fn given_circuit_breaker_open_when_poll_should_return_empty_without_error(
         .expect("open circuit should skip search");
     assert!(produced.messages.is_empty());
     assert!(produced.state.is_none());
+}
+
+const SAME_TIMESTAMP: &str = "2024-01-01T00:00:00Z";
+
+fn scripted_router(pages: Vec<Value>) -> (Router, Arc<Mutex<Vec<Value>>>) {
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let router = mock_router(StatusCode::OK, {
+        let bodies = bodies.clone();
+        move |request: Request| {
+            let pages = pages.clone();
+            let bodies = bodies.clone();
+            let calls = calls.clone();
+            async move {
+                let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
+                    bodies.lock().await.push(body);
+                }
+                let page = calls.fetch_add(1, Ordering::SeqCst).min(pages.len() - 1);
+                (StatusCode::OK, pages[page].to_string())
+            }
+        }
+    });
+    (router, bodies)
+}
+
+fn same_timestamp_hit(doc_id: &str) -> Value {
+    search_hit(doc_id, SAME_TIMESTAMP, json!({}))
+}
+
+fn restart_tuple() -> Value {
+    json!([SAME_TIMESTAMP, "", ""])
+}
+
+#[tokio::test]
+async fn given_late_visible_hit_with_smaller_id_when_polling_again_should_publish_it() {
+    let (app, bodies) = scripted_router(vec![
+        search_response(vec![same_timestamp_hit("zz")]),
+        search_response(vec![same_timestamp_hit("aa"), same_timestamp_hit("zz")]),
+    ]);
+    let base = start_server(app).await;
+    let mut source = OpenSearchSource::new(1, base_config(&base), None);
+    source.open().await.unwrap();
+
+    let first = source.poll().await.expect("first poll");
+    assert_eq!(first.messages.len(), 1);
+    ack(&source).await;
+    let second = source.poll().await.expect("second poll");
+
+    assert_eq!(second.messages.len(), 1);
+    assert_eq!(
+        second.messages[0].id,
+        Some(crate::message_id(TEST_INDEX, "aa"))
+    );
+    let bodies = bodies.lock().await;
+    assert_eq!(bodies[1]["search_after"], restart_tuple());
+}
+
+#[tokio::test]
+async fn given_only_published_hits_when_polling_again_should_publish_nothing_and_stage_nothing() {
+    let (app, _) = scripted_router(vec![search_response(vec![same_timestamp_hit("a")])]);
+    let base = start_server(app).await;
+    let mut source = OpenSearchSource::new(1, base_config(&base), None);
+    source.open().await.unwrap();
+    source.poll().await.expect("first poll");
+    ack(&source).await;
+    let cursor_before = source.test_last_sort().await;
+
+    let second = source.poll().await.expect("second poll");
+
+    assert!(second.messages.is_empty());
+    assert!(second.state.is_none());
+    assert_eq!(source.test_last_sort().await, cursor_before);
+}
+
+#[tokio::test]
+async fn given_full_page_of_published_hits_when_polling_should_step_to_the_next_page() {
+    let (app, bodies) = scripted_router(vec![
+        search_response(vec![same_timestamp_hit("a"), same_timestamp_hit("b")]),
+        search_response(vec![same_timestamp_hit("c")]),
+        search_response(vec![same_timestamp_hit("a"), same_timestamp_hit("b")]),
+        search_response(vec![same_timestamp_hit("c"), same_timestamp_hit("d")]),
+    ]);
+    let base = start_server(app).await;
+    let mut config = base_config(&base);
+    config.batch_size = Some(2);
+    let mut source = OpenSearchSource::new(1, config, None);
+    source.open().await.unwrap();
+    for _ in 0..2 {
+        source.poll().await.expect("poll that publishes");
+        ack(&source).await;
+    }
+
+    let third = source
+        .poll()
+        .await
+        .expect("poll that steps past published hits");
+
+    assert_eq!(third.messages.len(), 1);
+    let bodies = bodies.lock().await;
+    assert_eq!(bodies.len(), 4);
+    assert_eq!(bodies[1]["search_after"], json!([SAME_TIMESTAMP, "b"]));
+    assert_eq!(bodies[2]["search_after"], restart_tuple());
+    assert_eq!(bodies[3]["search_after"], json!([SAME_TIMESTAMP, "b"]));
+}
+
+#[tokio::test]
+async fn given_persisted_state_when_first_poll_should_scan_from_the_watermark() {
+    let (app, bodies) = scripted_router(vec![search_response(vec![])]);
+    let base = start_server(app).await;
+    let state = State {
+        last_sort: Some(vec![json!(SAME_TIMESTAMP), json!("doc-9")]),
+        ..State::default()
+    };
+    let persisted = ConnectorState::serialize(&state, "test", 1);
+    let mut source = OpenSearchSource::new(1, base_config(&base), persisted);
+    source.open().await.unwrap();
+
+    source.poll().await.expect("poll");
+
+    assert_eq!(bodies.lock().await[0]["search_after"], restart_tuple());
+}
+
+#[tokio::test]
+async fn given_too_many_hits_at_one_timestamp_when_polling_should_fail_without_moving() {
+    let (app, _) = scripted_router(vec![search_response(vec![same_timestamp_hit("fresh")])]);
+    let base = start_server(app).await;
+    let state = State {
+        last_sort: Some(vec![json!(SAME_TIMESTAMP), json!("doc-0")]),
+        watermark_hits: (0..MAX_WATERMARK_HITS)
+            .map(|number| HitKey {
+                index: TEST_INDEX.to_string(),
+                id: format!("doc-{number}"),
+            })
+            .collect(),
+        ..State::default()
+    };
+    let persisted = ConnectorState::serialize(&state, "test", 1);
+    let mut source = OpenSearchSource::new(1, base_config(&base), persisted);
+    source.open().await.unwrap();
+    let cursor_before = source.test_last_sort().await;
+
+    let error = source.poll().await.expect_err("cap should fail the poll");
+
+    assert!(matches!(error, Error::SchemaMismatch(_)), "got {error:?}");
+    assert_eq!(source.test_last_sort().await, cursor_before);
+}
+
+fn keyword_mapping_router(field: &str, mapping: Value) -> (Router, Arc<Mutex<Vec<Value>>>) {
+    let (router, bodies) = scripted_router(vec![search_response(vec![])]);
+    let body = json!({
+        TEST_INDEX: { "mappings": { field: { "full_name": field, "mapping": { field: mapping } } } }
+    });
+    let router = router.route(
+        &format!("/{TEST_INDEX}/_mapping/field/{field}"),
+        get(move || {
+            let body = body.clone();
+            async move { (StatusCode::OK, body.to_string()) }
+        }),
+    );
+    (router, bodies)
+}
+
+#[tokio::test]
+async fn given_keyword_tiebreaker_when_polling_should_sort_on_it_instead_of_id() {
+    let (app, bodies) = keyword_mapping_router("event_id", json!({ "type": "keyword" }));
+    let base = start_server(app).await;
+    let mut config = base_config(&base);
+    config.tiebreaker_field = Some("event_id".to_string());
+    let mut source = OpenSearchSource::new(1, config, None);
+    source
+        .open()
+        .await
+        .expect("keyword tie-breaker is accepted");
+
+    source.poll().await.expect("poll");
+
+    let sort = bodies.lock().await[0]["sort"].clone();
+    assert_eq!(sort[1], json!({ "event_id": { "order": "asc" } }));
+}
+
+#[tokio::test]
+async fn given_default_tiebreaker_when_polling_should_sort_on_id() {
+    let (app, bodies) = scripted_router(vec![search_response(vec![])]);
+    let base = start_server(app).await;
+    let mut source = OpenSearchSource::new(1, base_config(&base), None);
+    source.open().await.unwrap();
+
+    source.poll().await.expect("poll");
+
+    let sort = bodies.lock().await[0]["sort"].clone();
+    assert_eq!(sort[1], json!({ "_id": { "order": "asc" } }));
+}
+
+#[tokio::test]
+async fn given_non_keyword_tiebreaker_when_open_should_return_invalid_config() {
+    let (app, _) = keyword_mapping_router("event_id", json!({ "type": "text" }));
+    let base = start_server(app).await;
+    let mut config = base_config(&base);
+    config.tiebreaker_field = Some("event_id".to_string());
+    let mut source = OpenSearchSource::new(1, config, None);
+
+    let error = source.open().await.expect_err("text field is rejected");
+
+    assert!(
+        matches!(error, Error::InvalidConfigValue(_)),
+        "got {error:?}"
+    );
 }

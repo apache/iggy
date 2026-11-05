@@ -30,7 +30,7 @@ use opensearch::{
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 use tokio::{sync::Mutex, time::sleep};
 use tracing::{debug, error, info, warn};
@@ -47,6 +47,11 @@ const CONNECTOR_NAME: &str = "OpenSearch source";
 const DEFAULT_POLLING_INTERVAL: &str = "10s";
 const DEFAULT_BATCH_SIZE: usize = 100;
 const DEFAULT_REQUEST_TIMEOUT: &str = "30s";
+const DEFAULT_TIEBREAKER_FIELD: &str = "_id";
+// Sort clause length: timestamp, tie-breaker, `_index`.
+const SORT_KEY_COUNT: usize = 3;
+// Bounds the persisted state when many documents share the newest timestamp.
+const MAX_WATERMARK_HITS: usize = 10_000;
 // OpenSearch rejects `size` above the default `index.max_result_window` with HTTP 400.
 const MAX_BATCH_SIZE: usize = 10_000;
 const DOCUMENT_ID_HEADER: &str = "opensearch.document_id";
@@ -72,15 +77,30 @@ struct State {
     total_documents_published: usize,
     #[serde(default)]
     poll_count: usize,
-    /// OpenSearch `search_after` tuple from the last hit in the previous batch.
+    /// Sort tuple of the newest published hit. Its first element is the watermark: the next
+    /// scan starts there instead of after the tuple, so a hit that became searchable late is
+    /// still found.
     #[serde(default)]
-    search_after: Option<Vec<Value>>,
+    last_sort: Option<Vec<Value>>,
     #[serde(default)]
     error_count: usize,
     #[serde(default)]
     last_error: Option<String>,
     #[serde(default)]
     processing_stats: ProcessingStats,
+    /// Hits published at the watermark, skipped when the next scan reads them again. The
+    /// state is MessagePack without field names, so new fields must stay at the end.
+    #[serde(default)]
+    watermark_hits: Vec<HitKey>,
+    /// Page cursor of the running scan. Not persisted: a restart rescans from the watermark.
+    #[serde(skip)]
+    scan_cursor: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct HitKey {
+    index: String,
+    id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -111,6 +131,9 @@ pub struct OpenSearchSourceConfig {
     pub polling_interval: Option<String>,
     pub batch_size: Option<usize>,
     pub timestamp_field: Option<String>,
+    /// Unique `keyword` field with doc values that breaks timestamp ties. Defaults to `_id`,
+    /// which OpenSearch sorts through heap-backed fielddata.
+    pub tiebreaker_field: Option<String>,
     /// Limit per HTTP request, from connecting to the last byte of the response body.
     pub request_timeout: Option<String>,
     #[serde(default)]
@@ -149,9 +172,23 @@ pub struct OpenSearchSource {
 
 struct SearchOutcome {
     messages: Vec<ProducedMessage>,
-    search_after: Option<Vec<Value>>,
+    /// `None` when the scan found nothing new to publish or skip.
+    last_sort: Option<Vec<Value>>,
+    watermark_hits: Vec<HitKey>,
+    scan_cursor: Option<Vec<Value>>,
     last_poll_timestamp: Option<DateTime<Utc>>,
     batch_bytes: u64,
+}
+
+struct Page {
+    messages: Vec<ProducedMessage>,
+    sorts: Vec<Vec<Value>>,
+    keys: Vec<HitKey>,
+    /// Positions in `sorts` and `keys` of hits that were not published before.
+    fresh: Vec<usize>,
+    last_poll_timestamp: Option<DateTime<Utc>>,
+    batch_bytes: u64,
+    full: bool,
 }
 
 impl OpenSearchSource {
@@ -211,6 +248,13 @@ impl OpenSearchSource {
 
     fn batch_size(&self) -> usize {
         self.config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE)
+    }
+
+    fn tiebreaker_field(&self) -> &str {
+        self.config
+            .tiebreaker_field
+            .as_deref()
+            .unwrap_or(DEFAULT_TIEBREAKER_FIELD)
     }
 
     fn timestamp_field(&self) -> Result<&str, Error> {
@@ -276,6 +320,44 @@ impl OpenSearchSource {
         })
     }
 
+    async fn check_tiebreaker_mapping(&self, client: &OpenSearch) -> Result<(), Error> {
+        let field = self.tiebreaker_field();
+        if field == DEFAULT_TIEBREAKER_FIELD {
+            return Ok(());
+        }
+        let index = &self.config.index;
+        let response = retry_async(
+            self.open_retry_policy,
+            &format!("{CONNECTOR_NAME} ID {} tiebreaker mapping check", self.id),
+            RequestFailure::is_transient,
+            || async {
+                let response = client
+                    .indices()
+                    .get_field_mapping(
+                        opensearch::indices::IndicesGetFieldMappingParts::IndexFields(
+                            &[index],
+                            &[field],
+                        ),
+                    )
+                    .send()
+                    .await
+                    .map_err(RequestFailure::transport)?;
+                RequestFailure::check(response).await
+            },
+        )
+        .await
+        .map_err(|failure| {
+            Error::InitError(format!(
+                "Failed to read the mapping of '{field}': {}",
+                failure.into_error()
+            ))
+        })?;
+        let mapping: Value = response.json().await.map_err(|error| {
+            Error::InitError(format!("Failed to parse the mapping of '{field}': {error}"))
+        })?;
+        ensure_keyword_with_doc_values(&mapping, field)
+    }
+
     async fn send_search_with_retry(
         &self,
         client: &OpenSearch,
@@ -301,12 +383,73 @@ impl OpenSearchSource {
     }
 
     async fn search_documents(&self, client: &OpenSearch) -> Result<SearchOutcome, Error> {
-        let state = self.state.lock().await;
-        let search_after = state.search_after.clone();
-        drop(state);
+        let (last_sort, watermark_hits, scan_cursor) = {
+            let state = self.state.lock().await;
+            (
+                state.last_sort.clone(),
+                state.watermark_hits.clone(),
+                state.scan_cursor.clone(),
+            )
+        };
+        let watermark = last_sort.as_deref().and_then(<[Value]>::first);
+        let published: HashSet<&HitKey> = watermark_hits.iter().collect();
+        let mut cursor = scan_cursor.or_else(|| watermark.map(restart_cursor));
 
-        let timestamp_field = self.timestamp_field()?;
+        let page = loop {
+            let hits = self.fetch_hits(client, cursor.as_deref()).await?;
+            let page = self.read_page(hits, watermark, &published)?;
+            if !page.fresh.is_empty() || !page.full {
+                break page;
+            }
+            // A full page of hits published before: step past them within this scan.
+            cursor = page.sorts.last().cloned();
+        };
 
+        let moved = match page.fresh.last() {
+            Some(&last) => {
+                let sort = page.sorts[last].clone();
+                let mut hits = if watermark == sort.first() {
+                    watermark_hits.clone()
+                } else {
+                    Vec::new()
+                };
+                hits.extend(
+                    page.fresh
+                        .iter()
+                        .filter(|&&position| page.sorts[position].first() == sort.first())
+                        .map(|&position| page.keys[position].clone()),
+                );
+                if hits.len() > MAX_WATERMARK_HITS {
+                    return Err(Error::SchemaMismatch(format!(
+                        "more than {MAX_WATERMARK_HITS} documents share one value of the sort \
+                         field; use a timestamp_field with a finer resolution"
+                    )));
+                }
+                Some((sort, hits))
+            }
+            None => None,
+        };
+        let (last_sort, watermark_hits) = moved.unzip();
+
+        Ok(SearchOutcome {
+            scan_cursor: if page.full {
+                page.sorts.last().cloned()
+            } else {
+                None
+            },
+            messages: page.messages,
+            last_sort,
+            watermark_hits: watermark_hits.unwrap_or_default(),
+            last_poll_timestamp: page.last_poll_timestamp,
+            batch_bytes: page.batch_bytes,
+        })
+    }
+
+    async fn fetch_hits(
+        &self,
+        client: &OpenSearch,
+        cursor: Option<&[Value]>,
+    ) -> Result<Vec<Value>, Error> {
         let mut search_body = self
             .search_body_base
             .as_ref()
@@ -314,29 +457,40 @@ impl OpenSearchSource {
                 Error::Connection("connector not initialized; call open() first".to_string())
             })?
             .clone();
-
-        if let Some(cursor) = search_after {
+        if let Some(cursor) = cursor {
             search_body["search_after"] = json!(cursor);
         }
 
         let response = self.send_search_with_retry(client, &search_body).await?;
-
         let mut response_body: Value = response.json().await.map_err(|e| {
             Error::PermanentHttpError(format!("Failed to parse search response: {e}"))
         })?;
         ensure_complete_response(&response_body)?;
 
-        let hits: Vec<Value> = response_body
+        Ok(response_body
             .get_mut("hits")
             .and_then(|h| h.get_mut("hits"))
             .and_then(|arr| arr.as_array_mut())
             .map(std::mem::take)
-            .unwrap_or_default();
+            .unwrap_or_default())
+    }
 
-        let mut messages = Vec::with_capacity(hits.len());
-        let mut batch_bytes = 0u64;
-        let mut last_sort = None;
-        let mut last_poll_timestamp = None;
+    fn read_page(
+        &self,
+        hits: Vec<Value>,
+        watermark: Option<&Value>,
+        published: &HashSet<&HitKey>,
+    ) -> Result<Page, Error> {
+        let timestamp_field = self.timestamp_field()?;
+        let mut page = Page {
+            full: hits.len() >= self.batch_size(),
+            messages: Vec::with_capacity(hits.len()),
+            sorts: Vec::with_capacity(hits.len()),
+            keys: Vec::with_capacity(hits.len()),
+            fresh: Vec::new(),
+            last_poll_timestamp: None,
+            batch_bytes: 0,
+        };
 
         for mut hit in hits {
             let Some(sort) = hit
@@ -360,52 +514,63 @@ impl OpenSearchSource {
                 )));
             }
 
-            let Some(source) = hit.get_mut("_source").map(Value::take) else {
-                warn!(
-                    connector_id = self.id,
-                    hit_id = hit.get("_id").and_then(|v| v.as_str()),
-                    hit_index = hit.get("_index").and_then(|v| v.as_str()),
-                    "Skipping OpenSearch hit without _source; it has no body to publish"
-                );
-                last_sort = Some(sort);
-                continue;
-            };
-
-            let document_timestamp = source
-                .get(timestamp_field)
-                .and_then(parse_document_timestamp);
-            if let Some(timestamp_utc) = document_timestamp {
-                last_poll_timestamp = Some(timestamp_utc);
+            let key = hit_key(&hit, &self.config.index)?;
+            let already_published = watermark == sort.first() && published.contains(&key);
+            if !already_published {
+                page.fresh.push(page.sorts.len());
+                match hit.get_mut("_source").map(Value::take) {
+                    Some(source) => {
+                        self.push_message(&mut page, &hit, &key, &source, timestamp_field)?;
+                    }
+                    None => warn!(
+                        connector_id = self.id,
+                        hit_id = key.id,
+                        hit_index = key.index,
+                        "Skipping OpenSearch hit without _source; it has no body to publish"
+                    ),
+                }
             }
+            page.sorts.push(sort);
+            page.keys.push(key);
+        }
+        Ok(page)
+    }
 
-            let payload = serde_json::to_vec(&source)
-                .map_err(|e| Error::Serialization(format!("Failed to serialize document: {e}")))?;
-            batch_bytes += payload.len() as u64;
-
-            let document_id = hit.get("_id").and_then(Value::as_str);
-            // `index` may be a pattern, so the concrete index of each hit keeps equal `_id`s
-            // in different indices from sharing a message id.
-            let reported_index = hit.get("_index").and_then(Value::as_str);
-            let hit_index = reported_index.unwrap_or(&self.config.index);
-            messages.push(ProducedMessage {
-                id: document_id.map(|document_id| message_id(hit_index, document_id)),
-                headers: document_headers(self.id, reported_index, document_id),
-                checksum: None,
-                timestamp: None,
-                origin_timestamp: document_timestamp
-                    .and_then(|timestamp| u64::try_from(timestamp.timestamp_micros()).ok()),
-                payload,
-            });
-            // Cursor advances only after the document is queued for publish.
-            last_sort = Some(sort);
+    fn push_message(
+        &self,
+        page: &mut Page,
+        hit: &Value,
+        key: &HitKey,
+        source: &Value,
+        timestamp_field: &str,
+    ) -> Result<(), Error> {
+        let document_timestamp = source
+            .get(timestamp_field)
+            .and_then(parse_document_timestamp);
+        if let Some(timestamp_utc) = document_timestamp {
+            page.last_poll_timestamp = Some(timestamp_utc);
         }
 
-        Ok(SearchOutcome {
-            messages,
-            search_after: last_sort,
-            last_poll_timestamp,
-            batch_bytes,
-        })
+        let payload = serde_json::to_vec(source)
+            .map_err(|e| Error::Serialization(format!("Failed to serialize document: {e}")))?;
+        page.batch_bytes += payload.len() as u64;
+
+        // `index` may be a pattern, so the concrete index of each hit keeps equal `_id`s
+        // in different indices from sharing a message id.
+        page.messages.push(ProducedMessage {
+            id: Some(message_id(&key.index, &key.id)),
+            headers: document_headers(
+                self.id,
+                hit.get("_index").and_then(Value::as_str),
+                Some(&key.id),
+            ),
+            checksum: None,
+            timestamp: None,
+            origin_timestamp: document_timestamp
+                .and_then(|timestamp| u64::try_from(timestamp.timestamp_micros()).ok()),
+            payload,
+        });
+        Ok(())
     }
 
     async fn finalize_poll(
@@ -416,10 +581,12 @@ impl OpenSearchSource {
         let mut state = self.state.lock().await.clone();
         state.total_documents_published += outcome.messages.len();
         state.poll_count += 1;
-        let cursor_moved = outcome.search_after.is_some();
-        if let Some(cursor) = outcome.search_after {
-            state.search_after = Some(cursor);
+        let cursor_moved = outcome.last_sort.is_some();
+        if outcome.last_sort.is_some() {
+            state.last_sort = outcome.last_sort;
+            state.watermark_hits = outcome.watermark_hits;
         }
+        state.scan_cursor = outcome.scan_cursor;
         if let Some(timestamp) = outcome.last_poll_timestamp {
             state.last_poll_timestamp = Some(timestamp);
         }
@@ -489,8 +656,8 @@ impl OpenSearchSource {
     }
 
     #[cfg(test)]
-    async fn test_search_after(&self) -> Option<Vec<Value>> {
-        self.state.lock().await.search_after.clone()
+    async fn test_last_sort(&self) -> Option<Vec<Value>> {
+        self.state.lock().await.last_sort.clone()
     }
 
     #[cfg(test)]
@@ -526,6 +693,62 @@ fn truncated(message: String) -> String {
         Some((end, _)) => format!("{}...", &message[..end]),
         None => message,
     }
+}
+
+// Sorting on any other field type would fail or load the field into heap, and a field that is
+// missing from one matched index gives its documents no tie-break at all.
+fn ensure_keyword_with_doc_values(mappings: &Value, field: &str) -> Result<(), Error> {
+    let Some(indices) = mappings.as_object() else {
+        return Ok(());
+    };
+    for (index, entry) in indices {
+        let Some(mapping) = entry
+            .get("mappings")
+            .and_then(|mappings| mappings.get(field))
+            .and_then(|mapped| mapped.get("mapping"))
+            .and_then(Value::as_object)
+            .and_then(|by_leaf_name| by_leaf_name.values().next())
+        else {
+            return Err(Error::InvalidConfigValue(format!(
+                "tiebreaker_field '{field}' is not mapped in index '{index}'"
+            )));
+        };
+        if mapping.get("type").and_then(Value::as_str) != Some("keyword") {
+            return Err(Error::InvalidConfigValue(format!(
+                "tiebreaker_field '{field}' must be of type keyword in index '{index}'"
+            )));
+        }
+        if mapping.get("doc_values").and_then(Value::as_bool) == Some(false) {
+            return Err(Error::InvalidConfigValue(format!(
+                "tiebreaker_field '{field}' must have doc_values enabled in index '{index}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn hit_key(hit: &Value, default_index: &str) -> Result<HitKey, Error> {
+    let id = hit.get("_id").and_then(Value::as_str).ok_or_else(|| {
+        Error::SchemaMismatch(
+            "OpenSearch hit has no _id; it cannot be told apart from published documents"
+                .to_string(),
+        )
+    })?;
+    let index = hit
+        .get("_index")
+        .and_then(Value::as_str)
+        .unwrap_or(default_index);
+    Ok(HitKey {
+        index: index.to_owned(),
+        id: id.to_owned(),
+    })
+}
+
+// Lowest possible tuple at the watermark, so the scan sees every hit with that sort value.
+fn restart_cursor(watermark: &Value) -> Vec<Value> {
+    std::iter::once(watermark.clone())
+        .chain(std::iter::repeat_n(json!(""), SORT_KEY_COUNT - 1))
+        .collect()
 }
 
 // A partial page can omit hits sorted before the last returned one. The cursor would then move
@@ -588,6 +811,16 @@ fn validate_open_config(config: &OpenSearchSourceConfig) -> Result<(), Error> {
         return Err(Error::InvalidConfigValue(format!(
             "batch_size must be between 1 and {MAX_BATCH_SIZE}, got {batch_size}"
         )));
+    }
+
+    if config
+        .tiebreaker_field
+        .as_deref()
+        .is_some_and(str::is_empty)
+    {
+        return Err(Error::InvalidConfigValue(
+            "tiebreaker_field must not be empty".to_string(),
+        ));
     }
 
     if config
@@ -699,8 +932,10 @@ impl Source for OpenSearchSource {
         let client = self.create_client().await?;
 
         self.check_index_exists_with_retry(&client).await?;
+        self.check_tiebreaker_mapping(&client).await?;
 
         let timestamp_field = self.timestamp_field()?;
+        let tiebreaker_field = self.tiebreaker_field();
         let batch_size = self.batch_size();
         self.search_body_base = Some(json!({
             "query": self.config.query.clone().unwrap_or_else(|| json!({ "match_all": {} })),
@@ -708,7 +943,7 @@ impl Source for OpenSearchSource {
             "track_total_hits": false,
             "sort": [
                 { timestamp_field: { "order": "asc", "missing": "_first" } },
-                { "_id": { "order": "asc" } },
+                { tiebreaker_field: { "order": "asc" } },
                 { "_index": { "order": "asc" } }
             ]
         }));
@@ -814,6 +1049,7 @@ mod tests {
             circuit_breaker_threshold: None,
             circuit_breaker_cool_down: None,
             request_timeout: None,
+            tiebreaker_field: None,
         }
     }
 
@@ -822,7 +1058,7 @@ mod tests {
             last_poll_timestamp: None,
             total_documents_published: 500,
             poll_count: 7,
-            search_after: Some(vec![json!("2024-01-01T00:00:00Z"), json!("doc_42")]),
+            last_sort: Some(vec![json!("2024-01-01T00:00:00Z"), json!("doc_42")]),
             error_count: 1,
             last_error: Some("connection reset".to_string()),
             processing_stats: ProcessingStats {
@@ -832,7 +1068,49 @@ mod tests {
                 empty_polls_count: 2,
                 successful_polls_count: 5,
             },
+            watermark_hits: vec![HitKey {
+                index: "logs".to_string(),
+                id: "doc_42".to_string(),
+            }],
+            scan_cursor: None,
         }
+    }
+
+    fn mapping_of(index: &str, field: &str, mapping: Value) -> Value {
+        json!({ index: { "mappings": { field: { "mapping": { field: mapping } } } } })
+    }
+
+    #[test]
+    fn given_keyword_with_doc_values_when_checking_tiebreaker_should_accept() {
+        let body = mapping_of("logs", "event_id", json!({ "type": "keyword" }));
+        assert!(ensure_keyword_with_doc_values(&body, "event_id").is_ok());
+        assert!(ensure_keyword_with_doc_values(&json!({}), "event_id").is_ok());
+    }
+
+    #[test]
+    fn given_text_or_disabled_doc_values_when_checking_tiebreaker_should_reject() {
+        for mapping in [
+            json!({ "type": "text" }),
+            json!({ "type": "keyword", "doc_values": false }),
+        ] {
+            let body = mapping_of("logs", "event_id", mapping);
+            assert!(matches!(
+                ensure_keyword_with_doc_values(&body, "event_id"),
+                Err(Error::InvalidConfigValue(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn given_field_missing_in_one_index_when_checking_tiebreaker_should_reject() {
+        let body = json!({
+            "logs-a": { "mappings": { "event_id": { "mapping": { "event_id": { "type": "keyword" } } } } },
+            "logs-b": { "mappings": {} }
+        });
+        assert!(matches!(
+            ensure_keyword_with_doc_values(&body, "event_id"),
+            Err(Error::InvalidConfigValue(message)) if message.contains("logs-b")
+        ));
     }
 
     #[test]
@@ -849,7 +1127,7 @@ mod tests {
             assert_eq!(restored.total_documents_published, 500);
             assert_eq!(restored.poll_count, 7);
             assert_eq!(
-                restored.search_after,
+                restored.last_sort,
                 Some(vec![json!("2024-01-01T00:00:00Z"), json!("doc_42")])
             );
             assert!(source.state_restore_error.is_none());
@@ -865,7 +1143,7 @@ mod tests {
             let state = source.state.lock().await;
             assert_eq!(state.total_documents_published, 0);
             assert_eq!(state.poll_count, 0);
-            assert_eq!(state.search_after, None);
+            assert_eq!(state.last_sort, None);
             assert!(source.state_restore_error.is_none());
         });
     }
@@ -1047,7 +1325,7 @@ mod tests {
 
         assert_eq!(restored.total_documents_published, 500);
         assert_eq!(restored.poll_count, state.poll_count);
-        assert_eq!(restored.search_after, state.search_after);
+        assert_eq!(restored.last_sort, state.last_sort);
         assert_eq!(restored.error_count, state.error_count);
     }
 }

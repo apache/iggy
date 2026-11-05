@@ -78,6 +78,22 @@ impl OpenSearchSourceFixture {
             .await
     }
 
+    pub async fn insert_document_at(
+        &self,
+        doc_id: i32,
+        timestamp: &str,
+    ) -> Result<(), TestBinaryError> {
+        let document = serde_json::json!({
+            "id": doc_id,
+            "name": format!("doc_{doc_id}"),
+            "value": 0,
+            "timestamp": timestamp
+        });
+        self.index_document(&self.index, &doc_id.to_string(), &document)
+            .await?;
+        self.refresh_index().await
+    }
+
     pub async fn insert_document_without_timestamp(
         &self,
         doc_id: i32,

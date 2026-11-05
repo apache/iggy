@@ -32,6 +32,7 @@ const TEST_MESSAGE_COUNT: usize = 3;
 const POLL_ATTEMPTS: usize = 100;
 const POLL_INTERVAL_MS: u64 = 50;
 const NEXT_POLL_COUNT: u32 = 10;
+const SHARED_TIMESTAMP: &str = "2024-01-01T00:00:00Z";
 const FULL_READ_POLL_COUNT: u32 = 100;
 const CHECKPOINT_FILE: &str = "source_opensearch.state";
 const CHECKPOINT_FAILURE_LOG: &str = "Failed to save state for source connector";

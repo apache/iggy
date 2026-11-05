@@ -16,8 +16,9 @@
 // under the License.
 
 use super::{
-    CHECKPOINT_FILE, POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT, expected_ids,
-    json_payloads, poll_next, read_from_start, sorted_document_ids, wait_for_failed_checkpoint,
+    CHECKPOINT_FILE, POLL_ATTEMPTS, POLL_INTERVAL_MS, SHARED_TIMESTAMP, TEST_MESSAGE_COUNT,
+    expected_ids, json_payloads, poll_next, read_from_start, sorted_document_ids,
+    wait_for_failed_checkpoint,
 };
 use crate::connectors::fixtures::{
     OpenSearchSourceMissingIndexFixture, OpenSearchSourcePreCreatedFixture,
@@ -185,6 +186,36 @@ async fn checkpoint_failure_source_replays_documents_until_acknowledged(
         settled.len(),
         replayed.len(),
         "once the checkpoint is saved the cursor must stop replaying"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_late_visible_document_with_smaller_id_when_polling_should_still_publish_it(
+    harness: &TestHarness,
+    fixture: OpenSearchSourcePreCreatedFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+
+    fixture
+        .insert_document_at(20, SHARED_TIMESTAMP)
+        .await
+        .expect("Failed to insert the first document");
+    let first = poll_next(&client, "late_visible", 1).await;
+    assert_eq!(sorted_document_ids(&json_payloads(&first)), vec![20]);
+
+    fixture
+        .insert_document_at(10, SHARED_TIMESTAMP)
+        .await
+        .expect("Failed to insert the late document");
+    let late = poll_next(&client, "late_visible", 1).await;
+
+    assert_eq!(
+        sorted_document_ids(&json_payloads(&late)),
+        vec![10],
+        "a document that sorts before the saved position must not be skipped"
     );
 }
 

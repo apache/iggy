@@ -4,9 +4,11 @@ Polls documents from an OpenSearch index and publishes each one to an Iggy
 topic as a JSON message. The connector is read-only: it never writes to
 OpenSearch.
 
-Progress is tracked with `search_after` on `(timestamp_field, _id, _index)`.
-The cursor is saved by the connectors runtime, so a restart resumes where the
-last acknowledged batch ended.
+Progress is tracked by a watermark: the sort position of the newest published
+document, ordered by `(timestamp_field, tiebreaker_field, _index)`. The
+connectors runtime saves it, so a restart resumes from the last acknowledged
+batch. See [How polling works](#how-polling-works) for what that means for
+documents that appear late.
 
 ## Configuration
 
@@ -52,6 +54,7 @@ query = { match_all = {} }
 | `username` / `password` | none | HTTP basic authentication, used only when both are set. |
 | `query` | `match_all` | Query DSL object, applied on every poll. |
 | `polling_interval` | `10s` | Wait before each poll, so the first poll also waits. |
+| `tiebreaker_field` | `_id` | Unique `keyword` field with doc values that orders documents with the same timestamp. Message ids and the `opensearch.document_id` header always come from `_id`. |
 | `batch_size` | `100` | Documents per search, `1` to `10000` (the OpenSearch default `max_result_window`). |
 | `request_timeout` | `30s` | Limit per HTTP request, from connecting to the last byte of the response. A timeout counts as a failed attempt and is retried. |
 | `max_retries` | `3` | Total HTTP attempts per search, not the number of retries. |
@@ -66,15 +69,32 @@ query = { match_all = {} }
 ## How polling works
 
 Each poll sleeps for `polling_interval`, then sends `POST /{index}/_search`
-sorted ascending by `timestamp_field`, `_id` and `_index`, with `search_after`
-set to the previous batch's last sort tuple. The `_id` and `_index` keys break
-ties between documents with the same timestamp, so none are skipped at a batch
-boundary, including across the indices of a pattern.
+sorted ascending by `timestamp_field`, `tiebreaker_field` (`_id` by default) and
+`_index`. The tie-breaker and `_index` keys order documents with the same
+timestamp, so none are skipped at a batch boundary, including across the
+indices of a pattern.
+
+A scan is a run of polls that ends at the first page shorter than `batch_size`.
+Within a scan each poll continues with `search_after` set to the previous page's
+last sort tuple. A new scan does not continue after that tuple. It restarts at
+the newest published timestamp (the watermark) and skips the hits it already
+published there. A document that becomes searchable after the scan passed it
+(another shard refreshed later, or a bulk request still being indexed) is
+therefore found when it has the same timestamp as the newest published document,
+even if its `_id` sorts before the ones already read.
+
+`_id` has no doc values, so OpenSearch sorts on it through heap-backed fielddata,
+and a cluster with `indices.id_field_data.enabled=false` rejects the sort. Set
+`tiebreaker_field` to a unique `keyword` field with doc values (for example an
+event id) to avoid that. `open()` reads its mapping and fails with
+`InvalidConfigValue` when the field is missing from a matched index, is not a
+`keyword`, or has `doc_values` disabled. It cannot check that the values are
+unique, and documents that share a value can still be skipped.
 
 Documents that lack `timestamp_field` are sorted first (`missing: "_first"`).
 OpenSearch would otherwise sort them last under a value larger than any real
-timestamp, and the cursor stored there would hide every document indexed later.
-They are published on the initial scan, but one indexed after the cursor has
+timestamp, and a watermark stored there would hide every document indexed later.
+They are published on the initial scan, but one indexed after the watermark has
 moved on is skipped, like any document with an older timestamp. If a hit ever
 comes back sorted on that last-place value, the poll fails with `SchemaMismatch`
 instead of storing it.
@@ -94,10 +114,10 @@ For every hit:
   leaves it unset and the document is still published.
 
 Two cases do not produce a message. A hit without `_source` (for example an
-index mapped with `"_source": false`) is skipped with a warning, and the cursor
-moves past it so the poll does not repeat forever. A hit without a sort tuple
-fails the poll with `SchemaMismatch` and the cursor stays put, since that means
-the mapping cannot be paginated.
+index mapped with `"_source": false`) is skipped with a warning and counted as
+published, so later scans do not warn about it again. A hit without a sort tuple
+or `_id` fails the poll with `SchemaMismatch` and the state stays put, since
+that means the results cannot be paginated or told apart.
 
 ## Delivery and state
 
@@ -108,15 +128,21 @@ rejected batch is fetched again. If the batch reached Iggy but the state save
 failed, the batch is replayed as well. Consumers should dedupe on the message
 `id`.
 
-A page where every hit lacks `_source` publishes nothing, but its cursor still
-moves, so it goes through the same `Ack` and `Nack` handling and is saved by the
-runtime. A poll that returns no hits at all has no cursor to protect and is
-counted directly.
+A page where every new hit lacks `_source` publishes nothing, but the watermark
+still moves, so it goes through the same `Ack` and `Nack` handling and is saved
+by the runtime. A poll that finds nothing new (no hits, or only hits published
+before) leaves the watermark alone and is counted directly.
 
-The state holds the `search_after` cursor, `last_poll_timestamp` (informational
-only), document and poll counters, the last error, and processing stats. A
-corrupt saved state makes `open()` fail with `InitError` instead of silently
-restarting from the first document.
+The state holds the sort tuple of the newest published hit (its first element is
+the watermark), the `(index, _id)` of every published hit at that watermark,
+`last_poll_timestamp` (informational only), document and poll counters, the last
+error, and processing stats. The list of hits at the watermark is capped at
+10,000. If more documents than that share the newest timestamp, the poll fails
+with `SchemaMismatch` and the state stays put; use a `timestamp_field` with a
+finer resolution. After a restart the first scan starts from the watermark, so
+the hits at that timestamp are read again and skipped. A corrupt saved state
+makes `open()` fail with `InitError` instead of silently restarting from the
+first document.
 
 With no saved state the connector starts at the beginning of the index and
 republishes everything. If you lose the runtime state file, keep `state_path` on
@@ -130,30 +156,30 @@ jitter. Other `4xx` responses and unparsable search responses fail immediately.
 The delay is always computed locally, so a `Retry-After` header is ignored.
 
 Searches are sent with `allow_partial_search_results=false`, and a response that
-reports `timed_out` or failed shards is rejected before the cursor moves. A
-partial page could omit documents that sort before its last hit, and the cursor
-would skip them for good.
+reports `timed_out` or failed shards is rejected before the state changes. A
+partial page could omit documents that sort before its last hit, and the
+watermark would pass them for good.
 
 After the retry budget is spent the poll fails. Network errors and `429`/`5xx`
 failures count toward the circuit breaker; permanent errors do not, because
 pausing polls cannot fix a bad query or mapping and the error should stay
 visible. While the breaker is open, `poll()` logs a warning, sleeps
-`polling_interval` and returns an empty batch without touching the cursor. After
+`polling_interval` and returns an empty batch without touching the state. After
 the cool-down, polls resume and the breaker reopens once the threshold is hit
 again. A successful search resets it.
 
 | Error | Raised when |
 | --- | --- |
 | `InitError` | Corrupt saved state, missing index or unreachable cluster in `open()`. |
-| `InvalidConfigValue` | Invalid `url`, missing `timestamp_field`, `batch_size` outside `1..=10000`, or a `query` that is not an object. |
+| `InvalidConfigValue` | Invalid `url`, missing `timestamp_field`, `batch_size` outside `1..=10000`, a `query` that is not an object, an empty `tiebreaker_field`, or a `tiebreaker_field` that is not a keyword with doc values in every matched index. |
 | `Connection` | Network failure during a search. |
 | `HttpRequestFailed` | `429` or `5xx` after the retries are used up, or a search that timed out or failed on some shards. |
 | `PermanentHttpError` | Other `4xx`, or a search response that cannot be parsed. |
-| `SchemaMismatch` | A hit has no sort tuple, or sorted on the missing-value sentinel. |
+| `SchemaMismatch` | A hit has no sort tuple or `_id`, sorted on the missing-value sentinel, or more than 10,000 documents share the newest timestamp. |
 
 ## Limits
 
-- One sequential reader with one cursor. There is no Scroll, point-in-time or
+- One sequential reader with one watermark. There is no Scroll, point-in-time or
   sliced parallel export.
 - Throughput is `batch_size` per `polling_interval`. The defaults give about 10
   documents per second, so a large first load needs tuning, for example
@@ -163,8 +189,12 @@ again. A successful search resets it.
   nanoseconds), so the order across them is wrong and the cursor can skip
   documents. The sort does not set `numeric_type`, because OpenSearch rejects it
   on a `keyword` timestamp.
-- The cursor only moves forward. Documents indexed later with a
-  `timestamp_field` older than the cursor are not read until the state is reset.
+- The watermark only moves forward. A document that becomes searchable later
+  with a `timestamp_field` strictly older than the watermark is not read until
+  the state is reset. Only documents at the newest published timestamp are
+  rescanned.
+- Each scan re-reads the documents at the newest published timestamp and skips
+  them, so a timestamp shared by many documents costs extra reads on every scan.
 - Only the whole `_source` is published, as JSON. There is no field projection.
 - The client talks to the single `url` and does not discover other nodes.
 
@@ -177,4 +207,4 @@ again. A successful search resets it.
 | Nothing new after a restart | `timestamp_field` mapping must match the indexed documents. |
 | Duplicate messages | Expected after a `Nack` or a failed state save. Dedupe on the message `id`. |
 | Repeated warnings about `_source` | The index disables `_source`, so those hits are skipped. |
-| Backfilled documents missing | Their timestamps are older than the cursor. Reset the state or adjust `query`. |
+| Backfilled documents missing | Their timestamps are older than the watermark. Reset the state or adjust `query`. |

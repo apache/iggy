@@ -36,6 +36,9 @@ index = "logs-*"
 polling_interval = "10s"
 batch_size = 100
 timestamp_field = "@timestamp"
+# Unique keyword field with doc values that orders documents with the same timestamp.
+# Defaults to _id, which OpenSearch sorts through heap-backed fielddata.
+# tiebreaker_field = "event_id"
 # username = "admin"
 # password = "replace_with_secret"
 # verbose_logging = false
