@@ -78,6 +78,14 @@ async fn primary_with_refused_offset_prepare(
     (partition, replies, header)
 }
 
+/// One tick of a partition outside a table: advance the clock of its group,
+/// then tick the group, as the shard tick does.
+fn advance_and_tick<B: MessageBus>(partition: &IggyPartition<B>) -> Vec<consensus::VsrAction> {
+    let consensus = partition.consensus();
+    consensus.tick_clock().advance();
+    consensus.tick(PlaneKind::Partitions)
+}
+
 fn answer_partition_heartbeat(
     partition: &IggyPartition<RecordingBus>,
     action: &consensus::VsrAction,
@@ -154,7 +162,7 @@ async fn given_a_wal_still_full_at_the_first_retry_when_capacity_frees_should_re
         if retries == 1 {
             persistence.release_capacity_for_test();
         }
-        for action in partition.consensus().tick(PlaneKind::Partitions) {
+        for action in advance_and_tick(&partition) {
             answer_partition_heartbeat(&partition, &action);
             if let consensus::VsrAction::RetryLocalWrite { op } = action {
                 partition.retry_local_write(op).await;
@@ -200,7 +208,7 @@ async fn given_a_self_ack_queued_in_loopback_when_the_prepare_timeout_keeps_firi
     partition.drive_persistence().await;
 
     for _ in 0..consensus::TimeoutManager::PREPARE_TICKS * 40 {
-        for action in partition.consensus().tick(PlaneKind::Partitions) {
+        for action in advance_and_tick(&partition) {
             answer_partition_heartbeat(&partition, &action);
             if let consensus::VsrAction::RetryLocalWrite { op } = action {
                 partition.retry_local_write(op).await;
@@ -255,7 +263,7 @@ async fn given_a_wal_that_refused_the_primary_prepare_when_the_prepare_timeout_f
 
     let mut retried = false;
     for _ in 0..=consensus::TimeoutManager::PREPARE_TICKS {
-        for action in partition.consensus().tick(PlaneKind::Partitions) {
+        for action in advance_and_tick(&partition) {
             match action {
                 consensus::VsrAction::RetryLocalWrite { op } => {
                     partition.retry_local_write(op).await;

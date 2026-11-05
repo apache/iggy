@@ -53,7 +53,7 @@ use metadata::stm::StateMachine;
 use metadata::stm::consumer_group::{ConsumerGroup, ConsumerGroupMember, JoinConsumerGroupRequest};
 use metadata::stm::stream::{Partition, Stream, StreamsInner, Topic};
 use metadata::stm::user::Users;
-use partitions::state_transfer::PartitionTransferSession;
+use partitions::state_transfer::{PartitionTransferSession, TransferSlot};
 use partitions::{
     IggyPartition, IggyPartitions, PartitionsConfig, PollingArgs, PollingConsumer, RepairSession,
 };
@@ -2157,12 +2157,16 @@ fn lagging_replica_in_cluster(namespace: IggyNamespace, replica_count: u8) -> Co
         consensus,
         config.segment_size,
     );
-    arm_lagging_transfer(&mut partition, GROUP_PRIMARY);
+    arm_lagging_transfer(
+        &mut partition,
+        GROUP_PRIMARY,
+        owner.plane.partitions().transfer_slot(),
+    );
     owner.plane.partitions().insert(namespace, partition);
     owner
 }
 
-fn arm_lagging_transfer<B, S>(partition: &mut IggyPartition<B, S>, peer: u8)
+fn arm_lagging_transfer<B, S>(partition: &mut IggyPartition<B, S>, peer: u8, slot: TransferSlot)
 where
     B: message_bus::MessageBus,
     S: journal::superblock::SuperblockStore,
@@ -2178,6 +2182,7 @@ where
         scan: None,
         seed: None,
         pulled_len: 0,
+        slot,
     }));
 }
 
@@ -2264,7 +2269,7 @@ fn rearm_lagging_transfer_to(owner: &CompletionTestShard, namespace: IggyNamespa
         .get_mut_by_ns(&namespace)
         .expect("the partition stays registered");
     partition.transfer_rearm = None;
-    arm_lagging_transfer(partition, peer);
+    arm_lagging_transfer(partition, peer, partitions.transfer_slot());
 }
 
 /// The peer the lagging replica's next transfer attempt is scheduled against.
@@ -2445,7 +2450,7 @@ async fn given_a_hard_refusal_from_a_backup_when_this_replica_ratcheted_its_view
             .get_mut_by_ns(&namespace)
             .expect("the partition stays registered");
         partition.transfer_rearm = None;
-        arm_lagging_transfer(partition, FAILED_BACKUP);
+        arm_lagging_transfer(partition, FAILED_BACKUP, partitions.transfer_slot());
     }
 
     owner
@@ -2758,6 +2763,37 @@ async fn tick_until_metadata_repair_peer_changes(
         }
     }
     panic!("the metadata repair session never moved off {previous:?}");
+}
+
+/// The pump ages state-transfer offers once per tick on every shard, so the
+/// metadata tick must not age them a second time.
+#[compio::test]
+async fn given_a_served_offer_when_the_metadata_tick_runs_should_leave_its_age() {
+    const REQUESTER: u8 = 1;
+    let (owner, _dir) = gap_stopped_metadata_backup(5).await;
+    let key = (IggyNamespace::new(0, 0, 0).inner(), REQUESTER);
+    let offer = partitions::state_transfer::PartitionStateTransferOffer {
+        commit_op: 0,
+        segments: Vec::new(),
+        chain: None,
+        offsets: (
+            consensus::StateArtifact::for_bytes(consensus::artifact_kind::CONSUMER_OFFSETS, 0, &[]),
+            Rc::new(Vec::new()),
+        ),
+    };
+    owner.state_transfer_offers.borrow_mut().insert(
+        key,
+        crate::ServedStateTransfer {
+            nonce: 0,
+            offer: crate::ServedOffer::Partition(Rc::new(offer)),
+            idle_ticks: 0,
+            fully_served: false,
+        },
+    );
+
+    owner.tick_metadata().await;
+
+    assert_eq!(owner.state_transfer_offers.borrow()[&key].idle_ticks, 0);
 }
 
 /// The metadata plane aims its gap-repair arm and stall rotation at the

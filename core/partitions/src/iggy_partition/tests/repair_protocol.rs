@@ -1115,6 +1115,7 @@ async fn given_session_remint_when_attempts_burned_should_survive_on_partition()
             scan: None,
             seed: None,
             pulled_len: 0,
+            slot: crate::state_transfer::TransferSlot::new(&Rc::default()),
         }));
     }
     assert!(partition.burn_transfer_attempt(), "budget exhausts");

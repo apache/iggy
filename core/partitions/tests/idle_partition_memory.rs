@@ -46,13 +46,16 @@ const WRITTEN_PARTITIONS: usize = 16;
 const REPLICAS: u8 = 3;
 /// `[partition] prepare_queue_depth` as shipped.
 const PREPARE_QUEUE_DEPTH: usize = 32;
-/// Measured at 8561 B: the 5.5 KB `IggyPartition` slot of the shard plus
-/// 3.1 KB of heap. The 655 B of headroom catches the 3 KB view-change table
-/// held inline, or all 1.2 KB of the boxed session state. It does not catch
-/// one boxed field held inline, because the largest takes 360 B. Const
-/// asserts next to `IggyPartition` and `VsrConsensus` pin each of those
-/// fields to the size of one pointer.
+/// Measured at 8336 B: the 5.2 KB `IggyPartition` box, 50 B of slot and index
+/// entry in the shard, and 3.1 KB of heap. The 880 B of headroom catches the
+/// 3 KB view-change table held inline, or all 1.2 KB of the boxed session
+/// state. It does not catch one boxed field held inline, because the largest
+/// takes 360 B. Const asserts next to `IggyPartition` and `VsrConsensus` pin
+/// each of those fields to the size of one pointer.
 const IDLE_PARTITION_BYTES_MAX: usize = 9 * 1024;
+/// A partition in its own `Box` takes a whole mimalloc size class: 5,120 B is
+/// one, and one byte more falls into the 6,144 B class.
+const BOXED_PARTITION_BYTES_MAX: usize = 5 * 1024;
 /// A primary frees its queues at the second commit heartbeat after its last
 /// write.
 const IDLE_TICKS: u64 = 2 * TimeoutManager::COMMIT_MESSAGE_TICKS;
@@ -112,8 +115,10 @@ async fn given_partitions_that_filled_the_prepare_queue_when_idle_should_free_th
 
     let ((), freed) = freed_bytes_during(|| {
         for partition in &partitions {
+            let consensus = partition.consensus();
             for _ in 0..IDLE_TICKS {
-                drop(partition.consensus().tick(PlaneKind::Partitions));
+                consensus.tick_clock().advance();
+                drop(consensus.tick(PlaneKind::Partitions));
             }
         }
     });
@@ -124,6 +129,15 @@ async fn given_partitions_that_filled_the_prepare_queue_when_idle_should_free_th
         per_partition >= prepare_queue_bytes,
         "an idle partition freed {per_partition} bytes, below the {prepare_queue_bytes} bytes of \
          its prepare queue"
+    );
+}
+
+#[test]
+fn given_a_partition_when_boxed_should_fit_one_mimalloc_size_class() {
+    let size = size_of::<ReplicatedPartition>();
+    assert!(
+        size <= BOXED_PARTITION_BYTES_MAX,
+        "a partition takes {size} bytes, above {BOXED_PARTITION_BYTES_MAX}"
     );
 }
 
