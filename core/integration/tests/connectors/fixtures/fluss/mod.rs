@@ -21,5 +21,5 @@ mod source;
 pub use source::{
     FlussSourceAllTypesFixture, FlussSourceFixture, FlussSourceLatestFixture,
     FlussSourceProjectedFixture, FlussSourceReservedColumnFixture, FlussSourceSlowPollFixture,
-    FlussSourceUnconvertibleRowFixture,
+    FlussSourceTieredProjectionFixture, FlussSourceUnconvertibleRowFixture,
 };

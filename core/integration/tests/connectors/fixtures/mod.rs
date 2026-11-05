@@ -68,7 +68,7 @@ pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedF
 pub use fluss::{
     FlussSourceAllTypesFixture, FlussSourceFixture, FlussSourceLatestFixture,
     FlussSourceProjectedFixture, FlussSourceReservedColumnFixture, FlussSourceSlowPollFixture,
-    FlussSourceUnconvertibleRowFixture,
+    FlussSourceTieredProjectionFixture, FlussSourceUnconvertibleRowFixture,
 };
 pub use http::{
     GITHUB_ENDPOINT_ID, GITHUB_HMAC_HEADER, GITHUB_INSTANCE, HttpSinkAtLeastOnceFixture,

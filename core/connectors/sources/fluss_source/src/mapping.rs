@@ -37,34 +37,53 @@ const NANOS_PER_MILLI: i64 = 1_000_000;
 /// while `TIMESTAMP_LTZ` is an instant and is written in UTC.
 pub(crate) struct JsonRow<'a> {
     row: &'a dyn InternalRow,
-    fields: &'a [DataField],
+    columns: &'a [Column],
     metadata: &'a [(&'a str, i64)],
 }
 
 impl<'a> JsonRow<'a> {
     pub(crate) fn new(
         row: &'a dyn InternalRow,
-        fields: &'a [DataField],
+        columns: &'a [Column],
         metadata: &'a [(&'a str, i64)],
     ) -> Self {
         Self {
             row,
-            fields,
+            columns,
             metadata,
         }
     }
 }
 
+/// A column written into the payload, with its position in the rows the scanner hands over.
+/// The scanner reads every column of the table, so a projected column keeps its table
+/// position rather than its place in the projection.
+pub(crate) struct Column {
+    position: usize,
+    field: DataField,
+}
+
+impl Column {
+    pub(crate) fn new(position: usize, field: DataField) -> Self {
+        Self { position, field }
+    }
+
+    pub(crate) fn field(&self) -> &DataField {
+        &self.field
+    }
+}
+
 impl Serialize for JsonRow<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut object = serializer.serialize_map(Some(self.fields.len() + self.metadata.len()))?;
-        for (position, field) in self.fields.iter().enumerate() {
+        let mut object =
+            serializer.serialize_map(Some(self.columns.len() + self.metadata.len()))?;
+        for column in self.columns {
             let value = JsonField {
                 row: self.row,
-                position,
-                field,
+                position: column.position,
+                field: &column.field,
             };
-            object.serialize_entry(field.name(), &value)?;
+            object.serialize_entry(column.field.name(), &value)?;
         }
         for (name, value) in self.metadata {
             object.serialize_entry(name, value)?;
@@ -75,7 +94,9 @@ impl Serialize for JsonRow<'_> {
 
 /// Rejects column types with no JSON representation before the first poll, so a table with
 /// an unsupported column fails at startup instead of once per batch.
-pub(crate) fn ensure_supported_types(fields: &[DataField]) -> Result<(), Error> {
+pub(crate) fn ensure_supported_types<'a>(
+    fields: impl IntoIterator<Item = &'a DataField>,
+) -> Result<(), Error> {
     for field in fields {
         if !is_supported(field.data_type()) {
             return Err(Error::SchemaMismatch(format!(
@@ -237,9 +258,18 @@ mod tests {
         DataField::new(name, data_type, None)
     }
 
+    /// Every field, at its own position.
+    fn columns(fields: &[DataField]) -> Vec<Column> {
+        fields
+            .iter()
+            .enumerate()
+            .map(|(position, field)| Column::new(position, field.clone()))
+            .collect()
+    }
+
     fn to_json(row: &GenericRow, fields: &[DataField]) -> Value {
-        let payload =
-            serde_json::to_vec(&JsonRow::new(row, fields, &[])).expect("Failed to map row");
+        let payload = serde_json::to_vec(&JsonRow::new(row, &columns(fields), &[]))
+            .expect("Failed to map row");
         serde_json::from_slice(&payload).expect("The payload should be JSON")
     }
 
@@ -309,7 +339,7 @@ mod tests {
         let mut row = GenericRow::new(1);
         row.set_field(0, Date::new(i32::MAX));
 
-        let error = serde_json::to_vec(&JsonRow::new(&row, &fields, &[]))
+        let error = serde_json::to_vec(&JsonRow::new(&row, &columns(&fields), &[]))
             .expect_err("A date chrono cannot hold should fail");
 
         assert!(error.to_string().contains("'shipped_on'"), "{error}");
@@ -409,6 +439,23 @@ mod tests {
         let error = ensure_supported_types(&fields).expect_err("Nested column should be rejected");
 
         assert!(matches!(error, Error::SchemaMismatch(message) if message.contains("tags")));
+    }
+
+    #[test]
+    fn given_projected_columns_should_read_their_table_positions_in_the_requested_order() {
+        let mut row = GenericRow::new(3);
+        row.set_field(0, 7i32);
+        row.set_field(1, "left out");
+        row.set_field(2, "kept");
+        let projected = vec![
+            Column::new(2, field("payload", DataTypes::string())),
+            Column::new(0, field("id", DataTypes::int())),
+        ];
+
+        let payload =
+            serde_json::to_string(&JsonRow::new(&row, &projected, &[])).expect("Failed to map row");
+
+        assert_eq!(payload, r#"{"payload":"kept","id":7}"#);
     }
 
     #[test]

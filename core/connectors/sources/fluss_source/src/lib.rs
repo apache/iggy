@@ -67,8 +67,8 @@ pub struct FlussSourceConfig {
     pub table_type: Option<String>,
     /// `earliest` (default), `latest`, or an explicit numeric offset applied to every bucket.
     pub starting_offset: Option<String>,
-    /// Column projection pushed down to the server. Omit to read every column. An empty list or
-    /// a repeated name is rejected.
+    /// Columns written to each message, in this order. Omit to write every column. An empty
+    /// list or a repeated name is rejected.
     pub columns: Option<Vec<String>>,
     pub poll_interval: Option<String>,
     pub poll_timeout: Option<String>,
@@ -173,7 +173,7 @@ pub struct FlussSource {
     /// arrived after the last acknowledged batch.
     unreadable_state: bool,
     scanner: Option<LogScanner>,
-    fields: Vec<DataField>,
+    columns: Vec<mapping::Column>,
     state: Mutex<State>,
     staged: Mutex<Option<StagedBatch>>,
     /// Records of a batch the runtime rejected, or of one whose state could not be staged. The
@@ -203,7 +203,7 @@ impl std::fmt::Debug for FlussSource {
             .field("poll_interval", &self.poll_interval)
             .field("poll_timeout", &self.poll_timeout)
             .field("include_metadata", &self.include_metadata)
-            .field("columns", &self.fields.len())
+            .field("columns", &self.columns.len())
             .field("opened", &self.scanner.is_some())
             .finish_non_exhaustive()
     }
@@ -250,7 +250,7 @@ impl FlussSource {
             verbose_logging,
             unreadable_state,
             scanner: None,
-            fields: Vec::new(),
+            columns: Vec::new(),
             state: Mutex::new(restored_state.unwrap_or_default()),
             staged: Mutex::new(None),
             replay: Mutex::new(None),
@@ -485,7 +485,7 @@ impl FlussSource {
             &[]
         };
 
-        let payload = serde_json::to_vec(&mapping::JsonRow::new(row, &self.fields, metadata))
+        let payload = serde_json::to_vec(&mapping::JsonRow::new(row, &self.columns, metadata))
             .map_err(|error| Error::InvalidRecordValue(error.to_string()))?;
 
         Ok(ProducedMessage {
@@ -572,7 +572,7 @@ impl FlussSource {
         // The scanner aligns every row to the schema it was created with, so the columns used to
         // decode rows come from the same table snapshot rather than from a second lookup that a
         // schema change could land between.
-        let (scanner, fields, bucket_count, table) = {
+        let (scanner, columns, bucket_count, table) = {
             let table = connection
                 .get_table(&self.table_path)
                 .await
@@ -592,41 +592,32 @@ impl FlussSource {
                 )));
             }
 
+            // `columns` is applied here rather than pushed down to the server. A projected scan
+            // in fluss-rs 1.0 decodes every remote batch with the schema it started with, so a
+            // batch tiered before a column was added fails on every poll. A full scan aligns
+            // each batch to that schema instead, and the columns are picked from the result.
             let table_row_type = table_info.get_row_type();
-            let projection = self
-                .config
-                .columns
-                .as_deref()
-                .map(|columns| projection_indices(table_row_type, columns, &self.table_path))
-                .transpose()?;
-            let projection_error = |error: fluss::error::Error| {
-                Error::InitError(format!(
-                    "failed to project the columns of table '{}': {error}",
-                    self.table_path
-                ))
+            let positions = match self.config.columns.as_deref() {
+                Some(columns) => projection_indices(table_row_type, columns, &self.table_path)?,
+                None => (0..table_row_type.fields().len()).collect(),
             };
-            let row_type = match projection.as_deref() {
-                Some(indices) => table_row_type.project(indices).map_err(projection_error)?,
-                None => table_row_type.clone(),
-            };
-            mapping::ensure_supported_types(row_type.fields())?;
+            let columns: Vec<mapping::Column> = positions
+                .into_iter()
+                .map(|position| {
+                    mapping::Column::new(position, table_row_type.fields()[position].clone())
+                })
+                .collect();
+            mapping::ensure_supported_types(columns.iter().map(mapping::Column::field))?;
             if self.include_metadata {
-                ensure_no_metadata_collision(row_type.fields())?;
+                ensure_no_metadata_collision(columns.iter().map(mapping::Column::field))?;
             }
 
-            let scan = match projection.as_deref() {
-                Some(indices) => table
-                    .new_scan()
-                    .project(indices)
-                    .map_err(projection_error)?,
-                None => table.new_scan(),
-            };
-            let scanner = scan.create_log_scanner().map_err(|error| {
+            let scanner = table.new_scan().create_log_scanner().map_err(|error| {
                 Error::InitError(format!("failed to create log scanner: {error}"))
             })?;
             (
                 scanner,
-                row_type.fields().clone(),
+                columns,
                 table_info.get_num_buckets(),
                 TableIdentity::new(&self.table_path, table_info.get_table_id()),
             )
@@ -678,7 +669,7 @@ impl FlussSource {
         }
 
         // The scanner holds its own handles to the client, so the connection is not kept.
-        self.fields = fields;
+        self.columns = columns;
         self.scanner = Some(scanner);
 
         info!(
@@ -686,7 +677,7 @@ impl FlussSource {
              columns: {}, poll interval: {:?}",
             self.id,
             self.table_path,
-            self.fields.len(),
+            self.columns.len(),
             self.poll_interval
         );
         Ok(())
@@ -824,8 +815,8 @@ fn connection_error(error: fluss::error::Error) -> Error {
     Error::Connection(format!("Apache Fluss client failure: {error}"))
 }
 
-/// Resolves the configured names once, so the row decoder and the scanner use the same
-/// positions in the same order.
+/// Resolves the configured names to their positions in the table's rows, in the order they
+/// are listed.
 fn projection_indices(
     row_type: &RowType,
     columns: &[String],
@@ -859,9 +850,11 @@ fn ensure_same_table(saved: Option<&TableIdentity>, current: &TableIdentity) -> 
 
 /// `include_metadata` writes its fields into the same object as the columns, so a column under
 /// the reserved prefix would be overwritten.
-fn ensure_no_metadata_collision(fields: &[DataField]) -> Result<(), Error> {
+fn ensure_no_metadata_collision<'a>(
+    fields: impl IntoIterator<Item = &'a DataField>,
+) -> Result<(), Error> {
     match fields
-        .iter()
+        .into_iter()
         .find(|field| field.name().starts_with(METADATA_PREFIX))
     {
         Some(field) => Err(Error::InitError(format!(
@@ -1457,7 +1450,7 @@ mod tests {
         let mut config = test_config();
         config.include_metadata = Some(include_metadata);
         let mut source = FlussSource::new(1, config, None);
-        source.fields = vec![field("id")];
+        source.columns = vec![mapping::Column::new(0, field("id"))];
         let mut row = GenericRow::new(1);
         row.set_field(0, 7i32);
         (source, row)

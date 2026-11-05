@@ -24,13 +24,18 @@ use super::container::{
 use async_trait::async_trait;
 use fluss::client::FlussConnection;
 use fluss::config::Config;
-use fluss::metadata::{DataTypes, Schema, TableDescriptor, TablePath};
+use fluss::metadata::{
+    AddColumn, AlterTableChanges, ColumnPositionType, DataType, DataTypes, JsonSerde, Schema,
+    TableDescriptor, TablePath,
+};
 use fluss::row::{Date, Decimal, GenericRow, Time, TimestampLtz, TimestampNtz};
 use integration::harness::seeds;
 use integration::harness::{TestBinaryError, TestFixture};
 use std::collections::HashMap;
 use std::ops::Deref;
+use std::path::Path;
 use std::time::Duration;
+use tempfile::TempDir;
 use tokio::time::sleep;
 
 const DATABASE: &str = "iggy_test";
@@ -41,6 +46,12 @@ const EXISTING_ROW_COUNT: usize = 3;
 const ALL_TYPES_COLUMN_COUNT: usize = 17;
 const READY_ATTEMPTS: usize = 20;
 const READY_RETRY_DELAY: Duration = Duration::from_millis(500);
+const TIERED_BATCH_COUNT: usize = 4;
+const TIERED_ROWS_PER_BATCH: usize = 5;
+const TIERING_ATTEMPTS: usize = 120;
+/// Keeps a single segment on local disk, so the older ones are left only in remote storage.
+const TIERED_LOCAL_SEGMENTS: (&str, &str) = ("table.log.tiered.local-segments", "1");
+const FIRST_SEGMENT_FILE: &str = "00000000000000000000.log";
 
 /// Fluss log table read by the source connector under test.
 pub struct FlussSourceFixture {
@@ -75,7 +86,29 @@ impl FlussSourceFixture {
             .drop_table(&Self::table_path(), false)
             .await
             .map_err(|error| self.error(error))?;
-        self.create_table_when_ready(events_schema).await
+        self.create_table_when_ready(events_schema, &[]).await
+    }
+
+    /// Adds a nullable column at the end of the table, which gives it a new schema version.
+    async fn add_column(&self, name: &str, data_type: DataType) -> Result<(), TestBinaryError> {
+        let connection = self.connect().await?;
+        let admin = connection.get_admin().map_err(|error| self.error(error))?;
+        let data_type_json = data_type
+            .serialize_json()
+            .map_err(|error| self.error(error))?;
+        let changes = AlterTableChanges {
+            add_columns: vec![AddColumn {
+                column_name: name.to_owned(),
+                data_type_json: data_type_json.to_string().into_bytes(),
+                comment: None,
+                position: ColumnPositionType::Last,
+            }],
+            ..AlterTableChanges::default()
+        };
+        admin
+            .alter_table(&Self::table_path(), false, changes)
+            .await
+            .map_err(|error| self.error(error))
     }
 
     /// Starts a cluster and creates the table the connector reads, with the given schema.
@@ -83,7 +116,7 @@ impl FlussSourceFixture {
         let fixture = Self {
             container: FlussContainer::start().await?,
         };
-        fixture.create_table_when_ready(schema).await?;
+        fixture.create_table_when_ready(schema, &[]).await?;
         Ok(fixture)
     }
 
@@ -110,10 +143,11 @@ impl FlussSourceFixture {
     async fn create_table_when_ready(
         &self,
         schema: fn() -> fluss::error::Result<Schema>,
+        properties: &[(&str, &str)],
     ) -> Result<(), TestBinaryError> {
         let mut last_error = None;
         for _ in 0..READY_ATTEMPTS {
-            match self.try_create_table(schema).await {
+            match self.try_create_table(schema, properties).await {
                 Ok(()) => return Ok(()),
                 Err(error) => last_error = Some(error),
             }
@@ -128,6 +162,7 @@ impl FlussSourceFixture {
     async fn try_create_table(
         &self,
         schema: fn() -> fluss::error::Result<Schema>,
+        properties: &[(&str, &str)],
     ) -> Result<(), TestBinaryError> {
         let connection = self.connect().await?;
         let admin = connection.get_admin().map_err(|error| self.error(error))?;
@@ -139,6 +174,7 @@ impl FlussSourceFixture {
         let schema = schema().map_err(|error| self.error(error))?;
         let descriptor = TableDescriptor::builder()
             .schema(schema)
+            .properties(properties.iter().copied().collect::<HashMap<_, _>>())
             .build()
             .map_err(|error| self.error(error))?;
         admin
@@ -452,6 +488,107 @@ impl TestFixture for FlussSourceProjectedFixture {
         envs.insert(ENV_SOURCE_COLUMNS.to_string(), "[payload,id]".to_string());
         envs
     }
+}
+
+/// Rows written before a column was added, whose segments the cluster has already moved to
+/// remote storage when the connector starts, read through a projection of two columns.
+pub struct FlussSourceTieredProjectionFixture {
+    inner: FlussSourceFixture,
+    payloads: Vec<String>,
+    _storage: TempDir,
+}
+
+impl FlussSourceTieredProjectionFixture {
+    /// Rows appended before the column was added, in offset order.
+    pub fn payloads(&self) -> &[String] {
+        &self.payloads
+    }
+
+    /// The first segment is in remote storage and no longer on local disk, so reading it from
+    /// offset 0 goes to remote storage.
+    async fn wait_for_first_segment_in_remote_storage(
+        &self,
+        storage: &Path,
+    ) -> Result<(), TestBinaryError> {
+        for _ in 0..TIERING_ATTEMPTS {
+            if contains_file(&storage.join("remote"), FIRST_SEGMENT_FILE)
+                && !contains_file(&storage.join("data"), FIRST_SEGMENT_FILE)
+            {
+                return Ok(());
+            }
+            sleep(READY_RETRY_DELAY).await;
+        }
+        Err(TestBinaryError::FixtureSetup {
+            fixture_type: "FlussSourceTieredProjectionFixture".to_string(),
+            message: "The first log segment never moved to remote storage".to_string(),
+        })
+    }
+}
+
+#[async_trait]
+impl TestFixture for FlussSourceTieredProjectionFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let setup_error = |message: String| TestBinaryError::FixtureSetup {
+            fixture_type: "FlussSourceTieredProjectionFixture".to_string(),
+            message,
+        };
+        let storage = TempDir::new().map_err(|error| {
+            setup_error(format!("Failed to create a storage directory: {error}"))
+        })?;
+        // Docker Desktop reaches the temp directory through its resolved path, so the server
+        // reports that path and the client has to open the same one.
+        let storage_path = storage.path().canonicalize().map_err(|error| {
+            setup_error(format!("Failed to resolve the storage directory: {error}"))
+        })?;
+
+        let inner = FlussSourceFixture {
+            container: FlussContainer::start_with_tiered_storage(&storage_path).await?,
+        };
+        inner
+            .create_table_when_ready(events_schema, &[TIERED_LOCAL_SEGMENTS])
+            .await?;
+        let payloads: Vec<String> = (0..TIERED_BATCH_COUNT * TIERED_ROWS_PER_BATCH)
+            .map(|index| format!("tiered-{index}"))
+            .collect();
+        // One append per batch, so the rows span several segments.
+        for batch in payloads.chunks(TIERED_ROWS_PER_BATCH) {
+            inner.append_rows(batch).await?;
+        }
+
+        let fixture = Self {
+            inner,
+            payloads,
+            _storage: storage,
+        };
+        fixture
+            .wait_for_first_segment_in_remote_storage(&storage_path)
+            .await?;
+        fixture
+            .inner
+            .add_column("note", DataTypes::string())
+            .await?;
+        Ok(fixture)
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_SOURCE_COLUMNS.to_string(), "[payload,id]".to_string());
+        envs
+    }
+}
+
+fn contains_file(dir: &Path, name: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            contains_file(&path, name)
+        } else {
+            entry.file_name() == name
+        }
+    })
 }
 
 fn events_schema() -> fluss::error::Result<Schema> {

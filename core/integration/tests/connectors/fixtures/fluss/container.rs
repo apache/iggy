@@ -18,7 +18,8 @@
 use crate::connectors::fixtures;
 use integration::harness::TestBinaryError;
 use std::net::TcpListener;
-use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
+use std::path::Path;
+use testcontainers_modules::testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
@@ -64,16 +65,43 @@ pub(super) struct FlussContainer {
 
 impl FlussContainer {
     pub(super) async fn start() -> Result<Self, TestBinaryError> {
+        Self::start_with_storage(None).await
+    }
+
+    /// Keeps the log and its tiered copy under `storage_dir`, mounted at the same path inside
+    /// the container. The client reads a tiered segment from the path the server reports, so
+    /// the path has to reach the same files on both sides. Segments are kept small and tiered
+    /// every second, so a few appends reach remote storage within a test.
+    pub(super) async fn start_with_tiered_storage(
+        storage_dir: &Path,
+    ) -> Result<Self, TestBinaryError> {
+        Self::start_with_storage(Some(storage_dir)).await
+    }
+
+    async fn start_with_storage(storage_dir: Option<&Path>) -> Result<Self, TestBinaryError> {
         let [coordinator_port, tablet_port] = reserve_host_ports()?;
 
-        let container = GenericImage::new(FLUSS_IMAGE, FLUSS_VERSION)
+        let request = GenericImage::new(FLUSS_IMAGE, FLUSS_VERSION)
             .with_wait_for(WaitFor::message_on_stdout(READY_MESSAGE))
             .with_entrypoint("/bin/bash")
             .with_container_name(fixtures::unique_container_name("fluss"))
             .with_mapped_port(coordinator_port, coordinator_port.tcp())
             .with_mapped_port(tablet_port, tablet_port.tcp())
-            .with_env_var("FLUSS_PROPERTIES", server_properties(coordinator_port))
-            .with_cmd(["-c", &startup_script(tablet_port)])
+            .with_env_var(
+                "FLUSS_PROPERTIES",
+                server_properties(coordinator_port, storage_dir),
+            )
+            .with_cmd(["-c", &startup_script(tablet_port)]);
+        let request = match storage_dir {
+            Some(dir) => {
+                let dir = dir.to_string_lossy();
+                request
+                    .with_mount(Mount::bind_mount(dir.as_ref(), dir.as_ref()))
+                    .with_security_opt("label=disable")
+            }
+            None => request,
+        };
+        let container = request
             .start()
             .await
             .map_err(|error| TestBinaryError::FixtureSetup {
@@ -90,7 +118,17 @@ impl FlussContainer {
 
 /// The coordinator settings land in `server.yaml`. The tablet server inherits them and
 /// overrides only its listeners on the command line.
-fn server_properties(coordinator_port: u16) -> String {
+fn server_properties(coordinator_port: u16, storage_dir: Option<&Path>) -> String {
+    let storage = match storage_dir {
+        Some(dir) => format!(
+            "data.dir: {dir}/data\n\
+             remote.data.dir: {dir}/remote\n\
+             log.segment.file-size: 1kb\n\
+             remote.log.task-interval-duration: 1s\n",
+            dir = dir.display()
+        ),
+        None => "data.dir: /tmp/fluss/data\nremote.data.dir: /tmp/fluss/remote-data\n".to_owned(),
+    };
     format!(
         "zookeeper.address: localhost:2181\n\
          bind.listeners: CLIENT://0.0.0.0:{coordinator_port}\n\
@@ -98,8 +136,7 @@ fn server_properties(coordinator_port: u16) -> String {
          internal.listener.name: CLIENT\n\
          default.bucket.number: 1\n\
          default.replication.factor: 1\n\
-         data.dir: /tmp/fluss/data\n\
-         remote.data.dir: /tmp/fluss/remote-data\n\
+         {storage}\
          tablet-server.id: 0\n"
     )
 }

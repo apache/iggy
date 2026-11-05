@@ -19,7 +19,7 @@ use super::{API_KEY, POLL_ATTEMPTS, POLL_INTERVAL_MS, SOURCE_KEY, STATE_FILE, TE
 use crate::connectors::fixtures::{
     FlussSourceAllTypesFixture, FlussSourceFixture, FlussSourceLatestFixture,
     FlussSourceProjectedFixture, FlussSourceReservedColumnFixture, FlussSourceSlowPollFixture,
-    FlussSourceUnconvertibleRowFixture,
+    FlussSourceTieredProjectionFixture, FlussSourceUnconvertibleRowFixture,
 };
 use iggy::prelude::IggyClient;
 use iggy_common::MessageClient;
@@ -461,6 +461,19 @@ async fn given_projection_in_reverse_column_order_should_map_each_column_by_name
             "Only the projected columns should arrive, each under its own name"
         );
     }
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/fluss/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_projection_over_tiered_rows_written_before_a_column_was_added_should_deliver_them(
+    harness: &TestHarness,
+    fixture: FlussSourceTieredProjectionFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    let received = poll_records(&client, fixture.payloads().len(), POLL_ATTEMPTS).await;
+    assert_rows_delivered(&received, fixture.payloads(), 0);
 }
 
 /// The paired projection test reads the same table successfully, so the failure here comes from
