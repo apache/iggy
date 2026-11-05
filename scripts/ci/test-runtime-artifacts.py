@@ -22,6 +22,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -369,6 +370,61 @@ class RuntimeConsumers(unittest.TestCase):
         result, events = self.run_python_examples(sync_exit=23)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(events, ["sync --frozen"])
+
+    def test_python_consumer_failures_return_nonzero(self):
+        for example in ("basic", "getting-started"):
+            failures = {
+                "connect": "connection failed",
+                "poll": "poll failed",
+                "decode": "UnicodeDecodeError",
+            }
+            if example == "getting-started":
+                failures["config"] = "invalid configuration"
+            for failure, message in failures.items():
+                with self.subTest(example=example, failure=failure):
+                    result = self.run_python_consumer(example, failure)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn(message, result.stderr)
+
+    def test_python_consumers_complete_successfully(self):
+        for example in ("basic", "getting-started"):
+            with self.subTest(example=example):
+                result = self.run_python_consumer(example)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def run_python_consumer(self, example, failure=""):
+        script = r"""
+import asyncio
+import runpy
+import sys
+from unittest.mock import AsyncMock, MagicMock, patch
+
+path, failure = sys.argv[1:]
+message = MagicMock()
+message.payload.return_value = b"hello" if failure != "decode" else b"\xff"
+client = MagicMock()
+client.connect = AsyncMock()
+client.poll_messages = AsyncMock(return_value=MagicMock(messages=[message]))
+sdk = MagicMock()
+sdk.IggyClient.return_value = client
+sdk.IggyClient.from_connection_string.return_value = client
+if failure == "connect":
+    client.connect.side_effect = RuntimeError("connection failed")
+elif failure == "poll":
+    client.poll_messages.side_effect = RuntimeError("poll failed")
+elif failure == "config":
+    sdk.TcpConfig.side_effect = ValueError("invalid configuration")
+sys.argv = [path]
+with (
+    patch.dict(sys.modules, {"apache_iggy": sdk, "loguru": MagicMock()}),
+    patch.object(asyncio, "sleep", new=AsyncMock()),
+):
+    consumer = runpy.run_path(path, run_name="__main__")
+if not failure and client.poll_messages.await_count != consumer["BATCHES_LIMIT"]:
+    raise AssertionError("Consumer did not complete all batches")
+"""
+        return run(sys.executable, "-c", script,
+                   str(REPO_ROOT / "examples/python" / example / "consumer.py"), failure)
 
     def run_python_examples(self, *, sync_exit=0):
         with tempfile.TemporaryDirectory() as directory:
