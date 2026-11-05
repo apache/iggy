@@ -151,24 +151,21 @@ impl CliCommand for GetConsumerGroupCmd {
                     )
                 });
 
+            // Topic details and the offset reply can disagree. One head keeps
+            // the current-offset column and the lag column on the same value.
+            let head = partition.current_offset;
             let (current_offset, stored_offset, lag) = match consumer_offset {
                 Ok(Some(offset_info)) => {
                     // Recovery keeps a stored offset above the commit head when
                     // acked messages were not flushed. Subtracting underflows.
-                    let lag = offset_info
-                        .current_offset
-                        .saturating_sub(offset_info.stored_offset);
+                    let lag = head.saturating_sub(offset_info.stored_offset);
                     (
-                        format!("{}", offset_info.current_offset),
+                        format!("{head}"),
                         format!("{}", offset_info.stored_offset),
-                        format!("{}", lag),
+                        format!("{lag}"),
                     )
                 }
-                Ok(None) => (
-                    format!("{}", partition.current_offset),
-                    "-".to_string(),
-                    format!("{}", partition.messages_count),
-                ),
+                Ok(None) => (format!("{head}"), "-".to_string(), format!("{head}")),
                 Err(error) => {
                     if offset_error.is_none() {
                         offset_error = Some(error);
@@ -861,10 +858,14 @@ mod tests {
     async fn should_render_partition_ids_past_the_partition_count() {
         let output = rendered(&ScriptedClient {
             partitions_count: 1,
-            topic: TopicReply::Partitions(vec![partition(3)]),
+            topic: TopicReply::Partitions(vec![{
+                let mut partition = partition(3);
+                partition.current_offset = 20;
+                partition
+            }]),
             offset_fails: false,
             offset_fails_for: None,
-            offset: Some((20, 5)),
+            offset: Some((8, 5)),
             members: vec![ConsumerGroupMember {
                 id: 17,
                 partitions_count: 1,
@@ -938,10 +939,17 @@ mod tests {
         let error = cmd
             .execute_cmd(&ScriptedClient {
                 partitions_count: 2,
-                topic: TopicReply::Partitions(vec![partition(0), partition(1)]),
+                topic: TopicReply::Partitions(vec![
+                    {
+                        let mut partition = partition(0);
+                        partition.current_offset = 20;
+                        partition
+                    },
+                    partition(1),
+                ]),
                 offset_fails: false,
                 offset_fails_for: Some(1),
-                offset: Some((20, 5)),
+                offset: Some((8, 5)),
                 members: vec![ConsumerGroupMember {
                     id: 17,
                     partitions_count: 2,
@@ -986,6 +994,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn should_use_the_partition_head_as_lag_when_no_offset_is_stored() {
+        let mut partition = partition(0);
+        partition.current_offset = 9;
+        partition.messages_count = 10;
+        let output = rendered(&ScriptedClient {
+            partitions_count: 1,
+            topic: TopicReply::Partitions(vec![partition]),
+            offset_fails: false,
+            offset_fails_for: None,
+            offset: None,
+            members: Vec::new(),
+        })
+        .await;
+
+        assert!(
+            output.contains("9              | -             | 9"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("| 10"),
+            "message count is not lag, got {output}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn should_report_zero_lag_when_stored_offset_leads_current() {
         let logs = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
@@ -999,12 +1032,14 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let mut cmd = command();
+        let mut partition = partition(0);
+        partition.current_offset = 4;
         cmd.execute_cmd(&ScriptedClient {
             partitions_count: 1,
-            topic: TopicReply::OnePartition,
+            topic: TopicReply::Partitions(vec![partition]),
             offset_fails: false,
             offset_fails_for: None,
-            offset: Some((4, 10)),
+            offset: Some((99, 10)),
             members: Vec::new(),
         })
         .await
@@ -1016,6 +1051,31 @@ mod tests {
         assert!(
             output.contains("4") && output.contains("10") && output.contains("| 0"),
             "lag should clamp to zero, got {output}"
+        );
+        assert!(
+            !output.contains("99"),
+            "current offset comes from the partition, got {output}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn should_subtract_the_stored_offset_from_the_partition_head() {
+        let mut partition = partition(0);
+        partition.current_offset = 30;
+        let output = rendered(&ScriptedClient {
+            partitions_count: 1,
+            topic: TopicReply::Partitions(vec![partition]),
+            offset_fails: false,
+            offset_fails_for: None,
+            offset: Some((20, 5)),
+            members: Vec::new(),
+        })
+        .await;
+
+        assert!(output.contains("30") && output.contains("| 25"), "{output}");
+        assert!(
+            !output.contains("20") && !output.contains("| 15"),
+            "lag uses the partition head, got {output}"
         );
     }
 }
