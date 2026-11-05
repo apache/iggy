@@ -17,9 +17,8 @@
 
 import argparse
 import os
-import urllib.parse
 
-from apache_iggy import IggyClient, IggyError, Permissions, UserStatus
+from apache_iggy import IggyClient, IggyError, Permissions
 from loguru import logger
 
 TOPICS = ("events", "logs", "notifications")
@@ -30,8 +29,10 @@ PARTITION_ID = 0
 UNAUTHORIZED = 41
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
+def build_parser(environment_help: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        epilog=f"Environment variables: {environment_help}"
+    )
     parser.add_argument(
         "connection_string",
         help=(
@@ -47,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def read_positive_int(parser: argparse.ArgumentParser, name: str, default: str) -> int:
     value = os.environ.get(name, default)
-    if not value.isdigit() or int(value) < 1:
+    if not value.isdecimal() or int(value) < 1:
         parser.error(f"{name} must be a positive integer, got {value!r}")
     return int(value)
 
@@ -71,9 +72,7 @@ async def ensure_user(
     root: IggyClient, username: str, permissions: Permissions
 ) -> None:
     if await root.get_user(username) is None:
-        await root.create_user(
-            username, TENANT_PASSWORD, status=UserStatus.Active, permissions=permissions
-        )
+        await root.create_user(username, TENANT_PASSWORD, permissions=permissions)
         logger.info(f"Created user {username}")
         return
 
@@ -116,9 +115,9 @@ async def ensure_stream_access(
 
 def tenant_connection_string(root_connection_string: str, username: str) -> str:
     # Each tenant signs in as its own user, so only the credentials change. The
-    # SDK splits them on ':' and '@' without decoding percent escapes, so they
-    # go in as they are.
-    url = urllib.parse.urlsplit(root_connection_string)
-    address = url.netloc.rpartition("@")[2]
-    netloc = f"{username}:{TENANT_PASSWORD}@{address}"
-    return urllib.parse.urlunsplit(url._replace(netloc=netloc))
+    # string is split the way the SDK parser splits it, at "://" and at "@", so
+    # a root password with "/", "?" or "#" keeps the address intact. The SDK
+    # does not decode percent escapes, so the credentials go in as they are.
+    scheme, _, rest = root_connection_string.partition("://")
+    address = rest.rpartition("@")[2]
+    return f"{scheme}://{username}:{TENANT_PASSWORD}@{address}"

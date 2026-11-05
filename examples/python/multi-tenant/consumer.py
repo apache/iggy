@@ -25,7 +25,6 @@ from apache_iggy import (
     Permissions,
     PollingStrategy,
     PollOptions,
-    StreamDetails,
     StreamPermissions,
 )
 from loguru import logger
@@ -53,7 +52,10 @@ class ArgNamespace:
 
 
 def parse_args() -> ArgNamespace:
-    parser = build_parser()
+    parser = build_parser(
+        "TENANTS_COUNT sets the number of tenants (default 3). "
+        "TENANT_ID sets the tenant that the consumer reads (default 1)."
+    )
     args = parser.parse_args()
     tenants_count = read_positive_int(parser, "TENANTS_COUNT", "3")
     tenant_id = read_positive_int(parser, "TENANT_ID", "1")
@@ -84,12 +86,13 @@ async def main() -> None:
 
 async def create_consumer_user(root: IggyClient, tenant_id: int) -> None:
     name = stream_name(tenant_id)
-    stream: StreamDetails | None = await root.get_stream(name)
+    stream = await root.get_stream(name)
     if stream is None:
         raise RuntimeError(f"Stream {name} does not exist, run the producer first")
 
-    # Reading the stream includes polling its topics and storing consumer
-    # offsets, but not sending messages or changing topics.
+    # Reading the stream includes polling its topics, storing consumer offsets,
+    # and creating or deleting consumer groups in the stream. It does not allow
+    # sending messages or changing topics.
     permissions = Permissions(streams={stream.id: StreamPermissions(read_stream=True)})
     await ensure_user(root, consumer_username(tenant_id), permissions)
 

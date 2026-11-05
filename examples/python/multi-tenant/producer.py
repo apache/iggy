@@ -18,7 +18,7 @@
 import asyncio
 from dataclasses import dataclass
 
-from apache_iggy import IggyClient, Permissions, StreamDetails, StreamPermissions
+from apache_iggy import IggyClient, Permissions, StreamPermissions
 from apache_iggy import SendMessage as Message
 from loguru import logger
 from tenants import (
@@ -44,7 +44,7 @@ class ArgNamespace:
 
 
 def parse_args() -> ArgNamespace:
-    parser = build_parser()
+    parser = build_parser("TENANTS_COUNT sets the number of tenants (default 3).")
     args = parser.parse_args()
     tenants_count = read_positive_int(parser, "TENANTS_COUNT", "3")
     return ArgNamespace(args.connection_string, tenants_count)
@@ -72,7 +72,7 @@ async def main() -> None:
 
 async def create_stream_and_user(root: IggyClient, tenant_id: int) -> None:
     name = stream_name(tenant_id)
-    stream: StreamDetails | None = await root.get_stream(name)
+    stream = await root.get_stream(name)
     if stream is None:
         stream = await root.create_stream(name=name)
         logger.info(f"Created stream {name} with ID {stream.id}")
