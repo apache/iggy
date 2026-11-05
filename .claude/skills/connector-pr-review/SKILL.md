@@ -52,11 +52,16 @@ Plain `String` for a credential is a review-blocker. Pattern:
       (template default `max_delivery_time = 20s`). When it runs out the sink
       stops, counts every undelivered message as failed, logs the stream, topic,
       partition and offset range, and returns the error (see `connector-sink`
-      Delivery budget). Permanent and unclassified errors only affect their own
-      chunk.
+      Delivery budget). At most once, permanent and unclassified errors only
+      affect their own chunk.
 - [ ] An open circuit breaker is waited out inside the budget, never answered
-      with an immediate error: the offset is already stored, so a refused batch
-      is lost.
+      with an immediate error: by default the offset is already stored, so a
+      refused batch is lost.
+- [ ] A sink that accepts `[delivery] guarantee = "at_least_once"`
+      (`enable_at_least_once()` returns `Ok`; the SDK default refuses) never
+      skips a message. A permanent rejection fails the call so the runtime
+      stops the sink at that offset, and a sink that buffers across calls
+      proves delivery in `flush()`.
 - [ ] README must not claim "no data loss" / strong idempotency unless the
       backend + runtime path actually enforce it.
 
@@ -336,10 +341,12 @@ Every new connector README must answer in one short paragraph:
 1. **What happens on transient failure?** (retry N times, then Err)
 2. **What happens on permanent failure?** (drop/skip vs fail batch)
 3. **What is the duplication window?** (sources: at-least-once because state
-   saves after Iggy send. Sinks: at-most-once from Iggy, because the server
-   stores the offset when it answers the poll and the runtime never redelivers
-   a failed batch, so say what a failed batch costs and where your own retries
-   can duplicate)
+   saves after Iggy send. Sinks: at-most-once from Iggy by default, because the
+   server stores the offset when it answers the poll and the runtime never
+   redelivers a failed batch, so say what a failed batch costs and where your
+   own retries can duplicate. With `[delivery] guarantee = "at_least_once"` the
+   runtime redelivers a failed call, so say that duplicates are expected and
+   what the write is idempotent on)
 4. **What is the dedup key?** (or "none — duplicates possible")
 
 If the answer is hand-wavy, the PR is not ready.

@@ -87,13 +87,20 @@ The two sides of a connector differ:
 
 - **Sources** are at-least-once. State is saved after the Iggy send, and a
   failed batch is re-polled.
-- **Sinks** are at-most-once from Iggy. The server stores the consumer
-  offset when it answers the poll, before the plugin sees the messages.
-  The runtime logs and counts an `Err` from `consume()` and fetches the
-  next batch; it never redelivers the failed one. Return `Err` for a failed
-  batch so it is logged and counted, but do not expect it to be retried.
-  The only second chance a batch gets is the retrying the plugin does
-  itself.
+- **Sinks** are at-most-once from Iggy by default. The server stores the
+  consumer offset when it answers the poll, before the plugin sees the
+  messages. The runtime logs and counts an `Err` from `consume()` and
+  fetches the next batch; it never redelivers the failed one. Return `Err`
+  for a failed batch so it is logged and counted, but do not expect it to
+  be retried. The only second chance a batch gets is the retrying the
+  plugin does itself.
+- A sink whose connector config has `[delivery] guarantee =
+  "at_least_once"` is at-least-once instead. The runtime stores the offset
+  of a partition only after the plugin proved the messages delivered, hands
+  a failed call over again, and stops the sink at the offset of a permanent
+  failure. See [Sink delivery guarantees](../runtime/README.md#sink-delivery-guarantees).
+  A sink configured for it with a plugin that does not support it refuses
+  to start.
 
 ### Source-specific
 
@@ -136,10 +143,21 @@ calls `on_batch_result(SourceBatchResult::Ack | Nack)`. Only
   round, and keep the cool-down shorter than the budget.
 - **When you give up, say what was lost.** Log the stream, topic,
   partition and offset range, count the messages as failed, and stop
-  instead of attempting the rest of the call. An operator can replay that
-  range from Iggy.
-- Skip a permanent error's chunk without opening the breaker. A data
-  problem says nothing about whether the destination is up.
+  instead of attempting the rest of the call. At most once, an operator
+  can replay that range from Iggy. At least once, the runtime hands the
+  failed call over again.
+- Never open the breaker for a permanent error. A data problem says
+  nothing about whether the destination is up. At most once, skip that
+  error's chunk. At least once, fail the call instead, because the runtime
+  stores the offset past every message of a successful call and a skipped
+  chunk would be lost for good.
+- **Decide on at-least-once.** `enable_at_least_once()` runs when the sink
+  is configured for it, and the default returns `Error::Unsupported`, so a
+  sink refuses the mode until it overrides the method. Accept only if a
+  successful `consume()` proves the destination has every message, as it
+  does for a sink that writes inside `consume()`, and fail the call for a
+  permanent rejection instead of skipping it. A sink that buffers across
+  calls also implements `flush()` and keeps buffers per topic and partition.
 - **Make the destination idempotent.** Retries, replays and a server
   failover all repeat messages. Key writes on `stream:topic:partition:offset`
   (or a natural backend key), which names a log position for good and never
@@ -211,6 +229,7 @@ touch unrelated foreign SDKs in the same PR.
 [ ] Transient vs permanent errors mapped (no Display substring matching)
 [ ] Sinks: one delivery time budget per consume(); breaker paces attempts and never discards a batch; cool-down shorter than the budget; offset range logged when giving up
 [ ] Sinks: writes idempotent on stream:topic:partition:offset (or a natural key); no random UUID per emit
+[ ] Sinks: at-least-once either left refused (the default) or supported (a permanent rejection fails the call and is never skipped, buffered writes proved by flush)
 [ ] README delivery semantics paragraph present and honest
 [ ] README defaults match code consts
 [ ] deny_unknown_fields on plugin config

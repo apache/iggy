@@ -56,3 +56,10 @@ circuit_breaker_cool_down = "10s"
 # well under a minute: the call blocks a runtime worker thread, and a stop waits for it.
 max_delivery_time = "20s"
 verbose_logging = false
+
+# Delivery guarantee (a table of the connector config, not of `plugin_config`). By default the
+# server stores the offset when it answers a poll, so a batch that `consume()` fails is lost.
+# With "at_least_once" the runtime stores it after `consume()` succeeds and hands a failed
+# batch over again; a permanent rejection then stops the sink at that offset.
+# [delivery]
+# guarantee = "at_least_once"

@@ -34,11 +34,12 @@ with the destination or source system being integrated:
 - **Config knobs with drifting names.** `retry_max_delay` here,
   `max_retry_delay` there, `request_timeout` somewhere else, for the
   same concept.
-- **Sinks that quietly lose data.** The server stores a sink's consumer
-  offset when it answers the poll, so the runtime never redelivers a batch
-  after `consume()` fails. A sink has to keep trying inside the call, say
-  exactly what it gave up on, and write idempotently, and the first
-  version of most sinks does none of these.
+- **Sinks that quietly lose data.** By default the server stores a sink's
+  consumer offset when it answers the poll, so the runtime never redelivers
+  a batch after `consume()` fails, unless the sink opts into
+  `[delivery] guarantee = "at_least_once"`. A sink has to keep trying inside
+  the call, say exactly what it gave up on, and write idempotently, and the
+  first version of most sinks does none of these.
 - **Missing canonical tests.** State restore/round-trip and ACK/NACK
   commit/discard behavior left untested because nobody had a reference
   test suite to copy.

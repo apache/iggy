@@ -133,7 +133,7 @@ Per `[[streams]]` entry per sink:
 
 1. Build / ensure consumer group `iggy-connect-sink-{key}` (`connect` matches the docker image name `apache/iggy-connect` - see `runtime/src/sink.rs::default_consumer_group`). Overridable via the stream config's `consumer_group`.
 2. Spawn one task per topic (`spawn_consume_tasks`).
-3. Poll Iggy → batch messages (default `batch_length = 1000`, the poll `count`). Polls use `CommitPolicy::OnRead`: the server stores the offset of each reply, so a reply lost after that store skips its batch. A `consumer.next()` `Err` (a `ReadError`) bumps `errors` and `continue`s.
+3. Poll Iggy → batch messages (default `batch_length = 1000`, the poll `count`). By default polls use `CommitPolicy::OnRead`: the server stores the offset of each reply, so a reply lost after that store skips its batch. A sink with `[delivery] guarantee = "at_least_once"` polls without storing, and the runtime stores an offset only after the plugin proved the messages delivered (`runtime/src/sink_delivery.rs`). A `consumer.next()` `Err` (a `ReadError`) bumps `errors` and `continue`s.
    The reader retries most errors by itself. For a partition that it stops, `handle_read_error` seeks: after a read with an unknown outcome (`FetchProgressUncertain`, `PartitionLaneBlocked`) it first calls `abandon_operation` and then seeks `Next` (after the stored offset). It seeks the `skip` of a message that does not decode, and `Next` after `HistoryUnavailable`.
 
    It also seeks `Next` after six refusals in a row that a retry does not change (`ReadError::is_lasting_refusal`: `Unauthorized`, a missing stream, topic or partition, and the other lasting refusals). A seek to `Next` stores nothing, so it works while the refusal lasts.
@@ -150,7 +150,7 @@ Stages (both labels snake_case): `decode` (schema decode loop), `prepare` (trans
 Gotchas:
 
 - Batch flushes when a message is the last one in its partition (`message_offset == current_offset`), when the batch is full, OR before a message of another partition, because the plugin gets one partition id per batch. `max_wait` and `min_count` on the stream make the server collect larger replies.
-- The server stores the offset on read (`OnRead`), so sink delivery is at-most-once while the primary stays up: a crash after the poll and before the plugin write loses that batch. A failover before the store replicates can deliver the last batch again.
+- By default the server stores the offset on read (`OnRead`), so sink delivery is at-most-once while the primary stays up (a sink with `[delivery] guarantee = "at_least_once"` is the exception): a crash after the poll and before the plugin write loses that batch. A failover before the store replicates can deliver the last batch again.
 - A stop still flushes the batch the loop holds, and the task then awaits `IggyConsumer::shutdown`, which rewinds over the batches the consumer holds. Without either step, the next run skips messages that the polls committed.
 
 ## Logging format

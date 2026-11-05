@@ -12,11 +12,14 @@ blog post for the checklist this template is built against.
 Read this before you write `push_batch()`. It is the contract the template is
 built on, and it is not the one most message consumers expect.
 
-The runtime polls Iggy for the sink using deferred (long) polling. **The server
-stores the consumer offset when it answers a poll, before your plugin sees the
-messages.** The runtime then calls `consume()`, and if that returns an error it
-logs and counts it and moves on to the next batch. It never fetches the failed
-batch again. So:
+The runtime polls Iggy for the sink using deferred (long) polling. What happens
+to the offset and to a failed batch depends on the `[delivery]` table of the
+sink's connector config (see [Delivery mode](#delivery-mode)).
+
+**By default (`at_most_once`), the server stores the consumer offset when it
+answers a poll, before your plugin sees the messages.** The runtime then calls
+`consume()`, and if that returns an error it logs and counts it and moves on to
+the next batch. It never fetches the failed batch again. So:
 
 - From Iggy to your plugin, delivery is **at-most-once**. The only second
   chance a batch gets is whatever your plugin does inside `consume()`.
@@ -24,6 +27,13 @@ batch again. So:
   (default `20s`) before it gives up.
 - Giving up loses that batch from the destination's point of view. The messages
   are still in the Iggy topic, and the log line says which offsets to replay.
+
+**With `guarantee = "at_least_once"`, the runtime stores no offset on read.** It
+stores the offset of a partition only after `consume()` returned `Ok`. The
+template writes inside `consume()`, so the default no-op `flush()` is enough and
+`enable_at_least_once()` accepts the mode. A failed call is handed over again,
+and a message can arrive more than once, but none is skipped. A permanent
+failure stops the sink at that offset instead of skipping the batch.
 
 What `consume()` does with each chunk of up to `batch_size` messages, in order:
 
@@ -34,15 +44,18 @@ What `consume()` does with each chunk of up to `batch_size` messages, in order:
 3. A transient error (`HttpRequestFailed`, `Connection`, `CannotStoreData`)
    counts as one failed round toward the breaker. It waits with jittered
    exponential backoff (`retry_delay` up to `retry_max_delay`) and tries again.
-4. A permanent error (`PermanentHttpError`) skips that chunk, counts it and goes
-   on to the next one. It never touches the breaker, because bad data says
-   nothing about whether the destination is up.
+4. A permanent error (`PermanentHttpError`) never touches the breaker, because
+   bad data says nothing about whether the destination is up. At most once, the
+   chunk is skipped, counted, and the next one is tried. At least once, skipping
+   would let the stored offset pass an undelivered message, so `consume()` stops
+   at that chunk, counts it and every later message as failed, and returns the
+   error. The runtime then stops the sink at that offset.
 5. Any other error is not retried. The chunk is counted as failed, the error is
    returned at the end, and the remaining chunks are still tried.
 6. When `max_delivery_time` runs out on a transient error, `consume()` stops,
    does not attempt the remaining chunks, counts every undelivered message as
    failed and logs, at `error` level, the stream, topic, partition and offset
-   range it gave up on.
+   range it gave up on. At least once, the runtime hands that range over again.
 
 The budget covers the whole `consume()` call, not each chunk.
 
@@ -51,15 +64,20 @@ The budget covers the whole `consume()` call, not each chunk.
 Every connector README has to answer these four questions. For this template:
 
 1. **Transient failure**: the chunk is retried with backoff for up to
-   `max_delivery_time`. After that `consume()` returns the error and the
-   messages from that chunk onward are lost to the destination. The runtime logs
-   the error and keeps polling.
+   `max_delivery_time`. After that `consume()` returns the error. At most once,
+   the messages from that chunk onward are lost to the destination and the
+   runtime keeps polling. At least once, the runtime hands them over again after
+   its own backoff.
 2. **Permanent failure** (bad schema, the destination rejects the payload
-   shape): that chunk is skipped and counted. The breaker is not affected.
-3. **Duplication window**: at-most-once from Iggy to the plugin, for the reason
-   above. Duplicates come from your own retries (a request that failed part way
-   through a write), from replaying an offset range after a logged loss, and
-   from a server failover before the stored offset replicated.
+   shape): the breaker is not affected. At most once, that chunk is skipped and
+   counted. At least once, the sink stops at that offset until you fix the
+   cause and restart it.
+3. **Duplication window**: at-most-once by default, for the reason above, and
+   at-least-once with `[delivery]`. Duplicates come from your own retries (a
+   request that failed part way through a write), from redelivery of a call
+   that failed after some of its chunks were written, from replaying an offset
+   range after a logged loss, and from a server failover before the stored
+   offset replicated.
 4. **Dedup key**: none by default, because `push_batch()` is a stub. The
    `dedup_key()` helper builds `stream:topic:partition:offset`. Make your
    destination's write idempotent on it (upsert, `ON CONFLICT`, unique index),
@@ -78,10 +96,31 @@ produced at different offsets collapsed.
 
 ### Recovering after a logged loss
 
-The error log names the partition and an offset range such as `1200..=1299`.
-Move the consumer group's offset on that partition back to the first offset and
-let the connector run. Because the writes are idempotent, anything that did reach
-the destination is overwritten with identical data.
+At most once, the error log names the partition and an offset range such as
+`1200..=1299`. Move the consumer group's offset on that partition back to the
+first offset and let the connector run. Because the writes are idempotent,
+anything that did reach the destination is overwritten with identical data.
+
+At least once, nothing needs replaying after a transient outage. After a
+permanent rejection the sink stops and the error names the stream, topic,
+partition and offset. Fix the cause and restart the sink, or move the stored
+offset past the rejected message as the
+[runtime README](../../runtime/README.md#sink-delivery-guarantees) describes.
+
+### Delivery mode
+
+`[delivery]` goes in the sink's connector config, next to `[plugin_config]`, not
+inside it:
+
+```toml
+[delivery]
+guarantee = "at_least_once"  # default "at_most_once"
+```
+
+The runtime README lists the other fields (`retry_max_attempts`,
+`flush_interval`, `invalid_messages` and the rest). The mode only holds for
+messages the server still has, so use topic `durability = "persisted"` and a
+retention longer than the longest expected outage.
 
 ## Configuration
 
@@ -134,18 +173,24 @@ Batching from Iggy is set in the `[[streams]]` entry, not in the plugin:
 
 Waiting for a full batch means fewer, larger writes, and an idle topic costs one
 request to the server per `max_wait`. The cost is up to `max_wait` of latency on
-a quiet topic, and a bigger batch is a bigger loss if the destination is down for
-longer than `max_delivery_time`. `min_count` must not exceed `batch_length`,
+a quiet topic, and at most once a bigger batch is a bigger loss if the
+destination is down for longer than `max_delivery_time`. `min_count` must not exceed `batch_length`,
 `max_wait` must be above zero, and the server caps it at 30 s. `poll_interval`
 no longer exists for sinks; the runtime refuses to start a sink that sets it.
 
 ## Known limits
 
-- **A crash between the poll and the write loses that batch.** The offset is
-  already stored. Only an idempotent replay recovers it.
-- **A long outage loses one batch per `max_delivery_time`.** Each give-up is
-  logged with its offsets. True zero loss needs a runtime change, such as storing
-  the offset only after `consume()` succeeds. That is not part of this template.
+- **At most once, a crash between the poll and the write loses that batch.** The
+  offset is already stored. Only an idempotent replay recovers it. Set
+  `guarantee = "at_least_once"` to avoid it.
+- **At most once, a long outage loses one batch per `max_delivery_time`.** Each
+  give-up is logged with its offsets. At least once, the runtime hands the batch
+  over again instead.
+- **At least once, a permanent rejection stops the sink.** It stays stopped at
+  that message until you fix the cause or move the stored offset past it.
+- **At least once, a failed call repeats its whole batch.** Chunks written before
+  the failure are written again, which is why the write must be idempotent on
+  `dedup_key()`.
 - **`consume()` blocks a runtime worker thread.** The call is synchronous inside
   the runtime, and the runtime has one worker per CPU core by default. If as many
   sink topics as there are cores wait on a dead destination at once, the HTTP
@@ -171,6 +216,8 @@ no longer exists for sinks; the runtime refuses to start a sink that sets it.
 - The delivery loop described above, with the breaker used as a pacing device and
   failures recorded once per round.
 - Batching: `consume()` chunks the incoming messages by `batch_size`.
+- Support for the runtime's at-least-once mode: `enable_at_least_once()`, and a
+  permanent rejection that fails the call instead of skipping the chunk.
 - Failure accounting: written and failed counters, and an `error` log with the
   offset range of anything that was given up on or skipped.
 - `dedup_key()`, a stable per-message key.
@@ -179,7 +226,7 @@ no longer exists for sinks; the runtime refuses to start a sink that sets it.
 - `verbose_logging` upgrading the per-batch log line from `debug!` to `info!`.
 - Unit tests for config validation, the delivery loop (recovery, giving up,
   attempt bounds, no calls while the breaker is open, permanent and unclassified
-  errors), the cool-down rule and the dedup key.
+  errors in both delivery modes), the cool-down rule and the dedup key.
 
 ## What you need to fill in
 
@@ -189,8 +236,8 @@ and two more are conditional or documentation:
 **`push_batch()`** (required): send one chunk to your destination using
 `self.config.connection_string` and `self.config.target` (already validated), via
 `self.client` (already retry-wrapped). The error you return steers the loop:
-transient errors are retried, `PermanentHttpError` skips the chunk, anything else
-is not retried. Use `message.payload.try_to_bytes()` and do not clone
+transient errors are retried, `PermanentHttpError` skips the chunk (and stops the
+sink at least once), anything else is not retried. Use `message.payload.try_to_bytes()` and do not clone
 `Payload::Json`. If the destination's call can succeed at the transport level
 while rejecting rows (a bulk API answering 200 with per-item errors), count the
 accepted rows yourself and return an error when none were accepted. Do not return

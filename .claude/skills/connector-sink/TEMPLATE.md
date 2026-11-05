@@ -18,13 +18,19 @@ crate is more scaffolding than you need.
 
 ## The delivery contract this kit is built on
 
-The server stores a sink's consumer offset when it answers the poll, before
-`consume()` runs, and the runtime never redelivers a batch after `consume()`
-returns an error. So delivery from Iggy is at-most-once, and the retrying the
-plugin does inside `consume()` is the only second chance a batch gets. The
-skeleton below therefore keeps trying a batch within one time budget
+By default the server stores a sink's consumer offset when it answers the poll,
+before `consume()` runs, and the runtime never redelivers a batch after
+`consume()` returns an error. So delivery from Iggy is at-most-once, and the
+retrying the plugin does inside `consume()` is the only second chance a batch
+gets. The skeleton below therefore keeps trying a batch within one time budget
 (`max_delivery_time`), logs the offset range it gives up on, and leaves
 idempotent writes to you.
+
+The skeleton skips a chunk the backend rejects for good, so it does not
+override `enable_at_least_once()`, and a sink configured with
+`[delivery] guarantee = "at_least_once"` refuses to start. To support that
+mode, copy `deliver_messages()` and `enable_at_least_once()` from
+`sinks/sink_template`, which fail the call instead of skipping.
 
 ## Files to create
 
@@ -501,9 +507,9 @@ Your README must include a **Delivery semantics** section answering:
 1. Transient failure behavior (retried with backoff within `max_delivery_time`,
    then given up on, with the offset range logged)
 2. Permanent failure behavior (skip the chunk and count it, or fail)
-3. Duplication window (a sink is at-most-once from Iggy because the offset is
-   stored when the poll is answered; say where your own retries, replays and
-   failovers can duplicate)
+3. Duplication window (a sink is at-most-once from Iggy by default because the
+   offset is stored when the poll is answered; say where your own retries,
+   replays and failovers can duplicate)
 4. Dedup key (`stream:topic:partition:offset`, a natural backend key, or "none —
    duplicates possible")
 

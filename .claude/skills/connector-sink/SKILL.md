@@ -68,15 +68,17 @@ for getting them to the external system reliably and efficiently.
 
 ### Errors
 
-| Scenario                                   | SDK variant                                                                 | Retry?                                   |
-| ------------------------------------------ | --------------------------------------------------------------------------- | ---------------------------------------- |
-| Init / connectivity failure                | `Error::InitError`                                                          | n/a (fails open)                         |
-| Bad config value                           | `Error::InvalidConfigValue(field)`                                          | n/a                                      |
-| Single-message validation failure          | `Error::InvalidRecordValue(reason)`                                         | no - skip + log                          |
-| Transient backend (5xx, conn reset, ...)   | `Error::HttpRequestFailed` / `Error::Connection` / `Error::CannotStoreData` | yes                                      |
-| Permanent 4xx, schema mismatch, constraint | `Error::PermanentHttpError` / `Error::SchemaMismatch`                       | **no** - retrying trips circuit breakers |
-| I/O failure mid-write (parquet/iceberg)    | `Error::WriteFailure`                                                       | caller decides                           |
-| Catalog commit failure (Iceberg)           | `Error::CatalogCommitError`                                                 | **no - not idempotent**                  |
+| Scenario                                   | SDK variant                                                                 | Retry?                                                                   |
+| ------------------------------------------ | --------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| Init / connectivity failure                | `Error::InitError`                                                          | n/a (fails open)                                                         |
+| Bad config value                           | `Error::InvalidConfigValue(field)`                                          | n/a                                                                      |
+| Single-message validation failure          | `Error::InvalidRecordValue(reason)`                                         | no - skip + log; under at-least-once, fail the call (stops the sink)     |
+| Transient backend (5xx, conn reset, ...)   | `Error::HttpRequestFailed` / `Error::Connection` / `Error::CannotStoreData` | yes                                                                      |
+| Permanent 4xx, schema mismatch, constraint | `Error::PermanentHttpError` / `Error::SchemaMismatch`                       | **no** - retrying trips circuit breakers                                 |
+| I/O failure mid-write (parquet/iceberg)    | `Error::WriteFailure`                                                       | caller decides                                                           |
+| Catalog commit failure (Iceberg)           | `Error::CatalogCommitError`                                                 | not in place (txn consumed); under at-least-once, the runtime redelivers |
+
+`Error::is_permanent()` (`sdk/src/lib.rs`) is the class the runtime acts on for an at-least-once sink: a permanent error stops the delivery, a transient one hands the messages over again. `CatalogCommitError` is transient there, because the redelivered messages rebuild the transaction, and a commit that did land shows up as a duplicate, which at-least-once allows.
 
 ### Retry
 
@@ -89,17 +91,25 @@ for getting them to the external system reliably and efficiently.
 
 ### Delivery budget
 
-The server stores the offset when it answers the poll and the runtime never redelivers a batch after `Err` (see `connector-runtime`), so what `consume()` does inside one call is all the safety a batch gets. `sinks/sink_template` is the reference implementation.
+By default the server stores the offset when it answers the poll and the runtime never redelivers a batch after `Err` (see `connector-runtime`), so what `consume()` does inside one call is all the safety a batch gets. `sinks/sink_template` is the reference implementation. With `[delivery] guarantee = "at_least_once"` the runtime redelivers a failed call; see At-least-once below.
 
 - **One time budget per call** (`max_delivery_time`, template default `20s`), shared by all chunks. `consume()` is a synchronous FFI call that blocks a runtime worker thread (one per CPU core by default), and a stop waits for it (the runtime's close budget is the poll timeout plus 60 s). Keep the budget well under a minute.
-- **Retry only transient errors** (`HttpRequestFailed`, `Connection`, `CannotStoreData`), with jittered backoff (`retry_backoff`). Skip a `PermanentHttpError` chunk without retrying and without touching the breaker. Do not retry anything unclassified.
+- **Retry only transient errors** (`HttpRequestFailed`, `Connection`, `CannotStoreData`), with jittered backoff (`retry_backoff`). Never retry a `PermanentHttpError` or touch the breaker for it. At most once, skip that chunk; at least once, fail the call (see below). Do not retry anything unclassified.
 - **The circuit breaker paces attempts; it does not discard batches.** While it is open, wait for the cool-down rather than returning an error, because a refused batch is gone. Record one failure per failed round. The SDK breaker resets completely after its cool-down and needs `threshold` new failures to reopen, so keep the threshold small (template default 3). Keep the cool-down shorter than the budget and reject a config that breaks that in `open()`.
-- **When the budget runs out, stop.** Do not attempt the remaining chunks. Count every undelivered message as failed, log the stream, topic, partition and offset range at `error!`, and return the error. The messages are still in Iggy, so an operator can replay that range.
+- **When the budget runs out, stop.** Do not attempt the remaining chunks. Count every undelivered message as failed, log the stream, topic, partition and offset range at `error!`, and return the error. The messages are still in Iggy, so at most once an operator can replay that range, and at least once the runtime hands them over again.
 - **Stream settings are part of the design.** `[[streams]]` takes `batch_length`, `min_count` and `max_wait` (which replace `poll_interval`; a sink that sets it fails to start). Waiting for full batches (`min_count = batch_length`) means fewer, larger writes to the destination.
+
+### At-least-once
+
+A sink configured with `[delivery] guarantee = "at_least_once"` gets `enable_at_least_once()` once after `open()`. The SDK default returns `Error::Unsupported`, so the sink refuses to start until it overrides the method.
+
+- **Accept only if a successful `consume()` proves delivery.** A sink that writes inside `consume()` keeps the default no-op `flush()`. A sink that buffers across calls implements `flush()`, which must make every accepted message of the listed partitions durable, and keeps its buffers per topic and partition because topics run concurrently.
+- **Never skip a message.** The runtime stores the offset past every message of a successful call, so a skipped chunk is lost for good. Fail the call for a permanent rejection (`is_permanent()` errors stop the sink at that offset; transient ones are handed over again with backoff). `sinks/sink_template` does this in `deliver_messages()`.
+- **Expect duplicates.** A failed call repeats its whole batch, including chunks already written, and the same stream, topic, partition and offset can arrive again.
 
 ### Idempotency
 
-The runtime does not retry or redeliver a batch after `Err`: it logs and counts the error and keeps polling, and the server already stored the offset when it answered the poll (at-most-once from Iggy). Duplicates come from a plugin's own retries and from a failover before the stored offset replicates. In-tree guarantees:
+By default the runtime does not retry or redeliver a batch after `Err`: it logs and counts the error and keeps polling, and the server already stored the offset when it answered the poll (at-most-once from Iggy). At least once it does redeliver, so duplicates are certain rather than rare. Duplicates come from a plugin's own retries, from redelivery and from a failover before the stored offset replicates. In-tree guarantees:
 
 - **Postgres** (`postgres_sink::build_batch_insert_query`): PK on `id`, but plain `INSERT` (no `ON CONFLICT`). Duplicate retry triggers `23505`, `is_transient_error` does NOT mark it transient -> error propagates. Adding `ON CONFLICT (id) DO NOTHING` is a known improvement.
 - **MongoDB**: composite `_id` from `stream:topic:partition:message_id`, via `insert_many(docs).ordered(false)`. Per-document duplicate-key errors don't abort the batch - effective idempotency under retry.
@@ -133,12 +143,12 @@ Use literal API field names as labels (`offset=`, `current_offset=`).
 2. Cloning the whole `Payload::Json` to serialize - use `try_to_bytes(&self)`.
 3. Holding `Mutex` across `.await` when the locked region does I/O.
 4. `&mut self` on `consume` - won't compile. you need interior mutability.
-5. Dropping the rest of a call silently when one chunk fails. After the budget runs out, count and log every undelivered message with its offset range. Permanent and unclassified errors only affect their own chunk, so keep going and return the last error.
+5. Dropping the rest of a call silently when one chunk fails. After the budget runs out, count and log every undelivered message with its offset range. At most once, permanent and unclassified errors only affect their own chunk, so keep going and return the last error. At least once, stop at a permanent error.
 6. Forgetting to map `PermanentHttpError` - retries hammer the backend with bad data.
 7. Mutating config in `consume()` - config is a snapshot from `new()`. Reload requires runtime restart.
 8. Logging the connection string. Redact at construction: `http_sink::sanitize_url_for_log` populates `HttpSink.log_url`.
-9. Returning an error from `consume()` expecting a retry. The runtime logs it and moves on; the batch is not redelivered.
-10. Refusing batches while the circuit breaker is open. The offset is already stored, so that discards them. Wait out the cool-down inside the budget instead.
+9. Returning an error from `consume()` expecting a retry. By default the runtime logs it and moves on; the batch is not redelivered. Only a sink configured for at-least-once gets the call handed over again.
+10. Refusing batches while the circuit breaker is open. By default the offset is already stored, so that discards them. Wait out the cool-down inside the budget instead.
 
 ## Tests
 

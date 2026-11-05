@@ -25,12 +25,16 @@
 //! are chunked by a configurable batch size instead of shipped as one
 //! unbounded request.
 //!
-//! Delivery follows the runtime's contract. The server stores the offset when
-//! it answers the poll, and the runtime never redelivers a batch after an
-//! error, so `consume()` keeps trying a batch for up to `max_delivery_time`
-//! before it gives up and logs the lost offset range. The circuit breaker only
-//! paces those attempts; it never discards a batch. Writes must be idempotent
-//! on `dedup_key()`, because replays and failovers can repeat a message.
+//! Delivery follows the sink's `[delivery]` table. By default the server stores
+//! the offset when it answers the poll and the runtime never redelivers a
+//! batch after an error, so `consume()` keeps trying a batch for up to
+//! `max_delivery_time` before it gives up and logs the lost offset range. With
+//! `guarantee = "at_least_once"` the runtime stores the offset only after
+//! `consume()` succeeds, hands a failed batch over again, and stops the sink on
+//! a permanent error instead of skipping the batch. The circuit breaker only
+//! paces the attempts; it never discards a batch. Writes must be idempotent on
+//! `dedup_key()`, because retries, redelivery and failovers can repeat a
+//! message.
 //!
 //! There is exactly **one** place you need to write code, marked
 //! `TODO(ConnectorDeveloper)`: `TemplateSink::push_batch()` — build the
@@ -77,6 +81,10 @@ use tracing::{debug, error, info, warn};
 sink_connector!(TemplateSink);
 
 const CONNECTOR_NAME: &str = "Template sink";
+
+const REDELIVERY_AT_MOST_ONCE: &str =
+    "The runtime does not redeliver them; replay that range from Iggy to recover them.";
+const REDELIVERY_AT_LEAST_ONCE: &str = "The runtime hands them over again.";
 
 const DEFAULT_BATCH_SIZE: usize = 100;
 const DEFAULT_TIMEOUT: &str = "30s";
@@ -192,6 +200,7 @@ pub struct TemplateSink {
     retry_max_delay: Duration,
     cool_down: Duration,
     max_delivery_time: Duration,
+    at_least_once: bool,
     verbose: bool,
     state: Mutex<State>,
     records_written_total: AtomicU64,
@@ -229,6 +238,7 @@ impl TemplateSink {
             retry_max_delay,
             cool_down,
             max_delivery_time,
+            at_least_once: false,
             verbose,
             state: Mutex::new(State::default()),
             records_written_total: AtomicU64::new(0),
@@ -261,24 +271,31 @@ impl TemplateSink {
     ///   `Error::CannotStoreData` (network error, 5xx, timeout) are transient.
     ///   `consume()` retries the same chunk with backoff until
     ///   `max_delivery_time` runs out, and each failed round counts toward the
-    ///   circuit breaker.
+    ///   circuit breaker. At least once, the failed call then makes the
+    ///   runtime hand the batch over again.
     /// - `Error::PermanentHttpError` (bad schema, the destination rejects the
-    ///   payload shape) will never succeed. The chunk is skipped and counted,
-    ///   and the breaker is left alone, because a data problem says nothing
-    ///   about whether the destination is up. See the doc comment on that
-    ///   variant in `iggy_connector_sdk::Error`.
+    ///   payload shape) will never succeed, and the breaker is left alone,
+    ///   because a data problem says nothing about whether the destination is
+    ///   up. By default the chunk is skipped and counted. At least once, the
+    ///   call fails and the runtime stops the sink at that offset, since a
+    ///   skipped chunk would let the stored offset pass an undelivered
+    ///   message. See the doc comment on that variant in
+    ///   `iggy_connector_sdk::Error`.
     /// - Any other error is not retried. The chunk is counted as failed and
     ///   the error is returned once every chunk has been tried.
     ///
-    /// The runtime never redelivers a batch after an error, because the server
-    /// stored the offset when it answered the poll. The retries above are the
-    /// only second chance a batch gets, so from Iggy to this plugin delivery is
-    /// at-most-once. Duplicates come from those retries (a request that failed
-    /// part way through a write), from replaying an offset range after a
-    /// logged loss, and from a server failover before the stored offset
-    /// replicated. Build a stable key with `dedup_key()` below for every
-    /// message you write, and make the write idempotent on it (upsert /
-    /// `ON CONFLICT` / unique index) — see `connector-pr-review` B5.
+    /// By default the runtime never redelivers a batch after an error, because
+    /// the server stored the offset when it answered the poll. The retries
+    /// above are then the only second chance a batch gets, so from Iggy to this
+    /// plugin delivery is at-most-once. With `[delivery] guarantee =
+    /// "at_least_once"` the runtime stores the offset after `consume()`
+    /// succeeds and redelivers a failed batch. Duplicates come from the
+    /// retries (a request that failed part way through a write), from
+    /// redelivery, from replaying an offset range after a logged loss, and from
+    /// a server failover before the stored offset replicated. Build a stable
+    /// key with `dedup_key()` below for every message you write, and make the
+    /// write idempotent on it (upsert / `ON CONFLICT` / unique index) — see
+    /// `connector-pr-review` B5.
     ///
     /// If your destination's write call can succeed at the transport level
     /// while rejecting some or all rows individually (a bulk/batch API
@@ -308,6 +325,114 @@ impl TemplateSink {
              template_sink/src/lib.rs"
                 .to_string(),
         ))
+    }
+
+    /// Pushes `messages` in chunks of `batch_size_limit` through `push_chunk`, which receives
+    /// the index range of one chunk.
+    ///
+    /// All chunks share one delivery budget. A chunk the destination rejects for good is skipped
+    /// and counted, except in at-least-once mode, where skipping would let the runtime store
+    /// an offset past an undelivered message: the call fails and the runtime stops the sink.
+    async fn deliver_messages<F, Fut>(
+        &self,
+        topic_metadata: &TopicMetadata,
+        messages_metadata: &MessagesMetadata,
+        messages: &[ConsumedMessage],
+        push_chunk: F,
+    ) -> Result<(), Error>
+    where
+        F: Fn(std::ops::Range<usize>) -> Fut,
+        Fut: Future<Output = Result<(), Error>>,
+    {
+        // One budget for the whole call. With a dead destination every chunk would otherwise wait
+        // out a budget of its own, and the runtime is blocked on this call for all of them.
+        let deadline = Instant::now() + self.max_delivery_time;
+        let mut last_err: Option<Error> = None;
+        let mut written = 0u64;
+        let mut failed = 0u64;
+
+        for start in (0..messages.len()).step_by(self.batch_size_limit) {
+            let end = (start + self.batch_size_limit).min(messages.len());
+            let chunk = &messages[start..end];
+            let result = self
+                .deliver_chunk(deadline, || push_chunk(start..end))
+                .await;
+            match result {
+                Ok(()) => written += chunk.len() as u64,
+                Err(err @ Error::PermanentHttpError(_)) if self.at_least_once => {
+                    let undelivered = &messages[start..];
+                    failed += undelivered.len() as u64;
+                    error!(
+                        "{CONNECTOR_NAME} connector with ID: {} stops at {} messages (permanent),                          stream: {}, topic: {}, partition: {}, offsets {}. The stored offset stays                          below them. Cause: {err}",
+                        self.id,
+                        undelivered.len(),
+                        topic_metadata.stream,
+                        topic_metadata.topic,
+                        messages_metadata.partition_id,
+                        offset_range(undelivered)
+                    );
+                    last_err = Some(err);
+                    break;
+                }
+                Err(Error::PermanentHttpError(message)) => {
+                    failed += chunk.len() as u64;
+                    error!(
+                        "{CONNECTOR_NAME} connector with ID: {} skipping {} messages \
+                         (permanent), offsets {}: {message}",
+                        self.id,
+                        chunk.len(),
+                        offset_range(chunk)
+                    );
+                }
+                // The budget is spent, so the chunks after this one are not attempted either.
+                Err(err) if is_transient(&err) => {
+                    let undelivered = &messages[start..];
+                    failed += undelivered.len() as u64;
+                    let redelivery = if self.at_least_once {
+                        REDELIVERY_AT_LEAST_ONCE
+                    } else {
+                        REDELIVERY_AT_MOST_ONCE
+                    };
+                    error!(
+                        "{CONNECTOR_NAME} connector with ID: {} gave up on {} messages after \
+                         {:?}, stream: {}, topic: {}, partition: {}, offsets {}. {redelivery} \
+                         Cause: {err}",
+                        self.id,
+                        undelivered.len(),
+                        self.max_delivery_time,
+                        topic_metadata.stream,
+                        topic_metadata.topic,
+                        messages_metadata.partition_id,
+                        offset_range(undelivered)
+                    );
+                    last_err = Some(err);
+                    break;
+                }
+                Err(err) => {
+                    failed += chunk.len() as u64;
+                    error!(
+                        "{CONNECTOR_NAME} connector with ID: {} failed {} messages, offsets {}: \
+                         {err}",
+                        self.id,
+                        chunk.len(),
+                        offset_range(chunk)
+                    );
+                    last_err = Some(err);
+                }
+            }
+        }
+
+        let mut state = self.state.lock().await;
+        state.messages_written += written;
+        state.messages_failed += failed;
+        drop(state);
+        self.records_written_total
+            .fetch_add(written, Ordering::Relaxed);
+
+        match last_err {
+            None => Ok(()),
+            Some(err) => Err(err),
+        }
     }
 
     /// Runs `attempt` until it succeeds, fails for good, or `deadline` passes.
@@ -540,76 +665,19 @@ impl Sink for TemplateSink {
             Error::Connection("client not initialized -- was open() called?".into())
         })?;
 
-        // One budget for the whole call. With a dead destination every chunk would otherwise wait
-        // out a budget of its own, and the runtime is blocked on this call for all of them.
-        let deadline = Instant::now() + self.max_delivery_time;
-        let mut last_err: Option<Error> = None;
-        let mut written = 0u64;
-        let mut failed = 0u64;
+        self.deliver_messages(topic_metadata, &messages_metadata, &messages, |range| {
+            self.push_batch(client, topic_metadata, &messages_metadata, &messages[range])
+        })
+        .await
+    }
 
-        for (index, chunk) in messages.chunks(self.batch_size_limit).enumerate() {
-            let result = self
-                .deliver_chunk(deadline, || {
-                    self.push_batch(client, topic_metadata, &messages_metadata, chunk)
-                })
-                .await;
-            match result {
-                Ok(()) => written += chunk.len() as u64,
-                Err(Error::PermanentHttpError(message)) => {
-                    failed += chunk.len() as u64;
-                    error!(
-                        "{CONNECTOR_NAME} connector with ID: {} skipping {} messages \
-                         (permanent), offsets {}: {message}",
-                        self.id,
-                        chunk.len(),
-                        offset_range(chunk)
-                    );
-                }
-                // The budget is spent, so the chunks after this one are not attempted either.
-                Err(err) if is_transient(&err) => {
-                    let undelivered = &messages[index * self.batch_size_limit..];
-                    failed += undelivered.len() as u64;
-                    error!(
-                        "{CONNECTOR_NAME} connector with ID: {} gave up on {} messages after \
-                         {:?}, stream: {}, topic: {}, partition: {}, offsets {}. The runtime \
-                         does not redeliver them; replay that range from Iggy to recover \
-                         them. Cause: {err}",
-                        self.id,
-                        undelivered.len(),
-                        self.max_delivery_time,
-                        topic_metadata.stream,
-                        topic_metadata.topic,
-                        messages_metadata.partition_id,
-                        offset_range(undelivered)
-                    );
-                    last_err = Some(err);
-                    break;
-                }
-                Err(err) => {
-                    failed += chunk.len() as u64;
-                    error!(
-                        "{CONNECTOR_NAME} connector with ID: {} failed {} messages, offsets {}: \
-                         {err}",
-                        self.id,
-                        chunk.len(),
-                        offset_range(chunk)
-                    );
-                    last_err = Some(err);
-                }
-            }
-        }
-
-        let mut state = self.state.lock().await;
-        state.messages_written += written;
-        state.messages_failed += failed;
-        drop(state);
-        self.records_written_total
-            .fetch_add(written, Ordering::Relaxed);
-
-        match last_err {
-            None => Ok(()),
-            Some(err) => Err(err),
-        }
+    /// The SDK default refuses at-least-once. The template accepts because it writes inside
+    /// `consume()` and fails the call for anything it did not write, so `Ok` already proves
+    /// delivery and the default `flush` has nothing to do. Replace `push_batch()` with a
+    /// buffering write only together with a `flush()`.
+    fn enable_at_least_once(&mut self) -> Result<(), Error> {
+        self.at_least_once = true;
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -659,6 +727,59 @@ mod tests {
             sink.circuit_breaker.record_failure().await;
         }
         assert!(sink.circuit_breaker.is_open().await);
+    }
+
+    /// Delivers three one-message chunks where the second is rejected for good, and returns
+    /// the call result with the number of chunks that were attempted.
+    async fn deliver_with_rejected_second_chunk(sink: &TemplateSink) -> (Result<(), Error>, usize) {
+        let (topic_metadata, messages_metadata) = topic_and_messages_metadata();
+        let messages: Vec<_> = (0..3).map(consumed_message).collect();
+        let attempted = std::sync::atomic::AtomicUsize::new(0);
+        let result = sink
+            .deliver_messages(&topic_metadata, &messages_metadata, &messages, |range| {
+                attempted.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if range.start == 1 {
+                        Err(Error::PermanentHttpError("schema rejected".to_string()))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+        (result, attempted.load(Ordering::SeqCst))
+    }
+
+    fn single_message_chunks_sink() -> TemplateSink {
+        let mut config = test_config();
+        config.batch_size = Some(1);
+        TemplateSink::new(1, config)
+    }
+
+    #[tokio::test]
+    async fn given_at_most_once_when_a_chunk_is_rejected_for_good_should_skip_it_and_go_on() {
+        let sink = single_message_chunks_sink();
+
+        let (result, attempted) = deliver_with_rejected_second_chunk(&sink).await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempted, 3);
+        let state = sink.state.lock().await;
+        assert_eq!((state.messages_written, state.messages_failed), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn given_at_least_once_when_a_chunk_is_rejected_for_good_should_fail_the_call() {
+        let mut sink = single_message_chunks_sink();
+        sink.enable_at_least_once().expect("template supports it");
+
+        let (result, attempted) = deliver_with_rejected_second_chunk(&sink).await;
+
+        let error = result.expect_err("a skipped chunk would let the offset pass it");
+        assert!(error.is_permanent(), "got {error:?}");
+        assert_eq!(attempted, 2, "chunks after the rejected one are not sent");
+        let state = sink.state.lock().await;
+        assert_eq!((state.messages_written, state.messages_failed), (1, 2));
     }
 
     #[test]

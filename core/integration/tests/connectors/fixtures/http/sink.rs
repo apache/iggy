@@ -17,6 +17,8 @@
 
 use super::container::{
     DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, DEFAULT_TEST_TOPIC_2, ENV_SINK_BATCH_MODE,
+    ENV_SINK_DELIVERY_GUARANTEE, ENV_SINK_DELIVERY_RETRY_INITIAL_BACKOFF,
+    ENV_SINK_DELIVERY_RETRY_MAX_ATTEMPTS, ENV_SINK_DELIVERY_RETRY_MAX_BACKOFF,
     ENV_SINK_INCLUDE_METADATA, ENV_SINK_MAX_RETRIES, ENV_SINK_METHOD, ENV_SINK_PATH,
     ENV_SINK_RETRY_DELAY, ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA,
     ENV_SINK_STREAMS_0_STREAM, ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_TIMEOUT, ENV_SINK_URL,
@@ -208,6 +210,75 @@ impl TestFixture for HttpSinkMultiTopicFixture {
         envs.insert(
             ENV_SINK_STREAMS_0_TOPICS.to_string(),
             format!("[{},{}]", DEFAULT_TEST_TOPIC, DEFAULT_TEST_TOPIC_2),
+        );
+        envs
+    }
+}
+
+/// HTTP sink fixture that delivers at least once and retries a rejected batch every few hundred
+/// milliseconds until the receiver accepts it.
+pub struct HttpSinkAtLeastOnceFixture {
+    container: HttpSinkWireMockContainer,
+}
+
+impl HttpSinkAtLeastOnceFixture {
+    pub fn container(&self) -> &HttpSinkWireMockContainer {
+        &self.container
+    }
+
+    fn at_least_once_envs(container: &HttpSinkWireMockContainer) -> HashMap<String, String> {
+        let mut envs = HttpSinkIndividualFixture::base_envs(container);
+        envs.insert(
+            ENV_SINK_DELIVERY_GUARANTEE.to_string(),
+            "at_least_once".to_string(),
+        );
+        envs.insert(
+            ENV_SINK_DELIVERY_RETRY_INITIAL_BACKOFF.to_string(),
+            "100ms".to_string(),
+        );
+        envs.insert(
+            ENV_SINK_DELIVERY_RETRY_MAX_BACKOFF.to_string(),
+            "300ms".to_string(),
+        );
+        envs
+    }
+}
+
+#[async_trait]
+impl TestFixture for HttpSinkAtLeastOnceFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = HttpSinkWireMockContainer::start().await?;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        Self::at_least_once_envs(&self.container)
+    }
+}
+
+/// HTTP sink fixture that delivers at least once and stops at the first rejected batch.
+pub struct HttpSinkAtLeastOnceStopFixture {
+    container: HttpSinkWireMockContainer,
+}
+
+impl HttpSinkAtLeastOnceStopFixture {
+    pub fn container(&self) -> &HttpSinkWireMockContainer {
+        &self.container
+    }
+}
+
+#[async_trait]
+impl TestFixture for HttpSinkAtLeastOnceStopFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = HttpSinkWireMockContainer::start().await?;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HttpSinkAtLeastOnceFixture::at_least_once_envs(&self.container);
+        envs.insert(
+            ENV_SINK_DELIVERY_RETRY_MAX_ATTEMPTS.to_string(),
+            "1".to_string(),
         );
         envs
     }
