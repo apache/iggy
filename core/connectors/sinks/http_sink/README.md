@@ -263,7 +263,19 @@ A custom `HttpSinkRetryStrategy` respects user-configured `success_status_codes`
 
 **HTTP 429 `Retry-After`**: The middleware does not natively support `Retry-After` headers. When an unsuccessful response carries `Retry-After`, a warning is logged with the header value. The middleware uses computed exponential backoff instead.
 
-**Partial delivery** (`individual`/`raw` modes): If a message fails after exhausting retries, subsequent messages continue processing. After 3 consecutive HTTP failures, the remaining batch is aborted to avoid hammering a dead endpoint.
+**Partial delivery** (`individual`/`raw` modes): Without [at-least-once delivery](#at-least-once-delivery), if a message fails after exhausting retries, subsequent messages continue processing. After 3 consecutive HTTP failures, the remaining batch is aborted to avoid hammering a dead endpoint.
+
+## At-least-once delivery
+
+The sink supports the runtime's `[delivery] guarantee = "at_least_once"` (see the [runtime README](../../runtime/README.md#sink-delivery-guarantees)). A response with one of `success_status_codes` is the receiver's acknowledgment, so the receiver must have stored the message durably before it answers with one.
+
+With the guarantee enabled:
+
+- A message that `ndjson` or `json_array` mode would skip for a serialization error fails the call instead.
+- `individual` and `raw` modes stop at the first message that fails, after the retries above, and at a payload above `max_payload_size_bytes`, so a later message is not sent before an earlier one is delivered.
+- An `ndjson` or `json_array` batch above `max_payload_size_bytes` stops the sink, since sending the same batch again cannot make it smaller. Lower `batch_length` or raise `max_payload_size_bytes`, then restart the sink.
+- A failure after retries with a non-transient status, such as 400 or 404, stops the sink. A transient one is retried by the runtime, which hands over again every message of the partition since its last flush. Without `flush_interval` that is the failed batch. With it, the batches accepted before the failure go again too, although the receiver already has them.
+- The receiver can therefore see a message more than once, and should deduplicate by `iggy_stream`, `iggy_topic`, `iggy_partition_id` and `iggy_offset`. `raw` mode and `include_metadata = false` send none of these fields, so the receiver has no key to deduplicate by.
 
 ## Use Cases
 
@@ -802,9 +814,9 @@ A failed batch may already be partially delivered, and a retry after an ambiguou
 
 ## Known Limitations
 
-1. **No runtime batch retry**: Nonzero `consume()` results are logged and counted as errors, but the runtime does not retry the batch. A failed batch may have been partially delivered; the FFI result does not report a per-message outcome.
+1. **No runtime batch retry by default**: Without [at-least-once delivery](#at-least-once-delivery), nonzero `consume()` results are logged and counted as errors, but the runtime does not retry the batch. A failed batch may have been partially delivered; the FFI result does not report a per-message outcome.
 
-2. **Offsets committed before processing**: The `PollingMessages` auto-commit strategy commits consumer group offsets before `consume()` is called. Combined with limitation 1, at-least-once delivery is not achievable. ([#2928](https://github.com/apache/iggy/issues/2928))
+2. **Offsets committed before processing by default**: Without [at-least-once delivery](#at-least-once-delivery), the server stores consumer group offsets when it answers a poll, before `consume()` is called, so a failed batch is lost.
 
 3. **`Retry-After` header not used for backoff**: The `reqwest-middleware` retry layer uses computed exponential backoff. `Retry-After` headers are logged as warnings but do not influence retry timing.
 
