@@ -24,7 +24,9 @@ use lapin::{
     types::{AMQPValue, FieldTable},
 };
 use std::time::Duration;
-use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers_modules::testcontainers::core::{
+    CmdWaitFor, ExecCommand, IntoContainerPort, WaitFor,
+};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::time::sleep;
@@ -149,6 +151,25 @@ impl RabbitMqContainer {
 
     pub(super) async fn start() -> Result<Self, TestBinaryError> {
         Self::start_with(RabbitMqExchangeSetup::Topic, 1).await
+    }
+
+    pub(super) async fn stop_broker(&self) -> Result<(), String> {
+        self.rabbitmqctl("stop_app").await
+    }
+
+    pub(super) async fn start_broker(&self) -> Result<(), String> {
+        self.rabbitmqctl("start_app").await
+    }
+
+    async fn rabbitmqctl(&self, command: &str) -> Result<(), String> {
+        self.container
+            .exec(
+                ExecCommand::new(vec!["rabbitmqctl", command])
+                    .with_cmd_ready_condition(CmdWaitFor::exit_code(0)),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     pub(super) async fn start_fanout() -> Result<Self, TestBinaryError> {

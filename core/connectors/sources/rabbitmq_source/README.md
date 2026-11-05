@@ -13,7 +13,7 @@ Create the queue and its bindings in RabbitMQ. The connector does not create bro
 ## Features
 
 - Manual acknowledgements after Iggy accepts a batch.
-- Batch collection by message count and timeout.
+- Batch collection by message count, payload bytes, and timeout.
 - Raw mode for unchanged message bodies and selected AMQP properties.
 - JSON envelope mode for message properties, AMQP headers, and delivery details.
 - TLS with a trusted or custom CA, with optional mutual TLS.
@@ -45,6 +45,14 @@ This can cause message loss. The runtime currently accepts `exactly_once = true`
 | `tls.ca_file` | No | None | Optional PEM file for a custom CA. |
 | `tls.client_cert_file` | No | None | Optional PEM client certificate for mutual TLS. Set it with `tls.client_key_file`. |
 | `tls.client_key_file` | No | None | Optional PEM client key for mutual TLS. Set it with `tls.client_cert_file`. |
+
+Each batch contains at most 64,000,000 bytes of prepared payloads. The source keeps
+one copy for retry and makes another copy for the runtime, for up to 128,000,000
+payload bytes across those copies. It can also retain one delivery of up to
+64,000,000 payload bytes for the next batch. Together, these payloads can use
+up to 192,000,000 bytes. Headers, serialization, RabbitMQ prefetch, and runtime buffers use more
+memory, so this limit does not bound total process memory. In metadata mode, the
+limit counts the JSON envelope, including its Base64 body.
 
 Use `amqps://` when the RabbitMQ listener uses TLS. If you add a `[plugin_config.tls]` table, the URL must use `amqps://`. The client certificate and key must appear together.
 
@@ -162,7 +170,7 @@ In raw mode, the connector adds these headers when values are available:
 | `amqp.redelivered` | Redelivery flag. |
 | `amqp.message_id` | Message ID. |
 
-Raw mode does not copy user-defined AMQP headers. It omits `amqp.message_id` when its value is empty, exceeds 255 bytes, or exceeds the remaining 100,000-byte header budget. It does not add the other AMQP properties as Iggy headers.
+Raw mode does not copy user-defined AMQP headers. It omits `amqp.message_id` when its value is empty or exceeds 255 bytes. It does not add the other AMQP properties as Iggy headers.
 
 The connector leaves Iggy's message ID unset. Iggy assigns its own ID. The RabbitMQ `message_id` remains in AMQP metadata. Consumers can use that value to recognize duplicates after redelivery. The connector does not remove duplicates automatically.
 
@@ -206,7 +214,7 @@ The source stops after five consecutive batch failures. Restore the Iggy connect
 
 If the connector stops while a delivery is unacknowledged, RabbitMQ can requeue it. Iggy can receive a duplicate if RabbitMQ redelivers a message after Iggy accepted it but before RabbitMQ received its acknowledgement.
 
-After Iggy accepts a batch, the source acknowledges each RabbitMQ delivery. If an acknowledgement fails or times out, the source
+After Iggy accepts a batch, the source sends one acknowledgement with `multiple: true` for the last delivery. This acknowledges all deliveries in the batch. If an acknowledgement fails or times out, the source
 attempts to close its RabbitMQ connection and stops with an error. Lapin acknowledgement handles are single-use, so the source
 does not retry an acknowledgement or replay the batch. RabbitMQ requeues deliveries that remain unacknowledged when the
 connection closes. After the source restarts, RabbitMQ can redeliver those messages, so Iggy can receive duplicates. An

@@ -228,11 +228,11 @@ use std::{
 
 use async_trait::async_trait;
 use iggy_connector_sdk::{
-    ConnectorState, Error, ProducedMessages, Schema, Source, source::SourceBatchResult,
-    source_connector,
+    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
+    source::SourceBatchResult, source_connector,
 };
 use lapin::{
-    Connection, ConnectionProperties,
+    Acker, Connection, ConnectionProperties,
     options::{BasicAckOptions, BasicRejectOptions},
     tcp::OwnedTLSConfig,
 };
@@ -244,8 +244,10 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    batch::PendingBatch, config::RabbitMqSourceConfig, driver::RabbitMqDriver,
-    message::prepare_delivery,
+    batch::PendingBatch,
+    config::RabbitMqSourceConfig,
+    driver::RabbitMqDriver,
+    message::{MAX_PAYLOAD_BYTES, prepare_delivery},
 };
 
 source_connector!(RabbitMqSource);
@@ -257,6 +259,7 @@ pub struct RabbitMqSource {
     tls: OwnedTLSConfig,
     driver: Mutex<Option<RabbitMqDriver>>,
     pending: Mutex<Option<PendingBatch>>,
+    overflow: Mutex<Option<(ProducedMessage, Acker, Instant)>>,
     deferred_failure: Mutex<Option<Failure>>,
     retry_attempts: AtomicU32,
     last_warning: Mutex<BTreeMap<(&'static str, Option<String>), Instant>>,
@@ -314,6 +317,7 @@ impl RabbitMqSource {
             tls: OwnedTLSConfig::default(),
             driver: Mutex::new(None),
             pending: Mutex::new(None),
+            overflow: Mutex::new(None),
             deferred_failure: Mutex::new(None),
             retry_attempts: AtomicU32::new(0),
             last_warning: Mutex::new(BTreeMap::new()),
@@ -427,8 +431,19 @@ impl Source for RabbitMqSource {
             },
         };
         let mut deliveries = Vec::with_capacity(usize::from(self.config.batch_size));
+        let mut payload_bytes = 0;
         let mut deadline = None;
+        if let Some((message, acker, received_at)) = self.overflow.lock().await.take() {
+            payload_bytes = message.payload.len();
+            deliveries.push((message, acker));
+            deadline = Some(received_at + self.batch_timeout);
+        }
         loop {
+            if deliveries.len() >= usize::from(self.config.batch_size)
+                || payload_bytes == MAX_PAYLOAD_BYTES
+            {
+                break;
+            }
             let wait = deadline.map_or(Duration::from_secs(1), |deadline: Instant| {
                 deadline.saturating_duration_since(Instant::now())
             });
@@ -481,6 +496,11 @@ impl Source for RabbitMqSource {
                 }
             };
             if let Some(message) = message {
+                if message.payload.len() > MAX_PAYLOAD_BYTES - payload_bytes {
+                    *self.overflow.lock().await = Some((message, delivery.acker, received_at));
+                    break;
+                }
+                payload_bytes += message.payload.len();
                 deliveries.push((message, delivery.acker));
                 deadline.get_or_insert(received_at + self.batch_timeout);
                 if deliveries.len() >= usize::from(self.config.batch_size) {
@@ -570,6 +590,7 @@ impl Source for RabbitMqSource {
 
     async fn close(&mut self) -> Result<(), Error> {
         self.pending.get_mut().take();
+        self.overflow.get_mut().take();
         self.deferred_failure.get_mut().take();
         if let Some(driver) = self.driver.get_mut().take() {
             self.close_driver(driver).await;

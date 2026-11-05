@@ -17,7 +17,9 @@
 
 use std::time::Duration;
 
-use crate::connectors::fixtures::{RabbitMqSourceFixture, RabbitMqSourceMetadataFixture};
+use crate::connectors::fixtures::{
+    RabbitMqSourceBatchFixture, RabbitMqSourceFixture, RabbitMqSourceMetadataFixture,
+};
 use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
 use iggy_common::{
     CommitPolicy, Consumer, Identifier, IggyMessage, MessageClient, PollOptions, PollingStrategy,
@@ -115,6 +117,67 @@ async fn given_supported_delivery_when_iggy_accepts_batch_should_acknowledge_rab
     server(connectors_runtime(config_path = "tests/connectors/rabbitmq/source.toml")),
     seed = seeds::connector_stream
 )]
+async fn given_three_deliveries_when_iggy_accepts_batch_should_acknowledge_all(
+    harness: &mut TestHarness,
+    fixture: RabbitMqSourceBatchFixture,
+) {
+    let messages = next_messages(harness, 3).await;
+    let payloads: Vec<_> = messages
+        .iter()
+        .map(|message| message.payload.as_ref())
+        .collect();
+    assert_eq!(
+        payloads,
+        vec![b"batch-1".as_slice(), b"batch-2", b"batch-3"]
+    );
+
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if fixture
+                .acknowledged_messages()
+                .await
+                .expect("RabbitMQ queue inspection must succeed")
+                == Some(3)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("RabbitMQ must acknowledge all three deliveries");
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("connectors runtime must stop");
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if fixture
+                .consumer_count()
+                .await
+                .expect("RabbitMQ consumer inspection must succeed")
+                == 0
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("RabbitMQ source consumer must disconnect");
+    assert!(
+        !fixture
+            .get_ready_message()
+            .await
+            .expect("RabbitMQ queue inspection must succeed")
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/rabbitmq/source.toml")),
+    seed = seeds::connector_stream
+)]
 async fn rabbitmq_source_reconnects_after_connection_is_closed(
     harness: &TestHarness,
     fixture: RabbitMqSourceFixture,
@@ -162,6 +225,80 @@ async fn rabbitmq_source_reconnects_after_connection_is_closed(
         .expect("RabbitMQ should accept a publish after reconnecting");
     let message = next_message(harness).await;
     assert_eq!(message.payload.as_ref(), b"rabbitmq-broker-reconnect");
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/rabbitmq/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_broker_outage_when_reconnect_fails_should_retry_after_recovery(
+    harness: &TestHarness,
+    fixture: RabbitMqSourceFixture,
+) {
+    wait_for_running(harness).await;
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if fixture
+                .consumer_count()
+                .await
+                .expect("RabbitMQ consumer inspection must succeed")
+                == 1
+            {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("RabbitMQ source consumer must start");
+
+    fixture
+        .stop_broker()
+        .await
+        .expect("RabbitMQ broker must stop");
+    let runtime = harness
+        .connectors_runtime()
+        .expect("connector runtime must exist");
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let (stdout, stderr) = runtime.collect_logs();
+            if stdout.contains("RabbitMQ connect failed")
+                || stderr.contains("RabbitMQ connect failed")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("RabbitMQ source must report a failed reconnect while the broker is stopped");
+
+    fixture
+        .start_broker()
+        .await
+        .expect("RabbitMQ broker must start");
+    let mut last_observation = String::new();
+    timeout(Duration::from_secs(60), async {
+        loop {
+            match fixture.consumer_count().await {
+                Ok(1) => break,
+                Ok(count) => last_observation = format!("consumer count: {count}"),
+                Err(error) => last_observation = format!("management request failed: {error}"),
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("RabbitMQ source must reconnect after the broker starts: {last_observation}")
+    });
+
+    fixture
+        .publish(b"rabbitmq-retry-after-outage", BasicProperties::default())
+        .await
+        .expect("RabbitMQ publish must succeed after recovery");
+    let message = next_message(harness).await;
+    assert_eq!(message.payload.as_ref(), b"rabbitmq-retry-after-outage");
 }
 
 #[iggy_harness(
@@ -384,6 +521,10 @@ async fn wait_for_running(harness: &TestHarness) {
 }
 
 async fn next_message(harness: &TestHarness) -> IggyMessage {
+    next_messages(harness, 1).await.remove(0)
+}
+
+async fn next_messages(harness: &TestHarness, count: u32) -> Vec<IggyMessage> {
     let client = harness
         .root_client()
         .await
@@ -398,6 +539,7 @@ async fn next_message(harness: &TestHarness) -> IggyMessage {
         .try_into()
         .expect("consumer identifier must parse");
     timeout(Duration::from_secs(30), async {
+        let mut messages = Vec::with_capacity(count as usize);
         loop {
             if let Ok(polled) = client
                 .poll_messages(
@@ -407,19 +549,21 @@ async fn next_message(harness: &TestHarness) -> IggyMessage {
                     &Consumer::new(consumer.clone()),
                     &PollingStrategy::next(),
                     PollOptions {
-                        count: 10,
+                        count: count - messages.len() as u32,
                         commit: CommitPolicy::OnRead,
                         ..PollOptions::default()
                     },
                 )
                 .await
-                && let Some(message) = polled.messages.into_iter().next()
             {
-                return message;
+                messages.extend(polled.messages);
+                if messages.len() == count as usize {
+                    return messages;
+                }
             }
             sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("RabbitMQ delivery must reach Iggy")
+    .expect("RabbitMQ deliveries must reach Iggy")
 }

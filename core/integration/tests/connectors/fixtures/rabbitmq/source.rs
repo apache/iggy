@@ -21,33 +21,31 @@ use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
 use lapin::{
     BasicProperties, Connection, ConnectionProperties,
-    options::{BasicGetOptions, BasicPublishOptions},
+    options::{BasicGetOptions, BasicPublishOptions, ConfirmSelectOptions},
 };
 
 use super::container::{DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, RabbitMqContainer};
 
 pub struct RabbitMqSourceFixture {
     container: RabbitMqContainer,
+    http: reqwest::Client,
     metadata: bool,
 }
 
 impl RabbitMqSourceFixture {
+    pub async fn stop_broker(&self) -> Result<(), String> {
+        self.container.stop_broker().await
+    }
+
+    pub async fn start_broker(&self) -> Result<(), String> {
+        self.container.start_broker().await
+    }
+
     pub async fn acknowledged_messages(&self) -> Result<Option<u64>, String> {
         let queue = &self.container.queue_names[0];
-        let response: serde_json::Value = reqwest::Client::new()
-            .get(format!(
-                "{}/api/queues/%2F/{queue}",
-                self.container.management_url
-            ))
-            .basic_auth("iggy_test", Some("iggy_test_password"))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?
-            .error_for_status()
-            .map_err(|error| error.to_string())?
-            .json()
-            .await
-            .map_err(|error| error.to_string())?;
+        let response = self
+            .management_get(&format!("/api/queues/%2F/{queue}"))
+            .await?;
         if !response.is_object() {
             return Err(format!(
                 "RabbitMQ returned unexpected queue data: {response}"
@@ -62,20 +60,9 @@ impl RabbitMqSourceFixture {
     }
 
     pub async fn consumer_connections(&self) -> Result<Vec<String>, String> {
-        let consumers: Vec<serde_json::Value> = reqwest::Client::new()
-            .get(format!(
-                "{}/api/consumers/%2F",
-                self.container.management_url
-            ))
-            .basic_auth("iggy_test", Some("iggy_test_password"))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?
-            .error_for_status()
-            .map_err(|error| error.to_string())?
-            .json()
-            .await
-            .map_err(|error| error.to_string())?;
+        let consumers: Vec<serde_json::Value> =
+            serde_json::from_value(self.management_get("/api/consumers/%2F").await?)
+                .map_err(|error| error.to_string())?;
         consumers
             .iter()
             .filter(|consumer| {
@@ -98,7 +85,7 @@ impl RabbitMqSourceFixture {
         url.path_segments_mut()
             .map_err(|()| "RabbitMQ management URL cannot be a base URL".to_string())?
             .extend(["api", "connections", connection]);
-        reqwest::Client::new()
+        self.http
             .delete(url)
             .basic_auth("iggy_test", Some("iggy_test_password"))
             .send()
@@ -110,20 +97,9 @@ impl RabbitMqSourceFixture {
     }
 
     pub async fn consumer_count(&self) -> Result<usize, String> {
-        let consumers: Vec<serde_json::Value> = reqwest::Client::new()
-            .get(format!(
-                "{}/api/consumers/%2F",
-                self.container.management_url
-            ))
-            .basic_auth("iggy_test", Some("iggy_test_password"))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?
-            .error_for_status()
-            .map_err(|error| error.to_string())?
-            .json()
-            .await
-            .map_err(|error| error.to_string())?;
+        let consumers: Vec<serde_json::Value> =
+            serde_json::from_value(self.management_get("/api/consumers/%2F").await?)
+                .map_err(|error| error.to_string())?;
         let mut count = 0;
         for consumer in consumers {
             let queue = consumer
@@ -139,18 +115,9 @@ impl RabbitMqSourceFixture {
 
     pub async fn unacknowledged_messages(&self) -> Result<u32, String> {
         let queue = &self.container.queue_names[0];
-        let response = reqwest::Client::new()
-            .get(format!(
-                "{}/api/queues/%2F/{queue}",
-                self.container.management_url
-            ))
-            .basic_auth("iggy_test", Some("iggy_test_password"))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?
-            .error_for_status()
-            .map_err(|error| error.to_string())?;
-        let queue: serde_json::Value = response.json().await.map_err(|error| error.to_string())?;
+        let queue = self
+            .management_get(&format!("/api/queues/%2F/{queue}"))
+            .await?;
         queue
             .get("messages_unacknowledged")
             .and_then(serde_json::Value::as_u64)
@@ -210,6 +177,20 @@ impl RabbitMqSourceFixture {
         Ok(())
     }
 
+    async fn management_get(&self, path: &str) -> Result<serde_json::Value, String> {
+        self.http
+            .get(format!("{}{path}", self.container.management_url))
+            .basic_auth("iggy_test", Some("iggy_test_password"))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?
+            .error_for_status()
+            .map_err(|error| error.to_string())?
+            .json()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     fn envs(&self) -> HashMap<String, String> {
         HashMap::from([
             (
@@ -249,6 +230,7 @@ impl TestFixture for RabbitMqSourceFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         Ok(Self {
             container: RabbitMqContainer::start().await?,
+            http: reqwest::Client::new(),
             metadata: false,
         })
     }
@@ -259,6 +241,69 @@ impl TestFixture for RabbitMqSourceFixture {
 }
 
 pub struct RabbitMqSourceMetadataFixture(RabbitMqSourceFixture);
+
+pub struct RabbitMqSourceBatchFixture(RabbitMqSourceFixture);
+
+impl std::ops::Deref for RabbitMqSourceBatchFixture {
+    type Target = RabbitMqSourceFixture;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[async_trait]
+impl TestFixture for RabbitMqSourceBatchFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let fixture = RabbitMqSourceFixture::setup().await?;
+        let publish = async {
+            let connection =
+                Connection::connect(&fixture.container.amqp_url, ConnectionProperties::default())
+                    .await?;
+            let channel = connection.create_channel().await?;
+            channel
+                .confirm_select(ConfirmSelectOptions::default())
+                .await?;
+            for payload in [b"batch-1", b"batch-2", b"batch-3"] {
+                let confirmation = channel
+                    .basic_publish(
+                        "".into(),
+                        fixture.container.queue_names[0].as_str().into(),
+                        BasicPublishOptions::default(),
+                        payload,
+                        BasicProperties::default(),
+                    )
+                    .await?
+                    .await?;
+                if !confirmation.is_ack() {
+                    return Err("RabbitMQ did not confirm the publication".into());
+                }
+            }
+            connection.close(200, "OK".into()).await?;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        };
+        publish
+            .await
+            .map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "RabbitMqSourceBatchFixture".to_string(),
+                message: format!("Failed to publish batch: {error}"),
+            })?;
+        Ok(Self(fixture))
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.0.envs();
+        envs.insert(
+            "IGGY_CONNECTORS_SOURCE_RABBITMQ_PLUGIN_CONFIG_BATCH_SIZE".into(),
+            "3".into(),
+        );
+        envs.insert(
+            "IGGY_CONNECTORS_SOURCE_RABBITMQ_PLUGIN_CONFIG_BATCH_TIMEOUT".into(),
+            "5s".into(),
+        );
+        envs
+    }
+}
 
 impl std::ops::Deref for RabbitMqSourceMetadataFixture {
     type Target = RabbitMqSourceFixture;
@@ -272,6 +317,7 @@ impl TestFixture for RabbitMqSourceMetadataFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         Ok(Self(RabbitMqSourceFixture {
             container: RabbitMqContainer::start().await?,
+            http: reqwest::Client::new(),
             metadata: true,
         }))
     }

@@ -155,7 +155,9 @@ fn format_float(value: f64) -> String {
     }
 }
 
-const MAX_PAYLOAD_BYTES: usize = 64_000_000;
+pub(crate) const MAX_PAYLOAD_BYTES: usize = 64_000_000;
+// The envelope needs space beyond the padded Base64 body.
+const MAX_METADATA_BODY_BYTES: usize = (MAX_PAYLOAD_BYTES / 4 - 1) * 3;
 
 pub fn prepare_delivery(
     delivery: &mut Delivery,
@@ -187,7 +189,11 @@ pub fn prepare_delivery(
 }
 
 fn unsupported_body(size: usize, include_metadata: bool) -> bool {
-    exceeds_payload_limit(size) || (!include_metadata && size == 0)
+    if include_metadata {
+        size > MAX_METADATA_BODY_BYTES
+    } else {
+        size == 0 || exceeds_payload_limit(size)
+    }
 }
 
 fn exceeds_payload_limit(size: usize) -> bool {
@@ -318,7 +324,9 @@ mod tests {
     #[test]
     fn given_body_size_boundaries_should_apply_the_payload_limit() {
         assert!(!unsupported_body(MAX_PAYLOAD_BYTES, false));
-        assert!(!unsupported_body(MAX_PAYLOAD_BYTES, true));
+        assert!(!unsupported_body(47_999_997, true));
+        assert!(unsupported_body(47_999_998, true));
+        assert!(unsupported_body(48_000_000, true));
         assert!(unsupported_body(MAX_PAYLOAD_BYTES + 1, false));
         assert!(unsupported_body(MAX_PAYLOAD_BYTES + 1, true));
         assert!(unsupported_body(0, false));

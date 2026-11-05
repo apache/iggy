@@ -25,4 +25,6 @@ pub use sink::{
     RabbitMqSinkHeadersFixture, RabbitMqSinkRawSchemaFixture, RabbitMqSinkUnroutableFixture,
     RabbitMqSinkWithoutMetadataFixture,
 };
-pub use source::{RabbitMqSourceFixture, RabbitMqSourceMetadataFixture};
+pub use source::{
+    RabbitMqSourceBatchFixture, RabbitMqSourceFixture, RabbitMqSourceMetadataFixture,
+};
