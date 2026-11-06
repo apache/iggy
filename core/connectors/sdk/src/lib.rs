@@ -162,7 +162,7 @@ pub trait Sink: Send + Sync {
     ///
     /// Returning `Ok` promises that, from now on, a successful [`Sink::consume`] never drops a
     /// message without failing the call, unless the sink's configuration explicitly tells it to
-    /// skip such messages and it logs each one with its offset, and that a successful
+    /// skip messages it cannot write and it logs each one with its offset, and that a successful
     /// [`Sink::flush`] proves that the destination acknowledged every message of the covered
     /// partitions handed over so far.
     /// Return [`Error::Unsupported`] when the sink, or the configuration it was opened with,
