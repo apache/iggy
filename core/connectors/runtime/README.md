@@ -139,7 +139,7 @@ At least once, the runtime behaves as follows:
 
 The guarantee needs a plugin that supports it, and a sink configured for it
 with a plugin that does not refuses to start. Of the bundled sinks, `http`
-supports it. It covers only messages the server still holds: use topic
+and `iceberg` support it. It covers only messages the server still holds: use topic
 `durability = "persisted"` and a retention longer than the longest expected
 sink outage.
 
