@@ -22,7 +22,7 @@ using Microsoft.Extensions.Logging;
 using var loggerFactory = LoggerFactory.Create(builder => { builder.AddConsole(); });
 var logger = loggerFactory.CreateLogger<Program>();
 
-var address = MultiTenantHelpers.GetTcpServerAddr(args, logger);
+var address = ExampleHelpers.GetTcpServerAddr(args, logger);
 var tenantsCount = MultiTenantHelpers.ReadPositiveInt("TENANTS_COUNT", 3);
 var tenantId = MultiTenantHelpers.ReadPositiveInt("TENANT_ID", 1);
 if (tenantId > tenantsCount)

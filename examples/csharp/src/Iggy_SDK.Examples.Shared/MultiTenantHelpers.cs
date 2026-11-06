@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Net;
 using Apache.Iggy;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
@@ -36,6 +35,7 @@ public static class MultiTenantHelpers
     // Real tenants would each get their own secret.
     private const string TenantPassword = "secret";
     private const int Unauthorized = 41;
+    private const int UserAlreadyExists = 46;
 
     public static readonly string[] Topics = ["events", "logs", "notifications"];
 
@@ -71,7 +71,9 @@ public static class MultiTenantHelpers
         {
             BaseAddress = address,
             Protocol = Protocol.Tcp,
-            LoggerFactory = loggerFactory
+            LoggerFactory = loggerFactory,
+            // The SDK retries forever by default, so the example would hang when no server is running.
+            ReconnectionSettings = new ReconnectionSettings { MaxRetries = 2 }
         });
 
         await client.ConnectAsync();
@@ -84,7 +86,7 @@ public static class MultiTenantHelpers
         return Connect(address, username, TenantPassword, loggerFactory);
     }
 
-    // The user gets no global permissions and no other stream, so the rest of the server is closed to it.
+    // The user gets no global permissions and no other stream, so other tenants' streams are closed to it.
     public static Permissions StreamOnlyPermissions(uint streamId, bool manageTopics)
     {
         return new Permissions
@@ -122,12 +124,18 @@ public static class MultiTenantHelpers
         var userId = Identifier.String(username);
         if (await root.GetUserAsync(userId) is null)
         {
-            await root.CreateUserAsync(username, TenantPassword, UserStatus.Active, permissions);
-            logger.LogInformation("Created user {Username}.", username);
-            return;
+            try
+            {
+                await root.CreateUserAsync(username, TenantPassword, UserStatus.Active, permissions);
+                logger.LogInformation("Created user {Username}.", username);
+                return;
+            }
+            catch (IggyInvalidStatusCodeException error) when (error.FromServer && error.StatusCode == UserAlreadyExists)
+            {
+            }
         }
 
-        // The stream may have been deleted and created again under a new ID since the last run,
+        // Deleting a stream removes its grants, even if it is created again under the same ID,
         // so the stored permissions are replaced, not trusted.
         await root.UpdatePermissionsAsync(userId, permissions);
         logger.LogWarning("User {Username} already exists, its permissions were updated.", username);
@@ -175,36 +183,5 @@ public static class MultiTenantHelpers
                 );
             }
         }
-    }
-
-    public static string GetTcpServerAddr(string[] args, ILogger logger)
-    {
-        var defaultServerAddr = "127.0.0.1:8090";
-        var argumentName = args.Length > 0 ? args[0] : null;
-        var tcpServerAddr = args.Length > 1 ? args[1] : null;
-
-        if (argumentName is null && tcpServerAddr is null)
-        {
-            return defaultServerAddr;
-        }
-
-        argumentName = argumentName ?? throw new ArgumentNullException(argumentName);
-        if (argumentName != "--tcp-server-address")
-        {
-            throw new FormatException(
-                $"Invalid argument {argumentName}! Usage: --tcp-server-address <server-address>"
-            );
-        }
-
-        tcpServerAddr = tcpServerAddr ?? throw new ArgumentNullException(tcpServerAddr);
-        if (!IPEndPoint.TryParse(tcpServerAddr, out _))
-        {
-            throw new FormatException(
-                $"Invalid server address {tcpServerAddr}! Usage: --tcp-server-address <server-address>"
-            );
-        }
-
-        logger.LogInformation("Using server address: {TcpServerAddr}", tcpServerAddr);
-        return tcpServerAddr;
     }
 }

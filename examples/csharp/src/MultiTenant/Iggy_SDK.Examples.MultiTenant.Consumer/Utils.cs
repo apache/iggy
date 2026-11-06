@@ -40,7 +40,8 @@ public static class Utils
         var stream = await root.GetStreamByIdAsync(Identifier.String(name))
                      ?? throw new InvalidOperationException($"Stream {name} does not exist, run the producer first.");
 
-        // Reading the stream includes polling its topics and storing consumer offsets.
+        // Reading the stream includes polling its topics, storing consumer offsets,
+        // and creating or deleting consumer groups in the stream.
         // It does not allow sending messages or changing topics.
         var permissions = MultiTenantHelpers.StreamOnlyPermissions(stream.Id, manageTopics: false);
         await MultiTenantHelpers.EnsureUser(root, ConsumerUsername(tenantId), permissions, logger);
@@ -68,7 +69,7 @@ public static class Utils
                     consumer,
                     PollingStrategy.Next(),
                     MessagesPerPoll,
-                    true
+                    autoCommit: true
                 );
 
                 if (polled.Messages.Count == 0)
