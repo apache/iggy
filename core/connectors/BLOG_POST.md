@@ -84,9 +84,9 @@ passing `cargo test`:
   errors) and for idempotent keys. Both cover config validation.
 
 What's left is marked `TODO(ConnectorDeveloper)` in each crate's `src/lib.rs`:
-one spot for a sink (`push_batch()`), two for a source
-(`build_raw_client()` if you're not talking HTTP, and
-`fetch_records()`). Everything else — the parts that used to eat a
+one spot for a sink (`push_batch()`) and one for a source
+(`fetch_records()`). A non-HTTP backend also swaps the HTTP client, which
+each README lists step by step. Everything else — the parts that used to eat a
 review round — is already done.
 
 ## Using one

@@ -39,7 +39,7 @@ below.
 
 ## Quick reference
 
-- Skeleton: [TEMPLATE.md](TEMPLATE.md) (fill-in-the-blank kit — implement only `TODO(ConnectorDeveloper)`).
+- Skeleton: [TEMPLATE.md](TEMPLATE.md) (steps for copying `sources/source_template`, with an HTTP and a non-HTTP path).
 - PR pre-flight: [connector-pr-review](../connector-pr-review/SKILL.md).
 - Exemplars: `random_source` (minimal + canonical state tests), `postgres_source` (cursor / delete-after-read / processed-column modes, restart-survives-state tests), `elasticsearch_source` (scroll cursor), `influxdb_source` (time-series scan).
 
@@ -166,7 +166,7 @@ Match `ProducedMessages.schema` to the bytes in `messages[i].payload`:
 
 - `ProducedMessage.id: Option<u128>` - set when a natural ID exists (DB PK, document id). It rides the wire as the message id, which is what a **consumer** can dedupe an at-least-once duplicate on.
 - **Iggy itself does not dedupe on that id.** The server's only read of the field is `core/server/src/http/wire.rs`, which mints a fresh uuid when the incoming id is 0 and otherwise passes it through. Its dedup path is a per-client request-id watermark (`dedup_clients_max`) that never looks at this field.
-- `origin_timestamp: Option<u64>` - source-system event time in nanoseconds. Lets downstream sinks reason about lag.
+- `origin_timestamp: Option<u64>` - leave `None`. The runtime does not forward it: `build_iggy_message` builds the message with `IggyMessage::builder()`, which stamps the time of sending. The Iggy `origin_timestamp` header is in microseconds, so a unit chosen here would be wrong anyway until the runtime change lands.
 - `timestamp` and `checksum` are Iggy-side - leave `None`.
 
 ### Concurrency

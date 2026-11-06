@@ -27,21 +27,13 @@
 //! There is exactly **one** place you need to write code, marked
 //! `TODO(ConnectorDeveloper)`: `TemplateSource::fetch_records()` — fetch up
 //! to `batch_size` new records from your external system, starting after
-//! `cursor`. `TemplateSource::build_raw_client()` carries a second
-//! `TODO(ConnectorDeveloper)` too, but only applies if your source isn't
-//! HTTP (see below); a third, on the `connection_string` field's doc
-//! comment, just asks you to describe its expected shape — not code.
-//! `grep` for the marker and you'll find all three.
+//! `cursor`. A second `TODO(ConnectorDeveloper)`, on the `connection_string`
+//! field's doc comment, just asks you to describe its expected shape — not
+//! code. `grep` for the marker and you'll find both.
 //!
-//! This template assumes an HTTP-ish source and uses `reqwest` wrapped by
-//! the SDK's retry middleware, because that's what `iggy_connector_sdk::retry`
-//! is built for and it covers the common case. If your source talks to
-//! something else (a database, a queue, a filesystem), swap the client type
-//! in `build_raw_client()`/`fetch_records()` for your driver of choice and lean on
-//! its own retry/pooling behavior — keep the surrounding shape (validation
-//! in `open()`, circuit breaker, cursor staging, batching) unchanged. See
-//! `core/connectors/sources/postgres_source` in this repo for a real
-//! non-HTTP example of that same shape.
+//! This crate is the HTTP path: `reqwest` wrapped by the SDK's retry
+//! middleware. For a database, queue or filesystem, replace the client as
+//! listed under "Choose your backend path" in the README and keep the rest.
 
 use async_trait::async_trait;
 use iggy_connector_sdk::retry::{
@@ -56,7 +48,6 @@ use reqwest_middleware::ClientWithMiddleware;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -177,7 +168,6 @@ pub struct TemplateSource {
     verbose: bool,
     state: Mutex<State>,
     pending_state: Mutex<Option<State>>,
-    records_produced: AtomicU64,
 }
 
 impl TemplateSource {
@@ -216,7 +206,6 @@ impl TemplateSource {
             verbose,
             state: Mutex::new(restored_state.unwrap_or_default()),
             pending_state: Mutex::new(None),
-            records_produced: AtomicU64::new(0),
         }
     }
 
@@ -224,14 +213,9 @@ impl TemplateSource {
         ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
     }
 
-    /// TODO(ConnectorDeveloper): build your actual client/connection here using
-    /// `self.config.connection_string` (and `self.config.auth_token`, if
-    /// your system needs it). This template builds a plain `reqwest::Client`
-    /// to hand to `build_retry_client` — if you're not talking HTTP, replace
-    /// this with e.g. a `sqlx::PgPool::connect(...)` or your driver's
-    /// equivalent, store it on `self` (add a field, since `client` here is
-    /// HTTP-specific), and skip the `check_connectivity_with_retry` call
-    /// below in favor of whatever your driver offers (a ping, a test query).
+    /// Builds the plain `reqwest::Client` that `open()` wraps in the retry
+    /// middleware. Use `self.config.auth_token` here if the source needs one.
+    /// A non-HTTP backend replaces this; see the README, Path B.
     fn build_raw_client(&self) -> Result<reqwest::Client, Error> {
         let timeout = parse_duration(self.config.timeout.as_deref(), DEFAULT_TIMEOUT);
         reqwest::Client::builder()
@@ -312,9 +296,6 @@ impl TemplateSource {
             ))
         })?;
         *self.pending_state.lock().await = Some(candidate_state);
-
-        self.records_produced
-            .fetch_add(messages.len() as u64, Ordering::Relaxed);
 
         if self.verbose {
             info!(
@@ -511,10 +492,8 @@ impl Source for TemplateSource {
     async fn close(&mut self) -> Result<(), Error> {
         let state = self.state.lock().await;
         info!(
-            "{CONNECTOR_NAME} connector with ID: {} closed. Cursor: {:?}, total records produced: {}",
-            self.id,
-            state.cursor,
-            self.records_produced.load(Ordering::Relaxed)
+            "{CONNECTOR_NAME} connector with ID: {} closed. Cursor: {:?}",
+            self.id, state.cursor
         );
         drop(state);
         self.client = None;
@@ -614,7 +593,6 @@ mod tests {
             "got {error:?}"
         );
         assert!(source.pending_state.lock().await.is_none());
-        assert_eq!(source.records_produced.load(Ordering::Relaxed), 0);
     }
 
     #[test]

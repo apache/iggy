@@ -44,19 +44,11 @@
 //! collection-shaped name). A second `TODO(ConnectorDeveloper)` on the
 //! `connection_string` field's doc comment just asks you to describe its
 //! expected shape — not code, but worth personalizing too. `grep` for the
-//! marker and you'll find both, plus one more on `build_raw_client()` that
-//! only applies if your destination isn't HTTP (see below).
+//! marker and you'll find both.
 //!
-//! This template assumes an HTTP-ish destination and uses `reqwest` wrapped
-//! by the SDK's retry middleware, because that's what
-//! `iggy_connector_sdk::retry` is built for and it covers the common case.
-//! If your destination talks something else (a database, a queue, object
-//! storage), swap the client type in `build_raw_client()`/`push_batch()` for
-//! your driver of choice and lean on its own retry/pooling behavior — keep the
-//! surrounding shape (validation in `open()`, circuit breaker, batching,
-//! identifier validation) unchanged. See `core/connectors/sinks/postgres_sink`
-//! or `core/connectors/sinks/s3_sink` in this repo for non-HTTP examples of
-//! that same shape.
+//! This crate is the HTTP path: `reqwest` wrapped by the SDK's retry
+//! middleware. For a database, queue or object store, replace the client as
+//! listed under "Choose your backend path" in the README and keep the rest.
 
 use async_trait::async_trait;
 use iggy_connector_sdk::retry::{
@@ -242,15 +234,9 @@ impl TemplateSink {
         }
     }
 
-    /// TODO(ConnectorDeveloper): build your actual client/connection here using
-    /// `self.config.connection_string` (and `self.config.auth_token`, if
-    /// your destination needs it). This template builds a plain
-    /// `reqwest::Client` to hand to `build_retry_client` — if you're not
-    /// talking HTTP, replace this with e.g. a database connection pool or
-    /// your driver's equivalent, store it on `self` (add a field, since
-    /// `client` here is HTTP-specific), and skip the
-    /// `check_connectivity_with_retry` call below in favor of whatever your
-    /// driver offers (a ping, a test query).
+    /// Builds the plain `reqwest::Client` that `open()` wraps in the retry
+    /// middleware. Use `self.config.auth_token` here if the destination needs
+    /// one. A non-HTTP backend replaces this; see the README, Path B.
     fn build_raw_client(&self) -> Result<reqwest::Client, Error> {
         let timeout = parse_duration(self.config.timeout.as_deref(), DEFAULT_TIMEOUT);
         reqwest::Client::builder()

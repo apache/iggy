@@ -150,6 +150,7 @@ Keep one source under `.claude/skills/` and link its directory from
 - [connector-source](.claude/skills/connector-source/SKILL.md) - source plugin authoring
 - [connector-transform](.claude/skills/connector-transform/SKILL.md) - transform authoring
 - [connector-testing](.claude/skills/connector-testing/SKILL.md) - unit + integration test patterns
+- [connector-pr-review](.claude/skills/connector-pr-review/SKILL.md) - review checklist to pre-flight a sink/source PR
 
 Review skills are user-invoked only. Keep `disable-model-invocation: true`
 for Claude Code and `policy.allow_implicit_invocation: false` in

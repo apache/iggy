@@ -4,8 +4,8 @@ Starting point for a new Apache Iggy **sink** connector. Everything except
 pushing data to your actual destination is already implemented and follows
 the project's required resilience and security patterns. See the module-level
 doc comment at the top of `src/lib.rs` for the rationale, and the
-`connector-pr-review` skill and the "Building Connectors That Pass Review"
-blog post for the checklist this template is built against.
+`connector-pr-review` skill and `core/connectors/docs/authoring-sinks-and-sources.md`
+for the checklist this template is built against.
 
 ## How a batch is delivered
 
@@ -231,38 +231,83 @@ no longer exists for sinks; the runtime refuses to start a sink that sets it.
   attempt bounds, no calls while the breaker is open, permanent and unclassified
   errors in both delivery modes), the cool-down rule and the dedup key.
 
+## Choose your backend path
+
+Pick exactly one path. They do not mix. Both keep the circuit breaker, the
+time-budgeted delivery loop, `is_transient()`, `dedup_key()`, identifier
+validation, the counters and the at-least-once support, because none of that
+depends on the transport.
+
+### Path A: HTTP backend
+
+Keep the crate as it is. `connection_string` is the base URL, `self.client` is
+a `reqwest` client wrapped by the SDK retry middleware, and `open()` probes
+`health_check_path` with `check_connectivity_with_retry`. Return
+`HttpRequestFailed`, `Connection` or `CannotStoreData` for a failure worth
+retrying and `PermanentHttpError` for a payload the server will never accept.
+
+### Path B: non-HTTP backend (database, queue, object store)
+
+Replace the HTTP client and nothing else:
+
+1. `Cargo.toml`: remove `reqwest` and `reqwest-middleware`, add your driver.
+2. `src/lib.rs`:
+   - Change the type of the `client` field from `Option<ClientWithMiddleware>` to
+     your driver's client, which must implement `Debug`, and change the `client`
+     parameter of `push_batch()` to match.
+   - Make `build_raw_client()` return that client and store it in `self.client`
+     in `open()`.
+   - In `open()` delete the `health_check_path` block (`Url::parse`,
+     `RetryPolicy`, `check_connectivity_with_retry`) and the `build_retry_client`
+     call. Probe the backend with your driver instead (a ping or a test query)
+     and map a failure to `Error::Connection`.
+   - Delete the imports that are left unused (`Url`, `ClientWithMiddleware`,
+     `RetryPolicy`, `build_retry_client`, `check_connectivity_with_retry`).
+3. Config: delete `health_check_path`, `max_retries`, `max_open_retries` and
+   `open_retry_max_delay` everywhere they appear: the config field, its
+   `DEFAULT_*` const, `config.toml`, the copy under
+   `runtime/example_config/connectors/`, the table in this README, `test_config()`
+   and the JSON in `given_numeric_knobs_as_json_numbers_should_deserialize`.
+   Delete `timeout` the same way unless you apply it to your driver. Keep
+   `retry_delay`, `retry_max_delay`, `circuit_breaker_*`, `max_delivery_time` and
+   `batch_size`, which the delivery loop uses.
+4. Map driver errors onto the SDK variants, because the loop acts on them:
+   `Connection`, `CannotStoreData` or `HttpRequestFailed` are retried, and
+   `Error::is_permanent()` variants (`SchemaMismatch`, `InvalidRecordValue`,
+   `Serialization`) are skipped, or stop the sink at least once. The name
+   `PermanentHttpError` is only a name.
+5. Tests: `given_breaker_open_past_budget_when_consuming_should_count_every_message_failed`
+   builds a `reqwest` client. Set `sink.client` to your client type or a stub.
+
+See `core/connectors/sinks/postgres_sink` or `core/connectors/sinks/s3_sink`
+for a finished non-HTTP sink.
+
 ## What you need to fill in
 
-Search for `TODO(ConnectorDeveloper)` in `src/lib.rs`. One spot requires code,
-and two more are conditional or documentation:
+Search for `TODO(ConnectorDeveloper)` in `src/lib.rs`. One spot requires code
+and one is documentation:
 
 **`push_batch()`** (required): send one chunk to your destination using
 `self.config.connection_string` and `self.config.target` (already validated), via
-`self.client` (already retry-wrapped). The error you return steers the loop:
-transient errors are retried, a permanent error (`Error::is_permanent()`) skips the
-chunk (and stops the sink at least once), anything else is not retried. Use `message.payload.try_to_bytes()` and do not clone
-`Payload::Json`. If the destination's call can succeed at the transport level
-while rejecting rows (a bulk API answering 200 with per-item errors), count the
-accepted rows yourself and return an error unless every row was accepted. At least
-once, `Ok(())` for a partly rejected chunk would let the stored offset pass the
-rejected rows. Do not return `Ok(())` for a batch that was not written.
+`self.client`. The error you return steers the loop: transient errors are
+retried, a permanent error (`Error::is_permanent()`) skips the chunk (and stops
+the sink at least once), anything else is not retried. Use
+`message.payload.try_to_bytes()` and do not clone `Payload::Json`. If the
+destination's call can succeed at the transport level while rejecting rows (a
+bulk API answering 200 with per-item errors), count the accepted rows yourself
+and return an error unless every row was accepted. At least once, `Ok(())` for a
+partly rejected chunk would let the stored offset pass the rejected rows. Do not
+return `Ok(())` for a batch that was not written.
 
 **`connection_string`'s doc comment** (documentation only): describe the exact
 shape your connector expects.
-
-**`build_raw_client()`** (only if the destination is not HTTP): swap
-`reqwest::Client` for your driver's connection or pool, store it on `TemplateSink`
-in place of the HTTP-specific `client` field, and adjust the
-`check_connectivity_with_retry` call in `open()` to whatever probe your driver
-offers. See `core/connectors/sinks/postgres_sink` or
-`core/connectors/sinks/s3_sink` for non-HTTP examples.
 
 ## Using it
 
 1. Copy this directory, rename it and the package in `Cargo.toml`
    (`iggy_connector_<yourname>_sink`), and add it to the `members` list in the
    workspace root `Cargo.toml`.
-2. Fill in the `TODO(ConnectorDeveloper)` section(s).
+2. Choose a backend path above, then fill in `push_batch()`.
 3. Update `config.toml` with your real `connection_string` and `target` and any
    settings specific to your system. Delete `auth_token` if you don't need it, or
    add fields of your own the same way (see `TemplateSinkConfig`).

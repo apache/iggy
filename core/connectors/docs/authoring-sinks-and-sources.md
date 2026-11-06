@@ -5,8 +5,8 @@
 > Companion materials:
 >
 > - Review checklist skill: `.claude/skills/connector-pr-review/SKILL.md`
-> - Sink fill-in-the-blank kit: `.claude/skills/connector-sink/TEMPLATE.md`
-> - Source fill-in-the-blank kit: `.claude/skills/connector-source/TEMPLATE.md`
+> - Sink template: `core/connectors/sinks/sink_template` (README: HTTP and non-HTTP paths)
+> - Source template: `core/connectors/sources/source_template` (same)
 > - Testing skill: `.claude/skills/connector-testing/SKILL.md`
 
 Connector PRs in Apache Iggy often spend multiple review rounds on the
@@ -38,9 +38,8 @@ points: config parsing, `SecretString`, retry loops, circuit breaker,
 the time-budgeted delivery loop (sink), ACK/NACK cursor staging (source),
 sleep-first poll, lock discipline, and unit-test stubs are already
 wired up. Copy the crate, rename the package, and fill in the
-`TODO(ConnectorDeveloper)` spots in `src/lib.rs` — see each crate's `README.md`.
-The skills' `TEMPLATE.md` files describe the same pattern in prose, for
-when copying a whole crate is more than you need.
+`TODO(ConnectorDeveloper)` spots in `src/lib.rs` — see each crate's `README.md`,
+which has one section for an HTTP backend and one for a non-HTTP backend.
 
 **Your implementation surface is intentionally small:**
 

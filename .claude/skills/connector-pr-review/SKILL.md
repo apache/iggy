@@ -9,7 +9,7 @@ description: Review checklist for Apache Iggy connector sink/source PRs. Load wh
 > Authoring skills: [connector-sink](../connector-sink/SKILL.md),
 > [connector-source](../connector-source/SKILL.md),
 > [connector-testing](../connector-testing/SKILL.md).
-> Fill-in-the-blank kits: those skills' `TEMPLATE.md` files.
+> Template crates: `sinks/sink_template`, `sources/source_template` (steps in those skills' `TEMPLATE.md`).
 
 Use this skill to **catch the issues that repeatedly burn review cycles**
 before asking for a human re-review. Cite symbols/paths, not stale line numbers.
@@ -156,7 +156,7 @@ that state on success, then calls `on_batch_result(Ack | Nack)`. Only
       re-emit an entire index without calling that out in README.
 - [ ] Config flag combos that no-op should `warn!` or `Err`, not silently ignore.
 
-### B9. Zero delivered is a failure, even if the call "succeeded"
+### B9. A batch with any row not delivered is a failure, even if the call "succeeded"
 
 A bulk/batch API call returning 200 does not mean every row in it landed.
 Recurring, independently-discovered bug across four different sinks:
@@ -201,6 +201,12 @@ server-side. Confirmed independently on two unrelated backends:
 - [ ] This is why `build_raw_client()` in the sink/source templates sets
       `.timeout()` on the `reqwest::Client` itself rather than wrapping calls
       — copy that pattern, don't wrap instead of it.
+- [ ] The sink template does also wrap each attempt in `timeout(remaining
+      budget)` in `deliver_chunk()`, in addition to the transport timeout, so
+      one hung request cannot outlast `max_delivery_time`. It treats the
+      expiry as an unknown outcome, which is safe only because the write is
+      idempotent on `dedup_key()`. A sink without that idempotency must not
+      retry after a wrapping timeout.
 
 ### B11. Ack-path work has no SDK deadline, but it blocks every later poll
 
@@ -444,7 +450,7 @@ Postgres source ACK/NACK + CDC hardening (#3957), the shared
 `retry_async`/`RetryPolicy` SDK helper review (#4104). Highest-density
 themes: delivery/offset semantics, idempotency IDs, transient/permanent
 mapping, config-name drift, secrets, README/code drift, false-green tests,
-CI/lockfile hygiene, zero-delivered-still-reports-Ok, a wrapping timeout
+CI/lockfile hygiene, undelivered-rows-still-reports-Ok, a wrapping timeout
 that doesn't cancel in-flight work, ack-path work blowing its fixed budget,
 and holding a lock across slow I/O.
 
