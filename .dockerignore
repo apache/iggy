@@ -19,6 +19,11 @@
 /foreign/swift/.build
 /bdd/swift/**/.build
 /examples/swift/**/.build
+/conformance/agents/swift/**/.build
+/conformance/agents/cpp/build
+/conformance/agents/java/build
+/conformance/agents/csharp/artifacts
+/conformance/agents/python/.venv
 /foreign/java/**/build
 /bdd/java/build
 /examples/java/**/build

@@ -136,6 +136,11 @@ fn validate_operator(operator: &str, operand: &Value) -> Result<(), String> {
         ("$$exists", Value::Bool(_))
         | ("$$capture" | "$$ref", Value::String(_))
         | ("$$gte" | "$$lte", Value::Number(_)) => Ok(()),
+        ("$$gte" | "$$lte", bound)
+            if matches!(self::operator(bound), Some(("$$ref", Value::String(_)))) =>
+        {
+            Ok(())
+        }
         ("$$type", Value::String(name)) => validate_type_name(name),
         ("$$type", Value::Array(names)) if !names.is_empty() => names.iter().try_for_each(|name| {
             name.as_str()
@@ -305,14 +310,27 @@ fn match_operator(
                 &format!("{path}.$$len"),
             )
         }
-        ("$$gte" | "$$lte", Value::Number(bound)) => {
+        ("$$gte" | "$$lte", bound) => {
+            let bound = match self::operator(bound) {
+                Some(("$$ref", Value::String(name))) => match captures.get(name) {
+                    Some(Value::Number(captured)) => captured.clone(),
+                    Some(other) => {
+                        return fail(format!("{name:?} holds {}, not a number", compact(other)));
+                    }
+                    None => return fail(format!("nothing captured {name:?}")),
+                },
+                _ => match bound {
+                    Value::Number(number) => number.clone(),
+                    other => return fail(format!("invalid bound {}", compact(other))),
+                },
+            };
             let Value::Number(number) = actual else {
                 return fail(format!(
                     "{operator} needs a number, got {}",
                     compact(actual)
                 ));
             };
-            let ordering = compare_numbers(number, bound);
+            let ordering = compare_numbers(number, &bound);
             let holds = if operator == "$$gte" {
                 ordering != Ordering::Less
             } else {
@@ -574,6 +592,16 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn given_a_captured_bound_when_matching_should_compare_with_it() {
+        let mut captures = Captures::default();
+        captures.insert("own_op", json!(10));
+        let below = json!({"$$lte": {"$$ref": "own_op"}});
+        assert!(matches(&below, &json!(9), &mut captures).is_ok());
+        assert!(matches(&below, &json!(11), &mut captures).is_err());
+        assert!(validate_expectation(&below).is_ok());
     }
 
     #[test]

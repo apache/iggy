@@ -131,6 +131,72 @@ type memberResult struct {
 	Partitions      []uint32 `json:"partitions"`
 }
 
+type rawResult struct {
+	PayloadHex string `json:"payload_hex"`
+}
+
+type optionSpecResult struct {
+	Key        string `json:"key"`
+	Kind       string `json:"kind"`
+	Updatable  bool   `json:"updatable"`
+	Resettable bool   `json:"resettable"`
+	Secret     bool   `json:"secret"`
+	ReadOnly   bool   `json:"read_only"`
+	Critical   bool   `json:"critical"`
+}
+
+type userDetailsResult struct {
+	ID          uint32                 `json:"id"`
+	Username    string                 `json:"username"`
+	Status      string                 `json:"status"`
+	CreatedAt   uint64                 `json:"created_at"`
+	Permissions *permissionsResult     `json:"permissions"`
+	Options     map[string]optionEntry `json:"options"`
+}
+
+type permissionsResult struct {
+	Global map[string]bool `json:"global"`
+}
+
+type receivedMessageResult struct {
+	PartitionID uint32        `json:"partition_id"`
+	Message     messageResult `json:"message"`
+}
+
+type connectionInfoResult struct {
+	ServerAddress string `json:"server_address"`
+}
+
+func canonicalUser(user *iggcon.UserInfoDetails) (userDetailsResult, error) {
+	options, err := canonicalOptions(user.Options, user.DerivedOptions)
+	if err != nil {
+		return userDetailsResult{}, err
+	}
+	converted := userDetailsResult{
+		ID:        user.Id,
+		Username:  user.Username,
+		Status:    statusName(user.Status),
+		CreatedAt: user.CreatedAt,
+		Options:   options,
+	}
+	if user.Permissions != nil {
+		converted.Permissions = &permissionsResult{Global: globalView(user.Permissions.Global)}
+	}
+	return converted, nil
+}
+
+func canonicalOptionSpec(spec iggcon.OptionSpec) optionSpecResult {
+	return optionSpecResult{
+		Key:        spec.Key,
+		Kind:       kindNames[spec.DefaultValue.Kind],
+		Updatable:  spec.Updatable,
+		Resettable: spec.Resettable,
+		Secret:     spec.Secret,
+		ReadOnly:   spec.ReadOnly,
+		Critical:   spec.Critical,
+	}
+}
+
 func canonicalStream(stream iggcon.Stream) (streamResult, error) {
 	options, err := canonicalOptions(stream.Options, stream.DerivedOptions)
 	return streamResult{

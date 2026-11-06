@@ -232,6 +232,59 @@ func commitPolicy(commit string) (iggcon.CommitPolicy, error) {
 	}
 }
 
+// metadataStart is earliest, latest, {after: cursor} or {current: token or null}.
+type metadataStart struct {
+	value iggcon.MetadataChangeStart
+}
+
+func (m *metadataStart) UnmarshalJSON(raw []byte) error {
+	key, value, err := keyed(raw)
+	if err != nil {
+		return err
+	}
+	switch key {
+	case "earliest":
+		m.value = iggcon.EarliestMetadataChangeStart()
+	case "latest":
+		m.value = iggcon.LatestMetadataChangeStart()
+	case "after":
+		var text string
+		if err = json.Unmarshal(value, &text); err != nil {
+			return err
+		}
+		cursor, err := iggcon.ParseMetadataChangeCursor(text)
+		if err != nil {
+			return err
+		}
+		m.value = iggcon.AfterMetadataChangeStart(cursor)
+	case "current":
+		var text *string
+		if err = json.Unmarshal(value, &text); err != nil {
+			return err
+		}
+		var token *iggcon.MetadataCurrentPageToken
+		if text != nil {
+			if token, err = iggcon.ParseMetadataCurrentPageToken(*text); err != nil {
+				return err
+			}
+		}
+		m.value = iggcon.CurrentMetadataChangeStart(token)
+	default:
+		return fmt.Errorf("unknown metadata start %q", key)
+	}
+	return nil
+}
+
+func userStatus(status *string) (iggcon.UserStatus, error) {
+	if status == nil || *status == "active" {
+		return iggcon.Active, nil
+	}
+	if *status == "inactive" {
+		return iggcon.Inactive, nil
+	}
+	return iggcon.Active, fmt.Errorf("unknown user status %q", *status)
+}
+
 func milliseconds(value *uint64) time.Duration {
 	if value == nil {
 		return 0

@@ -115,6 +115,68 @@ type buildReaderArgs struct {
 	Commit     string    `json:"commit"`
 }
 
+type buildConsumerArgs struct {
+	StreamID  id      `json:"stream_id"`
+	TopicID   id      `json:"topic_id"`
+	Group     string  `json:"group"`
+	MaxWaitMs *uint64 `json:"max_wait_ms"`
+	Count     *uint32 `json:"count"`
+	Commit    string  `json:"commit"`
+}
+
+type binaryRequestArgs struct {
+	Code       uint32 `json:"code"`
+	PayloadHex string `json:"payload_hex"`
+}
+
+type binaryRequestToReplicaArgs struct {
+	Code       uint32 `json:"code"`
+	PayloadHex string `json:"payload_hex"`
+	Replica    uint8  `json:"replica"`
+}
+
+type describeOptionsArgs struct {
+	Scope string `json:"scope"`
+}
+
+type globalPermissionsArg struct {
+	ManageServers bool `json:"manage_servers"`
+	ReadServers   bool `json:"read_servers"`
+	ManageUsers   bool `json:"manage_users"`
+	ReadUsers     bool `json:"read_users"`
+	ManageStreams bool `json:"manage_streams"`
+	ReadStreams   bool `json:"read_streams"`
+	ManageTopics  bool `json:"manage_topics"`
+	ReadTopics    bool `json:"read_topics"`
+	PollMessages  bool `json:"poll_messages"`
+	SendMessages  bool `json:"send_messages"`
+}
+
+type createUserArgs struct {
+	Username    string  `json:"username"`
+	Password    string  `json:"password"`
+	Status      *string `json:"status"`
+	Permissions *struct {
+		Global globalPermissionsArg `json:"global"`
+	} `json:"permissions"`
+}
+
+type userArgs struct {
+	UserID id `json:"user_id"`
+}
+
+type updateUserArgs struct {
+	UserID   id      `json:"user_id"`
+	Username *string `json:"username"`
+	Status   *string `json:"status"`
+}
+
+type metadataChangesArgs struct {
+	Start  metadataStart `json:"start"`
+	Groups []string      `json:"groups"`
+	Limit  *uint32       `json:"limit"`
+}
+
 type resolveArgs struct {
 	OperationID uint64  `json:"operation_id"`
 	DeadlineMs  *uint64 `json:"deadline_ms"`
@@ -127,22 +189,49 @@ type abandonArgs struct {
 // disconnecter is the SDK client that can drop its links and connect again.
 type disconnecter interface{ Disconnect() error }
 
+// disconnectable is the client, or the client that it wraps, as a
+// disconnecter, or nil.
+func disconnectable(client iggcon.Client) disconnecter {
+	for {
+		if dropping, ok := client.(disconnecter); ok {
+			return dropping
+		}
+		wrapper, ok := client.(interface{ Unwrap() iggcon.Client })
+		if !ok {
+			return nil
+		}
+		client = wrapper.Unwrap()
+	}
+}
+
 func (a *agent) call(ctx context.Context, entity, method string, raw json.RawMessage, saveAs string) reply {
 	if method == "next" {
-		target := a.reader(entity)
-		if target == nil {
-			return failure("no reader %q", entity)
-		}
 		if err := decode(raw, &noArgs{}); err != nil {
 			return failure("arguments: %v", err)
 		}
-		target.mu.Lock()
-		defer target.mu.Unlock()
-		polled, err := target.reader.Next(ctx)
-		if err != nil {
-			return sdkError(err)
+		if target := a.reader(entity); target != nil {
+			target.mu.Lock()
+			defer target.mu.Unlock()
+			polled, err := target.reader.Next(ctx)
+			if err != nil {
+				return sdkError(err)
+			}
+			return converted(canonicalPolled(polled))
 		}
-		return converted(canonicalPolled(polled))
+		if target := a.consumer(entity); target != nil {
+			target.mu.Lock()
+			defer target.mu.Unlock()
+			received, err := target.consumer.Next(ctx)
+			if err != nil {
+				return sdkError(err)
+			}
+			message, err := canonicalMessage(received.Message)
+			if err != nil {
+				return failure("result: %v", err)
+			}
+			return result(receivedMessageResult{PartitionID: received.PartitionID, Message: message})
+		}
+		return failure("no reader or consumer %q", entity)
 	}
 	cli := a.client(entity)
 	if cli == nil {
@@ -152,8 +241,8 @@ func (a *agent) call(ctx context.Context, entity, method string, raw json.RawMes
 	case "connect":
 		return noArgsCall(raw, func() error { return cli.Connect(ctx) })
 	case "disconnect":
-		dropping, ok := cli.(disconnecter)
-		if !ok {
+		dropping := disconnectable(cli)
+		if dropping == nil {
 			return unsupported("a client without Disconnect")
 		}
 		return noArgsCall(raw, dropping.Disconnect)
@@ -394,6 +483,170 @@ func (a *agent) call(ctx context.Context, entity, method string, raw json.RawMes
 		}
 		a.keepReader(saveAs, built)
 		return result(nil)
+	case "build_consumer":
+		var args buildConsumerArgs
+		if err := decode(raw, &args); err != nil {
+			return failure("arguments: %v", err)
+		}
+		if saveAs == "" {
+			return failure("build_consumer needs save_as")
+		}
+		commit, err := commitPolicy(args.Commit)
+		if err != nil {
+			return failure("arguments: %v", err)
+		}
+		options := iggcon.DefaultPollOptions()
+		options.Commit = commit
+		options.MaxWait = milliseconds(args.MaxWaitMs)
+		if args.Count != nil {
+			options.Count = *args.Count
+		}
+		group, err := iggcon.NewIdentifier(args.Group)
+		if err != nil {
+			return sdkError(err)
+		}
+		built, err := reader.NewIggyConsumer(ctx, cli, args.StreamID.identifier, args.TopicID.identifier,
+			iggcon.NewGroupConsumer(group), reader.WithPollOptions(options))
+		if err != nil {
+			return sdkError(err)
+		}
+		a.keepConsumer(saveAs, built)
+		return result(nil)
+	case "send_binary_request":
+		var args binaryRequestArgs
+		if err := decode(raw, &args); err != nil {
+			return failure("arguments: %v", err)
+		}
+		payload, err := hex.DecodeString(args.PayloadHex)
+		if err != nil {
+			return failure("payload_hex: %v", err)
+		}
+		answer, err := cli.SendBinaryRequest(ctx, args.Code, payload)
+		if err != nil {
+			return sdkError(err)
+		}
+		return result(rawResult{PayloadHex: hex.EncodeToString(answer)})
+	case "send_binary_request_to_replica":
+		var args binaryRequestToReplicaArgs
+		if err := decode(raw, &args); err != nil {
+			return failure("arguments: %v", err)
+		}
+		payload, err := hex.DecodeString(args.PayloadHex)
+		if err != nil {
+			return failure("payload_hex: %v", err)
+		}
+		answer, err := cli.SendBinaryRequestToReplica(ctx, args.Code, payload, args.Replica)
+		if err != nil {
+			return sdkError(err)
+		}
+		return result(rawResult{PayloadHex: hex.EncodeToString(answer)})
+	case "describe_options":
+		var args describeOptionsArgs
+		if err := decode(raw, &args); err != nil {
+			return failure("arguments: %v", err)
+		}
+		scopes := map[string]iggcon.OptionsScope{
+			"stream": iggcon.OptionsScopeStream, "topic": iggcon.OptionsScopeTopic, "user": iggcon.OptionsScopeUser,
+		}
+		scope, known := scopes[args.Scope]
+		if !known {
+			return failure("unknown scope %q", args.Scope)
+		}
+		specs, err := cli.DescribeOptions(ctx, scope)
+		if err != nil {
+			return sdkError(err)
+		}
+		results := make([]optionSpecResult, 0, len(specs))
+		for _, spec := range specs {
+			results = append(results, canonicalOptionSpec(spec))
+		}
+		return result(results)
+	case "create_user":
+		var args createUserArgs
+		if err := decode(raw, &args); err != nil {
+			return failure("arguments: %v", err)
+		}
+		status, err := userStatus(args.Status)
+		if err != nil {
+			return failure("arguments: %v", err)
+		}
+		var permissions *iggcon.Permissions
+		if args.Permissions != nil {
+			global := args.Permissions.Global
+			permissions = &iggcon.Permissions{Global: iggcon.GlobalPermissions{
+				ManageServers: global.ManageServers, ReadServers: global.ReadServers,
+				ManageUsers: global.ManageUsers, ReadUsers: global.ReadUsers,
+				ManageStreams: global.ManageStreams, ReadStreams: global.ReadStreams,
+				ManageTopics: global.ManageTopics, ReadTopics: global.ReadTopics,
+				PollMessages: global.PollMessages, SendMessages: global.SendMessages,
+			}}
+		}
+		user, err := cli.CreateUser(ctx, args.Username, args.Password, status, permissions, nil)
+		if err != nil {
+			return sdkError(err)
+		}
+		return converted(canonicalUser(user))
+	case "get_user":
+		var args userArgs
+		if err := decode(raw, &args); err != nil {
+			return failure("arguments: %v", err)
+		}
+		user, err := cli.GetUser(ctx, args.UserID.identifier)
+		if err != nil {
+			return sdkError(err)
+		}
+		if user == nil {
+			return result(nil)
+		}
+		return converted(canonicalUser(user))
+	case "update_user":
+		var args updateUserArgs
+		if err := decode(raw, &args); err != nil {
+			return failure("arguments: %v", err)
+		}
+		update := iggcon.UserUpdate{Username: args.Username}
+		if args.Status != nil {
+			status, err := userStatus(args.Status)
+			if err != nil {
+				return failure("arguments: %v", err)
+			}
+			update.Status = &status
+		}
+		return nullOrError(cli.UpdateUser(ctx, args.UserID.identifier, update))
+	case "delete_user":
+		var args userArgs
+		if err := decode(raw, &args); err != nil {
+			return failure("arguments: %v", err)
+		}
+		return nullOrError(cli.DeleteUser(ctx, args.UserID.identifier))
+	case "get_metadata_changes":
+		var args metadataChangesArgs
+		if err := decode(raw, &args); err != nil {
+			return failure("arguments: %v", err)
+		}
+		groups := make([]iggcon.MetadataChangeGroup, 0, len(args.Groups))
+		for _, name := range args.Groups {
+			group, err := iggcon.ParseMetadataChangeGroup(name)
+			if err != nil {
+				return failure("group %q: %v", name, err)
+			}
+			groups = append(groups, group)
+		}
+		query := iggcon.NewMetadataChangesQuery(args.Start.value, groups...)
+		if args.Limit != nil {
+			query.Limit = *args.Limit
+		}
+		changes, err := cli.GetMetadataChanges(ctx, query)
+		if err != nil {
+			return sdkError(err)
+		}
+		return converted(changesView(changes))
+	case "get_connection_info":
+		if err := decode(raw, &noArgs{}); err != nil {
+			return failure("arguments: %v", err)
+		}
+		info := cli.GetConnectionInfo()
+		return result(connectionInfoResult{ServerAddress: info.ServerAddress})
 	case "resolve_operation":
 		var args resolveArgs
 		if err := decode(raw, &args); err != nil {

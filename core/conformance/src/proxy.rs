@@ -186,7 +186,17 @@ impl ProxyHub {
     ///
     /// Fails when no local port is free.
     pub async fn listen(&mut self, client: &str, upstream: &str) -> io::Result<String> {
-        let socket = TcpListener::bind("127.0.0.1:0").await?;
+        self.listen_at(client, "127.0.0.1:0", upstream).await
+    }
+
+    /// Opens a listener at a fixed address, such as the address that a cluster
+    /// node advertises to clients.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the address is taken.
+    pub async fn listen_at(&mut self, key: &str, bind: &str, upstream: &str) -> io::Result<String> {
+        let socket = TcpListener::bind(bind).await?;
         let address = socket.local_addr()?.to_string();
         let state = Arc::new(ListenerState {
             upstream: upstream.to_owned(),
@@ -200,11 +210,21 @@ impl ProxyHub {
         let accept = tokio::spawn(accept_loop(socket, Arc::clone(&state)));
         if let Some(previous) = self
             .listeners
-            .insert(client.to_owned(), Listener { state, accept })
+            .insert(key.to_owned(), Listener { state, accept })
         {
             previous.close();
         }
         Ok(address)
+    }
+
+    /// Forgets the rules and the recorded frames of every listener, and keeps
+    /// the listeners and their connections open.
+    pub fn reset(&self) {
+        for listener in self.listeners.values() {
+            lock(&listener.state.rules).clear();
+            lock(&listener.state.frames).clear();
+            *lock(&listener.state.refuse_until) = None;
+        }
     }
 
     /// # Errors

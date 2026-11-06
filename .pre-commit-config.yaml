@@ -33,9 +33,9 @@ repos:
     hooks:
       - id: ruff-check
         args: [--fix]
-        files: ^(foreign|bdd|examples)/python/.*\.(py|pyi)$
+        files: ^(foreign|bdd|examples|conformance/agents)/python/.*\.(py|pyi)$
       - id: ruff-format
-        files: ^(foreign|bdd|examples)/python/.*\.(py|pyi)$
+        files: ^(foreign|bdd|examples|conformance/agents)/python/.*\.(py|pyi)$
 
   # Python type checking
   - repo: local
@@ -293,9 +293,9 @@ repos:
     hooks:
       - id: java-gradle-check
         name: java gradle check
-        entry: bash -ec 'for dir in foreign/java bdd/java examples/java; do if [ -f "$dir/build.gradle.kts" ]; then (cd "$dir" && ./gradlew check -x test); fi; done'
+        entry: bash -ec 'for dir in foreign/java bdd/java examples/java conformance/agents/java; do if [ -f "$dir/build.gradle.kts" ]; then (cd "$dir" && ./gradlew check -x test); fi; done'
         language: system
-        files: ^(foreign|bdd|examples)/java/.*\.(java|kt|kts)$
+        files: ^(foreign|bdd|examples|conformance/agents)/java/.*\.(java|kt|kts)$
         pass_filenames: false
         stages: [pre-push]
 
@@ -304,9 +304,9 @@ repos:
     hooks:
       - id: csharp-dotnet-format
         name: csharp dotnet format
-        entry: bash -c 'dotnet format foreign/csharp/Iggy_SDK.sln --verify-no-changes && dotnet format examples/csharp/Iggy_SDK.Examples.sln --verify-no-changes'
+        entry: bash -c 'dotnet format foreign/csharp/Iggy_SDK.sln --verify-no-changes && dotnet format examples/csharp/Iggy_SDK.Examples.sln --verify-no-changes && dotnet format conformance/agents/csharp/IggyAgent.csproj --verify-no-changes'
         language: system
-        files: ^(foreign|examples)/csharp/.*\.cs$
+        files: ^(foreign|examples|conformance/agents)/csharp/.*\.cs$
         pass_filenames: false
         stages: [pre-push]
 

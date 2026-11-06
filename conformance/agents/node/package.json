@@ -1,0 +1,17 @@
+{
+  "name": "iggy-conformance-agent-node",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The conformance agent of the Apache Iggy Node.js SDK",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "typescript": "6.0.3"
+  }
+}

@@ -23,10 +23,13 @@
 //! agent. The result check decodes a result into its canonical type.
 
 use crate::canonical::{
-    ConsumerGroupResult, IdentityResult, PolledMessagesResult, StreamDetailsResult, StreamResult,
-    TopicDetailsResult, TopicResult,
+    ConnectionInfoResult, ConsumerGroupResult, IdentityResult, OptionSpecResult,
+    PolledMessagesResult, RawResult, ReceivedMessageResult, StreamDetailsResult, StreamResult,
+    TopicDetailsResult, TopicResult, UserDetailsResult,
 };
+use crate::matcher;
 use crate::protocol::EntityKind;
+use iggy_common::MetadataChanges;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -57,9 +60,19 @@ pub enum Method {
     GetConsumerGroup,
     DeleteConsumerGroup,
     BuildReader,
+    BuildConsumer,
     ResolveOperation,
     AbandonOperation,
-    /// The next batch of a reader.
+    SendBinaryRequest,
+    SendBinaryRequestToReplica,
+    DescribeOptions,
+    CreateUser,
+    GetUser,
+    UpdateUser,
+    DeleteUser,
+    GetMetadataChanges,
+    GetConnectionInfo,
+    /// The next batch of a reader, or the next message of a consumer.
     Next,
 }
 
@@ -69,12 +82,12 @@ impl Method {
         self.into()
     }
 
-    /// The entity kind that owns the method.
+    /// The entity kinds that have the method.
     #[must_use]
-    pub fn target(self) -> EntityKind {
+    pub fn targets(self) -> &'static [EntityKind] {
         match self {
-            Self::Next => EntityKind::Reader,
-            _ => EntityKind::Client,
+            Self::Next => &[EntityKind::Reader, EntityKind::Consumer],
+            _ => &[EntityKind::Client],
         }
     }
 
@@ -83,17 +96,26 @@ impl Method {
     pub fn creates(self) -> Option<EntityKind> {
         match self {
             Self::BuildReader => Some(EntityKind::Reader),
+            Self::BuildConsumer => Some(EntityKind::Consumer),
             _ => None,
         }
     }
 
-    /// The agent capability that a call of the method needs.
+    /// The agent capability that a call of the method on `kind` needs.
     #[must_use]
-    pub fn capability(self) -> Option<&'static str> {
+    pub fn capability(self, kind: EntityKind) -> Option<&'static str> {
         match self {
-            Self::BuildReader | Self::Next => Some("reader"),
+            Self::BuildReader => Some("reader"),
+            Self::BuildConsumer => Some("consumer"),
+            Self::Next if kind == EntityKind::Consumer => Some("consumer"),
+            Self::Next => Some("reader"),
             Self::ResolveOperation => Some("resolve_operation"),
             Self::AbandonOperation => Some("abandon_operation"),
+            Self::SendBinaryRequest => Some("raw_command"),
+            Self::SendBinaryRequestToReplica => Some("raw_command_replica"),
+            Self::DescribeOptions => Some("describe_options"),
+            Self::GetMetadataChanges => Some("metadata_changes"),
+            Self::GetConnectionInfo => Some("connection_info"),
             _ => None,
         }
     }
@@ -105,9 +127,20 @@ impl Method {
     /// Returns the decode error, which names the field.
     pub fn check_args(self, args: &Value) -> Result<(), String> {
         match self {
-            Self::Connect | Self::Disconnect | Self::Ping | Self::LogoutUser | Self::GetStreams => {
-                decode::<NoArgs>(args)
-            }
+            Self::Connect
+            | Self::Disconnect
+            | Self::Ping
+            | Self::LogoutUser
+            | Self::GetStreams
+            | Self::GetConnectionInfo => decode::<NoArgs>(args),
+            Self::BuildConsumer => decode::<BuildConsumerArgs>(args),
+            Self::SendBinaryRequest => decode::<BinaryRequestArgs>(args),
+            Self::SendBinaryRequestToReplica => decode::<BinaryRequestToReplicaArgs>(args),
+            Self::DescribeOptions => decode::<DescribeOptionsArgs>(args),
+            Self::CreateUser => decode::<CreateUserArgs>(args),
+            Self::GetUser | Self::DeleteUser => decode::<UserArgs>(args),
+            Self::UpdateUser => decode::<UpdateUserArgs>(args),
+            Self::GetMetadataChanges => decode::<MetadataChangesArgs>(args),
             Self::Next => decode::<NextArgs>(args),
             Self::LoginUser => decode::<LoginUserArgs>(args),
             Self::GetStream | Self::DeleteStream | Self::GetTopics => decode::<StreamArgs>(args),
@@ -126,13 +159,22 @@ impl Method {
         }
     }
 
-    /// Decodes a result into its canonical type.
+    /// Decodes a result of a call on `kind` into its canonical type.
     ///
     /// # Errors
     ///
     /// Returns the decode error, which names a missing or unknown field.
-    pub fn check_result(self, result: &Value) -> Result<(), String> {
+    pub fn check_result(self, kind: EntityKind, result: &Value) -> Result<(), String> {
         match self {
+            Self::Next if kind == EntityKind::Consumer => decode::<ReceivedMessageResult>(result),
+            Self::SendBinaryRequest | Self::SendBinaryRequestToReplica => {
+                decode::<RawResult>(result)
+            }
+            Self::DescribeOptions => decode::<Vec<OptionSpecResult>>(result),
+            Self::CreateUser => decode::<UserDetailsResult>(result),
+            Self::GetUser => decode::<Option<UserDetailsResult>>(result),
+            Self::GetMetadataChanges => round_trip::<MetadataChanges>(result),
+            Self::GetConnectionInfo => decode::<ConnectionInfoResult>(result),
             Self::LoginUser => decode::<IdentityResult>(result),
             Self::GetStream => decode::<Option<StreamDetailsResult>>(result),
             Self::GetStreams => decode::<Vec<StreamResult>>(result),
@@ -154,8 +196,11 @@ impl Method {
             | Self::SendMessages
             | Self::DeleteConsumerGroup
             | Self::BuildReader
+            | Self::BuildConsumer
             | Self::ResolveOperation
-            | Self::AbandonOperation => decode::<()>(result),
+            | Self::AbandonOperation
+            | Self::UpdateUser
+            | Self::DeleteUser => decode::<()>(result),
         }
     }
 }
@@ -164,6 +209,19 @@ fn decode<T: DeserializeOwned>(value: &Value) -> Result<(), String> {
     T::deserialize(value)
         .map(drop)
         .map_err(|error| error.to_string())
+}
+
+/// For a form that the SDK types define, such as the HTTP JSON of metadata
+/// changes: the value must decode into the type and encode back to itself, so
+/// a missing, misnamed or extra field fails.
+fn round_trip<T: DeserializeOwned + Serialize>(value: &Value) -> Result<(), String> {
+    let decoded = T::deserialize(value).map_err(|error| error.to_string())?;
+    let encoded = serde_json::to_value(&decoded).map_err(|error| error.to_string())?;
+    if matcher::values_equal(&encoded, value) {
+        Ok(())
+    } else {
+        Err(format!("it encodes back as {}", matcher::compact(&encoded)))
+    }
 }
 
 /// A stream, topic, group or consumer: a number is an id, text is a name.
@@ -389,13 +447,135 @@ pub struct BuildReaderArgs {
     pub stream_id: Id,
     pub topic_id: Id,
     pub consumer: Option<ConsumerArg>,
-    /// The partitions to read. Without it a group reader reads its assignment
-    /// and a single consumer reads every partition.
+    /// The partitions to read. A group reader reads its assignment without it,
+    /// and a single consumer needs it.
     pub partitions: Option<Vec<u32>>,
     pub start: Option<Strategy>,
     pub max_wait_ms: Option<u64>,
     #[serde(default)]
     pub commit: Commit,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildConsumerArgs {
+    pub stream_id: Id,
+    pub topic_id: Id,
+    /// The consumer group to join, which must exist.
+    pub group: String,
+    pub max_wait_ms: Option<u64>,
+    /// The most messages that one poll of the consumer reads.
+    pub count: Option<u32>,
+    #[serde(default)]
+    pub commit: Commit,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BinaryRequestArgs {
+    pub code: u32,
+    #[serde(default)]
+    pub payload_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BinaryRequestToReplicaArgs {
+    pub code: u32,
+    #[serde(default)]
+    pub payload_hex: String,
+    pub replica: u8,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DescribeOptionsArgs {
+    pub scope: OptionsScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionsScope {
+    Stream,
+    Topic,
+    User,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateUserArgs {
+    pub username: String,
+    pub password: String,
+    #[serde(default)]
+    pub status: UserStatus,
+    /// Without it the user has no permissions.
+    pub permissions: Option<PermissionsArg>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserStatus {
+    #[default]
+    Active,
+    Inactive,
+}
+
+/// Global permissions only. Stream permissions are not in format 1.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionsArg {
+    #[serde(default)]
+    pub global: GlobalPermissionsArg,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GlobalPermissionsArg {
+    pub manage_servers: bool,
+    pub read_servers: bool,
+    pub manage_users: bool,
+    pub read_users: bool,
+    pub manage_streams: bool,
+    pub read_streams: bool,
+    pub manage_topics: bool,
+    pub read_topics: bool,
+    pub poll_messages: bool,
+    pub send_messages: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserArgs {
+    pub user_id: Id,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateUserArgs {
+    pub user_id: Id,
+    pub username: Option<String>,
+    pub status: Option<UserStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataChangesArgs {
+    pub start: MetadataStart,
+    /// Group names such as `streams`. Empty means every group.
+    #[serde(default)]
+    pub groups: Vec<String>,
+    pub limit: Option<u32>,
+}
+
+/// `earliest`, `latest`, `{after: cursor}` or `{current: page token or null}`,
+/// with the cursor and the token in their text forms.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataStart {
+    Earliest,
+    Latest,
+    After(String),
+    Current(Option<String>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -449,19 +629,44 @@ mod tests {
 
     #[test]
     fn given_a_result_with_a_misnamed_field_when_checking_should_fail() {
+        let client = EntityKind::Client;
         let result = json!({"user_id": 1, "userId": 1});
-        assert!(Method::LoginUser.check_result(&result).is_err());
+        assert!(Method::LoginUser.check_result(client, &result).is_err());
         assert!(
             Method::LoginUser
-                .check_result(&json!({"user_id": 1}))
+                .check_result(client, &json!({"user_id": 1}))
                 .is_ok()
         );
     }
 
     #[test]
     fn given_a_unit_method_when_checking_a_value_should_fail() {
-        assert!(Method::DeleteStream.check_result(&Value::Null).is_ok());
-        assert!(Method::DeleteStream.check_result(&json!({})).is_err());
+        let client = EntityKind::Client;
+        assert!(
+            Method::DeleteStream
+                .check_result(client, &Value::Null)
+                .is_ok()
+        );
+        assert!(
+            Method::DeleteStream
+                .check_result(client, &json!({}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn given_metadata_starts_when_decoding_should_accept_each_form() {
+        for start in [
+            json!("latest"),
+            json!({"after": "mc1_x"}),
+            json!({"current": null}),
+        ] {
+            let args = json!({"start": start, "groups": ["streams"]});
+            assert!(
+                Method::GetMetadataChanges.check_args(&args).is_ok(),
+                "{args}"
+            );
+        }
     }
 
     #[test]

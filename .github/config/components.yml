@@ -404,6 +404,79 @@ components:
       - "conformance/agents/go/**"
     tasks: ["conformance-go"]
 
+  conformance-python:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk"
+      - "sdk-python"
+      - "conformance-infrastructure"
+      - "ci-infrastructure"
+    paths:
+      - "conformance/agents/python/**"
+    tasks: ["conformance-python"]
+
+  conformance-csharp:
+    depends_on:
+      - "rust-server"
+      - "sdk-csharp"
+      - "conformance-infrastructure"
+      - "ci-infrastructure"
+    paths:
+      - "conformance/agents/csharp/**"
+    tasks: ["conformance-csharp"]
+
+  conformance-java:
+    depends_on:
+      - "rust-server"
+      - "sdk-java"
+      - "conformance-infrastructure"
+      - "ci-infrastructure"
+    paths:
+      - "conformance/agents/java/**"
+    tasks: ["conformance-java"]
+
+  conformance-node:
+    depends_on:
+      - "rust-server"
+      - "sdk-node"
+      - "conformance-infrastructure"
+      - "ci-infrastructure"
+    paths:
+      - "conformance/agents/node/**"
+    tasks: ["conformance-node"]
+
+  conformance-cpp:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk"
+      - "sdk-cpp"
+      - "conformance-infrastructure"
+      - "ci-infrastructure"
+    paths:
+      - "conformance/agents/cpp/**"
+    tasks: ["conformance-cpp"]
+
+  conformance-php:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk"
+      - "sdk-php"
+      - "conformance-infrastructure"
+      - "ci-infrastructure"
+    paths:
+      - "conformance/agents/php/**"
+    tasks: ["conformance-php"]
+
+  conformance-swift:
+    depends_on:
+      - "rust-server"
+      - "sdk-swift"
+      - "conformance-infrastructure"
+      - "ci-infrastructure"
+    paths:
+      - "conformance/agents/swift/**"
+    tasks: ["conformance-swift"]
+
   # Individual BDD tests per SDK - only run when specific SDK changes
   bdd-rust:
     depends_on:

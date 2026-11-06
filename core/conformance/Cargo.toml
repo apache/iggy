@@ -31,6 +31,7 @@ path = "src/main.rs"
 bytemuck = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["env"] }
+futures = { workspace = true }
 hex = { workspace = true }
 humantime = { workspace = true }
 iggy = { workspace = true }

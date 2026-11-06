@@ -25,15 +25,22 @@ To run another SDK, give the command that starts its agent:
 target/debug/iggy-conformance run --server 127.0.0.1:8090 --agent conformance/agents/go/iggy-agent
 ```
 
-`scripts/run-conformance-tests.sh <sdk>` does all of this the way CI does. It starts a single node and a node that
-cannot reach quorum on spare local ports, builds the agent, runs the corpus with the skip list and writes the reports
-to `reports/`. The supported SDKs are `rust` and `go`.
+`scripts/run-conformance-tests.sh <sdk>` does all of this the way CI does. It starts a single node, a node that
+cannot reach quorum and a two-node cluster on spare local ports, builds the agent, runs the corpus with the skip list
+and writes the reports to `reports/`. Its header lists the environment variables, for example `CONFORMANCE_HOST` to
+run two suites side by side on two loopback addresses.
+
+The script builds and runs the agents of `rust`, `go`, `python`, `csharp`, `java`, `node`, `cpp`, `php` and `swift`.
+Each agent directory under `conformance/agents/` holds its own build files. The PHP agent, and the Swift agent on a
+machine without Swift, build and run in Docker images.
 
 Other options:
 
 | Option | Effect |
 | --- | --- |
 | `--no-quorum <address>` | The address of a cluster node that cannot reach quorum. Tests with `topology: no_quorum` need it. |
+| `--leader <address>`, `--follower <address>` | The addresses of the two nodes of a cluster. Tests with `topology: cluster` need them. |
+| `--cluster-proxy-host <host>` | The host that the cluster nodes advertise. The orchestrator proxies the port of each node there. |
 | `--filter <text>` | Runs only the tests whose id contains the text. |
 | `--junit <file>`, `--json <file>` | Writes the results as JUnit XML or as a JSON report. |
 | `--skips conformance/skips.toml` | Fails the run on a skip or a divergence that the list does not allow. |
@@ -102,7 +109,7 @@ create_entities:
 
 | Client field | Meaning |
 | --- | --- |
-| `id` | The name that operations use. `orchestrator` and `proxy` are reserved. |
+| `id` | The name that operations use. `orchestrator`, `proxy` and `admin` are reserved. |
 | `login` | `root` (the default), `none`, or `{username, password}`. |
 | `node` | `default` (the single node), `no_quorum`, `leader` or `follower`. |
 | `through_proxy` | `true` connects the client through a fault proxy of its own. |
@@ -120,7 +127,7 @@ A call such as `build_reader` creates an entity of another kind. Its `save_resul
 
 | Key | Meaning |
 | --- | --- |
-| `object` | An entity id, `orchestrator` or `proxy`. |
+| `object` | An entity id, `orchestrator`, `proxy` or `admin`. |
 | `name` | The method. For an entity, it is the Rust SDK method name. |
 | `arguments` | The arguments, named after the Rust parameters. |
 | `expect_result` | The expected result. Without it, the call must still succeed. |
@@ -128,6 +135,10 @@ A call such as `build_reader` creates an entity of another kind. Its `save_resul
 | `save_result_as` | The id of the entity that the call creates. |
 | `background` | Starts the call as a task with this name. An `await` collects its answer later. |
 | `within`, `not_before` | Time bounds such as `2s` or `200ms`. For an `await`, they count from the start of the task. |
+
+An operation on `admin` calls a method with the orchestrator's own client, which is the Rust SDK. Use it for a setup
+step that the test does not check, so that a divergence of the SDK under test fails only the tests that check that
+call.
 
 An error name is the snake_case name of the `IggyError` variant, as in the shared codec fixtures.
 The orchestrator maps the name to its code.
@@ -180,6 +191,11 @@ expect_frames:
 ```
 
 `commands` and `direction` select frames, and pings are left out unless `include_pings` is `true`.
+
+In a run with `--cluster-proxy-host`, the cluster nodes advertise the proxy host. The orchestrator listens there on the
+port of each node for the whole run, so every client of the cluster goes through the proxy, also after a redirect.
+These listeners are shared by the clients of a test. The proxy calls and `expect_frames` name them `@leader` and
+`@follower` in place of a client.
 Each frame has these fields:
 
 | Field | Meaning |
@@ -213,7 +229,8 @@ Each frame has these fields:
 | `{$$capture: name}` | Any value. The test keeps it under the name. |
 | `{$$ref: name}` | The captured value. In `arguments`, the captured value replaces the operator. |
 
-Each test starts with two captures: `root_username` and `root_password` of the run.
+Each test starts with captures of the run: `root_username`, `root_password`, `server_address`, and in a run with a
+cluster `leader_address` and `follower_address`.
 
 ## Methods
 
@@ -240,9 +257,20 @@ An identifier is a number for an id or text for a name.
 | `get_consumer_group` | client | `stream_id`, `topic_id`, `group_id` | consumer group or null |
 | `delete_consumer_group` | client | `stream_id`, `topic_id`, `group_id` | null |
 | `build_reader` | client | `stream_id`, `topic_id`, `consumer`, `partitions`, `start`, `max_wait_ms`, `commit` | null, and a reader entity |
+| `build_consumer` | client | `stream_id`, `topic_id`, `group`, `max_wait_ms`, `count`, `commit` | null, and a consumer entity |
 | `resolve_operation` | client | `operation_id`, `deadline_ms` | null |
 | `abandon_operation` | client | `operation_id` | null |
+| `send_binary_request` | client | `code`, `payload_hex` | raw reply |
+| `send_binary_request_to_replica` | client | `code`, `payload_hex`, `replica` | raw reply |
+| `describe_options` | client | `scope` | list of option specs |
+| `create_user` | client | `username`, `password`, `status`, `permissions` | user details |
+| `get_user` | client | `user_id` | user details or null |
+| `update_user` | client | `user_id`, `username`, `status` | null |
+| `delete_user` | client | `user_id` | null |
+| `get_metadata_changes` | client | `start`, `groups`, `limit` | metadata changes |
+| `get_connection_info` | client | none | connection info |
 | `next` | reader | none | polled messages |
+| `next` | consumer | none | received message |
 
 The argument forms are:
 
@@ -252,13 +280,27 @@ The argument forms are:
 | `max_topic_size` | `unlimited`, `server_default`, or bytes |
 | `partitioning` | `balanced`, `{partition_id: 0}` or `{messages_key: text}` |
 | `messages` | A list of `{id, payload}` or `{id, payload_hex}`, with optional `headers: {key: {kind, value}}`. `id` is decimal text. |
-| `consumer` | `{consumer: 1}` or `{group: readers}`. Without it the SDK default consumer applies. |
+| `consumer` | `{consumer: 1}` or `{group: readers}`. Without it the consumer is `{consumer: 0}`, the default of the Rust SDK. |
 | `strategy`, `start` | `first`, `last`, `next`, `{offset: 0}` or `{timestamp: microseconds}` |
 | `commit` | `manual` (the default), `on_read` or `after_processing` |
 | `reset` | Option keys to reset to their server defaults, such as `[max_topic_size]` |
+| `group` | The name of a consumer group that exists. `build_consumer` joins it. |
+| `scope` | `stream`, `topic` or `user` |
+| `status` | `active` (the default) or `inactive` |
+| `permissions` | `{global: {manage_servers, read_servers, manage_users, read_users, manage_streams, read_streams, manage_topics, read_topics, poll_messages, send_messages}}`, each flag false by default. Without it the user has no permissions. |
+| `start` | `earliest`, `latest`, `{after: cursor}` or `{current: page token or null}`, with the cursor and the page token in their text forms |
+| `groups` | Metadata change groups such as `[streams]`. Empty means every group. |
 
-`resolve_operation`, `abandon_operation` and the reader methods need the agent capabilities
-`resolve_operation`, `abandon_operation` and `reader`.
+Some methods need an agent capability. The orchestrator skips a test that needs a capability that the agent does
+not announce:
+
+| Capability | Methods |
+| --- | --- |
+| `reader` | `build_reader`, and `next` on a reader |
+| `consumer` | `build_consumer`, and `next` on a consumer |
+| `resolve_operation`, `abandon_operation` | The method of the same name |
+| `raw_command`, `raw_command_replica` | `send_binary_request`, `send_binary_request_to_replica` |
+| `describe_options`, `metadata_changes`, `connection_info` | `describe_options`, `get_metadata_changes`, `get_connection_info` |
 
 ## Canonical results
 
@@ -284,6 +326,15 @@ The forms are the types in `core/conformance/src/canonical.rs`:
 | polled messages | `partition_id`, `current_offset`, `count`, `messages` |
 | message | `offset`, `id`, `timestamp`, `origin_timestamp`, `checksum`, `payload`, `payload_hex`, `headers` |
 | consumer group | `id`, `name`, `partitions_count`, `members_count`, `members` (`id`, `partitions_count`, `partitions`) |
+| raw reply | `payload_hex` |
+| option spec | `key`, `kind`, `updatable`, `resettable`, `secret`, `read_only`, `critical` |
+| user details | `id`, `username`, `status`, `created_at`, `permissions` (`global` only, or null), `options` |
+| received message | `partition_id`, `message` |
+| connection info | `server_address` |
+| metadata changes | The HTTP JSON form that `core/common/fixtures/metadata_changes.json` calls `expected` |
+
+A metadata changes answer must decode into the Rust `MetadataChanges` type and encode back to the same JSON. Its
+records keep their fields at the top level, such as `kind`, `stream_id` and `requested_op`, as in the fixture.
 
 ## Agent protocol
 
@@ -326,7 +377,8 @@ Rules for every agent:
 
 1. Answer requests concurrently, and tag each answer with the `id` of its request.
 2. Return an SDK error as its numeric code. For the errors 14006 to 14010, add `operation_id`, and for 14009 add
-   `partition_id`.
+   `partition_id`. If the SDK reports an error that has no Iggy code, return code 0 with its message. No `IggyError`
+   has code 0, so the test fails, and the skip list can name the divergence.
 3. Answer `unsupported` for a method, an argument value, a transport or an entity kind that the SDK does not have.
    The orchestrator reports the test as a skip with that reason.
 4. Answer `failure` for a fault of the agent itself. The orchestrator reports the test as an error.

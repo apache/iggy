@@ -20,6 +20,7 @@
 use crate::agent::RustAgent;
 use crate::agent_host::{AgentCommand, AgentHost, HostError};
 use crate::api::Method;
+use crate::format;
 use crate::format::{
     AdminCall, ClientSpec, Credentials, EntitySpec, ErrorExpectation, LoadedFile, Login,
     LoginKeyword, Node, ORCHESTRATOR, Operation, OrchestratorCall, PROXY, ProxyCall, Requirements,
@@ -39,9 +40,15 @@ use std::time::{Duration, Instant};
 /// The entity id of the orchestrator's own client.
 const ADMIN: &str = "admin";
 
+/// The entity id of the orchestrator's client of the cluster leader.
+const CLUSTER_ADMIN: &str = "admin-cluster";
+
 /// How long past a time bound the runner waits before it calls an answer
 /// late, so that a late answer fails with its time instead of a timeout.
 const LATE_GRACE: Duration = Duration::from_secs(1);
+
+/// The pause between two reads of an `eventually` operation.
+const EVENTUALLY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How long a reset may take before the runner restarts the agent.
 const RESET_TIMEOUT: Duration = Duration::from_secs(30);
@@ -52,6 +59,8 @@ pub struct RunConfig {
     pub server: String,
     /// The TCP address of a node that cannot reach quorum, if one runs.
     pub no_quorum: Option<String>,
+    /// The TCP addresses of the primary and of a backup of a cluster, if one runs.
+    pub cluster: Option<ClusterAddresses>,
     pub root: Credentials,
     pub transport: Transport,
     pub agent: AgentCommand,
@@ -64,6 +73,21 @@ pub struct RunConfig {
     /// that a test author can start from what the agent observed.
     pub record: bool,
 }
+
+#[derive(Debug, Clone)]
+pub struct ClusterAddresses {
+    pub leader: String,
+    pub follower: String,
+    /// The host that the nodes advertise to clients. The orchestrator listens
+    /// there on the port of each node, so every client of the cluster goes
+    /// through the fault proxy, a redirect included.
+    pub proxy_host: Option<String>,
+}
+
+/// The proxy listener of a cluster node, as `fail_frames` and `expect_frames`
+/// name it in place of a client.
+pub const LEADER_LISTENER: &str = "@leader";
+pub const FOLLOWER_LISTENER: &str = "@follower";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verdict", content = "reason", rename_all = "snake_case")]
@@ -107,6 +131,8 @@ pub struct Runner {
     config: RunConfig,
     admin: RustAgent,
     proxy: ProxyHub,
+    /// The listeners of the cluster nodes, open for the whole run.
+    node_proxy: ProxyHub,
     host: Option<AgentHost>,
     hello: Hello,
 }
@@ -119,18 +145,41 @@ impl Runner {
     /// Fails when the server or the agent cannot be reached.
     pub async fn start(config: RunConfig) -> Result<Self, RunError> {
         let admin = RustAgent::default();
-        let create = Request::Create {
-            kind: EntityKind::Client,
-            entity: ADMIN.to_owned(),
-            args: to_value(&CreateClientArgs {
-                transport: Transport::Tcp,
-                address: config.server.clone(),
-                login: Some(config.root.clone()),
-            }),
-        };
-        match admin.handle(create).await {
-            Reply::Result(_) => {}
-            other => return Err(RunError::Admin(describe_reply(&other))),
+        let mut admins = vec![(ADMIN, config.server.clone())];
+        if let Some(cluster) = &config.cluster {
+            admins.push((CLUSTER_ADMIN, cluster.leader.clone()));
+        }
+        for (entity, address) in admins {
+            let create = Request::Create {
+                kind: EntityKind::Client,
+                entity: entity.to_owned(),
+                args: to_value(&CreateClientArgs {
+                    transport: Transport::Tcp,
+                    address,
+                    login: Some(config.root.clone()),
+                }),
+            };
+            match admin.handle(create).await {
+                Reply::Result(_) => {}
+                other => return Err(RunError::Admin(describe_reply(&other))),
+            }
+        }
+        let mut node_proxy = ProxyHub::default();
+        if let Some(cluster) = &config.cluster
+            && let Some(proxy_host) = &cluster.proxy_host
+        {
+            for (key, upstream) in [
+                (LEADER_LISTENER, &cluster.leader),
+                (FOLLOWER_LISTENER, &cluster.follower),
+            ] {
+                let bind = advertised(proxy_host, upstream).map_err(RunError::Admin)?;
+                node_proxy
+                    .listen_at(key, &bind, upstream)
+                    .await
+                    .map_err(|error| {
+                        RunError::Admin(format!("cannot listen at {bind}: {error}"))
+                    })?;
+            }
         }
         let host = AgentHost::spawn(&config.agent, config.hello_timeout).await?;
         let hello = host.hello().clone();
@@ -143,6 +192,7 @@ impl Runner {
             admin,
             host: Some(host),
             proxy: ProxyHub::default(),
+            node_proxy,
             hello,
         })
     }
@@ -227,12 +277,16 @@ impl Runner {
                 )));
             }
         }
-        self.admin
-            .purge(ADMIN, &self.config.root.username)
-            .await
-            .map_err(|error| Step::Errored(format!("cannot purge the server: {error}")))?;
+        let admin = Self::admin_of(test);
+        for entity in self.admin_entities() {
+            self.admin
+                .purge(entity, &self.config.root.username)
+                .await
+                .map_err(|error| Step::Errored(format!("cannot purge {entity}: {error}")))?;
+        }
         let mut state = TestState {
             test: id.to_owned(),
+            admin,
             ..TestState::default()
         };
         // Tests refer to the root credentials of the run with `$$ref`.
@@ -244,8 +298,22 @@ impl Runner {
             "root_password",
             Value::from(self.config.root.password.clone()),
         );
+        // And to the addresses of the nodes, to check where a client went.
+        state
+            .captures
+            .insert("server_address", Value::from(self.config.server.clone()));
+        if self.config.cluster.is_some() {
+            for (name, node) in [
+                ("leader_address", Node::Leader),
+                ("follower_address", Node::Follower),
+            ] {
+                let address = self.node_address(node).map_err(Step::Errored)?;
+                state.captures.insert(name, Value::from(address));
+            }
+        }
+        self.node_proxy.reset();
         for call in &file.file.initial_data {
-            self.admin_call(call, &mut state.captures)
+            self.admin_call(admin, call, &mut state.captures)
                 .await
                 .map_err(|step| step.errored(&format!("initial_data {}", call.name)))?;
         }
@@ -265,7 +333,7 @@ impl Runner {
         }
         for expectation in &test.expect_frames {
             let selected: Vec<Value> = self
-                .proxy
+                .proxy_of(&expectation.client)
                 .frames(&expectation.client)
                 .map_err(Step::Errored)?
                 .iter()
@@ -293,7 +361,7 @@ impl Runner {
             })?;
         }
         for call in &test.outcome {
-            self.admin_call(call, &mut state.captures)
+            self.admin_call(admin, call, &mut state.captures)
                 .await
                 .map_err(|step| step.context(&format!("outcome {}", call.name)))?;
         }
@@ -304,6 +372,9 @@ impl Runner {
         let mut topologies = vec![Topology::Single];
         if self.config.no_quorum.is_some() {
             topologies.push(Topology::NoQuorum);
+        }
+        if self.config.cluster.is_some() {
+            topologies.push(Topology::Cluster);
         }
         topologies
     }
@@ -357,10 +428,20 @@ impl Runner {
                 .clone()
                 .ok_or_else(|| Step::Skipped("no no_quorum node in this run".to_owned()))?,
             Node::Leader | Node::Follower => {
-                return Err(Step::Skipped("no cluster in this run".to_owned()));
+                if self.config.cluster.is_none() {
+                    return Err(Step::Skipped("no cluster in this run".to_owned()));
+                }
+                self.node_address(spec.node).map_err(Step::Errored)?
             }
         };
-        let address = if spec.through_proxy {
+        let proxied_cluster = spec.node.topology() == Topology::Cluster
+            && self
+                .config
+                .cluster
+                .as_ref()
+                .is_some_and(|cluster| cluster.proxy_host.is_some());
+        // A client of a proxied cluster already goes through the node listeners.
+        let address = if spec.through_proxy && !proxied_cluster {
             self.proxy
                 .listen(&spec.id, &upstream)
                 .await
@@ -407,6 +488,7 @@ impl Runner {
         match operation.object.as_str() {
             ORCHESTRATOR => self.orchestrator_call(operation, args, state).await,
             PROXY => self.proxy_call(operation, args),
+            format::ADMIN => self.admin_operation(operation, args, state).await,
             entity => self.entity_call(entity, operation, args, state).await,
         }
     }
@@ -424,14 +506,14 @@ impl Runner {
             .ok_or_else(|| Step::Errored(format!("no entity {entity:?}")))?;
         let method = Method::from_str(&operation.name)
             .map_err(|_| Step::Errored(format!("unknown method {}", operation.name)))?;
-        if method.target() != kind {
+        if !method.targets().contains(&kind) {
             return Err(Step::Errored(format!(
-                "{} is a method of a {:?}, and {entity} is a {kind:?}",
+                "{} is a method of {:?}, and {entity} is a {kind:?}",
                 operation.name,
-                method.target()
+                method.targets()
             )));
         }
-        if let Some(capability) = method.capability()
+        if let Some(capability) = method.capability(kind)
             && !self
                 .hello
                 .capabilities
@@ -453,7 +535,14 @@ impl Runner {
             };
             return match self.request(request, self.config.call_timeout).await? {
                 Reply::Result(Value::Null) => {
-                    state.tasks.insert(task.clone(), Task { method, started });
+                    state.tasks.insert(
+                        task.clone(),
+                        Task {
+                            method,
+                            kind,
+                            started,
+                        },
+                    );
                     Ok(())
                 }
                 Reply::Unsupported(reason) => Err(Step::Skipped(reason)),
@@ -476,6 +565,11 @@ impl Runner {
             }
             (None, None) => None,
         };
+        if operation.eventually.is_some() {
+            return self
+                .eventually(entity, operation, (method, kind), &args, state)
+                .await;
+        }
         let request = Request::Call {
             entity: entity.to_owned(),
             method: operation.name.clone(),
@@ -489,12 +583,50 @@ impl Runner {
         let reply = self.timed_request(request, limit, operation.within).await?;
         let elapsed = started.elapsed();
         let produced = matches!(reply, Reply::Result(_));
-        self.judge_recorded(state, method, operation, reply, elapsed)?;
+        self.judge_recorded(state, method, kind, operation, reply, elapsed)?;
         self.bounds_recorded(state, elapsed, operation)?;
         if let (Some(created), Some(id), true) = (method.creates(), save_as, produced) {
             state.entities.insert(id, created);
         }
         Ok(())
+    }
+
+    /// Repeats a read until its answer matches, or reports the last mismatch.
+    async fn eventually(
+        &mut self,
+        entity: &str,
+        operation: &Operation,
+        (method, kind): (Method, EntityKind),
+        args: &Value,
+        state: &mut TestState,
+    ) -> Result<(), Step> {
+        let limit = operation.eventually.unwrap_or_default();
+        let started = Instant::now();
+        loop {
+            let request = Request::Call {
+                entity: entity.to_owned(),
+                method: operation.name.clone(),
+                args: args.clone(),
+                save_as: None,
+            };
+            let reply = self.request(request, self.config.call_timeout).await?;
+            match judge(
+                method,
+                kind,
+                operation.expect_result.as_ref(),
+                operation.expect_error.as_ref(),
+                reply,
+                &mut state.captures,
+            ) {
+                Err(Step::Failed(_)) if started.elapsed() < limit => {
+                    tokio::time::sleep(EVENTUALLY_INTERVAL).await;
+                }
+                Err(Step::Failed(reason)) => {
+                    return Err(Step::Failed(format!("still after {limit:?}: {reason}")));
+                }
+                other => return other,
+            }
+        }
     }
 
     async fn orchestrator_call(
@@ -523,7 +655,7 @@ impl Runner {
                     .timed_request(Request::Await { task: args.task }, limit, operation.within)
                     .await?;
                 let elapsed = task.started.elapsed();
-                self.judge_recorded(state, task.method, operation, reply, elapsed)?;
+                self.judge_recorded(state, task.method, task.kind, operation, reply, elapsed)?;
                 self.bounds_recorded(state, elapsed, operation)
             }
             OrchestratorCall::Cancel => {
@@ -562,16 +694,102 @@ impl Runner {
     fn proxy_call(&self, operation: &Operation, args: Value) -> Result<(), Step> {
         let call = ProxyCall::from_str(&operation.name).map_err(Step::Errored)?;
         let applied = match call {
-            ProxyCall::FailFrames => self.proxy.fail_frames(decode::<FailFramesArgs>(args)?),
-            ProxyCall::RefuseConnections => self
-                .proxy
-                .refuse_connections(&decode::<RefuseConnectionsArgs>(args)?),
-            ProxyCall::ClearRules => self.proxy.clear_rules(&decode::<ClientArgs>(args)?.client),
+            ProxyCall::FailFrames => {
+                let args: FailFramesArgs = decode(args)?;
+                self.proxy_of(&args.client).fail_frames(args)
+            }
+            ProxyCall::RefuseConnections => {
+                let args: RefuseConnectionsArgs = decode(args)?;
+                self.proxy_of(&args.client).refuse_connections(&args)
+            }
+            ProxyCall::ClearRules => {
+                let args: ClientArgs = decode(args)?;
+                self.proxy_of(&args.client).clear_rules(&args.client)
+            }
         };
         applied.map_err(Step::Errored)
     }
 
-    async fn admin_call(&self, call: &AdminCall, captures: &mut Captures) -> Result<(), Step> {
+    /// The node listeners for `@leader` and `@follower`, the per-client
+    /// listeners for an entity.
+    fn proxy_of(&self, client: &str) -> &ProxyHub {
+        if client.starts_with('@') {
+            &self.node_proxy
+        } else {
+            &self.proxy
+        }
+    }
+
+    /// The address that a client of a cluster node dials: the advertised proxy
+    /// address when the cluster runs behind the proxy.
+    fn node_address(&self, node: Node) -> Result<String, String> {
+        let cluster = self
+            .config
+            .cluster
+            .as_ref()
+            .ok_or_else(|| "no cluster in this run".to_owned())?;
+        let address = if node == Node::Leader {
+            &cluster.leader
+        } else {
+            &cluster.follower
+        };
+        match &cluster.proxy_host {
+            Some(proxy_host) => advertised(proxy_host, address),
+            None => Ok(address.clone()),
+        }
+    }
+
+    /// A setup call with the orchestrator's own client, so that a step that a
+    /// test does not check never fails on a divergence of the SDK under test.
+    async fn admin_operation(
+        &self,
+        operation: &Operation,
+        args: Value,
+        state: &mut TestState,
+    ) -> Result<(), Step> {
+        let method = Method::from_str(&operation.name)
+            .map_err(|_| Step::Errored(format!("unknown method {}", operation.name)))?;
+        method
+            .check_args(&args)
+            .map_err(|error| Step::Errored(format!("arguments: {error}")))?;
+        let reply = self
+            .admin
+            .call(state.admin, &operation.name, args, None)
+            .await;
+        judge(
+            method,
+            EntityKind::Client,
+            operation.expect_result.as_ref(),
+            operation.expect_error.as_ref(),
+            reply,
+            &mut state.captures,
+        )
+    }
+
+    /// The admin client of the deployment that a test uses: the cluster for a
+    /// test with a client of a cluster node, the single node otherwise.
+    fn admin_of(test: &TestCase) -> &'static str {
+        let clustered = test
+            .create_entities
+            .iter()
+            .any(|entity| entity.client.node.topology() == Topology::Cluster);
+        if clustered { CLUSTER_ADMIN } else { ADMIN }
+    }
+
+    fn admin_entities(&self) -> Vec<&'static str> {
+        if self.config.cluster.is_some() {
+            vec![ADMIN, CLUSTER_ADMIN]
+        } else {
+            vec![ADMIN]
+        }
+    }
+
+    async fn admin_call(
+        &self,
+        admin: &str,
+        call: &AdminCall,
+        captures: &mut Captures,
+    ) -> Result<(), Step> {
         let method = Method::from_str(&call.name)
             .map_err(|_| Step::Errored(format!("unknown method {}", call.name)))?;
         let args = matcher::resolve_refs(&Value::Object(call.arguments.clone()), captures)
@@ -579,8 +797,15 @@ impl Runner {
         method
             .check_args(&args)
             .map_err(|error| Step::Errored(format!("arguments: {error}")))?;
-        let reply = self.admin.call(ADMIN, &call.name, args, None).await;
-        judge(method, call.expect_result.as_ref(), None, reply, captures)
+        let reply = self.admin.call(admin, &call.name, args, None).await;
+        judge(
+            method,
+            EntityKind::Client,
+            call.expect_result.as_ref(),
+            None,
+            reply,
+            captures,
+        )
     }
 
     /// Judges an answer, and in record mode prints it and keeps going.
@@ -588,6 +813,7 @@ impl Runner {
         &self,
         state: &mut TestState,
         method: Method,
+        kind: EntityKind,
         operation: &Operation,
         reply: Reply,
         elapsed: Duration,
@@ -604,6 +830,7 @@ impl Runner {
         }
         let judged = judge(
             method,
+            kind,
             operation.expect_result.as_ref(),
             operation.expect_error.as_ref(),
             reply,
@@ -677,6 +904,8 @@ impl Runner {
 #[derive(Default)]
 struct TestState {
     test: String,
+    /// The admin client of the deployment that the test uses.
+    admin: &'static str,
     operation: usize,
     captures: Captures,
     entities: HashMap<String, EntityKind>,
@@ -685,6 +914,7 @@ struct TestState {
 
 struct Task {
     method: Method,
+    kind: EntityKind,
     started: Instant,
 }
 
@@ -738,6 +968,7 @@ struct EntityArgs {
 /// Compares an answer with the expectation of its call.
 fn judge(
     method: Method,
+    kind: EntityKind,
     expect_result: Option<&Value>,
     expect_error: Option<&ErrorExpectation>,
     reply: Reply,
@@ -747,7 +978,7 @@ fn judge(
         Reply::Unsupported(reason) => Err(Step::Skipped(format!("unsupported: {reason}"))),
         Reply::Failure(reason) => Err(Step::Errored(format!("agent failure: {reason}"))),
         Reply::Result(value) => {
-            method.check_result(&value).map_err(|error| {
+            method.check_result(kind, &value).map_err(|error| {
                 Step::Failed(format!(
                     "the result is not the canonical form of {}: {error}: {}",
                     method.name(),
@@ -814,6 +1045,14 @@ fn check_bounds(
         )));
     }
     Ok(())
+}
+
+/// The proxy host with the port of a node address.
+fn advertised(proxy_host: &str, address: &str) -> Result<String, String> {
+    let (_, port) = address
+        .rsplit_once(':')
+        .ok_or_else(|| format!("{address} has no port"))?;
+    Ok(format!("{proxy_host}:{port}"))
 }
 
 fn expect_null(reply: &Reply, what: &str) -> Result<(), Step> {

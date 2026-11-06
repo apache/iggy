@@ -25,9 +25,9 @@
 
 use bytes::Bytes;
 use iggy_common::{
-    ConsumerGroupDetails, HeaderKey, HeaderValue, IdentityInfo, IggyError, IggyMessage, Partition,
-    PolledMessages, ResourceOptions, Stream, StreamDetails, Topic, TopicDetails,
-    resource_options_json,
+    ConsumerGroupDetails, GlobalPermissions, HeaderKey, HeaderKind, HeaderValue, IdentityInfo,
+    IggyError, IggyMessage, OptionSpec, Partition, PolledMessages, ResourceOptions, Stream,
+    StreamDetails, Topic, TopicDetails, UserInfoDetails, UserStatus, resource_options_json,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -161,6 +161,135 @@ pub struct MemberResult {
     pub id: u32,
     pub partitions_count: u32,
     pub partitions: Vec<u32>,
+}
+
+/// The reply of a raw request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawResult {
+    pub payload_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptionSpecResult {
+    pub key: String,
+    pub kind: String,
+    pub updatable: bool,
+    pub resettable: bool,
+    pub secret: bool,
+    pub read_only: bool,
+    pub critical: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserDetailsResult {
+    pub id: u32,
+    pub username: String,
+    /// `active` or `inactive`.
+    pub status: String,
+    pub created_at: u64,
+    /// Global permissions only. Stream permissions are not in format 1.
+    pub permissions: Option<PermissionsResult>,
+    pub options: Options,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionsResult {
+    pub global: GlobalPermissionsResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalPermissionsResult {
+    pub manage_servers: bool,
+    pub read_servers: bool,
+    pub manage_users: bool,
+    pub read_users: bool,
+    pub manage_streams: bool,
+    pub read_streams: bool,
+    pub manage_topics: bool,
+    pub read_topics: bool,
+    pub poll_messages: bool,
+    pub send_messages: bool,
+}
+
+/// One message of a consumer, with the partition that it came from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceivedMessageResult {
+    pub partition_id: u32,
+    pub message: MessageResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionInfoResult {
+    /// The address of the node that the client talks to now.
+    pub server_address: String,
+}
+
+impl TryFrom<&OptionSpec> for OptionSpecResult {
+    type Error = IggyError;
+
+    fn try_from(spec: &OptionSpec) -> Result<Self, IggyError> {
+        Ok(Self {
+            key: spec.key.clone(),
+            kind: kind_text(spec.kind)?,
+            updatable: spec.updatable,
+            resettable: spec.resettable,
+            secret: spec.secret,
+            read_only: spec.read_only,
+            critical: spec.critical,
+        })
+    }
+}
+
+impl TryFrom<&UserInfoDetails> for UserDetailsResult {
+    type Error = IggyError;
+
+    fn try_from(user: &UserInfoDetails) -> Result<Self, IggyError> {
+        Ok(Self {
+            id: user.id,
+            username: user.username.clone(),
+            status: status_text(user.status).to_owned(),
+            created_at: user.created_at.as_micros(),
+            permissions: user
+                .permissions
+                .as_ref()
+                .map(|permissions| PermissionsResult {
+                    global: GlobalPermissionsResult::from(&permissions.global),
+                }),
+            options: options(&user.options)?,
+        })
+    }
+}
+
+impl From<&GlobalPermissions> for GlobalPermissionsResult {
+    fn from(global: &GlobalPermissions) -> Self {
+        Self {
+            manage_servers: global.manage_servers,
+            read_servers: global.read_servers,
+            manage_users: global.manage_users,
+            read_users: global.read_users,
+            manage_streams: global.manage_streams,
+            read_streams: global.read_streams,
+            manage_topics: global.manage_topics,
+            read_topics: global.read_topics,
+            poll_messages: global.poll_messages,
+            send_messages: global.send_messages,
+        }
+    }
+}
+
+#[must_use]
+pub fn status_text(status: UserStatus) -> &'static str {
+    match status {
+        UserStatus::Active => "active",
+        UserStatus::Inactive => "inactive",
+    }
 }
 
 impl From<&IdentityInfo> for IdentityResult {
@@ -339,7 +468,11 @@ fn header_entry(value: &HeaderValue) -> Result<HeaderEntry, IggyError> {
 }
 
 fn kind_name(value: &HeaderValue) -> Result<String, IggyError> {
-    match serde_json::to_value(value.kind()) {
+    kind_text(value.kind())
+}
+
+fn kind_text(kind: HeaderKind) -> Result<String, IggyError> {
+    match serde_json::to_value(kind) {
         Ok(serde_json::Value::String(name)) => Ok(name),
         _ => Err(IggyError::InvalidFormat),
     }

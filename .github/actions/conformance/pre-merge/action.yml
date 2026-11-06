@@ -37,6 +37,38 @@ runs:
       if: inputs.task == 'conformance-go'
       uses: ./.github/actions/utils/setup-go
 
+    # The Python and C++ agents build the Rust SDK through pyo3 and cxx.
+    - name: Setup Rust for the wrapped SDKs
+      if: inputs.task == 'conformance-python' || inputs.task == 'conformance-cpp'
+      uses: ./.github/actions/utils/setup-rust
+      with:
+        free-disk-space: "false"
+
+    - name: Setup uv
+      if: inputs.task == 'conformance-python'
+      uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+    - name: Setup .NET
+      if: inputs.task == 'conformance-csharp'
+      uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: "10.0.x"
+
+    - name: Setup Java
+      if: inputs.task == 'conformance-java'
+      uses: ./.github/actions/utils/setup-java
+
+    - name: Setup Node
+      if: inputs.task == 'conformance-node'
+      uses: ./.github/actions/utils/setup-node
+
+    - name: Setup Swift
+      if: inputs.task == 'conformance-swift'
+      uses: ./.github/actions/utils/setup-swift
+      with:
+        package-path: conformance/agents/swift/agent
+        cache-key: conformance-agent
+
     - name: Run the conformance corpus
       shell: bash
       env:

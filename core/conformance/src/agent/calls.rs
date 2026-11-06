@@ -20,25 +20,32 @@
 
 use super::{RustAgent, sdk_error};
 use crate::api::{
-    AbandonOperationArgs, BuildReaderArgs, Commit, ConsumerArg, ConsumerGroupArgs,
-    CreateConsumerGroupArgs, CreateStreamArgs, CreateTopicArgs, Expiry, ExpiryKeyword, Id,
-    LoginUserArgs, MessageArg, Method, NextArgs, NoArgs, Partitioning, PollMessagesArgs,
-    ResolveOperationArgs, SendMessagesArgs, Strategy, StreamArgs, TopicArgs, TopicSize,
-    TopicSizeKeyword, UpdateStreamArgs, UpdateTopicArgs,
+    AbandonOperationArgs, BinaryRequestArgs, BinaryRequestToReplicaArgs, BuildConsumerArgs,
+    BuildReaderArgs, Commit, ConsumerArg, ConsumerGroupArgs, CreateConsumerGroupArgs,
+    CreateStreamArgs, CreateTopicArgs, CreateUserArgs, DescribeOptionsArgs, Expiry, ExpiryKeyword,
+    Id, LoginUserArgs, MessageArg, MetadataChangesArgs, MetadataStart, Method, NextArgs, NoArgs,
+    OptionsScope, Partitioning, PollMessagesArgs, ResolveOperationArgs, SendMessagesArgs, Strategy,
+    StreamArgs, TopicArgs, TopicSize, TopicSizeKeyword, UpdateStreamArgs, UpdateTopicArgs,
+    UpdateUserArgs, UserArgs, UserStatus,
 };
 use crate::canonical::{
-    ConsumerGroupResult, IdentityResult, PolledMessagesResult, StreamDetailsResult, StreamResult,
-    TopicDetailsResult, TopicResult,
+    ConnectionInfoResult, ConsumerGroupResult, IdentityResult, MessageResult, OptionSpecResult,
+    PolledMessagesResult, RawResult, ReceivedMessageResult, StreamDetailsResult, StreamResult,
+    TopicDetailsResult, TopicResult, UserDetailsResult,
 };
-use crate::protocol::{EntityKind, Reply};
+use crate::protocol::Reply;
 use bytes::Bytes;
-use iggy::prelude::PartitionReader;
+use futures::StreamExt;
 use iggy::prelude::{
-    AutoCommit, Client, CommitAfter, CommitPolicy, Consumer, ConsumerGroupClient, HeaderKey,
-    Identifier, IggyByteSize, IggyClient, IggyDuration, IggyError, IggyExpiry, IggyMessage,
-    IggyTimestamp, MaxTopicSize, MessageClient, PollOptions, PollingStrategy, StreamClient,
-    StreamCreateOptions, StreamEncryptionKey, StreamUpdateOptions, SystemClient, TopicClient,
-    TopicCreateOptions, TopicUpdateOptions, UserClient,
+    AutoCommit, Client, CommitAfter, CommitPolicy, Consumer, ConsumerGroupClient,
+    GlobalPermissions, HeaderKey, Identifier, IggyByteSize, IggyClient, IggyConsumer, IggyDuration,
+    IggyError, IggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize, MessageClient,
+    MetadataChangeCursor, MetadataChangeGroup, MetadataChangeStart, MetadataChangesQuery,
+    MetadataCurrentPageToken, OptionsScope as SdkOptionsScope, PartitionReader, Permissions,
+    PollOptions, PollingStrategy, ReadError, StreamClient, StreamCreateOptions,
+    StreamEncryptionKey, StreamUpdateOptions, SystemClient, TopicClient, TopicCreateOptions,
+    TopicUpdateOptions, UserClient, UserCreateOptions, UserStatus as SdkUserStatus,
+    UserUpdateOptions,
 };
 use iggy_common::resource_options_json;
 use serde::Serialize;
@@ -62,33 +69,73 @@ pub(super) async fn call(
     let Ok(method) = Method::from_str(method_name) else {
         return Reply::Unsupported(format!("the method {method_name}"));
     };
-    let outcome = match method.target() {
-        EntityKind::Client => match agent.client(entity) {
-            Some(client) => client_call(agent, &client, method, args, save_as).await,
-            None => Err(Reply::Failure(format!("no client {entity:?}"))),
-        },
-        EntityKind::Reader => match agent.reader(entity) {
-            Some(reader) => reader_call(&reader, args).await,
-            None => Err(Reply::Failure(format!("no reader {entity:?}"))),
-        },
-        EntityKind::Consumer => Err(Reply::Unsupported("consumer entities".to_owned())),
+    let outcome = if let Some(client) = agent.client(entity) {
+        client_call(agent, &client, method, args, save_as).await
+    } else if let Some(reader) = agent.reader(entity) {
+        reader_call(&reader, method, args).await
+    } else if let Some(consumer) = agent.consumer(entity) {
+        consumer_call(&consumer, method, args).await
+    } else {
+        Err(Reply::Failure(format!("no entity {entity:?}")))
     };
     outcome.unwrap_or_else(|reply| reply)
 }
 
-async fn reader_call(reader: &Mutex<PartitionReader>, args: Value) -> Result<Reply, Reply> {
+async fn consumer_call(
+    consumer: &Mutex<IggyConsumer>,
+    method: Method,
+    args: Value,
+) -> Result<Reply, Reply> {
+    if method != Method::Next {
+        return Err(Reply::Failure(format!(
+            "{} is not a consumer method",
+            method.name()
+        )));
+    }
+    decode::<NextArgs>(args)?;
+    let mut consumer = consumer.lock().await;
+    let received = consumer
+        .next()
+        .await
+        .ok_or_else(|| Reply::Failure("the consumer stream ended".to_owned()))?
+        .map_err(|failure| read_error(&failure))?;
+    canonical(
+        MessageResult::try_from(&received.message).map(|message| ReceivedMessageResult {
+            partition_id: received.partition_id,
+            message,
+        }),
+    )
+}
+
+async fn reader_call(
+    reader: &Mutex<PartitionReader>,
+    method: Method,
+    args: Value,
+) -> Result<Reply, Reply> {
+    if method != Method::Next {
+        return Err(Reply::Failure(format!(
+            "{} is not a reader method",
+            method.name()
+        )));
+    }
     decode::<NextArgs>(args)?;
     let mut reader = reader.lock().await;
-    let polled = reader.next().await.map_err(|failure| {
-        let mut reply = sdk_error(&failure.error);
-        if let Reply::Error(error) = &mut reply
-            && error.partition_id.is_none()
-        {
-            error.partition_id = failure.partition_id;
-        }
-        reply
-    })?;
+    let polled = reader
+        .next()
+        .await
+        .map_err(|failure| read_error(&failure))?;
     canonical(PolledMessagesResult::try_from(&polled))
+}
+
+/// The answer for a failed read, with the partition that the read names.
+fn read_error(failure: &ReadError) -> Reply {
+    let mut reply = sdk_error(&failure.error);
+    if let Reply::Error(error) = &mut reply
+        && error.partition_id.is_none()
+    {
+        error.partition_id = failure.partition_id;
+    }
+    reply
 }
 
 async fn client_call(
@@ -377,8 +424,183 @@ async fn client_call(
                 .map_err(sdk)?;
             Value::Null
         }
+        Method::BuildConsumer => {
+            let args: BuildConsumerArgs = decode(args)?;
+            let Some(entity) = save_as else {
+                return Err(Reply::Failure(
+                    "build_consumer needs save_result_as".to_owned(),
+                ));
+            };
+            let mut options = PollOptions {
+                commit: commit_policy(args.commit),
+                ..PollOptions::default()
+            };
+            if let Some(count) = args.count {
+                options.count = count;
+            }
+            if let Some(max_wait_ms) = args.max_wait_ms {
+                options.max_wait = IggyDuration::from(Duration::from_millis(max_wait_ms));
+            }
+            let mut consumer = client
+                .consumer_group(
+                    &args.group,
+                    &identifier_text(&args.stream_id),
+                    &identifier_text(&args.topic_id),
+                )
+                .map_err(sdk)?
+                .poll_options(options)
+                .build();
+            consumer.init().await.map_err(sdk)?;
+            agent.keep_consumer(entity, consumer);
+            Value::Null
+        }
+        Method::SendBinaryRequest => {
+            let args: BinaryRequestArgs = decode(args)?;
+            let payload = hex_payload(&args.payload_hex)?;
+            let reply = client
+                .send_binary_request(args.code, payload)
+                .await
+                .map_err(sdk)?;
+            json(&RawResult {
+                payload_hex: hex::encode(&reply),
+            })?
+        }
+        Method::SendBinaryRequestToReplica => {
+            let args: BinaryRequestToReplicaArgs = decode(args)?;
+            let payload = hex_payload(&args.payload_hex)?;
+            let reply = client
+                .send_binary_request_to_replica(args.code, payload, args.replica)
+                .await
+                .map_err(sdk)?;
+            json(&RawResult {
+                payload_hex: hex::encode(&reply),
+            })?
+        }
+        Method::DescribeOptions => {
+            let args: DescribeOptionsArgs = decode(args)?;
+            let scope = match args.scope {
+                OptionsScope::Stream => SdkOptionsScope::Stream,
+                OptionsScope::Topic => SdkOptionsScope::Topic,
+                OptionsScope::User => SdkOptionsScope::User,
+            };
+            let specs = client.describe_options(scope).await.map_err(sdk)?;
+            let specs = specs
+                .iter()
+                .map(OptionSpecResult::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sdk)?;
+            json(&specs)?
+        }
+        Method::CreateUser => {
+            let args: CreateUserArgs = decode(args)?;
+            let permissions = args.permissions.map(|permissions| {
+                let global = permissions.global;
+                Permissions {
+                    global: GlobalPermissions {
+                        manage_servers: global.manage_servers,
+                        read_servers: global.read_servers,
+                        manage_users: global.manage_users,
+                        read_users: global.read_users,
+                        manage_streams: global.manage_streams,
+                        read_streams: global.read_streams,
+                        manage_topics: global.manage_topics,
+                        read_topics: global.read_topics,
+                        poll_messages: global.poll_messages,
+                        send_messages: global.send_messages,
+                    },
+                    streams: None,
+                }
+            });
+            let user = client
+                .create_user(
+                    &args.username,
+                    &args.password,
+                    user_status(args.status),
+                    permissions,
+                    &UserCreateOptions::default(),
+                )
+                .await
+                .map_err(sdk)?;
+            json(&UserDetailsResult::try_from(&user).map_err(sdk)?)?
+        }
+        Method::GetUser => {
+            let args: UserArgs = decode(args)?;
+            let user = client
+                .get_user(&identifier(&args.user_id)?)
+                .await
+                .map_err(sdk)?;
+            match user {
+                Some(user) => json(&UserDetailsResult::try_from(&user).map_err(sdk)?)?,
+                None => Value::Null,
+            }
+        }
+        Method::UpdateUser => {
+            let args: UpdateUserArgs = decode(args)?;
+            let options = UserUpdateOptions {
+                username: args.username,
+                status: args.status.map(user_status),
+                ..UserUpdateOptions::default()
+            };
+            client
+                .update_user(&identifier(&args.user_id)?, &options)
+                .await
+                .map_err(sdk)?;
+            Value::Null
+        }
+        Method::DeleteUser => {
+            let args: UserArgs = decode(args)?;
+            client
+                .delete_user(&identifier(&args.user_id)?)
+                .await
+                .map_err(sdk)?;
+            Value::Null
+        }
+        Method::GetMetadataChanges => {
+            let args: MetadataChangesArgs = decode(args)?;
+            let start = match args.start {
+                MetadataStart::Earliest => MetadataChangeStart::Earliest,
+                MetadataStart::Latest => MetadataChangeStart::Latest,
+                MetadataStart::After(cursor) => MetadataChangeStart::After(
+                    MetadataChangeCursor::from_str(&cursor).map_err(sdk)?,
+                ),
+                MetadataStart::Current(token) => MetadataChangeStart::Current(
+                    token
+                        .as_deref()
+                        .map(MetadataCurrentPageToken::from_str)
+                        .transpose()
+                        .map_err(sdk)?,
+                ),
+            };
+            let groups = args
+                .groups
+                .iter()
+                .map(|group| {
+                    MetadataChangeGroup::from_str(group)
+                        .map_err(|_| Reply::Failure(format!("unknown group {group:?}")))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut query = MetadataChangesQuery {
+                start,
+                groups,
+                ..MetadataChangesQuery::default()
+            };
+            if let Some(limit) = args.limit {
+                query.limit = limit;
+            }
+            let changes = client.get_metadata_changes(&query).await.map_err(sdk)?;
+            json(&changes)?
+        }
+        Method::GetConnectionInfo => {
+            decode::<NoArgs>(args)?;
+            let info = client.get_connection_info().await;
+            json(&ConnectionInfoResult {
+                server_address: info.server_address,
+            })?
+        }
         Method::Next => {
-            return Err(Reply::Failure("next is a reader method".to_owned()));
+            return Err(Reply::Failure(
+                "next is a reader or consumer method".to_owned(),
+            ));
         }
     };
     Ok(Reply::Result(value))
@@ -399,6 +621,27 @@ fn canonical<T: Serialize>(result: Result<T, IggyError>) -> Result<Reply, Reply>
 
 fn sdk(error: IggyError) -> Reply {
     sdk_error(&error)
+}
+
+/// The identifier as the text that consumer builders take.
+fn identifier_text(id: &Id) -> String {
+    match id {
+        Id::Numeric(id) => id.to_string(),
+        Id::Named(name) => name.clone(),
+    }
+}
+
+fn hex_payload(text: &str) -> Result<Bytes, Reply> {
+    hex::decode(text)
+        .map(Bytes::from)
+        .map_err(|error| Reply::Failure(format!("payload_hex: {error}")))
+}
+
+fn user_status(status: UserStatus) -> SdkUserStatus {
+    match status {
+        UserStatus::Active => SdkUserStatus::Active,
+        UserStatus::Inactive => SdkUserStatus::Inactive,
+    }
 }
 
 fn identifier(id: &Id) -> Result<Identifier, Reply> {

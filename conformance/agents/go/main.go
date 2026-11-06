@@ -43,7 +43,10 @@ const protocolVersion = 1
 // the same commit, so the version is the commit's.
 const sdkVersion = "workspace"
 
-var capabilities = []string{"reader", "resolve_operation", "abandon_operation"}
+var capabilities = []string{
+	"reader", "consumer", "resolve_operation", "abandon_operation", "raw_command",
+	"raw_command_replica", "describe_options", "metadata_changes", "connection_info",
+}
 
 type request struct {
 	ID     uint64          `json:"id"`
@@ -83,11 +86,12 @@ func failure(format string, args ...any) reply {
 }
 
 // sdkError is the answer for an error of the SDK. An error that carries no
-// Iggy code is a failure of the agent, not an answer of the SDK.
+// Iggy code is code 0, which no IggyError has, so the test fails and the
+// skip list can name the divergence.
 func sdkError(err error) reply {
 	var iggyError ierror.IggyError
 	if !errors.As(err, &iggyError) {
-		return failure("an error without an Iggy code: %v", err)
+		return reply{err: &agentError{Code: 0, Message: err.Error()}}
 	}
 	answer := &agentError{Code: uint32(iggyError.Code()), Message: err.Error()}
 	var uncertain ierror.OperationUncertain
@@ -189,18 +193,25 @@ type readerEntity struct {
 	reader *reader.PartitionReader
 }
 
+type consumerEntity struct {
+	mu       sync.Mutex
+	consumer *reader.IggyConsumer
+}
+
 type agent struct {
-	mu      sync.Mutex
-	clients map[string]iggcon.Client
-	readers map[string]*readerEntity
-	tasks   map[string]*task
+	mu        sync.Mutex
+	clients   map[string]iggcon.Client
+	readers   map[string]*readerEntity
+	consumers map[string]*consumerEntity
+	tasks     map[string]*task
 }
 
 func newAgent() *agent {
 	return &agent{
-		clients: map[string]iggcon.Client{},
-		readers: map[string]*readerEntity{},
-		tasks:   map[string]*task{},
+		clients:   map[string]iggcon.Client{},
+		readers:   map[string]*readerEntity{},
+		consumers: map[string]*consumerEntity{},
+		tasks:     map[string]*task{},
 	}
 }
 
@@ -308,6 +319,18 @@ func (a *agent) keepReader(entity string, partitionReader *reader.PartitionReade
 	a.readers[entity] = &readerEntity{reader: partitionReader}
 }
 
+func (a *agent) consumer(entity string) *consumerEntity {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.consumers[entity]
+}
+
+func (a *agent) keepConsumer(entity string, groupConsumer *reader.IggyConsumer) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.consumers[entity] = &consumerEntity{consumer: groupConsumer}
+}
+
 func (a *agent) takeTask(name string) *task {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -320,9 +343,16 @@ func (a *agent) close(entity string) {
 	a.mu.Lock()
 	partitionReader := a.readers[entity]
 	delete(a.readers, entity)
+	groupConsumer := a.consumers[entity]
+	delete(a.consumers, entity)
 	closing := a.clients[entity]
 	delete(a.clients, entity)
 	a.mu.Unlock()
+	if groupConsumer != nil {
+		if err := groupConsumer.consumer.Shutdown(context.Background()); err != nil {
+			slog.Warn("cannot shut down a consumer", "entity", entity, "error", err)
+		}
+	}
 	if partitionReader != nil {
 		if err := partitionReader.reader.Close(context.Background()); err != nil {
 			slog.Warn("cannot close a reader", "entity", entity, "error", err)
@@ -339,8 +369,11 @@ func (a *agent) reset() {
 	a.mu.Lock()
 	tasks := a.tasks
 	a.tasks = map[string]*task{}
-	entities := make([]string, 0, len(a.readers)+len(a.clients))
+	entities := make([]string, 0, len(a.readers)+len(a.consumers)+len(a.clients))
 	for entity := range a.readers {
+		entities = append(entities, entity)
+	}
+	for entity := range a.consumers {
 		entities = append(entities, entity)
 	}
 	for entity := range a.clients {

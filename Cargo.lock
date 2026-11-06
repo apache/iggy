@@ -5789,6 +5789,7 @@ dependencies = [
  "bytemuck",
  "bytes",
  "clap",
+ "futures",
  "hex",
  "humantime",
  "iggy",

@@ -61,10 +61,10 @@ tests:
     create_entities:
       - client: {id: client0}
     operations:
-      - object: client0
+      - object: admin
         name: create_topic
         arguments: {stream_id: orders, name: first, partitions_count: 1}
-      - object: client0
+      - object: admin
         name: create_topic
         arguments: {stream_id: orders, name: second, partitions_count: 3}
       - object: client0
@@ -79,7 +79,7 @@ tests:
     create_entities:
       - client: {id: client0}
     operations:
-      - object: client0
+      - object: admin
         name: create_topic
         arguments: {stream_id: orders, name: before, partitions_count: 1, message_expiry: 3600000000}
         expect_result: {id: {$$capture: topic_id}}
@@ -98,7 +98,7 @@ tests:
     create_entities:
       - client: {id: client0}
     operations:
-      - object: client0
+      - object: admin
         name: create_topic
         arguments: {stream_id: orders, name: doomed, partitions_count: 1}
         expect_result: {id: {$$capture: topic_id}}

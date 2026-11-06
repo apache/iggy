@@ -142,6 +142,7 @@ updates:
     directories:
       - "/foreign/node"
       - "/examples/node"
+      - "/conformance/agents/node"
     schedule:
       interval: "weekly"
       day: "thursday"
@@ -170,6 +171,7 @@ updates:
       - "/foreign/go"
       - "/bdd/go"
       - "/examples/go"
+      - "/conformance/agents/go"
     schedule:
       interval: "weekly"
       day: "friday"
@@ -197,6 +199,7 @@ updates:
     directories:
       - "/foreign/csharp"
       - "/examples/csharp"
+      - "/conformance/agents/csharp"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -229,6 +232,7 @@ updates:
       - "/foreign/java"
       - "/bdd/java"
       - "/examples/java"
+      - "/conformance/agents/java"
     schedule:
       interval: "weekly"
       day: "tuesday"

@@ -1,0 +1,3 @@
+.venv/
+# The only dependency is the SDK of the tree, so a lock holds nothing to pin.
+uv.lock

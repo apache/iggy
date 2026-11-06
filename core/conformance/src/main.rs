@@ -20,7 +20,7 @@ use iggy_conformance::agent;
 use iggy_conformance::agent_host::AgentCommand;
 use iggy_conformance::format::{self, Credentials, Transport};
 use iggy_conformance::report::{self, Totals};
-use iggy_conformance::runner::{RunConfig, RunReport, Runner};
+use iggy_conformance::runner::{ClusterAddresses, RunConfig, RunReport, Runner};
 use iggy_conformance::skips::SkipList;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -71,6 +71,16 @@ struct RunArgs {
     /// The TCP address of a node that cannot reach quorum.
     #[arg(long, env = "IGGY_CONFORMANCE_NO_QUORUM")]
     no_quorum: Option<String>,
+    /// The TCP address of the primary of a two-node cluster.
+    #[arg(long, env = "IGGY_CONFORMANCE_LEADER", requires = "follower")]
+    leader: Option<String>,
+    /// The TCP address of the backup of a two-node cluster.
+    #[arg(long, env = "IGGY_CONFORMANCE_FOLLOWER", requires = "leader")]
+    follower: Option<String>,
+    /// The host that the cluster nodes advertise. The orchestrator proxies the
+    /// port of each node there.
+    #[arg(long, env = "IGGY_CONFORMANCE_CLUSTER_PROXY_HOST", requires = "leader")]
+    cluster_proxy_host: Option<String>,
     /// `rust` for the built-in agent, or a shell command that starts an agent.
     #[arg(long, default_value = "rust")]
     agent: String,
@@ -175,6 +185,9 @@ fn matrix(paths: &[PathBuf], markdown: Option<&Path>) -> Result<(), String> {
 }
 
 async fn run(args: RunArgs, record: bool) -> Result<(), String> {
+    if record && args.agent != "rust" {
+        return Err("record runs the Rust agent only, so it takes no other --agent".to_owned());
+    }
     let (files, unread) = format::load_corpus(&args.tests).map_err(|error| error.to_string())?;
     for file in &unread {
         tracing::warn!("Not read: {}: {}", file.name, file.reason);
@@ -183,6 +196,14 @@ async fn run(args: RunArgs, record: bool) -> Result<(), String> {
     let config = RunConfig {
         server: args.server,
         no_quorum: args.no_quorum,
+        cluster: args
+            .leader
+            .zip(args.follower)
+            .map(|(leader, follower)| ClusterAddresses {
+                leader,
+                follower,
+                proxy_host: args.cluster_proxy_host,
+            }),
         root: Credentials {
             username: args.username,
             password: args.password,

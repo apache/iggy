@@ -28,8 +28,8 @@ use crate::protocol::{
     RequestLine,
 };
 use iggy::prelude::{
-    Client, ClientWrapper, Identifier, IggyClient, IggyError, PartitionReader, StreamClient,
-    TcpClient, TcpClientConfig, UserClient,
+    Client, ClientWrapper, Identifier, IggyClient, IggyConsumer, IggyError, PartitionReader,
+    StreamClient, TcpClient, TcpClientConfig, UserClient,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -39,7 +39,17 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 /// What this agent implements beyond the methods every agent has.
-pub const CAPABILITIES: [&str; 3] = ["reader", "resolve_operation", "abandon_operation"];
+pub const CAPABILITIES: [&str; 9] = [
+    "reader",
+    "consumer",
+    "resolve_operation",
+    "abandon_operation",
+    "raw_command",
+    "raw_command_replica",
+    "describe_options",
+    "metadata_changes",
+    "connection_info",
+];
 
 /// Serves the protocol on stdin and stdout until stdin closes.
 ///
@@ -120,6 +130,7 @@ pub struct RustAgent {
 struct State {
     clients: SyncMutex<HashMap<String, Arc<IggyClient>>>,
     readers: SyncMutex<HashMap<String, Arc<Mutex<PartitionReader>>>>,
+    consumers: SyncMutex<HashMap<String, Arc<Mutex<IggyConsumer>>>>,
     tasks: SyncMutex<HashMap<String, JoinHandle<Reply>>>,
 }
 
@@ -220,8 +231,20 @@ impl RustAgent {
         lock(&self.state.readers).insert(entity, Arc::new(Mutex::new(reader)));
     }
 
+    fn consumer(&self, entity: &str) -> Option<Arc<Mutex<IggyConsumer>>> {
+        lock(&self.state.consumers).get(entity).cloned()
+    }
+
+    fn keep_consumer(&self, entity: String, consumer: IggyConsumer) {
+        lock(&self.state.consumers).insert(entity, Arc::new(Mutex::new(consumer)));
+    }
+
     async fn close(&self, entity: &str) {
         lock(&self.state.readers).remove(entity);
+        let consumer = lock(&self.state.consumers).remove(entity);
+        if let Some(consumer) = consumer {
+            shut_down(entity, &consumer).await;
+        }
         let client = lock(&self.state.clients).remove(entity);
         if let Some(client) = client
             && let Err(error) = client.shutdown().await
@@ -261,12 +284,23 @@ impl RustAgent {
             task.abort();
         }
         lock(&self.state.readers).clear();
+        let consumers: Vec<(String, Arc<Mutex<IggyConsumer>>)> =
+            lock(&self.state.consumers).drain().collect();
+        for (entity, consumer) in consumers {
+            shut_down(&entity, &consumer).await;
+        }
         let clients: Vec<(String, Arc<IggyClient>)> = lock(&self.state.clients).drain().collect();
         for (entity, client) in clients {
             if let Err(error) = client.shutdown().await {
                 tracing::warn!("Cannot shut down the client {entity}: {error}");
             }
         }
+    }
+}
+
+async fn shut_down(entity: &str, consumer: &Mutex<IggyConsumer>) {
+    if let Err(error) = consumer.lock().await.shutdown().await {
+        tracing::warn!("Cannot shut down the consumer {entity}: {error}");
     }
 }
 

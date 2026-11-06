@@ -38,6 +38,8 @@ pub const FORMAT_VERSION: FormatVersion = FormatVersion { major: 1, minor: 0 };
 /// Objects that are not entities.
 pub const ORCHESTRATOR: &str = "orchestrator";
 pub const PROXY: &str = "proxy";
+/// The orchestrator's own client, for a setup step in the middle of a test.
+pub const ADMIN: &str = "admin";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -183,6 +185,10 @@ pub struct Operation {
     pub within: Option<Duration>,
     #[serde(default, deserialize_with = "duration")]
     pub not_before: Option<Duration>,
+    /// Repeats a read until its answer matches or this time passes, for state
+    /// that the server publishes after the call that changed it returned.
+    #[serde(default, deserialize_with = "duration")]
+    pub eventually: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -413,7 +419,7 @@ fn validate(file: &TestFile) -> Result<(), String> {
 fn validate_test(test: &TestCase) -> Result<(), String> {
     let mut entities: Vec<&str> = Vec::new();
     for EntitySpec { client } in &test.create_entities {
-        if [ORCHESTRATOR, PROXY].contains(&client.id.as_str()) {
+        if [ORCHESTRATOR, PROXY, ADMIN].contains(&client.id.as_str()) {
             return Err(format!("{:?} is a reserved object name", client.id));
         }
         if entities.contains(&client.id.as_str()) {
@@ -432,7 +438,8 @@ fn validate_test(test: &TestCase) -> Result<(), String> {
         .map(|entity| entity.client.id.as_str())
         .collect();
     for expectation in &test.expect_frames {
-        if !proxied.contains(&expectation.client.as_str()) {
+        let node_listener = ["@leader", "@follower"].contains(&expectation.client.as_str());
+        if !node_listener && !proxied.contains(&expectation.client.as_str()) {
             return Err(format!(
                 "expect_frames names {:?}, which does not go through the proxy",
                 expectation.client
@@ -459,9 +466,21 @@ fn validate_operation(operation: &Operation) -> Result<(), String> {
             || operation.expect_error.is_some()
             || operation.within.is_some()
             || operation.not_before.is_some()
-            || operation.save_result_as.is_some())
+            || operation.save_result_as.is_some()
+            || operation.eventually.is_some())
     {
         return Err("a background call has no expectation; await its task instead".to_owned());
+    }
+    if operation.eventually.is_some()
+        && (operation.save_result_as.is_some()
+            || operation.within.is_some()
+            || operation.not_before.is_some()
+            || (operation.expect_result.is_none() && operation.expect_error.is_none()))
+    {
+        return Err(
+            "eventually repeats a read with an expectation, without time bounds or a saved entity"
+                .to_owned(),
+        );
     }
     if let Some(expected) = &operation.expect_result {
         matcher::validate_expectation(expected)?;
@@ -483,6 +502,11 @@ fn validate_operation(operation: &Operation) -> Result<(), String> {
         if let Some(operation_id) = operation_id {
             matcher::validate_expectation(operation_id)?;
         }
+    }
+    if operation.object == ADMIN
+        && (operation.background.is_some() || operation.save_result_as.is_some())
+    {
+        return Err("an admin call runs in the foreground and creates no entity".to_owned());
     }
     match operation.object.as_str() {
         ORCHESTRATOR => OrchestratorCall::from_str(&operation.name).map(drop),

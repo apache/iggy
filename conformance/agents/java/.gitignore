@@ -1,0 +1,5 @@
+.gradle/
+build/
+
+# Gradle wrapper jar (auto-fetched by gradlew script)
+gradle/wrapper/gradle-wrapper.jar
