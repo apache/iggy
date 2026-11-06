@@ -783,6 +783,54 @@ mod tests {
     }
 
     #[test]
+    fn given_secrets_in_config_should_not_appear_in_debug_output() {
+        let mut config = test_config();
+        config.connection_string = SecretString::from("https://user:hunter2@example.com");
+        config.auth_token = Some(SecretString::from("tok-9f3a"));
+        let sink = TemplateSink::new(1, config);
+
+        let rendered = format!("{sink:?}");
+
+        assert!(
+            !rendered.contains("hunter2"),
+            "connection string leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("tok-9f3a"),
+            "auth token leaked: {rendered}"
+        );
+    }
+
+    #[test]
+    fn given_unknown_config_key_should_be_rejected() {
+        let config = serde_json::json!({
+            "connection_string": "https://api.example.com",
+            "target": "events",
+            "unknown_knob": 10,
+        });
+
+        assert!(serde_json::from_value::<TemplateSinkConfig>(config).is_err());
+    }
+
+    #[test]
+    fn given_numeric_knobs_as_json_numbers_should_deserialize() {
+        let config: TemplateSinkConfig = serde_json::from_value(serde_json::json!({
+            "connection_string": "https://api.example.com",
+            "target": "events",
+            "batch_size": 10,
+            "max_retries": 2,
+            "max_open_retries": 3,
+            "circuit_breaker_threshold": 4,
+            "verbose_logging": true,
+        }))
+        .expect("numbers and booleans must not need to be strings");
+
+        assert_eq!(config.batch_size, Some(10));
+        assert_eq!(config.circuit_breaker_threshold, Some(4));
+        assert_eq!(config.verbose_logging, Some(true));
+    }
+
+    #[test]
     fn given_verbose_logging_enabled_should_set_verbose_flag() {
         let mut config = test_config();
         config.verbose_logging = Some(true);

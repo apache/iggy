@@ -22,6 +22,13 @@ shipping:
    `Error::PermanentHttpError` from `fetch_records()` — `poll()` does not
    trip the circuit breaker on it, since a bad config/auth state isn't a
    connectivity signal the breaker should react to.
+   A record that cannot be converted is different: set
+   `FetchedRecord::payload` to `Err(Error::InvalidRecordValue(..))`. `poll()`
+   sends the records before it and stops, and never moves the cursor past it. A
+   bad record at the front of a batch fails the poll every `poll_interval` until
+   the cause is fixed, so the problem stays visible instead of the record being
+   lost. Skipping a record is a policy to choose on purpose, with a log line and
+   a counter, never a silent `continue`.
 3. **Duplication window**: at-least-once. `poll()` stages the cursor as
    *candidate* state; the runtime persists it only after the batch is sent,
    then reports `Ack`/`Nack`. A NACK (or a crash between send and the
@@ -65,7 +72,7 @@ three spots: one required, one conditional, one documentation-only.
 1. **`fetch_records()`** (required) — fetch up to `self.batch_size` new
    records from your system, ordered after `cursor` (`None` = start from the
    beginning, or from "now" — whichever fits your source). Map each result
-   to a `FetchedRecord { cursor_value, payload }`, using something
+   to a `FetchedRecord { cursor_value, natural_id, payload }`, using something
    monotonically increasing as `cursor_value` (a timestamp, an ID, a page
    token) — that's what lets the cursor-staging logic advance correctly.
 2. **`build_raw_client()`** (only if your source isn't HTTP) — replace the

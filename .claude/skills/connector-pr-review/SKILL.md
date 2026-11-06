@@ -19,6 +19,7 @@ before asking for a human re-review. Cite symbols/paths, not stale line numbers.
 - [How to use](#how-to-use)
 - [Blockers (must fix before merge)](#blockers-must-fix-before-merge)
 - [High-frequency convention nits](#high-frequency-convention-nits)
+- [Domain risks by connector family](#domain-risks-by-connector-family)
 - [Delivery semantics (document honestly)](#delivery-semantics-document-honestly)
 - [PR / CI hygiene](#pr--ci-hygiene)
 - [Pre-flight author checklist](#pre-flight-author-checklist)
@@ -334,6 +335,52 @@ These are "cheap" but burn full review rounds when missed.
       (or fixed `iggy-test-<svc>` for reuse fixtures).
 - [ ] Custom Docker networks cleaned up.
 
+## Domain risks by connector family
+
+The blockers above are generic, and they explain roughly one review comment in six. Most of the
+rest is backend-specific but repeats inside a family. Before the first request for review, walk
+the cross-family list and the row for your family. Each line names the test that proves it (see
+`connector-testing`, Canonical tests beyond state).
+
+### Cross-family
+
+- [ ] **Bad records.** A record that cannot be converted never lets the cursor pass it: stop before
+      it, or skip it on purpose with a log line and a counter. Test: the template's bad-record tests.
+- [ ] **Cursor ties.** Rows that share a cursor value, equal values that differ as strings, and
+      commits that land out of order must not be skipped at a batch boundary. Test: equal cursor
+      values across a batch boundary.
+- [ ] **State identity.** Persisted state names what it belongs to (endpoint, prefix, table, topic)
+      and is validated against the config on restore. A re-created source topic or table must not be
+      resumed with stale offsets.
+- [ ] **Type fidelity.** No silent loss: precision, units, sign, reserved null encodings, NaN and
+      infinity. An unsupported type fails loudly, never becomes `null`. Test: type matrix.
+- [ ] **Built strings.** Queries, paths, object keys and connection strings are never assembled from
+      config or message data without quoting or an allowlist, and a sanitizer is injective. Test:
+      distinct inputs never collide.
+- [ ] **Success that is not.** Say how the client reports partial failure (per-item errors in a 2xx,
+      a `flush` that returns `Ok` after a rejection) and test it with a fake that does exactly that.
+- [ ] **Third-party defaults.** Derived `Debug` on a client that holds credentials, TLS and
+      panic-on-default configuration, unbounded response or object sizes, and fallbacks that mask a
+      bad value. Test: no secret in `Debug`; every size has a limit set in `open()`.
+- [ ] **Persistent failure.** A failing poll or flush backs off and counts toward the breaker. Test:
+      persistent failure is paced.
+- [ ] **Probes.** The startup probe needs no more privilege than the connector uses and has no side
+      effect. Document the least privilege the connector needs.
+- [ ] **Env overrides.** Numeric and boolean knobs are typed fields and survive the env-override path.
+- [ ] **Tests that prove something.** A test that stays green with the behavior removed does not
+      count: a broker reconnect with no proof of disconnect, a read that can land mid-write, a fixed
+      sleep. Revert the fix and watch the test fail.
+
+### By family
+
+| Family | Also check |
+| --- | --- |
+| SQL and JDBC sources (MySQL, JDBC, MSSQL CDC, Postgres) | Keyset pagination with a tie-breaker, comparing cursors the way the database does. Quoted identifiers and placeholders (replace order, `$offset`, table and key quoting). A custom query without an order or `LIMIT`. Mark or delete staged and applied only on `Ack`. Driver defaults that differ per database (parameter metadata, timeouts). CDC: which capture instance a fresh start selects, operation ordering inside one transaction, and what `latest` means under capture lag. |
+| Object stores (S3, OpenDAL, Azure) | Key encoding (`+` against space, percent-decoding) and collisions after sanitizing. Listing truncation and `StartAfter`. Persisted state includes endpoint and prefix. Atomic writes (a reader must not see a partial object). Credential chain and profile handling. A probe that needs list or delete permission. Object size bounds and rotation. |
+| Brokers (RabbitMQ, MQTT, Iggy as a source) | Ack granularity (acknowledge the last delivery with `multiple`, not each one). Reconnect and session semantics (clean start, QoS, client id uniqueness, keep-alive between batches). Whether the exactly-once replay state survives a restart. Metadata fidelity (publisher timestamp, message type, headers). Poison messages. TLS errors classified as permanent. |
+| Search and index (OpenSearch, Fluss, Elasticsearch) | A bulk 200 with per-item errors and an absent `items` array. Document id validation, and an overwrite when a retry reorders the same id. `Retry-After`. Mapping and schema conflicts, cache invalidation after `ALTER` or drop, and unbounded auto-created tables. Late-visible documents and a unique tie-breaker field. |
+| HTTP and telemetry sinks (HTTP, OTLP) | A cap on response bytes. Partial-success bodies parsed whatever the media-type case. Retries that block a runtime worker (see `connector-sink`, Delivery budget). Header and payload size limits. |
+
 ## Delivery semantics (document honestly)
 
 Every new connector README must answer in one short paragraph:
@@ -398,6 +445,11 @@ mapping, config-name drift, secrets, README/code drift, false-green tests,
 CI/lockfile hygiene, zero-delivered-still-reports-Ok, a wrapping timeout
 that doesn't cancel in-flight work, ack-path work blowing its fixed budget,
 and holding a lock across slow I/O.
+
+The domain-risk section comes from classifying about 360 inline review comments on the open
+connector PRs (MySQL, JDBC, MSSQL CDC, S3, OpenDAL, MQTT, RabbitMQ, OpenSearch, Fluss, QuestDB,
+OTLP, ScopeDB and the Iggy source): about 17% matched a rule above, about 34% were
+backend-specific, and about 38% were performance or style.
 
 Re-derive or extend this list with `gh pr list --repo apache/iggy --search
 "connectors in:title" --state all --limit 100` plus `gh api

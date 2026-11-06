@@ -156,7 +156,13 @@ struct FetchedRecord {
     /// alone usually isn't it either, since a timestamp-based cursor is
     /// commonly shared by more than one record.
     natural_id: Option<u128>,
-    payload: serde_json::Value,
+    /// The record as JSON, or why the row could not be converted (a value the
+    /// target type cannot hold, an unsupported column type, a malformed field).
+    /// Use `Error::InvalidRecordValue` for a record that is bad. `poll()` never
+    /// moves the cursor past an `Err` record: it sends the records before it and
+    /// stops, and a bad record at the front of a batch fails the poll, so the
+    /// problem stays visible instead of the record being lost.
+    payload: Result<serde_json::Value, Error>,
 }
 
 #[derive(Debug)]
@@ -260,6 +266,80 @@ impl TemplateSource {
              in template_source/src/lib.rs"
                 .to_string(),
         ))
+    }
+    /// Turns fetched records into messages and stages the cursor that follows them.
+    ///
+    /// The first record that cannot be converted ends the batch: the cursor stays
+    /// before it, so it is never skipped and never lost. When it is the first
+    /// record, there is nothing to send and the poll fails with that error, which
+    /// `poll_interval` paces.
+    async fn stage_batch(
+        &self,
+        cursor: Option<String>,
+        records: Vec<FetchedRecord>,
+    ) -> Result<ProducedMessages, Error> {
+        let mut messages = Vec::with_capacity(records.len());
+        let mut new_cursor = cursor;
+        for record in records {
+            let payload = record.payload.and_then(|value| {
+                serde_json::to_vec(&value).map_err(|e| Error::Serialization(e.to_string()))
+            });
+            let payload = match payload {
+                Ok(payload) => payload,
+                Err(error) => {
+                    error!(
+                        "{CONNECTOR_NAME} connector with ID: {} cannot convert the record at \
+                         cursor {}, not moving past it: {error}",
+                        self.id, record.cursor_value
+                    );
+                    if messages.is_empty() {
+                        return Err(error);
+                    }
+                    break;
+                }
+            };
+            new_cursor = Some(record.cursor_value);
+            messages.push(ProducedMessage {
+                id: record.natural_id,
+                headers: None,
+                checksum: None,
+                timestamp: None,
+                origin_timestamp: None,
+                payload,
+            });
+        }
+
+        let candidate_state = State { cursor: new_cursor };
+        let persisted_state = self.serialize_state(&candidate_state).ok_or_else(|| {
+            Error::Serialization(format!(
+                "failed to serialize state for {CONNECTOR_NAME} connector with ID: {}",
+                self.id
+            ))
+        })?;
+        *self.pending_state.lock().await = Some(candidate_state);
+
+        self.records_produced
+            .fetch_add(messages.len() as u64, Ordering::Relaxed);
+
+        if self.verbose {
+            info!(
+                "{CONNECTOR_NAME} connector with ID: {} produced {} messages",
+                self.id,
+                messages.len()
+            );
+        } else {
+            debug!(
+                "{CONNECTOR_NAME} connector with ID: {} produced {} messages",
+                self.id,
+                messages.len()
+            );
+        }
+
+        Ok(ProducedMessages {
+            schema: Schema::Json,
+            messages,
+            state: Some(persisted_state),
+        })
     }
 }
 
@@ -391,74 +471,7 @@ impl Source for TemplateSource {
             });
         }
 
-        let mut messages = Vec::with_capacity(records.len());
-        let mut new_cursor = cursor;
-        for record in records {
-            let Ok(payload) = serde_json::to_vec(&record.payload) else {
-                error!(
-                    "Failed to serialize a record fetched by {CONNECTOR_NAME} connector with ID: {}",
-                    self.id
-                );
-                continue;
-            };
-            // Only advance the candidate cursor once the record actually made it
-            // into `messages` - advancing on a dropped (unserializable) record
-            // would stage a cursor past data that was never produced, and a
-            // later Ack would commit past it permanently.
-            let natural_id = record.natural_id;
-            new_cursor = Some(record.cursor_value);
-            messages.push(ProducedMessage {
-                id: natural_id,
-                headers: None,
-                checksum: None,
-                timestamp: None,
-                origin_timestamp: None,
-                payload,
-            });
-        }
-
-        if messages.is_empty() {
-            // Every fetched record failed to serialize - no progress was
-            // made, so there's nothing to stage and no reason to write
-            // state, same as the `records.is_empty()` case above.
-            return Ok(ProducedMessages {
-                schema: Schema::Json,
-                messages: Vec::new(),
-                state: None,
-            });
-        }
-
-        let candidate_state = State { cursor: new_cursor };
-        let persisted_state = self.serialize_state(&candidate_state).ok_or_else(|| {
-            Error::Serialization(format!(
-                "failed to serialize state for {CONNECTOR_NAME} connector with ID: {}",
-                self.id
-            ))
-        })?;
-        *self.pending_state.lock().await = Some(candidate_state);
-
-        self.records_produced
-            .fetch_add(messages.len() as u64, Ordering::Relaxed);
-
-        if self.verbose {
-            info!(
-                "{CONNECTOR_NAME} connector with ID: {} produced {} messages",
-                self.id,
-                messages.len()
-            );
-        } else {
-            debug!(
-                "{CONNECTOR_NAME} connector with ID: {} produced {} messages",
-                self.id,
-                messages.len()
-            );
-        }
-
-        Ok(ProducedMessages {
-            schema: Schema::Json,
-            messages,
-            state: Some(persisted_state),
-        })
+        self.stage_batch(cursor, records).await
     }
 
     /// The staged cursor from `poll()` is only committed here, and only on
@@ -554,6 +567,150 @@ mod tests {
             circuit_breaker_cool_down: Some("50ms".to_string()),
             verbose_logging: None,
         }
+    }
+
+    fn good_record(cursor_value: &str) -> FetchedRecord {
+        FetchedRecord {
+            cursor_value: cursor_value.to_string(),
+            natural_id: None,
+            payload: Ok(serde_json::json!({ "cursor": cursor_value })),
+        }
+    }
+
+    fn bad_record(cursor_value: &str) -> FetchedRecord {
+        FetchedRecord {
+            cursor_value: cursor_value.to_string(),
+            natural_id: None,
+            payload: Err(Error::InvalidRecordValue(format!(
+                "cannot convert {cursor_value}"
+            ))),
+        }
+    }
+
+    fn staged_cursor(produced: &ProducedMessages) -> Option<String> {
+        let state = produced
+            .state
+            .as_ref()
+            .expect("a batch with messages stages state");
+        rmp_serde::from_slice::<State>(&state.0)
+            .expect("staged state deserializes")
+            .cursor
+    }
+
+    #[tokio::test]
+    async fn given_bad_record_after_good_ones_should_send_the_good_ones_and_stop_before_it() {
+        let source = TemplateSource::new(1, test_config(), None);
+        let records = vec![
+            good_record("c1"),
+            good_record("c2"),
+            bad_record("c3"),
+            good_record("c4"),
+        ];
+
+        let produced = source
+            .stage_batch(None, records)
+            .await
+            .expect("records before the bad one are sent");
+
+        assert_eq!(produced.messages.len(), 2);
+        assert_eq!(staged_cursor(&produced), Some("c2".to_string()));
+        let pending = source.pending_state.lock().await.clone();
+        assert_eq!(
+            pending.and_then(|state| state.cursor),
+            Some("c2".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn given_bad_first_record_should_fail_without_staging_a_cursor() {
+        let source = TemplateSource::new(1, test_config(), None);
+
+        let error = source
+            .stage_batch(
+                Some("c0".to_string()),
+                vec![bad_record("c1"), good_record("c2")],
+            )
+            .await
+            .expect_err("the cursor must not pass a record that cannot be converted");
+
+        assert!(
+            matches!(error, Error::InvalidRecordValue(_)),
+            "got {error:?}"
+        );
+        assert!(source.pending_state.lock().await.is_none());
+        assert_eq!(source.records_produced.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn given_secrets_in_config_should_not_appear_in_debug_output() {
+        let mut config = test_config();
+        config.connection_string = SecretString::from("https://user:hunter2@example.com");
+        config.auth_token = Some(SecretString::from("tok-9f3a"));
+        let source = TemplateSource::new(1, config, None);
+
+        let rendered = format!("{source:?}");
+
+        assert!(
+            !rendered.contains("hunter2"),
+            "connection string leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("tok-9f3a"),
+            "auth token leaked: {rendered}"
+        );
+    }
+
+    #[test]
+    fn given_unknown_config_key_should_be_rejected() {
+        let config = serde_json::json!({
+            "connection_string": "https://api.example.com",
+            "unknown_knob": 10,
+        });
+
+        assert!(serde_json::from_value::<TemplateSourceConfig>(config).is_err());
+    }
+
+    #[test]
+    fn given_numeric_knobs_as_json_numbers_should_deserialize() {
+        let config: TemplateSourceConfig = serde_json::from_value(serde_json::json!({
+            "connection_string": "https://api.example.com",
+            "batch_size": 10,
+            "max_retries": 2,
+            "max_open_retries": 3,
+            "circuit_breaker_threshold": 4,
+            "verbose_logging": true,
+        }))
+        .expect("numbers and booleans must not need to be strings");
+
+        assert_eq!(config.batch_size, Some(10));
+        assert_eq!(config.circuit_breaker_threshold, Some(4));
+        assert_eq!(config.verbose_logging, Some(true));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_persistent_fetch_failure_should_wait_poll_interval_between_polls() {
+        let mut source = TemplateSource::new(1, test_config(), None);
+        source.open().await.expect("open without a health probe");
+        let started = tokio::time::Instant::now();
+
+        for _ in 0..3 {
+            source
+                .poll()
+                .await
+                .expect_err("the stub fetch always fails");
+        }
+        let after_failures = started.elapsed();
+        let paused = source
+            .poll()
+            .await
+            .expect("an open breaker returns an empty batch");
+
+        assert!(
+            after_failures >= 3 * source.poll_interval,
+            "polls spun: {after_failures:?}"
+        );
+        assert!(paused.messages.is_empty());
+        assert!(started.elapsed() >= 4 * source.poll_interval);
     }
 
     #[test]

@@ -55,8 +55,11 @@ Everything else should match siblings.
 
 ### Secrets
 
-- Credentials are `secrecy::SecretString` with
-  `iggy_common::serde_secret::serialize_secret`.
+- Credentials are `secrecy::SecretString`, which redacts `Debug` and `Display`.
+  The `iggy_common::serde_secret::serialize_secret` attribute the plugins add only
+  lets the config derive `Serialize`: it writes the plaintext, so never serialize
+  a config into logs, errors or state. Use `serialize_redacted` where a redacted
+  copy is needed.
 - Never log connection strings, API keys, or tokens.
 - Never persist URL userinfo / bearers into source state files.
 
@@ -112,6 +115,12 @@ calls `on_batch_result(SourceBatchResult::Ack | Nack)`. Only
 `poll()` again until it returns.
 
 - `async fn poll(&self)` with state behind `tokio::sync::Mutex`.
+- **Never move the cursor past a record you could not convert.** Send the
+  records before it, stop, and fail the poll when it is the first record.
+  Skipping is a policy to choose on purpose, with a log line and a counter.
+  A `continue` that drops the record while the cursor takes the next record's
+  value loses it silently, and one that leaves the cursor behind a bad last
+  record re-fetches it forever.
 - **Sleep first**, then fetch.
 - Brief lock → drop → I/O → brief lock write.
 - **Stage, don't commit, in `poll()`.** Cursor advances and destructive
@@ -227,6 +236,7 @@ touch unrelated foreign SDKs in the same PR.
 [ ] SecretString on all credentials; no secret logs/state
 [ ] consume/poll never returns Ok(()) after a failed batch
 [ ] Transient vs permanent errors mapped (no Display substring matching)
+[ ] Sources: a record that cannot be converted never lets the cursor pass it (stop before it, or skip it on purpose with a log and a counter)
 [ ] Sinks: one delivery time budget per consume(); breaker paces attempts and never discards a batch; cool-down shorter than the budget; offset range logged when giving up
 [ ] Sinks: writes idempotent on stream:topic:partition:offset (or a natural key); no random UUID per emit
 [ ] Sinks: at-least-once either left refused (the default) or supported (a permanent rejection fails the call and is never skipped, buffered writes proved by flush)

@@ -221,6 +221,7 @@ Iggy consumer-loop labels use literal API names (`offset=`, `current_offset=`).
 7. `std::sync::Mutex` - blocks the executor. Use `tokio::sync::Mutex`.
 8. Not setting `ProducedMessage.id` when a stable ID exists - loses idempotency.
 9. Spawning side tasks - the runtime owns the scheduler.
+10. Dropping a record that fails to convert with `continue` while the cursor takes the next record's value. The record is lost silently, and a bad last record is re-fetched forever. Stop before it (fail the poll when it is first), or skip it on purpose with a log line and a counter. `sources/source_template` does the former in `stage_batch()`.
 
 ## Tests
 

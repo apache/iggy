@@ -102,7 +102,9 @@ The connectors codebase is intentionally repetitive across plugins. Cross-plugin
 
 ### Secrets
 
-Any credential-bearing field (connection strings, API keys, bearer tokens, AWS keys) must be `SecretString` from the `secrecy` crate, with the workspace serde wrapper applied so `Debug` and serialization both redact. Runtime exposes plugin configs over the `/stats` HTTP surface via serialization - plain `String` leaks the secret to anyone who can hit the endpoint. Plain `String` for a credential is a review-blocker. Pattern (from `sinks/postgres_sink/src/lib.rs::PostgresSinkConfig`):
+Any credential-bearing field (connection strings, API keys, bearer tokens, AWS keys) must be `SecretString` from the `secrecy` crate, so `Debug` and `Display` print a placeholder instead of the value. Plain `String` for a credential is a review-blocker.
+
+`SecretString` does not implement `Serialize`. The in-tree plugins add `iggy_common::serde_secret::serialize_secret` (or `serialize_optional_secret`) so the config struct can derive `Serialize`, and that helper **writes the plaintext**. It does not redact. Redaction on serialization needs `serialize_redacted` / `serialize_optional_redacted`, or leaving `serialize_with` off so the struct cannot be serialized at all. A plugin-side annotation does not protect the runtime's HTTP surface either: the runtime holds `plugin_config` as a raw `serde_json::Value` and serves it as written, so the plugin's serde attributes never run for that endpoint. Never serialize a plugin config into logs, errors or state files. Pattern (from `sinks/postgres_sink/src/lib.rs::PostgresSinkConfig`):
 
 ```rust
 use secrecy::{ExposeSecret, SecretString};
@@ -199,7 +201,7 @@ Each implemented in at least one in-tree plugin or runtime path.
 | `flume::unbounded()` channel                                            | `runtime/src/source.rs::spawn_source_handler` / `source_forwarding_loop`           | MPSC handoff from SDK async task to runtime loop  |
 | `tokio::sync::watch::channel(())`                                       | `sdk/src/{sink,source}.rs`, `runtime/src/sink.rs`, `runtime/src/manager/*`         | One-shot shutdown broadcast                       |
 | `dashmap::DashMap`                                                      | `runtime/src/manager/sink.rs`, `source.rs::SOURCE_SENDERS`, SDK `INSTANCES`        | Lock-free concurrent keyed access                 |
-| `secrecy::SecretString` + `iggy_common::serde_secret::serialize_secret` | `sinks/postgres_sink::PostgresSinkConfig::connection_string`                       | Auto-redact on Debug/Display + serialization      |
+| `secrecy::SecretString` + `iggy_common::serde_secret::serialize_secret` | `sinks/postgres_sink::PostgresSinkConfig::connection_string`                       | Redacts on Debug/Display; serialization writes plaintext |
 
 ## Drop accounting
 
