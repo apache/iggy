@@ -340,10 +340,8 @@ impl MqttSink {
             self.client_id().to_owned(),
             self.keep_alive,
             self.publish_timeout,
-            self.config
-                .request_capacity
-                .unwrap_or(DEFAULT_REQUEST_CAPACITY),
             self.max_in_flight,
+            self.retry_delay,
         )
         .await
     }
@@ -491,7 +489,7 @@ impl MqttSink {
                 },
             };
             connection_retries = 0;
-            if let Err(error) = active_driver.discard_queued_events().await {
+            if let Err(error) = active_driver.begin_batch().await {
                 self.finish_unconfirmed_publications(&confirmed);
                 return Err(error);
             }
@@ -530,19 +528,30 @@ impl MqttSink {
                     .map(|&index| &publications[index])
                     .collect();
                 let mut window_state = active_driver.new_publish_window(window.len(), qos);
-                let initial_indexes: Vec<_> = (0..window.len()).collect();
-                if let Err(error) = active_driver
-                    .enqueue_window(
-                        &window,
-                        &initial_indexes,
-                        qos,
-                        self.config.retain,
-                        &mut window_state,
-                    )
+                let mut retry_in_progress = false;
+                let expired_indexes = match active_driver
+                    .enqueue_window(&window, qos, self.config.retain, &mut window_state)
                     .await
                 {
-                    self.finish_unconfirmed_publications(&confirmed);
-                    return Err(error);
+                    Ok(expired_indexes) => expired_indexes,
+                    Err(error) => {
+                        self.finish_unconfirmed_publications(&confirmed);
+                        return Err(error);
+                    }
+                };
+                for index in expired_indexes {
+                    let publication_index = window_indices[index];
+                    warn!(
+                        "Skipping expired MQTT record for connector with ID {}: stream: {}, topic: {}, offset: {}",
+                        self.id,
+                        topic_metadata.stream,
+                        topic_metadata.topic,
+                        publications[publication_index].offset
+                    );
+                    confirmed[publication_index] = true;
+                    skipped += 1;
+                    self.in_flight_publications.fetch_sub(1, Ordering::Relaxed);
+                    self.publish_errors.fetch_add(1, Ordering::Relaxed);
                 }
                 loop {
                     let window_deadline = match self.publish_window_deadline() {
@@ -568,13 +577,16 @@ impl MqttSink {
                         // rumqttc retains unacknowledged requests only when the broker resumes
                         // the previous session. A fresh session clears its pending queue.
                         Ok(PublishWindowProgress::SessionPresent(true)) => {
-                            if window_retries >= self.max_retries {
-                                self.finish_unconfirmed_publications(&confirmed);
-                                return Err(Error::Connection(
-                                    "MQTT reconnect retry limit reached before unconfirmed publications were acknowledged".to_string(),
-                                ));
+                            if !retry_in_progress {
+                                if window_retries >= self.max_retries {
+                                    self.finish_unconfirmed_publications(&confirmed);
+                                    return Err(Error::Connection(
+                                        "MQTT reconnect retry limit reached before unconfirmed publications were acknowledged".to_string(),
+                                    ));
+                                }
+                                window_retries += 1;
                             }
-                            window_retries += 1;
+                            retry_in_progress = false;
                             debug!(
                                 "MQTT reconnect for connector with ID {} resumed the previous session; keeping sink packet mappings for rumqttc retransmission (retry {}/{})",
                                 self.id, window_retries, self.max_retries,
@@ -590,25 +602,25 @@ impl MqttSink {
                             self.in_flight_publications
                                 .fetch_sub(newly_confirmed as u64, Ordering::Relaxed);
                             let unconfirmed = window.len() - confirmed_indexes.len();
-                            if window_retries >= self.max_retries {
-                                self.finish_unconfirmed_publications(&confirmed);
-                                return Err(Error::Connection(
-                                    "MQTT session was not resumed before unconfirmed publications could be requeued".to_string(),
-                                ));
+                            if !retry_in_progress {
+                                if window_retries >= self.max_retries {
+                                    self.finish_unconfirmed_publications(&confirmed);
+                                    return Err(Error::Connection(
+                                        "MQTT session was not resumed before unconfirmed publications could be requeued".to_string(),
+                                    ));
+                                }
+                                window_retries += 1;
                             }
                             warn!(
                                 "MQTT reconnect for connector with ID {} did not resume the previous session; recreating the driver and requeuing {unconfirmed} unconfirmed publications (retry {}/{})",
-                                self.id,
-                                window_retries + 1,
-                                self.max_retries,
+                                self.id, window_retries, self.max_retries,
                             );
                             let delay = retry_backoff(
                                 self.retry_delay,
-                                window_retries + 1,
+                                window_retries,
                                 self.max_retry_delay,
                             );
                             tokio::time::sleep(delay).await;
-                            window_retries += 1;
                             requeued_window_retries = Some(window_retries);
                             // Leaving this scope drops the driver and its stale event loop.
                             continue 'publish;
@@ -666,13 +678,24 @@ impl MqttSink {
                                 window_retries + 1,
                                 self.max_retry_delay,
                             );
-                            tokio::time::sleep(delay).await;
+                            if let Err(error) = active_driver.retry(delay).await {
+                                self.finish_unconfirmed_publications(&confirmed);
+                                return Err(error);
+                            }
                             window_retries += 1;
+                            retry_in_progress = true;
                         }
                     }
                 }
             }
-            *self.driver.lock().await = Some(active_driver);
+            if let Err(error) = active_driver.end_batch().await {
+                warn!(
+                    "MQTT event loop stopped after completing a batch for connector with ID {}: {error}",
+                    self.id
+                );
+            } else {
+                *self.driver.lock().await = Some(active_driver);
+            }
             return Ok(confirmed.iter().filter(|confirmed| **confirmed).count() as u64 - skipped);
         }
     }

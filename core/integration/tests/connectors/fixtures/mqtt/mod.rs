@@ -36,7 +36,8 @@ pub use sink::{
     Mqtt311SinkQosOneFixture, Mqtt311SinkQosTwoFixture, Mqtt311SinkQosZeroFixture,
     MqttSinkDynamicTopicFixture, MqttSinkEnvelopeFixture, MqttSinkFixture, MqttSinkIdleFixture,
     MqttSinkInvalidCredentialsFixture, MqttSinkPipelinedFixture, MqttSinkQosTwoFixture,
-    MqttSinkQosZeroFixture, MqttSinkRawSchemaFixture, MqttSinkTemplateTopicFixture,
+    MqttSinkQosZeroFixture, MqttSinkRawSchemaFixture, MqttSinkRetainedSessionFixture,
+    MqttSinkTemplateTopicFixture,
 };
 
 const SOURCE_CLIENT_ID: &str = "iggy-mqtt-integration-source";

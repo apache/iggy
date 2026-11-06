@@ -28,8 +28,9 @@ use rumqttc_v4::{
     mqttbytes::QoS as Mqtt311Qos,
 };
 use rumqttc_v5::{
-    AsyncClient as Mqtt5Client, Broker as Mqtt5Broker, Event as Mqtt5Event,
-    EventLoop as Mqtt5EventLoop, Incoming as Mqtt5Incoming, MqttOptions as Mqtt5Options,
+    AsyncClient as Mqtt5Client, Broker as Mqtt5Broker, BrokerSessionResumePolicy,
+    Event as Mqtt5Event, EventLoop as Mqtt5EventLoop, Incoming as Mqtt5Incoming,
+    MqttOptions as Mqtt5Options, Outgoing as Mqtt5Outgoing,
     mqttbytes::{QoS as Mqtt5Qos, v5::PublishProperties},
 };
 use std::{
@@ -47,6 +48,7 @@ const MAXIMUM_TEST_PACKET_SIZE: usize = 1024 * 1024;
 
 const ENV_SINK_BROKER_URL: &str = "IGGY_CONNECTORS_SINK_MQTT_PLUGIN_CONFIG_BROKER_URL";
 const ENV_SINK_CLIENT_ID: &str = "IGGY_CONNECTORS_SINK_MQTT_PLUGIN_CONFIG_CLIENT_ID";
+const ENV_SINK_CLEAN_START: &str = "IGGY_CONNECTORS_SINK_MQTT_PLUGIN_CONFIG_CLEAN_START";
 const ENV_SINK_KEEP_ALIVE: &str = "IGGY_CONNECTORS_SINK_MQTT_PLUGIN_CONFIG_KEEP_ALIVE";
 const ENV_SINK_MAX_IN_FLIGHT: &str = "IGGY_CONNECTORS_SINK_MQTT_PLUGIN_CONFIG_MAX_IN_FLIGHT";
 const ENV_SINK_MAX_RETRIES: &str = "IGGY_CONNECTORS_SINK_MQTT_PLUGIN_CONFIG_MAX_RETRIES";
@@ -349,68 +351,6 @@ impl TestFixture for MqttSinkIdleFixture {
     }
 }
 
-pub struct MqttSinkQosTwoFixture {
-    inner: MqttSinkFixture,
-}
-
-impl std::ops::Deref for MqttSinkQosTwoFixture {
-    type Target = MqttSinkFixture;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl std::ops::DerefMut for MqttSinkQosTwoFixture {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-#[async_trait]
-impl TestFixture for MqttSinkQosTwoFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        Ok(Self {
-            inner: MqttSinkFixture::start(MqttProtocol::Mqtt5, 2, Schema::Json, 3).await?,
-        })
-    }
-
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        self.inner.connectors_runtime_envs()
-    }
-}
-
-pub struct MqttSinkQosZeroFixture {
-    inner: MqttSinkFixture,
-}
-
-impl std::ops::Deref for MqttSinkQosZeroFixture {
-    type Target = MqttSinkFixture;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl std::ops::DerefMut for MqttSinkQosZeroFixture {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-#[async_trait]
-impl TestFixture for MqttSinkQosZeroFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        Ok(Self {
-            inner: MqttSinkFixture::start(MqttProtocol::Mqtt5, 0, Schema::Json, 1).await?,
-        })
-    }
-
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        self.inner.connectors_runtime_envs()
-    }
-}
-
 pub struct MqttSinkRawSchemaFixture {
     inner: MqttSinkFixture,
 }
@@ -481,7 +421,79 @@ macro_rules! mqtt_sink_fixture {
 mqtt_sink_fixture!(Mqtt311SinkQosZeroFixture, MqttProtocol::Mqtt311, 0, 1);
 mqtt_sink_fixture!(Mqtt311SinkQosOneFixture, MqttProtocol::Mqtt311, 1, 1);
 mqtt_sink_fixture!(Mqtt311SinkQosTwoFixture, MqttProtocol::Mqtt311, 2, 1);
+mqtt_sink_fixture!(MqttSinkQosZeroFixture, MqttProtocol::Mqtt5, 0, 1);
+mqtt_sink_fixture!(MqttSinkQosTwoFixture, MqttProtocol::Mqtt5, 2, 3);
 mqtt_sink_fixture!(MqttSinkPipelinedFixture, MqttProtocol::Mqtt5, 1, 3);
+
+pub struct MqttSinkRetainedSessionFixture {
+    inner: MqttSinkFixture,
+}
+
+impl std::ops::Deref for MqttSinkRetainedSessionFixture {
+    type Target = MqttSinkFixture;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+#[async_trait]
+impl TestFixture for MqttSinkRetainedSessionFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let inner = MqttSinkFixture::start(MqttProtocol::Mqtt5, 2, Schema::Json, 1).await?;
+        let url = Url::parse(&inner.broker.broker_url).expect("broker URL must parse");
+        let mut options = Mqtt5Options::new(
+            SINK_CLIENT_ID,
+            Mqtt5Broker::tcp(
+                url.host_str().expect("broker URL must have a host"),
+                url.port().expect("broker URL must have a port"),
+            ),
+        );
+        options
+            .set_credentials(MQTT_USERNAME, MQTT_PASSWORD)
+            .set_clean_start(false)
+            .set_session_expiry_interval(Some(3600))
+            .set_broker_session_resume_policy(BrokerSessionResumePolicy::AllowBrokerOnly);
+
+        for expected_session_present in [false, true] {
+            let (client, mut event_loop) = Mqtt5Client::builder(options.clone())
+                .try_build()
+                .expect("session setup client must build");
+            let session_present = timeout(RECEIVE_TIMEOUT, async {
+                loop {
+                    match event_loop.poll().await.expect("session setup must connect") {
+                        Mqtt5Event::Incoming(Mqtt5Incoming::ConnAck(connack)) => {
+                            break connack.session_present;
+                        }
+                        _ => continue,
+                    }
+                }
+            })
+            .await
+            .expect("session setup must receive CONNACK");
+            assert_eq!(session_present, expected_session_present);
+            client.disconnect().await.expect("disconnect must enqueue");
+            timeout(RECEIVE_TIMEOUT, async {
+                loop {
+                    if let Mqtt5Event::Outgoing(Mqtt5Outgoing::Disconnect) =
+                        event_loop.poll().await.expect("disconnect must flush")
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("session setup must disconnect");
+        }
+        Ok(Self { inner })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_SINK_CLEAN_START.to_string(), "false".to_string());
+        envs
+    }
+}
 
 pub struct MqttSinkInvalidCredentialsFixture {
     inner: MqttSinkFixture,

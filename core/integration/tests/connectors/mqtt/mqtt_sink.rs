@@ -19,7 +19,8 @@ use crate::connectors::fixtures::{
     Mqtt311SinkQosOneFixture, Mqtt311SinkQosTwoFixture, Mqtt311SinkQosZeroFixture,
     MqttSinkDynamicTopicFixture, MqttSinkEnvelopeFixture, MqttSinkFixture, MqttSinkIdleFixture,
     MqttSinkInvalidCredentialsFixture, MqttSinkPipelinedFixture, MqttSinkQosTwoFixture,
-    MqttSinkQosZeroFixture, MqttSinkRawSchemaFixture, MqttSinkTemplateTopicFixture,
+    MqttSinkQosZeroFixture, MqttSinkRawSchemaFixture, MqttSinkRetainedSessionFixture,
+    MqttSinkTemplateTopicFixture,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
@@ -35,6 +36,18 @@ use tokio::time::{sleep, timeout};
 
 const SINK_STATUS_TIMEOUT: Duration = Duration::from_secs(15);
 const MQTT_SINK_KEY: &str = "mqtt";
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mqtt/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn mqtt5_fresh_sink_publishes_after_retained_session(
+    harness: &TestHarness,
+    fixture: MqttSinkRetainedSessionFixture,
+) {
+    wait_for_sink_status(harness, "running").await;
+    publish_json_message_and_assert_delivery(harness, &fixture, "retained-session").await;
+}
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/mqtt/sink.toml")),

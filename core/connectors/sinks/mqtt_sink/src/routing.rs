@@ -48,6 +48,7 @@ pub struct PreparedPublication {
     pub payload: Bytes,
     pub packet_size: usize,
     pub properties: Option<PublishProperties>,
+    pub(crate) expiry_deadline: Option<u128>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -279,6 +280,7 @@ pub fn prepare_publication_with_batch_topic(
                 payload: message.payload.try_into_vec()?.into(),
                 packet_size: 0,
                 properties: None,
+                expiry_deadline: None,
             };
             publication.packet_size = driver::publication_packet_size(
                 &publication,
@@ -289,7 +291,7 @@ pub fn prepare_publication_with_batch_topic(
             Ok(publication)
         }
         TopicMode::Dynamic => {
-            let (topic, payload, properties) =
+            let (topic, payload, properties, expiry_deadline) =
                 prepare_dynamic(message, metadata, fallback, options.protocol)?;
             validate_topic(&topic, "resolved topic")
                 .map_err(|error| Error::InvalidRecordValue(error.to_string()))?;
@@ -299,6 +301,7 @@ pub fn prepare_publication_with_batch_topic(
                 payload,
                 packet_size: 0,
                 properties,
+                expiry_deadline,
             };
             publication.packet_size = driver::publication_packet_size(
                 &publication,
@@ -316,7 +319,7 @@ fn prepare_dynamic(
     metadata: &TopicMetadata,
     fallback: &str,
     protocol: MqttProtocol,
-) -> Result<(String, Bytes, Option<PublishProperties>), Error> {
+) -> Result<(String, Bytes, Option<PublishProperties>, Option<u128>), Error> {
     // Raw messages can carry only the source topic header. JSON messages may
     // additionally contain the versioned MQTT 5 envelope used by mqtt_source.
     let ConsumedMessage {
@@ -337,7 +340,7 @@ fn prepare_dynamic(
                 .map(|value| value.to_string_value())
                 .filter(|topic| !topic.trim().is_empty())
                 .unwrap_or_else(|| render_template(fallback, metadata));
-            Ok((topic, payload.try_into_vec()?.into(), None))
+            Ok((topic, payload.try_into_vec()?.into(), None, None))
         }
         Payload::Json(value)
             if matches!(
@@ -373,17 +376,37 @@ fn prepare_dynamic(
                         "invalid MQTT envelope payload_base64: {error}"
                     ))
                 })?);
+            let expiry_deadline = envelope.properties.as_ref().and_then(|properties| {
+                properties.message_expiry_interval.map(|interval| {
+                    u128::from(timestamp) + u128::from(interval) * u128::from(MICROS_PER_SECOND)
+                })
+            });
             let properties = envelope
                 .properties
                 .map(|properties| prepare_publish_properties(properties, timestamp))
                 .transpose()?;
-            Ok((topic, payload, properties))
+            Ok((topic, payload, properties, expiry_deadline))
         }
         payload => Ok((
             render_template(fallback, metadata),
             payload.try_into_vec()?.into(),
             None,
+            None,
         )),
+    }
+}
+
+impl PreparedPublication {
+    pub(crate) fn remaining_expiry(&self, now: u64) -> Option<Option<u32>> {
+        let Some(deadline) = self.expiry_deadline else {
+            return Some(None);
+        };
+        let remaining = deadline.saturating_sub(u128::from(now));
+        if remaining == 0 {
+            return None;
+        }
+        let seconds = remaining.div_ceil(u128::from(MICROS_PER_SECOND));
+        Some(Some(seconds.min(u128::from(u32::MAX)) as u32))
     }
 }
 
@@ -481,16 +504,16 @@ fn remaining_message_expiry_interval(
     };
 
     let elapsed_micros = now_timestamp.saturating_sub(message_timestamp);
-    let elapsed_seconds = elapsed_micros / MICROS_PER_SECOND
-        + u64::from(!elapsed_micros.is_multiple_of(MICROS_PER_SECOND));
-    let remaining = u64::from(message_expiry_interval).saturating_sub(elapsed_seconds);
-    if remaining == 0 {
+    let lifetime_micros = u64::from(message_expiry_interval) * MICROS_PER_SECOND;
+    let remaining_micros = lifetime_micros.saturating_sub(elapsed_micros);
+    if remaining_micros == 0 {
         return Err(Error::InvalidRecordValue(
             "MQTT message expired before sink publication".to_string(),
         ));
     }
 
-    Ok(Some(remaining as u32))
+    let remaining_seconds = remaining_micros.div_ceil(MICROS_PER_SECOND);
+    Ok(Some(remaining_seconds as u32))
 }
 
 fn mqtt_properties_length(

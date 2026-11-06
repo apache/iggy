@@ -94,7 +94,8 @@ pub use mqtt::{
     Mqtt311SinkQosTwoFixture, Mqtt311SinkQosZeroFixture, MqttSinkDynamicTopicFixture,
     MqttSinkEnvelopeFixture, MqttSinkFixture, MqttSinkIdleFixture,
     MqttSinkInvalidCredentialsFixture, MqttSinkPipelinedFixture, MqttSinkQosTwoFixture,
-    MqttSinkQosZeroFixture, MqttSinkRawSchemaFixture, MqttSinkTemplateTopicFixture,
+    MqttSinkQosZeroFixture, MqttSinkRawSchemaFixture, MqttSinkRetainedSessionFixture,
+    MqttSinkTemplateTopicFixture,
 };
 pub use postgres::{
     POSTGRES_LARGE_BATCH_SIZE, PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture,
