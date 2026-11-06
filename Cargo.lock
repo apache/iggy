@@ -7941,7 +7941,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "dashmap",
- "humantime",
  "iggy_common",
  "iggy_connector_sdk",
  "reqwest 0.13.5",

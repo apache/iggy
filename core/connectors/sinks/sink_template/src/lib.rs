@@ -72,7 +72,6 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep, timeout};
@@ -203,7 +202,6 @@ pub struct TemplateSink {
     at_least_once: bool,
     verbose: bool,
     state: Mutex<State>,
-    records_written_total: AtomicU64,
 }
 
 impl TemplateSink {
@@ -241,7 +239,6 @@ impl TemplateSink {
             at_least_once: false,
             verbose,
             state: Mutex::new(State::default()),
-            records_written_total: AtomicU64::new(0),
         }
     }
 
@@ -434,8 +431,6 @@ impl TemplateSink {
         state.messages_written += written;
         state.messages_failed += failed;
         drop(state);
-        self.records_written_total
-            .fetch_add(written, Ordering::Relaxed);
 
         match last_err {
             None => Ok(()),
@@ -716,6 +711,7 @@ impl Sink for TemplateSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     fn test_config() -> TemplateSinkConfig {
         TemplateSinkConfig {

@@ -231,7 +231,7 @@ struct State {
 impl NameSink {
     pub fn new(id: u32, config: NameSinkConfig) -> Self {
         let batch_size = config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1) as usize;
-        // `parse_duration` falls back to the default with a `warn!` on a bad value.
+        // `parse_duration` falls back to 1s, not to the default, with a `warn!` on a bad value.
         let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
         let retry_max_delay =
             parse_duration(config.retry_max_delay.as_deref(), DEFAULT_RETRY_MAX_DELAY);
@@ -483,11 +483,11 @@ mod tests {
     }
 
     #[test]
-    fn given_invalid_retry_delay_should_fall_back_to_default() {
+    fn given_invalid_retry_delay_should_fall_back_to_one_second() {
         let mut config = test_config();
         config.retry_delay = Some("not-a-duration".into());
         let sink = NameSink::new(1, config);
-        assert_eq!(sink.retry_delay, Duration::from_millis(500));
+        assert_eq!(sink.retry_delay, Duration::from_secs(1));
     }
 }
 ```

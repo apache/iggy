@@ -182,12 +182,7 @@ pub struct TemplateSource {
 
 impl TemplateSource {
     pub fn new(id: u32, config: TemplateSourceConfig, state: Option<ConnectorState>) -> Self {
-        let poll_interval = *humantime::Duration::from_str_lossy(
-            config
-                .poll_interval
-                .as_deref()
-                .unwrap_or(DEFAULT_POLL_INTERVAL),
-        );
+        let poll_interval = parse_duration(config.poll_interval.as_deref(), DEFAULT_POLL_INTERVAL);
         let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
         let circuit_breaker = Arc::new(CircuitBreaker::new(
             config
@@ -524,25 +519,6 @@ impl Source for TemplateSource {
         drop(state);
         self.client = None;
         Ok(())
-    }
-}
-
-// Small local shim so `new()` doesn't need to pull in `humantime::Duration`'s
-// `FromStr` (which returns `Result`) just to apply a default — mirrors the
-// fallback-with-warning behavior of `iggy_connector_sdk::retry::parse_duration`
-// for the one duration field (`poll_interval`) that isn't itself optional in
-// spirit (there's always a poll interval, just maybe the default one).
-trait DurationExt {
-    fn from_str_lossy(s: &str) -> humantime::Duration;
-}
-impl DurationExt for humantime::Duration {
-    fn from_str_lossy(s: &str) -> humantime::Duration {
-        use std::str::FromStr;
-        humantime::Duration::from_str(s).unwrap_or_else(|_| {
-            warn!("Invalid poll_interval {s:?}, falling back to {DEFAULT_POLL_INTERVAL}");
-            humantime::Duration::from_str(DEFAULT_POLL_INTERVAL)
-                .expect("DEFAULT_POLL_INTERVAL must itself be a valid duration literal")
-        })
     }
 }
 
