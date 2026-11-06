@@ -506,6 +506,14 @@ mod tests {
 
         let disabled = client_config("tls_validate_certificate=false");
         assert!(!disabled.validate_certificate);
+        let deprecated_disabled = client_config("validate_certificate=false");
+        assert!(!deprecated_disabled.validate_certificate);
+
+        let mixed = client_config(
+            "validate_certificate=false&tls_validate_certificate=true&reestablish_after=1s&reconnection_reestablish_after=2s",
+        );
+        assert!(mixed.validate_certificate);
+        assert_eq!(mixed.reconnection.reestablish_after, duration("2s"));
 
         let omitted = ConnectionString::<QuicConnectionStringOptions>::new(QUIC_URL).unwrap();
         let omitted = QuicClientConfig::from(omitted);
@@ -599,5 +607,13 @@ mod tests {
             ));
         });
         assert!(warnings.contains("use `tls_validate_certificate` instead"));
+
+        let warnings = capture_warnings(|| {
+            assert!(matches!(
+                parse("reconnection_reestablish_after=invalid"),
+                Err(IggyError::InvalidConnectionString)
+            ));
+        });
+        assert!(warnings.contains("use `reestablish_after` instead"));
     }
 }
