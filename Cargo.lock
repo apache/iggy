@@ -7199,6 +7199,7 @@ version = "0.15.0"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
+ "async-broadcast",
  "async-trait",
  "bytes",
  "cfg_aliases",
