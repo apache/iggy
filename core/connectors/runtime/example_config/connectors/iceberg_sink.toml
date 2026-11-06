@@ -51,6 +51,10 @@ max_retries = 5
 retry_delay = "1s"
 max_retry_delay = "30s"
 
+[delivery]
+# Store offsets only after the batch is committed to Iceberg.
+guarantee = "at_least_once"
+
 [transforms.add_fields]
 enabled = true
 

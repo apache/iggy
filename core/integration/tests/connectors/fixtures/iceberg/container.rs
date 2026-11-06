@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use integration::harness::{SinglePortReserver, TestBinaryError, TestFixture};
+use integration::harness::{SinglePortReserver, TestBinaryError, TestFixture, seeds};
 use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
@@ -54,6 +54,23 @@ pub const ENV_SINK_MAX_RETRIES: &str = "IGGY_CONNECTORS_SINK_ICEBERG_PLUGIN_CONF
 pub const ENV_SINK_RETRY_DELAY: &str = "IGGY_CONNECTORS_SINK_ICEBERG_PLUGIN_CONFIG_RETRY_DELAY";
 pub const ENV_SINK_MAX_RETRY_DELAY: &str =
     "IGGY_CONNECTORS_SINK_ICEBERG_PLUGIN_CONFIG_MAX_RETRY_DELAY";
+pub const ENV_SINK_DELIVERY_GUARANTEE: &str = "IGGY_CONNECTORS_SINK_ICEBERG_DELIVERY_GUARANTEE";
+pub const ENV_SINK_DELIVERY_FLUSH_INTERVAL: &str =
+    "IGGY_CONNECTORS_SINK_ICEBERG_DELIVERY_FLUSH_INTERVAL";
+pub const ENV_SINK_DELIVERY_RETRY_INITIAL_BACKOFF: &str =
+    "IGGY_CONNECTORS_SINK_ICEBERG_DELIVERY_RETRY_INITIAL_BACKOFF";
+pub const ENV_SINK_DELIVERY_RETRY_MAX_BACKOFF: &str =
+    "IGGY_CONNECTORS_SINK_ICEBERG_DELIVERY_RETRY_MAX_BACKOFF";
+// Setting one field of a `[[streams]]` entry from the environment replaces the whole entry.
+pub const ENV_SINK_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SINK_ICEBERG_STREAMS_0_STREAM";
+pub const ENV_SINK_STREAMS_0_TOPICS: &str = "IGGY_CONNECTORS_SINK_ICEBERG_STREAMS_0_TOPICS";
+pub const ENV_SINK_STREAMS_0_SCHEMA: &str = "IGGY_CONNECTORS_SINK_ICEBERG_STREAMS_0_SCHEMA";
+pub const ENV_SINK_STREAMS_0_BATCH_LENGTH: &str =
+    "IGGY_CONNECTORS_SINK_ICEBERG_STREAMS_0_BATCH_LENGTH";
+pub const ENV_SINK_STREAMS_0_CONSUMER_GROUP: &str =
+    "IGGY_CONNECTORS_SINK_ICEBERG_STREAMS_0_CONSUMER_GROUP";
+/// The messages of one batch of `IcebergDeferredCheckpointFixture`.
+pub const DEFERRED_CHECKPOINT_BATCH_LENGTH: u32 = 2;
 
 pub const ENV_AWS_ACCESS_KEY_ID: &str = "AWS_ACCESS_KEY_ID";
 pub const ENV_AWS_SECRET_ACCESS_KEY: &str = "AWS_SECRET_ACCESS_KEY";
@@ -356,6 +373,9 @@ pub struct SnapshotSummary {
     pub added_records: Option<String>,
     #[serde(rename = "changed-partition-count")]
     pub changed_partition_count: Option<String>,
+    /// The last message that an at-least-once append holds.
+    #[serde(rename = "iggy.last-offset")]
+    pub last_offset: Option<String>,
 }
 
 impl IcebergFixture {
@@ -549,6 +569,123 @@ impl TestFixture for IcebergCatalogRestartFixture {
         envs.insert(ENV_SINK_MAX_RETRIES.to_string(), "30".to_string());
         envs.insert(ENV_SINK_RETRY_DELAY.to_string(), "200ms".to_string());
         envs.insert(ENV_SINK_MAX_RETRY_DELAY.to_string(), "1s".to_string());
+        envs
+    }
+}
+
+/// Same table as `IcebergPreCreatedFixture`, with a sink that delivers at least once. Its own
+/// commit retries run out within a second, so a longer catalog outage reaches the runtime, which
+/// hands the batch over again.
+pub struct IcebergAtLeastOnceFixture {
+    inner: IcebergPreCreatedFixture,
+}
+
+impl std::ops::Deref for IcebergAtLeastOnceFixture {
+    type Target = IcebergFixture;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl IcebergOps for IcebergAtLeastOnceFixture {
+    fn catalog_url(&self) -> &str {
+        self.inner.catalog_url()
+    }
+
+    fn http_client(&self) -> &HttpClient {
+        self.inner.http_client()
+    }
+}
+
+#[async_trait]
+impl TestFixture for IcebergAtLeastOnceFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            inner: IcebergPreCreatedFixture::setup().await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(
+            ENV_SINK_DELIVERY_GUARANTEE.to_string(),
+            "at_least_once".to_string(),
+        );
+        envs.insert(ENV_SINK_MAX_RETRIES.to_string(), "2".to_string());
+        envs.insert(ENV_SINK_RETRY_DELAY.to_string(), "200ms".to_string());
+        envs.insert(ENV_SINK_MAX_RETRY_DELAY.to_string(), "200ms".to_string());
+        envs.insert(
+            ENV_SINK_DELIVERY_RETRY_INITIAL_BACKOFF.to_string(),
+            "200ms".to_string(),
+        );
+        envs.insert(
+            ENV_SINK_DELIVERY_RETRY_MAX_BACKOFF.to_string(),
+            "1s".to_string(),
+        );
+        envs
+    }
+}
+
+/// Same table as `IcebergPreCreatedFixture`, with a sink that delivers at least once and stores
+/// no offset within a test, so every message it committed is above the stored offset. Its
+/// batches hold [`DEFERRED_CHECKPOINT_BATCH_LENGTH`] messages, so that a few messages already
+/// make a backlog of several batches.
+pub struct IcebergDeferredCheckpointFixture {
+    inner: IcebergPreCreatedFixture,
+}
+
+impl std::ops::Deref for IcebergDeferredCheckpointFixture {
+    type Target = IcebergFixture;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl IcebergOps for IcebergDeferredCheckpointFixture {
+    fn catalog_url(&self) -> &str {
+        self.inner.catalog_url()
+    }
+
+    fn http_client(&self) -> &HttpClient {
+        self.inner.http_client()
+    }
+}
+
+#[async_trait]
+impl TestFixture for IcebergDeferredCheckpointFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            inner: IcebergPreCreatedFixture::setup().await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(
+            ENV_SINK_DELIVERY_GUARANTEE.to_string(),
+            "at_least_once".to_string(),
+        );
+        envs.insert(
+            ENV_SINK_DELIVERY_FLUSH_INTERVAL.to_string(),
+            "1h".to_string(),
+        );
+        envs.insert(
+            ENV_SINK_STREAMS_0_STREAM.to_string(),
+            seeds::names::STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SINK_STREAMS_0_TOPICS.to_string(),
+            format!("[{}]", seeds::names::TOPIC),
+        );
+        envs.insert(ENV_SINK_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(
+            ENV_SINK_STREAMS_0_BATCH_LENGTH.to_string(),
+            DEFERRED_CHECKPOINT_BATCH_LENGTH.to_string(),
+        );
+        envs.insert(
+            ENV_SINK_STREAMS_0_CONSUMER_GROUP.to_string(),
+            "iceberg_sink_connector".to_string(),
+        );
         envs
     }
 }
