@@ -339,7 +339,7 @@ mod tests {
 
         fn event(&self, event: &tracing::Event<'_>) {
             if *event.metadata().level() == tracing::Level::WARN
-                && event.metadata().target() == module_path!()
+                && event.metadata().target() == module_path!().trim_end_matches("::tests")
             {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
