@@ -15,14 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
+use std::fmt::Display;
+use std::io::{self, Write};
+use std::time::SystemTime;
+
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
 use iggy_common::Client;
-use std::fmt::Display;
-use std::time::SystemTime;
 use tracing::{Level, event};
+
+use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum GetStatsOutput {
@@ -58,6 +61,10 @@ impl GetStatsCmd {
 impl CliCommand for GetStatsCmd {
     fn explain(&self) -> String {
         "stats command".to_owned()
+    }
+
+    fn machine_readable_output(&self) -> bool {
+        matches!(self.output, GetStatsOutput::Json | GetStatsOutput::Toml)
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
@@ -244,7 +251,9 @@ impl CliCommand for GetStatsCmd {
             GetStatsOutput::Json => serde_json::to_string_pretty(&stats)?,
         };
 
-        if self.quiet_mode {
+        if self.machine_readable_output() {
+            writeln!(io::stdout().lock(), "{output}")?;
+        } else if self.quiet_mode {
             println!("{output}");
         } else {
             event!(target: PRINT_TARGET, Level::INFO,"{output}");

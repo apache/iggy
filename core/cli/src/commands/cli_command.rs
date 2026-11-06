@@ -33,6 +33,12 @@ pub trait CliCommand {
     fn use_tracing(&self) -> bool {
         true
     }
+    /// Whether the command prints machine-readable output (JSON, TOML) that
+    /// callers pipe into a parser. The `Executing ...` line then goes to
+    /// stderr, so stdout holds only the output.
+    fn machine_readable_output(&self) -> bool {
+        false
+    }
     fn login_required(&self) -> bool {
         true
     }

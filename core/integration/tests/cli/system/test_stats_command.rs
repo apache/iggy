@@ -169,6 +169,68 @@ impl IggyCmdTestCase for TestStatsCmd {
     }
 }
 
+struct TestStructuredStats {
+    output: GetStatsOutput,
+    quiet: bool,
+}
+
+#[async_trait]
+impl IggyCmdTestCase for TestStructuredStats {
+    async fn prepare_server_state(&mut self, _client: &dyn Client) {}
+
+    fn get_command(&self) -> IggyCmdCommand {
+        let command = IggyCmdCommand::new()
+            .args(vec![
+                "stats".to_owned(),
+                "-o".to_owned(),
+                self.output.to_string(),
+            ])
+            .with_env_credentials();
+        if self.quiet {
+            command.opt("-q")
+        } else {
+            command
+        }
+    }
+
+    fn verify_command(&self, command_state: Assert) {
+        let output = command_state.success();
+        let stdout = std::str::from_utf8(&output.get_output().stdout).unwrap();
+        match self.output {
+            GetStatsOutput::Json => {
+                let value: serde_json::Value = serde_json::from_str(stdout).unwrap();
+                assert!(value.get("streams_count").is_some());
+            }
+            GetStatsOutput::Toml => {
+                let value: toml::Value = toml::from_str(stdout).unwrap();
+                assert!(value.get("streams_count").is_some());
+            }
+            _ => unreachable!(),
+        }
+        let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+        assert_eq!(
+            stderr.contains("Executing stats command"),
+            !self.quiet,
+            "{stderr}"
+        );
+    }
+
+    async fn verify_server_state(&self, _client: &dyn Client) {}
+}
+
+#[tokio::test]
+#[parallel]
+async fn given_structured_stats_when_requested_should_keep_stdout_parseable() {
+    let mut test = IggyCmdTest::default();
+    test.setup().await;
+    for output in [GetStatsOutput::Json, GetStatsOutput::Toml] {
+        for quiet in [false, true] {
+            test.execute_test(TestStructuredStats { output, quiet })
+                .await;
+        }
+    }
+}
+
 struct TestStatsCmdWithMessages {
     stream_id: u32,
     topic_id: u32,
