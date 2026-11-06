@@ -430,7 +430,7 @@ Examples
  iggy topic get test debugs
  iggy topic get 2 debugs
 
-{USAGE_PREFIX} topic get <STREAM_ID> <TOPIC_ID>
+{USAGE_PREFIX} topic get [OPTIONS] <STREAM_ID> <TOPIC_ID>
 
 Arguments:
   <STREAM_ID>
@@ -444,6 +444,12 @@ Arguments:
           Topic ID can be specified as a topic name or ID
 
 Options:
+  -o, --output <OUTPUT>
+          Output format (table or json)
+{CLAP_INDENT}
+          [default: table]
+          [possible values: table, json]
+
   -h, --help
           Print help (see a summary with '-h')
 "#,
@@ -463,14 +469,15 @@ pub async fn should_short_help_match() {
             format!(
                 r#"Get topic detail for given topic ID and stream ID
 
-{USAGE_PREFIX} topic get <STREAM_ID> <TOPIC_ID>
+{USAGE_PREFIX} topic get [OPTIONS] <STREAM_ID> <TOPIC_ID>
 
 Arguments:
   <STREAM_ID>  Stream ID to get topic
   <TOPIC_ID>   Topic ID to get
 
 Options:
-  -h, --help  Print help (see more with '--help')
+  -o, --output <OUTPUT>  Output format (table or json) [default: table] [possible values: table, json]
+  -h, --help             Print help (see more with '--help')
 "#,
             ),
         ))

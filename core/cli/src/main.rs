@@ -155,10 +155,11 @@ fn get_command(
             TopicAction::Get(args) => Box::new(GetTopicCmd::new(
                 args.stream_id.clone(),
                 args.topic_id.clone(),
+                args.output.into(),
             )),
             TopicAction::List(args) => Box::new(GetTopicsCmd::new(
                 args.stream_id.clone(),
-                args.list_mode.into(),
+                args.output().into(),
             )),
         },
         Command::Partition(command) => match command {

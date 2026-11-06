@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
-use anyhow::Context;
+use crate::commands::cli_command::{CliCommand, PRINT_TARGET, print_json};
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use comfy_table::{Table, presets::ASCII_NO_BORDERS};
 use iggy_common::Client;
@@ -25,16 +25,23 @@ use iggy_common::IggyExpiry;
 use iggy_common::TopicDetails;
 use tracing::{Level, event};
 
+pub enum GetTopicOutput {
+    Table,
+    Json,
+}
+
 pub struct GetTopicCmd {
     stream_id: Identifier,
     topic_id: Identifier,
+    output: GetTopicOutput,
 }
 
 impl GetTopicCmd {
-    pub fn new(stream_id: Identifier, topic_id: Identifier) -> Self {
+    pub fn new(stream_id: Identifier, topic_id: Identifier, output: GetTopicOutput) -> Self {
         Self {
             stream_id,
             topic_id,
+            output,
         }
     }
 }
@@ -48,6 +55,10 @@ impl CliCommand for GetTopicCmd {
         )
     }
 
+    fn machine_readable_output(&self) -> bool {
+        matches!(self.output, GetTopicOutput::Json)
+    }
+
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         let topic = client
             .get_topic(&self.stream_id, &self.topic_id)
@@ -59,12 +70,22 @@ impl CliCommand for GetTopicCmd {
                 )
             })?;
 
-        if topic.is_none() {
+        let Some(topic) = topic else {
+            if self.machine_readable_output() {
+                bail!(
+                    "Topic with ID: {} in stream {} was not found",
+                    self.topic_id,
+                    self.stream_id
+                );
+            }
             event!(target: PRINT_TARGET, Level::INFO, "Topic with ID: {} in stream {} was not found", self.topic_id, self.stream_id);
             return Ok(());
+        };
+
+        if self.machine_readable_output() {
+            return print_json(&topic);
         }
 
-        let topic = topic.unwrap();
         let table = topic_table(&topic);
 
         event!(target: PRINT_TARGET, Level::INFO,"{table}");

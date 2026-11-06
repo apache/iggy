@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
+use crate::commands::cli_command::{CliCommand, PRINT_TARGET, print_json};
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
@@ -27,6 +27,7 @@ use tracing::{Level, event};
 pub enum GetTopicsOutput {
     Table,
     List,
+    Json,
 }
 
 impl Display for GetTopicsOutput {
@@ -34,6 +35,7 @@ impl Display for GetTopicsOutput {
         match self {
             GetTopicsOutput::Table => write!(f, "table"),
             GetTopicsOutput::List => write!(f, "list"),
+            GetTopicsOutput::Json => write!(f, "json"),
         }?;
 
         Ok(())
@@ -58,6 +60,10 @@ impl CliCommand for GetTopicsCmd {
             "list topics from stream with ID: {} in {} mode",
             self.stream_id, self.output
         )
+    }
+
+    fn machine_readable_output(&self) -> bool {
+        matches!(self.output, GetTopicsOutput::Json)
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
@@ -124,6 +130,7 @@ impl CliCommand for GetTopicsCmd {
                         );
                 });
             }
+            GetTopicsOutput::Json => print_json(&topics)?,
         }
 
         Ok(())
