@@ -15,9 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::io::{self, Write};
+
 use anyhow::{Error, Result};
 use async_trait::async_trait;
 use iggy_common::Client;
+use serde::Serialize;
 
 pub static PRINT_TARGET: &str = "iggy::cli::output";
 
@@ -54,4 +57,14 @@ pub trait CliCommand {
         false
     }
     async fn execute_cmd(&mut self, client: &dyn Client) -> Result<(), Error>;
+}
+
+/// Print `value` as pretty JSON to stdout.
+///
+/// Bypasses [`PRINT_TARGET`] on purpose: JSON was asked for explicitly, so
+/// `--quiet` must not hide it.
+pub fn print_json<T: Serialize + ?Sized>(value: &T) -> Result<()> {
+    let stdout = io::stdout();
+    writeln!(stdout.lock(), "{}", serde_json::to_string_pretty(value)?)?;
+    Ok(())
 }

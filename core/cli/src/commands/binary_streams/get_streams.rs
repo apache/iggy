@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::commands::binary_streams::get_stream::encryption_source;
-use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
+use crate::commands::cli_command::{CliCommand, PRINT_TARGET, print_json};
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
@@ -26,6 +26,7 @@ use tracing::{Level, event};
 pub enum GetStreamsOutput {
     Table,
     List,
+    Json,
 }
 
 pub struct GetStreamsCmd {
@@ -52,8 +53,13 @@ impl CliCommand for GetStreamsCmd {
         let mode = match self.output {
             GetStreamsOutput::Table => "table",
             GetStreamsOutput::List => "list",
+            GetStreamsOutput::Json => "json",
         };
         format!("list streams in {mode} mode")
+    }
+
+    fn machine_readable_output(&self) -> bool {
+        matches!(self.output, GetStreamsOutput::Json)
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
@@ -62,7 +68,7 @@ impl CliCommand for GetStreamsCmd {
             .await
             .with_context(|| String::from("Problem getting list of streams"))?;
 
-        if streams.is_empty() {
+        if streams.is_empty() && !self.machine_readable_output() {
             event!(target: PRINT_TARGET, Level::INFO, "No streams found!");
             return Ok(());
         }
@@ -109,6 +115,7 @@ impl CliCommand for GetStreamsCmd {
                     );
                 });
             }
+            GetStreamsOutput::Json => print_json(&streams)?,
         }
 
         Ok(())

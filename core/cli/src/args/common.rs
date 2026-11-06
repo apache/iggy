@@ -22,6 +22,7 @@ use iggy_cli::commands::binary_cluster::get_cluster_metadata::GetClusterMetadata
 use iggy_cli::commands::binary_consumer_groups::get_consumer_groups::GetConsumerGroupsOutput;
 use iggy_cli::commands::binary_context::get_contexts::GetContextsOutput;
 use iggy_cli::commands::binary_personal_access_tokens::get_personal_access_tokens::GetPersonalAccessTokensOutput;
+use iggy_cli::commands::binary_streams::get_stream::GetStreamOutput;
 use iggy_cli::commands::binary_streams::get_streams::GetStreamsOutput;
 use iggy_cli::commands::binary_system::stats::GetStatsOutput;
 use iggy_cli::commands::binary_topics::get_topics::GetTopicsOutput;
@@ -39,15 +40,6 @@ impl From<ListMode> for GetClusterMetadataOutput {
         match mode {
             ListMode::Table => GetClusterMetadataOutput::Table,
             ListMode::List => GetClusterMetadataOutput::List,
-        }
-    }
-}
-
-impl From<ListMode> for GetStreamsOutput {
-    fn from(mode: ListMode) -> Self {
-        match mode {
-            ListMode::Table => GetStreamsOutput::Table,
-            ListMode::List => GetStreamsOutput::List,
         }
     }
 }
@@ -102,6 +94,51 @@ impl From<ListMode> for GetContextsOutput {
         match mode {
             ListMode::Table => GetContextsOutput::Table,
             ListMode::List => GetContextsOutput::List,
+        }
+    }
+}
+
+/// Output format of a list command, set with `--output`.
+///
+/// `--list-mode` stays for compatibility and covers only the human formats.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum ListOutput {
+    Table,
+    List,
+    Json,
+}
+
+impl From<ListMode> for ListOutput {
+    fn from(mode: ListMode) -> Self {
+        match mode {
+            ListMode::Table => ListOutput::Table,
+            ListMode::List => ListOutput::List,
+        }
+    }
+}
+
+impl From<ListOutput> for GetStreamsOutput {
+    fn from(output: ListOutput) -> Self {
+        match output {
+            ListOutput::Table => GetStreamsOutput::Table,
+            ListOutput::List => GetStreamsOutput::List,
+            ListOutput::Json => GetStreamsOutput::Json,
+        }
+    }
+}
+
+/// Output format of a get command, set with `--output`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum GetOutput {
+    Table,
+    Json,
+}
+
+impl From<GetOutput> for GetStreamOutput {
+    fn from(output: GetOutput) -> Self {
+        match output {
+            GetOutput::Table => GetStreamOutput::Table,
+            GetOutput::Json => GetStreamOutput::Json,
         }
     }
 }

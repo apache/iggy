@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::args::common::{ListMode, parse_key_value, split_reset};
+use crate::args::common::{GetOutput, ListMode, ListOutput, parse_key_value, split_reset};
 use clap::{Args, Subcommand};
 use iggy::prelude::{Identifier, StreamUpdateOptions};
 use std::path::PathBuf;
@@ -136,6 +136,10 @@ pub(crate) struct StreamGetArgs {
     ///
     /// Stream ID can be specified as a stream name or ID
     pub(crate) stream_id: Identifier,
+
+    /// Output format (table or json)
+    #[clap(short, long, value_enum, default_value_t = GetOutput::Table)]
+    pub(crate) output: GetOutput,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -143,6 +147,16 @@ pub(crate) struct StreamListArgs {
     /// List mode (table or list)
     #[clap(short, long, value_enum, default_value_t = ListMode::Table)]
     pub(crate) list_mode: ListMode,
+
+    /// Output format (table, list or json), replaces --list-mode
+    #[clap(short, long, value_enum, conflicts_with = "list_mode")]
+    pub(crate) output: Option<ListOutput>,
+}
+
+impl StreamListArgs {
+    pub(crate) fn output(&self) -> ListOutput {
+        self.output.unwrap_or_else(|| self.list_mode.into())
+    }
 }
 
 #[cfg(test)]
