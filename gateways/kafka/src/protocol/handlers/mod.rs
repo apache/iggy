@@ -124,7 +124,9 @@ pub async fn dispatch(
         API_KEY_FETCH => fetch::handle(state, connection, api_version, body).await,
         API_KEY_LIST_OFFSETS => list_offsets::handle(state, api_version, body).await,
         API_KEY_METADATA => metadata::handle(state, connection, principal, api_version, body).await,
-        API_KEY_OFFSET_COMMIT => offset_commit::handle(state, connection, api_version, body).await,
+        API_KEY_OFFSET_COMMIT => {
+            offset_commit::handle(state, connection, principal, api_version, body).await
+        }
         API_KEY_OFFSET_FETCH => offset_fetch::handle(state, connection, api_version, body).await,
         API_KEY_API_VERSIONS => api_versions::handle(connection, api_version, body).await,
         API_KEY_CREATE_TOPICS => create_topics::handle(state, connection, api_version, body).await,
@@ -207,6 +209,22 @@ fn may_delete_groups(principal: Option<&AuthenticatedPrincipal>, api: &str) -> b
         return false;
     }
     principal.permissions.manage_topics
+}
+
+/// Whether `principal` may create a group: the Iggy group that holds its offsets on a topic,
+/// which the first commit there creates. `None` means no listener of this gateway names
+/// principals, and `ANONYMOUS` comes from a listener that authenticates no one. Both create
+/// groups, as any client there can.
+///
+/// Kafka asks for `READ` on the group. Iggy lets a user create a consumer group with a read or
+/// manage permission on topics or streams, which `read_topics` stands for, and which
+/// `DescribeAcls` shows as that `READ`. A principal whose permissions were never read creates
+/// none.
+fn may_create_groups(principal: Option<&AuthenticatedPrincipal>) -> bool {
+    principal.is_none_or(|principal| {
+        principal.is_anonymous()
+            || (principal.permissions_known && principal.permissions.read_topics)
+    })
 }
 
 /// When an offset call on `connection` gives up. See `GroupCoordinator::offset_hold`.

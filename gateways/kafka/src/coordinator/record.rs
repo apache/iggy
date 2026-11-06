@@ -91,7 +91,7 @@ pub enum Body {
     /// id.
     TopicOffsetsDeleted { topic: String, incarnation: u64 },
     /// The group had no members and no commit for the retention period, so the log drops its
-    /// offsets. Iggy still holds them.
+    /// offsets. The owner deletes them in Iggy before it appends this.
     GroupOffsetsExpired { group_id: String },
     /// A checkpoint's mark that the log holds every offset of the group, as after
     /// [`Body::GroupOffsetsDeleted`]. The group's offsets follow it. It removes none, so a load

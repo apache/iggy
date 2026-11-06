@@ -27,6 +27,11 @@
 //! its metadata and writes once. Any other appends once Iggy stored it, since that store checks
 //! the topic and the partition, and once the change log shows the topic. So each logged offset
 //! names its topic's incarnation, and a late deletion of an older topic of that name leaves it.
+//!
+//! A principal that may not create groups (`may_create_groups`) commits only where the Iggy group
+//! of the offsets exists. Elsewhere the partition gets `GROUP_AUTHORIZATION_FAILED` (30), as Kafka
+//! answers a principal without `READ` on the group. Its partitions append to the log only once
+//! Iggy stored them, so the log never holds a refused offset.
 
 use bytes::Bytes;
 use kafka_protocol::messages::offset_commit_response::{
@@ -35,6 +40,7 @@ use kafka_protocol::messages::offset_commit_response::{
 use kafka_protocol::messages::{OffsetCommitRequest, OffsetCommitResponse};
 use tokio::time::{Instant, timeout_at};
 
+use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::{
     BridgeError, IggyBridge, OffsetCalls, OffsetGroupSource, TopicShape, TopicShapes, TopicTarget,
 };
@@ -44,12 +50,14 @@ use crate::error::Result;
 use crate::group::CommitRequest;
 use crate::protocol::api::{
     API_KEY_OFFSET_COMMIT, ApiVersionRange, ConnectionState, ERROR_COORDINATOR_LOAD_IN_PROGRESS,
-    ERROR_NONE, ERROR_OFFSET_METADATA_TOO_LARGE, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome, is_supported_version,
+    ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_NONE, ERROR_OFFSET_METADATA_TOO_LARGE,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome,
+    is_supported_version,
 };
 use crate::protocol::bounds_guard::validate_offset_commit_shape;
 use crate::protocol::handlers::{
-    decode_guarded, encode_message, offset_deadline, offset_refusal_cause, respond_or_close,
+    decode_guarded, encode_message, may_create_groups, offset_deadline, offset_refusal_cause,
+    respond_or_close,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -69,6 +77,7 @@ const MAX_OFFSET_METADATA_BYTES: usize = 4096;
 pub async fn handle(
     state: &GatewayState,
     connection: &ConnectionState,
+    principal: Option<&AuthenticatedPrincipal>,
     api_version: i16,
     body: Bytes,
 ) -> HandleOutcome {
@@ -97,15 +106,55 @@ pub async fn handle(
             // The commit stays counted until none of its Iggy calls can land, also past the
             // deadline, so a deletion of the group's offsets waits for them.
             let calls = OffsetCalls::new(offset_deadline(state, connection).await).keeping(commit);
-            match state.coordination.as_deref() {
-                Some(coordination) => commit_logged(bridge, coordination, &request, &calls).await,
+            let may_create = may_create_groups(principal);
+            let calls = if may_create {
+                calls
+            } else {
+                calls.creating_no_group()
+            };
+            let topics = match state.coordination.as_deref() {
+                Some(coordination) => {
+                    commit_logged(bridge, coordination, &request, &calls, may_create).await
+                }
                 None => commit_all(bridge, &request, &calls).await,
+            };
+            if let Some(principal) = principal.filter(|_| refused_group(&topics)) {
+                log_refused_group(principal, request.group_id.0.as_str());
             }
+            topics
         }
         (None, Ok(_)) => same_code(&request, ERROR_COORDINATOR_LOAD_IN_PROGRESS),
         (_, Err(error)) => same_code(&request, error),
     };
     respond_or_close(encode_response(api_version, topics), "OffsetCommit")
+}
+
+/// Whether a partition of `topics` needed a group that the principal may not create.
+fn refused_group(topics: &[OffsetCommitResponseTopic]) -> bool {
+    topics
+        .iter()
+        .flat_map(|topic| &topic.partitions)
+        .any(|partition| partition.error_code == ERROR_GROUP_AUTHORIZATION_FAILED)
+}
+
+/// One line per refused request. A principal whose permissions were never read is the operator's
+/// to look into, so that one warns.
+fn log_refused_group(principal: &AuthenticatedPrincipal, group: &str) {
+    if principal.permissions_known {
+        tracing::debug!(
+            principal = %principal.username,
+            group,
+            "the principal holds no read or manage permission on topics or streams, so its \
+             commit creates no group"
+        );
+    } else {
+        tracing::warn!(
+            principal = %principal.username,
+            group,
+            "OffsetCommit asked on a connection whose permissions were never read, so its commit \
+             creates no group"
+        );
+    }
 }
 
 /// One requested partition that passed the gateway's own checks.
@@ -130,11 +179,14 @@ async fn commit_all(
 
 /// Stores every requested offset in Iggy and appends it to the coordinator log, with its metadata.
 /// A partition gets the log's code when the append fails, since the commit counts only in the log.
+/// Unless `may_create`, every partition appends once Iggy stored it: Iggy can refuse one for want
+/// of a group.
 async fn commit_logged(
     bridge: &IggyBridge,
     coordination: &Coordination,
     request: &OffsetCommitRequest,
     calls: &OffsetCalls,
+    may_create: bool,
 ) -> Vec<OffsetCommitResponseTopic> {
     let targets = targets(bridge, request);
     let (mut topics, planned) = plan(request, &targets, true);
@@ -142,7 +194,7 @@ async fn commit_logged(
     let shapes = request_shapes(request, &bridge.topic_shapes().borrow());
     let (checked, unchecked): (Vec<&Planned<'_>>, Vec<&Planned<'_>>) =
         planned.iter().partition(|planned| {
-            shapes[planned.at.0].is_some_and(|shape| planned.index < shape.partitions)
+            may_create && shapes[planned.at.0].is_some_and(|shape| planned.index < shape.partitions)
         });
     let commit_timestamp_ms = unix_millis();
     let ((), logged) = tokio::join!(
@@ -423,7 +475,9 @@ mod tests {
     use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
 
     use super::*;
+    use crate::auth::UserKey;
     use crate::bridge::BridgeError;
+    use crate::protocol::acl::PrincipalPermissions;
     use crate::protocol::api::ERROR_UNKNOWN_MEMBER_ID;
 
     fn request(generation_id: i32, member_id: &'static str) -> OffsetCommitRequest {
@@ -454,7 +508,7 @@ mod tests {
     async fn codes(version: i16, request: &OffsetCommitRequest) -> Vec<(String, i32, i16)> {
         let state = GatewayState::stub(8 * 1024 * 1024);
         let connection = ConnectionState::default();
-        let mut response = handle(&state, &connection, version, body(version, request))
+        let mut response = handle(&state, &connection, None, version, body(version, request))
             .await
             .expect_response("OffsetCommit answers");
         let response = OffsetCommitResponse::decode(&mut response, version).unwrap();
@@ -486,6 +540,60 @@ mod tests {
                 "v{version}"
             );
         }
+    }
+
+    fn principal(read_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
+        AuthenticatedPrincipal {
+            username: "ann".to_string(),
+            user: Some(UserKey {
+                user_id: 7,
+                created_at: 1,
+            }),
+            permissions: PrincipalPermissions {
+                read_topics,
+                poll_messages: true,
+                ..PrincipalPermissions::default()
+            },
+            permissions_known,
+        }
+    }
+
+    #[test]
+    fn given_each_kind_of_principal_should_let_only_readers_and_unauthenticated_ones_create_groups()
+    {
+        assert!(may_create_groups(None), "no listener names principals");
+        assert!(
+            may_create_groups(Some(&AuthenticatedPrincipal::anonymous())),
+            "a listener that authenticates no one"
+        );
+        assert!(may_create_groups(Some(&principal(true, true))));
+        assert!(
+            !may_create_groups(Some(&principal(false, true))),
+            "polling alone does not create a consumer group in Iggy"
+        );
+        assert!(
+            !may_create_groups(Some(&principal(true, false))),
+            "permissions never read"
+        );
+
+        let unread_anonymous = AuthenticatedPrincipal {
+            username: AuthenticatedPrincipal::ANONYMOUS.to_string(),
+            user: None,
+            permissions: PrincipalPermissions::default(),
+            permissions_known: false,
+        };
+        assert!(
+            !may_create_groups(Some(&unread_anonymous)),
+            "an Iggy user named ANONYMOUS whose read failed is not the anonymous principal"
+        );
+    }
+
+    #[test]
+    fn given_a_refused_group_creation_should_answer_group_authorization_failed() {
+        assert_eq!(
+            BridgeError::GroupCreationRefused.to_offset_error_code(),
+            ERROR_GROUP_AUTHORIZATION_FAILED
+        );
     }
 
     #[tokio::test]
@@ -535,9 +643,13 @@ mod tests {
         let connection = ConnectionState::default();
 
         let truncated = body(9, &request(-1, "")).slice(..5);
-        assert!(handle(&state, &connection, 9, truncated).await.is_close());
         assert!(
-            handle(&state, &connection, 10, body(9, &request(-1, "")))
+            handle(&state, &connection, None, 9, truncated)
+                .await
+                .is_close()
+        );
+        assert!(
+            handle(&state, &connection, None, 10, body(9, &request(-1, "")))
                 .await
                 .is_close()
         );

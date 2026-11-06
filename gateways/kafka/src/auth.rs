@@ -236,6 +236,13 @@ impl AuthenticatedPrincipal {
             permissions_known: true,
         }
     }
+
+    /// Whether this is [`Self::anonymous`]: a connection on a listener that authenticates no one.
+    /// A login whose user could not be read has no user either, but its permissions are unknown.
+    #[must_use]
+    pub fn is_anonymous(&self) -> bool {
+        self.user.is_none() && self.permissions_known && self.username == Self::ANONYMOUS
+    }
 }
 
 /// One Iggy user. Iggy gives the id and name of a deleted user to new users, never its creation
