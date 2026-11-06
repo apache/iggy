@@ -22,3 +22,9 @@
 # sdk = "swift"
 # test = "<file path>#<test description>"
 # issue = "https://github.com/apache/iggy/issues/NNNN"
+
+[[divergence]]
+sdk = "go"
+test = "streams/stream_crud.yaml#Delete a stream."
+issue = "not filed yet"
+reason = "GetStream returns ErrStreamIdNotFound (1009) for a missing stream, where Rust and Java return no stream"

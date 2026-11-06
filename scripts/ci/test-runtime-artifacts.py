@@ -60,7 +60,8 @@ class RuntimeArtifacts(unittest.TestCase):
         self.env = os.environ.copy()
         self.env["GIT_DIR"] = run("git", "rev-parse", "--absolute-git-dir").stdout.strip()
         self.revision = run("git", "rev-parse", "HEAD").stdout.strip()
-        self.files = ["target/debug/iggy-server", "target/debug/iggy"]
+        # The CLI comes last: the test of a missing CLI drops the last file.
+        self.files = ["target/debug/iggy-server", "target/debug/iggy-conformance", "target/debug/iggy"]
         for name in self.files:
             binary = self.producer / name
             binary.write_text("#!/bin/sh\nprintf 'shared-runtime\\n'\n")

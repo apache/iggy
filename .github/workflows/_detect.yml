@@ -342,7 +342,7 @@ jobs:
               else if (name === 'sdk-csharp') groups.csharp.push(...entries);
               else if (name === 'sdk-cpp') groups.cpp.push(...entries);
               else if (name === 'sdk-swift') groups.swift.push(...entries);
-              else if (name.startsWith('bdd-')) {
+              else if (name.startsWith('bdd-') || name.startsWith('conformance-')) {
                 // Individual BDD tests should run separately with proper Docker setup
                 groups.bdd.push(...entries);
               }

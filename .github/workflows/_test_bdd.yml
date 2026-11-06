@@ -44,8 +44,48 @@ jobs:
       - uses: actions/checkout@v7.0.1
 
       - name: Run BDD suite
+        if: ${{ !startsWith(matrix.task, 'conformance-') }}
         uses: ./.github/actions/bdd/pre-merge
         with:
           component: ${{ matrix.component }}
           task: ${{ matrix.task }}
           codecov-token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Run conformance suite
+        if: ${{ startsWith(matrix.task, 'conformance-') }}
+        uses: ./.github/actions/conformance/pre-merge
+        with:
+          component: ${{ matrix.component }}
+          task: ${{ matrix.task }}
+
+  conformance-matrix:
+    name: Conformance matrix
+    needs: run
+    if: ${{ !cancelled() && contains(inputs.matrix, 'conformance-') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Download runtime binaries
+        uses: ./.github/actions/utils/download-runtime
+        with:
+          install-system-dependencies: "false"
+
+      - name: Download conformance reports
+        uses: actions/download-artifact@v8
+        with:
+          pattern: conformance-reports-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: conformance-reports
+          merge-multiple: true
+
+      - name: Join the reports into one matrix
+        shell: bash
+        run: |
+          if compgen -G 'conformance-reports/conformance-*.json' > /dev/null; then
+            {
+              echo "## Conformance matrix"
+              echo
+              target/debug/iggy-conformance matrix conformance-reports/conformance-*.json
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

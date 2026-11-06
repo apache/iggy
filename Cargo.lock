@@ -5786,11 +5786,9 @@ dependencies = [
 name = "iggy-conformance"
 version = "0.1.0"
 dependencies = [
- "base64 0.23.1",
  "bytemuck",
  "bytes",
  "clap",
- "futures",
  "hex",
  "humantime",
  "iggy",

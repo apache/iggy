@@ -210,7 +210,10 @@ runs:
         if [[ "$ARTIFACT_TASK" == runtime ]]; then
           # Workspace target selection keeps the dependency feature graph stable across SDK PRs.
           cargo build --locked --bin iggy-server --bin iggy
-          tar --zstd -cf "$ARTIFACT_DIR/runtime.tar.zst" target/debug/iggy-server target/debug/iggy
+          # A separate build leaves the feature graph of the server and the CLI as it was.
+          cargo build --locked --bin iggy-conformance
+          tar --zstd -cf "$ARTIFACT_DIR/runtime.tar.zst" \
+            target/debug/iggy-server target/debug/iggy target/debug/iggy-conformance
           exit 0
         fi
 

@@ -27,7 +27,7 @@ if [[ "$artifact_revision" != "$revision" ]]; then
 fi
 
 tar --zstd -xf "$artifact_dir/runtime.tar.zst"
-for binary in target/debug/iggy-server target/debug/iggy; do
+for binary in target/debug/iggy-server target/debug/iggy-conformance target/debug/iggy; do
   if [[ ! -x "$binary" ]]; then
     echo "::error::Runtime binary missing or not executable: $binary"
     exit 1

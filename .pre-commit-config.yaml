@@ -258,6 +258,16 @@ repos:
         pass_filenames: false
         stages: [pre-push]
 
+      - id: golangci-lint-conformance
+        name: golangci-lint (conformance/agents/go)
+        entry: bash -c 'cd conformance/agents/go && golangci-lint run --timeout=5m ./...'
+        language: golang
+        additional_dependencies:
+          ["github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2"]
+        files: ^conformance/agents/go/.*\.go$
+        pass_filenames: false
+        stages: [pre-push]
+
   # Node.js linting
   - repo: local
     hooks:

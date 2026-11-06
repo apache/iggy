@@ -219,6 +219,7 @@ components:
       - "rust-kafka-wire"
       - "rust-object-store"
       - "rust-tools"
+      - "rust-conformance"
       - "rust-cli"
       - "rust-bench"
       - "rust-mcp"
@@ -315,6 +316,7 @@ components:
       - "foreign/go/**"
       - "bdd/go/**"
       - "examples/go/**"
+      - "conformance/agents/go/**"
       # The SDK compiles against the VSR wire contract, so a change to the
       # protocol crate or the VSR server must rerun it.
       - "core/binary_protocol/**"
@@ -373,6 +375,34 @@ components:
       - "bdd/docker-compose.cluster.yml"
       - "bdd/docker-compose.no-quorum.yml"
       - "bdd/docker-compose.coverage.yml"
+
+  # The conformance corpus, its orchestrator and its runner affect every SDK agent.
+  conformance-infrastructure:
+    paths:
+      - "conformance/tests/**"
+      - "conformance/skips.toml"
+      - "core/conformance/**"
+      - "scripts/run-conformance-tests.sh"
+
+  conformance-rust:
+    depends_on:
+      - "rust-sdk"
+      - "rust-server"
+      - "conformance-infrastructure"
+      - "ci-infrastructure"
+    paths:
+      - "core/conformance/**"
+    tasks: ["conformance-rust"]
+
+  conformance-go:
+    depends_on:
+      - "rust-server"
+      - "sdk-go"
+      - "conformance-infrastructure"
+      - "ci-infrastructure"
+    paths:
+      - "conformance/agents/go/**"
+    tasks: ["conformance-go"]
 
   # Individual BDD tests per SDK - only run when specific SDK changes
   bdd-rust:
@@ -608,6 +638,12 @@ components:
       - "rust-workspace"
     paths:
       - "core/tools/**"
+
+  rust-conformance:
+    depends_on:
+      - "rust-workspace"
+    paths:
+      - "core/conformance/**"
 
   # CI/CD workflow monitoring (informational, no tasks)
   ci-workflows:

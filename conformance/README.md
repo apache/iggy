@@ -21,8 +21,13 @@ target/debug/iggy-conformance run --server 127.0.0.1:8090
 To run another SDK, give the command that starts its agent:
 
 ```bash
-target/debug/iggy-conformance run --server 127.0.0.1:8090 --agent "conformance/agents/go/iggy-agent"
+(cd conformance/agents/go && go build -o iggy-agent .)
+target/debug/iggy-conformance run --server 127.0.0.1:8090 --agent conformance/agents/go/iggy-agent
 ```
+
+`scripts/run-conformance-tests.sh <sdk>` does all of this the way CI does. It starts a single node and a node that
+cannot reach quorum on spare local ports, builds the agent, runs the corpus with the skip list and writes the reports
+to `reports/`. The supported SDKs are `rust` and `go`.
 
 Other options:
 
@@ -31,7 +36,7 @@ Other options:
 | `--no-quorum <address>` | The address of a cluster node that cannot reach quorum. Tests with `topology: no_quorum` need it. |
 | `--filter <text>` | Runs only the tests whose id contains the text. |
 | `--junit <file>`, `--json <file>` | Writes the results as JUnit XML or as a JSON report. |
-| `--skips conformance/skips.toml` | Fails the run on a skip that the list does not allow. |
+| `--skips conformance/skips.toml` | Fails the run on a skip or a divergence that the list does not allow. |
 
 The other commands are:
 
@@ -328,19 +333,27 @@ Rules for every agent:
 5. On `reset`, cancel every task and close every entity.
 6. Never judge a result. Return what the SDK returned.
 
-## Skips
+## Skips and divergences
 
-`conformance/skips.toml` lists the skips that each SDK is allowed:
+`conformance/skips.toml` lists the skips that each SDK is allowed, and its known divergences.
+A divergence is a test that fails because the SDK differs from the contract.
 
 ```toml
 [[skip]]
 sdk = "swift"
 test = "faults/lost_send_reply.yaml#The replay of a send that the server committed stores its messages once."
 issue = "https://github.com/apache/iggy/issues/NNNN"
+
+[[divergence]]
+sdk = "go"
+test = "streams/stream_crud.yaml#Delete a stream."
+issue = "https://github.com/apache/iggy/issues/NNNN"
+reason = "GetStream returns an error for a missing stream"
 ```
 
-With `--skips`, a skip that the list does not name fails the run.
+With `--skips`, a skip that the list does not name fails the run, and a listed divergence does not.
 A listed test that passes also fails the run, so the list can only shrink.
+Test ids are relative to `--tests`, so a run of part of the corpus uses `--filter`, not another `--tests` directory.
 
 ## Keep the suite honest
 

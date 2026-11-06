@@ -28,11 +28,9 @@ name = "iggy-conformance"
 path = "src/main.rs"
 
 [dependencies]
-base64 = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["env"] }
-futures = { workspace = true }
 hex = { workspace = true }
 humantime = { workspace = true }
 iggy = { workspace = true }

@@ -33,7 +33,7 @@ runs:
       shell: bash
       if: inputs.task == 'lint'
       run: |
-        for dir in foreign/go bdd/go examples/go; do
+        for dir in foreign/go bdd/go examples/go conformance/agents/go; do
           if [ -d "$dir" ]; then
             echo "Checking formatting in $dir..."
             if [ -n "$(gofmt -l "$dir")" ]; then
@@ -48,7 +48,7 @@ runs:
       shell: bash
       if: inputs.task == 'test' || inputs.task == 'lint'
       run: |
-        for dir in foreign/go bdd/go examples/go; do
+        for dir in foreign/go bdd/go examples/go conformance/agents/go; do
           if [ -f "$dir/go.mod" ]; then
             echo "Checking go mod tidy in $dir..."
             (cd "$dir" && go mod tidy && git diff --exit-code go.mod go.sum)
@@ -105,6 +105,15 @@ runs:
       with:
         version: v2.13.2
         working-directory: examples/go
+        args: --timeout=5m
+        skip-cache: true
+
+    - name: Lint conformance agent
+      if: inputs.task == 'lint' && hashFiles('conformance/agents/go/go.mod') != ''
+      uses: golangci/golangci-lint-action@v9
+      with:
+        version: v2.13.2
+        working-directory: conformance/agents/go
         args: --timeout=5m
         skip-cache: true
 

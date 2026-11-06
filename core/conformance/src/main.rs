@@ -217,17 +217,33 @@ async fn run(args: RunArgs, record: bool) -> Result<(), String> {
         write(path, &json)?;
     }
     let totals = Totals::of(&report.tests);
+    let known = skips
+        .as_ref()
+        .map(|list| list.known_failures(&report))
+        .unwrap_or_default();
     println!(
-        "{}: {} passed, {} failed, {} errored, {} skipped",
-        report.sdk, totals.passed, totals.failed, totals.errored, totals.skipped
+        "{}: {} passed, {} failed ({} known divergences), {} errored, {} skipped",
+        report.sdk,
+        totals.passed,
+        totals.failed,
+        known.len(),
+        totals.errored,
+        totals.skipped
     );
+    for divergence in &known {
+        println!(
+            "known divergence: {}: {} ({})",
+            divergence.test, divergence.reason, divergence.issue
+        );
+    }
     let violations = skips
-        .map(|skips| skips.violations(&report, args.filter.is_some()))
+        .as_ref()
+        .map(|list| list.violations(&report, args.filter.is_some()))
         .unwrap_or_default();
     for violation in &violations {
         eprintln!("{violation}");
     }
-    if totals.failed + totals.errored > 0 || !violations.is_empty() {
+    if totals.failed - known.len() + totals.errored > 0 || !violations.is_empty() {
         return Err("the conformance run failed".to_owned());
     }
     Ok(())
