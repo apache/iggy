@@ -16,7 +16,7 @@
 // under the License.
 
 use super::client::{ConnectorEndpoint, ConnectorKind};
-use super::{as_array, cell};
+use super::{as_array, cell, str_field};
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -76,11 +76,7 @@ impl CliCommand for GetTransformsCmd {
         table.set_header(vec!["Type", "Config"]);
         transforms.iter().for_each(|transform| {
             table.add_row(vec![
-                transform
-                    .get("type")
-                    .and_then(|kind| kind.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
+                str_field(transform, "type").to_string(),
                 transform.get("config").map(cell).unwrap_or_default(),
             ]);
         });

@@ -175,35 +175,41 @@ impl ConnectorsApiClient {
         query: &[(&str, String)],
         body: Option<&Value>,
     ) -> Result<reqwest::Response> {
-        for attempt in 0..2 {
-            let mut request = self
-                .inner
-                .request(method.clone(), format!("{}{path}", self.base_url));
-            if !query.is_empty() {
-                request = request.query(query);
-            }
-            if let Some(body) = body {
-                request = request.json(body);
-            }
-            if let Some(key) = &self.api_key {
-                request = request.header("api-key", key.expose_secret());
-            }
-            let response = request
-                .send()
-                .await
-                .with_context(|| format!("problem calling connectors API {method} {path}"))?;
-            if response.status() == StatusCode::UNAUTHORIZED
-                && self.api_key.is_none()
-                && attempt == 0
-                && isatty(Stream::Stdin)
-            {
-                let key = prompt_password_tty(Some("Connectors API key: "))?;
-                self.api_key = Some(SecretString::from(key));
-                continue;
-            }
-            return Ok(response);
+        let response = self.send(&method, path, query, body).await?;
+        if response.status() == StatusCode::UNAUTHORIZED
+            && self.api_key.is_none()
+            && isatty(Stream::Stdin)
+        {
+            let key = prompt_password_tty(Some("Connectors API key: "))?;
+            self.api_key = Some(SecretString::from(key));
+            return self.send(&method, path, query, body).await;
         }
-        bail!("connectors API request {method} {path} was not sent")
+        Ok(response)
+    }
+
+    async fn send(
+        &self,
+        method: &Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<&Value>,
+    ) -> Result<reqwest::Response> {
+        let mut request = self
+            .inner
+            .request(method.clone(), format!("{}{path}", self.base_url));
+        if !query.is_empty() {
+            request = request.query(query);
+        }
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        if let Some(key) = &self.api_key {
+            request = request.header("api-key", key.expose_secret());
+        }
+        request
+            .send()
+            .await
+            .with_context(|| format!("problem calling connectors API {method} {path}"))
     }
 
     async fn ensure_success(response: reqwest::Response, path: &str) -> Result<reqwest::Response> {

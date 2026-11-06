@@ -16,7 +16,7 @@
 // under the License.
 
 use super::client::ConnectorEndpoint;
-use super::{bool_field, cell, str_field};
+use super::{as_array, bool_field, cell, str_field};
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -55,6 +55,10 @@ impl CliCommand for GetConnectorStatsCmd {
             .await
             .with_context(|| "problem getting connectors runtime statistics")?;
 
+        anyhow::ensure!(
+            stats.is_object(),
+            "connectors API returned statistics that are not a JSON object"
+        );
         let mut table = Table::new();
         table.set_header(vec!["Property", "Value"]);
         for key in [
@@ -78,11 +82,10 @@ impl CliCommand for GetConnectorStatsCmd {
         }
         event!(target: PRINT_TARGET, Level::INFO, "{table}");
 
-        let connectors = stats
-            .get("connectors")
-            .and_then(|connectors| connectors.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let connectors = match stats.get("connectors") {
+            Some(connectors) => as_array(connectors, "connectors")?,
+            None => &[],
+        };
         if connectors.is_empty() {
             return Ok(());
         }

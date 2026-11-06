@@ -26,19 +26,21 @@ pub(crate) enum ConnectorKind {
     Source,
 }
 
-/// Same rule as the runtime, so a key cannot carry `/`, `?`, `#` or `..`
-/// into the request path.
+const MAX_CONNECTOR_KEY_LENGTH: usize = 128;
+
+/// Mirrors the runtime's `ConnectorKey` so a key cannot add `/`, `?`, `#` or
+/// `..` to the request path.
 fn parse_connector_key(key: &str) -> Result<String, String> {
     let mut chars = key.chars();
-    let valid = chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+    let valid = key.len() <= MAX_CONNECTOR_KEY_LENGTH
+        && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     if valid {
         Ok(key.to_string())
     } else {
-        Err(
-            "must start with a letter or digit and contain only letters, digits, '.', '_' and '-'"
-                .to_string(),
-        )
+        Err(format!(
+            "must be at most {MAX_CONNECTOR_KEY_LENGTH} bytes, start with a letter or digit and contain only letters, digits, '.', '_' and '-'"
+        ))
     }
 }
 
@@ -102,9 +104,10 @@ pub(crate) struct ConnectorGetArgs {
 pub(crate) enum ConnectorConfigAction {
     /// List all configuration versions of a sink or source
     ///
-    /// The Running column marks the version the connector runs now, which
-    /// differs from the activated one until a restart. The responses
-    /// include plugin credentials in plaintext.
+    /// The Running column marks the version the connector runs now. On the
+    /// local provider a restart loads the highest stored version, and the
+    /// activated one applies only when the runtime process starts. The
+    /// responses include plugin credentials in plaintext.
     ///
     /// Examples:
     ///  iggy connector config list sink my-sink
@@ -152,7 +155,8 @@ pub(crate) enum ConnectorConfigAction {
     /// Mark a version as active
     ///
     /// Only records the version; the running connector keeps its
-    /// configuration until it restarts.
+    /// configuration. On the local provider the marker applies when the
+    /// runtime process starts, not on a connector restart.
     ///
     /// Examples:
     ///  iggy connector config activate sink my-sink --version 3
@@ -301,6 +305,14 @@ mod tests {
             );
         }
         assert!(parse(&["connector", "get", "sink", "orders_sink-1.v2"]).is_ok());
+    }
+
+    #[test]
+    fn should_limit_key_length_like_the_runtime() {
+        let longest = "k".repeat(MAX_CONNECTOR_KEY_LENGTH);
+        assert!(parse(&["connector", "get", "sink", &longest]).is_ok());
+        let too_long = "k".repeat(MAX_CONNECTOR_KEY_LENGTH + 1);
+        assert!(parse(&["connector", "get", "sink", &too_long]).is_err());
     }
 
     #[test]

@@ -256,8 +256,9 @@ Options:
           Connectors runtime HTTP API key
 {CLAP_INDENT}
           Sent as the api-key header. Falls back to IGGY_CONNECTORS_API_KEY,
-          then to the active context. When the runtime answers 401 and stdin
-          is a terminal, the key is prompted for and the request retried once.
+          then to the active context. When no key is set and the runtime
+          answers 401 on a terminal, the key is prompted for and the request
+          retried once.
 
       --connectors-tls-ca-file <CONNECTORS_TLS_CA_FILE>
           CA certificate file for a connectors runtime that uses TLS

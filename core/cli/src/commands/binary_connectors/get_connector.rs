@@ -62,13 +62,18 @@ impl CliCommand for GetConnectorCmd {
             .await
             .with_context(|| format!("problem getting {} {}", self.kind.singular(), self.key))?;
 
+        let object = details.as_object().with_context(|| {
+            format!(
+                "connectors API returned {} {} details that are not a JSON object",
+                self.kind.singular(),
+                self.key
+            )
+        })?;
         let mut table = Table::new();
         table.set_header(vec!["Property", "Value"]);
-        if let Some(object) = details.as_object() {
-            object.iter().for_each(|(key, value)| {
-                table.add_row(vec![key.clone(), cell(value)]);
-            });
-        }
+        object.iter().for_each(|(key, value)| {
+            table.add_row(vec![key.clone(), cell(value)]);
+        });
         event!(target: PRINT_TARGET, Level::INFO, "{table}");
 
         Ok(())

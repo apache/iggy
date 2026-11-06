@@ -152,9 +152,11 @@ impl From<ContextCreateArgs> for ContextConfig {
             token_name: args.token_name,
             connectors_api_url: args.connectors_api_url,
             connectors_api_key: args.connectors_api_key,
-            // Stored absolute so the context works from any directory.
+            // Absolute so the context works from any directory, even when the
+            // file does not exist yet.
             connectors_tls_ca_file: args.connectors_tls_ca_file.map(|path| {
                 std::fs::canonicalize(&path)
+                    .or_else(|_| std::path::absolute(&path))
                     .map(|absolute| absolute.to_string_lossy().into_owned())
                     .unwrap_or(path)
             }),
@@ -262,6 +264,31 @@ mod tests {
         let stored = config.connectors_tls_ca_file.unwrap();
         assert!(!stored.contains(".."));
         assert!(std::path::Path::new(&stored).is_absolute());
+    }
+
+    #[test]
+    fn should_store_missing_ca_file_as_absolute_path() {
+        let args = ContextCreateArgs {
+            context_name: "tls".to_string(),
+            transport: None,
+            tcp_server_address: None,
+            http_api_url: None,
+            quic_server_address: None,
+            tcp_tls_enabled: None,
+            username: None,
+            password: None,
+            token: None,
+            token_name: None,
+            connectors_api_url: None,
+            connectors_api_key: None,
+            connectors_tls_ca_file: Some("does-not-exist/ca.pem".to_string()),
+        };
+
+        let config: ContextConfig = args.into();
+
+        let stored = config.connectors_tls_ca_file.unwrap();
+        assert!(std::path::Path::new(&stored).is_absolute());
+        assert!(stored.ends_with("does-not-exist/ca.pem"));
     }
 
     #[test]

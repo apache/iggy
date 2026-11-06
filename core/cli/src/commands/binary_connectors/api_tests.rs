@@ -612,6 +612,51 @@ async fn should_fail_when_list_body_is_not_an_array() {
 }
 
 #[tokio::test]
+async fn should_fail_when_connector_details_are_not_an_object() {
+    let server = MockServer::start().await;
+    expect(&server, "GET", "/sinks/orders-sink", ok(json!(["proxy"]))).await;
+    let mut command = GetConnectorCmd::new(
+        ConnectorKind::Sinks,
+        "orders-sink".into(),
+        endpoint(&server),
+    );
+
+    let (result, output) = run(&mut command).await;
+
+    assert!(format!("{:#}", result.unwrap_err()).contains("not a JSON object"));
+    assert!(output.is_empty());
+}
+
+#[tokio::test]
+async fn should_fail_when_stats_are_not_an_object() {
+    let server = MockServer::start().await;
+    expect(&server, "GET", "/stats", ok(json!("proxy"))).await;
+    let mut command = GetConnectorStatsCmd::new(endpoint(&server));
+
+    let (result, output) = run(&mut command).await;
+
+    assert!(format!("{:#}", result.unwrap_err()).contains("not a JSON object"));
+    assert!(output.is_empty());
+}
+
+#[tokio::test]
+async fn should_fail_when_stats_connectors_are_not_an_array() {
+    let server = MockServer::start().await;
+    expect(
+        &server,
+        "GET",
+        "/stats",
+        ok(json!({ "process_id": 42, "connectors": "proxy" })),
+    )
+    .await;
+    let mut command = GetConnectorStatsCmd::new(endpoint(&server));
+
+    let (result, _) = run(&mut command).await;
+
+    assert!(format!("{:#}", result.unwrap_err()).contains("not a JSON array"));
+}
+
+#[tokio::test]
 async fn should_send_no_key_header_when_none_is_configured() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

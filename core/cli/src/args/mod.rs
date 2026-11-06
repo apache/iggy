@@ -162,9 +162,9 @@ pub(crate) struct CliOptions {
     /// Connectors runtime HTTP API key
     ///
     /// Sent as the api-key header. Falls back to IGGY_CONNECTORS_API_KEY,
-    /// then to the active context. When no key is configured, the runtime
-    /// answers 401 and stdin is a terminal, the key is prompted for and
-    /// the request retried once.
+    /// then to the active context. When no key is set and the runtime
+    /// answers 401 on a terminal, the key is prompted for and the request
+    /// retried once.
     #[clap(long, verbatim_doc_comment)]
     pub(crate) connectors_api_key: Option<String>,
 
