@@ -44,7 +44,8 @@ What `consume()` does with each chunk of up to `batch_size` messages, in order:
 3. A transient error (`HttpRequestFailed`, `Connection`, `CannotStoreData`)
    counts as one failed round toward the breaker. It waits with jittered
    exponential backoff (`retry_delay` up to `retry_max_delay`) and tries again.
-4. A permanent error (`PermanentHttpError`) never touches the breaker, because
+4. A permanent error (`Error::is_permanent()`, such as `PermanentHttpError` or
+   `SchemaMismatch`) never touches the breaker, because
    bad data says nothing about whether the destination is up. At most once, the
    chunk is skipped, counted, and the next one is tried. At least once, skipping
    would let the stored offset pass an undelivered message, so `consume()` stops
@@ -57,7 +58,9 @@ What `consume()` does with each chunk of up to `batch_size` messages, in order:
    failed and logs, at `error` level, the stream, topic, partition and offset
    range it gave up on. At least once, the runtime hands that range over again.
 
-The budget covers the whole `consume()` call, not each chunk.
+The budget covers the whole `consume()` call, not each chunk. An attempt still
+running when it runs out is cancelled and counts as a transient failure, so a
+hung request cannot outlast `max_delivery_time`.
 
 ## Delivery semantics
 
@@ -236,12 +239,13 @@ and two more are conditional or documentation:
 **`push_batch()`** (required): send one chunk to your destination using
 `self.config.connection_string` and `self.config.target` (already validated), via
 `self.client` (already retry-wrapped). The error you return steers the loop:
-transient errors are retried, `PermanentHttpError` skips the chunk (and stops the
-sink at least once), anything else is not retried. Use `message.payload.try_to_bytes()` and do not clone
+transient errors are retried, a permanent error (`Error::is_permanent()`) skips the
+chunk (and stops the sink at least once), anything else is not retried. Use `message.payload.try_to_bytes()` and do not clone
 `Payload::Json`. If the destination's call can succeed at the transport level
 while rejecting rows (a bulk API answering 200 with per-item errors), count the
-accepted rows yourself and return an error when none were accepted. Do not return
-`Ok(())` for a batch that was not written.
+accepted rows yourself and return an error unless every row was accepted. At least
+once, `Ok(())` for a partly rejected chunk would let the stored offset pass the
+rejected rows. Do not return `Ok(())` for a batch that was not written.
 
 **`connection_string`'s doc comment** (documentation only): describe the exact
 shape your connector expects.

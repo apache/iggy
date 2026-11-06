@@ -164,8 +164,10 @@ Recurring, independently-discovered bug across four different sinks:
 - [ ] If your destination's write API can partially or fully reject a batch
       while the call itself succeeds (HTTP 200 with per-item errors, a bulk
       index response, a stream-load response), count accepted items and
-      return `Err` when the accepted count is **zero** for a non-empty input —
-      never `Ok(())`. BigQuery (#4394): "when every row of a non-empty batch
+      return `Err` unless **every** item of a non-empty input was accepted —
+      never `Ok(())`. A partial reject is the case at-least-once cannot
+      absorb: `Ok(())` lets the stored offset pass the rejected rows.
+      BigQuery (#4394): "when every row of a non-empty batch
       is rejected, `consume` still returns `Ok`." Elasticsearch (#4154): bulk
       index knows the rejected count but still returns `Ok`. Doris (#3215):
       "if every message in the batch is non-JSON... `consume()` returns

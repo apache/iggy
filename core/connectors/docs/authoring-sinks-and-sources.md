@@ -66,8 +66,10 @@ Everything else should match siblings.
 ### Errors and retries
 
 - `max_retries` means **total attempts** (default **3**). README must match.
-- Map infra/auth/schema failures to permanent variants
-  (`PermanentHttpError`, `InitError`, `SchemaMismatch`).
+- Map auth/schema/bad-data failures to permanent variants
+  (`PermanentHttpError`, `SchemaMismatch`, `InvalidRecordValue`).
+  `Error::is_permanent()` is the list the runtime and the templates act on.
+  `InitError` is not on it.
 - Map network/5xx/retryable SQLSTATE to transient variants.
 - Do **not** decide retryability by substring-matching `err.to_string()`.
 - Cap backoff so a dead backend cannot stall shutdown. A sink's whole
@@ -145,7 +147,10 @@ calls `on_batch_result(SourceBatchResult::Ack | Nack)`. Only
   with jittered backoff until a per-call budget (`max_delivery_time`,
   template default `20s`) runs out. Keep it well under a minute: the call
   blocks a runtime worker thread (one per CPU core by default), and a stop
-  waits for it. Share the budget across the chunks of one call.
+  waits for it. Share the budget across the chunks of one call, and cut off an
+  attempt still running when it runs out (`tokio::time::timeout` on the remaining
+  budget), because the retry middleware's own timeouts and `Retry-After` sleeps
+  can otherwise run past it.
 - **Use the circuit breaker to pace attempts, not to discard batches.**
   While it is open, wait for the cool-down instead of returning an error,
   because a refused batch is gone for good. Record one failure per failed

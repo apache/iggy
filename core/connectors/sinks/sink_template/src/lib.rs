@@ -75,7 +75,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout};
 use tracing::{debug, error, info, warn};
 
 sink_connector!(TemplateSink);
@@ -273,7 +273,8 @@ impl TemplateSink {
     ///   `max_delivery_time` runs out, and each failed round counts toward the
     ///   circuit breaker. At least once, the failed call then makes the
     ///   runtime hand the batch over again.
-    /// - `Error::PermanentHttpError` (bad schema, the destination rejects the
+    /// - A permanent error (`Error::is_permanent()`, for example `PermanentHttpError`,
+    ///   `SchemaMismatch` or `InvalidRecordValue`: bad schema, the destination rejects the
     ///   payload shape) will never succeed, and the breaker is left alone,
     ///   because a data problem says nothing about whether the destination is
     ///   up. By default the chunk is skipped and counted. At least once, the
@@ -300,8 +301,13 @@ impl TemplateSink {
     /// If your destination's write call can succeed at the transport level
     /// while rejecting some or all rows individually (a bulk/batch API
     /// returning 200 with per-item errors, a stream-load response, a bulk
-    /// index response), count accepted rows yourself and return `Err` when
-    /// that count is zero for a non-empty `batch` — never `Ok(())`. Four
+    /// index response), count accepted rows yourself and return `Err` unless
+    /// every row of a non-empty `batch` was accepted — never `Ok(())`. A partly
+    /// rejected chunk matters most at least once: `Ok(())` would let the stored
+    /// offset pass the rejected rows. Return a permanent error when the data
+    /// is at fault (retrying cannot help) and a transient one when the destination
+    /// refused for capacity or availability. Retrying a chunk that was partly
+    /// written is safe because the write is idempotent on `dedup_key()`. Four
     /// unrelated sinks shipped exactly this bug in review (BigQuery,
     /// Elasticsearch, Doris, S3): the call "succeeded," `consume()` reported
     /// success, and the batch was gone with no signal anywhere. See
@@ -359,11 +365,13 @@ impl TemplateSink {
                 .await;
             match result {
                 Ok(()) => written += chunk.len() as u64,
-                Err(err @ Error::PermanentHttpError(_)) if self.at_least_once => {
+                Err(err) if self.at_least_once && err.is_permanent() => {
                     let undelivered = &messages[start..];
                     failed += undelivered.len() as u64;
                     error!(
-                        "{CONNECTOR_NAME} connector with ID: {} stops at {} messages (permanent),                          stream: {}, topic: {}, partition: {}, offsets {}. The stored offset stays                          below them. Cause: {err}",
+                        "{CONNECTOR_NAME} connector with ID: {} stops at {} messages (permanent), \
+                         stream: {}, topic: {}, partition: {}, offsets {}. The stored offset stays \
+                         below them. Cause: {err}",
                         self.id,
                         undelivered.len(),
                         topic_metadata.stream,
@@ -374,11 +382,11 @@ impl TemplateSink {
                     last_err = Some(err);
                     break;
                 }
-                Err(Error::PermanentHttpError(message)) => {
+                Err(err) if err.is_permanent() => {
                     failed += chunk.len() as u64;
                     error!(
                         "{CONNECTOR_NAME} connector with ID: {} skipping {} messages \
-                         (permanent), offsets {}: {message}",
+                         (permanent), offsets {}: {err}",
                         self.id,
                         chunk.len(),
                         offset_range(chunk)
@@ -435,7 +443,9 @@ impl TemplateSink {
         }
     }
 
-    /// Runs `attempt` until it succeeds, fails for good, or `deadline` passes.
+    /// Runs `attempt` until it succeeds, fails for good, or `deadline` passes. An attempt still
+    /// running at the deadline is dropped, so it must be safe to cancel: a write cut off half way
+    /// may have landed, which the idempotent write on `dedup_key()` absorbs.
     ///
     /// A failed round counts once toward the circuit breaker, and the wait before the next
     /// round is jittered exponential backoff. While the breaker is open nothing reaches the
@@ -452,7 +462,16 @@ impl TemplateSink {
             if let Err(still_open) = self.wait_for_closed_breaker(deadline).await {
                 return Err(last_err.unwrap_or(still_open));
             }
-            match attempt().await {
+            // The destination can hang or sleep on `Retry-After` inside one attempt, so the
+            // attempt gets only what is left of the budget. A cut-off attempt counts as transient.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let outcome = match timeout(remaining, attempt()).await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(Error::CannotStoreData(format!(
+                    "attempt did not finish within the remaining delivery budget of {remaining:?}"
+                ))),
+            };
+            match outcome {
                 Ok(()) => {
                     self.circuit_breaker.record_success();
                     return Ok(());
@@ -731,7 +750,10 @@ mod tests {
 
     /// Delivers three one-message chunks where the second is rejected for good, and returns
     /// the call result with the number of chunks that were attempted.
-    async fn deliver_with_rejected_second_chunk(sink: &TemplateSink) -> (Result<(), Error>, usize) {
+    async fn deliver_with_rejected_second_chunk(
+        sink: &TemplateSink,
+        rejection: fn() -> Error,
+    ) -> (Result<(), Error>, usize) {
         let (topic_metadata, messages_metadata) = topic_and_messages_metadata();
         let messages: Vec<_> = (0..3).map(consumed_message).collect();
         let attempted = std::sync::atomic::AtomicUsize::new(0);
@@ -740,7 +762,7 @@ mod tests {
                 attempted.fetch_add(1, Ordering::SeqCst);
                 async move {
                     if range.start == 1 {
-                        Err(Error::PermanentHttpError("schema rejected".to_string()))
+                        Err(rejection())
                     } else {
                         Ok(())
                     }
@@ -748,6 +770,10 @@ mod tests {
             })
             .await;
         (result, attempted.load(Ordering::SeqCst))
+    }
+
+    fn schema_rejected() -> Error {
+        Error::PermanentHttpError("schema rejected".to_string())
     }
 
     fn single_message_chunks_sink() -> TemplateSink {
@@ -760,7 +786,7 @@ mod tests {
     async fn given_at_most_once_when_a_chunk_is_rejected_for_good_should_skip_it_and_go_on() {
         let sink = single_message_chunks_sink();
 
-        let (result, attempted) = deliver_with_rejected_second_chunk(&sink).await;
+        let (result, attempted) = deliver_with_rejected_second_chunk(&sink, schema_rejected).await;
 
         assert!(result.is_ok());
         assert_eq!(attempted, 3);
@@ -773,13 +799,55 @@ mod tests {
         let mut sink = single_message_chunks_sink();
         sink.enable_at_least_once().expect("template supports it");
 
-        let (result, attempted) = deliver_with_rejected_second_chunk(&sink).await;
+        let (result, attempted) = deliver_with_rejected_second_chunk(&sink, schema_rejected).await;
 
         let error = result.expect_err("a skipped chunk would let the offset pass it");
         assert!(error.is_permanent(), "got {error:?}");
         assert_eq!(attempted, 2, "chunks after the rejected one are not sent");
         let state = sink.state.lock().await;
         assert_eq!((state.messages_written, state.messages_failed), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn given_any_permanent_error_variant_when_at_most_once_should_skip_the_chunk() {
+        let sink = single_message_chunks_sink();
+
+        let (result, attempted) = deliver_with_rejected_second_chunk(&sink, || {
+            Error::SchemaMismatch("column type".to_string())
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempted, 3);
+    }
+
+    #[tokio::test]
+    async fn given_any_permanent_error_variant_when_at_least_once_should_stop_at_the_chunk() {
+        let mut sink = single_message_chunks_sink();
+        sink.enable_at_least_once().expect("template supports it");
+
+        let (result, attempted) = deliver_with_rejected_second_chunk(&sink, || {
+            Error::SchemaMismatch("column type".to_string())
+        })
+        .await;
+
+        assert!(matches!(result, Err(Error::SchemaMismatch(_))));
+        assert_eq!(attempted, 2, "chunks after the rejected one are not sent");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_hung_attempt_should_give_up_when_the_budget_runs_out() {
+        let sink = TemplateSink::new(1, test_config());
+        let started = Instant::now();
+
+        let result = sink
+            .deliver_chunk(started + sink.max_delivery_time, || {
+                std::future::pending::<Result<(), Error>>()
+            })
+            .await;
+
+        assert!(matches!(result, Err(Error::CannotStoreData(_))));
+        assert!(started.elapsed() <= sink.max_delivery_time);
     }
 
     #[test]
