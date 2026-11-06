@@ -117,7 +117,7 @@ When an older response supplies a complete, atomic rejection with structured row
 
 Every local rejection and terminal failed/unconfirmed row is logged with stream, topic, partition, and message offset. `stats()` and the shutdown log distinguish written, rejected, failed, and unconfirmed rows. These are logical input counts; opt-in unknown replay can create extra physical copies. If every message is rejected, `consume()` returns an error. There is no dead-letter queue.
 
-The Iggy connectors runtime currently commits consumer group offsets during polling, before the sink persists the messages. A failed consume call is not redelivered and stops the affected consumer task. A crash after the offset commit can lose that batch. Split requests can partially succeed.
+The Iggy connectors runtime currently uses `OnRead` to commit consumer group offsets during polling, before the sink persists messages. Failed consume calls are logged, and consumption continues without automatically redelivering failed batches. If ScopeDB remains unavailable, subsequent batches can also be lost. A crash after offset commit can lose unpersisted messages. Split requests can partially succeed.
 
 This connector does not promise crash-safe at-least-once or exactly-once delivery. Use the source metadata for reconciliation and downstream deduplication; stronger guarantees require runtime offset handling changes.
 
