@@ -11013,9 +11013,13 @@ where
     const PARTITION_TRANSFER_TOTAL_LEN_MAX: u64 = 1 << 40;
 
     /// Bound the buffered offset and dedup state plus one maximum-sized
-    /// checkpoint prepare and its length prefix before allocating the artifact.
-    const CONSUMER_OFFSETS_ARTIFACT_LEN_MAX: u64 =
-        (32 << 20) + journal::partition_journal::PREPARE_BYTES_MAX as u64 + 4;
+    /// checkpoint prepare and state-machine snapshot, each with its length
+    /// prefix, before allocating the artifact.
+    const CONSUMER_OFFSETS_ARTIFACT_LEN_MAX: u64 = (32 << 20)
+        + journal::partition_journal::PREPARE_BYTES_MAX as u64
+        + 4
+        + partitions::state_machine::SNAPSHOT_BYTES_MAX as u64
+        + 4;
 
     /// Concurrent partition transfers this shard will run as a RECEIVER. A
     /// whole-node rejoin arms one per lagging partition; unbounded, the sum

@@ -33,6 +33,7 @@ use crate::poll_plan::{
 };
 use crate::producer_state::{ProducerAdmission, ProducerEntry, ProducerTable, StampedBatch};
 use crate::segment::Segment;
+use crate::state_machine::StateMachines;
 use crate::state_transfer::{
     PartitionTransferSession, PartitionTransferUnavailable, PendingTransferRearm, TransferPlanSlot,
 };
@@ -173,6 +174,8 @@ where
     pub(crate) owner_install_barrier: u64,
     pending_history_transition: Cell<Option<TransitionPartitionHistoryRequest>>,
     pub(crate) history_transition: Option<InstalledPartitionHistory>,
+    /// The partition's state machines, applied at commit in op order.
+    pub(crate) state_machines: StateMachines,
     pub stats: Arc<PartitionStats>,
     /// Widest batch committed here, the floor for a disk poll's first read.
     /// See [`Self::widest_committed_batch`].
@@ -264,7 +267,7 @@ where
     /// Fences the partition: every path that would advance or serve it turns
     /// into a no-op, so the shard's tick can observe the fault and shut the
     /// server down without the partition moving again in the meantime.
-    fatal: Option<FatalCommit>,
+    pub(crate) fatal: Option<FatalCommit>,
     pending_commit: Option<PendingCommit>,
     local_request_order: Cell<u64>,
     no_ack: VecDeque<PendingNoAck>,
@@ -926,6 +929,7 @@ where
             owner_install_barrier: 0,
             pending_history_transition: Cell::new(None),
             history_transition: None,
+            state_machines: StateMachines::default(),
             stats,
             widest_batch_bytes: Cell::new(0),
             committed_bytes: 0,
@@ -1823,6 +1827,9 @@ where
                 self.apply_replicated_operation(message).await?;
             }
         }
+        if persistence.holds_commands() {
+            self.log.journal().inner.retain_commands_from(checkpoint);
+        }
         if head > 0 {
             if self.consensus.replica_count() == 1 {
                 commit = head;
@@ -2418,7 +2425,7 @@ where
 
     const fn requires_persistence(&self, operation: Operation) -> bool {
         match operation {
-            Operation::RetireSession => true,
+            Operation::RetireSession | Operation::StateMachineCommand => true,
             Operation::SendMessages => self.durability().is_persisted(),
             Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
                 self.consumer_offset_durability().is_persisted()
@@ -3105,6 +3112,8 @@ where
             history_transition: self.history_transition,
             owner_retirement: self.owner_retirement.take(),
             producers: std::mem::take(&mut self.producers),
+            machines: (!self.state_machines.is_empty())
+                .then(|| self.state_machines.capture(self.consensus().commit_min())),
             durable_offset: self.offset.load(Ordering::Acquire),
             write_offset: self.dirty_offset.load(Ordering::Relaxed),
             offset_space: self.offset_space,
@@ -3146,7 +3155,25 @@ where
             history_transition,
             owner_retirement,
             producers,
+            machines,
         } = state;
+        // A restart that registers other machines than the process before it
+        // is refused the way a boot refuses a checkpoint of them.
+        if let Some(machines) = &machines
+            && let Err(error) = self.restore_machines(Some(machines), machines.op)
+        {
+            error!(
+                namespace_raw = self.namespace().inner(),
+                op = machines.op,
+                %error,
+                "cannot restore the retained state machines"
+            );
+            self.fatal = Some(FatalCommit {
+                namespace_raw: self.namespace().inner(),
+                op: machines.op,
+                operation: None,
+            });
+        }
         self.log = log;
         self.consumer_group_owners = consumer_group_owners;
         self.history_transition = history_transition;
@@ -4824,7 +4851,7 @@ where
         Ok(batches)
     }
 
-    fn local_request_must_queue(&self) -> bool {
+    pub(crate) fn local_request_must_queue(&self) -> bool {
         self.consensus.pipeline_is_full()
             || self
                 .consensus
@@ -7794,6 +7821,30 @@ where
                 } else {
                     None
                 };
+            if message.header().operation == Operation::StateMachineCommand
+                && let Some((error, reason)) =
+                    self.command_refusal(message.header(), message.body())
+            {
+                // The others are transient. This one is a caller's bug, and a
+                // server-originated command has no client to report it to.
+                if matches!(error, IggyError::InvalidCommand) {
+                    warn!(
+                        namespace_raw = message.header().group,
+                        client = message.header().client,
+                        reason,
+                        "refusing a state-machine command"
+                    );
+                }
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    error.as_code(),
+                    reason,
+                    reply.take(),
+                )
+                .await;
+                return;
+            }
             // Checked before dedup: a finalized session's cached receipt must
             // not be served either until the debt is paid.
             if !is_auto_commit_client(client_id) && self.owes_session_retirement() {
@@ -9427,6 +9478,12 @@ where
                 self.journal_append(frozen.clone()).await?;
                 Ok(frozen)
             }
+            Operation::StateMachineCommand => {
+                Self::check_replicated_command(message.body())?;
+                let frozen = message.into_frozen();
+                self.journal_append(frozen.clone()).await?;
+                Ok(frozen)
+            }
             Operation::RetireSession => {
                 let retirement = RetireSessionsRequest::decode_from(message.body())
                     .map_err(|_| IggyError::InvalidCommand)?;
@@ -10191,7 +10248,7 @@ where
         self.offset_reservations_need_resync.set(true);
         self.truncated_since_scan.set(true);
         drop(entries);
-        if self.log.journal().inner.is_empty() {
+        if self.log.journal().inner.holds_no_ops() {
             self.reset_proof_walk_memory();
         }
         Ok(removed)
@@ -11610,6 +11667,13 @@ where
                     return None;
                 }
             };
+            // After the receipt, so a commit that fences never leaves the
+            // machines applied past `commit_min`.
+            if header.operation == Operation::StateMachineCommand
+                && !self.apply_committed_command(header)
+            {
+                return None;
+            }
             self.consensus.advance_commit_min(header.op);
             // A lifecycle completion counts only once the reporter commits the
             // fence locally, so the backups must not wait for the heartbeat.
@@ -11646,10 +11710,32 @@ where
         }
         self.consensus.sync_prepare_timeout();
         self.evict_committed_prefix(pending.evictable);
+        self.release_checkpointed_commands();
         for touched in &self.consumer_offset_dirs_touched {
             touched.set(None);
         }
         Some(committed)
+    }
+
+    /// Commands leave memory only once a checkpoint covers them, so a repair
+    /// floor they lift sits where the WALs dropped them too. Past the
+    /// retention caps with nothing checkpointed to drop, ask for the
+    /// checkpoint.
+    fn release_checkpointed_commands(&self) {
+        let commit_min = self.consensus.commit_min();
+        let checkpoint_op = self
+            .persistence
+            .as_ref()
+            .map_or(commit_min, |persistence| persistence.checkpoint_op())
+            .min(commit_min);
+        let over = self
+            .log
+            .journal()
+            .inner
+            .release_checkpointed_commands(checkpoint_op);
+        if over && let Some(persistence) = &self.persistence {
+            persistence.request_checkpoint();
+        }
     }
 
     /// Every replica retains the committed result, so a promoted primary answers
@@ -11700,6 +11786,7 @@ where
                     | Operation::DeleteConsumerOffset
                     | Operation::InstallConsumerGroupOwner
                     | Operation::RetireConsumerGroupOwners
+                    | Operation::StateMachineCommand
             ) && (header.partition_incarnation != self.created_revision()
                 || self.history_deleted())
             {
@@ -11725,6 +11812,8 @@ where
                 .is_err()
                 || (header.operation == Operation::SendMessages && batch_stats.is_none())
                 || (header.operation == Operation::RetireSession && retirement.is_none())
+                || (header.operation == Operation::StateMachineCommand
+                    && !self.committed_command_is_held(header))
             {
                 error!(
                     namespace_raw,
@@ -13261,7 +13350,9 @@ where
         {
             // Offset continuity cannot certify that recovered bytes belong to
             // the adopted history. An evicted proof gap needs state transfer.
-            if self.consensus().view_log_unproven() {
+            // So does any jump past commands, which no machine would apply,
+            // while a transfer carries the machines' snapshot.
+            if self.consensus().view_log_unproven() || !self.state_machines.is_empty() {
                 self.repair = None;
                 return RepairConclusion::FloorRefused {
                     floor,
@@ -13866,7 +13957,7 @@ fn upsert_offset_max<K>(
 /// `PrepareHeader`, so reading the tag is a cheap cast, not a full batch decode;
 /// it tells a committed consumer-offset op (no segment bytes) apart from a
 /// `SendMessages` batch without relying on a decode failure to do so.
-fn peek_operation(entry: &Frozen<4096>) -> Operation {
+pub fn peek_operation(entry: &Frozen<4096>) -> Operation {
     bytemuck::checked::try_from_bytes::<PrepareHeader>(
         &entry[..std::mem::size_of::<PrepareHeader>()],
     )
@@ -14238,7 +14329,7 @@ fn nth_oldest_sealed_end(segments: &[Segment], count: u32) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndex, IggyIndexCache};
     use crate::iggy_index_reader::IggyIndexReader;
@@ -16136,6 +16227,7 @@ mod tests {
                     dedup: Vec::new(),
                     retirement_paid_through: 0,
                     producers: Vec::new(),
+                    machines: None,
                 };
                 partition
                     .install_state_transfer(&repair_config(), 1, staged, &offsets.encode())
@@ -16218,6 +16310,7 @@ mod tests {
             dedup: Vec::new(),
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         };
         partition
             .install_state_transfer(&repair_config(), 3, staged, &offsets.encode())
@@ -16270,6 +16363,7 @@ mod tests {
             dedup: Vec::new(),
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         };
         assert!(matches!(
             partition
@@ -16498,6 +16592,7 @@ mod tests {
             owner_retirement: None,
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         };
 
         let result = partition
@@ -17592,6 +17687,205 @@ mod tests {
         }
     }
 
+    const COMMAND_KIND: u16 = 10;
+
+    /// A backup on disk at `directory` with a counter machine owning
+    /// [`COMMAND_KIND`], its sends and offsets under `durability`.
+    async fn backup_with_counter(
+        config: &PartitionsConfig,
+        directory: &std::path::Path,
+        durability: iggy_common::Durability,
+    ) -> Box<IggyPartition<RecordingBus>> {
+        const BACKUP: u8 = 2;
+        let (backup, _) = recording_partition_at(BACKUP, 3);
+        let mut backup = Box::new(backup);
+        backup.runtime_options.durability = durability;
+        backup.runtime_options.consumer_offset_durability = durability;
+        backup
+            .register_state_machine(Box::new(
+                crate::state_machine::registry::tests::CounterMachine::new(1, &[COMMAND_KIND]),
+            ))
+            .unwrap();
+        backup.set_partition_dir(directory.to_string_lossy().into_owned());
+        set_offset_dirs_under(&mut backup, directory);
+        Box::pin(backup.open_persistence()).await.unwrap();
+        backup.log.retire_front().unwrap();
+        Box::pin(backup.install_empty_segment(config, 0))
+            .await
+            .unwrap();
+        backup.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        backup
+    }
+
+    fn sent_prepare_oks(partition: &IggyPartition<RecordingBus>) -> Vec<u64> {
+        partition
+            .consensus()
+            .message_bus()
+            .sent_to_replicas
+            .borrow()
+            .iter()
+            .filter_map(|(_, frame)| {
+                let header =
+                    bytemuck::checked::try_from_bytes::<iggy_binary_protocol::GenericHeader>(
+                        frame
+                            .as_slice()
+                            .get(..size_of::<iggy_binary_protocol::GenericHeader>())?,
+                    )
+                    .ok()?;
+                (header.command == Command::PrepareOk)
+                    .then(|| bytemuck::checked::from_bytes::<PrepareOkHeader>(frame.as_slice()).op)
+            })
+            .collect()
+    }
+
+    /// A command a backup receives between two batches goes to the
+    /// state-machine log, both logs persist, and the commit applies it.
+    #[compio::test]
+    async fn given_a_backup_when_a_command_replicates_between_batches_should_journal_persist_and_apply_it()
+     {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = repair_config();
+        config.path_layout.streams_root = root.path().to_string_lossy().into_owned();
+        let directory = std::path::PathBuf::from(config.get_partition_path(1, 1, 0));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut backup =
+            backup_with_counter(&config, &directory, iggy_common::Durability::Persisted).await;
+        let persistence = Rc::clone(backup.persistence.as_ref().unwrap());
+
+        let first = checksummed_segment_prepare(1, 0, 0, b"before");
+        let command = command_prepare(2, first.header().checksum, COMMAND_KIND, 9);
+        let third = checksummed_segment_prepare(3, command.header().checksum, 1, b"after");
+        for prepare in [first, command, third] {
+            Box::pin(backup.on_replicate(prepare)).await;
+        }
+        persistence.drain().await.unwrap();
+        assert!(persistence.holds_commands());
+        assert_eq!(persistence.durable_op(), 3);
+        let journal = &backup.log.journal().inner;
+        assert_eq!(journal.command_ops(), vec![2]);
+        assert_eq!(
+            journal
+                .resident_entries()
+                .iter()
+                .map(peek_op)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+
+        Box::pin(commit_on_heartbeat(&mut backup, &config, 3)).await;
+        Box::pin(settle_partition_io(&mut backup, &config)).await;
+        assert!(backup.fatal().is_none(), "{:?}", backup.fatal());
+        assert_eq!(backup.consensus.commit_min(), 3);
+        assert_eq!(backup.state_machines().applied_op(), 2);
+        assert_eq!(
+            backup
+                .state_machine::<crate::state_machine::registry::tests::CounterMachine>(
+                    crate::state_machine::MachineId(1)
+                )
+                .map(|machine| machine.total),
+            Some(9)
+        );
+        drop(backup);
+        persistence.retire();
+        drop(persistence);
+
+        let wal = directory.join("prepares-0");
+        let (_, recovered) =
+            PartitionPersistence::open(&wal, IggyNamespace::new(1, 1, 0).inner(), 0)
+                .await
+                .unwrap();
+        let recovered: Vec<(u64, Operation)> = recovered
+            .iter()
+            .map(|prepare| (prepare.header().op, prepare.header().operation))
+            .collect();
+        assert_eq!(
+            recovered,
+            vec![
+                (1, Operation::SendMessages),
+                (2, Operation::StateMachineCommand),
+                (3, Operation::SendMessages),
+            ]
+        );
+    }
+
+    /// Under the default durability a backup writes its sends without a
+    /// barrier, and each command's barrier has to cover them, or the command
+    /// never becomes durable, its `PrepareOk` never goes out, and the commit
+    /// stops at it. Two commands in one view, so the first's creation of the
+    /// state-machine log is not what carries the second.
+    #[compio::test]
+    async fn given_replicated_durability_when_two_commands_replicate_in_one_view_should_ack_and_commit_both()
+     {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = repair_config();
+        config.path_layout.streams_root = root.path().to_string_lossy().into_owned();
+        let directory = std::path::PathBuf::from(config.get_partition_path(1, 1, 0));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut backup =
+            backup_with_counter(&config, &directory, iggy_common::Durability::Replicated).await;
+        let persistence = Rc::clone(backup.persistence.as_ref().unwrap());
+
+        let first = checksummed_segment_prepare(1, 0, 0, b"first");
+        let second = command_prepare(2, first.header().checksum, COMMAND_KIND, 9);
+        let third = checksummed_segment_prepare(3, second.header().checksum, 1, b"third");
+        let fourth = command_prepare(4, third.header().checksum, COMMAND_KIND, 5);
+        let fifth = checksummed_segment_prepare(5, fourth.header().checksum, 2, b"fifth");
+        for prepare in [first, second, third, fourth, fifth] {
+            Box::pin(backup.on_replicate(prepare)).await;
+        }
+        persistence.drain().await.unwrap();
+        Box::pin(backup.drive_persistence()).await;
+        assert!(persistence.is_durable_through(4));
+        let acked = sent_prepare_oks(&backup);
+        assert!(
+            acked.contains(&2) && acked.contains(&4),
+            "both commands are acknowledged: {acked:?}"
+        );
+
+        Box::pin(commit_on_heartbeat(&mut backup, &config, 5)).await;
+        Box::pin(settle_partition_io(&mut backup, &config)).await;
+        assert!(backup.fatal().is_none(), "{:?}", backup.fatal());
+        assert_eq!(backup.consensus.commit_min(), 5);
+        assert_eq!(backup.state_machines().applied_op(), 4);
+        assert_eq!(
+            backup
+                .state_machine::<crate::state_machine::registry::tests::CounterMachine>(
+                    crate::state_machine::MachineId(1)
+                )
+                .map(|machine| machine.total),
+            Some(14)
+        );
+    }
+
+    fn command_prepare(op: u64, parent: u128, kind: u16, value: u64) -> Message<PrepareHeader> {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let body = crate::state_machine::MachineCommand::encode(
+            crate::state_machine::CommandKind(kind),
+            &value.to_le_bytes(),
+        )
+        .unwrap();
+        let total = size_of::<PrepareHeader>() + body.len();
+        let mut prepare = Message::<PrepareHeader>::new(total);
+        prepare.as_mut_slice()[size_of::<PrepareHeader>()..].copy_from_slice(&body);
+        prepare.transmute_header(|_, header: &mut PrepareHeader| {
+            header.command = Command::Prepare;
+            header.operation = Operation::StateMachineCommand;
+            header.cluster = TEST_CLUSTER;
+            header.group = namespace.inner();
+            header.op = op;
+            header.parent = parent;
+            header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+            header.request = op;
+            header.session = 1;
+            header.retry_capacity = u32::try_from(consensus::PARTITION_DEDUP_CLIENTS_MAX).unwrap();
+            header.size = u32::try_from(total).unwrap();
+            header.checksum = header.identity_checksum();
+        })
+    }
+
     /// The primary's Commit heartbeat, handled as the shard's `on_commit` does.
     async fn commit_on_heartbeat(
         partition: &mut IggyPartition<RecordingBus>,
@@ -18260,7 +18554,14 @@ mod tests {
         assert!(budget.reservation().try_add(BYTES));
     }
 
-    fn test_partition_with_replicas(replica_count: u8) -> IggyPartition<IggyMessageBus> {
+    pub fn test_partition_with_replicas(replica_count: u8) -> IggyPartition<IggyMessageBus> {
+        test_partition_with_pipeline(replica_count, LocalPipeline::new())
+    }
+
+    pub fn test_partition_with_pipeline(
+        replica_count: u8,
+        pipeline: LocalPipeline,
+    ) -> IggyPartition<IggyMessageBus> {
         let namespace = IggyNamespace::new(1, 1, 0);
         let consensus = VsrConsensus::new(
             TEST_CLUSTER,
@@ -18268,7 +18569,7 @@ mod tests {
             replica_count,
             namespace.inner(),
             IggyMessageBus::new(0),
-            LocalPipeline::new(),
+            pipeline,
         );
         consensus.init();
         IggyPartition::with_in_memory_storage(
@@ -19761,6 +20062,7 @@ mod tests {
             owner_retirement: None,
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         };
         let installed = backup
             .install_state_transfer(&repair_config(), 1, vec![staged], &offsets.encode())
@@ -20675,6 +20977,7 @@ mod tests {
                     history_transition: None,
                     retirement_paid_through: 0,
                     producers: Vec::new(),
+                    machines: None,
                 };
                 partition
                     .install_state_transfer(&config, 2, vec![staged], &offsets.encode())
@@ -24330,6 +24633,7 @@ mod tests {
             dedup: Vec::new(),
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         };
         let outcome = partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &offer.encode())
@@ -25277,7 +25581,7 @@ mod tests {
 
     /// A `SendMessages` request in the shape `convert_request_message` leaves at
     /// [`ChecksumMode::Skip`]: canonical batch, `batch_checksum` zeroed.
-    fn checksumless_send_request(
+    pub fn checksumless_send_request(
         namespace: IggyNamespace,
         message_count: u32,
     ) -> Message<RoutedRequestHeader> {
@@ -25447,6 +25751,7 @@ mod tests {
             dedup: Vec::new(),
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         };
         partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &wire.encode())
@@ -27213,6 +27518,7 @@ mod tests {
             dedup: Vec::new(),
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         };
         partition
             .install_state_transfer(&repair_config(), 1, Vec::new(), &wire.encode())
@@ -30915,6 +31221,7 @@ mod tests {
             dedup: Vec::new(),
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         };
         let installed_commit_operation = 12;
         partition
@@ -31102,6 +31409,7 @@ mod tests {
             dedup: Vec::new(),
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         };
         let offered_commit_operation = 12;
         let install_error = partition
@@ -32918,7 +33226,7 @@ mod tests {
     /// One-message segment record in on-disk layout `[256B command header][blob]`
     /// stamped at `base_offset`, with a valid batch checksum so it decodes
     /// through `decode_batch_slice` and matches an `Offset` poll.
-    fn build_segment_record(namespace: IggyNamespace, base_offset: u64) -> Vec<u8> {
+    pub fn build_segment_record(namespace: IggyNamespace, base_offset: u64) -> Vec<u8> {
         build_segment_record_with_payload(namespace, base_offset, Bytes::from_static(b"abcdefgh"))
     }
 
@@ -33723,7 +34031,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn repair_config() -> PartitionsConfig {
+    pub fn repair_config() -> PartitionsConfig {
         PartitionsConfig {
             messages_required_to_save: 1,
             size_of_messages_required_to_save: IggyByteSize::from(1024 * 1024),
@@ -35345,6 +35653,107 @@ mod tests {
         );
     }
 
+    /// The primary of a new view acts on its machines only once it applied
+    /// every op of the log the view started with, here three commands. The
+    /// view starts with them uncommitted in its rebuilt pipeline, so nothing
+    /// else holds a new command back: no committed op is left unapplied.
+    #[compio::test]
+    async fn given_a_primary_behind_its_view_start_when_a_command_arrives_should_refuse_it_until_applied()
+     {
+        const VIEW: u32 = 4;
+        const HEAD: u64 = 3;
+        let (partition, _) = recording_partition_at(1, 3);
+        let mut partition = Box::new(partition);
+        partition
+            .register_state_machine(Box::new(
+                crate::state_machine::registry::tests::CounterMachine::new(1, &[COMMAND_KIND]),
+            ))
+            .unwrap();
+        let mut parent = 0;
+        let mut headers = Vec::new();
+        for op in 1..=HEAD {
+            // A view-change suffix runs down the log with falling timestamps.
+            let prepare = command_prepare(op, parent, COMMAND_KIND, op).transmute_header(
+                |mut header, next: &mut PrepareHeader| {
+                    header.timestamp = op;
+                    header.checksum = header.identity_checksum();
+                    *next = header;
+                },
+            );
+            parent = prepare.header().checksum;
+            headers.push(*prepare.header());
+            Box::pin(partition.on_replicate(prepare)).await;
+        }
+        let body: Vec<u8> = headers
+            .iter()
+            .rev()
+            .flat_map(|header| bytemuck::bytes_of(header).to_vec())
+            .collect();
+        let size = size_of::<iggy_binary_protocol::DoViewChangeHeader>() + body.len();
+        let mut dvc = Message::<iggy_binary_protocol::GenericHeader>::new(size);
+        dvc.as_mut_slice()[size_of::<iggy_binary_protocol::DoViewChangeHeader>()..]
+            .copy_from_slice(&body);
+        let dvc =
+            dvc.transmute_header(|_, header: &mut iggy_binary_protocol::DoViewChangeHeader| {
+                header.command = Command::DoViewChange;
+                header.size = u32::try_from(size).unwrap();
+                header.group = partition.consensus.group();
+                header.cluster = TEST_CLUSTER;
+                header.view = VIEW;
+                header.log_view = 0;
+                header.replica = 0;
+                header.op = HEAD;
+                header.commit = 0;
+                header.present_bitset = 0b111;
+            });
+        partition.consensus.handle_do_view_change(
+            consensus::PlaneKind::Partitions,
+            dvc.header(),
+            &dvc.as_slice()[size_of::<iggy_binary_protocol::DoViewChangeHeader>()..],
+        );
+        assert!(partition.consensus.is_primary_elect());
+        // Stands in for the shard's proof walk and pipeline rebuild.
+        partition.consensus.settle_view_log_proof();
+        let _ = partition
+            .consensus
+            .start_pending_view(consensus::PlaneKind::Partitions);
+        partition.consensus.with_pipeline_mut(|pipeline| {
+            for header in &headers {
+                pipeline.push(consensus::PipelineEntry::new(*header));
+            }
+        });
+        assert!(partition.consensus.is_primary() && partition.consensus.is_normal());
+        assert_eq!(partition.consensus.commit_min(), 0);
+        assert_eq!(partition.consensus.commit_max(), 0);
+        assert!(!partition.state_machines_current());
+
+        let command = |partition: &IggyPartition<RecordingBus>, request| {
+            partition
+                .command_request(
+                    crate::state_machine::CommandKind(COMMAND_KIND),
+                    &1u64.to_le_bytes(),
+                    request,
+                )
+                .unwrap()
+        };
+        let (sender, refusal) = consensus::oneshot_channel();
+        Box::pin(partition.on_request(command(&partition, 1), Some(sender))).await;
+        // Checked before the await: an admitted command gets no reply here.
+        assert_eq!(partition.consensus.sequencer().current_sequence(), HEAD);
+        assert_eq!(
+            refusal.await.unwrap().header().status,
+            IggyError::TransientNotAccepted.as_code()
+        );
+
+        partition.consensus.advance_commit_max(HEAD);
+        Box::pin(partition.commit_journal(&repair_config())).await;
+        assert_eq!(partition.consensus.commit_min(), HEAD);
+        assert_eq!(partition.state_machines().applied_op(), HEAD);
+        assert!(partition.state_machines_current());
+        Box::pin(partition.on_request(command(&partition, 2), None)).await;
+        assert_eq!(partition.consensus.sequencer().current_sequence(), HEAD + 1);
+    }
+
     #[compio::test]
     async fn given_a_primary_elect_when_repair_memory_is_exhausted_should_request_transfer() {
         const VIEW: u32 = 4;
@@ -35910,6 +36319,43 @@ mod tests {
              commits the resident batches above it"
         );
         assert!(partition.repair.is_some());
+    }
+
+    /// The same connecting window as above, on a partition with a state
+    /// machine: the jump would skip the commands committed below the floor
+    /// without applying them, so the window goes to state transfer, which
+    /// carries the machines' snapshot.
+    #[compio::test]
+    async fn given_state_machines_when_a_connecting_floor_arrives_should_refuse_the_jump() {
+        let mut partition = test_partition();
+        partition
+            .register_state_machine(Box::new(
+                crate::state_machine::registry::tests::CounterMachine::new(1, &[COMMAND_KIND]),
+            ))
+            .unwrap();
+        partition.consensus().advance_commit_max(300);
+        partition.recovered_durable_offset = Some(3);
+        partition.repair = Some(floorless_session(300, 300));
+        partition
+            .apply_repaired_prepare(repaired_send_prepare_at(6, 4, 0, 0x66))
+            .await;
+        partition
+            .apply_repaired_prepare(repaired_send_prepare_at(7, 5, 0x66, 0x77))
+            .await;
+        partition.repair = None;
+        partition.repair = Some(armed_session(300, 5));
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(
+            conclusion,
+            RepairConclusion::FloorRefused {
+                floor: 5,
+                to_op: 300
+            }
+        );
+        assert_eq!(partition.consensus().commit_min(), 0);
+        assert!(partition.repair.is_none());
     }
 
     /// The same shape as above with batches that start past the durable end:
@@ -36593,6 +37039,7 @@ mod tests {
             dedup: Vec::new(),
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         };
         let refused = partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &behind.encode())
@@ -36650,6 +37097,7 @@ mod tests {
             dedup: Vec::new(),
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         };
         let refused = partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &stale.encode())
@@ -37904,6 +38352,7 @@ mod tests {
             owner_retirement: None,
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         };
         partition
             .install_state_transfer(&repair_config(), INSTALLED_OPS, staged, &offsets.encode())

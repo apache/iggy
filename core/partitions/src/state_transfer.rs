@@ -37,6 +37,9 @@ use crate::producer_state::{
     PRODUCER_BATCHES_RETAINED, PRODUCERS_MAX, ProducerBatch, ProducerEntry,
 };
 use crate::segment_anchor::ANCHOR_SUFFIX;
+use crate::state_machine::{
+    SNAPSHOT_BYTES_MAX, SnapshotDecodeError, StateMachineError, StateMachineSnapshot,
+};
 use crate::types::{OFFSETS_DIR, PartitionsConfig};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use consensus::client_table::{CLIENTS_TABLE_SLOT_MAX, ClientTable, ClientTableMode};
@@ -103,7 +106,9 @@ const RETRY_CHECKPOINT_BYTES_MAX: usize = journal::partition_journal::PREPARE_BY
     + CONSUMER_GROUP_OWNERS_MAX as usize * size_of::<u64>()
     + size_of::<PrepareHeader>()
     + size_of::<u32>()
-    + PRODUCERS_MAX * PRODUCER_ENTRY_LEN_MAX;
+    + PRODUCERS_MAX * PRODUCER_ENTRY_LEN_MAX
+    + size_of::<u32>()
+    + SNAPSHOT_BYTES_MAX;
 
 /// Per-section entry ceiling for the consumer-offsets artifact.
 ///
@@ -599,6 +604,11 @@ pub(crate) struct ConsumerOffsetsWire {
     pub retirement_paid_through: u64,
     /// The committed producer table, ascending by producer id.
     pub producers: Vec<(u64, ProducerEntry)>,
+    /// The state machines at the artifact's op, `None` for a partition that
+    /// registers none. An optional tail: without it the artifact is the version
+    /// 9 layout byte for byte, and a decoder that predates it refuses the tail
+    /// as trailing bytes.
+    pub machines: Option<StateMachineSnapshot>,
 }
 
 impl ConsumerOffsetsWire {
@@ -614,7 +624,8 @@ impl ConsumerOffsetsWire {
     /// prepare_checksum u128 | prepare_length u32 | checkpoint_prepare bytes |
     /// retirement_paid_through u64 | producer_count u32 | {producer_id u64,
     /// epoch u16, last_timestamp u64, batch_count u8, {first_sequence u32,
-    /// last_sequence u32, base_offset u64}xB}xP | XxHash3_64 trailer`.
+    /// last_sequence u32, base_offset u64}xB}xP | [machines_length u32 |
+    /// state machine snapshot] | XxHash3_64 trailer`.
     /// Little-endian throughout.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -710,6 +721,7 @@ impl ConsumerOffsetsWire {
                 out.extend_from_slice(&batch.base_offset.to_le_bytes());
             }
         }
+        self.encode_machine_section(&mut out);
         debug_assert_eq!(out.len() + size_of::<u64>(), reserved, "encode reservation");
         let trailer = state_artifact_checksum(&out);
         out.extend_from_slice(&trailer.to_le_bytes());
@@ -814,10 +826,17 @@ impl ConsumerOffsetsWire {
         } else {
             Self::decode_producer_section(&mut cursor)?
         };
+        let machines = if version == CONSUMER_OFFSETS_VERSION_MIN {
+            None
+        } else {
+            Self::decode_machine_section(&mut cursor)?
+        };
         if !cursor.remaining().is_empty() {
-            // Distinct from `Truncated`: extra bytes point at a NEWER
+            // Distinct from `Truncated`: extra bytes past the optional machine
+            // section, the last one version 9 can carry, point at a NEWER
             // encoder, and telling the operator the artifact is short would
-            // send them the wrong way.
+            // send them the wrong way. A section after it needs version 10,
+            // since an optional tail cannot tell what follows it.
             return Err(ConsumerOffsetsWireError::TrailingBytes {
                 extra: cursor.remaining().len(),
             });
@@ -838,7 +857,39 @@ impl ConsumerOffsetsWire {
             owner_retirement,
             retirement_paid_through,
             producers,
+            machines,
         })
+    }
+
+    /// `[length u32 | snapshot bytes]`, absent without machines.
+    ///
+    /// # Panics
+    /// When the snapshot is past `u32::MAX` bytes, which the capture bound of
+    /// [`SNAPSHOT_BYTES_MAX`] rules out.
+    fn encode_machine_section(&self, out: &mut Vec<u8>) {
+        if let Some(machines) = &self.machines {
+            let length =
+                u32::try_from(machines.encoded_size()).expect("bounded state machine snapshot");
+            out.extend_from_slice(&length.to_le_bytes());
+            machines.encode_into(out);
+        }
+    }
+
+    fn decode_machine_section(
+        cursor: &mut LeCursor<'_>,
+    ) -> Result<Option<StateMachineSnapshot>, ConsumerOffsetsWireError> {
+        if cursor.remaining().is_empty() {
+            return Ok(None);
+        }
+        let length = cursor.u32()? as usize;
+        if length > SNAPSHOT_BYTES_MAX {
+            return Err(ConsumerOffsetsWireError::InvalidStateMachines(
+                SnapshotDecodeError::TooLarge { length },
+            ));
+        }
+        StateMachineSnapshot::decode(cursor.take(length)?)
+            .map(Some)
+            .map_err(ConsumerOffsetsWireError::InvalidStateMachines)
     }
 
     /// The producer section, ascending by producer id. Every field stays
@@ -949,6 +1000,10 @@ impl ConsumerOffsetsWire {
                     PRODUCER_ENTRY_PREFIX_LEN + entry.batches().len() * PRODUCER_BATCH_LEN
                 })
                 .sum::<usize>()
+            + self
+                .machines
+                .as_ref()
+                .map_or(0, |machines| size_of::<u32>() + machines.encoded_size())
             + size_of::<u64>()
             + size_of::<u64>()
     }
@@ -1154,7 +1209,8 @@ pub enum ConsumerOffsetsWireError {
     UnsupportedVersion {
         version: u8,
     },
-    /// Bytes remained after this version's field set: a newer encoder.
+    /// Bytes remained after this version's last section, the optional
+    /// state-machine snapshot: a newer encoder.
     TrailingBytes {
         extra: usize,
     },
@@ -1185,6 +1241,8 @@ pub enum ConsumerOffsetsWireError {
     /// A producer entry is out of order, above a field maximum, or keeps no
     /// batch or too many.
     InvalidProducer,
+    /// The state-machine snapshot is malformed or oversized.
+    InvalidStateMachines(SnapshotDecodeError),
 }
 
 impl From<Truncated> for ConsumerOffsetsWireError {
@@ -1254,6 +1312,12 @@ impl fmt::Display for ConsumerOffsetsWireError {
             }
             Self::InvalidProducer => {
                 write!(f, "invalid producer entry in consumer-offsets artifact")
+            }
+            Self::InvalidStateMachines(source) => {
+                write!(
+                    f,
+                    "invalid state machine snapshot in consumer-offsets artifact: {source}"
+                )
             }
         }
     }
@@ -1391,6 +1455,7 @@ mod tests {
             ],
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         }
     }
 
@@ -1500,6 +1565,43 @@ mod tests {
         released.extend_from_slice(&trailer.to_le_bytes());
 
         assert_eq!(ConsumerOffsetsWire::decode(&released), Ok(paid));
+    }
+
+    #[test]
+    fn given_machines_when_round_tripping_should_keep_their_snapshot() {
+        let wire = ConsumerOffsetsWire {
+            machines: Some(StateMachineSnapshot {
+                op: 12,
+                machines: vec![
+                    (crate::state_machine::MachineId(1), b"floor".to_vec()),
+                    (crate::state_machine::MachineId(3), Vec::new()),
+                ],
+            }),
+            ..table()
+        };
+        let encoded = wire.encode();
+        let snapshot_len = wire.machines.as_ref().unwrap().encoded_size();
+        assert_eq!(
+            encoded.len(),
+            table().encode().len() + size_of::<u32>() + snapshot_len,
+            "machines only append their own section to the version 9 layout"
+        );
+        assert_eq!(encoded[CONSUMER_OFFSETS_MAGIC.len()], 9);
+        assert_eq!(ConsumerOffsetsWire::decode(&encoded), Ok(wire));
+
+        let mut damaged = table().encode();
+        let content_len = damaged.len() - size_of::<u64>();
+        damaged.truncate(content_len);
+        damaged.extend_from_slice(&3u32.to_le_bytes());
+        damaged.extend_from_slice(&[1, 2, 3]);
+        let trailer = state_artifact_checksum(&damaged);
+        damaged.extend_from_slice(&trailer.to_le_bytes());
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&damaged),
+            Err(ConsumerOffsetsWireError::InvalidStateMachines(
+                SnapshotDecodeError::Truncated
+            ))
+        );
     }
 
     fn dedup_entry(client: u128, watermark: u64, latest_commit: u64) -> DedupWatermark {
@@ -1684,6 +1786,7 @@ mod tests {
             dedup: Vec::new(),
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         };
         let encoded = empty.encode();
         assert_eq!(
@@ -1817,6 +1920,7 @@ mod tests {
             }),
             retirement_paid_through: 0,
             producers: vec![producer_entry(1, &[(0, 2, 7)])],
+            machines: None,
         };
         let without_external = ConsumerOffsetsWire {
             external_groups: Vec::new(),
@@ -1927,6 +2031,7 @@ mod tests {
             dedup: vec![dedup_entry(9, 1, 1), dedup_entry(4, 2, 2)],
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         };
         assert_eq!(
             ConsumerOffsetsWire::decode(&unordered.encode()),
@@ -1952,6 +2057,7 @@ mod tests {
             dedup: vec![dedup_entry(0, 1, 1), dedup_entry(4, 2, 2)],
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         };
         assert_eq!(
             ConsumerOffsetsWire::decode(&reserved.encode()),
@@ -2091,6 +2197,7 @@ mod tests {
             dedup: Vec::new(),
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         };
         assert_eq!(
             ConsumerOffsetsWire::decode(&duplicate.encode()),
@@ -2115,6 +2222,7 @@ mod tests {
             dedup: Vec::new(),
             retirement_paid_through: 0,
             producers: Vec::new(),
+            machines: None,
         };
         assert_eq!(
             ConsumerOffsetsWire::decode(&unordered.encode()),
@@ -2127,7 +2235,11 @@ mod tests {
 
     #[test]
     fn given_trailing_bytes_when_decoded_should_reject() {
-        let mut padded = table().encode();
+        let with_machines = ConsumerOffsetsWire {
+            machines: Some(StateMachineSnapshot::default()),
+            ..table()
+        };
+        let mut padded = with_machines.encode();
         let content_len = padded.len() - size_of::<u64>();
         padded.truncate(content_len);
         padded.push(0);
@@ -2137,6 +2249,19 @@ mod tests {
             ConsumerOffsetsWire::decode(&padded),
             Err(ConsumerOffsetsWireError::TrailingBytes { extra: 1 }),
             "bytes past the last section must fail closed"
+        );
+
+        // Without machines the optional tail starts there, so a short tail is
+        // a truncated machine section, which fails closed as well.
+        let mut padded = table().encode();
+        let content_len = padded.len() - size_of::<u64>();
+        padded.truncate(content_len);
+        padded.push(0);
+        let trailer = state_artifact_checksum(&padded);
+        padded.extend_from_slice(&trailer.to_le_bytes());
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&padded),
+            Err(ConsumerOffsetsWireError::Truncated)
         );
     }
 
@@ -2556,6 +2681,8 @@ pub enum PartitionTransferUnavailable {
         start_offset: u64,
         source: std::io::Error,
     },
+    /// The machines' snapshot is past the size a receiver accepts.
+    StateMachines(StateMachineError),
 }
 
 impl PartitionTransferUnavailable {
@@ -2581,7 +2708,8 @@ impl PartitionTransferUnavailable {
             | Self::ConsumerOffsetStateInconsistent { .. }
             | Self::ManifestTooLarge { .. }
             | Self::FlushFailed(_)
-            | Self::SegmentUnreadable { .. } => false,
+            | Self::SegmentUnreadable { .. }
+            | Self::StateMachines(_) => false,
         }
     }
 
@@ -2635,6 +2763,9 @@ impl fmt::Display for PartitionTransferUnavailable {
                 start_offset,
                 source,
             } => write!(f, "segment {start_offset:0>20}.log is unreadable: {source}"),
+            Self::StateMachines(source) => {
+                write!(f, "cannot offer the state machines: {source}")
+            }
         }
     }
 }
@@ -2710,6 +2841,9 @@ pub enum PartitionInstallError {
         source: iggy_common::IggyError,
     },
     Offsets(ConsumerOffsetsWireError),
+    /// The offer's state machines are not this replica's: its snapshot is at
+    /// another op, or names a machine this replica does not register.
+    StateMachines(StateMachineError),
     RetryProtection(consensus::ClientTableWireError),
     /// Duplicate base offset in the staged set.
     DuplicateSegment {
@@ -2796,6 +2930,9 @@ impl fmt::Display for PartitionInstallError {
                 write!(f, "consumer offset persistence failed at {path}: {source}")
             }
             Self::Offsets(source) => write!(f, "consumer-offsets artifact rejected: {source}"),
+            Self::StateMachines(source) => {
+                write!(f, "transferred state machines rejected: {source}")
+            }
             Self::RetryProtection(source) => write!(f, "retry protection rejected: {source}"),
             Self::DuplicateSegment { start_offset } => {
                 write!(f, "duplicate staged segment at base offset {start_offset}")
@@ -3901,6 +4038,9 @@ where
             owner_retirement: self.owner_retirement.clone(),
             retirement_paid_through: self.retirement_paid_through,
             producers: self.producer_entries(),
+            machines: self
+                .machines_snapshot_at(commit_op)
+                .map_err(PartitionTransferUnavailable::StateMachines)?,
         })
     }
 
@@ -5163,6 +5303,23 @@ where
         if let Some(retry_table) = install.retry_table.take() {
             *self.dedup_mut() = retry_table;
         }
+        // Checked before the install began, so only a machine that refuses a
+        // snapshot it produced fails here.
+        if let Err(error) =
+            self.restore_machines(install.offsets_wire.machines.as_ref(), install.commit_op)
+        {
+            tracing::error!(
+                namespace_raw = self.consensus().group(),
+                commit_op = install.commit_op,
+                %error,
+                "cannot install the transferred state machines"
+            );
+            self.fatal = Some(crate::types::FatalCommit {
+                namespace_raw: self.consensus().group(),
+                op: install.commit_op,
+                operation: None,
+            });
+        }
         self.restore_producers(std::mem::take(&mut install.offsets_wire.producers));
         self.required_metadata_frontier = self
             .required_metadata_frontier
@@ -5327,6 +5484,8 @@ where
         }
         let offsets_wire = ConsumerOffsetsWire::decode(offsets_bytes)?;
         offsets_wire.validate_owners(self.created_revision(), commit_op)?;
+        self.check_machines_snapshot(offsets_wire.machines.as_ref(), commit_op)
+            .map_err(PartitionInstallError::StateMachines)?;
         if self.history_deleted() && offsets_wire.history_transition != self.history_transition {
             return Err(ConsumerOffsetsWireError::InvalidOwnership.into());
         }
@@ -6268,6 +6427,9 @@ where
             owner_retirement: self.owner_retirement.clone(),
             retirement_paid_through: self.retirement_paid_through,
             producers: self.producer_entries(),
+            machines: self
+                .machines_snapshot_at(through_op)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
             ..Default::default()
         };
         Ok(retry_checkpoint_bytes(
@@ -6284,6 +6446,7 @@ where
     /// Returns an error for missing, corrupt, or incompatible retry protection.
     pub async fn restore_retry_checkpoint(&mut self, through_op: u64) -> std::io::Result<()> {
         if through_op == 0 {
+            self.state_machines.reset();
             if self.partition_dir.is_some()
                 && let Err(error) = self.reclaim_retry_checkpoints(through_op).await
             {
@@ -6343,6 +6506,8 @@ where
         wire.validate_owners(self.created_revision(), through_op)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let table = checked_retry_table(&wire, through_op, self.dedup().capacity())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        self.restore_machines(wire.machines.as_ref(), through_op)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         *self.dedup_mut() = table;
         self.restore_producers(wire.producers);
