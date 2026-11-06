@@ -96,7 +96,7 @@ Runtime retries on any `Err` - same batch can be redelivered. In-tree guarantees
 - **MongoDB**: composite `_id` from `stream:topic:partition:message_id`, via `insert_many(docs).ordered(false)`. Per-document duplicate-key errors don't abort the batch - effective idempotency under retry.
 - **Elasticsearch** (`bulk_index_documents`): bulk action specifies only `_index`, no `_id` -> ES auto-generates ids -> NOT idempotent. Extensions should add `"_id"`.
 - **HTTP**: endpoint-dependent. Document in the plugin README.
-- **Iceberg**: transactional commit per table. `router/commit.rs` tags each snapshot with `iggy.commit-id`, and a commit retry first checks whether the catalog already holds it. At least once, `router/redelivery.rs` records the last message of each source partition in the snapshot summary. A redelivered batch that carries the last message of any append on the current snapshot history appends only the messages after the newest one.
+- **Iceberg**: transactional commit per table. `router/commit.rs` tags each snapshot with `iggy.commit-id`, and a commit retry first checks whether the catalog already holds it. At least once, `router/redelivery.rs` records the first offset and the last message of each source partition in the snapshot summary. A redelivered batch that carries the last message of an append on the current snapshot history skips the start of the batch that such appends cover without a gap.
 
 When writing a new sink, prefer dedup-on-write using the message `id` field. Mongo's upsert-style is the cleanest reference.
 

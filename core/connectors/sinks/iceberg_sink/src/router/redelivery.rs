@@ -18,8 +18,8 @@
 //! Which messages of a partition a table already holds. At least once, the runtime hands a
 //! message over again when it cannot prove it delivered, for example after a crash between the
 //! commit and the offset store, or after a batch committed to one table and failed on another.
-//! Every append records the last message it holds in its snapshot summary, and a delivery of
-//! the same messages again appends only the ones after the newest append.
+//! Every append records in its snapshot summary the first offset and the last message it holds,
+//! and a delivery of the same messages again skips the ones that proven appends cover.
 
 use crate::router::BatchOrigin;
 use crate::router::commit::table_load_error;
@@ -28,7 +28,7 @@ use iceberg::spec::Snapshot;
 use iceberg::table::Table;
 use iceberg::util::snapshot::ancestors_of;
 use iceberg::{Catalog, TableIdent};
-use iggy_connector_sdk::{ConsumedMessage, Error};
+use iggy_connector_sdk::{ConsumedMessage, Error, FlushPartition, TopicMetadata};
 use std::collections::{BTreeMap, HashMap};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -36,15 +36,45 @@ use uuid::Uuid;
 const STREAM_PROPERTY: &str = "iggy.stream";
 const TOPIC_PROPERTY: &str = "iggy.topic";
 const PARTITION_ID_PROPERTY: &str = "iggy.partition-id";
+const FIRST_OFFSET_PROPERTY: &str = "iggy.first-offset";
 const LAST_OFFSET_PROPERTY: &str = "iggy.last-offset";
 const LAST_MESSAGE_ID_PROPERTY: &str = "iggy.last-message-id";
 const LAST_TIMESTAMP_PROPERTY: &str = "iggy.last-timestamp";
+
+/// The messages of a partition that one append holds: every message from offset `first` to
+/// `last`, except the ones the sink skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Append {
+    first: u64,
+    last: LastMessage,
+}
+
+impl Append {
+    /// The append of the messages from `first` to `last`.
+    pub(crate) fn new(first: &ConsumedMessage, last: &ConsumedMessage) -> Self {
+        Self {
+            first: first.offset,
+            last: LastMessage::from(last),
+        }
+    }
+
+    fn from_properties(properties: &HashMap<String, String>) -> Option<Self> {
+        Some(Self {
+            first: properties.get(FIRST_OFFSET_PROPERTY)?.parse().ok()?,
+            last: LastMessage::from_properties(properties)?,
+        })
+    }
+
+    fn offsets(&self) -> (u64, u64) {
+        (self.first, self.last.offset)
+    }
+}
 
 /// The last message of a partition that an append holds. The message ID and the time the
 /// server stored the message tell it apart from another message at the same offset in a later
 /// history of the partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LastMessage {
+struct LastMessage {
     offset: u64,
     id: u128,
     timestamp: u64,
@@ -70,11 +100,10 @@ impl LastMessage {
     }
 }
 
-/// The snapshot summary properties that record `last` as the last message of `origin` the
-/// append holds.
+/// The snapshot summary properties that record `append` as the messages of `origin` it holds.
 pub(crate) fn snapshot_properties(
     origin: &BatchOrigin<'_>,
-    last: LastMessage,
+    append: Append,
 ) -> HashMap<String, String> {
     HashMap::from([
         (STREAM_PROPERTY.to_owned(), origin.stream.to_owned()),
@@ -83,17 +112,25 @@ pub(crate) fn snapshot_properties(
             PARTITION_ID_PROPERTY.to_owned(),
             origin.partition_id.to_string(),
         ),
-        (LAST_OFFSET_PROPERTY.to_owned(), last.offset.to_string()),
-        (LAST_MESSAGE_ID_PROPERTY.to_owned(), last.id.to_string()),
+        (FIRST_OFFSET_PROPERTY.to_owned(), append.first.to_string()),
+        (
+            LAST_OFFSET_PROPERTY.to_owned(),
+            append.last.offset.to_string(),
+        ),
+        (
+            LAST_MESSAGE_ID_PROPERTY.to_owned(),
+            append.last.id.to_string(),
+        ),
         (
             LAST_TIMESTAMP_PROPERTY.to_owned(),
-            last.timestamp.to_string(),
+            append.last.timestamp.to_string(),
         ),
     ])
 }
 
 /// A partition delivered to a table. The table UUID tells a table recreated under the same
-/// name apart.
+/// name apart, once a router loads the table again. The static router keeps the table it loaded
+/// first, so a recreated table needs a restart of the sink.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TablePartition {
     table: Uuid,
@@ -116,16 +153,17 @@ impl TablePartition {
 /// The appends of one partition that a table holds.
 #[derive(Debug, Default)]
 struct Appends {
-    /// The last message of each append, by offset. Where two histories of the partition
-    /// appended at the same offset, the newer one is kept.
-    last_messages: BTreeMap<u64, LastMessage>,
-    newest: Option<LastMessage>,
+    /// Each append by the offset of its last message. Where two appends end at the same offset,
+    /// as two histories of the partition can, the newer one is kept.
+    by_last: BTreeMap<u64, Append>,
+    /// The offset of the last message of the append committed last.
+    newest: Option<u64>,
 }
 
 impl Appends {
-    fn record(&mut self, last: LastMessage) {
-        self.last_messages.insert(last.offset, last);
-        self.newest = Some(last);
+    fn record(&mut self, append: Append) {
+        self.by_last.insert(append.last.offset, append);
+        self.newest = Some(append.last.offset);
     }
 }
 
@@ -138,72 +176,70 @@ pub(crate) struct HeldMessages {
 }
 
 impl HeldMessages {
-    /// The tail of `messages` that `table` does not hold yet. `current` is a copy of `table`
-    /// just loaded from the catalog, which saves loading it again.
+    /// The tail of `messages` that `table` does not hold yet. `fresh` says that `table` was just
+    /// loaded from the catalog, which saves loading it again.
     pub(crate) async fn unheld<'m>(
         &self,
         origin: &BatchOrigin<'_>,
         table: &Table,
-        current: Option<&Table>,
+        fresh: bool,
         catalog: &dyn Catalog,
         messages: &'m [ConsumedMessage],
     ) -> Result<&'m [ConsumedMessage], Error> {
         let key = TablePartition::new(origin, table);
-        if !self.known.contains_key(&key) {
-            let appends = match current {
-                Some(current) => appends_in(current, origin),
-                None => {
-                    let identifier = table.identifier();
-                    let current = catalog
-                        .load_table(identifier)
-                        .await
-                        .map_err(|error| table_load_error(&identifier.to_string(), &error))?;
-                    appends_in(&current, origin)
-                }
-            };
-            self.known.entry(key.clone()).or_insert(appends);
-        }
-        let held = match self.known.get_mut(&key) {
-            Some(mut appends) => {
-                match held_prefix(origin, table.identifier(), messages, &appends) {
-                    Prefix::Held(held) => held,
-                    Prefix::NewHistory => {
-                        *appends = Appends::default();
-                        0
-                    }
-                    Prefix::Unproven => 0,
-                }
+        let loaded = if self.known.contains_key(&key) {
+            None
+        } else if fresh {
+            Some(appends_in(table, origin))
+        } else {
+            let identifier = table.identifier();
+            let current = catalog
+                .load_table(identifier)
+                .await
+                .map_err(|error| table_load_error(&identifier.to_string(), &error))?;
+            Some(appends_in(&current, origin))
+        };
+        let mut appends = self
+            .known
+            .entry(key)
+            .or_insert_with(|| loaded.unwrap_or_default());
+        let held = match held_prefix(origin, table.identifier(), messages, &appends) {
+            Prefix::Held(held) => held,
+            Prefix::NewHistory => {
+                *appends = Appends::default();
+                0
             }
-            None => 0,
+            Prefix::Unproven => 0,
         };
         Ok(&messages[held..])
     }
 
-    /// The last message of a commit to record in its snapshot. A batch that the table could not
-    /// prove it held, but that ends below the newest append, records that append again, so that
-    /// the record never moves back within one history of the partition.
-    pub(crate) fn last_to_record(
-        &self,
-        origin: &BatchOrigin<'_>,
-        table: &Table,
-        last: LastMessage,
-    ) -> LastMessage {
-        self.known
-            .get(&TablePartition::new(origin, table))
-            .and_then(|appends| appends.newest)
-            .filter(|newest| newest.offset > last.offset)
-            .unwrap_or(last)
-    }
-
-    pub(crate) fn committed(&self, origin: &BatchOrigin<'_>, table: &Table, last: LastMessage) {
+    pub(crate) fn committed(&self, origin: &BatchOrigin<'_>, table: &Table, append: Append) {
         self.known
             .entry(TablePartition::new(origin, table))
             .or_default()
-            .record(last);
+            .record(append);
     }
 
     pub(crate) fn forget(&self, origin: &BatchOrigin<'_>, table: &Table) {
         self.known.remove(&TablePartition::new(origin, table));
+    }
+
+    /// Forgets the appends that end at or before the offset each of `partitions` flushed. The
+    /// runtime never hands those messages over again, and a restart reads the table anew.
+    pub(crate) fn flushed(&self, topic_metadata: &TopicMetadata, partitions: &[FlushPartition]) {
+        for mut known in self.known.iter_mut() {
+            let (key, appends) = known.pair_mut();
+            if key.stream != topic_metadata.stream || key.topic != topic_metadata.topic {
+                continue;
+            }
+            if let Some(flushed) = partitions
+                .iter()
+                .find(|partition| partition.partition_id == key.partition_id)
+            {
+                appends.by_last.retain(|&last, _| last > flushed.offset);
+            }
+        }
     }
 }
 
@@ -220,17 +256,17 @@ fn appends_in(table: &Table, origin: &BatchOrigin<'_>) -> Appends {
             continue;
         }
         let properties = &snapshot.summary().additional_properties;
-        let Some(last) = LastMessage::from_properties(properties) else {
+        let Some(append) = Append::from_properties(properties) else {
             warn!(
-                "Iceberg table {} has snapshot {} of {origin} without a readable last message. Skipping it",
+                "Iceberg table {} has snapshot {} of {origin} without readable offsets. Skipping it",
                 table.identifier(),
                 snapshot.snapshot_id()
             );
             continue;
         };
         // The walk runs from the newest snapshot back, so the first one seen at an offset wins.
-        appends.last_messages.entry(last.offset).or_insert(last);
-        appends.newest.get_or_insert(last);
+        appends.by_last.entry(append.last.offset).or_insert(append);
+        appends.newest.get_or_insert(append.last.offset);
     }
     appends
 }
@@ -249,59 +285,120 @@ enum Prefix {
     Held(usize),
     /// None: the table holds other messages at the batch's offsets.
     NewHistory,
-    /// None that can be proven, although the batch reaches offsets the table holds.
+    /// None that can be proven, although appends cover some of the batch's offsets.
     Unproven,
 }
 
-/// What the table holds of the start of `messages`. Messages count as held only when the batch
-/// carries the last message of one of the table's appends, which proves that it is the history
-/// the table holds. Then every message up to the newest append is held.
+/// What the table holds of the start of `messages`. An append counts only when the batch carries
+/// its last message, which proves that the batch is the history the append holds. Once one does,
+/// the appends after the end of the batch count too, up to the newest one, since a batch cut at
+/// other offsets than before carries none of their last messages. The messages held are the
+/// start of the batch that the counted appends cover without a gap, so a message that no append
+/// holds, for example one an at-most-once run lost, is appended again.
 fn held_prefix(
     origin: &BatchOrigin<'_>,
     table: &TableIdent,
     messages: &[ConsumedMessage],
     appends: &Appends,
 ) -> Prefix {
-    let Some(newest) = appends.newest else {
+    let (Some(first), Some(last)) = (messages.first(), messages.last()) else {
         return Prefix::Held(0);
     };
-    // A run of one partition carries ascending offsets.
-    let held = messages.partition_point(|message| message.offset <= newest.offset);
-    if held == 0 {
-        return Prefix::Held(0);
-    }
+    let mut proven = Vec::new();
     let mut other_history = false;
-    for message in &messages[..held] {
-        match appends.last_messages.get(&message.offset) {
-            Some(last) if *last == LastMessage::from(message) => {
-                info!(
-                    "Skipping {held} messages from offset: {} to offset: {} ({origin}) that Iceberg table {table} already holds",
-                    messages[0].offset,
-                    messages[held - 1].offset,
-                );
-                return Prefix::Held(held);
+    for message in messages {
+        match appends.by_last.get(&message.offset) {
+            Some(append) if append.last == LastMessage::from(message) => {
+                proven.push(append.offsets());
             }
             Some(_) => other_history = true,
             None => {}
         }
     }
+    if proven.is_empty() {
+        return prefix_without_proof(
+            origin,
+            table,
+            first.offset,
+            last.offset,
+            appends,
+            other_history,
+        );
+    }
+    if let Some(newest) = appends.newest
+        && newest > last.offset
+    {
+        proven.extend(
+            appends
+                .by_last
+                .range(last.offset + 1..=newest)
+                .map(|(_, append)| append.offsets()),
+        );
+    }
+    proven.sort_unstable();
+    let held = covered_prefix(messages, &proven);
+    if held > 0 {
+        info!(
+            "Skipping {held} messages from offset: {} to offset: {} ({origin}) that Iceberg table {table} already holds",
+            first.offset,
+            messages[held - 1].offset,
+        );
+    }
+    Prefix::Held(held)
+}
+
+/// What the table holds of a batch from offset `first` to `last` that carries the last message
+/// of no append.
+fn prefix_without_proof(
+    origin: &BatchOrigin<'_>,
+    table: &TableIdent,
+    first: u64,
+    last: u64,
+    appends: &Appends,
+    other_history: bool,
+) -> Prefix {
     if other_history {
         warn!(
             "Iceberg table {table} holds other messages at the offsets of the batch ({origin}), so the partition has a new history. Appending every message of the batch"
         );
         return Prefix::NewHistory;
     }
+    let covered = appends
+        .by_last
+        .range(first..)
+        .any(|(_, append)| append.first <= last);
+    if !covered {
+        return Prefix::Held(0);
+    }
     warn!(
-        "Iceberg table {table} holds messages up to offset: {} ({origin}), but the batch carries no message that proves which ones. Appending every message of the batch, which can append some twice",
-        newest.offset
+        "Iceberg table {table} holds messages between offset: {first} and offset: {last} ({origin}), but the batch carries no message that proves which ones. Appending every message of the batch, which can append some twice"
     );
     Prefix::Unproven
+}
+
+/// How many messages from the start of `messages` the offset ranges cover without a gap. The
+/// ranges are sorted by their first offset.
+fn covered_prefix(messages: &[ConsumedMessage], ranges: &[(u64, u64)]) -> usize {
+    let mut next = 0;
+    let mut covered_to = None;
+    messages
+        .iter()
+        .take_while(|message| {
+            while let Some(&(first, last)) = ranges.get(next)
+                && first <= message.offset
+            {
+                covered_to = covered_to.max(Some(last));
+                next += 1;
+            }
+            covered_to.is_some_and(|to| message.offset <= to)
+        })
+        .count()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_connector_sdk::Payload;
+    use crate::router::commit::tests::{message, messages};
 
     const ORIGIN: BatchOrigin<'static> = BatchOrigin {
         connector_id: 1,
@@ -314,26 +411,11 @@ mod tests {
         TableIdent::from_strs(["ns", "table"]).expect("a valid table name")
     }
 
-    fn message(offset: u64) -> ConsumedMessage {
-        ConsumedMessage {
-            id: u128::from(offset) + 100,
-            offset,
-            checksum: 0,
-            timestamp: offset + 1_000,
-            origin_timestamp: 0,
-            headers: None,
-            payload: Payload::Raw(Vec::new()),
-        }
-    }
-
-    fn messages(offsets: std::ops::RangeInclusive<u64>) -> Vec<ConsumedMessage> {
-        offsets.map(message).collect()
-    }
-
-    fn appends(last_offsets: &[u64]) -> Appends {
+    /// Appends of the messages from each first to each last offset, committed in this order.
+    fn appends(offsets: &[(u64, u64)]) -> Appends {
         let mut appends = Appends::default();
-        for &offset in last_offsets {
-            appends.record(LastMessage::from(&message(offset)));
+        for &(first, last) in offsets {
+            appends.record(Append::new(&message(first), &message(last)));
         }
         appends
     }
@@ -347,14 +429,55 @@ mod tests {
 
     #[test]
     fn given_a_batch_carrying_the_newest_append_should_hold_up_to_it() {
-        let prefix = held_prefix(&ORIGIN, &table(), &messages(3..=5), &appends(&[4]));
+        let prefix = held_prefix(&ORIGIN, &table(), &messages(3..=5), &appends(&[(0, 4)]));
 
         assert_eq!(prefix, Prefix::Held(2));
     }
 
     #[test]
-    fn given_a_backlog_batch_carrying_an_older_append_should_hold_up_to_the_newest() {
-        let prefix = held_prefix(&ORIGIN, &table(), &messages(0..=1), &appends(&[1, 3, 5]));
+    fn given_a_backlog_batch_carrying_an_older_append_should_hold_the_appends_after_it() {
+        let prefix = held_prefix(
+            &ORIGIN,
+            &table(),
+            &messages(0..=2),
+            &appends(&[(0, 1), (2, 3), (4, 5)]),
+        );
+
+        assert_eq!(prefix, Prefix::Held(3));
+    }
+
+    #[test]
+    fn given_a_gap_between_appends_should_hold_only_the_messages_before_it() {
+        let prefix = held_prefix(
+            &ORIGIN,
+            &table(),
+            &messages(0..=7),
+            &appends(&[(0, 1), (6, 7)]),
+        );
+
+        assert_eq!(prefix, Prefix::Held(2));
+    }
+
+    #[test]
+    fn given_a_batch_ending_after_the_newest_append_should_not_count_older_appends_after_it() {
+        let prefix = held_prefix(
+            &ORIGIN,
+            &table(),
+            &messages(5..=12),
+            &appends(&[(10, 19), (0, 9)]),
+        );
+
+        assert_eq!(prefix, Prefix::Held(5));
+    }
+
+    #[test]
+    fn given_a_batch_ending_before_the_newest_append_should_not_count_older_appends_after_it() {
+        let prefix = held_prefix(
+            &ORIGIN,
+            &table(),
+            &messages(3..=7),
+            &appends(&[(5, 19), (0, 4), (9, 10)]),
+        );
 
         assert_eq!(prefix, Prefix::Held(2));
     }
@@ -364,21 +487,26 @@ mod tests {
         let mut batch = messages(3..=4);
         batch[1].timestamp += 1;
 
-        let prefix = held_prefix(&ORIGIN, &table(), &batch, &appends(&[4]));
+        let prefix = held_prefix(&ORIGIN, &table(), &batch, &appends(&[(0, 4)]));
 
         assert_eq!(prefix, Prefix::NewHistory);
     }
 
     #[test]
     fn given_a_batch_after_the_newest_append_should_append_every_message() {
-        let prefix = held_prefix(&ORIGIN, &table(), &messages(5..=6), &appends(&[4]));
+        let prefix = held_prefix(&ORIGIN, &table(), &messages(5..=6), &appends(&[(0, 4)]));
 
         assert_eq!(prefix, Prefix::Held(0));
     }
 
     #[test]
     fn given_a_batch_without_an_appended_message_should_append_every_message() {
-        let prefix = held_prefix(&ORIGIN, &table(), &messages(2..=3), &appends(&[1, 4]));
+        let prefix = held_prefix(
+            &ORIGIN,
+            &table(),
+            &messages(2..=3),
+            &appends(&[(0, 1), (2, 4)]),
+        );
 
         assert_eq!(prefix, Prefix::Unproven);
     }

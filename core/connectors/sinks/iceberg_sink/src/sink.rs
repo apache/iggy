@@ -18,11 +18,13 @@
 use crate::{
     IcebergSink,
     catalog::init_catalog,
-    router::{BatchOrigin, dynamic_router::DynamicRouter, static_router::StaticRouter},
+    router::{Appender, BatchOrigin, dynamic_router::DynamicRouter, static_router::StaticRouter},
 };
 use async_trait::async_trait;
 use iceberg::Catalog;
-use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
+use iggy_connector_sdk::{
+    ConsumedMessage, Error, FlushPartition, MessagesMetadata, Sink, TopicMetadata,
+};
 use tracing::{debug, error, info};
 
 #[async_trait]
@@ -71,23 +73,16 @@ impl Sink for IcebergSink {
 
         let catalog: Box<dyn Catalog> = init_catalog(&self.config).await?;
         let invalid_rows = self.config.invalid_rows.unwrap_or_default();
+        let appender = Appender::new(catalog, invalid_rows, self.commit_retry);
 
         if self.config.dynamic_routing {
             self.router = Some(Box::new(DynamicRouter::new(
-                catalog,
+                appender,
                 self.config.dynamic_route_field.clone(),
-                invalid_rows,
-                self.commit_retry,
             )))
         } else {
             self.router = Some(Box::new(
-                StaticRouter::new(
-                    catalog,
-                    &self.config.tables,
-                    invalid_rows,
-                    self.commit_retry,
-                )
-                .await?,
+                StaticRouter::new(appender, &self.config.tables).await?,
             ));
         }
 
@@ -130,13 +125,26 @@ impl Sink for IcebergSink {
         Ok(())
     }
 
-    /// The sink commits every batch inside `consume`, so the default flush has nothing left to
-    /// prove.
+    /// The sink commits every batch inside `consume`, so a flush has nothing left to prove.
     fn enable_at_least_once(&mut self) -> Result<(), Error> {
         let Some(router) = self.router.as_mut() else {
             return Err(Error::InvalidState);
         };
         router.enable_at_least_once()
+    }
+
+    /// Writes nothing, since `consume` committed every message already. It lets the router forget
+    /// what the tables hold of the flushed messages, which the runtime never hands over again.
+    async fn flush(
+        &self,
+        topic_metadata: &TopicMetadata,
+        partitions: &[FlushPartition],
+    ) -> Result<(), Error> {
+        let Some(router) = &self.router else {
+            return Err(Error::InvalidState);
+        };
+        router.flushed(topic_metadata, partitions);
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Error> {
