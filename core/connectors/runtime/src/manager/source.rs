@@ -188,9 +188,19 @@ impl SourceManager {
 
         // The result callback can race with close, so the forwarding loop
         // treats callback failures during Stopping as expected shutdown.
-        if let Some(container) = &container {
+        if let Some(container) = container {
             info!("Closing source connector with ID: {plugin_id} for plugin: {key}");
-            (container.iggy_source_close)(plugin_id);
+            match tokio::task::spawn_blocking(move || (container.iggy_source_close)(plugin_id))
+                .await
+            {
+                Ok(0) => {}
+                Ok(code) => {
+                    warn!("Source connector close returned code {code} (plugin_id: {plugin_id})")
+                }
+                Err(error) => {
+                    warn!("Source connector close task failed (plugin_id: {plugin_id}): {error}")
+                }
+            }
             info!("Closed source connector with ID: {plugin_id} for plugin: {key}");
         }
 

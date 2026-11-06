@@ -364,11 +364,11 @@ JDBC SQL types are automatically mapped to JSON:
 
 | SQL Type | JSON Type | Notes |
 | ---------- | ----------- | ------- |
-| BIT, BOOLEAN | boolean | - |
+| BOOLEAN, BIT(1) | boolean | - |
+| BIT(n), n > 1 | string | Base64 encoded because multi-bit values are binary data, not booleans |
 | TINYINT, SMALLINT, INTEGER | number | Integer |
-| BIGINT | string | Emitted as a string to preserve full 64-bit precision (many JSON consumers parse numbers as f64 and would lose precision above 2^53) |
-| FLOAT, REAL | number | Float |
-| DOUBLE | number | Double |
+| BIGINT | string | Emitted as a string to preserve signed and unsigned precision (many JSON consumers parse numbers as f64 and would lose precision above 2^53) |
+| FLOAT, REAL, DOUBLE | number | Read through JDBC `getDouble` to avoid an intermediate 32-bit rounding step |
 | NUMERIC, DECIMAL | string | Emitted as a string to preserve arbitrary precision (e.g. money) |
 | CHAR, VARCHAR, TEXT | string | Cannot be used as an incremental tracking column because database collation equality is not portable |
 | DATE, TIME, TIMESTAMP | string | Driver string form |

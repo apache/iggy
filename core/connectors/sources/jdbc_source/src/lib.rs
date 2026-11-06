@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -29,11 +29,12 @@ use iggy_connector_sdk::{
     source::SourceBatchResult, source_connector,
 };
 use java::sql::Types;
-use jni::objects::{GlobalRef, JByteArray, JObject, JString, JThrowable, JValue};
+use jni::objects::{GlobalRef, JByteArray, JObject, JString, JThrowable, JValue, JValueOwned};
 use jni::{JNIEnv, JavaVM};
 use regex::Regex;
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize, Serializer};
 use tracing::{debug, error, info, warn};
 
 /// Clear any pending Java exception on the current thread. The JNI spec forbids
@@ -317,7 +318,34 @@ struct State {
 struct ColumnMetadata {
     output_name: String,
     sql_type: i32,
+    precision: i32,
     is_tracking: bool,
+}
+
+struct BorrowedRow<'a> {
+    columns: &'a [ColumnMetadata],
+    values: &'a [serde_json::Value],
+}
+
+impl Serialize for BorrowedRow<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.values.len()))?;
+        for (column, value) in self.columns.iter().zip(self.values) {
+            map.serialize_entry(&column.output_name, value)?;
+        }
+        map.end()
+    }
+}
+
+#[derive(Serialize)]
+struct BorrowedDatabaseRecord<'a> {
+    table_name: Option<&'a str>,
+    operation_type: &'static str,
+    timestamp: DateTime<Utc>,
+    data: BorrowedRow<'a>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -336,22 +364,98 @@ pub struct DatabaseRecord {
     pub data: serde_json::Value,
 }
 
+#[derive(Debug, Default)]
+struct ActiveQueryState {
+    running: bool,
+    cancel_requested: bool,
+    statement: Option<GlobalRef>,
+}
+
+#[derive(Debug, Default)]
+struct ActiveQuery {
+    state: Mutex<ActiveQueryState>,
+    completed: Condvar,
+}
+
+impl ActiveQuery {
+    fn begin(self: &Arc<Self>) -> Result<ActiveQueryGuard, Error> {
+        let mut state = lock_mutex(&self.state, "active_query")?;
+        if state.running {
+            return Err(Error::InvalidState);
+        }
+        state.running = true;
+        state.cancel_requested = false;
+        state.statement = None;
+        drop(state);
+        Ok(ActiveQueryGuard {
+            active_query: self.clone(),
+        })
+    }
+
+    fn install_statement(&self, statement: GlobalRef) -> Result<bool, Error> {
+        let mut state = lock_mutex(&self.state, "active_query")?;
+        state.statement = Some(statement);
+        Ok(state.cancel_requested)
+    }
+
+    fn cancellation_requested(&self) -> Result<bool, Error> {
+        Ok(lock_mutex(&self.state, "active_query")?.cancel_requested)
+    }
+
+    fn clear_statement(&self) -> Result<(), Error> {
+        lock_mutex(&self.state, "active_query")?.statement = None;
+        Ok(())
+    }
+
+    fn request_cancellation(&self) -> Result<(bool, Option<GlobalRef>), Error> {
+        let mut state = lock_mutex(&self.state, "active_query")?;
+        state.cancel_requested = true;
+        Ok((state.running, state.statement.clone()))
+    }
+
+    fn wait_for_completion(&self) -> Result<(), Error> {
+        let state = lock_mutex(&self.state, "active_query")?;
+        let state = self
+            .completed
+            .wait_while(state, |state| state.running)
+            .map_err(|_| Error::Connection("active_query mutex poisoned".to_string()))?;
+        drop(state);
+        Ok(())
+    }
+}
+
+struct ActiveQueryGuard {
+    active_query: Arc<ActiveQuery>,
+}
+
+impl Drop for ActiveQueryGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.active_query.state.lock() {
+            state.statement = None;
+            state.running = false;
+            self.active_query.completed.notify_all();
+        }
+    }
+}
+
 /// JDBC Source Connector
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct JdbcSource {
     id: u32,
     config: JdbcSourceConfig,
     jvm: Option<Arc<JavaVM>>,
     // Behind a Mutex so `poll()` (&self) can transparently re-establish a dead
     // direct connection without `&mut self`.
-    connection: Mutex<Option<GlobalRef>>,
+    connection: Arc<Mutex<Option<GlobalRef>>>,
     // The committed cursor: only ever advanced from `pending_state` once the
     // runtime confirms the batch was both sent and its checkpoint persisted.
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     // The cursor this in-flight batch would advance to, staged by `poll` and
     // resolved by `on_batch_result`. The SDK keeps at most one batch in flight,
     // so a single slot is sufficient.
-    pending_state: Mutex<Option<State>>,
+    pending_state: Arc<Mutex<Option<State>>>,
+    // Coordinates cancellation and teardown for the blocking JDBC operation.
+    active_query: Arc<ActiveQuery>,
     // Poll interval parsed once from `config.poll_interval` at construction.
     poll_interval: Duration,
     // Whether per-poll details should be promoted from debug to info.
@@ -394,9 +498,10 @@ impl JdbcSource {
             id,
             config,
             jvm: None,
-            connection: Mutex::new(None),
-            state: Mutex::new(state),
-            pending_state: Mutex::new(None),
+            connection: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(state)),
+            pending_state: Arc::new(Mutex::new(None)),
+            active_query: Arc::new(ActiveQuery::default()),
             poll_interval,
             verbose,
         }
@@ -799,8 +904,9 @@ impl JdbcSource {
             self.id, query.sql
         );
 
-        let (messages, row_count, max_offset) =
+        let (messages, max_offset) =
             self.execute_statement_and_fetch_rows(env, &connection, &query)?;
+        let row_count = messages.len() as u64;
 
         // Fail closed on bulk truncation. The bulk fetch probes with batch_size+1
         // rows, so seeing more than batch_size means the result set is larger than
@@ -854,7 +960,7 @@ impl JdbcSource {
         env: &mut JNIEnv,
         connection: &JObject,
         query: &PreparedQuery,
-    ) -> Result<(Vec<ProducedMessage>, u64, Option<String>), Error> {
+    ) -> Result<(Vec<ProducedMessage>, Option<String>), Error> {
         let query_jstring = jni!(
             env,
             env.new_string(&query.sql),
@@ -873,6 +979,16 @@ impl JdbcSource {
             Ok(s) => s,
             Err(_) => return Err(classify_query_failure(env, "prepare statement")),
         };
+
+        let statement_ref = jni!(
+            env,
+            env.new_global_ref(&statement),
+            "Failed to retain the active JDBC statement"
+        );
+        if self.active_query.install_statement(statement_ref)? {
+            best_effort_close(env, &statement);
+            return Err(Error::Connection("JDBC query cancelled".to_string()));
+        }
 
         // Use setMaxRows for database-agnostic row limiting instead of SQL LIMIT.
         // Both modes fetch one probe row beyond the batch. Bulk mode uses it to
@@ -936,7 +1052,7 @@ impl JdbcSource {
                 return Err(err);
             }
         };
-        let (messages, row_count, max_offset) = match self.read_rows(env, &result_set, &columns) {
+        let (messages, max_offset) = match self.read_rows(env, &result_set, &columns) {
             Ok(result) => result,
             Err(err) => {
                 best_effort_close(env, &statement);
@@ -947,7 +1063,65 @@ impl JdbcSource {
         // Close statement (best-effort)
         best_effort_close(env, &statement);
 
-        Ok((messages, row_count, max_offset))
+        Ok((messages, max_offset))
+    }
+
+    fn cancel_active_query_and_wait(&self, env: &mut JNIEnv) -> Result<(), Error> {
+        let (running, statement) = self.active_query.request_cancellation()?;
+        if !running {
+            return Ok(());
+        }
+        if let Some(statement) = statement
+            && env
+                .call_method(statement.as_obj(), "cancel", "()V", &[])
+                .is_err()
+        {
+            clear_pending_exception(env);
+            warn!(
+                "JDBC source connector [{}] could not cancel its active statement",
+                self.id
+            );
+        }
+
+        let connection = lock_mutex(&self.connection, "connection")?.clone();
+        if let Some(connection) = connection {
+            let executor = env
+                .call_static_method(
+                    "java/util/concurrent/ForkJoinPool",
+                    "commonPool",
+                    "()Ljava/util/concurrent/ForkJoinPool;",
+                    &[],
+                )
+                .and_then(|value| value.l());
+            match executor {
+                Ok(executor) => {
+                    if env
+                        .call_method(
+                            connection.as_obj(),
+                            "abort",
+                            "(Ljava/util/concurrent/Executor;)V",
+                            &[JValue::Object(&executor)],
+                        )
+                        .is_err()
+                    {
+                        clear_pending_exception(env);
+                        warn!(
+                            "JDBC source connector [{}] could not abort its active connection",
+                            self.id
+                        );
+                    }
+                }
+                Err(_) => {
+                    clear_pending_exception(env);
+                    warn!(
+                        "JDBC source connector [{}] could not obtain an executor to abort its active connection",
+                        self.id
+                    );
+                }
+            }
+        }
+
+        self.active_query.wait_for_completion()
     }
 
     /// Read column names and types from the ResultSet metadata.
@@ -1011,7 +1185,8 @@ impl JdbcSource {
         for i in 1..=column_count {
             let source_name = get_column_label(env, &metadata, i)?;
             let sql_type = get_column_type(env, &metadata, i)?;
-            raw_columns.push((source_name, sql_type));
+            let precision = get_column_precision(env, &metadata, i)?;
+            raw_columns.push((source_name, sql_type, precision));
         }
 
         self.prepare_column_metadata(raw_columns)
@@ -1019,13 +1194,13 @@ impl JdbcSource {
 
     fn prepare_column_metadata(
         &self,
-        raw_columns: Vec<(String, i32)>,
+        raw_columns: Vec<(String, i32, i32)>,
     ) -> Result<Vec<ColumnMetadata>, Error> {
         let mut columns = Vec::with_capacity(raw_columns.len());
         let mut output_names = std::collections::HashSet::new();
         let mut tracking_matches = 0usize;
         let mut tracking_sql_type = None;
-        for (source_name, sql_type) in raw_columns {
+        for (source_name, sql_type, precision) in raw_columns {
             let output_name = if self.config.snake_case_columns {
                 to_snake_case(&source_name)
             } else {
@@ -1050,6 +1225,7 @@ impl JdbcSource {
             columns.push(ColumnMetadata {
                 output_name,
                 sql_type,
+                precision,
                 is_tracking,
             });
         }
@@ -1091,12 +1267,11 @@ impl JdbcSource {
         env: &mut JNIEnv,
         result_set: &JObject,
         columns: &[ColumnMetadata],
-    ) -> Result<(Vec<ProducedMessage>, u64, Option<String>), Error> {
+    ) -> Result<(Vec<ProducedMessage>, Option<String>), Error> {
         // The emitted batch is capped at batch_size; the possible extra row is a
         // probe and is never retained. Clamp the pre-allocation so an extreme
         // batch_size cannot request an absurd allocation up front.
         let mut messages = Vec::with_capacity((self.config.batch_size as usize).min(8192));
-        let mut row_count: u64 = 0;
         let mut last_offset: Option<String> = None;
 
         loop {
@@ -1127,7 +1302,9 @@ impl JdbcSource {
             // If it shares the last in-batch tracking value, advancing with strict
             // `>` would skip it and any following ties. Fail the complete poll so
             // no messages or checkpoint can escape from an unsafe page.
-            if self.config.mode == Mode::Incremental && row_count == self.config.batch_size as u64 {
+            if self.config.mode == Mode::Incremental
+                && messages.len() == self.config.batch_size as usize
+            {
                 if offset == last_offset {
                     return Err(Error::InvalidConfigValue(format!(
                         "incremental batch boundary splits rows with tracking value '{}'; increase batch_size or use a unique, strictly increasing tracking_column",
@@ -1147,12 +1324,11 @@ impl JdbcSource {
                 last_offset = Some(offset);
             }
 
-            let message = self.build_message(row_data)?;
+            let message = self.build_message(columns, &row_data)?;
             messages.push(message);
-            row_count += 1;
         }
 
-        Ok((messages, row_count, last_offset))
+        Ok((messages, last_offset))
     }
 
     /// Extract data from a single result set row, returning the row map and optional offset.
@@ -1161,21 +1337,21 @@ impl JdbcSource {
         env: &mut JNIEnv,
         result_set: &JObject,
         columns: &[ColumnMetadata],
-    ) -> Result<(serde_json::Map<String, serde_json::Value>, Option<String>), Error> {
-        let mut row_data = serde_json::Map::new();
+    ) -> Result<(Vec<serde_json::Value>, Option<String>), Error> {
+        let mut row_data = Vec::with_capacity(columns.len());
         let mut offset = None;
 
         for (idx, column) in columns.iter().enumerate() {
             let col_idx = (idx + 1) as i32;
-            let value = extract_column_value(env, result_set, col_idx, &column.sql_type)?;
-            row_data.insert(column.output_name.clone(), value);
+            let value = extract_column_value(env, result_set, col_idx, column)?;
 
             if column.is_tracking
                 && let Some(ref tracking_column) = self.config.tracking_column
             {
-                let value = extract_offset_value(&row_data, &column.output_name, column.sql_type)?;
-                offset = self.tracking_offset_or_error(value, tracking_column)?;
+                let cursor = extract_offset_value(&value, &column.output_name, column.sql_type)?;
+                offset = self.tracking_offset_or_error(cursor, tracking_column)?;
             }
+            row_data.push(value);
         }
 
         Ok((row_data, offset))
@@ -1202,23 +1378,28 @@ impl JdbcSource {
         }
     }
 
-    /// Build a ProducedMessage from row data, optionally wrapping in DatabaseRecord metadata.
+    /// Build a ProducedMessage from row data, optionally wrapping it in metadata.
     fn build_message(
         &self,
-        row_data: serde_json::Map<String, serde_json::Value>,
+        columns: &[ColumnMetadata],
+        row_data: &[serde_json::Value],
     ) -> Result<ProducedMessage, Error> {
         let now = Utc::now();
+        let data = BorrowedRow {
+            columns,
+            values: row_data,
+        };
         let payload = if self.config.include_metadata {
-            let record = DatabaseRecord {
+            let record = BorrowedDatabaseRecord {
                 table_name: None,
-                operation_type: "SELECT".to_string(),
+                operation_type: "SELECT",
                 timestamp: now,
-                data: serde_json::Value::Object(row_data),
+                data,
             };
             serde_json::to_vec(&record)
                 .map_err(|e| Error::Serialization(format!("Failed to serialize record: {e}")))?
         } else {
-            serde_json::to_vec(&serde_json::Value::Object(row_data))
+            serde_json::to_vec(&data)
                 .map_err(|e| Error::Serialization(format!("Failed to serialize row data: {e}")))?
         };
 
@@ -1335,6 +1516,28 @@ fn get_column_type(env: &mut JNIEnv, metadata: &JObject, column_index: i32) -> R
     Ok(col_type)
 }
 
+/// Get the driver-reported column precision. For `Types::BIT`, this is the
+/// number of bits and distinguishes a boolean-compatible `BIT(1)` from a
+/// wider bit string whose value must not be collapsed to true/false.
+fn get_column_precision(
+    env: &mut JNIEnv,
+    metadata: &JObject,
+    column_index: i32,
+) -> Result<i32, Error> {
+    let precision = jni!(
+        env,
+        env.call_method(
+            metadata,
+            "getPrecision",
+            "(I)I",
+            &[JValue::Int(column_index)],
+        )
+        .and_then(|value| value.i()),
+        "Failed to get column precision"
+    );
+    Ok(precision)
+}
+
 /// Return `value`, or JSON `null` when the last primitive getter read a SQL
 /// NULL (detected via `ResultSet.wasNull()`).
 fn null_or(
@@ -1360,15 +1563,15 @@ fn extract_column_value(
     env: &mut JNIEnv,
     result_set: &JObject,
     column_index: i32,
-    sql_type: &i32,
+    column: &ColumnMetadata,
 ) -> Result<serde_json::Value, Error> {
     // Primitive getters (getInt/getBoolean/...) return 0/false for SQL NULL,
     // so `null_or` consults ResultSet.wasNull() after the getter to tell an
     // actual NULL from a zero value. Object getters (getString/getBytes)
     // return a null reference for SQL NULL and are null-checked directly, so
     // there is no separate getObject probe (one JNI call per column, not two).
-    match *sql_type {
-        Types::BIT | Types::BOOLEAN => {
+    match column.sql_type {
+        Types::BOOLEAN => {
             let value = jni!(
                 env,
                 env.call_method(
@@ -1382,6 +1585,21 @@ fn extract_column_value(
             );
             null_or(env, result_set, serde_json::Value::Bool(value))
         }
+        Types::BIT if column.precision == 1 => {
+            let value = jni!(
+                env,
+                env.call_method(
+                    result_set,
+                    "getBoolean",
+                    "(I)Z",
+                    &[JValue::Int(column_index)]
+                )
+                .and_then(|value| value.z()),
+                "Failed to get single-bit boolean"
+            );
+            null_or(env, result_set, serde_json::Value::Bool(value))
+        }
+        Types::BIT => get_column_as_base64(env, result_set, column_index),
         Types::TINYINT | Types::SMALLINT | Types::INTEGER => {
             let value = jni!(
                 env,
@@ -1391,28 +1609,10 @@ fn extract_column_value(
             );
             null_or(env, result_set, serde_json::json!(value))
         }
-        // BIGINT is emitted as a string (like NUMERIC/DECIMAL below) so a
-        // value above 2^53 is not silently rounded by a JSON consumer that
-        // parses numbers as f64.
-        Types::BIGINT => {
-            let value = jni!(
-                env,
-                env.call_method(result_set, "getLong", "(I)J", &[JValue::Int(column_index)])
-                    .and_then(|v| v.j()),
-                "Failed to get long"
-            );
-            null_or(env, result_set, serde_json::json!(value.to_string()))
-        }
-        Types::FLOAT | Types::REAL => {
-            let value = jni!(
-                env,
-                env.call_method(result_set, "getFloat", "(I)F", &[JValue::Int(column_index)])
-                    .and_then(|v| v.f()),
-                "Failed to get float"
-            );
-            finite_float_or_null(env, result_set, f64::from(value), column_index)
-        }
-        Types::DOUBLE => {
+        // Read BIGINT through the driver's string representation. Calling
+        // getLong first rejects MySQL BIGINT UNSIGNED values above i64::MAX.
+        Types::BIGINT => get_column_as_string(env, result_set, column_index),
+        Types::FLOAT | Types::REAL | Types::DOUBLE => {
             let value = jni!(
                 env,
                 env.call_method(
@@ -1422,7 +1622,7 @@ fn extract_column_value(
                     &[JValue::Int(column_index)]
                 )
                 .and_then(|v| v.d()),
-                "Failed to get double"
+                "Failed to get floating-point value"
             );
             finite_float_or_null(env, result_set, value, column_index)
         }
@@ -1433,32 +1633,40 @@ fn extract_column_value(
         // Binary columns are base64-encoded so arbitrary bytes survive the
         // round-trip through JSON.
         Types::BINARY | Types::VARBINARY | Types::LONGVARBINARY => {
-            let bytes_obj = jni!(
-                env,
-                env.call_method(
-                    result_set,
-                    "getBytes",
-                    "(I)[B",
-                    &[JValue::Int(column_index)]
-                )
-                .and_then(|v| v.l()),
-                "Failed to get bytes"
-            );
-            if bytes_obj.is_null() {
-                return Ok(serde_json::Value::Null);
-            }
-            let buf = jni!(
-                env,
-                env.convert_byte_array(JByteArray::from(bytes_obj)),
-                "Failed to convert bytes"
-            );
-            Ok(serde_json::Value::String(
-                base64::engine::general_purpose::STANDARD.encode(&buf),
-            ))
+            get_column_as_base64(env, result_set, column_index)
         }
         // Default: getString for all other types (CHAR, VARCHAR, etc.)
         _ => get_column_as_string(env, result_set, column_index),
     }
+}
+
+fn get_column_as_base64(
+    env: &mut JNIEnv,
+    result_set: &JObject,
+    column_index: i32,
+) -> Result<serde_json::Value, Error> {
+    let bytes_obj = jni!(
+        env,
+        env.call_method(
+            result_set,
+            "getBytes",
+            "(I)[B",
+            &[JValue::Int(column_index)]
+        )
+        .and_then(|value| value.l()),
+        "Failed to get bytes"
+    );
+    if bytes_obj.is_null() {
+        return Ok(serde_json::Value::Null);
+    }
+    let bytes = jni!(
+        env,
+        env.convert_byte_array(JByteArray::from(bytes_obj)),
+        "Failed to convert bytes"
+    );
+    Ok(serde_json::Value::String(
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+    ))
 }
 
 fn finite_float_or_null(
@@ -1527,12 +1735,12 @@ fn get_column_as_string(
 /// tracking value cannot be watermarked), so the tracking column must be
 /// NOT NULL; see the README.
 fn extract_offset_value(
-    row_data: &serde_json::Map<String, serde_json::Value>,
+    value: &serde_json::Value,
     col_name: &str,
     sql_type: i32,
 ) -> Result<Option<String>, Error> {
-    match row_data.get(col_name) {
-        Some(serde_json::Value::Number(number)) => {
+    match value {
+        serde_json::Value::Number(number) => {
             if matches!(sql_type, Types::FLOAT | Types::REAL | Types::DOUBLE)
                 && number.as_f64().is_some_and(|value| value == 0.0)
             {
@@ -1540,7 +1748,7 @@ fn extract_offset_value(
             }
             Ok(Some(number.to_string()))
         }
-        Some(serde_json::Value::String(value)) if !value.is_empty() => {
+        serde_json::Value::String(value) if !value.is_empty() => {
             if matches!(sql_type, Types::NUMERIC | Types::DECIMAL) {
                 let canonical = BigDecimal::from_str(value).map_err(|error| {
                     Error::InvalidRecordValue(format!(
@@ -1715,9 +1923,9 @@ impl Source for JdbcSource {
             self.validate_config()?;
 
             // JVM boot and DriverManager.getConnection are blocking JNI work. Run
-            // them via block_in_place (like poll()/close()) so they do not monopolize
-            // a shared async-runtime worker; the login timeout set in the connection
-            // path bounds how long a stuck connect can block.
+            // them via block_in_place so they do not monopolize a shared async-runtime
+            // worker; the login timeout set in the connection path bounds how long a
+            // stuck connect can block.
             tokio::task::block_in_place(|| -> Result<(), Error> {
                 self.initialize_jvm()?;
                 self.create_connection()?;
@@ -1744,13 +1952,18 @@ impl Source for JdbcSource {
         // retry still observes the configured poll interval.
         tokio::time::sleep(self.poll_interval).await;
 
-        // The JDBC/JNI fetch is synchronous, blocking work; run it via
-        // block_in_place so it does not monopolize a shared async-runtime worker
-        // while other connectors need to make progress. The connectors runtime is
-        // multi-threaded, which block_in_place requires.
-        let (messages, candidate_state) = tokio::task::block_in_place(
-            || -> Result<(Vec<ProducedMessage>, Option<State>), Error> {
-                let jvm = self
+        // A poll future can be dropped during shutdown while its blocking task
+        // remains alive. ActiveQuery keeps close() aware of that task and gives
+        // it the statement handle needed to cancel the JDBC call.
+        let active_query_guard = self.active_query.begin()?;
+        let source = self.clone();
+        let (messages, candidate_state) = tokio::task::spawn_blocking(
+            move || -> Result<(Vec<ProducedMessage>, Option<State>), Error> {
+                let _active_query_guard = active_query_guard;
+                if source.active_query.cancellation_requested()? {
+                    return Err(Error::Connection("JDBC query cancelled".to_string()));
+                }
+                let jvm = source
                     .jvm
                     .as_ref()
                     .ok_or_else(|| Error::InitError("JVM not initialized".to_string()))?;
@@ -1772,10 +1985,14 @@ impl Source for JdbcSource {
                     env.push_local_frame(16),
                     "Failed to push poll local frame"
                 );
-                let result = self.execute_query(&mut env);
-                finish_local_frame(&mut env, result)
+                let result = source.execute_query(&mut env);
+                let result = finish_local_frame(&mut env, result);
+                source.active_query.clear_statement()?;
+                result
             },
-        )?;
+        )
+        .await
+        .map_err(|error| Error::Connection(format!("JDBC polling task failed: {error}")))??;
 
         // Stage the advanced cursor rather than committing it. The runtime saves
         // the returned state only after the batch is sent, then reports the
@@ -1838,6 +2055,7 @@ impl Source for JdbcSource {
                 let Ok(mut env) = jvm.attach_current_thread() else {
                     return Ok(());
                 };
+                self.cancel_active_query_and_wait(&mut env)?;
                 let mut guard = lock_mutex(&self.connection, "connection")?;
                 if let Some(connection) = guard.as_ref() {
                     best_effort_close(&mut env, connection.as_obj());
@@ -1975,9 +2193,9 @@ fn get_or_create_jvm(
 /// driver. Drivers such as MySQL Connector/J do not expose parameter types with
 /// their default settings, so that case falls back to `setString` and lets the
 /// database coerce the cursor for the comparison.
-fn bind_offset_parameters(
-    env: &mut JNIEnv,
-    statement: &JObject,
+fn bind_offset_parameters<'local>(
+    env: &mut JNIEnv<'local>,
+    statement: &JObject<'local>,
     query: &PreparedQuery,
     connector_id: u32,
 ) -> Result<(), Error> {
@@ -2000,16 +2218,20 @@ fn bind_offset_parameters(
     for parameter_index in 1..=expected_count {
         let bind_result = if let Some(parameter_types) = parameter_types.as_ref() {
             let sql_type = parameter_types[(parameter_index - 1) as usize];
-            env.call_method(
-                statement,
-                "setObject",
-                "(ILjava/lang/Object;I)V",
-                &[
-                    JValue::Int(parameter_index),
-                    JValue::Object(&offset_object),
-                    JValue::Int(sql_type),
-                ],
-            )
+            if sql_type == Types::TIME {
+                bind_time_offset(env, statement, parameter_index, &offset_object)
+            } else {
+                env.call_method(
+                    statement,
+                    "setObject",
+                    "(ILjava/lang/Object;I)V",
+                    &[
+                        JValue::Int(parameter_index),
+                        JValue::Object(&offset_object),
+                        JValue::Int(sql_type),
+                    ],
+                )
+            }
         } else {
             env.call_method(
                 statement,
@@ -2023,6 +2245,28 @@ fn bind_offset_parameters(
         }
     }
     Ok(())
+}
+
+fn bind_time_offset<'local>(
+    env: &mut JNIEnv<'local>,
+    statement: &JObject<'local>,
+    parameter_index: i32,
+    offset: &JObject<'local>,
+) -> jni::errors::Result<JValueOwned<'local>> {
+    let local_time = env
+        .call_static_method(
+            "java/time/LocalTime",
+            "parse",
+            "(Ljava/lang/CharSequence;)Ljava/time/LocalTime;",
+            &[JValue::Object(offset)],
+        )?
+        .l()?;
+    env.call_method(
+        statement,
+        "setObject",
+        "(ILjava/lang/Object;)V",
+        &[JValue::Int(parameter_index), JValue::Object(&local_time)],
+    )
 }
 
 fn offset_parameter_types(
@@ -2708,7 +2952,7 @@ mod tests {
         config.tracking_column = Some("id".to_string());
         let source = JdbcSource::new(1, config, None);
         let err = source
-            .prepare_column_metadata(vec![("id".to_string(), 4), ("ID".to_string(), 4)])
+            .prepare_column_metadata(vec![("id".to_string(), 4, 10), ("ID".to_string(), 4, 10)])
             .expect_err("duplicate tracking labels must be rejected");
         assert!(matches!(err, Error::InvalidConfigValue(msg) if msg.contains("matches 2 columns")));
     }
@@ -2717,7 +2961,7 @@ mod tests {
     fn given_duplicate_bulk_labels_should_be_rejected() {
         let source = JdbcSource::new(1, base_config(), None);
         let error = source
-            .prepare_column_metadata(vec![("id".to_string(), 4), ("id".to_string(), 4)])
+            .prepare_column_metadata(vec![("id".to_string(), 4, 10), ("id".to_string(), 4, 10)])
             .expect_err("duplicate output keys must be rejected in every mode");
         assert!(
             matches!(error, Error::InvalidConfigValue(message) if message.contains("duplicate output key"))
@@ -2731,7 +2975,7 @@ mod tests {
         config.tracking_column = Some("id".to_string());
         let source = JdbcSource::new(1, config, None);
         let err = source
-            .prepare_column_metadata(vec![("name".to_string(), 12)])
+            .prepare_column_metadata(vec![("name".to_string(), 12, 255)])
             .expect_err("missing tracking label must be rejected");
         assert!(matches!(err, Error::InvalidConfigValue(msg) if msg.contains("not present")));
     }
@@ -2743,7 +2987,7 @@ mod tests {
         config.tracking_column = Some("cursor_value".to_string());
         let source = JdbcSource::new(1, config, None);
         let error = source
-            .prepare_column_metadata(vec![("cursor_value".to_string(), 12)])
+            .prepare_column_metadata(vec![("cursor_value".to_string(), 12, 255)])
             .expect_err("text cursors do not have a cross-database canonical representation");
         assert!(
             matches!(error, Error::InvalidConfigValue(message) if message.contains("canonical cursor representation"))
@@ -3316,10 +3560,17 @@ mod tests {
     #[test]
     fn given_built_message_should_leave_broker_timestamps_unset() {
         let source = JdbcSource::new(1, base_config(), None);
-        let mut row = serde_json::Map::new();
-        row.insert("id".to_string(), serde_json::json!(1));
+        let columns = [ColumnMetadata {
+            output_name: "id".to_string(),
+            sql_type: Types::INTEGER,
+            precision: 10,
+            is_tracking: false,
+        }];
+        let row = [serde_json::json!(1)];
 
-        let message = source.build_message(row).expect("message should build");
+        let message = source
+            .build_message(&columns, &row)
+            .expect("message should build");
 
         assert!(message.timestamp.is_none());
         assert!(message.origin_timestamp.is_none());
@@ -3611,33 +3862,29 @@ mod tests {
 
     #[test]
     fn given_integer_cursor_should_extract_as_string() {
-        let mut row = serde_json::Map::new();
-        row.insert("id".to_string(), serde_json::json!(42));
         assert_eq!(
-            extract_offset_value(&row, "id", Types::INTEGER).unwrap(),
+            extract_offset_value(&serde_json::json!(42), "id", Types::INTEGER).unwrap(),
             Some("42".to_string())
         );
     }
 
     #[test]
     fn given_timestamp_cursor_should_extract_unchanged() {
-        let mut row = serde_json::Map::new();
-        row.insert(
-            "updated_at".to_string(),
-            serde_json::json!("2024-06-15 12:00:00"),
-        );
         assert_eq!(
-            extract_offset_value(&row, "updated_at", Types::TIMESTAMP).unwrap(),
+            extract_offset_value(
+                &serde_json::json!("2024-06-15 12:00:00"),
+                "updated_at",
+                Types::TIMESTAMP,
+            )
+            .unwrap(),
             Some("2024-06-15 12:00:00".to_string())
         );
     }
 
     #[test]
     fn given_float_cursor_should_extract_as_string() {
-        let mut row = serde_json::Map::new();
-        row.insert("version".to_string(), serde_json::json!(3.5));
         assert_eq!(
-            extract_offset_value(&row, "version", Types::DOUBLE).unwrap(),
+            extract_offset_value(&serde_json::json!(3.5), "version", Types::DOUBLE).unwrap(),
             Some("3.5".to_string())
         );
     }
@@ -3645,10 +3892,8 @@ mod tests {
     #[test]
     fn given_signed_zero_float_cursors_should_have_one_canonical_form() {
         for value in [-0.0, 0.0] {
-            let mut row = serde_json::Map::new();
-            row.insert("version".to_string(), serde_json::json!(value));
             assert_eq!(
-                extract_offset_value(&row, "version", Types::DOUBLE).unwrap(),
+                extract_offset_value(&serde_json::json!(value), "version", Types::DOUBLE).unwrap(),
                 Some("0".to_string())
             );
         }
@@ -3657,10 +3902,9 @@ mod tests {
     #[test]
     fn given_equivalent_decimal_cursors_should_have_one_canonical_form() {
         for value in ["1", "1.0", "1.00"] {
-            let mut row = serde_json::Map::new();
-            row.insert("position".to_string(), serde_json::json!(value));
             assert_eq!(
-                extract_offset_value(&row, "position", Types::NUMERIC).unwrap(),
+                extract_offset_value(&serde_json::json!(value), "position", Types::NUMERIC)
+                    .unwrap(),
                 Some("1".to_string())
             );
         }
@@ -3668,20 +3912,9 @@ mod tests {
 
     #[test]
     fn given_null_cursor_should_not_extract() {
-        let mut row = serde_json::Map::new();
-        row.insert("id".to_string(), serde_json::Value::Null);
         // A SQL NULL tracking value must not become the persisted offset.
         assert_eq!(
-            extract_offset_value(&row, "id", Types::INTEGER).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn given_missing_cursor_column_should_not_extract() {
-        let row = serde_json::Map::new();
-        assert_eq!(
-            extract_offset_value(&row, "nonexistent", Types::INTEGER).unwrap(),
+            extract_offset_value(&serde_json::Value::Null, "id", Types::INTEGER).unwrap(),
             None
         );
     }

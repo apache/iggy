@@ -17,11 +17,14 @@
 
 use crate::connectors::fixtures::{
     JdbcBulkFixture, JdbcBulkOverflowFixture, JdbcBulkRowsFixture, JdbcIncrementalFixture,
-    JdbcLargeResultFixture, JdbcMetadataFixture, JdbcMySqlFixture, JdbcNumericTieBoundaryFixture,
-    JdbcQueryTimeoutFixture, JdbcRecoveryFixture, JdbcTextCursorFixture, JdbcTieBoundaryFixture,
+    JdbcLargeResultFixture, JdbcLockedMetadataFixture, JdbcMetadataFixture, JdbcMySqlFixture,
+    JdbcNumericTieBoundaryFixture, JdbcQueryTimeoutFixture, JdbcRecoveryFixture, JdbcSqliteFixture,
+    JdbcTextCursorFixture, JdbcTieBoundaryFixture, JdbcTimeCursorFixture,
 };
 use iggy::prelude::IggyClient;
-use iggy_common::{Consumer, Identifier, MessageClient, PollingStrategy};
+use iggy_common::{
+    CommitPolicy, Consumer, Identifier, MessageClient, PollOptions, PollingStrategy,
+};
 use integration::harness::{TestHarness, seeds};
 use integration::iggy_harness;
 use std::collections::BTreeSet;
@@ -254,12 +257,89 @@ async fn mysql_default_parameter_metadata_configuration_advances_offset(
     _fixture: JdbcMySqlFixture,
 ) {
     let client = harness.root_client().await.expect("root client");
-    let (ids, received) =
-        poll_until_ids_seen(&client, &consumer("jdbc_mysql"), &[1, 2], POLL_TIMEOUT).await;
+    let messages = poll_json_messages(&client, "jdbc_mysql", 2).await;
+    assert_eq!(messages.len(), 2, "expected two messages from MySQL");
+    let first = messages[0].get("data").expect("first row data");
+    let second = messages[1].get("data").expect("second row data");
+    assert_eq!(first["id"], 1);
+    assert_eq!(first["flag"], false);
+    assert_eq!(first["bits"], "Ag==");
+    assert_eq!(first["unsigned_value"], "18446744073709551615");
+    assert_eq!(second["id"], 2);
+    assert_eq!(second["flag"], true);
+    assert_eq!(second["bits"], "Aw==");
+    assert_eq!(second["unsigned_value"], "9223372036854775808");
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/jdbc/config_postgres.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_fractional_time_cursor_when_polling_should_advance_without_replay(
+    harness: &TestHarness,
+    _fixture: JdbcTimeCursorFixture,
+) {
+    let client = harness.root_client().await.expect("root client");
+    let (ids, received) = poll_until_ids_seen(
+        &client,
+        &consumer("jdbc_time_cursor"),
+        &[1, 2],
+        Duration::from_secs(5),
+    )
+    .await;
     assert_eq!(
         ids,
         vec![1, 2],
-        "expected ids 1,2 from MySQL, got {ids:?} from {received} messages"
+        "expected both fractional-time rows, got {ids:?} from {received} messages"
+    );
+    assert_eq!(received, 2, "fractional-time cursor must not replay row 1");
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/jdbc/config_postgres.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_sqlite_double_when_polling_should_preserve_precision(
+    harness: &TestHarness,
+    _fixture: JdbcSqliteFixture,
+) {
+    let client = harness.root_client().await.expect("root client");
+    let messages = poll_json_messages(&client, "jdbc_sqlite_double", 1).await;
+    let value = messages
+        .first()
+        .and_then(|message| message.get("data"))
+        .and_then(|data| data.get("value"))
+        .and_then(serde_json::Value::as_f64);
+    assert_eq!(value, Some(16_777_217.0));
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/jdbc/config_postgres.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_blocked_metadata_query_when_restarting_should_cancel_promptly(
+    harness: &TestHarness,
+    fixture: JdbcLockedMetadataFixture,
+) {
+    fixture
+        .wait_until_query_is_blocked()
+        .await
+        .expect("JDBC metadata query should block on the table lock");
+    let runtime = harness.connectors_runtime().expect("connectors runtime");
+    let restart = reqwest::Client::new()
+        .post(format!("{}/sources/jdbc_pg/restart", runtime.http_url()))
+        .send();
+    let response = tokio::time::timeout(Duration::from_secs(3), restart)
+        .await
+        .expect("restart should not wait for the JDBC query timeout")
+        .expect("restart request should be sent");
+    assert!(
+        response.status().is_success(),
+        "restart should succeed, got {}",
+        response.status()
     );
 }
 
@@ -355,11 +435,14 @@ async fn poll(client: &IggyClient, consumer: &Consumer) -> iggy_common::PolledMe
         .poll_messages(
             &stream,
             &topic,
-            None,
+            0,
             consumer,
             &PollingStrategy::next(),
-            POLL_BATCH,
-            true,
+            PollOptions {
+                count: POLL_BATCH,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll JDBC messages")

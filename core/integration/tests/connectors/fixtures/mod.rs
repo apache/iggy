@@ -84,8 +84,9 @@ pub use influxdb::{
 };
 pub use jdbc::{
     JdbcBulkFixture, JdbcBulkOverflowFixture, JdbcBulkRowsFixture, JdbcIncrementalFixture,
-    JdbcLargeResultFixture, JdbcMetadataFixture, JdbcMySqlFixture, JdbcNumericTieBoundaryFixture,
-    JdbcQueryTimeoutFixture, JdbcRecoveryFixture, JdbcTextCursorFixture, JdbcTieBoundaryFixture,
+    JdbcLargeResultFixture, JdbcLockedMetadataFixture, JdbcMetadataFixture, JdbcMySqlFixture,
+    JdbcNumericTieBoundaryFixture, JdbcQueryTimeoutFixture, JdbcRecoveryFixture, JdbcSqliteFixture,
+    JdbcTextCursorFixture, JdbcTieBoundaryFixture, JdbcTimeCursorFixture,
 };
 pub use meilisearch::{MeilisearchOps, MeilisearchSinkFixture, TEST_INDEX};
 pub use mongodb::{

@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture, seeds};
 use sha2::{Digest, Sha256};
 use sqlx::mysql::MySqlPoolOptions;
-use sqlx::{Pool, Postgres};
+use sqlx::{Pool, Postgres, Transaction};
 use testcontainers_modules::testcontainers::core::wait::LogWaitStrategy;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -40,6 +40,9 @@ const POSTGRES_DRIVER_SHA256: &str =
 const MYSQL_DRIVER_CLASS_ENTRY: &str = "com/mysql/cj/jdbc/Driver.class";
 const MYSQL_DRIVER_SHA256: &str =
     "e2a3b2fc726a1ac64e998585db86b30fa8bf3f706195b78bb77c5f99bf877bd9";
+const SQLITE_DRIVER_CLASS_ENTRY: &str = "org/sqlite/JDBC.class";
+const SQLITE_DRIVER_SHA256: &str =
+    "af3a3376391e186a0fed63ecd414b72a882bf452667b490a0be3abf85b637d3f";
 const MYSQL_IMAGE: &str = "mysql";
 const MYSQL_TAG: &str = "8.0.33";
 const MYSQL_PORT: u16 = 3306;
@@ -87,6 +90,8 @@ enum Scenario {
     BulkOverflow,
     TieBoundary,
     NumericTieBoundary,
+    TimeCursor,
+    LockedMetadata,
 }
 
 struct JdbcPostgresFixture {
@@ -143,6 +148,14 @@ impl JdbcPostgresFixture {
             Scenario::NumericTieBoundary => &[
                 "CREATE TABLE numeric_tie_test (id INT PRIMARY KEY, position NUMERIC NOT NULL)",
                 "INSERT INTO numeric_tie_test (id, position) VALUES (1, 1), (2, 2.0), (3, 2.00), (4, 3)",
+            ],
+            Scenario::TimeCursor => &[
+                "CREATE TABLE time_cursor_test (id INT PRIMARY KEY, cursor_value TIME(6) UNIQUE NOT NULL)",
+                "INSERT INTO time_cursor_test (id, cursor_value) VALUES (1, '12:00:00.123456'), (2, '12:00:00.123457')",
+            ],
+            Scenario::LockedMetadata => &[
+                "CREATE TABLE locked_cursor_test (id INT PRIMARY KEY)",
+                "INSERT INTO locked_cursor_test (id) VALUES (1)",
             ],
         };
         for statement in statements {
@@ -316,6 +329,76 @@ jdbc_fixture!(
     "position",
     None
 );
+jdbc_fixture!(
+    JdbcTimeCursorFixture,
+    Scenario::TimeCursor,
+    "SELECT id, cursor_value FROM time_cursor_test WHERE cursor_value > {last_offset} ORDER BY cursor_value",
+    "incremental",
+    1,
+    "cursor_value",
+    Some("00:00:00")
+);
+
+pub struct JdbcLockedMetadataFixture {
+    base: JdbcPostgresFixture,
+    pool: Pool<Postgres>,
+    _table_lock: Transaction<'static, Postgres>,
+}
+
+impl JdbcLockedMetadataFixture {
+    pub async fn wait_until_query_is_blocked(&self) -> Result<(), TestBinaryError> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let blocked = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE query LIKE '%locked_cursor_test%' AND wait_event_type = 'Lock')",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| fixture_error(format!("failed to inspect PostgreSQL locks: {error}")))?;
+            if blocked {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(fixture_error("JDBC query did not block on the table lock"));
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+#[async_trait]
+impl TestFixture for JdbcLockedMetadataFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let base = JdbcPostgresFixture::setup(Scenario::LockedMetadata).await?;
+        let lock_pool = base.create_pool().await?;
+        let pool = base.create_pool().await?;
+        let mut table_lock = lock_pool
+            .begin()
+            .await
+            .map_err(|error| fixture_error(format!("failed to begin table lock: {error}")))?;
+        sqlx::query("LOCK TABLE locked_cursor_test IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *table_lock)
+            .await
+            .map_err(|error| fixture_error(format!("failed to lock PostgreSQL table: {error}")))?;
+        Ok(Self {
+            base,
+            pool,
+            _table_lock: table_lock,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.base.envs(
+            "SELECT id FROM locked_cursor_test WHERE id > {last_offset} ORDER BY id",
+            "incremental",
+            1,
+            "id",
+            None,
+        );
+        envs.insert(ENV_QUERY_TIMEOUT.to_string(), "30000".to_string());
+        envs
+    }
+}
 
 pub struct JdbcQueryTimeoutFixture {
     base: JdbcPostgresFixture,
@@ -384,11 +467,15 @@ impl TestFixture for JdbcMySqlFixture {
                 }
             }
         };
-        sqlx::query("CREATE TABLE mysql_cursor_test (id INT PRIMARY KEY, name VARCHAR(32))")
+        sqlx::query(
+            "CREATE TABLE mysql_cursor_test (id INT PRIMARY KEY, name VARCHAR(32), flag BIT(1), bits BIT(8), unsigned_value BIGINT UNSIGNED)",
+        )
             .execute(&pool)
             .await
             .map_err(|error| fixture_error(format!("failed to create MySQL table: {error}")))?;
-        sqlx::query("INSERT INTO mysql_cursor_test (id, name) VALUES (1, 'a'), (2, 'b')")
+        sqlx::query(
+            "INSERT INTO mysql_cursor_test (id, name, flag, bits, unsigned_value) VALUES (1, 'a', b'0', b'00000010', 18446744073709551615), (2, 'b', b'1', b'00000011', 9223372036854775808)",
+        )
             .execute(&pool)
             .await
             .map_err(|error| fixture_error(format!("failed to seed MySQL: {error}")))?;
@@ -418,7 +505,7 @@ impl TestFixture for JdbcMySqlFixture {
             (ENV_MYSQL_PASSWORD.to_string(), MYSQL_PASSWORD.to_string()),
             (
                 ENV_MYSQL_QUERY.to_string(),
-                "SELECT id, name FROM mysql_cursor_test WHERE id > {last_offset} ORDER BY id"
+                "SELECT id, name, flag, bits, unsigned_value FROM mysql_cursor_test WHERE id > {last_offset} ORDER BY id"
                     .to_string(),
             ),
             (ENV_MYSQL_POLL_INTERVAL.to_string(), "100ms".to_string()),
@@ -429,6 +516,44 @@ impl TestFixture for JdbcMySqlFixture {
             ),
             (ENV_MYSQL_TOPIC.to_string(), seeds::names::TOPIC.to_string()),
             (ENV_MYSQL_SCHEMA.to_string(), "json".to_string()),
+        ])
+    }
+}
+
+pub struct JdbcSqliteFixture {
+    driver_jar_path: String,
+}
+
+#[async_trait]
+impl TestFixture for JdbcSqliteFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            driver_jar_path: sqlite_driver_jar().await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        HashMap::from([
+            (ENV_JDBC_URL.to_string(), "jdbc:sqlite::memory:".to_string()),
+            (ENV_DRIVER_CLASS.to_string(), "org.sqlite.JDBC".to_string()),
+            (
+                ENV_DRIVER_JAR_PATH.to_string(),
+                self.driver_jar_path.clone(),
+            ),
+            (ENV_USERNAME.to_string(), String::new()),
+            (ENV_PASSWORD.to_string(), String::new()),
+            (
+                ENV_QUERY.to_string(),
+                "SELECT 16777217.0 AS value".to_string(),
+            ),
+            (ENV_POLL_INTERVAL.to_string(), "100ms".to_string()),
+            (ENV_BATCH_SIZE.to_string(), "1".to_string()),
+            (ENV_MODE.to_string(), "bulk".to_string()),
+            (ENV_TRACKING_COLUMN.to_string(), "value".to_string()),
+            (ENV_INCLUDE_METADATA.to_string(), "true".to_string()),
+            (ENV_STREAM.to_string(), seeds::names::STREAM.to_string()),
+            (ENV_TOPIC.to_string(), seeds::names::TOPIC.to_string()),
+            (ENV_SCHEMA.to_string(), "json".to_string()),
         ])
     }
 }
@@ -449,6 +574,16 @@ async fn mysql_driver_jar() -> Result<String, TestBinaryError> {
         "https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/8.0.33/mysql-connector-j-8.0.33.jar",
         MYSQL_DRIVER_SHA256,
         MYSQL_DRIVER_CLASS_ENTRY,
+    )
+    .await
+}
+
+async fn sqlite_driver_jar() -> Result<String, TestBinaryError> {
+    jdbc_driver_jar(
+        "sqlite-jdbc-3.36.0.3.jar",
+        "https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/3.36.0.3/sqlite-jdbc-3.36.0.3.jar",
+        SQLITE_DRIVER_SHA256,
+        SQLITE_DRIVER_CLASS_ENTRY,
     )
     .await
 }
