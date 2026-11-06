@@ -82,8 +82,7 @@ enum ConsensusOperation: UInt8, Sendable, Hashable {
     /// plus the operations the server orders on the partition plane.
     var isInternal: Bool {
         switch self {
-        case .retireSession, .installConsumerGroupOwner, .transitionPartitionHistory, .retireConsumerGroupOwners,
-             .stateMachineCommand:
+        case .retireSession, .installConsumerGroupOwner, .transitionPartitionHistory, .retireConsumerGroupOwners, .stateMachineCommand:
             true
         default:
             rawValue >= Self.internalStart && rawValue < Self.metadataStart
