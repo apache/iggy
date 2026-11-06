@@ -425,14 +425,10 @@ function run_readme_commands() {
         set +e
         if [ "${cmd_timeout}" -gt 0 ] 2>/dev/null; then
             eval "portable_timeout ${cmd_timeout} ${command}"
-            local test_exit_code=$?
-            if [[ ${test_exit_code} -ne 0 && ${test_exit_code} -ne 124 ]]; then
-                EXAMPLES_EXIT_CODE=${test_exit_code}
-            fi
         else
             eval "${command}"
-            EXAMPLES_EXIT_CODE=$?
         fi
+        EXAMPLES_EXIT_CODE=$?
         set -e
 
         if [ "${EXAMPLES_EXIT_CODE}" -ne 0 ]; then
