@@ -18,6 +18,7 @@
 mod container;
 
 pub use container::{
-    DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergEnvAuthFixture, IcebergOps,
-    IcebergPartitionedTableFixture, IcebergPreCreatedFixture,
+    DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergCatalogRestartFixture, IcebergEnvAuthFixture,
+    IcebergOps, IcebergPartitionedTableFixture, IcebergPreCreatedFixture,
+    IcebergSkipInvalidRowsFixture,
 };

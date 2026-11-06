@@ -158,6 +158,41 @@ pub trait Sink: Send + Sync {
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error>;
 
+    /// Called once after [`Sink::open`] when the sink is configured for at-least-once delivery.
+    ///
+    /// Returning `Ok` promises that, from now on, a successful [`Sink::consume`] never drops a
+    /// message without failing the call, and that a successful [`Sink::flush`] proves that the
+    /// destination acknowledged every message of the covered partitions handed over so far.
+    /// Return [`Error::Unsupported`] when the sink, or the configuration it was opened with,
+    /// cannot keep that promise. The default does.
+    fn enable_at_least_once(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported(
+            "this sink does not support at-least-once delivery".to_owned(),
+        ))
+    }
+
+    /// Makes every message of `partitions` that [`Sink::consume`] accepted, up to and including
+    /// each listed offset, durable at the destination. The runtime stores consumer offsets only
+    /// after this returns `Ok`, and only calls it after [`Sink::enable_at_least_once`] succeeded.
+    ///
+    /// The runtime hands over again only the partitions of a failed call: the listed partitions
+    /// after a failed flush, and the partition of its messages after a failed `consume`. A sink
+    /// may drop what it buffered for those partitions, but must keep the
+    /// buffers of every other partition. Clearing them all would let a later flush prove
+    /// messages that were never written, and the runtime would store offsets past them.
+    ///
+    /// Every topic of the sink has a task of its own that calls the same instance, so `consume`
+    /// and `flush` of different topics run concurrently. Key buffers by topic and partition.
+    ///
+    /// A sink that writes inside `consume` keeps the default, which has nothing left to do.
+    async fn flush(
+        &self,
+        _topic_metadata: &TopicMetadata,
+        _partitions: &[FlushPartition],
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Invoked when the sink is closed, allowing it to perform any necessary cleanup.
     async fn close(&mut self) -> Result<(), Error>;
 }
@@ -415,6 +450,15 @@ pub struct MessagesMetadata {
     pub schema: Schema,
 }
 
+/// One partition of a [`Sink::flush`]: every message of it up to and including `offset` that
+/// the sink accepted must be durable once the flush succeeds.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlushPartition {
+    pub partition_id: u32,
+    pub offset: u64,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReceivedMessage {
@@ -583,6 +627,48 @@ pub enum Error {
     /// retried.
     #[error("State provider latched after a permanent state error")]
     StateLatched,
+    /// The sink cannot provide a capability the runtime asked for, such as at-least-once
+    /// delivery. Retrying the same request will not change the answer.
+    #[error("Unsupported: {0}")]
+    Unsupported(String),
+}
+
+impl Error {
+    /// Whether retrying the same messages cannot succeed. The runtime stops the delivery of an
+    /// at-least-once sink on a permanent error and retries a transient one.
+    pub const fn is_permanent(&self) -> bool {
+        match self {
+            Error::InvalidConfig
+            | Error::InvalidConfigValue(_)
+            | Error::InvalidRecord
+            | Error::InvalidRecordValue(_)
+            | Error::InvalidTransformer
+            | Error::InvalidPayloadType
+            | Error::InvalidJsonPayload
+            | Error::InvalidTextPayload
+            | Error::CannotDecode(_)
+            | Error::Serialization(_)
+            | Error::InvalidProtobufPayload
+            | Error::InvalidState
+            | Error::PermanentHttpError(_)
+            | Error::SchemaMismatch(_)
+            | Error::TransactionApplyError(_)
+            | Error::PermanentState(_)
+            | Error::StateLatched
+            | Error::Unsupported(_) => true,
+            Error::HttpRequestFailed(_)
+            | Error::InitError(_)
+            | Error::Storage(_)
+            | Error::CannotOpenStateFile
+            | Error::CannotReadStateFile
+            | Error::CannotWriteStateFile
+            | Error::Connection(_)
+            | Error::CannotStoreData(_)
+            | Error::WriteFailure(_)
+            | Error::CatalogCommitError(_)
+            | Error::TransientState(_) => false,
+        }
+    }
 }
 
 #[cfg(test)]

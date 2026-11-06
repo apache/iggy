@@ -27,7 +27,7 @@ verbose = true
 stream = "test_stream"
 topics = ["test_topic"]
 schema = "json"
-batch_length = 100
+batch_length = 1000
 consumer_group = "iceberg_sink_connector"
 
 [plugin_config]
@@ -43,3 +43,7 @@ store_secret_access_key = "password"
 store_region = "us-east-1"
 store_class = "s3"
 store_path_style_access = true
+invalid_rows = "fail"
+max_retries = 5
+retry_delay = "1s"
+max_retry_delay = "30s"
