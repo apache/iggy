@@ -157,7 +157,7 @@ async def produce_messages(client: IggyClient) -> None:
         except Exception as error:
             logger.error(f"Exception type: {type(error).__name__}, message: {error}")
             logger.exception(error)
-            break
+            raise
 
         await asyncio.sleep(interval)
 

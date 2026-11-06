@@ -74,18 +74,23 @@ async def connect(connection_string: str) -> IggyClient:
 
 def log_order(message_type: OrderType | str | None, payload: object) -> None:
     match message_type:
-        case OrderType.CREATED | "OrderCreated":
+        case OrderType.CREATED:
             logger.info(f"Order Created: {payload}")
-        case OrderType.CONFIRMED | "OrderConfirmed":
+        case OrderType.CONFIRMED:
             logger.info(f"Order Confirmed: {payload}")
-        case OrderType.REJECTED | "OrderRejected":
+        case OrderType.REJECTED:
             logger.info(f"Order Rejected: {payload}")
         case _:
             logger.warning(f"Received unknown message type: {message_type}")
 
 
 def handle_message(message: ReceiveMessage) -> None:
-    raw_payload = message.payload().decode("utf-8")
+    try:
+        raw_payload = message.payload().decode("utf-8")
+    except UnicodeDecodeError as error:
+        logger.error(f"Skipping message with invalid UTF-8 payload: {error}")
+        return
+
     logger.info(
         f"Handling message at offset {message.offset()} "
         f"with origin timestamp {message.origin_timestamp()}."
@@ -154,7 +159,7 @@ async def consume_messages(
             await asyncio.sleep(interval)
         except Exception as error:
             logger.exception(f"Exception occurred while consuming messages: {error}")
-            break
+            raise
 
     logger.info(f"Consumed {consumed_batches} batches of messages, exiting.")
 
