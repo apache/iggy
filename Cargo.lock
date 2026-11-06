@@ -7668,7 +7668,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_jdbc_source"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
