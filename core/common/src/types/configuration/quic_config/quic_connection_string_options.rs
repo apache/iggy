@@ -563,23 +563,29 @@ mod tests {
     #[test]
     fn deprecated_aliases_warn_on_every_occurrence_and_identify_replacements() {
         let warnings = capture_warnings(|| {
-            parse("reconnection_reestablish_after=100ms&reestablish_after=500ms&reconnection_reestablish_after=1s").unwrap();
-            parse("validate_certificate=false&tls_validate_certificate=true&validate_certificate=true").unwrap();
+            parse(
+                "reconnection_reestablish_after=100ms&reestablish_after=500ms&reconnection_reestablish_after=1s",
+            )
+            .unwrap();
+            parse(
+                "validate_certificate=false&tls_validate_certificate=true&validate_certificate=true",
+            )
+            .unwrap();
         });
         assert_eq!(
             warnings
-                .matches("option \`reconnection_reestablish_after\` is deprecated")
+                .matches("option `reconnection_reestablish_after` is deprecated")
                 .count(),
             2
         );
         assert_eq!(
             warnings
-                .matches("option \`validate_certificate\` is deprecated")
+                .matches("option `validate_certificate` is deprecated")
                 .count(),
             2
         );
-        assert!(warnings.contains("use \`reestablish_after\` instead"));
-        assert!(warnings.contains("use \`tls_validate_certificate\` instead"));
+        assert!(warnings.contains("use `reestablish_after` instead"));
+        assert!(warnings.contains("use `tls_validate_certificate` instead"));
 
         let warnings = capture_warnings(|| {
             parse("reestablish_after=500ms&tls_validate_certificate=true").unwrap();
@@ -592,6 +598,6 @@ mod tests {
                 Err(IggyError::InvalidConnectionString)
             ));
         });
-        assert!(warnings.contains("use \`tls_validate_certificate\` instead"));
+        assert!(warnings.contains("use `tls_validate_certificate` instead"));
     }
 }
