@@ -384,10 +384,13 @@ JDBC SQL types are automatically mapped to JSON:
   source's classpath. A JDBC source and a JDBC sink are separate shared libraries
   and **cannot both create a JVM in the same runtime process**. Run them in
   separate connectors-runtime processes.
-- **Blocking I/O.** JDBC calls go through JNI and are synchronous. The fetch in
-  `poll()` (and the close in `close()`) runs under `tokio::task::block_in_place`
-  so it does not monopolize a shared async-runtime worker, but the work is still
-  blocking; size the runtime and `poll_interval`/`batch_size` accordingly.
+- **Blocking I/O.** JDBC calls go through JNI and are synchronous. Each `poll()`
+  fetch runs on Tokio's blocking pool through `tokio::task::spawn_blocking`.
+  Startup and close use `tokio::task::block_in_place`, which lets the runtime
+  move unrelated async work to another worker while those calls complete. The
+  database work is still blocking; size `poll_interval` and `batch_size`
+  accordingly. During shutdown, the connector cancels the active statement and
+  aborts its connection before waiting for the blocking poll to finish.
 - **Bulk mode has no pagination beyond `batch_size`, and fails closed.** Row
   limiting uses JDBC `setMaxRows`. In bulk mode the connector probes with
   `batch_size + 1` rows and, if the result set is larger than `batch_size`,
@@ -415,9 +418,9 @@ JDBC SQL types are automatically mapped to JSON:
   database.
 - **Connection recovery.** The connection is validated with `Connection.isValid`
   each poll and transparently re-established (closing the old handle) if it has
-  dropped. The check runs on the shared `block_in_place` worker, so its timeout
+  dropped. The check runs inside the poll's blocking task, so its timeout
   (`connection_timeout_ms`) is intentionally converted to whole seconds and
-  capped at 5s: a dead connection must not block the worker for tens of seconds.
+  capped at 5s: a dead connection must not occupy that task for tens of seconds.
 - **Bounded database operations.** Each connection receives
   `query_timeout_ms` through `Connection.setNetworkTimeout`, covering parameter
   metadata and other driver network requests. Prepared statements also receive

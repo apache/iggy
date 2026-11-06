@@ -859,8 +859,8 @@ impl JdbcSource {
     /// Best-effort `Connection.isValid(timeout)` check. Returns false on any
     /// JNI error so the caller re-establishes the connection.
     fn connection_is_valid(&self, env: &mut JNIEnv, conn: &JObject) -> bool {
-        // Cap the liveness check short: it runs on a shared block_in_place worker,
-        // so a dead connection must not block it for tens of seconds.
+        // Cap the liveness check short: it runs inside the poll's blocking task,
+        // so a dead connection must not occupy that task for tens of seconds.
         let timeout_secs = (self.config.connection_timeout_ms / 1000).clamp(1, 5) as i32;
         match env
             .call_method(conn, "isValid", "(I)Z", &[JValue::Int(timeout_secs)])
@@ -2049,8 +2049,9 @@ impl Source for JdbcSource {
         info!("Closing JDBC source connector [{}]", self.id);
 
         if let Some(jvm) = self.jvm.as_ref() {
-            // Closing the JDBC connection is blocking JNI work; run it off the
-            // async worker like the poll path.
+            // Closing the JDBC connection is blocking JNI work. block_in_place
+            // lets the runtime move unrelated async work to another worker while
+            // cancellation and cleanup complete.
             tokio::task::block_in_place(|| -> Result<(), Error> {
                 let Ok(mut env) = jvm.attach_current_thread() else {
                     return Ok(());
