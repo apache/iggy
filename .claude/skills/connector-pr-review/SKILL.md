@@ -99,7 +99,8 @@ that state on success, then calls `on_batch_result(Ack | Nack)`. Only
 ### B4. Transient vs permanent errors
 
 - [ ] Infra/auth/schema-gone failures map to `Error::PermanentHttpError` /
-      `Error::InitError` / `Error::SchemaMismatch` — not `InvalidRecord`.
+      `Error::SchemaMismatch` — not `InvalidRecord`. `Error::InitError` is not on
+      `Error::is_permanent()`; use it for a failed `open()` only.
 - [ ] Retryable network/5xx/SQLSTATE map to transient variants
       (`HttpRequestFailed`, `Connection`, `CannotStoreData`).
 - [ ] Do **not** classify retryability by substring-matching `err.to_string()`.
@@ -291,7 +292,7 @@ These are "cheap" but burn full review rounds when missed.
 - [ ] `publish = false` in `[package]` — every in-tree plugin needs it, and
       it's easy to forget on a new crate (missed on S3 #3103 and Doris
       #3215, both caught in review).
-- [ ] Example TOML plugin path uses `../../target/release/lib…` like siblings.
+- [ ] Example TOML plugin path uses `target/release/lib…` like siblings.
 - [ ] Row added to `sinks/README.md` or `sources/README.md`.
 - [ ] Sample under `runtime/example_config/connectors/`.
 - [ ] README defaults **byte-equal** to consts in code (diff them).

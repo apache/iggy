@@ -122,6 +122,12 @@ pub struct TemplateSourceConfig {
 /// Read cursor. Kept as a plain `Option<String>` so it fits whatever ordering
 /// field your source uses (a timestamp, an auto-increment ID, an opaque
 /// pagination token, ...) — stringify it however makes sense for your data.
+///
+/// `new()` starts with `cursor: None` when no state exists or the stored state
+/// does not deserialize, so `fetch_records()` must define what `None` means.
+/// If the saved cursor is only valid for one endpoint, table or topic, add that
+/// identity as a field and drop the restored state in `new()` when it differs
+/// from the config; a cursor from another source would skip or repeat data.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct State {
     cursor: Option<String>,
@@ -132,7 +138,10 @@ struct State {
 /// `fetch_records()` actually produces.
 struct FetchedRecord {
     /// The value `cursor` should advance to once this record's batch is
-    /// acknowledged — typically this record's timestamp/ID/token.
+    /// acknowledged — typically this record's timestamp/ID/token. Values must
+    /// be unique and strictly increasing in fetch order: `fetch_records()`
+    /// resumes after the last one sent, so a repeated value after a bad record
+    /// would skip or repeat records.
     cursor_value: String,
     /// TODO(ConnectorDeveloper): set this from a true per-record identity —
     /// a numeric row PK, a hash of a document `_id`, an event UUID the
@@ -419,6 +428,7 @@ impl Source for TemplateSource {
                 state: None,
             });
         }
+        // Sleeping before every fetch caps throughput at `batch_size` per `poll_interval`.
         tokio::time::sleep(self.poll_interval).await;
 
         let client = self.client.as_ref().ok_or_else(|| {
@@ -432,7 +442,7 @@ impl Source for TemplateSource {
                 records
             }
             Err(err) => {
-                if !matches!(err, Error::PermanentHttpError(_)) {
+                if !err.is_permanent() {
                     self.circuit_breaker.record_failure().await;
                 }
                 return Err(err);

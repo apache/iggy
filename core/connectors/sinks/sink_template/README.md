@@ -41,7 +41,8 @@ What `consume()` does with each chunk of up to `batch_size` messages, in order:
    refusing the batch. Nothing reaches the destination while it waits, and the
    runtime does not poll Iggy again until `consume()` returns.
 2. It calls `push_batch()`.
-3. A transient error (`HttpRequestFailed`, `Connection`, `CannotStoreData`)
+3. A transient error (`HttpRequestFailed`, `Connection`, `CannotStoreData`,
+   `WriteFailure`, `Storage`, `TransientState`, `CatalogCommitError`)
    counts as one failed round toward the breaker. It waits with jittered
    exponential backoff (`retry_delay` up to `retry_max_delay`) and tries again.
 4. A permanent error (`Error::is_permanent()`, such as `PermanentHttpError` or
@@ -178,7 +179,8 @@ Waiting for a full batch means fewer, larger writes, and an idle topic costs one
 request to the server per `max_wait`. The cost is up to `max_wait` of latency on
 a quiet topic, and at most once a bigger batch is a bigger loss if the
 destination is down for longer than `max_delivery_time`. `min_count` must not exceed `batch_length`,
-`max_wait` must be above zero, and the server caps it at 30 s. `poll_interval`
+`max_wait` must be above zero, and the server shortens a longer wait to its
+`deferred_poll_max_wait` (default 30 s). `poll_interval`
 no longer exists for sinks; the runtime refuses to start a sink that sets it.
 
 ## Known limits

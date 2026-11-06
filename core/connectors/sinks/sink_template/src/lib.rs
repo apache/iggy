@@ -250,8 +250,9 @@ impl TemplateSink {
     /// `self.config.target`, via `self.client` (already retry-wrapped).
     ///
     /// The error you return decides what `consume()` does next:
-    /// - `Error::HttpRequestFailed`, `Error::Connection` and
-    ///   `Error::CannotStoreData` (network error, 5xx, timeout) are transient.
+    /// - `Error::HttpRequestFailed`, `Error::Connection`, `Error::CannotStoreData`,
+    ///   `Error::WriteFailure`, `Error::Storage`, `Error::TransientState` and
+    ///   `Error::CatalogCommitError` (network error, 5xx, timeout) are transient.
     ///   `consume()` retries the same chunk with backoff until
     ///   `max_delivery_time` runs out, and each failed round counts toward the
     ///   circuit breaker. At least once, the failed call then makes the
@@ -522,7 +523,13 @@ fn dedup_key(
 fn is_transient(error: &Error) -> bool {
     matches!(
         error,
-        Error::HttpRequestFailed(_) | Error::Connection(_) | Error::CannotStoreData(_)
+        Error::HttpRequestFailed(_)
+            | Error::Connection(_)
+            | Error::CannotStoreData(_)
+            | Error::WriteFailure(_)
+            | Error::Storage(_)
+            | Error::TransientState(_)
+            | Error::CatalogCommitError(_)
     )
 }
 
@@ -1088,6 +1095,19 @@ mod tests {
 
         assert!(matches!(result, Err(Error::InitError(_))));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn given_non_permanent_driver_errors_should_be_transient_except_init_error() {
+        for error in [
+            Error::WriteFailure("w".to_string()),
+            Error::Storage("s".to_string()),
+            Error::TransientState("t".to_string()),
+            Error::CatalogCommitError("c".to_string()),
+        ] {
+            assert!(is_transient(&error), "{error} must be retried");
+        }
+        assert!(!is_transient(&Error::InitError("i".to_string())));
     }
 
     #[tokio::test(start_paused = true)]

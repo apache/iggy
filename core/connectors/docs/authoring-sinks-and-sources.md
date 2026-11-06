@@ -216,7 +216,7 @@ first hot-path call after sleep.
    testcontainers or wiremock). No false-green mocks.
 5. Row in `sinks/README.md` or `sources/README.md`.
 6. Sample TOML under `runtime/example_config/connectors/` with plugin
-   path `../../target/release/lib…`.
+   path `target/release/lib…`.
 7. README defaults **byte-equal** to code consts.
 8. Honest delivery-semantics paragraph.
 

@@ -20,9 +20,9 @@ shipping:
    it. On Path B the error is returned at once. Either way the runtime polls
    again after `poll_interval`.
 2. **Permanent failure** (auth rejected, schema gone): return
-   `Error::PermanentHttpError` from `fetch_records()` — `poll()` does not
-   trip the circuit breaker on it, since a bad config/auth state isn't a
-   connectivity signal the breaker should react to.
+   `Error::PermanentHttpError` (or any `Error::is_permanent()` variant) from
+   `fetch_records()` — `poll()` does not trip the circuit breaker on it, since
+   a bad config/auth state isn't a connectivity signal the breaker should react to.
    A record that cannot be converted is different: set
    `FetchedRecord::payload` to `Err(Error::InvalidRecordValue(..))`. `poll()`
    sends the records before it and stops, and never moves the cursor past it. A
@@ -34,7 +34,16 @@ shipping:
    *candidate* state; the runtime persists it only after the batch is sent,
    then reports `Ack`/`Nack`. A NACK (or a crash between send and the
    persisted-state write) redelivers the same range on the next poll.
-4. **Dedup key**: set `FetchedRecord::natural_id` from a true per-record
+4. **Restart without state**: when no state exists, or the stored state does not
+   deserialize, the source starts with `cursor = None` and logs a warning.
+   `fetch_records()` decides what that means: from the beginning (duplicates,
+   nothing lost) or from now (no duplicates, the gap is lost). Persisted state
+   that belongs to one endpoint, table or topic must carry that identity, and
+   `new()` must drop it when the config differs.
+5. **Throughput**: `poll()` sleeps `poll_interval` before every fetch, even
+   after a full batch. The source delivers at most `batch_size` records per
+   `poll_interval`. Raise `batch_size` or lower `poll_interval` for more.
+6. **Dedup key**: set `FetchedRecord::natural_id` from a true per-record
    identity (row PK, document `_id`, event UUID) whenever your source has
    one — it becomes `ProducedMessage.id`, which a downstream sink can key an
    idempotent upsert on (see `mongodb_sink`) so the redelivery above doesn't
@@ -123,7 +132,9 @@ and one is documentation:
    beginning, or from "now" - whichever fits your source). Map each result
    to a `FetchedRecord { cursor_value, natural_id, payload }`, using something
    monotonically increasing as `cursor_value` (a timestamp, an ID, a page
-   token) - that's what lets the cursor-staging logic advance correctly.
+   token) - that's what lets the cursor-staging logic advance correctly. The
+   values must be unique and strictly increasing in fetch order, because the
+   next fetch resumes after the last one sent.
 2. **`connection_string`'s doc comment** (documentation only) - describe
    the exact shape your connector expects instead of the generic example.
 

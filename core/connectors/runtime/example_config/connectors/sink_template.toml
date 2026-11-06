@@ -35,7 +35,8 @@ batch_length = 100
 # expires. These replace `poll_interval`, which the runtime refuses for sinks.
 # Waiting for a full batch means fewer, larger writes to the destination, and an
 # idle topic costs one request per `max_wait`. `min_count` must not exceed
-# `batch_length`; `max_wait` must be above zero, and the server caps it at 30s.
+# `batch_length`; `max_wait` must be above zero. The server shortens a longer
+# wait to its `deferred_poll_max_wait` (default 30s).
 max_wait = "2s"
 min_count = 100
 consumer_group = "template_sink_connector"
