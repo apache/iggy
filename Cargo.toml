@@ -31,6 +31,7 @@ members = [
     "core/common",
     "core/configs",
     "core/configs_derive",
+    "core/conformance",
     "core/consensus",
     "core/cpu_allocation",
     "core/harness_derive",
@@ -250,6 +251,7 @@ send_wrapper = "0.6.0"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.154"
 serde_with = { version = "3.24.0", features = ["base64", "macros"] }
+serde_yaml_ng = "0.10.0"
 serial_test = "4.0.1"
 server = { path = "core/server", default-features = false }
 server_common = { path = "core/server_common" }
