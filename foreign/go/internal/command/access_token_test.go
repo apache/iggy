@@ -128,11 +128,8 @@ func TestPersonalAccessTokenCommandsMarshalBinary(t *testing.T) {
 			if !errors.Is(err, test.wantErr) {
 				t.Fatalf("error = %v, want %v", err, test.wantErr)
 			}
-			if test.wantErr != nil {
-				if got != nil {
-					t.Fatalf("command body = %x, want nil", got)
-				}
-				return
+			if got != nil && test.wantErr != nil {
+				t.Fatalf("command body = %x, want nil", got)
 			}
 			if !bytes.Equal(got, test.want) {
 				t.Fatalf("command body = %x, want %x", got, test.want)
