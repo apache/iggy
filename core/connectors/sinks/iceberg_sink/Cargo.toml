@@ -28,17 +28,17 @@ repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 publish = false
 
-[package.metadata.cargo-machete]
-ignored = ["dashmap"]
-
 [lib]
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
 arrow-array = { workspace = true }
 arrow-json = { workspace = true }
+arrow-schema = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
+http = { workspace = true }
+humantime = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-storage-opendal = { workspace = true }

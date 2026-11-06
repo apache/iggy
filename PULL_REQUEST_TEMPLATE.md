@@ -59,5 +59,8 @@ If AI tools were used, please answer:
 3. How did you verify the generated code works correctly?
 4. Can you explain every line of the code if asked?
 
+Maintainers can close agent-driven PRs without a code review.
+See https://github.com/apache/iggy/blob/master/CONTRIBUTING.md#agent-driven-prs
+
 If no AI tools were used, write "None" or delete this section.
 -->
