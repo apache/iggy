@@ -10,6 +10,13 @@ PRs without one may be closed at maintainer's discretion.
     - Maintainer may request for more details or a different approach
 3. Then code
 
+### Good First Issues
+
+The `good first issue` label marks issues for new contributors.
+
+Take only one good first issue. After that, pick issues without the label, so that the
+next new contributor can find one.
+
 ## High-Risk Areas
 
 These require design discussion in the issue before coding:
