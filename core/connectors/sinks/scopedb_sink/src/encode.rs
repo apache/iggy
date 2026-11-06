@@ -167,13 +167,10 @@ fn raw_json(payload: Payload) -> Result<Value, Error> {
 
 fn validate_numbers(value: &Value) -> Result<(), Error> {
     match value {
-        Value::Number(number) if number.as_i64().is_none() => {
-            let encoded = number.to_string();
-            if !encoded.contains(['.', 'e', 'E']) || number.as_f64().is_none() {
-                return Err(Error::InvalidRecordValue(
-                    "number exceeds the NDJSON input range".into(),
-                ));
-            }
+        Value::Number(number) if !number.is_i64() && !number.is_f64() => {
+            return Err(Error::InvalidRecordValue(
+                "number exceeds the NDJSON input range".into(),
+            ));
         }
         Value::Array(values) => {
             for value in values {
