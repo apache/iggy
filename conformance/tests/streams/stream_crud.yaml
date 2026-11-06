@@ -1,0 +1,100 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+schema_version: "1.0"
+description: An SDK creates, reads, lists, renames and deletes a stream by its numeric id.
+
+tests:
+  - description: Create a stream.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: create_stream
+        arguments: {name: stream-crud-create}
+        expect_result:
+          id: {$$capture: stream_id}
+          name: stream-crud-create
+          topics_count: 0
+          messages_count: 0
+          size_bytes: 0
+          topics: []
+      - object: client0
+        name: get_stream
+        arguments: {stream_id: {$$ref: stream_id}}
+        expect_result: {id: {$$ref: stream_id}, name: stream-crud-create}
+
+  - description: Get a stream by its numeric id.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: create_stream
+        arguments: {name: stream-crud-get}
+        expect_result: {id: {$$capture: stream_id}}
+      - object: client0
+        name: get_stream
+        arguments: {stream_id: {$$ref: stream_id}}
+        expect_result: {id: {$$ref: stream_id}, name: stream-crud-get, topics: []}
+
+  - description: List streams.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: create_stream
+        arguments: {name: stream-crud-list}
+        expect_result: {id: {$$capture: stream_id}}
+      - object: client0
+        name: get_streams
+        expect_result:
+          - {id: {$$ref: stream_id}, name: stream-crud-list, topics_count: 0}
+
+  - description: Rename a stream.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: create_stream
+        arguments: {name: stream-crud-update}
+        expect_result: {id: {$$capture: stream_id}}
+      - object: client0
+        name: update_stream
+        arguments: {stream_id: {$$ref: stream_id}, name: stream-crud-updated}
+      - object: client0
+        name: get_stream
+        arguments: {stream_id: {$$ref: stream_id}}
+        expect_result: {name: stream-crud-updated}
+
+  - description: Delete a stream.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: create_stream
+        arguments: {name: stream-crud-delete}
+        expect_result: {id: {$$capture: stream_id}}
+      - object: client0
+        name: delete_stream
+        arguments: {stream_id: {$$ref: stream_id}}
+      - object: client0
+        name: get_stream
+        arguments: {stream_id: {$$ref: stream_id}}
+        expect_result: null
+    outcome:
+      - name: get_streams
+        expect_result: []

@@ -97,4 +97,5 @@ jobs:
             storage
             simulator
             configs
+            conformance
             gateways

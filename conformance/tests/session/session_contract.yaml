@@ -1,0 +1,47 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+schema_version: "1.0"
+description: >-
+  Every SDK ends a call with the same error code when it has no session or no
+  primary, so an application handles a sign-out and an unavailable cluster the
+  same way in every language.
+
+tests:
+  - description: A call after sign-out fails as unauthenticated.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: logout_user
+      - object: client0
+        name: get_stream
+        arguments: {stream_id: 1}
+        expect_error: {name: unauthenticated}
+
+  - description: A sign-in that no primary accepts fails at its deadline.
+    run_on:
+      - topology: no_quorum
+    create_entities:
+      - client: {id: client0, node: no_quorum, login: none}
+    operations:
+      - object: client0
+        name: login_user
+        arguments:
+          username: {$$ref: root_username}
+          password: {$$ref: root_password}
+        expect_error: {name: transient_not_accepted}

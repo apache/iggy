@@ -1,0 +1,85 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+schema_version: "1.0"
+description: An SDK sends messages to one partition and polls them back in order.
+
+tests:
+  - description: Create a stream and a topic, send ten messages and poll them from offset 0.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: get_streams
+        expect_result: []
+      - object: client0
+        name: create_stream
+        arguments: {name: test-stream}
+        expect_result: {id: {$$capture: stream_id}, name: test-stream}
+      - object: client0
+        name: create_topic
+        arguments:
+          stream_id: {$$ref: stream_id}
+          name: test-topic
+          partitions_count: 3
+          message_expiry: never
+        expect_result:
+          id: {$$capture: topic_id}
+          name: test-topic
+          partitions_count: 3
+          partitions: {$$len: 3}
+      - object: client0
+        name: send_messages
+        arguments:
+          stream_id: {$$ref: stream_id}
+          topic_id: {$$ref: topic_id}
+          partitioning: {partition_id: 0}
+          messages:
+            - {id: "1", payload: test message 0}
+            - {id: "2", payload: test message 1}
+            - {id: "3", payload: test message 2}
+            - {id: "4", payload: test message 3}
+            - {id: "5", payload: test message 4}
+            - {id: "6", payload: test message 5}
+            - {id: "7", payload: test message 6}
+            - {id: "8", payload: test message 7}
+            - {id: "9", payload: test message 8}
+            - {id: "10", payload: test message 9}
+      - object: client0
+        name: poll_messages
+        arguments:
+          stream_id: {$$ref: stream_id}
+          topic_id: {$$ref: topic_id}
+          partition_id: 0
+          consumer: {consumer: 1}
+          strategy: {offset: 0}
+          count: 100
+        expect_result:
+          partition_id: 0
+          current_offset: 9
+          count: 10
+          messages:
+            - {offset: 0, id: "1", payload: test message 0}
+            - {offset: 1, id: "2", payload: test message 1}
+            - {offset: 2, id: "3", payload: test message 2}
+            - {offset: 3, id: "4", payload: test message 3}
+            - {offset: 4, id: "5", payload: test message 4}
+            - {offset: 5, id: "6", payload: test message 5}
+            - {offset: 6, id: "7", payload: test message 6}
+            - {offset: 7, id: "8", payload: test message 7}
+            - {offset: 8, id: "9", payload: test message 8}
+            - {offset: 9, id: "10", payload: test message 9}
