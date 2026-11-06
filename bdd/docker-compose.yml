@@ -33,11 +33,8 @@ services:
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
       - ./scenarios/leader_redirection.feature:/app/features/leader_redirection.feature
-      - ./scenarios/raw_command.feature:/app/features/raw_command.feature
       - ./scenarios/session_contract.feature:/app/features/session_contract.feature
-      - ./scenarios/stream_crud.feature:/app/features/stream_crud.feature
       - ./scenarios/stream_options.feature:/app/features/stream_options.feature
-      - ./scenarios/resource_options_patch.feature:/app/features/resource_options_patch.feature
       - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
       - ./scenarios/deferred_polling.feature:/app/features/deferred_polling.feature
     command:
@@ -47,11 +44,8 @@ services:
         case "$$BDD_FEATURE" in
           basic_messaging)    cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test basic_messaging ;;
           leader_redirection) cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test leader_redirection ;;
-          raw_command)        cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test raw_command ;;
           session_contract)   cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test session_contract ;;
-          stream_crud)        cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test stream_crud ;;
           stream_options)     cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test stream_options ;;
-          resource_options_patch) cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test resource_options_patch ;;
           metadata_changes)   cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test metadata_changes ;;
           deferred_polling)   cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test deferred_polling ;;
           *)                  cargo test -p bdd --features "$$BDD_RUST_FEATURES" ;;
@@ -70,9 +64,7 @@ services:
       - BDD_FEATURE=${BDD_FEATURE:-all}
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
-      - ./scenarios/raw_command.feature:/app/features/raw_command.feature
       - ./scenarios/stream_options.feature:/app/features/stream_options.feature
-      - ./scenarios/resource_options_patch.feature:/app/features/resource_options_patch.feature
       - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
       - ./scenarios/session_contract.feature:/app/features/session_contract.feature
       - ./scenarios/deferred_polling.feature:/app/features/deferred_polling.feature
@@ -83,10 +75,8 @@ services:
       - |
         case "$$BDD_FEATURE" in
           basic_messaging)        TEST_PATH='tests/test_basic_messaging.py' ;;
-          raw_command)            TEST_PATH='tests/test_raw_command.py' ;;
           session_contract)       TEST_PATH='tests/test_session_contract.py' ;;
           stream_options)         TEST_PATH='tests/test_stream_options.py' ;;
-          resource_options_patch) TEST_PATH='tests/test_resource_options_patch.py' ;;
           metadata_changes)       TEST_PATH='tests/test_metadata_changes.py' ;;
           deferred_polling)       TEST_PATH='tests/test_deferred_polling.py' ;;
           *)                      TEST_PATH='tests/' ;;
@@ -105,7 +95,6 @@ services:
       - BDD_FEATURE=${BDD_FEATURE:-all}
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
-      - ./scenarios/raw_command.feature:/app/features/raw_command.feature
       - ./scenarios/stream_options.feature:/app/features/stream_options.feature
       - ./scenarios/session_contract.feature:/app/features/session_contract.feature
       - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
@@ -116,7 +105,6 @@ services:
       - |
         case "$$BDD_FEATURE" in
           basic_messaging)  GROUP='--group basic-messaging' ;;
-          raw_command)      GROUP='--group raw-command' ;;
           session_contract) GROUP='--group session-contract' ;;
           stream_options)   GROUP='--group stream-options' ;;
           metadata_changes) GROUP='--group metadata-changes' ;;
@@ -156,10 +144,8 @@ services:
       - |
         case "$$BDD_FEATURE" in
           basic_messaging)        TAGS='--tags @basic-messaging' ;;
-          raw_command)            TAGS='--tags @raw-command' ;;
           session_contract)       TAGS='--tags @session-contract' ;;
           stream_options)         TAGS='--tags @stream-options' ;;
-          resource_options_patch) TAGS='--tags @resource-options-patch' ;;
           metadata_changes)       TAGS='--tags @metadata-changes' ;;
           deferred_polling)       TAGS='--tags @deferred-polling' ;;
           *)                      TAGS='' ;;
@@ -185,9 +171,7 @@ services:
         case "$$BDD_FEATURE" in
           basic_messaging)    FILTER='--filter-trait Category=basic-messaging' ;;
           leader_redirection) FILTER='--filter-trait Category=requires-leader-awareness' ;;
-          raw_command)        FILTER='--filter-trait Category=raw-command' ;;
           stream_options)     FILTER='--filter-trait Category=stream-options' ;;
-          resource_options_patch) FILTER='--filter-trait Category=resource-options-patch' ;;
           metadata_changes)   FILTER='--filter-trait Category=metadata-changes' ;;
           deferred_polling)   FILTER='--filter-trait Category=deferred-polling' ;;
           session_contract)   FILTER='--filter-trait Category=session-contract' ;;
@@ -208,11 +192,8 @@ services:
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
       - ./scenarios/leader_redirection.feature:/app/features/leader_redirection.feature
-      - ./scenarios/raw_command.feature:/app/features/raw_command.feature
       - ./scenarios/session_contract.feature:/app/features/session_contract.feature
-      - ./scenarios/stream_crud.feature:/app/features/stream_crud.feature
       - ./scenarios/stream_options.feature:/app/features/stream_options.feature
-      - ./scenarios/resource_options_patch.feature:/app/features/resource_options_patch.feature
       - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
       - ./scenarios/deferred_polling.feature:/app/features/deferred_polling.feature
     command:
@@ -222,11 +203,8 @@ services:
         case "$$BDD_FEATURE" in
           basic_messaging)    export CUCUMBER_FILTER_TAGS='@basic-messaging' ;;
           leader_redirection) export CUCUMBER_FILTER_TAGS='@requires-leader-awareness' ;;
-          raw_command)        export CUCUMBER_FILTER_TAGS='@raw-command' ;;
           session_contract)   export CUCUMBER_FILTER_TAGS='@session-contract' ;;
-          stream_crud)        export CUCUMBER_FILTER_TAGS='@stream-crud' ;;
           stream_options)     export CUCUMBER_FILTER_TAGS='@stream-options' ;;
-          resource_options_patch) export CUCUMBER_FILTER_TAGS='@resource-options-patch' ;;
           metadata_changes)   export CUCUMBER_FILTER_TAGS='@metadata-changes' ;;
           deferred_polling)   export CUCUMBER_FILTER_TAGS='@deferred-polling' ;;
         esac
@@ -257,9 +235,7 @@ services:
       - BDD_FEATURE=${BDD_FEATURE:-all}
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
-      - ./scenarios/raw_command.feature:/app/features/raw_command.feature
       - ./scenarios/stream_options.feature:/app/features/stream_options.feature
-      - ./scenarios/resource_options_patch.feature:/app/features/resource_options_patch.feature
       - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
       - ./scenarios/session_contract.feature:/app/features/session_contract.feature
       - ./scenarios/deferred_polling.feature:/app/features/deferred_polling.feature

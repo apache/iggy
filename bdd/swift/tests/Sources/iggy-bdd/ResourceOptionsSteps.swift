@@ -18,8 +18,8 @@
 import Foundation
 import Iggy
 
-/// `stream_options.feature` and `resource_options_patch.feature`, whose
-/// stream and topic steps `metadata_changes.feature` shares.
+/// `stream_options.feature`, whose stream and topic steps
+/// `metadata_changes.feature` shares.
 enum ResourceOptionsSteps {
     /// The partition every message of these scenarios goes to.
     static let partitionID: UInt32 = 0
@@ -30,7 +30,6 @@ enum ResourceOptionsSteps {
         registerStreams(into: &registry)
         registerMessages(into: &registry)
         registerTopics(into: &registry)
-        registerUsers(into: &registry)
     }
 
     private static func registerStreams(into registry: inout StepRegistry) {
@@ -46,7 +45,6 @@ enum ResourceOptionsSteps {
         registry.step("I create a stream named \"([^\"]+)\" with an encryption key of 32 bytes valued (\\d+)", keyed)
         registry.step("a stream named \"([^\"]+)\" with an encryption key of 32 bytes valued (\\d+) exists", keyed)
         registry.step("I create a stream named \"([^\"]+)\" without an encryption key", keyless)
-        registry.step("a stream named \"([^\"]+)\" exists", keyless)
         registry.step("the stream should report encryption key source \"([^\"]+)\"") { world, groups in
             let stream = try await fetchStream(world)
             try check(
@@ -129,62 +127,6 @@ enum ResourceOptionsSteps {
             let options = TopicCreateOptions(partitionsCount: try number(groups[1]), messageExpiry: .never)
             world.lastTopicID = try await world.requireClient().createTopic(streamID: try world.requireStream(), name: groups[0], options: options).id
         }
-        registry.step(
-            "a topic named \"([^\"]+)\" exists in the stream with message expiry (\\d+) microseconds and max topic size (\\d+) bytes"
-        ) { world, groups in
-            let options = TopicCreateOptions(
-                partitionsCount: 1, messageExpiry: .after(.microseconds(try number(groups[1], as: UInt64.self))),
-                maxTopicSize: .bytes(try number(groups[2])))
-            world.lastTopicID = try await world.requireClient().createTopic(streamID: try world.requireStream(), name: groups[0], options: options).id
-        }
-        registry.step("I update the topic message expiry to (\\d+) microseconds without a name") { world, groups in
-            try await updateTopic(world, TopicUpdateOptions(messageExpiry: .after(.microseconds(try number(groups[0], as: UInt64.self)))))
-        }
-        registry.step("I reset the topic option \"([^\"]+)\"") { world, groups in
-            try await updateTopic(
-                world, TopicOptionKey(rawValue: groups[0]).map { TopicUpdateOptions(reset: [$0]) } ?? TopicUpdateOptions(rawReset: [groups[0]]))
-        }
-        registry.step("I rename the topic to \"([^\"]+)\"") { world, groups in
-            try await updateTopic(world, TopicUpdateOptions(name: groups[0]))
-        }
-        registry.step("the topic name should be \"([^\"]+)\"") { world, groups in
-            let name = try await fetchTopic(world).name
-            try check(name == groups[0], "topic name is \(name), want \(groups[0])")
-        }
-        registry.step("the topic message expiry should be (\\d+) microseconds set explicitly") { world, groups in
-            let topic = try await fetchTopic(world)
-            let expected: UInt64 = try number(groups[0])
-            try check(topic.messageExpiry == .after(.microseconds(expected)), "message expiry is \(topic.messageExpiry), want \(expected) microseconds")
-            try check(topic.options[TopicOptionKey.messageExpiry.rawValue]?.explicit == true, "message expiry must be set explicitly")
-        }
-        registry.step("the topic max topic size should be (\\d+) bytes set explicitly") { world, groups in
-            let topic = try await fetchTopic(world)
-            let expected: UInt64 = try number(groups[0])
-            try check(topic.maxTopicSize == .bytes(expected), "max topic size is \(topic.maxTopicSize), want \(expected) bytes")
-            try check(topic.options[TopicOptionKey.maxTopicSize.rawValue]?.explicit == true, "max topic size must be set explicitly")
-        }
-        registry.step("the topic max topic size should be derived from the server default") { world, _ in
-            let option = try await fetchTopic(world).options[TopicOptionKey.maxTopicSize.rawValue]
-            try check(option?.explicit == false, "max topic size must be derived from the server default, got \(option.map { "\($0)" } ?? "nothing")")
-        }
-    }
-
-    private static func registerUsers(into registry: inout StepRegistry) {
-        registry.step("a user named \"([^\"]+)\" with password \"([^\"]+)\" exists") { world, groups in
-            try await createUser(world, username: groups[0], password: groups[1], permissions: nil)
-        }
-        registry.step("I update the user username to \"([^\"]+)\" and status to \"([^\"]+)\"") { world, groups in
-            let options = UserUpdateOptions(username: groups[0], status: try userStatus(groups[1]))
-            try await world.requireClient().updateUser(try world.requireUser(), options: options)
-        }
-        registry.step("the user should have username \"([^\"]+)\"") { world, groups in
-            let username = try await fetchUser(world).username
-            try check(username == groups[0], "username is \(username), want \(groups[0])")
-        }
-        registry.step("the user should have status \"([^\"]+)\"") { world, groups in
-            let status = try await fetchUser(world).status
-            try check(status == (try userStatus(groups[0])), "user status is \(status), want \(groups[0])")
-        }
     }
 
     static func createStream(_ world: World, name: String, options: StreamCreateOptions) async throws {
@@ -196,7 +138,6 @@ enum ResourceOptionsSteps {
 
     static func createUser(_ world: World, username: String, password: String, permissions: Permissions?) async throws {
         let user = try await world.requireClient().createUser(username: username, password: password, permissions: permissions)
-        world.userID = user.id
         world.createdUsers.append(user.id)
     }
 
@@ -247,10 +188,6 @@ enum ResourceOptionsSteps {
         return message
     }
 
-    private static func updateTopic(_ world: World, _ options: TopicUpdateOptions) async throws {
-        try await world.requireClient().updateTopic(streamID: try world.requireStream(), topicID: try world.requireTopic(), options: options)
-    }
-
     private static func optionFlags(_ world: World, _ key: String) throws -> OptionFlags {
         guard let spec = world.optionSpecs.first(where: { $0.key == key }) else {
             throw StepFailure("the catalog does not describe \(key)")
@@ -263,27 +200,5 @@ enum ResourceOptionsSteps {
             throw StepFailure("the stream is gone")
         }
         return stream
-    }
-
-    private static func fetchTopic(_ world: World) async throws -> TopicDetails {
-        guard let topic = try await world.requireClient().getTopic(streamID: try world.requireStream(), topicID: try world.requireTopic()) else {
-            throw StepFailure("the topic is gone")
-        }
-        return topic
-    }
-
-    private static func fetchUser(_ world: World) async throws -> UserInfoDetails {
-        guard let user = try await world.requireClient().getUser(try world.requireUser()) else {
-            throw StepFailure("the user is gone")
-        }
-        return user
-    }
-
-    private static func userStatus(_ name: String) throws -> UserStatus {
-        switch name {
-        case "active": .active
-        case "inactive": .inactive
-        default: throw StepFailure("unknown user status \(name)")
-        }
     }
 }

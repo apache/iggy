@@ -75,7 +75,6 @@ final class World: @unchecked Sendable {
 
     var lastSentMessage: IggyMessage?
     var lastPolled: PolledMessages?
-    var lastRawResponse: [UInt8]?
     var lastStreamID: UInt32?
     var lastStreamName: String?
     var lastTopicID: UInt32?
@@ -83,7 +82,6 @@ final class World: @unchecked Sendable {
     var lastTopicPartitions: UInt32?
 
     var streamKey: Data?
-    var userID: UInt32?
     var createdStreams: [UInt32] = []
     var createdUsers: [UInt32] = []
     var optionSpecs: [OptionSpec] = []
@@ -121,13 +119,6 @@ final class World: @unchecked Sendable {
             throw StepFailure("no topic was created in this scenario")
         }
         return Identifier(numeric: lastTopicID)
-    }
-
-    func requireUser() throws -> Identifier {
-        guard let userID else {
-            throw StepFailure("no user was created in this scenario")
-        }
-        return Identifier(numeric: userID)
     }
 
     func requirePoll() throws -> Task<PolledMessages, any Error> {

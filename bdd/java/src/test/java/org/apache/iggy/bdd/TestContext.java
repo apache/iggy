@@ -27,13 +27,10 @@ class TestContext {
     String serverAddr;
     Long lastStreamId;
     String lastStreamName;
-    boolean lastStreamWasFound;
     Long lastTopicId;
     String lastTopicName;
     Long lastTopicPartitions;
     PolledMessages lastPolledMessages;
     String lastSentMessage;
-    byte[] lastRawResponse;
-    RuntimeException lastRawError;
     RuntimeException lastCallError;
 }

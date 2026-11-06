@@ -24,14 +24,12 @@ import io.cucumber.java.en.Then;
 import io.cucumber.java.en.When;
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
-import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
-import org.apache.iggy.stream.StreamUpdate;
 import org.apache.iggy.topic.TopicDetails;
 
 import java.math.BigInteger;
@@ -45,7 +43,6 @@ import java.util.Optional;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class BasicMessagingSteps {
@@ -94,68 +91,6 @@ public class BasicMessagingSteps {
         Optional<StreamDetails> stream = getClient().streams().getStream(context.lastStreamId);
         assertTrue(stream.isPresent(), "Stream should exist");
         assertEquals(streamName, stream.get().name(), "Stream should have expected name");
-    }
-
-    @Given("a stream with name {string} exists")
-    public void streamExists(String streamName) {
-        createStream(streamName);
-    }
-
-    @When("I get the stream by its numeric ID")
-    public void getStreamByNumericId() {
-        Optional<StreamDetails> stream = getClient().streams().getStream(context.lastStreamId);
-        context.lastStreamName = stream.map(StreamDetails::name).orElse(null);
-    }
-
-    @Then("the returned stream should have name {string}")
-    public void returnedStreamHasName(String streamName) {
-        assertEquals(streamName, context.lastStreamName, "Stream should have expected name");
-    }
-
-    @When("I list all streams")
-    public void listAllStreams() {
-        List<StreamBase> streams = getClient().streams().getStreams();
-        context.lastStreamWasFound =
-                streams.stream().anyMatch(stream -> stream.id().equals(context.lastStreamId));
-    }
-
-    @Then("the stream list should contain the created stream")
-    public void streamListContainsCreatedStream() {
-        assertTrue(context.lastStreamWasFound, "Stream list should contain the created stream");
-    }
-
-    @When("I update the stream name to {string}")
-    public void updateStreamName(String streamName) {
-        getClient()
-                .streams()
-                .updateStream(
-                        context.lastStreamId,
-                        StreamUpdate.builder().name(streamName).build());
-    }
-
-    @Then("getting the stream by its numeric ID should return name {string}")
-    public void getStreamReturnsName(String streamName) {
-        getStreamByNumericId();
-        returnedStreamHasName(streamName);
-    }
-
-    @When("I delete the stream by its numeric ID")
-    public void deleteStreamByNumericId() {
-        getClient().streams().deleteStream(context.lastStreamId);
-    }
-
-    @Then("getting the stream by its numeric ID should return no stream")
-    public void getStreamReturnsNoStream() {
-        // The assertion is "not the stream we deleted", not "nothing at this id":
-        // the server hands out the lowest free stream id, so once these scenarios
-        // run concurrently against one server a fresh create can legitimately
-        // occupy the deleted stream's id. Named, so a missing pre-value fails
-        // here instead of making the comparison below vacuously true.
-        assertNotNull(context.lastStreamName, "Stream should have been created");
-        Optional<StreamDetails> stream = getClient().streams().getStream(context.lastStreamId);
-        assertTrue(
-                stream.isEmpty() || !stream.get().name().equals(context.lastStreamName),
-                "Deleted stream should not be returned");
     }
 
     @When("I create a topic with name {string} in stream {int} with {int} partitions")
@@ -261,58 +196,6 @@ public class BasicMessagingSteps {
 
         String lastPayload = new String(messages.get(messages.size() - 1).payload(), StandardCharsets.UTF_8);
         assertEquals(context.lastSentMessage, lastPayload, "Last message should match sent message");
-    }
-
-    @When("I send a raw command with code {int} and an empty payload")
-    public void sendRawCommand(int code) {
-        try {
-            context.lastRawResponse = getClient().sendBinaryRequest(code, new byte[0]);
-            context.lastRawError = null;
-        } catch (RuntimeException error) {
-            context.lastRawResponse = null;
-            context.lastRawError = error;
-        }
-    }
-
-    @When("I send a raw command with code {int} and an empty payload to replica {int}")
-    public void sendRawCommandToReplica(int code, int replica) {
-        try {
-            context.lastRawResponse = getClient().sendBinaryRequestToReplica(code, new byte[0], replica);
-            context.lastRawError = null;
-        } catch (RuntimeException error) {
-            context.lastRawResponse = null;
-            context.lastRawError = error;
-        }
-    }
-
-    @Then("the raw command should succeed with an empty response")
-    public void rawCommandSucceedsWithEmptyResponse() {
-        assertNull(context.lastRawError, "Raw command should succeed");
-        assertNotNull(context.lastRawResponse, "Raw response should be present");
-        assertEquals(0, context.lastRawResponse.length, "Raw response should be empty");
-    }
-
-    @Then("the raw command should succeed with a non-empty response")
-    public void rawCommandSucceedsWithNonEmptyResponse() {
-        assertNull(context.lastRawError, "Raw command should succeed");
-        assertNotNull(context.lastRawResponse, "Raw response should be present");
-        assertTrue(context.lastRawResponse.length > 0, "Raw response should not be empty");
-    }
-
-    @Then("the raw command should fail with an invalid command error")
-    public void rawCommandFailsWithInvalidCommand() {
-        assertNull(context.lastRawResponse, "Raw response should be absent");
-        assertTrue(context.lastRawError instanceof IggyServerException, "Expected an Iggy server error");
-        IggyServerException error = (IggyServerException) context.lastRawError;
-        assertEquals(IggyErrorCode.INVALID_COMMAND, error.getErrorCode());
-    }
-
-    @Then("the raw command should fail with an invalid identifier error")
-    public void rawCommandFailsWithInvalidIdentifier() {
-        assertNull(context.lastRawResponse, "Raw response should be absent");
-        assertTrue(context.lastRawError instanceof IggyServerException, "Expected an Iggy server error");
-        IggyServerException error = (IggyServerException) context.lastRawError;
-        assertEquals(IggyErrorCode.INVALID_IDENTIFIER, error.getErrorCode());
     }
 
     @Given("I have a cluster node that cannot reach quorum")

@@ -51,13 +51,10 @@ struct GlobalContext {
     std::uint64_t last_sent_id_lo = 0;
     std::string last_sent_payload;
     PolledData polled;
-    std::vector<std::uint8_t> raw_response;
-    std::string raw_error;
     // Public client for the option and metadata change steps, see sdk_client().
     std::optional<iggy::IggyBlockingClient> sdk;
     std::optional<std::uint32_t> last_stream_id;
     std::optional<std::uint32_t> last_topic_id;
-    std::optional<std::uint32_t> last_user_id;
     std::optional<std::vector<std::uint8_t>> last_stream_key;
     bool last_update_rejected = false;
     std::vector<iggy::OptionSpec> last_option_specs;

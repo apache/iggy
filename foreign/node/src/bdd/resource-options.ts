@@ -19,8 +19,8 @@ import assert from 'node:assert/strict';
 import { Given, When, Then } from '@cucumber/cucumber';
 import {
   Consumer, HeaderKeyFactory, HeaderValue, OptionsScope, Partitioning, PollingStrategy,
-  StreamEncryptionKey, UserStatus, encryptionKeyFingerprint,
-  type OptionSpec, type StreamOptionKey, type TopicOptionKey
+  StreamEncryptionKey, encryptionKeyFingerprint,
+  type OptionSpec, type StreamOptionKey
 } from '../wire/index.js';
 import type { Headers } from '../wire/message/header.utils.js';
 import type { TestWorld } from './world.js';
@@ -38,20 +38,6 @@ const fetchStream = async (world: TestWorld) => {
   const stream = await world.client.stream.get({ streamId: world.stream.id });
   assert.ok(stream, 'the stream exists');
   return stream;
-};
-
-const fetchTopic = async (world: TestWorld) => {
-  const topic = await world.client.topic.get({
-    streamId: world.stream.id, topicId: world.topic.id
-  });
-  assert.ok(topic, 'the topic exists');
-  return topic;
-};
-
-const fetchUser = async (world: TestWorld) => {
-  const user = await world.client.user.get({ userId: world.userId! });
-  assert.ok(user, 'the user exists');
-  return user;
 };
 
 const optionSpec = (world: TestWorld, key: string): OptionSpec => {
@@ -83,15 +69,6 @@ const pollFirst = async (world: TestWorld) => {
   return messages[0];
 };
 
-const updateTopic = async (
-  world: TestWorld,
-  update: { name?: string, messageExpiry?: bigint, reset?: TopicOptionKey[] }
-) => {
-  assert.ok(await world.client.topic.update({
-    streamId: world.stream.id, topicId: world.topic.id, ...update
-  }));
-};
-
 When(
   'I create a stream named {string} with an encryption key of 32 bytes valued {int}',
   async function (this: TestWorld, name: string, byte: number) {
@@ -112,10 +89,6 @@ When(
     await createStream(this, name);
   }
 );
-
-Given('a stream named {string} exists', async function (this: TestWorld, name: string) {
-  await createStream(this, name);
-});
 
 Then(
   'the stream should report encryption key source {string}',
@@ -245,89 +218,4 @@ Then(
 Then('the stream option {string} should be read only', function (this: TestWorld, key: string) {
   const spec = optionSpec(this, key);
   assert.ok(spec.readOnly && !spec.updatable && !spec.secret);
-});
-
-Given(
-  /^a topic named "([^"]+)" exists in the stream with message expiry (\d+) microseconds and max topic size (\d+) bytes$/,
-  async function (this: TestWorld, name: string, expiry: string, maxSize: string) {
-    this.topic = await this.client.topic.create({
-      streamId: this.stream.id, name, partitionCount: 1,
-      messageExpiry: BigInt(expiry), maxTopicSize: BigInt(maxSize)
-    });
-  }
-);
-
-When(
-  /^I update the topic message expiry to (\d+) microseconds without a name$/,
-  async function (this: TestWorld, expiry: string) {
-    await updateTopic(this, { messageExpiry: BigInt(expiry) });
-  }
-);
-
-When('I reset the topic option {string}', async function (this: TestWorld, key: string) {
-  await updateTopic(this, { reset: [key as TopicOptionKey] });
-});
-
-When('I rename the topic to {string}', async function (this: TestWorld, name: string) {
-  await updateTopic(this, { name });
-});
-
-Then('the topic name should be {string}', async function (this: TestWorld, name: string) {
-  assert.equal((await fetchTopic(this)).name, name);
-});
-
-Then(
-  /^the topic message expiry should be (\d+) microseconds set explicitly$/,
-  async function (this: TestWorld, expiry: string) {
-    const topic = await fetchTopic(this);
-    assert.equal(topic.messageExpiry, BigInt(expiry));
-    assert.equal(topic.options.message_expiry, BigInt(expiry));
-  }
-);
-
-Then(
-  /^the topic max topic size should be (\d+) bytes set explicitly$/,
-  async function (this: TestWorld, maxSize: string) {
-    const topic = await fetchTopic(this);
-    assert.equal(topic.maxTopicSize, BigInt(maxSize));
-    assert.equal(topic.options.max_topic_size, BigInt(maxSize));
-  }
-);
-
-Then(
-  'the topic max topic size should be derived from the server default',
-  async function (this: TestWorld) {
-    const topic = await fetchTopic(this);
-    assert.equal('max_topic_size' in topic.options, false);
-    assert.equal(topic.derivedOptions.max_topic_size, topic.maxTopicSize);
-  }
-);
-
-Given(
-  'a user named {string} with password {string} exists',
-  async function (this: TestWorld, username: string, password: string) {
-    const user = await this.client.user.create({
-      username, password, status: UserStatus.Active, options: []
-    });
-    this.userId = user.id;
-  }
-);
-
-When(
-  'I update the user username to {string} and status to {string}',
-  async function (this: TestWorld, username: string, status: string) {
-    assert.ok(await this.client.user.update({
-      userId: this.userId!,
-      username,
-      status: status === 'active' ? UserStatus.Active : UserStatus.Inactive
-    }));
-  }
-);
-
-Then('the user should have username {string}', async function (this: TestWorld, username: string) {
-  assert.equal((await fetchUser(this)).userName, username);
-});
-
-Then('the user should have status {string}', async function (this: TestWorld, status: string) {
-  assert.equal((await fetchUser(this)).status.toLowerCase(), status);
 });

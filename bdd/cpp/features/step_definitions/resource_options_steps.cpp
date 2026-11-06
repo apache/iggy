@@ -50,20 +50,6 @@ constexpr iggy::StreamOptionKey kStreamOptionKeys[] = {
     iggy::StreamOptionKey::EncryptionKekFingerprint,
 };
 
-constexpr iggy::TopicOptionKey kTopicOptionKeys[] = {
-    iggy::TopicOptionKey::Name,
-    iggy::TopicOptionKey::CompressionAlgorithm,
-    iggy::TopicOptionKey::MessageExpiry,
-    iggy::TopicOptionKey::MaxTopicSize,
-    iggy::TopicOptionKey::SegmentSize,
-    iggy::TopicOptionKey::Durability,
-    iggy::TopicOptionKey::ConsumerOffsetDurability,
-    iggy::TopicOptionKey::PartitionResizePolicy,
-    iggy::TopicOptionKey::MessagesRequiredToSave,
-    iggy::TopicOptionKey::SizeOfMessagesRequiredToSave,
-    iggy::TopicOptionKey::PreallocateSegments,
-};
-
 template <typename Key, std::size_t Count>
 Key KeyFromName(const Key (&keys)[Count], const std::string &name) {
     for (const auto key : keys) {
@@ -74,34 +60,12 @@ Key KeyFromName(const Key (&keys)[Count], const std::string &name) {
     throw std::invalid_argument("Unknown option key " + name);
 }
 
-iggy::UserStatus UserStatusFromName(const std::string &name) {
-    if (name == "active") {
-        return iggy::UserStatus::Active;
-    }
-    if (name == "inactive") {
-        return iggy::UserStatus::Inactive;
-    }
-    throw std::invalid_argument("Unknown user status " + name);
-}
-
 iggy::Identifier StreamIdentifier(const bdd::GlobalContext &context) {
     return iggy::Identifier::Numeric(context.last_stream_id.value());
 }
 
-iggy::Identifier TopicIdentifier(const bdd::GlobalContext &context) {
-    return iggy::Identifier::Numeric(context.last_topic_id.value());
-}
-
 iggy::StreamDetails FetchStream(bdd::GlobalContext &context) {
     return bdd::sdk_client(context).GetStream(StreamIdentifier(context));
-}
-
-iggy::TopicDetails FetchTopic(bdd::GlobalContext &context) {
-    return bdd::sdk_client(context).GetTopic(StreamIdentifier(context), TopicIdentifier(context));
-}
-
-iggy::UserInfoDetails FetchUser(bdd::GlobalContext &context) {
-    return bdd::sdk_client(context).GetUser(iggy::Identifier::Numeric(context.last_user_id.value()));
 }
 
 void CreateStream(bdd::GlobalContext &context,
@@ -158,10 +122,6 @@ const iggy::OptionSpec &StreamOptionSpec(const bdd::GlobalContext &context, cons
     throw std::runtime_error("Stream option " + key + " was not described");
 }
 
-void UpdateTopic(bdd::GlobalContext &context, const iggy::TopicUpdateOptions &options) {
-    bdd::sdk_client(context).UpdateTopic(StreamIdentifier(context), TopicIdentifier(context), options);
-}
-
 }  // namespace
 
 WHEN("^I create a stream named \"([^\"]+)\" with an encryption key of 32 bytes valued ([0-9]+)$") {
@@ -181,13 +141,6 @@ GIVEN("^a stream named \"([^\"]+)\" with an encryption key of 32 bytes valued ([
 }
 
 WHEN("^I create a stream named \"([^\"]+)\" without an encryption key$") {
-    REGEX_PARAM(std::string, name);
-    cucumber::ScenarioScope<bdd::GlobalContext> context;
-
-    CreateStream(*context, name, std::nullopt);
-}
-
-GIVEN("^a stream named \"([^\"]+)\" exists$") {
     REGEX_PARAM(std::string, name);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
@@ -355,109 +308,4 @@ THEN("^the stream option \"([^\"]+)\" should be read only$") {
 
     const auto &spec = StreamOptionSpec(*context, key);
     EXPECT_TRUE(spec.ReadOnly() && !spec.Updatable() && !spec.Secret());
-}
-
-GIVEN(
-    "^a topic named \"([^\"]+)\" exists in the stream with message expiry ([0-9]+) microseconds and max topic "
-    "size ([0-9]+) bytes$") {
-    REGEX_PARAM(std::string, name);
-    REGEX_PARAM(std::uint64_t, expiry);
-    REGEX_PARAM(std::uint64_t, max_size);
-    cucumber::ScenarioScope<bdd::GlobalContext> context;
-
-    CreateTopic(*context, name,
-                iggy::TopicCreateOptions()
-                    .SetPartitionsCount(1)
-                    .SetMessageExpiry(iggy::Expiry::Duration(expiry))
-                    .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(max_size)));
-}
-
-WHEN("^I update the topic message expiry to ([0-9]+) microseconds without a name$") {
-    REGEX_PARAM(std::uint64_t, expiry);
-    cucumber::ScenarioScope<bdd::GlobalContext> context;
-
-    UpdateTopic(*context, iggy::TopicUpdateOptions().SetMessageExpiry(iggy::Expiry::Duration(expiry)));
-}
-
-WHEN("^I reset the topic option \"([^\"]+)\"$") {
-    REGEX_PARAM(std::string, key);
-    cucumber::ScenarioScope<bdd::GlobalContext> context;
-
-    UpdateTopic(*context, iggy::TopicUpdateOptions().Reset(KeyFromName(kTopicOptionKeys, key)));
-}
-
-WHEN("^I rename the topic to \"([^\"]+)\"$") {
-    REGEX_PARAM(std::string, name);
-    cucumber::ScenarioScope<bdd::GlobalContext> context;
-
-    UpdateTopic(*context, iggy::TopicUpdateOptions().SetName(name));
-}
-
-THEN("^the topic name should be \"([^\"]+)\"$") {
-    REGEX_PARAM(std::string, name);
-    cucumber::ScenarioScope<bdd::GlobalContext> context;
-
-    EXPECT_EQ(FetchTopic(*context).Name(), name);
-}
-
-THEN("^the topic message expiry should be ([0-9]+) microseconds set explicitly$") {
-    REGEX_PARAM(std::uint64_t, expiry);
-    cucumber::ScenarioScope<bdd::GlobalContext> context;
-
-    const auto topic = FetchTopic(*context);
-    EXPECT_EQ(topic.MessageExpiry(), expiry);
-    EXPECT_EQ(topic.Options().Explicit().count(std::string(iggy::to_string(iggy::TopicOptionKey::MessageExpiry))), 1u);
-}
-
-THEN("^the topic max topic size should be ([0-9]+) bytes set explicitly$") {
-    REGEX_PARAM(std::uint64_t, max_size);
-    cucumber::ScenarioScope<bdd::GlobalContext> context;
-
-    const auto topic = FetchTopic(*context);
-    EXPECT_EQ(topic.MaxTopicSize(), max_size);
-    EXPECT_EQ(topic.Options().Explicit().count(std::string(iggy::to_string(iggy::TopicOptionKey::MaxTopicSize))), 1u);
-}
-
-THEN("^the topic max topic size should be derived from the server default$") {
-    cucumber::ScenarioScope<bdd::GlobalContext> context;
-
-    const auto topic = FetchTopic(*context);
-    const auto key   = std::string(iggy::to_string(iggy::TopicOptionKey::MaxTopicSize));
-    EXPECT_EQ(topic.Options().Explicit().count(key), 0u);
-    EXPECT_EQ(topic.Options().Derived().count(key), 1u);
-    EXPECT_EQ(topic.MaxTopicSize(), std::numeric_limits<std::uint64_t>::max());
-}
-
-GIVEN("^a user named \"([^\"]+)\" with password \"([^\"]+)\" exists$") {
-    REGEX_PARAM(std::string, username);
-    REGEX_PARAM(std::string, password);
-    cucumber::ScenarioScope<bdd::GlobalContext> context;
-
-    const auto user = bdd::sdk_client(*context).CreateUser(username, password, iggy::UserStatus::Active, std::nullopt,
-                                                           iggy::UserCreateOptions());
-    context->last_user_id = user.Id();
-}
-
-WHEN("^I update the user username to \"([^\"]+)\" and status to \"([^\"]+)\"$") {
-    REGEX_PARAM(std::string, username);
-    REGEX_PARAM(std::string, status);
-    cucumber::ScenarioScope<bdd::GlobalContext> context;
-
-    bdd::sdk_client(*context).UpdateUser(
-        iggy::Identifier::Numeric(context->last_user_id.value()),
-        iggy::UserUpdateOptions().SetUsername(username).SetStatus(UserStatusFromName(status)));
-}
-
-THEN("^the user should have username \"([^\"]+)\"$") {
-    REGEX_PARAM(std::string, username);
-    cucumber::ScenarioScope<bdd::GlobalContext> context;
-
-    EXPECT_EQ(FetchUser(*context).Username(), username);
-}
-
-THEN("^the user should have status \"([^\"]+)\"$") {
-    REGEX_PARAM(std::string, status);
-    cucumber::ScenarioScope<bdd::GlobalContext> context;
-
-    EXPECT_EQ(FetchUser(*context).Status(), UserStatusFromName(status));
 }

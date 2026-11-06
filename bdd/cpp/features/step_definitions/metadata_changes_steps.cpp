@@ -304,10 +304,9 @@ GIVEN("^a user named \"([^\"]+)\" with password \"([^\"]+)\" and no server permi
     REGEX_PARAM(std::string, password);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    const auto user = bdd::sdk_client(*context).CreateUser(
+    bdd::sdk_client(*context).CreateUser(
         username, password, iggy::UserStatus::Active,
         iggy::Permissions().SetGlobal(iggy::GlobalPermissions().SetReadServers(true)), iggy::UserCreateOptions());
-    context->last_user_id = user.Id();
 }
 
 WHEN("^I authenticate as \"([^\"]+)\" with password \"([^\"]+)\"$") {

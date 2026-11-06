@@ -197,7 +197,6 @@ cc_binary(
         "tests/bdd/deferred_polling_steps.cpp",
         "tests/bdd/messaging_steps.cpp",
         "tests/bdd/metadata_changes_steps.cpp",
-        "tests/bdd/raw_command_steps.cpp",
         "tests/bdd/resource_options_steps.cpp",
         "tests/bdd/session_contract_steps.cpp",
         "tests/bdd/world.hpp",

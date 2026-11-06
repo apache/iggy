@@ -53,17 +53,6 @@ func TestFeatures(t *testing.T) {
 			},
 		})
 	}
-	if feature == "all" || feature == "raw_command" {
-		suites = append(suites, godog.TestSuite{
-			ScenarioInitializer: initRawCommandScenario,
-			Options: &godog.Options{
-				Format:   "pretty",
-				Paths:    []string{"../../scenarios/raw_command.feature"},
-				Strict:   true,
-				TestingT: t,
-			},
-		})
-	}
 	if feature == "all" || feature == "session_contract" {
 		suites = append(suites, godog.TestSuite{
 			ScenarioInitializer: initSessionContractScenario,
@@ -82,17 +71,6 @@ func TestFeatures(t *testing.T) {
 			Options: &godog.Options{
 				Format:   "pretty",
 				Paths:    []string{"../../scenarios/stream_options.feature"},
-				Strict:   true,
-				TestingT: t,
-			},
-		})
-	}
-	if feature == "all" || feature == "resource_options_patch" {
-		suites = append(suites, godog.TestSuite{
-			ScenarioInitializer: initResourceOptionsScenario,
-			Options: &godog.Options{
-				Format:   "pretty",
-				Paths:    []string{"../../scenarios/resource_options_patch.feature"},
 				Strict:   true,
 				TestingT: t,
 			},

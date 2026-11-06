@@ -127,37 +127,6 @@ enum BasicMessagingSteps {
     }
 }
 
-/// `raw_command.feature`.
-enum RawCommandSteps {
-    static func register(into registry: inout StepRegistry) {
-        registry.step("I send a raw command with code (\\d+) and an empty payload") { world, groups in
-            let client = try world.requireClient()
-            let code: UInt32 = try number(groups[0])
-            await world.captureReply { try await client.sendRawRequest(code: code, payload: []) }
-        }
-        registry.step("I send a raw command with code (\\d+) and an empty payload to replica (\\d+)") { world, groups in
-            let client = try world.requireClient()
-            let code: UInt32 = try number(groups[0])
-            let replica: UInt8 = try number(groups[1])
-            await world.captureReply { try await client.sendRawRequest(code: code, payload: [], replica: replica) }
-        }
-        registry.step("the raw command should succeed with an empty response") { world, _ in
-            try check(world.lastError == nil, "the raw command failed: \(world.lastError.map { "\($0)" } ?? "")")
-            try check(world.lastRawResponse?.isEmpty == true, "expected an empty response, got \(world.lastRawResponse?.count ?? 0) bytes")
-        }
-        registry.step("the raw command should succeed with a non-empty response") { world, _ in
-            try check(world.lastError == nil, "the raw command failed: \(world.lastError.map { "\($0)" } ?? "")")
-            try check(world.lastRawResponse?.isEmpty == false, "expected a non-empty response")
-        }
-        registry.step("the raw command should fail with an invalid command error") { world, _ in
-            try world.expectFailure(.invalidCommand)
-        }
-        registry.step("the raw command should fail with an invalid identifier error") { world, _ in
-            try world.expectFailure(.invalidIdentifier)
-        }
-    }
-}
-
 /// `session_contract.feature`.
 enum SessionContractSteps {
     static func register(into registry: inout StepRegistry) {
@@ -199,12 +168,6 @@ extension World {
         } catch {
             lastError = error
         }
-    }
-
-    /// Runs a raw request whose reply or failure a later step checks.
-    func captureReply(_ call: () async throws -> [UInt8]) async {
-        lastRawResponse = nil
-        await capture { lastRawResponse = try await call() }
     }
 
     func expectFailure(_ code: IggyErrorCode) throws {

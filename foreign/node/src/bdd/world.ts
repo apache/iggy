@@ -38,13 +38,10 @@ export interface TestWorld {
   topic: Topic,
   sendMessages: CreateMessage[],
   polledMessages: Message[],
-  rawResponse?: Buffer,
-  rawError?: Error,
   /** Key the last stream was created with, absent for a keyless stream */
   streamKey?: Buffer,
   updateError?: unknown,
   optionSpecs?: OptionSpec[],
-  userId?: number,
   callError?: Error,
   /** Groups the metadata change steps read */
   changeGroups?: MetadataChangeGroup[],

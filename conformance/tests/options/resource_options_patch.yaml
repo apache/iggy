@@ -1,0 +1,96 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Converted from bdd/scenarios/resource_options_patch.feature.
+schema_version: "1.0"
+description: >-
+  An update of a topic or a user changes only the settings that it names, so it never resends
+  or silently resets the others.
+initial_data:
+  - name: create_stream
+    arguments: {name: patch-stream}
+  - name: create_topic
+    arguments:
+      stream_id: patch-stream
+      name: patch-topic
+      partitions_count: 1
+      message_expiry: 3600000000
+      max_topic_size: 1073741824
+
+tests:
+  - description: Update one topic setting.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: update_topic
+        arguments: {stream_id: patch-stream, topic_id: patch-topic, message_expiry: 7200000000}
+      - object: client0
+        name: get_topic
+        arguments: {stream_id: patch-stream, topic_id: patch-topic}
+        expect_result:
+          name: patch-topic
+          options:
+            message_expiry: {value: "7200000000", explicit: true}
+            max_topic_size: {value: "1073741824", explicit: true}
+
+  - description: Reset a topic setting to the server default.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: update_topic
+        arguments: {stream_id: patch-stream, topic_id: patch-topic, reset: [max_topic_size]}
+      - object: client0
+        name: get_topic
+        arguments: {stream_id: patch-stream, topic_id: patch-topic}
+        expect_result:
+          options:
+            max_topic_size: {explicit: false}
+            message_expiry: {value: "3600000000", explicit: true}
+
+  - description: Rename a topic.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: update_topic
+        arguments: {stream_id: patch-stream, topic_id: patch-topic, name: patch-renamed}
+      - object: client0
+        name: get_topic
+        arguments: {stream_id: patch-stream, topic_id: patch-renamed}
+        expect_result:
+          name: patch-renamed
+          options:
+            message_expiry: {value: "3600000000", explicit: true}
+            max_topic_size: {value: "1073741824", explicit: true}
+
+  - description: Update the username and the status of a user.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: admin
+        name: create_user
+        arguments: {username: patch-user, password: patch-password}
+        expect_result: {id: {$$capture: user_id}, username: patch-user, status: active}
+      - object: client0
+        name: update_user
+        arguments: {user_id: {$$ref: user_id}, username: patch-user-renamed, status: inactive}
+      - object: client0
+        name: get_user
+        arguments: {user_id: {$$ref: user_id}}
+        expect_result: {id: {$$ref: user_id}, username: patch-user-renamed, status: inactive}

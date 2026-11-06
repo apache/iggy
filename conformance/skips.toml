@@ -41,6 +41,22 @@ test = "topics/topic_crud.yaml#Create a topic with explicit settings and read th
 issue = "not filed yet"
 reason = "create_topic returns None: the binding drops the topic details that the Rust SDK returns"
 
+[[skip]]
+sdk = "csharp"
+test = "polling/deferred_polling.yaml#A committing poll whose reply is lost blocks its partition until abandoned."
+issue = "not filed yet: the SDK has no public disconnect"
+
+[[skip]]
+sdk = "node"
+test = "polling/deferred_polling.yaml#A committing poll whose reply is lost blocks its partition until abandoned."
+issue = "not filed yet: the SDK has no disconnect that keeps the client usable"
+
+[[divergence]]
+sdk = "node"
+test = "streams/stream_options.yaml#Rename a keyed stream."
+issue = "not filed yet"
+reason = "stream.get returns a stream without its topic list"
+
 [[divergence]]
 sdk = "cpp"
 test = "session/session_contract.yaml#A call after sign-out fails as unauthenticated."
@@ -68,6 +84,101 @@ issue = "not filed yet: the SDK cannot set the id of a message"
 sdk = "php"
 test = "messaging/basic_messaging.yaml#Create a stream and a topic, send ten messages and poll them from offset 0."
 issue = "not filed yet: the SDK has no get_streams"
+
+[[divergence]]
+sdk = "php"
+test = "metadata/metadata_changes.yaml#Follow stream changes from the latest position."
+issue = "not filed yet"
+reason = "option values carry no kind, and stream and topic details lack fields such as created_at and size_bytes"
+
+[[divergence]]
+sdk = "php"
+test = "metadata/metadata_changes.yaml#Filter changes by group."
+issue = "not filed yet"
+reason = "option values carry no kind, and stream and topic details lack fields such as created_at and size_bytes"
+
+[[divergence]]
+sdk = "php"
+test = "metadata/metadata_changes.yaml#Record a two-phase delete at its completion."
+issue = "not filed yet"
+reason = "option values carry no kind, and stream and topic details lack fields such as created_at and size_bytes"
+
+[[divergence]]
+sdk = "php"
+test = "metadata/metadata_changes.yaml#Keyed stream changes carry fingerprints and no key."
+issue = "not filed yet"
+reason = "option values carry no kind, and stream and topic details lack fields such as created_at and size_bytes"
+
+[[divergence]]
+sdk = "php"
+test = "metadata/metadata_changes.yaml#Rebuild from current state after the cursor expired."
+issue = "not filed yet"
+reason = "option values carry no kind, and stream and topic details lack fields such as created_at and size_bytes"
+
+[[divergence]]
+sdk = "php"
+test = "options/resource_options_patch.yaml#Update one topic setting."
+issue = "not filed yet"
+reason = "option values carry no kind, and stream and topic details lack fields such as created_at and size_bytes"
+
+[[divergence]]
+sdk = "php"
+test = "options/resource_options_patch.yaml#Reset a topic setting to the server default."
+issue = "not filed yet"
+reason = "option values carry no kind, and stream and topic details lack fields such as created_at and size_bytes"
+
+[[divergence]]
+sdk = "php"
+test = "options/resource_options_patch.yaml#Rename a topic."
+issue = "not filed yet"
+reason = "option values carry no kind, and stream and topic details lack fields such as created_at and size_bytes"
+
+[[skip]]
+sdk = "php"
+test = "options/resource_options_patch.yaml#Update the username and the status of a user."
+issue = "not filed yet: the SDK has no update_user"
+
+[[divergence]]
+sdk = "php"
+test = "polling/deferred_polling.yaml#A parked deferred poll answers when a message arrives."
+issue = "not filed yet"
+reason = "a received message has no origin_timestamp and no user headers"
+
+[[divergence]]
+sdk = "php"
+test = "polling/deferred_polling.yaml#A poll that commits on read stores the offset of its last message."
+issue = "not filed yet"
+reason = "a received message has no origin_timestamp and no user headers"
+
+[[divergence]]
+sdk = "php"
+test = "polling/deferred_polling.yaml#A cancelled deferred poll does not commit its consumer offset."
+issue = "not filed yet"
+reason = "a received message has no origin_timestamp and no user headers"
+
+[[divergence]]
+sdk = "php"
+test = "polling/deferred_polling.yaml#A partition reader returns the partition that holds messages."
+issue = "not filed yet"
+reason = "a received message has no origin_timestamp and no user headers"
+
+[[divergence]]
+sdk = "php"
+test = "polling/deferred_polling.yaml#A group consumer reads every partition that holds messages."
+issue = "not filed yet"
+reason = "a received message has no origin_timestamp and no user headers"
+
+[[divergence]]
+sdk = "php"
+test = "polling/deferred_polling.yaml#A group consumer that commits after processing resumes after its last message."
+issue = "not filed yet"
+reason = "a received message has no origin_timestamp and no user headers"
+
+[[divergence]]
+sdk = "php"
+test = "polling/deferred_polling.yaml#A committing poll whose reply is lost blocks its partition until abandoned."
+issue = "not filed yet"
+reason = "loginUser returns no identity"
 
 [[skip]]
 sdk = "php"
@@ -103,6 +214,35 @@ sdk = "php"
 test = "streams/stream_crud.yaml#Delete a stream."
 issue = "not filed yet"
 reason = "createStream returns nothing instead of the stream details"
+
+[[divergence]]
+sdk = "php"
+test = "streams/stream_options.yaml#Create a stream with its own key."
+issue = "not filed yet"
+reason = "createStream returns nothing instead of the stream details"
+
+[[divergence]]
+sdk = "php"
+test = "streams/stream_options.yaml#Create a stream with a server generated key."
+issue = "not filed yet"
+reason = "createStream returns nothing instead of the stream details"
+
+[[skip]]
+sdk = "php"
+test = "streams/stream_options.yaml#Send and poll a message with headers on a keyed stream."
+issue = "not filed yet: the SDK cannot send user headers"
+
+[[divergence]]
+sdk = "php"
+test = "streams/stream_options.yaml#Rename a keyed stream."
+issue = "not filed yet"
+reason = "option values carry no kind, and stream and topic details lack fields such as created_at and size_bytes"
+
+[[divergence]]
+sdk = "php"
+test = "streams/stream_options.yaml#A reset of the stream key is rejected."
+issue = "not filed yet"
+reason = "option values carry no kind, and stream and topic details lack fields such as created_at and size_bytes"
 
 [[divergence]]
 sdk = "php"

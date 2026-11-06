@@ -220,7 +220,7 @@ Then('the current state should list the same streams as the stream list', async 
 Given(
   'a user named {string} with password {string} and no server permissions exists',
   async function (this: TestWorld, username: string, password: string) {
-    const user = await this.client.user.create({
+    await this.client.user.create({
       username, password, status: UserStatus.Active,
       permissions: {
         global: {
@@ -231,7 +231,6 @@ Given(
         streams: []
       }
     });
-    this.userId = user.id;
   }
 );
 

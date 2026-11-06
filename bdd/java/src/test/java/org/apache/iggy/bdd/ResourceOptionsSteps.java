@@ -28,7 +28,6 @@ import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
-import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
@@ -42,13 +41,6 @@ import org.apache.iggy.stream.StreamOptions;
 import org.apache.iggy.stream.StreamUpdate;
 import org.apache.iggy.system.OptionSpec;
 import org.apache.iggy.system.OptionsScope;
-import org.apache.iggy.topic.TopicDetails;
-import org.apache.iggy.topic.TopicOptionKey;
-import org.apache.iggy.topic.TopicOptions;
-import org.apache.iggy.topic.TopicUpdate;
-import org.apache.iggy.user.UserOptions;
-import org.apache.iggy.user.UserStatus;
-import org.apache.iggy.user.UserUpdate;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
@@ -71,7 +63,6 @@ public final class ResourceOptionsSteps {
     private Long streamId;
     private Long createdStreamId;
     private Long topicId;
-    private Long userId;
     private String streamName;
     private byte[] streamKey;
     private boolean updateRejected;
@@ -91,9 +82,6 @@ public final class ResourceOptionsSteps {
         }
         if (streamId != null) {
             client.streams().deleteStream(streamId);
-        }
-        if (userId != null) {
-            client.users().deleteUser(userId);
         }
         client.close();
     }
@@ -121,11 +109,6 @@ public final class ResourceOptionsSteps {
         streamId = created.id();
         createdStreamId = streamId;
         streamName = name;
-    }
-
-    @Given("a stream named {string} exists")
-    public void streamExists(String name) {
-        createKeylessStream(name);
     }
 
     @Then("the stream should report encryption key source {string}")
@@ -268,111 +251,6 @@ public final class ResourceOptionsSteps {
         assertTrue(streamOption(key).readOnly());
     }
 
-    @Given(
-            "a topic named {string} exists in the stream with message expiry {long} microseconds and max topic size {long} bytes")
-    public void topicWithOptions(String name, long expiry, long maxSize) {
-        var options = TopicOptions.builder()
-                .messageExpiry(BigInteger.valueOf(expiry))
-                .maxTopicSize(BigInteger.valueOf(maxSize))
-                .build();
-        var created = client().topics().createTopic(StreamId.of(requireStreamId()), name, 1L, options);
-        topicId = created.id();
-    }
-
-    @When("I update the topic message expiry to {long} microseconds without a name")
-    public void updateTopicExpiry(long expiry) {
-        client().topics()
-                .updateTopic(
-                        StreamId.of(requireStreamId()),
-                        TopicId.of(requireTopicId()),
-                        TopicUpdate.builder()
-                                .messageExpiry(BigInteger.valueOf(expiry))
-                                .build());
-    }
-
-    @When("I reset the topic option {string}")
-    public void resetTopicOption(String key) {
-        client().topics()
-                .updateTopic(
-                        StreamId.of(requireStreamId()),
-                        TopicId.of(requireTopicId()),
-                        TopicUpdate.builder()
-                                .reset(TopicOptionKey.valueOf(key.toUpperCase()))
-                                .build());
-    }
-
-    @When("I rename the topic to {string}")
-    public void renameTopic(String name) {
-        client().topics()
-                .updateTopic(
-                        StreamId.of(requireStreamId()),
-                        TopicId.of(requireTopicId()),
-                        TopicUpdate.builder().name(name).build());
-    }
-
-    @Then("the topic name should be {string}")
-    public void topicName(String name) {
-        assertEquals(name, topic().name());
-    }
-
-    @Then("the topic message expiry should be {long} microseconds set explicitly")
-    public void topicExpiry(long expiry) {
-        assertEquals(
-                HeaderValue.fromUint64(BigInteger.valueOf(expiry)),
-                topic().options().get("message_expiry"));
-    }
-
-    @Then("the topic max topic size should be {long} bytes set explicitly")
-    public void topicMaxSize(long bytes) {
-        assertEquals(
-                HeaderValue.fromUint64(BigInteger.valueOf(bytes)),
-                topic().options().get("max_topic_size"));
-    }
-
-    @Then("the topic max topic size should be derived from the server default")
-    public void defaultTopicMaxSize() {
-        assertEquals(
-                BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE),
-                topic().derivedOptions().get("max_topic_size").asUint64());
-    }
-
-    @Given("a user named {string} with password {string} exists")
-    public void createUser(String name, String password) {
-        var created =
-                client().users().createUser(name, password, UserStatus.Active, Optional.empty(), UserOptions.empty());
-        userId = created.id();
-    }
-
-    @When("I update the user username to {string} and status to {string}")
-    public void updateUser(String name, String status) {
-        client().users()
-                .updateUser(
-                        UserId.of(requireUserId()),
-                        UserUpdate.builder()
-                                .username(name)
-                                .status(UserStatus.valueOf(
-                                        status.substring(0, 1).toUpperCase() + status.substring(1)))
-                                .build());
-    }
-
-    @Then("the user should have username {string}")
-    public void userName(String name) {
-        assertEquals(
-                name, client().users().getUser(requireUserId()).orElseThrow().username());
-    }
-
-    @Then("the user should have status {string}")
-    public void userStatus(String status) {
-        assertEquals(
-                status,
-                client().users()
-                        .getUser(requireUserId())
-                        .orElseThrow()
-                        .status()
-                        .name()
-                        .toLowerCase());
-    }
-
     static ResourceOptionsSteps current() {
         return current;
     }
@@ -405,12 +283,6 @@ public final class ResourceOptionsSteps {
         return client().streams().getStream(requireStreamId()).orElseThrow();
     }
 
-    private TopicDetails topic() {
-        return client().topics()
-                .getTopic(StreamId.of(requireStreamId()), TopicId.of(requireTopicId()))
-                .orElseThrow();
-    }
-
     private OptionSpec streamOption(String key) {
         return client().system().describeOptions(OptionsScope.Stream).stream()
                 .filter(option -> option.key().equals(key))
@@ -439,10 +311,5 @@ public final class ResourceOptionsSteps {
     private Long requireTopicId() {
         assertNotNull(topicId);
         return topicId;
-    }
-
-    private Long requireUserId() {
-        assertNotNull(userId);
-        return userId;
     }
 }

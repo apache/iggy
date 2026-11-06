@@ -1,0 +1,361 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Converted from bdd/scenarios/deferred_polling.feature. A deferred poll parks on the server
+# until a message arrives or its max wait ends. A second client sends while a poll of the
+# first one waits.
+schema_version: "1.0"
+description: >-
+  A poll, a partition reader and a consumer wait on the server until messages arrive, so a
+  new message reaches the caller at once without a polling loop.
+initial_data:
+  - name: create_stream
+    arguments: {name: orders}
+  - name: create_topic
+    arguments: {stream_id: orders, name: events, partitions_count: 3, message_expiry: never}
+  - name: create_consumer_group
+    arguments: {stream_id: orders, topic_id: events, name: readers}
+  - name: create_consumer_group
+    arguments: {stream_id: orders, topic_id: events, name: resumers}
+
+tests:
+  - description: A parked deferred poll answers when a message arrives.
+    create_entities:
+      - client: {id: poller}
+    operations:
+      - object: poller
+        name: poll_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partition_id: 0
+          strategy: {offset: 0}
+          count: 10
+          max_wait_ms: 10000
+        background: poll0
+      - object: orchestrator
+        name: wait
+        arguments: {duration_ms: 100}
+      - object: admin
+        name: send_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partitioning: {partition_id: 0}
+          messages: [{payload: wake-up}]
+      - object: orchestrator
+        name: await
+        arguments: {task: poll0}
+        within: 2s
+        expect_result:
+          messages: [{payload: wake-up}]
+
+  - description: A deferred poll without messages returns empty after its max wait.
+    create_entities:
+      - client: {id: poller}
+    operations:
+      - object: poller
+        name: poll_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partition_id: 1
+          strategy: {offset: 0}
+          count: 10
+          max_wait_ms: 1000
+        background: poll0
+      - object: orchestrator
+        name: await
+        arguments: {task: poll0}
+        not_before: 1s
+        within: 3s
+        expect_result: {messages: []}
+
+  - description: A poll that commits on read stores the offset of its last message.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: admin
+        name: send_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partitioning: {partition_id: 0}
+          messages: [{payload: one}]
+      - object: admin
+        name: send_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partitioning: {partition_id: 0}
+          messages: [{payload: two}]
+      - object: client0
+        name: poll_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partition_id: 0
+          consumer: {consumer: on-read}
+          strategy: next
+          count: 1
+          commit: on_read
+        expect_result:
+          messages: [{payload: one}]
+      - object: client0
+        name: poll_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partition_id: 0
+          consumer: {consumer: on-read}
+          strategy: next
+          count: 1
+        expect_result:
+          messages: [{payload: two}]
+
+  - description: A cancelled deferred poll does not commit its consumer offset.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: admin
+        name: send_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partitioning: {partition_id: 2}
+          messages: [{payload: unseen}]
+      - object: client0
+        name: poll_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partition_id: 2
+          consumer: {consumer: cancel-check}
+          strategy: next
+          count: 10
+          commit: on_read
+          min_count: 2
+          max_wait_ms: 1000
+        background: poll0
+      - object: orchestrator
+        name: wait
+        arguments: {duration_ms: 200}
+      - object: orchestrator
+        name: cancel
+        arguments: {task: poll0}
+      - object: orchestrator
+        name: wait
+        arguments: {duration_ms: 2000}
+      - object: client0
+        name: poll_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partition_id: 2
+          consumer: {consumer: cancel-check}
+          strategy: next
+          count: 10
+        expect_result:
+          messages: [{payload: unseen}]
+
+  - description: A partition reader returns the partition that holds messages.
+    run_on:
+      - capabilities: [reader]
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: build_reader
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partitions: [0, 1, 2]
+          start: {offset: 0}
+          max_wait_ms: 10000
+        save_result_as: reader0
+      - object: admin
+        name: send_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partitioning: {partition_id: 1}
+          messages: [{payload: ready}]
+      - object: reader0
+        name: next
+        within: 2s
+        expect_result:
+          partition_id: 1
+          messages: [{payload: ready}]
+
+  - description: A group consumer reads every partition that holds messages.
+    run_on:
+      - capabilities: [consumer]
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: build_consumer
+        arguments: {stream_id: orders, topic_id: events, group: readers, max_wait_ms: 10000, count: 10}
+        save_result_as: consumer0
+      - object: admin
+        name: send_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partitioning: {partition_id: 2}
+          messages: [{payload: first}]
+      - object: consumer0
+        name: next
+        within: 2s
+        expect_result: {partition_id: 2, message: {payload: first}}
+      - object: admin
+        name: send_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partitioning: {partition_id: 1}
+          messages: [{payload: second}]
+      - object: consumer0
+        name: next
+        within: 2s
+        expect_result: {partition_id: 1, message: {payload: second}}
+      - object: admin
+        name: send_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partitioning: {partition_id: 0}
+          messages: [{payload: third}]
+      - object: consumer0
+        name: next
+        within: 2s
+        expect_result: {partition_id: 0, message: {payload: third}}
+
+  - description: A group consumer that commits after processing resumes after its last message.
+    run_on:
+      - capabilities: [consumer]
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: admin
+        name: send_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partitioning: {partition_id: 0}
+          messages: [{payload: processed}]
+      - object: client0
+        name: build_consumer
+        arguments: {stream_id: orders, topic_id: events, group: resumers, max_wait_ms: 10000, count: 10, commit: after_processing}
+        save_result_as: consumer0
+      - object: consumer0
+        name: next
+        within: 2s
+        expect_result: {message: {payload: processed}}
+      - object: orchestrator
+        name: close
+        arguments: {entity: consumer0}
+      - object: admin
+        name: send_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partitioning: {partition_id: 0}
+          messages: [{payload: next}]
+      - object: client0
+        name: build_consumer
+        arguments: {stream_id: orders, topic_id: events, group: resumers, max_wait_ms: 10000, count: 10, commit: after_processing}
+        save_result_as: consumer1
+      - object: consumer1
+        name: next
+        within: 2s
+        expect_result: {message: {payload: next}}
+
+  - description: A committing poll whose reply is lost blocks its partition until abandoned.
+    run_on:
+      - capabilities: [abandon_operation]
+    create_entities:
+      - client: {id: client0}
+    operations:
+      # A first poll learns the route of the partition, so that the deferred poll goes out at
+      # once and parks before the disconnect.
+      - object: client0
+        name: poll_messages
+        arguments: {stream_id: orders, topic_id: events, partition_id: 0, strategy: first, count: 1}
+        expect_result: {messages: []}
+      - object: client0
+        name: poll_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partition_id: 0
+          consumer: {consumer: lost-check}
+          strategy: next
+          count: 10
+          commit: on_read
+          max_wait_ms: 10000
+        background: poll0
+      - object: orchestrator
+        name: wait
+        arguments: {duration_ms: 500}
+      - object: client0
+        name: disconnect
+      - object: orchestrator
+        name: await
+        arguments: {task: poll0}
+        within: 10s
+        expect_error: {name: fetch_progress_uncertain, operation_id: {$$capture: lost}}
+      - object: client0
+        name: connect
+      - object: client0
+        name: login_user
+        arguments:
+          username: {$$ref: root_username}
+          password: {$$ref: root_password}
+      - object: client0
+        name: poll_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partition_id: 0
+          consumer: {consumer: lost-check}
+          strategy: next
+          count: 10
+          commit: on_read
+        expect_error: {name: partition_lane_blocked, operation_id: {$$ref: lost}}
+      - object: client0
+        name: abandon_operation
+        arguments: {operation_id: {$$ref: lost}}
+      - object: admin
+        name: send_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partitioning: {partition_id: 0}
+          messages: [{payload: after}]
+      - object: client0
+        name: poll_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partition_id: 0
+          consumer: {consumer: lost-check}
+          strategy: next
+          count: 10
+          commit: on_read
+        expect_result:
+          messages: [{payload: after}]

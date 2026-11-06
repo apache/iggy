@@ -45,7 +45,6 @@ type resourceOptionsCtx struct {
 	streamName     string
 	streamKey      []byte
 	topicId        *uint32
-	userId         *uint32
 	createdStreams []uint32
 	createdUsers   []uint32
 	updateError    error
@@ -359,146 +358,6 @@ func (resourceOptionsSteps) optionSpec(ctx context.Context, key string) (iggcon.
 	return iggcon.OptionSpec{}, fmt.Errorf("the catalog does not describe %s", key)
 }
 
-func (resourceOptionsSteps) givenTopicWithSettings(ctx context.Context, name string, expiry, maxTopicSize uint64) error {
-	state := getResourceOptionsCtx(ctx)
-	partitions := uint32(1)
-	messageExpiry := iggcon.Duration(expiry)
-	topic, err := state.client.CreateTopic(ctx, streamIdentifier(state), name, &iggcon.TopicOptions{
-		PartitionsCount: &partitions,
-		MessageExpiry:   &messageExpiry,
-		MaxTopicSize:    &maxTopicSize,
-	})
-	if err != nil {
-		return fmt.Errorf("create topic %s: %w", name, err)
-	}
-	state.topicId = &topic.Id
-	return nil
-}
-
-func (s resourceOptionsSteps) whenUpdateTopicExpiry(ctx context.Context, expiry uint64) error {
-	messageExpiry := iggcon.Duration(expiry)
-	return s.updateTopic(ctx, iggcon.TopicUpdate{MessageExpiry: &messageExpiry})
-}
-
-func (s resourceOptionsSteps) whenResetTopicOption(ctx context.Context, key string) error {
-	return s.updateTopic(ctx, iggcon.TopicUpdate{Reset: []iggcon.TopicOptionKey{iggcon.TopicOptionKey(key)}})
-}
-
-func (s resourceOptionsSteps) whenRenameTopic(ctx context.Context, name string) error {
-	return s.updateTopic(ctx, iggcon.TopicUpdate{Name: &name})
-}
-
-func (resourceOptionsSteps) updateTopic(ctx context.Context, update iggcon.TopicUpdate) error {
-	state := getResourceOptionsCtx(ctx)
-	if err := state.client.UpdateTopic(ctx, streamIdentifier(state), topicIdentifier(state), update); err != nil {
-		return fmt.Errorf("update topic: %w", err)
-	}
-	return nil
-}
-
-func (s resourceOptionsSteps) thenTopicName(ctx context.Context, name string) error {
-	topic, err := s.fetchTopic(ctx)
-	if err != nil {
-		return err
-	}
-	if topic.Name != name {
-		return fmt.Errorf("topic name is %q, want %q", topic.Name, name)
-	}
-	return nil
-}
-
-func (s resourceOptionsSteps) thenTopicExpiryExplicit(ctx context.Context, expiry uint64) error {
-	topic, err := s.fetchTopic(ctx)
-	if err != nil {
-		return err
-	}
-	if uint64(topic.MessageExpiry) != expiry {
-		return fmt.Errorf("message expiry is %d, want %d", topic.MessageExpiry, expiry)
-	}
-	if _, explicit := topic.Options[string(iggcon.TopicOptionMessageExpiry)]; !explicit {
-		return errors.New("message expiry must be set explicitly")
-	}
-	return nil
-}
-
-func (s resourceOptionsSteps) thenTopicMaxSizeExplicit(ctx context.Context, maxTopicSize uint64) error {
-	topic, err := s.fetchTopic(ctx)
-	if err != nil {
-		return err
-	}
-	if topic.MaxTopicSize != maxTopicSize {
-		return fmt.Errorf("max topic size is %d, want %d", topic.MaxTopicSize, maxTopicSize)
-	}
-	if _, explicit := topic.Options[string(iggcon.TopicOptionMaxTopicSize)]; !explicit {
-		return errors.New("max topic size must be set explicitly")
-	}
-	return nil
-}
-
-func (s resourceOptionsSteps) thenTopicMaxSizeDerived(ctx context.Context) error {
-	topic, err := s.fetchTopic(ctx)
-	if err != nil {
-		return err
-	}
-	if _, explicit := topic.Options[string(iggcon.TopicOptionMaxTopicSize)]; explicit {
-		return errors.New("max topic size must no longer be explicit")
-	}
-	if _, derived := topic.DerivedOptions[string(iggcon.TopicOptionMaxTopicSize)]; !derived {
-		return errors.New("max topic size must be derived from the server default")
-	}
-	return nil
-}
-
-func (resourceOptionsSteps) givenUser(ctx context.Context, username, password string) error {
-	state := getResourceOptionsCtx(ctx)
-	user, err := state.client.CreateUser(ctx, username, password, iggcon.Active, nil, &iggcon.UserOptions{})
-	if err != nil {
-		return fmt.Errorf("create user %s: %w", username, err)
-	}
-	state.userId = &user.Id
-	state.createdUsers = append(state.createdUsers, user.Id)
-	return nil
-}
-
-func (resourceOptionsSteps) whenUpdateUser(ctx context.Context, username, status string) error {
-	state := getResourceOptionsCtx(ctx)
-	userStatus, err := parseUserStatus(status)
-	if err != nil {
-		return err
-	}
-	update := iggcon.UserUpdate{Username: &username, Status: &userStatus}
-	if err = state.client.UpdateUser(ctx, userIdentifier(state), update); err != nil {
-		return fmt.Errorf("update user: %w", err)
-	}
-	return nil
-}
-
-func (s resourceOptionsSteps) thenUserUsername(ctx context.Context, username string) error {
-	user, err := s.fetchUser(ctx)
-	if err != nil {
-		return err
-	}
-	if user.Username != username {
-		return fmt.Errorf("username is %q, want %q", user.Username, username)
-	}
-	return nil
-}
-
-func (s resourceOptionsSteps) thenUserStatus(ctx context.Context, status string) error {
-	user, err := s.fetchUser(ctx)
-	if err != nil {
-		return err
-	}
-	want, err := parseUserStatus(status)
-	if err != nil {
-		return err
-	}
-	if user.Status != want {
-		return fmt.Errorf("user status is %d, want %s", user.Status, status)
-	}
-	return nil
-}
-
 func (resourceOptionsSteps) fetchStream(ctx context.Context) (*iggcon.StreamDetails, error) {
 	state := getResourceOptionsCtx(ctx)
 	stream, err := state.client.GetStream(ctx, streamIdentifier(state))
@@ -506,24 +365,6 @@ func (resourceOptionsSteps) fetchStream(ctx context.Context) (*iggcon.StreamDeta
 		return nil, fmt.Errorf("get stream: %w", err)
 	}
 	return stream, nil
-}
-
-func (resourceOptionsSteps) fetchTopic(ctx context.Context) (*iggcon.TopicDetails, error) {
-	state := getResourceOptionsCtx(ctx)
-	topic, err := state.client.GetTopic(ctx, streamIdentifier(state), topicIdentifier(state))
-	if err != nil {
-		return nil, fmt.Errorf("get topic: %w", err)
-	}
-	return topic, nil
-}
-
-func (resourceOptionsSteps) fetchUser(ctx context.Context) (*iggcon.UserInfoDetails, error) {
-	state := getResourceOptionsCtx(ctx)
-	user, err := state.client.GetUser(ctx, userIdentifier(state))
-	if err != nil {
-		return nil, fmt.Errorf("get user: %w", err)
-	}
-	return user, nil
 }
 
 func initResourceOptionsScenario(sc *godog.ScenarioContext) {
@@ -536,7 +377,6 @@ func initResourceOptionsScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^I create a stream named "([^"]+)" with an encryption key of 32 bytes valued (\d+)$`, s.whenCreateKeyedStream)
 	sc.Step(`^a stream named "([^"]+)" with an encryption key of 32 bytes valued (\d+) exists$`, s.whenCreateKeyedStream)
 	sc.Step(`^I create a stream named "([^"]+)" without an encryption key$`, s.whenCreateKeylessStream)
-	sc.Step(`^a stream named "([^"]+)" exists$`, s.whenCreateKeylessStream)
 	sc.Step(`^the stream should report encryption key source "([^"]+)"$`, s.thenStreamSource)
 	sc.Step(`^the stream encryption key fingerprint should match the key$`, s.thenFingerprintMatchesKey)
 	sc.Step(`^the stream should report an encryption key fingerprint$`, s.thenStreamReportsFingerprint)
@@ -555,18 +395,6 @@ func initResourceOptionsScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^the stream option "([^"]+)" should be updatable and not secret$`, s.thenOptionUpdatable)
 	sc.Step(`^the stream option "([^"]+)" should be create only and secret$`, s.thenOptionCreateOnlySecret)
 	sc.Step(`^the stream option "([^"]+)" should be read only$`, s.thenOptionReadOnly)
-	sc.Step(`^a topic named "([^"]+)" exists in the stream with message expiry (\d+) microseconds and max topic size (\d+) bytes$`, s.givenTopicWithSettings)
-	sc.Step(`^I update the topic message expiry to (\d+) microseconds without a name$`, s.whenUpdateTopicExpiry)
-	sc.Step(`^I reset the topic option "([^"]+)"$`, s.whenResetTopicOption)
-	sc.Step(`^I rename the topic to "([^"]+)"$`, s.whenRenameTopic)
-	sc.Step(`^the topic name should be "([^"]+)"$`, s.thenTopicName)
-	sc.Step(`^the topic message expiry should be (\d+) microseconds set explicitly$`, s.thenTopicExpiryExplicit)
-	sc.Step(`^the topic max topic size should be (\d+) bytes set explicitly$`, s.thenTopicMaxSizeExplicit)
-	sc.Step(`^the topic max topic size should be derived from the server default$`, s.thenTopicMaxSizeDerived)
-	sc.Step(`^a user named "([^"]+)" with password "([^"]+)" exists$`, s.givenUser)
-	sc.Step(`^I update the user username to "([^"]+)" and status to "([^"]+)"$`, s.whenUpdateUser)
-	sc.Step(`^the user should have username "([^"]+)"$`, s.thenUserUsername)
-	sc.Step(`^the user should have status "([^"]+)"$`, s.thenUserStatus)
 	sc.After(resourceOptionsCleanup)
 }
 
@@ -596,20 +424,4 @@ func streamIdentifier(state *resourceOptionsCtx) iggcon.Identifier {
 func topicIdentifier(state *resourceOptionsCtx) iggcon.Identifier {
 	identifier, _ := iggcon.NewIdentifier(*state.topicId)
 	return identifier
-}
-
-func userIdentifier(state *resourceOptionsCtx) iggcon.Identifier {
-	identifier, _ := iggcon.NewIdentifier(*state.userId)
-	return identifier
-}
-
-func parseUserStatus(status string) (iggcon.UserStatus, error) {
-	switch status {
-	case "active":
-		return iggcon.Active, nil
-	case "inactive":
-		return iggcon.Inactive, nil
-	default:
-		return 0, fmt.Errorf("unknown user status %q", status)
-	}
 }

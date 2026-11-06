@@ -2,6 +2,9 @@
 
 This directory contains cross-SDK Behavior-Driven Development (BDD) tests for Apache Iggy, designed to ensure consistency across different language SDKs.
 
+A feature that the [conformance suite](../conformance/README.md) covers on every SDK that ran it
+moves there, and its feature file and step code leave this directory.
+
 ## Structure
 
 ```bash
@@ -54,7 +57,7 @@ bdd/
 ```bash
 # Usage: ../scripts/run-bdd-tests.sh [--coverage] <sdk> [feature]
 #   sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | swift | all | clean  (default: all)
-#   feature: basic_messaging | leader_redirection | raw_command | session_contract | stream_crud | all  (default: all)
+#   feature: basic_messaging | leader_redirection | session_contract | stream_options | metadata_changes | deferred_polling | all  (default: all)
 
 # Run all features for all SDKs
 ../scripts/run-bdd-tests.sh all
@@ -143,7 +146,7 @@ The PHP implementation is located in `bdd/php/tests/` and runs through PHPUnit.
 
 The Swift implementation is located in `bdd/swift/tests/`, a SwiftPM package with a small Gherkin
 runner that walks the shared feature files and drives the SDK. It runs every feature but
-`leader_redirection` and `stream_crud`. Outside Docker, set `IGGY_TCP_ADDRESS`,
+`leader_redirection`. Outside Docker, set `IGGY_TCP_ADDRESS`,
 `IGGY_TCP_ADDRESS_NO_QUORUM`, `IGGY_ROOT_USERNAME`, and `IGGY_ROOT_PASSWORD`, then run
 `swift run iggy-bdd`, with `BDD_FEATURE` to pick one feature.
 

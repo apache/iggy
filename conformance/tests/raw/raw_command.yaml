@@ -1,0 +1,75 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Converted from bdd/scenarios/raw_command.feature.
+schema_version: "1.0"
+description: >-
+  An SDK sends a command code with a payload directly, so that an application can call a
+  command that has no typed SDK method.
+run_on:
+  - capabilities: [raw_command]
+
+tests:
+  - description: Known command codes round-trip.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: send_binary_request
+        arguments: {code: 1}
+        expect_result: {payload_hex: ""}
+      - object: client0
+        name: send_binary_request
+        arguments: {code: 10}
+        expect_result: {payload_hex: {$$len: {$$gte: 2}}}
+
+  - description: An unknown command code is rejected.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: send_binary_request
+        arguments: {code: 60000}
+        expect_error: {name: invalid_command}
+
+  - description: A session control command code is rejected.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: send_binary_request
+        arguments: {code: 38}
+        expect_error: {name: invalid_command}
+
+  - description: A raw command goes to a chosen replica.
+    run_on:
+      - capabilities: [raw_command_replica]
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: send_binary_request_to_replica
+        arguments: {code: 10, replica: 0}
+        expect_result: {payload_hex: {$$len: {$$gte: 2}}}
+      - object: client0
+        name: send_binary_request_to_replica
+        arguments: {code: 10, replica: 9}
+        expect_error: {name: invalid_identifier}
+      - object: client0
+        name: send_binary_request_to_replica
+        arguments: {code: 202, replica: 0}
+        expect_error: {name: invalid_command}

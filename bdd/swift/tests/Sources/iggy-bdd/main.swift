@@ -23,10 +23,8 @@ import Foundation
 // defaults to the repository's bdd/scenarios.
 let features: [(name: String, register: (inout StepRegistry) -> Void)] = [
     ("basic_messaging", BasicMessagingSteps.register),
-    ("raw_command", RawCommandSteps.register),
     ("session_contract", SessionContractSteps.register),
     ("stream_options", ResourceOptionsSteps.register),
-    ("resource_options_patch", ResourceOptionsSteps.register),
     (
         "metadata_changes",
         { registry in

@@ -18,11 +18,10 @@
 use crate::common::global_context::GlobalContext;
 use cucumber::{given, then, when};
 use iggy::prelude::{
-    Consumer, HeaderKey, HeaderValue, Identifier, IggyExpiry, IggyMessage, MaxTopicSize,
-    MessageClient, OptionKey, OptionSpec, OptionsScope, Partitioning, PollOptions, PollingStrategy,
-    StreamClient, StreamCreateOptions, StreamDetails, StreamEncryptionKey, StreamEncryptionSource,
-    StreamUpdateOptions, SystemClient, TopicClient, TopicCreateOptions, TopicDetails,
-    TopicUpdateOptions, UserClient, UserCreateOptions, UserStatus, UserUpdateOptions,
+    Consumer, HeaderKey, HeaderValue, Identifier, IggyExpiry, IggyMessage, MessageClient,
+    OptionKey, OptionSpec, OptionsScope, Partitioning, PollOptions, PollingStrategy, StreamClient,
+    StreamCreateOptions, StreamDetails, StreamEncryptionKey, StreamEncryptionSource,
+    StreamUpdateOptions, SystemClient, TopicClient, TopicCreateOptions,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
@@ -54,11 +53,6 @@ pub async fn when_create_stream_without_key(world: &mut GlobalContext, name: Str
     world.last_stream_id = Some(stream.id);
     world.last_stream_name = Some(stream.name);
     world.last_stream_key = None;
-}
-
-#[given(regex = r#"^a stream named "([^"]+)" exists$"#)]
-pub async fn given_plain_stream(world: &mut GlobalContext, name: String) {
-    when_create_stream_without_key(world, name).await;
 }
 
 #[then(regex = r#"^the stream should report encryption key source "([^"]+)"$"#)]
@@ -237,157 +231,6 @@ pub async fn then_option_read_only(world: &mut GlobalContext, key: String) {
     assert!(spec.read_only && !spec.updatable && !spec.secret);
 }
 
-#[given(
-    regex = r#"^a topic named "([^"]+)" exists in the stream with message expiry (\d+) microseconds and max topic size (\d+) bytes$"#
-)]
-pub async fn given_topic_with_settings(
-    world: &mut GlobalContext,
-    name: String,
-    expiry: u64,
-    max_size: u64,
-) {
-    let client = world.client.as_ref().expect("client");
-    let topic = client
-        .create_topic(
-            &stream_identifier(world),
-            &name,
-            &TopicCreateOptions {
-                partitions_count: Some(1),
-                message_expiry: Some(IggyExpiry::from(expiry)),
-                max_topic_size: Some(MaxTopicSize::from(max_size)),
-                ..TopicCreateOptions::default()
-            },
-        )
-        .await
-        .expect("create topic");
-    world.last_topic_id = Some(topic.id);
-    world.last_topic_name = Some(topic.name);
-}
-
-#[when(regex = r"^I update the topic message expiry to (\d+) microseconds without a name$")]
-pub async fn when_update_topic_expiry(world: &mut GlobalContext, expiry: u64) {
-    update_topic(
-        world,
-        TopicUpdateOptions {
-            message_expiry: Some(IggyExpiry::from(expiry)),
-            ..TopicUpdateOptions::default()
-        },
-    )
-    .await;
-}
-
-#[when(regex = r#"^I reset the topic option "([^"]+)"$"#)]
-pub async fn when_reset_topic_option(world: &mut GlobalContext, key: String) {
-    update_topic(
-        world,
-        TopicUpdateOptions {
-            reset: BTreeSet::from([OptionKey::from_str(&key).expect("known key")]),
-            ..TopicUpdateOptions::default()
-        },
-    )
-    .await;
-}
-
-#[when(regex = r#"^I rename the topic to "([^"]+)"$"#)]
-pub async fn when_rename_topic(world: &mut GlobalContext, name: String) {
-    update_topic(
-        world,
-        TopicUpdateOptions {
-            name: Some(name),
-            ..TopicUpdateOptions::default()
-        },
-    )
-    .await;
-}
-
-#[then(regex = r#"^the topic name should be "([^"]+)"$"#)]
-pub async fn then_topic_name(world: &mut GlobalContext, name: String) {
-    assert_eq!(fetch_topic(world).await.name, name);
-}
-
-#[then(regex = r"^the topic message expiry should be (\d+) microseconds set explicitly$")]
-pub async fn then_topic_expiry_explicit(world: &mut GlobalContext, expiry: u64) {
-    let topic = fetch_topic(world).await;
-    assert_eq!(
-        topic.resolved_options().message_expiry,
-        IggyExpiry::from(expiry)
-    );
-    assert!(topic_option_explicit(&topic, OptionKey::MessageExpiry));
-}
-
-#[then(regex = r"^the topic max topic size should be (\d+) bytes set explicitly$")]
-pub async fn then_topic_max_size_explicit(world: &mut GlobalContext, max_size: u64) {
-    let topic = fetch_topic(world).await;
-    assert_eq!(
-        topic.resolved_options().max_topic_size,
-        MaxTopicSize::from(max_size)
-    );
-    assert!(topic_option_explicit(&topic, OptionKey::MaxTopicSize));
-}
-
-#[then("the topic max topic size should be derived from the server default")]
-pub async fn then_topic_max_size_derived(world: &mut GlobalContext) {
-    let topic = fetch_topic(world).await;
-    assert!(!topic_option_explicit(&topic, OptionKey::MaxTopicSize));
-}
-
-#[given(regex = r#"^a user named "([^"]+)" with password "([^"]+)" exists$"#)]
-pub async fn given_user(world: &mut GlobalContext, username: String, password: String) {
-    let client = world.client.as_ref().expect("client");
-    let user = client
-        .create_user(
-            &username,
-            &password,
-            UserStatus::Active,
-            None,
-            &UserCreateOptions::default(),
-        )
-        .await
-        .expect("create user");
-    world.last_user_id = Some(user.id);
-}
-
-#[when(regex = r#"^I update the user username to "([^"]+)" and status to "([^"]+)"$"#)]
-pub async fn when_update_user(world: &mut GlobalContext, username: String, status: String) {
-    let client = world.client.as_ref().expect("client");
-    client
-        .update_user(
-            &user_identifier(world),
-            &UserUpdateOptions {
-                username: Some(username),
-                status: Some(UserStatus::from_str(&status).expect("known status")),
-                ..UserUpdateOptions::default()
-            },
-        )
-        .await
-        .expect("update user");
-}
-
-#[then(regex = r#"^the user should have username "([^"]+)"$"#)]
-pub async fn then_user_username(world: &mut GlobalContext, username: String) {
-    let client = world.client.as_ref().expect("client");
-    let user = client
-        .get_user(&user_identifier(world))
-        .await
-        .expect("get user")
-        .expect("user exists");
-    assert_eq!(user.username, username);
-}
-
-#[then(regex = r#"^the user should have status "([^"]+)"$"#)]
-pub async fn then_user_status(world: &mut GlobalContext, status: String) {
-    let client = world.client.as_ref().expect("client");
-    let user = client
-        .get_user(&user_identifier(world))
-        .await
-        .expect("get user")
-        .expect("user exists");
-    assert_eq!(
-        user.status,
-        UserStatus::from_str(&status).expect("known status")
-    );
-}
-
 async fn create_keyed_stream(world: &mut GlobalContext, name: &str, byte: u8) {
     let key = StreamEncryptionKey::try_from([byte; KEY_LENGTH].as_slice()).expect("32 bytes");
     let client = world.client.as_ref().expect("client");
@@ -413,27 +256,6 @@ async fn fetch_stream(world: &GlobalContext) -> StreamDetails {
         .await
         .expect("get stream")
         .expect("stream exists")
-}
-
-async fn fetch_topic(world: &GlobalContext) -> TopicDetails {
-    let client = world.client.as_ref().expect("client");
-    client
-        .get_topic(&stream_identifier(world), &topic_identifier(world))
-        .await
-        .expect("get topic")
-        .expect("topic exists")
-}
-
-async fn update_topic(world: &GlobalContext, options: TopicUpdateOptions) {
-    let client = world.client.as_ref().expect("client");
-    client
-        .update_topic(
-            &stream_identifier(world),
-            &topic_identifier(world),
-            &options,
-        )
-        .await
-        .expect("update topic");
 }
 
 async fn send_message(
@@ -491,21 +313,10 @@ fn option_spec<'a>(world: &'a GlobalContext, key: &str) -> &'a OptionSpec {
         .expect("described key")
 }
 
-fn topic_option_explicit(topic: &TopicDetails, key: OptionKey) -> bool {
-    topic
-        .options
-        .get(&HeaderKey::from(key))
-        .is_some_and(|option| option.explicit)
-}
-
 fn stream_identifier(world: &GlobalContext) -> Identifier {
     Identifier::numeric(world.last_stream_id.expect("stream created")).expect("stream id")
 }
 
 fn topic_identifier(world: &GlobalContext) -> Identifier {
     Identifier::numeric(world.last_topic_id.expect("topic created")).expect("topic id")
-}
-
-fn user_identifier(world: &GlobalContext) -> Identifier {
-    Identifier::numeric(world.last_user_id.expect("user created")).expect("user id")
 }

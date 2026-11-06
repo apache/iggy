@@ -20,7 +20,6 @@ pub mod deferred_polling;
 pub mod leader_redirection;
 pub mod messages;
 pub mod metadata_changes;
-pub mod raw_command;
 pub mod resource_options;
 pub mod server;
 pub mod session;

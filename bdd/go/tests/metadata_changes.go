@@ -305,7 +305,6 @@ func (metadataChangesSteps) givenUserWithoutServerPermissions(ctx context.Contex
 	if err != nil {
 		return fmt.Errorf("create user %s: %w", username, err)
 	}
-	options.userId = &user.Id
 	options.createdUsers = append(options.createdUsers, user.Id)
 	return nil
 }

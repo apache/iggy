@@ -1,0 +1,266 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Converted from bdd/scenarios/metadata_changes.feature. Each test takes its cursor after the
+# purge of the server, so a follow returns only the changes of the test itself. A two-phase
+# delete records its change when it completes, so the follows read until the change arrives.
+schema_version: "1.0"
+description: >-
+  An operator reads the metadata changes that the server committed, so that a mirror of
+  streams, topics, users and sessions stays current without listing everything again.
+run_on:
+  - capabilities: [metadata_changes]
+initial_data:
+  - name: create_user
+    arguments:
+      username: changes-reader
+      password: changes-secret
+      permissions: {global: {read_servers: true}}
+
+tests:
+  - description: Follow stream changes from the latest position.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: get_metadata_changes
+        arguments: {start: latest, groups: [streams]}
+        expect_result: {status: ok, records: [], next: {$$capture: cursor}}
+      - object: admin
+        name: create_stream
+        arguments: {name: changes-follow}
+        expect_result: {id: {$$capture: stream_id}}
+      - object: admin
+        name: update_stream
+        arguments: {stream_id: {$$ref: stream_id}, name: changes-follow-renamed}
+      - object: admin
+        name: delete_stream
+        arguments: {stream_id: {$$ref: stream_id}}
+      - object: client0
+        name: get_metadata_changes
+        arguments: {start: {after: {$$ref: cursor}}, groups: [streams], limit: 100}
+        eventually: 10s
+        expect_result:
+          status: ok
+          records:
+            - {kind: stream_created, stream_id: {$$ref: stream_id}, name: changes-follow, actor_user_id: 0}
+            - {kind: stream_updated, stream_id: {$$ref: stream_id}, name: changes-follow-renamed, actor_user_id: 0}
+            - {kind: stream_deleted, stream_id: {$$ref: stream_id}, actor_user_id: 0}
+
+  - description: Filter changes by group.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: get_metadata_changes
+        arguments: {start: latest, groups: [topics]}
+        expect_result: {status: ok, next: {$$capture: cursor}}
+      - object: admin
+        name: create_stream
+        arguments: {name: changes-filter}
+        expect_result: {id: {$$capture: stream_id}}
+      - object: admin
+        name: create_topic
+        arguments: {stream_id: changes-filter, name: events, partitions_count: 1}
+      - object: client0
+        name: get_metadata_changes
+        arguments: {start: {after: {$$ref: cursor}}, groups: [topics], limit: 100}
+        eventually: 10s
+        expect_result:
+          status: ok
+          records:
+            - {kind: topic_created, stream_id: {$$ref: stream_id}, name: events}
+
+  - description: Record a two-phase delete at its completion.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: get_metadata_changes
+        arguments: {start: latest, groups: [streams]}
+        expect_result: {status: ok, next: {$$capture: cursor}}
+      - object: admin
+        name: create_stream
+        arguments: {name: changes-two-phase}
+        expect_result: {id: {$$capture: stream_id}}
+      - object: admin
+        name: create_topic
+        arguments: {stream_id: changes-two-phase, name: events, partitions_count: 1}
+      - object: admin
+        name: delete_stream
+        arguments: {stream_id: {$$ref: stream_id}}
+      - object: client0
+        name: get_metadata_changes
+        arguments: {start: {after: {$$ref: cursor}}, groups: [streams], limit: 100}
+        eventually: 10s
+        expect_result:
+          status: ok
+          records:
+            - {kind: stream_created, stream_id: {$$ref: stream_id}}
+            - kind: stream_deleted
+              stream_id: {$$ref: stream_id}
+              op: {$$capture: deleted_op}
+              requested_op: {$$lte: {$$ref: deleted_op}}
+
+  - description: Keyed stream changes carry fingerprints and no key.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: get_metadata_changes
+        arguments: {start: latest, groups: [streams]}
+        expect_result: {status: ok, next: {$$capture: cursor}}
+      - object: admin
+        name: create_stream
+        arguments:
+          name: changes-keyed
+          encryption_key_hex: "1515151515151515151515151515151515151515151515151515151515151515"
+      - object: client0
+        name: get_metadata_changes
+        arguments: {start: {after: {$$ref: cursor}}, groups: [streams], limit: 100}
+        eventually: 10s
+        expect_result:
+          status: ok
+          records:
+            - kind: stream_created
+              name: changes-keyed
+              options:
+                encryption_key_source: {value: stream}
+                encryption_key_fingerprint: {value: 7f39654f15560771}
+                encryption_key: {$$exists: false}
+                encryption_key_wrapped: {$$exists: false}
+
+  - description: Rebuild from current state after the cursor expired.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: get_metadata_changes
+        arguments: {start: latest, groups: [streams]}
+        expect_result: {status: ok, next: {$$capture: cursor}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-0}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-0}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-1}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-1}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-2}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-2}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-3}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-3}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-4}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-4}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-5}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-5}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-6}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-6}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-7}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-7}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-8}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-8}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-9}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-9}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-10}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-10}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-11}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-11}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-12}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-12}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-13}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-13}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-14}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-14}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-15}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-15}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-16}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-16}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-17}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-17}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-18}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-18}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-19}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-19}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-20}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-20}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-21}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-21}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-22}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-22}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-23}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-23}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-24}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-24}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-25}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-25}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-26}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-26}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-27}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-27}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-28}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-28}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-29}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-29}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-30}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-30}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-31}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-31}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-32}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-32}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-33}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-33}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-34}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-34}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-35}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-35}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-36}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-36}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-37}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-37}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-38}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-38}}
+      - {object: admin, name: create_stream, arguments: {name: changes-churn-39}}
+      - {object: admin, name: delete_stream, arguments: {stream_id: changes-churn-39}}
+      - object: admin
+        name: create_stream
+        arguments: {name: changes-kept}
+        expect_result: {id: {$$capture: kept_id}}
+      - object: client0
+        name: get_metadata_changes
+        arguments: {start: {after: {$$ref: cursor}}, groups: [streams], limit: 100}
+        expect_result: {status: expired, records: [], next: null}
+      - object: client0
+        name: get_metadata_changes
+        arguments: {start: {current: null}, groups: [streams], limit: 100}
+        expect_result:
+          status: ok
+          has_more: false
+          items: [{group: streams, stream_id: {$$ref: kept_id}, name: changes-kept}]
+          next: {$$capture: anchor}
+      - object: client0
+        name: get_streams
+        expect_result: [{id: {$$ref: kept_id}, name: changes-kept}]
+      - object: client0
+        name: get_metadata_changes
+        arguments: {start: {after: {$$ref: anchor}}, groups: [streams], limit: 100}
+        expect_result: {status: ok}
+
+  - description: Reading changes needs the manage servers permission.
+    create_entities:
+      - client: {id: reader, login: {username: changes-reader, password: changes-secret}}
+    operations:
+      - object: reader
+        name: get_metadata_changes
+        arguments: {start: earliest, groups: [streams]}
+        expect_error: {name: unauthorized}

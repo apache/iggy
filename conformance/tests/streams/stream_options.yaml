@@ -1,0 +1,195 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Converted from bdd/scenarios/stream_options.feature. The server runs with encryption on.
+# A key fingerprint is a function of the key alone, so the files name the fingerprint of
+# each key: 32 bytes of 7 is f3e9d699ac366350, of 9 a7e5d00bd66db441, of 11
+# ba16e94c1288bbd8, and of 13 eac8eb201db06c79.
+schema_version: "1.0"
+description: >-
+  An SDK gives a stream its own encryption key through typed options, reads its source and
+  fingerprints back, and never sees key material.
+
+tests:
+  - description: Create a stream with its own key.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: create_stream
+        arguments:
+          name: stream-options-own-key
+          encryption_key_hex: "0707070707070707070707070707070707070707070707070707070707070707"
+        expect_result: &own_key
+          options:
+            encryption_key_source: {value: stream}
+            encryption_key_fingerprint: {value: f3e9d699ac366350}
+            encryption_kek_fingerprint: {value: {$$len: {$$gte: 16}}}
+            encryption_key: {$$exists: false}
+            encryption_key_wrapped: {$$exists: false}
+      - object: client0
+        name: get_stream
+        arguments: {stream_id: stream-options-own-key}
+        expect_result: *own_key
+
+  - description: Create a stream with a server generated key.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: create_stream
+        arguments: {name: stream-options-generated}
+        expect_result:
+          options:
+            encryption_key_source: {value: server}
+            encryption_key_fingerprint: {value: {$$len: 16}}
+            encryption_kek_fingerprint: {value: {$$len: {$$gte: 16}}}
+            encryption_key: {$$exists: false}
+            encryption_key_wrapped: {$$exists: false}
+      - object: admin
+        name: create_topic
+        arguments: {stream_id: stream-options-generated, name: events, partitions_count: 1, message_expiry: never}
+      - object: client0
+        name: send_messages
+        arguments:
+          stream_id: stream-options-generated
+          topic_id: events
+          partitioning: {partition_id: 0}
+          messages: [{payload: generated-key-payload}]
+      - object: client0
+        name: poll_messages
+        arguments:
+          stream_id: stream-options-generated
+          topic_id: events
+          partition_id: 0
+          strategy: first
+          count: 10
+        expect_result:
+          messages: [{payload: generated-key-payload}]
+
+  - description: Send and poll a message with headers on a keyed stream.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: admin
+        name: create_stream
+        arguments:
+          name: stream-options-custom
+          encryption_key_hex: "0909090909090909090909090909090909090909090909090909090909090909"
+      - object: admin
+        name: create_topic
+        arguments: {stream_id: stream-options-custom, name: events, partitions_count: 1, message_expiry: never}
+      - object: client0
+        name: send_messages
+        arguments:
+          stream_id: stream-options-custom
+          topic_id: events
+          partitioning: {partition_id: 0}
+          messages:
+            - payload: custom-key-payload
+              headers: {trace: {kind: string, value: abc}}
+      - object: client0
+        name: poll_messages
+        arguments:
+          stream_id: stream-options-custom
+          topic_id: events
+          partition_id: 0
+          strategy: first
+          count: 10
+        expect_result:
+          messages:
+            - payload: custom-key-payload
+              headers: {trace: {kind: string, value: abc}}
+
+  - description: Rename a keyed stream.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: admin
+        name: create_stream
+        arguments:
+          name: stream-options-rename
+          encryption_key_hex: "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+        expect_result: {id: {$$capture: stream_id}}
+      - object: admin
+        name: create_topic
+        arguments: {stream_id: stream-options-rename, name: events, partitions_count: 1, message_expiry: never}
+      - object: admin
+        name: send_messages
+        arguments:
+          stream_id: stream-options-rename
+          topic_id: events
+          partitioning: {partition_id: 0}
+          messages: [{payload: before-rename}]
+      - object: client0
+        name: update_stream
+        arguments: {stream_id: {$$ref: stream_id}, name: stream-options-renamed}
+      - object: client0
+        name: get_stream
+        arguments: {stream_id: {$$ref: stream_id}}
+        expect_result:
+          name: stream-options-renamed
+          options:
+            encryption_key_source: {value: stream}
+            encryption_key_fingerprint: {value: ba16e94c1288bbd8}
+      - object: client0
+        name: poll_messages
+        arguments:
+          stream_id: stream-options-renamed
+          topic_id: events
+          partition_id: 0
+          strategy: first
+          count: 10
+        expect_result:
+          messages: [{payload: before-rename}]
+
+  - description: A reset of the stream key is rejected.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: admin
+        name: create_stream
+        arguments:
+          name: stream-options-reset
+          encryption_key_hex: "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+        expect_result: {id: {$$capture: stream_id}}
+      - object: client0
+        name: update_stream
+        arguments: {stream_id: {$$ref: stream_id}, reset: [encryption_key]}
+        expect_error: {name: option_not_updatable}
+      - object: client0
+        name: get_stream
+        arguments: {stream_id: {$$ref: stream_id}}
+        expect_result:
+          name: stream-options-reset
+          options:
+            encryption_key_fingerprint: {value: eac8eb201db06c79}
+
+  - description: Describe the stream options.
+    run_on:
+      - capabilities: [describe_options]
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: describe_options
+        arguments: {scope: stream}
+        expect_result:
+          $$contains:
+            - {key: name, updatable: true, secret: false, read_only: false}
+            - {key: encryption_key, updatable: false, resettable: false, secret: true, read_only: false}
+            - {key: encryption_key_fingerprint, read_only: true, updatable: false, secret: false}

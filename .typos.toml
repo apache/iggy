@@ -15,6 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
+[default]
+# 16-digit hex values, such as the key fingerprints in conformance tests
+extend-ignore-re = ["\\b[0-9a-f]{16}\\b"]
+
 # Whitelist valid identifiers to avoid typos false positives
 [default.extend-identifiers]
 # Valid Python package name used in dependency metadata and lockfiles
