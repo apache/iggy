@@ -554,6 +554,45 @@ impl IggyClient {
         })
     }
 
+    /// Creates a personal access token for the authenticated user.
+    ///
+    /// The token is returned once, so store it when the call completes.
+    /// `IggyExpiry.ServerDefault()` and `IggyExpiry.NeverExpire()` create a
+    /// token that never expires.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to the raw token as `str`.
+    ///
+    /// Raises:
+    ///     ValueError: If the expiry is invalid.
+    ///     PendingOperationError: If the reply is lost on TCP, QUIC, or WebSocket.
+    ///         The token may exist with its value lost. A retry with the same name
+    ///         fails with code 51. Delete the token by name, then create it again.
+    ///         Until `delete_personal_access_token` is added, delete the token
+    ///         through the HTTP API or another SDK.
+    ///     RuntimeError: If the server refuses the request.
+    ///         On TCP, QUIC, and WebSocket, an empty name or a name over 255 bytes
+    ///         raises code 4 before anything is sent. On TCP, a name from 1 to
+    ///         255 bytes is accepted. On HTTP, a name outside 3 to 30 bytes is
+    ///         refused with code 300.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[str]", imports=("collections.abc")))]
+    fn create_personal_access_token<'a>(
+        &self,
+        py: Python<'a>,
+        name: String,
+        expiry: &IggyExpiry,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let expiry = RustIggyExpiry::try_from(expiry)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let token = inner
+                .create_personal_access_token(&name, expiry)
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(token.token)
+        })
+    }
+
     /// Get the info about a specific user by unique ID or username.
     ///
     /// Args:
