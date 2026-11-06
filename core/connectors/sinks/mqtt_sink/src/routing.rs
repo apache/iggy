@@ -51,11 +51,16 @@ pub struct PreparedPublication {
     pub(crate) expiry_deadline: Option<u128>,
 }
 
+pub(crate) enum ExpiryStatus {
+    NoExpiry,
+    ExpiresIn(u32),
+    Expired,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PublicationOptions {
     pub(crate) protocol: MqttProtocol,
     pub(crate) qos: u8,
-    pub(crate) retain: bool,
 }
 
 #[derive(Debug)]
@@ -246,11 +251,7 @@ pub fn prepare_publication(
         batch_topic.as_ref(),
         topic_template,
         fallback_topic,
-        PublicationOptions {
-            protocol,
-            qos: 1,
-            retain: false,
-        },
+        PublicationOptions { protocol, qos: 1 },
     )
 }
 
@@ -282,12 +283,8 @@ pub fn prepare_publication_with_batch_topic(
                 properties: None,
                 expiry_deadline: None,
             };
-            publication.packet_size = driver::publication_packet_size(
-                &publication,
-                options.protocol,
-                options.qos,
-                options.retain,
-            );
+            publication.packet_size =
+                driver::publication_packet_size(&publication, options.protocol, options.qos);
             Ok(publication)
         }
         TopicMode::Dynamic => {
@@ -303,12 +300,8 @@ pub fn prepare_publication_with_batch_topic(
                 properties,
                 expiry_deadline,
             };
-            publication.packet_size = driver::publication_packet_size(
-                &publication,
-                options.protocol,
-                options.qos,
-                options.retain,
-            );
+            publication.packet_size =
+                driver::publication_packet_size(&publication, options.protocol, options.qos);
             Ok(publication)
         }
     }
@@ -397,16 +390,16 @@ fn prepare_dynamic(
 }
 
 impl PreparedPublication {
-    pub(crate) fn remaining_expiry(&self, now: u64) -> Option<Option<u32>> {
+    pub(crate) fn remaining_expiry(&self, now: u64) -> ExpiryStatus {
         let Some(deadline) = self.expiry_deadline else {
-            return Some(None);
+            return ExpiryStatus::NoExpiry;
         };
         let remaining = deadline.saturating_sub(u128::from(now));
         if remaining == 0 {
-            return None;
+            return ExpiryStatus::Expired;
         }
         let seconds = remaining.div_ceil(u128::from(MICROS_PER_SECOND));
-        Some(Some(seconds.min(u128::from(u32::MAX)) as u32))
+        ExpiryStatus::ExpiresIn(seconds.min(u128::from(u32::MAX)) as u32)
     }
 }
 

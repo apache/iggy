@@ -56,7 +56,10 @@ use tokio::{
     time::timeout,
 };
 
-use crate::{DEFAULT_REQUEST_CAPACITY, MqttSinkConfig, routing::PreparedPublication};
+use crate::{
+    DEFAULT_REQUEST_CAPACITY, MqttSinkConfig,
+    routing::{ExpiryStatus, PreparedPublication},
+};
 
 mod rumqttc {
     pub use rumqttc_v4::*;
@@ -389,7 +392,7 @@ impl MqttDriver {
         config: &MqttSinkConfig,
         client_id: String,
         keep_alive: Duration,
-        connect_timeout: Duration,
+        publish_timeout: Duration,
         max_in_flight: usize,
         retry_delay: Duration,
     ) -> Result<Self, iggy_connector_sdk::Error> {
@@ -442,12 +445,12 @@ impl MqttDriver {
                     .map_err(|error| {
                         iggy_connector_sdk::Error::InvalidConfigValue(error.to_string())
                     })?;
-                wait_for_connack(&mut event_loop, id, connect_timeout).await?;
+                wait_for_connack(&mut event_loop, id, publish_timeout).await?;
                 if !config.clean_start {
                     client.disconnect().await.map_err(|error| {
                         iggy_connector_sdk::Error::Connection(error.to_string())
                     })?;
-                    wait_for_mqtt311_disconnect(&mut event_loop, connect_timeout).await?;
+                    wait_for_mqtt311_disconnect(&mut event_loop, publish_timeout).await?;
                     options.set_clean_session(false);
                     (client, event_loop) =
                         Mqtt311Client::builder(options)
@@ -455,7 +458,7 @@ impl MqttDriver {
                             .map_err(|error| {
                                 iggy_connector_sdk::Error::InvalidConfigValue(error.to_string())
                             })?;
-                    wait_for_connack(&mut event_loop, id, connect_timeout).await?;
+                    wait_for_connack(&mut event_loop, id, publish_timeout).await?;
                 }
                 (
                     MqttConnection::Mqtt311 {
@@ -497,7 +500,7 @@ impl MqttDriver {
                 let broker_max_packet_size = wait_for_connack_v5(
                     &mut event_loop,
                     id,
-                    connect_timeout,
+                    publish_timeout,
                     config.qos,
                     config.retain,
                 )
@@ -567,12 +570,18 @@ impl MqttDriver {
     ) -> Result<Vec<usize>, iggy_connector_sdk::Error> {
         let mut expired = Vec::new();
         for (index, &publication) in publications.iter().enumerate() {
-            let Some(remaining_expiry) =
-                publication.remaining_expiry(iggy_common::IggyTimestamp::now().as_micros())
-            else {
-                state.confirm(index);
-                expired.push(index);
-                continue;
+            let remaining_expiry = if publication.expiry_deadline.is_some() {
+                match publication.remaining_expiry(iggy_common::IggyTimestamp::now().as_micros()) {
+                    ExpiryStatus::NoExpiry => None,
+                    ExpiryStatus::ExpiresIn(seconds) => Some(seconds),
+                    ExpiryStatus::Expired => {
+                        state.confirm(index);
+                        expired.push(index);
+                        continue;
+                    }
+                }
+            } else {
+                None
             };
             self.enqueue_publication(publication, qos, retain, remaining_expiry)
                 .await?;
@@ -689,12 +698,12 @@ impl MqttDriver {
             .await
             .map_err(|_| {
                 iggy_connector_sdk::Error::Connection(
-                    "MQTT event loop stopped before it could discard queued events".to_string(),
+                    "MQTT event loop stopped before it could start the batch".to_string(),
                 )
             })?;
         result_receiver.await.map_err(|_| {
             iggy_connector_sdk::Error::Connection(
-                "MQTT event loop stopped before it could discard queued events".to_string(),
+                "MQTT event loop stopped before it could start the batch".to_string(),
             )
         })?;
         discard_queued_events(&mut self.events);
@@ -789,8 +798,6 @@ impl MqttDriver {
 impl MqttEventLoopTask {
     async fn run(mut self) {
         let mut pending_event = None;
-        // Idle connection events become stale before the next batch starts.
-        let mut idle_status = None;
         let mut batch_active = false;
         let mut paused = false;
         let mut retry_at = None;
@@ -810,7 +817,6 @@ impl MqttEventLoopTask {
                     }
                     Some(DriverCommand::BeginBatch { result_sender }) => {
                         pending_event = None;
-                        drop(idle_status.take());
                         batch_active = true;
                         let _ = result_sender.send(());
                     }
@@ -855,9 +861,6 @@ impl MqttEventLoopTask {
                     &self.max_packet_size,
                 ), if pending_event.is_none() && !paused => match result {
                     Ok(DriverEvent::Other) => {}
-                    Ok(event @ DriverEvent::SessionPresent(_)) if !batch_active => {
-                        idle_status = Some(event);
-                    }
                     Ok(_) if !batch_active => {}
                     Ok(event) => {
                         pending_event = Some(event);
@@ -869,7 +872,6 @@ impl MqttEventLoopTask {
                         if batch_active {
                             pending_event = Some(event);
                         } else {
-                            idle_status = Some(event);
                             retry_at = Some(tokio::time::Instant::now() + self.retry_delay);
                         }
                     }
@@ -953,7 +955,6 @@ pub(crate) fn publication_packet_size(
     publication: &PreparedPublication,
     protocol: MqttProtocol,
     qos: u8,
-    _retain: bool,
 ) -> usize {
     let mut remaining_len = 2 + publication.topic.as_str().len() + publication.payload.len();
     if qos > 0 {
@@ -1522,6 +1523,8 @@ fn mqtt5_connack_error(code: Mqtt5ConnectReturnCode, id: u32) -> iggy_connector_
 mod tests {
     use std::fs;
 
+    use bytes::Bytes;
+
     use rumqttc::v5::mqttbytes::v5::{
         ConnectReturnCode, DisconnectReasonCode, PubAckReason, PubCompReason, PubRecReason,
     };
@@ -1532,6 +1535,71 @@ mod tests {
         mqtt311_connection_error, read_certificate_file, read_private_key_file, rumqttc,
         validate_mqtt5_broker_capabilities,
     };
+    use crate::routing::{PreparedPublication, PublicationTopic};
+
+    #[test]
+    fn given_publications_when_calculating_packet_size_should_match_rumqttc() {
+        let properties = rumqttc_v5::mqttbytes::v5::PublishProperties {
+            payload_format_indicator: Some(1),
+            message_expiry_interval: Some(42),
+            topic_alias: Some(1),
+            response_topic: Some("response".into()),
+            correlation_data: Some(Bytes::from_static(b"correlation")),
+            user_properties: vec![("key".into(), "value".into())],
+            subscription_identifiers: vec![1, 128],
+            content_type: Some("text/plain".into()),
+        };
+
+        for payload_len in [0, 120, 121, 122, 123, 124, 127, 128, 16_380, 16_384] {
+            for qos in 0..=2 {
+                for properties in [None, Some(properties.clone())] {
+                    let publication = PreparedPublication {
+                        offset: 0,
+                        topic: PublicationTopic::Owned("topic".into()),
+                        payload: Bytes::from(vec![0; payload_len]),
+                        packet_size: 0,
+                        properties: properties.clone(),
+                        expiry_deadline: None,
+                    };
+                    let qos_v4 = match qos {
+                        0 => rumqttc_v4::QoS::AtMostOnce,
+                        1 => rumqttc_v4::QoS::AtLeastOnce,
+                        _ => rumqttc_v4::QoS::ExactlyOnce,
+                    };
+                    let mut v4 = rumqttc_v4::mqttbytes::v4::Publish::from_bytes(
+                        "topic",
+                        qos_v4,
+                        publication.payload.clone(),
+                    );
+                    v4.pkid = 1;
+                    assert_eq!(
+                        super::publication_packet_size(
+                            &publication,
+                            super::MqttProtocol::Mqtt311,
+                            qos
+                        ),
+                        v4.size()
+                    );
+
+                    let mut v5 = rumqttc_v5::mqttbytes::v5::Publish::new(
+                        "topic",
+                        super::mqtt5_qos(qos_v4),
+                        publication.payload.clone(),
+                        properties,
+                    );
+                    v5.pkid = 1;
+                    assert_eq!(
+                        super::publication_packet_size(
+                            &publication,
+                            super::MqttProtocol::Mqtt5,
+                            qos
+                        ),
+                        v5.size()
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn given_invalid_ca_pem_when_validating_should_return_configuration_error() {

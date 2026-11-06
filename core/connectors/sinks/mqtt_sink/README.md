@@ -336,10 +336,14 @@ broker delivery, but they do not provide end-to-end at-least-once delivery.
 3. **Client identity**: For `clean_start = false`, set a stable, unique `client_id`.
    The broker can resume the session while the same driver retains its state.
    Every new driver resets the broker session, which removes its subscriptions and queued messages.
+   For MQTT 3.1.1 with `clean_start = false`, a new driver connects twice.
+   The first connection resets the old session, and the second creates a persistent session.
+   The same driver can resume that session after a connection loss.
    Use a client ID dedicated to this sink. After a reset, the sink can replay unconfirmed publications
    while the current batch is available and retries remain. Subscribers can receive duplicates.
    The reset does not recover unconfirmed records after retries end or the process restarts.
-   Recovery after a restart depends on Iggy redelivering the batch. For `clean_start = true`,
+   The runtime commits offsets when it polls, so a restart does not redeliver the batch.
+   Unconfirmed records remain lost from this sink. For `clean_start = true`,
    omit `client_id` to generate a unique client ID for this sink instance.
 4. **Idle connections**: The MQTT task continues polling between batches. It sends keep-alive pings and reads their responses without waiting for another Iggy batch.
 5. **Invalid records**: The connector logs and skips malformed or oversized records. It does not provide a dead-letter queue.

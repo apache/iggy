@@ -407,7 +407,6 @@ impl MqttSink {
                 PublicationOptions {
                     protocol: self.config.protocol,
                     qos: self.config.qos,
-                    retain: self.config.retain,
                 },
             ) {
                 Ok(publication) => {
@@ -1374,7 +1373,6 @@ mod tests {
                 &publications[0],
                 sink.config.protocol,
                 sink.config.qos,
-                sink.config.retain,
             )
         );
     }
