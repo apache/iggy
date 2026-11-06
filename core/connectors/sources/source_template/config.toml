@@ -17,7 +17,9 @@
 
 type = "source"
 key = "template"
-enabled = true
+# Disabled until `connection_string` and the plugin code are filled in: a template
+# plugin cannot deliver anything yet. Set it to true once it can.
+enabled = false
 version = 0
 name = "Template source"
 path = "../../target/release/libiggy_connector_template_source"

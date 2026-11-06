@@ -309,7 +309,8 @@ shape your connector expects.
    workspace root `Cargo.toml`.
 2. Choose a backend path above, then fill in `push_batch()`.
 3. Update `config.toml` with your real `connection_string` and `target` and any
-   settings specific to your system. Delete `auth_token` if you don't need it, or
+   settings specific to your system, and set `enabled = true` (the template ships
+   disabled). Delete `auth_token` if you don't need it, or
    add fields of your own the same way (see `TemplateSinkConfig`).
 4. `cargo build --release -p iggy_connector_<yourname>_sink`, point a runtime
    connector config file's `path` at the built `.so`, `.dylib` or `.dll`, and run

@@ -134,7 +134,8 @@ and one is documentation:
    the workspace root `Cargo.toml`.
 2. Choose a backend path above, then fill in `fetch_records()`.
 3. Update `config.toml` with your real `connection_string` and any
-   settings specific to your system; delete `auth_token` if you don't need
+   settings specific to your system, and set `enabled = true` (the template
+   ships disabled); delete `auth_token` if you don't need
    it, or add fields of your own the same way (see `TemplateSourceConfig`).
 4. `cargo build --release -p iggy_connector_<yourname>_source`, point a
    runtime connector config file's `path` at the built `.so`/`.dylib`/`.dll`,
