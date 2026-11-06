@@ -154,7 +154,7 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// // Auto-logs in from the credentials in the string and retries forever on disconnect.
 /// let client = IggyClient::builder_from_connection_string(
 ///     "iggy+tcp://user:secret@localhost:8090\
-///      ?reconnection_retries=unlimited&reconnection_interval=1s&heartbeat_interval=5s&nodelay=true",
+///      ?reconnection_max_retries=unlimited&reconnection_interval=1s&heartbeat_interval=5s&nodelay=true",
 /// )?
 /// .build()?;
 /// client.connect().await?;
@@ -318,7 +318,9 @@ impl IggyClient {
     /// - `tls`: bool. Enable/disable TLS. Default: `false`.
     /// - `tls_domain`: string. Server name to validate the certificate against. Default: unset.
     /// - `tls_ca_file`: filesystem path. PEM roots replacing the built-in roots. Default: unset.
-    /// - `reconnection_retries`: "unlimited" or u32. Retry passes after the initial endpoint pass. Default: `unlimited`.
+    /// - `tls_validate_certificate`: bool. Verify the server certificate. Default: `true`; only `true` and `false` are accepted.
+    /// - `reconnection_max_retries`: "unlimited" or u32. Retry passes after the initial endpoint pass. Default: `unlimited`.
+    /// - `reconnection_retries`: deprecated alias for `reconnection_max_retries`. If both are supplied, the last value wins.
     /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Full-jitter exponential backoff base, capped at 10 seconds. Default: `1s`.
     /// - `reestablish_after`: [`IggyDuration`]. Stable connection duration that resets the retry count and backoff. Default: `5s`.
     /// - `max_pending_operations`: positive usize. Active and retained mutations per session. Default: `256`.
@@ -333,8 +335,8 @@ impl IggyClient {
     /// let client = IggyClient::builder_from_connection_string(
     ///     "iggy+tcp://user:secret@localhost:8090\
     ///      ?tls=true&tls_domain=localhost&tls_ca_file=/etc/iggy/ca.pem\
-    ///      &reconnection_retries=unlimited&reconnection_interval=1s&reestablish_after=5s\
-    ///      &heartbeat_interval=5s&nodelay=true",
+    ///      &tls_validate_certificate=true&reconnection_max_retries=unlimited\
+    ///      &reconnection_interval=1s&reestablish_after=5s&heartbeat_interval=5s&nodelay=true",
     /// )?
     /// .build()?;
     /// # Ok(())
