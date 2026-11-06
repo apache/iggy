@@ -138,13 +138,6 @@ jobs:
         if: matrix.task == 'examples-python'
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
-      - name: Cache uv
-        if: matrix.task == 'examples-python'
-        uses: actions/cache@v6.1.0
-        with:
-          path: ~/.cache/uv
-          key: uv-${{ runner.os }}-${{ hashFiles('examples/python/uv.lock', 'foreign/python/uv.lock', 'bdd/python/uv.lock') }}
-
       - name: Build PHP extension for examples
         if: matrix.task == 'examples-php'
         shell: bash
