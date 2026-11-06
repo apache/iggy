@@ -51,7 +51,7 @@ max_retry_delay = "30s"
 - **store_region**: The region of the object storage. Required, including for S3-compatible stores that ignore it.
 - **store_class**: The storage class to use. **Currently, only S3-compatible storage is supported.**
 - **store_path_style_access**: Use path-style S3 URLs (`http://host/bucket/key`). Defaults to `true`, which MinIO-style endpoints require; set to `false` for stores that only accept virtual-hosted-style URLs.
-- **invalid_rows**: What to do with a row that does not match the table schema. `fail`, the default, fails the whole batch. `skip` writes the rows that match and logs each skipped row as a warning with its offset. At least once, it also decides what happens to a message that dynamic routing cannot route.
+- **invalid_rows**: What to do with a row that does not match the table schema. `fail`, the default, commits the rows before the first such row and fails the call at it. `skip` writes the rows that match and logs each skipped row as a warning with its offset. At least once, it also decides what happens to a message without a JSON payload and to a message that dynamic routing cannot route. At most once, a message without a JSON payload is always skipped with a warning.
 - **max_retries**: Total attempts per catalog commit, including the first. Defaults to `5`. See [Commit Retries](#commit-retries).
 - **retry_delay**: Delay before the first commit retry, doubled for each further retry. Defaults to `1s`.
 - **max_retry_delay**: Upper bound for one delay between commit attempts. Defaults to `30s`.
@@ -62,8 +62,8 @@ Static routing requires a non-empty `tables` list; dynamic routing requires a no
 ## Static Routing
 
 With `dynamic_routing = false`, every batch is copied to every table in `tables`. Startup fails
-if none of them loads. A table that does not load at startup is loaded again by each batch. At
-most once, a batch skips a table that still does not load. At least once, it fails instead:
+if none of them loads. At most once, a table that does not load at startup is skipped until the
+connector restarts. At least once, each batch loads it again and fails while it does not load:
 transiently while the catalog cannot be reached, so that the runtime delivers it again, and for
 good when the table does not exist. A name without a namespace is skipped at startup, and at
 least once the sink refuses to start with one. The writer uses the schema and default partition
@@ -180,22 +180,28 @@ retries and how a stopped delivery resumes. At least once:
   `invalid_rows = "skip"` skips such a message instead, with a warning naming its offset. Skipping
   is an explicit choice that drops the message, and the runtime stores offsets past it.
 - **Redelivered messages are appended once.** Each append records in its snapshot summary the
-  source of its rows (`iggy.stream`, `iggy.topic`, `iggy.partition-id`) and its last message
-  (`iggy.last-offset`, `iggy.last-message-id`, and `iggy.last-timestamp`, the time the server
-  stored it). When a batch arrives again, and it carries the last message of any append on the
-  table's current snapshot history, the sink appends only the messages after the newest append.
-  A crash between the commit and the offset store, a backlog of several unflushed batches, or a
-  batch that committed to one table and failed on another, therefore does not append rows twice.
-  Each table keeps its own record, so a batch copied to several tables is appended once to each.
-- **Limits.** The record is the newest message a table holds, not a list of its rows. A message at
-  or below it is skipped even when the table lacks its row, for example a row deleted later, or
-  one that `invalid_rows = "skip"` left out. To append such messages again, replay them with
-  `guarantee = "at_most_once"`, which does not skip anything. A batch that carries no appended last
-  message, for example after `batch_length` changed, cannot be proven and is appended in full.
-  After a rollback of the table, restart the sink, since it keeps the record of its own commits
-  in memory. Keep one sink writing each table and partition, and keep the stream and topic
-  identifiers in its configuration unchanged, since the record names them. At most once, appends
-  record nothing.
+  source of its rows (`iggy.stream`, `iggy.topic`, `iggy.partition-id`), the offset of its first
+  message (`iggy.first-offset`), and its last message (`iggy.last-offset`, `iggy.last-message-id`,
+  and `iggy.last-timestamp`, the time the server stored it). An append on the table's current
+  snapshot history counts as proven when a batch that arrives again carries its last message.
+  The appends after the end of that batch, up to the newest one, count too, so a batch cut at
+  other offsets than before still finds them. The sink skips the start of the batch that the
+  counted appends cover without a gap, and appends the rest. A crash between the commit and the
+  offset store, a backlog of several unflushed batches, or a batch that committed to one table and
+  failed on another, therefore does not append rows twice. Each table keeps its own record, so a
+  batch copied to several tables is appended once to each.
+- **Limits.** The record is the range of offsets each append covers, not a list of its rows. A
+  message inside a counted append is skipped even when the table lacks its row, for example a row
+  deleted later, or one that `invalid_rows = "skip"` left out. To append such messages again,
+  replay them with `guarantee = "at_most_once"`, which does not skip anything. A message that no
+  append covers, for example one an at-most-once run lost, is appended again, and so is every
+  message after it in the batch, even when an append covers some of them. A batch that carries no
+  appended last message, for example after `batch_length` changed, cannot be proven and is
+  appended in full. After a rollback of the table, or after it is dropped and created again under
+  the same name, restart the sink, since it keeps the record of its own commits in memory and,
+  with static routing, the table it loaded. Keep one sink writing each table and partition, and
+  keep the stream and topic identifiers in its configuration unchanged, since the record names
+  them. At most once, appends record nothing.
 
 ## Commit Rate and Table Maintenance
 
@@ -218,7 +224,7 @@ At 2,000 messages per second, `batch_length = 100` creates about 20 snapshots pe
 values above about 2. A poll also returns once its reply reaches 1 MiB, and `max_wait` bounds how
 long a message waits for its batch.
 
-At least once, each snapshot summary also carries the six `iggy.*` properties described in
+At least once, each snapshot summary also carries the seven `iggy.*` properties described in
 [Delivery Guarantee](#delivery-guarantee), which add a few hundred bytes per snapshot to the table
 metadata until the snapshot expires.
 
@@ -230,8 +236,9 @@ schedule that keeps the time travel you need. Some managed catalogs run it autom
 
 Use `schema = "json"` on the stream. Each JSON object represents a table row; nested objects
 and arrays are supported when they match the table schema. Unknown fields are ignored. Missing
-nullable fields become null. A missing required field or an incompatible value fails the table
-write for the whole batch, unless `invalid_rows = "skip"` leaves out only that row.
+nullable fields become null. A missing required field or an incompatible value stops the write
+at that row: the rows before it are committed and the call fails, unless `invalid_rows = "skip"`
+leaves out only that row.
 
 Sources that wrap row data in an envelope need a transform when the table schema describes the
 inner row. Otherwise, the Arrow JSON reader maps envelope keys to table columns, producing nulls

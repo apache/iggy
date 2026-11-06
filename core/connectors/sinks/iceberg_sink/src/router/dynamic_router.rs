@@ -17,16 +17,13 @@
 
 use crate::InvalidRows;
 use crate::router::commit::{is_missing, table_load_error};
-use crate::router::redelivery::HeldMessages;
 use crate::router::{
-    BatchOrigin, Rejection, Router, before, first_rejection, format_error_chain,
-    is_valid_namespaced_table, load_table, write_data,
+    Appender, BatchOrigin, Rejection, Router, before, first_rejection, format_error_chain,
+    is_valid_namespaced_table, load_table,
 };
 use async_trait::async_trait;
-use iceberg::Catalog;
 use iceberg::table::Table;
-use iggy_connector_sdk::retry::RetryPolicy;
-use iggy_connector_sdk::{ConsumedMessage, Error, Payload, Schema};
+use iggy_connector_sdk::{ConsumedMessage, Error, FlushPartition, Payload, Schema, TopicMetadata};
 use simd_json::base::ValueAsObject;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -34,31 +31,75 @@ use tracing::{info, warn};
 
 #[derive(Debug)]
 pub struct DynamicRouter {
-    catalog: Box<dyn Catalog>,
     route_field: String,
-    invalid_rows: InvalidRows,
-    commit_retry: RetryPolicy,
-    held: Option<HeldMessages>,
+    appender: Appender,
+}
+
+/// Where the messages carrying one route value go.
+enum Destination {
+    /// The table at this index of the batch's tables.
+    Table(usize),
+    /// No table, for this reason.
+    Unroutable(String),
 }
 
 impl DynamicRouter {
-    pub fn new(
-        catalog: Box<dyn Catalog>,
-        route_field: String,
-        invalid_rows: InvalidRows,
-        commit_retry: RetryPolicy,
-    ) -> Self {
+    pub(crate) fn new(appender: Appender, route_field: String) -> Self {
         Self {
-            catalog,
             route_field,
-            invalid_rows,
-            commit_retry,
-            held: None,
+            appender,
         }
     }
 
     fn extract_route_field(&self, message: &ConsumedMessage) -> Option<String> {
         route_value(&message.payload, &self.route_field)
+    }
+
+    /// Where the messages carrying `route_field_val` go. Route values that load the same table
+    /// share its entry in `tables`, so that each table gets its messages in one ascending run,
+    /// which is what tells the messages it holds from the ones it does not.
+    async fn destination(
+        &self,
+        route_field_val: &str,
+        tables: &mut Vec<(Table, Vec<ConsumedMessage>)>,
+    ) -> Result<Destination, Error> {
+        if !is_valid_namespaced_table(route_field_val) {
+            return Ok(Destination::Unroutable(format!(
+                "its route field value: {route_field_val} names no table. It needs at least one namespace before the table, separated by '.'"
+            )));
+        }
+        let table = match load_table(route_field_val, self.appender.catalog.as_ref()).await {
+            Ok(table) => table,
+            Err(error) if is_missing(&error) => {
+                return Ok(Destination::Unroutable(format!(
+                    "table: {route_field_val} does not exist in the catalog: {}",
+                    format_error_chain(&error)
+                )));
+            }
+            // An unreachable catalog or a refused load says nothing about the message, so at
+            // least once the batch fails without skipping it.
+            Err(error) if self.appender.held.is_some() => {
+                return Err(table_load_error(route_field_val, &error));
+            }
+            Err(error) => {
+                return Ok(Destination::Unroutable(format!(
+                    "table: {route_field_val} does not load from the catalog: {}",
+                    format_error_chain(&error)
+                )));
+            }
+        };
+        let uuid = table.metadata().uuid();
+        let index = match tables
+            .iter()
+            .position(|(loaded, _)| loaded.metadata().uuid() == uuid)
+        {
+            Some(index) => index,
+            None => {
+                tables.push((table, Vec::new()));
+                tables.len() - 1
+            }
+        };
+        Ok(Destination::Table(index))
     }
 
     /// Drops a message that names no table it can be written to. At least once, it rejects the
@@ -69,17 +110,17 @@ impl DynamicRouter {
         message: &ConsumedMessage,
         reason: &str,
     ) -> Option<Rejection> {
-        if self.held.is_some() && self.invalid_rows == InvalidRows::Fail {
+        if self.appender.held.is_some() && self.appender.invalid_rows == InvalidRows::Fail {
             return Some(Rejection {
                 offset: message.offset,
                 error: Error::InvalidRecordValue(format!(
-                    "The message at offset {} ({origin}) cannot be routed: {reason}",
+                    "The message at offset: {} ({origin}) cannot be routed: {reason}",
                     message.offset
                 )),
             });
         }
         warn!(
-            "Dropping the message at offset {} ({origin}): {reason}",
+            "Dropping the message at offset: {} ({origin}): {reason}",
             message.offset
         );
         None
@@ -106,92 +147,50 @@ impl Router for DynamicRouter {
         messages_schema: Schema,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), crate::Error> {
-        let mut tables: HashMap<String, (Table, Vec<ConsumedMessage>)> = HashMap::new();
-        // Route values that name no table, with the reason, so that a batch loads each once.
-        let mut unroutable: HashMap<String, String> = HashMap::new();
+        let mut tables: Vec<(Table, Vec<ConsumedMessage>)> = Vec::new();
+        // Where each route value leads, so that a batch loads each table once.
+        let mut destinations: HashMap<String, Destination> = HashMap::new();
+        let without_route_field = Destination::Unroutable(format!(
+            "it is not a JSON object with the route field: {}",
+            self.route_field
+        ));
         let mut rejection = None;
         for mut message in messages {
             // Normalised once here so the routing read and the later write both
             // work off the document, rather than parsing the same proto text twice.
             message.payload = message.payload.into_json_document();
-            let Some(route_field_val) = self.extract_route_field(&message) else {
-                let reason = format!(
-                    "it is not a JSON object with the route field: {}",
-                    self.route_field
-                );
-                rejection = self.unroutable(origin, &message, &reason);
-                if rejection.is_some() {
-                    break;
-                }
-                continue;
-            };
-            if let Some(reason) = unroutable.get(&route_field_val) {
-                rejection = self.unroutable(origin, &message, reason);
-                if rejection.is_some() {
-                    break;
-                }
-                continue;
-            }
-
-            let entry = match tables.entry(route_field_val) {
-                Entry::Occupied(mut entry) => {
-                    entry.get_mut().1.push(message);
-                    continue;
-                }
-                Entry::Vacant(entry) => entry,
-            };
-            let route_field_val = entry.key();
-
-            let reason = if is_valid_namespaced_table(route_field_val) {
-                match load_table(route_field_val, self.catalog.as_ref()).await {
-                    Ok(table) => {
-                        entry.insert((table, vec![message]));
-                        continue;
+            let destination: &Destination = match self.extract_route_field(&message) {
+                Some(route_field_val) => match destinations.entry(route_field_val) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        let destination = self.destination(entry.key(), &mut tables).await?;
+                        entry.insert(destination)
                     }
-                    Err(error) if is_missing(&error) => format!(
-                        "table: {route_field_val} does not exist in the catalog: {}",
-                        format_error_chain(&error)
-                    ),
-                    // An unreachable catalog or a refused load says nothing about the message,
-                    // so at least once the batch fails without skipping it.
-                    Err(error) if self.held.is_some() => {
-                        return Err(table_load_error(route_field_val, &error));
-                    }
-                    Err(error) => format!(
-                        "table: {route_field_val} does not load from the catalog: {}",
-                        format_error_chain(&error)
-                    ),
-                }
-            } else {
-                format!(
-                    "its route field value: {route_field_val} names no table. It needs at least one namespace before the table, separated by '.'"
-                )
+                },
+                None => &without_route_field,
             };
-            rejection = self.unroutable(origin, &message, &reason);
-            if rejection.is_some() {
-                break;
+            match destination {
+                Destination::Table(index) => tables[*index].1.push(message),
+                Destination::Unroutable(reason) => {
+                    rejection = self.unroutable(origin, &message, reason);
+                    if rejection.is_some() {
+                        break;
+                    }
+                }
             }
-            unroutable.insert(entry.into_key(), reason);
         }
 
-        for (table_name, (table, batch_messages)) in tables {
+        for (table, table_messages) in &tables {
             // Once a message is rejected, the tables still need every message before it.
-            let messages = before(&batch_messages, rejection.as_ref());
-            let written = write_data(
-                origin,
-                messages,
-                &table,
-                Some(&table),
-                self.catalog.as_ref(),
-                messages_schema,
-                self.invalid_rows,
-                self.commit_retry,
-                self.held.as_ref(),
-            )
-            .await?;
+            let messages = before(table_messages, rejection.as_ref());
+            let written = self
+                .appender
+                .append(origin, table, true, messages_schema, messages)
+                .await?;
             info!(
-                "Dynamically routed {} input rows to iceberg table {table_name}, committed {}",
+                "Dynamically routed {} input rows to iceberg table {}, committed {}",
                 messages.len(),
+                table.identifier(),
                 written.committed_rows
             );
             rejection = first_rejection(rejection, written.rejection);
@@ -204,18 +203,22 @@ impl Router for DynamicRouter {
     }
 
     fn enable_at_least_once(&mut self) -> Result<(), Error> {
-        self.held = Some(HeldMessages::default());
+        self.appender.enable_at_least_once();
         Ok(())
+    }
+
+    fn flushed(&self, topic_metadata: &TopicMetadata, partitions: &[FlushPartition]) {
+        self.appender.flushed(topic_metadata, partitions);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-    use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
-    use iceberg::{CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
-    use std::time::Duration;
+    use crate::router::commit::tests::{
+        SINGLE_ATTEMPT, catalog_with_table, rest_catalog_answering,
+    };
+    use iceberg::TableIdent;
 
     const ORIGIN: BatchOrigin<'static> = BatchOrigin {
         connector_id: 1,
@@ -225,44 +228,11 @@ mod tests {
     };
 
     async fn router(invalid_rows: InvalidRows, at_least_once: bool) -> DynamicRouter {
-        let catalog = MemoryCatalogBuilder::default()
-            .load(
-                "memory",
-                HashMap::from([(
-                    MEMORY_CATALOG_WAREHOUSE.to_owned(),
-                    "memory://warehouse".to_owned(),
-                )]),
-            )
-            .await
-            .expect("Failed to create catalog");
-        let namespace = NamespaceIdent::new("test".to_owned());
-        catalog
-            .create_namespace(&namespace, HashMap::new())
-            .await
-            .expect("Failed to create namespace");
-        let schema = IcebergSchema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-            ])
-            .build()
-            .expect("Failed to build schema");
-        catalog
-            .create_table(
-                &namespace,
-                TableCreation::builder()
-                    .name("events".to_owned())
-                    .schema(schema)
-                    .build(),
-            )
-            .await
-            .expect("Failed to create table");
-        let retry = RetryPolicy {
-            max_attempts: 1,
-            base_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(1),
-        };
-        let mut router =
-            DynamicRouter::new(Box::new(catalog), "table".to_owned(), invalid_rows, retry);
+        let (catalog, _) = catalog_with_table(HashMap::new()).await;
+        let mut router = DynamicRouter::new(
+            Appender::new(Box::new(catalog), invalid_rows, SINGLE_ATTEMPT),
+            "table".to_owned(),
+        );
         if at_least_once {
             router
                 .enable_at_least_once()
@@ -303,7 +273,7 @@ mod tests {
                 .expect_err("An unroutable message should fail the batch");
 
             assert!(error.is_permanent(), "{error}");
-            assert!(error.to_string().contains("offset 7"), "{error}");
+            assert!(error.to_string().contains("offset: 7"), "{error}");
         }
     }
 
@@ -350,6 +320,15 @@ mod tests {
         assert_eq!(route_value(&payload, "region"), None);
     }
 
+    async fn events(router: &DynamicRouter) -> Table {
+        router
+            .appender
+            .catalog
+            .load_table(&TableIdent::from_strs(["test", "events"]).expect("a valid table name"))
+            .await
+            .expect("Failed to load table")
+    }
+
     #[tokio::test]
     async fn given_at_least_once_when_a_message_cannot_be_routed_should_commit_the_messages_before_it()
      {
@@ -365,12 +344,8 @@ mod tests {
             .await
             .expect_err("The unroutable message should stop the batch");
 
-        assert!(error.to_string().contains("offset 7"), "{error}");
-        let table = router
-            .catalog
-            .load_table(&TableIdent::from_strs(["test", "events"]).expect("a valid table name"))
-            .await
-            .expect("Failed to load table");
+        assert!(error.to_string().contains("offset: 7"), "{error}");
+        let table = events(&router).await;
         let snapshot = table
             .metadata()
             .current_snapshot()
@@ -385,19 +360,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_route_values_that_load_one_table_should_append_their_messages_together() {
+        let router = router(InvalidRows::Fail, true).await;
+        let table = events(&router).await;
+        let alias = TableIdent::from_strs(["test", "alias"]).expect("a valid table name");
+        router
+            .appender
+            .catalog
+            .register_table(
+                &alias,
+                table
+                    .metadata_location()
+                    .expect("A created table has a metadata location")
+                    .to_owned(),
+            )
+            .await
+            .expect("Failed to register the alias");
+        let batch = (0..4)
+            .map(|offset| ConsumedMessage {
+                id: u128::from(offset),
+                offset,
+                ..message(simd_json::json!({
+                    "table": if offset % 2 == 0 { "test.events" } else { "test.alias" },
+                    "id": offset,
+                }))
+            })
+            .collect();
+
+        router
+            .route_data(&ORIGIN, Schema::Json, batch)
+            .await
+            .expect("Both route values should load the table");
+
+        let table = events(&router).await;
+        let snapshot = table
+            .metadata()
+            .current_snapshot()
+            .expect("The batch should be appended");
+        assert_eq!(
+            snapshot
+                .summary()
+                .additional_properties
+                .get("added-records"),
+            Some(&"4".to_owned()),
+            "one append should hold the messages of both route values"
+        );
+    }
+
+    #[tokio::test]
     async fn given_a_catalog_that_refuses_the_load_when_skipping_rows_should_fail_without_skipping()
     {
-        let catalog =
-            crate::router::commit::tests::rest_catalog_answering(http::StatusCode::FORBIDDEN).await;
+        let catalog = rest_catalog_answering(http::StatusCode::FORBIDDEN).await;
         let mut router = DynamicRouter::new(
-            Box::new(catalog),
+            Appender::new(Box::new(catalog), InvalidRows::Skip, SINGLE_ATTEMPT),
             "table".to_owned(),
-            InvalidRows::Skip,
-            RetryPolicy {
-                max_attempts: 1,
-                base_delay: Duration::from_millis(1),
-                max_delay: Duration::from_millis(1),
-            },
         );
         router
             .enable_at_least_once()
@@ -410,6 +426,6 @@ mod tests {
             .expect_err("A refused load says nothing about the message, so it is not skipped");
 
         assert!(error.is_permanent(), "{error}");
-        assert!(matches!(error, Error::InvalidConfigValue(_)), "{error}");
+        assert!(matches!(error, Error::PermanentHttpError(_)), "{error}");
     }
 }

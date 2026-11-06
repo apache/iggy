@@ -18,7 +18,7 @@
 use crate::InvalidRows;
 use crate::router::arrow_streamer::JsonArrowReader;
 use crate::router::commit::commit_data_files;
-use crate::router::redelivery::{HeldMessages, LastMessage, snapshot_properties};
+use crate::router::redelivery::{Append, HeldMessages, snapshot_properties};
 use crate::slice_user_table;
 use arrow_array::RecordBatch;
 use arrow_json::ReaderBuilder;
@@ -38,7 +38,7 @@ use iceberg::{
     writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
 };
 use iggy_connector_sdk::retry::RetryPolicy;
-use iggy_connector_sdk::{ConsumedMessage, Error, Schema};
+use iggy_connector_sdk::{ConsumedMessage, Error, FlushPartition, Schema, TopicMetadata};
 use parquet::file::properties::WriterProperties;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -139,73 +139,131 @@ fn before<'m>(
     }
 }
 
-/// Writes and commits `messages` to `table`. With `held`, the sink delivers at least once: the
-/// messages that `table` already holds are not appended again, and the commit records the last
-/// message it holds. `current` is a copy of `table` just loaded from the catalog.
-#[allow(clippy::too_many_arguments)]
-async fn write_data(
-    origin: &BatchOrigin<'_>,
-    messages: &[ConsumedMessage],
-    table: &Table,
-    current: Option<&Table>,
-    catalog: &dyn Catalog,
-    messages_schema: Schema,
+/// What both routers need to append messages to a table.
+#[derive(Debug)]
+pub(crate) struct Appender {
+    catalog: Box<dyn Catalog>,
     invalid_rows: InvalidRows,
     commit_retry: RetryPolicy,
-    held: Option<&HeldMessages>,
-) -> Result<Written, Error> {
-    if messages.is_empty() {
-        return Ok(Written::default());
-    }
-    let messages = match held {
-        Some(held) => {
-            held.unheld(origin, table, current, catalog, messages)
-                .await?
+    /// Set when the sink delivers at least once.
+    held: Option<HeldMessages>,
+}
+
+impl Appender {
+    pub(crate) fn new(
+        catalog: Box<dyn Catalog>,
+        invalid_rows: InvalidRows,
+        commit_retry: RetryPolicy,
+    ) -> Self {
+        Self {
+            catalog,
+            invalid_rows,
+            commit_retry,
+            held: None,
         }
-        None => messages,
-    };
-    if messages.is_empty() {
-        return Ok(Written::default());
     }
-    let (data_files, rejection) =
-        write_data_files(origin, messages, table, messages_schema, invalid_rows).await?;
-    let handled = before(messages, rejection.as_ref());
-    let (Some(last), false) = (handled.last(), data_files.is_empty()) else {
-        // Every row was skipped or rejected, and an empty append would still add a snapshot.
-        return Ok(Written {
-            committed_rows: 0,
+
+    fn enable_at_least_once(&mut self) {
+        self.held = Some(HeldMessages::default());
+    }
+
+    fn flushed(&self, topic_metadata: &TopicMetadata, partitions: &[FlushPartition]) {
+        if let Some(held) = &self.held {
+            held.flushed(topic_metadata, partitions);
+        }
+    }
+
+    /// Writes and commits `messages` to `table`. `fresh` says that `table` was just loaded from
+    /// the catalog. At least once, the messages that `table` already holds are not appended
+    /// again, and the commit records the messages it appends.
+    async fn append(
+        &self,
+        origin: &BatchOrigin<'_>,
+        table: &Table,
+        fresh: bool,
+        messages_schema: Schema,
+        messages: &[ConsumedMessage],
+    ) -> Result<Written, Error> {
+        if messages.is_empty() {
+            return Ok(Written::default());
+        }
+        let messages = match &self.held {
+            Some(held) => {
+                held.unheld(origin, table, fresh, self.catalog.as_ref(), messages)
+                    .await?
+            }
+            None => messages,
+        };
+        if messages.is_empty() {
+            return Ok(Written::default());
+        }
+        // At most once, a failed call loses the rest of the run, so a payload without a JSON
+        // document is skipped whatever `invalid_rows` says.
+        let without_json = if self.held.is_some() {
+            self.invalid_rows
+        } else {
+            InvalidRows::Skip
+        };
+        let (data_files, rejection) = write_data_files(
+            origin,
+            messages,
+            table,
+            messages_schema,
+            self.invalid_rows,
+            without_json,
+        )
+        .await?;
+        let handled = before(messages, rejection.as_ref());
+        let (Some(first), Some(last), false) =
+            (handled.first(), handled.last(), data_files.is_empty())
+        else {
+            // Every row was skipped or rejected, and an empty append would still add a snapshot.
+            return Ok(Written {
+                committed_rows: 0,
+                rejection,
+            });
+        };
+        let committed_rows = data_files.iter().map(DataFile::record_count).sum();
+        let append = Append::new(first, last);
+        let properties = if self.held.is_some() {
+            snapshot_properties(origin, append)
+        } else {
+            HashMap::new()
+        };
+        let committed = commit_data_files(
+            table,
+            self.catalog.as_ref(),
+            data_files,
+            properties,
+            self.commit_retry,
+        )
+        .await;
+        if let Some(held) = &self.held {
+            match &committed {
+                Ok(()) => held.committed(origin, table, append),
+                Err(_) => held.forget(origin, table),
+            }
+        }
+        committed?;
+        Ok(Written {
+            committed_rows,
             rejection,
-        });
-    };
-    let committed_rows = data_files.iter().map(DataFile::record_count).sum();
-    let recorded = held.map(|held| held.last_to_record(origin, table, LastMessage::from(last)));
-    let properties = recorded
-        .map(|last| snapshot_properties(origin, last))
-        .unwrap_or_default();
-    let committed = commit_data_files(table, catalog, data_files, properties, commit_retry).await;
-    if let (Some(held), Some(recorded)) = (held, recorded) {
-        match &committed {
-            Ok(()) => held.committed(origin, table, recorded),
-            Err(_) => held.forget(origin, table),
-        }
+        })
     }
-    committed?;
-    Ok(Written {
-        committed_rows,
-        rejection,
-    })
 }
 
 /// Writes the JSON payloads as Parquet data files under the table location,
 /// laid out by the table's default partition spec. Nothing is committed here. With
 /// `invalid_rows = "fail"`, the first message that the table cannot take ends the write, and the
-/// data files hold the messages before it.
+/// data files hold the messages before it. `without_json` decides the same for a payload that
+/// holds no JSON document.
 async fn write_data_files(
     origin: &BatchOrigin<'_>,
     messages: &[ConsumedMessage],
     table: &Table,
     messages_schema: Schema,
     invalid_rows: InvalidRows,
+    without_json: InvalidRows,
 ) -> Result<(Vec<DataFile>, Option<Rejection>), Error> {
     let location = DefaultLocationGenerator::new(table.metadata()).map_err(|err| {
         error!(
@@ -252,7 +310,7 @@ async fn write_data_files(
             message.offset,
             table.identifier()
         );
-        if invalid_rows == InvalidRows::Skip {
+        if without_json == InvalidRows::Skip {
             warn!("Skipping a row. {reason}");
             continue;
         }
@@ -543,6 +601,10 @@ pub trait Router: std::fmt::Debug + Sync + Send {
     /// does not load, and appends only the messages a table does not hold yet when a batch is
     /// delivered again. Refuses when the configuration cannot keep that promise.
     fn enable_at_least_once(&mut self) -> Result<(), Error>;
+
+    /// A flush proved `partitions` delivered up to their offsets, so the runtime never hands those
+    /// messages over again.
+    fn flushed(&self, topic_metadata: &TopicMetadata, partitions: &[FlushPartition]);
 }
 
 #[cfg(test)]
@@ -642,6 +704,7 @@ mod tests {
             table,
             Schema::Json,
             invalid_rows,
+            invalid_rows,
         ))
     }
 
@@ -699,6 +762,7 @@ mod tests {
                 &messages(&payloads),
                 &table,
                 Schema::Proto,
+                InvalidRows::Fail,
                 InvalidRows::Fail,
             ))
             .expect("a rejected message is not a failed write");
@@ -788,6 +852,7 @@ mod tests {
                 &messages(&payloads),
                 &table,
                 Schema::Text,
+                InvalidRows::Skip,
                 InvalidRows::Skip,
             ))
             .expect("skipping every row is not an error");
