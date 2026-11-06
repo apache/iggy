@@ -29,8 +29,8 @@ use crate::shell::{
 };
 use configs::server::ServerConfig;
 use consensus::{
-    ClientTable, HistoryRecovery, JoinMode, LocalPipeline, PipelineEntry, Sequencer, VsrConsensus,
-    VsrRestore, VsrState,
+    ClientTable, HistoryRecovery, JoinMode, LocalPipeline, PipelineEntry, ReplicaSet, Sequencer,
+    VsrConsensus, VsrRestore, VsrState,
 };
 use iggy_common::{
     EncryptorKind, IggyByteSize, IggyError, PartitionStats, ServerKeyContext, StreamEncryption,
@@ -107,6 +107,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     reply_inbox: ShardReceiver<ShardFrame>,
     metrics: ShardMetrics,
     roster_cells: &RosterCells,
+    repair_memory: Arc<partitions::RepairMemoryBudget>,
 ) -> Result<ShardBuild, ServerError> {
     let shard_local_id = ShardId::new(shard_id);
     let retired_key: iggy_common::HeaderKey =
@@ -172,7 +173,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         refuse_partitionless_stream_keys(metadata.mux_stm.streams(), &key_context, solo)?;
     }
     refuse_unreadable_topics(metadata.mux_stm.streams())?;
-    let partitions = IggyPartitions::with_capacity(
+    let partitions = IggyPartitions::with_repair_memory(
         shard_local_id,
         PartitionsConfig {
             messages_required_to_save: iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
@@ -188,6 +189,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
             },
         },
         owned_partitions_capacity,
+        repair_memory,
     );
     let shards_table = PapayaShardsTable::with_capacity(total_partitions);
 
@@ -206,6 +208,13 @@ pub(in crate::boot) async fn build_shard_for_thread(
             let mut encryption = None;
             for (topic_id, topic) in &stream.topics {
                 for partition in &topic.partitions {
+                    if partition
+                        .replica_set(topology.replica_count)
+                        .member(topology.self_replica_id)
+                        .is_none()
+                    {
+                        continue;
+                    }
                     let namespace = IggyNamespace::new(stream.id, topic_id, partition.id);
                     let owning_shard =
                         calculate_shard_assignment(&namespace, u32::from(total_shards));
@@ -283,7 +292,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
             topic_runtime,
             topology.cluster_id,
             topology.self_replica_id,
-            topology.replica_count,
+            partition_metadata.replica_set(topology.replica_count),
             Rc::clone(&bus),
             &partitions,
         )
@@ -476,6 +485,7 @@ const _: () = assert!(
 );
 const _: () =
     assert!(configs::cluster::DEFAULT_VIEW_PROBE_ATTEMPTS_MAX == consensus::PROBE_ATTEMPTS_MAX);
+const _: () = assert!(configs::cluster::MAX_CLUSTER_REPLICAS == consensus::REPLICAS_MAX);
 const _: () =
     assert!(configs::partition::DEFAULT_EVICTED_RING_CAPACITY == partitions::EVICTED_RING_CAPACITY);
 const _: () = assert!(
@@ -780,7 +790,7 @@ pub(in crate::boot) fn restore_metadata_consensus(
     let consensus = VsrConsensus::restored(
         topology.cluster_id,
         topology.self_replica_id,
-        replica_count,
+        ReplicaSet::all(replica_count),
         server_common::sharding::METADATA_GROUP,
         bus,
         // Request queue keeps the stock 2x ratio over the prepare queue
@@ -979,6 +989,7 @@ mod tests {
                         partition_id: 0,
                         consensus_group_id: 1,
                         initial_view: 0,
+                        members: Vec::new(),
                     }],
                 }
                 .to_bytes(),

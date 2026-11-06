@@ -97,6 +97,11 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case lifecycleBusy = 88
     case notPrimary = 89
     case deferredPollCapacityExceeded = 90
+    case producerIdsExhausted = 91
+    case producerSequenceOutOfOrder = 92
+    case producerEpochFenced = 93
+    case producerUnknown = 94
+    case producerPartitionRequired = 95
     case clientNotFound = 100
     case invalidClientId = 101
     case connectionClosed = 206
@@ -284,6 +289,8 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case operationUncertain = 14006
     case laneBlocked = 14007
     case operationNotRetained = 14008
+    case partitionLaneBlocked = 14009
+    case fetchProgressUncertain = 14010
 }
 
 extension IggyErrorCode {
@@ -363,6 +370,11 @@ extension IggyErrorCode {
         case .lifecycleBusy: "lifecycle_busy"
         case .notPrimary: "not_primary"
         case .deferredPollCapacityExceeded: "deferred_poll_capacity_exceeded"
+        case .producerIdsExhausted: "producer_ids_exhausted"
+        case .producerSequenceOutOfOrder: "producer_sequence_out_of_order"
+        case .producerEpochFenced: "producer_epoch_fenced"
+        case .producerUnknown: "producer_unknown"
+        case .producerPartitionRequired: "producer_partition_required"
         case .clientNotFound: "client_not_found"
         case .invalidClientId: "invalid_client_id"
         case .connectionClosed: "connection_closed"
@@ -550,6 +562,8 @@ extension IggyErrorCode {
         case .operationUncertain: "operation_uncertain"
         case .laneBlocked: "lane_blocked"
         case .operationNotRetained: "operation_not_retained"
+        case .partitionLaneBlocked: "partition_lane_blocked"
+        case .fetchProgressUncertain: "fetch_progress_uncertain"
         }
     }
 }

@@ -26,6 +26,7 @@ import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyOperationException;
+import org.apache.iggy.exception.IggyValidationException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -93,7 +94,6 @@ class AsyncIggyTcpClientPartitionContextTest {
     private static final int PARTITION_NOT_OWNED = 5009;
     private static final int ASSIGNED_PARTITION = 7;
     private static final int DEFERRED_PARAMETERS_BYTES = 2 * Long.BYTES + 2 * Integer.BYTES;
-    private static final int RESYNC_REQUIRED_PARTITION = -1;
     // An offset write status of the fake primary: the write is stored.
     private static final int STORED = 0;
     private static final long ROUTE_INCARNATION = 1;
@@ -620,13 +620,11 @@ class AsyncIggyTcpClientPartitionContextTest {
         }
     }
 
+    /** A 106 names one partition, so the client refuses a deferred group poll without one, as the server would. */
     @Test
-    void shouldReduceDeferredPollBudgetsWhenAGroupResyncStartsAnotherAttempt() throws Exception {
+    void shouldRefuseADeferredGroupPollWithoutAPartitionBeforeSendingIt() throws Exception {
         InetAddress loopback = InetAddress.getLoopbackAddress();
         try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback)) {
-            AtomicInteger syncs = new AtomicInteger();
-            List<Long> waits = new CopyOnWriteArrayList<>();
-            List<Long> budgets = new CopyOnWriteArrayList<>();
             CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
                 if (request.operation() == OPERATION_REGISTER) {
                     return Response.success(OPERATION_REGISTER, registerBody(1));
@@ -635,52 +633,27 @@ class AsyncIggyTcpClientPartitionContextTest {
                     return Response.success(
                             OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
                 }
-                if (request.is(GROUP_SYNC_CODE, OPERATION_NON_REPLICATED)) {
-                    return Response.success(
-                            OPERATION_NON_REPLICATED,
-                            Unpooled.buffer()
-                                    .writeLongLE(syncs.incrementAndGet())
-                                    .writeIntLE(1)
-                                    .writeIntLE(0));
-                }
-                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
-                    return Response.success(
-                            OPERATION_NON_REPLICATED,
-                            pollRoute(request, 1, 1, coordinatorSocket.getLocalPort(), ROUTE_INCARNATION));
-                }
-                if (request.is(CommandCode.Messages.POLL_DEFERRED.getValue(), OPERATION_NON_REPLICATED)) {
-                    ByteBuffer body = ByteBuffer.wrap(request.body()).order(ByteOrder.LITTLE_ENDIAN);
-                    waits.add(body.getLong(body.limit() - DEFERRED_PARAMETERS_BYTES));
-                    budgets.add(body.getLong(body.limit() - Long.BYTES));
-                    return Response.success(
-                            OPERATION_NON_REPLICATED, emptyPoll(waits.size() == 1 ? RESYNC_REQUIRED_PARTITION : 0));
-                }
                 throw new IllegalStateException("Unexpected coordinator request: " + request);
             });
             AsyncIggyTcpClient client = client(coordinatorSocket);
-            var options = DeferredPollOptions.defaults();
             try {
                 client.connect().get(5, TimeUnit.SECONDS);
                 client.login().get(5, TimeUnit.SECONDS);
-                client.messages()
-                        .pollMessagesDeferred(
-                                StreamId.of(1L),
-                                TopicId.of(1L),
-                                Optional.empty(),
-                                Consumer.group(ConsumerId.of(7L)),
-                                PollingStrategy.next(),
-                                1L,
-                                false,
-                                options)
-                        .get(5, TimeUnit.SECONDS);
-                assertThat(syncs).hasValue(2);
-                assertThat(waits).hasSize(2);
-                assertThat(waits.get(0)).isLessThan(options.maxWaitMicros());
-                assertThat(waits.get(1)).isLessThan(waits.get(0));
-                assertThat(budgets.get(1)).isLessThan(budgets.get(0));
-                assertThat(budgets.get(0) - waits.get(0))
-                        .isEqualTo(options.requestTimeoutMicros() - options.maxWaitMicros());
-                assertThat(budgets.get(1) - waits.get(1)).isEqualTo(budgets.get(0) - waits.get(0));
+
+                assertThatThrownBy(() -> client.messages()
+                                .pollMessagesDeferred(
+                                        StreamId.of(1L),
+                                        TopicId.of(1L),
+                                        Optional.empty(),
+                                        Consumer.group(ConsumerId.of(7L)),
+                                        PollingStrategy.next(),
+                                        1L,
+                                        false,
+                                        DeferredPollOptions.defaults()))
+                        .isInstanceOfSatisfying(IggyValidationException.class, error -> {
+                            assertThat(error.getRawErrorCode()).isEqualTo(IggyErrorCode.INVALID_COMMAND.getCode());
+                            assertThat(error.getMessage()).contains("partition reader");
+                        });
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
             }
@@ -917,6 +890,29 @@ class AsyncIggyTcpClientPartitionContextTest {
             assertThat(cluster.primaryWrites)
                     .extracting(AsyncIggyTcpClientPartitionContextTest::stampedContext)
                     .containsOnly(routeContext(1));
+        }
+    }
+
+    @Test
+    void shouldDeleteTheReaderOffsetWithItsCapturedContext() throws Exception {
+        try (OffsetCluster cluster = new OffsetCluster(1, STORED)) {
+            AsyncIggyTcpClient client = client(cluster.coordinatorSocket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                ((ConsumerOffsetsTcpClient) client.consumerOffsets())
+                        .deleteConsumerOffset(StreamId.of(1L), TopicId.of(1L), 0L, Consumer.of(7L), CALLER_CONTEXT)
+                        .get(5, TimeUnit.SECONDS);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            cluster.awaitServed();
+            assertThat(cluster.primaryWrites)
+                    .extracting(Request::operation)
+                    .containsExactly(OPERATION_DELETE_CONSUMER_OFFSET);
+            assertThat(cluster.primaryWrites)
+                    .extracting(AsyncIggyTcpClientPartitionContextTest::stampedContext)
+                    .containsExactly(CALLER_CONTEXT);
         }
     }
 

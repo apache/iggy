@@ -20,6 +20,7 @@ use crate::types::configuration::websocket_config::websocket_connection_string_o
 use crate::{
     AutoLogin, NonZeroIggyDuration, PendingOperationsConfig, WebSocketClientReconnectionConfig,
 };
+use iggy_binary_protocol::MAX_RECORD_REPLY_SIZE;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use tungstenite::protocol::WebSocketConfig as TungsteniteConfig;
@@ -59,13 +60,14 @@ pub struct WebSocketConfig {
     pub write_buffer_size: Option<usize>,
     /// Maximum write buffer size.
     pub max_write_buffer_size: Option<usize>,
-    /// Maximum message size, or `None` for no limit. Defaults to tungstenite's
-    /// own limit rather than `None`, so `None` always means the limit was lifted
-    /// deliberately.
+    /// Maximum message size, or `None` for no limit. Defaults to the larger of
+    /// tungstenite's own limit and a reply that holds the largest message, so
+    /// `None` always means the limit was lifted deliberately.
     pub max_message_size: Option<usize>,
-    /// Maximum frame size, or `None` for no limit. Defaults to tungstenite's own
-    /// limit rather than `None`, so `None` always means the limit was lifted
-    /// deliberately.
+    /// Maximum frame size, or `None` for no limit. The server sends each reply as
+    /// one frame, so it defaults to the larger of tungstenite's own limit and a
+    /// reply that holds the largest message. `None` always means the limit was
+    /// lifted deliberately.
     pub max_frame_size: Option<usize>,
     /// Accept unmasked frames (client should typically keep as false).
     pub accept_unmasked_frames: bool,
@@ -96,8 +98,12 @@ impl Default for WebSocketConfig {
             read_buffer_size: Some(tungstenite_config.read_buffer_size),
             write_buffer_size: Some(tungstenite_config.write_buffer_size),
             max_write_buffer_size: Some(tungstenite_config.max_write_buffer_size),
-            max_message_size: tungstenite_config.max_message_size,
-            max_frame_size: tungstenite_config.max_frame_size,
+            max_message_size: tungstenite_config
+                .max_message_size
+                .map(|size| size.max(MAX_RECORD_REPLY_SIZE)),
+            max_frame_size: tungstenite_config
+                .max_frame_size
+                .map(|size| size.max(MAX_RECORD_REPLY_SIZE)),
             accept_unmasked_frames: false,
         }
     }
@@ -205,14 +211,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_should_carry_tungstenites_own_size_limits() {
+    fn given_no_size_limits_when_defaulted_should_hold_the_largest_record_reply() {
         let config = WebSocketConfig::default();
         let tungstenite = TungsteniteConfig::default();
 
-        assert_eq!(config.max_message_size, tungstenite.max_message_size);
-        assert_eq!(config.max_frame_size, tungstenite.max_frame_size);
-        assert!(config.max_message_size.is_some());
-        assert!(config.max_frame_size.is_some());
+        assert_eq!(
+            config.max_message_size,
+            tungstenite
+                .max_message_size
+                .map(|size| size.max(MAX_RECORD_REPLY_SIZE))
+        );
+        assert_eq!(config.max_frame_size, Some(MAX_RECORD_REPLY_SIZE));
     }
 
     #[test]
@@ -231,11 +240,11 @@ mod tests {
 
     #[test]
     fn default_size_limits_should_reach_tungstenite_unchanged() {
-        let tungstenite = WebSocketConfig::default().to_tungstenite_config();
-        let expected = TungsteniteConfig::default();
+        let config = WebSocketConfig::default();
+        let tungstenite = config.to_tungstenite_config();
 
-        assert_eq!(tungstenite.max_message_size, expected.max_message_size);
-        assert_eq!(tungstenite.max_frame_size, expected.max_frame_size);
+        assert_eq!(tungstenite.max_message_size, config.max_message_size);
+        assert_eq!(tungstenite.max_frame_size, config.max_frame_size);
     }
 
     #[test]

@@ -22,6 +22,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -343,6 +344,127 @@ class RuntimeConsumers(unittest.TestCase):
                 uses = [step.get("uses") for step in steps]
                 if SERVER_START in uses:
                     self.assertIn(DOWNLOAD_RUNTIME, uses[:uses.index(SERVER_START)], path.relative_to(REPO_ROOT))
+
+    def test_readme_timeout_fails_and_stops_remaining_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text("sleep 30\nprintf 'unexpected execution'\n")
+            result = run(
+                "bash", "-c",
+                'source "$1"; EXAMPLES_EXIT_CODE=0; '
+                'run_readme_commands README.md "." 1; exit "$EXAMPLES_EXIT_CODE"',
+                "bash", str(REPO_ROOT / "scripts/utils.sh"), cwd=root,
+            )
+            self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
+            self.assertNotIn("unexpected execution", result.stdout)
+
+    def test_python_examples_reuse_synced_environment_for_plain_and_tls(self):
+        result, events = self.run_python_examples()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(events, [
+            "sync --frozen", "server-start", "run --no-sync example.py", "example",
+            "server-start", "run --no-sync example.py --tls", "example --tls",
+        ])
+
+    def test_python_sync_failure_stops_before_starting_server_or_examples(self):
+        result, events = self.run_python_examples(sync_exit=23)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(events, ["sync --frozen"])
+
+    def test_python_consumer_failures_return_nonzero(self):
+        for example in ("basic", "getting-started"):
+            failures = {
+                "connect": "connection failed",
+                "poll": "poll failed",
+                "decode": "UnicodeDecodeError",
+            }
+            if example == "getting-started":
+                failures["config"] = "invalid configuration"
+            for failure, message in failures.items():
+                with self.subTest(example=example, failure=failure):
+                    result = self.run_python_consumer(example, failure)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn(message, result.stderr)
+
+    def test_python_consumers_complete_successfully(self):
+        for example in ("basic", "getting-started"):
+            with self.subTest(example=example):
+                result = self.run_python_consumer(example)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def run_python_consumer(self, example, failure=""):
+        script = r"""
+import asyncio
+import runpy
+import sys
+from unittest.mock import AsyncMock, MagicMock, patch
+
+path, failure = sys.argv[1:]
+message = MagicMock()
+message.payload.return_value = b"hello" if failure != "decode" else b"\xff"
+client = MagicMock()
+client.connect = AsyncMock()
+client.poll_messages = AsyncMock(return_value=MagicMock(messages=[message]))
+sdk = MagicMock()
+sdk.IggyClient.return_value = client
+sdk.IggyClient.from_connection_string.return_value = client
+if failure == "connect":
+    client.connect.side_effect = RuntimeError("connection failed")
+elif failure == "poll":
+    client.poll_messages.side_effect = RuntimeError("poll failed")
+elif failure == "config":
+    sdk.TcpConfig.side_effect = ValueError("invalid configuration")
+sys.argv = [path]
+with (
+    patch.dict(sys.modules, {"apache_iggy": sdk, "loguru": MagicMock()}),
+    patch.object(asyncio, "sleep", new=AsyncMock()),
+):
+    consumer = runpy.run_path(path, run_name="__main__")
+if not failure and client.poll_messages.await_count != consumer["BATCHES_LIMIT"]:
+    raise AssertionError("Consumer did not complete all batches")
+"""
+        return run(sys.executable, "-c", script,
+                   str(REPO_ROOT / "examples/python" / example / "consumer.py"), failure)
+
+    def run_python_examples(self, *, sync_exit=0):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            examples = root / "examples/python"
+            binaries = root / "target/debug"
+            examples.mkdir(parents=True)
+            binaries.mkdir(parents=True)
+            (examples / "README.md").write_text(
+                "uv run example.py\nuv run example.py --tls\n"
+            )
+            (examples / "example.py").write_text(
+                'import os, sys\n'
+                'with open(os.environ["EXAMPLE_EVENTS"], "a") as events:\n'
+                '    events.write(" ".join(["example", *sys.argv[1:]]) + "\\n")\n'
+            )
+            server = binaries / "iggy-server"
+            server.write_text(
+                '#!/usr/bin/env bash\n'
+                'echo server-start >> "$EXAMPLE_EVENTS"\n'
+                'echo "client listeners started"\n'
+                'exec sleep 60\n'
+            )
+            server.chmod(0o755)
+            uv = binaries / "uv"
+            uv.write_text(
+                '#!/usr/bin/env bash\n'
+                'echo "$*" >> "$EXAMPLE_EVENTS"\n'
+                'if [ "$1" = sync ]; then exit "$SYNC_EXIT"; fi\n'
+                'if [ "$1" != run ] || [ "$2" != --no-sync ]; then exit 1; fi\n'
+                'shift 2\n'
+                'exec python3 "$@"\n'
+            )
+            uv.chmod(0o755)
+            events = root / "events"
+            env = {**os.environ, "PATH": f'{binaries}:{os.environ["PATH"]}',
+                   "EXAMPLE_EVENTS": str(events), "SYNC_EXIT": str(sync_exit)}
+            result = run("bash", str(REPO_ROOT / "scripts/run-examples-from-readme.sh"),
+                         "--language", "python", cwd=root, env=env)
+            return result, events.read_text().splitlines()
 
 
 class PublishSelection(unittest.TestCase):

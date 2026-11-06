@@ -39,7 +39,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use iggy::prelude::{Consumer, Identifier, MessageClient, PollingStrategy};
+use iggy::prelude::{Consumer, Identifier, MessageClient, PollOptions, PollingStrategy};
 use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::records::{
     Compression, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE, Record,
@@ -327,11 +327,13 @@ async fn phase1_produce_flow_through_real_gateway_process_and_real_iggy_server()
         .poll_messages(
             &Identifier::named(STREAM).expect("stream name"),
             &Identifier::named(TOPIC).expect("topic name"),
-            Some(0),
+            0,
             &Consumer::new(Identifier::named("phase1-e2e-reader").expect("consumer name")),
             &PollingStrategy::offset(0),
-            2,
-            false,
+            PollOptions {
+                count: 2,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll produced messages")

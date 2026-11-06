@@ -159,7 +159,7 @@ This checkout moves the binary protocol to 0.12.0 and the metadata snapshot form
 - [Node.js (TypeScript)](https://www.npmjs.com/package/apache-iggy)
 - [Go](https://pkg.go.dev/github.com/apache/iggy/foreign/go)
 
-[C++](https://github.com/apache/iggy/tree/master/foreign/cpp) and [PHP](https://github.com/apache/iggy/tree/master/foreign/php) are work in progress.
+[C++](https://github.com/apache/iggy/tree/master/foreign/cpp), [PHP](https://github.com/apache/iggy/tree/master/foreign/php), and [Swift](https://github.com/apache/iggy/tree/master/foreign/swift) are work in progress.
 
 ---
 
@@ -289,7 +289,7 @@ What each policy survives in a cluster of `n` replicas. A partition gets the `pe
 
 - `persisted` keeps every acknowledged write through any pattern of crashes and restarts. It is needed to survive `q` or more replicas crashing at once, power loss of the whole cluster, or any crash in a one-replica cluster.
 - `replicated` keeps every acknowledged write as long as fewer than `q` replicas lose unflushed writes at the same time, where `q`, the replicas that acknowledge each write, is half the replicas rounded up but at most 3 (2 in a two-replica cluster). A replica that returns with that partition awaiting a state transfer counts as one of them: its log is not used, even if its WAL still holds ops.
-- Graceful restarts flush the WAL first and lose nothing, one at a time or all together. A crash (SIGKILL, OOM kill) loses the WAL writes not yet handed to the OS, and power loss also loses what the OS had not written to disk. Under `replicated`, `q` or more such crashes at once can lose the most recently acknowledged writes.
+- Graceful restarts flush the WAL first and lose nothing, one at a time or all together. After a crash (SIGKILL, OOM kill) or power loss, a replica recovers a `replicated` partition up to the last WAL frontier it published, at a checkpoint, a durable operation or a graceful shutdown, and discards later writes even if the OS held them. Under `replicated`, `q` or more such crashes at once can lose the most recently acknowledged writes. In a one-replica cluster, any crash can.
 - A restarted `replicated` replica accepts no writes and acknowledges no prepares until it joins a settled view: one a running primary sends it, or one that an election starts. Until then writes and polls sent to it, binary or HTTP, fail with `TransientNotAccepted` (HTTP 503), which clients retry.
   When no primary answers, the restarted replicas hold an election and mark their logs as possibly incomplete. A new view starts only from `n - q + 1` replicas whose logs are not marked (2 in a two-replica cluster, a majority up to six replicas), or once every replica has reported, and the partition stays unavailable until then.
   After a full-cluster restart that means every replica must be back. A replica whose partition awaits a state transfer still reports without a log while it is recovering; once it has joined a view it stays out of later elections until its transfer completes. A replica that never returns halts the partition indefinitely (no operator override yet).
@@ -471,19 +471,24 @@ producer.init().await?;
 let messages = vec![IggyMessage::from_str("Hello Apache Iggy")?];
 producer.send(messages).await?;
 
-// Create a consumer for the given stream and one of its topics
+// Create a consumer group member for the given stream and one of its topics.
+// It stores the last processed message every second and after each batch.
 let mut consumer = client
     .consumer_group("my_app", "dev01", "events")?
-    .auto_commit(AutoCommit::IntervalOrWhen(
-        NonZeroIggyDuration::from_str("1s")?,
-        AutoCommitWhen::ConsumingAllMessages,
-    ))
     .create_consumer_group_if_not_exists()
-    .auto_join_consumer_group()
     .polling_strategy(PollingStrategy::next())
-    .batch_length(1000)
+    .poll_options(PollOptions {
+        count: 1000,
+        commit: CommitPolicy::Auto(AutoCommit {
+            interval: Some(NonZeroIggyDuration::from_str("1s")?),
+            every: Some(CommitEvery::Batch),
+            after: CommitAfter::Processing,
+        }),
+        ..PollOptions::wait(IggyDuration::from_str("1s")?)
+    })
     .build();
 
+// Joins the group and starts reading
 consumer.init().await?;
 
 // Start consuming the messages
@@ -491,6 +496,8 @@ while let Some(message) = consumer.next().await {
     // Handle the message
 }
 ```
+
+For batches of many partitions, use `PartitionReader` from `client.reader(...)`. The [Rust SDK README](core/sdk/README.md#reading-messages) describes the three ways to read, the commit options and what to do after a lost reply.
 
 ---
 

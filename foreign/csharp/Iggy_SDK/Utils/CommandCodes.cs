@@ -50,8 +50,8 @@ internal static class CommandCodes
     // 103 and 104 are retired and must never be reused.
     internal const int GET_PARTITION_ROUTE_CODE = 105;
     internal const int POLL_MESSAGES_DEFERRED_CODE = 106;
-    internal const int WAIT_FOR_MESSAGES_CODE = 107;
     internal const int CANCEL_DEFERRED_REQUEST_CODE = 108;
+    internal const int FETCH_MESSAGES_CODE = 109;
     internal const int GET_CONSUMER_OFFSET_CODE = 120;
     internal const int STORE_CONSUMER_OFFSET_CODE = 121;
     internal const int DELETE_CONSUMER_OFFSET_CODE = 122;

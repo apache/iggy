@@ -112,6 +112,11 @@ impl Default for ClusterConfig {
                 .parse()
                 .unwrap(),
             view_probe_attempts_max: SERVER_CONFIG.cluster.view_probe_attempts_max as u32,
+            default_replication_factor: SERVER_CONFIG
+                .cluster
+                .default_replication_factor
+                .parse()
+                .unwrap(),
             repair_retry_interval: SERVER_CONFIG
                 .cluster
                 .repair_retry_interval
@@ -128,6 +133,7 @@ impl Default for ClusterConfig {
                 .nodes
                 .iter()
                 .map(|node| ClusterNodeConfig {
+                    rack: None,
                     name: node.name.parse().unwrap(),
                     ip: node.ip.parse().unwrap(),
                     advertised_address: None,
@@ -193,6 +199,10 @@ impl Default for PartitionConfig {
                 .wal_bytes_max
                 .parse()
                 .expect("embedded WAL capacity is valid"),
+            repair_memory_bytes_max: partition
+                .repair_memory_bytes_max
+                .parse()
+                .expect("embedded repair memory capacity is valid"),
             wal_group_commit_delay_micros: u64::try_from(partition.wal_group_commit_delay_micros)
                 .expect("embedded WAL group commit delay is valid"),
             validate_checksum: SERVER_CONFIG.partition.validate_checksum,

@@ -90,9 +90,8 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 VsrHeaders.readRequestOperation(requestFrame),
                 VsrHeaders.readRequestId(requestFrame),
                 RequestIdentity.from(requestFrame));
-        if (commandCode == CommandCode.Messages.POLL_DEFERRED.getValue()) {
-            pending.maxResponseBody =
-                    requestFrame.getUnsignedIntLE(requestFrame.writerIndex() - Long.BYTES - Integer.BYTES);
+        if (commandCode == CommandCode.Messages.POLL_DEFERRED.getValue()
+                || commandCode == CommandCode.Messages.FETCH_MESSAGES.getValue()) {
             pending.cancellation = new byte[VsrHeaders.HEADER_SIZE];
             requestFrame.getBytes(requestFrame.readerIndex(), pending.cancellation);
             ByteBuffer.wrap(pending.cancellation)
@@ -423,6 +422,21 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         /** Marks the logout that a sign-in sends first, so that its reply keeps the lineage that the sign-in began. */
         public void keepLineage() {
             keepsLineage = true;
+        }
+
+        /** Bounds the reply body, before the request is written, to what the request asked for. */
+        public void limitResponseBody(long bytes) {
+            maxResponseBody = bytes;
+        }
+
+        /**
+         * Asks the server to stop a request that stores offsets, and keeps the request registered: the server answers
+         * it once, refused when the cancel won, or with what it read and stored.
+         */
+        public synchronized void cancelOnServer(Channel channel) {
+            if (!future.isDone()) {
+                abandon(channel);
+            }
         }
     }
 

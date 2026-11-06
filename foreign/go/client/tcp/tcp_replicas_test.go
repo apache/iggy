@@ -1296,7 +1296,7 @@ func TestPublicMultiRequestCallsStopAfterCallerSignIn(t *testing.T) {
 		{"keyed_send", command.GetPartitionRouteCode, send(iggcon.Partitioning{Kind: iggcon.MessageKey, Value: []byte("key")})},
 		{"roster_before_send", command.GetClusterMetadataCode, send(iggcon.PartitionId(0))},
 		{"group_poll", command.SyncGroupCode, func(ctx context.Context, client *IggyTcpClient) error {
-			_, err := client.PollMessages(ctx, stream, topic, consumer, iggcon.NextPollingStrategy(), 1, false, nil)
+			_, err := client.pollMessages(ctx, stream, topic, consumer, iggcon.NextPollingStrategy(), 1, false, nil)
 			return err
 		}},
 	} {

@@ -25,6 +25,7 @@
 //! segment count, so the exact rotation point does not matter -- only that the
 //! volume sent clears the cap several times over.
 
+use super::POLL_REPLY_MAX_BYTES;
 use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_common::IggyByteSize;
@@ -135,11 +136,14 @@ pub async fn run_expiry_after_rotation(client: &IggyClient, data_path: &Path) {
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            total_messages as u32,
-            false,
+            PollOptions {
+                count: total_messages as u32,
+                max_bytes: POLL_REPLY_MAX_BYTES,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -158,11 +162,14 @@ pub async fn run_expiry_after_rotation(client: &IggyClient, data_path: &Path) {
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            total_messages as u32,
-            false,
+            PollOptions {
+                count: total_messages as u32,
+                max_bytes: POLL_REPLY_MAX_BYTES,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -310,11 +317,14 @@ pub async fn run_size_based_retention(client: &IggyClient, data_path: &Path) {
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            total_messages as u32,
-            false,
+            PollOptions {
+                count: total_messages as u32,
+                max_bytes: POLL_REPLY_MAX_BYTES,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -596,11 +606,13 @@ pub async fn run_fair_size_based_cleanup_multipartition(client: &IggyClient, dat
             .poll_messages(
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
-                Some(partition_id),
+                partition_id,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                messages_per_partition,
-                false,
+                PollOptions {
+                    count: messages_per_partition,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -708,11 +720,14 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
             .poll_messages(
                 &Identifier::named(TEST_STREAM).unwrap(),
                 &Identifier::named(TEST_TOPIC).unwrap(),
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &consumer,
                 &PollingStrategy::next(),
-                batch_size,
-                true, // auto_commit
+                PollOptions {
+                    count: batch_size,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -741,11 +756,13 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
         .poll_messages(
             &Identifier::named(TEST_STREAM).unwrap(),
             &Identifier::named(TEST_TOPIC).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::next(),
-            10,
-            false,
+            PollOptions {
+                count: 10,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();

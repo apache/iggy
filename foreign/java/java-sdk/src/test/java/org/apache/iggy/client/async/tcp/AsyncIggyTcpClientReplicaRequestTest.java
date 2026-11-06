@@ -57,7 +57,7 @@ class AsyncIggyTcpClientReplicaRequestTest {
     private static final int LOGIN_CODE = 38;
     private static final int LOGOUT_CODE = 39;
     private static final int POLL_DEFERRED_CODE = 106;
-    private static final int WAIT_FOR_MESSAGES_CODE = 107;
+    private static final int FETCH_MESSAGES_CODE = 109;
     private static final int CANCEL_DEFERRED_REQUEST_CODE = 108;
     private static final int GET_OFFSET_CODE = 120;
     private static final int NOT_PRIMARY = 89;
@@ -183,7 +183,7 @@ class AsyncIggyTcpClientReplicaRequestTest {
                         CREATE_STREAM_CODE,
                         POLL_CODE,
                         POLL_DEFERRED_CODE,
-                        WAIT_FOR_MESSAGES_CODE,
+                        FETCH_MESSAGES_CODE,
                         CANCEL_DEFERRED_REQUEST_CODE,
                         GET_OFFSET_CODE,
                         LOGIN_CODE,

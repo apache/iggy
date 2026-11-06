@@ -60,10 +60,12 @@ example `max_wait = "3s"` with `min_count` equal to `batch_length`. `min_count`
 must not exceed `batch_length`. `max_wait` must be above zero and at most 10
 minutes, and the server shortens a wait above its `deferred_poll_max_wait`.
 Use `max_wait` and `min_count` in place of `poll_interval`. If a sink
-`[[streams]]` entry sets `poll_interval`, that sink fails to start. The server
-commits the offset of each sink poll when it answers the poll, before the
-plugin consumes the messages. Sinks need a server that supports deferred polls
-(binary commands 106 and 107).
+`[[streams]]` entry sets `poll_interval`, that sink fails to start. By default
+the server commits the offset of each sink poll when it answers the poll,
+before the plugin consumes the messages. [Sink delivery
+guarantees](#sink-delivery-guarantees) describes the alternative. Sinks need a
+server that supports deferred polls (binary commands 106 and 109 in protocol
+0.12.1).
 
 At each start, a sink connects an Iggy client of its own. After the last
 consumer of that start stops, the sink logs the client out and shuts it down.
@@ -72,6 +74,78 @@ offset stores of another sink. The consumers inside one sink share its client.
 They share the progress lane of each partition, which orders their polls and
 offset calls. They also share the limit of 64 deferred requests per client.
 The [SDK README](../../sdk/README.md) describes both.
+
+## Sink delivery guarantees
+
+A sink delivers at most once by default: the offset of a poll is stored when the
+server answers it, so a batch that the plugin fails to write is lost. A
+`[delivery]` table makes a sink deliver at least once:
+
+```toml
+[delivery]
+guarantee = "at_least_once"  # default "at_most_once"
+retry_max_attempts = 10      # unset retries until the destination recovers
+retry_initial_backoff = "1s"
+retry_max_backoff = "30s"
+flush_interval = "5s"        # unset flushes after every batch
+flush_max_messages = 10000   # a partition with this many unflushed messages flushes at once
+invalid_messages = "stop"    # or "skip"
+```
+
+Every field is also an environment override, for example
+`IGGY_CONNECTORS_SINK_<KEY>_DELIVERY_GUARANTEE=at_least_once`.
+
+At least once, the runtime behaves as follows:
+
+- Polls store no offset. The plugin accepts each batch in `consume`, and the
+  runtime stores the offset of a partition only after the plugin's flush proved
+  the messages up to it delivered. A flush runs after every batch, or, with
+  `flush_interval`, when the interval runs out or a partition holds
+  `flush_max_messages` unflushed messages, whichever comes first.
+- A batch or flush that fails transiently is handed to the plugin again from
+  the first message not yet flushed, after a capped exponential backoff. A
+  message can arrive more than once, but none is skipped.
+- A permanent failure, or a transient one past `retry_max_attempts`, stops the
+  delivery of that topic with an error naming the stream, the topic, the
+  partitions and the offset. The sink reports the error, while its other
+  topics keep delivering. Before it stops, the topic flushes its other
+  partitions once and stores what the flush proved. The stored offset stays
+  below the message, so a restart, for example `POST /sinks/{key}/restart`,
+  delivers it again.
+- A restart helps once the destination recovers. A message that the plugin
+  rejects permanently stops the sink again at the same message, and
+  `invalid_messages = "skip"` does not cover it, since it covers only the
+  messages that the runtime cannot hand over. The error names the first offset
+  of the failed call, and the plugin's log names the rejected message. To move
+  past it, store its offset for the consumer group of the sink, then restart
+  the sink:
+
+  ```sh
+  iggy consumer-offset set <group> <stream> <topic> <partition> <offset> --kind consumer-group
+  ```
+
+  `<group>` is the `consumer_group` of the stream, or `iggy-connect-sink-<key>`
+  when it is unset. The stored offset marks the message and every one before
+  it as delivered.
+- A message that the runtime cannot decode, transform or serialize also stops
+  the sink, unless `invalid_messages = "skip"`, which skips it with an error
+  count and its offset in the log. A message that a transform filters counts as
+  delivered.
+- A partition whose next message no longer exists, after a new partition
+  history, stops the sink instead of skipping ahead. Move the stored offset to
+  resume.
+- A shutdown flushes once and stores what the flush proved. What it did not
+  prove is delivered again at the next start.
+
+The guarantee needs a plugin that supports it, and a sink configured for it
+with a plugin that does not refuses to start. Of the bundled sinks, `http`
+supports it. It covers only messages the server still holds: use topic
+`durability = "persisted"` and a retention longer than the longest expected
+sink outage.
+
+An older runtime ignores the `[delivery]` table, so after a rollback the server
+stores the offset of each sink poll when it answers it again, and the sink
+delivers at most once.
 
 ## State storage
 
@@ -133,6 +207,47 @@ Any HTTP server can back the state endpoint if it meets this contract:
 This contract lets a deployment back the endpoint with a replicated store and revoke a stale writer's authority mid-flight: the stale writer's next conditional PUT fails `403`/`412`, its provider latches, and its pipeline stops advancing state - no backend-specific knowledge in the runtime.
 
 The runtime does not delete remote state. Disabling, removing, or restarting a source preserves its checkpoint. Deletion is an explicit administrative action on the backing store because automatic deletion would make a connector lifecycle operation silently rewind the source.
+
+## Exactly-once sources
+
+If a source sets `exactly_once = true`, the runtime writes each batch of the source once. This holds after a lost reply, a NACK, or a crash of the runtime. Each batch goes to one partition as a batch of an idempotent producer. The [SDK README](../../sdk/README.md#idempotent-producers) describes idempotent producers.
+
+```toml
+exactly_once = true
+
+[[streams]]
+stream = "orders"
+topic = "created"
+schema = "json"
+partition_id = 0 # the partition of every batch, 0 when unset
+```
+
+The runtime keeps a producer record in the state of the source, in front of the plugin's bytes. The record holds these values:
+
+- The producer id. The runtime gets it from the session of its Iggy client.
+- The epoch. After each start, batches keep the stored epoch until the first save after a batch, which moves to the next epoch. The new epoch fences an older copy of the runtime.
+- The partition, and the first sequence of the next batch in it.
+
+The runtime saves the state after each batch for which the plugin returns new state. The save moves the next sequence past the batch and stores the plugin's new bytes. A batch without new state is not saved. The plugin gets only its own bytes. A new record, a new epoch or a new partition is also saved before its first batch goes. The `iggy_send` stage histogram includes that save.
+
+After a NACK or a restart, the plugin produces a batch again from its saved state. No save moved the record past that batch, so the runtime sends it with the same producer id, epoch and sequence. The partition answers with the offset of the first write, and the batch lands once.
+
+These limits apply:
+
+- All batches go to one partition. Balanced and messages-key partitioning are not available.
+- Each batch of the plugin goes to Iggy in one request. `batch_length` and `linger_time` do not apply.
+- The plugin must produce the same messages from the same state. The partition keeps the first copy.
+- If the plugin produces another message count, the partition refuses the batch as out of order, and the runtime moves to a new epoch and logs a warning. The unsaved batch can then land twice.
+- A partition drops a producer that sent no batch for 24 hours. Above 4096 producers, it drops the one idle the longest.
+- If the partition dropped the producer, the runtime moves to a new epoch. The unsaved batch can then land twice.
+- The partition keeps the last five batches of a producer. If the plugin returns no state for more than five batches in a row, a restart can write those batches twice.
+- If you change `partition_id`, the unsaved batch can land twice.
+- Give the topic `persisted` durability. With `replicated`, a quorum of nodes that crash at the same time can lose acknowledged batches.
+- The record starts with the bytes `\0IGGYEO\x01`. Plugin state that starts with these bytes is not supported.
+
+You can turn `exactly_once` on or off for a source that has state. The runtime reads both state formats.
+An older runtime does not know the record: its plugin fails to read the state and starts again without its cursor. To roll back, turn `exactly_once` off first and wait until the source saves its state.
+Builds released before idempotent producers cannot poll the batches of an exactly-once source. These are the Rust SDK and every client that embeds it (the Python, C++ and PHP SDKs, the CLI, the Kafka gateway and older connector runtimes), and the Swift SDK. Older Iggy nodes cannot store these batches. Upgrade every Iggy node and every consumer of the topic first.
 
 ## Logging
 

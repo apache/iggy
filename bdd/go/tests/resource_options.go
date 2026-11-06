@@ -261,8 +261,10 @@ func (s resourceOptionsSteps) thenPollReturnsPayloadAndHeader(ctx context.Contex
 func (resourceOptionsSteps) pollFirst(ctx context.Context) (iggcon.IggyMessage, error) {
 	state := getResourceOptionsCtx(ctx)
 	partition := uint32(resourceOptionsPartition)
-	polled, err := state.client.PollMessages(ctx, streamIdentifier(state), topicIdentifier(state),
-		iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), 1, false, &partition)
+	options := iggcon.DefaultPollOptions()
+	options.Count = 1
+	polled, err := state.client.PollMessages(ctx, streamIdentifier(state), topicIdentifier(state), partition,
+		iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), options)
 	if err != nil {
 		return iggcon.IggyMessage{}, fmt.Errorf("poll messages: %w", err)
 	}

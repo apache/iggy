@@ -20,6 +20,7 @@ mod consumer_group;
 mod consumer_group_membership;
 mod consumer_offset;
 mod consumer_shutdown;
+mod decode_diagnostics;
 mod disconnect_relogin;
 mod hello_world;
 mod http_refresh;

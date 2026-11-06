@@ -134,7 +134,7 @@ runs:
       run: cargo fmt --all -- --check
       shell: bash
 
-    # clippy-macos-aarch64 runs the same lint on macos-14. Code behind
+    # clippy-macos-aarch64 runs the same lint on macos-15. Code behind
     # cfg(target_os) splits is dead to the Linux leg, so its warnings would
     # otherwise reach master unseen.
     - name: Cargo clippy
@@ -397,13 +397,15 @@ runs:
           # naming the feature under test instead of naming the pull. The suite runs its
           # containers with --pull never, so a failed pull here makes it skip, which the guard
           # above turns into a job failure that names the missing image.
-          # Read the tags out of the suite itself; hardcoding them here lets a bump in the test
+          # Read the tags out of the suites themselves; hardcoding them here lets a bump in a test
           # desync silently, which pre-pulls the superseded image and puts the real one back
-          # inside the budget this block exists to avoid.
-          E2E_IMAGES=$(grep -oP '^const (KCAT|KAFKA)_IMAGE: &str = "\K[^"]+' \
-            gateways/kafka/tests/kafka_client_e2e_tests.rs)
+          # inside the budget this block exists to avoid. The failover suite runs the same
+          # clients against a cluster.
+          E2E_IMAGES=$(grep -ohP '^const (KCAT|KAFKA)_IMAGE: &str = "\K[^"]+' \
+            gateways/kafka/tests/kafka_client_e2e_tests.rs \
+            gateways/kafka/tests/cluster_failover_tests.rs | sort -u)
           if [[ -z "$E2E_IMAGES" ]]; then
-            echo "::warning::could not read client image tags from kafka_client_e2e_tests.rs; skipping pre-pull"
+            echo "::warning::could not read client image tags from the Kafka client suites; skipping pre-pull"
           fi
           for image in $E2E_IMAGES; do
             timeout 300 docker pull -q "$image" \

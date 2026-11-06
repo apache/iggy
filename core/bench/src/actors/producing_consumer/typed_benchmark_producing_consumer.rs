@@ -62,7 +62,7 @@ impl TypedBenchmarkProducingConsumer {
         moving_average_window: u32,
         limit_bytes_per_second: Option<IggyByteSize>,
         polling_kind: PollingKind,
-        poll_options: DeferredPollOptions,
+        poll_options: PollOptions,
         origin_timestamp_latency_calculation: bool,
         pretty: bool,
     ) -> Self {

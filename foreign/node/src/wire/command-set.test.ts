@@ -56,6 +56,14 @@ describe('CommandAPI.sendBinaryRequest', () => {
     });
   });
 
+  it('rejects the cancellation of a deferred request before reaching the client provider', async () => {
+    const client = new SimpleClient(mockRawClient());
+    await assert.rejects(
+      () => client.sendBinaryRequest(COMMAND_CODE.CancelDeferredRequest, Buffer.alloc(0)),
+      /code: 3, message: Invalid command/
+    );
+  });
+
   it('forwards a custom code and opaque payload to sendCommand', async () => {
     const customCode = 60_000;
     const payload = Buffer.from([0xAA, 0xBB, 0xCC]);

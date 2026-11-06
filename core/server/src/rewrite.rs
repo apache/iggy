@@ -72,7 +72,7 @@ use metadata::stm::user::Users;
 use server_common::Message;
 use std::cell::RefCell;
 use std::rc::Rc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// The pre-consensus rewrite stages of [`tcp_chain`], in chain order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,13 +385,23 @@ where
                         ..OptionColumns::default()
                     },
                 )?;
-                if let Some(segment_size) =
-                    TopicCreateOptions::from_resource_options(&admitted.explicit).segment_size
-                {
+                let explicit = TopicCreateOptions::from_resource_options(&admitted.explicit);
+                if let Some(segment_size) = explicit.segment_size {
                     validate_topic_segment_size(
                         segment_size.as_bytes_u64(),
                         iggy_common::MAX_TOPIC_SEGMENT_SIZE,
                     )?;
+                }
+                let nodes = shard.replica_topology().replica_count;
+                if let Some(factor) = explicit
+                    .replication_factor
+                    .filter(|factor| *factor > u32::from(nodes))
+                {
+                    debug!(
+                        replication_factor = factor,
+                        nodes, "refusing a topic whose replication factor exceeds the node count"
+                    );
+                    return Err(IggyError::InvalidReplicationFactor);
                 }
                 let mut stored = derived_defaults(OptionsScope::Topic, &admitted.explicit)?;
                 stored.extend(admitted.explicit);

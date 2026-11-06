@@ -28,4 +28,15 @@ public sealed class MalformedResponseException : InvalidResponseException
     internal MalformedResponseException(string message) : base(message)
     {
     }
+
+    internal MalformedResponseException(string message, ReadOnlySpan<byte> record) : base(message)
+    {
+        Record = record.ToArray();
+    }
+
+    /// <summary>
+    ///     For reply records that do not decode: the remaining bytes of the records from where decoding stopped,
+    ///     as received. Null for a malformed reply that is not records.
+    /// </summary>
+    public byte[]? Record { get; }
 }

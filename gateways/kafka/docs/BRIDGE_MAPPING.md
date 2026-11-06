@@ -203,22 +203,21 @@ builds one, so the answer does not depend on allocating a payload already known 
 
 ## Batch-level fields
 
-Per-record storage drops what the Kafka record batch header carries: producer id, producer
-epoch, base sequence, the transactional flag, compression and the batch CRC. Fetch synthesizes
-a batch with producer id `-1`, epoch `-1`, base sequence `-1`, no compression, `CreateTime`
+Per-record storage drops the transactional flag, the compression and the batch CRC of the Kafka
+record batch header. With `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, the producer id, the epoch and
+the base sequence of an idempotent batch go to the Iggy batch header, and the partition keeps them
+as producer state. Otherwise the gateway drops them. Fetch synthesizes a
+batch with producer id `-1`, epoch `-1`, base sequence `-1`, no compression, `CreateTime`
 timestamps, and a recomputed CRC32C.
 
 Two consequences worth stating before they surprise someone:
 
-- Idempotent-producer deduplication cannot be reconstructed from stored data later. If
-  [#3545](https://github.com/apache/iggy/issues/3545) ever grows past a stub, producer id,
-  epoch and sequence need their own tracking.
+- The partition writes each batch of an idempotent producer once, from the producer state that
+  it keeps. See [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 - The bytes a consumer receives are not the bytes the producer sent, so anything comparing
   batches byte for byte across the gateway will differ.
 
-Whether producer id `-1` is what Fetch actually sends depends on the InitProducerId decision in
-[`IDEMPOTENCE.md`](IDEMPOTENCE.md). Allocating producer ids does not change what is stored, only
-what Produce accepts, so this section holds under either answer.
+Fetch sends producer id `-1` whatever producer wrote the batch. A consumer does not need it.
 
 Produce refuses a control batch and a transactional batch. A stored message carries neither flag.
 A control record admitted here therefore reaches consumers as ordinary application data, and a
@@ -353,12 +352,14 @@ as an empty one, and the probe cannot tell them apart without a server-side sign
 time in that window still polls, and answers `-1` only when the polls come back empty as well. A
 reset by time there then moves to LATEST.
 
-Lookups by time run one partition at a time and reuse one Fetch read slot, however many
-partitions the request names. A poll that times out frees its slot as it stops, so for a moment
-the request can hold a second one. Each lookup gets a quarter of the request deadline, capped by
-the deadline itself. One whose time has already passed answers `REQUEST_TIMED_OUT` (7) without
-taking or using a slot, and one that does not finish in time answers 7 too. Clients retry 7.
-Repeated entries for one partition and time are looked up once.
+The lookups by time of one request share one Fetch read slot, however many partitions the request
+names, and up to 8 run at once. Each poll gets the time of a Fetch poll, 2 s or more for a
+partition whose pages took long. Lookups start only in the first 2 s after the request takes its
+slot. The request waits no longer for them, apart from a partition whose pages took long. A lookup
+with no answer by then answers `REQUEST_TIMED_OUT` (7). Clients retry 7. A poll with no
+answer in its time stalls its partition, as in Fetch. The lookups of a stalled partition answer
+`NOT_LEADER_OR_FOLLOWER` (6) with no poll until a re-check answers. Repeated entries for one
+partition and time are looked up once.
 
 ### Header order
 

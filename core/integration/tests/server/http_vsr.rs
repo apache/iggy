@@ -436,9 +436,9 @@ async fn given_fresh_topic_when_polling_over_http_should_serve_a_context_at_or_a
     let polled = http.poll(STREAM, TOPIC, PARTITION_ID, 0, 10).await;
     assert_eq!(polled.messages.len(), 1, "the sent message must come back");
     assert!(
-        polled.context.metadata_op >= topic_create_op,
+        polled.context().metadata_op >= topic_create_op,
         "the served context {:?} must cover the topic create at op {topic_create_op}",
-        polled.context
+        polled.context()
     );
 }
 
@@ -855,6 +855,89 @@ async fn given_oversized_body_when_producing_should_reject_413(harness: &TestHar
 }
 
 #[iggy_harness]
+async fn given_refused_typed_header_when_producing_should_reject_400_with_header_error(
+    harness: &TestHarness,
+) {
+    let http = HttpClient::login_root(harness).await;
+    http.create_stream_and_topic("http-headers", "typed", 1)
+        .await;
+    let path = "/streams/http-headers/topics/typed/messages";
+    let produce = async |key: serde_json::Value, value: serde_json::Value| {
+        let body = json!({
+            "partitioning": { "kind": "balanced", "value": "" },
+            "messages": [{
+                "id": 1,
+                "payload": "aGVsbG8=",
+                "user_headers": [{ "key": key, "value": value }]
+            }]
+        });
+        http.client
+            .post(http.url(path))
+            .bearer_auth(&http.token)
+            .json(&body)
+            .send()
+            .await
+            .expect("produce request")
+    };
+    let string = |value: &str| json!({ "kind": "string", "value": value });
+    let one_byte_int32 = json!({ "kind": "int32", "value": "AQ==" });
+
+    let cases = [
+        (
+            one_byte_int32.clone(),
+            string("dmFs"),
+            IggyError::InvalidHeaderKey,
+        ),
+        (string(""), string("dmFs"), IggyError::InvalidHeaderKey),
+        (
+            string("a2V5"),
+            one_byte_int32,
+            IggyError::InvalidHeaderValue,
+        ),
+        (
+            string("a2V5"),
+            json!({ "kind": "raw", "value": "" }),
+            IggyError::InvalidHeaderValue,
+        ),
+    ];
+    for (key, value, refusal) in cases {
+        let case = format!("key={key} value={value}");
+        let response = produce(key, value).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case}");
+        let error: serde_json::Value = response.json().await.expect("decode the error body");
+        assert_eq!(error["id"], refusal.as_code(), "{case}");
+        assert_eq!(error["code"], refusal.as_string(), "{case}");
+    }
+
+    let response = produce(
+        string("a2V5"),
+        json!({ "kind": "int32", "value": "AQAAAA==" }),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "a well-formed typed header must still commit"
+    );
+    let polled = http
+        .poll("http-headers", "typed", PARTITION_ID, 0, 10)
+        .await;
+    assert_eq!(
+        polled.messages.len(),
+        1,
+        "only the well-formed produce must land"
+    );
+    let user_headers = polled.messages[0]
+        .user_headers_map()
+        .expect("headers decode")
+        .expect("the message carries user headers");
+    assert_eq!(
+        user_headers.get(&HeaderKey::try_from("key").expect("header key")),
+        Some(&HeaderValue::from(1i32)),
+    );
+}
+
+#[iggy_harness]
 async fn given_ack_none_when_producing_should_return_202_and_commit(harness: &TestHarness) {
     const BURST_SIZE: u32 = 8;
     let http = HttpClient::login_root(harness).await;
@@ -935,7 +1018,7 @@ async fn given_ack_none_when_denied_before_the_partition_should_answer_the_deny(
         StatusCode::CREATED,
         "produce must commit"
     );
-    let mut context = http.poll(STREAM, TOPIC, PARTITION_ID, 0, 1).await.context;
+    let mut context = http.poll(STREAM, TOPIC, PARTITION_ID, 0, 1).await.context();
     context.metadata_op += UNAPPLIED_METADATA_OPS;
 
     let response = http

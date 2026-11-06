@@ -25,7 +25,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use iggy::prelude::{
     Consumer, Durability, Identifier, IggyExpiry, IggyMessage, MaxTopicSize, MessageClient,
-    Partitioning, Permissions, PollingStrategy, StreamClient, StreamCreateOptions,
+    Partitioning, Permissions, PollOptions, PollingStrategy, StreamClient, StreamCreateOptions,
     StreamPermissions, TopicClient, TopicCreateOptions, UserClient, UserCreateOptions, UserStatus,
 };
 use kafka_protocol::messages::{DescribeClusterResponse, MetadataResponse};
@@ -121,11 +121,13 @@ async fn stored_ids(server: &TestServer, default_stream: &str) -> Vec<String> {
         .poll_messages(
             &Identifier::named(&cluster_id_stream(default_stream)).expect("stream name"),
             &Identifier::named(CLUSTER_ID_TOPIC).expect("topic name"),
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            100,
-            false,
+            PollOptions {
+                count: 100,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll the id topic");

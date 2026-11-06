@@ -57,10 +57,13 @@ mod benchmark;
 pub(crate) mod configs;
 pub(crate) mod context;
 pub(crate) mod error;
+mod exactly_once;
 mod log;
 mod manager;
 pub(crate) mod metrics;
+mod plugin_instance;
 mod sink;
+mod sink_delivery;
 mod source;
 mod state;
 pub(crate) mod stats;
@@ -137,6 +140,17 @@ pub(crate) struct SinkApi {
     ) -> i32,
     iggy_sink_close: extern "C" fn(id: u32) -> i32,
     iggy_sink_version: extern "C" fn() -> *const std::ffi::c_char,
+    // Optional, so that plugins built before the delivery contract still load.
+    iggy_sink_enable_at_least_once: Option<extern "C" fn(id: u32, version: u32) -> i32>,
+    iggy_sink_flush: Option<
+        extern "C" fn(
+            id: u32,
+            topic_meta_ptr: *const u8,
+            topic_meta_len: usize,
+            partitions_ptr: *const u8,
+            partitions_len: usize,
+        ) -> i32,
+    >,
 }
 
 fn print_ascii_art(text: &str) {
@@ -524,6 +538,7 @@ struct SinkConnectorPlugin {
     error: Option<String>,
     verbose: bool,
     benchmark: bool,
+    delivery: Option<sink_delivery::Delivery>,
 }
 
 struct SinkConnectorConsumer {
@@ -583,6 +598,8 @@ struct SourceConnectorPlugin {
 struct SourceConnectorProducer {
     encoder: Arc<dyn StreamEncoder>,
     producer: IggyProducer,
+    /// Set when the source delivers exactly once. See `exactly_once`.
+    exactly_once: Option<exactly_once::ExactlyOnce>,
 }
 
 struct SourceConnectorWrapper {

@@ -304,17 +304,17 @@ jobs:
           encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
 
       - name: Setup Python
-        uses: actions/setup-python@v7.0.0
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: "3.11"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.87.28
+        uses: taiki-e/install-action@v2.87.32
         with:
           tool: cargo-llvm-cov
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       - name: Install dependencies
         run: |
@@ -598,7 +598,7 @@ jobs:
     name: Warm macOS cache
     needs: detect
     if: needs.detect.outputs.rust == 'true'
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1

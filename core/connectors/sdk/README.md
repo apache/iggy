@@ -31,6 +31,10 @@ The crash behavior is intentionally at-least-once:
 
 An ACK follows Iggy's quorum confirmation. The topic's `durability` policy decides whether that confirmation also waits for stable storage on the quorum. Both policies normally write messages to disk.
 
+A source with `exactly_once = true` removes the duplicates of the second and third rows. Before each send, the runtime stores the producer id, epoch and first sequence of the batch in the source's state. After a NACK or a crash, the plugin produces the batch again from its saved state.
+
+If that batch has the same message count, the runtime sends it with the stored values. The partition then answers with the offset of the first write and writes nothing. The plugin must produce the same messages from the same state, because the partition keeps the first copy. The [runtime README](../runtime/README.md#exactly-once-sources) describes the configuration and the limits.
+
 Source-side ACK work should be idempotent because process termination can interrupt it. NACK handling must discard staged cursor changes and staged delete or mark operations so polling can redeliver the batch. The SDK retries NACKed batches with capped exponential backoff and stops after five consecutive NACKs by default.
 
 A source whose accepted input cannot be re-read after a restart can override `Source::batch_policy()` and call `BatchPolicy::with_max_consecutive_nacks(None)` to keep retrying until shutdown. The SDK warns after 30 seconds without a batch result, but keeps that batch in flight until the runtime replies or the source shuts down.
@@ -59,6 +63,32 @@ enabled = true
 key = "message"
 value.static = "hello"
 ```
+
+## Sink delivery acknowledgment
+
+A sink configured with `guarantee = "at_least_once"` must opt in. The runtime calls
+`Sink::enable_at_least_once()` once after `open()`, and refuses to start the sink when it
+returns an error. The default refuses with `Error::Unsupported`. Returning `Ok` promises two
+things:
+
+1. A successful `consume()` never drops a message without failing the call. A message that
+   cannot be written fails the call instead of being skipped.
+2. A successful `Sink::flush()` proves that the destination acknowledged every message of the
+   listed partitions that `consume()` accepted, up to and including each listed offset.
+
+The runtime stores consumer offsets only after a flush succeeds. A sink that writes inside
+`consume()` keeps the default `flush()`, which has nothing left to do. A sink that buffers
+across calls writes its buffers in `flush()`.
+
+A failed call reports its class across the FFI boundary: `Error::is_permanent()` decides
+between a transient failure, which the runtime retries by handing the unflushed messages over
+again, and a permanent one, which stops the sink. A plugin built before this contract reports
+a failed `consume()` as `1`, which reads as transient, and a call it cannot dispatch or decode
+as `-1`, which reads as permanent. It lacks the `iggy_sink_enable_at_least_once` and
+`iggy_sink_flush` exports, and keeps loading for at-most-once sinks.
+
+SDK 0.5.1-edge.3 adds `Sink::enable_at_least_once()` and `Sink::flush()` with default
+implementations, so an existing sink needs no code change when rebuilt.
 
 ## Retry helpers
 

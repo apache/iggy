@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-gateway-kafka"
-version = "0.1.0-edge.1"
+version = "0.2.0"
 description = "Kafka wire protocol gateway foundation for Apache Iggy"
 edition = "2024"
 license = "Apache-2.0"
@@ -72,7 +72,8 @@ uuid = { workspace = true }
 x509-parser = { workspace = true }
 
 [dev-dependencies]
-# Partition route requests for `examples/partition_routes.rs`.
+# Partition route requests for `examples/partition_routes.rs`, and the Iggy request frames that a
+# test relay holds back.
 iggy_binary_protocol = { workspace = true }
 # The client half, so a test encodes requests and decodes responses the way a consumer does.
 kafka-protocol = { workspace = true, features = ["client"] }

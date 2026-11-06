@@ -27,6 +27,8 @@ use std::time::Duration;
 
 use consensus::VsrState;
 use iggy::prelude::{ClusterClient, ClusterNodeRole, ConsumerKind};
+use journal::PartitionPrepareJournal;
+use journal::partition_journal::FRONTIER_FILE_NAME;
 use journal::superblock::{SLOT_FILE_NAMES, SuperblockContents, decode_slots};
 use tokio::time::sleep;
 
@@ -43,6 +45,9 @@ const CONVERGENCE_STABLE_POLLS: u32 = 3;
 const OFFSETS_DIR: &str = "offsets";
 const CONSUMER_OFFSETS_DIR: &str = "consumers";
 const GROUP_OFFSETS_DIR: &str = "groups";
+/// Prefix of a partition's WAL directory, `prepares-{created_revision}`, as
+/// `partitions::iggy_partition` names it.
+const PREPARES_DIR_PREFIX: &str = "prepares-";
 
 /// Numeric regular offset files in one partition's selected kind directory.
 pub fn consumer_offset_file_ids(
@@ -574,6 +579,25 @@ pub fn read_metadata_superblock_state(data_path: &Path) -> Option<VsrState> {
 pub fn read_partition_superblock_state(data_path: &Path) -> Option<VsrState> {
     let dir = find_partition_superblock_dir(data_path)?;
     read_superblock_state_in(&dir, "partition")
+}
+
+/// The message offset the single partition's published WAL frontier ends at on
+/// a node: a restart keeps the segment messages below it and discards the rest.
+/// `None` while no frontier owning segment bodies exists. Read it while the
+/// node is down, since a live node keeps publishing. Intended for layouts with
+/// exactly one partition.
+pub fn read_partition_wal_frontier(data_path: &Path) -> Option<u64> {
+    let path = walk(data_path, &mut |path| {
+        path.file_name()
+            .is_some_and(|name| name == FRONTIER_FILE_NAME)
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(PREPARES_DIR_PREFIX))
+    })?;
+    let frontier = fs::read(path).ok()?;
+    PartitionPrepareJournal::published_segment_tail(&frontier).map(|tail| tail.next_offset)
 }
 
 fn read_superblock_state_in(dir: &Path, plane: &str) -> Option<VsrState> {
