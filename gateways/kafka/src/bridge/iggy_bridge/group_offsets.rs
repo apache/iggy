@@ -79,6 +79,9 @@ pub struct OffsetCalls {
     queued: [Arc<Semaphore>; OFFSET_SLOTS],
     /// Kept by each write until no Iggy call of it can land. See [`Self::keeping`].
     kept: Option<Arc<dyn Any + Send + Sync>>,
+    /// Whether a commit may create the Iggy group that holds the offsets. See
+    /// [`Self::creating_no_group`].
+    creates_groups: bool,
 }
 
 impl OffsetCalls {
@@ -89,7 +92,17 @@ impl OffsetCalls {
             deadline,
             queued: std::array::from_fn(|_| Arc::new(Semaphore::new(1))),
             kept: None,
+            creates_groups: true,
         }
+    }
+
+    /// These calls, with no commit that creates the Iggy group holding a Kafka group's offsets on
+    /// a topic. A commit that finds no such group fails with
+    /// [`BridgeError::GroupCreationRefused`] and stores nothing.
+    #[must_use]
+    pub const fn creating_no_group(mut self) -> Self {
+        self.creates_groups = false;
+        self
     }
 
     /// These calls, with `kept` held by each commit and each group deletion until no Iggy call of
@@ -125,8 +138,8 @@ impl IggyBridge {
     ///
     /// A negative offset deletes the key instead. Kafka consumers read any negative offset as
     /// none, and Iggy cannot store one. A key or a group that is not there counts as deleted. A
-    /// store that finds no Iggy group for the offsets creates it. A replay that Iggy already
-    /// applied counts as done.
+    /// store that finds no Iggy group for the offsets creates it, unless `calls` create none
+    /// ([`OffsetCalls::creating_no_group`]). A replay that Iggy already applied counts as done.
     ///
     /// Commits on one slot start one at a time, in the order given. A stored offset adds `group`
     /// to [`Self::offset_groups`] at once. Each topic that a commit stored to, or may have, counts
@@ -136,8 +149,9 @@ impl IggyBridge {
     /// # Errors
     ///
     /// Per commit: [`BridgeError::Iggy`] if Iggy refuses it or `group` names no valid Iggy group,
-    /// and [`BridgeError::Timeout`] if it does not end by the deadline of `calls`. A commit that
-    /// has not started by then never starts.
+    /// [`BridgeError::GroupCreationRefused`] if it needs a group that `calls` may not create, and
+    /// [`BridgeError::Timeout`] if it does not end by the deadline of `calls`. A commit that has
+    /// not started by then never starts.
     pub async fn commit_group_offsets(
         &self,
         group: &str,
@@ -152,6 +166,7 @@ impl IggyBridge {
             .iter()
             .any(|&(_, _, offset)| offset >= 0)
             .then(|| Arc::new(self.group_index.storing(group)));
+        let may_create = calls.creates_groups;
         // `join_all` polls each call once, in order, before any again, so calls on one slot
         // queue for it in order.
         let results = join_all(commits.iter().map(|&(topic, partition, offset)| {
@@ -161,9 +176,17 @@ impl IggyBridge {
             let held = storing.clone();
             let commit = move |client: Arc<IggyClient>| async move {
                 let mut created = None;
-                let written = commit_on(&client, &names, &topic, partition, offset, |id| {
-                    created = Some(id);
-                })
+                let written = commit_on(
+                    &client,
+                    &names,
+                    &topic,
+                    partition,
+                    offset,
+                    may_create,
+                    |id| {
+                        created = Some(id);
+                    },
+                )
                 .await;
                 if let Some(storing) = storing
                     && may_have_stored(&written, created)
@@ -1079,14 +1102,15 @@ pub(super) fn kafka_group_of(name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// One commit on `client`. A store that finds no Iggy group creates it, passes its numeric id to
-/// `created`, and stores again.
+/// One commit on `client`. A store that finds no Iggy group creates it when `may_create`, passes
+/// its numeric id to `created`, and stores again.
 async fn commit_on(
     client: &IggyClient,
     names: &OffsetNames,
     topic: &TopicTarget,
     partition: u32,
     offset: i64,
+    may_create: bool,
     created: impl FnOnce(u32),
 ) -> Result<(), BridgeError> {
     let deadline = (Instant::now() + SLOT_LIMIT).into_std();
@@ -1109,6 +1133,9 @@ async fn commit_on(
         })
     };
     match store().await {
+        Err(IggyError::ConsumerGroupNameNotFound(..)) if !may_create => {
+            Err(BridgeError::GroupCreationRefused)
+        }
         Err(IggyError::ConsumerGroupNameNotFound(..)) => {
             if let Some(id) = create_offset_group(client, stream_id, topic_id, &names.group).await?
             {
