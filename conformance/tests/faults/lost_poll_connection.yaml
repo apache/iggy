@@ -1,0 +1,98 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Ported from given_uncertain_poll_progress_when_a_reply_is_lost_should_end_without_replay in
+# core/sdk/src/driver.rs, with the lost link of its HangUp answer.
+schema_version: "1.0"
+description: >-
+  A committing poll whose connection drops after the server took it ends with uncertain progress.
+  Its partition stays blocked for that consumer until the caller abandons the poll.
+run_on:
+  - transports: [tcp]
+    capabilities: [abandon_operation]
+initial_data:
+  - name: create_stream
+    arguments: {name: orders}
+  - name: create_topic
+    arguments: {stream_id: orders, name: events, partitions_count: 1}
+
+tests:
+  - description: The partition stays blocked until the abandon, and the poll after it reads on.
+    create_entities:
+      - client: {id: client0, through_proxy: true}
+    operations:
+      - object: proxy
+        name: fail_frames
+        arguments:
+          client: client0
+          match: {command: message.poll_deferred}
+          action: close_after_forward
+      - object: client0
+        name: poll_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partition_id: 0
+          consumer: {consumer: lost-check}
+          strategy: next
+          count: 1
+          commit: on_read
+          max_wait_ms: 10000
+        expect_error: {name: fetch_progress_uncertain, operation_id: {$$capture: lost}}
+        within: 5s
+      - object: client0
+        name: poll_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partition_id: 0
+          consumer: {consumer: lost-check}
+          strategy: next
+          count: 1
+          commit: on_read
+        expect_error: {name: partition_lane_blocked, operation_id: {$$ref: lost}}
+      - object: client0
+        name: abandon_operation
+        arguments: {operation_id: {$$ref: lost}}
+      - object: client0
+        name: send_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partitioning: {partition_id: 0}
+          messages: [{payload: after}]
+      - object: client0
+        name: poll_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partition_id: 0
+          consumer: {consumer: lost-check}
+          strategy: next
+          count: 1
+          commit: on_read
+        expect_result:
+          messages: [{payload: after}]
+    # Uncertain progress is never replayed: the blocked poll sends no frame, and the poll after
+    # the abandon is a new request on the new connection.
+    expect_frames:
+      - client: client0
+        commands: [message.poll_deferred]
+        direction: request
+        frames:
+          - {connection: 1, request: {$$ref: lost}, outcome: closed_after}
+          - {connection: 2, request: {$$not: {$$ref: lost}}, outcome: forwarded}

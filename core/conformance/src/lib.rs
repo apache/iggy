@@ -29,6 +29,7 @@ pub mod format;
 pub mod iggy_errors;
 pub mod matcher;
 pub mod protocol;
+pub mod proxy;
 pub mod report;
 pub mod runner;
 pub mod skips;

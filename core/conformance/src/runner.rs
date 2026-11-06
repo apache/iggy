@@ -22,12 +22,13 @@ use crate::agent_host::{AgentCommand, AgentHost, HostError};
 use crate::api::Method;
 use crate::format::{
     AdminCall, ClientSpec, Credentials, EntitySpec, ErrorExpectation, LoadedFile, Login,
-    LoginKeyword, Node, ORCHESTRATOR, Operation, OrchestratorCall, PROXY, Requirements, TestCase,
-    Topology, Transport,
+    LoginKeyword, Node, ORCHESTRATOR, Operation, OrchestratorCall, PROXY, ProxyCall, Requirements,
+    TestCase, Topology, Transport,
 };
 use crate::iggy_errors;
 use crate::matcher::{self, Captures, compact};
 use crate::protocol::{AgentError, CreateClientArgs, EntityKind, Hello, Reply, Request};
+use crate::proxy::{ClientArgs, FailFramesArgs, ProxyHub, RefuseConnectionsArgs};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -105,6 +106,7 @@ pub enum RunError {
 pub struct Runner {
     config: RunConfig,
     admin: RustAgent,
+    proxy: ProxyHub,
     host: Option<AgentHost>,
     hello: Hello,
 }
@@ -140,6 +142,7 @@ impl Runner {
             config,
             admin,
             host: Some(host),
+            proxy: ProxyHub::default(),
             hello,
         })
     }
@@ -209,6 +212,7 @@ impl Runner {
             Err(Step::Agent(error)) => Verdict::Errored(format!("agent: {error}")),
         };
         self.reset_agent().await;
+        self.proxy.close_all();
         verdict
     }
 
@@ -258,6 +262,35 @@ impl Runner {
                         operation.object, operation.name
                     ))
                 })?;
+        }
+        for expectation in &test.expect_frames {
+            let selected: Vec<Value> = self
+                .proxy
+                .frames(&expectation.client)
+                .map_err(Step::Errored)?
+                .iter()
+                .filter(|frame| expectation.include_pings || !frame.is_ping())
+                .filter(|frame| {
+                    expectation.commands.is_empty() || expectation.commands.contains(&frame.command)
+                })
+                .filter(|frame| {
+                    expectation
+                        .direction
+                        .is_none_or(|direction| direction == frame.direction)
+                })
+                .map(to_value)
+                .collect();
+            matcher::matches(
+                &expectation.frames,
+                &Value::Array(selected),
+                &mut state.captures,
+            )
+            .map_err(|mismatch| {
+                Step::Failed(format!(
+                    "expect_frames of {}: {mismatch}",
+                    expectation.client
+                ))
+            })?;
         }
         for call in &test.outcome {
             self.admin_call(call, &mut state.captures)
@@ -316,10 +349,7 @@ impl Runner {
         spec: &ClientSpec,
         state: &mut TestState,
     ) -> Result<(), Step> {
-        if spec.through_proxy {
-            return Err(Step::Errored("this runner has no fault proxy".to_owned()));
-        }
-        let address = match spec.node {
+        let upstream = match spec.node {
             Node::Default => self.config.server.clone(),
             Node::NoQuorum => self
                 .config
@@ -329,6 +359,14 @@ impl Runner {
             Node::Leader | Node::Follower => {
                 return Err(Step::Skipped("no cluster in this run".to_owned()));
             }
+        };
+        let address = if spec.through_proxy {
+            self.proxy
+                .listen(&spec.id, &upstream)
+                .await
+                .map_err(|error| Step::Errored(format!("cannot open a proxy listener: {error}")))?
+        } else {
+            upstream
         };
         let login = match &spec.login {
             Login::Keyword(LoginKeyword::Root) => Some(self.config.root.clone()),
@@ -368,7 +406,7 @@ impl Runner {
                 .map_err(Step::Errored)?;
         match operation.object.as_str() {
             ORCHESTRATOR => self.orchestrator_call(operation, args, state).await,
-            PROXY => Err(Step::Errored("this runner has no fault proxy".to_owned())),
+            PROXY => self.proxy_call(operation, args),
             entity => self.entity_call(entity, operation, args, state).await,
         }
     }
@@ -519,6 +557,18 @@ impl Runner {
                 expect_null(&reply, "close")
             }
         }
+    }
+
+    fn proxy_call(&self, operation: &Operation, args: Value) -> Result<(), Step> {
+        let call = ProxyCall::from_str(&operation.name).map_err(Step::Errored)?;
+        let applied = match call {
+            ProxyCall::FailFrames => self.proxy.fail_frames(decode::<FailFramesArgs>(args)?),
+            ProxyCall::RefuseConnections => self
+                .proxy
+                .refuse_connections(&decode::<RefuseConnectionsArgs>(args)?),
+            ProxyCall::ClearRules => self.proxy.clear_rules(&decode::<ClientArgs>(args)?.client),
+        };
+        applied.map_err(Step::Errored)
     }
 
     async fn admin_call(&self, call: &AdminCall, captures: &mut Captures) -> Result<(), Step> {

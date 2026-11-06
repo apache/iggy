@@ -425,7 +425,19 @@ fn validate_test(test: &TestCase) -> Result<(), String> {
         validate_operation(operation)
             .map_err(|message| format!("operation {index} ({}): {message}", operation.name))?;
     }
+    let proxied: Vec<&str> = test
+        .create_entities
+        .iter()
+        .filter(|entity| entity.client.through_proxy)
+        .map(|entity| entity.client.id.as_str())
+        .collect();
     for expectation in &test.expect_frames {
+        if !proxied.contains(&expectation.client.as_str()) {
+            return Err(format!(
+                "expect_frames names {:?}, which does not go through the proxy",
+                expectation.client
+            ));
+        }
         matcher::validate_expectation(&expectation.frames)
             .map_err(|message| format!("expect_frames: {message}"))?;
     }
@@ -520,6 +532,7 @@ impl FromStr for OrchestratorCall {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyCall {
     FailFrames,
+    RefuseConnections,
     ClearRules,
 }
 
@@ -529,6 +542,7 @@ impl FromStr for ProxyCall {
     fn from_str(name: &str) -> Result<Self, Self::Err> {
         match name {
             "fail_frames" => Ok(Self::FailFrames),
+            "refuse_connections" => Ok(Self::RefuseConnections),
             "clear_rules" => Ok(Self::ClearRules),
             _ => Err(format!("unknown proxy call {name:?}")),
         }

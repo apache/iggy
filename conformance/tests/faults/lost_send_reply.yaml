@@ -1,0 +1,83 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Ported from given_a_silent_partition_primary_when_the_deadline_passes_should_retain_the_sent_operation
+# and given_a_retained_op_when_resolved_after_commit_should_return_ok_and_free_the_lane in
+# core/sdk/src/driver.rs. Against a real server, the lost reply also shows that the server
+# deduplicates the replay.
+schema_version: "1.0"
+description: >-
+  A send whose reply the network loses ends as uncertain and blocks its lane until the caller
+  resolves it. The resolution replays the send, and the server stores the messages once.
+run_on:
+  - transports: [tcp]
+    capabilities: [resolve_operation]
+initial_data:
+  - name: create_stream
+    arguments: {name: orders}
+  - name: create_topic
+    arguments: {stream_id: orders, name: events, partitions_count: 1}
+
+tests:
+  - description: The replay of a send that the server committed stores its messages once.
+    create_entities:
+      - client: {id: client0, through_proxy: true}
+    operations:
+      - object: proxy
+        name: fail_frames
+        arguments:
+          client: client0
+          match: {command: message.send}
+          action: drop_reply
+      - object: client0
+        name: send_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partitioning: {partition_id: 0}
+          messages: [{id: "1", payload: once}]
+        expect_error: {name: operation_uncertain, operation_id: {$$capture: lost}}
+      - object: client0
+        name: send_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partitioning: {partition_id: 0}
+          messages: [{id: "2", payload: blocked}]
+        expect_error: {name: lane_blocked, operation_id: {$$ref: lost}}
+      - object: client0
+        name: resolve_operation
+        arguments: {operation_id: {$$ref: lost}}
+      - object: client0
+        name: poll_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partition_id: 0
+          strategy: first
+          count: 10
+        expect_result:
+          count: 1
+          messages: [{offset: 0, id: "1", payload: once}]
+    expect_frames:
+      - client: client0
+        commands: [message.send]
+        frames:
+          - {direction: request, request: {$$ref: lost}, outcome: forwarded}
+          - {direction: reply, request: {$$ref: lost}, outcome: dropped}
+          - {direction: request, request: {$$ref: lost}, outcome: forwarded}
+          - {direction: reply, request: {$$ref: lost}, outcome: forwarded}

@@ -70,6 +70,7 @@ Each test has these keys:
 | `run_on` | Optional. Requirement sets, as at the file level. |
 | `create_entities` | The clients that the agent creates before the first operation. |
 | `operations` | The calls, in order. The first failed call ends the test. |
+| `expect_frames` | Optional. The frames that the fault proxy recorded for a client. See [Fault proxy](#fault-proxy). |
 | `outcome` | Optional. Calls that the orchestrator makes with its own client after the operations, each with `expect_result`. |
 
 Before each test, the orchestrator deletes every stream and every user except root.
@@ -134,6 +135,58 @@ The `orchestrator` object has these calls:
 | `await` | `task` | Collects the answer of a task and matches it with `expect_result` or `expect_error`. |
 | `cancel` | `task` | Cancels a task, as an application drops a call that it no longer wants. |
 | `close` | `entity` | Closes an entity. |
+
+### Fault proxy
+
+A client with `through_proxy: true` connects through a proxy listener of its own, so every frame on the listener
+belongs to that client. The proxy reads the 256-byte consensus header of each frame, forwards the bytes unchanged and
+records the frame. The proxy covers plain TCP only, so a test that uses it declares `transports: [tcp]`.
+
+The `proxy` object has these calls:
+
+| Call | Arguments | Effect |
+| --- | --- | --- |
+| `fail_frames` | `client`, `match`, `action`, `skip`, `times`, `delay_ms` | Applies the action to the matching frames. |
+| `refuse_connections` | `client`, `duration_ms` | Closes each new connection to the listener for the given time. |
+| `clear_rules` | `client` | Removes the rules of the client. |
+
+`match` selects frames by `direction` (`request` or `reply`), `command` and `code`.
+`skip` lets the first matching frames through, and `times` limits the frames that the rule changes. The default is
+one frame.
+
+| Action | Effect | What it models |
+| --- | --- | --- |
+| `drop_request` | The server never sees the request. The connection stays open. | A primary that ignores a request |
+| `drop_reply` | The server applies the request, and the reply never arrives. | A reply lost after the commit |
+| `close_before_forward` | The proxy closes the connection instead of forwarding. | A network failure before the server |
+| `close_after_forward` | The proxy forwards the frame, then closes the connection. | A failure with an unknown outcome |
+| `delay` | The proxy holds the frame for `delay_ms`. | A slow network or a slow primary |
+
+`expect_frames` matches the recorded frames of a client as a list:
+
+```yaml
+expect_frames:
+  - client: client0
+    commands: [consumer_group.join]
+    direction: request
+    frames:
+      - {request: {$$capture: lost}, outcome: dropped}
+      - {request: {$$ref: lost}, outcome: forwarded}
+```
+
+`commands` and `direction` select frames, and pings are left out unless `include_pings` is `true`.
+Each frame has these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `connection` | The proxy's number of the TCP connection, from 1. |
+| `direction` | `request` or `reply`. |
+| `command` | The protocol command name of `iggy_binary_protocol::codes::command_name`, such as `message.send`. A frame without a request has the consensus command, such as `ping_client`. |
+| `code` | The command code. A reply has the code of its request. |
+| `request`, `client`, `session` | The request number, the client id as text, and the session. A reply repeats the request number. |
+| `status` | The status of a reply. Zero means success. |
+| `size`, `at_ms` | The frame size, and the milliseconds since the listener started. |
+| `outcome` | `forwarded`, `dropped`, `delayed`, `closed_before` or `closed_after`. |
 
 ### Matching
 
