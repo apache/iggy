@@ -724,8 +724,7 @@ async fn given_http_only_routes_when_requested_should_return_expected_shapes(
     );
 }
 
-/// The static POST-only `/personal-access-tokens/login` route outranks the
-/// `{name}` capture, so a token named `login` must still delete over HTTP.
+/// The POST-only login route shadows `{name}`, which used to answer this DELETE with 405.
 #[iggy_harness]
 async fn given_pat_named_login_when_deleted_over_http_should_return_204(harness: &TestHarness) {
     let root = HttpClient::login_root(harness).await;

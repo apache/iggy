@@ -2276,9 +2276,6 @@ pub(in crate::http) async fn delete_pat(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `DELETE /personal-access-tokens/login`: the static POST-only login route
-/// outranks `/personal-access-tokens/{name}` in axum's matcher, so a token
-/// named `login` needs its own DELETE route.
 pub(in crate::http) async fn delete_pat_named_login(
     state: State<HttpState>,
     identity: Authenticated,

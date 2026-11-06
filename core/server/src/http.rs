@@ -546,7 +546,8 @@ fn forwardable_routes(state: HttpState) -> Router<HttpState> {
         )
         .route("/personal-access-tokens", get(get_pats).post(create_pat))
         .route("/personal-access-tokens/{name}", delete(delete_pat))
-        // Merges with the POST-only login route of the same path in `local`.
+        // Static routes outrank `{name}`, so DELETE on a token named `login` would hit the POST-only
+        // login route (405). Registered here rather than in `local` to keep forwarding to the primary.
         .route(
             "/personal-access-tokens/login",
             delete(delete_pat_named_login),
