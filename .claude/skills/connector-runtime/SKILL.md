@@ -217,7 +217,7 @@ Fatal errors propagate to `main` and exit. Per-connector / per-message errors ar
 
 All families labeled by `connector_key` + `connector_type` (histogram adds `stage`):
 
-- **Counters**: `iggy_connector_messages_{produced,sent,consumed,processed,filtered,errors}_total`.
+- **Counters**: `iggy_connector_messages_{produced,sent,consumed,processed,filtered}_total` and `iggy_connector_errors_total` (no `messages_` in the errors name).
   - `messages_filtered_total` - intentional drops via transform `Ok(None)`.
   - `errors_total` - unexpected drops (decode/encode/build failure, missing field, ...) + batch-level failures, one per failed run.
   - `sink_runs_total` - FFI `consume()` calls for sink batches, one per contiguous payload-variant run. Divide by `stage_duration_seconds_count{stage="total"}` for runs per batch.

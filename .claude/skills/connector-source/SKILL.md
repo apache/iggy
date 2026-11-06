@@ -184,7 +184,7 @@ Match `ProducedMessages.schema` to the bytes in `messages[i].payload`:
 | Transient fetch failure (retry-worthy)              | `Error::Connection` or `Error::HttpRequestFailed` |
 | Permanent fetch failure (auth, schema gone)         | `Error::PermanentHttpError`                       |
 | Row failed to serialize                             | `Error::Serialization(...)`                       |
-| State serialization failed                          | log + skip (non-fatal)                            |
+| State serialization failed                          | `Error::Serialization(...)` from `poll()`, nothing sent |
 | `on_batch_result()` failed to roll back staged work | `Err` - stops the SDK from polling further        |
 
 Returning `Err` from `poll()` is only logged by the SDK's FFI bridge
