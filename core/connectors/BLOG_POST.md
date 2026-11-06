@@ -71,8 +71,11 @@ passing `cargo test`:
   how the runtime really behaves. It retries a batch with backoff within
   one time budget, waits out an open breaker instead of discarding the
   batch, logs the exact offset range if it has to give up, and keys
-  writes on `stream:topic:partition:offset` so replays are harmless. It
-  never swallows a failed batch into `Ok(())`.
+  writes on `stream:topic:partition:offset` so a replay can be made
+  idempotent once you wire that key into your write (the stub only
+  builds it). A batch that is not delivered is counted and logged, and at
+  least once it fails the call. At most once, a chunk rejected for good is
+  skipped, counted and logged, and the call still returns `Ok(())`.
 - Source: the full #3855 ACK/NACK contract — `poll()` stages a
   candidate cursor, `on_batch_result()` commits it on `Ack` or
   discards it on `Nack`, so a dropped batch gets re-polled instead of

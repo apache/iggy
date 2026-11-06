@@ -33,7 +33,9 @@ stores the offset of a partition only after `consume()` returned `Ok`. The
 template writes inside `consume()`, so the default no-op `flush()` is enough and
 `enable_at_least_once()` accepts the mode. A failed call is handed over again,
 and a message can arrive more than once, but none is skipped. A permanent
-failure stops the sink at that offset instead of skipping the batch.
+failure stops the sink at that offset instead of skipping the batch. An
+unclassified failure ends the call at its chunk, and the runtime hands the batch
+over again.
 
 What `consume()` does with each chunk of up to `batch_size` messages, in order:
 
@@ -52,8 +54,11 @@ What `consume()` does with each chunk of up to `batch_size` messages, in order:
    would let the stored offset pass an undelivered message, so `consume()` stops
    at that chunk, counts it and every later message as failed, and returns the
    error. The runtime then stops the sink at that offset.
-5. Any other error is not retried. The chunk is counted as failed, the error is
-   returned at the end, and the remaining chunks are still tried.
+5. Any other error is not retried. At most once, the chunk is counted as failed,
+   the error is returned at the end, and the remaining chunks are still tried.
+   At least once, `consume()` stops at that chunk, counts it and every later
+   message as failed, and returns the error. The runtime hands the whole batch
+   over again, so a later chunk that was written would be written twice.
 6. When `max_delivery_time` runs out on a transient error, `consume()` stops,
    does not attempt the remaining chunks, counts every undelivered message as
    failed and logs, at `error` level, the stream, topic, partition and offset
@@ -91,8 +96,9 @@ Every connector README has to answer these four questions. For this template:
 ### Why the key uses the offset
 
 Partition plus offset names one position in one partition's log for good. A
-redelivered or replayed message always gets the same key, and two different
-messages never share one. `message.id` is a worse default because producers can
+redelivered or replayed message always gets the same key. The parts are joined
+with `:`, so unusual names that contain `:` can still collide, as in
+`mongodb_sink`. `message.id` is a worse default because producers can
 choose it, and two different messages with the same id would overwrite each
 other in the destination, which is silent data loss. Use `message.id` instead
 only when your producers guarantee unique ids and you also want duplicates
@@ -245,8 +251,8 @@ depends on the transport.
 Keep the crate as it is. `connection_string` is the base URL, `self.client` is
 a `reqwest` client wrapped by the SDK retry middleware, and `open()` probes
 `health_check_path` with `check_connectivity_with_retry`. Return
-`HttpRequestFailed`, `Connection` or `CannotStoreData` for a failure worth
-retrying and `PermanentHttpError` for a payload the server will never accept.
+`HttpRequestFailed`, `Connection`, `CannotStoreData` or another variant listed
+in step 3 above for a failure worth retrying and `PermanentHttpError` for a payload the server will never accept.
 
 ### Path B: non-HTTP backend (database, queue, object store)
 
@@ -293,7 +299,8 @@ and one is documentation:
 `self.config.connection_string` and `self.config.target` (already validated), via
 `self.client`. The error you return steers the loop: transient errors are
 retried, a permanent error (`Error::is_permanent()`) skips the chunk (and stops
-the sink at least once), anything else is not retried. Use
+the sink at least once), anything else is not retried (at least once it also
+stops the call at that chunk). Use
 `message.payload.try_to_bytes()` and do not clone `Payload::Json`. If the
 destination's call can succeed at the transport level while rejecting rows (a
 bulk API answering 200 with per-item errors), count the accepted rows yourself

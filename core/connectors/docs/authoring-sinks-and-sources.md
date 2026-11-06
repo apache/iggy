@@ -163,7 +163,8 @@ calls `on_batch_result(SourceBatchResult::Ack | Nack)`. Only
   nothing about whether the destination is up. At most once, skip that
   error's chunk. At least once, fail the call instead, because the runtime
   stores the offset past every message of a successful call and a skipped
-  chunk would be lost for good.
+  chunk would be lost for good. An unclassified error also stops the call at
+  its chunk, so no later chunk is written before the runtime redelivers the batch.
 - **Decide on at-least-once.** `enable_at_least_once()` runs when the sink
   is configured for it, and the default returns `Error::Unsupported`, so a
   sink refuses the mode until it overrides the method. Accept only if a

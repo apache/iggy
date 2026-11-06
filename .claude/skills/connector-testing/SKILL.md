@@ -483,12 +483,11 @@ Integration tests assume Docker is available locally and pull images from a publ
 1. **Skipping integration tests for a real-infra plugin.** Unit tests don't catch FFI/lifecycle/encoding regressions.
 2. **Forgetting the four canonical source state tests.** This is the most common review comment.
 3. **Mocking the client library** instead of using `testcontainers` - test exercises the mock.
-4. **`#[tokio::test]` in `src/lib.rs`** - pulls tokio test macros into prod build. Use `Runtime::new()` instead. (`#[tokio::test]` is fine in `tests/` directories, which compile separately.)
-5. **`unwrap()` in test assertions** - prefer `assert_eq!` / `expect("descriptive")` so failures tell you which step blew up.
-6. **Tests depending on system time** - inject the clock or use `tokio::time::pause()`.
-7. **Hidden coupling via shared globals** (static `AtomicU64`, env vars) - tests must be independent and parallelizable.
-8. **Asserting on `Display` of an error** - use `matches!(err, Error::Variant(_))`. `assert_eq!(err.to_string(), ...)` breaks on message tweaks.
-9. **Sleeping a fixed duration** instead of polling - causes flakes when CI is slow.
+4. **`unwrap()` in test assertions** - prefer `assert_eq!` / `expect("descriptive")` so failures tell you which step blew up.
+5. **Tests depending on system time** - inject the clock or use `tokio::time::pause()`.
+6. **Hidden coupling via shared globals** (static `AtomicU64`, env vars) - tests must be independent and parallelizable.
+7. **Asserting on `Display` of an error** - use `matches!(err, Error::Variant(_))`. `assert_eq!(err.to_string(), ...)` breaks on message tweaks.
+8. **Sleeping a fixed duration** instead of polling - causes flakes when CI is slow.
 
 ## Examples worth copying
 

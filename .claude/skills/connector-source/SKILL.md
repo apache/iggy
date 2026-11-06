@@ -179,13 +179,15 @@ Match `ProducedMessages.schema` to the bytes in `messages[i].payload`:
 
 | Scenario                                            | Variant                                           |
 | --------------------------------------------------- | ------------------------------------------------- |
-| Bad config in `new()`/`open()`                      | `Error::InitError`                                |
+| Bad config in `new()`/`open()`                      | `Error::InvalidConfigValue`                       |
 | Cannot reach external system at startup             | `Error::InitError` or `Error::Connection`         |
 | Transient fetch failure (retry-worthy)              | `Error::Connection` or `Error::HttpRequestFailed` |
 | Permanent fetch failure (auth, schema gone)         | `Error::PermanentHttpError`                       |
 | Row failed to serialize                             | `Error::Serialization(...)`                       |
 | State serialization failed                          | `Error::Serialization(...)` from `poll()`, nothing sent |
 | `on_batch_result()` failed to roll back staged work | `Err` - stops the SDK from polling further        |
+
+The template's stub `fetch_records()` returns `Error::InitError` as a placeholder. `poll()` counts it toward the breaker, so replace it with a real fetch.
 
 Returning `Err` from `poll()` is only logged by the SDK's FFI bridge
 (`sdk/src/source.rs::handle_messages`) - the loop continues, the next

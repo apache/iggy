@@ -37,8 +37,10 @@ before asking for a human re-review. Cite symbols/paths, not stale line numbers.
 
 ### B1. Secrets
 
-- [ ] Every credential field is `secrecy::SecretString` with
-      `#[serde(serialize_with = "iggy_common::serde_secret::serialize_secret")]`.
+- [ ] Every credential field is `secrecy::SecretString`. `serialize_secret`
+      (`iggy_common::serde_secret`) writes the plaintext, as the runtime needs it;
+      `SecretString` only hides it from `Debug`/`Display`. Use `serialize_redacted`
+      for a field that must never leave the process in serialized form.
 - [ ] No connection string / API key / token in `info!`/`debug!`/`error!` /
       `format!` into SQL / file-state metadata.
 - [ ] Source state must not persist URL userinfo or bearer tokens.
@@ -54,14 +56,15 @@ Plain `String` for a credential is a review-blocker. Pattern:
       stops, counts every undelivered message as failed, logs the stream, topic,
       partition and offset range, and returns the error (see `connector-sink`
       Delivery budget). At most once, permanent and unclassified errors only
-      affect their own chunk.
+      affect their own chunk. At least once, both stop the call at that chunk.
 - [ ] An open circuit breaker is waited out inside the budget, never answered
       with an immediate error: by default the offset is already stored, so a
       refused batch is lost.
 - [ ] A sink that accepts `[delivery] guarantee = "at_least_once"`
       (`enable_at_least_once()` returns `Ok`; the SDK default refuses) never
       skips a message. A permanent rejection fails the call so the runtime
-      stops the sink at that offset, and a sink that buffers across calls
+      stops the sink at that offset, an unclassified error stops the call at
+      its chunk so no later chunk is written before redelivery, and a sink that buffers across calls
       proves delivery in `flush()`.
 - [ ] README must not claim "no data loss" / strong idempotency unless the
       backend + runtime path actually enforce it.
@@ -102,7 +105,8 @@ that state on success, then calls `on_batch_result(Ack | Nack)`. Only
       `Error::SchemaMismatch` — not `InvalidRecord`. `Error::InitError` is not on
       `Error::is_permanent()`; use it for a failed `open()` only.
 - [ ] Retryable network/5xx/SQLSTATE map to transient variants
-      (`HttpRequestFailed`, `Connection`, `CannotStoreData`).
+      (`HttpRequestFailed`, `Connection`, `CannotStoreData`, `WriteFailure`,
+      `Storage`, `TransientState`, `CatalogCommitError`).
 - [ ] Do **not** classify retryability by substring-matching `err.to_string()`.
 - [ ] `max_retries` means **total attempts** (default 3). README must match code.
 - [ ] Cap retry budget so a dead backend cannot delay shutdown unboundedly. A
@@ -160,6 +164,8 @@ that state on success, then calls `on_batch_result(Ack | Nack)`. Only
 ### B9. A batch with any row not delivered is a failure, even if the call "succeeded"
 
 A bulk/batch API call returning 200 does not mean every row in it landed.
+This is about `push_batch()`. `consume()` itself returns `Ok` after a permanent skip
+at most once, on purpose: the chunk is counted and logged, not hidden.
 Recurring, independently-discovered bug across four different sinks:
 
 - [ ] If your destination's write API can partially or fully reject a batch

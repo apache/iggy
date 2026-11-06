@@ -266,8 +266,11 @@ impl TemplateSink {
     ///   skipped chunk would let the stored offset pass an undelivered
     ///   message. See the doc comment on that variant in
     ///   `iggy_connector_sdk::Error`.
-    /// - Any other error is not retried. The chunk is counted as failed and
-    ///   the error is returned once every chunk has been tried.
+    /// - Any other error is not retried. At most once, the chunk is counted as
+    ///   failed and the error is returned once every chunk has been tried. At
+    ///   least once, the call stops at that chunk like a permanent error,
+    ///   because the runtime redelivers the whole batch and a later chunk that
+    ///   was written would be written again.
     ///
     /// By default the runtime never redelivers a batch after an error, because
     /// the server stored the offset when it answered the poll. The retries
@@ -323,6 +326,8 @@ impl TemplateSink {
     /// All chunks share one delivery budget. A chunk the destination rejects for good is skipped
     /// and counted, except in at-least-once mode, where skipping would let the runtime store
     /// an offset past an undelivered message: the call fails and the runtime stops the sink.
+    /// At least once, an unclassified error also stops the call at its chunk, so no later chunk
+    /// is written before the runtime redelivers the batch.
     async fn deliver_messages<F, Fut>(
         &self,
         topic_metadata: &TopicMetadata,
@@ -349,11 +354,11 @@ impl TemplateSink {
                 .await;
             match result {
                 Ok(()) => written += chunk.len() as u64,
-                Err(err) if self.at_least_once && err.is_permanent() => {
+                Err(err) if self.at_least_once && !is_transient(&err) => {
                     let undelivered = &messages[start..];
                     failed += undelivered.len() as u64;
                     error!(
-                        "{CONNECTOR_NAME} connector with ID: {} stops at {} messages (permanent), \
+                        "{CONNECTOR_NAME} connector with ID: {} stops at {} messages (not retryable), \
                          stream: {}, topic: {}, partition: {}, offsets {}. The stored offset stays \
                          below them. Cause: {err}",
                         self.id,
@@ -474,8 +479,9 @@ impl TemplateSink {
         }
     }
 
-    /// Waits out an open breaker instead of refusing the batch. The runtime stored the offset
-    /// when it polled, so a refused batch would be gone for good.
+    /// Waits out an open breaker instead of refusing the batch. At most once, the
+    /// runtime stored the offset when it polled, so a refused batch would be gone for good. At
+    /// least once, a refused call makes the runtime redeliver the batch in a tight loop.
     async fn wait_for_closed_breaker(&self, deadline: Instant) -> Result<(), Error> {
         let mut warned = false;
         while self.circuit_breaker.is_open().await {
@@ -504,8 +510,9 @@ impl TemplateSink {
 /// for whatever identity column/key your destination's upsert needs.
 ///
 /// Partition plus offset names one position in one partition's log for good, so a
-/// replayed or redelivered message always gets the same key and two distinct
-/// messages never share one. `message.id` is not a safe default: producers can set
+/// replayed or redelivered message always gets the same key. The parts are joined with
+/// `:`, which names may contain, so two odd names can still collide (`a:b/c` and
+/// `a/b:c`); `mongodb_sink` joins the same way. `message.id` is not a safe default: producers can set
 /// it, and two different messages with the same id would overwrite each other in the
 /// destination. Swap it in only when your producers guarantee unique ids and you want
 /// duplicates produced at different offsets collapsed too.
@@ -822,6 +829,40 @@ mod tests {
 
         assert!(matches!(result, Err(Error::SchemaMismatch(_))));
         assert_eq!(attempted, 2, "chunks after the rejected one are not sent");
+    }
+
+    #[tokio::test]
+    async fn given_unclassified_error_when_at_least_once_should_stop_at_the_chunk() {
+        let mut sink = single_message_chunks_sink();
+        sink.enable_at_least_once().expect("template supports it");
+
+        let (result, attempted) = deliver_with_rejected_second_chunk(&sink, || {
+            Error::InitError("not implemented".to_string())
+        })
+        .await;
+
+        assert!(matches!(result, Err(Error::InitError(_))));
+        assert_eq!(
+            attempted, 2,
+            "no later chunk is written before the redelivery"
+        );
+        let state = sink.state.lock().await;
+        assert_eq!((state.messages_written, state.messages_failed), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn given_unclassified_error_when_at_most_once_should_fail_only_its_chunk() {
+        let sink = single_message_chunks_sink();
+
+        let (result, attempted) = deliver_with_rejected_second_chunk(&sink, || {
+            Error::InitError("not implemented".to_string())
+        })
+        .await;
+
+        assert!(matches!(result, Err(Error::InitError(_))));
+        assert_eq!(attempted, 3);
+        let state = sink.state.lock().await;
+        assert_eq!((state.messages_written, state.messages_failed), (2, 1));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1165,7 +1206,8 @@ mod tests {
     // always returns Error::InitError. That is neither transient nor a
     // PermanentHttpError, so a non-empty consume() call exercises the
     // "unclassified error" branch of the chunking loop end to end: the chunk
-    // is counted as failed, not retried, and the error is returned.
+    // is counted as failed, not retried, and the error is returned. At least
+    // once the same error stops the call at its chunk (see the tests above).
     #[tokio::test]
     async fn given_unimplemented_push_batch_should_return_err_and_count_failure() {
         let mut sink = TemplateSink::new(1, test_config());
