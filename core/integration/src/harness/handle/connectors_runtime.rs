@@ -89,6 +89,17 @@ impl ConnectorsRuntimeHandle {
         self.iggy_connection_options = None;
     }
 
+    /// Kills the runtime with SIGKILL, so that no flush or offset store of a graceful stop
+    /// runs. Start it again with [`TestBinary::start`] and [`IggyServerDependent::wait_ready`].
+    pub fn kill(&mut self) -> Result<(), TestBinaryError> {
+        let Some(mut child) = self.child_handle.take() else {
+            return Ok(());
+        };
+        child.kill()?;
+        child.wait()?;
+        Ok(())
+    }
+
     fn build_envs(&mut self) {
         let state_path = self.context.connectors_runtime_state_path(self.server_id);
         self.envs.insert(
@@ -180,13 +191,14 @@ impl TestBinary for ConnectorsRuntimeHandle {
             let stdout_path = self.context.connectors_runtime_stdout_path(self.server_id);
             let stderr_path = self.context.connectors_runtime_stderr_path(self.server_id);
 
+            // Appended, so that a start after a kill keeps the logs of the killed run.
             let stdout_file =
-                File::create(&stdout_path).map_err(|e| TestBinaryError::FileSystemError {
+                append_to(&stdout_path).map_err(|e| TestBinaryError::FileSystemError {
                     path: stdout_path.clone(),
                     source: e,
                 })?;
             let stderr_file =
-                File::create(&stderr_path).map_err(|e| TestBinaryError::FileSystemError {
+                append_to(&stderr_path).map_err(|e| TestBinaryError::FileSystemError {
                     path: stderr_path.clone(),
                     source: e,
                 })?;
@@ -321,4 +333,8 @@ impl Drop for ConnectorsRuntimeHandle {
         let _ = self.stop();
         common::dump_logs_on_panic("Iggy connectors", &self.stdout_path, &self.stderr_path);
     }
+}
+
+fn append_to(path: &std::path::Path) -> std::io::Result<File> {
+    OpenOptions::new().create(true).append(true).open(path)
 }
