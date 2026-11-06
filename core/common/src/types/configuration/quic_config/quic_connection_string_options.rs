@@ -21,6 +21,7 @@ use crate::{
 };
 use iggy_binary_protocol::MAX_RECORD_REPLY_SIZE;
 use std::str::FromStr;
+use tracing::warn;
 
 #[derive(Debug)]
 pub struct QuicConnectionStringOptions {
@@ -110,7 +111,7 @@ impl ConnectionStringOptions for QuicConnectionStringOptions {
         // For reconnection config
         let mut reconnection_max_retries = "unlimited".to_owned();
         let mut reconnection_interval = "1s".to_owned();
-        let mut reconnection_reestablish_after = "5s".to_owned();
+        let mut reestablish_after = IggyDuration::from_str("5s").unwrap();
 
         for option in options {
             let option_parts = option.split('=').collect::<Vec<&str>>();
@@ -192,8 +193,16 @@ impl ConnectionStringOptions for QuicConnectionStringOptions {
                         return Err(IggyError::InvalidConnectionString);
                     }
                 },
+                "tls_validate_certificate" => {
+                    validate_certificate = bool::from_str(option_parts[1])
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
+                }
                 "validate_certificate" => {
-                    validate_certificate = option_parts[1] == "true";
+                    warn!(
+                        "QUIC connection string option `validate_certificate` is deprecated; use `tls_validate_certificate` instead"
+                    );
+                    validate_certificate = bool::from_str(option_parts[1])
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
                 }
                 "heartbeat_interval" => {
                     heartbeat_interval = option_parts[1].to_string();
@@ -204,8 +213,16 @@ impl ConnectionStringOptions for QuicConnectionStringOptions {
                 "reconnection_interval" => {
                     reconnection_interval = option_parts[1].to_string();
                 }
+                "reestablish_after" => {
+                    reestablish_after = IggyDuration::from_str(option_parts[1])
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
+                }
                 "reconnection_reestablish_after" => {
-                    reconnection_reestablish_after = option_parts[1].to_string();
+                    warn!(
+                        "QUIC connection string option `reconnection_reestablish_after` is deprecated; use `reestablish_after` instead"
+                    );
+                    reestablish_after = IggyDuration::from_str(option_parts[1])
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
                 }
                 _ => {
                     return Err(IggyError::InvalidConnectionString);
@@ -225,8 +242,7 @@ impl ConnectionStringOptions for QuicConnectionStringOptions {
             },
             interval: NonZeroIggyDuration::from_str(reconnection_interval.as_str())
                 .map_err(|_| IggyError::InvalidConnectionString)?,
-            reestablish_after: IggyDuration::from_str(reconnection_reestablish_after.as_str())
-                .map_err(|_| IggyError::InvalidConnectionString)?,
+            reestablish_after,
         };
 
         let heartbeat_interval = NonZeroIggyDuration::from_str(heartbeat_interval.as_str())
@@ -299,5 +315,283 @@ impl Default for QuicConnectionStringOptions {
             validate_certificate: false,
             heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ConnectionString, QuicClientConfig, QuicClientConfigBuilder};
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
+    const QUIC_URL: &str = "iggy+quic://user:secret@127.0.0.1:8080";
+
+    fn parse(options: &str) -> Result<QuicConnectionStringOptions, IggyError> {
+        QuicConnectionStringOptions::parse_options(options)
+    }
+
+    fn duration(value: &str) -> IggyDuration {
+        IggyDuration::from_str(value).unwrap()
+    }
+
+    fn client_config(options: &str) -> QuicClientConfig {
+        let connection_string =
+            ConnectionString::<QuicConnectionStringOptions>::new(&format!("{QUIC_URL}?{options}"))
+                .unwrap();
+        QuicClientConfig::from(connection_string)
+    }
+
+    #[test]
+    fn cooldown_canonical_and_deprecated_keys_have_identical_values() {
+        let canonical = parse("reestablish_after=500ms").unwrap();
+        let deprecated = parse("reconnection_reestablish_after=500ms").unwrap();
+
+        assert_eq!(canonical.reconnection().reestablish_after, duration("500ms"));
+        assert_eq!(
+            canonical.reconnection().reestablish_after,
+            deprecated.reconnection().reestablish_after
+        );
+        assert_eq!(
+            parse("reestablish_after=0")
+                .unwrap()
+                .reconnection()
+                .reestablish_after,
+            duration("0")
+        );
+    }
+
+    #[test]
+    fn cooldown_last_occurrence_wins_in_original_order() {
+        for (options, expected) in [
+            (
+                "reconnection_reestablish_after=100ms&reestablish_after=500ms",
+                "500ms",
+            ),
+            (
+                "reestablish_after=500ms&reconnection_reestablish_after=100ms",
+                "100ms",
+            ),
+            ("reestablish_after=100ms&reestablish_after=500ms", "500ms"),
+            (
+                "reconnection_reestablish_after=100ms&reconnection_reestablish_after=500ms",
+                "500ms",
+            ),
+        ] {
+            assert_eq!(
+                parse(options).unwrap().reconnection().reestablish_after,
+                duration(expected),
+                "{options}"
+            );
+        }
+    }
+
+    #[test]
+    fn cooldown_rejects_invalid_values_even_when_later_overridden() {
+        for options in [
+            "reestablish_after=invalid",
+            "reconnection_reestablish_after=invalid",
+            "reestablish_after=500",
+            "reestablish_after=invalid&reconnection_reestablish_after=1s",
+            "reconnection_reestablish_after=invalid&reestablish_after=1s",
+            "reestablish_after=1s&reestablish_after=invalid",
+            "reconnection_reestablish_after=1s&reconnection_reestablish_after=invalid",
+            "reestablish_after=",
+        ] {
+            assert!(
+                matches!(parse(options), Err(IggyError::InvalidConnectionString)),
+                "{options}"
+            );
+        }
+    }
+
+    #[test]
+    fn cooldown_defaults_and_retry_option_remain_unchanged() {
+        assert_eq!(
+            QuicConnectionStringOptions::default()
+                .reconnection()
+                .reestablish_after,
+            duration("5s")
+        );
+        assert_eq!(
+            parse("reconnection_max_retries=unlimited")
+                .unwrap()
+                .reconnection()
+                .reestablish_after,
+            duration("5s")
+        );
+        assert_eq!(parse("reconnection_max_retries=3").unwrap().retries(), Some(3));
+        assert_eq!(
+            parse("reconnection_max_retries=unlimited")
+                .unwrap()
+                .retries(),
+            None
+        );
+        assert!(matches!(
+            parse("reconnection_max_retries=invalid"),
+            Err(IggyError::InvalidNumberValue)
+        ));
+        assert!(matches!(
+            parse("reconnection_retries=3"),
+            Err(IggyError::InvalidConnectionString)
+        ));
+    }
+
+    #[test]
+    fn tls_canonical_and_deprecated_keys_accept_exact_booleans() {
+        for key in ["tls_validate_certificate", "validate_certificate"] {
+            for (value, expected) in [("true", true), ("false", false)] {
+                let options = parse(&format!("{key}={value}")).unwrap();
+                assert_eq!(options.validate_certificate(), expected, "{key}={value}");
+            }
+        }
+        assert!(!QuicConnectionStringOptions::default().validate_certificate());
+        assert!(!parse("reconnection_max_retries=1").unwrap().validate_certificate());
+    }
+
+    #[test]
+    fn tls_last_occurrence_wins_in_original_order() {
+        for (options, expected) in [
+            ("tls_validate_certificate=true&validate_certificate=false", false),
+            ("validate_certificate=false&tls_validate_certificate=true", true),
+            ("tls_validate_certificate=false&tls_validate_certificate=true", true),
+            ("validate_certificate=true&validate_certificate=false", false),
+            ("validate_certificate=true&tls_validate_certificate=false", false),
+            ("tls_validate_certificate=false&validate_certificate=true", true),
+        ] {
+            assert_eq!(parse(options).unwrap().validate_certificate(), expected, "{options}");
+        }
+    }
+
+    #[test]
+    fn tls_rejects_invalid_values_even_when_later_overridden() {
+        for key in ["tls_validate_certificate", "validate_certificate"] {
+            for value in ["ture", "invalid", "yes", "1", "", "TRUE", "False", "0"] {
+                let options = format!("{key}={value}");
+                assert!(
+                    matches!(parse(&options), Err(IggyError::InvalidConnectionString)),
+                    "{options}"
+                );
+            }
+            let options = format!("{key}=invalid&tls_validate_certificate=true");
+            assert!(
+                matches!(parse(&options), Err(IggyError::InvalidConnectionString)),
+                "{options}"
+            );
+            let options = format!("tls_validate_certificate=true&{key}=invalid");
+            assert!(
+                matches!(parse(&options), Err(IggyError::InvalidConnectionString)),
+                "{options}"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_string_options_propagate_to_quic_client_config() {
+        let canonical = client_config(
+            "reestablish_after=750ms&tls_validate_certificate=true&reconnection_max_retries=2",
+        );
+        let deprecated = client_config(
+            "reconnection_reestablish_after=750ms&validate_certificate=true&reconnection_max_retries=2",
+        );
+        assert_eq!(canonical.reconnection.reestablish_after, duration("750ms"));
+        assert_eq!(
+            canonical.reconnection.reestablish_after,
+            deprecated.reconnection.reestablish_after
+        );
+        assert!(canonical.validate_certificate);
+        assert!(deprecated.validate_certificate);
+        assert_eq!(canonical.reconnection.max_retries, Some(2));
+        assert_eq!(deprecated.reconnection.max_retries, Some(2));
+
+        let disabled = client_config("tls_validate_certificate=false");
+        assert!(!disabled.validate_certificate);
+
+        let omitted = ConnectionString::<QuicConnectionStringOptions>::new(QUIC_URL).unwrap();
+        let omitted = QuicClientConfig::from(omitted);
+        assert!(!omitted.validate_certificate);
+        assert_eq!(omitted.reconnection.reestablish_after, duration("5s"));
+    }
+
+    #[test]
+    fn existing_public_quic_builder_and_config_api_are_compatible() {
+        let config = QuicClientConfigBuilder::new()
+            .with_validate_certificate(true)
+            .with_reestablish_after(duration("750ms"))
+            .with_reconnection_max_retries(Some(2))
+            .build()
+            .unwrap();
+        assert!(config.validate_certificate);
+        assert_eq!(config.reconnection.reestablish_after, duration("750ms"));
+        assert_eq!(config.reconnection.max_retries, Some(2));
+
+        let mut default_config = QuicClientConfig::default();
+        assert!(!default_config.validate_certificate);
+        default_config.validate_certificate = true;
+        assert!(default_config.validate_certificate);
+    }
+
+    struct WarningWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for WarningWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_warnings(f: impl FnOnce()) -> String {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || WarningWriter(Arc::clone(&writer)))
+            .finish();
+
+        // A thread-local subscriber avoids changing logging for concurrently running tests.
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = output.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn deprecated_aliases_warn_on_every_occurrence_and_identify_replacements() {
+        let warnings = capture_warnings(|| {
+            parse("reconnection_reestablish_after=100ms&reestablish_after=500ms&reconnection_reestablish_after=1s").unwrap();
+            parse("validate_certificate=false&tls_validate_certificate=true&validate_certificate=true").unwrap();
+        });
+        assert_eq!(
+            warnings
+                .matches("option \`reconnection_reestablish_after\` is deprecated")
+                .count(),
+            2
+        );
+        assert_eq!(
+            warnings
+                .matches("option \`validate_certificate\` is deprecated")
+                .count(),
+            2
+        );
+        assert!(warnings.contains("use \`reestablish_after\` instead"));
+        assert!(warnings.contains("use \`tls_validate_certificate\` instead"));
+
+        let warnings = capture_warnings(|| {
+            parse("reestablish_after=500ms&tls_validate_certificate=true").unwrap();
+        });
+        assert!(warnings.is_empty(), "canonical options must not warn: {warnings}");
+
+        let warnings = capture_warnings(|| {
+            assert!(matches!(
+                parse("validate_certificate=invalid"),
+                Err(IggyError::InvalidConnectionString)
+            ));
+        });
+        assert!(warnings.contains("use \`tls_validate_certificate\` instead"));
     }
 }
