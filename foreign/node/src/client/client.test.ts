@@ -412,6 +412,45 @@ describe('Client lifecycle events', () => {
     assert.equal(result.status, 0, result.stderr || String(result.error));
   });
 
+  for (const event of ['eviction', 'connectionError'] as const) {
+    it(`keeps ${event} listener exceptions outside eviction handling`, () => {
+      const result = spawnSync(process.execPath, [
+        '--import', '@swc-node/register/esm-register', '--input-type=module', '--eval', `
+          import { createServer } from 'node:net';
+          import { once } from 'node:events';
+          import { CommandResponseStream } from ${JSON.stringify(new URL('./client.socket.ts', import.meta.url).href)};
+          import { Command, EVICTION_OFFSET, EvictionReason, HEADER_SIZE, REPLY_OFFSET } from ${JSON.stringify(new URL('../wire/vsr/header.ts', import.meta.url).href)};
+          const eviction = Buffer.alloc(HEADER_SIZE);
+          eviction.writeUInt32LE(HEADER_SIZE, REPLY_OFFSET.size);
+          eviction.writeUInt8(Command.Eviction, REPLY_OFFSET.command);
+          eviction.writeUInt8(EvictionReason.SessionError, EVICTION_OFFSET.reason);
+          const server = createServer((socket) => {
+            socket.on('error', () => {});
+            socket.once('data', () => socket.write(eviction));
+          });
+          server.listen(0, '127.0.0.1');
+          await once(server, 'listening');
+          const client = new CommandResponseStream({
+            transport: 'TCP',
+            options: { host: '127.0.0.1', port: server.address().port },
+            reconnect: { enabled: false, interval: 0, maxRetries: 0 },
+            heartbeatInterval: 0
+          });
+          let calls = 0;
+          process.once('uncaughtException', (error, origin) => {
+            process.exit(error.message === 'listener failed' && origin === 'uncaughtException' && calls === 1 ? 0 : 3);
+          });
+          process.on('unhandledRejection', () => process.exit(4));
+          client.on('connectionError', () => {});
+          client.on(${JSON.stringify(event)}, () => { calls += 1; throw new Error('listener failed'); });
+          client.sendCommand(${COMMAND_CODE.Ping}, Buffer.alloc(0)).catch(() => {});
+          setTimeout(() => process.exit(5), 2000);
+        `
+      ], { encoding: 'utf8', timeout: 10_000 });
+      assert.equal(result.status, 0, result.stderr || String(result.error));
+    });
+  }
+
   it('supports JavaScript node:events.once and removes its temporary listeners', async () => {
     const server = await startServer();
     const client = new Client(clientConfig(server.server));

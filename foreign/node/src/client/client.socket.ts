@@ -1230,13 +1230,25 @@ export class CommandResponseStream extends EventEmitter {
         });
       }
     });
+    // The link reports failures and evictions from inside its socket handlers,
+    // whose catch blocks would take a listener exception for a transport
+    // failure, so public listeners run on the next tick instead.
     connection.on('error', (error: Error) => {
-      // Keep diagnostic link errors separate from EventEmitter's special
-      // 'error' event: internal events.once waits must survive link recovery.
-      if (!connection.ending && !this.lifetime.signal.aborted && this.listenerCount('connectionError') > 0)
-        this.emit('connectionError', error);
+      if (connection.ending || this.lifetime.signal.aborted) return;
+      process.nextTick(() => {
+        // Keep diagnostic link errors separate from EventEmitter's special
+        // 'error' event: internal events.once waits must survive link recovery.
+        if (!this.lifetime.signal.aborted && this.listenerCount('connectionError') > 0)
+          this.emit('connectionError', error);
+      });
     });
-    connection.on('eviction', (error) => this.emit('eviction', error));
+    connection.on('eviction', (error) => {
+      if (this.lifetime.signal.aborted) return;
+      process.nextTick(() => {
+        if (!this.lifetime.signal.aborted)
+          this.emit('eviction', error);
+      });
+    });
     return connection;
   }
 
