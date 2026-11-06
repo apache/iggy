@@ -42,17 +42,6 @@ func TestFeatures(t *testing.T) {
 			},
 		})
 	}
-	if feature == "all" || feature == "leader_redirection" {
-		suites = append(suites, godog.TestSuite{
-			ScenarioInitializer: initLeaderRedirectionScenario,
-			Options: &godog.Options{
-				Format:   "pretty",
-				Paths:    []string{"../../scenarios/leader_redirection.feature"},
-				Strict:   true,
-				TestingT: t,
-			},
-		})
-	}
 	if feature == "all" || feature == "session_contract" {
 		suites = append(suites, godog.TestSuite{
 			ScenarioInitializer: initSessionContractScenario,

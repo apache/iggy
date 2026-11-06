@@ -1,0 +1,86 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Converted from bdd/scenarios/leader_redirection.feature. Replica 0 leads the cluster in its
+# first view. The run names the address of each node, and every test starts with the captures
+# leader_address, follower_address and server_address.
+schema_version: "1.0"
+description: >-
+  A client of a cluster reaches the leader by itself, so that an application can dial any node.
+run_on:
+  - capabilities: [connection_info]
+
+tests:
+  - description: A client of the follower moves to the leader.
+    run_on:
+      - topology: cluster
+    create_entities:
+      - client: {id: client0, node: follower}
+    operations:
+      - object: client0
+        name: get_connection_info
+        eventually: 10s
+        expect_result: {server_address: {$$ref: leader_address}}
+      - object: client0
+        name: create_stream
+        arguments: {name: test-stream}
+        expect_result: {name: test-stream}
+    outcome:
+      - name: get_streams
+        expect_result: [{name: test-stream}]
+
+  - description: A client of the leader stays on it.
+    run_on:
+      - topology: cluster
+    create_entities:
+      - client: {id: client0, node: leader}
+    operations:
+      - object: client0
+        name: get_connection_info
+        expect_result: {server_address: {$$ref: leader_address}}
+      - object: client0
+        name: ping
+      - object: client0
+        name: get_connection_info
+        expect_result: {server_address: {$$ref: leader_address}}
+
+  - description: A client of a single server needs no cluster metadata.
+    create_entities:
+      - client: {id: client0}
+    operations:
+      - object: client0
+        name: get_connection_info
+        expect_result: {server_address: {$$ref: server_address}}
+      - object: client0
+        name: create_stream
+        arguments: {name: single-server-stream}
+        expect_result: {name: single-server-stream}
+
+  - description: Clients of both nodes reach the same leader.
+    run_on:
+      - topology: cluster
+    create_entities:
+      - client: {id: client_a, node: leader}
+      - client: {id: client_b, node: follower}
+    operations:
+      - object: client_a
+        name: get_connection_info
+        expect_result: {server_address: {$$ref: leader_address}}
+      - object: client_b
+        name: get_connection_info
+        eventually: 10s
+        expect_result: {server_address: {$$ref: leader_address}}

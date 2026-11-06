@@ -372,7 +372,6 @@ components:
       - "scripts/run-bdd-tests.sh"
       - "bdd/docker-compose.yml"
       - "bdd/docker-compose.server.yml"
-      - "bdd/docker-compose.cluster.yml"
       - "bdd/docker-compose.no-quorum.yml"
       - "bdd/docker-compose.coverage.yml"
 

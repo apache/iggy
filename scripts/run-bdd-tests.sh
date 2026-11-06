@@ -36,7 +36,7 @@ usage(){
   log "Usage: $0 [--coverage] <sdk> [feature]"
   log ""
   log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | swift | all | clean (default: all)"
-  log "  feature: basic_messaging | leader_redirection | session_contract | stream_options | metadata_changes | deferred_polling | all  (default: all)"
+  log "  feature: basic_messaging | session_contract | stream_options | metadata_changes | deferred_polling | all  (default: all)"
   log ""
   log "  Every suite runs against iggy-server, taken from IGGY_SERVER_PATH"
   log "  (default: target/debug/iggy-server) with an iggy CLI at IGGY_CLI_PATH."
@@ -44,12 +44,11 @@ usage(){
   log "Examples:"
   log "  $0 rust                         # run all features for Rust"
   log "  $0 rust basic_messaging         # run only basic_messaging for Rust"
-  log "  $0 all leader_redirection       # run leader_redirection for all supporting SDKs"
   log "  $0 --coverage go basic_messaging"
 }
 
 case "$FEATURE" in
-  basic_messaging|leader_redirection|session_contract|stream_options|metadata_changes|deferred_polling|all) ;;
+  basic_messaging|session_contract|stream_options|metadata_changes|deferred_polling|all) ;;
   *)
     log "Unknown feature: ${FEATURE}"
     usage
@@ -63,19 +62,14 @@ cd "$(dirname "$0")/../bdd"
 ALL_COMPOSE_FILES=(
   -f docker-compose.yml
   -f docker-compose.server.yml
-  -f docker-compose.cluster.yml
   -f docker-compose.no-quorum.yml
   -f docker-compose.coverage.yml
 )
 
 COMPOSE_FILES=(-f docker-compose.yml)
 case "$FEATURE" in
-  basic_messaging|leader_redirection|session_contract|stream_options|metadata_changes|deferred_polling|all)
+  basic_messaging|session_contract|stream_options|metadata_changes|deferred_polling|all)
     COMPOSE_FILES+=(-f docker-compose.server.yml) ;;
-esac
-case "$FEATURE" in
-  leader_redirection|all)
-    COMPOSE_FILES+=(-f docker-compose.cluster.yml) ;;
 esac
 case "$FEATURE" in
   session_contract|all)
@@ -113,15 +107,6 @@ unsupported(){
 
 run_suite(){
   local svc="$1" emoji="$2" label="$3"
-  if [ "$FEATURE" = "leader_redirection" ]; then
-    case "$svc" in
-      rust-bdd|go-bdd|csharp-bdd|java-bdd) ;;
-      *)
-        unsupported "$FEATURE" "$svc" || return 1
-        return 0 ;;
-    esac
-  fi
-
   if [ "$FEATURE" = "deferred_polling" ]; then
     case "$svc" in
       rust-bdd|python-bdd|php-bdd|cpp-bdd|swift-bdd|go-bdd|node-bdd|csharp-bdd|java-bdd) ;;

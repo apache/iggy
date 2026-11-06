@@ -41,14 +41,6 @@ final class TestEnvironment {
         return require("IGGY_TCP_ADDRESS");
     }
 
-    static String leaderAddress() {
-        return require("IGGY_TCP_ADDRESS_LEADER");
-    }
-
-    static String followerAddress() {
-        return require("IGGY_TCP_ADDRESS_FOLLOWER");
-    }
-
     static String noQuorumAddress() {
         return require("IGGY_TCP_ADDRESS_NO_QUORUM");
     }

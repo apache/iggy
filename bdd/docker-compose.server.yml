@@ -17,7 +17,6 @@
 
 # Single Iggy server test setup.
 # Activated by: ./scripts/run-bdd-tests.sh <sdk> basic_messaging
-#               ./scripts/run-bdd-tests.sh <sdk> leader_redirection
 #               ./scripts/run-bdd-tests.sh <sdk> all
 #
 # Each run starts from a new container, so `--fresh` would be redundant; root

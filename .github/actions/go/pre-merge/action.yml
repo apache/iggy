@@ -168,8 +168,8 @@ runs:
           ./...
 
         # Run BDD tests with coverage of foreign/go packages
-        # Only tcp_test suite (ginkgo); godog leader_redirection tests
-        # require a multi-node cluster not available in CI.
+        # Only the tcp_test suite (ginkgo). The godog features run in the
+        # BDD job, which starts the servers that they need.
         echo "Running BDD tests..."
         cd ../../bdd/go
         go test -v -race \

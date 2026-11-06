@@ -29,6 +29,26 @@ test = "streams/stream_crud.yaml#Delete a stream."
 issue = "not filed yet"
 reason = "GetStream returns ErrStreamIdNotFound (1009) for a missing stream, where Rust and Java return no stream"
 
+[[skip]]
+sdk = "python"
+test = "cluster/leader_redirection.yaml#A client of the follower moves to the leader."
+issue = "not filed yet: the SDK has no call that reports the node it talks to"
+
+[[skip]]
+sdk = "python"
+test = "cluster/leader_redirection.yaml#A client of the leader stays on it."
+issue = "not filed yet: the SDK has no call that reports the node it talks to"
+
+[[skip]]
+sdk = "python"
+test = "cluster/leader_redirection.yaml#A client of a single server needs no cluster metadata."
+issue = "not filed yet: the SDK has no call that reports the node it talks to"
+
+[[skip]]
+sdk = "python"
+test = "cluster/leader_redirection.yaml#Clients of both nodes reach the same leader."
+issue = "not filed yet: the SDK has no call that reports the node it talks to"
+
 [[divergence]]
 sdk = "python"
 test = "messaging/basic_messaging.yaml#Create a stream and a topic, send ten messages and poll them from offset 0."
@@ -48,6 +68,26 @@ issue = "not filed yet: the SDK has no public disconnect"
 
 [[skip]]
 sdk = "node"
+test = "cluster/leader_redirection.yaml#A client of the follower moves to the leader."
+issue = "not filed yet: the SDK has no call that reports the node it talks to"
+
+[[skip]]
+sdk = "node"
+test = "cluster/leader_redirection.yaml#A client of the leader stays on it."
+issue = "not filed yet: the SDK has no call that reports the node it talks to"
+
+[[skip]]
+sdk = "node"
+test = "cluster/leader_redirection.yaml#A client of a single server needs no cluster metadata."
+issue = "not filed yet: the SDK has no call that reports the node it talks to"
+
+[[skip]]
+sdk = "node"
+test = "cluster/leader_redirection.yaml#Clients of both nodes reach the same leader."
+issue = "not filed yet: the SDK has no call that reports the node it talks to"
+
+[[skip]]
+sdk = "node"
 test = "polling/deferred_polling.yaml#A committing poll whose reply is lost blocks its partition until abandoned."
 issue = "not filed yet: the SDK has no disconnect that keeps the client usable"
 
@@ -56,6 +96,26 @@ sdk = "node"
 test = "streams/stream_options.yaml#Rename a keyed stream."
 issue = "not filed yet"
 reason = "stream.get returns a stream without its topic list"
+
+[[skip]]
+sdk = "cpp"
+test = "cluster/leader_redirection.yaml#A client of the follower moves to the leader."
+issue = "not filed yet: the SDK has no call that reports the node it talks to"
+
+[[skip]]
+sdk = "cpp"
+test = "cluster/leader_redirection.yaml#A client of the leader stays on it."
+issue = "not filed yet: the SDK has no call that reports the node it talks to"
+
+[[skip]]
+sdk = "cpp"
+test = "cluster/leader_redirection.yaml#A client of a single server needs no cluster metadata."
+issue = "not filed yet: the SDK has no call that reports the node it talks to"
+
+[[skip]]
+sdk = "cpp"
+test = "cluster/leader_redirection.yaml#Clients of both nodes reach the same leader."
+issue = "not filed yet: the SDK has no call that reports the node it talks to"
 
 [[divergence]]
 sdk = "cpp"
@@ -68,6 +128,37 @@ sdk = "cpp"
 test = "streams/stream_crud.yaml#Delete a stream."
 issue = "not filed yet"
 reason = "get_stream raises an error without an Iggy code for a missing stream, where Rust returns no stream"
+
+[[divergence]]
+sdk = "php"
+test = "cluster/cluster_proxy.yaml#A client that the follower redirects reaches the leader through the proxy."
+issue = "not filed yet"
+reason = "createStream returns nothing instead of the stream details"
+
+[[skip]]
+sdk = "php"
+test = "cluster/cluster_proxy.yaml#A send whose reply the cluster loses is replayed and stored once."
+issue = "not filed yet: the SDK cannot set the id of a message"
+
+[[skip]]
+sdk = "php"
+test = "cluster/leader_redirection.yaml#A client of the follower moves to the leader."
+issue = "not filed yet: the SDK has no call that reports the node it talks to"
+
+[[skip]]
+sdk = "php"
+test = "cluster/leader_redirection.yaml#A client of the leader stays on it."
+issue = "not filed yet: the SDK has no call that reports the node it talks to"
+
+[[skip]]
+sdk = "php"
+test = "cluster/leader_redirection.yaml#A client of a single server needs no cluster metadata."
+issue = "not filed yet: the SDK has no call that reports the node it talks to"
+
+[[skip]]
+sdk = "php"
+test = "cluster/leader_redirection.yaml#Clients of both nodes reach the same leader."
+issue = "not filed yet: the SDK has no call that reports the node it talks to"
 
 [[divergence]]
 sdk = "php"
@@ -265,6 +356,11 @@ reason = "option values carry no kind, and stream and topic details lack fields 
 sdk = "php"
 test = "topics/topic_crud.yaml#Delete a topic."
 issue = "not filed yet: the SDK has no get_topics"
+
+[[skip]]
+sdk = "swift"
+test = "cluster/cluster_proxy.yaml#A send whose reply the cluster loses is replayed and stored once."
+issue = "not filed yet: the SDK has no call that resolves an operation"
 
 [[divergence]]
 sdk = "swift"

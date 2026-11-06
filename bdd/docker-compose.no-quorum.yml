@@ -23,9 +23,10 @@
 # A two-replica cluster needs both replicas to commit, so this node answers
 # pings but refuses every sign-in as not accepted (58) for as long as it runs.
 # An SDK keeps retrying until the call's deadline, which makes the deadline
-# outcome deterministic. The roster IPs follow the same static-address rules
-# as docker-compose.cluster.yml, and the absent replica's address is never
-# assigned to a container.
+# outcome deterministic. The server parses each roster IP as a strict IP
+# address and binds the cluster listeners to it, so the node has a static IP
+# and the healthcheck pings that address. The absent replica's address is
+# never assigned to a container.
 
 x-no-quorum-bdd-deps: &no-quorum-bdd-deps
   depends_on:

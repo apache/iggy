@@ -34,7 +34,6 @@ public class TestHooks
     {
         _context.Clients.Clear();
         _context.CreatedStream = null;
-        _context.RedirectionOccurred = false;
         _context.LastStreamId = null;
         _context.LastStreamKey = null;
         _context.LastCallError = null;

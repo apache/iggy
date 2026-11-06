@@ -32,7 +32,6 @@ services:
       - RUSTFLAGS=-C linker=gcc
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
-      - ./scenarios/leader_redirection.feature:/app/features/leader_redirection.feature
       - ./scenarios/session_contract.feature:/app/features/session_contract.feature
       - ./scenarios/stream_options.feature:/app/features/stream_options.feature
       - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
@@ -43,7 +42,6 @@ services:
       - |
         case "$$BDD_FEATURE" in
           basic_messaging)    cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test basic_messaging ;;
-          leader_redirection) cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test leader_redirection ;;
           session_contract)   cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test session_contract ;;
           stream_options)     cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test stream_options ;;
           metadata_changes)   cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test metadata_changes ;;
@@ -170,7 +168,6 @@ services:
         FILTER=""
         case "$$BDD_FEATURE" in
           basic_messaging)    FILTER='--filter-trait Category=basic-messaging' ;;
-          leader_redirection) FILTER='--filter-trait Category=requires-leader-awareness' ;;
           stream_options)     FILTER='--filter-trait Category=stream-options' ;;
           metadata_changes)   FILTER='--filter-trait Category=metadata-changes' ;;
           deferred_polling)   FILTER='--filter-trait Category=deferred-polling' ;;
@@ -191,7 +188,6 @@ services:
       - BDD_FEATURE=${BDD_FEATURE:-all}
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
-      - ./scenarios/leader_redirection.feature:/app/features/leader_redirection.feature
       - ./scenarios/session_contract.feature:/app/features/session_contract.feature
       - ./scenarios/stream_options.feature:/app/features/stream_options.feature
       - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
@@ -202,7 +198,6 @@ services:
       - |
         case "$$BDD_FEATURE" in
           basic_messaging)    export CUCUMBER_FILTER_TAGS='@basic-messaging' ;;
-          leader_redirection) export CUCUMBER_FILTER_TAGS='@requires-leader-awareness' ;;
           session_contract)   export CUCUMBER_FILTER_TAGS='@session-contract' ;;
           stream_options)     export CUCUMBER_FILTER_TAGS='@stream-options' ;;
           metadata_changes)   export CUCUMBER_FILTER_TAGS='@metadata-changes' ;;

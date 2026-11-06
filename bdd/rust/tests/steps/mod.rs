@@ -17,7 +17,6 @@
 
 pub mod auth;
 pub mod deferred_polling;
-pub mod leader_redirection;
 pub mod messages;
 pub mod metadata_changes;
 pub mod resource_options;

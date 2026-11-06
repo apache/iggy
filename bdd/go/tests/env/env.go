@@ -39,16 +39,6 @@ func ServerAddress() string {
 	return required("IGGY_TCP_ADDRESS")
 }
 
-// LeaderAddress returns the address of the cluster leader.
-func LeaderAddress() string {
-	return required("IGGY_TCP_ADDRESS_LEADER")
-}
-
-// FollowerAddress returns the address of the cluster follower.
-func FollowerAddress() string {
-	return required("IGGY_TCP_ADDRESS_FOLLOWER")
-}
-
 // NoQuorumAddress returns the address of the cluster node that cannot reach quorum.
 func NoQuorumAddress() string {
 	return required("IGGY_TCP_ADDRESS_NO_QUORUM")

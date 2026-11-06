@@ -10,8 +10,7 @@ moves there, and its feature file and step code leave this directory.
 ```bash
 bdd/
 ├── scenarios/                  # Shared Gherkin feature files
-│   ├── basic_messaging.feature
-│   └── leader_redirection.feature
+│   └── basic_messaging.feature
 ├── rust/                       # Rust SDK BDD implementation
 │   ├── Dockerfile              # Rust BDD test container
 │   ├── tests/
@@ -43,7 +42,6 @@ bdd/
 │   └── tests/                  # SwiftPM package with the Gherkin runner and steps
 ├── docker-compose.yml          # Base: SDK test clients (always included)
 ├── docker-compose.server.yml   # Single iggy-server test setup
-├── docker-compose.cluster.yml  # Leader + follower test setup
 ├── docker-compose.no-quorum.yml # Cluster node that never reaches quorum
 ├── docker-compose.coverage.yml # Coverage collection overlay
 ├── Dockerfile                  # Debug build of Iggy server
@@ -57,7 +55,7 @@ bdd/
 ```bash
 # Usage: ../scripts/run-bdd-tests.sh [--coverage] <sdk> [feature]
 #   sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | swift | all | clean  (default: all)
-#   feature: basic_messaging | leader_redirection | session_contract | stream_options | metadata_changes | deferred_polling | all  (default: all)
+#   feature: basic_messaging | session_contract | stream_options | metadata_changes | deferred_polling | all  (default: all)
 
 # Run all features for all SDKs
 ../scripts/run-bdd-tests.sh all
@@ -75,9 +73,6 @@ bdd/
 # Run only basic_messaging feature for Rust SDK
 ../scripts/run-bdd-tests.sh rust basic_messaging
 
-# Run only leader_redirection
-../scripts/run-bdd-tests.sh all leader_redirection
-
 # Every suite runs against iggy-server. Build the binaries first:
 #   cargo build --bin iggy-server --bin iggy
 
@@ -92,7 +87,7 @@ bdd/
 
 ### How it Works
 
-1. **Server Containers**: `docker-compose.server.yml` runs a single Iggy server; `docker-compose.cluster.yml` adds a leader + follower pair for cluster scenarios. `docker-compose.no-quorum.yml` adds a cluster node whose only peer never starts, so it refuses every sign-in until the caller's deadline
+1. **Server Containers**: `docker-compose.server.yml` runs a single Iggy server. `docker-compose.no-quorum.yml` adds a cluster node whose only peer never starts, so it refuses every sign-in until the caller's deadline
 2. **SDK Containers**: Each SDK has its own container with the appropriate runtime and dependencies
 3. **Shared Features**: All SDKs test against the same `.feature` files for consistency
 4. **Health Checks**: Containers wait for the server to be healthy before running tests
@@ -145,8 +140,8 @@ The PHP implementation is located in `bdd/php/tests/` and runs through PHPUnit.
 ### For Swift SDK
 
 The Swift implementation is located in `bdd/swift/tests/`, a SwiftPM package with a small Gherkin
-runner that walks the shared feature files and drives the SDK. It runs every feature but
-`leader_redirection`. Outside Docker, set `IGGY_TCP_ADDRESS`,
+runner that walks the shared feature files and drives the SDK. It runs every feature.
+Outside Docker, set `IGGY_TCP_ADDRESS`,
 `IGGY_TCP_ADDRESS_NO_QUORUM`, `IGGY_ROOT_USERNAME`, and `IGGY_ROOT_PASSWORD`, then run
 `swift run iggy-bdd`, with `BDD_FEATURE` to pick one feature.
 

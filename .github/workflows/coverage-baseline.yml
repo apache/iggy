@@ -530,8 +530,8 @@ jobs:
         run: |
           cd bdd/go
           mkdir -p ../../reports
-          # Run only tcp_test suite (ginkgo); godog leader_redirection
-          # tests require a multi-node cluster not available in CI.
+          # Run only the tcp_test suite (ginkgo). The godog features run in
+          # the BDD job, which starts the servers that they need.
           go test -v -race \
             -coverpkg=github.com/apache/iggy/foreign/go/... \
             -coverprofile=../../reports/go-coverage-bdd.out \

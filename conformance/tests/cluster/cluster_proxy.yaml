@@ -1,0 +1,78 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# The cluster advertises the host of the fault proxy, so every client of the cluster reaches each
+# node through a node listener, also after a redirect. fail_frames and expect_frames name these
+# listeners @leader and @follower.
+schema_version: "1.0"
+description: A client of a cluster stays behind the fault proxy, and the proxy can fail its frames.
+run_on:
+  - topology: cluster
+    transports: [tcp]
+
+tests:
+  - description: A client that the follower redirects reaches the leader through the proxy.
+    create_entities:
+      - client: {id: client0, node: follower}
+    operations:
+      - object: client0
+        name: create_stream
+        arguments: {name: behind-proxy}
+        expect_result: {name: behind-proxy}
+    expect_frames:
+      - client: "@leader"
+        commands: [stream.create]
+        direction: request
+        frames:
+          - {outcome: forwarded}
+
+  - description: A send whose reply the cluster loses is replayed and stored once.
+    run_on:
+      - capabilities: [resolve_operation]
+    create_entities:
+      - client: {id: client0, node: leader}
+    operations:
+      - object: admin
+        name: create_stream
+        arguments: {name: orders}
+      - object: admin
+        name: create_topic
+        arguments: {stream_id: orders, name: events, partitions_count: 1, message_expiry: never}
+      # The primary of the partition can be either node, so both listeners drop the first reply.
+      - object: proxy
+        name: fail_frames
+        arguments: {client: "@leader", match: {command: message.send}, action: drop_reply}
+      - object: proxy
+        name: fail_frames
+        arguments: {client: "@follower", match: {command: message.send}, action: drop_reply}
+      - object: client0
+        name: send_messages
+        arguments:
+          stream_id: orders
+          topic_id: events
+          partitioning: {partition_id: 0}
+          messages: [{id: "1", payload: once}]
+        expect_error: {name: operation_uncertain, operation_id: {$$capture: lost}}
+      - object: client0
+        name: resolve_operation
+        arguments: {operation_id: {$$ref: lost}}
+      - object: client0
+        name: poll_messages
+        arguments: {stream_id: orders, topic_id: events, partition_id: 0, strategy: first, count: 10}
+        expect_result:
+          count: 1
+          messages: [{offset: 0, id: "1", payload: once}]

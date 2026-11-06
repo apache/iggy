@@ -61,9 +61,6 @@ under the License.
         <ReqnrollFeatureFile Include="..\..\..\bdd\scenarios\basic_messaging.feature">
             <Link>Features\basic_messaging.feature</Link>
         </ReqnrollFeatureFile>
-        <ReqnrollFeatureFile Include="..\..\..\bdd\scenarios\leader_redirection.feature">
-            <Link>Features\leader_redirection.feature</Link>
-        </ReqnrollFeatureFile>
         <ReqnrollFeatureFile Include="..\..\..\bdd\scenarios\stream_options.feature">
             <Link>Features\stream_options.feature</Link>
         </ReqnrollFeatureFile>
