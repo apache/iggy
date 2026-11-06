@@ -1,6 +1,9 @@
 # JDBC Source Connector
 
-A JDBC source connector for Iggy designed to work with JDBC-compliant relational databases. PostgreSQL and MySQL are covered by the runtime integration suite; the other driver examples below are configuration guides and are not yet exercised in CI.
+A JDBC source connector for Iggy designed to work with JDBC-compliant relational
+databases. PostgreSQL, MySQL, and SQLite are covered by the runtime integration
+suite; the other driver examples below are configuration guides and are not yet
+exercised in CI.
 
 ## Overview
 
@@ -18,18 +21,17 @@ This connector reads data from relational databases using JDBC (Java Database Co
 
 ## Supported Databases
 
-PostgreSQL bulk and incremental modes and MySQL incremental mode are covered by
-end-to-end tests with real databases and their JDBC drivers. The connector is
-designed around standard JDBC APIs, so the following databases are expected to
-work with a compatible driver, but they are not currently part of the
-integration test matrix:
+PostgreSQL bulk and incremental modes, MySQL incremental mode, and SQLite bulk
+type mapping are covered by end-to-end tests with their JDBC drivers. The
+connector is designed around standard JDBC APIs, so the following databases are
+expected to work with a compatible driver, but they are not currently part of
+the integration test matrix:
 
 - Oracle Database
 - Microsoft SQL Server
 - H2 Database
 - Apache Derby
 - IBM DB2
-- SQLite (via JDBC)
 - SAP HANA
 - Teradata
 - Snowflake
@@ -389,8 +391,9 @@ JDBC SQL types are automatically mapped to JSON:
   Startup and close use `tokio::task::block_in_place`, which lets the runtime
   move unrelated async work to another worker while those calls complete. The
   database work is still blocking; size `poll_interval` and `batch_size`
-  accordingly. During shutdown, the connector cancels the active statement and
-  aborts its connection before waiting for the blocking poll to finish.
+  accordingly. During shutdown, the connector requests cancellation of the
+  active statement and asks the driver to abort its connection before waiting
+  for the blocking poll to finish.
 - **Bulk mode has no pagination beyond `batch_size`, and fails closed.** Row
   limiting uses JDBC `setMaxRows`. In bulk mode the connector probes with
   `batch_size + 1` rows and, if the result set is larger than `batch_size`,
@@ -629,7 +632,8 @@ column requirements above):
 ### Bulk Mode
 
 Uses standard JDBC result-set APIs and requires no tracking column. PostgreSQL
-is integration-tested; validate query and type behavior with other drivers.
+bulk behavior and SQLite floating-point type mapping are integration-tested;
+validate query and type behavior with other drivers.
 
 ```toml
 mode = "bulk"
