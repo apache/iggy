@@ -17,23 +17,26 @@
 
 use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
-    DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergEnvAuthFixture, IcebergOps,
-    IcebergPartitionedTableFixture, IcebergPreCreatedFixture,
+    DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergCatalogRestartFixture, IcebergEnvAuthFixture,
+    IcebergOps, IcebergPartitionedTableFixture, IcebergPreCreatedFixture,
+    IcebergSkipInvalidRowsFixture,
 };
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::Identifier;
 use iggy_common::MessageClient;
 use iggy_connector_sdk::api::SinkInfoResponse;
-use integration::harness::seeds;
+use integration::harness::{ConnectorsRuntimeHandle, seeds};
 use integration::iggy_harness;
 use reqwest::Client;
+use std::time::Duration;
 
 const API_KEY: &str = "test-api-key";
 const ICEBERG_SINK_KEY: &str = "iceberg";
 const SNAPSHOT_POLL_ATTEMPTS: usize = 30;
 const SNAPSHOT_POLL_INTERVAL_MS: u64 = 500;
 const BULK_SNAPSHOT_POLL_ATTEMPTS: usize = 60;
+const CATALOG_RESTART_SNAPSHOT_POLL_ATTEMPTS: usize = 120;
 /// `create_test_messages` alternates `active`, so this many messages span both partition values.
 const PARTITIONED_MESSAGE_COUNT: usize = 5;
 const ACTIVE_PARTITION_COUNT: usize = 2;
@@ -336,4 +339,176 @@ async fn iceberg_sink_uses_default_credential_chain(
         .expect("Data should be written to Iceberg table");
     assert!(snapshot_count >= 1);
     drop(fixture);
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/iceberg/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_invalid_rows_skip_when_a_batch_holds_a_row_that_does_not_match_should_write_the_other_rows(
+    harness: &TestHarness,
+    fixture: IcebergSkipInvalidRowsFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+
+    let valid_rows = create_test_messages(4);
+    let mut payloads: Vec<Vec<u8>> = valid_rows
+        .iter()
+        .map(|row| serde_json::to_vec(row).expect("Failed to serialize message"))
+        .collect();
+    // `id` is a required long column, so this row does not match the table.
+    payloads.insert(
+        2,
+        serde_json::to_vec(&serde_json::json!({ "id": "not a number", "name": "invalid" }))
+            .expect("Failed to serialize message"),
+    );
+    let mut messages: Vec<IggyMessage> = payloads
+        .into_iter()
+        .enumerate()
+        .map(|(i, payload)| {
+            IggyMessage::builder()
+                .id((i + 1) as u128)
+                .payload(Bytes::from(payload))
+                .build()
+                .expect("Failed to build message")
+        })
+        .collect();
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("Failed to send messages");
+
+    fixture
+        .wait_for_snapshots(
+            DEFAULT_NAMESPACE,
+            DEFAULT_TABLE,
+            1,
+            SNAPSHOT_POLL_ATTEMPTS,
+            SNAPSHOT_POLL_INTERVAL_MS,
+        )
+        .await
+        .expect("The matching rows should be written to Iceberg");
+    let metadata = fixture
+        .get_table_metadata(DEFAULT_NAMESPACE, DEFAULT_TABLE)
+        .await
+        .expect("Failed to get table metadata");
+    let written: u64 = metadata
+        .metadata
+        .snapshots
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|snapshot| snapshot.summary.as_ref()?.added_records.as_deref())
+        .map(|records| records.parse::<u64>().expect("added-records is a count"))
+        .sum();
+    assert_eq!(written, valid_rows.len() as u64);
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/iceberg/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_a_catalog_restart_when_a_commit_fails_should_retry_until_the_batch_is_committed(
+    harness: &TestHarness,
+    fixture: IcebergCatalogRestartFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let partitioning = Partitioning::partition_id(0);
+
+    let mut first_batch = json_messages(1, 3);
+    client
+        .send_messages(&stream_id, &topic_id, &partitioning, &mut first_batch)
+        .await
+        .expect("Failed to send messages");
+    fixture
+        .wait_for_snapshots(
+            DEFAULT_NAMESPACE,
+            DEFAULT_TABLE,
+            1,
+            SNAPSHOT_POLL_ATTEMPTS,
+            SNAPSHOT_POLL_INTERVAL_MS,
+        )
+        .await
+        .expect("The first batch should be committed");
+
+    fixture
+        .stop_catalog()
+        .await
+        .expect("Failed to stop the catalog");
+    let mut second_batch = json_messages(4, 4);
+    client
+        .send_messages(&stream_id, &topic_id, &partitioning, &mut second_batch)
+        .await
+        .expect("Failed to send messages");
+    wait_for_failed_commit(
+        harness
+            .connectors_runtime()
+            .expect("connector runtime should be available"),
+    )
+    .await;
+    fixture
+        .start_catalog()
+        .await
+        .expect("Failed to start the catalog");
+
+    fixture
+        .wait_for_snapshots(
+            DEFAULT_NAMESPACE,
+            DEFAULT_TABLE,
+            2,
+            CATALOG_RESTART_SNAPSHOT_POLL_ATTEMPTS,
+            SNAPSHOT_POLL_INTERVAL_MS,
+        )
+        .await
+        .expect("The second batch should be committed once the catalog is back");
+    let metadata = fixture
+        .get_table_metadata(DEFAULT_NAMESPACE, DEFAULT_TABLE)
+        .await
+        .expect("Failed to get table metadata");
+    let written: u64 = metadata
+        .metadata
+        .snapshots
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|snapshot| snapshot.summary.as_ref()?.added_records.as_deref())
+        .map(|records| records.parse::<u64>().expect("added-records is a count"))
+        .sum();
+    assert_eq!(written, 7);
+}
+
+fn json_messages(first_id: u128, count: usize) -> Vec<IggyMessage> {
+    create_test_messages(count)
+        .iter()
+        .zip(first_id..)
+        .map(|(row, id)| {
+            let payload = serde_json::to_vec(row).expect("Failed to serialize message");
+            IggyMessage::builder()
+                .id(id)
+                .payload(Bytes::from(payload))
+                .build()
+                .expect("Failed to build message")
+        })
+        .collect()
+}
+
+/// Waits for the sink to fail its first attempt to commit a batch, so that the batch can only
+/// land through a retry.
+async fn wait_for_failed_commit(runtime: &ConnectorsRuntimeHandle) {
+    let failed_attempt =
+        format!("Commit to Iceberg table {DEFAULT_NAMESPACE}.{DEFAULT_TABLE} failed on attempt 1/");
+    for _ in 0..SNAPSHOT_POLL_ATTEMPTS {
+        if runtime.collect_logs().0.contains(&failed_attempt) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(SNAPSHOT_POLL_INTERVAL_MS)).await;
+    }
+    panic!("The sink did not fail a commit while the catalog was down");
 }

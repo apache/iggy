@@ -160,7 +160,7 @@ async def main():
         config = build_config(args)
     except ValueError as error:
         logger.error(f"Invalid client configuration: {error}")
-        return
+        raise
     logger.info(f"Connecting with {config}")
 
     client = IggyClient(config)
@@ -172,6 +172,7 @@ async def main():
         await consume_messages(client)
     except Exception as error:
         logger.exception(f"Exception occurred in main function: {error}")
+        raise
 
 
 async def consume_messages(client: IggyClient):
@@ -210,7 +211,7 @@ async def consume_messages(client: IggyClient):
             await asyncio.sleep(interval)
         except Exception as error:
             logger.exception(f"Exception occurred while consuming messages: {error}")
-            break
+            raise
 
     logger.info(f"Consumed {n_consumed_batches} batches of messages, exiting.")
 

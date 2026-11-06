@@ -30,6 +30,7 @@ use iggy_connector_sdk::transforms::TransformType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Formatter;
+use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -50,6 +51,72 @@ pub enum ConfigFormat {
     #[strum(to_string = "text")]
     Text,
 }
+
+/// What a sink promises about each message it reads.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Display)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryGuarantee {
+    /// The offset is stored when a message is read, so a failed write loses the message.
+    #[default]
+    #[strum(to_string = "at_most_once")]
+    AtMostOnce,
+    /// The offset is stored once the plugin proved the message delivered, so a message can be
+    /// delivered again but is not lost while Iggy retains it.
+    #[strum(to_string = "at_least_once")]
+    AtLeastOnce,
+}
+
+/// What an at-least-once sink does with a message that the runtime cannot decode, transform or
+/// serialize.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Display)]
+#[serde(rename_all = "snake_case")]
+pub enum InvalidMessages {
+    /// Stop the delivery at the message, so that it is not lost.
+    #[default]
+    #[strum(to_string = "stop")]
+    Stop,
+    /// Skip the message, counting an error and logging its offset.
+    #[strum(to_string = "skip")]
+    Skip,
+}
+
+/// The `[delivery]` table of a sink. Absent, the sink keeps the at-most-once behaviour.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigEnv)]
+#[serde(default)]
+pub struct SinkDeliveryConfig {
+    #[config_env(leaf)]
+    pub guarantee: DeliveryGuarantee,
+    /// Attempts of a batch that fails transiently before the delivery stops. Unset retries until
+    /// the destination recovers.
+    #[config_env(leaf)]
+    pub retry_max_attempts: Option<NonZeroU32>,
+    pub retry_initial_backoff: String,
+    pub retry_max_backoff: String,
+    /// The longest that accepted messages wait for a flush. Unset flushes after every batch.
+    pub flush_interval: Option<String>,
+    /// The most messages that a partition holds accepted but unflushed. Reaching it flushes at
+    /// once, before `flush_interval` runs out.
+    #[config_env(leaf)]
+    pub flush_max_messages: NonZeroU32,
+    #[config_env(leaf)]
+    pub invalid_messages: InvalidMessages,
+}
+
+impl Default for SinkDeliveryConfig {
+    fn default() -> Self {
+        Self {
+            guarantee: DeliveryGuarantee::default(),
+            retry_max_attempts: None,
+            retry_initial_backoff: "1s".to_owned(),
+            retry_max_backoff: "30s".to_owned(),
+            flush_interval: None,
+            flush_max_messages: DEFAULT_FLUSH_MAX_MESSAGES,
+            invalid_messages: InvalidMessages::default(),
+        }
+    }
+}
+
+const DEFAULT_FLUSH_MAX_MESSAGES: NonZeroU32 = NonZeroU32::new(10_000).unwrap();
 
 /// A connector key becomes part of a filename under the local provider's
 /// `config_dir` and of a URL under the HTTP provider, so it must stay a single
@@ -154,6 +221,8 @@ pub struct CreateSinkConfig {
     pub verbose: bool,
     #[serde(default)]
     pub benchmark: bool,
+    #[serde(default)]
+    pub delivery: SinkDeliveryConfig,
 }
 
 impl CreateSinkConfig {
@@ -170,6 +239,7 @@ impl CreateSinkConfig {
             plugin_config: self.plugin_config,
             verbose: self.verbose,
             benchmark: self.benchmark,
+            delivery: self.delivery,
         }
     }
 }
@@ -195,6 +265,8 @@ pub struct SinkConfig {
     pub verbose: bool,
     #[serde(default)]
     pub benchmark: bool,
+    #[serde(default)]
+    pub delivery: SinkDeliveryConfig,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -531,6 +603,79 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn given_a_sink_without_a_delivery_table_when_parsed_should_deliver_at_most_once() {
+        let config: SinkConfig = toml::from_str(SINK_TOML).expect("the sink config should parse");
+
+        assert_eq!(config.delivery, SinkDeliveryConfig::default());
+        assert_eq!(config.delivery.guarantee, DeliveryGuarantee::AtMostOnce);
+    }
+
+    #[test]
+    fn given_a_delivery_table_when_parsed_should_read_every_setting() {
+        let toml = format!(
+            r#"{SINK_TOML}
+[delivery]
+guarantee = "at_least_once"
+retry_max_attempts = 5
+retry_max_backoff = "1m"
+flush_interval = "10s"
+flush_max_messages = 500
+invalid_messages = "skip"
+"#
+        );
+
+        let config: SinkConfig = toml::from_str(&toml).expect("the sink config should parse");
+
+        assert_eq!(
+            config.delivery,
+            SinkDeliveryConfig {
+                guarantee: DeliveryGuarantee::AtLeastOnce,
+                retry_max_attempts: NonZeroU32::new(5),
+                retry_max_backoff: "1m".to_owned(),
+                flush_interval: Some("10s".to_owned()),
+                flush_max_messages: NonZeroU32::new(500).expect("500 is not zero"),
+                invalid_messages: InvalidMessages::Skip,
+                ..SinkDeliveryConfig::default()
+            }
+        );
+    }
+
+    #[test]
+    fn given_the_sink_env_mappings_when_listed_should_reach_the_delivery_guarantee() {
+        assert!(
+            SinkConfig::env_mappings()
+                .iter()
+                .any(|mapping| mapping.env_name == "DELIVERY_GUARANTEE"),
+            "the delivery guarantee should be settable from the environment"
+        );
+    }
+
+    #[test]
+    fn given_a_zero_attempt_limit_or_message_cap_when_parsed_should_refuse_it() {
+        for setting in ["retry_max_attempts = 0", "flush_max_messages = 0"] {
+            let toml = format!("{SINK_TOML}\n[delivery]\n{setting}\n");
+
+            assert!(
+                toml::from_str::<SinkConfig>(&toml).is_err(),
+                "{setting} must be refused"
+            );
+        }
+    }
+
+    const SINK_TOML: &str = r#"
+key = "test"
+enabled = true
+version = 0
+name = "Test sink"
+path = "target/debug/libtest_sink"
+
+[[streams]]
+stream = "test_stream"
+topics = ["test_topic"]
+schema = "json"
+"#;
 
     #[test]
     fn given_single_component_key_when_parsed_should_succeed() {
