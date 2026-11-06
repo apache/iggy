@@ -310,25 +310,32 @@ impl PartitionState {
         logged
     }
 
-    /// The groups whose offsets the log drops at `now_ms`: no stored state, so no members here,
-    /// and no commit in the last `retention_ms`. A group with no commit, which holds only
-    /// deletions, goes at once: Iggy deleted those offsets too.
+    /// The groups whose offsets expired at `now_ms`. See [`Self::is_expired`].
     #[must_use]
     pub fn expired_groups(&self, retention_ms: i64, now_ms: i64) -> Vec<String> {
         self.offsets
-            .iter()
-            .filter(|(group_id, offsets)| {
-                !self.groups.contains_key(*group_id)
-                    && offsets
-                        .entries
-                        .values()
-                        .flatten()
-                        .map(|committed| committed.commit_timestamp_ms)
-                        .max()
-                        .is_none_or(|last| now_ms.saturating_sub(last) >= retention_ms)
-            })
-            .map(|(group_id, _)| group_id.clone())
+            .keys()
+            .filter(|group_id| self.is_expired(group_id, retention_ms, now_ms))
+            .cloned()
             .collect()
+    }
+
+    /// Whether the offsets of `group_id` expired at `now_ms`: the log holds offsets of it, no
+    /// stored state, so no members here, and no commit in the last `retention_ms`. A group with
+    /// no commit, which holds only deletions, expires at once: Iggy deleted those offsets too.
+    #[must_use]
+    pub fn is_expired(&self, group_id: &str, retention_ms: i64, now_ms: i64) -> bool {
+        let Some(offsets) = self.offsets.get(group_id) else {
+            return false;
+        };
+        !self.groups.contains_key(group_id)
+            && offsets
+                .entries
+                .values()
+                .flatten()
+                .map(|committed| committed.commit_timestamp_ms)
+                .max()
+                .is_none_or(|last| now_ms.saturating_sub(last) >= retention_ms)
     }
 
     /// The records a checkpoint writes, without building them.
@@ -930,8 +937,35 @@ mod tests {
         assert_eq!(state.apply(5, 0, record(1, expiry)), Applied::Valid);
         assert!(
             !state.offsets.contains_key("deleted"),
-            "Iggy answers for the group again"
+            "the log no longer answers for the group"
         );
+    }
+
+    #[test]
+    fn given_a_group_expired_when_it_commits_again_should_no_longer_expire() {
+        let mut state = PartitionState::default();
+        state.apply(0, 0, record(1, commit("old", "orders", 0, 100, None)));
+        state.apply(1, 0, record(1, commit("old", "orders", 1, 200, None)));
+        assert!(
+            state.is_expired("old", 500, 700),
+            "the newest commit is 500 ms old"
+        );
+        assert!(
+            !state.is_expired("old", 500, 699),
+            "the newest commit counts, not the oldest"
+        );
+        assert!(
+            !state.is_expired("unknown", 500, 1_000),
+            "the log holds no offsets of the group"
+        );
+
+        state.apply(2, 0, record(1, commit("old", "payments", 0, 650, None)));
+
+        assert!(
+            !state.is_expired("old", 500, 1_000),
+            "a commit to another topic counts too"
+        );
+        assert_eq!(state.expired_groups(500, 1_000), Vec::<String>::new());
     }
 
     /// A checkpoint goes on with a group's offsets where its last chunk ended.

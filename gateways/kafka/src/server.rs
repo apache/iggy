@@ -185,7 +185,8 @@ pub struct GatewayConfig {
     /// [`CoordinatorLog::Preferred`] when the bridge is on, `IGGY_KAFKA_BROKERS` lists the
     /// gateways and the variable is unset.
     pub coordinator_log: CoordinatorLog,
-    /// How the coordinator log behaves. No environment variable maps onto it yet.
+    /// How the coordinator log behaves. `IGGY_KAFKA_OFFSETS_RETENTION_MINUTES` sets its offsets
+    /// retention.
     pub coordination: CoordinationConfig,
 }
 

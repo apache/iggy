@@ -26,7 +26,10 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > as the bridge's Iggy user. DeleteGroups and OffsetDelete also run as that user. When no listener
 > names a principal, any client can delete committed offsets. When one does (SASL, or client
 > certificates), they also require a global `manage_topics` or `manage_streams`, and without it
-> they answer `GROUP_AUTHORIZATION_FAILED` (30). Iggy's `metadata.partitions_max` defaults to 0
+> they answer `GROUP_AUTHORIZATION_FAILED` (30). Such a principal needs a global read or manage
+> permission on topics or streams to create the offsets of a group on a topic. Iggy needs the
+> same from a user that creates a consumer group. Without it, a commit that needs a new group
+> answers `GROUP_AUTHORIZATION_FAILED` (30) there. Iggy's `metadata.partitions_max` defaults to 0
 > (unlimited), so set it before exposing the gateway. See [docs/SCOPE.md](docs/SCOPE.md).
 >
 > InitProducerId does real work too. With the bridge, Iggy builds the producer id. With `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, each partition also writes each batch of an idempotent producer once. Without the bridge, the gateway allocates the id, so a stock idempotent producer still starts.
@@ -78,6 +81,7 @@ Default bind: a `PLAINTEXT` listener on `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_NODE_ID` | `1` | This gateway's broker id in Metadata, 0 to 65535. Beside each Iggy node, use that node's replica id. Required with `IGGY_KAFKA_BROKERS` |
 | `IGGY_KAFKA_BROKERS` | unset | Every gateway in front of the Iggy cluster, this one included, as `id@host:port` entries separated by commas. With several listeners, one `id@PROTOCOL://host:port` entry per gateway and listener. Give every gateway the same list. See [Several gateways](#several-gateways-4515) |
 | `IGGY_KAFKA_COORDINATOR_LOG` | `true` with `IGGY_KAFKA_BROKERS` and the bridge, else `false` | Share the consumer groups through the coordinator log in Iggy (`true` or `false`). Needs the bridge, and `manage_servers` on the bridge's Iggy user. Setup tries again for up to 60 s while Iggy does not answer. See [Several gateways](#several-gateways-4515) |
+| `IGGY_KAFKA_OFFSETS_RETENTION_MINUTES` | `10080` (7 days) | The Kafka setting `offsets.retention.minutes`: how long the offsets of a group without members stay after its last commit. The gateway then deletes them in Iggy and in the coordinator log. Without the coordinator log, the gateway refuses the variable, because only the log keeps commit times. See [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md#limits) |
 | `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. If Iggy does not answer, startup tries again 1 s after each failed connect, for up to 60 s, and then the gateway stops. A wrong password or a missing permission stops it at once. It never falls back to stubs. |
 | `IGGY_KAFKA_SASL_ENABLED` | `false` | Single-listener form: require SASL/PLAIN before serving any other API (`true` or `false`, nothing else). With `IGGY_KAFKA_LISTENERS`, a `SASL_PLAINTEXT` or `SASL_SSL` listener says the same |
 | `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` | `15` | Seconds an unauthenticated connection may sit between frames. Waiting for an authentication slot and the verification itself each get this budget, the verification's starting once it holds a slot. Separate from the 10-minute idle timeout that applies once authenticated |
@@ -301,10 +305,10 @@ Limits:
   completed generation in Iggy, so another gateway or a restarted one takes the group over with
   its members ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md#more-than-one-gateway)).
 - Classic protocol only. A consumer with `group.protocol=consumer` (KIP-848) fails.
-- Offsets never expire in Iggy. `kafka-consumer-groups.sh --delete` and `--delete-offsets` delete
-  them ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md#deleting-groups-and-offsets)). The
-  coordinator log drops its copy, with the commit metadata, 7 days after the last commit of a
-  group without members. Iggy answers from then on.
+- With the coordinator log, the offsets of a group without members expire 7 days after its last
+  commit, in Iggy and in the log (`IGGY_KAFKA_OFFSETS_RETENTION_MINUTES`). Without the log, they
+  never expire. `kafka-consumer-groups.sh --delete` and `--delete-offsets` delete them at any time
+  ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md#deleting-groups-and-offsets)).
 - If `--delete` fails with `GroupAuthorizationException` although the principal holds a global
   `manage_topics` or `manage_streams`, look in the gateway log for `the bridge user may not list
   the Iggy groups of these Kafka topics, so DeleteGroups deletes nothing`. The bridge's Iggy user,

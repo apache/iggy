@@ -30,6 +30,7 @@ mod tcp;
 mod wire;
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use iggy::prelude::{
@@ -39,23 +40,37 @@ use iggy::prelude::{
 };
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
+use kafka_protocol::messages::offset_commit_request::{
+    OffsetCommitRequestPartition, OffsetCommitRequestTopic,
+};
+use kafka_protocol::messages::offset_fetch_request::OffsetFetchRequestTopic;
 use kafka_protocol::messages::{
     CreateTopicsRequest, CreateTopicsResponse, DescribeGroupsRequest, DescribeGroupsResponse,
-    GroupId, MetadataRequest, MetadataResponse, TopicName,
+    GroupId, MetadataRequest, MetadataResponse, OffsetCommitRequest, OffsetCommitResponse,
+    OffsetFetchRequest, OffsetFetchResponse, TopicName,
 };
 use kafka_protocol::protocol::StrBytes;
 use secrecy::SecretString;
 use serial_test::serial;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
+use iggy_gateway_kafka::auth::{AuthenticatedPrincipal, UserKey};
 use iggy_gateway_kafka::bridge::{
     COORDINATOR_LEASE_GROUP, COORDINATOR_LOG_TOPIC, cluster_id_stream,
 };
 use iggy_gateway_kafka::coordinator::record::{Body, Record};
-use iggy_gateway_kafka::coordinator::{CoordinationConfig, PARTITIONS, partition_of_group};
+use iggy_gateway_kafka::coordinator::{
+    Coordination, CoordinationConfig, PARTITIONS, partition_of_group,
+};
+use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::listener::parse_brokers;
+use iggy_gateway_kafka::protocol::acl::PrincipalPermissions;
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_CREATE_TOPICS, API_KEY_DESCRIBE_GROUPS, API_KEY_METADATA, ERROR_NONE,
-    ERROR_NOT_CONTROLLER, ERROR_NOT_COORDINATOR,
+    API_KEY_CREATE_TOPICS, API_KEY_DESCRIBE_GROUPS, API_KEY_METADATA, API_KEY_OFFSET_COMMIT,
+    API_KEY_OFFSET_FETCH, ConnectionState, ERROR_COORDINATOR_LOAD_IN_PROGRESS,
+    ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_NOT_COORDINATOR,
+    GatewayState, handle_connection_request,
 };
 use iggy_gateway_kafka::server::bind_listener;
 use iggy_gateway_kafka::{CoordinatorLog, GatewayConfig};
@@ -393,6 +408,7 @@ async fn given_checkpoints_in_the_log_when_the_gateway_restarts_should_load_the_
     let config = |brokers| GatewayConfig {
         coordination: CoordinationConfig {
             checkpoint_records: 4,
+            ..CoordinationConfig::default()
         },
         ..gateway_config(1, brokers)
     };
@@ -681,4 +697,228 @@ async fn given_a_partition_that_leaves_the_share_when_no_gateway_claims_it_shoul
     );
 
     gateway.stop().await;
+}
+
+/// A group without members that commits nothing for the retention loses its offsets in Iggy too,
+/// so its keys stop counting against `partition.consumer_offsets_max`. A group that commits on
+/// keeps them, and an expired group commits again from scratch.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn given_a_group_without_commits_for_the_retention_should_delete_its_offsets_in_iggy() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    create_topic(server.test_config()).await;
+    let retention = Duration::from_secs(4);
+    let socket = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = socket.local_addr().expect("local addr");
+    let brokers = parse_brokers(&format!("1@{addr}")).expect("one listed gateway");
+    let config = GatewayConfig {
+        coordination: CoordinationConfig {
+            offsets_retention: retention,
+            retention_check: Duration::from_millis(200),
+            ..CoordinationConfig::default()
+        },
+        ..gateway_config(1, brokers)
+    };
+    let gateway = start_gateway(server.test_config(), config, socket, addr).await;
+    let outside = StrBytes::default();
+    for group in ["idle", "busy"] {
+        agreed_coordinator(&[&gateway], group).await;
+        eventually(SETTLE, "a first commit", || async {
+            (commit(addr, group, &outside, -1, 1, "").await == ERROR_NONE).then_some(())
+        })
+        .await;
+    }
+    let idle_since = Instant::now();
+    let raw = raw_client(&server).await;
+    assert!(
+        offset_group_exists(&raw, "idle").await,
+        "the commit creates the Iggy group"
+    );
+
+    let mut offset = 1;
+    let last = eventually(
+        Duration::from_secs(30),
+        "the deletion of the idle group",
+        || {
+            // A commit that moves the offset is logged at once, so `busy` never looks idle.
+            offset += 1;
+            let (raw, outside, offset) = (&raw, &outside, offset);
+            async move {
+                assert_eq!(
+                    commit(addr, "busy", outside, -1, offset, "").await,
+                    ERROR_NONE
+                );
+                // Iggy goes first, so the log answers until its own deletion lands.
+                let gone = !offset_group_exists(raw, "idle").await
+                    && fetch(addr, "idle").await == (ERROR_NONE, -1, String::new());
+                gone.then_some(offset)
+            }
+        },
+    )
+    .await;
+
+    assert!(
+        idle_since.elapsed() >= retention.saturating_sub(Duration::from_millis(500)),
+        "deleted after {:?}, before the retention",
+        idle_since.elapsed()
+    );
+    assert!(offset_group_exists(&raw, "busy").await);
+    assert_eq!(fetch(addr, "busy").await, (ERROR_NONE, last, String::new()));
+    let again = eventually(
+        SETTLE,
+        "a commit once the deletion lets the group go",
+        || async {
+            let code = commit(addr, "idle", &outside, -1, 5, "").await;
+            (code != ERROR_COORDINATOR_LOAD_IN_PROGRESS).then_some(code)
+        },
+    )
+    .await;
+    assert_eq!(again, ERROR_NONE, "the group commits again from scratch");
+    assert_eq!(fetch(addr, "idle").await, (ERROR_NONE, 5, String::new()));
+
+    gateway.stop().await;
+}
+
+/// A principal that may not create groups commits only to groups that exist. Its refused commit
+/// never reaches the log, so `OffsetFetch`, which the log answers, does not return it.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn given_a_principal_that_may_not_create_groups_when_it_commits_to_a_new_group_should_log_nothing()
+ {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    create_topic(server.test_config()).await;
+    let bridge = Arc::new(connect(server.test_config()).await);
+    // As a gateway starts: the cluster id creates the stream that the log lives in.
+    bridge.load_cluster_id().await.expect("load the cluster id");
+    let groups = GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new());
+    let coordination = Coordination::start(
+        &bridge,
+        groups.clone(),
+        1,
+        CoordinationConfig::default(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("coordinate the groups");
+    let state = GatewayState::new(Some(bridge), 8 * 1024 * 1024, 1, groups)
+        .with_coordination(Arc::clone(&coordination));
+    let poller = principal(false);
+
+    let refused = eventually(SETTLE, "a coordinator for the group", || async {
+        let code = commit_by(&state, &poller, "fresh", 7).await;
+        (code != ERROR_COORDINATOR_LOAD_IN_PROGRESS && code != ERROR_NOT_COORDINATOR)
+            .then_some(code)
+    })
+    .await;
+    assert_eq!(refused, ERROR_GROUP_AUTHORIZATION_FAILED);
+    assert_eq!(
+        committed(&state, "fresh").await,
+        -1,
+        "the log holds nothing"
+    );
+
+    assert_eq!(
+        commit_by(&state, &principal(true), "fresh", 8).await,
+        ERROR_NONE
+    );
+    assert_eq!(
+        commit_by(&state, &poller, "fresh", 9).await,
+        ERROR_NONE,
+        "the group exists now"
+    );
+    assert_eq!(committed(&state, "fresh").await, 9);
+
+    coordination
+        .shutdown(Instant::now() + Duration::from_secs(5))
+        .await;
+}
+
+/// Whether Iggy holds the group that keeps the offsets of Kafka group `group` on [`TOPIC`].
+async fn offset_group_exists(raw: &iggy::prelude::IggyClient, group: &str) -> bool {
+    let named = |name: &str| Identifier::named(name).expect("valid Iggy name");
+    raw.get_consumer_group(
+        &named("kafka"),
+        &named(TOPIC),
+        &named(&format!("kafka.cg.{group}")),
+    )
+    .await
+    .expect("read the Iggy group")
+    .is_some()
+}
+
+/// A signed-in Iggy user that may poll, and read topics when `read_topics`.
+fn principal(read_topics: bool) -> AuthenticatedPrincipal {
+    AuthenticatedPrincipal {
+        username: "reporting".to_string(),
+        user: Some(UserKey {
+            user_id: 9,
+            created_at: 1,
+        }),
+        permissions: PrincipalPermissions {
+            read_topics,
+            poll_messages: true,
+            ..PrincipalPermissions::default()
+        },
+        permissions_known: true,
+    }
+}
+
+/// Commits `offset` for partition 0 of [`TOPIC`] as `principal`, outside the group protocol. The
+/// partition's code.
+async fn commit_by(
+    state: &GatewayState,
+    principal: &AuthenticatedPrincipal,
+    group: &str,
+    offset: i64,
+) -> i16 {
+    let request = OffsetCommitRequest::default()
+        .with_group_id(GroupId(StrBytes::from_string(group.to_string())))
+        .with_generation_id_or_member_epoch(-1)
+        .with_topics(vec![
+            OffsetCommitRequestTopic::default()
+                .with_name(TopicName(StrBytes::from_static_str(TOPIC)))
+                .with_partitions(vec![
+                    OffsetCommitRequestPartition::default()
+                        .with_partition_index(0)
+                        .with_committed_offset(offset),
+                ]),
+        ]);
+    let body = handle_connection_request(
+        state,
+        &ConnectionState::default(),
+        Some(principal),
+        API_KEY_OFFSET_COMMIT,
+        7,
+        wire::encode(&request, 7),
+    )
+    .await
+    .expect_response("OffsetCommit answers");
+    let response: OffsetCommitResponse = wire::decode(body, 7);
+    response.topics[0].partitions[0].error_code
+}
+
+/// The committed offset of `group` for partition 0 of [`TOPIC`].
+async fn committed(state: &GatewayState, group: &str) -> i64 {
+    let request = OffsetFetchRequest::default()
+        .with_group_id(GroupId(StrBytes::from_string(group.to_string())))
+        .with_topics(Some(vec![
+            OffsetFetchRequestTopic::default()
+                .with_name(TopicName(StrBytes::from_static_str(TOPIC)))
+                .with_partition_indexes(vec![0]),
+        ]));
+    let body = handle_connection_request(
+        state,
+        &ConnectionState::default(),
+        None,
+        API_KEY_OFFSET_FETCH,
+        6,
+        wire::encode(&request, 6),
+    )
+    .await
+    .expect_response("OffsetFetch answers");
+    let response: OffsetFetchResponse = wire::decode(body, 6);
+    assert_eq!(response.error_code, ERROR_NONE);
+    response.topics[0].partitions[0].committed_offset
 }

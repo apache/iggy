@@ -80,6 +80,11 @@ gates them on this same `GROUP READ`. A principal holding polling but no read gr
 shown no group binding even though Iggy would let it commit an offset. That under-reports, which is
 the safe direction, where deriving from polling would over-report membership.
 
+The gateway enforces this grant in one place. A commit that creates the offsets of a group on a
+topic needs it, as Iggy needs it to create a consumer group. Without it, the commit answers
+`GROUP_AUTHORIZATION_FAILED` (30). A commit to a group that exists does not need it
+([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md#gateway-rules)).
+
 **`manage_servers` renders nothing of its own.** Iggy reads it in exactly one rule, as an alias for
 `read_servers`, so it gates no mutation anywhere. Rendering `CLUSTER ALTER` from it would advertise
 an ability with nowhere to be used, and the write ACL APIs that operation authorizes are not even

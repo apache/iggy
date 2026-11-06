@@ -21,11 +21,12 @@ use thiserror::Error;
 use crate::bridge::iggy_bridge::{ClusterIdCall, CoordinatorLogCall};
 use crate::cluster_id::InvalidClusterId;
 use crate::protocol::api::{
-    ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_INVALID_PARTITIONS, ERROR_INVALID_PRODUCER_EPOCH,
-    ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION,
-    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_POLICY_VIOLATION,
-    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED,
-    ERROR_UNKNOWN_PRODUCER_ID, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_INVALID_PARTITIONS,
+    ERROR_INVALID_PRODUCER_EPOCH, ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST,
+    ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NOT_LEADER_OR_FOLLOWER,
+    ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
+    ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_PRODUCER_ID,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 
 /// Errors from the `IggyBridge`: connection lifecycle, config, and Iggy SDK calls.
@@ -56,6 +57,10 @@ pub enum BridgeError {
     /// The connection broke during a send, and the SDK does not replay it. It may have landed.
     #[error("Iggy connection lost during a send: {0}")]
     SendLost(IggyError),
+    /// A commit needed the Iggy group that holds a Kafka group's offsets on a topic, and the
+    /// request may not create it. Nothing was stored.
+    #[error("the request may not create the Iggy group that holds the Kafka group's offsets")]
+    GroupCreationRefused,
     /// `high_watermark` was asked about a partition index the topic doesn't have.
     #[error(
         "partition {partition} out of range for topic '{topic}' ({partitions_count} partitions)"
@@ -146,6 +151,8 @@ impl BridgeError {
         match self {
             Self::Iggy(err) => iggy_error_to_kafka_code(err),
             Self::Timeout | Self::SendLost(_) => ERROR_REQUEST_TIMED_OUT,
+            // Kafka's answer to a principal without `READ` on the group.
+            Self::GroupCreationRefused => ERROR_GROUP_AUTHORIZATION_FAILED,
             Self::PartitionOutOfRange { .. } => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
             Self::PartitionLoading { .. } => ERROR_NOT_LEADER_OR_FOLLOWER,
             Self::PartitionCountMismatch { .. } => ERROR_TOPIC_ALREADY_EXISTS,

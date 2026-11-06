@@ -40,6 +40,12 @@ leaves it behind.
 - A commit stores the offset. If group `kafka.cg.<group>` is not on the topic, the gateway creates it
   and stores again. A group that already exists counts as created. An operator can delete the group,
   and the next commit creates it again.
+- A principal that a SASL or certificate listener signs in needs a global read or manage
+  permission on topics or streams to create the group. Iggy needs the same from a user that
+  creates a consumer group, and `DescribeAcls` shows it as `READ` on the group. Without it, a
+  commit that needs the group gets `GROUP_AUTHORIZATION_FAILED` (30) for that partition and stores
+  nothing. A commit to a group that exists needs no more than before. On a listener that
+  authenticates no one, any client creates groups.
 - The prefix keeps a Kafka group apart from a native Iggy group with the same name.
 - Group id: 1 to 246 bytes, else `INVALID_GROUP_ID` (24). Iggy names stop at 255. Unlike Kafka,
   an empty id is refused in OffsetCommit and OffsetFetch too.
@@ -92,17 +98,22 @@ leaves it behind.
 
 DeleteGroups (42) deletes the `kafka.cg.<group>` group on every Kafka topic, and its keys go with
 it. OffsetDelete (47) deletes single keys
-([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md#deleting-groups-and-offsets)). The gateway deletes
-nothing on its own. So a group nobody uses keeps its keys until an admin tool deletes the group, or
-an operator deletes its Iggy group on each topic:
+([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md#deleting-groups-and-offsets)).
+
+With the coordinator log, the gateway also deletes the offsets of a group without members. It
+does this 7 days after the last commit of the group, as Kafka does (see "More than one gateway").
+Without the log, the gateway deletes nothing on its own. No gateway then knows whether another
+gateway or a standalone consumer still uses a group, and Iggy keeps no commit time.
+
+The log does not know a group that committed only before the log was on. It also does not know a
+group whose offsets an older gateway dropped from the log. Such a group keeps its keys, as every
+group does without the log. They stay until an admin tool deletes the group, or an operator
+deletes its Iggy group on each topic:
 
 ```bash
 iggy consumer-group list <stream> <topic>
 iggy consumer-group delete <stream> <topic> kafka.cg.<group>
 ```
-
-The gateway does not expire groups. No gateway knows whether another gateway or a standalone
-consumer still uses a group, and Iggy keeps no commit time.
 
 ## More than one gateway
 
@@ -118,7 +129,9 @@ log decides each offset:
   checks the topic and the partition. It also waits until the change log shows the topic, so the
   log names the topic's incarnation. A commit that the change log does not catch up with in the
   request's time answers `COORDINATOR_LOAD_IN_PROGRESS` (14).
-- A commit equal to the logged one writes no record, until the logged one is an hour old.
+- A commit equal to the logged one writes no record, until the logged one reaches its refresh age.
+  That age is an hour, or a quarter of the offsets retention, whichever is less. So a group that
+  commits on never expires.
 - A coordinator that lost the group's log partition can append, but its record does not count,
   and the commit answers `NOT_COORDINATOR` (16). Its Iggy copy can still land, so the copy can
   hold an older offset than the log. The log answers `OffsetFetch`.
@@ -133,8 +146,13 @@ log decides each offset:
 - An answer skips each offset of an older incarnation than the change log shows. So a deletion
   that no gateway heard of, as while every gateway was down, changes no answer, and each load
   removes those offsets from the log.
-- The log drops the offsets of a group without members 7 days after its last commit. Iggy still
-  holds them, and answers from then on.
+- The coordinator deletes the offsets of a group without members 7 days after its last commit,
+  Kafka's `offsets.retention.minutes` default (`IGGY_KAFKA_OFFSETS_RETENTION_MINUTES`). It looks
+  for such groups every 10 minutes. It deletes the group in Iggy on every Kafka topic, as
+  `DeleteGroups` does, and then in the log. Meanwhile the group's joins and commits answer
+  `COORDINATOR_LOAD_IN_PROGRESS` (14), which clients retry. A deletion that fails leaves the group
+  in the log, and the coordinator tries again 10 minutes later. A consumer that comes back later
+  finds no offset and starts at its `auto.offset.reset` position, as in Kafka.
 - Only the coordinator answers offset requests for a group, so a commit made through another
   gateway answers `NOT_COORDINATOR`, and the client asks the coordinator.
 

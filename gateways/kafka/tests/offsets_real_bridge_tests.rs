@@ -34,9 +34,13 @@ use iggy::prelude::{Consumer, ConsumerGroupClient, ConsumerOffsetClient, Identif
 use serial_test::serial;
 use tokio_util::sync::CancellationToken;
 
+use iggy_gateway_kafka::auth::{AuthenticatedPrincipal, UserKey};
 use iggy_gateway_kafka::bridge::{IggyBridge, OFFSET_GROUP_PREFIX};
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
-use iggy_gateway_kafka::protocol::api::{ConnectionState, ERROR_NONE, GatewayState};
+use iggy_gateway_kafka::protocol::acl::PrincipalPermissions;
+use iggy_gateway_kafka::protocol::api::{
+    ConnectionState, ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_NONE, GatewayState,
+};
 use iggy_gateway_kafka::protocol::handlers::{offset_commit, offset_fetch};
 
 use codec::Decoder;
@@ -82,14 +86,42 @@ async fn commit(state: &GatewayState, topic: &str, offset: i64) -> i16 {
 
 /// [`commit`] for `group`.
 async fn commit_as(state: &GatewayState, group: &str, topic: &str, offset: i64) -> i16 {
+    commit_by(state, None, group, topic, offset).await
+}
+
+/// [`commit_as`] on a connection that `principal` signed in on.
+async fn commit_by(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    group: &str,
+    topic: &str,
+    offset: i64,
+) -> i16 {
     let body = build_offset_commit_request(COMMIT_VERSION, group, topic, offset);
     let connection = ConnectionState::default();
-    let response = offset_commit::handle(state, &connection, COMMIT_VERSION, body)
+    let response = offset_commit::handle(state, &connection, principal, COMMIT_VERSION, body)
         .await
         .expect_response("OffsetCommit answers");
     let codes = decode_commit_codes(response);
     assert_eq!(codes.len(), 1, "one partition was committed");
     codes[0]
+}
+
+/// A signed-in Iggy user that may poll, and read topics when `read_topics`.
+fn principal(read_topics: bool) -> AuthenticatedPrincipal {
+    AuthenticatedPrincipal {
+        username: "reporting".to_string(),
+        user: Some(UserKey {
+            user_id: 9,
+            created_at: 1,
+        }),
+        permissions: PrincipalPermissions {
+            read_topics,
+            poll_messages: true,
+            ..PrincipalPermissions::default()
+        },
+        permissions_known: true,
+    }
 }
 
 /// The group error and partition 0's `(offset, error)` for `group` on `topic`.
@@ -227,6 +259,58 @@ async fn given_a_commit_the_offset_should_live_under_an_external_group_in_iggy()
         Some(7)
     );
     assert_eq!(stored(Consumer::group(group)).await, None);
+}
+
+/// A principal that may poll but holds no read or manage permission on topics or streams creates
+/// no group, as Iggy creates none for such a user. It still commits to a group that exists. A
+/// listener that authenticates no one creates groups as before.
+#[tokio::test]
+#[serial]
+async fn given_a_principal_without_a_read_permission_should_commit_only_to_groups_that_exist() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    seed_topic(&server, "orders").await;
+    let state = connected_state(&server).await;
+    let poller = principal(false);
+    let raw = iggy_server::raw_client(&server).await;
+    let (stream, topic) = (iggy_id("kafka"), iggy_id("orders"));
+    let iggy_group = iggy_id(&format!("{OFFSET_GROUP_PREFIX}fresh"));
+
+    assert_eq!(
+        commit_by(&state, Some(&poller), "fresh", "orders", 7).await,
+        ERROR_GROUP_AUTHORIZATION_FAILED
+    );
+    assert!(
+        raw.get_consumer_group(&stream, &topic, &iggy_group)
+            .await
+            .expect("read the group")
+            .is_none(),
+        "the refused commit creates no Iggy group"
+    );
+    assert_eq!(
+        fetch(&state, "fresh", "orders").await,
+        (ERROR_NONE, UNKNOWN_OFFSET, ERROR_NONE)
+    );
+
+    assert_eq!(
+        commit_by(&state, Some(&principal(true)), "fresh", "orders", 8).await,
+        ERROR_NONE
+    );
+    assert_eq!(
+        commit_by(&state, Some(&poller), "fresh", "orders", 9).await,
+        ERROR_NONE,
+        "the group exists now"
+    );
+    assert_eq!(
+        fetch(&state, "fresh", "orders").await,
+        (ERROR_NONE, 9, ERROR_NONE)
+    );
+
+    let anonymous = AuthenticatedPrincipal::anonymous();
+    assert_eq!(
+        commit_by(&state, Some(&anonymous), "open", "orders", 3).await,
+        ERROR_NONE
+    );
 }
 
 /// Kafka consumers read any negative offset as none, so a negative commit deletes the key. A key
