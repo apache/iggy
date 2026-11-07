@@ -71,7 +71,7 @@ impl<'a> TestMessagePollToFileCmd<'a> {
         let mut command = match self.strategy.kind {
             PollingKind::Offset => vec!["--offset".into(), format!("{}", self.strategy.value)],
             PollingKind::Timestamp => {
-                todo!("Timestamp based message polling is not supported yet")
+                vec!["--timestamp".into(), format!("{}", self.strategy.value)]
             }
             PollingKind::First => vec!["--first".into()],
             PollingKind::Next => vec!["--next".into()],
