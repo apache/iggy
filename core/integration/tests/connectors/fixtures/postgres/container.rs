@@ -128,7 +128,7 @@ pub struct PostgresContainer {
 }
 
 impl PostgresContainer {
-    pub(super) async fn start() -> Result<Self, TestBinaryError> {
+    pub(crate) async fn start() -> Result<Self, TestBinaryError> {
         Self::start_with_image(postgres::Postgres::default().into()).await
     }
 
@@ -179,5 +179,9 @@ impl PostgresContainer {
                 fixture_type: "PostgresContainer".to_string(),
                 message: format!("Failed to connect: {e}"),
             })
+    }
+
+    pub(crate) fn connection_string(&self) -> &str {
+        &self.connection_string
     }
 }

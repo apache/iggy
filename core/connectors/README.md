@@ -122,6 +122,7 @@ Please refer to the **[Source documentation](https://github.com/apache/iggy/tree
 ### Available Sources
 
 - **Elasticsearch Source** - polls documents from Elasticsearch indices
+- **JDBC Source** - reads rows through supplied JDBC drivers via an embedded JVM; PostgreSQL and MySQL are integration-tested, with configuration guides for Oracle, SQL Server, and H2
 - **PostgreSQL Source** - reads rows from PostgreSQL tables with multiple consumption strategies (delete after read, mark as processed, timestamp tracking)
 - **Random Source** - generates random test messages (useful for testing/development)
 
