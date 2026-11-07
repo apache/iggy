@@ -31,7 +31,7 @@ Run these commands from the root of the same Iggy source checkout used for the s
     ```
 
     For a debug build, omit `--release` and replace `target/release` with `target/debug` in both the commands and plugin paths. Make sure that the plugins specified in `core/connectors/runtime/example_config/connectors/` directory under `path` are available. The configuration must be provided in `toml` format.
-    The example directory also enables connectors for ClickHouse, Delta Lake, Apache Doris, Apache Iceberg, and InfluxDB. Without their backing services (or their compiled plugins) these are reported with the `Error` status, but they don't block the remaining connectors. Set `enabled = false` in their files to skip them entirely.
+    The example directory also enables connectors for ClickHouse, Delta Lake, Apache Doris, Apache Iceberg, InfluxDB, and QuestDB. Without their backing services (or their compiled plugins) these are reported with the `Error` status, but they don't block the remaining connectors. Set `enabled = false` in their files to skip them entirely.
 
 2. Run `docker compose -f examples/rust/src/sink-data-producer/docker-compose.yml up -d`, which will start the Quickwit server to be used by an example sink connector. At this point, you can access the Quickwit UI at [http://localhost:7280](http://localhost:7280) - check this dashboard again later on, after the `events` index will be created.
 

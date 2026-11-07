@@ -15,6 +15,7 @@ Sink connectors are responsible for writing data from Iggy streams to external s
 | **influxdb_sink** | Writes messages to InfluxDB as line-protocol points; supports both V2 (org/bucket, Flux) and V3 (db, SQL) |
 | **meilisearch_sink** | Indexes messages in Meilisearch for full-text search |
 | **postgres_sink** | Stores messages in PostgreSQL database tables with configurable schemas |
+| **questdb_sink** | Writes messages to QuestDB over QWP (WebSocket) with on-disk store-and-forward and multi-host failover |
 | **quickwit_sink** | Indexes messages in Quickwit search engine for log analytics |
 | **redshift_sink** | Stores messages in Redshift warehouse tables with configurable schemas vis S3 as staging |
 | **s3_sink** | Writes messages to Amazon S3 and S3-compatible stores (MinIO, R2, B2, DO Spaces) |
