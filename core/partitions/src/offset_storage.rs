@@ -415,7 +415,7 @@ async fn write_in_place<S: DurableStorage, const N: usize>(
         .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
     // The open truncates, so the record allocates a block whether or not the
     // file existed. The truncate freed the previous one, which the next sample sees.
-    let charge = storage.charge_allocation(OFFSET_FILE_BLOCK_BYTES);
+    let charge = DISK_USAGE.charge(OFFSET_FILE_BLOCK_BYTES);
     let written = file.write(0, record.to_vec()).await;
     drop(charge);
     written.map_err(|_| IggyError::CannotWriteToFile)
@@ -498,9 +498,7 @@ async fn write_replacement<S: DurableStorage, const N: usize>(
         .open(Path::new(&temporary), OpenMode::CreateWriteOnly)
         .await
         .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
-    let charge = creates
-        .then(|| storage.charge_allocation(OFFSET_FILE_BLOCK_BYTES))
-        .flatten();
+    let charge = creates.then(|| DISK_USAGE.charge(OFFSET_FILE_BLOCK_BYTES));
     let written = file.write(0, record.to_vec()).await;
     drop(charge);
     if written.is_err() {

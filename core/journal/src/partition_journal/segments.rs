@@ -22,8 +22,8 @@ use std::path::{Path, PathBuf};
 use iggy_binary_protocol::batch::BatchHeader;
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::MAX_TOPIC_SEGMENT_SIZE;
-use server_common::Charge;
 use server_common::iobuf::{Frozen, IOV_MAX};
+use server_common::{Charge, DISK_USAGE};
 
 use super::{
     JournalState, PartitionPrepareJournal, SegmentReference, StoredPrepare, invalid, segment_path,
@@ -335,9 +335,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                         .storage
                         .open(&reference.path(&self.directory), OpenMode::Create)
                         .await?;
-                    let _charge = self
-                        .storage
-                        .charge_allocation((prepare.len() - size_of::<PrepareHeader>()) as u64);
+                    let _charge =
+                        DISK_USAGE.charge((prepare.len() - size_of::<PrepareHeader>()) as u64);
                     file.write_frozen(0, prepare.slice(size_of::<PrepareHeader>()..))
                         .await?;
                     file.sync().await?;
@@ -470,7 +469,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         &mut self,
         reference: SegmentReference,
         end: u64,
-    ) -> io::Result<(Option<Charge<'static>>, &mut S::File)> {
+    ) -> io::Result<(Charge<'static>, &mut S::File)> {
         let preallocate_size = self
             .state
             .segment_storage
@@ -485,9 +484,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         .await?;
         self.segment_files_dirty = true;
         let segment = (reference.generation, reference.start_offset);
-        let charge =
-            self.storage
-                .charge_allocation(self.newly_allocated(segment, reference.position, end));
+        let charge = DISK_USAGE.charge(self.newly_allocated(segment, reference.position, end));
         let file = self
             .segment_files
             .get_mut(&segment)

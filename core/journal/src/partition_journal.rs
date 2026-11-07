@@ -25,7 +25,7 @@ use futures::TryStreamExt;
 use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
 use iggy_binary_protocol::{Command, ConsensusHeader, Operation, PrepareHeader};
 use server_common::{
-    Message,
+    DISK_USAGE, Message,
     fatal::NoteDescriptorExhaustion,
     iobuf::{Frozen, Owned},
     send_messages::decode_prepare_slice,
@@ -864,9 +864,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.poisoned = true;
         self.write_segment_bodies(prepares, &records).await?;
         self.retain_segment_inodes(&records).await?;
-        let charge = self
-            .storage
-            .charge_allocation(extent.as_slice().len() as u64);
+        let charge = DISK_USAGE.charge(extent.as_slice().len() as u64);
         self.file.write_aligned(self.state.length, extent).await?;
         drop(charge);
         for (op, record, _) in records {
@@ -1396,7 +1394,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 encoded.as_mut_slice(),
             )?;
             let length = encoded.as_slice().len();
-            let charge = self.storage.charge_allocation(length as u64);
+            let charge = DISK_USAGE.charge(length as u64);
             file.write_aligned(0, encoded).await?;
             drop(charge);
             entries.insert(
@@ -1471,7 +1469,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 )?;
             }
             let length = encoded.as_slice().len();
-            let charge = self.storage.charge_allocation(length as u64);
+            let charge = DISK_USAGE.charge(length as u64);
             file.write_aligned(state.length, encoded).await?;
             drop(charge);
             entries.insert(
