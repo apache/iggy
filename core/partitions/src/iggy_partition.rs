@@ -319,7 +319,7 @@ where
     /// the latch, so this flag makes that scan rebuild it.
     truncated_since_scan: Cell<bool>,
     offset_reservations_scan_state: Option<(u64, u64, u64, Option<u64>)>,
-    consumer_group_offsets_reconcile_epoch: Rc<Cell<u64>>,
+    consumer_group_offsets_dirty: Rc<RefCell<BTreeSet<IggyNamespace>>>,
     /// Shared by the partitions of a shard. Set when a fence publishes, so the
     /// pump wakes the reconciler that reports it to metadata.
     fence_published: Rc<Cell<bool>>,
@@ -985,7 +985,7 @@ where
             offset_reservations_need_resync: Cell::new(false),
             truncated_since_scan: Cell::new(false),
             offset_reservations_scan_state: None,
-            consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
+            consumer_group_offsets_dirty: Rc::default(),
             fence_published: Rc::default(),
             consumer_offset_dirs_dirty: std::array::from_fn(|_| Cell::new(false)),
             consumer_offset_dirs_touched: std::array::from_fn(|_| Cell::new(None)),
@@ -1360,7 +1360,7 @@ where
         self.last_polled_offsets
             .pin()
             .remove(&ConsumerGroupId(group_id as usize));
-        self.mark_consumer_group_offsets_need_reconcile();
+        self.mark_consumer_group_offsets_dirty();
         self.fence_published.set(true);
         self.publish_poll_visibility();
         Ok(())
@@ -4355,7 +4355,7 @@ where
                 );
             }
             if keyed_by_group(pending.kind) && created {
-                self.mark_consumer_group_offsets_need_reconcile();
+                self.mark_consumer_group_offsets_dirty();
             }
         } else {
             self.durable_consumer_offsets
@@ -4974,7 +4974,7 @@ where
         if keyed_by_group(pending.kind)
             && matches!(pending.mutation, PendingConsumerOffsetMutation::Delete)
         {
-            self.mark_consumer_group_offsets_need_reconcile();
+            self.mark_consumer_group_offsets_dirty();
         }
         let id = pending.consumer_id;
         if !pending.auto_commit {
@@ -5124,21 +5124,22 @@ where
         dead
     }
 
-    pub(crate) fn set_consumer_group_offsets_reconcile_epoch(&mut self, epoch: Rc<Cell<u64>>) {
-        self.consumer_group_offsets_reconcile_epoch = epoch;
-        self.mark_consumer_group_offsets_need_reconcile();
+    pub(crate) fn set_consumer_group_offsets_dirty(
+        &mut self,
+        dirty: Rc<RefCell<BTreeSet<IggyNamespace>>>,
+    ) {
+        self.consumer_group_offsets_dirty = dirty;
+        self.mark_consumer_group_offsets_dirty();
     }
 
     pub(crate) fn set_fence_published_flag(&mut self, flag: Rc<Cell<bool>>) {
         self.fence_published = flag;
     }
 
-    fn mark_consumer_group_offsets_need_reconcile(&self) {
-        self.consumer_group_offsets_reconcile_epoch.set(
-            self.consumer_group_offsets_reconcile_epoch
-                .get()
-                .wrapping_add(1),
-        );
+    fn mark_consumer_group_offsets_dirty(&self) {
+        self.consumer_group_offsets_dirty
+            .borrow_mut()
+            .insert(self.namespace());
     }
 
     /// The stored offset of external group `group_id`, if any.
@@ -5630,7 +5631,7 @@ where
             self.pending_owner_install.set(None);
             self.pending_history_transition.set(None);
             self.discard_queued_auto_commits();
-            self.mark_consumer_group_offsets_need_reconcile();
+            self.mark_consumer_group_offsets_dirty();
         } else if truncated {
             // A dropped install never publishes, so a latch on it refuses every
             // later install. A truncation follows a view change, which empties
@@ -29660,15 +29661,15 @@ mod tests {
     #[compio::test]
     async fn given_new_external_group_offset_when_committed_should_request_reconciliation() {
         let (mut partition, _) = recording_partition();
-        let epoch = partition.consumer_group_offsets_reconcile_epoch.clone();
-        let initial = epoch.get();
+        let dirty = Rc::clone(&partition.consumer_group_offsets_dirty);
         partition.stage_consumer_offset_upsert(1, ConsumerKind::ExternalGroup, 7, 1, false);
         partition
             .apply_staged_consumer_offset_commit(1)
             .await
             .unwrap();
-        assert!(
-            epoch.get() > initial,
+        assert_eq!(
+            dirty.take(),
+            BTreeSet::from([partition.namespace()]),
             "a new external group key must be reconciled against deleted groups"
         );
     }
@@ -29676,23 +29677,22 @@ mod tests {
     #[compio::test]
     async fn given_group_offset_updates_when_key_already_exists_should_keep_reconciliation_idle() {
         let (mut partition, _) = recording_partition();
-        let epoch = partition.consumer_group_offsets_reconcile_epoch.clone();
-        let initial = epoch.get();
+        let dirty = Rc::clone(&partition.consumer_group_offsets_dirty);
+        let marked = BTreeSet::from([partition.namespace()]);
         partition.stage_consumer_offset_upsert(1, ConsumerKind::ConsumerGroup, 7, 1, true);
         partition
             .apply_staged_consumer_offset_commit(1)
             .await
             .unwrap();
-        assert!(epoch.get() > initial);
-        let after_create = epoch.get();
+        assert_eq!(dirty.take(), marked);
         assert_eq!(partition.dead_group_offset_keys(|_| true), []);
-        assert_eq!(epoch.get(), after_create);
+        assert!(dirty.borrow().is_empty());
         partition.stage_consumer_offset_upsert(2, ConsumerKind::ConsumerGroup, 7, 2, true);
         partition
             .apply_staged_consumer_offset_commit(2)
             .await
             .unwrap();
-        assert_eq!(epoch.get(), after_create);
+        assert!(dirty.borrow().is_empty());
         partition.consumer_group_offsets.pin().insert(
             ConsumerGroupId(8),
             ConsumerOffset::new(ConsumerKind::ConsumerGroup, 8, 3, String::new()),
@@ -29702,8 +29702,9 @@ mod tests {
             .apply_staged_consumer_offset_commit(3)
             .await
             .unwrap();
-        assert!(
-            epoch.get() > after_create,
+        assert_eq!(
+            dirty.take(),
+            marked,
             "first durable commit must discover an eager map key"
         );
     }
