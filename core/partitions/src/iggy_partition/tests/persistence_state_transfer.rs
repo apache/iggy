@@ -385,12 +385,6 @@ fn given_unframed_operation_when_committed_should_reply_empty_body() {
     assert!(committed_reply_body(Operation::DeleteSegments).is_empty());
 }
 
-/// Every write to this device fails with `ENOSPC`, which is how the
-/// persist failure cases below inject a fault into one half of the flush
-/// without any production-side plumbing.
-#[cfg(target_os = "linux")]
-const DEV_FULL: &str = "/dev/full";
-
 #[cfg(target_os = "linux")]
 #[compio::test]
 async fn given_an_unsyncable_messages_writer_when_installing_should_refuse_the_barrier() {

@@ -1110,6 +1110,166 @@ pub(super) fn recording_partition_at(
     recording_partition_with_pipeline(replica, replica_count, LocalPipeline::new())
 }
 
+/// The offer `partition` serves once the I/O turn pinned its plan.
+async fn serve_offer(
+    partition: &mut IggyPartition<IggyMessageBus>,
+) -> Rc<crate::state_transfer::PartitionStateTransferOffer> {
+    let config = repair_config();
+    assert!(matches!(
+        partition.state_transfer_offer(&config).await,
+        Err(PartitionTransferUnavailable::FlushPending)
+    ));
+    settle_partition_io(partition, &config).await;
+    partition.state_transfer_offer(&config).await.unwrap()
+}
+
+/// `count` one-message records. Each call gives its messages new random
+/// ids, so two calls give records of the same lengths but other bytes.
+fn segment_records(count: u64) -> Vec<Vec<u8>> {
+    (0..count)
+        .map(|_| build_segment_record(IggyNamespace::new(1, 1, 0), 0))
+        .collect()
+}
+
+/// One-message batches each segment of [`partition_with_sealed_segments`]
+/// holds before it rolls.
+const BATCHES_PER_SEGMENT: u64 = 2;
+
+/// Ops the receivers of the reuse tests commit: two sealed segments and
+/// one batch in the active segment.
+const RECEIVER_OPS: u64 = 5;
+
+/// Ops the origin of the reuse tests commits: three sealed segments and
+/// one batch in the active segment.
+const ORIGIN_OPS: u64 = 7;
+
+/// Every write to this device fails with `ENOSPC`, which is how the
+/// persist failure cases below inject a fault into one half of the flush
+/// without any production-side plumbing.
+#[cfg(target_os = "linux")]
+const DEV_FULL: &str = "/dev/full";
+
+/// A primary on disk whose segments roll every [`BATCHES_PER_SEGMENT`]
+/// batches, with one op per record committed and written to its segments.
+async fn partition_with_sealed_segments(
+    records: &[Vec<u8>],
+) -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
+    let config = repair_config();
+    let (directory, mut partition) = Box::pin(disk_poll_partition_with_replicas(&config, 3)).await;
+    let batch_len = build_segment_record(partition.namespace(), 0).len() as u64;
+    let segment_size = IggyByteSize::from(BATCHES_PER_SEGMENT * batch_len);
+    partition.runtime_options.segment_size = Some(segment_size);
+    partition.log.active_segment_mut().max_size = segment_size;
+    partition.set_io_notifier(
+        Rc::new(|_, _| {}),
+        crate::largest_legal_job_charge().unwrap(),
+    );
+    Box::pin(commit_records(&mut partition, 1, records)).await;
+    assert_eq!(partition.consensus().commit_min(), records.len() as u64);
+    (directory, partition)
+}
+
+/// Journals `records` as the ops from `first_op` on, and commits and
+/// writes each one before the next.
+async fn commit_records(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    first_op: u64,
+    records: &[Vec<u8>],
+) {
+    let config = repair_config();
+    for (op, record) in (first_op..).zip(records) {
+        journal_send_record(partition, op, record).await;
+        partition.consensus().advance_commit_max(op);
+        settle_partition_io(partition, &config).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn log_inode(directory: &Path, start_offset: u64) -> u64 {
+    std::fs::metadata(directory.join(format!("{start_offset:020}.log")))
+        .unwrap()
+        .ino()
+}
+
+/// Runs a reuse scan the way a session does: in a detached task, and then
+/// accepted on the pump. Returns what the pump accepted.
+async fn reuse_scan(
+    receiver: &mut IggyPartition<IggyMessageBus>,
+    manifest: &[consensus::StateArtifact],
+) -> Vec<(u32, crate::state_transfer::StagedSegmentMeta)> {
+    let scan = receiver.begin_reuse_scan(manifest);
+    let _ = receiver.staging_work_ended.take().unwrap().await;
+    let scanned = scan.result.borrow_mut().take().unwrap();
+    receiver.accept_reuse_scan(scanned)
+}
+
+/// The bytes of each segment file in the partition directory, in offset
+/// order.
+fn segment_file_bytes(directory: &Path) -> Vec<Vec<u8>> {
+    let mut paths: Vec<_> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "log"))
+        .collect();
+    paths.sort();
+    paths
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect()
+}
+
+/// The offered bytes of each segment of `offer`.
+fn offered_segment_bytes(
+    offer: &crate::state_transfer::PartitionStateTransferOffer,
+) -> Vec<Vec<u8>> {
+    offer
+        .segments
+        .iter()
+        .map(|source| {
+            let mut bytes = std::fs::read(&source.log_path).unwrap();
+            bytes.truncate(usize::try_from(source.entry.len).unwrap());
+            bytes
+        })
+        .collect()
+}
+
+/// Installs `offer` the way the shard does: the reuse scan first, then a
+/// spill of each segment that the scan did not adopt. Returns the manifest
+/// indexes that the scan adopted.
+async fn install_offer_with_reuse(
+    receiver: &mut IggyPartition<IggyMessageBus>,
+    offer: &crate::state_transfer::PartitionStateTransferOffer,
+) -> Vec<u32> {
+    let mut staged = vec![None; offer.segments.len()];
+    let mut adopted = Vec::new();
+    for (index, meta) in reuse_scan(receiver, &offer.manifest()).await {
+        adopted.push(index);
+        staged[index as usize] = Some(meta);
+    }
+    for (slot, source) in staged.iter_mut().zip(&offer.segments) {
+        if slot.is_none() {
+            let mut bytes = std::fs::read(&source.log_path).unwrap();
+            bytes.truncate(usize::try_from(source.entry.len).unwrap());
+            *slot = Some(
+                receiver
+                    .spill_transfer_segment(&source.entry, bytes, None)
+                    .await
+                    .unwrap(),
+            );
+        }
+    }
+    receiver
+        .queue_state_transfer_install(
+            offer.commit_op,
+            staged.into_iter().map(Option::unwrap).collect(),
+            &offer.offsets.1,
+            0,
+        )
+        .unwrap();
+    Box::pin(finish_install_io(receiver)).await.unwrap();
+    adopted
+}
+
 async fn journal_prepare(partition: &IggyPartition<IggyMessageBus>, op: u64, operation: Operation) {
     let size = std::mem::size_of::<PrepareHeader>();
     let prepare =
