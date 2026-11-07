@@ -406,9 +406,9 @@ unset). With a bridge, A5 writes one record to `test-topic`: `ec=0` if it exists
 
 For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-message-gen send --host 127.0.0.1:9093` with `--version N`.
 
-`kafka-message-gen` encodes ApiVersions only up to v4, as `kafka-protocol` 0.18 does. For v5, run
-`kafka-broker-api-versions.sh` from `apache/kafka:4.4.0`. It prints
-`ApiVersions(18): 0 to 5 [usable: 5]`.
+`kafka-protocol` 0.18 encodes ApiVersions only up to v4, so `kafka-message-gen` writes the v5
+request itself. To check v5 with a real client, run `kafka-broker-api-versions.sh` from
+`apache/kafka:4.4.0`. It prints `ApiVersions(18): 0 to 5 [usable: 5]`.
 
 | API key | Name | Min | Max | Test versions |
 | --------- | ------ | ----- | ----- | --------------- |
