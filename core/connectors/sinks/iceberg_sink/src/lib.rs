@@ -40,7 +40,7 @@ const DEFAULT_MAX_RETRY_DELAY: &str = "30s";
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum InvalidRows {
-    /// Fail the whole batch.
+    /// Commit the rows before the first row that does not match, then fail the call at it.
     #[default]
     Fail,
     /// Write the rows that match, and log each skipped row with its offset.
