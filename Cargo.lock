@@ -7594,8 +7594,11 @@ version = "0.6.0"
 dependencies = [
  "arrow-array 58.4.1",
  "arrow-json 58.4.1",
+ "arrow-schema 58.4.1",
  "async-trait",
  "dashmap",
+ "http 1.5.0",
+ "humantime",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",

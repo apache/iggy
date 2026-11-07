@@ -35,7 +35,7 @@ use secrecy::SecretString;
 
 use iggy_gateway_kafka::bridge::{
     DEFAULT_FETCH_SLOTS, DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, KnownNodes,
-    ProduceSessionLimits, TopicMapping,
+    ProduceSessionLimits, TopicDefaults, TopicMapping,
 };
 
 /// Desired slot count - the actual count `port_band()` computes may be smaller if the machine's
@@ -406,6 +406,7 @@ impl TestServer {
             produce_sessions: ProduceSessionLimits::default(),
             idempotent_producers: true,
             nodes: KnownNodes::default(),
+            topic_defaults: TopicDefaults::default(),
         }
     }
 }
@@ -675,6 +676,7 @@ impl TestCluster {
             produce_sessions: ProduceSessionLimits::default(),
             idempotent_producers: true,
             nodes: KnownNodes::default(),
+            topic_defaults: TopicDefaults::default(),
         }
     }
 }

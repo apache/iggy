@@ -168,6 +168,18 @@ impl PartitionPrepareJournal {
         Ok(state.is_some())
     }
 
+    /// The segment tail in whichever slot of `frontier`, the bytes of a
+    /// [`FRONTIER_FILE_NAME`] file, recovery would select. When every slot
+    /// verifies, recovery truncates the tail segment to it. `None` when no slot
+    /// verifies or the WAL does not own segment bodies.
+    #[must_use]
+    pub fn published_segment_tail(frontier: &[u8]) -> Option<SegmentPosition> {
+        let (state, _, _) = newest_frontier_slot(frontier);
+        state?
+            .segment_storage
+            .map(|segments| segments.tail.position)
+    }
+
     /// # Errors
     /// Returns an error on I/O failure or invalid durable history.
     pub async fn open(directory: &Path, group: u64, incarnation: u64) -> io::Result<Self> {
@@ -402,23 +414,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         file: Option<&S::File>,
         slots: usize,
     ) -> io::Result<(Option<JournalState>, u64, usize)> {
-        let mut newest = None;
-        let mut sequence = 0;
-        let mut verified = 0;
         let Some(file) = file.filter(|_| slots > 0) else {
-            return Ok((newest, sequence, verified));
+            return Ok((None, 0, 0));
         };
         let bytes = file.read(0, slots * PARTITION_WAL_BLOCK_SIZE).await?;
-        for slot in bytes.as_chunks::<PARTITION_WAL_BLOCK_SIZE>().0 {
-            if let Ok((state, slot_sequence)) = JournalState::decode(slot) {
-                verified += 1;
-                if newest.is_none() || slot_sequence > sequence {
-                    newest = Some(state);
-                    sequence = slot_sequence;
-                }
-            }
-        }
-        Ok((newest, sequence, verified))
+        Ok(newest_frontier_slot(&bytes))
     }
 
     pub const fn certified_log_view(&self) -> Option<u32> {
@@ -1648,6 +1648,24 @@ impl JournalState {
 /// what keeps a publication off the copy it would have to fall back on.
 const fn frontier_offset(sequence: u64) -> u64 {
     (sequence % FRONTIER_SLOTS as u64) * PARTITION_WAL_BLOCK_SIZE as u64
+}
+
+/// The newest verifying slot in `bytes`, its publication sequence, and how
+/// many whole slots verified. See [`PartitionPrepareJournal::read_frontier`].
+fn newest_frontier_slot(bytes: &[u8]) -> (Option<JournalState>, u64, usize) {
+    let mut newest = None;
+    let mut sequence = 0;
+    let mut verified = 0;
+    for slot in bytes.as_chunks::<PARTITION_WAL_BLOCK_SIZE>().0 {
+        if let Ok((state, slot_sequence)) = JournalState::decode(slot) {
+            verified += 1;
+            if newest.is_none() || slot_sequence > sequence {
+                newest = Some(state);
+                sequence = slot_sequence;
+            }
+        }
+    }
+    (newest, sequence, verified)
 }
 
 /// Padded size of a prepare record, including its envelope.

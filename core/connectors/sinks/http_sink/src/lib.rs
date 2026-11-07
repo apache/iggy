@@ -223,6 +223,9 @@ pub struct HttpSink {
     tls_danger_accept_invalid_certs: bool,
     max_connections: usize,
     verbose: bool,
+    /// Set by the runtime's at-least-once handshake. A message that would be skipped fails
+    /// the call instead.
+    at_least_once: bool,
     /// Pre-built HTTP headers (excluding Content-Type). Built once in `open()` from validated
     /// `self.headers`, reused for every request. `None` before `open()` is called.
     request_headers: Option<reqwest::header::HeaderMap>,
@@ -326,6 +329,7 @@ impl HttpSink {
             tls_danger_accept_invalid_certs,
             max_connections,
             verbose,
+            at_least_once: false,
             request_headers: None,
             client: None,
             send_attempts: AtomicU64::new(0),
@@ -553,11 +557,12 @@ impl HttpSink {
             truncate_response(&response_body, 500),
         );
         self.errors_count.fetch_add(1, Ordering::Relaxed);
-        Err(Error::HttpRequestFailed(format!(
-            "HTTP {} — status: {}",
-            self.log_url,
-            status.as_u16()
-        )))
+        let failure = format!("HTTP {} — status: {}", self.log_url, status.as_u16());
+        if is_retried_status(status.as_u16()) {
+            Err(Error::HttpRequestFailed(failure))
+        } else {
+            Err(Error::PermanentHttpError(failure))
+        }
     }
 
     /// Shared per-message send loop for `individual` and `raw` modes.
@@ -596,6 +601,9 @@ impl HttpSink {
                     self.errors_count.fetch_add(1, Ordering::Relaxed);
                     serialization_failures += 1;
                     last_error = Some(e);
+                    if self.at_least_once {
+                        break;
+                    }
                     continue;
                 }
             };
@@ -611,10 +619,13 @@ impl HttpSink {
                 );
                 self.errors_count.fetch_add(1, Ordering::Relaxed);
                 serialization_failures += 1;
-                last_error = Some(Error::HttpRequestFailed(format!(
+                last_error = Some(Error::InvalidRecordValue(format!(
                     "Payload exceeds max size: {} bytes",
                     body.len()
                 )));
+                if self.at_least_once {
+                    break;
+                }
                 continue;
             }
 
@@ -631,6 +642,10 @@ impl HttpSink {
                     http_failures += 1;
                     consecutive_failures += 1;
                     last_error = Some(e);
+                    // Later messages would land before this one is delivered again.
+                    if self.at_least_once {
+                        break;
+                    }
 
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                         let processed = delivered + http_failures + serialization_failures;
@@ -751,6 +766,9 @@ impl HttpSink {
                         self.id, message.offset, e
                     );
                     self.errors_count.fetch_add(1, Ordering::Relaxed);
+                    if self.at_least_once {
+                        return Err(e);
+                    }
                     skipped += 1;
                     continue;
                 }
@@ -768,6 +786,9 @@ impl HttpSink {
                         self.id, message.offset, e
                     );
                     self.errors_count.fetch_add(1, Ordering::Relaxed);
+                    if self.at_least_once {
+                        return Err(e);
+                    }
                     skipped += 1;
                     continue;
                 }
@@ -780,6 +801,12 @@ impl HttpSink {
                     self.id, message.offset, e
                 );
                 self.errors_count.fetch_add(1, Ordering::Relaxed);
+                if self.at_least_once {
+                    return Err(Error::Serialization(format!(
+                        "Envelope serialize at offset {}: {e}",
+                        message.offset
+                    )));
+                }
                 skipped += 1;
                 continue;
             }
@@ -802,7 +829,7 @@ impl HttpSink {
             );
             // Count all successfully-serialized messages as errors (skipped already counted individually)
             self.errors_count.fetch_add(count, Ordering::Relaxed);
-            return Err(Error::HttpRequestFailed(format!(
+            return Err(Error::InvalidRecordValue(format!(
                 "NDJSON batch exceeds max size: {} bytes",
                 body.len()
             )));
@@ -833,6 +860,9 @@ impl HttpSink {
                         self.id, message.offset, e
                     );
                     self.errors_count.fetch_add(1, Ordering::Relaxed);
+                    if self.at_least_once {
+                        return Err(e);
+                    }
                     skipped += 1;
                     continue;
                 }
@@ -850,6 +880,9 @@ impl HttpSink {
                         self.id, message.offset, e
                     );
                     self.errors_count.fetch_add(1, Ordering::Relaxed);
+                    if self.at_least_once {
+                        return Err(e);
+                    }
                     skipped += 1;
                     continue;
                 }
@@ -895,7 +928,7 @@ impl HttpSink {
             );
             // Count all successfully-serialized messages as errors (skipped already counted individually)
             self.errors_count.fetch_add(count, Ordering::Relaxed);
-            return Err(Error::HttpRequestFailed(format!(
+            return Err(Error::InvalidRecordValue(format!(
                 "JSON array batch exceeds max size: {} bytes",
                 body.len()
             )));
@@ -955,14 +988,21 @@ impl RetryableStrategy for HttpSinkRetryStrategy {
                         status, header_str,
                     );
                 }
-                match status {
-                    429 | 500 | 502 | 503 | 504 => Some(Retryable::Transient),
-                    _ => Some(Retryable::Fatal),
+                if is_retried_status(status) {
+                    Some(Retryable::Transient)
+                } else {
+                    Some(Retryable::Fatal)
                 }
             }
             Err(_) => Some(Retryable::Transient),
         }
     }
+}
+
+/// The statuses that the middleware retries. A request that still ends on one of them fails
+/// transiently, and on any other status permanently, so the runtime and the middleware agree.
+fn is_retried_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
 /// Map an `HttpMethod` to a `reqwest_middleware::RequestBuilder` for the given URL.
@@ -1183,11 +1223,14 @@ impl Sink for HttpSink {
     /// mitigates this by aborting early, but a fail-succeed-fail pattern can bypass it.
     ///
     /// **Runtime note**: The FFI boundary in `sdk/src/sink.rs` maps `consume()`'s `Result` to
-    /// `i32` (0=ok, 1=err), but the runtime's `process_messages()` in `runtime/src/sink.rs`
-    /// logs and counts a nonzero code, records no processed messages for the run that
-    /// returned it, and continues polling. A batch that mixes payload variants is split
-    /// into one `consume()` call per run, so the other runs of that poll still count as
-    /// processed. Returning `Err` does not trigger a runtime retry.
+    /// an `i32` status: 0 for `Ok`, 2 for an error that `Error::is_permanent` reports and 1 for
+    /// any other error. At most once, the runtime's `process_messages()` in
+    /// `runtime/src/sink.rs` logs and counts a nonzero status, records no processed messages
+    /// for the run that returned it, and continues polling, so an `Err` is never retried. A
+    /// batch that mixes payload variants is split into one `consume()` call per run, so the
+    /// other runs of that poll still count as processed. At least once, a 1 hands the messages
+    /// to `consume()` again from the first one not yet flushed, after a backoff, while a 2, or
+    /// a 1 past `retry_max_attempts`, stops the delivery of the topic.
     async fn consume(
         &self,
         topic_metadata: &TopicMetadata,
@@ -1231,6 +1274,13 @@ impl Sink for HttpSink {
         }
 
         result
+    }
+
+    /// Writes happen inside `consume`, so the default flush holds. A configured success status
+    /// is the receiver's acknowledgment of the request.
+    fn enable_at_least_once(&mut self) -> Result<(), Error> {
+        self.at_least_once = true;
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -2050,6 +2100,112 @@ mod tests {
 
     fn given_sink_with_defaults() -> HttpSink {
         HttpSink::new(1, given_default_config())
+    }
+
+    fn given_raw_message(offset: u64, size: usize) -> ConsumedMessage {
+        ConsumedMessage {
+            id: u128::from(offset),
+            offset,
+            checksum: 0,
+            timestamp: 0,
+            origin_timestamp: 0,
+            headers: None,
+            payload: Payload::Raw(vec![b'x'; size]),
+        }
+    }
+
+    /// A sink pointed at a closed port, so every request that it sends fails at once and
+    /// `send_attempts` counts the requests.
+    async fn given_unreachable_sink(batch_mode: BatchMode, at_least_once: bool) -> HttpSink {
+        let mut sink = HttpSink::new(
+            1,
+            HttpSinkConfig {
+                url: "http://127.0.0.1:9/ingest".to_string(),
+                batch_mode: Some(batch_mode),
+                max_payload_size_bytes: Some(8),
+                max_retries: Some(1),
+                health_check_enabled: Some(false),
+                ..given_default_config()
+            },
+        );
+        sink.open().await.expect("open should build the client");
+        if at_least_once {
+            sink.enable_at_least_once()
+                .expect("the HTTP sink supports at-least-once delivery");
+        }
+        sink
+    }
+
+    #[tokio::test]
+    async fn given_at_least_once_when_a_payload_is_too_large_should_fail_before_sending_the_rest() {
+        let sink = given_unreachable_sink(BatchMode::Raw, true).await;
+
+        let result = sink
+            .consume(
+                &given_topic_metadata(),
+                given_messages_metadata(),
+                vec![given_raw_message(0, 64), given_raw_message(1, 4)],
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(error) if error.is_permanent()),
+            "got {result:?}"
+        );
+        assert_eq!(sink.send_attempts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn given_at_most_once_when_a_payload_is_too_large_should_skip_it_and_send_the_rest() {
+        let sink = given_unreachable_sink(BatchMode::Raw, false).await;
+
+        let result = sink
+            .consume(
+                &given_topic_metadata(),
+                given_messages_metadata(),
+                vec![given_raw_message(0, 64), given_raw_message(1, 4)],
+            )
+            .await;
+
+        assert!(result.is_err(), "the skipped message still fails the call");
+        assert_eq!(sink.send_attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn given_a_batch_mode_when_the_batch_is_too_large_should_fail_permanently_without_sending()
+     {
+        for batch_mode in [BatchMode::NdJson, BatchMode::JsonArray] {
+            let sink = given_unreachable_sink(batch_mode, true).await;
+
+            let result = sink
+                .consume(
+                    &given_topic_metadata(),
+                    given_messages_metadata(),
+                    vec![given_raw_message(0, 64)],
+                )
+                .await;
+
+            assert!(
+                matches!(&result, Err(error) if error.is_permanent()),
+                "{batch_mode}: got {result:?}"
+            );
+            assert_eq!(
+                sink.send_attempts.load(Ordering::Relaxed),
+                0,
+                "{batch_mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_final_status_when_classified_should_be_transient_only_where_the_middleware_retries()
+    {
+        for status in [429, 500, 502, 503, 504] {
+            assert!(is_retried_status(status), "{status} is retried");
+        }
+        for status in [400, 404, 501, 505, 599] {
+            assert!(!is_retried_status(status), "{status} is fatal");
+        }
     }
 
     fn given_topic_metadata() -> TopicMetadata {

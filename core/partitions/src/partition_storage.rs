@@ -1104,12 +1104,13 @@ mod tests {
         std::fs::set_permissions(&offsets, Permissions::from_mode(NO_REMOVALS)).unwrap();
         // Root ignores the mode, so nothing would cut the removal short.
         let blocked = std::fs::remove_file(offsets.join("1")).is_err();
+        if !blocked {
+            std::fs::set_permissions(&offsets, Permissions::from_mode(mode)).unwrap();
+            return;
+        }
 
         let result = remove_partition_dir(partition_dir).await;
         std::fs::set_permissions(&offsets, Permissions::from_mode(mode)).unwrap();
-        if !blocked {
-            return;
-        }
 
         assert_eq!(
             result.unwrap_err().kind(),

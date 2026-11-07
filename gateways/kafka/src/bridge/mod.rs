@@ -27,6 +27,7 @@ pub mod error;
 pub mod iggy_bridge;
 pub mod nodes;
 pub mod topic_map;
+pub mod topic_settings;
 
 pub use config::{
     DEFAULT_FETCH_SLOTS, DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, MAX_FETCH_SLOTS,
@@ -43,3 +44,7 @@ pub use iggy_bridge::{
 };
 pub use nodes::KnownNodes;
 pub use topic_map::{TopicMapping, TopicOverride};
+pub use topic_settings::{
+    CleanupPolicy, KafkaTopicSettings, RetentionBytes, SettingChange, TopicConfigSnapshot,
+    TopicConfigUpdate, TopicDefaults,
+};
