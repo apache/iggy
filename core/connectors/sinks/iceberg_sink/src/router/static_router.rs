@@ -15,39 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::InvalidRows;
 use crate::router::commit::table_load_error;
-use crate::router::redelivery::HeldMessages;
 use crate::router::{
-    BatchOrigin, Router, before, first_rejection, format_error_chain, is_valid_namespaced_table,
-    load_table, write_data,
+    Appender, BatchOrigin, Router, before, first_rejection, format_error_chain,
+    is_valid_namespaced_table, load_table,
 };
 use async_trait::async_trait;
-use iceberg::Catalog;
 use iceberg::table::Table;
-use iggy_connector_sdk::retry::RetryPolicy;
-use iggy_connector_sdk::{ConsumedMessage, Error, Schema};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use iggy_connector_sdk::{ConsumedMessage, Error, FlushPartition, Schema, TopicMetadata};
+use std::sync::OnceLock;
 use tracing::{error, info, warn};
 
-/// A table that the configuration declares. A table that does not load is loaded again by the
-/// next batch, so that a catalog that was unreachable at startup does not drop it for good.
+/// A table that the configuration declares, set once it loads.
 #[derive(Debug)]
 struct DeclaredTable {
     name: String,
-    table: Mutex<Option<Arc<Table>>>,
-}
-
-impl DeclaredTable {
-    fn loaded(&self) -> Option<Arc<Table>> {
-        self.lock().clone()
-    }
-
-    fn lock(&self) -> MutexGuard<'_, Option<Arc<Table>>> {
-        // The guarded value is replaced whole, so a panic while the lock was held cannot leave it
-        // half written.
-        self.table.lock().unwrap_or_else(PoisonError::into_inner)
-    }
+    table: OnceLock<Table>,
 }
 
 #[derive(Debug)]
@@ -55,19 +38,11 @@ pub(crate) struct StaticRouter {
     tables: Vec<DeclaredTable>,
     /// Declared names that name no table, which no load can fix.
     invalid_names: Vec<String>,
-    catalog: Box<dyn Catalog>,
-    invalid_rows: InvalidRows,
-    commit_retry: RetryPolicy,
-    held: Option<HeldMessages>,
+    appender: Appender,
 }
 
 impl StaticRouter {
-    pub async fn new(
-        catalog: Box<dyn Catalog>,
-        declared_tables: &Vec<String>,
-        invalid_rows: InvalidRows,
-        commit_retry: RetryPolicy,
-    ) -> Result<Self, Error> {
+    pub async fn new(appender: Appender, declared_tables: &Vec<String>) -> Result<Self, Error> {
         let mut tables = Vec::with_capacity(declared_tables.len());
         let mut invalid_names = Vec::new();
         for declared_table in declared_tables {
@@ -80,24 +55,24 @@ impl StaticRouter {
                 continue;
             }
 
-            let table = match load_table(declared_table, catalog.as_ref()).await {
-                Ok(table) => Some(Arc::new(table)),
+            let table = match load_table(declared_table, appender.catalog.as_ref()).await {
+                Ok(table) => OnceLock::from(table),
                 Err(err) => {
                     warn!(
-                        "Declared table {declared_table} does not load from the configured catalog, so each batch tries again. {}",
+                        "Declared table {declared_table} does not load from the configured catalog. At most once it is skipped until the connector restarts, at least once each batch loads it again. {}",
                         format_error_chain(&err)
                     );
-                    None
+                    OnceLock::new()
                 }
             };
             tables.push(DeclaredTable {
                 name: declared_table.clone(),
-                table: Mutex::new(table),
+                table,
             });
         }
         let loaded = tables
             .iter()
-            .filter(|declared| declared.loaded().is_some())
+            .filter(|declared| declared.table.get().is_some())
             .count();
         info!(
             "Static router found {loaded} tables on iceberg catalog from {} tables declared",
@@ -110,37 +85,25 @@ impl StaticRouter {
         Ok(StaticRouter {
             tables,
             invalid_names,
-            catalog,
-            invalid_rows,
-            commit_retry,
-            held: None,
+            appender,
         })
     }
 
-    /// The table of `declared`, loaded from the catalog when no earlier batch could. At most
-    /// once, a table that does not load is skipped for this batch. At least once, it fails the
-    /// batch, so that its messages are delivered again instead of lost.
-    async fn table(&self, declared: &DeclaredTable) -> Result<Option<Arc<Table>>, Error> {
-        if let Some(table) = declared.loaded() {
+    /// The table of `declared`. At most once, a table that did not load at startup is skipped,
+    /// so that a batch does not pay a catalog call for it. At least once, it is loaded again, and
+    /// a failed load fails the batch, so that its messages are delivered again instead of lost.
+    async fn table<'d>(&self, declared: &'d DeclaredTable) -> Result<Option<&'d Table>, Error> {
+        if let Some(table) = declared.table.get() {
             return Ok(Some(table));
         }
-        match load_table(&declared.name, self.catalog.as_ref()).await {
-            Ok(table) => {
-                let table = Arc::new(table);
-                info!("Declared table {} loaded from the catalog", declared.name);
-                *declared.lock() = Some(Arc::clone(&table));
-                Ok(Some(table))
-            }
-            Err(err) if self.held.is_some() => Err(table_load_error(&declared.name, &err)),
-            Err(err) => {
-                warn!(
-                    "Skipping declared table {} for this batch, it does not load from the catalog. {}",
-                    declared.name,
-                    format_error_chain(&err)
-                );
-                Ok(None)
-            }
+        if self.appender.held.is_none() {
+            return Ok(None);
         }
+        let table = load_table(&declared.name, self.appender.catalog.as_ref())
+            .await
+            .map_err(|err| table_load_error(&declared.name, &err))?;
+        info!("Declared table {} loaded from the catalog", declared.name);
+        Ok(Some(declared.table.get_or_init(|| table)))
     }
 }
 
@@ -159,18 +122,10 @@ impl Router for StaticRouter {
             };
             // Once a table rejects a message, the others still need every message before it.
             let messages = before(&messages, rejection.as_ref());
-            let written = write_data(
-                origin,
-                messages,
-                &table,
-                None,
-                self.catalog.as_ref(),
-                messages_schema,
-                self.invalid_rows,
-                self.commit_retry,
-                self.held.as_ref(),
-            )
-            .await?;
+            let written = self
+                .appender
+                .append(origin, table, false, messages_schema, messages)
+                .await?;
             info!(
                 "Routed {} input rows to iceberg table {}, committed {}",
                 messages.len(),
@@ -193,20 +148,23 @@ impl Router for StaticRouter {
                 self.invalid_names
             )));
         }
-        self.held = Some(HeldMessages::default());
+        self.appender.enable_at_least_once();
         Ok(())
+    }
+
+    fn flushed(&self, topic_metadata: &TopicMetadata, partitions: &[FlushPartition]) {
+        self.appender.flushed(topic_metadata, partitions);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-    use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
-    use iceberg::{CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+    use crate::InvalidRows;
+    use crate::router::commit::tests::{SINGLE_ATTEMPT, catalog_with_table};
+    use iceberg::{TableCreation, TableIdent};
     use iggy_connector_sdk::Payload;
     use std::collections::HashMap;
-    use std::time::Duration;
 
     const ORIGIN: BatchOrigin<'static> = BatchOrigin {
         connector_id: 1,
@@ -217,44 +175,10 @@ mod tests {
 
     /// A router over `declared` tables, of which the catalog holds only `test.events`.
     async fn router(declared: &[&str]) -> StaticRouter {
-        let catalog = MemoryCatalogBuilder::default()
-            .load(
-                "memory",
-                HashMap::from([(
-                    MEMORY_CATALOG_WAREHOUSE.to_owned(),
-                    "memory://warehouse".to_owned(),
-                )]),
-            )
-            .await
-            .expect("Failed to create catalog");
-        let namespace = NamespaceIdent::new("test".to_owned());
-        catalog
-            .create_namespace(&namespace, HashMap::new())
-            .await
-            .expect("Failed to create namespace");
-        let schema = IcebergSchema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-            ])
-            .build()
-            .expect("Failed to build schema");
-        catalog
-            .create_table(
-                &namespace,
-                TableCreation::builder()
-                    .name("events".to_owned())
-                    .schema(schema)
-                    .build(),
-            )
-            .await
-            .expect("Failed to create table");
+        let (catalog, _) = catalog_with_table(HashMap::new()).await;
         let declared: Vec<String> = declared.iter().map(|name| (*name).to_owned()).collect();
-        let retry = RetryPolicy {
-            max_attempts: 1,
-            base_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(1),
-        };
-        StaticRouter::new(Box::new(catalog), &declared, InvalidRows::Fail, retry)
+        let appender = Appender::new(Box::new(catalog), InvalidRows::Fail, SINGLE_ATTEMPT);
+        StaticRouter::new(appender, &declared)
             .await
             .expect("One declared table should load")
     }
@@ -271,10 +195,11 @@ mod tests {
         }]
     }
 
-    async fn snapshots(router: &StaticRouter) -> usize {
+    async fn snapshots(router: &StaticRouter, table: &str) -> usize {
         router
+            .appender
             .catalog
-            .load_table(&TableIdent::from_strs(["test", "events"]).expect("a valid table name"))
+            .load_table(&TableIdent::from_strs(["test", table]).expect("a valid table name"))
             .await
             .expect("Failed to load table")
             .metadata()
@@ -291,7 +216,38 @@ mod tests {
             .await
             .expect("At most once, a table that does not load is skipped");
 
-        assert_eq!(snapshots(&router).await, 1);
+        assert_eq!(snapshots(&router, "events").await, 1);
+    }
+
+    #[tokio::test]
+    async fn given_a_declared_table_created_after_startup_when_at_most_once_should_keep_skipping_it()
+     {
+        let router = router(&["test.events", "test.later"]).await;
+        let events = router
+            .appender
+            .catalog
+            .load_table(&TableIdent::from_strs(["test", "events"]).expect("a valid table name"))
+            .await
+            .expect("Failed to load table");
+        router
+            .appender
+            .catalog
+            .create_table(
+                events.identifier().namespace(),
+                TableCreation::builder()
+                    .name("later".to_owned())
+                    .schema(events.metadata().current_schema().as_ref().clone())
+                    .build(),
+            )
+            .await
+            .expect("Failed to create table");
+
+        router
+            .route_data(&ORIGIN, Schema::Json, messages())
+            .await
+            .expect("At most once, a table that did not load at startup is skipped");
+
+        assert_eq!(snapshots(&router, "later").await, 0);
     }
 
     #[tokio::test]
