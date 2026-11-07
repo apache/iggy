@@ -94,6 +94,7 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
 ] }
+rmp-serde = { workspace = true }
 rumqttc-v4 = { workspace = true }
 rumqttc-v5 = { workspace = true }
 rust-s3 = { workspace = true }
