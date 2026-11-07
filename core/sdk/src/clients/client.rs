@@ -402,7 +402,9 @@ impl IggyClient {
     /// ## WebSocket
     ///
     /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
-    /// - `reconnection_retries`: "unlimited" or u32. Retry passes after the initial endpoint pass. Default: `unlimited`.
+    /// - `reconnection_max_retries`: "unlimited" or u32. Retry passes after the initial endpoint pass. Default: `unlimited`.
+    ///   The deprecated `reconnection_retries` alias is still accepted and logs a warning.
+    ///   When either spelling is repeated, the last occurrence takes effect.
     /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Full-jitter exponential backoff base, capped at 10 seconds. Default: `1s`.
     /// - `reestablish_after`: [`IggyDuration`]. Stable connection duration that resets the retry count and backoff. Default: `5s`.
     /// - `max_pending_operations`: positive usize. Active and retained mutations per session. Default: `256`.
@@ -416,18 +418,19 @@ impl IggyClient {
     /// - `tls`: `bool`. Enable/disable TLS. Default: `false`.
     /// - `tls_domain`: string. Server name to validate the certificate against. Default: unset.
     /// - `tls_ca_file`: filesystem path. PEM roots replacing the built-in roots. Default: unset.
-    /// - `tls_validate_certificate`: bool. Whether to verify the server certificate. Default: `false`.
+    /// - `tls_validate_certificate`: Whether to verify the server certificate. Accepts exactly
+    ///   `true` or `false`. Other values return `IggyError::InvalidConnectionString`. Default: `false`.
     ///
     /// ```no_run
     /// use iggy::prelude::*;
     ///
     /// # fn run() -> Result<(), IggyError> {
     /// let client = IggyClient::builder_from_connection_string(
-    ///     "iggy+ws://user:secret@localhost:8092\
-    ///      ?heartbeat_interval=5s&reconnection_retries=unlimited&reconnection_interval=1s&reestablish_after=5s\
-    ///      &read_buffer_size=131072&write_buffer_size=131072\
-    ///      &max_message_size=67108864&max_frame_size=16777216&accept_unmasked_frames=false\
-    ///      &tls=true&tls_domain=localhost&tls_ca_file=/etc/iggy/ca.pem&tls_validate_certificate=true",
+    ///     "iggy+ws://user:secret@localhost:8092?reconnection_max_retries=5&reestablish_after=500ms&tls_validate_certificate=true&tls=true&tls_domain=localhost",
+    /// )?
+    /// .build()?;
+    /// let legacy_client = IggyClient::builder_from_connection_string(
+    ///     "iggy+ws://user:secret@localhost:8092?reconnection_retries=5&reestablish_after=500ms&tls_validate_certificate=false",
     /// )?
     /// .build()?;
     /// # Ok(())

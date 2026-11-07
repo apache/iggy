@@ -369,10 +369,14 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use crate::links::test_support::{LOCALHOST, SERVER_NAME, quic_server};
+    use crate::websocket::websocket_client::WebSocketClient;
     use iggy_binary_protocol::{HEADER_SIZE, MAX_RECORD_REPLY_SIZE};
     use iggy_common::WebSocketConfig;
     use rustls::RootCertStore;
+    use rustls::pki_types::PrivatePkcs8KeyDer;
     use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+    use tokio_tungstenite::accept_async;
 
     const INVALID_TLS_DOMAIN: &str = "invalid server name";
     const INVALID_CA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml/ca.pem");
@@ -390,6 +394,64 @@ mod tests {
                 Some(IggyError::CannotEstablishConnection),
                 "{:?} must allow another endpoint after port zero fails",
                 dialer.protocol()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn given_websocket_connection_strings_when_dialing_should_apply_certificate_validation() {
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let certified = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()]).unwrap();
+        let key = PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der());
+        let tls = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![certified.cert.der().clone()], key.into())
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(tls));
+        let listener = TcpListener::bind(LOCALHOST).await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+
+        for (query, use_tls, should_connect) in [
+            ("", false, true),
+            ("?tls=true", true, true),
+            ("?tls=true&tls_validate_certificate=false", true, true),
+            ("?tls=true&tls_validate_certificate=true", true, false),
+        ] {
+            let connection_string = format!("iggy+ws://user:secret@{endpoint}{query}");
+            let connection_string = if use_tls {
+                format!("{connection_string}&tls_domain={SERVER_NAME}")
+            } else {
+                connection_string
+            };
+            let client = WebSocketClient::from_connection_string(&connection_string).unwrap();
+            let dialer = Dialer::WebSocket(Arc::clone(&client.config));
+            let server_handshake = async {
+                let (stream, _) = listener.accept().await.unwrap();
+                if use_tls {
+                    match acceptor.accept(stream).await {
+                        Ok(stream) => accept_async(stream).await.is_ok(),
+                        Err(_) => false,
+                    }
+                } else {
+                    accept_async(stream).await.is_ok()
+                }
+            };
+            let (result, server_connected) = timeout(DIAL_TIMEOUT, async {
+                tokio::join!(dialer.dial(&endpoint), server_handshake)
+            })
+            .await
+            .unwrap();
+            assert_eq!(server_connected, should_connect, "{query}");
+            assert_eq!(
+                result.err(),
+                if should_connect {
+                    None
+                } else {
+                    Some(IggyError::CannotEstablishConnection)
+                },
+                "{query}"
             );
         }
     }
