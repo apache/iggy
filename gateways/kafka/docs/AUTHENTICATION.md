@@ -146,23 +146,28 @@ Per connection, with SASL enabled. Only ApiVersions and SaslHandshake are legal 
 | ------- | ------- | -------- |
 | `AwaitHandshake` | ApiVersions (18) | answer, stay |
 | | SaslHandshake (17) v1, supported mechanism | answer `error_code` 0, go to `AwaitToken` |
-| | SaslHandshake (17) v1, unknown mechanism | answer 33 with the mechanism list, then close |
-| | SaslHandshake (17) v0 | answer 35 with the mechanism list, then close |
+| | SaslHandshake (17) v0, supported mechanism | answer `error_code` 0, go to `AwaitRawToken` |
+| | SaslHandshake (17) v0 or v1, unknown mechanism | answer 33 with the mechanism list, then close |
 | | anything else | answer 34 shaped for that API, then close |
 | `AwaitToken` | SaslAuthenticate (36), credentials valid | answer 0, empty `auth_bytes`, go to `Authenticated` |
 | | SaslAuthenticate (36), credentials rejected | answer 58 with a generic message, then close |
 | | anything else | answer 34, then close |
+| `AwaitRawToken` | bare PLAIN token, credentials valid | send the empty server token in a length-prefixed frame (four zero bytes), go to `Authenticated` |
+| | bare token rejected, malformed or longer than 4096 bytes | close without an answer |
 | `Authenticated` | any supported API, including ApiVersions again | serve |
 | `AwaitHandshake` | ApiVersions past the allowance | answer 34, then close (two are allowed: the one a real broker allows, plus the KIP-511 downgrade retry) |
+| | SaslHandshake above v1 | close, no schema exists at that version |
 | `AwaitToken` | SaslAuthenticate above the advertised ceiling | close, no schema exists at that version |
 | any | Metadata or Produce while unauthenticated | close with no body (no error field, and acks=0 forbids one) |
 | | SaslHandshake or SaslAuthenticate | answer 34, keep the connection |
 
 Notes that decide the implementation.
 
-- **Handshake v1 only.** The handshake version selects the token framing (KIP-152). Refusing v0 means the
-  legacy bare-token mode is never entered, so the frame reader stays header-parsing-only. Only pre-1.0
-  Kafka clients are excluded.
+- **Handshake v0 and v1.** The handshake version selects the token framing (KIP-152). After v0, the next
+  frame is the bare token, with no request header. The connection loop reads it before it parses a header,
+  and caps it at 4096 bytes. A bare token has no answer that can carry an error, so every failure closes
+  the connection, as on a Kafka broker. kafka-python 2.0.2, Sarama up to 1.40.1 and aiokafka up to 0.12
+  send v0.
 - **`session_lifetime_ms` is 0.** No KIP-368 re-authentication, which keeps mid-connection identity change
   out of scope. That matters beyond convenience, see the re-authentication note below.
 - **ApiVersions is answered twice.** The Java client sends it once before the handshake and again after
