@@ -76,6 +76,19 @@ Uses MessagesGenerator to create OrderCreated, OrderConfirmed, and OrderRejected
 
 ## Security Examples
 
+### Multi-Tenant
+
+Shows several tenants sharing one server, each limited to its own stream:
+
+```bash
+dotnet run --project  examples/csharp/src/MultiTenant/Iggy_SDK.Examples.MultiTenant.Producer
+dotnet run --project  examples/csharp/src/MultiTenant/Iggy_SDK.Examples.MultiTenant.Consumer
+```
+
+The producer connects as root and creates a stream and a user for each tenant, with permissions on that stream only. It then connects as each tenant, checks that the other tenants' streams are refused, and sends messages to the `events`, `logs` and `notifications` topics. The consumer creates a read-only user for one tenant, runs the same check, and reads that tenant's messages.
+
+Both programs read the tenant count from `TENANTS_COUNT` (default 3). The consumer reads the tenant set by `TENANT_ID` (default 1). Run the producer first.
+
 ### TCP/TLS
 
 Demonstrates secure TLS-encrypted TCP connections:
