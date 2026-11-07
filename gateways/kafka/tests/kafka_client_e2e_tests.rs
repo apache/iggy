@@ -82,7 +82,10 @@ use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
 use server::{spawn_gateway as spawn_listeners, spawn_test_server_with_authenticator};
 
 const KCAT_IMAGE: &str = "edenhill/kcat:1.7.1";
-const KAFKA_IMAGE: &str = "apache/kafka:3.9.0";
+/// The newest Kafka 4 release. The gateway supports Java clients from Kafka 4.0 on.
+const KAFKA_IMAGE: &str = "apache/kafka:4.4.0";
+/// The oldest Kafka 4 release, for the one test that runs both ends of the range.
+const KAFKA_OLDEST_IMAGE: &str = "apache/kafka:4.0.2";
 const ROOT_USER: &str = "iggy";
 const ROOT_PASSWORD: &str = "iggy";
 /// Password for every non-root principal these tests create.
@@ -1036,6 +1039,77 @@ async fn given_the_java_client_should_authenticate_and_list_the_sasl_apis() {
     assert!(
         output.contains("SaslAuthenticate(36)"),
         "both SASL keys must be advertised while the feature is on, got: {output}"
+    );
+}
+
+/// Java clients 4.0 to 4.3 open `ApiVersions` at v4, and 4.4 clients at v5 (KIP-1242). Each finds
+/// its version in the advertisement, so neither asks again at v3 (KIP-511). The oldest Kafka 4
+/// client then produces and reads back in a group, as the newest one does in the other tests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_4_0_and_4_4_clients_should_use_their_own_api_versions_and_serve_records() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    if !image_present(KAFKA_OLDEST_IMAGE)
+        && skip(&format!(
+            "client image {KAFKA_OLDEST_IMAGE} is not pulled; run `docker pull {KAFKA_OLDEST_IMAGE}`"
+        ))
+    {
+        return;
+    }
+    let bootstrap = gateway.to_string();
+    for (image, usable) in [(KAFKA_OLDEST_IMAGE, 4), (KAFKA_IMAGE, 5)] {
+        let versions = run_client(
+            image,
+            &[
+                "/opt/kafka/bin/kafka-broker-api-versions.sh",
+                "--bootstrap-server",
+                &bootstrap,
+            ],
+            &[],
+        )
+        .expect_ran("java client api-versions");
+        assert!(
+            versions.contains(&format!("ApiVersions(18): 0 to 5 [usable: {usable}]")),
+            "{image} must use ApiVersions v{usable}, got: {versions}"
+        );
+    }
+
+    let produce = format!(
+        "printf 'k1:alpha\\nk2:beta\\n' | /opt/kafka/bin/kafka-console-producer.sh \
+         --bootstrap-server {bootstrap} --topic {TOPIC} --property parse.key=true \
+         --property key.separator=: --producer-property max.block.ms=20000"
+    );
+    let produced = run_client(KAFKA_OLDEST_IMAGE, &["sh", "-c", &produce], &[])
+        .expect_ran("java 4.0 console producer");
+    assert!(
+        !produced.contains("ERROR"),
+        "the 4.0 producer must send, got: {produced}"
+    );
+    let consumed = run_client(
+        KAFKA_OLDEST_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            &bootstrap,
+            "--topic",
+            TOPIC,
+            "--group",
+            "kafka-4-0",
+            "--from-beginning",
+            "--max-messages",
+            "2",
+            "--timeout-ms",
+            "20000",
+            "--property",
+            "print.key=true",
+        ],
+        &[],
+    )
+    .expect_ran("java 4.0 console consumer in a group");
+    assert!(
+        consumed.contains("k1\talpha") && consumed.contains("k2\tbeta"),
+        "the 4.0 consumer must read both records, got: {consumed}"
     );
 }
 

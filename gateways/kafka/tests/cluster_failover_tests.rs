@@ -100,7 +100,7 @@ use iggy_gateway_kafka::protocol::api::{
 use deployment::{Deployment, KAFKA_STREAM, NODES, TAIL_LINES, tail};
 use docker_clients::{Container, missing_prerequisite, run_to_end, skip};
 
-const KAFKA_IMAGE: &str = "apache/kafka:3.9.0";
+const KAFKA_IMAGE: &str = "apache/kafka:4.4.0";
 const KCAT_IMAGE: &str = "edenhill/kcat:1.7.1";
 
 /// The topic of the load. Two partitions per node, so a stop of any node moves primaries.
