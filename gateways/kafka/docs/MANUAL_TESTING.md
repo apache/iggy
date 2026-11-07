@@ -98,6 +98,8 @@ docker run --rm --network host edenhill/kcat:1.7.1 -b 127.0.0.1:9095 \
 | S4 | No credentials | `docker run --rm --network host edenhill/kcat:1.7.1 -b 127.0.0.1:9095 -L` | No metadata served; client suggests SASL may be required | Pass |
 | S5 | Java client | see below | Authenticates, and lists `SaslHandshake(17): 0 to 1 [usable: 1]` and `SaslAuthenticate(36): 0 to 2 [usable: 2]` | Pass |
 | S6 | Feature off | restart without `IGGY_KAFKA_SASL_ENABLED`, rerun S1 | Client reports no broker SASL support; plaintext `-L` still served | Pass |
+| S7 | kafka-python 2.0.2 | see below | Produces 10 records and reads them back in a group. With the password `WRONG`, it ends with `NoBrokersAvailable` | Pass |
+| S8 | Sarama 1.40.1 | see below | Produces 10 records and reads them back. With the password `WRONG`, it ends with `client has run out of available brokers to talk to: EOF` | Pass |
 
 S5 is the case that matters most, because the Java client negotiates `SaslAuthenticate` **v2**, the
 compact framing no other case here exercises, and it sends `ApiVersions` both before and after
@@ -113,6 +115,34 @@ docker run --rm --network host -v /tmp/client.properties:/tmp/client.properties:
   apache/kafka:3.9.0 /opt/kafka/bin/kafka-broker-api-versions.sh \
   --bootstrap-server 127.0.0.1:9095 --command-config /tmp/client.properties
 ```
+
+S7 and S8 send `SaslHandshake` v0 and then the token in a bare frame with no request header
+(KIP-152). kafka-python 2.0.2 always does this, and Sarama does it by default up to 1.40.1. Both
+cases produce, so add `IGGY_KAFKA_BRIDGE_ENABLED=true IGGY_KAFKA_IGGY_USERNAME=iggy
+IGGY_KAFKA_IGGY_PASSWORD=iggy IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` to the gateway in
+terminal 2. kafka-python 2.0.2 needs Python 3.11 or older:
+
+```bash
+uv venv --python 3.11 /tmp/kafka-python-2.0.2
+uv pip install --python /tmp/kafka-python-2.0.2/bin/python kafka-python==2.0.2
+/tmp/kafka-python-2.0.2/bin/python - <<'EOF'
+from kafka import KafkaConsumer, KafkaProducer
+common = dict(bootstrap_servers="127.0.0.1:9095", security_protocol="SASL_PLAINTEXT",
+              sasl_mechanism="PLAIN", sasl_plain_username="iggy", sasl_plain_password="iggy")
+producer = KafkaProducer(**common)
+for i in range(10):
+    producer.send("v0-kafka-python", f"kafka-python {i}".encode()).get(timeout=10)
+producer.close()
+consumer = KafkaConsumer("v0-kafka-python", group_id="v0", auto_offset_reset="earliest",
+                         consumer_timeout_ms=15000, **common)
+print(len(list(consumer)), "records read")
+EOF
+```
+
+For S8, a Go program on `github.com/IBM/sarama v1.40.1` does the same. It sets
+`config.Net.SASL.Version = sarama.SASLHandshakeV0`, sends 10 records with a `SyncProducer`, and
+reads them back with `ConsumePartition` from `OffsetOldest`. With `RUST_LOG=debug`, the gateway logs
+`SASL mechanism negotiated` with `api_version=0` for each connection of both clients.
 
 ### Category T — ACL view
 

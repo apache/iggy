@@ -146,7 +146,12 @@ pub enum SaslState {
     AwaitHandshake {
         api_versions_answered: u8,
     },
+    /// A v1 handshake negotiated the mechanism. The token comes in a `SaslAuthenticate` request.
     AwaitToken(SaslMechanism),
+    /// A v0 handshake negotiated the mechanism. The next frame is the bare token, with no request
+    /// header (KIP-152), so the connection loop reads it before it parses any header, and it never
+    /// reaches [`Self::classify`].
+    AwaitRawToken(SaslMechanism),
     Authenticated,
 }
 
@@ -157,6 +162,24 @@ impl SaslState {
         Self::AwaitHandshake {
             api_versions_answered: 0,
         }
+    }
+
+    /// The state after a `SaslHandshake` at `api_version` negotiated `mechanism`. The version
+    /// selects how the token comes (KIP-152): v0 in a bare length-prefixed frame, v1 in a
+    /// `SaslAuthenticate` request.
+    #[must_use]
+    pub const fn awaiting_token(mechanism: SaslMechanism, api_version: i16) -> Self {
+        if api_version == 0 {
+            Self::AwaitRawToken(mechanism)
+        } else {
+            Self::AwaitToken(mechanism)
+        }
+    }
+
+    /// Whether the next frame is a bare token rather than a request.
+    #[must_use]
+    pub const fn awaits_raw_token(self) -> bool {
+        matches!(self, Self::AwaitRawToken(_))
     }
 
     /// Records one answered pre-authentication `ApiVersions`.
@@ -186,15 +209,13 @@ impl Default for SaslState {
 pub enum SaslAction {
     /// Hand the frame to the ordinary request dispatch.
     Dispatch,
-    /// Answer a `SaslHandshake` for this mechanism and advance to [`SaslState::AwaitToken`].
+    /// Answer a `SaslHandshake` for this mechanism and advance to the state that
+    /// [`SaslState::awaiting_token`] names for its version.
     AcceptHandshake(SaslMechanism),
     /// Answer a `SaslHandshake` with `UNSUPPORTED_SASL_MECHANISM`, then close.
     RejectMechanism,
-    /// Answer a `SaslHandshake` with `UNSUPPORTED_VERSION`, then close.
-    ///
-    /// The handshake version selects the token framing (KIP-152): at v0 the tokens that follow
-    /// arrive as bare length-prefixed frames with no request header. Refusing v0 here is what
-    /// lets the frame reader stay header-parsing-only, and it costs only pre-1.0 clients.
+    /// A `SaslHandshake` above [`SASL_HANDSHAKE_VERSION`], or below 0. No response schema exists
+    /// at that version, so close without an answer.
     RejectHandshakeVersion,
     /// Parse the frame as a `SaslAuthenticate` token and verify the credentials it carries.
     Authenticate,
@@ -220,6 +241,13 @@ pub const MAX_PRE_AUTH_API_VERSIONS: u8 = 2;
 
 /// Highest `SaslHandshake` version accepted. See [`SaslAction::RejectHandshakeVersion`].
 pub const SASL_HANDSHAKE_VERSION: i16 = 1;
+
+/// What the gateway sends back for a bare token that it accepts after a v0 handshake.
+///
+/// It is the empty server token that completes PLAIN, in a length-prefixed frame. A rejected token
+/// gets no answer, and the connection closes, as a Kafka broker does it. kafka-python and Sarama
+/// wait for exactly these four bytes.
+pub const RAW_TOKEN_ACCEPTED: [u8; 4] = [0; 4];
 
 /// Highest `SaslAuthenticate` version accepted, matching what `ApiVersions` advertises.
 ///
@@ -261,7 +289,7 @@ impl SaslState {
                 SaslAction::DispatchPreAuthApiVersions
             }
             (Self::AwaitHandshake { .. }, API_KEY_SASL_HANDSHAKE) => {
-                if api_version == SASL_HANDSHAKE_VERSION {
+                if (0..=SASL_HANDSHAKE_VERSION).contains(&api_version) {
                     mechanism
                         .and_then(|name| SaslMechanism::from_str(name).ok())
                         .map_or(SaslAction::RejectMechanism, SaslAction::AcceptHandshake)
@@ -466,13 +494,62 @@ mod tests {
     }
 
     #[test]
-    fn given_await_handshake_when_handshake_v0_arrives_should_reject_the_version() {
+    fn given_await_handshake_when_handshake_v0_offers_plain_should_accept_it() {
         let state = SaslState::new();
         assert_eq!(
             state.classify(API_KEY_SASL_HANDSHAKE, 0, Some("PLAIN")),
-            SaslAction::RejectHandshakeVersion,
-            "v0 selects the headerless token framing the frame reader cannot parse"
+            SaslAction::AcceptHandshake(SaslMechanism::Plain),
+            "Sarama up to 1.40.1, kafka-python 2.0.2 and aiokafka up to 0.12 send v0"
         );
+        assert_eq!(
+            state.classify(API_KEY_SASL_HANDSHAKE, 0, Some("GSSAPI")),
+            SaslAction::RejectMechanism
+        );
+    }
+
+    #[test]
+    fn given_a_handshake_outside_the_known_versions_should_reject_the_version() {
+        let state = SaslState::new();
+        for version in [-1, SASL_HANDSHAKE_VERSION + 1] {
+            assert_eq!(
+                state.classify(API_KEY_SASL_HANDSHAKE, version, Some("PLAIN")),
+                SaslAction::RejectHandshakeVersion,
+                "v{version} has no response schema"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_negotiated_mechanism_should_await_the_token_framing_of_the_handshake_version() {
+        assert_eq!(
+            SaslState::awaiting_token(SaslMechanism::Plain, 0),
+            SaslState::AwaitRawToken(SaslMechanism::Plain)
+        );
+        assert_eq!(
+            SaslState::awaiting_token(SaslMechanism::Plain, 1),
+            SaslState::AwaitToken(SaslMechanism::Plain)
+        );
+        assert!(SaslState::AwaitRawToken(SaslMechanism::Plain).awaits_raw_token());
+        assert!(!SaslState::AwaitToken(SaslMechanism::Plain).awaits_raw_token());
+        assert!(!SaslState::new().awaits_raw_token());
+        assert!(!SaslState::Authenticated.awaits_raw_token());
+    }
+
+    #[test]
+    fn given_await_raw_token_when_a_request_is_classified_should_be_illegal_state() {
+        // The connection loop reads the bare token before it parses a header, so a request
+        // classified in this state means that the loop skipped that step. Fail closed.
+        let state = SaslState::AwaitRawToken(SaslMechanism::Plain);
+        for (api_key, api_version) in [
+            (API_KEY_SASL_AUTHENTICATE, 1),
+            (API_KEY_API_VERSIONS, 3),
+            (0, 9),
+        ] {
+            assert_eq!(
+                state.classify(api_key, api_version, None),
+                SaslAction::IllegalState
+            );
+        }
     }
 
     #[test]
