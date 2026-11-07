@@ -108,6 +108,11 @@ jobs:
             DOCKER_COMPONENTS="$ALL_DOCKER_COMPONENTS"
           fi
 
+          # release_only images are published by hand, never on a merge.
+          DOCKER_COMPONENTS=$(jq -Rr --argjson configured "$COMPONENTS_JSON" '
+            split(",") | map(select(length > 0 and (($configured[.].release_only // false) | not))) | join(",")
+          ' <<< "$DOCKER_COMPONENTS")
+
           echo "docker_components=$DOCKER_COMPONENTS" >> "$GITHUB_OUTPUT"
           echo "Docker components to refresh: ${DOCKER_COMPONENTS:-<none>}"
 

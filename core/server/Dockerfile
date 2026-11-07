@@ -34,7 +34,7 @@ ARG LIBC=musl
 ARG IGGY_CI_BUILD
 ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
 
-RUN apk add --no-cache bash curl tar zig make autoconf automake libtool pkgconfig hwloc-dev xz-dev xz-static nodejs npm && \
+RUN apk add --no-cache bash curl jq tar zig make autoconf automake libtool pkgconfig hwloc-dev xz-dev xz-static nodejs npm && \
     cargo install cargo-zigbuild --version '=0.23.2' --locked
 
 COPY rust-toolchain.toml rust-toolchain.toml
@@ -120,7 +120,7 @@ RUN chmod +x /out/iggy-server /out/iggy
 # the compiled web UI (see core/server/build.rs), so the manifest must
 # also enumerate the web npm production dependencies.
 FROM --platform=$BUILDPLATFORM chef AS license-gen
-RUN apk add --no-cache bash curl tar nodejs npm
+RUN apk add --no-cache bash curl jq tar nodejs npm
 COPY . .
 RUN cd web && npm ci --omit=dev --prefer-offline --no-audit
 RUN TARGET="$(uname -m)-unknown-linux-musl" && \

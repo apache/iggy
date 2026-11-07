@@ -86,6 +86,23 @@ components:
     platforms: ["linux/amd64", "linux/arm64"]
     version_file: "core/connectors/runtime/Cargo.toml"
     version_regex: '(?m)^\s*version\s*=\s*"([^"]+)"'
+    # Never refreshed by post-merge. Built only by a manual publish.yml run, so
+    # the heavy fat build stays off every merge to master and every edge refresh.
+    release_only: true
+    # Two published flavors from one Dockerfile. The fat flavor (empty suffix,
+    # runtime-fat stage) bundles every connector plugin and is the default;
+    # -slim (runtime stage) ships the runtime binary only. Each flavor keeps
+    # its own per-arch digest set and manifest tags. Components without a
+    # flavors list build their single default stage.
+    flavors:
+      - name: fat
+        suffix: ""
+        stage: runtime-fat
+        # The LTO plugin links took ~39 min on amd64 and the plugin set grows.
+        timeout_minutes: 90
+      - name: slim
+        suffix: "-slim"
+        stage: runtime
 
   rust-kafka-gateway:
     tag_pattern: "^kafka-gateway-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"

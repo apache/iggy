@@ -166,13 +166,13 @@ Showcases the newer SDK APIs with simplified setup, automatic topic creation, co
 
 ### High-Volume Data Generation
 
-Testing and benchmarking support:
+Testing and benchmarking support. The example feeds the Delta Lake sink connector:
 
 ```bash
 cargo run --example sink-data-producer
 ```
 
-Produces 100 batches of 100 to 499 random user records, with a direct-send request limit of 1000 messages. Connection and stream settings are configurable via environment variables.
+Produces 100 batches of 100 to 499 random user records to the `users` topic of the `example_stream` stream (created if missing), with a direct-send request limit of 1000 messages. Connection and stream settings are configurable via environment variables. To run it end to end with the connectors runtime and an S3 emulator, follow the [connectors Quick Start](../../core/connectors/README.md#quick-start).
 
 ## Stream Builder Examples
 
