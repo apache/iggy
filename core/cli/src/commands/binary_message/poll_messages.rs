@@ -25,11 +25,12 @@ use iggy::prelude::{IggyConsumer, ReadError, ReceivedMessage};
 use iggy_binary_protocol::WireUserHeaders;
 use iggy_common::Client;
 use iggy_common::{
-    CommitPolicy, Consumer, HeaderKey, HeaderKind, Identifier, IggyByteSize, IggyDuration,
-    IggyMessage, IggyTimestamp, PollOptions, PollingStrategy, Sizeable,
-    wire_conversions::user_headers_from_wire,
+    AutoCommit, CommitAfter, CommitPolicy, Consumer, HeaderKey, HeaderKind, Identifier,
+    IggyByteSize, IggyDuration, IggyError, IggyMessage, IggyTimestamp, NonZeroIggyDuration,
+    PollOptions, PollingStrategy, Sizeable, wire_conversions::user_headers_from_wire,
 };
 use std::collections::HashSet;
+use std::io::Write;
 use std::time::{Duration, Instant};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -39,6 +40,11 @@ use tracing::{Level, event};
 /// Idle time after which a group poll without `--follow` stops. A new group member can take
 /// several seconds to receive its first message.
 const GROUP_IDLE_WAIT: Duration = Duration::from_secs(5);
+/// Lets the server hold an idle group poll, so a new message shows without a client retry.
+const GROUP_POLL_WAIT: Duration = Duration::from_secs(1);
+/// Stored with `--auto-commit` at this interval, and again on shutdown.
+const GROUP_COMMIT_INTERVAL: Duration = Duration::from_secs(1);
+const ROW_HEADER: &str = "Offset\tPartition\tTimestamp\tID\tLength\tPayload";
 
 pub struct PollMessagesCmd {
     stream_id: Identifier,
@@ -51,6 +57,7 @@ pub struct PollMessagesCmd {
     output_file: Option<String>,
     consumer_group: Option<String>,
     follow: bool,
+    auto_commit: bool,
 }
 
 impl PollMessagesCmd {
@@ -104,6 +111,7 @@ impl PollMessagesCmd {
             output_file,
             consumer_group,
             follow,
+            auto_commit,
         }
     }
 
@@ -119,26 +127,56 @@ impl PollMessagesCmd {
             .stream(self.stream_id.clone())
             .topic(self.topic_id.clone())
             .polling_strategy(self.strategy)
-            .poll_options(self.options)
+            .poll_options(PollOptions {
+                count: self.options.count,
+                max_wait: IggyDuration::new(GROUP_POLL_WAIT),
+                commit: self.group_commit_policy(),
+                ..PollOptions::default()
+            })
             .do_not_create_consumer_group_if_not_exists()
             .build();
         Ok(consumer)
     }
 
+    /// A position is stored only for printed messages, so a run that is killed re-delivers
+    /// messages instead of skipping them.
+    fn group_commit_policy(&self) -> CommitPolicy {
+        if !self.auto_commit {
+            return CommitPolicy::Manual;
+        }
+        CommitPolicy::Auto(AutoCommit {
+            interval: NonZeroIggyDuration::new(GROUP_COMMIT_INTERVAL).ok(),
+            every: None,
+            after: CommitAfter::Marked,
+        })
+    }
+
     async fn poll_consumer_group(&self, client: &IggyClient, group: &str) -> anyhow::Result<()> {
+        // Opened before the join, so a bad path costs no join and no rebalance.
+        let mut output = match self.output_file.as_deref() {
+            Some(path) => Some(OutputFile::open(path).await?),
+            None => None,
+        };
         let mut consumer = self.build_consumer_group(client, group)?;
-        let polled = self.receive_group_messages(&mut consumer, group).await;
-        consumer
-            .shutdown()
-            .await
-            .with_context(|| format!("Problem leaving consumer group: {group}"))?;
-        polled
+        let polled = self
+            .receive_group_messages(&mut consumer, group, output.as_mut())
+            .await;
+        // Ctrl-C during the leave exits at once. The first Ctrl-C replaced the default SIGINT
+        // action, so without this a second one would do nothing.
+        let stopped = tokio::select! {
+            stopped = consumer.shutdown() => stopped,
+            _ = tokio::signal::ctrl_c() => std::process::exit(130),
+        };
+        // The poll error is the one to report. A failed leave is only logged by the SDK.
+        polled?;
+        stopped.with_context(|| format!("Problem stopping consumer group: {group}"))
     }
 
     async fn receive_group_messages(
         &self,
         consumer: &mut IggyConsumer,
         group: &str,
+        mut output: Option<&mut OutputFile<'_>>,
     ) -> anyhow::Result<()> {
         let interrupt = tokio::signal::ctrl_c();
         tokio::pin!(interrupt);
@@ -148,20 +186,21 @@ impl PollMessagesCmd {
                 .with_context(|| format!("Problem joining consumer group: {group}"))?,
         }
 
-        let mut output = match self.output_file.as_deref() {
-            Some(path) => Some(OutputFile::open(path).await?),
-            None => None,
-        };
-        if self.follow && output.is_none() {
-            event!(target: PRINT_TARGET, Level::INFO, "Offset\tTimestamp\tID\tLength\tPayload");
+        if output.is_none() {
+            write_line(ROW_HEADER).context("Problem writing to standard output")?;
         }
-        let count = self.options.count as usize;
         let idle = (!self.follow).then_some(GROUP_IDLE_WAIT);
-        let mut messages = Vec::with_capacity(count);
         let start = Instant::now();
-        loop {
-            if !self.follow && messages.len() >= count {
-                break;
+        let mut last_arrival = start;
+        let mut polled_count = 0usize;
+        let mut polled_size = IggyByteSize::default();
+        while self.follow || polled_count < self.options.count as usize {
+            // Rows already read reach the file before the wait, so a long idle keeps none back.
+            if let Some(output) = output.as_mut() {
+                output
+                    .flush()
+                    .await
+                    .with_context(|| format!("Problem writing message to file: {}", output.path))?;
             }
             let next = tokio::select! {
                 _ = &mut interrupt => break,
@@ -170,65 +209,57 @@ impl PollMessagesCmd {
             let Some(received) = next else {
                 break;
             };
-            let message = received
-                .with_context(|| format!("Problem polling consumer group: {group}"))?
-                .message;
-            if self.follow {
-                self.print_follow_message(&message, output.as_mut()).await?;
-            } else {
-                messages.push(message);
+            let received = match received {
+                Ok(received) => received,
+                // The reader reconnects by itself, so a dropped connection is not a failed poll.
+                Err(error) if matches!(error.error, IggyError::Disconnected) => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Problem polling consumer group: {group}"));
+                }
+            };
+            let partition_id = received.partition_id;
+            let checkpoint = received.checkpoint();
+            let message = received.message;
+            match output.as_mut() {
+                Some(output) => {
+                    let saved = output
+                        .store(std::slice::from_ref(&message))
+                        .await
+                        .with_context(|| {
+                            format!("Problem writing message to file: {}", output.path)
+                        })?;
+                    polled_size += saved;
+                }
+                None => {
+                    write_line(&row(self.show_headers, partition_id, &message))
+                        .context("Problem writing to standard output")?;
+                    polled_size += message.get_size_bytes();
+                }
             }
+            if self.auto_commit {
+                consumer
+                    .mark(checkpoint)
+                    .context("Problem marking polled message")?;
+            }
+            polled_count += 1;
+            last_arrival = Instant::now();
         }
 
+        if let Some(output) = output.as_mut() {
+            output
+                .flush()
+                .await
+                .with_context(|| format!("Problem writing message to file: {}", output.path))?;
+        }
         if !self.follow {
-            let elapsed = IggyDuration::new(start.elapsed());
-            self.print_batch(&messages, elapsed, output.as_mut())
-                .await?;
+            log_polled(
+                polled_count,
+                polled_size,
+                IggyDuration::new(last_arrival.duration_since(start)),
+            );
         }
         Ok(())
-    }
-
-    async fn print_follow_message(
-        &self,
-        message: &IggyMessage,
-        output: Option<&mut OutputFile<'_>>,
-    ) -> anyhow::Result<()> {
-        match output {
-            Some(output) => {
-                let output_file = output.path;
-                output
-                    .store(std::slice::from_ref(message))
-                    .await
-                    .with_context(|| format!("Problem writing message to file: {output_file}"))?;
-            }
-            None => {
-                let line = self.follow_line(message)?;
-                event!(target: PRINT_TARGET, Level::INFO, "{line}");
-            }
-        }
-        Ok(())
-    }
-
-    fn follow_line(&self, message: &IggyMessage) -> anyhow::Result<String> {
-        let timestamp =
-            IggyTimestamp::from(message.header.timestamp).to_local_string("%Y-%m-%d %H:%M:%S%.6f");
-        let mut fields = vec![
-            message.header.offset.to_string(),
-            timestamp,
-            message.header.id.to_string(),
-            message.payload.len().to_string(),
-            String::from_utf8_lossy(&message.payload).to_string(),
-        ];
-        if self.show_headers {
-            let headers = message
-                .user_headers_map()
-                .context("Failed to parse user headers")?
-                .unwrap_or_default();
-            fields.extend(headers.iter().map(|(key, value)| {
-                format!("{}={}", key.to_string_value(), value.to_string_value())
-            }));
-        }
-        Ok(fields.join("\t"))
     }
 
     async fn next_message(
@@ -254,11 +285,7 @@ impl PollMessagesCmd {
                 .sum::<u64>(),
         );
 
-        let message_count_message = match messages.len() {
-            1 => "1 message".into(),
-            count => format!("{count} messages"),
-        };
-        event!(target: PRINT_TARGET, Level::INFO, "Polled {message_count_message} of total size {polled_size}, it took {}", elapsed.as_human_time_string());
+        log_polled(messages.len(), polled_size, elapsed);
 
         if let Some(output) = output {
             let output_file = output.path;
@@ -268,8 +295,13 @@ impl PollMessagesCmd {
                 .store(messages)
                 .await
                 .with_context(|| format!("Problem writing message to file: {output_file}"))?;
+            output
+                .flush()
+                .await
+                .with_context(|| format!("Problem writing message to file: {output_file}"))?;
 
             let saved_size_str = saved_size.as_human_string();
+            let message_count_message = messages_label(messages.len());
             event!(target: PRINT_TARGET, Level::INFO, "Stored {message_count_message} of total size {saved_size_str} to {output_file} binary file");
         } else {
             let message_header_keys = self.create_message_header_keys(messages);
@@ -358,7 +390,8 @@ impl PollMessagesCmd {
                     .map(|(key, kind)| {
                         message
                             .user_headers_map()
-                            .expect("Failed to parse user headers")
+                            .ok()
+                            .flatten()
                             .as_ref()
                             .map(|h| {
                                 h.get(key)
@@ -453,6 +486,59 @@ impl CliCommand for PollMessagesCmd {
     }
 }
 
+fn messages_label(count: usize) -> String {
+    match count {
+        1 => "1 message".into(),
+        count => format!("{count} messages"),
+    }
+}
+
+fn log_polled(count: usize, size: IggyByteSize, elapsed: IggyDuration) {
+    let message_count_message = messages_label(count);
+    event!(target: PRINT_TARGET, Level::INFO, "Polled {message_count_message} of total size {size}, it took {}", elapsed.as_human_time_string());
+}
+
+/// One message as a tab-separated row. Fields are escaped so a tab or newline in a payload
+/// cannot split the row.
+fn row(show_headers: bool, partition_id: u32, message: &IggyMessage) -> String {
+    let mut fields = vec![
+        message.header.offset.to_string(),
+        partition_id.to_string(),
+        IggyTimestamp::from(message.header.timestamp).to_local_string("%Y-%m-%d %H:%M:%S%.6f"),
+        message.header.id.to_string(),
+        message.payload.len().to_string(),
+        String::from_utf8_lossy(&message.payload).into_owned(),
+    ];
+    if show_headers {
+        match message.user_headers_map() {
+            Ok(Some(headers)) => fields.extend(headers.iter().map(|(key, value)| {
+                format!("{}={}", key.to_string_value(), value.to_string_value())
+            })),
+            Ok(None) => {}
+            Err(error) => tracing::error!("Failed to parse user headers, error: {error}"),
+        }
+    }
+    fields
+        .iter()
+        .map(|field| escape(field))
+        .collect::<Vec<_>>()
+        .join("\t")
+}
+
+fn escape(field: &str) -> String {
+    field
+        .replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn write_line(line: &str) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{line}")?;
+    stdout.flush()
+}
+
 /// The `--output-file`, open for the whole command.
 struct OutputFile<'a> {
     path: &'a str,
@@ -473,8 +559,7 @@ impl<'a> OutputFile<'a> {
         })
     }
 
-    /// Appends `messages` and flushes them. A file reports a failed write only at a later write
-    /// or a flush, so the flush fails the command before it polls again.
+    /// Buffers `messages`. A failed write surfaces at the next [`Self::flush`].
     async fn store(&mut self, messages: &[IggyMessage]) -> std::io::Result<IggyByteSize> {
         let mut saved_size = IggyByteSize::default();
         for message in messages {
@@ -482,8 +567,11 @@ impl<'a> OutputFile<'a> {
             saved_size += IggyByteSize::from(message.len() as u64);
             self.writer.write_all(&message).await?;
         }
-        self.writer.flush().await?;
         Ok(saved_size)
+    }
+
+    async fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush().await
     }
 }
 
@@ -516,6 +604,7 @@ mod tests {
 
         output.store(&first).await.unwrap();
         output.store(&second).await.unwrap();
+        output.flush().await.unwrap();
 
         assert_eq!(
             tokio::fs::read(path).await.unwrap(),
@@ -525,39 +614,32 @@ mod tests {
     }
 
     #[test]
-    fn given_follow_message_when_formatted_should_be_one_tab_separated_row() {
-        let cmd = PollMessagesCmd::new(
-            Identifier::numeric(1).unwrap(),
-            Identifier::numeric(1).unwrap(),
-            None,
-            1,
-            false,
-            None,
-            true,
-            false,
-            false,
-            Identifier::default(),
-            false,
-            None,
-            Some("group".to_owned()),
-            true,
-        );
-
-        let line = cmd.follow_line(&IggyMessage::from("hello")).unwrap();
+    fn given_message_when_formatted_should_be_one_tab_separated_row() {
+        let line = row(false, 3, &IggyMessage::from("hello"));
 
         let fields: Vec<&str> = line.split('\t').collect();
-        assert_eq!(fields.len(), 5);
-        assert_eq!(fields[3], "5");
-        assert_eq!(fields[4], "hello");
+        assert_eq!(fields.len(), 6);
+        assert_eq!(fields[1], "3");
+        assert_eq!(fields[4], "5");
+        assert_eq!(fields[5], "hello");
+    }
+
+    #[test]
+    fn given_payload_with_tab_and_newline_when_formatted_should_escape_them() {
+        let line = row(false, 0, &IggyMessage::from("a\tb\nc"));
+
+        assert_eq!(line.split('\t').count(), 6);
+        assert!(line.ends_with("a\\tb\\nc"));
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn given_a_full_device_when_storing_a_batch_should_fail() {
+    async fn given_a_full_device_when_flushing_a_batch_should_fail() {
         let mut output = OutputFile::open("/dev/full").await.unwrap();
+        output.store(&batch(&["lost"])).await.unwrap();
 
         let error = output
-            .store(&batch(&["lost"]))
+            .flush()
             .await
             .expect_err("a write that the device refused must fail the command");
 

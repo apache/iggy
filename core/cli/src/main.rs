@@ -41,7 +41,7 @@ use iggy::client_provider::{self, ClientProviderConfig};
 use iggy::clients::client::IggyClient;
 use iggy::prelude::{
     Aes256GcmEncryptor, ClientError, EncryptorKind, MetadataChangesQuery,
-    PersonalAccessTokenExpiry, StreamUpdateOptions, TopicUpdateOptions,
+    PersonalAccessTokenExpiry, StreamUpdateOptions, TopicUpdateOptions, TransportProtocol,
 };
 use iggy_cli::commands::binary_context::common::{ContextManager, validate_transport};
 use iggy_cli::commands::binary_context::create_context::CreateContextCmd;
@@ -95,6 +95,7 @@ use iggy_cli::commands::{
     },
 };
 use std::error::Error;
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{Level, event};
 
@@ -412,7 +413,9 @@ async fn run() -> Result<(), IggyCmdError> {
     validate_transport(&iggy_args.transport)?;
     if let Command::Message(MessageAction::Poll(poll_args)) = &command {
         poll_args.validate()?;
-        if poll_args.consumer_group.is_some() && iggy_args.transport == "http" {
+        if poll_args.consumer_group.is_some()
+            && TransportProtocol::from_str(&iggy_args.transport) == Ok(TransportProtocol::Http)
+        {
             return Err(anyhow::anyhow!("--consumer-group is not supported over HTTP").into());
         }
     }
@@ -467,7 +470,10 @@ async fn run() -> Result<(), IggyCmdError> {
     }
     command.execute_with_iggy_client(&client).await?;
 
-    credentials.logout_user().await?;
+    tokio::select! {
+        logout = credentials.logout_user() => logout?,
+        _ = tokio::signal::ctrl_c() => std::process::exit(130),
+    }
 
     Ok(())
 }

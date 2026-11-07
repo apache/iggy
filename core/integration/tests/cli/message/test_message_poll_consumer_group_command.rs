@@ -191,3 +191,208 @@ fn given_http_transport_when_polling_consumer_group_should_reject_before_connect
         .failure()
         .stderr(contains("--consumer-group is not supported over HTTP"));
 }
+
+async fn create_stream_topic_and_group(client: &dyn Client, partitions_count: u32) -> (u32, u32) {
+    let stream = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream_id: Identifier = stream.id.try_into().unwrap();
+    let topic = client
+        .create_topic(
+            &stream_id,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(partitions_count),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let topic_id: Identifier = topic.id.try_into().unwrap();
+    client
+        .create_consumer_group(&stream_id, &topic_id, GROUP_NAME)
+        .await
+        .unwrap();
+    (stream.id, topic.id)
+}
+
+async fn send_one_message_per_partition(
+    client: &dyn Client,
+    stream_id: u32,
+    topic_id: u32,
+    partitions_count: u32,
+) {
+    let stream_id: Identifier = stream_id.try_into().unwrap();
+    let topic_id: Identifier = topic_id.try_into().unwrap();
+    for partition_id in 0..partitions_count {
+        let mut messages = vec![
+            IggyMessage::builder()
+                .payload(Bytes::from(format!("partition-{partition_id}")))
+                .build()
+                .expect("Failed to create message"),
+        ];
+        client
+            .send_messages(
+                &stream_id,
+                &topic_id,
+                &Partitioning::partition_id(partition_id),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+    }
+}
+
+struct TestMessagePollAutoCommitCmd {
+    actual_stream_id: Option<u32>,
+    actual_topic_id: Option<u32>,
+}
+
+#[async_trait]
+impl IggyCmdTestCase for TestMessagePollAutoCommitCmd {
+    async fn prepare_server_state(&mut self, client: &dyn Client) {
+        let (stream_id, topic_id) = create_stream_topic_and_group(client, 2).await;
+        self.actual_stream_id = Some(stream_id);
+        self.actual_topic_id = Some(topic_id);
+        send_one_message_per_partition(client, stream_id, topic_id, 2).await;
+    }
+
+    fn get_command(&self) -> IggyCmdCommand {
+        IggyCmdCommand::new()
+            .arg("message")
+            .arg("poll")
+            .args(vec![
+                "--consumer-group",
+                GROUP_NAME,
+                "--next",
+                "--auto-commit",
+                "--message-count",
+                "2",
+                STREAM_NAME,
+                TOPIC_NAME,
+            ])
+            .with_env_credentials()
+    }
+
+    fn verify_command(&self, command_state: Assert) {
+        command_state
+            .success()
+            .stdout(contains("Polled 2 messages"))
+            .stdout(contains("partition-0"))
+            .stdout(contains("partition-1"));
+    }
+
+    async fn verify_server_state(&self, client: &dyn Client) {
+        let (Some(stream_id), Some(topic_id)) = (self.actual_stream_id, self.actual_topic_id)
+        else {
+            return;
+        };
+        let stream_id: Identifier = stream_id.try_into().unwrap();
+        let topic_id: Identifier = topic_id.try_into().unwrap();
+        let group = Consumer::group(Identifier::named(GROUP_NAME).unwrap());
+        for partition_id in 0..2 {
+            let offset = client
+                .get_consumer_offset(&group, &stream_id, &topic_id, Some(partition_id))
+                .await
+                .unwrap()
+                .expect("the group offset of every assigned partition is stored");
+            assert_eq!(offset.stored_offset, 0, "partition {partition_id}");
+        }
+
+        client.delete_topic(&stream_id, &topic_id).await.unwrap();
+        client.delete_stream(&stream_id).await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[parallel]
+pub async fn given_two_partitions_when_polling_with_auto_commit_should_store_offset_per_partition()
+{
+    let mut iggy_cmd_test = IggyCmdTest::default();
+
+    iggy_cmd_test.setup().await;
+    iggy_cmd_test
+        .execute_test(TestMessagePollAutoCommitCmd {
+            actual_stream_id: None,
+            actual_topic_id: None,
+        })
+        .await;
+}
+
+#[cfg(target_os = "linux")]
+struct TestMessagePollFailedWriteCmd {
+    actual_stream_id: Option<u32>,
+    actual_topic_id: Option<u32>,
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait]
+impl IggyCmdTestCase for TestMessagePollFailedWriteCmd {
+    async fn prepare_server_state(&mut self, client: &dyn Client) {
+        let (stream_id, topic_id) = create_stream_topic_and_group(client, 1).await;
+        self.actual_stream_id = Some(stream_id);
+        self.actual_topic_id = Some(topic_id);
+        send_one_message_per_partition(client, stream_id, topic_id, 1).await;
+    }
+
+    fn get_command(&self) -> IggyCmdCommand {
+        IggyCmdCommand::new()
+            .arg("message")
+            .arg("poll")
+            .args(vec![
+                "--consumer-group",
+                GROUP_NAME,
+                "--first",
+                "--output-file",
+                "/dev/full",
+                STREAM_NAME,
+                TOPIC_NAME,
+            ])
+            .with_env_credentials()
+    }
+
+    fn verify_command(&self, command_state: Assert) {
+        command_state
+            .failure()
+            .stderr(contains("Problem writing message to file"));
+    }
+
+    async fn verify_server_state(&self, client: &dyn Client) {
+        let (Some(stream_id), Some(topic_id)) = (self.actual_stream_id, self.actual_topic_id)
+        else {
+            return;
+        };
+        let stream_id: Identifier = stream_id.try_into().unwrap();
+        let topic_id: Identifier = topic_id.try_into().unwrap();
+        let group = Identifier::named(GROUP_NAME).unwrap();
+        let details = client
+            .get_consumer_group(&stream_id, &topic_id, &group)
+            .await
+            .unwrap()
+            .expect("the consumer group still exists");
+        assert_eq!(
+            details.members_count, 0,
+            "a failed poll must leave the group"
+        );
+
+        client.delete_topic(&stream_id, &topic_id).await.unwrap();
+        client.delete_stream(&stream_id).await.unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[parallel]
+pub async fn given_failed_output_write_after_join_when_polling_should_leave_group() {
+    let mut iggy_cmd_test = IggyCmdTest::default();
+
+    iggy_cmd_test.setup().await;
+    iggy_cmd_test
+        .execute_test(TestMessagePollFailedWriteCmd {
+            actual_stream_id: None,
+            actual_topic_id: None,
+        })
+        .await;
+}

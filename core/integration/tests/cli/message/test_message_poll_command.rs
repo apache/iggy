@@ -321,6 +321,8 @@ Examples:
  iggy message poll --offset 0 stream 2 1
  iggy message poll --offset 0 1 topic 1
  iggy message poll --offset 0 stream topic 1
+ iggy message poll --consumer-group group --next stream topic
+ iggy message poll --consumer-group group --follow stream topic
 
 {USAGE_PREFIX} message poll [OPTIONS] <--offset <OFFSET>|--first|--last|--next> <STREAM_ID> <TOPIC_ID> [PARTITION_ID]
 
@@ -383,16 +385,18 @@ Options:
           The CLI joins the group, polls the partitions that the server assigns
           to it and leaves the group on exit, also after Ctrl-C or an error.
           The group must already exist. Cannot be combined with --consumer,
-          --offset or PARTITION_ID.
+          --offset or PARTITION_ID. A number is also read as a name, so use
+          the group name rather than its ID.
 {CLAP_INDENT}
-          With --auto-commit, the group offset moves past the messages that
-          are printed, so the other group members never receive them.
+          With --auto-commit, the group offset moves past each message once it
+          is printed. Requires --next.
 
       --follow
           Keep polling until interrupted with Ctrl-C
 {CLAP_INDENT}
           Requires --consumer-group. Each message is printed as it arrives.
-          Without this flag, the command stops after --message-count messages
+          Cannot be combined with --message-count. With --consumer-group and
+          without this flag, the command stops after --message-count messages
           or once no message arrives for five seconds.
 
   -s, --show-headers

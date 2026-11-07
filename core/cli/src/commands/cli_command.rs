@@ -29,7 +29,8 @@ pub static PRINT_TARGET: &str = "iggy::cli::output";
 pub static DIAGNOSTIC_TARGET: &str = "iggy::cli::diagnostic";
 
 #[async_trait]
-/// Boxed commands are awaited across tasks, so they must be `Send`.
+/// `main` awaits `execute_with_iggy_client` through `Box<dyn CliCommand>`, and the
+/// `async_trait` future of that default method needs `Self: Send`.
 pub trait CliCommand: Send {
     fn explain(&self) -> String;
     fn use_tracing(&self) -> bool {
