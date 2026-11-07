@@ -938,6 +938,7 @@ impl Sink for OpenSearchSink {
         let messages_count = messages.len();
         let mut documents = Vec::with_capacity(messages_count);
         let mut invalid_records = 0usize;
+        let mut first_invalid = None;
         for message in messages {
             // One message failing preparation must not discard the documents
             // already built from earlier messages in this batch.
@@ -946,6 +947,7 @@ impl Sink for OpenSearchSink {
                 Err(error) => {
                     invalid_records += 1;
                     self.log_invalid_record(&error.to_string());
+                    first_invalid.get_or_insert(error);
                 }
             }
         }
@@ -954,8 +956,10 @@ impl Sink for OpenSearchSink {
                 .fetch_add(invalid_records as u64, Ordering::Relaxed);
         }
 
+        // Returned only after the valid records are indexed, so the runtime's
+        // /stats errors counter sees the drops without costing their siblings.
         if documents.is_empty() {
-            return Ok(());
+            return first_invalid.map_or(Ok(()), Err);
         }
 
         match self.index_documents(client, documents).await {
@@ -969,7 +973,7 @@ impl Sink for OpenSearchSink {
                     messages_count,
                     self.config.index
                 );
-                Ok(())
+                first_invalid.map_or(Ok(()), Err)
             }
             Err(partial) => {
                 self.documents_indexed
@@ -2923,6 +2927,65 @@ mod tests {
         assert_eq!(sink.invocations_count.load(Ordering::Relaxed), 1);
         assert_eq!(sink.documents_indexed.load(Ordering::Relaxed), 0);
         assert_eq!(sink.errors_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn given_invalid_record_beside_valid_one_should_index_valid_and_return_invalid_record() {
+        let server = MockServer::start().await;
+        let mut sink = mock_bulk_sink(&server, 0);
+        sink.client = Some(mock_client(&sink));
+
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "errors": false,
+                "items": [{ "index": { "_id": "a", "status": 201, "result": "created" } }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = sink
+            .consume(
+                &topic_metadata(),
+                messages_metadata(),
+                vec![
+                    message(Payload::Text("hello".to_string())),
+                    message(Payload::Avro(vec![1, 2, 3])),
+                ],
+            )
+            .await
+            .expect_err("a dropped record should surface as an error");
+
+        assert!(matches!(error, Error::InvalidRecordValue(_)));
+        assert_eq!(sink.documents_indexed.load(Ordering::Relaxed), 1);
+        assert_eq!(sink.errors_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn given_only_invalid_records_should_skip_bulk_and_return_invalid_record() {
+        let server = MockServer::start().await;
+        let mut sink = mock_bulk_sink(&server, 0);
+        sink.client = Some(mock_client(&sink));
+
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let error = sink
+            .consume(
+                &topic_metadata(),
+                messages_metadata(),
+                vec![message(Payload::Avro(vec![1, 2, 3]))],
+            )
+            .await
+            .expect_err("an all-invalid batch should surface as an error");
+
+        assert!(matches!(error, Error::InvalidRecordValue(_)));
+        assert_eq!(sink.errors_count.load(Ordering::Relaxed), 1);
     }
 
     fn mock_health_sink(server: &MockServer, base_path: &str) -> OpenSearchSink {

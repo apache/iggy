@@ -105,11 +105,11 @@ data_encoding: "base64"}`. `Payload::Text` is indexed as `{text, data_type:
 "text"}`. `Payload::Proto` holds text, for example from a `proto_convert`
 transform on a stream. If the text is a JSON document it is indexed like
 `Payload::Json`, otherwise like `Payload::Text`. `Payload::FlatBuffer` and
-`Payload::Avro` are unsupported: they are dropped with a warning and counted
-as sink errors. This matches the connector runtime's per-record drop
-convention, and because the sink returns success after dropping such a
-record, the runtime commits the consumer offset for it. There is no
-dead-letter queue for these drops.
+`Payload::Avro` are unsupported: such a record is dropped with a warning, the
+rest of the batch is still indexed, and `consume()` then returns
+`InvalidRecordValue` so the drop reaches the runtime's `/stats` `errors`
+counter. The runtime has already committed the consumer offset, so the dropped
+record is not redelivered. There is no dead-letter queue for these drops.
 
 The sink acts on the payload variant it receives after decoding and
 transforms, not on the stream's configured schema. A stream with a `json`
@@ -217,6 +217,12 @@ connector continued consuming and indexing later messages normally.
 **Operators should alert on the `/stats` `errors` counter and read this
 connector's own `tracing` output (`error!` at target
 `iggy_connector_opensearch_sink`) for the cause.**
+
+Records the sink cannot index at all, such as an unsupported payload or an
+unusable `document_id_field` value, are reported the same way. The valid
+records in that run are still indexed, but the run counts as one error and none
+of its messages count as processed, because `consume()` returns a single
+status for the whole run.
 
 Within a single `consume()` call, a `_bulk` request can return HTTP 200 while
 individual documents fail. This connector parses the per-item `items[]`
