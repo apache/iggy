@@ -151,9 +151,10 @@ pub trait DurableStorage {
 
 pub trait DurableFile {
     /// Best-effort reservation that must not change bytes or logical length.
-    /// Backends without physical allocation may ignore this hint.
-    fn preallocate(&self, _path: &Path, _length: u64) -> impl Future<Output = ()> {
-        async {}
+    /// Backends without physical allocation may ignore this hint. Returns how
+    /// much of the file the reservation covers, 0 when it reserved nothing.
+    fn preallocate(&self, _path: &Path, _length: u64) -> impl Future<Output = u64> {
+        async { 0 }
     }
 
     /// # Errors
@@ -419,8 +420,8 @@ impl DurableStorage for DiskStorage {
 }
 
 impl DurableFile for File {
-    async fn preallocate(&self, path: &Path, length: u64) {
-        server_common::fs_utils::preallocate_file(self, path, length).await;
+    async fn preallocate(&self, path: &Path, length: u64) -> u64 {
+        server_common::fs_utils::preallocate_file(self, path, length).await
     }
 
     async fn read(&self, offset: u64, length: usize) -> io::Result<Vec<u8>> {

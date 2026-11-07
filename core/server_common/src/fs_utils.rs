@@ -62,9 +62,13 @@ impl DirEntry {
 
 /// Reserve segment space without changing its contents or logical length.
 /// Unsupported or failed reservations fall back to buffered allocation.
+///
+/// Returns how much of the file the reservation covers: `len` once the file's
+/// blocks reach it, otherwise 0. Writes below the returned length take no new
+/// space, so the blocks they fill must not be charged again.
 #[cfg(target_os = "linux")]
-pub async fn preallocate_file(file: &fs::File, file_path: &Path, len: u64) {
-    preallocate_charging(&DISK_USAGE, file, file_path, len).await;
+pub async fn preallocate_file(file: &fs::File, file_path: &Path, len: u64) -> u64 {
+    preallocate_charging(&DISK_USAGE, file, file_path, len).await
 }
 
 /// [`preallocate_file`] charging `usage`, so a test can watch an estimate of
@@ -75,7 +79,7 @@ async fn preallocate_charging(
     file: &fs::File,
     file_path: &Path,
     len: u64,
-) {
+) -> u64 {
     let Ok(reserved_len) = i64::try_from(len) else {
         warn!(
             target: "iggy.partitions.storage",
@@ -83,7 +87,7 @@ async fn preallocate_charging(
             preallocate_len = len,
             "file preallocation size is unsupported, using buffered allocation"
         );
-        return;
+        return 0;
     };
 
     let reservation = async {
@@ -97,22 +101,27 @@ async fn preallocate_charging(
         })
         .await
     };
-    if let Err(error) = reservation.await {
-        warn!(
-            target: "iggy.partitions.storage",
-            file = %file_path.display(),
-            preallocate_len = len,
-            %error,
-            "file preallocation failed, using buffered allocation"
-        );
+    match reservation.await {
+        Ok(reserved) => reserved,
+        Err(error) => {
+            warn!(
+                target: "iggy.partitions.storage",
+                file = %file_path.display(),
+                preallocate_len = len,
+                %error,
+                "file preallocation failed, using buffered allocation"
+            );
+            0
+        }
     }
 }
 
-/// Reserves `len` bytes and charges `usage` for the blocks it allocates.
+/// Reserves `len` bytes, charges `usage` for the blocks it allocates and
+/// returns how much of the file the reservation covers.
 /// Recovery reserves segments that already own their blocks again, which
 /// allocates nothing and must not be counted as disk usage.
 #[cfg(target_os = "linux")]
-fn reserve(file: &std::fs::File, len: i64, usage: &DiskUsage) -> io::Result<()> {
+fn reserve(file: &std::fs::File, len: i64, usage: &DiskUsage) -> io::Result<u64> {
     // `st_blocks` counts 512-byte units whatever the filesystem's block size.
     let allocated = || file.metadata().ok().map(|metadata| metadata.blocks() * 512);
     let before = allocated();
@@ -132,15 +141,28 @@ fn reserve(file: &std::fs::File, len: i64, usage: &DiskUsage) -> io::Result<()> 
 
     // Filesystem metadata, such as extent tree blocks, can grow it further.
     // Those blocks are allocated already, so their charge settles at once.
-    if let (Some(before), Some(after)) = (before, allocated()) {
+    let after = allocated();
+    if let (Some(before), Some(after)) = (before, after) {
         drop(usage.charge(after.saturating_sub(before).saturating_sub(expected)));
     }
-    Ok(())
+    Ok(reserved_bytes(len.unsigned_abs(), after))
+}
+
+/// The blocks decide, not `fallocate`: OpenZFS reports success without
+/// allocating anything. Unknown blocks count as no reservation, so the writes
+/// are charged and the estimate errs towards a fuller disk.
+#[cfg(target_os = "linux")]
+fn reserved_bytes(requested_bytes: u64, allocated_bytes: Option<u64>) -> u64 {
+    if allocated_bytes.is_some_and(|allocated_bytes| allocated_bytes >= requested_bytes) {
+        requested_bytes
+    } else {
+        0
+    }
 }
 
 /// Reserve segment space when supported, without changing its logical length.
 #[cfg(not(target_os = "linux"))]
-pub async fn preallocate_file(_file: &fs::File, file_path: &Path, _len: u64) {
+pub async fn preallocate_file(_file: &fs::File, file_path: &Path, _len: u64) -> u64 {
     PREALLOCATION_UNAVAILABLE.call_once(|| {
         warn!(
             target: "iggy.partitions.storage",
@@ -148,6 +170,7 @@ pub async fn preallocate_file(_file: &fs::File, file_path: &Path, _len: u64) {
             "file preallocation is unavailable on this platform, using buffered allocation"
         );
     });
+    0
 }
 
 /// Asynchronously walks a directory tree iteratively (without recursion).
@@ -330,7 +353,8 @@ mod tests {
                 .open(&path)
                 .await
                 .unwrap();
-            preallocate_charging(usage, &file, &path, RESERVATION_BYTES).await;
+            let reserved = preallocate_charging(usage, &file, &path, RESERVATION_BYTES).await;
+            assert_eq!(reserved, RESERVATION_BYTES);
             let fresh = usage.charged_bytes();
             assert_eq!(
                 fresh,
@@ -372,6 +396,27 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn given_blocks_short_of_the_reservation_when_reading_what_it_covers_should_report_nothing() {
+        const REQUESTED_BYTES: u64 = 1024;
+
+        assert_eq!(
+            reserved_bytes(REQUESTED_BYTES, Some(REQUESTED_BYTES)),
+            REQUESTED_BYTES
+        );
+        assert_eq!(
+            reserved_bytes(REQUESTED_BYTES, Some(REQUESTED_BYTES + 512)),
+            REQUESTED_BYTES
+        );
+        assert_eq!(
+            reserved_bytes(REQUESTED_BYTES, Some(REQUESTED_BYTES - 512)),
+            0
+        );
+        assert_eq!(reserved_bytes(REQUESTED_BYTES, Some(0)), 0);
+        assert_eq!(reserved_bytes(REQUESTED_BYTES, None), 0);
+    }
+
     /// The reservation is charged before `fallocate` runs, so the estimate
     /// never trails the volume by a segment while it lands. The cost shows
     /// when `fallocate` fails: the charge stays, and the estimate reads a whole
@@ -390,7 +435,11 @@ mod tests {
         runtime.block_on(async {
             // Read-only, so `fallocate` fails with EBADF whatever the filesystem.
             let file = fs::OpenOptions::new().read(true).open(&path).await.unwrap();
-            preallocate_charging(&USAGE, &file, &path, RESERVATION_BYTES).await;
+            let reserved = preallocate_charging(&USAGE, &file, &path, RESERVATION_BYTES).await;
+            assert_eq!(
+                reserved, 0,
+                "a failed reservation must not exempt the writes below it from charges"
+            );
         });
 
         assert_eq!(

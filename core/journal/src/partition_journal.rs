@@ -122,6 +122,9 @@ pub struct PartitionPrepareJournal<S: DurableStorage = DiskStorage> {
     cleanup_directory_dirty: bool,
     recovered_prepares: Vec<Message<PrepareHeader>>,
     segment_files: BTreeMap<(u64, u64), S::File>,
+    /// How much of each open segment file its reservation covers. A file
+    /// without an entry has none, so all its writes take new space.
+    segment_reservations: BTreeMap<(u64, u64), u64>,
     segment_files_dirty: bool,
     segment_links_dirty: bool,
     preallocate_segments: bool,
@@ -290,6 +293,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             cleanup_directory_dirty: false,
             recovered_prepares: Vec::new(),
             segment_files: BTreeMap::new(),
+            segment_reservations: BTreeMap::new(),
             segment_files_dirty: false,
             segment_links_dirty: false,
             preallocate_segments,

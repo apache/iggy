@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use iggy_binary_protocol::batch::BatchHeader;
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::MAX_TOPIC_SEGMENT_SIZE;
+use server_common::Charge;
 use server_common::iobuf::{Frozen, IOV_MAX};
 
 use super::{
@@ -275,9 +276,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             ));
         }
         if self.preallocate_segments {
-            installed_file
+            let reserved = installed_file
                 .preallocate(&cursor.path(&self.directory), max_size)
                 .await;
+            self.segment_reservations
+                .insert((generation, initial.start_offset), reserved);
         }
         let checkpoint_prepare = if let Some(prepare) = prepare {
             let header = self.validate_checkpoint_prepare(&prepare)?;
@@ -426,13 +429,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 buffers.push(prepares[index].slice(size_of::<PrepareHeader>()..));
                 bodies.next();
             }
-            let _charge = self
-                .storage
-                .charge_allocation(self.newly_allocated(first.position, end));
-            self.segment_writing_file(first)
-                .await?
-                .write_frozen_vectored(first.position, buffers)
-                .await?;
+            let (_charge, file) = self.charged_segment_writing_file(first, end).await?;
+            file.write_frozen_vectored(first.position, buffers).await?;
         }
         Ok(())
     }
@@ -443,37 +441,36 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         prepare: &Frozen<4096>,
     ) -> io::Result<()> {
         let end = reference.position + (prepare.len() - size_of::<PrepareHeader>()) as u64;
-        let _charge = self
-            .storage
-            .charge_allocation(self.newly_allocated(reference.position, end));
-        self.segment_writing_file(reference)
-            .await?
-            .write_frozen(
-                reference.position,
-                prepare.slice(size_of::<PrepareHeader>()..),
-            )
-            .await?;
+        let (_charge, file) = self.charged_segment_writing_file(reference, end).await?;
+        file.write_frozen(
+            reference.position,
+            prepare.slice(size_of::<PrepareHeader>()..),
+        )
+        .await?;
         Ok(())
     }
 
-    /// How many bytes of a body write at `position..end` take new disk space.
-    /// With `preallocate_segments`, the segment file already reserved its first
-    /// `max_size` bytes when it was opened, so writes below `max_size` take no new
-    /// space. Only the part past `max_size` does: a segment can grow past
-    /// `max_size` because the last batch may cross it.
-    fn newly_allocated(&self, position: u64, end: u64) -> u64 {
+    /// How many bytes of a body write at `position..end` of `segment` take new
+    /// disk space. Writes below the end of its reservation take none. The part
+    /// past it does: a segment can grow past `max_size` because the last batch
+    /// may cross it, and without a reservation that is the whole write.
+    fn newly_allocated(&self, segment: (u64, u64), position: u64, end: u64) -> u64 {
         let reserved_end = self
-            .state
-            .segment_storage
-            .filter(|_| self.preallocate_segments)
-            .map_or(0, |segments| segments.max_size);
+            .segment_reservations
+            .get(&segment)
+            .copied()
+            .unwrap_or(0);
         end.saturating_sub(position.max(reserved_end))
     }
 
-    async fn segment_writing_file(
+    /// Opens the segment `reference` writes into, which reserves a new one, and
+    /// charges the bytes of `reference.position..end` that its reservation does
+    /// not cover. Hold the charge until the write finishes or fails.
+    async fn charged_segment_writing_file(
         &mut self,
         reference: SegmentReference,
-    ) -> io::Result<&mut S::File> {
+        end: u64,
+    ) -> io::Result<(Option<Charge<'static>>, &mut S::File)> {
         let preallocate_size = self
             .state
             .segment_storage
@@ -487,9 +484,15 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         )
         .await?;
         self.segment_files_dirty = true;
-        self.segment_files
-            .get_mut(&(reference.generation, reference.start_offset))
-            .ok_or_else(|| invalid("segment writing handle is absent"))
+        let segment = (reference.generation, reference.start_offset);
+        let charge =
+            self.storage
+                .charge_allocation(self.newly_allocated(segment, reference.position, end));
+        let file = self
+            .segment_files
+            .get_mut(&segment)
+            .ok_or_else(|| invalid("segment writing handle is absent"))?;
+        Ok((charge, file))
     }
 
     /// Barrier over every body and link this journal wrote, leaving the dirty
@@ -528,6 +531,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 segments.tail.position.start_offset,
             );
             self.segment_files.retain(|key, _| *key == active);
+            self.segment_reservations.retain(|key, _| *key == active);
         }
     }
 
@@ -617,8 +621,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 file.truncate(cursor.position.length).await?;
                 self.segment_files_dirty = true;
                 if self.preallocate_segments {
-                    file.preallocate(&cursor.path(&self.directory), segments.max_size)
+                    let reserved = file
+                        .preallocate(&cursor.path(&self.directory), segments.max_size)
                         .await;
+                    self.segment_reservations
+                        .insert((cursor.generation, cursor.position.start_offset), reserved);
                 }
             }
             self.sync_segment_files().await?;
@@ -688,11 +695,12 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         }
         file.truncate(cursor.position.length).await?;
         // Truncating frees the reservation past the new length, reserved
-        // blocks included. Reserving again keeps the segment reserved up to
-        // `max_size`, which charging only body bytes past it relies on.
+        // blocks included, so what it covered no longer holds.
         if self.preallocate_segments {
-            file.preallocate(&cursor.path(&self.directory), segments.max_size)
+            let reserved = file
+                .preallocate(&cursor.path(&self.directory), segments.max_size)
                 .await;
+            self.segment_reservations.insert(key, reserved);
         }
         file.sync().await?;
         self.poisoned = false;
@@ -713,6 +721,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         let retained = segment_path(&self.directory, generation, start_offset);
         if self.storage.exists(&retained).await? {
             let file = self.storage.open(&retained, OpenMode::ReadWrite).await?;
+            // Nothing recorded survives a reopen, and only the file can tell.
+            if let Some(size) = preallocate_size {
+                let reserved = file.preallocate(&retained, size).await;
+                self.segment_reservations.insert(key, reserved);
+            }
             self.segment_files.insert(key, file);
             return Ok(());
         }
@@ -744,7 +757,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         if length == 0
             && let Some(size) = preallocate_size
         {
-            file.preallocate(&retained, size).await;
+            let reserved = file.preallocate(&retained, size).await;
+            self.segment_reservations.insert(key, reserved);
         }
         self.segment_files_dirty = true;
         self.segment_links_dirty = true;
@@ -952,14 +966,15 @@ mod tests {
 
     const MAX_SIZE: u64 = 1024 * 1024;
     const BODY_BYTES: u64 = 64 * 1024;
+    const SEGMENT: (u64, u64) = (1, 0);
 
     #[compio::test]
     async fn given_no_preallocation_when_writing_a_body_should_count_every_byte() {
         let (_directory, journal) = journal(false).await;
 
-        assert_eq!(journal.newly_allocated(0, BODY_BYTES), BODY_BYTES);
+        assert_eq!(journal.newly_allocated(SEGMENT, 0, BODY_BYTES), BODY_BYTES);
         assert_eq!(
-            journal.newly_allocated(MAX_SIZE - BODY_BYTES, MAX_SIZE + BODY_BYTES),
+            journal.newly_allocated(SEGMENT, MAX_SIZE - BODY_BYTES, MAX_SIZE + BODY_BYTES),
             2 * BODY_BYTES
         );
     }
@@ -967,11 +982,61 @@ mod tests {
     #[compio::test]
     async fn given_preallocation_when_a_body_crosses_the_reservation_should_count_only_the_bytes_past_it()
      {
-        let (_directory, journal) = journal(true).await;
+        let (_directory, mut journal) = journal(true).await;
+        journal.segment_reservations.insert(SEGMENT, MAX_SIZE);
 
         assert_eq!(
-            journal.newly_allocated(MAX_SIZE - BODY_BYTES, MAX_SIZE + BODY_BYTES),
+            journal.newly_allocated(SEGMENT, MAX_SIZE - BODY_BYTES, MAX_SIZE + BODY_BYTES),
             BODY_BYTES
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_reservation_that_covered_nothing_when_writing_a_body_should_count_every_byte()
+    {
+        let (_directory, mut journal) = journal(true).await;
+        journal.segment_reservations.insert(SEGMENT, 0);
+
+        assert_eq!(
+            journal.newly_allocated(SEGMENT, 0, BODY_BYTES),
+            BODY_BYTES,
+            "a failed reservation allocated nothing, so the write takes new space"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_segment_when_opening_and_reopening_should_record_what_its_reservation_covers()
+    {
+        let (directory, mut journal) = journal(true).await;
+        let probe = std::fs::File::create(directory.path().join("probe")).unwrap();
+        if nix::fcntl::fallocate(
+            &probe,
+            nix::fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE,
+            0,
+            1,
+        )
+        .is_err()
+        {
+            eprintln!("skipped: the temporary directory does not support fallocate");
+            return;
+        }
+
+        journal
+            .open_segment_file(SEGMENT.0, SEGMENT.1, 0, Some(MAX_SIZE))
+            .await
+            .unwrap();
+        assert_eq!(journal.segment_reservations.get(&SEGMENT), Some(&MAX_SIZE));
+
+        journal.segment_files.clear();
+        journal.segment_reservations.clear();
+        journal
+            .open_segment_file(SEGMENT.0, SEGMENT.1, 0, Some(MAX_SIZE))
+            .await
+            .unwrap();
+        assert_eq!(
+            journal.segment_reservations.get(&SEGMENT),
+            Some(&MAX_SIZE),
+            "a reopened segment must report the blocks it still owns"
         );
     }
 

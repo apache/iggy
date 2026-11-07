@@ -37,8 +37,9 @@ pub struct MessagesWriter {
     file: File,
     messages_size_bytes: Rc<AtomicU64>,
     fsync: bool,
-    /// End of the space `new` reserved, 0 without preallocation. Writes below
-    /// it fill blocks the reservation already charged.
+    /// End of the space `new` reserved, 0 without preallocation or when the
+    /// reservation took no effect. Writes below it fill blocks the reservation
+    /// already charged.
     reserved_end: u64,
 }
 
@@ -67,9 +68,10 @@ impl MessagesWriter {
             .note_descriptor_exhaustion(|| format!("opening {file_path}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
-        if let Some(preallocate_size) = preallocate_size {
-            preallocate_file(&file, Path::new(file_path), preallocate_size.as_bytes_u64()).await;
-        }
+        let reserved_end = match preallocate_size {
+            Some(size) => preallocate_file(&file, Path::new(file_path), size.as_bytes_u64()).await,
+            None => 0,
+        };
 
         if file_exists {
             file.sync_all()
@@ -104,7 +106,7 @@ impl MessagesWriter {
             file,
             messages_size_bytes,
             fsync,
-            reserved_end: preallocate_size.map_or(0, |size| size.as_bytes_u64()),
+            reserved_end,
         })
     }
 
