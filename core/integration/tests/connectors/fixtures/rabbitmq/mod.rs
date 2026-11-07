@@ -17,10 +17,14 @@
 
 mod container;
 mod sink;
+mod source;
 
 pub use container::RabbitMqOps;
 pub use sink::{
     RabbitMqSinkDirectFixture, RabbitMqSinkFanoutFixture, RabbitMqSinkFixture,
     RabbitMqSinkHeadersFixture, RabbitMqSinkRawSchemaFixture, RabbitMqSinkUnroutableFixture,
     RabbitMqSinkWithoutMetadataFixture,
+};
+pub use source::{
+    RabbitMqSourceBatchFixture, RabbitMqSourceFixture, RabbitMqSourceMetadataFixture,
 };

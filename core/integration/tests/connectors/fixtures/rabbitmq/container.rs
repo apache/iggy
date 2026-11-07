@@ -24,7 +24,9 @@ use lapin::{
     types::{AMQPValue, FieldTable},
 };
 use std::time::Duration;
-use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers_modules::testcontainers::core::{
+    CmdWaitFor, ExecCommand, IntoContainerPort, WaitFor,
+};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::time::sleep;
@@ -34,6 +36,7 @@ use uuid::Uuid;
 const RABBITMQ_IMAGE: &str = "docker.io/rabbitmq";
 const RABBITMQ_TAG: &str = "4.0-management";
 const RABBITMQ_PORT: u16 = 5672;
+const RABBITMQ_MANAGEMENT_PORT: u16 = 15672;
 const RABBITMQ_READY_MSG: &str = "Time to start RabbitMQ:";
 const RABBITMQ_BOOT_ATTEMPTS: usize = 60;
 const RABBITMQ_BOOT_INTERVAL_MS: u64 = 1000;
@@ -60,6 +63,23 @@ pub(super) const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_RABBITMQ_PATH";
 pub(super) const ENV_SINK_INCLUDE_METADATA: &str =
     "IGGY_CONNECTORS_SINK_RABBITMQ_PLUGIN_CONFIG_INCLUDE_METADATA";
 
+pub(super) const ENV_SOURCE_AMQP_URL: &str =
+    "IGGY_CONNECTORS_SOURCE_RABBITMQ_PLUGIN_CONFIG_AMQP_URL";
+pub(super) const ENV_SOURCE_QUEUE: &str = "IGGY_CONNECTORS_SOURCE_RABBITMQ_PLUGIN_CONFIG_QUEUE";
+pub(super) const ENV_SOURCE_INCLUDE_METADATA: &str =
+    "IGGY_CONNECTORS_SOURCE_RABBITMQ_PLUGIN_CONFIG_INCLUDE_METADATA";
+pub(super) const ENV_SOURCE_BATCH_SIZE: &str =
+    "IGGY_CONNECTORS_SOURCE_RABBITMQ_PLUGIN_CONFIG_BATCH_SIZE";
+pub(super) const ENV_SOURCE_BATCH_TIMEOUT: &str =
+    "IGGY_CONNECTORS_SOURCE_RABBITMQ_PLUGIN_CONFIG_BATCH_TIMEOUT";
+pub(super) const ENV_SOURCE_STREAMS_0_STREAM: &str =
+    "IGGY_CONNECTORS_SOURCE_RABBITMQ_STREAMS_0_STREAM";
+pub(super) const ENV_SOURCE_STREAMS_0_TOPIC: &str =
+    "IGGY_CONNECTORS_SOURCE_RABBITMQ_STREAMS_0_TOPIC";
+pub(super) const ENV_SOURCE_STREAMS_0_SCHEMA: &str =
+    "IGGY_CONNECTORS_SOURCE_RABBITMQ_STREAMS_0_SCHEMA";
+pub(super) const ENV_SOURCE_PATH: &str = "IGGY_CONNECTORS_SOURCE_RABBITMQ_PATH";
+
 #[derive(PartialEq)]
 pub(super) enum RabbitMqExchangeSetup {
     Topic,
@@ -71,16 +91,22 @@ pub struct RabbitMqContainer {
     #[allow(dead_code)]
     container: ContainerAsync<GenericImage>,
     pub(super) amqp_url: String,
+    pub(super) management_url: String,
     pub(super) queue_names: Vec<String>,
     pub(super) exchange_setup: RabbitMqExchangeSetup,
 }
 
 impl RabbitMqContainer {
-    async fn start_container() -> Result<(ContainerAsync<GenericImage>, String), TestBinaryError> {
+    async fn start_container()
+    -> Result<(ContainerAsync<GenericImage>, String, String), TestBinaryError> {
         let container = GenericImage::new(RABBITMQ_IMAGE, RABBITMQ_TAG)
-            .with_exposed_port(RABBITMQ_PORT.tcp())
             .with_wait_for(WaitFor::message_on_stdout(RABBITMQ_READY_MSG))
+            .with_exposed_port(RABBITMQ_PORT.tcp())
+            .with_exposed_port(RABBITMQ_MANAGEMENT_PORT.tcp())
+            .with_env_var("RABBITMQ_DEFAULT_USER", "iggy_test")
+            .with_env_var("RABBITMQ_DEFAULT_PASS", "iggy_test_password")
             .with_mapped_port(0, RABBITMQ_PORT.tcp())
+            .with_mapped_port(0, RABBITMQ_MANAGEMENT_PORT.tcp())
             .with_container_name(fixtures::unique_container_name("rabbitmq"))
             .start()
             .await
@@ -101,15 +127,28 @@ impl RabbitMqContainer {
                 fixture_type: "RabbitMqContainer".to_string(),
                 message: "No mapping for RabbitMQ port".to_string(),
             })?;
-        let amqp_url = format!("amqp://guest:guest@127.0.0.1:{mapped_port}");
-        Ok((container, amqp_url))
+        let amqp_url = format!("amqp://iggy_test:iggy_test_password@127.0.0.1:{mapped_port}");
+        let management_port = container
+            .ports()
+            .await
+            .map_err(|e| TestBinaryError::FixtureSetup {
+                fixture_type: "RabbitMqContainer".to_string(),
+                message: format!("Failed to get management port: {e}"),
+            })?
+            .map_to_host_port_ipv4(RABBITMQ_MANAGEMENT_PORT)
+            .ok_or_else(|| TestBinaryError::FixtureSetup {
+                fixture_type: "RabbitMqContainer".to_string(),
+                message: "No mapping for RabbitMQ management port".to_string(),
+            })?;
+        let management_url = format!("http://127.0.0.1:{management_port}");
+        Ok((container, amqp_url, management_url))
     }
 
     async fn start_with(
         exchange_setup: RabbitMqExchangeSetup,
         queue_count: usize,
     ) -> Result<Self, TestBinaryError> {
-        let (container, amqp_url) = Self::start_container().await?;
+        let (container, amqp_url, management_url) = Self::start_container().await?;
         let queue_names = (0..queue_count)
             .map(|index| format!("test_queue_{}_{}", Uuid::new_v4().simple(), index))
             .collect();
@@ -117,6 +156,7 @@ impl RabbitMqContainer {
         let instance = Self {
             container,
             amqp_url,
+            management_url,
             exchange_setup,
             queue_names,
         };
@@ -128,6 +168,25 @@ impl RabbitMqContainer {
 
     pub(super) async fn start() -> Result<Self, TestBinaryError> {
         Self::start_with(RabbitMqExchangeSetup::Topic, 1).await
+    }
+
+    pub(super) async fn stop_broker(&self) -> Result<(), String> {
+        self.rabbitmqctl("stop_app").await
+    }
+
+    pub(super) async fn start_broker(&self) -> Result<(), String> {
+        self.rabbitmqctl("start_app").await
+    }
+
+    async fn rabbitmqctl(&self, command: &str) -> Result<(), String> {
+        self.container
+            .exec(
+                ExecCommand::new(vec!["rabbitmqctl", command])
+                    .with_cmd_ready_condition(CmdWaitFor::exit_code(0)),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     pub(super) async fn start_fanout() -> Result<Self, TestBinaryError> {
@@ -206,7 +265,8 @@ impl RabbitMqContainer {
                 .queue_declare(
                     queue_name.as_str().into(),
                     QueueDeclareOptions {
-                        auto_delete: true,
+                        durable: true,
+                        auto_delete: false,
                         ..Default::default()
                     },
                     FieldTable::default(),

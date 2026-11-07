@@ -7792,6 +7792,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_rabbitmq_source"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "dashmap",
+ "futures-util",
+ "humantime",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "lapin",
+ "rand 0.10.3",
+ "rustls",
+ "rustls-pemfile",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "iggy_connector_random_source"
 version = "0.6.0"
 dependencies = [

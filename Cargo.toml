@@ -55,6 +55,7 @@ members = [
     "core/connectors/sources/influxdb_source",
     "core/connectors/sources/mqtt_source",
     "core/connectors/sources/postgres_source",
+    "core/connectors/sources/rabbitmq_source",
     "core/connectors/sources/random_source",
     "core/consensus",
     "core/cpu_allocation",
