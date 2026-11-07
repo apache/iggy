@@ -110,13 +110,16 @@ already-built `iggy-server` in the same target directory, and a host JDK 17+ (`j
 consumer `offsetsForTimes` probe. Missing any of them makes it skip with a printed reason rather
 than fail, which is what lets `cargo test -p iggy-gateway-kafka` stay usable without them.
 
-Client containers run with `--pull never`, so pull the two images first. Without them the suite
-skips and names the missing one.
+Client containers run with `--pull never`, so pull the images first. Without them the suite
+skips and names the missing one. The Java tools come from Kafka 4.4.0, the newest Kafka 4 release.
+One test also runs the tools of 4.0.2, the oldest Kafka 4 release. Clients 4.0 to 4.3 open
+ApiVersions at v4, and 4.4 clients open it at v5.
 
 ```bash
 cargo build --bin iggy-server
 docker pull edenhill/kcat:1.7.1
-docker pull apache/kafka:3.9.0
+docker pull apache/kafka:4.4.0
+docker pull apache/kafka:4.0.2
 KAFKA_E2E_REQUIRED=1 cargo test -p iggy-gateway-kafka --test kafka_client_e2e_tests
 ```
 
@@ -133,14 +136,14 @@ because they cover cases a test does not assert, but the load-bearing ones now r
 
 ## Failover suite
 
-`cluster_failover_tests.rs` uses the same two images and `KAFKA_E2E_REQUIRED` as the real-client
-suite, and skips in the same way. It needs no JDK. Cargo builds the gateway binary for the test,
-but `iggy-server` comes from another package, so build it first:
+`cluster_failover_tests.rs` uses the kcat image, the Kafka 4.4.0 image and `KAFKA_E2E_REQUIRED`, as
+the real-client suite does. It skips in the same way. It needs no JDK. Cargo builds the gateway
+binary for the test, but `iggy-server` comes from another package, so build it first:
 
 ```bash
 cargo build --bin iggy-server
 docker pull edenhill/kcat:1.7.1
-docker pull apache/kafka:3.9.0
+docker pull apache/kafka:4.4.0
 KAFKA_E2E_REQUIRED=1 cargo test -p iggy-gateway-kafka --test cluster_failover_tests
 ```
 

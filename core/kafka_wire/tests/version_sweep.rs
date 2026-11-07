@@ -16,14 +16,15 @@
 // under the License.
 
 //! Every validator, at every version it guards, against the bytes `kafka_protocol` itself
-//! encodes: a well-formed request with one element in every array is accepted and decodes, every
-//! strict prefix of it is refused, and the versions just outside the guarded range are refused.
+//! encodes, or bytes built by hand where it cannot encode a version: a well-formed request with
+//! one element in every array is accepted and decodes, every strict prefix of it is refused, and
+//! the versions just outside the guarded range are refused.
 //!
 //! This is the crate's proof that each walk stays aligned with the decoder's field order. A walk
 //! that reads one field too few or too many fails the prefix check, because a cut inside that
 //! field goes unnoticed or a complete body reads as truncated.
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use iggy_kafka_wire::Result;
 use iggy_kafka_wire::api::{
     API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_PARTITIONS, API_KEY_CREATE_TOPICS,
@@ -34,6 +35,7 @@ use iggy_kafka_wire::api::{
     API_KEY_METADATA, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_DELETE, API_KEY_OFFSET_FETCH,
     API_KEY_PRODUCE, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, API_KEY_SYNC_GROUP,
 };
+use iggy_kafka_wire::api_versions::{CODEC_MAX_VERSION, decode_request};
 use iggy_kafka_wire::bounds_guard::{
     guarded_range, validate_alter_configs_shape, validate_api_versions_shape,
     validate_create_partitions_shape, validate_create_topics_shape, validate_delete_groups_shape,
@@ -114,14 +116,30 @@ fn sweep<R: Encodable + Decodable>(
     build: impl Fn(i16) -> R,
     validate: impl Fn(i16, &Bytes) -> Result<()>,
 ) {
+    sweep_bodies(
+        api_key,
+        |version| encode(&build(version), version),
+        validate,
+        |version, body| decode_exhaustive::<R>(version, body).map(drop),
+    );
+}
+
+/// [`sweep`] over bodies that `body` builds and `decode` reads, for versions that
+/// `kafka_protocol` cannot encode.
+fn sweep_bodies(
+    api_key: i16,
+    body: impl Fn(i16) -> Bytes,
+    validate: impl Fn(i16, &Bytes) -> Result<()>,
+    decode: impl Fn(i16, Bytes) -> Result<()>,
+) {
     let range =
         guarded_range(api_key).unwrap_or_else(|| panic!("api key {api_key} has no guarded range"));
     for version in range.min_version..=range.max_version {
-        let body = encode(&build(version), version);
+        let body = body(version);
         validate(version, &body).unwrap_or_else(|error| {
             panic!("api {api_key} v{version}: a well-formed body was refused: {error}")
         });
-        if let Err(error) = decode_exhaustive::<R>(version, body.clone()) {
+        if let Err(error) = decode(version, body.clone()) {
             panic!("api {api_key} v{version}: the decoder disagrees with the guard: {error}");
         }
         for cut in 0..body.len() {
@@ -132,15 +150,13 @@ fn sweep<R: Encodable + Decodable>(
             );
         }
     }
-    let body = encode(&build(range.max_version), range.max_version);
     assert!(
-        validate(range.max_version + 1, &body).is_err(),
+        validate(range.max_version + 1, &body(range.max_version)).is_err(),
         "api {api_key}: v{} is above the guarded range and must be refused",
         range.max_version + 1
     );
-    let body = encode(&build(range.min_version), range.min_version);
     assert!(
-        validate(range.min_version - 1, &body).is_err(),
+        validate(range.min_version - 1, &body(range.min_version)).is_err(),
         "api {api_key}: v{} is below the guarded range and must be refused",
         range.min_version - 1
     );
@@ -439,20 +455,35 @@ fn sasl_handshake() {
     );
 }
 
+/// `kafka_protocol` encodes `ApiVersions` only up to v4, so the v5 body is built by hand, and every
+/// version decodes through `decode_request`, as the gateway decodes it.
 #[test]
 fn api_versions() {
-    sweep(
+    sweep_bodies(
         API_KEY_API_VERSIONS,
         |version| {
-            if version >= 3 {
-                ApiVersionsRequest::default()
+            if version > CODEC_MAX_VERSION {
+                let mut body = BytesMut::new();
+                // `ClientSoftwareName`, `ClientSoftwareVersion` and `ClusterId`, as compact
+                // strings, then `NodeId` and no tagged fields.
+                for field in ["client", "1", "cluster"] {
+                    body.put_u8(u8::try_from(field.len() + 1).expect("a short field"));
+                    body.put_slice(field.as_bytes());
+                }
+                body.put_i32(1);
+                body.put_u8(0);
+                body.freeze()
+            } else if version >= 3 {
+                let request = ApiVersionsRequest::default()
                     .with_client_software_name(text("client"))
-                    .with_client_software_version(text("1"))
+                    .with_client_software_version(text("1"));
+                encode(&request, version)
             } else {
-                ApiVersionsRequest::default()
+                encode(&ApiVersionsRequest::default(), version)
             }
         },
         validate_api_versions_shape,
+        |version, body| decode_request(version, body).map(drop),
     );
 }
 

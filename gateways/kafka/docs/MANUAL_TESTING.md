@@ -110,7 +110,7 @@ sasl.mechanism=PLAIN
 sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="iggy" password="iggy";
 EOF
 docker run --rm --network host -v /tmp/client.properties:/tmp/client.properties:ro \
-  apache/kafka:3.9.0 /opt/kafka/bin/kafka-broker-api-versions.sh \
+  apache/kafka:4.4.0 /opt/kafka/bin/kafka-broker-api-versions.sh \
   --bootstrap-server 127.0.0.1:9095 --command-config /tmp/client.properties
 ```
 
@@ -141,7 +141,7 @@ Then list each principal's ACLs with the real admin client, swapping the usernam
 
 ```bash
 docker run --rm --network host -v /tmp/client.properties:/tmp/client.properties:ro \
-  apache/kafka:3.9.0 /opt/kafka/bin/kafka-acls.sh \
+  apache/kafka:4.4.0 /opt/kafka/bin/kafka-acls.sh \
   --bootstrap-server 127.0.0.1:9095 --command-config /tmp/client.properties --list
 ```
 
@@ -217,7 +217,7 @@ IGGY_KAFKA_LISTENERS=PLAINTEXT://127.0.0.1:9093,SSL://127.0.0.1:9094,SASL_SSL://
 ```
 
 `KC` below is `docker run --rm --network host -v /tmp/certs:/certs:ro edenhill/kcat:1.7.1`, and
-`KAFKA` is `docker run --rm --network host -v /tmp/certs:/certs:ro -v /tmp/client.properties:/tmp/client.properties:ro apache/kafka:3.9.0`.
+`KAFKA` is `docker run --rm --network host -v /tmp/certs:/certs:ro -v /tmp/client.properties:/tmp/client.properties:ro apache/kafka:4.4.0`.
 
 | ID | Test | Command | Pass criteria | Last run |
 | ---- | ------ | --------- | --------------- | ---------- |
@@ -376,9 +376,13 @@ unset). With a bridge, A5 writes one record to `test-topic`: `ec=0` if it exists
 
 For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-message-gen send --host 127.0.0.1:9093` with `--version N`.
 
+`kafka-message-gen` encodes ApiVersions only up to v4, as `kafka-protocol` 0.18 does. For v5, run
+`kafka-broker-api-versions.sh` from `apache/kafka:4.4.0`. It prints
+`ApiVersions(18): 0 to 5 [usable: 5]`.
+
 | API key | Name | Min | Max | Test versions |
 | --------- | ------ | ----- | ----- | --------------- |
-| 18 | ApiVersions | 0 | 3 | −1, 0, 3, 4 |
+| 18 | ApiVersions | 0 | 5 | −1, 0, 5, 6 |
 | 3 | Metadata | 0 | 9 | −1, 0, 9, 10 |
 | 0 | Produce | 3 | 9 | 2, 3, 9, 10 |
 | 1 | Fetch | 4 | 12 | 3, 4, 12, 13 |
