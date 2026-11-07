@@ -388,6 +388,22 @@ async fn given_retirement_debt_when_session_requests_arrive_should_refuse_them_u
     assert_eq!(wire.retirement_paid_through, DEBT_OP);
 }
 
+#[test]
+fn given_new_partition_when_created_revision_exceeds_session_end_should_require_retirement() {
+    let mut partition = test_partition();
+    let ended = SessionIdentity {
+        client_id: 1,
+        session: 2,
+        metadata_watermark: 3,
+    };
+    partition.set_created_revision(7);
+
+    assert!(
+        !partition.session_retired(ended),
+        "a Streams revision cannot certify an applied metadata retirement barrier"
+    );
+}
+
 #[compio::test]
 async fn retirement_excludes_pending_target_writes_and_reports_during_unrelated_commits() {
     const ENDING_FRONTIER: u64 = 10;

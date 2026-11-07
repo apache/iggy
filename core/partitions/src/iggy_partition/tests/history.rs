@@ -72,22 +72,6 @@ async fn checkpoint_index_sync_failure_fences_during_transfer_flush() {
     );
 }
 
-#[test]
-fn given_new_partition_when_created_revision_exceeds_session_end_should_require_retirement() {
-    let mut partition = test_partition();
-    let ended = SessionIdentity {
-        client_id: 1,
-        session: 2,
-        metadata_watermark: 3,
-    };
-    partition.set_created_revision(7);
-
-    assert!(
-        !partition.session_retired(ended),
-        "a Streams revision cannot certify an applied metadata retirement barrier"
-    );
-}
-
 /// The history is live, so the incarnation stamp is the only thing that
 /// tells admission this send was aimed at an older partition with this id.
 #[compio::test]
