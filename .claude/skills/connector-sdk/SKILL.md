@@ -133,12 +133,13 @@ Non-breaking additions (new default method, new struct field with `#[serde(defau
 The macros (in `sink.rs` and `source.rs`) generate:
 
 - `iggy_<kind>_open(id, config_ptr, config_len, [state_ptr, state_len,] log_callback) -> i32`
-- `iggy_sink_consume(id, ...)` / `iggy_source_handle(id, callback) -> i32`
+- `iggy_sink_consume(id, ...)` / `iggy_source_handle_v2(id, callback) -> i32`
 - `iggy_<kind>_close(id) -> i32`
 - `iggy_<kind>_version() -> *const c_char` (static lifetime, from `env!("CARGO_PKG_VERSION")`)
 
 Invariants:
 
+- **Return codes**: a sink call returns a `SinkCallStatus` code: `0` success, `1` transient failure, `2` permanent failure, `-1` dispatch failure. Sinks also export `iggy_sink_flush` and `iggy_sink_enable_at_least_once`.
 - **Duplicate-ID guard** returns `-1` if the caller reopens an ID without closing first. Don't remove this - it prevents silent buffered-data loss.
 - `INSTANCES: Lazy<DashMap<u32, SinkContainer<$type>>>` (and `SourceContainer<$type>` mirror) is the only mutable global the macro introduces - keep it that way.
 - Return codes: `0` success, `-1` invalid call, `1` open failure. Don't repurpose.

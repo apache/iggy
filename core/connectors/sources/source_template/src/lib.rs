@@ -1,0 +1,799 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Template Apache Iggy **source** connector.
+//!
+//! Everything in this file is already wired up and follows the patterns the
+//! connector-review checklist expects: config validation happens in
+//! `open()`, secrets are `SecretString`, outbound calls go through a
+//! retry-wrapped client plus a circuit breaker, and the read cursor is
+//! staged in `poll()` and only committed in `on_batch_result()` on an ACK so
+//! a dropped/nacked batch can be re-polled instead of silently lost.
+//!
+//! There is exactly **one** place you need to write code, marked
+//! `TODO(ConnectorDeveloper)`: `TemplateSource::fetch_records()` - fetch up
+//! to `batch_size` new records from your external system, starting after
+//! `cursor`. Two more markers ask for a decision, not code: the
+//! `connection_string` doc comment (describe its shape) and
+//! `FetchedRecord::natural_id` (pick a stable per-record identity).
+//! `grep` for the marker and you'll find all three.
+//!
+//! This crate is the HTTP path: `reqwest` wrapped by the SDK's retry
+//! middleware. For a database, queue or filesystem, replace the client as
+//! listed under "Choose your backend path" in the README and keep the rest.
+
+use async_trait::async_trait;
+use iggy_connector_sdk::retry::{
+    CircuitBreaker, RetryPolicy, build_retry_client, check_connectivity_with_retry, parse_duration,
+};
+use iggy_connector_sdk::{
+    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
+    source::SourceBatchResult, source_connector,
+};
+use reqwest::Url;
+use reqwest_middleware::ClientWithMiddleware;
+use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tracing::{debug, error, info, warn};
+
+source_connector!(TemplateSource);
+
+const CONNECTOR_NAME: &str = "Template source";
+
+const DEFAULT_POLL_INTERVAL: &str = "1s";
+const DEFAULT_BATCH_SIZE: u32 = 100;
+const DEFAULT_TIMEOUT: &str = "30s";
+const DEFAULT_MAX_RETRIES: u32 = 3;
+const DEFAULT_RETRY_DELAY: &str = "500ms";
+const DEFAULT_RETRY_MAX_DELAY: &str = "5s";
+const DEFAULT_MAX_OPEN_RETRIES: u32 = 10;
+const DEFAULT_OPEN_RETRY_MAX_DELAY: &str = "60s";
+const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
+const DEFAULT_CIRCUIT_BREAKER_COOL_DOWN: &str = "30s";
+
+// ── Configuration ───────────────────────────────────────────────────────────
+//
+// Every tunable except `connection_string` is optional with a sane default,
+// and unknown keys are rejected outright so a typo in a TOML file fails at
+// load time instead of silently doing nothing.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateSourceConfig {
+    /// TODO(ConnectorDeveloper): document the exact shape this connector expects, e.g.
+    /// "<https://api.example.com>" or "postgres://user:pass@host:5432/db".
+    /// `SecretString` because DSNs commonly embed credentials - never plain
+    /// `String` for this field, see `PostgresSinkConfig::connection_string`
+    /// in `sinks/postgres_sink` for the same pattern.
+    #[serde(serialize_with = "iggy_common::serde_secret::serialize_secret")]
+    pub connection_string: SecretString,
+
+    /// Example of a secret-shaped setting. `SecretString` keeps it out of
+    /// `Debug`/log output; delete this field if `connection_string` already
+    /// carries all required auth. Read it with `.expose_secret()` (from the
+    /// `secrecy::ExposeSecret` trait) at the one place you actually need the
+    /// plaintext - e.g. when building an auth header in `build_raw_client()`.
+    #[serde(
+        default,
+        serialize_with = "iggy_common::serde_secret::serialize_optional_secret"
+    )]
+    pub auth_token: Option<SecretString>,
+
+    /// Optional path (e.g. "/health") probed with retry during `open()`
+    /// before the connector is considered ready. Leave unset if your target
+    /// has no health endpoint - the probe is skipped, not failed, in that case.
+    pub health_check_path: Option<String>,
+
+    pub batch_size: Option<u32>,
+    pub poll_interval: Option<String>,
+    pub timeout: Option<String>,
+    pub max_retries: Option<u32>,
+    pub retry_delay: Option<String>,
+    pub retry_max_delay: Option<String>,
+    pub max_open_retries: Option<u32>,
+    pub open_retry_max_delay: Option<String>,
+    pub circuit_breaker_threshold: Option<u32>,
+    pub circuit_breaker_cool_down: Option<String>,
+
+    /// Upgrades the per-poll log line from `debug!` to `info!`. Mirrors the
+    /// runtime's own `verbose` flag; keep the field name `verbose_logging`
+    /// (see `postgres_source::PostgresSourceConfig::verbose_logging`).
+    pub verbose_logging: Option<bool>,
+}
+
+// ── Internal state ──────────────────────────────────────────────────────────
+
+/// Read cursor. Kept as a plain `Option<String>` so it fits whatever ordering
+/// field your source uses (a timestamp, an auto-increment ID, an opaque
+/// pagination token, ...) - stringify it however makes sense for your data.
+///
+/// `new()` starts with `cursor: None` when no state exists or the stored state
+/// does not deserialize, so `fetch_records()` must define what `None` means.
+/// If the saved cursor is only valid for one endpoint, table or topic, add that
+/// identity as a field and drop the restored state in `new()` when it differs
+/// from the config; a cursor from another source would skip or repeat data.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct State {
+    cursor: Option<String>,
+}
+
+/// One record as fetched from the external system, before it's turned into
+/// an Iggy message. Replace the `payload` type with whatever your
+/// `fetch_records()` actually produces.
+struct FetchedRecord {
+    /// The value `cursor` should advance to once this record's batch is
+    /// acknowledged - typically this record's timestamp/ID/token. Values must
+    /// be unique and strictly increasing in fetch order: `fetch_records()`
+    /// resumes after the last one sent, so a repeated value after a bad record
+    /// would skip or repeat records.
+    cursor_value: String,
+    /// TODO(ConnectorDeveloper): set this from a true per-record identity -
+    /// a numeric row PK, a hash of a document `_id`, an event UUID the
+    /// upstream system itself assigned - so `ProducedMessage.id` below is
+    /// stable across a NACK-triggered redelivery of this same record. A
+    /// *fresh* random id per emit defeats a downstream sink's dedup-by-id
+    /// (see `connector-pr-review` B5): a redelivered row would arrive with a
+    /// different id than its first delivery, so a sink keying its upsert on
+    /// `message.id` would store it twice instead of overwriting. Leave this
+    /// `None` only when records genuinely have no natural per-record
+    /// identity (a pure generator, e.g. `random_source`) - `cursor_value`
+    /// alone usually isn't it either, since a timestamp-based cursor is
+    /// commonly shared by more than one record.
+    natural_id: Option<u128>,
+    /// The record as JSON, or why the row could not be converted (a value the
+    /// target type cannot hold, an unsupported column type, a malformed field).
+    /// Use `Error::InvalidRecordValue` for a record that is bad. `poll()` never
+    /// moves the cursor past an `Err` record: it sends the records before it and
+    /// stops, and a bad record at the front of a batch fails the poll, so the
+    /// problem stays in the error log instead of the record being lost.
+    payload: Result<serde_json::Value, Error>,
+}
+
+#[derive(Debug)]
+pub struct TemplateSource {
+    id: u32,
+    config: TemplateSourceConfig,
+    client: Option<ClientWithMiddleware>,
+    circuit_breaker: Arc<CircuitBreaker>,
+    batch_size: u32,
+    poll_interval: Duration,
+    retry_delay: Duration,
+    verbose: bool,
+    state: Mutex<State>,
+    pending_state: Mutex<Option<State>>,
+}
+
+impl TemplateSource {
+    pub fn new(id: u32, config: TemplateSourceConfig, state: Option<ConnectorState>) -> Self {
+        let poll_interval = parse_duration(config.poll_interval.as_deref(), DEFAULT_POLL_INTERVAL);
+        let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
+        let circuit_breaker = Arc::new(CircuitBreaker::new(
+            config
+                .circuit_breaker_threshold
+                .unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD),
+            parse_duration(
+                config.circuit_breaker_cool_down.as_deref(),
+                DEFAULT_CIRCUIT_BREAKER_COOL_DOWN,
+            ),
+        ));
+        let batch_size = config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
+        let verbose = config.verbose_logging.unwrap_or(false);
+
+        let restored_state = state
+            .and_then(|s| s.deserialize::<State>(CONNECTOR_NAME, id))
+            .inspect(|s| {
+                info!(
+                    "Restored state for {CONNECTOR_NAME} connector with ID: {id}. Cursor: {:?}",
+                    s.cursor
+                );
+            });
+
+        Self {
+            id,
+            config,
+            client: None,
+            circuit_breaker,
+            batch_size,
+            poll_interval,
+            retry_delay,
+            verbose,
+            state: Mutex::new(restored_state.unwrap_or_default()),
+            pending_state: Mutex::new(None),
+        }
+    }
+
+    fn serialize_state(&self, state: &State) -> Option<ConnectorState> {
+        ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
+    }
+
+    /// Builds the plain `reqwest::Client` that `open()` wraps in the retry
+    /// middleware. Use `self.config.auth_token` here if the source needs one.
+    /// A non-HTTP backend replaces this; see the README, Path B.
+    fn build_raw_client(&self) -> Result<reqwest::Client, Error> {
+        let timeout = parse_duration(self.config.timeout.as_deref(), DEFAULT_TIMEOUT);
+        reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|e| Error::Connection(format!("failed to build HTTP client: {e}")))
+    }
+
+    /// TODO(ConnectorDeveloper): fetch up to `self.batch_size` new records from your
+    /// external system, ordered after `cursor` (`None` means "from the
+    /// beginning" or "from now" - whichever is right for your source).
+    /// Use `self.config.connection_string` as the base address and
+    /// `self.client` (already retry-wrapped) to make the request. Map each
+    /// result row/document/event to a `FetchedRecord`, using something that
+    /// monotonically increases (a timestamp, an ID, a page token) as
+    /// `cursor_value` so the state-staging logic in `stage_batch()` below can
+    /// advance the cursor correctly, and set `natural_id` from a true
+    /// per-record identity if one exists (see the field's own doc comment).
+    async fn fetch_records(
+        &self,
+        client: &ClientWithMiddleware,
+        cursor: Option<&str>,
+    ) -> Result<Vec<FetchedRecord>, Error> {
+        let _ = (client, cursor); // remove once implemented
+        Err(Error::InitError(
+            "TemplateSource::fetch_records is not implemented yet - see the TODO(ConnectorDeveloper) comment \
+             in source_template/src/lib.rs"
+                .to_string(),
+        ))
+    }
+    /// Turns fetched records into messages and stages the cursor that follows them.
+    ///
+    /// The first record that cannot be converted ends the batch: the cursor stays
+    /// before it, so it is never skipped and never lost. When it is the first
+    /// record, there is nothing to send and the poll fails with that error, which
+    /// `poll_interval` paces.
+    async fn stage_batch(
+        &self,
+        cursor: Option<String>,
+        records: Vec<FetchedRecord>,
+    ) -> Result<ProducedMessages, Error> {
+        let mut messages = Vec::with_capacity(records.len());
+        let mut new_cursor = cursor;
+        for record in records {
+            let payload = record.payload.and_then(|value| {
+                serde_json::to_vec(&value).map_err(|e| Error::Serialization(e.to_string()))
+            });
+            let payload = match payload {
+                Ok(payload) => payload,
+                Err(error) => {
+                    error!(
+                        "{CONNECTOR_NAME} connector with ID: {} cannot convert the record at \
+                         cursor {}, not moving past it: {error}",
+                        self.id, record.cursor_value
+                    );
+                    if messages.is_empty() {
+                        return Err(error);
+                    }
+                    break;
+                }
+            };
+            new_cursor = Some(record.cursor_value);
+            messages.push(ProducedMessage {
+                id: record.natural_id,
+                headers: None,
+                checksum: None,
+                timestamp: None,
+                origin_timestamp: None,
+                payload,
+            });
+        }
+
+        let candidate_state = State { cursor: new_cursor };
+        let persisted_state = self.serialize_state(&candidate_state).ok_or_else(|| {
+            Error::Serialization(format!(
+                "failed to serialize state for {CONNECTOR_NAME} connector with ID: {}",
+                self.id
+            ))
+        })?;
+        *self.pending_state.lock().await = Some(candidate_state);
+
+        if self.verbose {
+            info!(
+                "{CONNECTOR_NAME} connector with ID: {} produced {} messages",
+                self.id,
+                messages.len()
+            );
+        } else {
+            debug!(
+                "{CONNECTOR_NAME} connector with ID: {} produced {} messages",
+                self.id,
+                messages.len()
+            );
+        }
+
+        Ok(ProducedMessages {
+            schema: Schema::Json,
+            messages,
+            state: Some(persisted_state),
+        })
+    }
+}
+
+// ── Source trait ────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl Source for TemplateSource {
+    async fn open(&mut self) -> Result<(), Error> {
+        // Structural validation happens here, not in `new()`, because only
+        // `open()` can return an error - `new()` is a plain factory function
+        // with nowhere to send a "this config is invalid" result.
+        if self
+            .config
+            .connection_string
+            .expose_secret()
+            .trim()
+            .is_empty()
+        {
+            return Err(Error::InvalidConfigValue(
+                "connection_string must not be empty".to_string(),
+            ));
+        }
+
+        info!(
+            "Opening {CONNECTOR_NAME} connector with ID: {}, batch_size: {}, poll_interval: {:?}",
+            self.id, self.batch_size, self.poll_interval
+        );
+
+        let raw_client = self.build_raw_client()?;
+
+        if let Some(health_path) = &self.config.health_check_path {
+            let base = Url::parse(self.config.connection_string.expose_secret()).map_err(|e| {
+                Error::InvalidConfigValue(format!("connection_string is not a valid URL: {e}"))
+            })?;
+            let health_url = base.join(health_path).map_err(|e| {
+                Error::InvalidConfigValue(format!("invalid health_check_path: {e}"))
+            })?;
+            check_connectivity_with_retry(
+                &raw_client,
+                health_url,
+                CONNECTOR_NAME,
+                self.id,
+                RetryPolicy {
+                    max_attempts: self
+                        .config
+                        .max_open_retries
+                        .unwrap_or(DEFAULT_MAX_OPEN_RETRIES),
+                    base_delay: self.retry_delay,
+                    max_delay: parse_duration(
+                        self.config.open_retry_max_delay.as_deref(),
+                        DEFAULT_OPEN_RETRY_MAX_DELAY,
+                    ),
+                },
+            )
+            .await?;
+        } else {
+            warn!(
+                "{CONNECTOR_NAME} connector with ID: {} has no health_check_path configured - \
+                 skipping the startup connectivity probe. Consider adding one.",
+                self.id
+            );
+        }
+
+        self.client = Some(build_retry_client(
+            raw_client,
+            self.config
+                .max_retries
+                .unwrap_or(DEFAULT_MAX_RETRIES)
+                .max(1),
+            self.retry_delay,
+            parse_duration(
+                self.config.retry_max_delay.as_deref(),
+                DEFAULT_RETRY_MAX_DELAY,
+            ),
+            CONNECTOR_NAME,
+        ));
+
+        info!(
+            "{CONNECTOR_NAME} connector with ID: {} opened successfully",
+            self.id
+        );
+        Ok(())
+    }
+
+    async fn poll(&self) -> Result<ProducedMessages, Error> {
+        // If the breaker is open, sleep for the normal poll interval and
+        // return an empty (not an error) result. Returning `Err` here would
+        // make the SDK call `poll()` again immediately with no delay - see
+        // `handle_messages` in the SDK's source container - so an empty batch
+        // (sent with no state, so it is ACKed) is how a source waits out a
+        // known-bad window without busy-looping.
+        if self.circuit_breaker.is_open().await {
+            warn!(
+                "{CONNECTOR_NAME} connector with ID: {} - circuit breaker OPEN, skipping poll",
+                self.id
+            );
+            tokio::time::sleep(self.poll_interval).await;
+            return Ok(ProducedMessages {
+                schema: Schema::Json,
+                messages: Vec::new(),
+                state: None,
+            });
+        }
+        // Sleeping before every fetch caps throughput at `batch_size` per `poll_interval`.
+        tokio::time::sleep(self.poll_interval).await;
+
+        let client = self.client.as_ref().ok_or_else(|| {
+            Error::Connection("client not initialized -- was open() called?".into())
+        })?;
+        let cursor = self.state.lock().await.cursor.clone();
+
+        let records = match self.fetch_records(client, cursor.as_deref()).await {
+            Ok(records) => {
+                self.circuit_breaker.record_success();
+                records
+            }
+            Err(err) => {
+                if !err.is_permanent() {
+                    self.circuit_breaker.record_failure().await;
+                }
+                return Err(err);
+            }
+        };
+
+        if records.is_empty() {
+            return Ok(ProducedMessages {
+                schema: Schema::Json,
+                messages: Vec::new(),
+                state: None,
+            });
+        }
+
+        self.stage_batch(cursor, records).await
+    }
+
+    /// The staged cursor from `poll()` is only committed here, and only on
+    /// an ACK. A NACK (delivery failed, state-save failed, runtime is
+    /// shutting down) discards the candidate so the same range is re-polled
+    /// next time - the cursor never moves past data that wasn't confirmed
+    /// delivered. If `fetch_records()` ever needs to perform a destructive
+    /// read against the source (delete-after-read, mark-as-processed),
+    /// stage that side effect the same way and only apply it here on `Ack`.
+    /// A missing runtime result does not produce a synthetic NACK - the SDK
+    /// just keeps waiting (warning past ~30s) rather than guessing.
+    ///
+    /// If you add real I/O here (an external ack call, a delete, a mark-
+    /// processed update), two things from a real connector's review history
+    /// apply directly:
+    ///
+    /// 1. `on_batch_result` has no SDK-enforced deadline, but the SDK will
+    ///    not call `poll()` again until it returns - slow I/O here silently
+    ///    stalls the whole source, it doesn't fail loudly. If you stage more
+    ///    than one operation, budget for *all* of them (a per-item retry
+    ///    budget multiplies with the item count), and reject
+    ///    `max_retries`/`retry_delay` combinations in `open()` that would
+    ///    make that stall unbounded. See `connector-pr-review` B11.
+    /// 2. A failed op must not be silently logged while the batch is still
+    ///    ACKed - the cursor has already committed past it by the time you
+    ///    find out. Count consecutive failures and return `Err` past a
+    ///    threshold so the SDK stops the source, instead of resending the
+    ///    same broken operation forever. A source whose input genuinely
+    ///    cannot be replayed after restart should instead override
+    ///    `batch_policy()` with `BatchPolicy::with_max_consecutive_nacks(None)`
+    ///    rather than relying on the default 5-consecutive-Nack stop.
+    async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
+        let candidate_state = self.pending_state.lock().await.take();
+        if result == SourceBatchResult::Ack
+            && let Some(candidate_state) = candidate_state
+        {
+            *self.state.lock().await = candidate_state;
+        }
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<(), Error> {
+        let state = self.state.lock().await;
+        info!(
+            "{CONNECTOR_NAME} connector with ID: {} closed. Cursor: {:?}",
+            self.id, state.cursor
+        );
+        drop(state);
+        self.client = None;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> TemplateSourceConfig {
+        TemplateSourceConfig {
+            connection_string: SecretString::from("https://api.example.com"),
+            auth_token: None,
+            health_check_path: None,
+            batch_size: Some(50),
+            poll_interval: Some("50ms".to_string()),
+            timeout: Some("5s".to_string()),
+            max_retries: Some(2),
+            retry_delay: Some("10ms".to_string()),
+            retry_max_delay: Some("100ms".to_string()),
+            max_open_retries: Some(2),
+            open_retry_max_delay: Some("100ms".to_string()),
+            circuit_breaker_threshold: Some(3),
+            circuit_breaker_cool_down: Some("50ms".to_string()),
+            verbose_logging: None,
+        }
+    }
+
+    fn good_record(cursor_value: &str) -> FetchedRecord {
+        FetchedRecord {
+            cursor_value: cursor_value.to_string(),
+            natural_id: None,
+            payload: Ok(serde_json::json!({ "cursor": cursor_value })),
+        }
+    }
+
+    fn bad_record(cursor_value: &str) -> FetchedRecord {
+        FetchedRecord {
+            cursor_value: cursor_value.to_string(),
+            natural_id: None,
+            payload: Err(Error::InvalidRecordValue(format!(
+                "cannot convert {cursor_value}"
+            ))),
+        }
+    }
+
+    fn staged_cursor(produced: &ProducedMessages) -> Option<String> {
+        let state = produced
+            .state
+            .as_ref()
+            .expect("a batch with messages stages state");
+        rmp_serde::from_slice::<State>(&state.0)
+            .expect("staged state deserializes")
+            .cursor
+    }
+
+    #[tokio::test]
+    async fn given_bad_record_after_good_ones_should_send_the_good_ones_and_stop_before_it() {
+        let source = TemplateSource::new(1, test_config(), None);
+        let records = vec![
+            good_record("c1"),
+            good_record("c2"),
+            bad_record("c3"),
+            good_record("c4"),
+        ];
+
+        let produced = source
+            .stage_batch(None, records)
+            .await
+            .expect("records before the bad one are sent");
+
+        assert_eq!(produced.messages.len(), 2);
+        assert_eq!(staged_cursor(&produced), Some("c2".to_string()));
+        let pending = source.pending_state.lock().await.clone();
+        assert_eq!(
+            pending.and_then(|state| state.cursor),
+            Some("c2".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn given_bad_first_record_should_fail_without_staging_a_cursor() {
+        let source = TemplateSource::new(1, test_config(), None);
+
+        let error = source
+            .stage_batch(
+                Some("c0".to_string()),
+                vec![bad_record("c1"), good_record("c2")],
+            )
+            .await
+            .expect_err("the cursor must not pass a record that cannot be converted");
+
+        assert!(
+            matches!(error, Error::InvalidRecordValue(_)),
+            "got {error:?}"
+        );
+        assert!(source.pending_state.lock().await.is_none());
+    }
+
+    #[test]
+    fn given_secrets_in_config_should_not_appear_in_debug_output() {
+        let mut config = test_config();
+        config.connection_string = SecretString::from("https://user:hunter2@example.com");
+        config.auth_token = Some(SecretString::from("tok-9f3a"));
+        let source = TemplateSource::new(1, config, None);
+
+        let rendered = format!("{source:?}");
+
+        assert!(
+            !rendered.contains("hunter2"),
+            "connection string leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("tok-9f3a"),
+            "auth token leaked: {rendered}"
+        );
+    }
+
+    #[test]
+    fn given_unknown_config_key_should_be_rejected() {
+        let config = serde_json::json!({
+            "connection_string": "https://api.example.com",
+            "unknown_knob": 10,
+        });
+
+        assert!(serde_json::from_value::<TemplateSourceConfig>(config).is_err());
+    }
+
+    #[test]
+    fn given_numeric_knobs_as_json_numbers_should_deserialize() {
+        let config: TemplateSourceConfig = serde_json::from_value(serde_json::json!({
+            "connection_string": "https://api.example.com",
+            "batch_size": 10,
+            "max_retries": 2,
+            "max_open_retries": 3,
+            "circuit_breaker_threshold": 4,
+            "verbose_logging": true,
+        }))
+        .expect("numbers and booleans must not need to be strings");
+
+        assert_eq!(config.batch_size, Some(10));
+        assert_eq!(config.circuit_breaker_threshold, Some(4));
+        assert_eq!(config.verbose_logging, Some(true));
+    }
+
+    // Relies on the stub `fetch_records()` failing. Rewrite it against a failing fetch of your own.
+    #[tokio::test(start_paused = true)]
+    async fn given_persistent_fetch_failure_should_wait_poll_interval_between_polls() {
+        let mut source = TemplateSource::new(1, test_config(), None);
+        source.open().await.expect("open without a health probe");
+        let started = tokio::time::Instant::now();
+
+        for _ in 0..3 {
+            source
+                .poll()
+                .await
+                .expect_err("the stub fetch always fails");
+        }
+        let after_failures = started.elapsed();
+        let paused = source
+            .poll()
+            .await
+            .expect("an open breaker returns an empty batch");
+
+        assert!(
+            after_failures >= 3 * source.poll_interval,
+            "polls spun: {after_failures:?}"
+        );
+        assert!(paused.messages.is_empty());
+        assert!(started.elapsed() >= 4 * source.poll_interval);
+    }
+
+    #[test]
+    fn given_verbose_logging_enabled_should_set_verbose_flag() {
+        let mut config = test_config();
+        config.verbose_logging = Some(true);
+        let source = TemplateSource::new(1, config, None);
+        assert!(source.verbose);
+    }
+
+    #[test]
+    fn given_verbose_logging_disabled_should_not_set_verbose_flag() {
+        let source = TemplateSource::new(1, test_config(), None);
+        assert!(!source.verbose);
+    }
+
+    #[tokio::test]
+    async fn given_empty_connection_string_should_reject_open() {
+        let mut config = test_config();
+        config.connection_string = SecretString::from("   ");
+        let mut source = TemplateSource::new(1, config, None);
+        let result = source.open().await;
+        assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
+    }
+
+    #[tokio::test]
+    async fn given_no_state_should_start_fresh() {
+        let source = TemplateSource::new(1, test_config(), None);
+        assert_eq!(source.state.lock().await.cursor, None);
+    }
+
+    #[tokio::test]
+    async fn given_persisted_state_should_restore_cursor() {
+        let state = State {
+            cursor: Some("2024-01-01T00:00:00Z".to_string()),
+        };
+        let serialized = rmp_serde::to_vec(&state).expect("failed to serialize state");
+        let source = TemplateSource::new(1, test_config(), Some(ConnectorState(serialized)));
+        assert_eq!(
+            source.state.lock().await.cursor,
+            Some("2024-01-01T00:00:00Z".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn given_invalid_state_should_start_fresh() {
+        let source = TemplateSource::new(
+            1,
+            test_config(),
+            Some(ConnectorState(b"not valid msgpack".to_vec())),
+        );
+        assert_eq!(source.state.lock().await.cursor, None);
+    }
+
+    #[test]
+    fn state_should_be_serializable_and_deserializable() {
+        let original = State {
+            cursor: Some("2024-01-01T00:00:00Z".to_string()),
+        };
+
+        let serialized = rmp_serde::to_vec(&original).expect("failed to serialize state");
+        let deserialized: State =
+            rmp_serde::from_slice(&serialized).expect("failed to deserialize state");
+
+        assert_eq!(original.cursor, deserialized.cursor);
+    }
+
+    #[tokio::test]
+    async fn given_ack_when_batch_is_staged_should_commit_candidate_state() {
+        let source = TemplateSource::new(1, test_config(), None);
+        *source.pending_state.lock().await = Some(State {
+            cursor: Some("next-cursor".to_string()),
+        });
+
+        source
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("ACK should be applied");
+
+        assert_eq!(
+            source.state.lock().await.cursor,
+            Some("next-cursor".to_string())
+        );
+        assert!(source.pending_state.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn given_nack_when_batch_is_staged_should_keep_committed_state() {
+        let source = TemplateSource::new(1, test_config(), None);
+        *source.pending_state.lock().await = Some(State {
+            cursor: Some("next-cursor".to_string()),
+        });
+
+        source
+            .on_batch_result(SourceBatchResult::Nack)
+            .await
+            .expect("NACK should be applied");
+
+        // The committed cursor is unchanged (still None) - the candidate is
+        // simply discarded so the same range is polled again.
+        assert_eq!(source.state.lock().await.cursor, None);
+        assert!(source.pending_state.lock().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_open_circuit_breaker_should_return_empty_without_error() {
+        let source = TemplateSource::new(1, test_config(), None);
+        source.circuit_breaker.record_failure().await;
+        source.circuit_breaker.record_failure().await;
+        source.circuit_breaker.record_failure().await;
+        assert!(source.circuit_breaker.is_open().await);
+
+        let result = source
+            .poll()
+            .await
+            .expect("open breaker should not error poll()");
+        assert!(result.messages.is_empty());
+        assert!(result.state.is_none());
+    }
+}

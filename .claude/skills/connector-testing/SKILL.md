@@ -54,7 +54,7 @@ fn given_payload_json_should_serialize_correctly() { ... }
 
 You may **omit one part** when the test is small (`given_X_should_Y` instead of full `given_X_when_Y_should_Z`), but **stay consistent within a file**. Imperative `test_foo` / `does_bar` names are not the convention here.
 
-A test whose subject is a **type** rather than a scenario has no "given" to name, and drops the prefix: it reads `<subject>_should_<property>`. The canonical state round trip below is `state_should_be_serializable_and_deserializable` in all three shipped sources (`random_source`, `postgres_source`, `http_source`). Leave those as they are rather than bending them into the scenario form.
+A test whose subject is a **type** rather than a scenario has no "given" to name, and drops the prefix: it reads `<subject>_should_<property>`. The canonical state round trip below is `state_should_be_serializable_and_deserializable` in the shipped sources (`random_source`, `postgres_source`, `http_source`, `elasticsearch_source`, `source_template`). Leave those as they are rather than bending them into the scenario form.
 
 ### Prove a test can fail, before trusting it
 
@@ -100,17 +100,23 @@ fn test_config() -> RandomSourceConfig {
 
 ### Async testing pattern
 
-The trait methods are `async`. For unit tests, build a runtime locally - don't add `#[tokio::test]` in `src/lib.rs` (it pulls test macros into prod build):
+The trait methods are `async`. Prefer `#[tokio::test]` directly on the test fn - `#[cfg(test)]`
+gates the whole module out of a plain `cargo build`, and this workspace's resolver (`resolver = "3"`
+in the root `Cargo.toml`, tied to the edition-2024 crates here) keeps `tokio`'s `test-util`/`macros`
+dev-dependency features out of that build too, so there's no prod-build leak to avoid. This is also
+the dominant pattern in-tree
+(`postgres_source::tests` uses `#[tokio::test]` throughout, no manual runtime):
 
 ```rust
-#[test]
-fn given_X_should_Y() {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    runtime.block_on(async {
-        // await calls here
-    });
+#[tokio::test]
+async fn given_x_should_y() {
+    // await calls directly, no manual Runtime::new()
 }
 ```
+
+A manual `tokio::runtime::Runtime::new().unwrap().block_on(...)` inside a plain `#[test]` still
+works and you'll see it in some older plugin tests (`random_source`), but don't ask for it in
+review - it's equivalent, not a correctness requirement.
 
 ### Mandatory: four canonical source state tests
 
@@ -177,6 +183,82 @@ fn given_invalid_state_should_refuse_to_open() {
 ```
 
 Name the test for whichever it is and say why in a comment. What is never right is starting fresh silently when the state that was discarded was load-bearing.
+
+### Canonical tests beyond state
+
+Review history shows the same defects across unrelated connectors. Each has a test that
+proves the fix, and a reviewer should find it in the PR.
+
+**Already in `sink_template` and `source_template`.** Copy them and keep them green:
+
+| Test | Catches |
+| --- | --- |
+| `given_secrets_in_config_should_not_appear_in_debug_output` | A derived `Debug` printing a credential. Wrap third-party clients that derive `Debug` in a newtype with a manual one. |
+| `given_unknown_config_key_should_be_rejected` | A typo in a config key silently doing nothing. |
+| `given_numeric_knobs_as_json_numbers_should_deserialize` | A numeric or boolean knob typed `Option<String>`, which fails when it arrives from an env override as a number. |
+| `given_persistent_fetch_failure_should_wait_poll_interval_between_polls` (source) | A failing poll that spins without backoff. It relies on the stub fetch failing, so rewrite it against a failing fetch of your own. |
+| `given_bad_record_after_good_ones_should_send_the_good_ones_and_stop_before_it`, `given_bad_first_record_should_fail_without_staging_a_cursor` (source) | A cursor that moves past a record that could not be converted. |
+| `given_at_least_once_when_a_chunk_is_rejected_for_good_should_fail_the_call` (sink) | A permanent rejection skipped while the runtime stores the offset past it. |
+
+**Write these for your backend.** The templates cannot contain them, because they need the backend.
+Name each one in the PR description.
+
+```rust
+// Incremental sources: rows that share a cursor value must not be skipped at a batch boundary.
+#[tokio::test]
+async fn given_equal_cursor_values_across_a_batch_boundary_should_not_skip_rows() {
+    let backend = FakeBackend::with_rows(vec![row(1, "t1"), row(2, "t1"), row(3, "t1"), row(4, "t2")]);
+    let source = source_with_batch_size(&backend, 2);
+
+    let first = poll_and_ack(&source).await;
+    let second = poll_and_ack(&source).await;
+
+    assert_eq!(ids(&[first, second]), vec![1, 2, 3, 4], "no row lost, none read twice");
+}
+
+// Persisted state names what it belongs to, so a reconfigured connector does not resume
+// another target's cursor.
+#[test]
+fn given_state_for_another_target_should_not_be_reused() {
+    let state = State { target: "orders".into(), cursor: Some("42".into()) };
+    let source = MySource::new(1, config_for("invoices"), Some(serialize(&state)));
+    assert_eq!(source.restored_cursor(), None);
+}
+
+// Every type the backend can return converts exactly, or fails loudly. Never a silent null.
+#[test]
+fn given_every_backend_type_should_convert_exactly_or_fail_loudly() {
+    for (case, native, expected) in [
+        ("max bigint", Native::Int(i64::MAX), Ok(json!(i64::MAX))),
+        ("reserved null sentinel", Native::Int(i64::MIN), Err(())),
+        ("wide decimal", Native::Decimal("99999999999999999.5"), Ok(json!("99999999999999999.5"))),
+        ("nan", Native::Float(f64::NAN), Err(())),
+        ("unsupported", Native::Geometry(vec![0]), Err(())),
+    ] {
+        assert_eq!(convert(&native).map_err(|_| ()), expected, "{case}");
+    }
+}
+
+// Names built from config or message data cannot collide.
+#[test]
+fn given_distinct_inputs_should_never_sanitize_to_the_same_key() {
+    for (a, b) in [("a b", "a_b"), ("a/b", "a%2Fb"), ("..", "_.")] {
+        assert_ne!(object_key(a), object_key(b), "{a:?} and {b:?} collide");
+    }
+}
+
+// A 2xx whose body reports per-item failures is a failed call.
+#[tokio::test]
+async fn given_per_item_failure_in_a_success_response_should_fail_the_call() {
+    let backend = FakeBackend::answering(200, json!({ "errors": true, "items": [{ "index": { "error": {} } }] }));
+    let result = sink_for(&backend).consume(&topic(), metadata(), messages(1)).await;
+    assert!(result.is_err());
+}
+```
+
+Also cover, with the same shape: a startup probe that works with the narrowest credential the
+connector documents (a write-only key must still open it), and an env-override round trip through
+the integration harness for every numeric and boolean knob.
 
 ### Sink unit tests
 
@@ -401,12 +483,11 @@ Integration tests assume Docker is available locally and pull images from a publ
 1. **Skipping integration tests for a real-infra plugin.** Unit tests don't catch FFI/lifecycle/encoding regressions.
 2. **Forgetting the four canonical source state tests.** This is the most common review comment.
 3. **Mocking the client library** instead of using `testcontainers` - test exercises the mock.
-4. **`#[tokio::test]` in `src/lib.rs`** - pulls tokio test macros into prod build. Use `Runtime::new()` instead. (`#[tokio::test]` is fine in `tests/` directories, which compile separately.)
-5. **`unwrap()` in test assertions** - prefer `assert_eq!` / `expect("descriptive")` so failures tell you which step blew up.
-6. **Tests depending on system time** - inject the clock or use `tokio::time::pause()`.
-7. **Hidden coupling via shared globals** (static `AtomicU64`, env vars) - tests must be independent and parallelizable.
-8. **Asserting on `Display` of an error** - use `matches!(err, Error::Variant(_))`. `assert_eq!(err.to_string(), ...)` breaks on message tweaks.
-9. **Sleeping a fixed duration** instead of polling - causes flakes when CI is slow.
+4. **`unwrap()` in test assertions** - prefer `assert_eq!` / `expect("descriptive")` so failures tell you which step blew up.
+5. **Tests depending on system time** - inject the clock or use `tokio::time::pause()`.
+6. **Hidden coupling via shared globals** (static `AtomicU64`, env vars) - tests must be independent and parallelizable.
+7. **Asserting on `Display` of an error** - use `matches!(err, Error::Variant(_))`. `assert_eq!(err.to_string(), ...)` breaks on message tweaks.
+8. **Sleeping a fixed duration** instead of polling - causes flakes when CI is slow.
 
 ## Examples worth copying
 

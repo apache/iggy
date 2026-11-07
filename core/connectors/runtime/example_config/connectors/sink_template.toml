@@ -1,0 +1,68 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "sink"
+key = "template"
+# Disabled until `connection_string` and the plugin code are filled in: a template
+# plugin cannot deliver anything yet. Set it to true once it can.
+enabled = false
+version = 0
+name = "Template sink"
+path = "target/release/libiggy_connector_template_sink"
+plugin_config_format = "toml"
+verbose = false
+
+[[streams]]
+stream = "example_stream"
+topics = ["example_topic"]
+schema = "json"
+batch_length = 100
+# Long poll: the server answers once `min_count` messages are ready or `max_wait`
+# expires. These replace `poll_interval`, which the runtime refuses for sinks.
+# Waiting for a full batch means fewer, larger writes to the destination, and an
+# idle topic costs one request per `max_wait`. `min_count` must not exceed
+# `batch_length`; `max_wait` must be above zero. The server shortens a longer
+# wait to its `deferred_poll_max_wait` (default 30s).
+max_wait = "2s"
+min_count = 100
+consumer_group = "template_sink_connector"
+
+[plugin_config]
+connection_string = "https://api.example.com"
+target = "events"
+health_check_path = "/health"
+batch_size = 100
+timeout = "30s"
+max_retries = 3
+retry_delay = "500ms"
+retry_max_delay = "5s"
+max_open_retries = 10
+open_retry_max_delay = "60s"
+circuit_breaker_threshold = 3
+# Must be shorter than `max_delivery_time`; `open()` rejects the config otherwise.
+circuit_breaker_cool_down = "10s"
+# How long one `consume()` call keeps trying before it gives up on its messages. Keep it
+# well under a minute: the call blocks a runtime worker thread, and a stop waits for it.
+max_delivery_time = "20s"
+verbose_logging = false
+
+# Delivery guarantee (a table of the connector config, not of `plugin_config`). By default the
+# server stores the offset when it answers a poll, so a batch that `consume()` fails is lost.
+# With "at_least_once" the runtime stores it after `consume()` succeeds and hands a failed
+# batch over again; a permanent rejection then stops the sink at that offset.
+# [delivery]
+# guarantee = "at_least_once"

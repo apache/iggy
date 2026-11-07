@@ -101,17 +101,17 @@ Don't mix.
 
 - File path: `{state_path}/source_{connector_key}.state`. Mode `0o600` on Unix.
 - `save()` is crash-atomic. `rename(2)` is atomic in the namespace (no observer sees a half-renamed file). the preceding `sync_data` on the tmp file plus the post-rename parent-dir `sync_all` are what make a crash leave either the old or new content - never truncated. The parent-dir fsync failure is propagated as `CannotWriteStateFile` (not swallowed) so a lost rename surfaces instead of silently restarting the source from scratch. A `Mutex<()>` serializes concurrent saves on the same provider.
-- Save after every successful Apache Iggy send. Save failure logs + continues. next batch retries.
+- Save after every successful Apache Iggy send. A save failure NACKs the batch (`set_error` plus the errors counter), the plugin discards its staged state, and the range is re-polled.
 - `load()` returns `Ok(None)` for missing or empty files. After a `NotFound` read, re-stats the parent directory: missing parent -> `Err(CannotOpenStateFile)` so a broken state path fails at init rather than masquerading as "fresh start".
 - Sinks have no state - only sources.
 
 ## Source forwarding loop
 
-1. `iggy_source_handle(id, send_callback)` - plugin registers itself.
-2. Plugin polls + invokes `send_callback(plugin_id, ptr, len)`.
+1. `iggy_source_handle_v2(id, callback)` - plugin registers itself.
+2. Plugin polls + invokes `callback(plugin_id, batch_id, ptr, len)`.
 3. Callback runs in the SDK macro's spawned async task. Pushes postcard `ProducedMessages` into a `flume` channel keyed by `plugin_id` in `SOURCE_SENDERS: Lazy<DashMap<u32, SourceSenderEntry>>` (`pub(crate)`). `SourceSenderEntry` wraps the sender + a pre-extracted owned `Counter` (the `errors` series, `Arc<AtomicU64>` inside). The FFI callback bumps errors on deserialize or channel-closed failure with one relaxed atomic - no `Family` lookup, no `Arc<Metrics>` handle.
 4. The runtime registers the optional source-stop callback, then `source_forwarding_loop` pulls from the channel, deserializes, applies transforms, encodes via `StreamEncoder`, and sends to the Iggy producer. The SDK warns after 30 seconds without a result but keeps the same batch pending; it does not poll or enqueue another copy.
-5. On success, save returned `ConnectorState` via `FileStateProvider`, then return the batch result to the plugin. A result NACK may cause replay with capped backoff.
+5. On success, save returned `ConnectorState` through the `StateStorage` abstraction (`FileStateProvider` is one backend), then return the batch result to the plugin. A result NACK may cause replay with capped backoff.
 6. A stop-callback reason ends the forwarding loop and reports an unexpected stop. Closing the stop channel on normal shutdown disables that select arm, allowing already queued batches to receive results before the forwarding channel disconnects.
 7. At loop exit, clean up `SOURCE_SENDERS` and update status and metrics. A self-stop reports `Error` and removes the source from the running gauge; normal shutdown reports `Stopped`.
 
@@ -131,9 +131,9 @@ Gotchas:
 
 Per `[[streams]]` entry per sink:
 
-1. Build / ensure consumer group `iggy-connect-sink-{key}` (`connect` matches the docker image name `apache/iggy-connect` - see `runtime/src/sink.rs::default_consumer_group`). Overridable via the stream config's `consumer_group`.
+1. Build / ensure consumer group `iggy-connect-sink-{key}` (`connect` matches the docker image name `apache/iggy-connect` - see `setup_sink_consumers` in `runtime/src/sink.rs`). Overridable via the stream config's `consumer_group`.
 2. Spawn one task per topic (`spawn_consume_tasks`).
-3. Poll Iggy → batch messages (default `batch_length = 1000`, the poll `count`). Polls use `CommitPolicy::OnRead`: the server stores the offset of each reply, so a reply lost after that store skips its batch. A `consumer.next()` `Err` (a `ReadError`) bumps `errors` and `continue`s.
+3. Poll Iggy → batch messages (default `batch_length = 1000`, the poll `count`). By default polls use `CommitPolicy::OnRead`: the server stores the offset of each reply, so a reply lost after that store skips its batch. A sink with `[delivery] guarantee = "at_least_once"` polls without storing, and the runtime stores an offset only after the plugin proved the messages delivered (`runtime/src/sink_delivery.rs`). A `consumer.next()` `Err` (a `ReadError`) bumps `errors` and `continue`s.
    The reader retries most errors by itself. For a partition that it stops, `handle_read_error` seeks: after a read with an unknown outcome (`FetchProgressUncertain`, `PartitionLaneBlocked`) it first calls `abandon_operation` and then seeks `Next` (after the stored offset). It seeks the `skip` of a message that does not decode, and `Next` after `HistoryUnavailable`.
 
    It also seeks `Next` after six refusals in a row that a retry does not change (`ReadError::is_lasting_refusal`: `Unauthorized`, a missing stream, topic or partition, and the other lasting refusals). A seek to `Next` stores nothing, so it works while the refusal lasts.
@@ -150,7 +150,7 @@ Stages (both labels snake_case): `decode` (schema decode loop), `prepare` (trans
 Gotchas:
 
 - Batch flushes when a message is the last one in its partition (`message_offset == current_offset`), when the batch is full, OR before a message of another partition, because the plugin gets one partition id per batch. `max_wait` and `min_count` on the stream make the server collect larger replies.
-- The server stores the offset on read (`OnRead`), so sink delivery is at-most-once while the primary stays up: a crash after the poll and before the plugin write loses that batch. A failover before the store replicates can deliver the last batch again.
+- By default the server stores the offset on read (`OnRead`), so sink delivery is at-most-once while the primary stays up (a sink with `[delivery] guarantee = "at_least_once"` is the exception): a crash after the poll and before the plugin write loses that batch and every batch the consumer had already read ahead. A failover before the store replicates can deliver the last batch again.
 - A stop still flushes the batch the loop holds, and the task then awaits `IggyConsumer::shutdown`, which rewinds over the batches the consumer holds. Without either step, the next run skips messages that the polls committed.
 
 ## Logging format
@@ -217,11 +217,11 @@ Fatal errors propagate to `main` and exit. Per-connector / per-message errors ar
 
 All families labeled by `connector_key` + `connector_type` (histogram adds `stage`):
 
-- **Counters**: `iggy_connector_messages_{produced,sent,consumed,processed,filtered}_total` and `iggy_connector_errors_total`. These are the *rendered* names; each is registered without the `_total`, which the OpenMetrics encoder appends.
+- **Counters**: `iggy_connector_messages_{produced,sent,consumed,processed,filtered}_total` and `iggy_connector_errors_total` (no `messages_` in the errors name). These are the *rendered* names; each is registered without the `_total`, which the OpenMetrics encoder appends.
   - `messages_filtered_total` - intentional drops via transform `Ok(None)`.
   - `errors_total` - unexpected drops (decode/encode/build failure, missing field, ...) + batch-level failures, one per failed run.
   - `sink_runs_total` - FFI `consume()` calls for sink batches, one per contiguous payload-variant run. Divide by `stage_duration_seconds_count{stage="total"}` for runs per batch.
-- **Histograms**: `iggy_connector_stage_duration_seconds{stage}` (snake_case stage labels - `prepare`, `ffi`, `decode`, `iggy_send`, `state_save`, `total`). Buckets `STAGE_BUCKETS_SECONDS`. Always populated regardless of any flag. One sample per batch for every stage; `ffi` is summed over the batch's runs. Scraped at `/metrics` when `[http.metrics] enabled = true`.
+- **Histograms**: `iggy_connector_stage_duration_seconds{stage}` (snake_case stage labels - `prepare`, `ffi`, `decode`, `iggy_send`, `state_save`, `total`). Buckets `STAGE_BUCKETS_SECONDS`. Always populated regardless of any flag. `total` is recorded for every batch, the other stages only when processing succeeded; `ffi` is summed over the batch's runs. Scraped at `/metrics` when `[http.metrics] enabled = true`.
 - **Gauges**: `iggy_connectors_{sources,sinks}_{total,running}`.
 
 `/stats` JSON surface mirrors counters per-connector via `ConnectorStats` (`sdk/api.rs`): `messages_filtered`, `errors`, kind-specific counters.

@@ -9,8 +9,13 @@ A **source** is a Rust `cdylib` that implements
 `iggy_connector_sdk::Source` and exposes FFI symbols via the
 `source_connector!` macro. The runtime calls `poll()` in a loop,
 applies transforms, encodes via the configured `Schema`, sends to
-Apache Iggy, and persists the returned `ConnectorState` after every
-successful send.
+Apache Iggy, and persists the state `poll()` returned - but only after
+the send succeeds. Only one batch is ever in flight: the runtime does
+not call `poll()` again until it has reported `Ack` or `Nack` for the
+current one via `on_batch_result()` (source batch acknowledgment, see PR #3855
+for the full contract). See
+[State persistence](#state-persistence-stage-in-poll-commit-in-on_batch_result)
+below.
 
 > **Universal connector rules** (SecretString, benchmark, verbose flag, drop accounting, filter contract, exemplar patterns) live in
 > [connectors-overview](../connectors-overview/SKILL.md). This skill
@@ -27,14 +32,15 @@ successful send.
 
 ## STOP and ask the user before
 
-- Changing the SDK trait surface (`Source::open` / `poll` / `on_batch_result` / `close`) - that's an SDK change.
+- Changing the SDK trait surface (`Source::open` / `poll` / `on_batch_result` / `batch_policy` / `close`) - that's an SDK change, and `poll`/`on_batch_result` are also an FFI change (`iggy_source_handle_v2`, `iggy_source_batch_result` - breaks every pre-built plugin `.so`).
 - Adding a long-running side task in the plugin - the runtime owns lifecycle, and orphans survive `close()`. Sanctioned only where the source is itself a server the runtime cannot drive, as in `http_source`'s listener, and then only with an explicit shutdown in the last `close()` that awaits its tasks before returning.
 - Persisting unbounded state - `State` is rewritten every batch.
 - Adding a source that requires authoritative offsets external to Apache Iggy without coordinating retention.
 
 ## Quick reference
 
-- Skeleton: [TEMPLATE.md](TEMPLATE.md) (load on demand).
+- Skeleton: [TEMPLATE.md](TEMPLATE.md) (steps for copying `sources/source_template`, with an HTTP and a non-HTTP path).
+- PR pre-flight: [connector-pr-review](../connector-pr-review/SKILL.md).
 - Exemplars: `random_source` (minimal + canonical state tests), `postgres_source` (cursor / delete-after-read / processed-column modes, restart-survives-state tests), `elasticsearch_source` (scroll cursor), `influxdb_source` (time-series scan).
 
 ## Hard rules
@@ -72,35 +78,67 @@ callback, so rebuild older source plugins.
   produce a synthetic NACK. A source that replays on `Nack` is at-least-once, not exactly-once.
 - The trait has a **default no-op**, which suits only a source with no staged cursor and no
   destructive work. If `poll()` advances a cursor, deletes rows, or drains an in-memory buffer,
-  omitting this loses data silently and nothing will tell you. `random_source` and `http_source`
-  implement it; the other shipped sources take the default and skip rows on a NACK.
+  omitting this loses data silently and nothing will tell you. Every shipped source overrides it;
+  the default is for a pure generator only.
 - Stage in `poll()`, apply on `Ack`, discard or replay on `Nack`. A source whose input is pushed to
   it, rather than re-readable upstream, has to hold the batch itself: see `http_source`'s staging.
 - Returning `Err` from it stops the source immediately, so it is not a retry signal.
 
-### State persistence
+### State persistence: stage in `poll()`, commit in `on_batch_result()`
 
-- `ConnectorState` is `Vec<u8>` via MessagePack (`rmp_serde`). Use
-  `ConnectorState::serialize(&state, NAME, id)` and
-  `ConnectorState::deserialize::<State>(NAME, id)`.
-- `poll()` must not commit cursors or destructive work. Return messages with candidate state and
-  keep the corresponding work staged.
-- The runtime sends the batch, saves its candidate state to
-  `{state_path}/source_{key}.state`, then calls `on_batch_result(Ack)`. Commit staged in-memory
-  state and external delete or mark operations only on ACK. A NACK discards the candidate so the
-  same data can be polled again.
-- A crash between `poll()` returning and state persistence leaves the prior cursor for the next
-  poll, so downstream must tolerate at-least-once delivery.
-- Cursor sources that stage state until `on_batch_result` can attach state to the corresponding
-  message batch. Control-plane state that is independent of a publish can ride an empty batch
-  instead.
-- Return `state: None` for an empty poll when no watermark changed. If an empty poll advances a
-  watermark, stage and return the new state through the same ACK handshake.
-- The runtime can still NACK an empty batch when state storage is latched or a pending checkpoint
-  cannot resolve. Never treat hand-off as durable; `on_batch_result` reports the outcome.
-- Treat candidate-state serialization failure as a poll error. Do not send messages without the
-  state needed to resume them safely.
+Source connectors use a one-in-flight-batch ACK/NACK contract (#3855)
+between the plugin and the runtime:
+
+1. `poll()` returns messages and *candidate* state without committing
+   cursor changes or destructive operations (deletes, mark-processed).
+2. The runtime sends the batch to Apache Iggy and waits for the
+   producer result.
+3. After a successful send, the runtime persists the candidate state
+   to `{state_path}/source_{key}.state`.
+4. The runtime calls `on_batch_result(SourceBatchResult::Ack)`. A send
+   or state-save failure calls `on_batch_result(SourceBatchResult::Nack)`
+   instead.
+5. `on_batch_result()` commits or discards the plugin's staged work
+   before the next `poll()` starts. The SDK allows only one batch in
+   flight - it will not call `poll()` again until `on_batch_result()`
+   for the current batch has returned.
+
+Canonical pattern (`sources/random_source/src/lib.rs`):
+
+```rust
+pending_state: Mutex<Option<State>>,   // staged, not yet committed
+
+async fn poll(&self) -> Result<ProducedMessages, Error> {
+    // ... fetch ...
+    let candidate_state = State { cursor: next_cursor };
+    *self.pending_state.lock().await = Some(candidate_state.clone());
+    Ok(ProducedMessages {
+        schema: Schema::Json,
+        messages,
+        state: Some(ConnectorState::serialize(&candidate_state, NAME, self.id)?),
+    })
+}
+
+async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
+    let candidate_state = self.pending_state.lock().await.take();
+    if result == SourceBatchResult::Ack
+        && let Some(candidate_state) = candidate_state
+    {
+        *self.state.lock().await = candidate_state;
+    }
+    // Nack: drop candidate_state, committed self.state is untouched -
+    // the same range is polled again.
+    Ok(())
+}
+```
+
+- `ConnectorState` is `Vec<u8>` via MessagePack (`rmp_serde`). Use `ConnectorState::serialize(&state, NAME, id)` + `ConnectorState::deserialize::<State>(NAME, id)`. Both return `Option<T>` and log on failure (non-fatal).
+- **The default `on_batch_result` is a no-op.** Only override it - and only then does staging via `pending_state` matter - if `poll()` advances a cursor or performs destructive work (delete-after-read, mark-processed). A source with no staged work (e.g. a pure generator) can rely on the default.
+- Returning `Err` from `on_batch_result` **stops the SDK from polling further** - a failed rollback must not be allowed to silently advance to the next batch.
+- **Always return state in every `ProducedMessages`**, including empty polls that made progress. Return `state: None` for an empty poll that made *no* progress - this avoids an unnecessary state write and cannot persist state left over from a failed batch.
 - Keep `State` small - rewritten every batch. No unbounded vecs.
+- NACK handling must discard staged cursor changes and staged delete/mark operations so polling redelivers the batch. The SDK retries NACKed batches with capped exponential backoff and stops the source after repeated consecutive NACKs.
+- Crash recovery is at-least-once at every point except after the plugin has processed the ACK (see the SDK README's crash-point table, `core/connectors/sdk/README.md#source-delivery-acknowledgment`, for the full breakdown).
 
 The SDK allows one in-flight batch. Five consecutive NACKs stop a source using
 the default policy and require a manual restart. Returning `Err` from
@@ -127,31 +165,36 @@ Match `ProducedMessages.schema` to the bytes in `messages[i].payload`:
 ### IDs and timestamps
 
 - `ProducedMessage.id: Option<u128>` - set when a natural ID exists (DB PK, document id). It rides the wire as the message id, which is what a **consumer** can dedupe an at-least-once duplicate on.
-- **Iggy itself does not dedupe on that id.** The server's only read of the field is `core/server/src/http/wire.rs`, which mints a fresh uuid when the incoming id is 0 and otherwise passes it through. Its dedup path is a per-client request-id watermark (`dedup_clients_max`) that never looks at this field.
-- `origin_timestamp: Option<u64>` - source-system event time in nanoseconds. Lets downstream sinks reason about lag.
+- **Iggy itself does not dedupe on that id.** The Rust SDK mints a fresh id client-side when the id is 0 (`core/common/src/traits/binary_impls/messages.rs`) and otherwise passes it through. Its dedup path is a per-client request-id watermark (`dedup_clients_max`) that never looks at this field.
+- `origin_timestamp: Option<u64>` - leave `None`. The runtime does not forward it: `build_iggy_message` builds the message with `IggyMessage::builder()`, which stamps the time of sending. The Iggy `origin_timestamp` header is in microseconds, so a unit chosen here would be wrong anyway until the runtime change lands.
 - `timestamp` and `checksum` are Iggy-side - leave `None`.
 
 ### Concurrency
 
 - Runtime spawns ONE `poll()` task per source. No concurrent `poll()`.
+- Only one batch is ever in flight: the SDK does not call `poll()` again until the runtime has reported `Ack`/`Nack` and `on_batch_result()` has returned for the previous batch. Past 30s without a result the SDK only warns and keeps waiting - it does not synthesize a Nack or move on.
 - Don't spawn your own long-running Tokio tasks: the runtime owns lifecycle. The exception is a source that listens rather than polls, which has to own its listener; `http_source` is the worked example, and it shuts its tasks down in the last `close()` rather than leaving them to outlive the connector.
 
 ### Errors
 
-| Scenario                                    | Variant                                           |
-| ------------------------------------------- | ------------------------------------------------- |
-| Bad config in `new()`/`open()`              | `Error::InitError`                                |
-| Cannot reach external system at startup     | `Error::InitError` or `Error::Connection`         |
-| Transient fetch failure (retry-worthy)      | `Error::Connection` or `Error::HttpRequestFailed` |
-| Permanent fetch failure (auth, schema gone) | `Error::PermanentHttpError`                       |
-| Row failed to serialize                     | `Error::Serialization(...)`                       |
-| State serialization failed                  | `Error::Serialization(...)`                       |
+| Scenario                                            | Variant                                           |
+| --------------------------------------------------- | ------------------------------------------------- |
+| Bad config in `new()`/`open()`                      | `Error::InvalidConfigValue`                       |
+| Cannot reach external system at startup             | `Error::InitError` or `Error::Connection`         |
+| Transient fetch failure (retry-worthy)              | `Error::Connection` or `Error::HttpRequestFailed` |
+| Permanent fetch failure (auth, schema gone)         | `Error::PermanentHttpError`                       |
+| Row failed to serialize                             | `Error::Serialization(...)`                       |
+| State serialization failed                          | `Error::Serialization(...)` from `poll()`, nothing sent |
+| `on_batch_result()` failed to roll back staged work | `Err` - stops the SDK from polling further        |
+
+The template's stub `fetch_records()` returns `Error::InitError` as a placeholder. `poll()` counts it toward the breaker, so replace it with a real fetch.
 
 Returning `Err` from `poll()` is only logged by the SDK's FFI bridge
 (`sdk/src/source.rs::handle_messages`) - the loop continues, the next
 `poll()` runs. Connector status does NOT flip to `Error` from a poll
-failure. Status `Error` is set by the runtime only on transform/encode
-failure, Iggy send failure, or state save failure
+failure. Status `Error` is set by the runtime on transform/encode
+failure, Iggy send failure, state save failure, a failed batch-result
+delivery, or an unexpected self-stop such as the NACK limit
 (`runtime/src/source.rs::source_forwarding_loop` calls to
 `context.sources.set_error`). To surface a poll failure as unhealth,
 raise it through the metric counter or escalate to `Error::InitError`
@@ -175,15 +218,21 @@ Iggy consumer-loop labels use literal API names (`offset=`, `current_offset=`).
 1. `async fn poll(&mut self)` - won't compile. Use `&self` + `Mutex<State>`.
 2. Holding `state.lock()` across the fetch I/O - blocks `close()`, causes shutdown timeouts.
 3. Forgetting to sleep - 100% CPU on idle source.
-4. Committing a cursor or deleting source data in `poll()` - stage it and wait for ACK.
-5. Unbounded data in `State` - rewritten every batch. keep O(constant).
-6. `std::sync::Mutex` - blocks the executor. Use `tokio::sync::Mutex`.
-7. Not setting `ProducedMessage.id` when a stable ID exists - leaves a consumer nothing to dedupe a replayed duplicate on. It does not make the write idempotent server-side, because nothing there reads it.
-8. Spawning side tasks - the runtime owns the scheduler. The one exception is a source that listens rather than polls and must own its listener (see [Concurrency](#concurrency) and the STOP list); it owes an explicit shutdown in the last `close()` that awaits its tasks.
+4. Returning `state: None` for an empty poll that *did* make progress (e.g. advanced a watermark) - only a no-progress empty poll should return `None`.
+5. Committing a cursor or destructive work (delete/mark-processed) directly in `poll()` instead of staging it and applying it in `on_batch_result()` on `Ack` - a Nack (send or state-save failure) has nothing to discard, and the batch is redelivered against already-mutated state.
+6. Unbounded data in `State` - rewritten every batch. keep O(constant).
+7. `std::sync::Mutex` - blocks the executor. Use `tokio::sync::Mutex`.
+8. Not setting `ProducedMessage.id` when a stable ID exists - loses idempotency.
+9. Spawning side tasks - the runtime owns the scheduler.
+10. Dropping a record that fails to convert with `continue` while the cursor takes the next record's value. The record is lost silently, and a bad last record is re-fetched forever. Stop before it (fail the poll when it is first), or skip it on purpose with a log line and a counter. `sources/source_template` does the former in `stage_batch()`.
 
 ## Tests
 
-Mandatory four canonical source state tests (see [connector-testing](../connector-testing/SKILL.md) for the full pattern). Copy from `sources/random_source/src/lib.rs::tests`. Plus config defaults, payload building, schema selection.
+Mandatory six canonical source tests (see [connector-testing](../connector-testing/SKILL.md) for the full pattern): the four
+state tests (restore / no-state / invalid-state / round-trip) plus `given_ack_when_batch_is_staged_should_commit_candidate_state`
+and `given_nack_when_batch_is_staged_should_keep_committed_state`. Copy from `sources/random_source/src/lib.rs::tests`. Plus
+config defaults, payload building, schema selection. A source relying on the default no-op `on_batch_result` (no staged work)
+may skip the ack/nack pair.
 
 Integration tests under `core/integration/tests/connectors/<backend>/` for any source backed by external infra. Use `#[iggy_harness]` + a `TestFixture` backed by `testcontainers-modules`. Reference: `core/integration/tests/connectors/postgres/postgres_source.rs` (multi-mode tests) + `restart.rs` (state survives restart). Exercise both ACK and NACK paths when the source stages cursors or destructive work.
 
