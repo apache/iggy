@@ -31,25 +31,25 @@ use uuid::Uuid;
 /// whether the catalog applied an earlier attempt whose response was lost.
 pub(crate) const COMMIT_ID_PROPERTY: &str = "iggy.commit-id";
 
-/// Appends `data_files` to `table` in one snapshot and retries a failed commit
-/// with `retry`. Every retry first looks for the snapshot of an earlier attempt.
+/// Appends `data_files` to `table` in one snapshot, with `properties` in its summary, and
+/// retries a failed commit with `retry`. Every retry first looks for the snapshot of an earlier
+/// attempt.
 pub(crate) async fn commit_data_files(
     table: &Table,
     catalog: &dyn Catalog,
     data_files: Vec<DataFile>,
+    mut properties: HashMap<String, String>,
     retry: RetryPolicy,
 ) -> Result<(), Error> {
     let commit_id = Uuid::new_v4().to_string();
+    properties.insert(COMMIT_ID_PROPERTY.to_owned(), commit_id.clone());
     let transaction = Transaction::new(table);
     // The check reads every manifest of the table at once on each commit, and the data files
     // carry fresh UUID names it could never match.
     let action = transaction
         .fast_append()
         .with_check_duplicate(false)
-        .set_snapshot_properties(HashMap::from([(
-            COMMIT_ID_PROPERTY.to_owned(),
-            commit_id.clone(),
-        )]))
+        .set_snapshot_properties(properties)
         .add_data_files(data_files);
     let transaction = action.apply(transaction).map_err(|err| {
         let chain = format_error_chain(&err);
@@ -82,15 +82,50 @@ pub(crate) async fn commit_data_files(
             failure.attempts,
             chain
         );
-        Error::CatalogCommitError(chain)
+        // A conflict outlasted the table's own retries, so a delivery of the batch again rebuilds
+        // the transaction on fresh metadata. Any other refusal, such as a denied write, fails the
+        // same way every time.
+        if is_transient(&failure.error) || failure.error.kind() == ErrorKind::CatalogCommitConflicts
+        {
+            Error::CatalogCommitError(chain)
+        } else {
+            Error::PermanentHttpError(format!(
+                "The Iceberg catalog refused the commit to table {identifier}: {chain}"
+            ))
+        }
     })
 }
 
-/// A commit that could not reach the catalog, or that the catalog failed or throttled, can pass
-/// on another attempt. A conflict is not retried here: `Transaction::commit` has already retried
-/// it as far as the table's `commit.retry.*` properties allow.
-fn is_transient(error: &iceberg::Error) -> bool {
+/// A catalog call that could not reach the catalog, or that the catalog failed or throttled, can
+/// pass on another attempt. A commit conflict is not retried here: `Transaction::commit` has
+/// already retried it as far as the table's `commit.retry.*` properties allow.
+pub(crate) fn is_transient(error: &iceberg::Error) -> bool {
     error.kind() == ErrorKind::Unexpected && response_status(error).is_none_or(is_transient_status)
+}
+
+/// The error for a table that does not load from the catalog. An unreachable, failing or
+/// throttling catalog is transient. A missing table, or any other refusal such as denied access,
+/// fails the same way until the configuration or the catalog changes.
+pub(crate) fn table_load_error(table: &str, error: &iceberg::Error) -> Error {
+    let reason = format!(
+        "Failed to load Iceberg table {table} from the catalog: {}",
+        format_error_chain(error)
+    );
+    if is_transient(error) {
+        Error::Connection(reason)
+    } else if is_missing(error) {
+        Error::InvalidConfigValue(reason)
+    } else {
+        Error::PermanentHttpError(reason)
+    }
+}
+
+/// Whether a table load failed because the table or its namespace does not exist.
+pub(crate) fn is_missing(error: &iceberg::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::TableNotFound | ErrorKind::NamespaceNotFound
+    )
 }
 
 /// `iceberg-catalog-rest` keeps the status of an answer it did not expect only in the error's
@@ -136,19 +171,25 @@ fn holds_commit(table: &Table, commit_id: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::InvalidRows;
+    use crate::router::redelivery::{Append, HeldMessages, snapshot_properties};
+    use crate::router::{Appender, BatchOrigin, Written};
     use async_trait::async_trait;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType,
         Schema as IcebergSchema, Type,
     };
+    use iceberg::spec::{MAIN_BRANCH, SnapshotReference, SnapshotRetention, TableMetadataBuilder};
     use iceberg::{
         CatalogBuilder, MemoryCatalog, Namespace, NamespaceIdent, TableCommit, TableCreation,
     };
     use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalog, RestCatalogBuilder};
+    use iggy_connector_sdk::{ConsumedMessage, FlushPartition, Payload, Schema, TopicMetadata};
     use std::collections::VecDeque;
+    use std::ops::RangeInclusive;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
@@ -160,6 +201,68 @@ mod tests {
         base_delay: Duration::from_millis(1),
         max_delay: Duration::from_millis(1),
     };
+
+    pub(crate) const SINGLE_ATTEMPT: RetryPolicy = RetryPolicy {
+        max_attempts: 1,
+        ..FAST_RETRY
+    };
+
+    /// A memory catalog holding the table `test.events`, created with `properties`, whose rows
+    /// hold one required `id` column.
+    pub(crate) async fn catalog_with_table(
+        properties: HashMap<String, String>,
+    ) -> (MemoryCatalog, Table) {
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_owned(),
+                    "memory://warehouse".to_owned(),
+                )]),
+            )
+            .await
+            .expect("Failed to create catalog");
+        let namespace = NamespaceIdent::new("test".to_owned());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .expect("Failed to create namespace");
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .expect("Failed to build schema");
+        let table = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("events".to_owned())
+                    .schema(schema)
+                    .properties(properties)
+                    .build(),
+            )
+            .await
+            .expect("Failed to create table");
+        (catalog, table)
+    }
+
+    /// A message at `offset`, with an ID and a timestamp that tell it apart.
+    pub(crate) fn message(offset: u64) -> ConsumedMessage {
+        ConsumedMessage {
+            id: u128::from(offset) + 100,
+            offset,
+            checksum: 0,
+            timestamp: offset + 1_000,
+            origin_timestamp: 0,
+            headers: None,
+            payload: Payload::Raw(Vec::new()),
+        }
+    }
+
+    pub(crate) fn messages(offsets: RangeInclusive<u64>) -> Vec<ConsumedMessage> {
+        offsets.map(message).collect()
+    }
 
     /// What `FlakyCatalog` does with the next `update_table` call.
     #[derive(Debug, Clone, Copy)]
@@ -193,38 +296,7 @@ mod tests {
             failures: &[CommitFailure],
             properties: HashMap<String, String>,
         ) -> (Self, Table) {
-            let inner = MemoryCatalogBuilder::default()
-                .load(
-                    "memory",
-                    HashMap::from([(
-                        MEMORY_CATALOG_WAREHOUSE.to_owned(),
-                        "memory://warehouse".to_owned(),
-                    )]),
-                )
-                .await
-                .expect("Failed to create catalog");
-            let namespace = NamespaceIdent::new("test".to_owned());
-            inner
-                .create_namespace(&namespace, HashMap::new())
-                .await
-                .expect("Failed to create namespace");
-            let schema = IcebergSchema::builder()
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-                ])
-                .build()
-                .expect("Failed to build schema");
-            let table = inner
-                .create_table(
-                    &namespace,
-                    TableCreation::builder()
-                        .name("events".to_owned())
-                        .schema(schema)
-                        .properties(properties)
-                        .build(),
-                )
-                .await
-                .expect("Failed to create table");
+            let (inner, table) = catalog_with_table(properties).await;
             let catalog = Self {
                 inner,
                 failures: Mutex::new(failures.iter().copied().collect()),
@@ -387,9 +459,15 @@ mod tests {
             FlakyCatalog::with_table(&[CommitFailure::Unreachable, CommitFailure::Unreachable])
                 .await;
 
-        commit_data_files(&table, &catalog, vec![data_file(&table)], FAST_RETRY)
-            .await
-            .expect("The third attempt should commit");
+        commit_data_files(
+            &table,
+            &catalog,
+            vec![data_file(&table)],
+            HashMap::new(),
+            FAST_RETRY,
+        )
+        .await
+        .expect("The third attempt should commit");
 
         assert_eq!(catalog.update_calls(), 3);
         assert_eq!(catalog.snapshot_count(&table).await, 1);
@@ -399,9 +477,15 @@ mod tests {
     async fn given_a_lost_commit_response_should_not_append_the_files_twice() {
         let (catalog, table) = FlakyCatalog::with_table(&[CommitFailure::ResponseLost]).await;
 
-        commit_data_files(&table, &catalog, vec![data_file(&table)], FAST_RETRY)
-            .await
-            .expect("The retry should find the applied commit");
+        commit_data_files(
+            &table,
+            &catalog,
+            vec![data_file(&table)],
+            HashMap::new(),
+            FAST_RETRY,
+        )
+        .await
+        .expect("The retry should find the applied commit");
 
         assert_eq!(catalog.update_calls(), 1);
         assert_eq!(catalog.snapshot_count(&table).await, 1);
@@ -411,11 +495,20 @@ mod tests {
     async fn given_a_refused_commit_should_fail_without_retrying() {
         let (catalog, table) = FlakyCatalog::with_table(&[CommitFailure::Refused]).await;
 
-        let error = commit_data_files(&table, &catalog, vec![data_file(&table)], FAST_RETRY)
-            .await
-            .expect_err("A refused commit should fail");
+        let error = commit_data_files(
+            &table,
+            &catalog,
+            vec![data_file(&table)],
+            HashMap::new(),
+            FAST_RETRY,
+        )
+        .await
+        .expect_err("A refused commit should fail");
 
-        assert!(matches!(error, Error::CatalogCommitError(_)), "{error}");
+        assert!(
+            error.is_permanent(),
+            "a refused commit should stop the delivery: {error}"
+        );
         assert_eq!(catalog.update_calls(), 1);
         assert_eq!(catalog.snapshot_count(&table).await, 0);
     }
@@ -425,11 +518,20 @@ mod tests {
         let (catalog, table) =
             FlakyCatalog::with_table(&[CommitFailure::Rejected(StatusCode::FORBIDDEN)]).await;
 
-        let error = commit_data_files(&table, &catalog, vec![data_file(&table)], FAST_RETRY)
-            .await
-            .expect_err("A forbidden commit should fail");
+        let error = commit_data_files(
+            &table,
+            &catalog,
+            vec![data_file(&table)],
+            HashMap::new(),
+            FAST_RETRY,
+        )
+        .await
+        .expect_err("A forbidden commit should fail");
 
-        assert!(matches!(error, Error::CatalogCommitError(_)), "{error}");
+        assert!(
+            error.is_permanent(),
+            "a refused commit should stop the delivery: {error}"
+        );
         assert_eq!(catalog.update_calls(), 1);
         assert_eq!(catalog.snapshot_count(&table).await, 0);
     }
@@ -440,9 +542,15 @@ mod tests {
             FlakyCatalog::with_table(&[CommitFailure::Rejected(StatusCode::TOO_MANY_REQUESTS)])
                 .await;
 
-        commit_data_files(&table, &catalog, vec![data_file(&table)], FAST_RETRY)
-            .await
-            .expect("The retry should commit");
+        commit_data_files(
+            &table,
+            &catalog,
+            vec![data_file(&table)],
+            HashMap::new(),
+            FAST_RETRY,
+        )
+        .await
+        .expect("The retry should commit");
 
         assert_eq!(catalog.update_calls(), 2);
         assert_eq!(catalog.snapshot_count(&table).await, 1);
@@ -458,9 +566,15 @@ mod tests {
         let (catalog, table) =
             FlakyCatalog::with_table_properties(&[CommitFailure::Conflict; 6], table_retries).await;
 
-        let error = commit_data_files(&table, &catalog, vec![data_file(&table)], FAST_RETRY)
-            .await
-            .expect_err("The commit should fail once the table retries run out");
+        let error = commit_data_files(
+            &table,
+            &catalog,
+            vec![data_file(&table)],
+            HashMap::new(),
+            FAST_RETRY,
+        )
+        .await
+        .expect_err("The commit should fail once the table retries run out");
 
         assert!(matches!(error, Error::CatalogCommitError(_)), "{error}");
         assert_eq!(catalog.update_calls(), 2);
@@ -491,9 +605,15 @@ mod tests {
     async fn given_an_unreachable_catalog_when_the_attempts_run_out_should_fail() {
         let (catalog, table) = FlakyCatalog::with_table(&[CommitFailure::Unreachable; 3]).await;
 
-        let error = commit_data_files(&table, &catalog, vec![data_file(&table)], FAST_RETRY)
-            .await
-            .expect_err("The commit should fail once the attempts run out");
+        let error = commit_data_files(
+            &table,
+            &catalog,
+            vec![data_file(&table)],
+            HashMap::new(),
+            FAST_RETRY,
+        )
+        .await
+        .expect_err("The commit should fail once the attempts run out");
 
         assert!(matches!(error, Error::CatalogCommitError(_)), "{error}");
         assert_eq!(catalog.update_calls(), FAST_RETRY.max_attempts);
@@ -501,7 +621,7 @@ mod tests {
     }
 
     /// A REST catalog whose server answers every request with `status` and no body.
-    async fn rest_catalog_answering(status: StatusCode) -> RestCatalog {
+    pub(crate) async fn rest_catalog_answering(status: StatusCode) -> RestCatalog {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("Failed to bind the catalog server");
@@ -527,5 +647,387 @@ mod tests {
             )
             .await
             .expect("Failed to create the REST catalog")
+    }
+
+    const ORIGIN: BatchOrigin<'static> = BatchOrigin {
+        connector_id: 1,
+        stream: "stream",
+        topic: "topic",
+        partition_id: 2,
+    };
+
+    fn json_messages(offsets: RangeInclusive<u64>) -> Vec<ConsumedMessage> {
+        offsets
+            .map(|offset| ConsumedMessage {
+                payload: Payload::Json(simd_json::json!({ "id": offset })),
+                ..message(offset)
+            })
+            .collect()
+    }
+
+    fn offsets(messages: &[ConsumedMessage]) -> Vec<u64> {
+        messages.iter().map(|message| message.offset).collect()
+    }
+
+    fn append(offsets: RangeInclusive<u64>) -> Append {
+        Append::new(&message(*offsets.start()), &message(*offsets.end()))
+    }
+
+    async fn commit_append(
+        catalog: &FlakyCatalog,
+        table: &Table,
+        origin: &BatchOrigin<'_>,
+        offsets: RangeInclusive<u64>,
+    ) {
+        let properties = snapshot_properties(origin, append(offsets));
+        commit_data_files(
+            table,
+            catalog,
+            vec![data_file(table)],
+            properties,
+            FAST_RETRY,
+        )
+        .await
+        .expect("The append should commit");
+    }
+
+    async fn current_table(catalog: &dyn Catalog, table: &Table) -> Table {
+        catalog
+            .load_table(table.identifier())
+            .await
+            .expect("Failed to load table")
+    }
+
+    /// An appender of one attempt per commit to the table of a `FlakyCatalog` that fails its
+    /// commits as `failures` script.
+    async fn appender(
+        failures: &[CommitFailure],
+        invalid_rows: InvalidRows,
+        at_least_once: bool,
+    ) -> (Appender, Table) {
+        let (catalog, table) = FlakyCatalog::with_table(failures).await;
+        let mut appender = Appender::new(Box::new(catalog), invalid_rows, SINGLE_ATTEMPT);
+        if at_least_once {
+            appender.enable_at_least_once();
+        }
+        (appender, table)
+    }
+
+    async fn write(
+        appender: &Appender,
+        table: &Table,
+        batch: &[ConsumedMessage],
+    ) -> Result<Written, Error> {
+        appender
+            .append(&ORIGIN, table, false, Schema::Json, batch)
+            .await
+    }
+
+    #[tokio::test]
+    async fn given_a_table_holding_part_of_a_batch_should_append_only_the_messages_after_it() {
+        let (catalog, table) = FlakyCatalog::with_table(&[]).await;
+        commit_append(&catalog, &table, &ORIGIN, 0..=4).await;
+        let other_partition = BatchOrigin {
+            partition_id: 3,
+            ..ORIGIN
+        };
+        commit_append(&catalog, &table, &other_partition, 0..=9).await;
+        let batch = messages(3..=5);
+
+        let unheld = HeldMessages::default()
+            .unheld(&ORIGIN, &table, false, &catalog, &batch)
+            .await
+            .expect("The table should load");
+
+        assert_eq!(offsets(unheld), [5]);
+    }
+
+    #[tokio::test]
+    async fn given_a_backlog_batch_carrying_an_older_append_should_skip_up_to_the_newest() {
+        let (catalog, table) = FlakyCatalog::with_table(&[]).await;
+        for offsets in [0..=1, 2..=3, 4..=5] {
+            commit_append(&catalog, &table, &ORIGIN, offsets).await;
+        }
+        let first_batch = messages(0..=1);
+        let longer_batch = messages(0..=6);
+
+        let held = HeldMessages::default();
+        let first = held
+            .unheld(&ORIGIN, &table, false, &catalog, &first_batch)
+            .await
+            .expect("The table should load");
+        let longer = held
+            .unheld(&ORIGIN, &table, false, &catalog, &longer_batch)
+            .await
+            .expect("The table should load");
+
+        assert!(first.is_empty(), "{:?}", offsets(first));
+        assert_eq!(offsets(longer), [6]);
+    }
+
+    #[tokio::test]
+    async fn given_a_rolled_back_table_should_not_count_the_appends_left_behind() {
+        let (catalog, table) = FlakyCatalog::with_table(&[]).await;
+        commit_append(&catalog, &table, &ORIGIN, 0..=4).await;
+        let kept = current_table(&catalog, &table)
+            .await
+            .metadata()
+            .current_snapshot_id()
+            .expect("The append should be the current snapshot");
+        commit_append(&catalog, &table, &ORIGIN, 5..=9).await;
+        let current = current_table(&catalog, &table).await;
+        let rolled_back = TableMetadataBuilder::new_from_metadata(current.metadata().clone(), None)
+            .set_ref(
+                MAIN_BRANCH,
+                SnapshotReference::new(kept, SnapshotRetention::branch(None, None, None)),
+            )
+            .expect("The branch should move back")
+            .build()
+            .expect("The metadata should build")
+            .metadata;
+        let rolled_back = Table::builder()
+            .metadata(rolled_back)
+            .identifier(current.identifier().clone())
+            .file_io(current.file_io().clone())
+            .runtime(iceberg::Runtime::current())
+            .build()
+            .expect("The table should build");
+        let batch = messages(3..=10);
+
+        let unheld = HeldMessages::default()
+            .unheld(&ORIGIN, &rolled_back, true, &catalog, &batch)
+            .await
+            .expect("The current table needs no catalog");
+
+        assert_eq!(offsets(unheld), [5, 6, 7, 8, 9, 10]);
+    }
+
+    #[tokio::test]
+    async fn given_a_commit_this_sink_made_should_skip_it_without_loading_the_table() {
+        let (_, table) = FlakyCatalog::with_table(&[]).await;
+        let unreachable = rest_catalog_answering(StatusCode::SERVICE_UNAVAILABLE).await;
+        let held = HeldMessages::default();
+        held.committed(&ORIGIN, &table, append(0..=4));
+        let batch = messages(3..=5);
+
+        let unheld = held
+            .unheld(&ORIGIN, &table, false, &unreachable, &batch)
+            .await
+            .expect("The known commit should need no catalog");
+
+        assert_eq!(offsets(unheld), [5]);
+    }
+
+    #[tokio::test]
+    async fn given_a_failed_commit_should_read_the_table_again() {
+        let (_, table) = FlakyCatalog::with_table(&[]).await;
+        let unreachable = rest_catalog_answering(StatusCode::SERVICE_UNAVAILABLE).await;
+        let held = HeldMessages::default();
+        held.committed(&ORIGIN, &table, append(0..=4));
+        held.forget(&ORIGIN, &table);
+
+        let error = held
+            .unheld(&ORIGIN, &table, false, &unreachable, &messages(3..=5))
+            .await
+            .expect_err("A forgotten commit should be read from the catalog");
+
+        assert!(!error.is_permanent(), "{error}");
+    }
+
+    #[tokio::test]
+    async fn given_a_flushed_offset_should_forget_the_appends_up_to_it_in_that_partition() {
+        let (_, table) = FlakyCatalog::with_table(&[]).await;
+        let unreachable = rest_catalog_answering(StatusCode::SERVICE_UNAVAILABLE).await;
+        let other_partition = BatchOrigin {
+            partition_id: 3,
+            ..ORIGIN
+        };
+        let held = HeldMessages::default();
+        for origin in [&ORIGIN, &other_partition] {
+            held.committed(origin, &table, append(0..=4));
+            held.committed(origin, &table, append(5..=9));
+        }
+        let topic_metadata = TopicMetadata {
+            stream: ORIGIN.stream.to_owned(),
+            topic: ORIGIN.topic.to_owned(),
+        };
+
+        held.flushed(
+            &topic_metadata,
+            &[FlushPartition {
+                partition_id: ORIGIN.partition_id,
+                offset: 4,
+            }],
+        );
+
+        let batch = messages(3..=9);
+        let flushed = held
+            .unheld(&ORIGIN, &table, false, &unreachable, &batch)
+            .await
+            .expect("The partition should stay known");
+        let other = held
+            .unheld(&other_partition, &table, false, &unreachable, &batch)
+            .await
+            .expect("The partition should stay known");
+        assert_eq!(offsets(flushed), offsets(&batch));
+        assert!(other.is_empty(), "{:?}", offsets(other));
+    }
+
+    #[tokio::test]
+    async fn given_a_catalog_that_cannot_load_the_table_should_fail_by_the_cause() {
+        let (_, table) = FlakyCatalog::with_table(&[]).await;
+        for (status, permanent) in [
+            (StatusCode::SERVICE_UNAVAILABLE, false),
+            (StatusCode::TOO_MANY_REQUESTS, false),
+            (StatusCode::FORBIDDEN, true),
+            (StatusCode::NOT_FOUND, true),
+        ] {
+            let catalog = rest_catalog_answering(status).await;
+
+            let error = HeldMessages::default()
+                .unheld(&ORIGIN, &table, false, &catalog, &messages(3..=5))
+                .await
+                .expect_err("The table should not load");
+
+            assert_eq!(error.is_permanent(), permanent, "{status}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_commit_that_landed_but_failed_when_delivered_again_should_not_append_it_twice()
+    {
+        let (appender, table) =
+            appender(&[CommitFailure::ResponseLost], InvalidRows::Fail, true).await;
+        let batch = json_messages(0..=2);
+
+        write(&appender, &table, &batch)
+            .await
+            .expect_err("The lost response should fail the commit");
+        let again = write(&appender, &table, &batch)
+            .await
+            .expect("The batch delivered again should succeed");
+
+        assert_eq!(again.committed_rows, 0, "the table already holds the batch");
+        let current = current_table(appender.catalog.as_ref(), &table).await;
+        assert_eq!(current.metadata().snapshots().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn given_a_row_that_does_not_match_when_failing_rows_should_commit_the_rows_before_it() {
+        let (appender, table) = appender(&[], InvalidRows::Fail, true).await;
+        let mut batch = json_messages(0..=3);
+        batch[2].payload = Payload::Json(simd_json::json!({ "id": "two" }));
+
+        let written = write(&appender, &table, &batch)
+            .await
+            .expect("The rows before the rejected one should commit");
+
+        assert_eq!(written.committed_rows, 2);
+        let rejection = written.rejection.expect("The row should be rejected");
+        assert_eq!(rejection.offset, 2);
+        assert!(rejection.error.is_permanent(), "{}", rejection.error);
+        assert!(
+            rejection.error.to_string().contains("offset: 2"),
+            "{}",
+            rejection.error
+        );
+        let current = current_table(appender.catalog.as_ref(), &table).await;
+        assert_eq!(current.metadata().snapshots().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn given_a_payload_without_json_should_reject_it_only_when_failing_rows_at_least_once() {
+        let mut batch = json_messages(0..=3);
+        batch[1].payload = Payload::Proto("id: 1".to_owned());
+
+        let mut written = Vec::new();
+        for (invalid_rows, at_least_once) in [
+            (InvalidRows::Fail, true),
+            (InvalidRows::Fail, false),
+            (InvalidRows::Skip, true),
+        ] {
+            let (appender, table) = appender(&[], invalid_rows, at_least_once).await;
+            written.push(
+                write(&appender, &table, &batch)
+                    .await
+                    .expect("A payload without JSON is not a failed write"),
+            );
+        }
+
+        assert_eq!(written[0].committed_rows, 1);
+        assert_eq!(
+            written[0]
+                .rejection
+                .as_ref()
+                .map(|rejection| rejection.offset),
+            Some(1)
+        );
+        for skipped in &written[1..] {
+            assert_eq!(skipped.committed_rows, 3);
+            assert!(skipped.rejection.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn given_at_most_once_should_record_no_delivered_messages_in_the_snapshot() {
+        let (appender, table) = appender(&[], InvalidRows::Fail, false).await;
+
+        write(&appender, &table, &json_messages(0..=2))
+            .await
+            .expect("The batch should commit");
+
+        let current = current_table(appender.catalog.as_ref(), &table).await;
+        let snapshot = current
+            .metadata()
+            .current_snapshot()
+            .expect("The batch should be appended");
+        let properties = &snapshot.summary().additional_properties;
+        assert!(properties.contains_key(COMMIT_ID_PROPERTY));
+        assert!(
+            !properties
+                .keys()
+                .any(|key| key.starts_with("iggy.") && key != COMMIT_ID_PROPERTY),
+            "{properties:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_an_empty_call_should_succeed_without_the_catalog() {
+        let (_, table) = FlakyCatalog::with_table(&[]).await;
+        let unreachable = rest_catalog_answering(StatusCode::SERVICE_UNAVAILABLE).await;
+        let mut appender = Appender::new(Box::new(unreachable), InvalidRows::Fail, FAST_RETRY);
+        appender.enable_at_least_once();
+
+        let written = write(&appender, &table, &[])
+            .await
+            .expect("An empty call has nothing to write");
+
+        assert_eq!(written.committed_rows, 0);
+    }
+
+    #[test]
+    fn given_load_errors_should_tell_missing_tables_and_outages_apart() {
+        let missing = iceberg::Error::new(ErrorKind::TableNotFound, "Table does not exist");
+        let unreachable = iceberg::Error::new(ErrorKind::Unexpected, "Connection refused");
+        let forbidden = iceberg::Error::new(
+            ErrorKind::Unexpected,
+            "Received response with unexpected status code",
+        )
+        .with_context("status", StatusCode::FORBIDDEN.to_string());
+
+        assert!(is_missing(&missing));
+        assert!(!is_missing(&forbidden));
+        assert!(matches!(
+            table_load_error("test.events", &missing),
+            Error::InvalidConfigValue(_)
+        ));
+        assert!(matches!(
+            table_load_error("test.events", &unreachable),
+            Error::Connection(_)
+        ));
+        assert!(matches!(
+            table_load_error("test.events", &forbidden),
+            Error::PermanentHttpError(_)
+        ));
     }
 }

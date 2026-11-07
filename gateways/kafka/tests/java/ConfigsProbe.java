@@ -27,6 +27,9 @@ import org.apache.kafka.clients.admin.AlterConfigOp;
 import org.apache.kafka.clients.admin.AlterConfigsOptions;
 import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.ConfigEntry;
+import org.apache.kafka.clients.admin.CreateTopicsResult;
+import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.common.Node;
 import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.errors.InvalidConfigurationException;
 
@@ -121,6 +124,49 @@ public final class ConfigsProbe {
             Config deleted = describe(admin, resource);
             require("-1".equals(deleted.get("retention.ms").value()), "incremental delete retention.ms");
             System.out.println("incremental_delete_retention.ms=" + deleted.get("retention.ms").value());
+
+            // The Strimzi Topic Operator reads these two keys from every broker at startup, and
+            // stops when either is missing.
+            for (Node node : admin.describeCluster().nodes().get()) {
+                ConfigResource broker = new ConfigResource(ConfigResource.Type.BROKER, node.idString());
+                Config brokerConfig = describe(admin, broker);
+                ConfigEntry autoCreate = brokerConfig.get("auto.create.topics.enable");
+                ConfigEntry minIsr = brokerConfig.get("min.insync.replicas");
+                require(autoCreate != null && autoCreate.value() != null, "broker auto.create.topics.enable");
+                require(minIsr != null && "1".equals(minIsr.value()), "broker min.insync.replicas");
+                System.out.println("broker_auto.create.topics.enable=" + autoCreate.value()
+                        + " broker_min.insync.replicas=" + minIsr.value());
+            }
+
+            NewTopic configured = new NewTopic(topic + "-configured", 2, (short) 1)
+                    .configs(Map.of(
+                            "retention.bytes", "1073741824",
+                            "segment.bytes", "67108864",
+                            "cleanup.policy", "delete"));
+            Config created = admin.createTopics(List.of(configured)).config(configured.name()).get();
+            require("1073741824".equals(created.get("retention.bytes").value()), "created retention.bytes");
+            require(created.get("cleanup.policy") == null, "created cleanup.policy is not reported");
+            ConfigResource configuredResource = new ConfigResource(ConfigResource.Type.TOPIC, configured.name());
+            Config described = describe(admin, configuredResource);
+            require("67108864".equals(described.get("segment.bytes").value()), "described segment.bytes");
+            System.out.println("created_retention.bytes=" + created.get("retention.bytes").value()
+                    + " source=" + created.get("retention.bytes").source());
+
+            // Kafka Connect creates its internal topics this way. Iggy does not compact, so the
+            // topic keeps every record, and the policy is not reported.
+            NewTopic compacted = new NewTopic(topic + "-compacted", 1, (short) 1)
+                    .configs(Map.of(
+                            "cleanup.policy", "compact",
+                            "min.insync.replicas", "1",
+                            "compression.type", "zstd"));
+            CreateTopicsResult compactedResult = admin.createTopics(List.of(compacted));
+            Config compactedConfig = compactedResult.config(compacted.name()).get();
+            int compactedFactor = compactedResult.replicationFactor(compacted.name()).get();
+            require("-1".equals(compactedConfig.get("retention.ms").value()), "compacted retention.ms");
+            require(compactedConfig.get("cleanup.policy") == null, "compacted cleanup.policy is not reported");
+            require(compactedFactor == 1, "compacted replication factor");
+            System.out.println("compacted_retention.ms=" + compactedConfig.get("retention.ms").value()
+                    + " replication_factor=" + compactedFactor);
 
             long started = System.nanoTime();
             for (int i = 0; i < 50; i++) {
