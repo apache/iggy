@@ -23,16 +23,12 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"log"
 	"math/rand"
-	"net"
 	"time"
 
 	"github.com/apache/iggy/examples/go/common"
-	"github.com/apache/iggy/foreign/go/client"
-	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
@@ -130,29 +126,22 @@ func (g *MessagesGenerator) generate() SerializableMessage {
 }
 
 func main() {
-	serverAddr, tcpOptions := getTcpOptions()
-
-	cli, err := client.NewIggyClient(
-		client.WithTcp(tcpOptions...),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer func() {
-		if err := cli.Close(); err != nil {
-			log.Printf("Error closing client: %v", err)
-		}
-	}()
+	serverAddr, tcpOptions := common.GetTcpOptions()
 
 	ctx := context.Background()
 	log.Printf("Connecting to server at %s", serverAddr)
-	if err := cli.Connect(ctx); err != nil {
-		log.Printf("Failed to connect to server at %s: %v", serverAddr, err)
-	}
 
-	if _, err := cli.LoginUser(ctx, common.DefaultRootUsername, common.DefaultRootPassword); err != nil {
-		log.Fatalf("Login failed: %v", err)
+	cli, err := common.Dial(
+		ctx,
+		serverAddr,
+		tcpOptions,
+		common.DefaultRootUsername,
+		common.DefaultRootPassword,
+	)
+	if err != nil {
+		log.Fatalf("Iggy Client Dial Failed: %v", err)
 	}
+	defer common.Close(cli)
 	initSystem(ctx, cli)
 	if err := produceMessages(ctx, cli); err != nil {
 		log.Fatalf("Producing messages failed: %v", err)
@@ -162,8 +151,9 @@ func main() {
 func initSystem(ctx context.Context, client iggcon.Client) {
 	if _, err := client.CreateStream(ctx, StreamID, nil); err != nil {
 		log.Printf("WARN: Stream already exists or error: %v", err)
+	} else {
+		log.Println("Stream was created.")
 	}
-	log.Println("Stream was created.")
 
 	streamIdentifier, _ := iggcon.NewIdentifier(StreamID)
 	partitions := uint32(1)
@@ -174,8 +164,9 @@ func initSystem(ctx context.Context, client iggcon.Client) {
 		TopicID,
 		&iggcon.TopicOptions{PartitionsCount: &partitions, MessageExpiry: &expiry}); err != nil {
 		log.Printf("WARN: Topic already exists and will not be created again or error: %v", err)
+	} else {
+		log.Println("Topic was created.")
 	}
-	log.Println("Topic was created.")
 }
 
 func produceMessages(ctx context.Context, client iggcon.Client) error {
@@ -234,34 +225,4 @@ func produceMessages(ctx context.Context, client iggcon.Client) error {
 		sentBatches++
 		log.Printf("Sent %d message(s).", messagesPerBatch)
 	}
-}
-
-func getTcpOptions() (string, []tcp.Option) {
-	tcpServerAddr := flag.String("tcp-server-address", "127.0.0.1:8090", "TCP server address")
-	tlsEnabled := flag.Bool("tls", false, "Enable TLS")
-	tlsCAFile := flag.String("tls-ca-file", "", "Path to CA certificate file for TLS")
-	tlsDomain := flag.String("tls-domain", "", "TLS server domain name for SNI")
-	flag.Parse()
-
-	if _, err := net.ResolveTCPAddr("tcp", *tcpServerAddr); err != nil {
-		log.Fatalf("Invalid server address %s! Usage: --tcp-server-address <server-address>", *tcpServerAddr)
-	}
-
-	tcpOptions := []tcp.Option{
-		tcp.WithServerAddress(*tcpServerAddr),
-	}
-
-	if *tlsEnabled {
-		var tlsOpts []tcp.TLSOption
-		if *tlsCAFile != "" {
-			tlsOpts = append(tlsOpts, tcp.WithTLSCAFile(*tlsCAFile))
-		}
-		if *tlsDomain != "" {
-			tlsOpts = append(tlsOpts, tcp.WithTLSDomain(*tlsDomain))
-		}
-		tcpOptions = append(tcpOptions, tcp.WithTLS(tlsOpts...))
-		log.Printf("TLS enabled with CA file: %s, domain: %s", *tlsCAFile, *tlsDomain)
-	}
-
-	return *tcpServerAddr, tcpOptions
 }

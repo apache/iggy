@@ -23,15 +23,11 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"log"
-	"net"
 	"time"
 
 	"github.com/apache/iggy/examples/go/common"
-	"github.com/apache/iggy/foreign/go/client"
-	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
@@ -72,30 +68,22 @@ const (
 )
 
 func main() {
-	serverAddr, tcpOptions := getTcpOptions()
-
-	cli, err := client.NewIggyClient(
-		client.WithTcp(tcpOptions...),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer func() {
-		if err := cli.Close(); err != nil {
-			log.Printf("Error closing client: %v", err)
-		}
-	}()
+	serverAddr, tcpOptions := common.GetTcpOptions()
 
 	ctx := context.Background()
 	log.Printf("Connecting to server at %s", serverAddr)
-	if err := cli.Connect(ctx); err != nil {
-		log.Printf("Failed to connect to server at %s: %v", serverAddr, err)
-	}
 
-	_, err = cli.LoginUser(ctx, common.DefaultRootUsername, common.DefaultRootPassword)
+	cli, err := common.Dial(
+		ctx,
+		serverAddr,
+		tcpOptions,
+		common.DefaultRootUsername,
+		common.DefaultRootPassword,
+	)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Iggy Client Dial Failed: %v", err)
 	}
+	defer common.Close(cli)
 
 	err = consumeMessages(ctx, cli)
 	if err != nil {
@@ -202,34 +190,4 @@ func handleMessage(message iggcon.IggyMessage) error {
 	}
 
 	return nil
-}
-
-func getTcpOptions() (string, []tcp.Option) {
-	tcpServerAddr := flag.String("tcp-server-address", "127.0.0.1:8090", "TCP server address")
-	tlsEnabled := flag.Bool("tls", false, "Enable TLS")
-	tlsCAFile := flag.String("tls-ca-file", "", "Path to CA certificate file for TLS")
-	tlsDomain := flag.String("tls-domain", "", "TLS server domain name for SNI")
-	flag.Parse()
-
-	if _, err := net.ResolveTCPAddr("tcp", *tcpServerAddr); err != nil {
-		log.Fatalf("Invalid server address %s! Usage: --tcp-server-address <server-address>", *tcpServerAddr)
-	}
-
-	tcpOptions := []tcp.Option{
-		tcp.WithServerAddress(*tcpServerAddr),
-	}
-
-	if *tlsEnabled {
-		var tlsOpts []tcp.TLSOption
-		if *tlsCAFile != "" {
-			tlsOpts = append(tlsOpts, tcp.WithTLSCAFile(*tlsCAFile))
-		}
-		if *tlsDomain != "" {
-			tlsOpts = append(tlsOpts, tcp.WithTLSDomain(*tlsDomain))
-		}
-		tcpOptions = append(tcpOptions, tcp.WithTLS(tlsOpts...))
-		log.Printf("TLS enabled with CA file: %s, domain: %s", *tlsCAFile, *tlsDomain)
-	}
-
-	return *tcpServerAddr, tcpOptions
 }
