@@ -10,6 +10,13 @@ PRs without one may be closed at maintainer's discretion.
     - Maintainer may request for more details or a different approach
 3. Then code
 
+### Good First Issues
+
+The `good first issue` label marks issues for new contributors.
+
+Take only one good first issue. After that, pick issues without the label, so that the
+next new contributor can find one.
+
 ## High-Risk Areas
 
 These require design discussion in the issue before coding:
@@ -37,6 +44,10 @@ not. Before you open a PR you must be able to explain what every part of the cha
 and why, answer review questions about it yourself, and defend the design without going
 back to the tool for an answer. If you can't, the PR isn't ready.
 
+The license rules for AI output are in the
+[ASF guidance on generative tooling](https://www.apache.org/legal/generative-tooling.html).
+You must follow them.
+
 If an AI assistant helped you write the change, review it with the
 [`team-review`](.claude/skills/team-review/SKILL.md) skill before you open the PR.
 The skill can report false findings. Fix every finding that is correct and that applies to
@@ -50,14 +61,40 @@ a model, rather than a change the author understands and takes responsibility fo
 a judgment about the submission, not about you, and it does not bar you from contributing
 again if you come back with a change you can take responsibility for.
 
+### Agent-Driven PRs
+
+An AI agent is a tool that writes code by itself. In an agent-driven PR, an
+agent does the work from start to end, and a person only approves the result. Maintainers
+can close an agent-driven PR at their own discretion, without a code review.
+
+Maintainers can run the same agents. Your PR is useful to us because you understand the
+change and can maintain it later. Maintainer review time is limited, so we spend it on people
+and not on agent output.
+
+Maintainers look for signs like these:
+
+- The AI Usage section says that an agent did the work and that you approved it.
+- The description or a reply to a review describes changes that are not in the diff.
+- You cannot explain the change without the agent.
+
+If you follow [Bugs Found by an Agent](#bugs-found-by-an-agent), a bug that an agent found
+is the exception. After a maintainer agrees on the approach and assigns the issue to you, an
+agent can write the test and the fix.
+
+Your first contribution does not have to be code. A [review of another PR](#reviewing-prs),
+an answer on Discord, and an issue that shows that you read the source are all contributions.
+
 ### Bugs Found by an Agent
 
-Prove the bug first. The fix comes after it's agreed on the issue.
+If the bug is a vulnerability, report it in private, as [SECURITY.md](SECURITY.md) tells you.
+Do not open a public issue or PR for it.
 
-1. Search open issues. If it's already there, comment on it
-2. Otherwise open an issue and a PR with a failing test marked `#[ignore]`
-3. Put any suggested fix in a TODO in the test
-4. Link the issue with "Relates to #123", not "Closes #123"
+1. Search open issues. If it is already there, comment on it.
+2. Otherwise open an issue that shows how to reproduce the bug.
+3. Wait until a maintainer agrees on the approach and assigns the issue to you.
+4. Open one PR with the test and the fix, and link the issue with "Closes #123".
+5. If the fix is hard, the PR can hold only the test, marked `#[ignore]`. Put any suggested
+   fix in a TODO in the test, and link the issue with "Relates to #123".
 
 ### Green CI
 
@@ -224,7 +261,8 @@ When a PR is opened, including a draft, `PR Triage Apply` checks its author once
 It adds `Prolific Author` if a human author opened PRs in more than 20 visible
 repositories over the last 30 days, unless they have at least 10 merged PRs in Iggy.
 This follows [Arrow-rs's criteria](https://github.com/apache/arrow-rs/issues/11808).
-The label is informational and is not removed automatically.
+The label is informational and is not removed automatically. Maintainers can use it to
+decide where to spend review time.
 
 Commands take up to ~90s. A 👍 reaction means applied, 😕 means you lacked
 permission; if neither shows up, check the `PR Triage Apply` run in the
@@ -235,6 +273,7 @@ Actions tab.
 PRs may be closed if:
 
 - Maintainer feels like proxy between maintainer and LLM
+- Agent-driven PR, see [Agent-Driven PRs](#agent-driven-prs)
 - No approved issue or no approval from a maintainer
 - Code not ran and tested locally
 - Mixed purposes or purposes not clear

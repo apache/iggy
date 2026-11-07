@@ -26,6 +26,7 @@ use tracing::warn;
 use crate::bridge::error::BridgeError;
 use crate::bridge::nodes::KnownNodes;
 use crate::bridge::topic_map::{TopicMapping, validate_identifier_name};
+use crate::bridge::topic_settings::TopicDefaults;
 use crate::env::parse_bool;
 
 /// Iggy address used when `IGGY_KAFKA_IGGY_ADDR` is unset.
@@ -180,6 +181,8 @@ pub struct IggyBridgeConfig {
     /// The nodes of the last roster the bridge read, which each new client dials after `address`.
     /// No variable sets it: the bridge fills it, and every clone of this config shares it.
     pub nodes: KnownNodes,
+    /// Settings of the topics the gateway creates, where the request names none.
+    pub topic_defaults: TopicDefaults,
 }
 
 impl IggyBridgeConfig {
@@ -205,6 +208,9 @@ impl IggyBridgeConfig {
         "IGGY_KAFKA_PRODUCE_SESSIONS",
         "IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS",
         "IGGY_KAFKA_IDEMPOTENT_PRODUCERS",
+        "IGGY_KAFKA_TOPIC_RETENTION_MS",
+        "IGGY_KAFKA_TOPIC_RETENTION_BYTES",
+        "IGGY_KAFKA_TOPIC_DURABILITY",
     ];
 
     /// Builds config from `IGGY_KAFKA_*` env vars, defaulting to the Iggy server's own
@@ -232,7 +238,8 @@ impl IggyBridgeConfig {
     /// the file is missing, fails to parse, or fails validation (e.g. a malformed mapping key or
     /// an empty `default_stream`), or if `IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE`,
     /// `IGGY_KAFKA_FETCH_SLOTS`, `IGGY_KAFKA_PRODUCE_SESSIONS`,
-    /// `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` or `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` does not parse.
+    /// `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS`, `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` or one of
+    /// [`TopicDefaults::KNOWN_ENV_VARS`] does not parse.
     pub fn from_env() -> Result<Self, BridgeError> {
         let address =
             std::env::var("IGGY_KAFKA_IGGY_ADDR").unwrap_or_else(|_| DEFAULT_IGGY_ADDR.to_string());
@@ -324,6 +331,7 @@ impl IggyBridgeConfig {
                 .map_err(BridgeError::InvalidConfig)?,
             Err(_) => false,
         };
+        let topic_defaults = TopicDefaults::from_env().map_err(BridgeError::InvalidConfig)?;
 
         Ok(Self {
             address,
@@ -336,6 +344,7 @@ impl IggyBridgeConfig {
             produce_sessions,
             idempotent_producers,
             nodes: KnownNodes::default(),
+            topic_defaults,
         })
     }
 }
@@ -361,6 +370,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn given_the_topic_default_variables_should_be_listed_by_the_bridge() {
+        for var in TopicDefaults::KNOWN_ENV_VARS {
+            assert!(
+                IggyBridgeConfig::KNOWN_ENV_VARS.contains(var),
+                "{var} is read by the bridge and must be in its list"
+            );
+        }
+    }
+
     fn test_config() -> IggyBridgeConfig {
         IggyBridgeConfig {
             address: "127.0.0.1:8090".to_string(),
@@ -374,6 +393,7 @@ mod tests {
             produce_sessions: ProduceSessionLimits::default(),
             idempotent_producers: false,
             nodes: KnownNodes::default(),
+            topic_defaults: TopicDefaults::default(),
         }
     }
 
