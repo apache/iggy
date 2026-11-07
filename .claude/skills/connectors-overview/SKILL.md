@@ -201,7 +201,7 @@ Each implemented in at least one in-tree plugin or runtime path.
 | `flume::unbounded()` channel                                            | `runtime/src/source.rs::spawn_source_handler` / `source_forwarding_loop`           | MPSC handoff from SDK async task to runtime loop  |
 | `tokio::sync::watch::channel(())`                                       | `sdk/src/{sink,source}.rs`, `runtime/src/sink.rs`, `runtime/src/manager/*`         | One-shot shutdown broadcast                       |
 | `dashmap::DashMap`                                                      | `runtime/src/manager/sink.rs`, `source.rs::SOURCE_SENDERS`, SDK `INSTANCES`        | Lock-free concurrent keyed access                 |
-| `secrecy::SecretString` + `iggy_common::serde_secret::serialize_secret` | `sinks/postgres_sink::PostgresSinkConfig::connection_string`                       | Redacts on Debug/Display; serialization writes plaintext |
+| `secrecy::SecretString` + `iggy_common::serde_secret::serialize_secret` | `sinks/postgres_sink::PostgresSinkConfig::connection_string`                       | Hidden in `Debug` output; no `Display` impl. Serialization writes plaintext |
 
 ## Drop accounting
 
@@ -222,7 +222,7 @@ Each implemented in at least one in-tree plugin or runtime path.
 - Plain `String` for a credential field - use `SecretString`.
 - `tokio::spawn` inside plugin code - runtime owns lifecycle.
 - `std::time::SystemTime::now()` in transforms - non-deterministic, breaks tests.
-- Returning `Ok(())` from `consume` after a failed batch (offsets can still advance).
+- Returning `Ok(())` from `consume` after a failed batch (offsets can still advance). A permanent chunk skipped at most once, logged and counted in the plugin's own stats, is the one deliberate exception.
 - Random UUIDs as message IDs / dedup keys.
 - Classifying retryability via `err.to_string()` substring matches.
 - README defaults that disagree with code consts.

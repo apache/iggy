@@ -29,11 +29,12 @@ the next batch. It never fetches the failed batch again. So:
   are still in the Iggy topic, and the log line says which offsets to replay.
 
 **With `guarantee = "at_least_once"`, the runtime stores no offset on read.** It
-stores the offset of a partition only after `consume()` returned `Ok`. The
+stores the offset of a partition only after `consume()` returned `Ok` and the
+flush that follows proved it. The
 template writes inside `consume()`, so the default no-op `flush()` is enough and
 `enable_at_least_once()` accepts the mode. A failed call is handed over again,
 and a message can arrive more than once, but none is skipped. A permanent
-failure stops the sink at that offset instead of skipping the batch. An
+failure stops delivery of that topic at that offset instead of skipping the batch. An
 unclassified failure ends the call at its chunk, and the runtime hands the batch
 over again.
 
@@ -41,7 +42,7 @@ What `consume()` does with each chunk of up to `batch_size` messages, in order:
 
 1. If the circuit breaker is open, it waits for the cool-down instead of
    refusing the batch. Nothing reaches the destination while it waits, and the
-   runtime does not poll Iggy again until `consume()` returns.
+   runtime does not ask Iggy for more until `consume()` returns.
 2. It calls `push_batch()`.
 3. A transient error (`HttpRequestFailed`, `Connection`, `CannotStoreData`,
    `WriteFailure`, `Storage`, `TransientState`, `CatalogCommitError`)
@@ -50,11 +51,16 @@ What `consume()` does with each chunk of up to `batch_size` messages, in order:
 4. A permanent error (`Error::is_permanent()`, such as `PermanentHttpError` or
    `SchemaMismatch`) never touches the breaker, because
    bad data says nothing about whether the destination is up. At most once, the
-   chunk is skipped, counted, and the next one is tried. At least once, skipping
+   chunk is skipped, logged at `error` level and counted in the plugin's own
+   stats (shown when the sink closes), and the next one is tried. `consume()`
+   still returns `Ok`, so the runtime metrics show the call as successful. At least once, skipping
    would let the stored offset pass an undelivered message, so `consume()` stops
    at that chunk, counts it and every later message as failed, and returns the
-   error. The runtime then stops the sink at that offset.
-5. Any other error is not retried. At most once, the chunk is counted as failed,
+   error. The runtime then stops delivery of that topic at that offset.
+5. Any other error is not retried. The runtime reads it as transient and
+   `retry_max_attempts` is unset by default, so at least once it redelivers
+   without end, with backoff, until a permanent error or an operator stops it.
+   At most once, the chunk is counted as failed,
    the error is returned at the end, and the remaining chunks are still tried.
    At least once, `consume()` stops at that chunk, counts it and every later
    message as failed, and returns the error. The runtime hands the whole batch
@@ -66,7 +72,8 @@ What `consume()` does with each chunk of up to `batch_size` messages, in order:
 
 The budget covers the whole `consume()` call, not each chunk. An attempt still
 running when it runs out is cancelled and counts as a transient failure, so a
-hung request cannot outlast `max_delivery_time`.
+hung request cannot outlast `max_delivery_time`, as long as `push_batch()`
+only awaits. A blocking driver call needs a timeout of its own.
 
 ## Delivery semantics
 
@@ -192,14 +199,16 @@ no longer exists for sinks; the runtime refuses to start a sink that sets it.
 ## Known limits
 
 - **At most once, a crash between the poll and the write loses that batch.** The
-  offset is already stored. Only an idempotent replay recovers it. Set
+  offset is already stored, and so is every batch the consumer had already
+  read ahead. Only an idempotent replay recovers it. Set
   `guarantee = "at_least_once"` to avoid it.
 - **At most once, a long outage loses one batch per `max_delivery_time`.** Each
   give-up is logged with its offsets. At least once, the runtime hands the batch
   over again instead.
-- **At least once, a permanent rejection stops the sink.** It stays stopped at
+- **At least once, a permanent rejection stops delivery of that topic.** It stays stopped at
   that message until you fix the cause or move the stored offset past it.
-- **At least once, a failed call repeats its whole batch.** Chunks written before
+- **At least once, a failed call repeats everything since the last flush, the
+  whole batch by default.** Chunks written before
   the failure are written again, which is why the write must be idempotent on
   `dedup_key()`.
 - **`consume()` blocks a runtime worker thread.** The call is synchronous inside
@@ -209,8 +218,9 @@ no longer exists for sinks; the runtime refuses to start a sink that sets it.
   `max_delivery_time` short, and do not point more topics at one failing
   destination than the machine has cores.
 - **A stop waits for the call in progress.** Closing the plugin waits for an
-  in-flight `consume()`, up to the remaining `max_delivery_time`. The runtime's
-  own close budget is the poll timeout plus 60 s, so 20 s fits inside it.
+  in-flight `consume()`, up to the remaining `max_delivery_time`, and usually
+  for one call. The runtime's own close budget is the poll timeout plus 60 s
+  and is the hard bound, so 20 s fits inside it.
 - **The SDK breaker is not a single-probe breaker.** It resets fully after the
   cool-down, which is why `circuit_breaker_threshold` defaults to 3.
 
@@ -282,7 +292,7 @@ Replace the HTTP client and nothing else:
 4. Map driver errors onto the SDK variants, because the loop acts on them:
    `Connection`, `CannotStoreData` or `HttpRequestFailed` are retried, and
    `Error::is_permanent()` variants (`SchemaMismatch`, `InvalidRecordValue`,
-   `Serialization`) are skipped, or stop the sink at least once. The name
+   `Serialization`) are skipped, or stop delivery of that topic at least once. The name
    `PermanentHttpError` is only a name.
 5. Tests: `given_breaker_open_past_budget_when_consuming_should_count_every_message_failed`
    builds a `reqwest` client. Set `sink.client` to your client type or a stub.
@@ -293,7 +303,7 @@ for a finished non-HTTP sink.
 ## What you need to fill in
 
 Search for `TODO(ConnectorDeveloper)` in `src/lib.rs`. One spot requires code
-and one is documentation:
+(`push_batch()`, which includes the `dedup_key` loop) and one is documentation:
 
 **`push_batch()`** (required): send one chunk to your destination using
 `self.config.connection_string` and `self.config.target` (already validated), via

@@ -38,7 +38,7 @@ points: config parsing, `SecretString`, retry loops, circuit breaker,
 the time-budgeted delivery loop (sink), ACK/NACK cursor staging (source),
 sleep-first poll, lock discipline, and unit-test stubs are already
 wired up. Copy the crate, rename the package, and fill in the
-`TODO(ConnectorDeveloper)` spots in `src/lib.rs` — see each crate's `README.md`,
+`TODO(ConnectorDeveloper)` spots in `src/lib.rs` - see each crate's `README.md`,
 which has one section for an HTTP backend and one for a non-HTTP backend.
 
 **Your implementation surface is intentionally small:**
@@ -54,7 +54,7 @@ Everything else should match siblings.
 
 ### Secrets
 
-- Credentials are `secrecy::SecretString`, which redacts `Debug` and `Display`.
+- Credentials are `secrecy::SecretString`, which hides the value in `Debug` output. It has no `Display` impl, so `{}` does not compile.
   The `iggy_common::serde_secret::serialize_secret` attribute the plugins add only
   lets the config derive `Serialize`: it writes the plaintext, so never serialize
   a config into logs, errors or state. Use `serialize_redacted` where a redacted
@@ -89,8 +89,8 @@ key **and** the runtime path actually enforce it.
 
 The two sides of a connector differ:
 
-- **Sources** are at-least-once. State is saved after the Iggy send, and a
-  failed batch is re-polled.
+- **Sources** are at-least-once unless `exactly_once = true` is set. State is
+  saved after the Iggy send, and a failed batch is re-polled.
 - **Sinks** are at-most-once from Iggy by default. The server stores the
   consumer offset when it answers the poll, before the plugin sees the
   messages. The runtime logs and counts an `Err` from `consume()` and
@@ -101,7 +101,7 @@ The two sides of a connector differ:
 - A sink whose connector config has `[delivery] guarantee =
   "at_least_once"` is at-least-once instead. The runtime stores the offset
   of a partition only after the plugin proved the messages delivered, hands
-  a failed call over again, and stops the sink at the offset of a permanent
+  a failed call over again, and stops delivery of that topic at the offset of a permanent
   failure. See [Sink delivery guarantees](../runtime/README.md#sink-delivery-guarantees).
   A sink configured for it with a plugin that does not support it refuses
   to start.
@@ -184,7 +184,7 @@ calls `on_batch_result(SourceBatchResult::Ack | Nack)`. Only
   batch_length`, `max_wait = "2s"`) so the destination gets fewer, larger
   writes. They replace `poll_interval`, and a sink that sets it fails to
   start.
-- Use `payload.try_to_bytes()` — do not clone `Payload::Json`.
+- Use `payload.try_to_bytes()` - do not clone `Payload::Json`.
 
 ### Config canon
 
@@ -201,10 +201,10 @@ calls `on_batch_result(SourceBatchResult::Ack | Nack)`. Only
 | Verbosity | `verbose_logging` |
 
 Use `Option<T>` + humantime strings for durations, apply defaults in
-`new()` with `warn!` on parse failure, and prefer
+`new()`; a bad duration falls back to 1 s with a `warn!`, and prefer
 `#[serde(deny_unknown_fields)]` so typo’d knobs fail loud.
 
-Validate structure and connectivity in `new()` / `open()`, never on the
+Validate structure and connectivity in `open()`, never on the
 first hot-path call after sleep.
 
 ## Required artifacts in the PR

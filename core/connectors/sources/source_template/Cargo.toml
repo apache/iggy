@@ -15,14 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# TEMPLATE — rename the package (and this directory) to
+# TEMPLATE - rename the package (and this directory) to
 # `iggy_connector_<yourname>_source` before publishing, and update the
-# `[[sources]]` entry you add to the workspace root Cargo.toml accordingly.
+# `members` entry you add to the workspace root Cargo.toml accordingly.
 
 [package]
 name = "iggy_connector_template_source"
 version = "0.1.0"
-description = "Template for an Apache Iggy source connector — copy this crate and fill in the TODO sections."
+description = "Template for an Apache Iggy source connector - copy this crate and fill in the TODO sections."
 edition = "2024"
 license = "Apache-2.0"
 keywords = ["iggy", "messaging", "streaming"]
@@ -34,7 +34,7 @@ publish = false
 
 [package.metadata.cargo-machete]
 # dashmap is used only inside the `source_connector!` macro expansion, so a
-# naive unused-dependency scan won't see the usage — keep it ignored rather
+# naive unused-dependency scan won't see the usage - keep it ignored rather
 # than removing it, or the plugin will fail to compile.
 ignored = ["dashmap"]
 

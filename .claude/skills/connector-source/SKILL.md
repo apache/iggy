@@ -32,7 +32,7 @@ below.
 
 ## STOP and ask the user before
 
-- Changing the SDK trait surface (`Source::open` / `poll` / `on_batch_result` / `on_batch_result` / `close`) - that's an SDK change, and `poll`/`on_batch_result` are also an FFI change (`iggy_source_handle_v2`, `iggy_source_batch_result` - breaks every pre-built plugin `.so`).
+- Changing the SDK trait surface (`Source::open` / `poll` / `on_batch_result` / `batch_policy` / `close`) - that's an SDK change, and `poll`/`on_batch_result` are also an FFI change (`iggy_source_handle_v2`, `iggy_source_batch_result` - breaks every pre-built plugin `.so`).
 - Adding a long-running side task in the plugin - the runtime owns lifecycle, and orphans survive `close()`. Sanctioned only where the source is itself a server the runtime cannot drive, as in `http_source`'s listener, and then only with an explicit shutdown in the last `close()` that awaits its tasks before returning.
 - Persisting unbounded state - `State` is rewritten every batch.
 - Adding a source that requires authoritative offsets external to Apache Iggy without coordinating retention.
@@ -78,8 +78,8 @@ callback, so rebuild older source plugins.
   produce a synthetic NACK. A source that replays on `Nack` is at-least-once, not exactly-once.
 - The trait has a **default no-op**, which suits only a source with no staged cursor and no
   destructive work. If `poll()` advances a cursor, deletes rows, or drains an in-memory buffer,
-  omitting this loses data silently and nothing will tell you. `random_source` and `http_source`
-  implement it; the other shipped sources take the default and skip rows on a NACK.
+  omitting this loses data silently and nothing will tell you. Every shipped source overrides it;
+  the default is for a pure generator only.
 - Stage in `poll()`, apply on `Ack`, discard or replay on `Nack`. A source whose input is pushed to
   it, rather than re-readable upstream, has to hold the batch itself: see `http_source`'s staging.
 - Returning `Err` from it stops the source immediately, so it is not a retry signal.
@@ -165,7 +165,7 @@ Match `ProducedMessages.schema` to the bytes in `messages[i].payload`:
 ### IDs and timestamps
 
 - `ProducedMessage.id: Option<u128>` - set when a natural ID exists (DB PK, document id). It rides the wire as the message id, which is what a **consumer** can dedupe an at-least-once duplicate on.
-- **Iggy itself does not dedupe on that id.** The server's only read of the field is `core/server/src/http/wire.rs`, which mints a fresh uuid when the incoming id is 0 and otherwise passes it through. Its dedup path is a per-client request-id watermark (`dedup_clients_max`) that never looks at this field.
+- **Iggy itself does not dedupe on that id.** The Rust SDK mints a fresh id client-side when the id is 0 (`core/common/src/traits/binary_impls/messages.rs`) and otherwise passes it through. Its dedup path is a per-client request-id watermark (`dedup_clients_max`) that never looks at this field.
 - `origin_timestamp: Option<u64>` - leave `None`. The runtime does not forward it: `build_iggy_message` builds the message with `IggyMessage::builder()`, which stamps the time of sending. The Iggy `origin_timestamp` header is in microseconds, so a unit chosen here would be wrong anyway until the runtime change lands.
 - `timestamp` and `checksum` are Iggy-side - leave `None`.
 
@@ -192,8 +192,9 @@ The template's stub `fetch_records()` returns `Error::InitError` as a placeholde
 Returning `Err` from `poll()` is only logged by the SDK's FFI bridge
 (`sdk/src/source.rs::handle_messages`) - the loop continues, the next
 `poll()` runs. Connector status does NOT flip to `Error` from a poll
-failure. Status `Error` is set by the runtime only on transform/encode
-failure, Iggy send failure, or state save failure
+failure. Status `Error` is set by the runtime on transform/encode
+failure, Iggy send failure, state save failure, a failed batch-result
+delivery, or an unexpected self-stop such as the NACK limit
 (`runtime/src/source.rs::source_forwarding_loop` calls to
 `context.sources.set_error`). To surface a poll failure as unhealth,
 raise it through the metric counter or escalate to `Error::InitError`

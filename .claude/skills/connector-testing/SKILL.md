@@ -54,7 +54,7 @@ fn given_payload_json_should_serialize_correctly() { ... }
 
 You may **omit one part** when the test is small (`given_X_should_Y` instead of full `given_X_when_Y_should_Z`), but **stay consistent within a file**. Imperative `test_foo` / `does_bar` names are not the convention here.
 
-A test whose subject is a **type** rather than a scenario has no "given" to name, and drops the prefix: it reads `<subject>_should_<property>`. The canonical state round trip below is `state_should_be_serializable_and_deserializable` in all three shipped sources (`random_source`, `postgres_source`, `http_source`). Leave those as they are rather than bending them into the scenario form.
+A test whose subject is a **type** rather than a scenario has no "given" to name, and drops the prefix: it reads `<subject>_should_<property>`. The canonical state round trip below is `state_should_be_serializable_and_deserializable` in the shipped sources (`random_source`, `postgres_source`, `http_source`, `elasticsearch_source`, `source_template`). Leave those as they are rather than bending them into the scenario form.
 
 ### Prove a test can fail, before trusting it
 
@@ -196,7 +196,7 @@ proves the fix, and a reviewer should find it in the PR.
 | `given_secrets_in_config_should_not_appear_in_debug_output` | A derived `Debug` printing a credential. Wrap third-party clients that derive `Debug` in a newtype with a manual one. |
 | `given_unknown_config_key_should_be_rejected` | A typo in a config key silently doing nothing. |
 | `given_numeric_knobs_as_json_numbers_should_deserialize` | A numeric or boolean knob typed `Option<String>`, which fails when it arrives from an env override as a number. |
-| `given_persistent_fetch_failure_should_wait_poll_interval_between_polls` (source) | A failing poll that spins without backoff. |
+| `given_persistent_fetch_failure_should_wait_poll_interval_between_polls` (source) | A failing poll that spins without backoff. It relies on the stub fetch failing, so rewrite it against a failing fetch of your own. |
 | `given_bad_record_after_good_ones_should_send_the_good_ones_and_stop_before_it`, `given_bad_first_record_should_fail_without_staging_a_cursor` (source) | A cursor that moves past a record that could not be converted. |
 | `given_at_least_once_when_a_chunk_is_rejected_for_good_should_fail_the_call` (sink) | A permanent rejection skipped while the runtime stores the offset past it. |
 

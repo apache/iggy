@@ -64,6 +64,6 @@ verbose_logging = false
 # Delivery guarantee (a table of the connector config, not of `plugin_config`). By default the
 # server stores the offset when it answers a poll, so a batch that `consume()` fails is lost.
 # With "at_least_once" the runtime stores it after `consume()` succeeds and hands a failed
-# batch over again; a permanent rejection then stops the sink at that offset.
+# batch over again; a permanent rejection then stops delivery of that topic at that offset.
 # [delivery]
 # guarantee = "at_least_once"

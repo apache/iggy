@@ -25,11 +25,12 @@
 //! a dropped/nacked batch can be re-polled instead of silently lost.
 //!
 //! There is exactly **one** place you need to write code, marked
-//! `TODO(ConnectorDeveloper)`: `TemplateSource::fetch_records()` — fetch up
+//! `TODO(ConnectorDeveloper)`: `TemplateSource::fetch_records()` - fetch up
 //! to `batch_size` new records from your external system, starting after
-//! `cursor`. A second `TODO(ConnectorDeveloper)`, on the `connection_string`
-//! field's doc comment, just asks you to describe its expected shape — not
-//! code. `grep` for the marker and you'll find both.
+//! `cursor`. Two more markers ask for a decision, not code: the
+//! `connection_string` doc comment (describe its shape) and
+//! `FetchedRecord::natural_id` (pick a stable per-record identity).
+//! `grep` for the marker and you'll find all three.
 //!
 //! This crate is the HTTP path: `reqwest` wrapped by the SDK's retry
 //! middleware. For a database, queue or filesystem, replace the client as
@@ -78,7 +79,7 @@ const DEFAULT_CIRCUIT_BREAKER_COOL_DOWN: &str = "30s";
 pub struct TemplateSourceConfig {
     /// TODO(ConnectorDeveloper): document the exact shape this connector expects, e.g.
     /// "<https://api.example.com>" or "postgres://user:pass@host:5432/db".
-    /// `SecretString` because DSNs commonly embed credentials — never plain
+    /// `SecretString` because DSNs commonly embed credentials - never plain
     /// `String` for this field, see `PostgresSinkConfig::connection_string`
     /// in `sinks/postgres_sink` for the same pattern.
     #[serde(serialize_with = "iggy_common::serde_secret::serialize_secret")]
@@ -88,7 +89,7 @@ pub struct TemplateSourceConfig {
     /// `Debug`/log output; delete this field if `connection_string` already
     /// carries all required auth. Read it with `.expose_secret()` (from the
     /// `secrecy::ExposeSecret` trait) at the one place you actually need the
-    /// plaintext — e.g. when building an auth header in `build_raw_client()`.
+    /// plaintext - e.g. when building an auth header in `build_raw_client()`.
     #[serde(
         default,
         serialize_with = "iggy_common::serde_secret::serialize_optional_secret"
@@ -97,7 +98,7 @@ pub struct TemplateSourceConfig {
 
     /// Optional path (e.g. "/health") probed with retry during `open()`
     /// before the connector is considered ready. Leave unset if your target
-    /// has no health endpoint — the probe is skipped, not failed, in that case.
+    /// has no health endpoint - the probe is skipped, not failed, in that case.
     pub health_check_path: Option<String>,
 
     pub batch_size: Option<u32>,
@@ -121,7 +122,7 @@ pub struct TemplateSourceConfig {
 
 /// Read cursor. Kept as a plain `Option<String>` so it fits whatever ordering
 /// field your source uses (a timestamp, an auto-increment ID, an opaque
-/// pagination token, ...) — stringify it however makes sense for your data.
+/// pagination token, ...) - stringify it however makes sense for your data.
 ///
 /// `new()` starts with `cursor: None` when no state exists or the stored state
 /// does not deserialize, so `fetch_records()` must define what `None` means.
@@ -138,21 +139,21 @@ struct State {
 /// `fetch_records()` actually produces.
 struct FetchedRecord {
     /// The value `cursor` should advance to once this record's batch is
-    /// acknowledged — typically this record's timestamp/ID/token. Values must
+    /// acknowledged - typically this record's timestamp/ID/token. Values must
     /// be unique and strictly increasing in fetch order: `fetch_records()`
     /// resumes after the last one sent, so a repeated value after a bad record
     /// would skip or repeat records.
     cursor_value: String,
-    /// TODO(ConnectorDeveloper): set this from a true per-record identity —
+    /// TODO(ConnectorDeveloper): set this from a true per-record identity -
     /// a numeric row PK, a hash of a document `_id`, an event UUID the
-    /// upstream system itself assigned — so `ProducedMessage.id` below is
+    /// upstream system itself assigned - so `ProducedMessage.id` below is
     /// stable across a NACK-triggered redelivery of this same record. A
     /// *fresh* random id per emit defeats a downstream sink's dedup-by-id
     /// (see `connector-pr-review` B5): a redelivered row would arrive with a
     /// different id than its first delivery, so a sink keying its upsert on
     /// `message.id` would store it twice instead of overwriting. Leave this
     /// `None` only when records genuinely have no natural per-record
-    /// identity (a pure generator, e.g. `random_source`) — `cursor_value`
+    /// identity (a pure generator, e.g. `random_source`) - `cursor_value`
     /// alone usually isn't it either, since a timestamp-based cursor is
     /// commonly shared by more than one record.
     natural_id: Option<u128>,
@@ -161,7 +162,7 @@ struct FetchedRecord {
     /// Use `Error::InvalidRecordValue` for a record that is bad. `poll()` never
     /// moves the cursor past an `Err` record: it sends the records before it and
     /// stops, and a bad record at the front of a batch fails the poll, so the
-    /// problem stays visible instead of the record being lost.
+    /// problem stays in the error log instead of the record being lost.
     payload: Result<serde_json::Value, Error>,
 }
 
@@ -235,12 +236,12 @@ impl TemplateSource {
 
     /// TODO(ConnectorDeveloper): fetch up to `self.batch_size` new records from your
     /// external system, ordered after `cursor` (`None` means "from the
-    /// beginning" or "from now" — whichever is right for your source).
+    /// beginning" or "from now" - whichever is right for your source).
     /// Use `self.config.connection_string` as the base address and
     /// `self.client` (already retry-wrapped) to make the request. Map each
     /// result row/document/event to a `FetchedRecord`, using something that
     /// monotonically increases (a timestamp, an ID, a page token) as
-    /// `cursor_value` so the state-staging logic in `poll()` below can
+    /// `cursor_value` so the state-staging logic in `stage_batch()` below can
     /// advance the cursor correctly, and set `natural_id` from a true
     /// per-record identity if one exists (see the field's own doc comment).
     async fn fetch_records(
@@ -250,8 +251,8 @@ impl TemplateSource {
     ) -> Result<Vec<FetchedRecord>, Error> {
         let _ = (client, cursor); // remove once implemented
         Err(Error::InitError(
-            "TemplateSource::fetch_records is not implemented yet — see the TODO(ConnectorDeveloper) comment \
-             in template_source/src/lib.rs"
+            "TemplateSource::fetch_records is not implemented yet - see the TODO(ConnectorDeveloper) comment \
+             in source_template/src/lib.rs"
                 .to_string(),
         ))
     }
@@ -334,7 +335,7 @@ impl TemplateSource {
 impl Source for TemplateSource {
     async fn open(&mut self) -> Result<(), Error> {
         // Structural validation happens here, not in `new()`, because only
-        // `open()` can return an error — `new()` is a plain factory function
+        // `open()` can return an error - `new()` is a plain factory function
         // with nowhere to send a "this config is invalid" result.
         if self
             .config
@@ -382,7 +383,7 @@ impl Source for TemplateSource {
             .await?;
         } else {
             warn!(
-                "{CONNECTOR_NAME} connector with ID: {} has no health_check_path configured — \
+                "{CONNECTOR_NAME} connector with ID: {} has no health_check_path configured - \
                  skipping the startup connectivity probe. Consider adding one.",
                 self.id
             );
@@ -412,13 +413,13 @@ impl Source for TemplateSource {
     async fn poll(&self) -> Result<ProducedMessages, Error> {
         // If the breaker is open, sleep for the normal poll interval and
         // return an empty (not an error) result. Returning `Err` here would
-        // make the runtime retry `poll()` again immediately with no delay —
-        // see `handle_messages` in the SDK's source container — so an empty
-        // ACK-free result is how a source waits out a known-bad window
-        // without busy-looping or counting against the NACK budget.
+        // make the SDK call `poll()` again immediately with no delay - see
+        // `handle_messages` in the SDK's source container - so an empty batch
+        // (sent with no state, so it is ACKed) is how a source waits out a
+        // known-bad window without busy-looping.
         if self.circuit_breaker.is_open().await {
             warn!(
-                "{CONNECTOR_NAME} connector with ID: {} — circuit breaker OPEN, skipping poll",
+                "{CONNECTOR_NAME} connector with ID: {} - circuit breaker OPEN, skipping poll",
                 self.id
             );
             tokio::time::sleep(self.poll_interval).await;
@@ -463,11 +464,11 @@ impl Source for TemplateSource {
     /// The staged cursor from `poll()` is only committed here, and only on
     /// an ACK. A NACK (delivery failed, state-save failed, runtime is
     /// shutting down) discards the candidate so the same range is re-polled
-    /// next time — the cursor never moves past data that wasn't confirmed
+    /// next time - the cursor never moves past data that wasn't confirmed
     /// delivered. If `fetch_records()` ever needs to perform a destructive
     /// read against the source (delete-after-read, mark-as-processed),
     /// stage that side effect the same way and only apply it here on `Ack`.
-    /// A missing runtime result does not produce a synthetic NACK — the SDK
+    /// A missing runtime result does not produce a synthetic NACK - the SDK
     /// just keeps waiting (warning past ~30s) rather than guessing.
     ///
     /// If you add real I/O here (an external ack call, a delete, a mark-
@@ -475,14 +476,14 @@ impl Source for TemplateSource {
     /// apply directly:
     ///
     /// 1. `on_batch_result` has no SDK-enforced deadline, but the SDK will
-    ///    not call `poll()` again until it returns — slow I/O here silently
+    ///    not call `poll()` again until it returns - slow I/O here silently
     ///    stalls the whole source, it doesn't fail loudly. If you stage more
     ///    than one operation, budget for *all* of them (a per-item retry
     ///    budget multiplies with the item count), and reject
     ///    `max_retries`/`retry_delay` combinations in `open()` that would
     ///    make that stall unbounded. See `connector-pr-review` B11.
     /// 2. A failed op must not be silently logged while the batch is still
-    ///    ACKed — the cursor has already committed past it by the time you
+    ///    ACKed - the cursor has already committed past it by the time you
     ///    find out. Count consecutive failures and return `Err` past a
     ///    threshold so the SDK stops the source, instead of resending the
     ///    same broken operation forever. A source whose input genuinely
@@ -651,6 +652,7 @@ mod tests {
         assert_eq!(config.verbose_logging, Some(true));
     }
 
+    // Relies on the stub `fetch_records()` failing. Rewrite it against a failing fetch of your own.
     #[tokio::test(start_paused = true)]
     async fn given_persistent_fetch_failure_should_wait_poll_interval_between_polls() {
         let mut source = TemplateSource::new(1, test_config(), None);
@@ -701,7 +703,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_no_state_should_start_with_no_cursor() {
+    async fn given_no_state_should_start_fresh() {
         let source = TemplateSource::new(1, test_config(), None);
         assert_eq!(source.state.lock().await.cursor, None);
     }
@@ -720,7 +722,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_invalid_persisted_state_should_start_fresh() {
+    async fn given_invalid_state_should_start_fresh() {
         let source = TemplateSource::new(
             1,
             test_config(),
@@ -743,7 +745,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_ack_should_commit_staged_cursor() {
+    async fn given_ack_when_batch_is_staged_should_commit_candidate_state() {
         let source = TemplateSource::new(1, test_config(), None);
         *source.pending_state.lock().await = Some(State {
             cursor: Some("next-cursor".to_string()),
@@ -762,7 +764,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_nack_should_discard_staged_cursor() {
+    async fn given_nack_when_batch_is_staged_should_keep_committed_state() {
         let source = TemplateSource::new(1, test_config(), None);
         *source.pending_state.lock().await = Some(State {
             cursor: Some("next-cursor".to_string()),
@@ -773,7 +775,7 @@ mod tests {
             .await
             .expect("NACK should be applied");
 
-        // The committed cursor is unchanged (still None) — the candidate is
+        // The committed cursor is unchanged (still None) - the candidate is
         // simply discarded so the same range is polled again.
         assert_eq!(source.state.lock().await.cursor, None);
         assert!(source.pending_state.lock().await.is_none());

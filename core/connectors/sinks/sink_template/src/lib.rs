@@ -30,21 +30,21 @@
 //! batch after an error, so `consume()` keeps trying a batch for up to
 //! `max_delivery_time` before it gives up and logs the lost offset range. With
 //! `guarantee = "at_least_once"` the runtime stores the offset only after
-//! `consume()` succeeds, hands a failed batch over again, and stops the sink on
+//! `consume()` succeeds, hands a failed batch over again, and stops delivery of that topic on
 //! a permanent error instead of skipping the batch. The circuit breaker only
 //! paces the attempts; it never discards a batch. Writes must be idempotent on
 //! `dedup_key()`, because retries, redelivery and failovers can repeat a
 //! message.
 //!
 //! There is exactly **one** place you need to write code, marked
-//! `TODO(ConnectorDeveloper)`: `TemplateSink::push_batch()` — build the
+//! `TODO(ConnectorDeveloper)`: `TemplateSink::push_batch()` - build the
 //! request/write that actually pushes one chunk of messages to your
 //! destination, using `self.config.connection_string` (and
 //! `self.config.target`, if your destination has a table/index/
-//! collection-shaped name). A second `TODO(ConnectorDeveloper)` on the
-//! `connection_string` field's doc comment just asks you to describe its
-//! expected shape — not code, but worth personalizing too. `grep` for the
-//! marker and you'll find both.
+//! collection-shaped name). The `dedup_key` loop inside it carries its own
+//! marker, and a third `TODO(ConnectorDeveloper)` on the `connection_string`
+//! field's doc comment asks you to describe its expected shape - not code.
+//! `grep` for the marker and you'll find all three.
 //!
 //! This crate is the HTTP path: `reqwest` wrapped by the SDK's retry
 //! middleware. For a database, queue or object store, replace the client as
@@ -106,7 +106,7 @@ const BREAKER_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
 pub struct TemplateSinkConfig {
     /// TODO(ConnectorDeveloper): document the exact shape this connector expects, e.g.
     /// "<https://api.example.com>" or "postgres://user:pass@host:5432/db".
-    /// `SecretString` because DSNs commonly embed credentials — never plain
+    /// `SecretString` because DSNs commonly embed credentials - never plain
     /// `String` for this field, see `PostgresSinkConfig::connection_string`
     /// in `sinks/postgres_sink` for the same pattern.
     #[serde(serialize_with = "iggy_common::serde_secret::serialize_secret")]
@@ -115,7 +115,7 @@ pub struct TemplateSinkConfig {
     /// The destination table/index/collection/bucket name. Kept as its own
     /// field (rather than folded into `connection_string`) specifically so
     /// it can be validated in `open()` before ever being interpolated into
-    /// a query, path, or URL — see `validate_identifier` below. Delete this
+    /// a query, path, or URL - see `validate_identifier` below. Delete this
     /// field if your destination has no such dynamic identifier.
     pub target: String,
 
@@ -123,7 +123,7 @@ pub struct TemplateSinkConfig {
     /// `Debug`/log output; delete this field if `connection_string` already
     /// carries all required auth. Read it with `.expose_secret()` (from the
     /// `secrecy::ExposeSecret` trait) at the one place you actually need the
-    /// plaintext — e.g. when building an auth header in `build_raw_client()`.
+    /// plaintext - e.g. when building an auth header in `build_raw_client()`.
     #[serde(
         default,
         serialize_with = "iggy_common::serde_secret::serialize_optional_secret"
@@ -132,7 +132,7 @@ pub struct TemplateSinkConfig {
 
     /// Optional path (e.g. "/health") probed with retry during `open()`
     /// before the connector is considered ready. Leave unset if your target
-    /// has no health endpoint — the probe is skipped, not failed, in that case.
+    /// has no health endpoint - the probe is skipped, not failed, in that case.
     pub health_check_path: Option<String>,
 
     pub batch_size: Option<usize>,
@@ -159,7 +159,7 @@ pub struct TemplateSinkConfig {
 /// Adjust the allowed character set to whatever your destination's naming
 /// rules actually are, but always validate *something* before a
 /// config-or-message-derived name is interpolated into a query, path, or
-/// URL — see `doris_sink::validate_identifier` / `surrealdb_sink::validate_identifier`
+/// URL - see `doris_sink::validate_identifier` / `surrealdb_sink::validate_identifier`
 /// in this repo for the same pattern applied to a real destination.
 fn validate_identifier(field: &str, value: &str) -> Result<(), Error> {
     if value.is_empty() || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -262,7 +262,7 @@ impl TemplateSink {
     ///   payload shape) will never succeed, and the breaker is left alone,
     ///   because a data problem says nothing about whether the destination is
     ///   up. By default the chunk is skipped and counted. At least once, the
-    ///   call fails and the runtime stops the sink at that offset, since a
+    ///   call fails and the runtime stops delivery of that topic at that offset, since a
     ///   skipped chunk would let the stored offset pass an undelivered
     ///   message. See the doc comment on that variant in
     ///   `iggy_connector_sdk::Error`.
@@ -282,14 +282,14 @@ impl TemplateSink {
     /// redelivery, from replaying an offset range after a logged loss, and from
     /// a server failover before the stored offset replicated. Build a stable
     /// key with `dedup_key()` below for every message you write, and make the
-    /// write idempotent on it (upsert / `ON CONFLICT` / unique index) — see
+    /// write idempotent on it (upsert / `ON CONFLICT` / unique index) - see
     /// `connector-pr-review` B5.
     ///
     /// If your destination's write call can succeed at the transport level
     /// while rejecting some or all rows individually (a bulk/batch API
     /// returning 200 with per-item errors, a stream-load response, a bulk
     /// index response), count accepted rows yourself and return `Err` unless
-    /// every row of a non-empty `batch` was accepted — never `Ok(())`. A partly
+    /// every row of a non-empty `batch` was accepted - never `Ok(())`. A partly
     /// rejected chunk matters most at least once: `Ok(())` would let the stored
     /// offset pass the rejected rows. Return a permanent error when the data
     /// is at fault (retrying cannot help) and a transient one when the destination
@@ -314,8 +314,8 @@ impl TemplateSink {
             let _ = key;
         }
         Err(Error::InitError(
-            "TemplateSink::push_batch is not implemented yet — see the TODO(ConnectorDeveloper) comment in \
-             template_sink/src/lib.rs"
+            "TemplateSink::push_batch is not implemented yet - see the TODO(ConnectorDeveloper) comment in \
+             sink_template/src/lib.rs"
                 .to_string(),
         ))
     }
@@ -325,7 +325,7 @@ impl TemplateSink {
     ///
     /// All chunks share one delivery budget. A chunk the destination rejects for good is skipped
     /// and counted, except in at-least-once mode, where skipping would let the runtime store
-    /// an offset past an undelivered message: the call fails and the runtime stops the sink.
+    /// an offset past an undelivered message: the call fails and the runtime stops delivery of that topic.
     /// At least once, an unclassified error also stops the call at its chunk, so no later chunk
     /// is written before the runtime redelivers the batch.
     async fn deliver_messages<F, Fut>(
@@ -481,7 +481,8 @@ impl TemplateSink {
 
     /// Waits out an open breaker instead of refusing the batch. At most once, the
     /// runtime stored the offset when it polled, so a refused batch would be gone for good. At
-    /// least once, a refused call makes the runtime redeliver the batch in a tight loop.
+    /// least once, a refused call makes the runtime hand the batch over again after its own backoff,
+    /// and each attempt counts toward `retry_max_attempts`.
     async fn wait_for_closed_breaker(&self, deadline: Instant) -> Result<(), Error> {
         let mut warned = false;
         while self.circuit_breaker.is_open().await {
@@ -505,8 +506,8 @@ impl TemplateSink {
     }
 }
 
-/// Stable per-message dedup key: `stream:topic:partition:offset`. Mirrors
-/// `mongodb_sink::build_composite_document_id` — copy this, not a random UUID,
+/// Stable per-message dedup key: `stream:topic:partition:offset`. Same shape as
+/// `mongodb_sink::build_composite_document_id`, keyed on the offset instead of `message_id` - copy this, not a random UUID,
 /// for whatever identity column/key your destination's upsert needs.
 ///
 /// Partition plus offset names one position in one partition's log for good, so a
@@ -553,7 +554,7 @@ fn offset_range(messages: &[ConsumedMessage]) -> String {
 impl Sink for TemplateSink {
     async fn open(&mut self) -> Result<(), Error> {
         // Structural validation happens here, not in `new()`, because only
-        // `open()` can return an error — `new()` is a plain factory function
+        // `open()` can return an error - `new()` is a plain factory function
         // with nowhere to send a "this config is invalid" result.
         if self
             .config
@@ -609,7 +610,7 @@ impl Sink for TemplateSink {
             .await?;
         } else {
             warn!(
-                "{CONNECTOR_NAME} connector with ID: {} has no health_check_path configured — \
+                "{CONNECTOR_NAME} connector with ID: {} has no health_check_path configured - \
                  skipping the startup connectivity probe. Consider adding one.",
                 self.id
             );
