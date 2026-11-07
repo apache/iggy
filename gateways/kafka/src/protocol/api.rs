@@ -672,19 +672,15 @@ pub fn supported_max_version(api_key: i16) -> Option<i16> {
 /// open, the answer a real broker gives on a PLAINTEXT listener. Keeping them out of the firewall
 /// table means dispatch never serves them on its own.
 ///
-/// `SaslHandshake` is pinned to v1 on both ends. v0 selects the headerless token framing (KIP-152)
-/// that the frame reader cannot parse, so advertising it would invite exactly the shape this
-/// gateway refuses.
+/// `SaslHandshake` v0 selects a bare token with no request header after it (KIP-152), and v1 a
+/// token in a `SaslAuthenticate` request. The connection loop serves both.
 static SASL_ADVERTISED_RANGES: &[ApiVersionRange] = &[
     ApiVersionRange {
-        // Advertised from v0 even though only v1 is accepted, the same split
-        // [`advertised_min_version`] already applies to Produce. librdkafka gates its whole
-        // SASL-handshake feature on `SaslHandshake` v0 appearing in the advertisement
-        // (`RD_KAFKA_FEATURE_SASL_HANDSHAKE` depends on key 17 at version 0), so advertising v1
-        // alone makes it report "SASL Handshake not supported by broker" and give up before it
-        // ever sends one. It then picks v1 anyway, because `SaslAuthenticate` being advertised is
-        // what selects the KIP-152 framing. A client that really only knows v0 still gets
-        // `UNSUPPORTED_VERSION` and a closed connection from the state machine.
+        // librdkafka gates its whole SASL-handshake feature on `SaslHandshake` v0 appearing in the
+        // advertisement (`RD_KAFKA_FEATURE_SASL_HANDSHAKE` depends on key 17 at version 0), so
+        // advertising v1 alone makes it report "SASL Handshake not supported by broker" and give
+        // up before it ever sends one. It then picks v1, because `SaslAuthenticate` being
+        // advertised is what selects the KIP-152 framing.
         api_key: API_KEY_SASL_HANDSHAKE,
         min_version: 0,
         max_version: 1,
