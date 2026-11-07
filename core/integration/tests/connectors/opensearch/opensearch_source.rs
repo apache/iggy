@@ -22,7 +22,7 @@ use super::{
 };
 use crate::connectors::fixtures::{
     OpenSearchSourceMissingIndexFixture, OpenSearchSourcePreCreatedFixture,
-    OpenSearchSourceSmallBatchFixture,
+    OpenSearchSourceSmallBatchFixture, OpenSearchSourceWildcardFixture,
 };
 use iggy_connector_sdk::api::{ConnectorStatus, SourceInfoResponse};
 use integration::harness::seeds;
@@ -266,5 +266,29 @@ async fn given_missing_index_when_connector_opens_should_report_error(
         last_error.message.contains("Plugin initialization failed"),
         "missing index should fail during plugin open, got: {}",
         last_error.message
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_wildcard_index_matching_nothing_when_index_appears_should_produce_messages(
+    harness: &TestHarness,
+    fixture: OpenSearchSourceWildcardFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+
+    fixture.setup_index().await.expect("Failed to create index");
+    fixture
+        .insert_documents(TEST_MESSAGE_COUNT)
+        .await
+        .expect("Failed to insert documents");
+
+    let messages = poll_next(&client, "wildcard_consumer", TEST_MESSAGE_COUNT).await;
+
+    assert_eq!(
+        sorted_document_ids(&json_payloads(&messages)),
+        expected_ids(1, TEST_MESSAGE_COUNT)
     );
 }

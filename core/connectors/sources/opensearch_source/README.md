@@ -19,7 +19,7 @@ cargo build --release -p iggy_connector_opensearch_source
 ```
 
 Then point the runtime at a config like this one (a ready copy lives in
-`runtime/example_config/connectors/opensearch_source.toml`):
+`core/connectors/runtime/example_config/connectors/opensearch_source.toml`):
 
 ```toml
 type = "source"
@@ -132,7 +132,9 @@ that means the results cannot be paginated or told apart.
 Delivery is at-least-once. `poll()` returns the batch together with a candidate
 state. The runtime sends the batch, saves the state and reports the result:
 the connector adopts the candidate on `Ack` and drops it on `Nack`, so a
-rejected batch is fetched again. If the batch reached Iggy but the state save
+rejected batch is fetched again. The SDK stops the source after five
+consecutive `Nack`s and reports it as `Error`; restart the connector to resume.
+If the batch reached Iggy but the state save
 failed, the batch is replayed as well. Consumers should dedupe on the message
 `id`.
 
@@ -143,14 +145,16 @@ before) leaves the watermark alone and is counted directly.
 
 The state holds the sort tuple of the newest published hit (its first element is
 the watermark), the `(index, tie-breaker value)` of every published hit at that watermark,
-`last_poll_timestamp` (informational only), document and poll counters, the last
-error, and processing stats. The list of hits at the watermark is capped at
+`last_poll_timestamp` (informational only), document and poll counters, the error count, and a fingerprint of `index`,
+`timestamp_field` and `query`. The list of hits at the watermark is capped at
 10,000. If more documents than that share the newest timestamp, the poll fails
 with `SchemaMismatch` and the state stays put; use a `timestamp_field` with a
 finer resolution. After a restart the first scan starts from the watermark, so
 the hits at that timestamp are read again and skipped. A corrupt saved state
 makes `open()` fail with `InitError` instead of silently restarting from the
-first document.
+first document. So does a state saved under another `index`, `timestamp_field` or
+`query`, because its watermark would skip documents. Delete the state file to
+start from the beginning.
 
 With no saved state the connector starts at the beginning of the index and
 republishes everything. If you lose the runtime state file, keep `state_path` on
@@ -211,7 +215,7 @@ again. A successful search resets it.
 | Symptom | Check |
 | --- | --- |
 | `open()` fails on a missing index | Index name, URL and credentials. |
-| `open()` fails with `state restore failed` | Repair or delete the runtime state file. |
+| `open()` fails with `state restore failed` | Repair or delete the runtime state file. A state saved for another `index`, `timestamp_field` or `query` also fails this way: delete the state file to start from the beginning. |
 | Nothing new after a restart | `timestamp_field` mapping must match the indexed documents. |
 | Duplicate messages | Expected after a `Nack` or a failed state save. Dedupe on the message `id`. |
 | Repeated warnings about `_source` | The index disables `_source`, so those hits are skipped. |

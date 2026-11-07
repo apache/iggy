@@ -274,6 +274,36 @@ impl TestFixture for OpenSearchSourceSmallBatchFixture {
     }
 }
 
+/// OpenSearch source fixture whose `index` is a pattern that matches nothing until the test
+/// creates the concrete index.
+pub struct OpenSearchSourceWildcardFixture {
+    inner: OpenSearchSourceFixture,
+}
+
+impl std::ops::Deref for OpenSearchSourceWildcardFixture {
+    type Target = OpenSearchSourceFixture;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+#[async_trait]
+impl TestFixture for OpenSearchSourceWildcardFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let inner = OpenSearchSourceFixture::setup().await?;
+        Ok(Self { inner })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(
+            ENV_SOURCE_INDEX.to_string(),
+            format!("{}*", self.inner.index),
+        );
+        envs
+    }
+}
+
 /// OpenSearch source fixture pointing at an index that is never created,
 /// for exercising the connector's "missing index" failure path.
 pub struct OpenSearchSourceMissingIndexFixture {

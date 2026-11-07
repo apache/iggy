@@ -97,6 +97,7 @@ pub use opensearch::{
     OpenSearchSourceCircuitBreakerFixture, OpenSearchSourceMissingIndexFixture,
     OpenSearchSourcePreCreatedFixture, OpenSearchSourceSmallBatchFixture,
     OpenSearchSourceTransientErrorFixture, OpenSearchSourceTypedFieldsFixture,
+    OpenSearchSourceWildcardFixture,
 };
 pub use postgres::{
     POSTGRES_LARGE_BATCH_SIZE, PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture,

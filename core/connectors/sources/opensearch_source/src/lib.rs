@@ -58,7 +58,6 @@ const MAX_BATCH_SIZE: usize = 10_000;
 const DOCUMENT_ID_HEADER: &str = "opensearch.document_id";
 const INDEX_HEADER: &str = "opensearch.index";
 const MAX_HEADER_VALUE_LENGTH: usize = 255;
-const MAX_LAST_ERROR_CHARS: usize = 512;
 // What OpenSearch reports for a document missing the sort field when it sorts last. The sort
 // asks for missing values first, so seeing this means that request option was not honored.
 const MISSING_LAST_SORT_VALUE: i64 = i64::MAX;
@@ -85,14 +84,14 @@ struct State {
     last_sort: Option<Vec<Value>>,
     #[serde(default)]
     error_count: usize,
-    #[serde(default)]
-    last_error: Option<String>,
-    #[serde(default)]
-    processing_stats: ProcessingStats,
     /// Hits published at the watermark, skipped when the next scan reads them again. The
     /// state is MessagePack without field names, so new fields must stay at the end.
     #[serde(default)]
     watermark_hits: Vec<HitKey>,
+    /// Identifies the index, timestamp field and query the cursor belongs to. A cursor from
+    /// other settings would skip documents, so `open()` refuses to start on a mismatch.
+    #[serde(default)]
+    config_fingerprint: Option<String>,
     /// Page cursor of the running scan. Not persisted: a restart rescans from the watermark.
     #[serde(skip)]
     scan_cursor: Option<Vec<Value>>,
@@ -102,22 +101,6 @@ struct State {
 struct HitKey {
     index: String,
     id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct ProcessingStats {
-    #[serde(default)]
-    total_bytes_processed: u64,
-    /// Running cumulative average over the connector's lifetime, persisted and accumulated
-    /// across restarts. Reflects long-term throughput baseline, not session-only average.
-    #[serde(default)]
-    avg_batch_processing_time_ms: f64,
-    #[serde(default)]
-    last_successful_poll: Option<DateTime<Utc>>,
-    #[serde(default)]
-    empty_polls_count: usize,
-    #[serde(default)]
-    successful_polls_count: usize,
 }
 
 // `Deserialize` only: nothing re-serializes a plugin config, and omitting `Serialize`
@@ -178,7 +161,6 @@ struct SearchOutcome {
     watermark_hits: Vec<HitKey>,
     scan_cursor: Option<Vec<Value>>,
     last_poll_timestamp: Option<DateTime<Utc>>,
-    batch_bytes: u64,
 }
 
 struct Page {
@@ -188,7 +170,6 @@ struct Page {
     /// Positions in `sorts` and `keys` of hits that were not published before.
     fresh: Vec<usize>,
     last_poll_timestamp: Option<DateTime<Utc>>,
-    batch_bytes: u64,
     full: bool,
 }
 
@@ -199,7 +180,8 @@ impl OpenSearchSource {
         let request_timeout =
             parse_duration(config.request_timeout.as_deref(), DEFAULT_REQUEST_TIMEOUT);
         let verbose = config.verbose_logging;
-        let (restored_state, state_restore_error) = restore_state(id, state);
+        let (restored_state, state_restore_error) =
+            restore_state(id, state, &config_fingerprint(&config));
 
         let cb_threshold = config
             .circuit_breaker_threshold
@@ -442,7 +424,6 @@ impl OpenSearchSource {
             last_sort,
             watermark_hits: watermark_hits.unwrap_or_default(),
             last_poll_timestamp: page.last_poll_timestamp,
-            batch_bytes: page.batch_bytes,
         })
     }
 
@@ -490,7 +471,6 @@ impl OpenSearchSource {
             keys: Vec::with_capacity(hits.len()),
             fresh: Vec::new(),
             last_poll_timestamp: None,
-            batch_bytes: 0,
         };
 
         for mut hit in hits {
@@ -553,7 +533,6 @@ impl OpenSearchSource {
 
         let payload = serde_json::to_vec(source)
             .map_err(|e| Error::Serialization(format!("Failed to serialize document: {e}")))?;
-        page.batch_bytes += payload.len() as u64;
 
         // `index` may be a pattern, so the concrete index of each hit keeps equal `_id`s
         // in different indices from sharing a message id.
@@ -575,7 +554,6 @@ impl OpenSearchSource {
     async fn finalize_poll(
         &self,
         outcome: SearchOutcome,
-        processing_time_ms: f64,
     ) -> Result<(Vec<ProducedMessage>, Option<ConnectorState>), Error> {
         let mut state = self.state.lock().await.clone();
         state.total_documents_published += outcome.messages.len();
@@ -589,20 +567,6 @@ impl OpenSearchSource {
         if let Some(timestamp) = outcome.last_poll_timestamp {
             state.last_poll_timestamp = Some(timestamp);
         }
-        state.processing_stats.total_bytes_processed += outcome.batch_bytes;
-
-        if outcome.messages.is_empty() {
-            state.processing_stats.empty_polls_count += 1;
-        } else {
-            state.processing_stats.successful_polls_count += 1;
-            state.processing_stats.last_successful_poll = Some(Utc::now());
-        }
-
-        let total_polls = state.processing_stats.successful_polls_count
-            + state.processing_stats.empty_polls_count;
-        state.processing_stats.avg_batch_processing_time_ms += (processing_time_ms
-            - state.processing_stats.avg_batch_processing_time_ms)
-            / total_polls as f64;
 
         let produced_count = outcome.messages.len();
         let total_documents_published = state.total_documents_published;
@@ -644,13 +608,12 @@ impl OpenSearchSource {
     }
 
     #[cfg(test)]
-    async fn test_metrics(&self) -> (usize, usize, usize, usize) {
+    async fn test_metrics(&self) -> (usize, usize, usize) {
         let state = self.state.lock().await;
         (
             state.total_documents_published,
             state.poll_count,
             state.error_count,
-            state.processing_stats.empty_polls_count,
         )
     }
 
@@ -672,25 +635,15 @@ impl OpenSearchSource {
             self.circuit_breaker.record_failure().await;
         }
         let mut state = self.state.lock().await;
-        // error_count and last_error accumulate in State and are captured by the next
-        // finalize_poll call (success path). Both runtime ConnectorState and file state
-        // preserve these values across restarts.
+        // error_count accumulates in State and is captured by the next finalize_poll call
+        // (success path).
         state.error_count += 1;
-        state.last_error = Some(truncated(error.to_string()));
         drop(state);
         error!(
             "{CONNECTOR_NAME} connector ID: {} poll failed: {error}",
             self.id
         );
         Err(error)
-    }
-}
-
-// `last_error` is persisted with every batch, and an OpenSearch error body can be large.
-fn truncated(message: String) -> String {
-    match message.char_indices().nth(MAX_LAST_ERROR_CHARS) {
-        Some((end, _)) => format!("{}...", &message[..end]),
-        None => message,
     }
 }
 
@@ -784,18 +737,43 @@ fn ensure_complete_response(body: &Value) -> Result<(), Error> {
     Ok(())
 }
 
-fn restore_state(id: u32, state: Option<ConnectorState>) -> (State, Option<String>) {
+fn restore_state(
+    id: u32,
+    state: Option<ConnectorState>,
+    fingerprint: &str,
+) -> (State, Option<String>) {
+    let fresh = || State {
+        config_fingerprint: Some(fingerprint.to_owned()),
+        ..State::default()
+    };
     let Some(connector_state) = state else {
-        return (State::default(), None);
+        return (fresh(), None);
     };
 
     match connector_state.deserialize::<State>(CONNECTOR_NAME, id) {
+        Some(restored)
+            if restored.last_sort.is_some()
+                && restored
+                    .config_fingerprint
+                    .as_deref()
+                    .is_some_and(|saved| saved != fingerprint) =>
+        {
+            let cause = "persisted state belongs to a different index, timestamp_field or query. \
+                         Delete the runtime state file to start from the beginning."
+                .to_string();
+            error!("{CONNECTOR_NAME} ID {id}: {cause}");
+            (fresh(), Some(cause))
+        }
         Some(restored) => {
             info!(
                 "Restored state for {CONNECTOR_NAME} connector with ID: {id}. \
                  Documents published: {}, poll count: {}",
                 restored.total_documents_published, restored.poll_count
             );
+            let restored = State {
+                config_fingerprint: Some(fingerprint.to_owned()),
+                ..restored
+            };
             (restored, None)
         }
         None => {
@@ -805,9 +783,18 @@ fn restore_state(id: u32, state: Option<ConnectorState>) -> (State, Option<Strin
                          Refusing to start to prevent silent cursor reset."
                 .to_string();
             error!("{CONNECTOR_NAME} ID {id}: {cause}");
-            (State::default(), Some(cause))
+            (fresh(), Some(cause))
         }
     }
+}
+
+// The query is part of the identity because a narrower or different query changes which
+// documents the saved cursor has already passed.
+fn config_fingerprint(config: &OpenSearchSourceConfig) -> String {
+    let identity = json!([config.index, config.timestamp_field, config.query]);
+    blake3::hash(identity.to_string().as_bytes())
+        .to_hex()
+        .to_string()
 }
 
 fn validate_open_config(config: &OpenSearchSourceConfig) -> Result<(), Error> {
@@ -993,8 +980,6 @@ impl Source for OpenSearchSource {
 
         sleep(self.polling_interval).await;
 
-        let start_time = std::time::Instant::now();
-
         let client = self
             .client
             .as_ref()
@@ -1003,8 +988,7 @@ impl Source for OpenSearchSource {
         match self.search_documents(client).await {
             Ok(outcome) => {
                 self.circuit_breaker.record_success();
-                let processing_time = start_time.elapsed().as_millis() as f64;
-                match self.finalize_poll(outcome, processing_time).await {
+                match self.finalize_poll(outcome).await {
                     Ok((messages, persisted_state)) => Ok(ProducedMessages {
                         schema: Schema::Json,
                         messages,
@@ -1081,18 +1065,11 @@ mod tests {
             poll_count: 7,
             last_sort: Some(vec![json!("2024-01-01T00:00:00Z"), json!("doc_42")]),
             error_count: 1,
-            last_error: Some("connection reset".to_string()),
-            processing_stats: ProcessingStats {
-                total_bytes_processed: 1024,
-                avg_batch_processing_time_ms: 12.5,
-                last_successful_poll: None,
-                empty_polls_count: 2,
-                successful_polls_count: 5,
-            },
             watermark_hits: vec![HitKey {
                 index: "logs".to_string(),
                 id: "doc_42".to_string(),
             }],
+            config_fingerprint: None,
             scan_cursor: None,
         }
     }
@@ -1156,6 +1133,58 @@ mod tests {
     }
 
     #[test]
+    fn given_state_from_other_index_when_new_should_set_restore_error() {
+        let source = OpenSearchSource::new(1, test_config(), None);
+        let mut state = test_state();
+        state.config_fingerprint = Some(config_fingerprint(&test_config()));
+        let saved = source
+            .serialize_state(&state)
+            .expect("state should serialize");
+        let mut other = test_config();
+        other.index = "other_documents".to_string();
+
+        let moved = OpenSearchSource::new(1, other, Some(saved));
+
+        assert!(moved.state_restore_error.is_some());
+    }
+
+    #[test]
+    fn given_state_with_changed_query_when_new_should_set_restore_error() {
+        let source = OpenSearchSource::new(1, test_config(), None);
+        let mut state = test_state();
+        state.config_fingerprint = Some(config_fingerprint(&test_config()));
+        let saved = source
+            .serialize_state(&state)
+            .expect("state should serialize");
+        let mut changed = test_config();
+        changed.query = Some(json!({ "term": { "level": "error" } }));
+
+        let moved = OpenSearchSource::new(1, changed, Some(saved));
+
+        assert!(moved.state_restore_error.is_some());
+    }
+
+    #[test]
+    fn given_state_without_fingerprint_when_new_should_restore_and_stamp() {
+        let source = OpenSearchSource::new(1, test_config(), None);
+        let saved = source
+            .serialize_state(&test_state())
+            .expect("state should serialize");
+
+        let restored = OpenSearchSource::new(1, test_config(), Some(saved));
+
+        assert!(restored.state_restore_error.is_none());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = restored.state.lock().await;
+            assert_eq!(
+                state.config_fingerprint,
+                Some(config_fingerprint(&test_config()))
+            );
+        });
+    }
+
+    #[test]
     fn given_no_runtime_state_when_new_should_start_fresh() {
         let source = OpenSearchSource::new(1, test_config(), None);
 
@@ -1201,19 +1230,6 @@ mod tests {
         config.timestamp_field = None;
         let error = validate_open_config(&config).expect_err("missing timestamp_field");
         assert!(matches!(error, Error::InvalidConfigValue(_)));
-    }
-
-    #[test]
-    fn given_long_error_message_when_truncated_should_stay_bounded_on_char_boundary() {
-        let message = "é".repeat(MAX_LAST_ERROR_CHARS * 2);
-
-        let shortened = truncated(message);
-
-        assert_eq!(
-            shortened.chars().count(),
-            MAX_LAST_ERROR_CHARS + "...".len()
-        );
-        assert_eq!(truncated("short".to_string()), "short");
     }
 
     #[test]

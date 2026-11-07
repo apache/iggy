@@ -20,6 +20,7 @@ use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
 use serde::Deserialize;
+use std::time::{Duration, Instant};
 use testcontainers_modules::testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -72,16 +73,28 @@ pub struct OpenSearchContainer {
     pub base_url: String,
 }
 
-impl OpenSearchContainer {
-    pub async fn start() -> Result<Self, TestBinaryError> {
-        let container = GenericImage::new(OPENSEARCH_IMAGE, OPENSEARCH_TAG)
+const CONTAINER_START_ATTEMPTS: u32 = 30;
+const CONTAINER_START_RETRY_DELAY: Duration = Duration::from_secs(1);
+const CLUSTER_READY_TIMEOUT_SECS: u64 = 120;
+const CLUSTER_READY_INTERVAL_MS: u64 = 250;
+const CLUSTER_READY_REQUEST_TIMEOUT_MS: u64 = 2_000;
+
+/// Creates the shared container, or attaches to it if another test won the race.
+///
+/// `ReuseDirective::Always` inspects the daemon and then creates when nothing matches, with
+/// no lock across the two steps, so concurrent tests on a cold daemon leave one winner and
+/// the rest holding `409 Conflict: name already in use`. Retrying turns those into attaches.
+async fn start_shared_container() -> Result<ContainerAsync<GenericImage>, TestBinaryError> {
+    let mut conflict = String::new();
+    for attempt in 1..=CONTAINER_START_ATTEMPTS {
+        let result = GenericImage::new(OPENSEARCH_IMAGE, OPENSEARCH_TAG)
             .with_exposed_port(OPENSEARCH_PORT.tcp())
             .with_wait_for(WaitFor::http(
                 HttpWaitStrategy::new(OPENSEARCH_HEALTH_ENDPOINT)
                     .with_port(OPENSEARCH_PORT.tcp())
                     .with_expected_status_code(200u16),
             ))
-            .with_startup_timeout(std::time::Duration::from_secs(120))
+            .with_startup_timeout(Duration::from_secs(CLUSTER_READY_TIMEOUT_SECS))
             .with_env_var("discovery.type", "single-node")
             .with_env_var("plugins.security.disabled", "true")
             .with_env_var("DISABLE_INSTALL_DEMO_CONFIG", "true")
@@ -91,11 +104,40 @@ impl OpenSearchContainer {
             .with_container_name(OPENSEARCH_CONTAINER_NAME)
             .with_reuse(ReuseDirective::Always)
             .start()
-            .await
-            .map_err(|e| TestBinaryError::FixtureSetup {
-                fixture_type: "OpenSearchContainer".to_string(),
-                message: format!("Failed to start container: {e}"),
-            })?;
+            .await;
+
+        match result {
+            Ok(container) => return Ok(container),
+            Err(error) => {
+                let message = error.to_string();
+                if !message.contains("is already in use") {
+                    return Err(TestBinaryError::FixtureSetup {
+                        fixture_type: "OpenSearchContainer".to_string(),
+                        message: format!("Failed to start container: {message}"),
+                    });
+                }
+                info!(
+                    "OpenSearch container name taken by another test (attempt {attempt}), retrying to attach"
+                );
+                conflict = message;
+                tokio::time::sleep(CONTAINER_START_RETRY_DELAY).await;
+            }
+        }
+    }
+
+    Err(TestBinaryError::FixtureSetup {
+        fixture_type: "OpenSearchContainer".to_string(),
+        message: format!(
+            "Failed to attach to container '{OPENSEARCH_CONTAINER_NAME}' after \
+             {CONTAINER_START_ATTEMPTS} attempts: {conflict}"
+        ),
+    })
+}
+
+impl OpenSearchContainer {
+    pub async fn start() -> Result<Self, TestBinaryError> {
+        let deadline = Instant::now() + Duration::from_secs(CLUSTER_READY_TIMEOUT_SECS);
+        let container = start_shared_container().await?;
 
         info!("Started OpenSearch container");
 
@@ -112,12 +154,84 @@ impl OpenSearchContainer {
                 message: "No mapping for OpenSearch port".to_string(),
             })?;
 
-        let base_url = format!("http://localhost:{mapped_port}");
+        // Docker publishes the port on IPv4 only, and `localhost` can resolve to ::1 first
+        // on macOS.
+        let base_url = format!("http://127.0.0.1:{mapped_port}");
         info!("OpenSearch container available at {base_url}");
 
-        Ok(Self {
+        let started = Self {
             _container: container,
             base_url,
+        };
+        // Attaching to a reused container skips testcontainers' wait, so a test that attaches
+        // while another one still boots the cluster must wait for health itself.
+        started.wait_until_ready(deadline).await?;
+        Ok(started)
+    }
+
+    async fn wait_until_ready(&self, deadline: Instant) -> Result<(), TestBinaryError> {
+        #[derive(Deserialize)]
+        struct ClusterHealth {
+            timed_out: bool,
+        }
+
+        // A dedicated short-timeout client: the shared one retries for minutes on a hung
+        // request, which looks like a stuck test.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(CLUSTER_READY_REQUEST_TIMEOUT_MS))
+            .build()
+            .map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "OpenSearchContainer".to_string(),
+                message: format!("Failed to build readiness HTTP client: {error}"),
+            })?;
+        // Without a wait_for_* parameter the timeout is ignored and a red cluster still
+        // answers 200 with timed_out=false.
+        let health_url = format!(
+            "{}{OPENSEARCH_HEALTH_ENDPOINT}?wait_for_status=yellow&timeout=1s",
+            self.base_url
+        );
+        let mut attempt: u32 = 0;
+        let mut last_error: String;
+
+        loop {
+            attempt += 1;
+            match client.get(&health_url).send().await {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<ClusterHealth>().await {
+                        Ok(health) if !health.timed_out => return Ok(()),
+                        Ok(_) => {
+                            last_error = format!("cluster health timed out on attempt {attempt}");
+                        }
+                        Err(error) => {
+                            last_error = format!(
+                                "cluster health body unparsable on attempt {attempt}: {error}"
+                            );
+                        }
+                    }
+                }
+                Ok(response) => {
+                    last_error = format!(
+                        "cluster health status {} on attempt {attempt}",
+                        response.status()
+                    );
+                }
+                Err(error) => {
+                    last_error =
+                        format!("cluster health request failed on attempt {attempt}: {error}");
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(CLUSTER_READY_INTERVAL_MS)).await;
+        }
+
+        Err(TestBinaryError::FixtureSetup {
+            fixture_type: "OpenSearchContainer".to_string(),
+            message: format!(
+                "OpenSearch at {} not ready after {CLUSTER_READY_TIMEOUT_SECS}s ({attempt} attempts): {last_error}",
+                self.base_url
+            ),
         })
     }
 }
@@ -125,7 +239,7 @@ impl OpenSearchContainer {
 pub fn create_http_client() -> HttpClient {
     let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(Duration::from_secs(30))
         .build()
         .expect("Failed to build HTTP client");
     reqwest_middleware::ClientBuilder::new(client)

@@ -25,4 +25,5 @@ pub use resilience::{
 pub use source::{
     OpenSearchSourceMissingIndexFixture, OpenSearchSourcePreCreatedFixture,
     OpenSearchSourceSmallBatchFixture, OpenSearchSourceTypedFieldsFixture,
+    OpenSearchSourceWildcardFixture,
 };

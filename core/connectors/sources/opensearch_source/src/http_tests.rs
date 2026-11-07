@@ -173,7 +173,7 @@ async fn given_search_hits_when_poll_should_produce_json_messages() {
     assert!(produced.state.is_some());
     ack(&source).await;
 
-    let (fetched, polls, _, _) = source.test_metrics().await;
+    let (fetched, polls, _) = source.test_metrics().await;
     assert_eq!(fetched, 1);
     assert_eq!(polls, 1);
 }
@@ -190,8 +190,8 @@ async fn given_empty_search_when_poll_should_count_empty_poll_and_stage_nothing(
     assert!(produced.state.is_none());
     assert!(source.pending_state.lock().await.is_none());
 
-    let (_, _, _, empty_polls) = source.test_metrics().await;
-    assert_eq!(empty_polls, 1);
+    let (published, polls, _) = source.test_metrics().await;
+    assert_eq!((published, polls), (0, 1));
 }
 
 #[tokio::test]
@@ -238,7 +238,7 @@ async fn given_search_after_cursor_when_second_poll_should_request_next_page() {
     assert!(bodies[0].get("search_after").is_none());
     assert!(bodies[1].get("search_after").is_some());
 
-    let (fetched, _, _, _) = source.test_metrics().await;
+    let (fetched, _, _) = source.test_metrics().await;
     assert_eq!(fetched, 2);
 }
 
@@ -308,7 +308,7 @@ async fn given_nack_when_batch_is_staged_should_keep_committed_state() {
     assert_eq!(produced.messages.len(), 1);
     nack(&source).await;
 
-    let (fetched, polls, _, _) = source.test_metrics().await;
+    let (fetched, polls, _) = source.test_metrics().await;
     assert_eq!((fetched, polls), (0, 0));
     assert!(source.test_last_sort().await.is_none());
     assert!(source.pending_state.lock().await.is_none());
@@ -374,7 +374,7 @@ async fn given_ack_when_batch_is_staged_should_commit_candidate_state() {
     );
     ack(&source).await;
 
-    let (fetched, polls, _, _) = source.test_metrics().await;
+    let (fetched, polls, _) = source.test_metrics().await;
     assert_eq!((fetched, polls), (1, 1));
     assert!(source.test_last_sort().await.is_some());
     assert!(source.pending_state.lock().await.is_none());
@@ -424,7 +424,7 @@ async fn given_stalled_response_when_poll_should_time_out_and_fail() {
 
     assert!(matches!(error, Error::Connection(_)), "got {error:?}");
     assert!(started.elapsed() < STALL);
-    let (_, _, errors, _) = source.test_metrics().await;
+    let (_, _, errors) = source.test_metrics().await;
     assert_eq!(errors, 1);
 }
 
@@ -594,7 +594,7 @@ async fn given_search_failure_when_poll_should_increment_error_count() {
     let error = source.poll().await.expect_err("poll should fail");
     assert!(matches!(error, Error::HttpRequestFailed(_)));
 
-    let (_, _, errors, _) = source.test_metrics().await;
+    let (_, _, errors) = source.test_metrics().await;
     assert_eq!(errors, 1);
 }
 
@@ -765,7 +765,7 @@ async fn given_hit_without_sort_tuple_when_poll_should_fail_without_advancing_cu
         .expect_err("missing sort tuple must fail");
     assert!(matches!(error, Error::SchemaMismatch(_)), "got {error:?}");
     assert!(source.test_last_sort().await.is_none());
-    let (_, _, errors, _) = source.test_metrics().await;
+    let (_, _, errors) = source.test_metrics().await;
     assert_eq!(errors, 1, "error counter must be incremented");
 }
 
