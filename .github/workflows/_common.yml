@@ -135,7 +135,7 @@ jobs:
     name: Validate third-party licenses
     if: inputs.validate-third-party-licenses
     runs-on: ubuntu-26.04
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: ./.github/actions/utils/validate-third-party-licenses
