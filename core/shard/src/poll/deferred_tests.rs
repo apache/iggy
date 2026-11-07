@@ -1077,7 +1077,7 @@ fn store_offset(owner: &TestShard, consumer: PollingConsumer, offset: u64) {
                     offset,
                     String::new(),
                 );
-                partition.consumer_offsets.pin().insert(id, stored);
+                partition.consumer_offsets.borrow_mut().insert(id, stored);
             }
             PollingConsumer::ConsumerGroup(id, _) => {
                 let stored = ConsumerOffset::new(
@@ -1088,7 +1088,7 @@ fn store_offset(owner: &TestShard, consumer: PollingConsumer, offset: u64) {
                 );
                 partition
                     .consumer_group_offsets
-                    .pin()
+                    .borrow_mut()
                     .insert(ConsumerGroupId(id), stored);
             }
         })

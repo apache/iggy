@@ -18,6 +18,7 @@
 #![allow(dead_code)]
 
 use crate::poll_plan::{PollPlan, PollReadResult};
+use crate::repair_memory::RingTicket;
 use crate::stream_keyring::{StreamKeyIdentity, StreamKeyring};
 use crate::types::PartitionsConfig;
 use crate::{IggyPartition, Partition, PollingArgs, PollingConsumer};
@@ -124,6 +125,7 @@ where
     persistence_notifier: RefCell<Option<crate::PersistenceNotifier>>,
     io_notifier: RefCell<Option<(crate::PartitionIoNotifier, usize)>>,
     repair_memory: Option<Arc<crate::RepairMemoryBudget>>,
+    repair_rings: Option<Rc<crate::RepairRingBudget>>,
     loopback_ready: Rc<LoopbackReady>,
     /// Debug-only tripwire: counts live [`Self::with_partition`] borrows so
     /// `insert` / `remove` can assert the partitions vec is never mutated
@@ -171,6 +173,7 @@ where
             persistence_notifier: RefCell::new(None),
             io_notifier: RefCell::new(None),
             repair_memory: None,
+            repair_rings: None,
             loopback_ready: Rc::default(),
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
@@ -194,6 +197,7 @@ where
             persistence_notifier: RefCell::new(None),
             io_notifier: RefCell::new(None),
             repair_memory: None,
+            repair_rings: None,
             loopback_ready: Rc::default(),
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
@@ -211,6 +215,53 @@ where
         let mut partitions = Self::with_capacity(shard_id, config, capacity);
         partitions.repair_memory = Some(budget);
         partitions
+    }
+
+    /// Charges the repair ring of every partition inserted from now on to
+    /// this shard's `budget`. [`Self::shed_repair_rings`] enforces it.
+    #[must_use]
+    pub fn with_repair_rings(mut self, budget: Rc<crate::RepairRingBudget>) -> Self {
+        self.repair_rings = Some(budget);
+        self
+    }
+
+    /// Sheds repair ring memory until the shard is within its ring budget:
+    /// first the bodies of the rings that grew earliest, then the oldest
+    /// entries of the rings with no body left to release. Every ring keeps
+    /// its newest entry.
+    pub fn shed_repair_rings(&self) {
+        let Some(budget) = self.repair_rings.as_deref() else {
+            return;
+        };
+        budget.retain_live(|ticket| self.ring_owner(ticket).is_some());
+        // A pass that keeps its ticket shed `excess` from that ring, so the
+        // next check ends the loop.
+        while let Some(excess) = budget.excess() {
+            if let Some(ticket) = budget.oldest_grown() {
+                let left = self.ring_owner(ticket).is_some_and(|partition| {
+                    partition.log.journal().inner.release_ring_bodies(excess)
+                });
+                if !left {
+                    budget.pop_grown();
+                }
+            } else if let Some(ticket) = budget.oldest_released() {
+                let left = self.ring_owner(ticket).is_some_and(|partition| {
+                    partition.log.journal().inner.drop_ring_entries(excess)
+                });
+                if !left {
+                    budget.pop_released();
+                }
+            } else {
+                return;
+            }
+        }
+    }
+
+    /// The partition whose ring `ticket` charges. `None` once the partition
+    /// left the shard, was fenced for delete, or took a new charge.
+    fn ring_owner(&self, ticket: RingTicket) -> Option<&IggyPartition<B, SB>> {
+        self.get_by_ns(&ticket.namespace)
+            .filter(|partition| partition.log.journal().inner.charged_by(ticket))
     }
 
     /// This node's key-encryption keys, for wrapping new stream keys.
@@ -414,6 +465,13 @@ where
         }
         if let Some(budget) = &self.repair_memory {
             partition.proof_walk_memory = Some(budget.reservation());
+        }
+        if let Some(budget) = &self.repair_rings {
+            partition
+                .log
+                .journal()
+                .inner
+                .attach_ring_budget(Rc::clone(budget), namespace);
         }
         self.install_loopback_notifier(namespace, &partition);
         partition.publish_current_offset();
@@ -1007,8 +1065,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Segment;
-    use crate::journal::MessageLookup;
+    use crate::journal::{BodyPosition, EVICTED_HEADER_BYTES, MessageLookup};
+    use crate::{RepairRingBudget, Segment};
     use bytes::Bytes;
     use consensus::LocalPipeline;
     use iggy_binary_protocol::Operation;
@@ -1023,9 +1081,11 @@ mod tests {
         Message, SegmentStorage,
         iobuf::{Frozen, Owned},
     };
+    use std::ops::RangeInclusive;
     use std::sync::Arc;
 
     const TEST_CLUSTER: u128 = 1;
+    const RING_OPS: RangeInclusive<u64> = 1..=4;
 
     fn build_partition() -> IggyPartition<IggyMessageBus> {
         let namespace = IggyNamespace::new(1, 1, 0);
@@ -1128,8 +1188,7 @@ mod tests {
     /// `build_partition` for a replicated group. The replica count is what
     /// decides whether the journal retains evicted entries for repair, so a
     /// single-replica partition cannot exercise anything that reads the ring.
-    fn build_replicated_partition() -> IggyPartition<IggyMessageBus> {
-        let namespace = IggyNamespace::new(1, 1, 0);
+    fn build_replicated_partition(namespace: IggyNamespace) -> IggyPartition<IggyMessageBus> {
         let consensus = VsrConsensus::new(
             TEST_CLUSTER,
             0,
@@ -1294,7 +1353,7 @@ mod tests {
     #[compio::test]
     async fn evicted_commit_point_still_answers_for_the_view_change_suffix() {
         let namespace = IggyNamespace::new(1, 1, 0);
-        let partition = build_replicated_partition();
+        let partition = build_replicated_partition(namespace);
 
         for offset in 0..=2u64 {
             partition
@@ -1463,7 +1522,7 @@ mod tests {
             path_layout: crate::PartitionPathLayout::default(),
         };
         let partitions = IggyPartitions::new(ShardId::new(0), config);
-        partitions.insert(namespace, build_replicated_partition());
+        partitions.insert(namespace, build_replicated_partition(namespace));
         let resolve = |count| {
             partitions
                 .segment_delete_resolution(&namespace, count)
@@ -1502,5 +1561,158 @@ mod tests {
                 "count {count} resolves to a sealed segment, which the waiting commits cannot change"
             );
         }
+    }
+
+    /// A shard whose repair rings share `bytes_max`, holding a replicated
+    /// partition for each of `namespaces`.
+    fn shard_with_ring_budget(
+        bytes_max: u64,
+        namespaces: &[IggyNamespace],
+    ) -> IggyPartitions<IggyMessageBus> {
+        let config = PartitionsConfig {
+            messages_required_to_save: 100,
+            size_of_messages_required_to_save: IggyByteSize::from(1024 * 1024_u64),
+            validate_checksum: true,
+            segment_size: IggyByteSize::from(1024 * 1024_u64),
+            preallocate_segments: false,
+            key_context: Arc::default(),
+            path_layout: crate::PartitionPathLayout::default(),
+        };
+        let partitions = IggyPartitions::new(ShardId::new(0), config)
+            .with_repair_rings(Rc::new(RepairRingBudget::new(bytes_max)));
+        for namespace in namespaces {
+            partitions.insert(*namespace, build_replicated_partition(*namespace));
+        }
+        partitions
+    }
+
+    /// Evicts `ops` into the ring of `namespace` as a flush does: one-message
+    /// batches that a segment holds.
+    async fn grow_ring(
+        partitions: &IggyPartitions<IggyMessageBus>,
+        namespace: IggyNamespace,
+        ops: RangeInclusive<u64>,
+    ) {
+        let journal = &partitions
+            .get_by_ns(&namespace)
+            .unwrap()
+            .log
+            .journal()
+            .inner;
+        let count = ops.clone().count();
+        for op in ops {
+            journal
+                .append(build_send_messages_entry(namespace, op, op - 1))
+                .await
+                .unwrap();
+        }
+        journal.evict_prefix_located(count, |op| {
+            Some(BodyPosition {
+                segment_start: 0,
+                position: op,
+            })
+        });
+    }
+
+    /// The ring of `namespace` over `ops`: `B` for a body in memory, `H` for a
+    /// header whose body went back to its segment, `-` for a dropped op.
+    fn ring_layout(
+        partitions: &IggyPartitions<IggyMessageBus>,
+        namespace: IggyNamespace,
+        ops: RangeInclusive<u64>,
+    ) -> String {
+        let journal = &partitions
+            .get_by_ns(&namespace)
+            .unwrap()
+            .log
+            .journal()
+            .inner;
+        ops.map(|op| {
+            if journal.repair_entry(op).is_some() {
+                'B'
+            } else if journal.evicted_header(op).is_some() {
+                'H'
+            } else {
+                '-'
+            }
+        })
+        .collect()
+    }
+
+    fn ring_body_len() -> u64 {
+        build_send_messages_entry(IggyNamespace::new(1, 1, 0), 1, 0).len() as u64
+    }
+
+    /// Past its budget a shard releases the bodies of the ring that grew
+    /// first, then those of the next ring, and drops no entry while a body is
+    /// left to release.
+    #[compio::test]
+    async fn given_rings_past_the_shard_budget_when_shedding_should_release_the_earliest_growth_first()
+     {
+        let (first, second) = (IggyNamespace::new(1, 1, 0), IggyNamespace::new(1, 1, 1));
+        let body = ring_body_len();
+        // Releasing the three older bodies of the first ring leaves one byte
+        // over the budget, and one release on the second ring covers it.
+        let budget = 8 * body - 3 * (body - EVICTED_HEADER_BYTES) - 1;
+        let partitions = shard_with_ring_budget(budget, &[first, second]);
+        grow_ring(&partitions, first, RING_OPS).await;
+        grow_ring(&partitions, second, RING_OPS).await;
+
+        partitions.shed_repair_rings();
+
+        assert_eq!(ring_layout(&partitions, first, RING_OPS), "HHHB");
+        assert_eq!(ring_layout(&partitions, second, RING_OPS), "HBBB");
+    }
+
+    /// Once no ring has a body left to release, a shard drops the oldest
+    /// entries of the ring whose bodies it released first.
+    #[compio::test]
+    async fn given_no_body_left_to_release_when_shedding_should_drop_the_oldest_entries_first() {
+        let (first, second) = (IggyNamespace::new(1, 1, 0), IggyNamespace::new(1, 1, 1));
+        let released = 2 * (ring_body_len() + 3 * EVICTED_HEADER_BYTES);
+        // One header and one byte more than two released rings fit.
+        let partitions =
+            shard_with_ring_budget(released - EVICTED_HEADER_BYTES - 1, &[first, second]);
+        grow_ring(&partitions, first, RING_OPS).await;
+        grow_ring(&partitions, second, RING_OPS).await;
+
+        partitions.shed_repair_rings();
+
+        assert_eq!(ring_layout(&partitions, first, RING_OPS), "--HB");
+        assert_eq!(ring_layout(&partitions, second, RING_OPS), "HHHB");
+    }
+
+    /// A budget below the newest entries leaves every ring its newest entry,
+    /// so the commit point stays servable, and shedding still returns.
+    #[compio::test]
+    async fn given_a_budget_below_the_newest_entries_when_shedding_should_keep_each_newest_entry() {
+        let (first, second) = (IggyNamespace::new(1, 1, 0), IggyNamespace::new(1, 1, 1));
+        let partitions = shard_with_ring_budget(0, &[first, second]);
+        grow_ring(&partitions, first, RING_OPS).await;
+        grow_ring(&partitions, second, RING_OPS).await;
+
+        partitions.shed_repair_rings();
+        partitions.shed_repair_rings();
+
+        assert_eq!(ring_layout(&partitions, first, RING_OPS), "---B");
+        assert_eq!(ring_layout(&partitions, second, RING_OPS), "---B");
+    }
+
+    /// A partition that leaves the shard returns its charge, and the ticket
+    /// it left queued does not shed the partition that takes its namespace.
+    #[compio::test]
+    async fn given_a_recreated_partition_when_shedding_should_skip_the_ticket_of_the_removed_one() {
+        let (recreated, other) = (IggyNamespace::new(1, 1, 0), IggyNamespace::new(1, 1, 1));
+        let partitions = shard_with_ring_budget(8 * ring_body_len() - 1, &[recreated, other]);
+        grow_ring(&partitions, recreated, RING_OPS).await;
+        drop(partitions.remove(&recreated));
+        grow_ring(&partitions, other, RING_OPS).await;
+        partitions.insert(recreated, build_replicated_partition(recreated));
+        grow_ring(&partitions, recreated, RING_OPS).await;
+
+        partitions.shed_repair_rings();
+
+        assert_eq!(ring_layout(&partitions, other, RING_OPS), "HBBB");
+        assert_eq!(ring_layout(&partitions, recreated, RING_OPS), "BBBB");
     }
 }

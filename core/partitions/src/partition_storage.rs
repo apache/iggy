@@ -27,10 +27,13 @@ use crate::offset_recovery::{
 };
 use crate::offset_storage::persist_emptied_marker_with_storage;
 use crate::segment_recovery::{PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredSegment};
-use crate::{IggyIndexWriter, IggyPartition, MessagesWriter, PartitionsConfig, Segment};
+use crate::{
+    ConsumerGroupOffsets, ConsumerOffsets, IggyIndexWriter, IggyPartition, MessagesWriter,
+    PartitionsConfig, Segment,
+};
 use compio::fs::create_dir_all;
 use compio::io::AsyncWriteAtExt;
-use iggy_common::{ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets, IggyError};
+use iggy_common::{ConsumerKind, ConsumerOffset, IggyError};
 use journal::durable_storage::{DiskStorage, DurableStorage};
 use message_bus::MessageBus;
 use server_common::SegmentStorage;
@@ -292,13 +295,10 @@ pub async fn recover_consumer_offsets_with_storage<S: DurableStorage, B: Message
         partition_id,
     )
     .await?;
-    let consumer_offsets = ConsumerOffsets::with_capacity(recovered_consumers.entries.len());
-    {
-        let guard = consumer_offsets.pin();
-        for offset in recovered_consumers.entries {
-            seed_recovered_offset(partition, ConsumerKind::Consumer, &offset);
-            guard.insert(offset.consumer_id as usize, offset);
-        }
+    let mut consumer_offsets = ConsumerOffsets::new();
+    for offset in recovered_consumers.entries {
+        seed_recovered_offset(partition, ConsumerKind::Consumer, &offset);
+        consumer_offsets.insert(offset.consumer_id as usize, offset);
     }
 
     let recovered_groups = load_partition_group_offsets(
@@ -310,14 +310,10 @@ pub async fn recover_consumer_offsets_with_storage<S: DurableStorage, B: Message
         partition_id,
     )
     .await?;
-    let consumer_group_offsets =
-        ConsumerGroupOffsets::with_capacity(recovered_groups.entries.len());
-    {
-        let guard = consumer_group_offsets.pin();
-        for (group_id, offset) in recovered_groups.entries {
-            seed_recovered_offset(partition, ConsumerKind::ConsumerGroup, &offset);
-            guard.insert(group_id, offset);
-        }
+    let mut consumer_group_offsets = ConsumerGroupOffsets::new();
+    for (group_id, offset) in recovered_groups.entries {
+        seed_recovered_offset(partition, ConsumerKind::ConsumerGroup, &offset);
+        consumer_group_offsets.insert(group_id, offset);
     }
 
     // A partition made before this kind existed has no directory for it. The checkpoint syncs
@@ -463,8 +459,7 @@ pub fn clamp_consumer_offsets<B: MessageBus>(
     // `mint_frontier` is one past the next mint, and reads 0 on the fresh-build
     // path, where the max leaves `current_offset` in charge as before.
     let ceiling = current_offset.max(partition.mint_frontier().saturating_sub(1));
-    let consumers = partition.consumer_offsets.pin();
-    for (_, offset) in &consumers {
+    for offset in partition.consumer_offsets.borrow().values() {
         clamp_recovered_offset(
             partition,
             namespace,
@@ -474,8 +469,7 @@ pub fn clamp_consumer_offsets<B: MessageBus>(
             current_offset,
         );
     }
-    let groups = partition.consumer_group_offsets.pin();
-    for (_, offset) in &groups {
+    for offset in partition.consumer_group_offsets.borrow().values() {
         clamp_recovered_offset(
             partition,
             namespace,
