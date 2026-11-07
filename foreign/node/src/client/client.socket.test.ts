@@ -16,7 +16,7 @@
 // under the License.
 
 import assert from 'node:assert/strict';
-import { once } from 'node:events';
+import { once, type EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import type { AddressInfo, Socket } from 'node:net';
@@ -76,7 +76,7 @@ import {
   OperationUncertainError
 } from './client.socket.js';
 import type { ClientConfig } from './client.type.js';
-import { SimpleClient } from './client.js';
+import { Client, SimpleClient } from './client.js';
 
 const TEST_SESSION = 42n;
 const PARTITION_ID_SIZE = 4;
@@ -547,6 +547,62 @@ describe('raw commands to a chosen replica', () => {
 });
 
 describe('unified partition routing', () => {
+  it('closes every link when destroyed from a replica connected listener', async () => {
+    const cluster = await startPollCluster();
+    const events: string[] = [];
+    let connected = 0;
+    const ended = once(cluster.client, 'end');
+    for (const event of ['connecting', 'error', 'end'])
+      cluster.client.on(event, () => events.push(event));
+    cluster.client.on('connected', () => {
+      events.push('connected');
+      if (++connected === 2) cluster.client.destroy();
+    });
+    try {
+      await cluster.client.authenticate(vsrConfig(cluster.coordinator.port).credentials);
+      await ended;
+      const afterEnd = [...events];
+      await waitUntil(() => cluster.primary.sockets.size === 0 && cluster.coordinator.sockets.size === 0);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(connected, 2);
+      assert.equal(events.filter((event) => event === 'end').length, 1);
+      assert.equal(events.at(-1), 'end');
+      assert.deepEqual(events, afterEnd);
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it('does not dial a late roster endpoint after destruction', async () => {
+    let held: { frame: Buffer, socket: Socket } | undefined;
+    const cluster = await startPollCluster(undefined, (frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetClusterMetadata) return false;
+      held = { frame, socket };
+      return true;
+    });
+    const events: string[] = [];
+    for (const event of ['connecting', 'connected', 'error', 'end'])
+      cluster.client.on(event, () => events.push(event));
+    try {
+      const login = cluster.client.authenticate(vsrConfig(cluster.coordinator.port).credentials);
+      const rejected = assert.rejects(login);
+      await waitUntil(() => held !== undefined);
+      const { frame, socket } = held!;
+      const ended = once(cluster.client, 'end');
+      cluster.client.destroy();
+      socket.write(replyFrame(frame, Operation.NonReplicated,
+        twoNodeMetadataBody(cluster.primary.port, cluster.coordinator.port)));
+      await rejected;
+      await ended;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(cluster.primary.frames.length, 0);
+      assert.equal(cluster.primary.sockets.size, 0);
+      assert.deepEqual(events, ['connecting', 'connected', 'end']);
+    } finally {
+      await cluster.close();
+    }
+  });
+
   const offset = { streamId: 1, topicId: 2, partitionId: 3,
     consumer: { kind: ConsumerKind.Single, id: 1 } };
   const poll = POLL_MESSAGES.serialize({ ...offset, count: 1,
@@ -3851,6 +3907,28 @@ describe('native mutation recovery', () => {
 
 
 describe('native replica and selection lifecycle', () => {
+  it('keeps normal login and logout out of public connection errors', async () => {
+    const server = await startVsrServer((frame, socket) => singleNodeHandler(server.port)(frame, socket));
+    const client = new Client({ ...vsrConfig(server.port), heartbeatInterval: 0 });
+    const errors: Error[] = [];
+    client.on('error', (error) => errors.push(error));
+    try {
+      await client.system.ping();
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const connected = once(client as unknown as EventEmitter, 'connected')
+          .then(() => undefined, (error: Error) => error);
+        await client.session.login({ username: 'iggy', password: 'iggy' });
+        assert.equal(await connected, undefined);
+        assert.deepEqual(errors, []);
+      }
+      await client.session.logout();
+      assert.deepEqual(errors, []);
+    } finally {
+      await client.destroy();
+      await server.close();
+    }
+  });
+
   for (const partition of [Partitioning.Balanced, Partitioning.MessageKey('key'), Partitioning.PartitionId(0)]) {
     for (const uncertain of [false, true]) {
       it(`handles partition-not-found for kind ${partition.kind} with uncertainty ${uncertain}`, async () => {
