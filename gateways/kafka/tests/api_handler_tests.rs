@@ -34,7 +34,7 @@ use iggy_gateway_kafka::cluster_id::ClusterId;
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_CREATE_PARTITIONS, API_KEY_CREATE_TOPICS, API_KEY_DELETE_TOPICS,
     API_KEY_FETCH, API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST,
-    ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_NOT_LEADER_OR_FOLLOWER,
+    ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_REBOOTSTRAP_REQUIRED,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION, GatewayState, handle_request,
     handle_request_bounded, is_supported_version, supported_api_ranges,
 };
@@ -44,10 +44,11 @@ use fixtures::load_fixture_body_or_skip;
 use scope::default_broker;
 use tcp::{build_metadata_legacy_request, build_produce_v3_body};
 use wire::{
-    build_api_versions_flexible_request, build_create_partitions_request,
-    build_delete_topics_request_with_name, build_metadata_all_topics_legacy,
-    build_metadata_flexible_request, build_metadata_flexible_request_v10,
-    build_metadata_legacy_request_for_version, build_produce_legacy_request,
+    build_api_versions_flexible_request, build_api_versions_v5_request,
+    build_create_partitions_request, build_delete_topics_request_with_name,
+    build_metadata_all_topics_legacy, build_metadata_flexible_request,
+    build_metadata_flexible_request_v10, build_metadata_legacy_request_for_version,
+    build_produce_legacy_request,
 };
 
 // ── ApiVersions ─────────────────────────────────────────────────────────────
@@ -110,6 +111,82 @@ async fn api_versions_v3_response_flexible_format() {
     let expected_keys: Vec<i16> = supported_api_ranges().iter().map(|r| r.api_key).collect();
     for k in expected_keys {
         assert!(keys.contains(&k));
+    }
+}
+
+/// `kafka-protocol` encodes `ApiVersions` only up to v4, and v5 adds no response field, so a v5
+/// request gets the v4 body.
+#[tokio::test]
+async fn api_versions_v5_answers_with_the_v4_body() {
+    let v4 = handle_request(
+        API_KEY_API_VERSIONS,
+        4,
+        build_api_versions_flexible_request("iggy-test", "0.1.0"),
+        &default_broker(),
+    )
+    .await
+    .expect_response("ApiVersions v4 answers");
+    let v5 = handle_request(
+        API_KEY_API_VERSIONS,
+        5,
+        build_api_versions_v5_request(None, -1),
+        &default_broker(),
+    )
+    .await
+    .expect_response("ApiVersions v5 answers");
+    assert_eq!(v4, v5);
+    assert_eq!(Decoder::new(v5).read_i16().unwrap(), ERROR_NONE);
+}
+
+/// KIP-1242: a Java client from 4.4 names the cluster and the node that its metadata gives for
+/// this address. The gateway serves the request when both are its own, or when the client names
+/// none, as it does on a connection to a bootstrap server.
+#[tokio::test]
+async fn api_versions_v5_naming_this_gateway_answers_the_versions() {
+    let state = GatewayState::stub(8 * 1024 * 1024).with_node_id(2);
+    let cluster_id = state.cluster_id.to_string();
+    for body in [
+        build_api_versions_v5_request(Some(&cluster_id), 2),
+        build_api_versions_v5_request(None, -1),
+    ] {
+        let response = handle_request_bounded(&state, API_KEY_API_VERSIONS, 5, body)
+            .await
+            .expect_response("ApiVersions answers");
+        let mut d = Decoder::new(response);
+        assert_eq!(d.read_i16().unwrap(), ERROR_NONE);
+        assert_eq!(
+            usize::try_from(d.read_varint().unwrap() - 1).expect("api count fits usize"),
+            supported_api_ranges().len()
+        );
+    }
+}
+
+/// KIP-1242: a client whose metadata names another node or another cluster for this address
+/// gets `REBOOTSTRAP_REQUIRED`, as from a Kafka broker, and starts again from its bootstrap
+/// servers.
+#[tokio::test]
+async fn api_versions_v5_naming_another_broker_asks_for_a_rebootstrap() {
+    let state = GatewayState::stub(8 * 1024 * 1024).with_node_id(2);
+    let cluster_id = state.cluster_id.to_string();
+    let another_cluster = ClusterId::random().to_string();
+    for (body, named) in [
+        (
+            build_api_versions_v5_request(Some(&cluster_id), 3),
+            "another node",
+        ),
+        (
+            build_api_versions_v5_request(Some(&another_cluster), 2),
+            "another cluster",
+        ),
+    ] {
+        let response = handle_request_bounded(&state, API_KEY_API_VERSIONS, 5, body)
+            .await
+            .expect_response("REBOOTSTRAP_REQUIRED is an answer, not a close");
+        assert_eq!(
+            Decoder::new(response).read_i16().unwrap(),
+            ERROR_REBOOTSTRAP_REQUIRED,
+            "{named}"
+        );
     }
 }
 
@@ -188,8 +265,8 @@ async fn unknown_api_key_closes_connection() {
 
 #[test]
 fn version_support_table_is_applied() {
-    assert!(is_supported_version(API_KEY_API_VERSIONS, 3));
-    assert!(!is_supported_version(API_KEY_API_VERSIONS, 10));
+    assert!(is_supported_version(API_KEY_API_VERSIONS, 5));
+    assert!(!is_supported_version(API_KEY_API_VERSIONS, 6));
     assert!(is_supported_version(API_KEY_METADATA, 1));
     assert!(!is_supported_version(API_KEY_METADATA, -1));
 }
@@ -340,7 +417,9 @@ async fn handle_request_succeeds_for_every_supported_version_with_fixture() {
         }
         if api_key == API_KEY_API_VERSIONS {
             for version in min_ver..=max_ver {
-                let body = if version >= 3 {
+                let body = if version >= 5 {
+                    build_api_versions_v5_request(None, -1)
+                } else if version >= 3 {
                     build_api_versions_flexible_request("iggy-test", "0.1.0")
                 } else {
                     Bytes::new()

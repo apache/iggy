@@ -98,7 +98,7 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 14 | SyncGroup | 0–5 | v4 |
 | 15 | DescribeGroups | 0–6 | v5 |
 | 16 | ListGroups | 0–5 | v3 |
-| 18 | ApiVersions | 0–3 | v3 |
+| 18 | ApiVersions | 0–5 | v3 |
 | 19 | CreateTopics | 2–5 | v5 |
 | 20 | DeleteTopics | 1–5 | v4 |
 | 22 | InitProducerId | 0–5 | v2 |
@@ -109,6 +109,13 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 44 | IncrementalAlterConfigs | 0–1 | v1 |
 | 47 | OffsetDelete | 0 | never |
 | 60 | DescribeCluster | 0–2 | v0 |
+
+The gateway supports Java clients from Kafka 4.0 on. Clients 4.0 to 4.3 open ApiVersions at v4,
+and 4.4 clients open it at v5. v5 names the cluster and the node that the client wants to reach
+(KIP-1242). If either one is not this gateway's, the gateway answers `REBOOTSTRAP_REQUIRED` (129),
+and the client starts again from its bootstrap servers. `kafka-protocol` 0.18 stops at
+ApiVersions v4, so `iggy_kafka_wire::api_versions` decodes the two v5 fields. The v5 response has
+no new field, so the v4 encoder writes it.
 
 ### Cluster id
 
