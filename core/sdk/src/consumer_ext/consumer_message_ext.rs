@@ -17,7 +17,7 @@
 
 use crate::clients::consumer::IggyConsumer;
 use crate::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
-use crate::prelude::{CommitAfter, IggyError, ReadError};
+use crate::prelude::{CommitAfter, ReadError};
 use async_trait::async_trait;
 use std::future::poll_fn;
 use tokio::sync::oneshot;
@@ -134,23 +134,7 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
                             }
                         }
                         Some(Err(err)) => {
-                            let ends = err.skip.is_some()
-                                || matches!(
-                                    err.error,
-                                    IggyError::InvalidServerAddress
-                                        | IggyError::InvalidClientAddress
-                                        | IggyError::InvalidConfiguration
-                                        | IggyError::LaneBlocked(_)
-                                        | IggyError::PartitionLaneBlocked(..)
-                                        | IggyError::FetchProgressUncertain(_)
-                                        | IggyError::HistoryUnavailable
-                                        | IggyError::InvalidNumberEncoding
-                                        | IggyError::InvalidMessagePayloadLength
-                                        | IggyError::InvalidMessagesCount
-                                        | IggyError::ClientShutdown
-                                )
-                                || err.is_lasting_refusal()
-                                || !self.client_can_recover().await;
+                            let ends = self.read_error_ends_consumption(&err).await;
                             if ends {
                                 error!("Client error: {err} for consumer: {name} on topic: {topic} and stream: {stream}",
                                     name = self.name(), topic = self.topic(), stream = self.stream());
