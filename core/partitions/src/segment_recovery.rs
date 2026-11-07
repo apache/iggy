@@ -3053,6 +3053,6 @@ fn read_u64_le(bytes: &[u8], at: usize) -> u64 {
     raw.copy_from_slice(&bytes[at..at + 8]);
     u64::from_le_bytes(raw)
 }
+
 #[cfg(test)]
-#[path = "segment_recovery_tests.rs"]
 mod tests;

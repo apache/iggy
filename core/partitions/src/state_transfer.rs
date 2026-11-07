@@ -1272,9 +1272,6 @@ const fn validate_consumer_offset_transfer_count(
     Err(PartitionTransferUnavailable::ConsumerOffsetsTooLarge { kind, count, max })
 }
 
-#[cfg(test)]
-#[path = "state_transfer_tests.rs"]
-mod tests;
 /// What a full validation walk over one segment payload derived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SegmentWalkStats {
@@ -5585,3 +5582,6 @@ async fn names_file_of(live: &compio::fs::Metadata, staged: &Path) -> bool {
 async fn names_file_of(_live: &compio::fs::Metadata, _staged: &Path) -> bool {
     false
 }
+
+#[cfg(test)]
+mod tests;

@@ -14238,5 +14238,4 @@ fn nth_oldest_sealed_end(segments: &[Segment], count: u32) -> Option<u64> {
 }
 
 #[cfg(test)]
-#[path = "iggy_partition_tests/mod.rs"]
 mod tests;
