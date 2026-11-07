@@ -26,8 +26,8 @@ use iggy_binary_protocol::WireUserHeaders;
 use iggy_common::Client;
 use iggy_common::{
     AutoCommit, CommitAfter, CommitPolicy, Consumer, HeaderKey, HeaderKind, Identifier,
-    IggyByteSize, IggyDuration, IggyError, IggyMessage, IggyTimestamp, NonZeroIggyDuration,
-    PollOptions, PollingStrategy, Sizeable, wire_conversions::user_headers_from_wire,
+    IggyByteSize, IggyDuration, IggyMessage, IggyTimestamp, NonZeroIggyDuration, PollOptions,
+    PollingStrategy, Sizeable, wire_conversions::user_headers_from_wire,
 };
 use std::collections::HashSet;
 use std::io::Write;
@@ -211,11 +211,13 @@ impl PollMessagesCmd {
             };
             let received = match received {
                 Ok(received) => received,
-                // The reader reconnects by itself, so a dropped connection is not a failed poll.
-                Err(error) if matches!(error.error, IggyError::Disconnected) => continue,
                 Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("Problem polling consumer group: {group}"));
+                    if consumer.read_error_ends_consumption(&error).await {
+                        return Err(error)
+                            .with_context(|| format!("Problem polling consumer group: {group}"));
+                    }
+                    tracing::error!("Error while polling consumer group {group}: {error}");
+                    continue;
                 }
             };
             let partition_id = received.partition_id;
