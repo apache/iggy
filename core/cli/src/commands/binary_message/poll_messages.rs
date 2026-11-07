@@ -418,6 +418,11 @@ impl CliCommand for PollMessagesCmd {
         )
     }
 
+    /// Follow mode prints only rows on stdout, so the banner goes to stderr.
+    fn stdout_is_data(&self) -> bool {
+        self.follow
+    }
+
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         let partition_id = self
             .partition_id
