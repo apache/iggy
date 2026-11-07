@@ -116,6 +116,16 @@ filter = 'package(integration) and test(/chaos_monkey/)'
 threads-required = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 60 }
 
+# The tests share one reusable container (`iggy-test-opensearch`). Running them
+# one at a time lets the first test create it and the rest attach by name,
+# instead of racing on the same name (Docker 409 Conflict).
+[test-groups.opensearch]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(/connectors::opensearch::/)'
+test-group = "opensearch"
+
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
 
