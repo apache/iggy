@@ -21,10 +21,16 @@ mod error;
 mod logging;
 
 use crate::args::{
-    Command, IggyConsoleArgs, client::ClientAction, cluster::ClusterAction,
-    consumer_group::ConsumerGroupAction, consumer_offset::ConsumerOffsetAction,
-    permissions::PermissionsArgs, personal_access_token::PersonalAccessTokenAction,
-    stream::StreamAction, topic::TopicAction,
+    Command, IggyConsoleArgs,
+    client::ClientAction,
+    cluster::ClusterAction,
+    connector::{ConnectorAction, ConnectorConfigAction, ConnectorKind},
+    consumer_group::ConsumerGroupAction,
+    consumer_offset::ConsumerOffsetAction,
+    permissions::PermissionsArgs,
+    personal_access_token::PersonalAccessTokenAction,
+    stream::StreamAction,
+    topic::TopicAction,
 };
 use crate::credentials::IggyCredentials;
 use crate::error::{CmdToolError, IggyCmdError};
@@ -43,7 +49,9 @@ use iggy::prelude::{
     Aes256GcmEncryptor, ClientError, EncryptorKind, MetadataChangesQuery,
     PersonalAccessTokenExpiry, StreamUpdateOptions, TopicUpdateOptions,
 };
-use iggy_cli::commands::binary_context::common::{ContextManager, validate_transport};
+use iggy_cli::commands::binary_context::common::{
+    ContextConfig, ContextManager, validate_transport,
+};
 use iggy_cli::commands::binary_context::create_context::CreateContextCmd;
 use iggy_cli::commands::binary_context::delete_context::DeleteContextCmd;
 use iggy_cli::commands::binary_context::show_context::ShowContextCmd;
@@ -57,6 +65,18 @@ use iggy_cli::commands::cli_command::{CliCommand, PRINT_TARGET};
 use iggy_cli::commands::{
     binary_client::{get_client::GetClientCmd, get_clients::GetClientsCmd},
     binary_cluster::get_cluster_metadata::GetClusterMetadataCmd,
+    binary_connectors::{
+        client::{ConnectorEndpoint, ConnectorKind as ApiConnectorKind},
+        config::{
+            ActivateConnectorConfigCmd, CreateConnectorConfigCmd, DeleteConnectorConfigCmd,
+            GetConnectorConfigCmd, GetConnectorConfigsCmd, GetConnectorPluginConfigCmd,
+        },
+        get_connector::GetConnectorCmd,
+        get_connectors::GetConnectorsCmd,
+        get_transforms::GetTransformsCmd,
+        restart_connector::RestartConnectorCmd,
+        stats::GetConnectorStatsCmd,
+    },
     binary_consumer_groups::{
         create_consumer_group::CreateConsumerGroupCmd,
         delete_consumer_group::DeleteConsumerGroupCmd, get_consumer_group::GetConsumerGroupCmd,
@@ -109,6 +129,21 @@ mod main_login_session {
 
 #[cfg(feature = "login-session")]
 use main_login_session::*;
+
+fn connector_kind(kind: ConnectorKind) -> ApiConnectorKind {
+    match kind {
+        ConnectorKind::Sink => ApiConnectorKind::Sinks,
+        ConnectorKind::Source => ApiConnectorKind::Sources,
+    }
+}
+
+fn connector_endpoint(cli_options: &CliOptions) -> ConnectorEndpoint {
+    ConnectorEndpoint {
+        api_url: cli_options.connectors_api_url.clone(),
+        api_key: cli_options.connectors_api_key.clone(),
+        tls_ca_file: cli_options.connectors_tls_ca_file.clone(),
+    }
+}
 
 fn get_command(
     command: Command,
@@ -338,7 +373,8 @@ fn get_command(
             }
             ContextAction::Create(create_args) => {
                 let context_name = create_args.context_name.clone();
-                Box::new(CreateContextCmd::new(context_name, create_args.into()))
+                let config: ContextConfig = (*create_args).into();
+                Box::new(CreateContextCmd::new(context_name, config))
             }
             ContextAction::Delete(delete_args) => {
                 Box::new(DeleteContextCmd::new(delete_args.context_name.clone()))
@@ -346,6 +382,68 @@ fn get_command(
             ContextAction::Show(show_args) => {
                 Box::new(ShowContextCmd::new(show_args.context_name.clone()))
             }
+        },
+        Command::Connector(command) => match command {
+            ConnectorAction::List(args) => Box::new(GetConnectorsCmd::new(
+                connector_kind(args.kind),
+                args.list_mode.into(),
+                connector_endpoint(cli_options),
+            )),
+            ConnectorAction::Get(args) => Box::new(GetConnectorCmd::new(
+                connector_kind(args.kind),
+                args.key.clone(),
+                connector_endpoint(cli_options),
+            )),
+            ConnectorAction::Transforms(args) => Box::new(GetTransformsCmd::new(
+                connector_kind(args.kind),
+                args.key.clone(),
+                connector_endpoint(cli_options),
+            )),
+            ConnectorAction::Restart(args) => Box::new(RestartConnectorCmd::new(
+                connector_kind(args.kind),
+                args.key.clone(),
+                connector_endpoint(cli_options),
+            )),
+            ConnectorAction::Stats => {
+                Box::new(GetConnectorStatsCmd::new(connector_endpoint(cli_options)))
+            }
+            ConnectorAction::Config(action) => match action {
+                ConnectorConfigAction::List(args) => Box::new(GetConnectorConfigsCmd::new(
+                    connector_kind(args.kind),
+                    args.key.clone(),
+                    connector_endpoint(cli_options),
+                )),
+                ConnectorConfigAction::Get(args) => Box::new(GetConnectorConfigCmd::new(
+                    connector_kind(args.kind),
+                    args.key.clone(),
+                    args.version,
+                    connector_endpoint(cli_options),
+                )),
+                ConnectorConfigAction::Plugin(args) => Box::new(GetConnectorPluginConfigCmd::new(
+                    connector_kind(args.kind),
+                    args.key.clone(),
+                    args.format.clone(),
+                    connector_endpoint(cli_options),
+                )),
+                ConnectorConfigAction::Create(args) => Box::new(CreateConnectorConfigCmd::new(
+                    connector_kind(args.kind),
+                    args.key.clone(),
+                    args.file.clone(),
+                    connector_endpoint(cli_options),
+                )),
+                ConnectorConfigAction::Delete(args) => Box::new(DeleteConnectorConfigCmd::new(
+                    connector_kind(args.kind),
+                    args.key.clone(),
+                    args.version,
+                    connector_endpoint(cli_options),
+                )),
+                ConnectorConfigAction::Activate(args) => Box::new(ActivateConnectorConfigCmd::new(
+                    connector_kind(args.kind),
+                    args.key.clone(),
+                    args.version,
+                    connector_endpoint(cli_options),
+                )),
+            },
         },
         #[cfg(feature = "login-session")]
         Command::Login(login_args) => Box::new(LoginCmd::new(
@@ -462,4 +560,102 @@ async fn run() -> Result<(), IggyCmdError> {
     credentials.logout_user().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod connector_command_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn explain(args: &[&str]) -> String {
+        let args =
+            IggyConsoleArgs::try_parse_from(std::iter::once("iggy").chain(args.iter().copied()))
+                .unwrap();
+        let command = args.command.unwrap();
+        get_command(command, &args.cli, "").explain()
+    }
+
+    #[test]
+    fn should_build_the_command_for_each_connector_subcommand() {
+        let cases = [
+            (
+                vec!["connector", "list", "sink"],
+                "list sinks in table mode",
+            ),
+            (
+                vec!["connector", "list", "source", "-l", "list"],
+                "list sources in list mode",
+            ),
+            (vec!["connector", "get", "sink", "k"], "get sink k"),
+            (
+                vec!["connector", "transforms", "source", "k"],
+                "get transforms of source k",
+            ),
+            (vec!["connector", "restart", "sink", "k"], "restart sink k"),
+            (
+                vec!["connector", "stats"],
+                "get connectors runtime statistics",
+            ),
+            (
+                vec!["connector", "config", "list", "sink", "k"],
+                "list configurations of sink k",
+            ),
+            (
+                vec!["connector", "config", "get", "sink", "k"],
+                "get active configuration of sink k",
+            ),
+            (
+                vec!["connector", "config", "get", "source", "k", "-v", "2"],
+                "get configuration version 2 of source k",
+            ),
+            (
+                vec!["connector", "config", "plugin", "sink", "k"],
+                "get plugin configuration of sink k",
+            ),
+            (
+                vec!["connector", "config", "create", "sink", "k"],
+                "create configuration for sink k",
+            ),
+            (
+                vec!["connector", "config", "delete", "sink", "k", "-v", "3"],
+                "delete configuration version 3 of sink k",
+            ),
+            (
+                vec!["connector", "config", "activate", "source", "k", "-v", "3"],
+                "activate configuration version 3 of source k",
+            ),
+        ];
+
+        for (args, expected) in cases {
+            assert_eq!(explain(&args), expected, "for {args:?}");
+        }
+    }
+
+    #[test]
+    fn should_take_endpoint_from_the_cli_options() {
+        let args = IggyConsoleArgs::try_parse_from([
+            "iggy",
+            "--connectors-api-url",
+            "https://runtime:8081",
+            "--connectors-api-key",
+            "secret",
+            "--connectors-tls-ca-file",
+            "ca.pem",
+            "connector",
+            "stats",
+        ])
+        .unwrap();
+
+        let endpoint = connector_endpoint(&args.cli);
+
+        assert_eq!(endpoint.api_url.as_deref(), Some("https://runtime:8081"));
+        assert_eq!(endpoint.api_key.as_deref(), Some("secret"));
+        assert_eq!(endpoint.tls_ca_file, Some(PathBuf::from("ca.pem")));
+    }
+
+    #[test]
+    fn should_map_kinds_to_routes() {
+        assert_eq!(connector_kind(ConnectorKind::Sink).path(), "sinks");
+        assert_eq!(connector_kind(ConnectorKind::Source).path(), "sources");
+    }
 }

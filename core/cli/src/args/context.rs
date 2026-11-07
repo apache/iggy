@@ -47,7 +47,7 @@ pub(crate) enum ContextAction {
     ///  iggy context create dev --transport http --http-api-url http://localhost:3000
     ///  iggy context create local --username iggy --password iggy
     #[clap(verbatim_doc_comment, visible_alias = "c")]
-    Create(ContextCreateArgs),
+    Create(Box<ContextCreateArgs>),
 
     /// Delete an existing context
     ///
@@ -129,6 +129,18 @@ pub(crate) struct ContextCreateArgs {
     /// Iggy server personal access token name
     #[clap(short = 'n', long)]
     pub(crate) token_name: Option<String>,
+
+    /// Connectors runtime HTTP API base URL
+    #[clap(long)]
+    pub(crate) connectors_api_url: Option<String>,
+
+    /// Connectors runtime HTTP API key
+    #[clap(long)]
+    pub(crate) connectors_api_key: Option<String>,
+
+    /// CA certificate file for a connectors runtime that uses TLS
+    #[clap(long)]
+    pub(crate) connectors_tls_ca_file: Option<String>,
 }
 
 impl From<ContextCreateArgs> for ContextConfig {
@@ -138,6 +150,16 @@ impl From<ContextCreateArgs> for ContextConfig {
             password: args.password,
             token: args.token,
             token_name: args.token_name,
+            connectors_api_url: args.connectors_api_url,
+            connectors_api_key: args.connectors_api_key,
+            // Absolute so the context works from any directory, even when the
+            // file does not exist yet.
+            connectors_tls_ca_file: args.connectors_tls_ca_file.map(|path| {
+                std::fs::canonicalize(&path)
+                    .or_else(|_| std::path::absolute(&path))
+                    .map(|absolute| absolute.to_string_lossy().into_owned())
+                    .unwrap_or(path)
+            }),
             iggy: ArgsOptional {
                 transport: args.transport,
                 tcp_server_address: args.tcp_server_address,
@@ -182,6 +204,9 @@ mod tests {
             password: Some("secret".to_string()),
             token: Some("tok123".to_string()),
             token_name: Some("my-token".to_string()),
+            connectors_api_url: Some("http://localhost:8081".to_string()),
+            connectors_api_key: None,
+            connectors_tls_ca_file: None,
         };
 
         let config: ContextConfig = args.into();
@@ -190,6 +215,11 @@ mod tests {
         assert_eq!(config.password.as_deref(), Some("secret"));
         assert_eq!(config.token.as_deref(), Some("tok123"));
         assert_eq!(config.token_name.as_deref(), Some("my-token"));
+        assert_eq!(
+            config.connectors_api_url.as_deref(),
+            Some("http://localhost:8081")
+        );
+        assert!(config.connectors_api_key.is_none());
         assert_eq!(config.iggy.transport.as_deref(), Some("tcp"));
         assert_eq!(
             config.iggy.tcp_server_address.as_deref(),
@@ -198,6 +228,67 @@ mod tests {
         assert!(config.iggy.http_api_url.is_none());
         assert!(config.iggy.quic_server_address.is_none());
         assert_eq!(config.iggy.tcp_tls_enabled, Some(true));
+    }
+
+    #[test]
+    fn should_store_relative_ca_file_as_absolute_path() {
+        let directory = std::env::temp_dir();
+        let file = directory.join(format!("iggy-cli-ca-{}.pem", std::process::id()));
+        std::fs::write(&file, "x").unwrap();
+        let args = ContextCreateArgs {
+            context_name: "tls".to_string(),
+            transport: None,
+            tcp_server_address: None,
+            http_api_url: None,
+            quic_server_address: None,
+            tcp_tls_enabled: None,
+            username: None,
+            password: None,
+            token: None,
+            token_name: None,
+            connectors_api_url: None,
+            connectors_api_key: None,
+            connectors_tls_ca_file: Some(
+                directory
+                    .join("..")
+                    .join(directory.file_name().unwrap())
+                    .join(file.file_name().unwrap())
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        };
+
+        let config: ContextConfig = args.into();
+        std::fs::remove_file(&file).unwrap();
+
+        let stored = config.connectors_tls_ca_file.unwrap();
+        assert!(!stored.contains(".."));
+        assert!(std::path::Path::new(&stored).is_absolute());
+    }
+
+    #[test]
+    fn should_store_missing_ca_file_as_absolute_path() {
+        let args = ContextCreateArgs {
+            context_name: "tls".to_string(),
+            transport: None,
+            tcp_server_address: None,
+            http_api_url: None,
+            quic_server_address: None,
+            tcp_tls_enabled: None,
+            username: None,
+            password: None,
+            token: None,
+            token_name: None,
+            connectors_api_url: None,
+            connectors_api_key: None,
+            connectors_tls_ca_file: Some("does-not-exist/ca.pem".to_string()),
+        };
+
+        let config: ContextConfig = args.into();
+
+        let stored = config.connectors_tls_ca_file.unwrap();
+        assert!(std::path::Path::new(&stored).is_absolute());
+        assert!(stored.ends_with("does-not-exist/ca.pem"));
     }
 
     #[test]
@@ -213,6 +304,9 @@ mod tests {
             password: None,
             token: None,
             token_name: None,
+            connectors_api_url: None,
+            connectors_api_key: None,
+            connectors_tls_ca_file: None,
         };
 
         let config: ContextConfig = args.into();
