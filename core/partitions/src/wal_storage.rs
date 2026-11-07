@@ -20,6 +20,7 @@ use futures::future::LocalBoxFuture;
 use journal::durable_storage::{
     DiskStorage, DurableFile, DurableStorage, OpenMode, RegularFiles, StorageEntry,
 };
+use server_common::Charge;
 use server_common::iobuf::{Frozen, Owned};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,7 @@ pub enum WalFile {
 
 /// [`DurableStorage`] as a trait object.
 pub trait InjectedStorage {
+    fn charge_allocation(&self, bytes: u64) -> Option<Charge<'static>>;
     /// # Errors
     /// As [`DurableStorage::writer_identity`].
     fn writer_identity(&self, path: &Path) -> io::Result<Option<PathBuf>>;
@@ -109,6 +111,13 @@ pub trait InjectedFile {
 
 impl DurableStorage for WalStorage {
     type File = WalFile;
+
+    fn charge_allocation(&self, bytes: u64) -> Option<Charge<'static>> {
+        match self {
+            Self::Disk => DurableStorage::charge_allocation(&DiskStorage, bytes),
+            Self::Injected(storage) => storage.charge_allocation(bytes),
+        }
+    }
 
     fn writer_identity(&self, path: &Path) -> io::Result<Option<PathBuf>> {
         match self {
@@ -307,6 +316,10 @@ where
     S: DurableStorage,
     S::File: 'static,
 {
+    fn charge_allocation(&self, bytes: u64) -> Option<Charge<'static>> {
+        DurableStorage::charge_allocation(self, bytes)
+    }
+
     fn writer_identity(&self, path: &Path) -> io::Result<Option<PathBuf>> {
         DurableStorage::writer_identity(self, path)
     }

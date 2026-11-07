@@ -332,6 +332,9 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                         .storage
                         .open(&reference.path(&self.directory), OpenMode::Create)
                         .await?;
+                    let _charge = self
+                        .storage
+                        .charge_allocation((prepare.len() - size_of::<PrepareHeader>()) as u64);
                     file.write_frozen(0, prepare.slice(size_of::<PrepareHeader>()..))
                         .await?;
                     file.sync().await?;
@@ -423,6 +426,9 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 buffers.push(prepares[index].slice(size_of::<PrepareHeader>()..));
                 bodies.next();
             }
+            let _charge = self
+                .storage
+                .charge_allocation(self.newly_allocated(first.position, end));
             self.segment_writing_file(first)
                 .await?
                 .write_frozen_vectored(first.position, buffers)
@@ -436,13 +442,32 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         reference: SegmentReference,
         prepare: &Frozen<4096>,
     ) -> io::Result<()> {
+        let end = reference.position + (prepare.len() - size_of::<PrepareHeader>()) as u64;
+        let _charge = self
+            .storage
+            .charge_allocation(self.newly_allocated(reference.position, end));
         self.segment_writing_file(reference)
             .await?
             .write_frozen(
                 reference.position,
                 prepare.slice(size_of::<PrepareHeader>()..),
             )
-            .await
+            .await?;
+        Ok(())
+    }
+
+    /// How many bytes of a body write at `position..end` take new disk space.
+    /// With `preallocate_segments`, the segment file already reserved its first
+    /// `max_size` bytes when it was opened, so writes below `max_size` take no new
+    /// space. Only the part past `max_size` does: a segment can grow past
+    /// `max_size` because the last batch may cross it.
+    fn newly_allocated(&self, position: u64, end: u64) -> u64 {
+        let reserved_end = self
+            .state
+            .segment_storage
+            .filter(|_| self.preallocate_segments)
+            .map_or(0, |segments| segments.max_size);
+        end.saturating_sub(position.max(reserved_end))
     }
 
     async fn segment_writing_file(
@@ -662,6 +687,13 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             return Err(invalid("segment lost durably published bytes"));
         }
         file.truncate(cursor.position.length).await?;
+        // Truncating frees the reservation past the new length, reserved
+        // blocks included. Reserving again keeps the segment reserved up to
+        // `max_size`, which charging only body bytes past it relies on.
+        if self.preallocate_segments {
+            file.preallocate(&cursor.path(&self.directory), segments.max_size)
+                .await;
+        }
         file.sync().await?;
         self.poisoned = false;
         Ok(())
@@ -909,4 +941,56 @@ pub(super) fn decode_batch(prepare: &[u8]) -> io::Result<BatchHeader> {
         return Err(invalid("invalid segment batch bounds"));
     }
     Ok(batch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::durable_storage::DiskStorage;
+    use crate::partition_journal::PARTITION_WAL_BYTES_MAX;
+    use tempfile::{TempDir, tempdir};
+
+    const MAX_SIZE: u64 = 1024 * 1024;
+    const BODY_BYTES: u64 = 64 * 1024;
+
+    #[compio::test]
+    async fn given_no_preallocation_when_writing_a_body_should_count_every_byte() {
+        let (_directory, journal) = journal(false).await;
+
+        assert_eq!(journal.newly_allocated(0, BODY_BYTES), BODY_BYTES);
+        assert_eq!(
+            journal.newly_allocated(MAX_SIZE - BODY_BYTES, MAX_SIZE + BODY_BYTES),
+            2 * BODY_BYTES
+        );
+    }
+
+    #[compio::test]
+    async fn given_preallocation_when_a_body_crosses_the_reservation_should_count_only_the_bytes_past_it()
+     {
+        let (_directory, journal) = journal(true).await;
+
+        assert_eq!(
+            journal.newly_allocated(MAX_SIZE - BODY_BYTES, MAX_SIZE + BODY_BYTES),
+            BODY_BYTES
+        );
+    }
+
+    async fn journal(preallocate: bool) -> (TempDir, PartitionPrepareJournal<DiskStorage>) {
+        let directory = tempdir().unwrap();
+        let mut journal = PartitionPrepareJournal::open_with_storage_and_capacity(
+            &directory.path().join("prepares-7"),
+            42,
+            7,
+            DiskStorage,
+            PARTITION_WAL_BYTES_MAX,
+            preallocate,
+        )
+        .await
+        .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), MAX_SIZE)
+            .await
+            .unwrap();
+        (directory, journal)
+    }
 }
