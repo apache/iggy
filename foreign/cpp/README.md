@@ -100,6 +100,7 @@ errors from these methods:
 
 - `Login`, `Logout`, `ResolveOperation`, and `AbandonOperation`.
 - `CreateUser`, `UpdateUser`, and `DeleteUser`.
+- `DeletePersonalAccessToken`.
 - `CreateStream`, `UpdateStream`, and `DeleteStream`.
 - `CreateTopic`, `UpdateTopic`, and `DeleteTopic`.
 - `CreatePartitions`, `DeletePartitions`, and `DeleteSegments`.

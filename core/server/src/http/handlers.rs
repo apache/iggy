@@ -2276,6 +2276,13 @@ pub(in crate::http) async fn delete_pat(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub(in crate::http) async fn delete_pat_named_login(
+    state: State<HttpState>,
+    identity: Authenticated,
+) -> Result<StatusCode, WriteError> {
+    delete_pat(state, identity, Path("login".to_owned())).await
+}
+
 /// Mint a token only while the account verified by login or named by the
 /// refresh token still occupies its user id.
 fn issue_identity(
