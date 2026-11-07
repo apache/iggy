@@ -23,13 +23,14 @@ comments unless the user asks you to.
 
 Tool names in this skill are Claude Code names. On Codex, use the equivalents from
 [execution instructions](../team-review/references/execution.md): `spawn_agent` for `Agent`, `send_message` and
-`followup_task` for `SendMessage`, `wait_agent` to see which fix agents are still running in place of `ListAgents`,
-and the client's own question tool in place of `AskUserQuestion`.
+`followup_task` for `SendMessage`, `list_agents` to see which fix agents are still running in place of `ListAgents`,
+`wait_agent` only to wait for an agent to finish, and the client's own question tool in place of `AskUserQuestion`.
+If `list_agents` is not available, treat every fix agent you launched as running until `wait_agent` returns its report.
 
 ## 1. Fetch the review
 
 ```bash
-gh pr view <PR> --json title,url,state,body
+gh pr view <PR> --json title,url,state,body,headRefOid
 gh pr view <PR> --repo <owner>/<repo> --json reviews --jq '.reviews[] | {author: .author.login, state: .state, body: .body}'
 gh api repos/<owner>/<repo>/pulls/<PR>/comments --paginate
 ```
@@ -38,6 +39,10 @@ Infer `<owner>/<repo>` from `gh repo view --json owner,name` or the git remote i
 inline comment via the `comments` API (paginated - a review can have 15+ line comments, don't stop at the first
 page). Note `path`, `line`, `diff_hunk`, `body`, and `in_reply_to_id` for each. Also capture the top-level review
 summary (`state`, `body`) if one was left alongside the inline comments - it often names a specific blocker.
+
+Before item 1, require that the checkout's `HEAD` equals `headRefOid` and that tracked files are clean, as in
+[Prepare the target](../team-review/references/execution.md#prepare-the-target). If either check fails, ask the
+user to prepare the checkout. Do not reset, stash, or switch branches yourself.
 
 Build an ordered list of every distinct comment (file order is fine, or blocker-first if the review names one
 explicitly - ask the user which they'd prefer if it's not obvious). Give the user the full list up front as a
@@ -114,7 +119,7 @@ conversation and call ListAgents to confirm which are still active.
 - If one is running, do not launch. Put the approved fix in a queue, in the order the user approved it, and
   tell the user it is queued. Write the full approved change to a scratch file in the session scratchpad
   directory, so that context compaction cannot drop it. Read that file when the agent prompt is written.
-- When the running agent reports (done, failed, or blocked and answered), launch the next queued fix. Do this
+- When the running agent reports (done or failed), launch the next queued fix. Do this
   as soon as the report arrives, before moving on to anything else, and then give the user the report.
 - If an agent is blocked waiting on the user, it still counts as running. Do not launch another until it
   finishes or the user tells you to abandon it.
@@ -167,13 +172,10 @@ Some comments call for something other than a code change:
 
 - **Replying on the PR thread** (e.g. explaining a disagreement, or noting a fix was applied): draft the exact
   comment text and get approval before posting, same as a code change. Post with
-  `gh api repos/<owner>/<repo>/pulls/comments/<comment_id>/replies -f body="..."`.
+  `gh api repos/<owner>/<repo>/pulls/<PR>/comments/<comment_id>/replies -f body="..."`.
 - **PR metadata** (title, description, `Closes #N` vs `Relates to #N`): treat as its own item, same propose →
   approve → apply flow. Check the linked issue's discussion first if the "why" is disputed - the resolution may
   already be documented there.
-- **A comment the user disagrees with**: don't just comply or just argue. Investigate (repo history, linked
-  issues, comparable code elsewhere in the repo) and bring back a grounded recommendation, then follow the
-  user's call.
 
 ## 6. Wrap-up
 
