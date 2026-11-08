@@ -126,6 +126,26 @@ Default bind: a `PLAINTEXT` listener on `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` | `4` | Credential verifications the gateway runs at once, across all connections. Each costs a password hash on an Iggy shard thread. This bounds the gateway's side only: a check that times out frees its slot while its hash keeps running inside Iggy. Size it below the Iggy node's shard count |
 | `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` | `false` | Kafka's `auto.create.topics.enable`: a `Metadata` lookup of a missing topic creates it ([Auto topic creation](#auto-topic-creation)). Needs `IGGY_KAFKA_BRIDGE_ENABLED=true`. Off by default, unlike Kafka |
 | `IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS` | `1` | Partitions of an auto-created topic, at most 1000. Only read while auto-creation is on, and refused otherwise |
+| `IGGY_KAFKA_HTTP_ADDR` | unset (the image sets `0.0.0.0:9096`) | IP and port of the HTTP endpoint of `/metrics`, `/ready` and `/live`. Unset means no endpoint. It has no authentication, so bind it where only a scraper and an orchestrator reach it. See [Metrics and health](#metrics-and-health) |
+
+## Metrics and health
+
+With `IGGY_KAFKA_HTTP_ADDR` set, the gateway serves three paths over HTTP:
+
+| Path | Answer |
+| --- | --- |
+| `/metrics` | Prometheus metrics in the OpenMetrics text format: requests, latency and error codes per Kafka API, connections per listener and closed connections per cause, slot use, Produce sends in doubt, consumer groups, and the coordinator partitions that the gateway serves |
+| `/ready` | 200 while the listeners accept and the bridge reaches Iggy. 503 with the reason while the gateway starts, while it drains at shutdown, and from about 5 s after it loses Iggy |
+| `/live` | 200 while the process answers. Iggy out of reach does not change it |
+
+The endpoint starts before the bridge connects, so an orchestrator sees the gateway live and not
+ready while it waits for Iggy. `iggy-gateway-kafka --check-ready` asks `/ready` at
+`IGGY_KAFKA_HTTP_ADDR` and exits 0 on 200, for a container health check.
+
+Each closed Kafka connection is counted by its cause. A cause that someone must act on, such as an
+oversized frame, a timeout or a failed login, logs at warn, at most 5 lines per cause each 10 s. A
+client that closes its connection logs at debug. See [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)
+for every metric, the readiness rules and the causes.
 
 ## Docker image
 
@@ -162,6 +182,13 @@ docker run --rm -p 9093:9093 \
 For stub mode, set `IGGY_KAFKA_BRIDGE_ENABLED=false` in place of the two Iggy variables. The
 [Compose quick start](#quick-start-docker-compose) sets both the advertised address and the bridge
 configuration.
+
+The image runs as user and group 10001, and the gateway writes no file, so a read-only root file
+system works. It exposes 9093 (Kafka) and 9096 (`/metrics`, `/ready`, `/live`, set by
+`IGGY_KAFKA_HTTP_ADDR`). Its `HEALTHCHECK` runs `iggy-gateway-kafka --check-ready`.
+
+On Kubernetes, the [`iggy-kafka-gateway` chart](../../helm/charts/iggy-kafka-gateway) runs N gateways
+as a StatefulSet beside an Iggy server or cluster, with probes on `/live` and `/ready`.
 
 ## Quick start (Docker Compose)
 
@@ -240,7 +267,8 @@ docker compose exec iggy-server /usr/local/bin/iggy --username iggy \
   --password iggy-gateway-quickstart message poll kafka orders 0 --offset 0 --message-count 1
 ```
 
-**Ports**: gateway `9093` (Kafka wire, the one a client dials), Iggy `8090` (TCP, `iggy` CLI/SDK),
+**Ports**: gateway `9093` (Kafka wire, the one a client dials) and `9096` (`/metrics`, `/ready`,
+`/live`), Iggy `8090` (TCP, `iggy` CLI/SDK),
 `3000`/`8080`/`8092` (Iggy HTTP/QUIC/WebSocket, unused by the gateway itself but published for
 direct Iggy inspection).
 

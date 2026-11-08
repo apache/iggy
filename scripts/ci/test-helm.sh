@@ -41,6 +41,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 CHART_DIR="${CHART_DIR:-helm/charts/iggy}"
+KAFKA_GATEWAY_CHART_DIR="${KAFKA_GATEWAY_CHART_DIR:-helm/charts/iggy-kafka-gateway}"
 HELM_RENDER_DIR="${HELM_RENDER_DIR:-/tmp/helm-render}"
 HELM_SMOKE_NAMESPACE="${HELM_SMOKE_NAMESPACE:-iggy-smoke}"
 HELM_SMOKE_RELEASE="${HELM_SMOKE_RELEASE:-iggy-smoke}"
@@ -450,6 +451,67 @@ validate() {
   validate_yamllint
   validate_helmfmt
   validate_helm_docs
+
+  validate_kafka_gateway
+}
+
+validate_kafka_gateway() {
+  local chart="$KAFKA_GATEWAY_CHART_DIR"
+  local render="$HELM_RENDER_DIR/kafka-gateway"
+  local required=(--set iggy.address=iggy.default.svc.cluster.local:8090 --set iggy.password=secret)
+  local headless="kafka-iggy-kafka-gateway-headless.default.svc.cluster.local"
+  mkdir -p "$render"
+
+  echo "Validating the Kafka gateway chart..."
+  helm lint --strict "$chart" "${required[@]}"
+
+  helm template kafka "$chart" "${required[@]}" > "$render/default.yaml"
+  test "$(grep -c '^kind: StatefulSet$' "$render/default.yaml")" -eq 1
+  test "$(grep -c '^kind: Service$' "$render/default.yaml")" -eq 2
+  test "$(grep -c '^kind: Secret$' "$render/default.yaml")" -eq 1
+  test "$(grep -c '^kind: PodDisruptionBudget$' "$render/default.yaml")" -eq 1
+  grep -q 'image: "apache/iggy-kafka-gateway:edge"' "$render/default.yaml"
+  grep -q "value: \"1@kafka-iggy-kafka-gateway-0.${headless}:9093,2@kafka-iggy-kafka-gateway-1.${headless}:9093,3@kafka-iggy-kafka-gateway-2.${headless}:9093\"" "$render/default.yaml"
+  grep -q 'publishNotReadyAddresses: true' "$render/default.yaml"
+  grep -q 'path: /ready' "$render/default.yaml"
+  grep -q 'path: /live' "$render/default.yaml"
+  grep -q 'runAsNonRoot: true' "$render/default.yaml"
+  grep -q 'readOnlyRootFilesystem: true' "$render/default.yaml"
+
+  helm template kafka "$chart" "${required[@]}" \
+    --set replicaCount=1 \
+    --set serviceMonitor.enabled=true \
+    --set kafka.sasl.enabled=true \
+    --set iggy.tls.enabled=true \
+    --set iggy.tls.caSecret=iggy-ca \
+    > "$render/all-features.yaml"
+  grep -q '^kind: ServiceMonitor$' "$render/all-features.yaml"
+  grep -q "value: \"1@kafka-iggy-kafka-gateway-0.${headless}:9093\"" "$render/all-features.yaml"
+  grep -q 'name: IGGY_KAFKA_SASL_ENABLED' "$render/all-features.yaml"
+  grep -q 'name: IGGY_KAFKA_IGGY_TLS_CA_FILE' "$render/all-features.yaml"
+  grep -q 'secretName: iggy-ca' "$render/all-features.yaml"
+
+  helm template kafka "$chart" \
+    --set iggy.address=iggy.default.svc.cluster.local:8090 \
+    --set iggy.existingSecret.name=iggy-credentials \
+    > "$render/existing-secret.yaml"
+  if grep -q '^kind: Secret$' "$render/existing-secret.yaml"; then
+    echo "Error: the Kafka gateway chart created a Secret beside iggy.existingSecret.name" >&2
+    exit 1
+  fi
+  grep -q 'name: iggy-credentials' "$render/existing-secret.yaml"
+
+  CHART_DIR="$chart" assert_render_rejected "a gateway without an Iggy address" \
+    --set iggy.password=secret
+  CHART_DIR="$chart" assert_render_rejected "a gateway without Iggy credentials" \
+    --set iggy.address=iggy.default.svc.cluster.local:8090
+  CHART_DIR="$chart" assert_render_rejected "no gateway" "${required[@]}" --set replicaCount=0
+  CHART_DIR="$chart" assert_render_rejected "one port for Kafka and HTTP" "${required[@]}" \
+    --set http.port=9093
+
+  CHART_DIR="$chart" validate_yamllint
+  CHART_DIR="$chart" validate_helmfmt
+  CHART_DIR="$chart" validate_helm_docs
 }
 
 # Assert that `helm template` refuses a values combination the chart guards

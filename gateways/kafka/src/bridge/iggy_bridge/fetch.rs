@@ -113,6 +113,15 @@ impl FetchPool {
     pub(super) async fn close(&self) -> Result<(), BridgeError> {
         LazyClient::close_all(&self.all).await
     }
+
+    /// The slots held now, and how many there are.
+    fn usage(&self) -> (usize, usize) {
+        let slots = self.all.len();
+        (
+            slots.saturating_sub(self.permits.available_permits()),
+            slots,
+        )
+    }
 }
 
 /// An Iggy client that connects at its first call, so a bridge that never needs it opens no
@@ -378,6 +387,12 @@ impl IggyBridge {
             tracing::debug!(%error, "a Fetch read slot could not connect to Iggy");
         }
         Some(slot)
+    }
+
+    /// The Fetch read slots held now, and how many there are (`IGGY_KAFKA_FETCH_SLOTS`).
+    #[must_use]
+    pub fn fetch_slot_use(&self) -> (usize, usize) {
+        self.fetch_pool.usage()
     }
 
     /// Probes every partition of the topic `kafka_topic` maps to, with one `get_topic` call, or

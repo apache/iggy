@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -40,6 +40,7 @@ use super::{
 };
 use crate::bridge::config::{IggyBridgeConfig, ProduceSessionLimits};
 use crate::bridge::error::BridgeError;
+use crate::observability::ProduceSessionCensus;
 
 /// Frame bytes besides the messages: request header, batch header and ids.
 const SEND_FRAME_ROOM: u64 = 4 * 1024;
@@ -121,6 +122,8 @@ pub(super) struct ProducePool {
     opens: Arc<Semaphore>,
     /// Whether the log already says that the pool filled up.
     full_logged: AtomicBool,
+    /// Sends whose outcome is unknown. See [`IggyBridge::sends_in_doubt`].
+    in_doubt: AtomicU64,
 }
 
 /// Every producer's seat, and how many of them have a session of their own.
@@ -144,6 +147,17 @@ impl ProducePool {
             limits,
             opens: Arc::new(Semaphore::new(SESSION_OPENS)),
             full_logged: AtomicBool::new(false),
+            in_doubt: AtomicU64::new(0),
+        }
+    }
+
+    /// How the producers sit in the pool now.
+    fn census(&self) -> ProduceSessionCensus {
+        let seats = self.seats.lock().unwrap_or_else(PoisonError::into_inner);
+        ProduceSessionCensus {
+            own: seats.own,
+            limit: self.limits.max,
+            shared: seats.held.len() - seats.own,
         }
     }
 
@@ -387,6 +401,20 @@ impl IggyBridge {
         self.produce_pool.forget(&Producer::Connection(connection));
     }
 
+    /// How the producers sit on the Produce sessions now.
+    #[must_use]
+    pub fn produce_sessions(&self) -> ProduceSessionCensus {
+        self.produce_pool.census()
+    }
+
+    /// Sends since the bridge connected whose outcome is unknown: the send went out, and its
+    /// answer did not come back by the deadline or the connection broke. The client got
+    /// `REQUEST_TIMED_OUT`, and the records may have landed.
+    #[must_use]
+    pub fn sends_in_doubt(&self) -> u64 {
+        self.produce_pool.in_doubt.load(Ordering::Relaxed)
+    }
+
     /// Appends `batch` to its partition of `target` on the session of `turn`, and returns the
     /// base offset. Hands `turn` and `kept` back with it.
     ///
@@ -493,8 +521,15 @@ impl IggyBridge {
         // The SDK cannot cancel a send. One that outlives this call keeps the turn in its task,
         // so the next one waits for it here instead of queueing its batch inside the SDK.
         let Some(((response, kept), turn)) = in_slot(turn, deadline, send).await else {
+            self.produce_pool.in_doubt.fetch_add(1, Ordering::Relaxed);
             return (Err(BridgeError::Timeout), None);
         };
+        if matches!(
+            response,
+            Err(BridgeError::SendLost(_) | BridgeError::Iggy(IggyError::OperationUncertain(_)))
+        ) {
+            self.produce_pool.in_doubt.fetch_add(1, Ordering::Relaxed);
+        }
         let base_offset = response.map(|response| {
             response
                 .confirmations
