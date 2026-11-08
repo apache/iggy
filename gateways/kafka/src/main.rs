@@ -245,17 +245,22 @@ fn reject_unknown_kafka_env_vars() -> Result<(), String> {
     Ok(())
 }
 
-/// Connects the Iggy bridge when `IGGY_KAFKA_BRIDGE_ENABLED` is true, otherwise returns `None`
+/// Connects the Iggy bridge unless `IGGY_KAFKA_BRIDGE_ENABLED` is false, otherwise returns `None`
 /// and every handler keeps answering with its stub.
 ///
-/// Off by default, so wiring one API at a time does not change what an operator sees. A connect
-/// that still fails at `give_up` is fatal: an operator who turned the bridge on must learn it is
-/// unreachable at startup, not from `NOT_LEADER_OR_FOLLOWER` on every produce.
+/// On by default: a gateway in stub mode accepts every Produce and stores nothing, and its clients
+/// retry without end. A connect that still fails at `give_up` is fatal: an operator must learn
+/// that Iggy is unreachable at startup, not from `NOT_LEADER_OR_FOLLOWER` on every produce.
 async fn connect_bridge(
     sasl_enabled: bool,
     give_up: Instant,
 ) -> Result<Option<Arc<IggyBridge>>, String> {
     if !bridge_enabled()? {
+        warn!(
+            "IGGY_KAFKA_BRIDGE_ENABLED is false: the gateway runs in stub mode and stores nothing. \
+             Produce, Fetch and ListOffsets answer the retriable NOT_LEADER_OR_FOLLOWER (6), so \
+             clients retry without end"
+        );
         let set: Vec<&str> = IggyBridgeConfig::KNOWN_ENV_VARS
             .iter()
             .copied()
@@ -271,7 +276,7 @@ async fn connect_bridge(
             .collect();
         if !set.is_empty() {
             warn!(
-                "{} set but IGGY_KAFKA_BRIDGE_ENABLED is not true: the gateway is answering with \
+                "{} set but IGGY_KAFKA_BRIDGE_ENABLED is false: the gateway is answering with \
                  stub responses and reads none of them",
                 set.join(", ")
             );
@@ -294,11 +299,12 @@ async fn connect_bridge(
     Ok(Some(Arc::new(bridge)))
 }
 
-/// `IGGY_KAFKA_BRIDGE_ENABLED`, rejecting anything that is neither `true` nor `false`.
+/// `IGGY_KAFKA_BRIDGE_ENABLED`, `true` when unset, rejecting anything that is neither `true` nor
+/// `false`.
 ///
-/// A typo otherwise reads as "off", which leaves stub responses and nothing in the log.
+/// A typo otherwise reads as one of the two, and the operator learns which only from the log.
 fn bridge_enabled() -> Result<bool, String> {
-    env_var("IGGY_KAFKA_BRIDGE_ENABLED").map_or(Ok(false), |raw| {
+    env_var("IGGY_KAFKA_BRIDGE_ENABLED").map_or(Ok(true), |raw| {
         raw.parse()
             .map_err(|e| format!("invalid IGGY_KAFKA_BRIDGE_ENABLED `{raw}`: {e}"))
     })
@@ -403,16 +409,16 @@ fn load_config() -> Result<GatewayConfig, String> {
     Ok(config)
 }
 
-/// Whether the gateways share their groups through the coordinator log. On by default when
-/// `IGGY_KAFKA_BROKERS` lists the gateways and the bridge is on, unless the bridge user cannot
-/// read Iggy's metadata change log. Set on, the log needs that.
+/// Whether the gateways share their groups through the coordinator log. On by default with the
+/// bridge, also for a single gateway, unless the bridge user cannot read Iggy's metadata change
+/// log. Only the log keeps commit times, so without it no offset expires. Set on, the log needs
+/// that.
 fn load_coordinator_log(
     config: &GatewayConfig,
     bridge_enabled: bool,
 ) -> Result<CoordinatorLog, String> {
     let Some(raw) = env_var("IGGY_KAFKA_COORDINATOR_LOG") else {
-        let preferred = bridge_enabled && !config.brokers.is_empty();
-        return Ok(if preferred {
+        return Ok(if bridge_enabled {
             CoordinatorLog::Preferred
         } else {
             CoordinatorLog::Off
@@ -660,7 +666,7 @@ fn reject_unread_iggy_tls(
         "IGGY_KAFKA_SASL_ENABLED is not true"
     };
     Err(format!(
-        "{} set but {sasl_switch} and IGGY_KAFKA_BRIDGE_ENABLED is not true; only the SASL \
+        "{} set but {sasl_switch} and IGGY_KAFKA_BRIDGE_ENABLED is false; only the SASL \
          credential check and the bridge dial Iggy, so nothing would be encrypted",
         set.join(", ")
     ))
@@ -758,12 +764,13 @@ mod tests {
 
     use serial_test::serial;
 
+    use iggy_gateway_kafka::CoordinatorLog;
     use iggy_gateway_kafka::listener::SecurityProtocol;
     use iggy_gateway_kafka::tls::ClientAuth;
 
     use super::{
-        KNOWN_KAFKA_ENV_VARS, load_config, parse_positive, reject_unknown_kafka_env_vars,
-        reject_unread_iggy_tls,
+        KNOWN_KAFKA_ENV_VARS, bridge_enabled, load_config, parse_positive,
+        reject_unknown_kafka_env_vars, reject_unread_iggy_tls,
     };
 
     /// Leaves every variable `load_config` reads unset, so one test's value cannot decide
@@ -937,6 +944,39 @@ mod tests {
         }
     }
 
+    /// A gateway with nothing set talks to Iggy, and keeps the commit times of its groups in the
+    /// coordinator log, so its offsets expire. Stub mode and a gateway without the log are asked
+    /// for.
+    #[test]
+    #[serial]
+    fn given_no_bridge_or_log_vars_when_loading_config_should_bridge_and_prefer_the_log() {
+        let defaults = load_with(&[]).expect("defaults load");
+        assert_eq!(
+            defaults.coordinator_log,
+            CoordinatorLog::Preferred,
+            "one gateway uses the log too"
+        );
+        assert_eq!(
+            defaults.coordination.offsets_retention, None,
+            "Kafka's 7 days"
+        );
+
+        let stub = load_with(&[("IGGY_KAFKA_BRIDGE_ENABLED", "false")]).expect("stub mode loads");
+        assert_eq!(stub.coordinator_log, CoordinatorLog::Off);
+        let unlogged = load_with(&[("IGGY_KAFKA_COORDINATOR_LOG", "false")]).expect("no log loads");
+        assert_eq!(unlogged.coordinator_log, CoordinatorLog::Off);
+
+        clear_gateway_env();
+        let unset = bridge_enabled();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_BRIDGE_ENABLED", "no");
+        }
+        let garbage = bridge_enabled();
+        clear_gateway_env();
+        assert_eq!(unset, Ok(true), "the bridge is on by default");
+        assert!(garbage.is_err_and(|error| error.contains("IGGY_KAFKA_BRIDGE_ENABLED")));
+    }
+
     #[test]
     #[serial]
     fn given_no_auto_create_vars_when_loading_config_should_leave_auto_creation_off() {
@@ -962,7 +1002,10 @@ mod tests {
     fn given_an_invalid_auto_create_setting_when_loading_config_should_refuse_and_name_it() {
         let cases: [(&[(&str, &str)], &str); 4] = [
             (
-                &[("IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED", "true")],
+                &[
+                    ("IGGY_KAFKA_BRIDGE_ENABLED", "false"),
+                    ("IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED", "true"),
+                ],
                 "IGGY_KAFKA_BRIDGE_ENABLED",
             ),
             (
@@ -1028,9 +1071,19 @@ mod tests {
             ]
         }
         let overflow = u64::MAX.to_string();
-        let cases: [(&[(&str, &str)], &str); 4] = [
+        let cases: [(&[(&str, &str)], &str); 5] = [
             (
-                &[("IGGY_KAFKA_OFFSETS_RETENTION_MINUTES", "60")],
+                &[
+                    ("IGGY_KAFKA_BRIDGE_ENABLED", "false"),
+                    ("IGGY_KAFKA_OFFSETS_RETENTION_MINUTES", "60"),
+                ],
+                "IGGY_KAFKA_COORDINATOR_LOG=true",
+            ),
+            (
+                &[
+                    ("IGGY_KAFKA_COORDINATOR_LOG", "false"),
+                    ("IGGY_KAFKA_OFFSETS_RETENTION_MINUTES", "60"),
+                ],
                 "IGGY_KAFKA_COORDINATOR_LOG=true",
             ),
             (&with_log("0"), "greater than 0"),

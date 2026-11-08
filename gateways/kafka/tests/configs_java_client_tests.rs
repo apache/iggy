@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
 
-use iggy_gateway_kafka::bridge::IggyBridge;
+use iggy_gateway_kafka::bridge::{IggyBridge, IggyBridgeConfig, TopicDefaults};
 use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol};
 use iggy_gateway_kafka::server::{BoundListener, bind_listener};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
@@ -208,10 +208,18 @@ fn classpath(jars: &Path, classes: &Path) -> String {
     parts.join(":")
 }
 
+/// A gateway with `IGGY_KAFKA_TOPIC_RETENTION_MS=-1`, so the topic starts with the -1 retention
+/// that the probe reads first.
 async fn spawn_gateway(server: &TestServer) -> SocketAddr {
-    let bridge = IggyBridge::connect(server.test_config())
-        .await
-        .expect("bridge connects");
+    let bridge = IggyBridge::connect(IggyBridgeConfig {
+        topic_defaults: TopicDefaults {
+            retention_ms: None,
+            ..TopicDefaults::default()
+        },
+        ..server.test_config()
+    })
+    .await
+    .expect("bridge connects");
     bridge
         .ensure_stream_and_topic(TOPIC, 1)
         .await

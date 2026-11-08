@@ -30,15 +30,15 @@ does. The core SDK README has the rules, under "Idempotent producers". In short:
 - Before the partition primary assigns offsets, it compares each batch with that state and with
   its uncommitted writes.
 
-With `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, Produce passes the three fields of a Kafka batch to
+With `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` on, Produce passes the three fields of a Kafka batch to
 Iggy, the id without the gateway's mark. So every resend finds the first write: through any
 gateway, on any Iggy session, and across a gateway restart.
 
-The switch is off by default. Released gateways, and released consumers built on the Rust SDK,
-refuse to read a batch that carries a producer, and older Iggy nodes cannot store it. Upgrade every
-Iggy node, every gateway and every consumer of the topics, then turn the switch on for every
-gateway. While it is off, Produce drops the three fields, and an idempotent producer gets
-at-least-once delivery.
+The switch is on by default. Builds from before the Iggy 0.10.0 release refuse to read a batch
+that carries a producer, and older Iggy nodes cannot store it. Upgrade every consumer of the topics
+before you run this gateway, or set `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=false` on every gateway.
+While it is off, Produce drops the three fields, and an idempotent producer gets at-least-once
+delivery.
 
 Iggy's client table does not do this job. It guards the hop from the gateway to Iggy. It keys on a
 request number that the Iggy client picks. A Kafka retry is a new Produce request. The gateway
@@ -178,10 +178,11 @@ branch load-bearing.
   forgets the one idle the longest. A resend of an old batch of a forgotten producer can write it
   twice, as in Kafka.
 - A resend older than the 5 batches that the partition keeps gets 45, as in Kafka.
-- Released builds refuse a polled batch with a producer section: the gateway, the Rust SDK and
-  every client that embeds it (the Python, C++ and PHP SDKs, the CLI and the connectors runtime),
-  and the Swift SDK. Before you set `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, upgrade every Iggy
-  node, every gateway and every consumer of the topics.
+- Builds from before the Iggy 0.10.0 release refuse a polled batch with a producer section. These
+  are the gateway, the Rust SDK before 0.12.0 and every client that embeds it, and the Swift SDK.
+  The clients that embed it are the Python, C++ and PHP SDKs, the CLI and the connectors runtime.
+  Upgrade every Iggy node and every consumer of the topics, or set
+  `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=false`.
 - Exactly-once delivery needs topics with `persisted` durability. With `replicated`, a quorum of
   nodes that crash at the same time can lose acknowledged batches.
 - Transactions are not supported.

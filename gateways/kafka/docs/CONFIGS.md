@@ -214,12 +214,13 @@ Three variables set what a new topic gets for each key its request leaves out. T
 
 | Variable | Kafka broker key | Default |
 | --- | --- | --- |
-| `IGGY_KAFKA_TOPIC_RETENTION_MS` | `log.retention.ms` | `-1`, never expire. Otherwise a positive count |
+| `IGGY_KAFKA_TOPIC_RETENTION_MS` | `log.retention.ms` | `604800000` (7 days), as Kafka. `-1` never expires. Otherwise a positive count |
 | `IGGY_KAFKA_TOPIC_RETENTION_BYTES` | `log.retention.bytes` | `-1`, no cap. Otherwise at least 1 GiB, so that every segment size fits |
 | `IGGY_KAFKA_TOPIC_DURABILITY` | None | `replicated`. `persisted` applies to the messages and to the consumer offsets of the topic |
 
-Kafka keeps records for 7 days by default. The gateway keeps them forever unless an operator sets
-`IGGY_KAFKA_TOPIC_RETENTION_MS`.
+The gateway keeps records for 7 days by default, as Kafka does. To keep them forever, set
+`IGGY_KAFKA_TOPIC_RETENTION_MS=-1`. Topics that Iggy clients create keep the Iggy default, which
+never expires.
 
 Iggy stores a default like any value that a client sends. So a describe reports a stored
 `retention.ms` or `retention.bytes` equal to the default as `STATIC_BROKER_CONFIG` (4), as Kafka

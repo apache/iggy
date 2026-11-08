@@ -115,6 +115,15 @@ const LOST_REPLY_RECORDS: u32 = 600;
 /// Produce responses the relay drops. Each drop closes that connection, as a lost reply does.
 const LOST_REPLIES: usize = 3;
 
+/// The topic that a default Java producer writes through a gateway on its defaults, and the
+/// records it sends there, as the values `0` to `DEFAULTS_RECORDS - 1`.
+const DEFAULTS_TOPIC: &str = "defaults";
+const DEFAULTS_RECORDS: u32 = 300;
+/// Produce responses that the relay holds past the producer's request timeout.
+const STALLED_REPLIES: usize = 3;
+/// The producer's request timeout there, below Kafka's 30 s, so three timeouts fit one client run.
+const STALL_REQUEST_TIMEOUT_MS: u64 = 3_000;
+
 /// Budget for `iggy-server` to start listening. Generous: it is a cold process start, and a debug
 /// build on a loaded machine is not quick.
 const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(45);
@@ -1697,7 +1706,7 @@ async fn given_kafka_configs_sh_when_describing_the_broker_should_report_the_gat
     for setting in [
         "auto.create.topics.enable=false",
         "min.insync.replicas=1",
-        "log.retention.ms=-1",
+        "log.retention.ms=604800000",
         "num.partitions=1",
         "default.replication.factor=1",
     ] {
@@ -3221,7 +3230,7 @@ async fn given_lost_produce_responses_when_an_idempotent_producer_retries_should
         .expect("bind the relay");
     let relay_addr = relay_listener.local_addr().expect("relay addr");
     let gateway = start_gateway_behind(&server, (LOST_REPLY_TOPIC, 1), relay_addr).await;
-    let relay = LosingRelay::start(relay_listener, gateway.addr, LOST_REPLIES);
+    let relay = LosingRelay::start(relay_listener, gateway.addr, LOST_REPLIES, Duration::ZERO);
 
     let bootstrap = format!("bootstrap.servers={relay_addr}");
     let records = LOST_REPLY_RECORDS.to_string();
@@ -3288,6 +3297,151 @@ async fn given_lost_produce_responses_when_an_idempotent_producer_retries_should
     gateway.stop().await;
 }
 
+/// A gateway started with only the Iggy address and password keeps the order of a default Java
+/// producer whose requests time out. Its defaults turn on the bridge and idempotent producers, so
+/// each resend after a timeout lands once, in its place. The listener settings only put the
+/// gateway behind the relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn given_only_the_iggy_address_and_password_when_requests_time_out_should_keep_a_default_java_producer_in_order()
+ {
+    let Some(server) = ready_server() else {
+        return;
+    };
+    root_bridge(&server)
+        .await
+        .ensure_stream_and_topic(DEFAULTS_TOPIC, 1)
+        .await
+        .expect("create the topic");
+    let relay_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the relay");
+    let relay_addr = relay_listener.local_addr().expect("relay addr");
+    let gateway_addr: SocketAddr = format!("127.0.0.1:{}", free_port())
+        .parse()
+        .expect("a socket address");
+    let _gateway = GatewayProcess::start(
+        &[
+            ("IGGY_KAFKA_IGGY_ADDR", &server.address),
+            ("IGGY_KAFKA_IGGY_PASSWORD", ROOT_PASSWORD),
+            ("IGGY_KAFKA_BIND_ADDR", &gateway_addr.to_string()),
+            ("IGGY_KAFKA_ADVERTISED_PORT", &relay_addr.port().to_string()),
+        ],
+        gateway_addr,
+    )
+    .await;
+    let hold = Duration::from_millis(2 * STALL_REQUEST_TIMEOUT_MS);
+    let relay = LosingRelay::start(relay_listener, gateway_addr, STALLED_REPLIES, hold);
+
+    // The tool sets `retries=0`, which also turns the default idempotence off. The file puts
+    // back the Java default, so the producer runs on Kafka's defaults but for the timeouts.
+    let config = tempfile::tempdir().expect("create config dir");
+    let properties = config.path().join("producer.properties");
+    std::fs::write(
+        &properties,
+        format!(
+            "retries=2147483647\nrequest.timeout.ms={STALL_REQUEST_TIMEOUT_MS}\n\
+             delivery.timeout.ms=60000\n"
+        ),
+    )
+    .expect("write the producer config");
+    let properties = properties.to_str().expect("a UTF-8 path");
+    let records = DEFAULTS_RECORDS.to_string();
+    let relay_bootstrap = relay_addr.to_string();
+    let output = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-verifiable-producer.sh",
+            "--bootstrap-server",
+            &relay_bootstrap,
+            "--topic",
+            DEFAULTS_TOPIC,
+            "--max-messages",
+            &records,
+            "--throughput",
+            "100",
+            "--producer.config",
+            "/tmp/producer.properties",
+        ],
+        &[(properties, "/tmp/producer.properties")],
+    )
+    .expect_ran("the producer runs");
+    let acked = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["name"] == "tool_data")
+        .and_then(|event| event["acked"].as_u64());
+    assert_eq!(
+        acked,
+        Some(u64::from(DEFAULTS_RECORDS)),
+        "every record must be acknowledged: {output}"
+    );
+    assert_eq!(
+        relay.lost(),
+        STALLED_REPLIES,
+        "the relay must hold that many responses past the timeout: {output}"
+    );
+
+    let read = run_client(
+        KCAT_IMAGE,
+        &[
+            "-b",
+            &relay_bootstrap,
+            "-C",
+            "-t",
+            DEFAULTS_TOPIC,
+            "-p",
+            "0",
+            "-o",
+            "beginning",
+            "-e",
+            "-f",
+            "%s\n",
+        ],
+        &[],
+    )
+    .expect_ran("kcat reads the topic");
+    let values: Vec<u32> = read.lines().filter_map(|line| line.parse().ok()).collect();
+    let sent: Vec<u32> = (0..DEFAULTS_RECORDS).collect();
+    assert_eq!(values, sent, "each record once, in the order sent: {read}");
+}
+
+/// The gateway binary, started with exactly the given variables, and killed on drop.
+struct GatewayProcess {
+    child: Child,
+}
+
+impl GatewayProcess {
+    /// Starts the binary with `env` and nothing else, then waits until `addr` accepts.
+    async fn start(env: &[(&str, &str)], addr: SocketAddr) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_iggy-gateway-kafka"));
+        command.env_clear();
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile);
+        }
+        command.envs(env.iter().copied()).stdout(Stdio::null());
+        let mut child = command.spawn().expect("spawn iggy-gateway-kafka");
+        let deadline = Instant::now() + SERVER_READY_TIMEOUT;
+        while TcpStream::connect(addr).await.is_err() {
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("the gateway exited with {status} before it listened");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the gateway did not listen on {addr} within {SERVER_READY_TIMEOUT:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Self { child }
+    }
+}
+
+impl Drop for GatewayProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// A bridged gateway that advertises `relay` in place of its own address, so a client that learns
 /// the brokers from Metadata stays behind the relay.
 async fn start_gateway_behind(
@@ -3320,13 +3474,14 @@ async fn start_gateway_behind(
 }
 
 /// A TCP relay to a gateway that loses its first Produce responses. It reads the Kafka frames of
-/// each connection, and drops a Produce response together with its connection.
+/// each connection, and drops a Produce response together with its connection after a hold. A
+/// hold past the client's request timeout makes the client time out first.
 struct LosingRelay {
     lost: Arc<AtomicUsize>,
 }
 
 impl LosingRelay {
-    fn start(listener: TcpListener, gateway: SocketAddr, losses: usize) -> Self {
+    fn start(listener: TcpListener, gateway: SocketAddr, losses: usize, hold: Duration) -> Self {
         let lost = Arc::new(AtomicUsize::new(0));
         let budget = Arc::new(AtomicUsize::new(losses));
         let counted = Arc::clone(&lost);
@@ -3340,6 +3495,7 @@ impl LosingRelay {
                     upstream,
                     Arc::clone(&budget),
                     Arc::clone(&counted),
+                    hold,
                 ));
             }
         });
@@ -3351,12 +3507,14 @@ impl LosingRelay {
     }
 }
 
-/// Copies frames both ways until one side closes, or until a Produce response is lost.
+/// Copies frames both ways until one side closes, or until a Produce response is lost. A lost
+/// response closes its connection after `hold`.
 async fn relay_frames(
     client: TcpStream,
     upstream: TcpStream,
     budget: Arc<AtomicUsize>,
     lost: Arc<AtomicUsize>,
+    hold: Duration,
 ) {
     const API_KEY_PRODUCE: i16 = 0;
     let (mut client_read, mut client_write) = client.into_split();
@@ -3397,6 +3555,7 @@ async fn relay_frames(
                     .is_ok()
             {
                 lost.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(hold).await;
                 return;
             }
             if client_write.write_all(&frame).await.is_err() {

@@ -182,8 +182,8 @@ pub struct GatewayConfig {
     pub brokers: Vec<BrokerEntry>,
     /// Whether the gateways share the consumer groups through the coordinator log in Iggy
     /// (`IGGY_KAFKA_COORDINATOR_LOG`). Off here by default. `load_config` in `main.rs` makes it
-    /// [`CoordinatorLog::Preferred`] when the bridge is on, `IGGY_KAFKA_BROKERS` lists the
-    /// gateways and the variable is unset.
+    /// [`CoordinatorLog::Preferred`] when the bridge is on and the variable is unset, also for a
+    /// gateway alone, since only the log keeps the commit times that offset expiry reads.
     pub coordinator_log: CoordinatorLog,
     /// How the coordinator log behaves. `IGGY_KAFKA_OFFSETS_RETENTION_MINUTES` sets its offsets
     /// retention.
@@ -667,9 +667,10 @@ impl KafkaGateway {
             warn!(
                 "the bridge's Iggy user cannot read Iggy's metadata change log, so this gateway \
                  runs without the coordinator log, as with IGGY_KAFKA_COORDINATOR_LOG=false: \
-                 the gateway with the lowest node id coordinates every group. To share the \
-                 groups, grant the bridge's Iggy user (IGGY_KAFKA_IGGY_USERNAME) the \
-                 manage_servers permission and restart every gateway"
+                 committed offsets never expire, and of several gateways the one with the lowest \
+                 node id coordinates every group. Grant the bridge's Iggy user \
+                 (IGGY_KAFKA_IGGY_USERNAME) the manage_servers permission and restart every \
+                 gateway"
             );
             return Ok(None);
         }
