@@ -117,6 +117,10 @@ pub enum Operation {
     InstallConsumerGroupOwner = 167,
     TransitionPartitionHistory = 168,
     RetireConsumerGroupOwners = 169,
+    /// Server-originated: seal a non-empty active segment before retention
+    /// removes it. The primary submits this through partition consensus so
+    /// every replica rotates at the same log position.
+    RollSegment = 170,
 }
 
 impl Operation {
@@ -163,6 +167,7 @@ impl Operation {
                     | Self::InstallConsumerGroupOwner
                     | Self::TransitionPartitionHistory
                     | Self::RetireConsumerGroupOwners
+                    | Self::RollSegment
             )
     }
 
@@ -297,7 +302,8 @@ impl Operation {
             | Self::RetireSession
             | Self::InstallConsumerGroupOwner
             | Self::TransitionPartitionHistory
-            | Self::RetireConsumerGroupOwners => None,
+            | Self::RetireConsumerGroupOwners
+            | Self::RollSegment => None,
             Self::CreateStream
             | Self::DeleteStream
             | Self::CreateTopic

@@ -2418,7 +2418,7 @@ where
 
     const fn requires_persistence(&self, operation: Operation) -> bool {
         match operation {
-            Operation::RetireSession => true,
+            Operation::RetireSession | Operation::RollSegment => true,
             Operation::SendMessages => self.durability().is_persisted(),
             Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
                 self.consumer_offset_durability().is_persisted()
@@ -9427,6 +9427,14 @@ where
                 self.journal_append(frozen.clone()).await?;
                 Ok(frozen)
             }
+            Operation::RollSegment => {
+                if !message.body().is_empty() {
+                    return Err(IggyError::InvalidCommand);
+                }
+                let frozen = message.into_frozen();
+                self.journal_append(frozen.clone()).await?;
+                Ok(frozen)
+            }
             Operation::RetireSession => {
                 let retirement = RetireSessionsRequest::decode_from(message.body())
                     .map_err(|_| IggyError::InvalidCommand)?;
@@ -10854,6 +10862,22 @@ where
             return;
         }
         loop {
+            let roll = self
+                .pending_commit
+                .as_ref()
+                .and_then(|pending| pending.headers.get(pending.next_entry))
+                .is_some_and(|header| header.operation == Operation::RollSegment);
+            if roll {
+                if let Err(error) = self.rotate_segment(config).await {
+                    self.fail_pending_commit(&error);
+                    return;
+                }
+                self.pending_commit
+                    .as_mut()
+                    .expect("selected commit exists")
+                    .next_entry += 1;
+                continue;
+            }
             let step = if std::mem::take(&mut just_selected) {
                 self.drive_validated_commit()
             } else {
@@ -11403,10 +11427,9 @@ where
     ) -> bool {
         // Lifecycle fences apply between complete commit walks, so owner changes
         // cannot overtake offsets.
-        if let Some(index) = headers
-            .iter()
-            .position(|header| header.operation.is_partition_lifecycle())
-        {
+        if let Some(index) = headers.iter().position(|header| {
+            header.operation.is_partition_lifecycle() || header.operation == Operation::RollSegment
+        }) {
             headers.truncate(index.max(1));
         }
         let applied_floor = self.consensus.commit_min();
@@ -12489,6 +12512,35 @@ where
             return SegmentRemoval::default();
         };
         self.remove_sealed_segments_up_to(up_to).await
+    }
+
+    /// Whether retention would become effective if the active segment were
+    /// sealed now. Empty active segments are deliberately left alone.
+    pub fn retention_roll_needed(
+        &self,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    ) -> bool {
+        let active = self.log.active_segment();
+        if active.size.as_bytes_u64() == 0 {
+            return false;
+        }
+        let expires = matches!(
+            message_expiry,
+            IggyExpiry::ExpireDuration(duration)
+                if active.max_timestamp != 0
+                    && active.max_timestamp.saturating_add(duration.as_micros()) <= now.as_micros()
+        );
+        let over_budget = max_bytes.is_some_and(|limit| {
+            self.log
+                .segments()
+                .iter()
+                .map(|segment| segment.size.as_bytes_u64())
+                .sum::<u64>()
+                > limit
+        });
+        expires || over_budget
     }
 
     /// Remove the oldest sealed segments whose `end_offset <= up_to_offset`,
@@ -13680,14 +13732,19 @@ where
     /// carry this partition's incarnation. A lifecycle fence names its
     /// incarnation in its body, which admission checks.
     fn request_history_available(&self, header: &RoutedRequestHeader) -> bool {
-        header.operation == Operation::RetireSession
-            || header.operation.is_partition_lifecycle()
+        matches!(
+            header.operation,
+            Operation::RetireSession | Operation::RollSegment
+        ) || header.operation.is_partition_lifecycle()
             || (header.partition_incarnation == self.created_revision() && !self.history_deleted())
     }
 
     const fn prepare_history_available(&self, header: &PrepareHeader) -> bool {
         header.partition_incarnation == self.created_revision()
-            && (matches!(header.operation, Operation::RetireSession) || !self.history_deleted())
+            && (matches!(
+                header.operation,
+                Operation::RetireSession | Operation::RollSegment
+            ) || !self.history_deleted())
     }
 
     async fn send_prepare_ok(&self, header: &PrepareHeader) -> bool {
