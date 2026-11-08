@@ -1228,24 +1228,7 @@ fn parse_bulk_response(
         });
     }
 
-    // `errors: false` is only trustworthy if every item has a 2xx result.
-    if !response.errors.unwrap_or(true) {
-        for (position, item) in items.iter().enumerate() {
-            let result = item.index.as_ref();
-            let has_error = result.is_some_and(|result| result.error.is_some());
-            let status_ok = result
-                .and_then(|result| result.status)
-                .is_some_and(|status| (200..300).contains(&status));
-            if has_error || !status_ok {
-                return Err(BulkResponseError::MalformedItem { position });
-            }
-        }
-        return Ok(BulkAttempt {
-            indexed: items.len(),
-            ..BulkAttempt::default()
-        });
-    }
-
+    let trusts_clean_flag = !response.errors.unwrap_or(true);
     let mut attempt = BulkAttempt::default();
     for (position, item) in items.iter().enumerate() {
         let Some(result) = item.index.as_ref() else {
@@ -1256,6 +1239,11 @@ fn parse_bulk_response(
         if result.error.is_none() && (200..300).contains(&status) {
             attempt.indexed += 1;
             continue;
+        }
+
+        // `errors: false` claims every item succeeded, so one failed item makes the whole response untrusted.
+        if trusts_clean_flag {
+            return Err(BulkResponseError::MalformedItem { position });
         }
 
         let failure = || {
@@ -1269,7 +1257,7 @@ fn parse_bulk_response(
 
         // A 2xx status reaching here always means `error` was present (the
         // `error.is_none() && 2xx` case above already returned) - the same
-        // contradictory shape the errors:false fast path treats as untrusted.
+        // contradictory shape the `errors: false` check above treats as untrusted.
         // Retryable, not permanent: OpenSearch may have indexed the document
         // already, and a resend is safe (idempotent by `_id`).
         if (200..300).contains(&status)
@@ -2493,7 +2481,7 @@ mod tests {
         assert!(attempt.into_outcome().into_error("iggy_probe").is_none());
     }
 
-    // Unlike the `errors: false` fast path (see the test above), this forces the
+    // Unlike the `errors: false` response in the test above, this forces the
     // per-item scan by mixing a replay with a fresh insert under `errors: true`,
     // proving that scan also ignores `result` and counts both as indexed.
     #[test]
@@ -2712,6 +2700,24 @@ mod tests {
         assert!(matches!(
             parsed(&response, 1),
             Err(BulkResponseError::MalformedItem { position: 0 })
+        ));
+    }
+
+    // A 500 would be retryable under `errors: true`, so this also catches the
+    // trust check moving below the retryable branch.
+    #[test]
+    fn given_clean_flag_bulk_response_with_later_failed_item_should_report_its_position() {
+        let response = json!({
+            "errors": false,
+            "items": [
+                { "index": { "_id": "a", "status": 201 } },
+                { "index": { "_id": "b", "status": 500 } }
+            ]
+        });
+
+        assert!(matches!(
+            parsed(&response, 2),
+            Err(BulkResponseError::MalformedItem { position: 1 })
         ));
     }
 
