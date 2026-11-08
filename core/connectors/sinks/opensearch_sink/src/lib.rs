@@ -627,8 +627,14 @@ impl OpenSearchSink {
         if self.config.document_id_field.is_some() {
             retain_last_per_id(&mut documents);
         }
-        // A superseded document is overwritten by design, not lost.
-        let mut indexed = total - documents.len();
+        let superseded = total - documents.len();
+        if superseded > 0 {
+            debug!(
+                "OpenSearch sink with ID: {} skipped {superseded} documents superseded by a newer copy of the same _id",
+                self.id
+            );
+        }
+        let mut indexed = 0;
         // The runtime commits the offset regardless of this error, so returning
         // early would drop the remaining chunks for good. The first failure is
         // kept, not the last, matching `BulkOutcome::merge`: it's the one an
@@ -648,14 +654,16 @@ impl OpenSearchSink {
             }
             debug!(
                 "OpenSearch sink with ID: {} indexed {}/{} documents",
-                self.id, indexed, total
+                self.id,
+                indexed,
+                documents.len()
             );
         }
 
         match first_error {
             Some(error) => Err(PartialIndexError {
                 indexed,
-                failed: total - indexed,
+                failed: documents.len() - indexed,
                 error,
             }),
             None => Ok(indexed),
@@ -2826,9 +2834,48 @@ mod tests {
         let indexed = sink
             .index_documents(&client, documents)
             .await
-            .expect("the superseded copy should count as handled");
+            .expect("both retained copies should be acknowledged");
 
-        assert_eq!(indexed, 3);
+        assert_eq!(indexed, 2);
+    }
+
+    #[tokio::test]
+    async fn given_rejected_newest_copy_should_count_superseded_copies_as_neither_indexed_nor_failed()
+     {
+        let server = MockServer::start().await;
+        let mut config = fast_retry_config(1);
+        config.url = server.uri();
+        config.document_id_field = Some("id".to_string());
+        let sink = sink_with_config(config);
+        let client = mock_client(&sink);
+        let documents = vec![versioned("a", 1), versioned("a", 2), versioned("a", 3)];
+
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "errors": true,
+                "items": [{
+                    "index": {
+                        "_id": "a",
+                        "status": 400,
+                        "error": {
+                            "type": "mapper_parsing_exception",
+                            "reason": "failed to parse field [version]"
+                        }
+                    }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let partial = sink
+            .index_documents(&client, documents)
+            .await
+            .expect_err("a rejected newest copy should fail the batch");
+
+        assert_eq!(partial.indexed, 0);
+        assert_eq!(partial.failed, 1);
     }
 
     #[test]
