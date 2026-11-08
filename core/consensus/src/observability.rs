@@ -788,6 +788,17 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::operation_as_str;
+    use iggy_binary_protocol::Operation;
+
+    #[test]
+    fn roll_segment_has_a_stable_observability_name() {
+        assert_eq!(operation_as_str(Operation::RollSegment), "roll_segment");
+    }
+}
+
 #[must_use]
 pub const fn namespace_component(component: Option<u32>) -> u32 {
     match component {

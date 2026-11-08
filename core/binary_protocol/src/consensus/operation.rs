@@ -438,6 +438,10 @@ mod tests {
         assert!(!Operation::TruncatePartition.is_client_allowed());
         assert!(Operation::StoreConsumerOffset.is_partition());
         assert!(Operation::DeleteConsumerOffset.is_partition());
+        assert!(Operation::RollSegment.is_internal());
+        assert!(Operation::RollSegment.is_partition());
+        assert!(!Operation::RollSegment.is_metadata());
+        assert!(!Operation::RollSegment.is_client_allowed());
     }
 
     /// Every operation belongs to exactly one plane, or to the short list
