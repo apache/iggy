@@ -861,6 +861,7 @@ fn principal(read_topics: bool) -> AuthenticatedPrincipal {
             poll_messages: true,
             ..PrincipalPermissions::default()
         },
+        topic_reads: Arc::default(),
         permissions_known: true,
     }
 }

@@ -51,6 +51,7 @@ pub mod sync_group;
 pub(crate) mod topic_config;
 
 use std::fmt::Display;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -62,7 +63,7 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::time::Instant;
 
 use crate::auth::AuthenticatedPrincipal;
-use crate::bridge::BridgeError;
+use crate::bridge::{BridgeError, GroupCreation};
 use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_PARTITIONS, API_KEY_CREATE_TOPICS,
@@ -211,20 +212,28 @@ fn may_delete_groups(principal: Option<&AuthenticatedPrincipal>, api: &str) -> b
     principal.permissions.manage_topics
 }
 
-/// Whether `principal` may create a group: the Iggy group that holds its offsets on a topic,
-/// which the first commit there creates. `None` means no listener of this gateway names
-/// principals, and `ANONYMOUS` comes from a listener that authenticates no one. Both create
-/// groups, as any client there can.
+/// Where `principal` may create a group: the Iggy group that holds its offsets on a topic, which
+/// the first commit there creates. `None` means no listener of this gateway names principals, and
+/// `ANONYMOUS` comes from a listener that authenticates no one. Both create groups, as any client
+/// there can.
 ///
-/// Kafka asks for `READ` on the group. Iggy lets a user create a consumer group with a read or
-/// manage permission on topics or streams, which `read_topics` stands for, and which
-/// `DescribeAcls` shows as that `READ`. A principal whose permissions were never read creates
-/// none.
-fn may_create_groups(principal: Option<&AuthenticatedPrincipal>) -> bool {
-    principal.is_none_or(|principal| {
-        principal.is_anonymous()
-            || (principal.permissions_known && principal.permissions.read_topics)
-    })
+/// Kafka asks for `READ` on the group. Iggy lets a user create a consumer group on a topic it may
+/// read: a read or manage permission on topics or streams, globally (`read_topics`, which
+/// `DescribeAcls` shows as that `READ`), on the topic's stream, or on the topic. A principal whose
+/// permissions were never read creates none.
+fn group_creation(principal: Option<&AuthenticatedPrincipal>) -> GroupCreation {
+    let Some(principal) = principal.filter(|principal| !principal.is_anonymous()) else {
+        return GroupCreation::Any;
+    };
+    if !principal.permissions_known {
+        GroupCreation::Never
+    } else if principal.permissions.read_topics {
+        GroupCreation::Any
+    } else if principal.topic_reads.is_empty() {
+        GroupCreation::Never
+    } else {
+        GroupCreation::Scoped(Arc::clone(&principal.topic_reads))
+    }
 }
 
 /// When an offset call on `connection` gives up. See `GroupCoordinator::offset_hold`.

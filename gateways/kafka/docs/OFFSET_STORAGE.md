@@ -40,11 +40,11 @@ leaves it behind.
 - A commit stores the offset. If group `kafka.cg.<group>` is not on the topic, the gateway creates it
   and stores again. A group that already exists counts as created. An operator can delete the group,
   and the next commit creates it again.
-- A principal that a SASL or certificate listener signs in needs a global read or manage
-  permission on topics or streams to create the group. Iggy needs the same from a user that
-  creates a consumer group, and `DescribeAcls` shows it as `READ` on the group. Without it, a
-  commit that needs the group gets `GROUP_AUTHORIZATION_FAILED` (30) for that partition and stores
-  nothing. A commit to a group that exists needs no more than before. On a listener that
+- To create the group, a principal that a SASL or certificate listener signs in needs a read or
+  manage permission. It can be global on topics or streams, or on the topic's stream, or on the
+  topic. Iggy needs the same from a user that creates a consumer group. `DescribeAcls` shows the
+  global one as `READ` on the group. Without any of them, a commit that needs the group gets
+  `GROUP_AUTHORIZATION_FAILED` (30) for that partition and stores nothing. A commit to a group that exists needs no more than before. On a listener that
   authenticates no one, any client creates groups.
 - The prefix keeps a Kafka group apart from a native Iggy group with the same name.
 - Group id: 1 to 246 bytes, else `INVALID_GROUP_ID` (24). Iggy names stop at 255. Unlike Kafka,

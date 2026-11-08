@@ -60,7 +60,7 @@ use fetch::{FetchPool, LazyClient};
 use group_index::GroupIndex;
 pub use group_index::{OffsetGroupSource, OffsetGroups, ScannedGroups};
 use group_offsets::OffsetPool;
-pub use group_offsets::{OFFSET_GROUP_PREFIX, OffsetCalls};
+pub use group_offsets::{GroupCreation, OFFSET_GROUP_PREFIX, OffsetCalls};
 pub(crate) use offsets::{LocatedRecord, RecordLookup};
 use produce::ProducePool;
 pub use produce::{PartitionBatch, ProduceTurn, Producer};

@@ -29,6 +29,7 @@ use futures::future::join_all;
 use futures::stream::{self, Stream, StreamExt};
 use iggy::prelude::{
     Client, Consumer, ConsumerGroupClient, ConsumerOffsetClient, Identifier, IggyClient, IggyError,
+    StreamClient, TopicClient,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, timeout, timeout_at};
@@ -39,6 +40,7 @@ use super::{
     IggyBridge, KafkaTopicMetadata, LazyClient, OffsetGroups, REQUEST_TIMEOUT, SLOT_LIMIT,
     ScannedGroups, TopicTarget, permit_by, resolve_blocker, write_with_recovery,
 };
+use crate::auth::TopicReads;
 use crate::bridge::error::BridgeError;
 use crate::group::is_valid_group_id;
 use crate::protocol::api::{ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_UNKNOWN_TOPIC_OR_PARTITION};
@@ -71,6 +73,47 @@ const OFFSET_SLOTS: usize = 4;
 /// The slot of a call that belongs to no partition. Any slot will do.
 const LISTING_SLOT: usize = 0;
 
+/// Where a commit may create the Iggy group that holds a Kafka group's offsets on a topic.
+///
+/// The gateway creates the group in its own name, and Iggy would create it for the principal only
+/// if the principal may read the topic. So a commit checks the principal's grants first.
+#[derive(Debug, Clone)]
+pub enum GroupCreation {
+    /// On every topic: no principal, the anonymous one, or a global grant.
+    Any,
+    /// On the topics that these stream and topic grants cover.
+    Scoped(Arc<TopicReads>),
+    /// On no topic.
+    Never,
+}
+
+impl GroupCreation {
+    /// Whether a commit may create a group on `topic`, on `client`. The grants name streams and
+    /// topics by numeric id, so a scoped check reads both ids. A stream or topic that is gone by
+    /// then gets no group.
+    async fn allows(&self, client: &IggyClient, topic: &TopicTarget) -> Result<bool, BridgeError> {
+        let reads = match self {
+            Self::Any => return Ok(true),
+            Self::Never => return Ok(false),
+            Self::Scoped(reads) => reads,
+        };
+        let ids = async {
+            let stream = client.get_stream(&topic.stream_id).await?;
+            let found = client.get_topic(&topic.stream_id, &topic.topic_id).await?;
+            Ok::<_, IggyError>(
+                stream
+                    .zip(found)
+                    .map(|(stream, found)| (stream.id, found.id)),
+            )
+        };
+        match ids.await.map_err(BridgeError::Iggy) {
+            Ok(ids) => Ok(ids.is_some_and(|(stream, topic)| reads.covers(stream, topic))),
+            Err(error) if topic_deleted(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 /// The offset calls of one Kafka request. A request queues at most one call per slot, so a
 /// request with many partitions cannot hold up the others.
 pub struct OffsetCalls {
@@ -79,9 +122,8 @@ pub struct OffsetCalls {
     queued: [Arc<Semaphore>; OFFSET_SLOTS],
     /// Kept by each write until no Iggy call of it can land. See [`Self::keeping`].
     kept: Option<Arc<dyn Any + Send + Sync>>,
-    /// Whether a commit may create the Iggy group that holds the offsets. See
-    /// [`Self::creating_no_group`].
-    creates_groups: bool,
+    /// Where a commit may create the Iggy group that holds the offsets. See [`Self::creating`].
+    creation: GroupCreation,
 }
 
 impl OffsetCalls {
@@ -92,16 +134,16 @@ impl OffsetCalls {
             deadline,
             queued: std::array::from_fn(|_| Arc::new(Semaphore::new(1))),
             kept: None,
-            creates_groups: true,
+            creation: GroupCreation::Any,
         }
     }
 
-    /// These calls, with no commit that creates the Iggy group holding a Kafka group's offsets on
-    /// a topic. A commit that finds no such group fails with
+    /// These calls, with commits that create the Iggy group holding a Kafka group's offsets on a
+    /// topic only where `creation` allows. Elsewhere, a commit that finds no such group fails with
     /// [`BridgeError::GroupCreationRefused`] and stores nothing.
     #[must_use]
-    pub const fn creating_no_group(mut self) -> Self {
-        self.creates_groups = false;
+    pub fn creating(mut self, creation: GroupCreation) -> Self {
+        self.creation = creation;
         self
     }
 
@@ -139,7 +181,7 @@ impl IggyBridge {
     /// A negative offset deletes the key instead. Kafka consumers read any negative offset as
     /// none, and Iggy cannot store one. A key or a group that is not there counts as deleted. A
     /// store that finds no Iggy group for the offsets creates it, unless `calls` create none
-    /// ([`OffsetCalls::creating_no_group`]). A replay that Iggy already applied counts as done.
+    /// ([`OffsetCalls::creating`]). A replay that Iggy already applied counts as done.
     ///
     /// Commits on one slot start one at a time, in the order given. A stored offset adds `group`
     /// to [`Self::offset_groups`] at once. Each topic that a commit stored to, or may have, counts
@@ -166,7 +208,6 @@ impl IggyBridge {
             .iter()
             .any(|&(_, _, offset)| offset >= 0)
             .then(|| Arc::new(self.group_index.storing(group)));
-        let may_create = calls.creates_groups;
         // `join_all` polls each call once, in order, before any again, so calls on one slot
         // queue for it in order.
         let results = join_all(commits.iter().map(|&(topic, partition, offset)| {
@@ -174,6 +215,7 @@ impl IggyBridge {
             let (names, topic) = (Arc::clone(&names), topic.clone());
             let storing = if offset >= 0 { storing.clone() } else { None };
             let held = storing.clone();
+            let creation = calls.creation.clone();
             let commit = move |client: Arc<IggyClient>| async move {
                 let mut created = None;
                 let written = commit_on(
@@ -182,7 +224,7 @@ impl IggyBridge {
                     &topic,
                     partition,
                     offset,
-                    may_create,
+                    &creation,
                     |id| {
                         created = Some(id);
                     },
@@ -1102,15 +1144,15 @@ pub(super) fn kafka_group_of(name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// One commit on `client`. A store that finds no Iggy group creates it when `may_create`, passes
-/// its numeric id to `created`, and stores again.
+/// One commit on `client`. A store that finds no Iggy group creates it where `creation` allows,
+/// passes its numeric id to `created`, and stores again.
 async fn commit_on(
     client: &IggyClient,
     names: &OffsetNames,
     topic: &TopicTarget,
     partition: u32,
     offset: i64,
-    may_create: bool,
+    creation: &GroupCreation,
     created: impl FnOnce(u32),
 ) -> Result<(), BridgeError> {
     let deadline = (Instant::now() + SLOT_LIMIT).into_std();
@@ -1133,10 +1175,10 @@ async fn commit_on(
         })
     };
     match store().await {
-        Err(IggyError::ConsumerGroupNameNotFound(..)) if !may_create => {
-            Err(BridgeError::GroupCreationRefused)
-        }
         Err(IggyError::ConsumerGroupNameNotFound(..)) => {
+            if !creation.allows(client, topic).await? {
+                return Err(BridgeError::GroupCreationRefused);
+            }
             if let Some(id) = create_offset_group(client, stream_id, topic_id, &names.group).await?
             {
                 created(id);

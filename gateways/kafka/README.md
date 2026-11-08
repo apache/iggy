@@ -26,10 +26,10 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > as the bridge's Iggy user. DeleteGroups and OffsetDelete also run as that user. When no listener
 > names a principal, any client can delete committed offsets. When one does (SASL, or client
 > certificates), they also require a global `manage_topics` or `manage_streams`, and without it
-> they answer `GROUP_AUTHORIZATION_FAILED` (30). Such a principal needs a global read or manage
-> permission on topics or streams to create the offsets of a group on a topic. Iggy needs the
-> same from a user that creates a consumer group. Without it, a commit that needs a new group
-> answers `GROUP_AUTHORIZATION_FAILED` (30) there. Iggy's `metadata.partitions_max` defaults to 0
+> they answer `GROUP_AUTHORIZATION_FAILED` (30). To create the offsets of a group on a topic, such a
+> principal needs a read or manage permission. It can be global on topics or streams, or on the
+> topic's stream, or on the topic. Iggy needs the same from a user that creates a consumer group.
+> Without it, a commit that needs a new group answers `GROUP_AUTHORIZATION_FAILED` (30) there. Iggy's `metadata.partitions_max` defaults to 0
 > (unlimited), so set it before exposing the gateway. See [docs/SCOPE.md](docs/SCOPE.md).
 >
 > InitProducerId does real work too. With the bridge, Iggy builds the producer id. With `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, each partition also writes each batch of an idempotent producer once. Without the bridge, the gateway allocates the id, so a stock idempotent producer still starts.

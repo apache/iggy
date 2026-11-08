@@ -1438,8 +1438,9 @@ impl<'a> PermissionFollow<'a> {
             return Some(revision);
         };
         match board.changed_since(principal.user, &principal.username, &mut self.seen) {
-            Some(UserAccess::Active(permissions)) => {
-                principal.permissions = permissions;
+            Some(UserAccess::Active(grants)) => {
+                principal.permissions = grants.permissions;
+                principal.topic_reads = grants.topic_reads;
                 principal.permissions_known = true;
             }
             Some(UserAccess::Revoked) => {

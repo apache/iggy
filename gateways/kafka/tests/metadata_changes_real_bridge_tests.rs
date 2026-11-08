@@ -298,7 +298,7 @@ async fn given_changed_permissions_of_a_user_when_following_should_show_them_on_
         .expect("bridge should connect");
     let board = bridge.permission_board();
     let manages_topics = |access: Option<UserAccess>| match access {
-        Some(UserAccess::Active(permissions)) => Some(permissions.manage_topics),
+        Some(UserAccess::Active(grants)) => Some(grants.permissions.manage_topics),
         _ => None,
     };
     let known = wait_for(|| manages_topics(board.access("alice")).is_some()).await;

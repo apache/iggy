@@ -28,10 +28,11 @@
 //! the topic and the partition, and once the change log shows the topic. So each logged offset
 //! names its topic's incarnation, and a late deletion of an older topic of that name leaves it.
 //!
-//! A principal that may not create groups (`may_create_groups`) commits only where the Iggy group
-//! of the offsets exists. Elsewhere the partition gets `GROUP_AUTHORIZATION_FAILED` (30), as Kafka
-//! answers a principal without `READ` on the group. Its partitions append to the log only once
-//! Iggy stored them, so the log never holds a refused offset.
+//! A principal commits only where the Iggy group of the offsets exists, or where it may create
+//! that group (`group_creation`): where it may read the topic, as Iggy checks. Elsewhere the
+//! partition gets `GROUP_AUTHORIZATION_FAILED` (30), as Kafka answers a principal without `READ`
+//! on the group. Unless the principal may create groups on every topic, its partitions append to
+//! the log only once Iggy stored them, so the log never holds a refused offset.
 
 use bytes::Bytes;
 use kafka_protocol::messages::offset_commit_response::{
@@ -42,7 +43,8 @@ use tokio::time::{Instant, timeout_at};
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::{
-    BridgeError, IggyBridge, OffsetCalls, OffsetGroupSource, TopicShape, TopicShapes, TopicTarget,
+    BridgeError, GroupCreation, IggyBridge, OffsetCalls, OffsetGroupSource, TopicShape,
+    TopicShapes, TopicTarget,
 };
 use crate::coordinator::record::CommittedOffset;
 use crate::coordinator::{Coordination, unix_millis};
@@ -56,7 +58,7 @@ use crate::protocol::api::{
 };
 use crate::protocol::bounds_guard::validate_offset_commit_shape;
 use crate::protocol::handlers::{
-    decode_guarded, encode_message, may_create_groups, offset_deadline, offset_refusal_cause,
+    decode_guarded, encode_message, group_creation, offset_deadline, offset_refusal_cause,
     respond_or_close,
 };
 
@@ -105,13 +107,11 @@ pub async fn handle(
         (Some(bridge), Ok(commit)) => {
             // The commit stays counted until none of its Iggy calls can land, also past the
             // deadline, so a deletion of the group's offsets waits for them.
-            let calls = OffsetCalls::new(offset_deadline(state, connection).await).keeping(commit);
-            let may_create = may_create_groups(principal);
-            let calls = if may_create {
-                calls
-            } else {
-                calls.creating_no_group()
-            };
+            let creation = group_creation(principal);
+            let may_create = matches!(creation, GroupCreation::Any);
+            let calls = OffsetCalls::new(offset_deadline(state, connection).await)
+                .keeping(commit)
+                .creating(creation);
             let topics = match state.coordination.as_deref() {
                 Some(coordination) => {
                     commit_logged(bridge, coordination, &request, &calls, may_create).await
@@ -463,11 +463,12 @@ pub fn encode_response(version: i16, topics: Vec<OffsetCommitResponseTopic>) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
 
     use bytes::BytesMut;
-    use iggy::prelude::IggyError;
+    use iggy::prelude::{IggyError, Permissions, StreamPermissions};
     use kafka_protocol::messages::offset_commit_request::{
         OffsetCommitRequestPartition, OffsetCommitRequestTopic,
     };
@@ -475,7 +476,7 @@ mod tests {
     use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
 
     use super::*;
-    use crate::auth::UserKey;
+    use crate::auth::{TopicReads, UserKey};
     use crate::bridge::BridgeError;
     use crate::protocol::acl::PrincipalPermissions;
     use crate::protocol::api::ERROR_UNKNOWN_MEMBER_ID;
@@ -554,36 +555,67 @@ mod tests {
                 poll_messages: true,
                 ..PrincipalPermissions::default()
             },
+            topic_reads: Arc::default(),
             permissions_known,
         }
     }
 
+    /// The kind of [`GroupCreation`] that `principal` gets.
+    fn creation(principal: Option<&AuthenticatedPrincipal>) -> &'static str {
+        match group_creation(principal) {
+            GroupCreation::Any => "any",
+            GroupCreation::Scoped(_) => "scoped",
+            GroupCreation::Never => "never",
+        }
+    }
+
     #[test]
-    fn given_each_kind_of_principal_should_let_only_readers_and_unauthenticated_ones_create_groups()
-    {
-        assert!(may_create_groups(None), "no listener names principals");
-        assert!(
-            may_create_groups(Some(&AuthenticatedPrincipal::anonymous())),
+    fn given_each_kind_of_principal_should_create_groups_only_where_iggy_would() {
+        assert_eq!(creation(None), "any", "no listener names principals");
+        assert_eq!(
+            creation(Some(&AuthenticatedPrincipal::anonymous())),
+            "any",
             "a listener that authenticates no one"
         );
-        assert!(may_create_groups(Some(&principal(true, true))));
-        assert!(
-            !may_create_groups(Some(&principal(false, true))),
+        assert_eq!(creation(Some(&principal(true, true))), "any");
+        assert_eq!(
+            creation(Some(&principal(false, true))),
+            "never",
             "polling alone does not create a consumer group in Iggy"
         );
-        assert!(
-            !may_create_groups(Some(&principal(true, false))),
+        assert_eq!(
+            creation(Some(&principal(true, false))),
+            "never",
             "permissions never read"
+        );
+
+        let mut on_stream = principal(false, true);
+        on_stream.topic_reads = Arc::new(TopicReads::of(&Permissions {
+            streams: Some(BTreeMap::from([(
+                1,
+                StreamPermissions {
+                    read_stream: true,
+                    ..StreamPermissions::default()
+                },
+            )])),
+            ..Permissions::default()
+        }));
+        assert_eq!(
+            creation(Some(&on_stream)),
+            "scoped",
+            "a grant on one stream creates groups on that stream's topics"
         );
 
         let unread_anonymous = AuthenticatedPrincipal {
             username: AuthenticatedPrincipal::ANONYMOUS.to_string(),
             user: None,
             permissions: PrincipalPermissions::default(),
+            topic_reads: Arc::default(),
             permissions_known: false,
         };
-        assert!(
-            !may_create_groups(Some(&unread_anonymous)),
+        assert_eq!(
+            creation(Some(&unread_anonymous)),
+            "never",
             "an Iggy user named ANONYMOUS whose read failed is not the anonymous principal"
         );
     }

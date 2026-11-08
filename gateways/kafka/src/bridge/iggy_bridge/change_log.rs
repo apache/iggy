@@ -30,8 +30,7 @@ use std::time::Duration;
 use iggy::prelude::{
     IggyClient, IggyError, MAX_METADATA_CHANGES_LIMIT, MetadataChange, MetadataChangeCursor,
     MetadataChangeGroup, MetadataChangeStart, MetadataChangeStatus, MetadataChanges,
-    MetadataChangesQuery, MetadataCurrentItem, MetadataUserChange, Permissions, SystemClient,
-    UserStatus,
+    MetadataChangesQuery, MetadataCurrentItem, MetadataUserChange, SystemClient, UserStatus,
 };
 use tokio::sync::{broadcast, watch};
 use tokio::time::{Instant, sleep};
@@ -41,11 +40,10 @@ use tracing::{debug, info, warn};
 use super::group_index::GroupFeed;
 use super::group_offsets::kafka_group_of;
 use super::{LazyClient, REQUEST_TIMEOUT};
-use crate::auth::{UserKey, principal_permissions};
+use crate::auth::{Grants, UserKey};
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::TopicMapping;
-use crate::protocol::acl::PrincipalPermissions;
 
 /// The record groups the follower reads. Members and sessions change with every consumer, and
 /// nothing here needs them.
@@ -112,10 +110,10 @@ pub struct PermissionBoard {
 }
 
 /// What an Iggy user can do, as the change log last said.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserAccess {
     /// An active user, with its permissions.
-    Active(PrincipalPermissions),
+    Active(Grants),
     /// A user that was deleted or is no longer active.
     Revoked,
 }
@@ -178,7 +176,7 @@ impl PermissionBoard {
             .iter()
             .filter(|(_, entry)| entry.username == username)
             .max_by_key(|(user, _)| user.created_at)
-            .map(|(_, entry)| entry.access)
+            .map(|(_, entry)| entry.access.clone())
     }
 
     fn set(&self, user: UserKey, username: &str, access: UserAccess) {
@@ -189,7 +187,7 @@ impl PermissionBoard {
 
     /// Sets the permissions of `user` while it is active. The change has no status, so it neither
     /// re-activates a revoked user nor adds one the board does not hold.
-    fn set_permissions(&self, user: UserKey, username: &str, permissions: PrincipalPermissions) {
+    fn set_permissions(&self, user: UserKey, username: &str, grants: Grants) {
         let mut users = lock(&self.users);
         let active = users
             .by_key
@@ -197,7 +195,7 @@ impl PermissionBoard {
             .is_some_and(|entry| entry.access != UserAccess::Revoked);
         if active {
             let revision = self.next_revision();
-            users.set(user, username, UserAccess::Active(permissions), revision);
+            users.set(user, username, UserAccess::Active(grants), revision);
         }
     }
 
@@ -261,17 +259,19 @@ impl Users {
         self.by_key.get(&user).map_or_else(
             || revoked(self.dropped),
             |entry| {
-                revoked(entry.revoked).or_else(|| (entry.changed > seen).then_some(entry.access))
+                revoked(entry.revoked)
+                    .or_else(|| (entry.changed > seen).then(|| entry.access.clone()))
             },
         )
     }
 
     fn set(&mut self, user: UserKey, username: &str, access: UserAccess, revision: u64) {
+        let revokes = access == UserAccess::Revoked;
         let entry = self.by_key.entry(user).or_insert_with(|| UserEntry {
             username: username.to_owned(),
             changed: revision,
             revoked: 0,
-            access,
+            access: access.clone(),
         });
         if entry.username != username {
             let renamed = mem::replace(&mut entry.username, username.to_owned());
@@ -279,7 +279,7 @@ impl Users {
         }
         entry.changed = revision;
         entry.access = access;
-        if access == UserAccess::Revoked {
+        if revokes {
             entry.revoked = revision;
             self.revoked_names.insert(username.to_owned(), revision);
         }
@@ -289,15 +289,11 @@ impl Users {
 impl UserAccess {
     fn of(user: &MetadataUserChange) -> Self {
         if user.status == UserStatus::Active {
-            Self::Active(granted(user.permissions.as_ref()))
+            Self::Active(Grants::of(user.permissions.as_ref()))
         } else {
             Self::Revoked
         }
     }
-}
-
-fn granted(permissions: Option<&Permissions>) -> PrincipalPermissions {
-    permissions.map(principal_permissions).unwrap_or_default()
 }
 
 /// What one read leaves the follower to do next.
@@ -706,8 +702,8 @@ impl Mirror {
                 Changed::default()
             }
             MetadataChange::UserPermissionsUpdated(user) => {
-                let granted = granted(user.permissions.as_ref());
-                permissions.set_permissions(user_key!(user), &user.username, granted);
+                let grants = Grants::of(user.permissions.as_ref());
+                permissions.set_permissions(user_key!(user), &user.username, grants);
                 Changed::default()
             }
             MetadataChange::UserDeleted(user) => {
@@ -917,7 +913,7 @@ mod tests {
         MetadataConsumerGroupDeleted, MetadataConsumerGroupItem, MetadataOptions,
         MetadataPartitionsChanged, MetadataPermissionsUpdatedReason, MetadataStreamChange,
         MetadataStreamDeleted, MetadataTopicChange, MetadataTopicDeleted, MetadataTopicItem,
-        MetadataUserIdentity, MetadataUserPermissionsUpdated,
+        MetadataUserIdentity, MetadataUserPermissionsUpdated, Permissions,
     };
 
     use super::super::ScannedGroups;
@@ -1081,11 +1077,11 @@ mod tests {
     }
 
     fn manages_topics() -> UserAccess {
-        UserAccess::Active(principal_permissions(&permissions(true)))
+        UserAccess::Active(Grants::of(Some(&permissions(true))))
     }
 
     fn reads_nothing() -> UserAccess {
-        UserAccess::Active(principal_permissions(&permissions(false)))
+        UserAccess::Active(Grants::of(Some(&permissions(false))))
     }
 
     /// A mirror with stream `kafka`, the default stream, and its topic `orders`.
