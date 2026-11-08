@@ -1250,12 +1250,14 @@ fn parse_bulk_response(
             continue;
         }
 
-        let reason = result
-            .error
-            .as_ref()
-            .and_then(|error| error.reason.as_deref())
-            .unwrap_or("unknown error");
-        let failure = format!("status {status}: {reason}");
+        let failure = || {
+            let reason = result
+                .error
+                .as_ref()
+                .and_then(|error| error.reason.as_deref())
+                .unwrap_or("unknown error");
+            format!("status {status}: {reason}")
+        };
 
         // A 2xx status reaching here always means `error` was present (the
         // `error.is_none() && 2xx` case above already returned) - the same
@@ -1266,16 +1268,12 @@ fn parse_bulk_response(
             || StatusCode::from_u16(status).is_ok_and(is_transient_status)
         {
             attempt.retryable.push(position);
-            if attempt.first_retryable_failure.is_none() {
-                attempt.first_retryable_failure = Some(failure);
-            }
+            attempt.first_retryable_failure.get_or_insert_with(failure);
             continue;
         }
 
         attempt.permanent_failed += 1;
-        if attempt.first_permanent_failure.is_none() {
-            attempt.first_permanent_failure = Some(failure);
-        }
+        attempt.first_permanent_failure.get_or_insert_with(failure);
     }
 
     Ok(attempt)
