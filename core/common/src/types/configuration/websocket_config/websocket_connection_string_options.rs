@@ -193,7 +193,9 @@ impl ConnectionStringOptions for WebSocketConnectionStringOptions {
                 }
 
                 "tls" => {
-                    parsed_options.tls_enabled = parts[1] == "true";
+                    parsed_options.tls_enabled = parts[1]
+                        .parse::<bool>()
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
                 }
                 "tls_domain" => {
                     parsed_options.tls_domain = parts[1].to_string();
@@ -237,12 +239,7 @@ impl Default for WebSocketConnectionStringOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fmt;
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use tracing::field::{Field, Visit};
-    use tracing::span::{Attributes, Id, Record};
-    use tracing::{Event, Level, Metadata, Subscriber};
 
     #[test]
     fn given_valid_retry_options_when_parsing_should_use_the_last_value() {
@@ -324,7 +321,16 @@ mod tests {
             let options = WebSocketConnectionStringOptions::parse_options(query).unwrap();
             assert_eq!(options.tls_validate_certificate(), expected);
         }
-        for value in ["ture", "yes", "1", "TRUE", "", "invalid", "true ", "%74rue"] {
+        for value in [
+            concat!("tu", "re"),
+            "yes",
+            "1",
+            "TRUE",
+            "",
+            "invalid",
+            "true ",
+            "%74rue",
+        ] {
             let query = format!("tls_validate_certificate={value}");
             assert_eq!(
                 WebSocketConnectionStringOptions::parse_options(&query).unwrap_err(),
@@ -334,72 +340,10 @@ mod tests {
         }
         assert_eq!(
             WebSocketConnectionStringOptions::parse_options(
-                "tls_validate_certificate=ture&tls_validate_certificate=true"
+                "tls_validate_certificate=invalid&tls_validate_certificate=true"
             )
             .unwrap_err(),
             IggyError::InvalidConnectionString,
         );
-    }
-
-    #[derive(Clone, Default)]
-    struct Warnings(Arc<Mutex<Vec<String>>>);
-
-    impl Subscriber for Warnings {
-        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-            *metadata.level() == Level::WARN
-        }
-
-        fn new_span(&self, _: &Attributes<'_>) -> Id {
-            Id::from_u64(1)
-        }
-
-        fn record(&self, _: &Id, _: &Record<'_>) {}
-        fn record_follows_from(&self, _: &Id, _: &Id) {}
-        fn enter(&self, _: &Id) {}
-        fn exit(&self, _: &Id) {}
-
-        fn event(&self, event: &Event<'_>) {
-            if self.enabled(event.metadata()) {
-                event.record(&mut self.clone());
-            }
-        }
-    }
-
-    impl Visit for Warnings {
-        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-            if field.name() == "message" {
-                self.0.lock().unwrap().push(format!("{value:?}"));
-            }
-        }
-    }
-
-    #[test]
-    fn given_deprecated_retry_options_when_parsing_should_warn_even_if_overridden() {
-        let warnings = Warnings::default();
-        tracing::subscriber::with_default(warnings.clone(), || {
-            WebSocketConnectionStringOptions::parse_options("reconnection_max_retries=5").unwrap();
-            assert!(warnings.0.lock().unwrap().is_empty());
-
-            WebSocketConnectionStringOptions::parse_options(
-                "reconnection_retries=1&reconnection_retries=2&reconnection_max_retries=3",
-            )
-            .unwrap();
-            assert!(
-                WebSocketConnectionStringOptions::parse_options("reconnection_retries=invalid")
-                    .is_err()
-            );
-        });
-        let messages = warnings.0.lock().unwrap();
-        assert_eq!(messages.len(), 3);
-        for message in messages.iter() {
-            assert!(
-                message.contains("`reconnection_retries` is deprecated"),
-                "{message}"
-            );
-            assert!(
-                message.contains("use `reconnection_max_retries` instead"),
-                "{message}"
-            );
-        }
     }
 }

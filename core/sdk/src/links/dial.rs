@@ -637,3 +637,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tcp_tls_tests;

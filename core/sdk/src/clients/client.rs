@@ -154,7 +154,7 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// // Auto-logs in from the credentials in the string and retries forever on disconnect.
 /// let client = IggyClient::builder_from_connection_string(
 ///     "iggy+tcp://user:secret@localhost:8090\
-///      ?reconnection_retries=unlimited&reconnection_interval=1s&heartbeat_interval=5s&nodelay=true",
+///      ?reconnection_max_retries=unlimited&reconnection_interval=1s&heartbeat_interval=5s&nodelay=true",
 /// )?
 /// .build()?;
 /// client.connect().await?;
@@ -311,14 +311,23 @@ impl IggyClient {
     /// - a bool use the literal `true` or `false`.
     /// - bytes and millisecond options provide a number such as `1024`.
     ///
+    /// Deprecated aliases warn on each parsed occurrence. For retry, cooldown,
+    /// and certificate validation options, the last occurrence wins across both
+    /// spellings. Malformed values fail even when a later value would override them.
+    ///
+    /// Certificate validation accepts exactly `true` or `false`. Disabling it
+    /// leaves the connection vulnerable to server impersonation.
+    ///
     /// ## TCP
     ///
     /// The same options apply for `iggy://` and `iggy+tcp://`.
     ///
-    /// - `tls`: bool. Enable/disable TLS. Default: `false`.
+    /// - `tls`: bool. Enable/disable TLS. Default: `false`; only `true` and `false` are accepted.
     /// - `tls_domain`: string. Server name to validate the certificate against. Default: unset.
     /// - `tls_ca_file`: filesystem path. PEM roots replacing the built-in roots. Default: unset.
-    /// - `reconnection_retries`: "unlimited" or u32. Retry passes after the initial endpoint pass. Default: `unlimited`.
+    /// - `tls_validate_certificate`: bool. Verify the server certificate. Default: `true`; only `true` and `false` are accepted.
+    /// - `reconnection_max_retries`: "unlimited" or u32. Retry passes after the initial endpoint pass. Default: `unlimited`.
+    /// - `reconnection_retries`: deprecated alias for `reconnection_max_retries`. If both are supplied, the last value wins.
     /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Full-jitter exponential backoff base, capped at 10 seconds. Default: `1s`.
     /// - `reestablish_after`: [`IggyDuration`]. Stable connection duration that resets the retry count and backoff. Default: `5s`.
     /// - `max_pending_operations`: positive usize. Active and retained mutations per session. Default: `256`.
@@ -333,8 +342,8 @@ impl IggyClient {
     /// let client = IggyClient::builder_from_connection_string(
     ///     "iggy+tcp://user:secret@localhost:8090\
     ///      ?tls=true&tls_domain=localhost&tls_ca_file=/etc/iggy/ca.pem\
-    ///      &reconnection_retries=unlimited&reconnection_interval=1s&reestablish_after=5s\
-    ///      &heartbeat_interval=5s&nodelay=true",
+    ///      &tls_validate_certificate=true&reconnection_max_retries=unlimited\
+    ///      &reconnection_interval=1s&reestablish_after=5s&heartbeat_interval=5s&nodelay=true",
     /// )?
     /// .build()?;
     /// # Ok(())
@@ -343,11 +352,13 @@ impl IggyClient {
     ///
     /// ## QUIC
     ///
-    /// - `validate_certificate`: bool. Verify the server certificate. Default: `false`.
+    /// - `tls_validate_certificate`: bool. Verify the server certificate. Default: `false`; only `true` and `false` are accepted.
+    /// - `validate_certificate`: deprecated alias for `tls_validate_certificate`. If both are supplied, the last value wins.
     /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
     /// - `reconnection_max_retries`: "unlimited" or u32. Retry passes after the initial endpoint pass. Default: `unlimited`.
     /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Full-jitter exponential backoff base, capped at 10 seconds. Default: `1s`.
-    /// - `reconnection_reestablish_after`: [`IggyDuration`]. Stable connection duration that resets the retry count and backoff. Default: `5s`.
+    /// - `reestablish_after`: [`IggyDuration`]. Stable connection duration that resets the retry count and backoff. Default: `5s`.
+    /// - `reconnection_reestablish_after`: deprecated alias for `reestablish_after`. If both are supplied, the last value wins.
     /// - `max_pending_operations`: positive usize. Active and retained mutations per session. Default: `256`.
     /// - `max_pending_operation_bytes`: positive usize. Frozen mutation headers and bodies. Default: `67108864` (64 MiB).
     /// - `response_buffer_size`: u64. Number of bytes in the response receive buffer, at least the largest read reply of one record. Default: `64156564`.
@@ -359,14 +370,18 @@ impl IggyClient {
     /// - `keep_alive_interval`: u64. QUIC keep-alive period in milliseconds; zero disables it. Default: `5000`.
     /// - `max_idle_timeout`: u64. Idle timeout in milliseconds; zero leaves Quinn's 30-second default. Default: `10000`.
     ///
+    /// Certificate validation uses the configured QUIC server name, which defaults to
+    /// `localhost` for connection strings. To use another certificate name, configure
+    /// [`iggy_common::QuicClientConfigBuilder::with_server_name`] explicitly.
+    ///
     /// ```no_run
     /// use iggy::prelude::*;
     ///
     /// # fn run() -> Result<(), IggyError> {
     /// let client = IggyClient::builder_from_connection_string(
     ///     "iggy+quic://user:secret@localhost:8080\
-    ///      ?validate_certificate=true&heartbeat_interval=5s\
-    ///      &reconnection_max_retries=unlimited&reconnection_interval=1s&reconnection_reestablish_after=5s\
+    ///      ?tls_validate_certificate=true&heartbeat_interval=5s\
+    ///      &reconnection_max_retries=unlimited&reconnection_interval=1s&reestablish_after=5s\
     ///      &response_buffer_size=64156564&max_concurrent_bidi_streams=10000\
     ///      &datagram_send_buffer_size=100000&initial_mtu=1200\
     ///      &send_window=100000&receive_window=100000\
@@ -415,7 +430,7 @@ impl IggyClient {
     /// - `max_message_size`: usize. Maximum accepted message size in bytes. Default: `67108864`.
     /// - `max_frame_size`: usize. Maximum accepted frame size in bytes. Default: `16777216`.
     /// - `accept_unmasked_frames`: bool. Has no effect on client connections. Default: `false`.
-    /// - `tls`: `bool`. Enable/disable TLS. Default: `false`.
+    /// - `tls`: bool. Enable/disable TLS. Default: `false`; only `true` and `false` are accepted.
     /// - `tls_domain`: string. Server name to validate the certificate against. Default: unset.
     /// - `tls_ca_file`: filesystem path. PEM roots replacing the built-in roots. Default: unset.
     /// - `tls_validate_certificate`: Whether to verify the server certificate. Accepts exactly
