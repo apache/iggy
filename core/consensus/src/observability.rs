@@ -803,17 +803,6 @@ where
     event.emit(sim_event);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::operation_as_str;
-    use iggy_binary_protocol::Operation;
-
-    #[test]
-    fn roll_segment_has_a_stable_observability_name() {
-        assert_eq!(operation_as_str(Operation::RollSegment), "roll_segment");
-    }
-}
-
 // INFO, not DEBUG: only view-change completion flows through here
 // (PrimaryElected / ReplicaStateChanged) - rare fault-path transitions and
 // the primary diagnostic for stalled clusters. Default test/prod filters
@@ -1039,5 +1028,16 @@ impl StructuredSimEvent for ControlActionLogEvent {
             action_commit = self.commit.unwrap_or_default(),
             action_untrusted_log = self.untrusted_log.unwrap_or_default(),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::operation_as_str;
+    use iggy_binary_protocol::Operation;
+
+    #[test]
+    fn roll_segment_has_a_stable_observability_name() {
+        assert_eq!(operation_as_str(Operation::RollSegment), "roll_segment");
     }
 }
