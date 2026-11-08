@@ -94,7 +94,7 @@ impl HttpEndpoint {
         self.local_addr
     }
 
-    /// Stops accepting, and waits up to [`STOP_WAIT`] for the requests in flight.
+    /// Stops accepting, and waits up to 2 s for the requests in flight.
     pub async fn stop(self) {
         self.stop.cancel();
         let mut task = self.task;
