@@ -361,7 +361,7 @@ pub async fn persist_offset_retained(
     offset: u64,
     existing: Option<compio::fs::File>,
 ) -> Result<(io::Result<()>, compio::fs::File), IggyError> {
-    let (mut file, charge) = if let Some(file) = existing {
+    let (mut file, _charge) = if let Some(file) = existing {
         (file, None)
     } else {
         create_parent_dir(path).await?;
@@ -371,7 +371,6 @@ pub async fn persist_offset_retained(
             .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?
     };
     let result = file.write_all_at(encode_offset_record(offset), 0).await.0;
-    drop(charge);
     Ok((result, file))
 }
 
@@ -415,10 +414,10 @@ async fn write_in_place<S: DurableStorage, const N: usize>(
         .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
     // The open truncates, so the record allocates a block whether or not the
     // file existed. The truncate freed the previous one, which the next sample sees.
-    let charge = DISK_USAGE.charge(OFFSET_FILE_BLOCK_BYTES);
-    let written = file.write(0, record.to_vec()).await;
-    drop(charge);
-    written.map_err(|_| IggyError::CannotWriteToFile)
+    let _charge = DISK_USAGE.charge(OFFSET_FILE_BLOCK_BYTES);
+    file.write(0, record.to_vec())
+        .await
+        .map_err(|_| IggyError::CannotWriteToFile)
 }
 
 async fn create_parent_dir(path: &str) -> Result<(), IggyError> {

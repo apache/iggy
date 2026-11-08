@@ -17,22 +17,25 @@
 
 //! The disk usage accounting of a running server.
 //!
-//! The burst tests compare what the write sites charged (`disk_charged_bytes`,
+//! The burst tests compare what the write sites charged (`disk_allocated_bytes`,
 //! which samples never move) with what the data directory allocated over the
 //! same burst. Both belong to this server alone, so the sampler keeps running
 //! and the tests may run beside others.
 //!
 //! The foreign file test compares the `disk_used_bytes` estimate with the
-//! whole volume, so it must run alone: a `#[serial]` excludes the other tests
-//! under `cargo test`, and `.config/nextest.toml` gives it every thread under
-//! nextest.
+//! whole volume, so it must run alone. Only nextest guarantees that, since
+//! `.config/nextest.toml` gives it every thread. Under `cargo test` its
+//! `#[serial]` keeps out only the tests marked `#[serial]` or `#[parallel]`,
+//! so unmarked tests elsewhere in the binary may still run beside it.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use iggy::prelude::*;
 use integration::harness::TestHarness;
-use integration::harness::disk::{allocated_bytes, volume_used_bytes};
+use integration::harness::disk::{
+    allocated_bytes, reservations_allocate, sync_volume, volume_used_bytes,
+};
 use integration::harness::seeds::{self, names};
 use serial_test::{parallel, serial};
 use tokio::time::sleep;
@@ -51,8 +54,10 @@ const MESSAGE_BYTES: usize = 64 * KIB as usize;
 const MESSAGES_PER_BATCH: usize = 4;
 
 /// 18 MiB of bodies in 72 prepares. Every prepare adds a 4 KiB WAL record, so
-/// the WAL grows by 288 KiB, and the WAL checkpoint (half the 256 MiB budget)
-/// stays out of reach: the counter never sees the frees a checkpoint makes.
+/// the WAL grows by 288 KiB. The checkpoint trigger counts each prepare whole
+/// and padded, about 18.3 MiB over the burst, against half the 256 MiB WAL
+/// budget, so a checkpoint stays out of reach and the counter never sees the
+/// frees one makes.
 const BATCHES: usize = 72;
 
 /// What the write sites rightly leave out: the end of every segment and index
@@ -97,12 +102,18 @@ async fn given_a_file_written_outside_iggy_when_the_next_sample_runs_should_coun
     // Beside the data directory, so on the same volume but never charged.
     let foreign_path = data_path.with_extension("foreign");
     let foreign_bytes = i128::from(FOREIGN_FILE_BYTES as u64);
+    // Commits what the server wrote so far, so the sync after the foreign file
+    // commits only that file on btrfs and OpenZFS.
+    sync_volume(&data_path);
     let idle = UsageSnapshot::take(&http, &data_path).await;
 
     std::fs::write(&foreign_path, vec![0u8; FOREIGN_FILE_BYTES]).expect("write foreign file");
+    // btrfs and OpenZFS show the write in `statvfs` only after a commit.
+    sync_volume(&data_path);
     let with_file = idle.wait_for_sample(&http, &data_path, foreign_bytes).await;
     // Removed before asserting, so a failure leaves no 16 MiB file behind.
     std::fs::remove_file(&foreign_path).expect("remove foreign file");
+    sync_volume(&data_path);
     let with_file = with_file.unwrap_or_else(|last| {
         panic!(
             "within {SAMPLE_DEADLINE:?} a sample must move the estimate by what the volume \
@@ -130,6 +141,15 @@ async fn assert_burst_is_charged_with_preallocation(preallocate: bool) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
     let http = HttpClient::login_root(&harness).await;
     let data_path = harness.server().data_path();
+    // Where a reservation allocates nothing, each segment charges it anyway and
+    // the burst lands far above what the data directory grows by.
+    if preallocate && !reservations_allocate(&data_path) {
+        eprintln!(
+            "skipped: fallocate allocates no blocks under {}",
+            data_path.display()
+        );
+        return;
+    }
     let stream = Identifier::named(names::STREAM).expect("stream identifier");
     client
         .create_topic(
@@ -217,7 +237,7 @@ async fn scrape(http: &HttpClient, name: &str) -> u64 {
 /// The charged total once [`SETTLED_SCRAPES`] scrapes in a row agree.
 async fn settled_charges(http: &HttpClient) -> u64 {
     let deadline = Instant::now() + SETTLE_DEADLINE;
-    let mut charged = scrape(http, "disk_charged_bytes_total").await;
+    let mut charged = scrape(http, "disk_allocated_bytes_total").await;
     let mut unchanged_scrapes = 0;
     while unchanged_scrapes < SETTLED_SCRAPES {
         assert!(
@@ -225,7 +245,7 @@ async fn settled_charges(http: &HttpClient) -> u64 {
             "the charged total must stop moving within {SETTLE_DEADLINE:?} (last {charged})"
         );
         sleep(POLL_INTERVAL).await;
-        let next = scrape(http, "disk_charged_bytes_total").await;
+        let next = scrape(http, "disk_allocated_bytes_total").await;
         unchanged_scrapes = if next == charged {
             unchanged_scrapes + 1
         } else {

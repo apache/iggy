@@ -960,9 +960,8 @@ impl PrepareJournal {
                 let size = header.size as usize;
                 let buf = vec![0u8; size];
                 let buf = self.storage.read_at(*old_offset, buf).await?;
-                let charge = DISK_USAGE.charge(size as u64);
+                let _charge = DISK_USAGE.charge(size as u64);
                 let (result, _buf) = tmp.write_all_at(buf, write_pos).await.into();
-                drop(charge);
                 result?;
                 write_pos += size as u64;
             }

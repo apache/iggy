@@ -159,48 +159,46 @@ fn encode_topic_gauge(
     Ok(())
 }
 
-/// Exports the disk usage estimate as a gauge, read at encode time like
-/// [`StatsRollupUnderflows`].
+/// Exports the disk usage of the volume holding the data directory, read at
+/// encode time like [`StatsRollupUnderflows`].
 ///
-/// The value is the last `statvfs` sample of the volume holding the data
-/// directory plus what Iggy has written since, so it moves with a burst
-/// instead of once a second. No series is exported until the first sample,
-/// since the count alone says nothing about the volume.
+/// `disk_used_bytes` is the estimate: the last `statvfs` sample plus what Iggy
+/// has written since, so it moves with a burst instead of once a second. It is
+/// not exported until the first sample, since the charges alone say nothing
+/// about the volume. Used means total minus free blocks (`f_blocks - f_bfree`),
+/// as `df` reports it. The free space in `/stats` is `f_bavail`, which leaves
+/// out the blocks reserved for root, so the two differ by that reserve.
+///
+/// `disk_allocated_bytes` counts what the write sites charged since the
+/// process started, the part of the estimate that samples never move. Its
+/// increase over an interval follows what Iggy allocated in it, with two
+/// overcounts: a write that failed stays charged, and a preallocation charges
+/// its whole segment up front, even when the reservation fails or allocates
+/// nothing and the writes into the segment are then charged again. Unlike
+/// `disk_used_bytes`, it does not move with deletes or with other processes on
+/// the volume.
 ///
 /// It holds the estimate it reads, so a test can export one of its own
 /// instead of the process-wide one other tests charge concurrently.
 #[derive(Debug)]
-struct DiskUsedBytes(&'static DiskUsage);
+struct DiskUsageMetrics(&'static DiskUsage);
 
-impl Collector for DiskUsedBytes {
+impl Collector for DiskUsageMetrics {
     fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
-        if !self.0.is_measured() {
-            return Ok(());
+        if let Some(used_bytes) = self.0.used_bytes() {
+            let gauge = ConstGauge::new(gauge_value(used_bytes));
+            let metric_encoder = encoder.encode_descriptor(
+                "disk_used_bytes",
+                "estimated bytes used on the volume holding the data directory, as total minus free blocks like df",
+                None,
+                gauge.metric_type(),
+            )?;
+            gauge.encode(metric_encoder)?;
         }
-        let gauge = ConstGauge::new(gauge_value(self.0.used_bytes()));
-        let metric_encoder = encoder.encode_descriptor(
-            "disk_used_bytes",
-            "estimated bytes used on the volume holding the data directory",
-            None,
-            gauge.metric_type(),
-        )?;
-        gauge.encode(metric_encoder)
-    }
-}
-
-/// Exports the bytes the write sites have charged since the process started,
-/// the part of [`DiskUsedBytes`] that samples never move. Its increase over an
-/// interval is what Iggy allocated in it; the gauge also moves with deletes
-/// and with other processes on the volume.
-#[derive(Debug)]
-struct DiskChargedBytes(&'static DiskUsage);
-
-impl Collector for DiskChargedBytes {
-    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
         let counter = ConstCounter::new(self.0.charged_bytes());
         let metric_encoder = encoder.encode_descriptor(
-            "disk_charged_bytes",
-            "bytes Iggy charged to the disk usage estimate since the process started",
+            "disk_allocated_bytes",
+            "bytes Iggy allocated on the volume holding the data directory since the process started, failed writes and reservations included",
             None,
             counter.metric_type(),
         )?;
@@ -294,8 +292,7 @@ impl HttpMetrics {
         registry.register_collector(Box::new(StatsRollupUnderflows));
         let topic_usage = TopicUsage::default();
         registry.register_collector(Box::new(topic_usage.clone()));
-        registry.register_collector(Box::new(DiskUsedBytes(&DISK_USAGE)));
-        registry.register_collector(Box::new(DiskChargedBytes(&DISK_USAGE)));
+        registry.register_collector(Box::new(DiskUsageMetrics(&DISK_USAGE)));
         // Every shard's drop / reconcile / partition counters, one
         // `shard`-labelled sub-registry per shard so series stay per-shard
         // without a `shard_id` label in the counter label sets (see
@@ -461,7 +458,7 @@ mod tests {
     fn registered_metrics_include_both_disk_usage_series() {
         DISK_USAGE.rebase(|| Some(((), 1)));
         let output = HttpMetrics::init(&[]).formatted_output();
-        for series in ["disk_used_bytes gauge", "disk_charged_bytes counter"] {
+        for series in ["disk_used_bytes gauge", "disk_allocated_bytes counter"] {
             assert!(
                 output.contains(&format!("# TYPE {series}\n")),
                 "expected {series} in the exposition:\n{output}"
@@ -470,15 +467,15 @@ mod tests {
     }
 
     #[test]
-    fn given_no_sample_when_encoding_disk_usage_should_export_only_the_charged_bytes() {
+    fn given_no_sample_when_encoding_disk_usage_should_export_only_the_allocated_bytes() {
         static USAGE: DiskUsage = DiskUsage::new();
         drop(USAGE.charge(3 * MIB));
 
         let output = disk_usage_exposition(&USAGE);
 
         assert!(
-            output.contains(&format!("\ndisk_charged_bytes_total {}\n", 3 * MIB)),
-            "expected the charged bytes in the exposition:\n{output}"
+            output.contains(&format!("\ndisk_allocated_bytes_total {}\n", 3 * MIB)),
+            "expected the allocated bytes in the exposition:\n{output}"
         );
         assert!(
             !output.contains("disk_used_bytes"),
@@ -501,8 +498,8 @@ mod tests {
                 "expected the estimate {used} in the exposition:\n{output}"
             );
             assert!(
-                output.contains(&format!("\ndisk_charged_bytes_total {total}\n")),
-                "expected the charged bytes {total} in the exposition:\n{output}"
+                output.contains(&format!("\ndisk_allocated_bytes_total {total}\n")),
+                "expected the allocated bytes {total} in the exposition:\n{output}"
             );
         }
     }
@@ -510,8 +507,7 @@ mod tests {
     /// Both disk usage series of `usage`, encoded as `/metrics` would.
     fn disk_usage_exposition(usage: &'static DiskUsage) -> String {
         let mut registry = Registry::default();
-        registry.register_collector(Box::new(DiskUsedBytes(usage)));
-        registry.register_collector(Box::new(DiskChargedBytes(usage)));
+        registry.register_collector(Box::new(DiskUsageMetrics(usage)));
         let mut output = String::new();
         encode(&mut output, &registry).expect("encode disk usage metrics");
         output

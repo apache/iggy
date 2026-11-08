@@ -35,6 +35,10 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(not(target_os = "linux"))]
 static PREALLOCATION_UNAVAILABLE: std::sync::Once = std::sync::Once::new();
 
+/// The unit of `st_blocks`, whatever the filesystem's block size.
+#[cfg(target_os = "linux")]
+const FILE_BLOCK_BYTES: u64 = 512;
+
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     pub path: PathBuf,
@@ -68,18 +72,6 @@ impl DirEntry {
 /// space, so the blocks they fill must not be charged again.
 #[cfg(target_os = "linux")]
 pub async fn preallocate_file(file: &fs::File, file_path: &Path, len: u64) -> u64 {
-    preallocate_charging(&DISK_USAGE, file, file_path, len).await
-}
-
-/// [`preallocate_file`] charging `usage`, so a test can watch an estimate of
-/// its own instead of the process-wide one other tests charge concurrently.
-#[cfg(target_os = "linux")]
-async fn preallocate_charging(
-    usage: &'static DiskUsage,
-    file: &fs::File,
-    file_path: &Path,
-    len: u64,
-) -> u64 {
     let Ok(reserved_len) = i64::try_from(len) else {
         warn!(
             target: "iggy.partitions.storage",
@@ -97,7 +89,7 @@ async fn preallocate_charging(
                 "duplicating a file descriptor to preallocate".to_owned()
             })?;
         run_blocking("iggy-file-preallocate", move || {
-            reserve(&std::fs::File::from(descriptor), reserved_len, usage)
+            reserve(&std::fs::File::from(descriptor), reserved_len, &DISK_USAGE)
         })
         .await
     };
@@ -116,14 +108,23 @@ async fn preallocate_charging(
     }
 }
 
-/// Reserves `len` bytes, charges `usage` for the blocks it allocates and
-/// returns how much of the file the reservation covers.
-/// Recovery reserves segments that already own their blocks again, which
-/// allocates nothing and must not be counted as disk usage.
+/// Reserves `len` bytes and returns how much of the file the reservation
+/// covers. It charges `usage` with the expected growth before `fallocate`
+/// runs, so that charge stays when the call fails, and then adds any blocks
+/// beyond it that the file gained. Recovery reserves segments that already own
+/// their blocks again, which allocates nothing and must not be counted as disk
+/// usage.
+///
+/// [`preallocate_file`] passes [`DISK_USAGE`]. Tests pass a `DiskUsage` of
+/// their own instead: tests running in parallel all charge the global one, so
+/// its counter would not show what a single test charged.
 #[cfg(target_os = "linux")]
 fn reserve(file: &std::fs::File, len: i64, usage: &DiskUsage) -> io::Result<u64> {
-    // `st_blocks` counts 512-byte units whatever the filesystem's block size.
-    let allocated = || file.metadata().ok().map(|metadata| metadata.blocks() * 512);
+    let allocated = || {
+        file.metadata()
+            .ok()
+            .map(|metadata| metadata.blocks() * FILE_BLOCK_BYTES)
+    };
     let before = allocated();
 
     // A reservation is a whole segment, 1 GiB by default, the largest single
@@ -336,64 +337,61 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("segment.log");
         let probe = std::fs::File::create(directory.path().join("probe")).unwrap();
-        if let Err(error) = fallocate(&probe, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, 1) {
-            eprintln!("skipped: the temporary directory does not support fallocate: {error}");
+        let probe_len = i64::try_from(BODY_BYTES).unwrap();
+        // OpenZFS reports success without allocating anything and still counts
+        // a block per file for its dnode, so only blocks that cover the probe count.
+        if fallocate(&probe, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, probe_len).is_err()
+            || probe.metadata().unwrap().blocks() * FILE_BLOCK_BYTES < BODY_BYTES as u64
+        {
+            eprintln!("skipped: fallocate allocates no blocks in the temporary directory");
             return;
         }
-        static USAGE: DiskUsage = DiskUsage::new();
-        let usage = &USAGE;
-        let allocated = || std::fs::metadata(&path).unwrap().blocks() * 512;
-        let runtime = create_shard_executor().unwrap();
+        let usage = DiskUsage::new();
+        let allocated = || std::fs::metadata(&path).unwrap().blocks() * FILE_BLOCK_BYTES;
+        let len = i64::try_from(RESERVATION_BYTES).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
 
-        runtime.block_on(async {
-            let file = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(&path)
-                .await
-                .unwrap();
-            let reserved = preallocate_charging(usage, &file, &path, RESERVATION_BYTES).await;
-            assert_eq!(reserved, RESERVATION_BYTES);
-            let fresh = usage.charged_bytes();
-            assert_eq!(
-                fresh,
-                RESERVATION_BYTES.max(allocated()),
-                "a fresh reservation must be charged in full, plus any metadata blocks"
-            );
+        let reserved = reserve(&file, len, &usage).unwrap();
+        assert_eq!(reserved, RESERVATION_BYTES);
+        let fresh = usage.charged_bytes();
+        assert_eq!(
+            fresh,
+            RESERVATION_BYTES.max(allocated()),
+            "a fresh reservation must be charged in full, plus any metadata blocks"
+        );
 
-            preallocate_charging(usage, &file, &path, RESERVATION_BYTES).await;
-            assert_eq!(
-                usage.charged_bytes(),
-                fresh,
-                "reserving blocks the file already owns must charge nothing"
-            );
+        reserve(&file, len, &usage).unwrap();
+        assert_eq!(
+            usage.charged_bytes(),
+            fresh,
+            "reserving blocks the file already owns must charge nothing"
+        );
 
-            // Not `fs::write`: it truncates, and truncating frees the reservation.
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .unwrap()
-                .write_all_at(&[7u8; BODY_BYTES], 0)
-                .unwrap();
-            assert_eq!(
-                allocated(),
-                fresh,
-                "writing into the reservation must allocate nothing, which is why \
-                 the write sites charge only what lands past it"
-            );
-            preallocate_charging(usage, &file, &path, RESERVATION_BYTES).await;
-            assert_eq!(
-                usage.charged_bytes(),
-                fresh,
-                "reserving a partly written segment again must charge nothing"
-            );
-            assert_eq!(
-                file.metadata().await.unwrap().len(),
-                BODY_BYTES as u64,
-                "reserving must not change the length"
-            );
-        });
+        // Not `fs::write`: it truncates, and truncating frees the reservation.
+        file.write_all_at(&[7u8; BODY_BYTES], 0).unwrap();
+        assert_eq!(
+            allocated(),
+            fresh,
+            "writing into the reservation must allocate nothing, which is why \
+             the write sites charge only what lands past it"
+        );
+        reserve(&file, len, &usage).unwrap();
+        assert_eq!(
+            usage.charged_bytes(),
+            fresh,
+            "reserving a partly written segment again must charge nothing"
+        );
+        assert_eq!(
+            file.metadata().unwrap().len(),
+            BODY_BYTES as u64,
+            "reserving must not change the length"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -406,11 +404,11 @@ mod tests {
             REQUESTED_BYTES
         );
         assert_eq!(
-            reserved_bytes(REQUESTED_BYTES, Some(REQUESTED_BYTES + 512)),
+            reserved_bytes(REQUESTED_BYTES, Some(REQUESTED_BYTES + FILE_BLOCK_BYTES)),
             REQUESTED_BYTES
         );
         assert_eq!(
-            reserved_bytes(REQUESTED_BYTES, Some(REQUESTED_BYTES - 512)),
+            reserved_bytes(REQUESTED_BYTES, Some(REQUESTED_BYTES - FILE_BLOCK_BYTES)),
             0
         );
         assert_eq!(reserved_bytes(REQUESTED_BYTES, Some(0)), 0);
@@ -426,39 +424,36 @@ mod tests {
     fn given_a_reservation_that_fails_when_preallocating_should_stay_charged_until_the_next_sample()
     {
         const RESERVATION_BYTES: u64 = 1024 * 1024;
-        static USAGE: DiskUsage = DiskUsage::new();
+        let usage = DiskUsage::new();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("segment.log");
         std::fs::File::create(&path).unwrap();
-        let runtime = create_shard_executor().unwrap();
+        // Read-only, so `fallocate` fails with EBADF whatever the filesystem.
+        let file = std::fs::File::open(&path).unwrap();
 
-        runtime.block_on(async {
-            // Read-only, so `fallocate` fails with EBADF whatever the filesystem.
-            let file = fs::OpenOptions::new().read(true).open(&path).await.unwrap();
-            let reserved = preallocate_charging(&USAGE, &file, &path, RESERVATION_BYTES).await;
-            assert_eq!(
-                reserved, 0,
-                "a failed reservation must not exempt the writes below it from charges"
-            );
-        });
+        let reservation = reserve(&file, i64::try_from(RESERVATION_BYTES).unwrap(), &usage);
 
+        assert!(
+            reservation.is_err(),
+            "a failed reservation must not report covering anything"
+        );
         assert_eq!(
-            std::fs::metadata(&path).unwrap().blocks(),
+            file.metadata().unwrap().blocks(),
             0,
             "the failed reservation must allocate nothing"
         );
         assert_eq!(
-            USAGE.charged_bytes(),
+            usage.charged_bytes(),
             RESERVATION_BYTES,
             "the segment charged up front stays charged after the failure"
         );
 
         // The volume never held the reservation, so the next sample drops it.
         let sample = 100 * RESERVATION_BYTES;
-        USAGE.rebase(|| Some(((), sample)));
+        usage.rebase(|| Some(((), sample)));
         assert_eq!(
-            USAGE.used_bytes(),
-            sample,
+            usage.used_bytes(),
+            Some(sample),
             "the next sample must remove the charge of a failed reservation"
         );
     }

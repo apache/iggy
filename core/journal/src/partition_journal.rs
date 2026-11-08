@@ -864,9 +864,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.poisoned = true;
         self.write_segment_bodies(prepares, &records).await?;
         self.retain_segment_inodes(&records).await?;
-        let charge = DISK_USAGE.charge(extent.as_slice().len() as u64);
+        let _charge = DISK_USAGE.charge(extent.as_slice().len() as u64);
         self.file.write_aligned(self.state.length, extent).await?;
-        drop(charge);
         for (op, record, _) in records {
             self.entries.insert(op, record);
         }
@@ -1394,9 +1393,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 encoded.as_mut_slice(),
             )?;
             let length = encoded.as_slice().len();
-            let charge = DISK_USAGE.charge(length as u64);
+            let _charge = DISK_USAGE.charge(length as u64);
             file.write_aligned(0, encoded).await?;
-            drop(charge);
             entries.insert(
                 checkpoint,
                 StoredPrepare {
@@ -1469,9 +1467,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 )?;
             }
             let length = encoded.as_slice().len();
-            let charge = DISK_USAGE.charge(length as u64);
+            let _charge = DISK_USAGE.charge(length as u64);
             file.write_aligned(state.length, encoded).await?;
-            drop(charge);
             entries.insert(
                 op,
                 StoredPrepare {
@@ -1814,8 +1811,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     const FILE_BLOCK_BYTES: u64 = 512;
 
+    /// Whether reserving `length` bytes under `directory` allocates them.
+    /// `OpenZFS` reports success without allocating anything and still counts a
+    /// block per file for its dnode, so only blocks that cover `length` count.
     #[cfg(target_os = "linux")]
-    fn supports_preallocation(directory: &Path, length: u64) -> bool {
+    pub(super) fn supports_preallocation(directory: &Path, length: u64) -> bool {
         let probe = tempfile::tempfile_in(directory).unwrap();
         match nix::fcntl::fallocate(
             &probe,
@@ -1823,7 +1823,7 @@ mod tests {
             0,
             i64::try_from(length).unwrap(),
         ) {
-            Ok(()) => true,
+            Ok(()) => probe.metadata().unwrap().blocks() * FILE_BLOCK_BYTES >= length,
             Err(nix::errno::Errno::EOPNOTSUPP | nix::errno::Errno::ENOSYS) => false,
             Err(error) => panic!("preallocation probe failed: {error}"),
         }

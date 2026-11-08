@@ -335,10 +335,13 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                         .storage
                         .open(&reference.path(&self.directory), OpenMode::Create)
                         .await?;
-                    let _charge =
+                    let charge =
                         DISK_USAGE.charge((prepare.len() - size_of::<PrepareHeader>()) as u64);
                     file.write_frozen(0, prepare.slice(size_of::<PrepareHeader>()..))
                         .await?;
+                    // Settled before the fsync, so a sample taken during it
+                    // does not count the bytes twice.
+                    drop(charge);
                     file.sync().await?;
                     Some(reference)
                 }
@@ -959,6 +962,7 @@ mod tests {
     use super::*;
     use crate::durable_storage::DiskStorage;
     use crate::partition_journal::PARTITION_WAL_BYTES_MAX;
+    use crate::partition_journal::tests::supports_preallocation;
     use tempfile::{TempDir, tempdir};
 
     const MAX_SIZE: u64 = 1024 * 1024;
@@ -1005,16 +1009,8 @@ mod tests {
     async fn given_a_segment_when_opening_and_reopening_should_record_what_its_reservation_covers()
     {
         let (directory, mut journal) = journal(true).await;
-        let probe = std::fs::File::create(directory.path().join("probe")).unwrap();
-        if nix::fcntl::fallocate(
-            &probe,
-            nix::fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE,
-            0,
-            1,
-        )
-        .is_err()
-        {
-            eprintln!("skipped: the temporary directory does not support fallocate");
+        if !supports_preallocation(directory.path(), MAX_SIZE) {
+            eprintln!("skipped: fallocate allocates no blocks in the temporary directory");
             return;
         }
 

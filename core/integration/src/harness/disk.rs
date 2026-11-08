@@ -22,6 +22,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -32,6 +34,9 @@ use journal::superblock::{SLOT_FILE_NAMES, SuperblockContents, decode_slots};
 use tokio::time::sleep;
 
 use super::TestHarness;
+
+/// The unit of `st_blocks`, whatever the filesystem's block size.
+const FILE_BLOCK_BYTES: u64 = 512;
 
 // Poll the per-node segment `.log` sizes until they agree and hold steady,
 // instead of a fixed sleep: a fixed wait either flakes under CI load or hides a
@@ -120,6 +125,34 @@ pub fn walk(root: &Path, matches: &mut dyn FnMut(&Path) -> bool) -> Option<PathB
     None
 }
 
+/// Whether `fallocate` with `FALLOC_FL_KEEP_SIZE` allocates blocks under
+/// `directory`, which preallocated segments rely on. Some filesystems refuse
+/// it, and OpenZFS reports success without allocating anything and still
+/// counts a block per file for its dnode, so only `st_blocks` that cover the
+/// probe count. Always false off Linux.
+pub fn reservations_allocate(directory: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        const PROBE_BYTES: libc::off_t = 64 * 1024;
+        let Ok(probe) = tempfile::tempfile_in(directory) else {
+            return false;
+        };
+        // SAFETY: `probe` owns the descriptor and outlives the call.
+        let reserved = unsafe {
+            libc::fallocate(probe.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, PROBE_BYTES)
+        } == 0;
+        reserved
+            && probe.metadata().is_ok_and(|metadata| {
+                metadata.blocks() * FILE_BLOCK_BYTES >= PROBE_BYTES.unsigned_abs()
+            })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = directory;
+        false
+    }
+}
+
 /// Bytes the filesystem has allocated for `root` and everything under it, the
 /// way `du` counts them: from `st_blocks`, each inode once. File lengths would
 /// count a WAL hard link to a segment body twice and miss the preallocated
@@ -134,7 +167,7 @@ pub fn allocated_bytes(root: &Path) -> u64 {
             continue;
         };
         if seen.insert((metadata.dev(), metadata.ino())) {
-            total += metadata.blocks() * 512;
+            total += metadata.blocks() * FILE_BLOCK_BYTES;
         }
         if metadata.is_dir()
             && let Ok(entries) = fs::read_dir(&path)
@@ -143,6 +176,31 @@ pub fn allocated_bytes(root: &Path) -> u64 {
         }
     }
     total
+}
+
+/// Flushes the filesystem holding `path` with `syncfs`, so `statvfs` shows
+/// what was written to or deleted from it. ext4 and XFS move their free count
+/// at once, but btrfs moves it only after writeback and a commit, and OpenZFS
+/// after a transaction group sync. Off Linux it flushes every filesystem.
+pub fn sync_volume(path: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        let file = fs::File::open(path).expect("open a path on the volume to sync");
+        // SAFETY: `file` owns the descriptor and outlives the call.
+        let synced = unsafe { libc::syncfs(file.as_raw_fd()) };
+        assert_eq!(
+            synced,
+            0,
+            "syncfs failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        // SAFETY: `sync` takes no arguments and cannot fail.
+        unsafe { libc::sync() };
+    }
 }
 
 /// Bytes used on the volume holding `path`, counted as `df` and the server's

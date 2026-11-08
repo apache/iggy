@@ -33,11 +33,19 @@
 //! in flight does not hold its bytes yet. Each charge therefore returns a
 //! [`Charge`], and a sample only takes over the charges whose [`Charge`] was
 //! dropped, once their writes finished or failed.
+//!
+//! Re-basing assumes `statvfs` already counts every write that finished
+//! before the sample. ext4 and XFS do: they take a write's blocks out of the
+//! free count as soon as the write reserves them. btrfs and OpenZFS do not:
+//! they update the free count only when they commit, every 30 s on btrfs
+//! (later for writes still waiting in the page cache) and every 5 s on OpenZFS
+//! by default. On those filesystems the estimate can read low after a sample,
+//! by the writes that finished since the last commit, until the next commit.
 
 use crossbeam::utils::CachePadded;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// The process-wide estimate. It counts from zero until the first sample.
+/// The process-wide estimate. It has no value until the first sample.
 pub static DISK_USAGE: DiskUsage = DiskUsage::new();
 
 #[derive(Debug)]
@@ -75,27 +83,28 @@ impl DiskUsage {
     }
 
     /// Estimated bytes used on the volume: the last sample plus the bytes
-    /// charged since.
+    /// charged since. `None` until a sample sets the base, since the charges
+    /// alone say nothing about the volume.
     #[must_use]
     #[inline]
-    pub fn used_bytes(&self) -> u64 {
-        self.base
-            .load(Ordering::Relaxed)
-            .wrapping_add(self.charged.load(Ordering::Relaxed))
+    pub fn used_bytes(&self) -> Option<u64> {
+        if !self.measured.load(Ordering::Acquire) {
+            return None;
+        }
+        // Pairs with the release in `rebase`, which follows its acquire of
+        // `settled`, which follows each settled charge's `fetch_add`. So the
+        // `charged` load below sees every charge the base subtracted, and the
+        // estimate never reads below the sample. The base must be loaded first.
+        let base = self.base.load(Ordering::Acquire);
+        Some(base.wrapping_add(self.charged.load(Ordering::Relaxed)))
     }
 
     /// Every byte charged since the process started. Samples do not move it.
+    /// `/metrics` exports it as `disk_allocated_bytes`.
     #[must_use]
     #[inline]
     pub fn charged_bytes(&self) -> u64 {
         self.charged.load(Ordering::Relaxed)
-    }
-
-    /// Whether a sample has set the base. Until then [`Self::used_bytes`]
-    /// holds only the bytes charged since the process started.
-    #[must_use]
-    pub fn is_measured(&self) -> bool {
-        self.measured.load(Ordering::Acquire)
     }
 
     /// Runs `measure` and re-bases the estimate on the used bytes it returns,
@@ -108,13 +117,16 @@ impl DiskUsage {
     /// `measure` runs is counted twice until the next sample, which errs
     /// towards a fuller disk. When `measure` returns `None` the estimate keeps
     /// counting from the previous base.
+    ///
+    /// On btrfs and OpenZFS the volume shows a finished write only after its
+    /// commit, so the estimate reads low until then (see the module docs).
     pub fn rebase<T>(&self, measure: impl FnOnce() -> Option<(T, u64)>) -> Option<T> {
         // Pairs with the release in `Charge::drop`: every write settled here
         // finished before the volume is measured.
         let settled = self.settled.load(Ordering::Acquire);
         let (sample, used_bytes) = measure()?;
         self.base
-            .store(used_bytes.wrapping_sub(settled), Ordering::Relaxed);
+            .store(used_bytes.wrapping_sub(settled), Ordering::Release);
         self.measured.store(true, Ordering::Release);
         Some(sample)
     }
@@ -154,13 +166,13 @@ mod tests {
     const MIB: u64 = 1024 * 1024;
 
     #[test]
-    fn given_no_sample_when_charging_should_count_from_zero() {
+    fn given_no_sample_when_charging_should_have_no_estimate_yet() {
         let usage = DiskUsage::new();
 
         drop(usage.charge(3 * MIB));
 
-        assert_eq!(usage.used_bytes(), 3 * MIB);
-        assert!(!usage.is_measured());
+        assert_eq!(usage.used_bytes(), None);
+        assert_eq!(usage.charged_bytes(), 3 * MIB);
     }
 
     #[test]
@@ -171,8 +183,7 @@ mod tests {
         let sample = usage.rebase(|| Some(("sample", 100 * MIB)));
 
         assert_eq!(sample, Some("sample"));
-        assert_eq!(usage.used_bytes(), 100 * MIB);
-        assert!(usage.is_measured());
+        assert_eq!(usage.used_bytes(), Some(100 * MIB));
     }
 
     #[test]
@@ -185,7 +196,7 @@ mod tests {
 
         assert_eq!(
             usage.used_bytes(),
-            90 * MIB,
+            Some(90 * MIB),
             "space freed since the last sample must lower the estimate"
         );
     }
@@ -215,7 +226,7 @@ mod tests {
 
         assert_eq!(
             usage.used_bytes(),
-            101 * MIB,
+            Some(101 * MIB),
             "storing the base must not drop a charge that landed after the measurement"
         );
         assert_eq!(usage.charged_bytes(), MIB);
@@ -233,7 +244,7 @@ mod tests {
 
         assert_eq!(
             usage.used_bytes(),
-            101 * MIB,
+            Some(101 * MIB),
             "a charge the sample may have missed must still be counted"
         );
     }
@@ -249,7 +260,7 @@ mod tests {
 
         assert_eq!(
             usage.used_bytes(),
-            101 * MIB,
+            Some(101 * MIB),
             "a sample taken while a write is in flight must not drop its charge"
         );
 
@@ -258,7 +269,7 @@ mod tests {
 
         assert_eq!(
             usage.used_bytes(),
-            101 * MIB,
+            Some(101 * MIB),
             "the first sample that holds a settled write must replace its charge"
         );
     }
@@ -285,7 +296,7 @@ mod tests {
 
         assert_eq!(
             usage.used_bytes(),
-            101 * MIB,
+            Some(101 * MIB),
             "a sample must not drop the charge of a write that was still in flight"
         );
     }
@@ -300,7 +311,7 @@ mod tests {
         drop(write);
         usage.rebase(|| Some(((), 100 * MIB)));
 
-        assert_eq!(usage.used_bytes(), 100 * MIB);
+        assert_eq!(usage.used_bytes(), Some(100 * MIB));
         assert_eq!(usage.charged_bytes(), MIB);
     }
 
@@ -313,7 +324,7 @@ mod tests {
         let sample: Option<()> = usage.rebase(|| None);
 
         assert!(sample.is_none());
-        assert_eq!(usage.used_bytes(), 101 * MIB);
+        assert_eq!(usage.used_bytes(), Some(101 * MIB));
     }
 
     #[test]
@@ -325,7 +336,7 @@ mod tests {
         usage.rebase(|| Some(((), 50 * MIB)));
 
         assert_eq!(usage.charged_bytes(), 7 * MIB);
-        assert_eq!(usage.used_bytes(), 50 * MIB);
+        assert_eq!(usage.used_bytes(), Some(50 * MIB));
     }
 
     #[test]
@@ -356,7 +367,7 @@ mod tests {
             usage.charged_bytes() < MIB,
             "the total must have wrapped for this test to mean anything"
         );
-        assert_eq!(usage.used_bytes(), 102 * MIB);
+        assert_eq!(usage.used_bytes(), Some(102 * MIB));
     }
 
     #[test]
@@ -369,7 +380,7 @@ mod tests {
         usage.rebase(|| Some(((), 100 * MIB)));
         drop(usage.charge(MIB));
 
-        assert_eq!(usage.used_bytes(), 101 * MIB);
+        assert_eq!(usage.used_bytes(), Some(101 * MIB));
     }
 
     #[test]
@@ -380,7 +391,7 @@ mod tests {
         usage.rebase(|| Some(((), 100 * MIB)));
         drop(usage.charge(MIB));
 
-        assert_eq!(usage.used_bytes(), 101 * MIB);
+        assert_eq!(usage.used_bytes(), Some(101 * MIB));
         assert_eq!(usage.charged_bytes(), 30001 * MIB);
     }
 }
