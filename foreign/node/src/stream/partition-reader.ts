@@ -606,17 +606,16 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
       const handedOver = state.handed && (!state.delivered || state.delivered.offset < state.handed.offset);
       const first = queued.get(partitionId) ?? state.catchUpBatch;
       if (!handedOver && !first && !state.pendingStart) continue;
-      let offset: bigint | null | undefined;
+      let offset: bigint | null;
       let context: PartitionContext | undefined;
       if (state.delivered) {
         offset = state.delivered.offset;
         context = state.delivered.context;
-      } else if (this.start.kind === PollingStrategyKind.Next) {
+      } else {
         const firstOffset = state.firstHanded ?? first?.messages[0].headers.offset ?? state.pendingStart!.value;
         offset = firstOffset === 0n ? null : firstOffset - 1n;
         context = state.handed?.context ?? first?.context ?? state.pendingStart!.context;
       }
-      if (offset === undefined) continue;
       try {
         if (offset === null) {
           await deleteOffset(this.getClient)({ ...this.target(), partitionId, context });
