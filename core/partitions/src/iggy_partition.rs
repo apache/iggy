@@ -13731,7 +13731,7 @@ where
     /// Retirement requests name sessions rather than histories; their prepares
     /// carry this partition's incarnation. A lifecycle fence names its
     /// incarnation in its body, which admission checks.
-    fn request_history_available(&self, header: &RoutedRequestHeader) -> bool {
+    const fn request_history_available(&self, header: &RoutedRequestHeader) -> bool {
         matches!(
             header.operation,
             Operation::RetireSession | Operation::RollSegment
