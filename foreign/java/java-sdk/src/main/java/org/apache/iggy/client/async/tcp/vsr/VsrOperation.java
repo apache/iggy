@@ -75,6 +75,7 @@ public final class VsrOperation {
     public static final int INSTALL_CONSUMER_GROUP_OWNER = 167;
     public static final int TRANSITION_PARTITION_HISTORY = 168;
     public static final int RETIRE_CONSUMER_GROUP_OWNERS = 169;
+    public static final int STATE_MACHINE_COMMAND = 170;
 
     private static final int INTERNAL_START = 64;
     private static final int METADATA_START = 128;
@@ -131,6 +132,7 @@ public final class VsrOperation {
         KNOWN_OPERATIONS.set(INSTALL_CONSUMER_GROUP_OWNER);
         KNOWN_OPERATIONS.set(TRANSITION_PARTITION_HISTORY);
         KNOWN_OPERATIONS.set(RETIRE_CONSUMER_GROUP_OWNERS);
+        KNOWN_OPERATIONS.set(STATE_MACHINE_COMMAND);
     }
 
     private VsrOperation() {}
