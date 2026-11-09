@@ -449,6 +449,9 @@ pub enum TransferFileJob {
         directory: String,
         keep: Vec<std::path::PathBuf>,
         bodies: bool,
+        /// The transferred chain's bytes, which replace the chain; `None`
+        /// removes it.
+        chain: Option<Vec<u8>>,
     },
     Rename {
         from: std::path::PathBuf,
@@ -1019,6 +1022,7 @@ impl TransferFileJob {
                 directory,
                 keep,
                 bodies,
+                chain,
             } => {
                 crate::state_transfer::sweep_staging_except(&directory, keep.into_iter().collect())
                     .await;
@@ -1027,7 +1031,15 @@ impl TransferFileJob {
                         crate::state_transfer::remove_public_segment_files(&directory).await?;
                     }
                     // The chain describes the segments the install replaces.
-                    remove_if_present(&crate::segment_chain::chain_path(&directory)).await?;
+                    match chain {
+                        Some(bytes) => {
+                            crate::segment_chain::replace_chain(&directory, bytes).await?;
+                        }
+                        None => {
+                            remove_if_present(&crate::segment_chain::chain_path(&directory))
+                                .await?;
+                        }
+                    }
                     crate::state_transfer::fsync_dir(&directory).await
                 }
                 .await;

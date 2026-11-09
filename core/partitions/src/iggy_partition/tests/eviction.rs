@@ -24,7 +24,7 @@ use crate::{LocalEnvelope, SegmentEviction, SegmentLocation};
 use iggy_common::{IggyExpiry, IggyTimestamp};
 
 /// Every sealed segment is outside an envelope that keeps nothing.
-const KEEP_NOTHING: LocalEnvelope = LocalEnvelope {
+pub(super) const KEEP_NOTHING: LocalEnvelope = LocalEnvelope {
     age: IggyExpiry::NeverExpire,
     size: Some(0),
 };
@@ -32,14 +32,14 @@ const KEEP_NOTHING: LocalEnvelope = LocalEnvelope {
 /// Sealed segments of a partition with [`RECEIVER_OPS`] one-message ops.
 const SEALED: [u64; 2] = [0, 2];
 
-fn confirm<B: MessageBus>(partition: &mut IggyPartition<B>, starts: &[u64]) {
+pub(super) fn confirm<B: MessageBus>(partition: &mut IggyPartition<B>, starts: &[u64]) {
     for start_offset in starts {
         let record = partition.sealed_segment_record(*start_offset).unwrap();
         assert!(partition.confirm_segment_hash(*start_offset, record.end_offset, &record.hash));
     }
 }
 
-async fn evict<B: MessageBus>(
+pub(super) async fn evict<B: MessageBus>(
     partition: &mut IggyPartition<B>,
     floor: u64,
     envelope: LocalEnvelope,
@@ -63,7 +63,7 @@ fn log_exists(directory: &Path, start_offset: u64) -> bool {
     directory.join(format!("{start_offset:020}.log")).exists()
 }
 
-async fn chain_records(directory: &Path) -> Vec<ChainRecord> {
+pub(super) async fn chain_records(directory: &Path) -> Vec<ChainRecord> {
     read_chain(&directory.to_string_lossy())
         .await
         .unwrap()
@@ -104,7 +104,7 @@ async fn tiered_partition_on_disk(
 }
 
 /// The partition boot rebuilds from what `config` names on disk.
-async fn reboot(config: &PartitionsConfig) -> IggyPartition<IggyMessageBus> {
+pub(super) async fn reboot(config: &PartitionsConfig) -> IggyPartition<IggyMessageBus> {
     let directory = config.get_partition_path(1, 1, 0);
     let recovered = crate::segment_recovery::load_persisted_segments(
         config,
@@ -388,23 +388,6 @@ async fn given_a_chain_of_another_incarnation_when_adopting_should_refuse_it() {
     other.set_created_revision(PREFIX.created_revision);
     assert!(other.adopt_segment_chain(&moved_chain).is_err());
     assert!(other.object_prefix().is_none());
-}
-
-/// The install replaces the segments the chain describes, so it drops the
-/// chain and its sweep removes the file.
-#[compio::test]
-async fn given_a_tiered_receiver_when_a_transfer_installs_should_drop_its_chain() {
-    let (_origin_directory, mut origin) =
-        Box::pin(partition_with_sealed_segments(&segment_records(ORIGIN_OPS))).await;
-    let offer = Box::pin(serve_offer(&mut origin)).await;
-    let (directory, mut receiver) =
-        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
-    assert!(receiver.object_prefix().is_some());
-
-    Box::pin(install_offer_with_reuse(&mut receiver, &offer)).await;
-
-    assert!(receiver.object_prefix().is_none());
-    assert!(!Path::new(&chain_path(&directory.path().to_string_lossy())).exists());
 }
 
 /// The WAL links its checkpoint-cursor segment and boot reads it, so a sealed

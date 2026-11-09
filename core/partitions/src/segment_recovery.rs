@@ -1084,12 +1084,9 @@ async fn read_partition_chain(
 /// The segments whose latest live record is remote, by start offset.
 fn remote_segments(chain: &Chain) -> BTreeMap<u64, SegmentRecord> {
     chain
-        .live_segments()
-        .into_values()
-        .filter_map(|record| match record {
-            ChainRecord::Remote(segment) => Some((segment.start_offset, segment)),
-            ChainRecord::Sealed(_) | ChainRecord::TrimPoint(_) => None,
-        })
+        .remote_segments()
+        .into_iter()
+        .map(|segment| (segment.start_offset, segment))
         .collect()
 }
 
@@ -1193,17 +1190,8 @@ impl PlannedSegment {
             namespace.topic_id(),
             namespace.partition_id(),
         );
-        let mut segment = Segment::new(record.start_offset, max_size);
-        segment.sealed = true;
-        segment.location = SegmentLocation::Remote;
-        segment.start_timestamp = record.start_timestamp;
-        segment.end_timestamp = record.end_timestamp;
-        segment.max_timestamp = record.max_timestamp;
-        segment.end_offset = record.end_offset;
-        segment.size = IggyByteSize::from(record.size);
-        segment.current_position = record.size;
         Self {
-            segment,
+            segment: record.remote_segment(max_size),
             messages_path: config.get_messages_path(
                 stream_id,
                 topic_id,
