@@ -53,6 +53,7 @@ fault-injection = []
 
 [dependencies]
 ahash = { workspace = true }
+blake3 = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
 compio = { workspace = true }

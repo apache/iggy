@@ -3612,6 +3612,7 @@ where
                         self.invalidate_poll_history();
                         self.log.invalidate_sealed_read_state();
                         self.segment_checksum_cache.borrow_mut().clear();
+                        self.discard_segment_digest();
                         self.reuse_scan_memo.borrow_mut().take();
                         if let Some(persistence) = &self.persistence {
                             persistence.retire_offset_files();
@@ -4410,6 +4411,7 @@ where
             );
         }
         *self.segment_checksum_cache.borrow_mut() = memos;
+        self.discard_segment_digest();
         self.stats.zero_out_all();
         self.stats.increment_segments_count(
             u32::try_from(self.log.segments().len()).expect("manifest segment count fits u32"),
@@ -4456,6 +4458,7 @@ where
         self.consensus().clear_pipeline();
         self.clear_install_offsets(0);
         self.segment_checksum_cache.borrow_mut().clear();
+        self.discard_segment_digest();
         self.reuse_scan_memo.borrow_mut().take();
         let end = install.offsets_wire.next_offset.saturating_sub(1);
         self.offset.store(end, Ordering::Release);
@@ -4809,11 +4812,11 @@ const PREFIX_READ_PIECE_LEN: u64 = 16 * OFFER_HASH_CHUNK_LEN as u64;
 /// build's checksum extension (no sink) and the serving side's load + re-verify
 /// (sink collects the artifact). Errors on a file shorter than `to`: the segment
 /// accounts bytes the disk does not hold.
-async fn hash_segment_range(
+pub(crate) async fn hash_segment_range<H: ChunkHasher + ?Sized>(
     path: &str,
     from: u64,
     to: u64,
-    hasher: &mut StateArtifactHasher,
+    hasher: &mut H,
     mut sink: Option<&mut Vec<u8>>,
 ) -> std::io::Result<()> {
     if from >= to {
@@ -5329,8 +5332,26 @@ async fn verify_state_artifact_yielding(entry: &consensus::StateArtifact, bytes:
     hasher.finish() == entry.checksum
 }
 
-pub(crate) async fn hash_yielding<'a>(
-    hasher: &mut StateArtifactHasher,
+/// A hash the chunked segment readers feed, so one reader serves the transfer
+/// checksum and the tiered segment hash alike.
+pub(crate) trait ChunkHasher {
+    fn update(&mut self, bytes: &[u8]);
+}
+
+impl ChunkHasher for StateArtifactHasher {
+    fn update(&mut self, bytes: &[u8]) {
+        Self::update(self, bytes);
+    }
+}
+
+impl<H: ChunkHasher + ?Sized> ChunkHasher for Box<H> {
+    fn update(&mut self, bytes: &[u8]) {
+        H::update(self, bytes);
+    }
+}
+
+pub(crate) async fn hash_yielding<'a, H: ChunkHasher + ?Sized>(
+    hasher: &mut H,
     slices: impl IntoIterator<Item = &'a [u8]>,
 ) {
     let mut remaining = OFFER_HASH_CHUNK_LEN;

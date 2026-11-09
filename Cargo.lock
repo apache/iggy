@@ -10497,6 +10497,7 @@ name = "partitions"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "blake3",
  "bytemuck",
  "bytes",
  "compio",
