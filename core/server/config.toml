@@ -868,9 +868,11 @@ shutdown_poll_interval = "50 ms"
 # shutdown_drain_timeout, or shards would be abandoned mid-drain.
 shutdown_join_timeout = "30 s"
 
-# Safety-tick cadence for the partition reconciliation loop. The reconciler
-# also wakes on every metadata commit from shard 0, so this only covers
-# dropped wake-ups and the initial post-bootstrap convergence window.
+# Tick cadence for the partition reconciliation loop. The reconciler also
+# wakes on every metadata commit from shard 0. The tick retries partitions
+# that a pass left unfinished (a backed-off build, an incomplete trim),
+# checks local changes that no commit announces, ages parked requests and
+# covers dropped wake-ups. A full reconcile runs every 10 minutes as a repair.
 reconcile_periodic_interval = "1 s"
 
 # WebSocket listener configuration. The frame-tuning knobs below are the
