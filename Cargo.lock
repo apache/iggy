@@ -5700,7 +5700,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-gateway-kafka"
-version = "0.2.0"
+version = "0.2.1-edge.1"
 dependencies = [
  "arc-swap",
  "async-trait",

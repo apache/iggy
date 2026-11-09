@@ -15,22 +15,165 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The readiness of the gateway binary while its Iggy server stops and comes back.
+//! The readiness and the metrics of the gateway binary: while it waits for Iggy, while Iggy stops
+//! and comes back, and while it drains at SIGTERM.
 //!
 //! Needs a built `iggy-server`, see `docs/TEST_SUITE.md`.
 
+#[path = "common/codec.rs"]
+mod codec;
 #[path = "common/gateway_process.rs"]
 mod gateway_process;
 #[path = "common/http.rs"]
 mod http;
 #[path = "common/iggy_server.rs"]
 mod iggy_server;
+#[path = "common/tcp.rs"]
+mod tcp;
 
 use std::time::Duration;
 
 use gateway_process::TestGateway;
 use http::{get, sample, wait_for};
-use iggy_server::TestServer;
+use iggy_server::{PortGuard, TestServer};
+use tcp::hold_answers;
+
+/// The series of a metric that `/metrics` must carry, and its value, for a gateway at rest.
+const AT_REST: [(&str, f64); 14] = [
+    ("iggy_kafka_gateway_ready", 1.0),
+    ("iggy_kafka_gateway_iggy_reachable", 1.0),
+    (
+        "iggy_kafka_gateway_connections_open{listener=\"PLAINTEXT\"}",
+        0.0,
+    ),
+    ("iggy_kafka_gateway_slots_used{pool=\"fetch\"}", 0.0),
+    ("iggy_kafka_gateway_slots{pool=\"fetch\"}", 4.0),
+    ("iggy_kafka_gateway_slots_used{pool=\"produce_large\"}", 0.0),
+    ("iggy_kafka_gateway_slots{pool=\"produce_large\"}", 4.0),
+    ("iggy_kafka_gateway_produce_memory_used_bytes", 0.0),
+    ("iggy_kafka_gateway_produce_sessions", 0.0),
+    ("iggy_kafka_gateway_produce_sessions_limit", 256.0),
+    ("iggy_kafka_gateway_produce_shared_producers", 0.0),
+    ("iggy_kafka_gateway_produce_sends_in_doubt_total", 0.0),
+    ("iggy_kafka_gateway_group_members", 0.0),
+    ("iggy_kafka_gateway_coordinator_partitions_served", 16.0),
+];
+
+/// The endpoint starts before the bridge connects, so an orchestrator sees a gateway that waits
+/// for Iggy as live, and does not restart it.
+#[tokio::test]
+async fn given_iggy_not_up_yet_should_answer_live_and_not_ready_while_it_waits() {
+    let stopped = PortGuard::acquire();
+    let iggy = format!("127.0.0.1:{}", stopped.port);
+    let gateway = TestGateway::start_with_env(&[
+        ("IGGY_KAFKA_BRIDGE_ENABLED", "true"),
+        ("IGGY_KAFKA_IGGY_ADDR", &iggy),
+        ("IGGY_KAFKA_IGGY_USERNAME", "iggy"),
+        ("IGGY_KAFKA_IGGY_PASSWORD", "iggy"),
+    ]);
+    let http = gateway
+        .http_address
+        .clone()
+        .expect("the gateway serves HTTP");
+
+    wait_for(&http, "/live", Duration::from_secs(10), |status, _| {
+        status == 200
+    })
+    .await;
+    let (status, body) = get(&http, "/ready").await.expect("/ready answers");
+    assert_eq!(status, 503);
+    assert!(body.contains("starting"), "{body}");
+}
+
+/// `/ready` answers 503 through the whole drain: the gateway turns unready before it drains, and
+/// the endpoint stops last.
+#[tokio::test]
+async fn given_sigterm_with_a_connection_open_should_answer_not_ready_until_the_drain_ends() {
+    let mut gateway = TestGateway::start_with_env(&[
+        ("IGGY_KAFKA_WRITE_TIMEOUT_SECS", "4"),
+        ("IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS", "10"),
+    ]);
+    let http = gateway
+        .http_address
+        .clone()
+        .expect("the gateway serves HTTP");
+    wait_for(&http, "/ready", Duration::from_secs(15), |status, _| {
+        status == 200
+    })
+    .await;
+    let _held = hold_answers(gateway.address.parse().expect("an address")).await;
+    wait_for(&http, "/metrics", Duration::from_secs(10), |_, metrics| {
+        metrics.contains("iggy_kafka_gateway_requests_total{api=\"Metadata\"")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    gateway.terminate();
+
+    // Well inside the 4 s write timeout that holds the drain open.
+    let (_, body, _) = wait_for(&http, "/ready", Duration::from_secs(2), |status, _| {
+        status == 503
+    })
+    .await;
+    assert!(body.contains("shutting down"), "{body}");
+    let metrics = get(&http, "/metrics").await.expect("metrics answer").1;
+    assert_eq!(
+        sample(
+            &metrics,
+            "iggy_kafka_gateway_connections_open{listener=\"PLAINTEXT\"}"
+        ),
+        Some(1.0),
+        "the drain still waits for the held connection:\n{metrics}"
+    );
+    assert!(gateway.is_running());
+}
+
+/// Each series that the census adds, read from a gateway with a bridge and the coordinator log.
+#[tokio::test]
+async fn given_a_gateway_at_rest_when_scraped_should_report_each_census_series() {
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let mut gateway = TestGateway::start_with_http_env(
+        &server.test_config(),
+        &[("IGGY_KAFKA_COORDINATOR_LOG", "true")],
+    );
+    gateway.wait_ready().await;
+    let http = gateway
+        .http_address
+        .clone()
+        .expect("the gateway serves HTTP");
+    wait_for(&http, "/metrics", Duration::from_secs(30), |_, metrics| {
+        sample(metrics, "iggy_kafka_gateway_coordinator_partitions_served") == Some(16.0)
+            && sample(metrics, "iggy_kafka_gateway_ready") == Some(1.0)
+    })
+    .await;
+    // A lease that the loop stopped reading would be older than this by now.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let metrics = get(&http, "/metrics").await.expect("metrics answer").1;
+    for (series, value) in AT_REST {
+        assert_eq!(
+            sample(&metrics, series),
+            Some(value),
+            "{series} in:\n{metrics}"
+        );
+    }
+    let memory = sample(&metrics, "iggy_kafka_gateway_produce_memory_capacity_bytes");
+    assert!(memory.is_some_and(|bytes| bytes > 0.0), "{metrics}");
+    let lease_age = sample(&metrics, "iggy_kafka_gateway_coordinator_lease_age_seconds");
+    assert!(
+        lease_age.is_some_and(|age| age < 3.0),
+        "the lease is read each second: {lease_age:?}"
+    );
+    assert_eq!(
+        sample(
+            &metrics,
+            "iggy_kafka_gateway_coordinator_partition_served{partition=\"0\"}"
+        ),
+        Some(1.0),
+        "{metrics}"
+    );
+}
 
 /// How long `/ready` may take to turn 503 after Iggy stops. The probe needs two failed pings, one
 /// second apart, each bounded by 2 s.

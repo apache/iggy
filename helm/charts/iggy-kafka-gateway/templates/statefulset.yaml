@@ -53,6 +53,9 @@ spec:
 {{- end }}
       serviceAccountName: {{ include "iggy-kafka-gateway.serviceAccountName" . }}
       automountServiceAccountToken: false
+      # A Service such as `iggy-kafka-gateway` injects `IGGY_KAFKA_GATEWAY_SERVICE_HOST`, and the
+      # gateway refuses unknown `IGGY_KAFKA_*` variables.
+      enableServiceLinks: false
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
@@ -92,6 +95,12 @@ spec:
               value: {{ .Values.kafka.port | quote }}
             - name: IGGY_KAFKA_BROKERS
               value: {{ include "iggy-kafka-gateway.brokers" . | quote }}
+{{- if gt (int .Values.replicaCount) 1 }}
+            # Without `manage_servers` the gateway then fails to start, instead of falling back to
+            # one coordinator for every group.
+            - name: IGGY_KAFKA_COORDINATOR_LOG
+              value: "true"
+{{- end }}
             - name: IGGY_KAFKA_HTTP_ADDR
               value: "0.0.0.0:{{ .Values.http.port }}"
 {{- if .Values.kafka.sasl.enabled }}
@@ -102,6 +111,10 @@ spec:
               value: "true"
             - name: IGGY_KAFKA_IGGY_ADDR
               value: {{ .Values.iggy.address | quote }}
+{{- with .Values.iggy.stream }}
+            - name: IGGY_KAFKA_IGGY_STREAM
+              value: {{ . | quote }}
+{{- end }}
             - name: IGGY_KAFKA_IGGY_USERNAME
               valueFrom:
                 secretKeyRef:

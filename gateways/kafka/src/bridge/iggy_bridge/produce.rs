@@ -689,6 +689,53 @@ mod tests {
             matches!(held, Some((_, 7))),
             "nothing runs, so nothing is kept"
         );
+        assert_eq!(
+            bridge.sends_in_doubt(),
+            0,
+            "a send that never left is not in doubt"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_send_refused_before_it_left_should_not_count_it_in_doubt() {
+        let bridge = IggyBridge::offline();
+        with_client(&bridge.produce_pool.take(id(1)).session).await;
+        let target = bridge.topic_target("orders").expect("a valid topic");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let batch = PartitionBatch {
+            partition: 0,
+            producer: None,
+            messages: Vec::new(),
+        };
+
+        let (sent, _) = bridge
+            .send_records(
+                bridge
+                    .produce_turn(id(1), deadline)
+                    .await
+                    .expect("a free turn"),
+                7,
+                &target,
+                batch,
+                deadline,
+            )
+            .await;
+        assert!(sent.is_err(), "the client never dialed");
+        assert_eq!(bridge.sends_in_doubt(), 0);
+    }
+
+    #[tokio::test]
+    async fn given_a_full_pool_when_taking_a_census_should_count_own_and_shared_producers() {
+        let pool = pool_of(1);
+        let _own = pool.take(id(1));
+        let _shared = (pool.take(id(2)), pool.take(id(3)));
+
+        let census = pool.census();
+        assert_eq!(
+            (census.own, census.limit, census.shared),
+            (1, 1, 2),
+            "{census:?}"
+        );
     }
 
     #[tokio::test]

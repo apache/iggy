@@ -36,32 +36,27 @@ use iggy_gateway_kafka::listener::{
     ListenerConfig, SecurityProtocol, apply_advertised_listeners, check_brokers, parse_brokers,
     parse_listeners,
 };
-use iggy_gateway_kafka::observability::{HttpEndpoint, Observability, check_ready};
+use iggy_gateway_kafka::observability::{HealthCheck, HttpEndpoint, Observability, check};
 use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
 use iggy_gateway_kafka::server::{bind_listeners, init_tracing};
 use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
 use iggy_gateway_kafka::{CoordinatorLog, GatewayConfig, KafkaGateway};
 
-/// The argument that asks the `/ready` of a running gateway and exits 0 when it answers 200, for
-/// a container health check in an image without an HTTP client.
-const CHECK_READY_ARG: &str = "--check-ready";
-
+/// `--check-ready` or `--check-live` asks that path of a running gateway and exits 0 when it
+/// answers 200, for a container health check in an image without an HTTP client.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    match (args.next(), args.next()) {
-        (None, _) => serve().await,
-        (Some(arg), None) if arg == CHECK_READY_ARG => {
-            let addr = load_http_addr()?
-                .ok_or("IGGY_KAFKA_HTTP_ADDR is not set, so the gateway serves no /ready to ask")?;
-            Ok(check_ready(addr).await?)
-        }
-        (Some(arg), _) => Err(format!(
-            "unknown argument `{arg}`: the gateway takes its configuration from IGGY_KAFKA_* \
-             environment variables, and {CHECK_READY_ARG} is its only argument"
-        )
-        .into()),
+    let Some(arg) = args.next() else {
+        return serve().await;
+    };
+    let health: HealthCheck = arg.parse()?;
+    if let Some(extra) = args.next() {
+        return Err(format!("unexpected argument `{extra}` after {arg}").into());
     }
+    let addr = load_http_addr()?
+        .ok_or("IGGY_KAFKA_HTTP_ADDR is not set, so the gateway serves no endpoint to ask")?;
+    Ok(check(addr, health).await?)
 }
 
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {

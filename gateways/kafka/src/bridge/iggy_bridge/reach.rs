@@ -18,19 +18,20 @@
 //! Whether the bridge reaches Iggy, for the gateway's readiness.
 //!
 //! A client of its own pings Iggy each second. The answer says nothing of whether the cluster
-//! takes writes, only that a node answers and the bridge's user can sign in.
+//! takes writes, only that a node answers and the bridge's user can sign in. Without a client, a
+//! check dials every known node at once, so a node that does not answer delays no other.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use iggy::prelude::{IggyClient, SystemClient};
+use iggy::prelude::{IggyClient, IggyError, SystemClient};
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::{IggyBridge, connect_client, sign_out_and_shut_down};
+use super::{IggyBridge, connect_client_to, out_of_reach, sign_out_and_shut_down};
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
 
@@ -169,7 +170,7 @@ impl Probe {
     async fn connect(&mut self, config: &IggyBridgeConfig) -> Result<(), String> {
         let connecting = self.connecting.get_or_insert_with(|| {
             let config = config.clone();
-            tokio::spawn(async move { connect_client(&config).await })
+            tokio::spawn(async move { dial_every_node(&config).await })
         });
         let Ok(joined) = timeout(PING_TIMEOUT, connecting).await else {
             return Err(format!("no connection to Iggy within {PING_TIMEOUT:?}"));
@@ -225,6 +226,52 @@ impl Probe {
             && let Err(error) = sign_out_and_shut_down(&client).await
         {
             debug!(%error, "the reach probe's client did not close cleanly");
+        }
+    }
+}
+
+/// A client signed in on the first known node that answers. Dials every node at once. A node that
+/// answers later is signed out in the background.
+async fn dial_every_node(config: &IggyBridgeConfig) -> Result<IggyClient, BridgeError> {
+    let mut dials = JoinSet::new();
+    for address in config.nodes.dial_order(&config.address) {
+        let config = config.clone();
+        dials.spawn(async move {
+            let dialed = connect_client_to(&config, &address).await;
+            (address, dialed)
+        });
+    }
+    let mut failure = BridgeError::Iggy(IggyError::CannotEstablishConnection);
+    while let Some(joined) = dials.join_next().await {
+        let Ok((address, dialed)) = joined else {
+            continue;
+        };
+        match dialed {
+            Ok(client) => {
+                config.nodes.mark_reachable(&address);
+                tokio::spawn(sign_out_the_rest(dials));
+                return Ok(client);
+            }
+            Err(error) if out_of_reach(&error) => {
+                config.nodes.mark_unreachable(&address);
+                if out_of_reach(&failure) {
+                    failure = error;
+                }
+            }
+            // A refused sign-in says more than a node out of reach.
+            Err(error) => failure = error,
+        }
+    }
+    Err(failure)
+}
+
+/// Signs out each client of `dials` that still connects.
+async fn sign_out_the_rest(mut dials: JoinSet<(String, Result<IggyClient, BridgeError>)>) {
+    while let Some(joined) = dials.join_next().await {
+        if let Ok((_, Ok(client))) = joined
+            && let Err(error) = sign_out_and_shut_down(&client).await
+        {
+            debug!(%error, "a spare client of the reach probe did not close cleanly");
         }
     }
 }

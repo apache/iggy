@@ -120,4 +120,14 @@ Refuse a render that the gateway would only refuse at startup, after the pods ar
   {{- if eq (int .Values.kafka.port) (int .Values.http.port) }}
     {{- fail "kafka.port and http.port must differ" }}
   {{- end }}
+  {{- $owned := list "IGGY_KAFKA_NODE_ID" "IGGY_KAFKA_BIND_ADDR" "IGGY_KAFKA_ADVERTISED_HOST" "IGGY_KAFKA_ADVERTISED_PORT" "IGGY_KAFKA_BROKERS" "IGGY_KAFKA_COORDINATOR_LOG" "IGGY_KAFKA_HTTP_ADDR" "IGGY_KAFKA_SASL_ENABLED" "IGGY_KAFKA_BRIDGE_ENABLED" "IGGY_KAFKA_IGGY_ADDR" "IGGY_KAFKA_IGGY_STREAM" "IGGY_KAFKA_IGGY_USERNAME" "IGGY_KAFKA_IGGY_PASSWORD" "IGGY_KAFKA_IGGY_TLS_ENABLED" "IGGY_KAFKA_IGGY_TLS_DOMAIN" "IGGY_KAFKA_IGGY_TLS_CA_FILE" "IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED" "IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS" }}
+  {{- range .Values.extraEnv }}
+    {{- $name := toString .name }}
+    {{- if has $name $owned }}
+      {{- fail (printf "extraEnv sets %s, which the chart sets. Use the chart values." $name) }}
+    {{- end }}
+    {{- if or (has $name (list "IGGY_KAFKA_LISTENERS" "IGGY_KAFKA_ADVERTISED_LISTENERS")) (hasPrefix "IGGY_KAFKA_TLS_" $name) }}
+      {{- fail (printf "extraEnv sets %s. The chart runs one PLAINTEXT or SASL_PLAINTEXT listener and has no TLS listener yet." $name) }}
+    {{- end }}
+  {{- end }}
 {{- end }}

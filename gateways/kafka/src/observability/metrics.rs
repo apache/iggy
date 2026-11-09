@@ -342,6 +342,9 @@ mod tests {
     use kafka_protocol::protocol::StrBytes;
 
     use super::*;
+    use crate::observability::census::{
+        CoordinatorCensus, GroupCensus, ListenerCensus, Pool, PoolCensus, ProduceSessionCensus,
+    };
     use crate::protocol::api::{
         API_KEY_FETCH, API_KEY_PRODUCE, API_KEY_SASL_HANDSHAKE, ERROR_NOT_LEADER_OR_FOLLOWER,
         ERROR_REQUEST_TIMED_OUT,
@@ -350,6 +353,118 @@ mod tests {
 
     fn rendered(metrics: &GatewayMetrics) -> String {
         metrics.render(Census::default(), &ReadyState::Starting)
+    }
+
+    /// The value of the sample `series` in `text`.
+    fn sample(text: &str, series: &str) -> Option<f64> {
+        text.lines().find_map(|line| {
+            let value = line.strip_prefix(series)?.strip_prefix(' ')?;
+            value.split_whitespace().next()?.parse().ok()
+        })
+    }
+
+    #[test]
+    fn given_a_census_should_render_each_of_its_series() {
+        let census = Census {
+            listeners: vec![ListenerCensus {
+                protocol: SecurityProtocol::SaslSsl,
+                open: 3,
+                limit: 100,
+            }],
+            pools: vec![
+                PoolCensus {
+                    pool: Pool::Fetch,
+                    used: 2,
+                    capacity: 16,
+                },
+                PoolCensus {
+                    pool: Pool::ProduceLarge,
+                    used: 1,
+                    capacity: 4,
+                },
+                PoolCensus {
+                    pool: Pool::Authentication,
+                    used: 5,
+                    capacity: 6,
+                },
+                PoolCensus {
+                    pool: Pool::CertificateLookup,
+                    used: 0,
+                    capacity: 6,
+                },
+            ],
+            produce_memory: Some((1_024, 4_096)),
+            produce_sessions: Some(ProduceSessionCensus {
+                own: 7,
+                limit: 8,
+                shared: 9,
+            }),
+            groups: GroupCensus {
+                states: vec![("Stable", 2), ("Empty", 1)],
+                members: 5,
+            },
+            coordinator: Some(CoordinatorCensus {
+                served: vec![1, 3],
+                partitions: 4,
+                lease_age: Duration::from_millis(1_500),
+            }),
+            sends_in_doubt: Some(11),
+            iggy_reachable: Some(true),
+        };
+        let text = GatewayMetrics::new().render(census, &ReadyState::Ready);
+
+        let expected = [
+            ("iggy_kafka_gateway_ready", 1.0),
+            ("iggy_kafka_gateway_iggy_reachable", 1.0),
+            (
+                "iggy_kafka_gateway_connections_open{listener=\"SASL_SSL\"}",
+                3.0,
+            ),
+            (
+                "iggy_kafka_gateway_connections_limit{listener=\"SASL_SSL\"}",
+                100.0,
+            ),
+            ("iggy_kafka_gateway_slots_used{pool=\"fetch\"}", 2.0),
+            ("iggy_kafka_gateway_slots{pool=\"fetch\"}", 16.0),
+            ("iggy_kafka_gateway_slots_used{pool=\"produce_large\"}", 1.0),
+            ("iggy_kafka_gateway_slots{pool=\"produce_large\"}", 4.0),
+            (
+                "iggy_kafka_gateway_slots_used{pool=\"authentication\"}",
+                5.0,
+            ),
+            ("iggy_kafka_gateway_slots{pool=\"authentication\"}", 6.0),
+            (
+                "iggy_kafka_gateway_slots_used{pool=\"certificate_lookup\"}",
+                0.0,
+            ),
+            ("iggy_kafka_gateway_slots{pool=\"certificate_lookup\"}", 6.0),
+            ("iggy_kafka_gateway_produce_memory_used_bytes", 1_024.0),
+            ("iggy_kafka_gateway_produce_memory_capacity_bytes", 4_096.0),
+            ("iggy_kafka_gateway_produce_sessions", 7.0),
+            ("iggy_kafka_gateway_produce_sessions_limit", 8.0),
+            ("iggy_kafka_gateway_produce_shared_producers", 9.0),
+            ("iggy_kafka_gateway_produce_sends_in_doubt_total", 11.0),
+            ("iggy_kafka_gateway_groups{state=\"Stable\"}", 2.0),
+            ("iggy_kafka_gateway_groups{state=\"Empty\"}", 1.0),
+            ("iggy_kafka_gateway_group_members", 5.0),
+            ("iggy_kafka_gateway_coordinator_partitions_served", 2.0),
+            (
+                "iggy_kafka_gateway_coordinator_partition_served{partition=\"0\"}",
+                0.0,
+            ),
+            (
+                "iggy_kafka_gateway_coordinator_partition_served{partition=\"1\"}",
+                1.0,
+            ),
+            (
+                "iggy_kafka_gateway_coordinator_partition_served{partition=\"3\"}",
+                1.0,
+            ),
+            ("iggy_kafka_gateway_coordinator_lease_age_seconds", 1.5),
+        ];
+        for (series, value) in expected {
+            assert_eq!(sample(&text, series), Some(value), "{series} in:\n{text}");
+        }
     }
 
     fn produce_response(codes: &[i16]) -> Bytes {

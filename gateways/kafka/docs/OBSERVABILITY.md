@@ -20,8 +20,9 @@ Otherwise it answers 503 and the reason:
 
 The bridge pings Iggy each second on a client of its own. A ping that takes more than 2 s fails.
 After two failed checks in a row, `/ready` answers 503, about 5 s after Iggy stops or stops
-answering. The second check dials Iggy again, through every node the bridge knows. One check that
-succeeds makes the gateway ready again.
+answering. After a failed ping, the next check dials every node the bridge knows at once, and the
+first node that answers within 2 s counts. So one dead node does not make the gateway unready while
+another node answers. One check that succeeds makes the gateway ready again.
 
 The ping checks that one Iggy node answers and that the bridge's user signs in. It does not check
 that the cluster takes writes. Error codes in the metrics show that.
@@ -32,10 +33,11 @@ because a restart does not bring Iggy back.
 The endpoint starts before the bridge connects. An orchestrator therefore sees a gateway that waits
 for Iggy as live and not ready, and does not restart it.
 
-`iggy-gateway-kafka --check-ready` asks `/ready` at `IGGY_KAFKA_HTTP_ADDR` and exits 0 on 200. On
-any other answer, or no answer within 3 s, it prints the reason and exits 1. An unspecified address
-such as `0.0.0.0` is asked on the loopback address. The image's `HEALTHCHECK` runs it, so the image
-needs no HTTP client.
+`iggy-gateway-kafka --check-ready` asks `/ready` at `IGGY_KAFKA_HTTP_ADDR` and exits 0 on 200.
+`--check-live` asks `/live`. On any other answer, or no answer within 3 s, it prints the reason and
+exits 1. An unspecified address such as `0.0.0.0` is asked on the loopback address. The image's
+`HEALTHCHECK` runs `--check-live`, so the image needs no HTTP client and an Iggy outage restarts no
+gateway. `docker-compose.yml` runs `--check-ready`, so `depends_on` waits for Iggy.
 
 ## Metrics
 
@@ -146,12 +148,12 @@ the peer, the listener, the cause and a detail, such as the error or the request
 | `frame_too_large` | warn | A frame is larger than `IGGY_KAFKA_MAX_FRAME_SIZE`. A TLS or HTTP client on a plaintext listener looks the same |
 | `invalid_frame` | warn | A frame has a length of zero or less |
 | `invalid_request` | warn | A request header does not decode |
-| `request_refused` | warn | No response can answer a request, such as an API key or version that the gateway does not serve |
-| `unacknowledged_produce_failed` | warn | A Produce with `acks=0` failed. Kafka closes such a connection, so the client refreshes its metadata |
+| `request_refused` | warn | No response can answer a request, such as an API key or version that the gateway does not serve, or a body that does not decode |
+| `unacknowledged_produce_failed` | warn | Iggy did not take the records of a Produce with `acks=0` in time. Kafka closes such a connection, so the client refreshes its metadata |
 | `illegal_sasl_state` | warn | A request came before SASL authentication. The client is not configured for SASL on this listener |
 | `unsupported_sasl_mechanism` | warn | The client asked for a SASL mechanism other than `PLAIN` |
 | `authentication_failed` | warn | Iggy rejected the credentials, or the token was malformed |
-| `authentication_dropped` | warn | The credentials were not checked: the peer was throttled after a rejected login, no check slot came free, or Iggy was unreachable |
+| `authentication_dropped` | warn | The credentials, or the user a client certificate names, were not checked. `detail` says why: the peer was throttled after a rejected login, no check slot came free, the check timed out, or Iggy was unreachable. A check cut short by a shutdown counts as `shutdown` |
 | `tls_handshake_failed` | warn | The TLS handshake failed or did not finish in time. A plaintext client on a TLS listener looks the same |
 | `certificate_rejected` | warn | The client certificate names no active Iggy user, or no mapping rule matches its subject |
 | `connection_limit` | warn | The listener held `IGGY_KAFKA_MAX_CONNECTIONS`. Counted in `connections_refused_total` |

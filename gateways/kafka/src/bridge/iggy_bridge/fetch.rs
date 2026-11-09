@@ -541,6 +541,23 @@ mod tests {
         Arc::new(client)
     }
 
+    #[tokio::test]
+    async fn given_a_held_fetch_slot_should_count_it_as_used() {
+        let bridge = IggyBridge::offline();
+        bridge.hold_fetch_clients(&unconnected()).await;
+        let slots = bridge.fetch_slot_use().1;
+
+        let slot = bridge
+            .fetch_slot(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("a free slot");
+        assert_eq!(bridge.fetch_slot_use(), (1, slots));
+        assert_eq!(slots, crate::bridge::DEFAULT_FETCH_SLOTS.get());
+
+        drop(slot);
+        assert_eq!(bridge.fetch_slot_use(), (0, slots));
+    }
+
     fn config() -> IggyBridgeConfig {
         IggyBridge::offline().config
     }

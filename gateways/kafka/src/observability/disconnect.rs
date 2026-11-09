@@ -75,8 +75,9 @@ pub enum CloseCause {
     UnsupportedSaslMechanism,
     /// Iggy rejected the credentials, or the token was malformed.
     AuthenticationFailed,
-    /// The credentials could not be checked: the peer was throttled after a rejected login, no
-    /// check slot came free, Iggy was unreachable or the gateway shut down.
+    /// The credentials, or the user a client certificate names, could not be checked: the peer
+    /// was throttled after a rejected login, no check slot came free, the check timed out or Iggy
+    /// was unreachable. The log line says which.
     AuthenticationDropped,
     /// The TLS handshake failed or did not finish in time.
     TlsHandshakeFailed,
@@ -182,9 +183,7 @@ impl CloseCause {
             }
             Self::AuthenticationFailed => "Kafka connection closed: SASL authentication failed",
             Self::AuthenticationDropped => {
-                "Kafka connection closed: the SASL credentials could not be checked. The peer is \
-                 throttled after a rejected login, no check slot came free, or Iggy is \
-                 unreachable"
+                "Kafka connection closed: the credentials could not be checked"
             }
             Self::TlsHandshakeFailed => "Kafka connection closed: the TLS handshake failed",
             Self::CertificateRejected => {
@@ -407,7 +406,159 @@ impl Window {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
     use super::*;
+
+    /// One log line: its level, its `cause` and its `left_out`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Line {
+        level: tracing::Level,
+        cause: String,
+        left_out: Option<u64>,
+    }
+
+    /// Collects the log lines written while it is the default subscriber.
+    #[derive(Clone, Default)]
+    struct Lines(Arc<Mutex<Vec<Line>>>);
+
+    impl Lines {
+        fn take(&self) -> Vec<Line> {
+            std::mem::take(&mut self.0.lock().unwrap())
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for Lines {
+        fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(Line {
+                level: *event.metadata().level(),
+                cause: fields.cause,
+                left_out: fields.left_out,
+            });
+        }
+    }
+
+    #[derive(Default)]
+    struct Fields {
+        cause: String,
+        left_out: Option<u64>,
+    }
+
+    impl Visit for Fields {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "cause" {
+                self.cause = value.to_string();
+            }
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            if field.name() == "left_out" {
+                self.left_out = Some(value);
+            }
+        }
+
+        fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+    }
+
+    /// Runs `log` with `lines` collecting what it writes.
+    fn logged(lines: &Lines, log: impl FnOnce()) {
+        let subscriber = tracing_subscriber::registry().with(lines.clone());
+        tracing::subscriber::with_default(subscriber, log);
+    }
+
+    fn peer() -> SocketAddr {
+        "10.0.0.7:50000".parse().unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_each_cause_should_log_it_at_the_level_of_who_acts_on_it() {
+        let lines = Lines::default();
+        logged(&lines, || {
+            let log = DisconnectLog::default();
+            for cause in CloseCause::ALL {
+                log.log(peer(), SecurityProtocol::Plaintext, &Disconnect::new(cause));
+            }
+        });
+
+        let levels: Vec<(String, tracing::Level)> = lines
+            .take()
+            .into_iter()
+            .map(|line| (line.cause, line.level))
+            .collect();
+        let expected: Vec<(String, tracing::Level)> = CloseCause::ALL
+            .iter()
+            .map(|cause| {
+                let level = match cause {
+                    CloseCause::ClientClosed | CloseCause::IdleTimeout | CloseCause::Shutdown => {
+                        tracing::Level::DEBUG
+                    }
+                    CloseCause::UserRevoked => tracing::Level::INFO,
+                    CloseCause::InternalError => tracing::Level::ERROR,
+                    _ => tracing::Level::WARN,
+                };
+                (cause.label().to_string(), level)
+            })
+            .collect();
+        assert_eq!(levels, expected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_flood_of_warnings_should_log_five_each_ten_seconds() {
+        let lines = Lines::default();
+        let log = DisconnectLog::default();
+        let flood = |cause: CloseCause, times: usize| {
+            logged(&lines, || {
+                for _ in 0..times {
+                    log.log(peer(), SecurityProtocol::Plaintext, &Disconnect::new(cause));
+                }
+            });
+        };
+
+        flood(CloseCause::FrameTooLarge, 8);
+        flood(CloseCause::InternalError, 8);
+        let first = lines.take();
+        assert_eq!(
+            first
+                .iter()
+                .filter(|line| line.cause == "frame_too_large")
+                .count(),
+            5,
+            "{first:?}"
+        );
+        assert_eq!(
+            first
+                .iter()
+                .filter(|line| line.cause == "internal_error")
+                .count(),
+            5,
+            "errors are limited too: {first:?}"
+        );
+
+        tokio::time::advance(Duration::from_millis(9_999)).await;
+        flood(CloseCause::FrameTooLarge, 1);
+        assert_eq!(lines.take(), [], "the window lasts 10 s");
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        flood(CloseCause::FrameTooLarge, 1);
+        assert_eq!(
+            lines.take(),
+            [Line {
+                level: tracing::Level::WARN,
+                cause: "frame_too_large".to_string(),
+                left_out: Some(4),
+            }],
+            "the first line of a new window says how many were left out"
+        );
+
+        flood(CloseCause::ClientClosed, 8);
+        assert_eq!(lines.take().len(), 8, "debug lines are not limited");
+    }
 
     #[test]
     fn given_the_causes_should_index_each_one_at_its_place() {

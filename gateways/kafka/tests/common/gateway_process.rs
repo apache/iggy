@@ -63,16 +63,31 @@ impl TestGateway {
     /// Starts `iggy-gateway-kafka` against the Iggy server that `config` names, which need not run
     /// yet. [`Self::wait_ready`] waits for its listener.
     pub fn start(config: &IggyBridgeConfig) -> Self {
-        Self::start_configured(config, None)
+        Self::start_configured(Some(config), None, &[])
     }
 
     /// [`Self::start`], with the HTTP endpoint of metrics, readiness and liveness on a port of its
     /// own (`IGGY_KAFKA_HTTP_ADDR`).
     pub fn start_with_http(config: &IggyBridgeConfig) -> Self {
-        Self::start_configured(config, Some(PortGuard::acquire()))
+        Self::start_with_http_env(config, &[])
     }
 
-    fn start_configured(config: &IggyBridgeConfig, http_port_guard: Option<PortGuard>) -> Self {
+    /// [`Self::start_with_http`], with more `IGGY_KAFKA_*` variables.
+    pub fn start_with_http_env(config: &IggyBridgeConfig, env: &[(&str, &str)]) -> Self {
+        Self::start_configured(Some(config), Some(PortGuard::acquire()), env)
+    }
+
+    /// A gateway with the HTTP endpoint and the `IGGY_KAFKA_*` variables `env`, so without the
+    /// bridge unless `env` enables it.
+    pub fn start_with_env(env: &[(&str, &str)]) -> Self {
+        Self::start_configured(None, Some(PortGuard::acquire()), env)
+    }
+
+    fn start_configured(
+        config: Option<&IggyBridgeConfig>,
+        http_port_guard: Option<PortGuard>,
+        env: &[(&str, &str)],
+    ) -> Self {
         let port_guard = PortGuard::acquire();
         let address = format!("127.0.0.1:{}", port_guard.port);
         let http_address = http_port_guard
@@ -90,22 +105,31 @@ impl TestGateway {
         if let Some(llvm_profile_file) = env::var_os("LLVM_PROFILE_FILE") {
             command.env("LLVM_PROFILE_FILE", llvm_profile_file);
         }
-        command
-            .env("IGGY_KAFKA_BIND_ADDR", &address)
-            .env("IGGY_KAFKA_BRIDGE_ENABLED", "true")
-            .env("IGGY_KAFKA_IGGY_ADDR", &config.address)
-            .env("IGGY_KAFKA_IGGY_USERNAME", &config.username)
-            .env(
-                "IGGY_KAFKA_IDEMPOTENT_PRODUCERS",
-                config.idempotent_producers.to_string(),
-            )
-            .env(
-                "IGGY_KAFKA_IGGY_PASSWORD",
-                secrecy::ExposeSecret::expose_secret(&config.password),
-            );
+        command.env("IGGY_KAFKA_BIND_ADDR", &address);
+        match config {
+            Some(config) => {
+                command
+                    .env("IGGY_KAFKA_BRIDGE_ENABLED", "true")
+                    .env("IGGY_KAFKA_IGGY_ADDR", &config.address)
+                    .env("IGGY_KAFKA_IGGY_USERNAME", &config.username)
+                    .env(
+                        "IGGY_KAFKA_IDEMPOTENT_PRODUCERS",
+                        config.idempotent_producers.to_string(),
+                    )
+                    .env(
+                        "IGGY_KAFKA_IGGY_PASSWORD",
+                        secrecy::ExposeSecret::expose_secret(&config.password),
+                    );
+            }
+            // The gateway turns the bridge on by default.
+            None => {
+                command.env("IGGY_KAFKA_BRIDGE_ENABLED", "false");
+            }
+        }
         if let Some(http_address) = &http_address {
             command.env("IGGY_KAFKA_HTTP_ADDR", http_address);
         }
+        command.envs(env.iter().copied());
         let child = command.spawn().expect("spawn iggy-gateway-kafka");
 
         Self {
@@ -130,6 +154,14 @@ impl TestGateway {
             .arg("--check-ready")
             .output()
             .expect("run iggy-gateway-kafka --check-ready")
+    }
+
+    /// Sends SIGTERM, as an orchestrator does, and returns at once.
+    pub fn terminate(&mut self) {
+        // Safety: the child has not been reaped: `Drop` is the only wait.
+        unsafe {
+            libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
+        }
     }
 
     /// Whether the process still runs.

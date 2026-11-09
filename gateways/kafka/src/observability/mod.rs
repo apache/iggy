@@ -41,7 +41,7 @@ pub use census::{
 };
 pub use disconnect::{CloseCause, Disconnect, FrameTimeout};
 pub use health::{Readiness, ReadyState};
-pub use http::{HttpEndpoint, check_ready};
+pub use http::{HealthCheck, HttpEndpoint, check};
 pub use metrics::GatewayMetrics;
 
 use crate::bridge::Reach;

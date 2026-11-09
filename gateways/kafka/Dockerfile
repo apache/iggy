@@ -89,9 +89,10 @@ EXPOSE 9093 9096
 
 USER 10001:10001
 
-# The binary asks its own /ready, so the image needs no HTTP client. The start period covers the
-# 60 s the gateway waits for Iggy at startup.
-HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
-    CMD ["/iggy-gateway-kafka", "--check-ready"]
+# /live, not /ready: an orchestrator that restarts unhealthy containers would restart every
+# gateway during an Iggy outage, and a restart does not bring Iggy back. docker-compose.yml asks
+# /ready for depends_on. The binary asks itself, so the image needs no HTTP client.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["/iggy-gateway-kafka", "--check-live"]
 
 CMD ["/iggy-gateway-kafka"]

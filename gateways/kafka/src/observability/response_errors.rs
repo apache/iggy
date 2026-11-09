@@ -312,7 +312,37 @@ impl ErrorCodes for OffsetDeleteResponse {
 mod tests {
     use bytes::Bytes;
     use kafka_protocol::messages::MetadataRequest;
+    use kafka_protocol::messages::alter_configs_response::AlterConfigsResourceResponse;
+    use kafka_protocol::messages::create_partitions_response::CreatePartitionsTopicResult;
+    use kafka_protocol::messages::create_topics_response::CreatableTopicResult;
+    use kafka_protocol::messages::delete_groups_response::DeletableGroupResult;
+    use kafka_protocol::messages::delete_topics_response::DeletableTopicResult;
+    use kafka_protocol::messages::describe_configs_response::DescribeConfigsResult;
+    use kafka_protocol::messages::describe_groups_response::DescribedGroup;
+    use kafka_protocol::messages::fetch_response::{FetchableTopicResponse, PartitionData};
+    use kafka_protocol::messages::find_coordinator_response::Coordinator;
+    use kafka_protocol::messages::incremental_alter_configs_response::AlterConfigsResourceResponse as IncrementalResource;
+    use kafka_protocol::messages::leave_group_response::MemberResponse;
+    use kafka_protocol::messages::list_offsets_response::{
+        ListOffsetsPartitionResponse, ListOffsetsTopicResponse,
+    };
     use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
+    use kafka_protocol::messages::metadata_response::{
+        MetadataResponsePartition, MetadataResponseTopic,
+    };
+    use kafka_protocol::messages::offset_commit_response::{
+        OffsetCommitResponsePartition, OffsetCommitResponseTopic,
+    };
+    use kafka_protocol::messages::offset_delete_response::{
+        OffsetDeleteResponsePartition, OffsetDeleteResponseTopic,
+    };
+    use kafka_protocol::messages::offset_fetch_response::{
+        OffsetFetchResponseGroup, OffsetFetchResponsePartition, OffsetFetchResponsePartitions,
+        OffsetFetchResponseTopic, OffsetFetchResponseTopics,
+    };
+    use kafka_protocol::messages::produce_response::{
+        PartitionProduceResponse, TopicProduceResponse,
+    };
     use kafka_protocol::protocol::StrBytes;
 
     use super::*;
@@ -376,6 +406,338 @@ mod tests {
                 ERROR_UNKNOWN_TOPIC_OR_PARTITION
             ]
         );
+    }
+
+    fn encoded<T: kafka_protocol::protocol::Encodable>(response: &T, version: i16) -> Bytes {
+        iggy_kafka_wire::codec::encode_message(response, version, 64).expect("the response encodes")
+    }
+
+    /// A response of `api_key` at `version`, and the codes the walker must read from it.
+    type Case = (i16, i16, Bytes, Vec<i16>);
+
+    /// Responses of the APIs that read and write records and offsets.
+    fn record_cases() -> Vec<Case> {
+        vec![
+            (
+                API_KEY_PRODUCE,
+                9,
+                encoded(
+                    &ProduceResponse::default().with_responses(vec![
+                        TopicProduceResponse::default().with_partition_responses(vec![
+                            PartitionProduceResponse::default().with_error_code(11),
+                            PartitionProduceResponse::default().with_error_code(12),
+                        ]),
+                    ]),
+                    9,
+                ),
+                vec![11, 12],
+            ),
+            (
+                API_KEY_FETCH,
+                12,
+                encoded(
+                    &FetchResponse::default()
+                        .with_error_code(11)
+                        .with_responses(vec![
+                            FetchableTopicResponse::default().with_partitions(vec![
+                                PartitionData::default().with_error_code(12),
+                            ]),
+                        ]),
+                    12,
+                ),
+                vec![11, 12],
+            ),
+            (
+                API_KEY_LIST_OFFSETS,
+                7,
+                encoded(
+                    &ListOffsetsResponse::default().with_topics(vec![
+                        ListOffsetsTopicResponse::default().with_partitions(vec![
+                            ListOffsetsPartitionResponse::default().with_error_code(11),
+                        ]),
+                    ]),
+                    7,
+                ),
+                vec![11],
+            ),
+            (
+                API_KEY_METADATA,
+                13,
+                encoded(
+                    &MetadataResponse::default()
+                        .with_error_code(11)
+                        .with_topics(vec![
+                            MetadataResponseTopic::default()
+                                .with_error_code(12)
+                                .with_partitions(vec![
+                                    MetadataResponsePartition::default().with_error_code(13),
+                                ]),
+                        ]),
+                    13,
+                ),
+                vec![11, 12, 13],
+            ),
+            (
+                API_KEY_OFFSET_COMMIT,
+                8,
+                encoded(
+                    &OffsetCommitResponse::default().with_topics(vec![
+                        OffsetCommitResponseTopic::default().with_partitions(vec![
+                            OffsetCommitResponsePartition::default().with_error_code(11),
+                        ]),
+                    ]),
+                    8,
+                ),
+                vec![11],
+            ),
+        ]
+    }
+
+    /// `OffsetFetch` answers one group before v8 and many from v8.
+    fn offset_fetch_cases() -> Vec<Case> {
+        vec![
+            (
+                API_KEY_OFFSET_FETCH,
+                7,
+                encoded(
+                    &OffsetFetchResponse::default()
+                        .with_error_code(11)
+                        .with_topics(vec![OffsetFetchResponseTopic::default().with_partitions(
+                            vec![OffsetFetchResponsePartition::default().with_error_code(12)],
+                        )]),
+                    7,
+                ),
+                vec![11, 12],
+            ),
+            (
+                API_KEY_OFFSET_FETCH,
+                8,
+                encoded(
+                    &OffsetFetchResponse::default().with_groups(vec![
+                        OffsetFetchResponseGroup::default()
+                            .with_error_code(11)
+                            .with_topics(vec![
+                                OffsetFetchResponseTopics::default().with_partitions(vec![
+                                    OffsetFetchResponsePartitions::default().with_error_code(12),
+                                ]),
+                            ]),
+                    ]),
+                    8,
+                ),
+                vec![11, 12],
+            ),
+        ]
+    }
+
+    /// Responses of the group APIs.
+    fn group_cases() -> Vec<Case> {
+        vec![
+            (
+                API_KEY_FIND_COORDINATOR,
+                3,
+                encoded(&FindCoordinatorResponse::default().with_error_code(11), 3),
+                vec![11],
+            ),
+            (
+                API_KEY_FIND_COORDINATOR,
+                4,
+                encoded(
+                    &FindCoordinatorResponse::default().with_coordinators(vec![
+                        Coordinator::default().with_error_code(11),
+                        Coordinator::default().with_error_code(12),
+                    ]),
+                    4,
+                ),
+                vec![11, 12],
+            ),
+            (
+                API_KEY_JOIN_GROUP,
+                7,
+                encoded(&JoinGroupResponse::default().with_error_code(11), 7),
+                vec![11],
+            ),
+            (
+                API_KEY_HEARTBEAT,
+                4,
+                encoded(&HeartbeatResponse::default().with_error_code(11), 4),
+                vec![11],
+            ),
+            (
+                API_KEY_LEAVE_GROUP,
+                3,
+                encoded(
+                    &LeaveGroupResponse::default()
+                        .with_error_code(11)
+                        .with_members(vec![MemberResponse::default().with_error_code(12)]),
+                    3,
+                ),
+                vec![11, 12],
+            ),
+            (
+                API_KEY_SYNC_GROUP,
+                5,
+                encoded(&SyncGroupResponse::default().with_error_code(11), 5),
+                vec![11],
+            ),
+            (
+                API_KEY_DESCRIBE_GROUPS,
+                5,
+                encoded(
+                    &DescribeGroupsResponse::default()
+                        .with_groups(vec![DescribedGroup::default().with_error_code(11)]),
+                    5,
+                ),
+                vec![11],
+            ),
+            (
+                API_KEY_LIST_GROUPS,
+                4,
+                encoded(&ListGroupsResponse::default().with_error_code(11), 4),
+                vec![11],
+            ),
+            (
+                API_KEY_DELETE_GROUPS,
+                2,
+                encoded(
+                    &DeleteGroupsResponse::default()
+                        .with_results(vec![DeletableGroupResult::default().with_error_code(11)]),
+                    2,
+                ),
+                vec![11],
+            ),
+            (
+                API_KEY_OFFSET_DELETE,
+                0,
+                encoded(
+                    &OffsetDeleteResponse::default()
+                        .with_error_code(11)
+                        .with_topics(vec![OffsetDeleteResponseTopic::default().with_partitions(
+                            vec![OffsetDeleteResponsePartition::default().with_error_code(12)],
+                        )]),
+                    0,
+                ),
+                vec![11, 12],
+            ),
+        ]
+    }
+
+    /// Responses of the SASL, topic, config and cluster APIs.
+    fn other_cases() -> Vec<Case> {
+        vec![
+            (
+                API_KEY_SASL_HANDSHAKE,
+                1,
+                encoded(&SaslHandshakeResponse::default().with_error_code(11), 1),
+                vec![11],
+            ),
+            (
+                API_KEY_CREATE_TOPICS,
+                5,
+                encoded(
+                    &CreateTopicsResponse::default()
+                        .with_topics(vec![CreatableTopicResult::default().with_error_code(11)]),
+                    5,
+                ),
+                vec![11],
+            ),
+            (
+                API_KEY_DELETE_TOPICS,
+                4,
+                encoded(
+                    &DeleteTopicsResponse::default()
+                        .with_responses(vec![DeletableTopicResult::default().with_error_code(11)]),
+                    4,
+                ),
+                vec![11],
+            ),
+            (
+                API_KEY_INIT_PRODUCER_ID,
+                4,
+                encoded(&InitProducerIdResponse::default().with_error_code(11), 4),
+                vec![11],
+            ),
+            (
+                API_KEY_DESCRIBE_ACLS,
+                3,
+                encoded(&DescribeAclsResponse::default().with_error_code(11), 3),
+                vec![11],
+            ),
+            (
+                API_KEY_DESCRIBE_CONFIGS,
+                4,
+                encoded(
+                    &DescribeConfigsResponse::default()
+                        .with_results(vec![DescribeConfigsResult::default().with_error_code(11)]),
+                    4,
+                ),
+                vec![11],
+            ),
+            (
+                API_KEY_ALTER_CONFIGS,
+                2,
+                encoded(
+                    &AlterConfigsResponse::default().with_responses(vec![
+                        AlterConfigsResourceResponse::default().with_error_code(11),
+                    ]),
+                    2,
+                ),
+                vec![11],
+            ),
+            (
+                API_KEY_SASL_AUTHENTICATE,
+                2,
+                encoded(&SaslAuthenticateResponse::default().with_error_code(11), 2),
+                vec![11],
+            ),
+            (
+                API_KEY_CREATE_PARTITIONS,
+                3,
+                encoded(
+                    &CreatePartitionsResponse::default().with_results(vec![
+                        CreatePartitionsTopicResult::default().with_error_code(11),
+                    ]),
+                    3,
+                ),
+                vec![11],
+            ),
+            (
+                API_KEY_INCREMENTAL_ALTER_CONFIGS,
+                1,
+                encoded(
+                    &IncrementalAlterConfigsResponse::default()
+                        .with_responses(vec![IncrementalResource::default().with_error_code(11)]),
+                    1,
+                ),
+                vec![11],
+            ),
+            (
+                API_KEY_DESCRIBE_CLUSTER,
+                1,
+                encoded(&DescribeClusterResponse::default().with_error_code(11), 1),
+                vec![11],
+            ),
+        ]
+    }
+
+    /// One response per type, and per shape where the codes move between versions. Each level
+    /// carries a code of its own, so a walker that skips a level loses its code.
+    #[test]
+    fn given_every_response_type_should_read_the_code_of_each_level() {
+        let cases = [
+            record_cases(),
+            offset_fetch_cases(),
+            group_cases(),
+            other_cases(),
+        ]
+        .concat();
+        assert_eq!(cases.len(), 28);
+        for (api_key, version, body, expected) in cases {
+            assert_eq!(
+                codes(api_key, version, &body),
+                expected,
+                "API key {api_key} v{version}"
+            );
+        }
     }
 
     #[test]

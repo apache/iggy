@@ -139,8 +139,8 @@ With `IGGY_KAFKA_HTTP_ADDR` set, the gateway serves three paths over HTTP:
 | `/live` | 200 while the process answers. Iggy out of reach does not change it |
 
 The endpoint starts before the bridge connects, so an orchestrator sees the gateway live and not
-ready while it waits for Iggy. `iggy-gateway-kafka --check-ready` asks `/ready` at
-`IGGY_KAFKA_HTTP_ADDR` and exits 0 on 200, for a container health check.
+ready while it waits for Iggy. `iggy-gateway-kafka --check-ready` and `--check-live` ask `/ready`
+or `/live` at `IGGY_KAFKA_HTTP_ADDR` and exit 0 on 200, for a container health check.
 
 Each closed Kafka connection is counted by its cause. A cause that someone must act on, such as an
 oversized frame, a timeout or a failed login, logs at warn, at most 5 lines per cause each 10 s. A
@@ -185,7 +185,17 @@ configuration.
 
 The image runs as user and group 10001, and the gateway writes no file, so a read-only root file
 system works. It exposes 9093 (Kafka) and 9096 (`/metrics`, `/ready`, `/live`, set by
-`IGGY_KAFKA_HTTP_ADDR`). Its `HEALTHCHECK` runs `iggy-gateway-kafka --check-ready`.
+`IGGY_KAFKA_HTTP_ADDR`). Its `HEALTHCHECK` runs `iggy-gateway-kafka --check-live`, so a tool that
+restarts unhealthy containers does not restart every gateway while Iggy is down. Use
+`--check-ready` where a dependency must wait for Iggy, as `docker-compose.yml` does.
+
+Upgrading from an image before 0.2.1:
+
+- The gateway runs as user 10001, not root. A TLS key or certificate bind-mounted from the host
+  must be readable by that user. A root-only `0600` key stops the gateway at startup. Kubernetes
+  and Docker secret mounts are not affected.
+- The image no longer has `nc`. A health check that runs `nc -z` stays unhealthy. Run
+  `/iggy-gateway-kafka --check-ready` instead.
 
 On Kubernetes, the [`iggy-kafka-gateway` chart](../../helm/charts/iggy-kafka-gateway) runs N gateways
 as a StatefulSet beside an Iggy server or cluster, with probes on `/live` and `/ready`.

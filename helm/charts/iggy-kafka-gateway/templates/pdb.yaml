@@ -24,6 +24,9 @@ metadata:
     {{- include "iggy-kafka-gateway.labels" . | nindent 4 }}
 spec:
   maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- with .Values.podDisruptionBudget.unhealthyPodEvictionPolicy }}
+  unhealthyPodEvictionPolicy: {{ . }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "iggy-kafka-gateway.selectorLabels" . | nindent 6 }}

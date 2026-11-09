@@ -85,6 +85,9 @@ pub enum HandleOutcome {
     RespondThenClose(Bytes),
     /// No parseable response exists for this request; close the TCP connection.
     Close,
+    /// Produce with `acks=0` whose records Iggy did not take in time. Write nothing and close,
+    /// as Kafka does, so the client refreshes its metadata.
+    UnacknowledgedProduceFailed,
 }
 
 impl HandleOutcome {
@@ -100,6 +103,7 @@ impl HandleOutcome {
             Self::Respond(body) | Self::RespondThenClose(body) => body,
             Self::NoResponse => panic!("{msg}: got NoResponse"),
             Self::Close => panic!("{msg}: got Close"),
+            Self::UnacknowledgedProduceFailed => panic!("{msg}: got UnacknowledgedProduceFailed"),
         }
     }
 
@@ -970,6 +974,18 @@ mod tests {
     use iggy_kafka_wire::bounds_guard::guarded_range;
 
     use super::*;
+
+    #[tokio::test]
+    async fn given_held_produce_slots_and_memory_should_count_them() {
+        let state = GatewayState::stub(1_024);
+        let _large = state.produce_large.acquire().await.unwrap();
+        let _memory = state.produce_memory.acquire_many(300).await.unwrap();
+
+        let (large, (used, capacity)) = state.produce_use();
+        assert_eq!(large.pool, Pool::ProduceLarge);
+        assert_eq!((large.used, large.capacity), (1, PRODUCE_LARGE));
+        assert_eq!((used, capacity), (300, produce_memory_capacity(1_024)));
+    }
 
     /// A version this gateway advertises but the guard does not walk would reach the decoder
     /// unchecked, so the two tables must never drift apart.

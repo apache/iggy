@@ -21,9 +21,8 @@ name: iggy-kafka-gateway
 description: A Helm chart for the Apache Iggy Kafka gateway, N Kafka brokers in front of an Iggy server or cluster
 type: application
 version: 0.1.0
-# The gateway serves /ready, which the probes ask, from the build after 0.2.0. Until a release
-# carries it, the chart runs the rolling `edge` image.
-appVersion: "edge"
+# First gateway build with /ready, which the probes ask.
+appVersion: "0.2.1-edge.1"
 sources:
   - https://github.com/apache/iggy
 keywords:

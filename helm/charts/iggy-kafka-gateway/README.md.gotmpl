@@ -29,10 +29,11 @@ stops hands its groups to the others.
 
 ## Prerequisites
 
-* Kubernetes 1.21+ (`policy/v1` PodDisruptionBudget)
+* Kubernetes 1.27+ (`unhealthyPodEvictionPolicy` of the PodDisruptionBudget)
 * Helm 3.2.0+
 * An Iggy server or cluster that the pods reach over TCP. The [iggy chart](../iggy) runs one.
-* With more than one gateway, an Iggy user with the `manage_servers` permission. The root user has it.
+* With more than one gateway, an Iggy user with the `manage_servers` permission, or the gateways do
+  not start. The root user has it.
 * Prometheus Operator CRDs if `serviceMonitor.enabled=true`
 
 ## Quick Start
@@ -65,9 +66,13 @@ a gateway that lost Iggy and gets a Kafka error code that it retries.
 
 * Clients connect to the per-pod DNS names, so they run inside the cluster. The chart has no
   external access per gateway yet.
-* The Kafka listener is PLAINTEXT, or SASL_PLAINTEXT with `kafka.sasl.enabled`. For TLS listeners,
-  set `IGGY_KAFKA_*` variables through `extraEnv` and mount the certificates through
-  `extraVolumes`, as the gateway README describes.
+* The Kafka listener is PLAINTEXT, or SASL_PLAINTEXT with `kafka.sasl.enabled`. The chart has no
+  TLS listener yet.
+* SASL is off by default: any pod that reaches the Kafka port can create and delete topics as
+  `iggy.username`. Set `kafka.sasl.enabled=true`, and give the bridge a user without root rights
+  where you can.
+* One release per Iggy stream (`iggy.stream`, default `kafka`). The stream holds the coordinator
+  log, and every release numbers its gateways from 1.
 * The image runs as user 10001 with a read-only root file system.
 
 {{ template "chart.requirementsSection" . }}

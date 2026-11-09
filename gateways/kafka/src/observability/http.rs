@@ -22,6 +22,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,8 +47,39 @@ const OPENMETRICS: &str = "application/openmetrics-text; version=1.0.0; charset=
 /// How long [`HttpEndpoint::stop`] waits for the requests in flight.
 const STOP_WAIT: Duration = Duration::from_secs(2);
 
-/// How long [`check_ready`] waits for an answer.
+/// How long [`check`] waits for an answer.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The path that a container health check asks: `--check-ready` or `--check-live`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthCheck {
+    Ready,
+    Live,
+}
+
+impl HealthCheck {
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Ready => "/ready",
+            Self::Live => "/live",
+        }
+    }
+}
+
+impl FromStr for HealthCheck {
+    type Err = String;
+
+    fn from_str(arg: &str) -> Result<Self, Self::Err> {
+        match arg {
+            "--check-ready" => Ok(Self::Ready),
+            "--check-live" => Ok(Self::Live),
+            _ => Err(format!(
+                "unknown argument `{arg}`: the gateway takes its configuration from IGGY_KAFKA_* \
+                 environment variables, and --check-ready and --check-live are its only arguments"
+            )),
+        }
+    }
+}
 
 /// A running HTTP endpoint.
 pub struct HttpEndpoint {
@@ -128,30 +160,31 @@ async fn live() -> &'static str {
     "live\n"
 }
 
-/// Asks the `/ready` of the endpoint bound to `addr`, for a container health check. An
-/// unspecified address, such as `0.0.0.0`, is asked on the loopback address.
+/// Asks `health` of the endpoint bound to `addr`, for a container health check. An unspecified
+/// address, such as `0.0.0.0`, is asked on the loopback address.
 ///
 /// # Errors
 ///
 /// What kept the answer from being 200: no connection, no answer in time, or the status line and
 /// the reason the endpoint gave.
-pub async fn check_ready(addr: SocketAddr) -> Result<(), String> {
+pub async fn check(addr: SocketAddr, health: HealthCheck) -> Result<(), String> {
     let addr = reachable(addr);
+    let path = health.path();
     let exchange = async {
         let mut stream = TcpStream::connect(addr).await?;
-        stream
-            .write_all(b"GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .await?;
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await?;
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await?;
         Ok::<_, io::Error>(response)
     };
     let response = match timeout(CHECK_TIMEOUT, exchange).await {
         Ok(Ok(response)) => response,
-        Ok(Err(error)) => return Err(format!("cannot ask {addr}/ready: {error}")),
+        Ok(Err(error)) => return Err(format!("cannot ask {addr}{path}: {error}")),
         Err(_) => {
             return Err(format!(
-                "{addr}/ready gave no answer within {CHECK_TIMEOUT:?}"
+                "{addr}{path} gave no answer within {CHECK_TIMEOUT:?}"
             ));
         }
     };
@@ -208,7 +241,15 @@ mod tests {
         let (status, body) = get(addr, "/ready").await;
         assert_eq!(status, 503);
         assert!(body.contains("not ready: starting"), "{body}");
-        assert!(check_ready(addr).await.unwrap_err().contains("starting"));
+        assert!(
+            check(addr, HealthCheck::Ready)
+                .await
+                .unwrap_err()
+                .contains("starting")
+        );
+        check(addr, HealthCheck::Live)
+            .await
+            .expect("live while it waits for Iggy");
 
         let (status, body) = get(addr, "/metrics").await;
         assert_eq!(status, 200);
@@ -221,13 +262,33 @@ mod tests {
 
         observability.readiness().serving(None);
         assert_eq!(get(addr, "/ready").await.0, 200);
-        check_ready(addr).await.expect("ready once it serves");
+        check(addr, HealthCheck::Ready)
+            .await
+            .expect("ready once it serves");
+
+        observability.draining();
+        assert!(
+            check(addr, HealthCheck::Ready)
+                .await
+                .unwrap_err()
+                .contains("shutting down")
+        );
+        check(addr, HealthCheck::Live)
+            .await
+            .expect("live while it drains");
 
         endpoint.stop().await;
         assert!(
-            check_ready(addr).await.is_err(),
+            check(addr, HealthCheck::Live).await.is_err(),
             "a stopped endpoint answers nothing"
         );
+    }
+
+    #[test]
+    fn given_the_health_check_arguments_should_name_their_paths() {
+        assert_eq!("--check-ready".parse(), Ok(HealthCheck::Ready));
+        assert_eq!("--check-live".parse(), Ok(HealthCheck::Live));
+        assert!("--check".parse::<HealthCheck>().is_err());
     }
 
     #[test]
