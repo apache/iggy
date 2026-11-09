@@ -144,6 +144,12 @@ pub trait DurableFile {
     /// Best-effort reservation that must not change bytes or logical length.
     /// Backends without physical allocation may ignore this hint. Returns how
     /// much of the file the reservation covers, 0 when it reserved nothing.
+    ///
+    /// An implementation that reserves space charges the reservation to
+    /// [`DISK_USAGE`](server_common::DISK_USAGE) itself. Callers charge only
+    /// the part of each write past the returned length, since the blocks below
+    /// it are charged already. The default reserves nothing and returns 0, so
+    /// callers charge every write.
     fn preallocate(&self, _path: &Path, _length: u64) -> impl Future<Output = u64> {
         async { 0 }
     }

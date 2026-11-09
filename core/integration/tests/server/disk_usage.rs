@@ -22,7 +22,7 @@
 //! same burst. Both belong to this server alone, so the sampler keeps running
 //! and the tests may run beside others.
 //!
-//! The foreign file test compares the `disk_used_bytes` estimate with the
+//! The foreign file test compares the `volume_used_bytes` estimate with the
 //! whole volume, so it must run alone. Only nextest guarantees that, since
 //! `.config/nextest.toml` gives it every thread. Under `cargo test` its
 //! `#[serial]` keeps out only the tests marked `#[serial]` or `#[parallel]`,
@@ -256,7 +256,7 @@ async fn settled_charges(http: &HttpClient) -> u64 {
     charged
 }
 
-/// The `disk_used_bytes` estimate and what `statvfs` reports for the volume,
+/// The `volume_used_bytes` estimate and what `statvfs` reports for the volume,
 /// read one after the other.
 #[derive(Clone, Copy)]
 struct UsageSnapshot {
@@ -266,7 +266,7 @@ struct UsageSnapshot {
 
 impl UsageSnapshot {
     async fn take(http: &HttpClient, data_path: &Path) -> Self {
-        let estimate = scrape(http, "disk_used_bytes").await;
+        let estimate = scrape(http, "volume_used_bytes").await;
         Self {
             estimate,
             volume: volume_used_bytes(data_path),

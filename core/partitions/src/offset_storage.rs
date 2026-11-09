@@ -26,7 +26,7 @@
 //! own that directory sync.
 
 use server_common::fatal::NoteDescriptorExhaustion;
-use server_common::{Charge, DISK_USAGE};
+use server_common::{DISK_USAGE, DiskCharge};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::io;
@@ -379,7 +379,9 @@ pub async fn persist_offset_retained(
 /// an existing file already owns one. Hold the charge until that record is
 /// written. Commits reopen existing files far more often than they create
 /// new ones, so the plain open goes first.
-async fn open_offset_file(path: &str) -> io::Result<(compio::fs::File, Option<Charge<'static>>)> {
+async fn open_offset_file(
+    path: &str,
+) -> io::Result<(compio::fs::File, Option<DiskCharge<'static>>)> {
     match OpenOptions::new().write(true).open(path).await {
         Ok(file) => return Ok((file, None)),
         Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),

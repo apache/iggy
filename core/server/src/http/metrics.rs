@@ -162,21 +162,23 @@ fn encode_topic_gauge(
 /// Exports the disk usage of the volume holding the data directory, read at
 /// encode time like [`StatsRollupUnderflows`].
 ///
-/// `disk_used_bytes` is the estimate: the last `statvfs` sample plus what Iggy
-/// has written since, so it moves with a burst instead of once a second. It is
-/// not exported until the first sample, since the charges alone say nothing
-/// about the volume. Used means total minus free blocks (`f_blocks - f_bfree`),
-/// as `df` reports it. The free space in `/stats` is `f_bavail`, which leaves
-/// out the blocks reserved for root, so the two differ by that reserve.
+/// `volume_used_bytes` is the estimate: the last `statvfs` sample plus what
+/// Iggy has written since, so it moves with a burst instead of once a second.
+/// It counts every file on the volume, not only Iggy's. It is not exported
+/// until the first sample, since the charges alone say nothing about the
+/// volume. Used means total minus free blocks (`f_blocks - f_bfree`), as `df`
+/// reports it. The free space in `/stats` is `f_bavail`, which leaves out the
+/// blocks reserved for root, so the two differ by that reserve.
 ///
 /// `disk_allocated_bytes` counts what the write sites charged since the
 /// process started, the part of the estimate that samples never move. Its
 /// increase over an interval follows what Iggy allocated in it, with two
-/// overcounts: a write that failed stays charged, and a preallocation charges
-/// its whole segment up front, even when the reservation fails or allocates
-/// nothing and the writes into the segment are then charged again. Unlike
-/// `disk_used_bytes`, it does not move with deletes or with other processes on
-/// the volume.
+/// overcounts: a write that failed stays charged, and so does a reservation
+/// that failed or allocated nothing, while the writes into its segment are
+/// charged again. A reservation charges up front what it adds to the blocks
+/// the file already owns, which is the whole segment only for a new file.
+/// Unlike `volume_used_bytes`, it does not move with deletes or with other
+/// processes on the volume.
 ///
 /// It holds the estimate it reads, so a test can export one of its own
 /// instead of the process-wide one other tests charge concurrently.
@@ -188,7 +190,7 @@ impl Collector for DiskUsageMetrics {
         if let Some(used_bytes) = self.0.used_bytes() {
             let gauge = ConstGauge::new(gauge_value(used_bytes));
             let metric_encoder = encoder.encode_descriptor(
-                "disk_used_bytes",
+                "volume_used_bytes",
                 "estimated bytes used on the volume holding the data directory, as total minus free blocks like df",
                 None,
                 gauge.metric_type(),
@@ -458,7 +460,7 @@ mod tests {
     fn registered_metrics_include_both_disk_usage_series() {
         DISK_USAGE.rebase(|| Some(((), 1)));
         let output = HttpMetrics::init(&[]).formatted_output();
-        for series in ["disk_used_bytes gauge", "disk_allocated_bytes counter"] {
+        for series in ["volume_used_bytes gauge", "disk_allocated_bytes counter"] {
             assert!(
                 output.contains(&format!("# TYPE {series}\n")),
                 "expected {series} in the exposition:\n{output}"
@@ -478,7 +480,7 @@ mod tests {
             "expected the allocated bytes in the exposition:\n{output}"
         );
         assert!(
-            !output.contains("disk_used_bytes"),
+            !output.contains("volume_used_bytes"),
             "the estimate must stay hidden until a sample sets its base:\n{output}"
         );
     }
@@ -494,7 +496,7 @@ mod tests {
 
         for (output, used, total) in [(&sampled, 100 * MIB, 0), (&charged, 101 * MIB, MIB)] {
             assert!(
-                output.contains(&format!("\ndisk_used_bytes {used}\n")),
+                output.contains(&format!("\nvolume_used_bytes {used}\n")),
                 "expected the estimate {used} in the exposition:\n{output}"
             );
             assert!(

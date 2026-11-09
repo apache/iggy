@@ -31,8 +31,8 @@
 //!
 //! A write site charges before it writes, so a sample taken while the write is
 //! in flight does not hold its bytes yet. Each charge therefore returns a
-//! [`Charge`], and a sample only takes over the charges whose [`Charge`] was
-//! dropped, once their writes finished or failed.
+//! [`DiskCharge`], and a sample only takes over the charges whose
+//! [`DiskCharge`] was dropped, once their writes finished or failed.
 //!
 //! Re-basing assumes `statvfs` already counts every write that finished
 //! before the sample. ext4 and XFS do: they take a write's blocks out of the
@@ -73,13 +73,14 @@ impl DiskUsage {
     }
 
     /// Adds `bytes` that Iggy is about to write to, or has reserved on, the
-    /// volume. Hold the returned [`Charge`] until the write finishes or fails.
+    /// volume. Hold the returned [`DiskCharge`] until the write finishes or
+    /// fails.
     #[inline]
-    pub fn charge(&self, bytes: u64) -> Charge<'_> {
+    pub fn charge(&self, bytes: u64) -> DiskCharge<'_> {
         if bytes > 0 {
             self.charged.fetch_add(bytes, Ordering::Relaxed);
         }
-        Charge { usage: self, bytes }
+        DiskCharge { usage: self, bytes }
     }
 
     /// Estimated bytes used on the volume: the last sample plus the bytes
@@ -121,8 +122,8 @@ impl DiskUsage {
     /// On btrfs and OpenZFS the volume shows a finished write only after its
     /// commit, so the estimate reads low until then (see the module docs).
     pub fn rebase<T>(&self, measure: impl FnOnce() -> Option<(T, u64)>) -> Option<T> {
-        // Pairs with the release in `Charge::drop`: every write settled here
-        // finished before the volume is measured.
+        // Pairs with the release in `DiskCharge::drop`: every write settled
+        // here finished before the volume is measured.
         let settled = self.settled.load(Ordering::Acquire);
         let (sample, used_bytes) = measure()?;
         self.base
@@ -143,12 +144,12 @@ impl Default for DiskUsage {
 /// volume, and a failed one allocated only what the volume shows.
 #[derive(Debug)]
 #[must_use = "a charge settles when dropped, so hold it until the write finishes"]
-pub struct Charge<'a> {
+pub struct DiskCharge<'a> {
     usage: &'a DiskUsage,
     bytes: u64,
 }
 
-impl Drop for Charge<'_> {
+impl Drop for DiskCharge<'_> {
     #[inline]
     fn drop(&mut self) {
         if self.bytes > 0 {

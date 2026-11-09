@@ -23,7 +23,7 @@ use iggy_binary_protocol::batch::BatchHeader;
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::MAX_TOPIC_SEGMENT_SIZE;
 use server_common::iobuf::{Frozen, IOV_MAX};
-use server_common::{Charge, DISK_USAGE};
+use server_common::{DISK_USAGE, DiskCharge};
 
 use super::{
     JournalState, PartitionPrepareJournal, SegmentReference, StoredPrepare, invalid, segment_path,
@@ -472,7 +472,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         &mut self,
         reference: SegmentReference,
         end: u64,
-    ) -> io::Result<(Charge<'static>, &mut S::File)> {
+    ) -> io::Result<(DiskCharge<'static>, &mut S::File)> {
         let preallocate_size = self
             .state
             .segment_storage

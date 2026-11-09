@@ -68,8 +68,10 @@ impl DirEntry {
 /// Unsupported or failed reservations fall back to buffered allocation.
 ///
 /// Returns how much of the file the reservation covers: `len` once the file's
-/// blocks reach it, otherwise 0. Writes below the returned length take no new
-/// space, so the blocks they fill must not be charged again.
+/// blocks reach it, otherwise 0. It charges [`DISK_USAGE`] with the blocks the
+/// reservation adds, so callers charge only the part of each write past the
+/// returned length. Writes below it take no new space, and charging them would
+/// count their blocks twice.
 #[cfg(target_os = "linux")]
 pub async fn preallocate_file(file: &fs::File, file_path: &Path, len: u64) -> u64 {
     let Ok(reserved_len) = i64::try_from(len) else {
@@ -162,6 +164,8 @@ fn reserved_bytes(requested_bytes: u64, allocated_bytes: Option<u64>) -> u64 {
 }
 
 /// Reserve segment space when supported, without changing its logical length.
+/// No platform but Linux supports it here, so this charges nothing and returns
+/// 0, and callers charge every write.
 #[cfg(not(target_os = "linux"))]
 pub async fn preallocate_file(_file: &fs::File, file_path: &Path, _len: u64) -> u64 {
     PREALLOCATION_UNAVAILABLE.call_once(|| {
