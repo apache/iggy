@@ -222,6 +222,7 @@ fn config_env_listing_excludes_other_processes_variables() {
         "IGGY_PASSWORD",
         "IGGY_TEST_CLEANUP_DISABLED",
         "IGGY_TEST_CLUSTER_NODES",
+        "IGGY_TEST_LOGS_DIR",
         "IGGY_TEST_VERBOSE",
         "IGGY_USERNAME",
     ] {

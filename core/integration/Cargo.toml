@@ -62,6 +62,7 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 toml = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 wiremock = { workspace = true }
 
@@ -92,7 +93,6 @@ iggy_connector_sdk = { workspace = true, features = ["api"] }
 jsonwebtoken = { workspace = true }
 keyring-core = { workspace = true }
 lapin = { workspace = true }
-lazy_static = { workspace = true }
 mongodb = { workspace = true }
 parquet = { workspace = true }
 pgwire = { workspace = true }
@@ -114,7 +114,6 @@ test-case = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 tokio-postgres = { workspace = true }
-tracing-subscriber = { workspace = true }
 twox-hash = { workspace = true }
 url = { workspace = true }
 zip = { workspace = true }

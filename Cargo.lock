@@ -8913,7 +8913,6 @@ dependencies = [
  "jsonwebtoken 11.1.0",
  "keyring-core",
  "lapin",
- "lazy_static",
  "libc",
  "mongodb",
  "parquet 58.4.1",
