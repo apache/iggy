@@ -17,11 +17,12 @@
 
 //! OTLP/HTTP transport. A request is encoded once and the same bytes are reused on every retry.
 
-use crate::signal::ExportResponse;
 use bytes::Bytes;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use iggy_connector_sdk::Error;
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceResponse;
+use prost::Message;
 use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{StatusCode, Url};
 use std::error::Error as StdError;
@@ -31,6 +32,8 @@ use std::time::Duration;
 
 const PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
 const MAX_ERROR_BODY_BYTES: usize = 512;
+/// A success response holds at most a `partial_success` report, so this is plenty.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Why one export attempt failed, and whether trying again could help.
 #[derive(Debug)]
@@ -60,14 +63,21 @@ impl ExportError {
     }
 
     fn from_reqwest(error: reqwest::Error) -> Self {
-        // The URL can carry a query with credentials in it.
-        let error = error.without_url();
-        let message = with_causes(format!("HTTP request: {error}"), error.source());
-        if error.is_builder() {
+        let permanent = error.is_builder();
+        let message = format!("HTTP request: {}", describe(error));
+        if permanent {
             Self::Permanent(message)
         } else {
             Self::Transient(message)
         }
+    }
+
+    /// The receiver answered with a success status, so it has the request, but its
+    /// `partial_success` report is lost. Trying again would export the request twice.
+    fn unreadable_response(problem: fmt::Arguments<'_>) -> Self {
+        Self::Permanent(format!(
+            "the receiver accepted the request, but its response {problem}"
+        ))
     }
 }
 
@@ -149,7 +159,7 @@ impl HttpExporter {
         }
     }
 
-    pub async fn export<U: ExportResponse>(&self, body: Bytes) -> Result<U, ExportError> {
+    pub async fn export(&self, body: Bytes) -> Result<ExportLogsServiceResponse, ExportError> {
         let response = self
             .client
             .post(self.url.clone())
@@ -165,15 +175,12 @@ impl HttpExporter {
                 &error_excerpt(response).await,
             ));
         }
-        let protobuf = response.headers().get(CONTENT_TYPE).is_some_and(|value| {
-            value
-                .as_bytes()
-                .starts_with(PROTOBUF_CONTENT_TYPE.as_bytes())
-        });
-        // The receiver accepted the request, so a body that fails to arrive loses only the
-        // `partial_success` report. Retrying would send accepted items again.
-        let body = response.bytes().await.unwrap_or_default();
-        Ok(decode_http_response(protobuf, &body))
+        let protobuf = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .is_some_and(is_protobuf);
+        let body = success_body(response).await?;
+        decode_http_response(protobuf, &body)
     }
 }
 
@@ -197,13 +204,63 @@ async fn error_excerpt(mut response: reqwest::Response) -> Vec<u8> {
     excerpt
 }
 
-/// A success response carries `partial_success`, encoded as protobuf because the request was.
-/// A backend that answers with an empty or unparsable body accepted everything.
-fn decode_http_response<U: ExportResponse>(protobuf: bool, body: &[u8]) -> U {
-    if !protobuf || body.is_empty() {
-        return U::default();
+/// The body of a success response, refused once it passes `MAX_RESPONSE_BYTES`.
+async fn success_body(mut response: reqwest::Response) -> Result<Vec<u8>, ExportError> {
+    let mut body = Vec::new();
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => return Ok(body),
+            Err(error) => {
+                return Err(ExportError::unreadable_response(format_args!(
+                    "could not be read: {}",
+                    describe(error)
+                )));
+            }
+        };
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(ExportError::unreadable_response(format_args!(
+                "is larger than {MAX_RESPONSE_BYTES} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
     }
-    U::decode(body).unwrap_or_default()
+}
+
+/// Whether a `Content-Type` is protobuf. A media type is case-insensitive and can carry
+/// parameters, such as `; charset=binary`.
+fn is_protobuf(content_type: &HeaderValue) -> bool {
+    content_type.to_str().is_ok_and(|value| {
+        let media_type = value
+            .split_once(';')
+            .map_or(value, |(media_type, _)| media_type);
+        media_type
+            .trim()
+            .eq_ignore_ascii_case(PROTOBUF_CONTENT_TYPE)
+    })
+}
+
+/// A success response carries `partial_success`, encoded as protobuf because the request was.
+/// An empty body is a response without it. A backend that answers with another content type
+/// reports nothing, so it accepted everything.
+fn decode_http_response(
+    protobuf: bool,
+    body: &[u8],
+) -> Result<ExportLogsServiceResponse, ExportError> {
+    if !protobuf {
+        return Ok(ExportLogsServiceResponse::default());
+    }
+    ExportLogsServiceResponse::decode(body).map_err(|error| {
+        ExportError::unreadable_response(format_args!(
+            "is not a protobuf ExportLogsServiceResponse: {error}"
+        ))
+    })
+}
+
+/// The error and its causes, without the URL, which can carry a query with credentials in it.
+fn describe(error: reqwest::Error) -> String {
+    let error = error.without_url();
+    with_causes(error.to_string(), error.source())
 }
 
 /// `head`, then every cause in the chain that starts at `source`. A cause that the text
@@ -232,11 +289,16 @@ fn gzip(bytes: &[u8]) -> Result<Vec<u8>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opentelemetry_proto::tonic::collector::logs::v1::{
-        ExportLogsPartialSuccess, ExportLogsServiceResponse,
-    };
-    use prost::Message;
+    use crate::logs::rejected_log_records;
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsPartialSuccess;
     use std::io::Read as _;
+
+    fn read_body(body: Vec<u8>) -> Result<Vec<u8>, ExportError> {
+        let response = reqwest::Response::from(http::Response::new(body));
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(success_body(response))
+    }
 
     #[test]
     fn given_retryable_http_statuses_should_be_transient() {
@@ -278,22 +340,70 @@ mod tests {
             }),
         };
 
-        let decoded: ExportLogsServiceResponse =
-            decode_http_response(true, &response.encode_to_vec());
+        let decoded =
+            decode_http_response(true, &response.encode_to_vec()).expect("valid response");
 
-        assert_eq!(decoded.rejected(), Some((3, "dropped")));
+        assert_eq!(rejected_log_records(&decoded), Some((3, "dropped")));
+    }
+
+    #[test]
+    fn given_empty_protobuf_success_body_should_mean_nothing_rejected() {
+        let empty = decode_http_response(true, b"").expect("an empty body is a valid response");
+
+        assert!(rejected_log_records(&empty).is_none());
+    }
+
+    #[test]
+    fn given_undecodable_protobuf_success_body_should_fail_without_retry() {
+        let error = decode_http_response(true, &[0xff, 0xff, 0xff])
+            .expect_err("the partial-success report is lost");
+
+        assert!(
+            !error.is_retryable(),
+            "a retry would export the request twice"
+        );
     }
 
     #[test]
     fn given_non_protobuf_success_body_should_mean_nothing_rejected() {
-        let empty: ExportLogsServiceResponse = decode_http_response(true, b"");
-        let garbage: ExportLogsServiceResponse = decode_http_response(false, b"OK");
-        let json: ExportLogsServiceResponse =
-            decode_http_response(false, br#"{"partialSuccess":{"rejectedLogRecords":"2"}}"#);
+        let text = decode_http_response(false, b"OK").expect("not a protobuf response");
+        let json = decode_http_response(false, br#"{"partialSuccess":{"rejectedLogRecords":"2"}}"#)
+            .expect("not a protobuf response");
 
-        assert!(empty.rejected().is_none());
-        assert!(garbage.rejected().is_none());
-        assert!(json.rejected().is_none());
+        assert!(rejected_log_records(&text).is_none());
+        assert!(rejected_log_records(&json).is_none());
+    }
+
+    #[test]
+    fn given_protobuf_content_types_should_match_case_insensitively_with_parameters() {
+        for value in [
+            "application/x-protobuf",
+            "Application/X-Protobuf",
+            "application/x-protobuf; charset=binary",
+            " application/x-protobuf ;",
+        ] {
+            assert!(is_protobuf(&HeaderValue::from_static(value)), "{value}");
+        }
+        for value in ["application/json", "application/x-protobufs", "text/plain"] {
+            assert!(!is_protobuf(&HeaderValue::from_static(value)), "{value}");
+        }
+    }
+
+    #[test]
+    fn given_success_body_within_limit_should_read_it() {
+        let body = vec![1u8; MAX_RESPONSE_BYTES];
+
+        assert_eq!(read_body(body.clone()).expect("within the limit"), body);
+    }
+
+    #[test]
+    fn given_success_body_above_limit_should_fail_without_retry() {
+        let error = read_body(vec![1u8; MAX_RESPONSE_BYTES + 1]).expect_err("above the limit");
+
+        assert!(
+            !error.is_retryable(),
+            "a retry would export the request twice"
+        );
     }
 
     #[test]

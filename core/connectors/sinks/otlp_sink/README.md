@@ -42,9 +42,13 @@ authorization = "Bearer <YOUR_TOKEN_HERE>"
 
 ## Delivery
 
-The connectors runtime commits a batch's offsets before handing it to the sink, so a batch that fails is not redelivered. The sink retries instead, inside `consume`, for the failures the OTLP/HTTP specification calls retryable: `429`, `502`, `503`, `504` and transport errors, such as a refused connection.
+The sink delivers at most once: the connectors runtime commits a batch's offsets before handing it to the sink, so a batch that fails is not redelivered. The sink retries instead, inside `consume`, for the failures the OTLP/HTTP specification calls retryable: `429`, `502`, `503`, `504` and transport errors, such as a refused connection.
 
-Every other status, such as `400`, `401` or `413`, is permanent and is not retried. Redirects are not followed, so a `3xx` answer is permanent too. A request is encoded once, so every retry sends the same bytes. When the receiver accepts a request but reports a `partial_success` with rejected log records, those records are logged and counted, and are not retried, as the specification requires.
+Every other status, such as `400`, `401` or `413`, is permanent and is not retried. Redirects are not followed, so a `3xx` answer is permanent too. A request is encoded once, so every retry sends the same bytes.
+
+When the receiver accepts a request but reports a `partial_success` with rejected log records, those records are logged and counted, and are not retried, as the specification requires. A success response that cannot be read, that is larger than 64 KiB, or that is not a protobuf `ExportLogsServiceResponse` counts as a failed request. It is not retried either, because the receiver already has the request.
+
+The sink does not support the runtime's [at-least-once delivery](../../runtime/README.md#sink-delivery-guarantees) yet, so a connector with `[delivery] guarantee = "at_least_once"` does not start.
 
 Some limits of this approach:
 

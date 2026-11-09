@@ -7735,6 +7735,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "flate2",
+ "http 1.5.0",
  "humantime",
  "iggy_connector_sdk",
  "opentelemetry-proto",

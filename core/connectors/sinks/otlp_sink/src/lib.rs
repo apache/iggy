@@ -17,7 +17,7 @@
 
 mod batch;
 mod exporter;
-mod signal;
+mod logs;
 
 use async_trait::async_trait;
 use batch::{Packed, Prepared};
@@ -26,11 +26,9 @@ use iggy_connector_sdk::retry::{RetryPolicy, retry_async};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Schema, Sink, TopicMetadata, sink_connector,
 };
-use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use reqwest::Url;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use signal::{ExportRequest, ExportResponse};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -264,7 +262,7 @@ impl OtlpSink {
         }
     }
 
-    async fn send_all<R: ExportRequest>(
+    async fn send_all(
         &self,
         opened: &Opened,
         prepared: Prepared,
@@ -303,7 +301,7 @@ impl OtlpSink {
         let mut export_error = None;
         for packed in requests {
             let messages = packed.messages;
-            match self.send::<R>(opened, packed).await {
+            match self.send(opened, packed).await {
                 Ok(()) => {
                     exported += messages;
                     self.counters
@@ -339,13 +337,10 @@ impl OtlpSink {
 
     /// Export one request with bounded retry. The runtime commits offsets before `consume`
     /// runs, so this is the only redelivery a transient failure gets.
-    async fn send<R: ExportRequest>(&self, opened: &Opened, packed: Packed) -> Result<(), Error> {
+    async fn send(&self, opened: &Opened, packed: Packed) -> Result<(), Error> {
         let context = format!(
-            "OTLP sink ID: {} export of {} {} from {} messages",
-            self.id,
-            packed.items,
-            R::ITEM_NAME,
-            packed.messages
+            "OTLP sink ID: {} export of {} log records from {} messages",
+            self.id, packed.log_records, packed.messages
         );
         let exporter = &opened.exporter;
         let body = exporter.prepare_body(packed.body)?;
@@ -358,7 +353,7 @@ impl OtlpSink {
             ExportError::is_retryable,
             || {
                 attempts += 1;
-                exporter.export::<R::Response>(body.clone())
+                exporter.export(body.clone())
             },
         )
         .await;
@@ -368,14 +363,11 @@ impl OtlpSink {
             Ok(response) => {
                 // Rejected items were seen and refused by the receiver, which the
                 // specification says must not be retried.
-                if let Some((rejected, reason)) = response.rejected() {
+                if let Some((rejected, reason)) = logs::rejected_log_records(&response) {
                     self.counters
                         .items_rejected
                         .fetch_add(u64::try_from(rejected).unwrap_or(0), Ordering::Relaxed);
-                    warn!(
-                        "{context}: receiver rejected {rejected} {}: {reason}",
-                        R::ITEM_NAME
-                    );
+                    warn!("{context}: receiver rejected {rejected} log records: {reason}");
                 }
                 Ok(())
             }
@@ -423,17 +415,9 @@ impl Sink for OtlpSink {
         })?;
 
         let received = messages.len();
-        let prepared = batch::pack_requests::<ExportLogsServiceRequest>(
-            messages,
-            opened.settings.max_request_bytes,
-        );
-        self.send_all::<ExportLogsServiceRequest>(
-            opened,
-            prepared,
-            received,
-            messages_metadata.schema,
-        )
-        .await
+        let prepared = batch::pack_requests(messages, opened.settings.max_request_bytes);
+        self.send_all(opened, prepared, received, messages_metadata.schema)
+            .await
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -468,6 +452,7 @@ fn endpoint_for_log(endpoint: &Url) -> Url {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
     use prost::Message;
 
     fn test_config() -> OtlpSinkConfig {
