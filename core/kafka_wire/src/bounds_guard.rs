@@ -1493,7 +1493,10 @@ pub fn validate_offset_delete_shape(
 /// `max_frame_size`, before a header is even decoded, so an unauthenticated peer can still make
 /// the gateway hold that much. What this cap bounds is everything downstream of the guard: what
 /// reaches `parse_plain`, and what a future mechanism would carry into a credential exchange.
-const MAX_SASL_AUTH_BYTES: usize = 4096;
+///
+/// A bare token after a `SaslHandshake` v0 gets the same cap. There the frame reader applies it,
+/// so such a token is never buffered past it.
+pub const MAX_SASL_AUTH_BYTES: usize = 4096;
 
 /// Mirrors the field order `DescribeConfigsRequest::decode` walks.
 ///
@@ -1714,9 +1717,8 @@ pub fn validate_describe_cluster_shape(version: i16, body: &Bytes) -> Result<()>
 
 /// `SaslHandshake` carries one non-nullable string, the mechanism name.
 ///
-/// The message is never flexible, so v0 and v1 share this shape, and both are walked: the
-/// connection loop reads the mechanism name out of every handshake body before the SASL state
-/// machine decides, and it is that decision, not this guard, that refuses v0.
+/// The message is never flexible, so v0 and v1 share this shape. The connection loop reads the
+/// mechanism name out of every handshake body before the SASL state machine decides.
 ///
 /// # Errors
 ///
