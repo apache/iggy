@@ -22,10 +22,10 @@ use crate::bridge::iggy_bridge::{ClusterIdCall, CoordinatorLogCall};
 use crate::cluster_id::InvalidClusterId;
 use crate::protocol::api::{
     ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_INVALID_PARTITIONS, ERROR_INVALID_PRODUCER_EPOCH,
-    ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NOT_LEADER_OR_FOLLOWER,
-    ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
-    ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_PRODUCER_ID,
-    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION,
+    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_POLICY_VIOLATION,
+    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED,
+    ERROR_UNKNOWN_PRODUCER_ID, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 
 /// Errors from the `IggyBridge`: connection lifecycle, config, and Iggy SDK calls.
@@ -339,6 +339,8 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         // The topic has no partition ids left to mint. A server-side rule refuses a valid
         // request, as with the two above.
         IggyError::PartitionIdSpaceExhausted => ERROR_POLICY_VIOLATION,
+        // A factor above the node count, as Kafka answers one above the broker count.
+        IggyError::InvalidReplicationFactor => ERROR_INVALID_REPLICATION_FACTOR,
         // Deliberately NOT special-cased here to ERROR_NONE: this function is shared by every
         // handler's error path, but "the operation did commit, so report success" only holds for
         // a caller that issued a *write* - the SDK's own reconnect path replayed a write whose
@@ -426,6 +428,12 @@ mod tests {
     fn partition_id_space_exhausted_maps_to_policy_violation() {
         let err = BridgeError::Iggy(IggyError::PartitionIdSpaceExhausted);
         assert_eq!(err.to_kafka_error_code(), ERROR_POLICY_VIOLATION);
+    }
+
+    #[test]
+    fn given_a_replication_factor_iggy_refuses_should_map_to_invalid_replication_factor() {
+        let err = BridgeError::Iggy(IggyError::InvalidReplicationFactor);
+        assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_REPLICATION_FACTOR);
     }
 
     #[test]
