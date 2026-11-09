@@ -118,7 +118,10 @@ async fn given_commands_between_sends_when_committed_should_apply_them_in_op_ord
     assert_eq!(counter_total(&partition), 12);
     assert_eq!(partition.state_machines().applied_op(), 5);
     let journal = &partition.log.journal().inner;
-    assert_eq!(journal.command_ops(), vec![2, 4, 5]);
+    assert!(
+        journal.command_ops().is_empty(),
+        "a single replica has nobody to repair, so it keeps no committed command"
+    );
     assert!(
         journal
             .resident_entries()
@@ -294,8 +297,8 @@ impl PartitionStateMachine for OversizedMachine {
         Applied::Refused
     }
 
-    fn snapshot(&self) -> Vec<u8> {
-        vec![0; SNAPSHOT_BYTES_MAX]
+    fn snapshot_into(&self, out: &mut Vec<u8>) {
+        out.resize(out.len() + SNAPSHOT_BYTES_MAX, 0);
     }
 
     fn restore(&mut self, _: &[u8]) -> Result<(), MachineRestoreError> {

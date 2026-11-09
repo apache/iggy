@@ -16,10 +16,10 @@
 // under the License.
 
 use std::collections::BTreeMap;
-use std::fmt;
+use std::collections::btree_map::Entry;
 use std::ops::RangeBounds;
 
-use iggy_binary_protocol::{Operation, PrepareHeader};
+use iggy_binary_protocol::PrepareHeader;
 use server_common::iobuf::Frozen;
 
 /// The commands a partition keeps in memory: every uncommitted one, and the
@@ -35,21 +35,14 @@ pub struct StateMachineLog {
 }
 
 impl StateMachineLog {
-    /// Hold a command. A second prepare for an op already held is ignored, as
-    /// the data journal keeps the first occurrence of an op.
-    ///
-    /// # Errors
-    /// Returns an error when the prepare is not a state-machine command.
-    pub fn insert(&mut self, prepare: Frozen<4096>) -> Result<(), StateMachineLogError> {
-        let header = header_of(&prepare).ok_or(StateMachineLogError::Malformed)?;
-        if header.operation != Operation::StateMachineCommand {
-            return Err(StateMachineLogError::NotACommand(header.operation));
-        }
-        if let std::collections::btree_map::Entry::Vacant(slot) = self.commands.entry(header.op) {
+    /// Hold the command prepared at `op`, which the caller read off its
+    /// header. A second prepare for an op already held is ignored, as the data
+    /// journal keeps the first occurrence of an op.
+    pub fn insert(&mut self, op: u64, prepare: Frozen<4096>) {
+        if let Entry::Vacant(slot) = self.commands.entry(op) {
             self.bytes += memory_bytes(&prepare);
             slot.insert(prepare);
         }
-        Ok(())
     }
 
     #[must_use]
@@ -101,17 +94,6 @@ impl StateMachineLog {
     #[must_use]
     pub const fn bytes(&self) -> u64 {
         self.bytes
-    }
-
-    /// Highest commit point any held command stamped.
-    #[must_use]
-    pub fn max_commit(&self) -> u64 {
-        self.commands
-            .values()
-            .filter_map(header_of)
-            .map(|header| header.commit)
-            .max()
-            .unwrap_or(0)
     }
 
     /// Drop the held commands in `ops`, returning how many went. They stay
@@ -189,36 +171,17 @@ fn header_of(prepare: &Frozen<4096>) -> Option<PrepareHeader> {
         .copied()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StateMachineLogError {
-    Malformed,
-    NotACommand(Operation),
-}
-
-impl fmt::Display for StateMachineLogError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Malformed => f.write_str("state-machine log entry is not a prepare"),
-            Self::NotACommand(operation) => {
-                write!(f, "{operation:?} is not a state-machine command")
-            }
-        }
-    }
-}
-
-impl std::error::Error for StateMachineLogError {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::Command;
+    use iggy_binary_protocol::{Command, Operation};
     use server_common::Message;
 
-    fn prepare(op: u64, operation: Operation, commit: u64) -> Frozen<4096> {
+    fn prepare(op: u64, commit: u64) -> Frozen<4096> {
         Message::<PrepareHeader>::new(size_of::<PrepareHeader>())
             .transmute_header(|_, header: &mut PrepareHeader| {
                 header.command = Command::Prepare;
-                header.operation = operation;
+                header.operation = Operation::StateMachineCommand;
                 header.op = op;
                 header.commit = commit;
                 header.size = u32::try_from(size_of::<PrepareHeader>()).unwrap();
@@ -230,12 +193,10 @@ mod tests {
     fn given_commands_when_holding_and_releasing_should_track_the_retained_floor() {
         let mut log = StateMachineLog::default();
         for op in [3, 7, 9] {
-            log.insert(prepare(op, Operation::StateMachineCommand, op - 1))
-                .unwrap();
+            log.insert(op, prepare(op, op - 1));
         }
         assert!(log.contains(7));
         assert_eq!(log.ops(4..=9).collect::<Vec<_>>(), vec![7, 9]);
-        assert_eq!(log.max_commit(), 8);
         assert_eq!(log.last_op(), Some(9));
 
         let one = log.bytes() / 3;
@@ -257,9 +218,9 @@ mod tests {
     #[test]
     fn given_a_small_command_when_held_should_charge_its_allocation() {
         let mut log = StateMachineLog::default();
-        let command = prepare(1, Operation::StateMachineCommand, 0);
+        let command = prepare(1, 0);
         assert!(command.len() < 4096);
-        log.insert(command).unwrap();
+        log.insert(1, command);
         assert!(log.bytes() >= 4096, "{}", log.bytes());
     }
 
@@ -267,8 +228,7 @@ mod tests {
     fn given_caps_when_releasing_should_keep_everything_above_the_checkpoint() {
         let mut log = StateMachineLog::default();
         for op in 1..=6 {
-            log.insert(prepare(op, Operation::StateMachineCommand, 0))
-                .unwrap();
+            log.insert(op, prepare(op, 0));
         }
         assert!(
             log.release_checkpointed(3, 2, u64::MAX),
@@ -284,19 +244,8 @@ mod tests {
     #[test]
     fn given_a_held_op_when_inserting_again_should_keep_the_first_copy() {
         let mut log = StateMachineLog::default();
-        log.insert(prepare(4, Operation::StateMachineCommand, 1))
-            .unwrap();
-        log.insert(prepare(4, Operation::StateMachineCommand, 2))
-            .unwrap();
+        log.insert(4, prepare(4, 1));
+        log.insert(4, prepare(4, 2));
         assert_eq!(log.header(4).unwrap().commit, 1);
-    }
-
-    #[test]
-    fn given_a_data_op_when_inserting_should_refuse_it() {
-        let mut log = StateMachineLog::default();
-        assert_eq!(
-            log.insert(prepare(1, Operation::SendMessages, 0)),
-            Err(StateMachineLogError::NotACommand(Operation::SendMessages))
-        );
     }
 }

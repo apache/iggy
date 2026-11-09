@@ -85,6 +85,47 @@ const RECORD_KIND_OFFSET: usize = 4;
 const SEGMENT_REFERENCE_BYTES: usize = 4 * size_of::<u64>();
 const REFERENCED_PREPARE_BYTES: usize = size_of::<PrepareHeader>() + SEGMENT_REFERENCE_BYTES;
 
+/// How [`PartitionPrepareJournal::open_with_options`] opens a WAL.
+#[derive(Debug, Clone, Copy)]
+pub struct WalOpenOptions {
+    /// Admission budget. Recovery reads the existing history whatever it is.
+    pub capacity: u64,
+    pub preallocate_segments: bool,
+    /// The WAL is one of the two logs of a partition consensus group and
+    /// accepts gaps between its ops, see [`PartitionPrepareJournal::allow_gaps`].
+    pub sparse: bool,
+    /// The view a WAL this open creates starts certified at. An existing WAL
+    /// keeps the certificate it published.
+    pub new_log_view: u32,
+}
+
+impl WalOpenOptions {
+    fn validate(&self) -> io::Result<()> {
+        if (PARTITION_WAL_CAPACITY_MIN..=PARTITION_WAL_CAPACITY_MAX).contains(&self.capacity)
+            && self
+                .capacity
+                .is_multiple_of(PARTITION_WAL_BLOCK_SIZE as u64)
+        {
+            Ok(())
+        } else {
+            Err(invalid(
+                "partition WAL capacity is out of bounds or unaligned",
+            ))
+        }
+    }
+}
+
+impl Default for WalOpenOptions {
+    fn default() -> Self {
+        Self {
+            capacity: PARTITION_WAL_BYTES_MAX,
+            preallocate_segments: false,
+            sparse: false,
+            new_log_view: 0,
+        }
+    }
+}
+
 /// A prepare body in a segment inode retained by the WAL.
 ///
 /// The caller assigns a fresh generation whenever an offset-named segment is
@@ -204,82 +245,29 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         incarnation: u64,
         storage: S,
     ) -> io::Result<Self> {
-        Self::open_with_storage_and_capacity(
+        Self::open_with_options(
             directory,
             group,
             incarnation,
             storage,
-            PARTITION_WAL_BYTES_MAX,
-            false,
+            WalOpenOptions::default(),
         )
         .await
     }
 
-    /// Open history independently of the current admission capacity.
+    /// Open and verify the durably published partition history, independently
+    /// of the current admission capacity.
     ///
     /// # Errors
     /// Returns an error for invalid capacity or unverifiable durable history.
-    pub async fn open_with_storage_and_capacity(
+    pub async fn open_with_options(
         directory: &Path,
         group: u64,
         incarnation: u64,
         storage: S,
-        capacity: u64,
-        preallocate_segments: bool,
+        options: WalOpenOptions,
     ) -> io::Result<Self> {
-        Self::open_inner(
-            directory,
-            group,
-            incarnation,
-            storage,
-            capacity,
-            preallocate_segments,
-            false,
-        )
-        .await
-    }
-
-    /// Open one of the two logs of a partition consensus group, whose ops are
-    /// not contiguous (see [`Self::is_sparse`]).
-    ///
-    /// # Errors
-    /// Returns an error for invalid capacity or unverifiable durable history.
-    pub async fn open_sparse_with_storage_and_capacity(
-        directory: &Path,
-        group: u64,
-        incarnation: u64,
-        storage: S,
-        capacity: u64,
-        preallocate_segments: bool,
-    ) -> io::Result<Self> {
-        Self::open_inner(
-            directory,
-            group,
-            incarnation,
-            storage,
-            capacity,
-            preallocate_segments,
-            true,
-        )
-        .await
-    }
-
-    async fn open_inner(
-        directory: &Path,
-        group: u64,
-        incarnation: u64,
-        storage: S,
-        capacity: u64,
-        preallocate_segments: bool,
-        sparse: bool,
-    ) -> io::Result<Self> {
-        if !(PARTITION_WAL_CAPACITY_MIN..=PARTITION_WAL_CAPACITY_MAX).contains(&capacity)
-            || !capacity.is_multiple_of(PARTITION_WAL_BLOCK_SIZE as u64)
-        {
-            return Err(invalid(
-                "partition WAL capacity is out of bounds or unaligned",
-            ));
-        }
+        options.validate()?;
         let parent = directory
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -295,24 +283,22 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         if slots > 0 && verified == 0 {
             return Err(invalid("unreadable partition WAL frontier"));
         }
-        // A verified frontier was installed after an earlier open made this
-        // directory durable in its parent, so only a new WAL pays for that.
-        if existing.is_none() {
-            storage.create_directories(directory).await?;
-            storage.sync_directory(parent).await?;
-        }
         if let Some(state) = existing
             && (state.group != group || state.incarnation != incarnation)
         {
             return Err(invalid("partition WAL identity mismatch"));
         }
+        // A verified frontier was installed after an earlier open made this
+        // directory durable in its parent, so only a new WAL pays for that.
         if existing.is_none() {
+            storage.create_directories(directory).await?;
+            storage.sync_directory(parent).await?;
             Self::validate_unpublished_history(&storage, directory).await?;
         }
         let state = existing.unwrap_or_else(|| JournalState {
             group,
             incarnation,
-            certified_log_view: Some(0),
+            certified_log_view: Some(options.new_log_view),
             ..JournalState::default()
         });
         let mode = if existing.is_none() {
@@ -349,7 +335,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             frontier_sequence,
             recovered_frontier: existing.is_some(),
             storage,
-            capacity,
+            capacity: options.capacity,
             state,
             entries: BTreeMap::new(),
             poisoned: false,
@@ -360,9 +346,9 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             segment_files: BTreeMap::new(),
             segment_files_dirty: false,
             segment_links_dirty: false,
-            preallocate_segments,
+            preallocate_segments: options.preallocate_segments,
             retained_bytes: 0,
-            sparse,
+            sparse: options.sparse,
         };
         // A slot that did not verify may have been the newest, so the frontier
         // this open read can name less than an acknowledgment already covered.
@@ -373,7 +359,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         // verify; what follows them is a tail no barrier ever covered.
         let recovered = journal.state;
         journal.durable_head = recovered.head;
-        let intact = existing.filter(|_| slots == FRONTIER_SLOTS && verified == slots);
+        let intact = existing.is_some() && slots == FRONTIER_SLOTS && verified == slots;
         journal.truncate_to_recovered(intact, file_length).await?;
         // Also when nothing changed but a slot did not verify: leaving it
         // damaged keeps every later open on the tail-walking path, where an
@@ -395,12 +381,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     /// so a file that ends exactly at the length an intact frontier published,
     /// with nothing recovered past it, has no tail to drop and nothing left
     /// to make durable.
-    async fn truncate_to_recovered(
-        &self,
-        intact: Option<JournalState>,
-        file_length: u64,
-    ) -> io::Result<()> {
-        if intact == Some(self.state) && file_length == self.state.length {
+    async fn truncate_to_recovered(&self, intact: bool, file_length: u64) -> io::Result<()> {
+        if intact && file_length == self.state.length {
             return Ok(());
         }
         self.file.truncate(self.state.length).await?;
@@ -412,12 +394,6 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     #[must_use]
     pub const fn recovered_frontier(&self) -> bool {
         self.recovered_frontier
-    }
-
-    /// Whether this WAL accepts gaps between its ops.
-    #[must_use]
-    pub const fn is_sparse(&self) -> bool {
-        self.sparse
     }
 
     /// Accept gaps from now on, once the partition's other log holds an op.
@@ -2820,13 +2796,15 @@ mod tests {
         const OTHER_LOG_CHECKSUM: u128 = 0xdead;
         let directory = tempdir().unwrap();
         let open = || {
-            PartitionPrepareJournal::open_sparse_with_storage_and_capacity(
+            PartitionPrepareJournal::open_with_options(
                 directory.path(),
                 42,
                 7,
                 DiskStorage,
-                PARTITION_WAL_BYTES_MAX,
-                false,
+                WalOpenOptions {
+                    sparse: true,
+                    ..WalOpenOptions::default()
+                },
             )
         };
         let first = prepare(1, 0);
@@ -2897,6 +2875,42 @@ mod tests {
         assert_eq!(journal.certified_log_view(), None);
     }
 
+    /// A WAL created mid-view publishes its first frontier at that view, so a
+    /// crash right after it is created leaves no lower certificate behind.
+    #[compio::test]
+    async fn given_a_new_log_view_when_creating_a_wal_should_publish_it_and_keep_an_existing_one() {
+        let directory = tempdir().unwrap();
+        let options = WalOpenOptions {
+            sparse: true,
+            new_log_view: 5,
+            ..WalOpenOptions::default()
+        };
+        let journal = PartitionPrepareJournal::open_with_options(
+            directory.path(),
+            42,
+            7,
+            DiskStorage,
+            options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(journal.certified_log_view(), Some(5));
+        drop(journal);
+        let reopened = PartitionPrepareJournal::open_with_options(
+            directory.path(),
+            42,
+            7,
+            DiskStorage,
+            WalOpenOptions {
+                new_log_view: 9,
+                ..options
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reopened.certified_log_view(), Some(5));
+    }
+
     #[compio::test]
     async fn given_a_contiguous_wal_when_an_op_skips_ahead_should_refuse_it() {
         let directory = tempdir().unwrap();
@@ -2945,13 +2959,16 @@ mod tests {
         journal.append_buffered(second.into_frozen()).await.unwrap();
         journal.append(third.into_frozen()).await.unwrap();
         drop(journal);
-        let mut journal = PartitionPrepareJournal::open_with_storage_and_capacity(
+        let mut journal = PartitionPrepareJournal::open_with_options(
             directory.path(),
             42,
             7,
             DiskStorage,
-            PARTITION_WAL_CAPACITY_MIN,
-            false,
+            WalOpenOptions {
+                capacity: PARTITION_WAL_CAPACITY_MIN,
+                preallocate_segments: false,
+                ..WalOpenOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -3250,13 +3267,16 @@ mod tests {
         std::fs::write(directory.join("frontier"), encoded.as_slice()).unwrap();
         drop(journal);
         assert!(
-            PartitionPrepareJournal::open_with_storage_and_capacity(
+            PartitionPrepareJournal::open_with_options(
                 &directory,
                 42,
                 7,
                 DiskStorage,
-                PARTITION_WAL_BYTES_MAX,
-                true,
+                WalOpenOptions {
+                    capacity: PARTITION_WAL_BYTES_MAX,
+                    preallocate_segments: true,
+                    ..WalOpenOptions::default()
+                },
             )
             .await
             .is_err()
@@ -3532,13 +3552,16 @@ mod tests {
             let partition = tempdir().unwrap();
             let preallocation_supported = supports_preallocation(partition.path(), SEGMENT_BYTES);
             let directory = partition.path().join("prepares-7");
-            let mut journal = PartitionPrepareJournal::open_with_storage_and_capacity(
+            let mut journal = PartitionPrepareJournal::open_with_options(
                 &directory,
                 42,
                 7,
                 DiskStorage,
-                PARTITION_WAL_BYTES_MAX,
-                preallocate,
+                WalOpenOptions {
+                    capacity: PARTITION_WAL_BYTES_MAX,
+                    preallocate_segments: preallocate,
+                    ..WalOpenOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -3560,13 +3583,16 @@ mod tests {
                 .unwrap()
                 .set_len(SEGMENT_BYTES + BODY_BYTES as u64)
                 .unwrap();
-            let mut journal = PartitionPrepareJournal::open_with_storage_and_capacity(
+            let mut journal = PartitionPrepareJournal::open_with_options(
                 &directory,
                 42,
                 7,
                 DiskStorage,
-                PARTITION_WAL_BYTES_MAX,
-                preallocate,
+                WalOpenOptions {
+                    capacity: PARTITION_WAL_BYTES_MAX,
+                    preallocate_segments: preallocate,
+                    ..WalOpenOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -3615,13 +3641,16 @@ mod tests {
         for materialized in [true, false] {
             let partition = tempdir().unwrap();
             let directory = partition.path().join("prepares-7");
-            let mut journal = PartitionPrepareJournal::open_with_storage_and_capacity(
+            let mut journal = PartitionPrepareJournal::open_with_options(
                 &directory,
                 42,
                 7,
                 DiskStorage,
-                PARTITION_WAL_BYTES_MAX,
-                true,
+                WalOpenOptions {
+                    capacity: PARTITION_WAL_BYTES_MAX,
+                    preallocate_segments: true,
+                    ..WalOpenOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -3937,13 +3966,16 @@ mod tests {
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[newest..newest + PARTITION_WAL_BLOCK_SIZE].fill(0);
         std::fs::write(&path, &bytes).unwrap();
-        let journal = PartitionPrepareJournal::open_with_storage_and_capacity(
+        let journal = PartitionPrepareJournal::open_with_options(
             directory.path(),
             42,
             7,
             DiskStorage,
-            PARTITION_WAL_CAPACITY_MIN,
-            false,
+            WalOpenOptions {
+                capacity: PARTITION_WAL_CAPACITY_MIN,
+                preallocate_segments: false,
+                ..WalOpenOptions::default()
+            },
         )
         .await
         .unwrap();

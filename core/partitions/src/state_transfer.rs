@@ -1570,13 +1570,13 @@ mod tests {
     #[test]
     fn given_machines_when_round_tripping_should_keep_their_snapshot() {
         let wire = ConsumerOffsetsWire {
-            machines: Some(StateMachineSnapshot {
-                op: 12,
-                machines: vec![
-                    (crate::state_machine::MachineId(1), b"floor".to_vec()),
-                    (crate::state_machine::MachineId(3), Vec::new()),
+            machines: Some(StateMachineSnapshot::from_parts(
+                12,
+                &[
+                    (crate::state_machine::MachineId(1), b"floor"),
+                    (crate::state_machine::MachineId(3), b""),
                 ],
-            }),
+            )),
             ..table()
         };
         let encoded = wire.encode();

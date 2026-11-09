@@ -899,8 +899,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         if is_command(&prepare) {
             let mut commands = self.commands.borrow_mut();
             commands.set_retained_from(op);
-            // Validated by the WAL that recovered it.
-            let _ = commands.insert(prepare);
+            commands.insert(op, prepare);
             return;
         }
         let ring = unsafe { &mut *self.evicted_ring.get() };
@@ -1516,10 +1515,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
             .expect("partition journal append expects a valid prepare header");
         if header.operation == Operation::StateMachineCommand {
-            self.commands
-                .borrow_mut()
-                .insert(entry)
-                .expect("a command header was just checked");
+            self.commands.borrow_mut().insert(header.op, entry);
             return;
         }
         let op = header.op;
@@ -1721,6 +1717,11 @@ where
     pub fn release_checkpointed_commands(&self, checkpoint_op: u64) -> bool {
         let mut commands = self.commands.borrow_mut();
         let before = commands.len();
+        // Without repair retention nothing serves a released command, so every
+        // checkpointed one goes, as the evicted data entries do.
+        if !self.repair_retention.get() {
+            commands.release_checkpointed(checkpoint_op, 0, 0);
+        }
         let over = commands.release_checkpointed(
             checkpoint_op,
             COMMANDS_RETAINED_MAX,
@@ -1877,23 +1878,6 @@ where
             // In-window ops only, deduplicated, so a count match IS coverage.
             complete: covered == expected_len,
         }
-    }
-
-    /// Highest `commit` any resident header stamped, in ONE pass.
-    ///
-    /// A lower bound on the group's commit point, which is what a rebuilt replica
-    /// can recover from a log alone: a prepare records the primary's commit point
-    /// at send time, so the true point may be one higher.
-    ///
-    /// Scans resident headers without probing every op up to the log head.
-    pub fn max_commit_watermark(&self) -> u64 {
-        let headers = unsafe { &*self.headers.get() };
-        headers
-            .iter()
-            .map(|header| header.commit)
-            .max()
-            .unwrap_or(0)
-            .max(self.commands.borrow().max_commit())
     }
 
     /// Headers for the contiguous op run `from_op ..= commit_max`, in op order,
@@ -3290,7 +3274,6 @@ mod tests {
             vec![1, 2, 3, 4, 5]
         );
         assert!(journal.repaired_window_shape(0, 5).complete);
-        assert_eq!(journal.max_commit_watermark(), 4);
         assert_eq!(
             journal
                 .committed_headers_from(1, 5, usize::MAX)
@@ -3348,6 +3331,27 @@ mod tests {
         journal.restore_checkpoint_prepare(3, build_command_prepare(3));
         assert_eq!(journal.commands_in(3..=3), 1);
         assert_eq!(journal.repair_retained_from(), Some(3));
+    }
+
+    /// Nothing serves a released command without repair retention, so every
+    /// checkpointed command goes and only the ones above the checkpoint stay.
+    #[compio::test]
+    async fn given_no_repair_retention_when_releasing_should_drop_every_checkpointed_command() {
+        let commands: Vec<_> = (1..=4).map(build_command_prepare).collect();
+        let retained = journal_with(&commands).await;
+        assert!(!retained.release_checkpointed_commands(3));
+        assert_eq!(
+            retained.commands_in(..),
+            4,
+            "within the caps, repair keeps them"
+        );
+
+        let unretained = journal_with(&commands).await;
+        unretained.set_repair_retention(false);
+        assert!(!unretained.release_checkpointed_commands(3));
+        assert_eq!(unretained.commands_in(..), 1);
+        assert_eq!(unretained.commands_in(4..=4), 1);
+        assert_eq!(unretained.repair_retained_from(), Some(4));
     }
 
     fn entry_ops(entries: &[Frozen<4096>]) -> Vec<u64> {

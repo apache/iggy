@@ -3160,17 +3160,17 @@ where
         // A restart that registers other machines than the process before it
         // is refused the way a boot refuses a checkpoint of them.
         if let Some(machines) = &machines
-            && let Err(error) = self.restore_machines(Some(machines), machines.op)
+            && let Err(error) = self.restore_machines(Some(machines), machines.op())
         {
             error!(
                 namespace_raw = self.namespace().inner(),
-                op = machines.op,
+                op = machines.op(),
                 %error,
                 "cannot restore the retained state machines"
             );
             self.fatal = Some(FatalCommit {
                 namespace_raw: self.namespace().inner(),
-                op: machines.op,
+                op: machines.op(),
                 operation: None,
             });
         }
@@ -17862,10 +17862,12 @@ pub mod tests {
 
     fn command_prepare(op: u64, parent: u128, kind: u16, value: u64) -> Message<PrepareHeader> {
         let namespace = IggyNamespace::new(1, 1, 0);
-        let body = crate::state_machine::MachineCommand::encode(
-            crate::state_machine::CommandKind(kind),
-            &value.to_le_bytes(),
-        )
+        let payload = value.to_le_bytes();
+        let body = crate::state_machine::MachineCommand {
+            kind: crate::state_machine::CommandKind(kind),
+            payload: &payload,
+        }
+        .encode()
         .unwrap();
         let total = size_of::<PrepareHeader>() + body.len();
         let mut prepare = Message::<PrepareHeader>::new(total);

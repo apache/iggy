@@ -99,12 +99,12 @@ where
         payload: &[u8],
         request: u64,
     ) -> Result<Message<RoutedRequestHeader>, CommandEncodeError> {
-        let body = MachineCommand::encode(kind, payload)?;
-        let size = size_of::<RoutedRequestHeader>() + body.len();
+        let command = MachineCommand { kind, payload };
+        let size = size_of::<RoutedRequestHeader>() + command.encoded_len()?;
         let wire_size =
             u32::try_from(size).map_err(|_| CommandEncodeError::TooLarge { length: size })?;
         let mut message = Message::<RoutedRequestHeader>::new(size);
-        message.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
+        command.encode_into(&mut message.as_mut_slice()[size_of::<RoutedRequestHeader>()..]);
         let group = self.consensus().group();
         let incarnation = self.created_revision();
         Ok(
@@ -274,9 +274,9 @@ where
         op: u64,
     ) -> Result<(), StateMachineError> {
         match snapshot {
-            Some(snapshot) if snapshot.op != op => Err(StateMachineError::SnapshotOp {
+            Some(snapshot) if snapshot.op() != op => Err(StateMachineError::SnapshotOp {
                 expected: op,
-                found: snapshot.op,
+                found: snapshot.op(),
             }),
             Some(snapshot) => self.state_machines.check_snapshot(snapshot),
             None => Ok(()),
@@ -290,12 +290,17 @@ where
         snapshot: Option<&StateMachineSnapshot>,
         op: u64,
     ) -> Result<(), StateMachineError> {
-        self.check_machines_snapshot(snapshot, op)?;
-        if let Some(snapshot) = snapshot {
-            return self.state_machines.restore(snapshot);
+        let Some(snapshot) = snapshot else {
+            self.state_machines.reset();
+            self.state_machines.advance_applied(op);
+            return Ok(());
+        };
+        if snapshot.op() != op {
+            return Err(StateMachineError::SnapshotOp {
+                expected: op,
+                found: snapshot.op(),
+            });
         }
-        self.state_machines.reset();
-        self.state_machines.advance_applied(op);
-        Ok(())
+        self.state_machines.restore(snapshot)
     }
 }

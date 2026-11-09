@@ -34,7 +34,7 @@ mod snapshot;
 #[cfg(test)]
 mod tests;
 
-pub use codec::{COMMAND_HEADER_SIZE, CommandDecodeError, CommandEncodeError, MachineCommand};
+pub use codec::{CommandDecodeError, CommandEncodeError, MachineCommand};
 pub(crate) use log::StateMachineLog;
 pub use registry::{
     Applied, CommandKind, MachineId, MachineRestoreError, PartitionStateMachine, RegistrationError,
@@ -42,19 +42,22 @@ pub use registry::{
 };
 pub use snapshot::{SNAPSHOT_BYTES_MAX, SnapshotDecodeError, StateMachineSnapshot};
 
-/// Commands may hold one slot in this many of a partition's pipeline, so a
-/// busy machine never stalls producers.
+/// Commands may hold one slot in this many of a partition's pipeline.
+///
+/// A busy machine leaves producers the rest. A pipeline shallower than this
+/// still gives commands one slot, more than their share: at a depth of one,
+/// the only slot.
 pub const STATE_MACHINE_PIPELINE_SHARE: usize = 4;
 
 /// Largest command body. Commands describe state, never carry user data.
 pub const COMMAND_BYTES_MAX: usize = 64 * 1024;
 
-/// Committed commands a partition keeps in memory so repair can serve them,
-/// by count and by the memory they take.
+/// Committed commands a partition keeps in memory so repair can serve them.
 ///
 /// Uncommitted commands, and committed ones above the partition's checkpoint,
 /// are never released.
 pub const COMMANDS_RETAINED_MAX: usize = 16 * 1024;
+/// Memory the retained commands may take, padded allocations included.
 pub const COMMANDS_RETAINED_BYTES_MAX: u64 = 16 * 1024 * 1024;
 
 /// The pipeline slots commands may hold in a pipeline of `prepare_queue_max`

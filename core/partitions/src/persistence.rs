@@ -23,7 +23,9 @@ use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::ConsumerKind;
 use journal::PartitionPrepareJournal;
 use journal::durable_storage::{DurableFile, DurableStorage};
-use journal::partition_journal::{PARTITION_WAL_BYTES_MAX, SegmentPosition, SegmentReference};
+use journal::partition_journal::{
+    PARTITION_WAL_BYTES_MAX, SegmentPosition, SegmentReference, WalOpenOptions,
+};
 use server_common::Message;
 use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
@@ -140,16 +142,21 @@ impl<S: DurableStorage + Clone> Logs<S> {
         preallocate_segments: bool,
     ) -> io::Result<(Self, Option<S>)> {
         let command_directory = directory.join(STATE_MACHINE_LOG_DIRECTORY);
-        if !storage.exists(&command_directory).await? {
-            let data = PartitionPrepareJournal::open_with_storage_and_capacity(
-                directory,
-                group,
-                incarnation,
-                storage.clone(),
+        let sparse = storage.exists(&command_directory).await?;
+        let data = PartitionPrepareJournal::open_with_options(
+            directory,
+            group,
+            incarnation,
+            storage.clone(),
+            WalOpenOptions {
                 capacity,
                 preallocate_segments,
-            )
-            .await?;
+                sparse,
+                new_log_view: 0,
+            },
+        )
+        .await?;
+        if !sparse {
             return Ok((
                 Self {
                     data,
@@ -158,22 +165,16 @@ impl<S: DurableStorage + Clone> Logs<S> {
                 Some(storage),
             ));
         }
-        let data = PartitionPrepareJournal::open_sparse_with_storage_and_capacity(
-            directory,
-            group,
-            incarnation,
-            storage.clone(),
-            capacity,
-            preallocate_segments,
-        )
-        .await?;
-        let commands = PartitionPrepareJournal::open_sparse_with_storage_and_capacity(
+        let commands = PartitionPrepareJournal::open_with_options(
             &command_directory,
             group,
             incarnation,
             storage,
-            capacity,
-            false,
+            WalOpenOptions {
+                capacity,
+                sparse,
+                ..WalOpenOptions::default()
+            },
         )
         .await?;
         Ok((
@@ -1628,13 +1629,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             }
             Mutation::CertifyView {
                 view, op, checksum, ..
-            } => {
-                logs.data.certify_log_view(view, op, checksum).await?;
-                if let Some(commands) = logs.commands.as_mut() {
-                    commands.certify_log_view(view, op, checksum).await?;
-                }
-                Ok(())
-            }
+            } => Self::certify_logs(logs, view, op, checksum).await,
             Mutation::OpenCommandLog { .. } => self.command_log(logs).await.map(|_| ()),
             Mutation::Append {
                 operation,
@@ -1713,6 +1708,26 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 ..
             } => self.reset_logs(logs, op, checksum, prepare, segments).await,
         }
+    }
+
+    /// Certify both logs at once, so a view change waits for one barrier
+    /// chain rather than two in a row.
+    async fn certify_logs(
+        logs: &mut Logs<S>,
+        view: u32,
+        op: u64,
+        checksum: u128,
+    ) -> io::Result<()> {
+        let Logs { data, commands } = logs;
+        let (data, commands) =
+            futures::future::join(data.certify_log_view(view, op, checksum), async {
+                match commands.as_mut() {
+                    Some(commands) => commands.certify_log_view(view, op, checksum).await,
+                    None => Ok(()),
+                }
+            })
+            .await;
+        data.and(commands)
     }
 
     async fn checkpoint_logs(
@@ -1876,25 +1891,25 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 self.command_storage.borrow_mut().take().ok_or_else(|| {
                     io::Error::other("partition state-machine log storage is gone")
                 })?;
-            let mut commands = PartitionPrepareJournal::open_sparse_with_storage_and_capacity(
+            // The pair is certified only at the lower view of the two, so a new
+            // log published at view zero would withdraw the data log's
+            // certificate mid-view, and a crash before a later certification
+            // would boot uncertified. Empty, it matches any view's history at
+            // the genesis checkpoint, so its first frontier names the data
+            // log's view.
+            let commands = PartitionPrepareJournal::open_with_options(
                 &logs.data.directory().join(STATE_MACHINE_LOG_DIRECTORY),
                 self.group,
                 self.incarnation,
                 storage,
-                self.capacity,
-                false,
+                WalOpenOptions {
+                    capacity: self.capacity,
+                    sparse: true,
+                    new_log_view: logs.data.certified_log_view().unwrap_or(0),
+                    ..WalOpenOptions::default()
+                },
             )
             .await?;
-            // A new log starts certified at view zero, and the pair is
-            // certified only at the lower view of the two, so left there it
-            // would withdraw the data log's certificate mid-view. Empty, it
-            // matches any view's history at the genesis checkpoint.
-            if let Some(view) = logs.data.certified_log_view()
-                && commands.head() == 0
-                && commands.certified_log_view() != Some(view)
-            {
-                commands.certify_log_view(view, 0, 0).await?;
-            }
             logs.data.allow_gaps();
             logs.commands = Some(commands);
             self.holds_commands.set(true);
@@ -2836,13 +2851,15 @@ mod tests {
     }
 
     async fn open_raw_log(directory: &Path) -> PartitionPrepareJournal<crate::WalStorage> {
-        PartitionPrepareJournal::open_sparse_with_storage_and_capacity(
+        PartitionPrepareJournal::open_with_options(
             directory,
             42,
             7,
             crate::WalStorage::default(),
-            PARTITION_WAL_BYTES_MAX,
-            false,
+            WalOpenOptions {
+                sparse: true,
+                ..WalOpenOptions::default()
+            },
         )
         .await
         .unwrap()

@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use super::codec::MachineCommand;
-use super::snapshot::{SNAPSHOT_BYTES_MAX, StateMachineSnapshot};
+use super::snapshot::{SNAPSHOT_BYTES_MAX, SnapshotWriter, StateMachineSnapshot};
 
 /// Identifies one kind of command. Each kind has exactly one owning machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -76,12 +76,20 @@ pub trait PartitionStateMachine: Any {
     /// view change for one, can commit it twice at two ops. Apply must
     /// tolerate that: make the command idempotent, or deduplicate on an id the
     /// owner puts in the payload.
+    ///
+    /// Apply must refuse a command that would grow the state past what
+    /// [`Self::snapshot_into`] may write, see there.
     fn apply(&mut self, op: u64, command: MachineCommand<'_>) -> Applied;
 
-    /// The machine's whole state, restorable by [`Self::restore`]. Every
-    /// machine of a partition together stays within [`SNAPSHOT_BYTES_MAX`],
-    /// or the partition cannot checkpoint.
-    fn snapshot(&self) -> Vec<u8>;
+    /// Append the machine's whole state, restorable by [`Self::restore`], to
+    /// `out`.
+    ///
+    /// Every machine of a partition together stays within
+    /// [`SNAPSHOT_BYTES_MAX`]. A larger snapshot fails the partition's
+    /// checkpoint, which stops the partition, and since every replica applies
+    /// the same commands, every replica stops on the same op. Bound the state
+    /// in [`Self::apply`] instead.
+    fn snapshot_into(&self, out: &mut Vec<u8>);
 
     /// Replace the machine's state with a snapshot it produced.
     ///
@@ -210,12 +218,6 @@ impl StateMachines {
         self.applied_op
     }
 
-    /// Every machine's state as of [`Self::applied_op`].
-    #[must_use]
-    pub fn snapshot(&self) -> StateMachineSnapshot {
-        self.capture(self.applied_op)
-    }
-
     /// Note that every op through `op` committed with no command among them
     /// above the last applied one, so a snapshot can be cut there.
     pub(crate) fn advance_applied(&mut self, op: u64) {
@@ -270,14 +272,11 @@ impl StateMachines {
     /// leaves memory.
     pub(crate) fn capture(&self, op: u64) -> StateMachineSnapshot {
         debug_assert!(op >= self.applied_op, "a snapshot cannot predate its state");
-        StateMachineSnapshot {
-            op: op.max(self.applied_op),
-            machines: self
-                .machines
-                .iter()
-                .map(|machine| (machine.id(), machine.snapshot()))
-                .collect(),
+        let mut writer = SnapshotWriter::new(op.max(self.applied_op));
+        for machine in &self.machines {
+            writer.machine(machine.id(), |out| machine.snapshot_into(out));
         }
+        writer.finish()
     }
 
     /// Whether every machine `snapshot` names is registered. A registered
@@ -291,12 +290,12 @@ impl StateMachines {
         &self,
         snapshot: &StateMachineSnapshot,
     ) -> Result<(), StateMachineError> {
-        match snapshot.machines.iter().find(|(id, _)| {
+        match snapshot.machines().find(|(id, _)| {
             self.machines
                 .binary_search_by_key(id, |machine| machine.id())
                 .is_err()
         }) {
-            Some((id, _)) => Err(StateMachineError::UnregisteredMachine { id: *id }),
+            Some((id, _)) => Err(StateMachineError::UnregisteredMachine { id }),
             None => Ok(()),
         }
     }
@@ -313,7 +312,7 @@ impl StateMachines {
         snapshot: &StateMachineSnapshot,
     ) -> Result<(), StateMachineError> {
         self.check_snapshot(snapshot)?;
-        let mut parts = snapshot.machines.iter().peekable();
+        let mut parts = snapshot.machines().peekable();
         for machine in &mut self.machines {
             let id = machine.id();
             let Some((_, bytes)) = parts.next_if(|(part, _)| *part == id) else {
@@ -325,7 +324,7 @@ impl StateMachines {
                 return Err(StateMachineError::Restore { id, source });
             }
         }
-        self.applied_op = snapshot.op;
+        self.applied_op = snapshot.op();
         Ok(())
     }
 
@@ -478,8 +477,8 @@ pub mod tests {
             Applied::Changed
         }
 
-        fn snapshot(&self) -> Vec<u8> {
-            self.total.to_le_bytes().to_vec()
+        fn snapshot_into(&self, out: &mut Vec<u8>) {
+            out.extend_from_slice(&self.total.to_le_bytes());
         }
 
         fn restore(&mut self, snapshot: &[u8]) -> Result<(), MachineRestoreError> {
@@ -544,13 +543,13 @@ pub mod tests {
             Some(7)
         );
 
-        let snapshot = machines.snapshot();
-        assert_eq!(snapshot.op, 9);
+        let snapshot = machines.capture(machines.applied_op());
+        assert_eq!(snapshot.op(), 9);
         assert_eq!(
-            snapshot.machines,
+            snapshot.machines().collect::<Vec<_>>(),
             vec![
-                (MachineId(1), 5u64.to_le_bytes().to_vec()),
-                (MachineId(2), 7u64.to_le_bytes().to_vec()),
+                (MachineId(1), &5u64.to_le_bytes()[..]),
+                (MachineId(2), &7u64.to_le_bytes()[..]),
             ]
         );
     }
@@ -570,9 +569,7 @@ pub mod tests {
             Applied::Refused
         }
 
-        fn snapshot(&self) -> Vec<u8> {
-            Vec::new()
-        }
+        fn snapshot_into(&self, _: &mut Vec<u8>) {}
 
         fn restore(&mut self, _: &[u8]) -> Result<(), MachineRestoreError> {
             Ok(())
@@ -650,13 +647,13 @@ pub mod tests {
         let mut source = counters(&[1]);
         source.apply(4, command(10, &9u64.to_le_bytes())).unwrap();
         source.advance_applied(8);
-        let snapshot = source.snapshot();
-        assert_eq!(snapshot.op, 8);
+        let snapshot = source.capture(source.applied_op());
+        assert_eq!(snapshot.op(), 8);
 
         let mut target = counters(&[1]);
         target.restore(&snapshot).unwrap();
         assert_eq!(target.applied_op(), 8);
-        assert_eq!(target.snapshot(), snapshot);
+        assert_eq!(target.capture(target.applied_op()), snapshot);
 
         let mut other = counters(&[2]);
         assert_eq!(
@@ -664,10 +661,7 @@ pub mod tests {
             Err(StateMachineError::UnregisteredMachine { id: MachineId(1) })
         );
 
-        let corrupt = StateMachineSnapshot {
-            op: 8,
-            machines: vec![(MachineId(1), vec![1, 2, 3])],
-        };
+        let corrupt = StateMachineSnapshot::from_parts(8, &[(MachineId(1), &[1, 2, 3])]);
         assert_eq!(
             target.restore(&corrupt),
             Err(StateMachineError::Restore {
@@ -686,17 +680,20 @@ pub mod tests {
     fn given_a_snapshot_without_a_registered_machine_when_restoring_should_start_it_fresh() {
         let mut source = counters(&[1]);
         source.apply(2, command(10, &9u64.to_le_bytes())).unwrap();
-        let snapshot = source.snapshot();
+        let snapshot = source.capture(source.applied_op());
 
         let mut target = counters(&[1, 2]);
         target.apply(1, command(20, &4u64.to_le_bytes())).unwrap();
         target.restore(&snapshot).unwrap();
         assert_eq!(target.applied_op(), 2);
         assert_eq!(
-            target.snapshot().machines,
+            target
+                .capture(target.applied_op())
+                .machines()
+                .collect::<Vec<_>>(),
             vec![
-                (MachineId(1), 9u64.to_le_bytes().to_vec()),
-                (MachineId(2), 0u64.to_le_bytes().to_vec()),
+                (MachineId(1), &9u64.to_le_bytes()[..]),
+                (MachineId(2), &0u64.to_le_bytes()[..]),
             ]
         );
     }
@@ -705,7 +702,7 @@ pub mod tests {
     fn given_an_empty_registry_when_snapshotting_should_restore_into_another_empty_one() {
         let mut machines = StateMachines::default();
         machines.advance_applied(12);
-        let snapshot = machines.snapshot();
+        let snapshot = machines.capture(machines.applied_op());
         let mut restored = StateMachines::default();
         restored.restore(&snapshot).unwrap();
         assert_eq!(restored.applied_op(), 12);
@@ -725,8 +722,8 @@ pub mod tests {
             fn apply(&mut self, _: u64, _: MachineCommand<'_>) -> Applied {
                 Applied::Refused
             }
-            fn snapshot(&self) -> Vec<u8> {
-                vec![0; SNAPSHOT_BYTES_MAX]
+            fn snapshot_into(&self, out: &mut Vec<u8>) {
+                out.resize(out.len() + SNAPSHOT_BYTES_MAX, 0);
             }
             fn restore(&mut self, _: &[u8]) -> Result<(), MachineRestoreError> {
                 Ok(())
@@ -739,6 +736,6 @@ pub mod tests {
             machines.snapshot_at(3),
             Err(StateMachineError::SnapshotTooLarge { length }) if length > SNAPSHOT_BYTES_MAX
         ));
-        assert_eq!(machines.capture(3).op, 3);
+        assert_eq!(machines.capture(3).op(), 3);
     }
 }

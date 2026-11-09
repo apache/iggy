@@ -22,7 +22,7 @@ use super::registry::CommandKind;
 
 /// Bytes ahead of a command's payload: the kind and reserved padding that
 /// keeps the payload 8-byte aligned inside the prepare body.
-pub const COMMAND_HEADER_SIZE: usize = 8;
+pub const MACHINE_COMMAND_HEADER_SIZE: usize = 8;
 
 /// A state-machine command: the body of a prepare with
 /// [`Operation::StateMachineCommand`], borrowing its payload.
@@ -42,10 +42,9 @@ impl<'a> MachineCommand<'a> {
         if body.len() > COMMAND_BYTES_MAX {
             return Err(CommandDecodeError::TooLarge { length: body.len() });
         }
-        let Some((header, payload)) = body.split_at_checked(COMMAND_HEADER_SIZE) else {
-            return Err(CommandDecodeError::Short { length: body.len() });
-        };
-        let [low, high, reserved @ ..] = header else {
+        let Some(([low, high, reserved @ ..], payload)) =
+            body.split_first_chunk::<MACHINE_COMMAND_HEADER_SIZE>()
+        else {
             return Err(CommandDecodeError::Short { length: body.len() });
         };
         if reserved.iter().any(|byte| *byte != 0) {
@@ -57,20 +56,34 @@ impl<'a> MachineCommand<'a> {
         })
     }
 
-    /// The prepare body of a command of `kind` carrying `payload`.
+    /// The prepare body of this command.
     ///
     /// # Errors
     /// Returns an error when the body would exceed [`COMMAND_BYTES_MAX`].
-    pub fn encode(kind: CommandKind, payload: &[u8]) -> Result<Vec<u8>, CommandEncodeError> {
-        let length = COMMAND_HEADER_SIZE + payload.len();
+    pub fn encode(&self) -> Result<Vec<u8>, CommandEncodeError> {
+        let mut body = vec![0; self.encoded_len()?];
+        self.encode_into(&mut body);
+        Ok(body)
+    }
+
+    /// The length of [`Self::encode`]'s body.
+    ///
+    /// # Errors
+    /// Returns an error when the body would exceed [`COMMAND_BYTES_MAX`].
+    pub const fn encoded_len(&self) -> Result<usize, CommandEncodeError> {
+        let length = MACHINE_COMMAND_HEADER_SIZE + self.payload.len();
         if length > COMMAND_BYTES_MAX {
             return Err(CommandEncodeError::TooLarge { length });
         }
-        let mut body = Vec::with_capacity(length);
-        body.extend_from_slice(&kind.0.to_le_bytes());
-        body.resize(COMMAND_HEADER_SIZE, 0);
-        body.extend_from_slice(payload);
-        Ok(body)
+        Ok(length)
+    }
+
+    /// Write the body into `out`, which holds exactly
+    /// [`Self::encoded_len`] zeroed bytes.
+    pub(crate) fn encode_into(&self, out: &mut [u8]) {
+        let (header, payload) = out.split_at_mut(MACHINE_COMMAND_HEADER_SIZE);
+        header[..size_of::<u16>()].copy_from_slice(&self.kind.0.to_le_bytes());
+        payload.copy_from_slice(self.payload);
     }
 }
 
@@ -123,10 +136,17 @@ impl std::error::Error for CommandEncodeError {}
 mod tests {
     use super::*;
 
+    const fn command(kind: u16, payload: &[u8]) -> MachineCommand<'_> {
+        MachineCommand {
+            kind: CommandKind(kind),
+            payload,
+        }
+    }
+
     #[test]
     fn given_a_payload_when_round_tripping_should_keep_kind_and_bytes() {
-        let body = MachineCommand::encode(CommandKind(7), b"floor").unwrap();
-        assert_eq!(body.len(), COMMAND_HEADER_SIZE + 5);
+        let body = command(7, b"floor").encode().unwrap();
+        assert_eq!(body.len(), MACHINE_COMMAND_HEADER_SIZE + 5);
         let command = MachineCommand::decode(&body).unwrap();
         assert_eq!(command.kind, CommandKind(7));
         assert_eq!(command.payload, b"floor");
@@ -134,7 +154,7 @@ mod tests {
 
     #[test]
     fn given_an_empty_payload_when_decoding_should_accept_the_bare_header() {
-        let body = MachineCommand::encode(CommandKind(u16::MAX), &[]).unwrap();
+        let body = command(u16::MAX, &[]).encode().unwrap();
         let command = MachineCommand::decode(&body).unwrap();
         assert_eq!(command.kind, CommandKind(u16::MAX));
         assert_eq!(command.payload, b"");
@@ -146,7 +166,7 @@ mod tests {
             MachineCommand::decode(&[1, 0, 0]),
             Err(CommandDecodeError::Short { length: 3 })
         );
-        let mut body = MachineCommand::encode(CommandKind(1), b"x").unwrap();
+        let mut body = command(1, b"x").encode().unwrap();
         body[size_of::<u16>()] = 1;
         assert_eq!(
             MachineCommand::decode(&body),
@@ -160,7 +180,7 @@ mod tests {
             })
         );
         assert_eq!(
-            MachineCommand::encode(CommandKind(1), &oversized[COMMAND_HEADER_SIZE..]),
+            command(1, &oversized[MACHINE_COMMAND_HEADER_SIZE..]).encode(),
             Err(CommandEncodeError::TooLarge {
                 length: COMMAND_BYTES_MAX + 1
             })

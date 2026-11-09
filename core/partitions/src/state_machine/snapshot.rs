@@ -16,11 +16,13 @@
 // under the License.
 
 use std::fmt;
+use std::ops::Range;
 
 use super::registry::MachineId;
 
 const MAGIC: &[u8; 8] = b"IGGYSMS1";
 const FIXED: usize = MAGIC.len() + size_of::<u64>() + size_of::<u32>();
+const COUNT_AT: usize = MAGIC.len() + size_of::<u64>();
 const MACHINE_FIXED: usize = size_of::<u16>() + size_of::<u32>();
 
 /// Largest snapshot a partition writes or accepts from disk or a peer.
@@ -30,51 +32,47 @@ pub const SNAPSHOT_BYTES_MAX: usize = 16 * 1024 * 1024;
 /// Every machine's state at one op: the state-machine log's replay point and
 /// what state transfer carries.
 ///
-/// It travels only inside an artifact that checksums its bytes, so it carries
-/// no checksum of its own.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Holds its own encoding, which machines write their state straight into,
+/// so a checkpoint keeps one serialized copy of the machines. It travels only
+/// inside an artifact that checksums its bytes, so it carries no checksum of
+/// its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateMachineSnapshot {
     /// Every command at or below this op is applied, none above it.
-    pub op: u64,
-    /// Ordered by id.
-    pub machines: Vec<(MachineId, Vec<u8>)>,
+    op: u64,
+    /// `magic | op u64 | count u32 | {id u16, length u32, state}*`.
+    encoded: Vec<u8>,
+    /// Where each machine's state sits in `encoded`, ordered by id.
+    parts: Vec<(MachineId, Range<usize>)>,
+}
+
+impl Default for StateMachineSnapshot {
+    fn default() -> Self {
+        SnapshotWriter::new(0).finish()
+    }
 }
 
 impl StateMachineSnapshot {
     #[must_use]
-    pub fn encoded_size(&self) -> usize {
-        FIXED
-            + self
-                .machines
-                .iter()
-                .map(|(_, bytes)| MACHINE_FIXED + bytes.len())
-                .sum::<usize>()
+    pub const fn op(&self) -> u64 {
+        self.op
+    }
+
+    /// Each machine's id and state, ordered by id.
+    pub fn machines(&self) -> impl Iterator<Item = (MachineId, &[u8])> + '_ {
+        self.parts
+            .iter()
+            .map(|(id, range)| (*id, &self.encoded[range.clone()]))
     }
 
     #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.encoded_size());
-        self.encode_into(&mut bytes);
-        bytes
+    pub const fn encoded_size(&self) -> usize {
+        self.encoded.len()
     }
 
     /// Append the encoding to `out`.
-    ///
-    /// # Panics
-    /// When a machine's state exceeds `u32::MAX` bytes or there are more than
-    /// `u32::MAX` machines, which a snapshot within [`SNAPSHOT_BYTES_MAX`]
-    /// rules out.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&self.op.to_le_bytes());
-        let count = u32::try_from(self.machines.len()).expect("machine count fits u32");
-        out.extend_from_slice(&count.to_le_bytes());
-        for (id, state) in &self.machines {
-            out.extend_from_slice(&id.0.to_le_bytes());
-            let length = u32::try_from(state.len()).expect("machine state fits u32");
-            out.extend_from_slice(&length.to_le_bytes());
-            out.extend_from_slice(state);
-        }
+        out.extend_from_slice(&self.encoded);
     }
 
     /// # Errors
@@ -86,59 +84,115 @@ impl StateMachineSnapshot {
                 length: bytes.len(),
             });
         }
-        let mut reader = Reader { bytes };
-        if reader.take(MAGIC.len())? != MAGIC {
+        let mut reader = Reader { bytes, at: 0 };
+        if reader.array::<{ MAGIC.len() }>()? != *MAGIC {
             return Err(SnapshotDecodeError::Magic);
         }
-        let op = reader.u64()?;
-        let count = reader.u32()? as usize;
-        let mut machines: Vec<(MachineId, Vec<u8>)> =
+        let op = u64::from_le_bytes(reader.array()?);
+        let count = u32::from_le_bytes(reader.array()?) as usize;
+        let mut parts: Vec<(MachineId, Range<usize>)> =
             Vec::with_capacity(count.min(bytes.len() / MACHINE_FIXED));
         for _ in 0..count {
-            let id = MachineId(reader.u16()?);
-            if machines.last().is_some_and(|(last, _)| *last >= id) {
+            let id = MachineId(u16::from_le_bytes(reader.array()?));
+            if parts.last().is_some_and(|(last, _)| *last >= id) {
                 return Err(SnapshotDecodeError::MachineOrder);
             }
-            let length = reader.u32()? as usize;
-            machines.push((id, reader.take(length)?.to_vec()));
+            let length = u32::from_le_bytes(reader.array()?) as usize;
+            parts.push((id, reader.take(length)?));
         }
-        if !reader.bytes.is_empty() {
+        if reader.at != bytes.len() {
             return Err(SnapshotDecodeError::TrailingBytes);
         }
-        Ok(Self { op, machines })
+        Ok(Self {
+            op,
+            encoded: bytes.to_vec(),
+            parts,
+        })
+    }
+
+    /// A snapshot of `parts` at `op`, in the given order.
+    #[cfg(test)]
+    pub(crate) fn from_parts(op: u64, parts: &[(MachineId, &[u8])]) -> Self {
+        let mut writer = SnapshotWriter::new(op);
+        for (id, state) in parts {
+            writer.machine(*id, |out| out.extend_from_slice(state));
+        }
+        writer.finish()
+    }
+}
+
+/// Builds a [`StateMachineSnapshot`] one machine at a time, each writing its
+/// state into the snapshot's own buffer.
+pub struct SnapshotWriter {
+    op: u64,
+    encoded: Vec<u8>,
+    parts: Vec<(MachineId, Range<usize>)>,
+}
+
+impl SnapshotWriter {
+    pub fn new(op: u64) -> Self {
+        let mut encoded = Vec::with_capacity(FIXED);
+        encoded.extend_from_slice(MAGIC);
+        encoded.extend_from_slice(&op.to_le_bytes());
+        encoded.extend_from_slice(&0u32.to_le_bytes());
+        Self {
+            op,
+            encoded,
+            parts: Vec::new(),
+        }
+    }
+
+    /// Add machine `id`, whose state `write` appends.
+    ///
+    /// A state past `u32::MAX` bytes records that length saturated, which no
+    /// reader decodes: such a snapshot is far past [`SNAPSHOT_BYTES_MAX`],
+    /// which every snapshot that leaves memory is checked against.
+    pub fn machine(&mut self, id: MachineId, write: impl FnOnce(&mut Vec<u8>)) {
+        self.encoded.extend_from_slice(&id.0.to_le_bytes());
+        let length_at = self.encoded.len();
+        self.encoded.extend_from_slice(&0u32.to_le_bytes());
+        let start = self.encoded.len();
+        write(&mut self.encoded);
+        let length = u32::try_from(self.encoded.len() - start).unwrap_or(u32::MAX);
+        self.encoded[length_at..start].copy_from_slice(&length.to_le_bytes());
+        self.parts.push((id, start..self.encoded.len()));
+    }
+
+    pub fn finish(mut self) -> StateMachineSnapshot {
+        let count = u32::try_from(self.parts.len()).unwrap_or(u32::MAX);
+        self.encoded[COUNT_AT..FIXED].copy_from_slice(&count.to_le_bytes());
+        StateMachineSnapshot {
+            op: self.op,
+            encoded: self.encoded,
+            parts: self.parts,
+        }
     }
 }
 
 struct Reader<'a> {
     bytes: &'a [u8],
+    at: usize,
 }
 
-impl<'a> Reader<'a> {
-    fn take(&mut self, length: usize) -> Result<&'a [u8], SnapshotDecodeError> {
-        let (taken, rest) = self
-            .bytes
-            .split_at_checked(length)
+impl Reader<'_> {
+    /// The range of the next `length` bytes, consumed.
+    fn take(&mut self, length: usize) -> Result<Range<usize>, SnapshotDecodeError> {
+        let end = self
+            .at
+            .checked_add(length)
+            .filter(|end| *end <= self.bytes.len())
             .ok_or(SnapshotDecodeError::Truncated)?;
-        self.bytes = rest;
-        Ok(taken)
+        let range = self.at..end;
+        self.at = end;
+        Ok(range)
     }
 
     fn array<const N: usize>(&mut self) -> Result<[u8; N], SnapshotDecodeError> {
-        self.take(N)?
-            .try_into()
-            .map_err(|_| SnapshotDecodeError::Truncated)
-    }
-
-    fn u16(&mut self) -> Result<u16, SnapshotDecodeError> {
-        self.array().map(u16::from_le_bytes)
-    }
-
-    fn u32(&mut self) -> Result<u32, SnapshotDecodeError> {
-        self.array().map(u32::from_le_bytes)
-    }
-
-    fn u64(&mut self) -> Result<u64, SnapshotDecodeError> {
-        self.array().map(u64::from_le_bytes)
+        let (taken, _) = self.bytes[self.at..]
+            .split_first_chunk::<N>()
+            .ok_or(SnapshotDecodeError::Truncated)?;
+        self.at += N;
+        Ok(*taken)
     }
 }
 
@@ -173,29 +227,35 @@ mod tests {
     use super::*;
 
     fn sample() -> StateMachineSnapshot {
-        StateMachineSnapshot {
-            op: 42,
-            machines: vec![
-                (MachineId(1), b"floor".to_vec()),
-                (MachineId(7), Vec::new()),
-            ],
-        }
+        StateMachineSnapshot::from_parts(42, &[(MachineId(1), b"floor"), (MachineId(7), b"")])
+    }
+
+    fn encoded(snapshot: &StateMachineSnapshot) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        snapshot.encode_into(&mut bytes);
+        bytes
     }
 
     #[test]
     fn given_a_snapshot_when_round_tripping_should_decode_what_was_encoded() {
         let snapshot = sample();
-        let bytes = snapshot.encode();
+        let bytes = encoded(&snapshot);
         assert_eq!(bytes.len(), snapshot.encoded_size());
-        assert_eq!(StateMachineSnapshot::decode(&bytes), Ok(snapshot));
+        let decoded = StateMachineSnapshot::decode(&bytes).unwrap();
+        assert_eq!(decoded, snapshot);
+        assert_eq!(decoded.op(), 42);
+        assert_eq!(
+            decoded.machines().collect::<Vec<_>>(),
+            vec![(MachineId(1), &b"floor"[..]), (MachineId(7), &b""[..])]
+        );
 
         let empty = StateMachineSnapshot::default();
-        assert_eq!(StateMachineSnapshot::decode(&empty.encode()), Ok(empty));
+        assert_eq!(StateMachineSnapshot::decode(&encoded(&empty)), Ok(empty));
     }
 
     #[test]
     fn given_truncated_or_garbled_bytes_when_decoding_should_refuse_them() {
-        let bytes = sample().encode();
+        let bytes = encoded(&sample());
         for length in 0..bytes.len() {
             assert!(StateMachineSnapshot::decode(&bytes[..length]).is_err());
         }
@@ -215,12 +275,10 @@ mod tests {
 
     #[test]
     fn given_unordered_machines_when_decoding_should_refuse_them() {
-        let unordered = StateMachineSnapshot {
-            op: 1,
-            machines: vec![(MachineId(2), Vec::new()), (MachineId(2), Vec::new())],
-        };
+        let unordered =
+            StateMachineSnapshot::from_parts(1, &[(MachineId(2), b""), (MachineId(2), b"")]);
         assert_eq!(
-            StateMachineSnapshot::decode(&unordered.encode()),
+            StateMachineSnapshot::decode(&encoded(&unordered)),
             Err(SnapshotDecodeError::MachineOrder)
         );
     }
