@@ -51,3 +51,23 @@ The examples use `IGGY_CONNECTION_STRING` when it is set; use a binary transport
 with credentials for automatic login. Otherwise they connect over TCP using
 `IGGY_HOST` and `IGGY_PORT`, then log in with `IGGY_USERNAME` and `IGGY_PASSWORD`
 without URL encoding. Defaults are `127.0.0.1:8090` and `iggy`/`iggy`.
+
+### TLS
+
+From the repository root, start a disposable TLS server with the development
+certificate pair and the same credential prerequisites:
+
+```bash
+IGGY_TCP_TLS_ENABLED=true \
+IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
+IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
+cargo run --bin iggy-server -- --fresh --with-default-root-credentials
+```
+
+From `examples/php`, run the getting-started producer with the PHP connection
+string and the development CA certificate:
+
+```bash
+IGGY_CONNECTION_STRING="iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=../../core/certs/iggy_ca_cert.pem" \
+php -d extension="${PHP_IGGY_EXTENSION:-../../foreign/php/target/debug/libiggy_php.so}" getting-started/producer.php
+```
