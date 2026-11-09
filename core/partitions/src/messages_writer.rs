@@ -20,10 +20,10 @@ use compio::{
     io::AsyncWriteAtExt,
 };
 use iggy_common::{IggyByteSize, IggyError};
-use server_common::DISK_USAGE;
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::fs_utils::preallocate_file;
 use server_common::iobuf::{Frozen, IOV_MAX};
+use server_common::{DISK_USAGE, unreserved_bytes};
 use std::{
     path::Path,
     rc::Rc,
@@ -202,7 +202,7 @@ async fn write_frozen_chunked<const ALIGN: usize>(
         let chunk_size: usize = chunk.iter().map(Frozen::len).sum();
         let chunk_vec: Vec<_> = chunk.to_vec();
         let end = position + chunk_size as u64;
-        let _charge = DISK_USAGE.charge(end.saturating_sub(position.max(reserved_end)));
+        let _charge = DISK_USAGE.charge(unreserved_bytes(position, end, reserved_end));
         let (result, _) = (&*file)
             .write_vectored_all_at(chunk_vec, position)
             .await

@@ -23,7 +23,7 @@ use iggy_binary_protocol::batch::BatchHeader;
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::MAX_TOPIC_SEGMENT_SIZE;
 use server_common::iobuf::{Frozen, IOV_MAX};
-use server_common::{DISK_USAGE, DiskCharge};
+use server_common::{DISK_USAGE, DiskCharge, unreserved_bytes};
 
 use super::{
     JournalState, PartitionPrepareJournal, SegmentReference, StoredPrepare, invalid, segment_path,
@@ -58,6 +58,13 @@ pub(super) struct SegmentState {
     pub next_generation: u64,
     pub tail: SegmentCursor,
     pub checkpoint: SegmentCursor,
+}
+
+/// An open segment file and how much of it its reservation covers. Without a
+/// reservation `reserved_end` is 0, so all its writes take new space.
+pub(super) struct SegmentFile<F> {
+    file: F,
+    reserved_end: u64,
 }
 
 impl<S: DurableStorage> PartitionPrepareJournal<S> {
@@ -266,21 +273,20 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.poisoned = true;
         self.open_segment_file(generation, initial.start_offset, initial.length, None)
             .await?;
-        let installed_file = self
+        let installed = self
             .segment_files
-            .get(&(generation, initial.start_offset))
+            .get_mut(&(generation, initial.start_offset))
             .ok_or_else(|| invalid("installed segment handle is absent"))?;
-        if installed_file.length().await? != initial.length {
+        if installed.file.length().await? != initial.length {
             return Err(invalid(
                 "installed segment size differs from its checkpoint",
             ));
         }
         if self.preallocate_segments {
-            let reserved = installed_file
+            installed.reserved_end = installed
+                .file
                 .preallocate(&cursor.path(&self.directory), max_size)
                 .await;
-            self.segment_reservations
-                .insert((generation, initial.start_offset), reserved);
         }
         let checkpoint_prepare = if let Some(prepare) = prepare {
             let header = self.validate_checkpoint_prepare(&prepare)?;
@@ -295,10 +301,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                         position: initial.length - batch.batch_length,
                         length: batch.batch_length,
                     };
-                    let file = self
+                    let file = &self
                         .segment_files
                         .get(&(generation, initial.start_offset))
-                        .ok_or_else(|| invalid("installed segment handle is absent"))?;
+                        .ok_or_else(|| invalid("installed segment handle is absent"))?
+                        .file;
                     if file
                         .read(
                             reference.position,
@@ -452,19 +459,6 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         Ok(())
     }
 
-    /// How many bytes of a body write at `position..end` of `segment` take new
-    /// disk space. Writes below the end of its reservation take none. The part
-    /// past it does: a segment can grow past `max_size` because the last batch
-    /// may cross it, and without a reservation that is the whole write.
-    fn newly_allocated(&self, segment: (u64, u64), position: u64, end: u64) -> u64 {
-        let reserved_end = self
-            .segment_reservations
-            .get(&segment)
-            .copied()
-            .unwrap_or(0);
-        end.saturating_sub(position.max(reserved_end))
-    }
-
     /// Opens the segment `reference` writes into, which reserves a new one, and
     /// charges the bytes of `reference.position..end` that its reservation does
     /// not cover. Hold the charge until the write finishes or fails.
@@ -486,13 +480,16 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         )
         .await?;
         self.segment_files_dirty = true;
-        let segment = (reference.generation, reference.start_offset);
-        let charge = DISK_USAGE.charge(self.newly_allocated(segment, reference.position, end));
-        let file = self
+        let segment = self
             .segment_files
-            .get_mut(&segment)
+            .get_mut(&(reference.generation, reference.start_offset))
             .ok_or_else(|| invalid("segment writing handle is absent"))?;
-        Ok((charge, file))
+        let charge = DISK_USAGE.charge(unreserved_bytes(
+            reference.position,
+            end,
+            segment.reserved_end,
+        ));
+        Ok((charge, &mut segment.file))
     }
 
     /// Barrier over every body and link this journal wrote, leaving the dirty
@@ -501,7 +498,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     /// barrier and clear both flags once the pair has completed.
     pub(super) async fn segment_barrier(&self) -> io::Result<()> {
         if self.segment_files_dirty {
-            for file in self.segment_files.values() {
+            for SegmentFile { file, .. } in self.segment_files.values() {
                 // Keep the writing handle: reopening after an errseq writeback error
                 // could turn a failed body barrier into a successful acknowledgment.
                 file.sync().await?;
@@ -531,7 +528,6 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 segments.tail.position.start_offset,
             );
             self.segment_files.retain(|key, _| *key == active);
-            self.segment_reservations.retain(|key, _| *key == active);
         }
     }
 
@@ -584,18 +580,21 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             || cursor.position.next_offset > segments.checkpoint.position.next_offset
             || self.storage.exists(&public).await?;
         if restore {
+            // Reserve after the truncation below, not here: cutting the file
+            // back to its durable length frees every block past it, reserved
+            // ones included.
             self.open_segment_file(
                 cursor.generation,
                 cursor.position.start_offset,
                 cursor.position.length,
-                self.preallocate_segments.then_some(segments.max_size),
+                None,
             )
             .await?;
-            let file = self
+            let segment = self
                 .segment_files
-                .get(&(cursor.generation, cursor.position.start_offset))
+                .get_mut(&(cursor.generation, cursor.position.start_offset))
                 .ok_or_else(|| invalid("segment rollback handle is absent"))?;
-            let length = file.length().await?;
+            let length = segment.file.length().await?;
             if length < cursor.position.length {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -618,15 +617,14 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                     discarded_bytes = length - cursor.position.length,
                     "discarding unpublished segment bytes beyond the durable WAL frontier"
                 );
-                file.truncate(cursor.position.length).await?;
+                segment.file.truncate(cursor.position.length).await?;
                 self.segment_files_dirty = true;
-                if self.preallocate_segments {
-                    let reserved = file
-                        .preallocate(&cursor.path(&self.directory), segments.max_size)
-                        .await;
-                    self.segment_reservations
-                        .insert((cursor.generation, cursor.position.start_offset), reserved);
-                }
+            }
+            if self.preallocate_segments {
+                segment.reserved_end = segment
+                    .file
+                    .preallocate(&cursor.path(&self.directory), segments.max_size)
+                    .await;
             }
             self.sync_segment_files().await?;
             // Keep the public name present across recovery crashes. Its absence
@@ -673,7 +671,13 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             let path = cursor.path(&self.directory);
             match self.storage.open(&path, OpenMode::ReadWrite).await {
                 Ok(file) => {
-                    self.segment_files.insert(key, file);
+                    self.segment_files.insert(
+                        key,
+                        SegmentFile {
+                            file,
+                            reserved_end: 0,
+                        },
+                    );
                 }
                 Err(error)
                     if error.kind() == io::ErrorKind::NotFound && cursor.position.length == 0 =>
@@ -686,23 +690,23 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         }
         // Live partitions own the public log/index names and may still hold their
         // descriptors. Namespace reconciliation belongs to startup recovery.
-        let file = self
+        let segment = self
             .segment_files
-            .get(&key)
+            .get_mut(&key)
             .ok_or_else(|| invalid("segment rollback handle is absent"))?;
-        if file.length().await? < cursor.position.length {
+        if segment.file.length().await? < cursor.position.length {
             return Err(invalid("segment lost durably published bytes"));
         }
-        file.truncate(cursor.position.length).await?;
+        segment.file.truncate(cursor.position.length).await?;
         // Truncating frees the reservation past the new length, reserved
         // blocks included, so what it covered no longer holds.
         if self.preallocate_segments {
-            let reserved = file
+            segment.reserved_end = segment
+                .file
                 .preallocate(&cursor.path(&self.directory), segments.max_size)
                 .await;
-            self.segment_reservations.insert(key, reserved);
         }
-        file.sync().await?;
+        segment.file.sync().await?;
         self.poisoned = false;
         Ok(())
     }
@@ -722,11 +726,12 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         if self.storage.exists(&retained).await? {
             let file = self.storage.open(&retained, OpenMode::ReadWrite).await?;
             // Nothing recorded survives a reopen, and only the file can tell.
-            if let Some(size) = preallocate_size {
-                let reserved = file.preallocate(&retained, size).await;
-                self.segment_reservations.insert(key, reserved);
-            }
-            self.segment_files.insert(key, file);
+            let reserved_end = match preallocate_size {
+                Some(size) => file.preallocate(&retained, size).await,
+                None => 0,
+            };
+            self.segment_files
+                .insert(key, SegmentFile { file, reserved_end });
             return Ok(());
         }
         let parent = self.segment_directory()?.to_path_buf();
@@ -754,15 +759,16 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         };
         let file = self.storage.open(&public, mode).await?;
         self.storage.hard_link(&public, &retained).await?;
-        if length == 0
-            && let Some(size) = preallocate_size
-        {
-            let reserved = file.preallocate(&retained, size).await;
-            self.segment_reservations.insert(key, reserved);
-        }
+        // A tail opened with bytes already in it, as `enable_segment_storage`
+        // opens one, is reserved too, so its writes are not charged again.
+        let reserved_end = match preallocate_size {
+            Some(size) => file.preallocate(&retained, size).await,
+            None => 0,
+        };
         self.segment_files_dirty = true;
         self.segment_links_dirty = true;
-        self.segment_files.insert(key, file);
+        self.segment_files
+            .insert(key, SegmentFile { file, reserved_end });
         // Establish the inode and links before buffered appends can be acknowledged.
         // A later shutdown barrier must not need a new directory descriptor.
         self.sync_segment_files().await?;
@@ -957,13 +963,13 @@ pub(super) fn decode_batch(prepare: &[u8]) -> io::Result<BatchHeader> {
     Ok(batch)
 }
 
-#[cfg(test)]
+// Off Linux `preallocate_file` reserves nothing, so there is nothing to check.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use crate::durable_storage::DiskStorage;
-    #[cfg(target_os = "linux")]
-    use crate::partition_journal::tests::supports_preallocation;
     use crate::partition_journal::{PARTITION_WAL_BYTES_MAX, WalOpenOptions};
+    use server_common::fs_utils::supports_preallocation;
     use tempfile::{TempDir, tempdir};
 
     const MAX_SIZE: u64 = 1024 * 1024;
@@ -971,47 +977,10 @@ mod tests {
     const SEGMENT: (u64, u64) = (1, 0);
 
     #[compio::test]
-    async fn given_no_preallocation_when_writing_a_body_should_count_every_byte() {
-        let (_directory, journal) = journal(false).await;
-
-        assert_eq!(journal.newly_allocated(SEGMENT, 0, BODY_BYTES), BODY_BYTES);
-        assert_eq!(
-            journal.newly_allocated(SEGMENT, MAX_SIZE - BODY_BYTES, MAX_SIZE + BODY_BYTES),
-            2 * BODY_BYTES
-        );
-    }
-
-    #[compio::test]
-    async fn given_preallocation_when_a_body_crosses_the_reservation_should_count_only_the_bytes_past_it()
-     {
-        let (_directory, mut journal) = journal(true).await;
-        journal.segment_reservations.insert(SEGMENT, MAX_SIZE);
-
-        assert_eq!(
-            journal.newly_allocated(SEGMENT, MAX_SIZE - BODY_BYTES, MAX_SIZE + BODY_BYTES),
-            BODY_BYTES
-        );
-    }
-
-    #[compio::test]
-    async fn given_a_reservation_that_covered_nothing_when_writing_a_body_should_count_every_byte()
-    {
-        let (_directory, mut journal) = journal(true).await;
-        journal.segment_reservations.insert(SEGMENT, 0);
-
-        assert_eq!(
-            journal.newly_allocated(SEGMENT, 0, BODY_BYTES),
-            BODY_BYTES,
-            "a failed reservation allocated nothing, so the write takes new space"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[compio::test]
     async fn given_a_segment_when_opening_and_reopening_should_record_what_its_reservation_covers()
     {
-        let (directory, mut journal) = journal(true).await;
-        if !supports_preallocation(directory.path(), MAX_SIZE) {
+        let (directory, mut journal) = journal().await;
+        if !supports_preallocation(directory.path(), MAX_SIZE).unwrap() {
             eprintln!("skipped: fallocate allocates no blocks in the temporary directory");
             return;
         }
@@ -1020,40 +989,76 @@ mod tests {
             .open_segment_file(SEGMENT.0, SEGMENT.1, 0, Some(MAX_SIZE))
             .await
             .unwrap();
-        assert_eq!(journal.segment_reservations.get(&SEGMENT), Some(&MAX_SIZE));
+        assert_eq!(journal.segment_files[&SEGMENT].reserved_end, MAX_SIZE);
 
         journal.segment_files.clear();
-        journal.segment_reservations.clear();
         journal
             .open_segment_file(SEGMENT.0, SEGMENT.1, 0, Some(MAX_SIZE))
             .await
             .unwrap();
         assert_eq!(
-            journal.segment_reservations.get(&SEGMENT),
-            Some(&MAX_SIZE),
+            journal.segment_files[&SEGMENT].reserved_end, MAX_SIZE,
             "a reopened segment must report the blocks it still owns"
         );
     }
 
-    async fn journal(preallocate: bool) -> (TempDir, PartitionPrepareJournal<DiskStorage>) {
+    #[compio::test]
+    async fn given_a_tail_with_bytes_when_enabling_segment_storage_should_record_what_its_reservation_covers()
+     {
         let directory = tempdir().unwrap();
-        let mut journal = PartitionPrepareJournal::open_with_options(
+        if !supports_preallocation(directory.path(), MAX_SIZE).unwrap() {
+            eprintln!("skipped: fallocate allocates no blocks in the temporary directory");
+            return;
+        }
+        std::fs::write(
+            directory.path().join(format!("{:020}.log", 0)),
+            vec![7u8; usize::try_from(BODY_BYTES).unwrap()],
+        )
+        .unwrap();
+        let mut journal = open_journal(&directory).await;
+
+        journal
+            .enable_segment_storage(
+                SegmentPosition {
+                    start_offset: 0,
+                    length: BODY_BYTES,
+                    next_offset: 1,
+                },
+                MAX_SIZE,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            journal.segment_files[&(0, 0)].reserved_end,
+            MAX_SIZE,
+            "the tail's writes would otherwise be charged again until the next roll"
+        );
+    }
+
+    async fn journal() -> (TempDir, PartitionPrepareJournal<DiskStorage>) {
+        let directory = tempdir().unwrap();
+        let mut journal = open_journal(&directory).await;
+        journal
+            .enable_segment_storage(SegmentPosition::default(), MAX_SIZE)
+            .await
+            .unwrap();
+        (directory, journal)
+    }
+
+    async fn open_journal(directory: &TempDir) -> PartitionPrepareJournal<DiskStorage> {
+        PartitionPrepareJournal::open_with_options(
             &directory.path().join("prepares-7"),
             42,
             7,
             DiskStorage,
             WalOpenOptions {
                 capacity: PARTITION_WAL_BYTES_MAX,
-                preallocate_segments: preallocate,
+                preallocate_segments: true,
                 ..WalOpenOptions::default()
             },
         )
         .await
-        .unwrap();
-        journal
-            .enable_segment_storage(SegmentPosition::default(), MAX_SIZE)
-            .await
-            .unwrap();
-        (directory, journal)
+        .unwrap()
     }
 }

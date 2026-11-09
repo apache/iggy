@@ -33,11 +33,10 @@ use std::time::{Duration, Instant};
 
 use iggy::prelude::*;
 use integration::harness::TestHarness;
-use integration::harness::disk::{
-    allocated_bytes, reservations_allocate, sync_volume, volume_used_bytes,
-};
+use integration::harness::disk::{allocated_bytes, sync_volume, volume_used_bytes};
 use integration::harness::seeds::{self, names};
 use serial_test::{parallel, serial};
+use server_common::fs_utils::supports_preallocation;
 use tokio::time::sleep;
 
 use super::http_client::HttpClient;
@@ -143,7 +142,9 @@ async fn assert_burst_is_charged_with_preallocation(preallocate: bool) {
     let data_path = harness.server().data_path();
     // Where a reservation allocates nothing, each segment charges it anyway and
     // the burst lands far above what the data directory grows by.
-    if preallocate && !reservations_allocate(&data_path) {
+    if preallocate
+        && !supports_preallocation(&data_path, SEGMENT_BYTES).expect("preallocation probe")
+    {
         eprintln!(
             "skipped: fallocate allocates no blocks under {}",
             data_path.display()

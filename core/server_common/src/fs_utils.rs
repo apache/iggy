@@ -28,9 +28,13 @@ use crate::fatal::NoteDescriptorExhaustion;
 #[cfg(target_os = "linux")]
 use crate::{DISK_USAGE, DiskUsage};
 #[cfg(target_os = "linux")]
+use nix::errno::Errno;
+#[cfg(target_os = "linux")]
 use nix::fcntl::{FallocateFlags, fallocate};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(not(target_os = "linux"))]
 static PREALLOCATION_UNAVAILABLE: std::sync::Once = std::sync::Once::new();
@@ -176,6 +180,51 @@ pub async fn preallocate_file(_file: &fs::File, file_path: &Path, _len: u64) -> 
         );
     });
     0
+}
+
+/// Whether reserving `len` bytes with [`preallocate_file`] allocates them on
+/// the volume holding `directory`. Some filesystems refuse `fallocate`, and
+/// OpenZFS reports success without allocating anything while still counting a
+/// block per file for its dnode, so only blocks that cover `len` count. It
+/// probes with a file of its own in `directory` and removes it.
+///
+/// Test support: tests call it to skip where reservations allocate nothing.
+/// Its file calls block, so it must not run on a shard thread.
+///
+/// # Errors
+/// Returns an error if the probe file cannot be created, inspected or removed,
+/// or if `fallocate` fails for a reason other than lacking support.
+#[cfg(target_os = "linux")]
+pub fn supports_preallocation(directory: &Path, len: u64) -> io::Result<bool> {
+    // Probes running at once in one directory each need a name of their own.
+    static PROBES: AtomicU64 = AtomicU64::new(0);
+    let path = directory.join(format!(
+        ".preallocation-probe-{}-{}",
+        std::process::id(),
+        PROBES.fetch_add(1, Ordering::Relaxed)
+    ));
+    let probe = std::fs::File::create_new(&path)?;
+    let allocates = i64::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "probe length exceeds i64"))
+        .and_then(|reserved_len| {
+            match fallocate(&probe, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, reserved_len) {
+                Ok(()) => Ok(probe.metadata()?.blocks() * FILE_BLOCK_BYTES >= len),
+                Err(Errno::EOPNOTSUPP | Errno::ENOSYS) => Ok(false),
+                Err(error) => Err(io::Error::from(error)),
+            }
+        });
+    drop(probe);
+    std::fs::remove_file(&path)?;
+    allocates
+}
+
+/// Off Linux [`preallocate_file`] reserves nothing, so this is always false.
+///
+/// # Errors
+/// Never fails. It returns a `Result` to match the Linux probe.
+#[cfg(not(target_os = "linux"))]
+pub fn supports_preallocation(_directory: &Path, _len: u64) -> io::Result<bool> {
+    Ok(false)
 }
 
 /// Asynchronously walks a directory tree iteratively (without recursion).
@@ -340,13 +389,7 @@ mod tests {
         const BODY_BYTES: usize = 64 * 1024;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("segment.log");
-        let probe = std::fs::File::create(directory.path().join("probe")).unwrap();
-        let probe_len = i64::try_from(BODY_BYTES).unwrap();
-        // OpenZFS reports success without allocating anything and still counts
-        // a block per file for its dnode, so only blocks that cover the probe count.
-        if fallocate(&probe, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, probe_len).is_err()
-            || probe.metadata().unwrap().blocks() * FILE_BLOCK_BYTES < BODY_BYTES as u64
-        {
+        if !supports_preallocation(directory.path(), BODY_BYTES as u64).unwrap() {
             eprintln!("skipped: fallocate allocates no blocks in the temporary directory");
             return;
         }

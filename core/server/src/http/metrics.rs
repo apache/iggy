@@ -188,7 +188,7 @@ struct DiskUsageMetrics(&'static DiskUsage);
 impl Collector for DiskUsageMetrics {
     fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
         if let Some(used_bytes) = self.0.used_bytes() {
-            let gauge = ConstGauge::new(gauge_value(used_bytes));
+            let gauge = ConstGauge::new(used_bytes);
             let metric_encoder = encoder.encode_descriptor(
                 "volume_used_bytes",
                 "estimated bytes used on the volume holding the data directory, as total minus free blocks like df",

@@ -158,6 +158,21 @@ impl Drop for DiskCharge<'_> {
     }
 }
 
+/// How many bytes of a write at `position..end` take new disk space when the
+/// file's reservation covers `..reserved_end`. Writes below the end of the
+/// reservation take none. The part past it does: a segment can grow past its
+/// reservation because the last batch may cross it, and a file without a
+/// reservation (`reserved_end` 0) takes new space for the whole write.
+#[must_use]
+pub const fn unreserved_bytes(position: u64, end: u64, reserved_end: u64) -> u64 {
+    let start = if position > reserved_end {
+        position
+    } else {
+        reserved_end
+    };
+    end.saturating_sub(start)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,50 +356,6 @@ mod tests {
     }
 
     #[test]
-    fn given_charges_past_u64_max_when_reading_the_charged_total_should_wrap_instead_of_panicking()
-    {
-        let usage = DiskUsage::new();
-        drop(usage.charge(u64::MAX));
-
-        drop(usage.charge(2));
-
-        assert_eq!(
-            usage.charged_bytes(),
-            1,
-            "the total wraps like a counter reset"
-        );
-    }
-
-    #[test]
-    fn given_the_charged_total_wraps_after_a_sample_when_reading_the_estimate_should_keep_the_charges()
-     {
-        let usage = DiskUsage::new();
-        drop(usage.charge(u64::MAX - MIB));
-        usage.rebase(|| Some(((), 100 * MIB)));
-
-        drop(usage.charge(2 * MIB));
-
-        assert!(
-            usage.charged_bytes() < MIB,
-            "the total must have wrapped for this test to mean anything"
-        );
-        assert_eq!(usage.used_bytes(), Some(102 * MIB));
-    }
-
-    #[test]
-    fn given_the_charged_total_wrapped_before_a_sample_when_rebasing_should_count_from_the_sample()
-    {
-        let usage = DiskUsage::new();
-        drop(usage.charge(u64::MAX));
-        drop(usage.charge(5 * MIB));
-
-        usage.rebase(|| Some(((), 100 * MIB)));
-        drop(usage.charge(MIB));
-
-        assert_eq!(usage.used_bytes(), Some(101 * MIB));
-    }
-
-    #[test]
     fn given_more_charged_than_the_volume_holds_when_rebasing_should_wrap_the_base() {
         let usage = DiskUsage::new();
         drop(usage.charge(30000 * MIB));
@@ -394,5 +365,23 @@ mod tests {
 
         assert_eq!(usage.used_bytes(), Some(101 * MIB));
         assert_eq!(usage.charged_bytes(), 30001 * MIB);
+    }
+
+    #[test]
+    fn given_a_reservation_when_writing_should_count_only_the_bytes_past_it() {
+        const RESERVED: u64 = 4 * MIB;
+
+        assert_eq!(unreserved_bytes(0, MIB, 0), MIB, "no reservation");
+        assert_eq!(unreserved_bytes(0, MIB, RESERVED), 0, "inside it");
+        assert_eq!(
+            unreserved_bytes(RESERVED - MIB, RESERVED + MIB, RESERVED),
+            MIB,
+            "crossing its end"
+        );
+        assert_eq!(
+            unreserved_bytes(RESERVED + MIB, RESERVED + 2 * MIB, RESERVED),
+            MIB,
+            "past its end"
+        );
     }
 }

@@ -130,34 +130,6 @@ pub fn walk(root: &Path, matches: &mut dyn FnMut(&Path) -> bool) -> Option<PathB
     None
 }
 
-/// Whether `fallocate` with `FALLOC_FL_KEEP_SIZE` allocates blocks under
-/// `directory`, which preallocated segments rely on. Some filesystems refuse
-/// it, and OpenZFS reports success without allocating anything and still
-/// counts a block per file for its dnode, so only `st_blocks` that cover the
-/// probe count. Always false off Linux.
-pub fn reservations_allocate(directory: &Path) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        const PROBE_BYTES: libc::off_t = 64 * 1024;
-        let Ok(probe) = tempfile::tempfile_in(directory) else {
-            return false;
-        };
-        // SAFETY: `probe` owns the descriptor and outlives the call.
-        let reserved = unsafe {
-            libc::fallocate(probe.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, PROBE_BYTES)
-        } == 0;
-        reserved
-            && probe.metadata().is_ok_and(|metadata| {
-                metadata.blocks() * FILE_BLOCK_BYTES >= PROBE_BYTES.unsigned_abs()
-            })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = directory;
-        false
-    }
-}
-
 /// Bytes the filesystem has allocated for `root` and everything under it, the
 /// way `du` counts them: from `st_blocks`, each inode once. File lengths would
 /// count a WAL hard link to a segment body twice and miss the preallocated

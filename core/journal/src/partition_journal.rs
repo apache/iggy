@@ -36,7 +36,7 @@ use crate::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMode}
 
 mod segments;
 pub use segments::SegmentPosition;
-use segments::SegmentState;
+use segments::{SegmentFile, SegmentState};
 
 pub const PARTITION_WAL_BLOCK_SIZE: usize = 4096;
 pub const PARTITION_WAL_BYTES_MAX: u64 = 256 * 1024 * 1024;
@@ -162,10 +162,7 @@ pub struct PartitionPrepareJournal<S: DurableStorage = DiskStorage> {
     obsolete: VecDeque<PathBuf>,
     cleanup_directory_dirty: bool,
     recovered_prepares: Vec<Message<PrepareHeader>>,
-    segment_files: BTreeMap<(u64, u64), S::File>,
-    /// How much of each open segment file its reservation covers. A file
-    /// without an entry has none, so all its writes take new space.
-    segment_reservations: BTreeMap<(u64, u64), u64>,
+    segment_files: BTreeMap<(u64, u64), SegmentFile<S::File>>,
     segment_files_dirty: bool,
     segment_links_dirty: bool,
     preallocate_segments: bool,
@@ -347,7 +344,6 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             cleanup_directory_dirty: false,
             recovered_prepares: Vec::new(),
             segment_files: BTreeMap::new(),
-            segment_reservations: BTreeMap::new(),
             segment_files_dirty: false,
             segment_links_dirty: false,
             preallocate_segments: options.preallocate_segments,
@@ -1994,29 +1990,13 @@ mod tests {
     use tempfile::tempdir;
 
     #[cfg(target_os = "linux")]
+    use server_common::fs_utils::supports_preallocation;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::MetadataExt;
 
     const REFERENCE_TEST_BODY_BYTES: usize = 1024 * 1024;
     #[cfg(target_os = "linux")]
     const FILE_BLOCK_BYTES: u64 = 512;
-
-    /// Whether reserving `length` bytes under `directory` allocates them.
-    /// `OpenZFS` reports success without allocating anything and still counts a
-    /// block per file for its dnode, so only blocks that cover `length` count.
-    #[cfg(target_os = "linux")]
-    pub(super) fn supports_preallocation(directory: &Path, length: u64) -> bool {
-        let probe = tempfile::tempfile_in(directory).unwrap();
-        match nix::fcntl::fallocate(
-            &probe,
-            nix::fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE,
-            0,
-            i64::try_from(length).unwrap(),
-        ) {
-            Ok(()) => probe.metadata().unwrap().blocks() * FILE_BLOCK_BYTES >= length,
-            Err(nix::errno::Errno::EOPNOTSUPP | nix::errno::Errno::ENOSYS) => false,
-            Err(error) => panic!("preallocation probe failed: {error}"),
-        }
-    }
 
     /// Reclamation used to run at the head of every append, so an unlink and a
     /// directory barrier for a generation the append does not touch landed
@@ -3560,7 +3540,8 @@ mod tests {
 
         for preallocate in [false, true] {
             let partition = tempdir().unwrap();
-            let preallocation_supported = supports_preallocation(partition.path(), SEGMENT_BYTES);
+            let preallocation_supported =
+                supports_preallocation(partition.path(), SEGMENT_BYTES).unwrap();
             let directory = partition.path().join("prepares-7");
             let mut journal = PartitionPrepareJournal::open_with_options(
                 &directory,
@@ -3652,7 +3633,7 @@ mod tests {
         const BODY_BYTES: usize = 256 * 1024;
 
         let partition = tempdir().unwrap();
-        if !supports_preallocation(partition.path(), SEGMENT_BYTES) {
+        if !supports_preallocation(partition.path(), SEGMENT_BYTES).unwrap() {
             eprintln!("skipped: the temporary directory does not support fallocate");
             return;
         }
@@ -3753,7 +3734,7 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(installed.len(), initial.length);
-                if supports_preallocation(partition.path(), (4 * BODY_BYTES) as u64) {
+                if supports_preallocation(partition.path(), (4 * BODY_BYTES) as u64).unwrap() {
                     assert!(installed.blocks() * FILE_BLOCK_BYTES >= (4 * BODY_BYTES) as u64);
                 }
             }

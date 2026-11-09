@@ -8185,6 +8185,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "server_common",
  "sqlparser 0.63.0",
  "sqlx",
  "sysinfo 0.40.1",
