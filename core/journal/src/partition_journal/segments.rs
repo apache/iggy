@@ -961,9 +961,9 @@ pub(super) fn decode_batch(prepare: &[u8]) -> io::Result<BatchHeader> {
 mod tests {
     use super::*;
     use crate::durable_storage::DiskStorage;
-    use crate::partition_journal::PARTITION_WAL_BYTES_MAX;
     #[cfg(target_os = "linux")]
     use crate::partition_journal::tests::supports_preallocation;
+    use crate::partition_journal::{PARTITION_WAL_BYTES_MAX, WalOpenOptions};
     use tempfile::{TempDir, tempdir};
 
     const MAX_SIZE: u64 = 1024 * 1024;
@@ -1037,13 +1037,16 @@ mod tests {
 
     async fn journal(preallocate: bool) -> (TempDir, PartitionPrepareJournal<DiskStorage>) {
         let directory = tempdir().unwrap();
-        let mut journal = PartitionPrepareJournal::open_with_storage_and_capacity(
+        let mut journal = PartitionPrepareJournal::open_with_options(
             &directory.path().join("prepares-7"),
             42,
             7,
             DiskStorage,
-            PARTITION_WAL_BYTES_MAX,
-            preallocate,
+            WalOpenOptions {
+                capacity: PARTITION_WAL_BYTES_MAX,
+                preallocate_segments: preallocate,
+                ..WalOpenOptions::default()
+            },
         )
         .await
         .unwrap();

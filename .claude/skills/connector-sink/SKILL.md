@@ -67,15 +67,17 @@ for getting them to the external system reliably and efficiently.
 
 ### Errors
 
-| Scenario                                   | SDK variant                                                                 | Retry?                                   |
-| ------------------------------------------ | --------------------------------------------------------------------------- | ---------------------------------------- |
-| Init / connectivity failure                | `Error::InitError`                                                          | n/a (fails open)                         |
-| Bad config value                           | `Error::InvalidConfigValue(field)`                                          | n/a                                      |
-| Single-message validation failure          | `Error::InvalidRecordValue(reason)`                                         | no - skip + log                          |
-| Transient backend (5xx, conn reset, ...)   | `Error::HttpRequestFailed` / `Error::Connection` / `Error::CannotStoreData` | yes                                      |
-| Permanent 4xx, schema mismatch, constraint | `Error::PermanentHttpError` / `Error::SchemaMismatch`                       | **no** - retrying trips circuit breakers |
-| I/O failure mid-write (parquet/iceberg)    | `Error::WriteFailure`                                                       | caller decides                           |
-| Catalog commit failure (Iceberg)           | `Error::CatalogCommitError`                                                 | **no - not idempotent**                  |
+| Scenario                                   | SDK variant                                                                 | Retry?                                                                   |
+| ------------------------------------------ | --------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| Init / connectivity failure                | `Error::InitError`                                                          | n/a (fails open)                                                         |
+| Bad config value                           | `Error::InvalidConfigValue(field)`                                          | n/a                                                                      |
+| Single-message validation failure          | `Error::InvalidRecordValue(reason)`                                         | no - skip + log; under at-least-once, fail the call (stops the sink)     |
+| Transient backend (5xx, conn reset, ...)   | `Error::HttpRequestFailed` / `Error::Connection` / `Error::CannotStoreData` | yes                                                                      |
+| Permanent 4xx, schema mismatch, constraint | `Error::PermanentHttpError` / `Error::SchemaMismatch`                       | **no** - retrying trips circuit breakers                                 |
+| I/O failure mid-write (parquet/iceberg)    | `Error::WriteFailure`                                                       | caller decides                                                           |
+| Catalog commit failure (Iceberg)           | `Error::CatalogCommitError`                                                 | not in place (txn consumed); under at-least-once, the runtime redelivers |
+
+`Error::is_permanent()` (`sdk/src/lib.rs`) is the class the runtime acts on for an at-least-once sink: a permanent error stops the delivery, a transient one hands the messages over again. `CatalogCommitError` is transient there, because the redelivered messages rebuild the transaction, and a commit that did land shows up as a duplicate, which at-least-once allows.
 
 ### Retry
 
@@ -94,7 +96,7 @@ Runtime retries on any `Err` - same batch can be redelivered. In-tree guarantees
 - **MongoDB**: composite `_id` from `stream:topic:partition:message_id`, via `insert_many(docs).ordered(false)`. Per-document duplicate-key errors don't abort the batch - effective idempotency under retry.
 - **Elasticsearch** (`bulk_index_documents`): bulk action specifies only `_index`, no `_id` -> ES auto-generates ids -> NOT idempotent. Extensions should add `"_id"`.
 - **HTTP**: endpoint-dependent. Document in the plugin README.
-- **Iceberg**: transactional commit. `Error::CatalogCommitError` documents that the txn is consumed on `commit()`. Rebuild-then-retry can duplicate data - callers must check the catalog first.
+- **Iceberg**: transactional commit per table. `router/commit.rs` tags each snapshot with `iggy.commit-id`, and a commit retry first checks whether the catalog already holds it. At least once, `router/redelivery.rs` records the first offset and the last message of each source partition in the snapshot summary. A redelivered batch that carries the last message of an append on the current snapshot history skips the start of the batch that such appends cover without a gap.
 
 When writing a new sink, prefer dedup-on-write using the message `id` field. Mongo's upsert-style is the cleanest reference.
 

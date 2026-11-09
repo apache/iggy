@@ -22,7 +22,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use iggy::prelude::{
     AutoLogin, Client, ClusterClient, Credentials, Identifier, IggyClient, IggyClientBuilder,
-    IggyError, UserClient,
+    IggyError, OptionKey, OptionSpec, OptionsScope, SystemClient, UserClient,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -35,6 +35,7 @@ use crate::bridge::config::{IggyBridgeConfig, MAX_FETCH_SLOTS};
 use crate::bridge::error::BridgeError;
 use crate::bridge::nodes::{KnownNodes, is_unreachable};
 use crate::bridge::topic_map::validate_kafka_topic_name;
+use crate::bridge::topic_settings::TopicDefaults;
 
 mod change_log;
 mod cluster_id;
@@ -92,7 +93,7 @@ const RECONNECTION_RETRIES: u32 = 3;
 /// A reconnect dial runs in the caller's future, so this timeout cancels a hung dial too.
 ///
 /// Sends use the Produce deadline instead. See `send_records`.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Wraps a single Iggy client call in [`REQUEST_TIMEOUT`].
 ///
@@ -437,6 +438,25 @@ impl IggyBridge {
         self.config.nodes.clone()
     }
 
+    /// Settings of the topics the gateway creates, where the request names none.
+    #[must_use]
+    pub const fn topic_defaults(&self) -> &TopicDefaults {
+        &self.config.topic_defaults
+    }
+
+    /// How many nodes the Iggy cluster had at the last roster read, or `None` before one.
+    #[must_use]
+    pub fn iggy_node_count(&self) -> Option<usize> {
+        self.config.nodes.node_count()
+    }
+
+    /// The replication factor Iggy gives a topic that names none, or `None` before the bridge
+    /// reads it.
+    #[must_use]
+    pub fn default_replication_factor(&self) -> Option<u32> {
+        self.config.nodes.default_replication_factor()
+    }
+
     /// Drops the auto topic creation client without signing it out, so [`Self::close`] does not
     /// wait behind a creation still running on it. Iggy ends its session when the lease runs out.
     pub(crate) fn discard_auto_create_client(&self) {
@@ -593,6 +613,7 @@ impl IggyBridge {
             tls: crate::bridge::IggyTls::default(),
             idempotent_producers: false,
             nodes: KnownNodes::default(),
+            topic_defaults: TopicDefaults::default(),
         };
         let client = Arc::new(client);
         Self {
@@ -686,11 +707,30 @@ async fn connect_client_to(
     Ok(client)
 }
 
-/// Reads the roster through `client` into `nodes`.
+/// Reads the roster through `client` into `nodes`, and then the replication factor that Iggy gives
+/// a topic by default. That factor can follow the roster, because Iggy keeps a topic on every
+/// node unless an operator set a number. A failed read of it keeps the last one.
 async fn learn_roster(client: &IggyClient, nodes: &KnownNodes) -> Result<(), BridgeError> {
     let roster = with_request_timeout(client.get_cluster_metadata()).await?;
     nodes.learn(&roster);
+    match with_request_timeout(client.describe_options(OptionsScope::Topic)).await {
+        Ok(specs) => {
+            if let Some(factor) = default_replication_factor(&specs) {
+                nodes.learn_default_replication_factor(factor);
+            }
+        }
+        Err(error) => debug!(%error, "could not read the default replication factor of Iggy"),
+    }
     Ok(())
+}
+
+/// The default of `replication_factor` among the topic option `specs` Iggy describes.
+fn default_replication_factor(specs: &[OptionSpec]) -> Option<u32> {
+    let spec = specs
+        .iter()
+        .find(|spec| spec.key == OptionKey::ReplicationFactor.to_string())?;
+    let bytes: [u8; 4] = spec.default_value.as_slice().try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
 }
 
 /// Reads the roster through `client` every [`ROSTER_REFRESH`], until the bridge drops the client

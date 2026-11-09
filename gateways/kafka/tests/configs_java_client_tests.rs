@@ -314,4 +314,16 @@ async fn kafka_39_admin_client_describes_and_alters_topic_configs() {
         text.contains("incremental_delete_retention.ms=-1"),
         "{text}"
     );
+    assert!(
+        text.contains("broker_auto.create.topics.enable=false broker_min.insync.replicas=1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("created_retention.bytes=1073741824 source=DYNAMIC_TOPIC_CONFIG"),
+        "{text}"
+    );
+    assert!(
+        text.contains("compacted_retention.ms=-1 replication_factor=1"),
+        "{text}"
+    );
 }

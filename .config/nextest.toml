@@ -86,7 +86,10 @@ test-group = "kafka_client_e2e"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'binary_id(iggy-gateway-kafka::coordinator_cluster_tests)'
+filter = '''
+    binary_id(iggy-gateway-kafka::coordinator_cluster_tests)
+    + binary_id(iggy-gateway-kafka::replication_factor_cluster_tests)
+'''
 test-group = "kafka_cluster"
 
 # The failover tests also run three gateway processes and Kafka clients in Docker for minutes, and
