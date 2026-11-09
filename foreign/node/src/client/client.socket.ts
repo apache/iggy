@@ -217,6 +217,8 @@ export class CommandResponseStream extends EventEmitter {
   private readonly configuredEndpoint: Endpoint;
   private metadataReplica?: number;
   private metadataWatermark = 0n;
+  /** The assignment that the last sync of each group in this session returned, by the body of the sync. */
+  private readonly groupAssignments = new Map<string, Buffer>();
   private routingGeneration = 0;
   private activeDials = 0;
   private pendingSubmissions = 0;
@@ -741,7 +743,9 @@ export class CommandResponseStream extends EventEmitter {
 
   /**
    * A fetch goes to the primary of its targets.
-   * Each target carries its own fence, so the header carries context zero.
+   * The header names only the metadata that the session saw, and each target
+   * its own fence. A replica that has not applied that metadata answers 58
+   * instead of judging the targets against older group state.
    * A target of history 0 takes the incarnation of its route once, before
    * the first attempt, and keeps its owner. A route names no owner, so a
    * fully zero target ends with the route context. A route of history 0
@@ -775,7 +779,8 @@ export class CommandResponseStream extends EventEmitter {
     }
     let response: CommandResponse;
     try {
-      response = await this.drive(command, body, { ...options, context: EMPTY_PARTITION_CONTEXT },
+      response = await this.drive(command, body,
+        { ...options, context: { ...EMPTY_PARTITION_CONTEXT, metadataOp: this.metadataWatermark } },
         deadline, signal, lineage);
     } catch (error) {
       if (error instanceof ResponseError && error.fromServer && STALE_ROUTE_CODES.has(error.errorCode))
@@ -875,7 +880,8 @@ export class CommandResponseStream extends EventEmitter {
     try {
       validateReplyForRequest(attempt.response, request!, command);
       const response = decodeVsrResponse(attempt.response, command);
-      if (generation === this.routingGeneration) this.observeMetadata(attempt.response);
+      if (generation === this.routingGeneration) this.observeMetadata(attempt.response,
+        command === COMMAND_CODE.SyncGroup && this.rememberAssignment(request!, response.data));
       return { response, raw: attempt.response, committed: hasCommittedResult(attempt.response), started: attempt.started };
     } catch (error) {
       if (this.isAuthenticated && command !== COMMAND_CODE.BindSession && isDetachedFailure(error) &&
@@ -1410,6 +1416,7 @@ export class CommandResponseStream extends EventEmitter {
     this.bootstrapPromise = undefined;
     this.rosterPromise = undefined;
     this.partitionRoutes.clear();
+    this.groupAssignments.clear();
     this.metadataReplica = undefined;
     this.isAuthenticated = false;
     this.userId = undefined;
@@ -1429,11 +1436,28 @@ export class CommandResponseStream extends EventEmitter {
       throw responseError(command, TRANSIENT_NOT_ACCEPTED);
   }
 
-  private observeMetadata(frame: Buffer): void {
+  /**
+   * A sync that returned a new assignment raises the watermark too: a handover installs the owner of a partition in a
+   * later op than the join, and a primary that has not applied it refuses a read of the member as not owned.
+   */
+  private observeMetadata(frame: Buffer, newAssignment = false): void {
     const operation = readReplyOperation(frame);
-    if (!hasCommittedResult(frame) || !(isMetadata(operation) || operation === Operation.DeleteSegments || operation === Operation.Register)) return;
+    if (!newAssignment && (!hasCommittedResult(frame) ||
+        !(isMetadata(operation) || operation === Operation.DeleteSegments || operation === Operation.Register))) return;
     const commit = frame.readBigUInt64LE(REPLY_OFFSET.commit);
     if (commit > this.metadataWatermark) this.metadataWatermark = commit;
+  }
+
+  /**
+   * Remembers the assignment that a sync returned for its group, and says whether it differs from the last one. An
+   * empty assignment names no member.
+   */
+  private rememberAssignment(sync: Buffer, assignment: Buffer): boolean {
+    const group = sync.subarray(HEADER_SIZE).toString('hex');
+    const cached = this.groupAssignments.get(group);
+    if (assignment.length === 0) this.groupAssignments.delete(group);
+    else this.groupAssignments.set(group, Buffer.from(assignment));
+    return assignment.length > 0 && !cached?.equals(assignment);
   }
 
   private _rememberCredentials(command: number, payload: Buffer): void {

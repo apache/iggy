@@ -228,9 +228,11 @@ extension IggyClient {
     }
 
     /// One fetch on the route of its first target, the primary of its group.
-    /// Each target carries its own fence, so the header carries no partition
-    /// context. A fetch with `autoCommit` runs as a task of its own, which
-    /// the cancellation of its caller does not reach.
+    /// Each target carries its own fence, and the header names only the
+    /// metadata the session saw: a replica that has not applied it yet
+    /// answers ``IggyErrorCode/transientNotAccepted`` instead of judging the
+    /// targets by older group state. A fetch with `autoCommit` runs as a task
+    /// of its own, which the cancellation of its caller does not reach.
     private func fetch(
         streamID: Identifier, topicID: Identifier, consumer: Consumer, targets: [Requests.FetchTarget], count: UInt32, autoCommit: Bool,
         options: DeferredPollOptions, started: ContinuousClock.Instant, lineage: UInt64
@@ -505,8 +507,8 @@ extension IggyClient {
         let payload = try Requests.consumerGroup(streamID: streamID, topicID: topicID, groupID: groupID)
         // A cancelled exchange takes the coordinator connection with it, so a
         // caller cancelled meanwhile lets the sync finish.
-        let body = try await Task {
-            try await self.core.exchange(code: CommandCode.syncConsumerGroup.rawValue, payload: payload, lineage: lineage)
+        let (body, commit) = try await Task {
+            try await self.core.exchangeWithCommit(code: CommandCode.syncConsumerGroup.rawValue, payload: payload, lineage: lineage)
         }.value
         let key = ConsumerGroupState.GroupKey(stream: streamID, topic: topicID, group: groupID)
         if body.isEmpty {
@@ -521,7 +523,7 @@ extension IggyClient {
         logger.debug(
             "Synced the consumer group assignment",
             metadata: ["group": "\(groupID)", "generation": "\(assignment.generation)", "partitions": "\(assignment.partitions)"])
-        state.applySync(key, member: (assignment.generation, assignment.partitions), scope: scope)
+        await core.applyGroupSync(key, member: (assignment.generation, assignment.partitions), scope: scope, commit: commit)
     }
 
     /// Syncs every joined group, so a member picks up a widened assignment

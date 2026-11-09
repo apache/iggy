@@ -47,6 +47,18 @@ public sealed class FetchMessagesTests
     /// <summary>The partitions a route names, so that every partition of a test exists.</summary>
     private const uint TopicPartitions = TcpContracts.MAX_PARTITIONS_PER_REQUEST + 1;
 
+    /// <summary>The metadata op that a join of the session commits.</summary>
+    private const ulong JoinCommit = 30;
+
+    /// <summary>The commit of a sync reply that changes the assignment of the member.</summary>
+    private const ulong AssignmentCommit = 40;
+
+    /// <summary>A later commit of a sync reply that keeps the assignment.</summary>
+    private const ulong LaterSyncCommit = 50;
+
+    /// <summary>The commit of a later sync reply that changes the partitions of the member.</summary>
+    private const ulong ReassignmentCommit = 60;
+
     private static readonly Identifier Stream = Identifier.Numeric(1);
     private static readonly Identifier Topic = Identifier.Numeric(2);
     private static readonly PartitionContext Route = new(17, 0, 1);
@@ -74,16 +86,24 @@ public sealed class FetchMessagesTests
     };
 
     /// <summary>
-    ///     The fetch goes to the primary of its first target with header context zero. A target without a fence
-    ///     takes the context of its route, and each target gets the byte limit of the options.
+    ///     The fetch goes to the primary of its first target. Its header names only the metadata op that the session
+    ///     saw, here the commit of a join. A target without a fence takes the context of its route, and each target
+    ///     gets the byte limit of the options.
     /// </summary>
     [Fact]
-    public async Task given_targets_with_and_without_a_fence_when_fetched_should_send_one_request_with_context_zero()
+    public async Task given_a_committed_join_and_targets_with_and_without_a_fence_when_fetched_should_send_one_request_with_the_session_watermark()
     {
         using var node = new MockNode();
         var fetches = new ConcurrentQueue<MockRequest>();
         node.Serve(request =>
         {
+            if (request.Operation == (byte)VsrOperation.JoinConsumerGroup)
+            {
+                var joined = Answer(request);
+                BinaryPrimitives.WriteUInt64LittleEndian(joined.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET), JoinCommit);
+                return joined;
+            }
+
             if (request.Code != FetchCode)
             {
                 return Standalone(node, request);
@@ -93,6 +113,7 @@ public sealed class FetchMessagesTests
             return Reply(request.Operation, FetchBody(GoldenSection(1, 0, Served), EmptySection(2, 7, Served)));
         });
         using var client = await ConnectAsync(node);
+        await client.JoinConsumerGroupAsync(Stream, Topic, Identifier.Numeric(3), TestContext.Current.CancellationToken);
         var fenced = new PartitionContext(18, 4, 0);
 
         using var reply = await client.FetchMessagesAsync(Stream, Topic,
@@ -100,7 +121,7 @@ public sealed class FetchMessagesTests
             false, LongWait, TestContext.Current.CancellationToken);
 
         var request = Assert.Single(fetches);
-        Assert.Equal(default, request.Context);
+        Assert.Equal(new PartitionContext(0, 0, JoinCommit), request.Context);
         var fetch = ReadFetch(request);
         Assert.Equal((1u, 10u, false, LongWait.MaxBytes), (fetch.MinCount, fetch.Count, fetch.AutoCommit,
             fetch.MaxBytes));
@@ -111,6 +132,67 @@ public sealed class FetchMessagesTests
         Assert.True(fetch.RequestTimeoutUs >= fetch.WaitUs + DeferredPollOptions.REPLY_MARGIN_US);
         Assert.Equal([0ul, 1ul], reply.Sections[0].Decode().Messages.Select(message => message.Header.Offset));
         Assert.Equal((7ul, 0u), (reply.Sections[1].NextOffset, reply.Sections[1].MessagesCount));
+    }
+
+    /// <summary>
+    ///     A sync that changes the assignment raises the watermark to the commit of its reply, so the next fetch waits
+    ///     for the handover that the reply saw. A heartbeat sync and a reader resync of the same assignment at a later
+    ///     commit raise nothing, so the fetches after them name the same commit. A resync that changes the partitions
+    ///     raises the watermark again.
+    /// </summary>
+    [Fact]
+    public async Task given_syncs_and_resyncs_that_keep_or_change_the_assignment_when_fetched_should_name_the_commit_of_the_last_change()
+    {
+        using var node = new MockNode();
+        (uint[] Partitions, ulong Commit)[] syncReplies =
+        [
+            ([1], AssignmentCommit), ([1], LaterSyncCommit), ([1], LaterSyncCommit), ([1, 2], ReassignmentCommit)
+        ];
+        var syncs = 0;
+        var fetches = new ConcurrentQueue<MockRequest>();
+        node.Serve(request =>
+        {
+            if (request.Code == CommandCodes.SYNC_CONSUMER_GROUP_CODE)
+            {
+                var index = Math.Min(Interlocked.Increment(ref syncs), syncReplies.Length) - 1;
+                var (partitions, commit) = syncReplies[index];
+                var synced = Reply(OPERATION_NON_REPLICATED, AssignmentBody(1, partitions));
+                BinaryPrimitives.WriteUInt64LittleEndian(synced.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET), commit);
+                return synced;
+            }
+
+            if (request.Code != FetchCode)
+            {
+                return Standalone(node, request);
+            }
+
+            fetches.Enqueue(request);
+            return Reply(request.Operation, FetchBody(EmptySection(1, 0, Served)));
+        });
+        using var client = await ConnectAsync(node);
+        var token = TestContext.Current.CancellationToken;
+        var assignments = (IConsumerGroupAssignmentProvider)client;
+        var group = Identifier.Numeric(3);
+
+        async Task FetchAsync()
+        {
+            using var reply = await client.FetchMessagesAsync(Stream, Topic, Targets(1), Consumer.Group(3), 10, false,
+                LongWait, token);
+        }
+
+        await assignments.GetAssignedPartitionsAsync(Stream, Topic, group, false, token);
+        await FetchAsync();
+        await client.PingAsync(token);
+        await FetchAsync();
+        await assignments.GetAssignedPartitionsAsync(Stream, Topic, group, true, token);
+        await FetchAsync();
+        var moved = await assignments.GetAssignedPartitionsAsync(Stream, Topic, group, true, token);
+        await FetchAsync();
+
+        Assert.Equal([1u, 2u], moved);
+        Assert.Equal(syncReplies.Length, node.Requests(CommandCodes.SYNC_CONSUMER_GROUP_CODE));
+        Assert.Equal([AssignmentCommit, AssignmentCommit, AssignmentCommit, ReassignmentCommit],
+            fetches.Select(fetch => fetch.Context.MetadataOp));
     }
 
     /// <summary>

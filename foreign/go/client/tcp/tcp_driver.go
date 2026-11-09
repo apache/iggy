@@ -61,8 +61,8 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 	historyRefreshed := false
 	keptContext := exact
 	// A zero context carries nothing, so it counts as none and takes the
-	// context of the route. A fetch keeps its zero header, since each of its
-	// targets names its own history.
+	// context of the route. A fetch keeps a header without a history, since
+	// each of its targets names its own.
 	if exact != nil && *exact == (iggcon.PartitionContext{}) && fencedByHistory(code) {
 		keptContext = nil
 	}
@@ -522,6 +522,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				possiblySent = false
 			}
 			c.refreshMembership(operation.code, operation.frame.data[vsr.HeaderSize:])
+			c.refreshAssignment(operation, &reply.header, outcome.Body)
 			return outcome.Body, nil
 		}
 		if committing {
@@ -749,7 +750,10 @@ func (c *IggyTcpClient) observeMetadataFor(fence uint64, header *[vsr.HeaderSize
 }
 
 func (c *IggyTcpClient) observeMetadata(header *[vsr.HeaderSize]byte) {
-	commit := vsr.MetadataCommit(header)
+	c.raiseMetadataWatermark(vsr.MetadataCommit(header))
+}
+
+func (c *IggyTcpClient) raiseMetadataWatermark(commit uint64) {
 	for {
 		previous := c.metadataWatermark.Load()
 		if commit <= previous || c.metadataWatermark.CompareAndSwap(previous, commit) {
@@ -759,9 +763,10 @@ func (c *IggyTcpClient) observeMetadata(header *[vsr.HeaderSize]byte) {
 }
 
 // MetadataWatermark returns the highest metadata op that the replies of the
-// client reported as committed: the reply that bound its session and every
-// reply of a replicated metadata command. A request without a partition
-// context names it as its minimum metadata op.
+// client reported as committed: the reply that bound its session, every reply
+// of a replicated metadata command and each sync reply that changed the cached
+// assignment. A request without a partition context names it as its minimum
+// metadata op.
 func (c *IggyTcpClient) MetadataWatermark() uint64 {
 	return c.metadataWatermark.Load()
 }

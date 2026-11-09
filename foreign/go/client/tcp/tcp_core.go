@@ -378,8 +378,9 @@ func (c *IggyTcpClient) doCaptured(ctx context.Context, cmd command.Command, cap
 			captured = poll.Strategy.Context
 		}
 		if cmd.Code() == command.FetchMessagesCode {
-			// Each target of a fetch carries its own fence.
-			captured = &iggcon.PartitionContext{}
+			// A replica answers 58 until it applied the metadata the session saw, instead
+			// of judging the targets on older group state. Each target keeps its own fence.
+			captured = &iggcon.PartitionContext{MetadataOp: c.metadataWatermark.Load()}
 		}
 		return c.drive(ctx, cmd.Code(), query, frame, captured, nil)
 	}

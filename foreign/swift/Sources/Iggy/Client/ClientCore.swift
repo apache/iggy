@@ -185,6 +185,15 @@ actor ClientCore {
         code: UInt32, payload: [UInt8], context: PartitionContext = .empty, deadline limit: ContinuousClock.Instant? = nil,
         lineage captured: UInt64? = nil
     ) async throws -> [UInt8] {
+        try await exchangeWithCommit(code: code, payload: payload, context: context, deadline: limit, lineage: captured).body
+    }
+
+    /// ``exchange(code:payload:context:deadline:lineage:)`` with the metadata
+    /// commit that its reply names.
+    func exchangeWithCommit(
+        code: UInt32, payload: [UInt8], context: PartitionContext = .empty, deadline limit: ContinuousClock.Instant? = nil,
+        lineage captured: UInt64? = nil
+    ) async throws -> (body: [UInt8], commit: UInt64) {
         if state == .shutdown { throw IggyError(.clientShutdown) }
         let lineage = captured ?? lineage
         if let refusal = lineageRefusal(lineage, code: code) { throw refusal }
@@ -323,8 +332,8 @@ actor ClientCore {
             code: code, payload: payload, context: context, lineage: captured ?? lineage, request: &request, epoch: &epoch, outcome: &outcome,
             transientDeadline: now, readDeadline: requestDeadline(within: limit), replaysUncommitted: false)
         switch attempted {
-        case .success(let body):
-            return body
+        case .success(let reply):
+            return reply.body
         case .failure(let error):
             dropConnection(after: error, epoch: epoch)
             throw Self.graded(error)
@@ -390,7 +399,13 @@ actor ClientCore {
     /// reply, and no frame of a session is stamped before its register reply,
     /// so such a write takes the newer of its op and the watermark. The
     /// incarnation stays, so a write of an earlier history is still refused.
+    ///
+    /// A fetch names only the watermark, read at each stamp, so every attempt
+    /// names the commits the session saw before it.
     private func sentContext(_ context: PartitionContext, code: UInt32, payload: [UInt8]) -> PartitionContext {
+        if code == CommandCode.fetchMessages.rawValue {
+            return Self.readContext(metadataWatermark)
+        }
         let writesOffset = code == CommandCode.storeConsumerOffset.rawValue || code == CommandCode.deleteConsumerOffset.rawValue
         guard writesOffset, context.ownerGeneration == 0,
             (try? RawRequest.consumerTarget(payload))?.consumerKind == Consumer.Kind.consumerGroup.rawValue
@@ -535,7 +550,7 @@ actor ClientCore {
     private func sendRaw(
         code: UInt32, payload: [UInt8], context: PartitionContext, lineage: UInt64, deadline: ContinuousClock.Instant,
         request: inout VSRFrame.EncodedRequest?, epoch: inout UInt64, outcome: inout RetryOutcome
-    ) async throws -> [UInt8] {
+    ) async throws -> (body: [UInt8], commit: UInt64) {
         switch state {
         case .shutdown:
             throw IggyError(.clientShutdown)
@@ -560,9 +575,9 @@ actor ClientCore {
                 transientDeadline: transientDeadline,
                 readDeadline: deadline, replaysUncommitted: true)
             switch attempted {
-            case .success(let body):
+            case .success(let reply):
                 refreshCredentials(afterCommitting: code, payload: payload)
-                return body
+                return reply
             case .failure(let failure):
                 let error = outcome.observe(Self.graded(failure))
                 guard error.code == .transientNotAccepted || failure.code == .notPrimary, !isLogin, clock.now < deadline else {
@@ -692,7 +707,7 @@ actor ClientCore {
     private func attempt(
         code: UInt32, payload: [UInt8], context: PartitionContext, lineage: UInt64, request: inout VSRFrame.EncodedRequest?, epoch: inout UInt64,
         outcome: inout RetryOutcome, transientDeadline: ContinuousClock.Instant, readDeadline: ContinuousClock.Instant, replaysUncommitted: Bool
-    ) async throws -> Result<[UInt8], IggyError> {
+    ) async throws -> Result<(body: [UInt8], commit: UInt64), IggyError> {
         try await exchangeLock.lock()
         defer { exchangeLock.unlock() }
         return await exchangeLocked(
@@ -710,7 +725,7 @@ actor ClientCore {
     private func exchangeLocked(
         code: UInt32, payload: [UInt8], context: PartitionContext, lineage: UInt64, request: inout VSRFrame.EncodedRequest?, epoch: inout UInt64,
         outcome: inout RetryOutcome, transientDeadline: ContinuousClock.Instant, readDeadline: ContinuousClock.Instant, replaysUncommitted: Bool
-    ) async -> Result<[UInt8], IggyError> {
+    ) async -> Result<(body: [UInt8], commit: UInt64), IggyError> {
         if let refusal = lineageRefusal(lineage, code: code) {
             return .failure(refusal)
         }
@@ -778,7 +793,7 @@ actor ClientCore {
                 {
                     throw IggyError(.transientNotCommitted, context: "the reply does not prove the earlier attempt committed")
                 }
-                return .success(Array(body))
+                return .success((body: Array(body), commit: VSRFrame.readReplyCommit(header) ?? 0))
             } catch let answer as IggyError {
                 let evicted = VSRFrame.peekCommand(header) == .eviction
                 if evicted, answer.code == .staleClient || Self.endsSessionOfWrite(answer, stamped.operation) {
@@ -833,14 +848,32 @@ actor ClientCore {
     }
 
     /// Raises the metadata watermark to the commit of a metadata reply, as
-    /// `observe_metadata_reply` in the Rust SDK. Reads and partition replies
-    /// carry no metadata commit.
+    /// `observe_metadata_reply` in the Rust SDK. A read reply names the commit
+    /// of the node that answered it, which only a changed group assignment
+    /// takes, in ``applyGroupSync(_:member:scope:commit:)``.
     private func observeMetadataReply(_ header: ArraySlice<UInt8>) {
         guard VSRFrame.peekCommand(header) == .reply, let operation = VSRFrame.readReplyOperation(header),
             operation != .nonReplicated, !operation.isPartition, let commit = VSRFrame.readReplyCommit(header)
         else {
             return
         }
+        observeMetadataCommit(commit)
+    }
+
+    /// Records the assignment that a sync read under `scope` found at
+    /// `commit`, as `synced_group_assignment` in the Rust SDK. A handover
+    /// installs the owner of a partition in a later op than the join, and a
+    /// primary that has not applied it refuses a read as not owned. So a
+    /// changed assignment raises the watermark to `commit` in the same turn
+    /// of the actor that publishes it: stamps run on this actor too, so no
+    /// read of a partition it added is stamped under the older watermark.
+    func applyGroupSync(_ key: ConsumerGroupState.GroupKey, member: (generation: UInt64, partitions: [UInt32]), scope: UInt64, commit: UInt64) {
+        if groupState.applySync(key, member: member, scope: scope) {
+            observeMetadataCommit(commit)
+        }
+    }
+
+    private func observeMetadataCommit(_ commit: UInt64) {
         metadataWatermark = max(metadataWatermark, commit)
     }
 

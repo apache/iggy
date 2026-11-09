@@ -22,9 +22,10 @@ use std::sync::Arc;
 use std::task::{Context, Waker};
 use std::time::Duration;
 
+use bytes::Bytes;
 use iggy_binary_protocol::codes::{
     CREATE_CONSUMER_GROUP_CODE, DELETE_CONSUMER_OFFSET_CODE, FETCH_MESSAGES_CODE,
-    GET_CONSUMER_GROUP_CODE, GET_CONSUMER_OFFSET_CODE, GET_PARTITION_ROUTE_CODE,
+    GET_CONSUMER_GROUP_CODE, GET_CONSUMER_OFFSET_CODE, GET_PARTITION_ROUTE_CODE, GET_STREAMS_CODE,
     JOIN_CONSUMER_GROUP_CODE, LEAVE_CONSUMER_GROUP_CODE, LOGIN_REGISTER_CODE,
     POLL_MESSAGES_DEFERRED_CODE, STORE_CONSUMER_OFFSET_CODE, SYNC_CONSUMER_GROUP_CODE,
 };
@@ -540,6 +541,58 @@ async fn given_a_join_whose_partition_becomes_pollable_later_when_reading_should
         "the member asks again soon after the join, but read after {:?}",
         started.elapsed()
     );
+}
+
+/// A handover installs the owner of a partition in a metadata op after the join, and a sync
+/// lists the partition once its replica applied that op. So a sync that changes the assignment
+/// raises the metadata watermark to its commit, and a primary that has not applied the handover
+/// refuses a later read as not accepted, not as not owned. A sync that changes nothing keeps the
+/// watermark, so the reads of a settled member never wait for unrelated metadata.
+#[tokio::test(start_paused = true)]
+async fn given_syncs_at_rising_commits_when_reading_metadata_should_wait_only_for_the_syncs_that_changed_the_assignment()
+ {
+    const ADDED: u64 = 5;
+    const UNCHANGED: u64 = ADDED + 1;
+    const EXTENDED: u64 = UNCHANGED + 1;
+    const NOT_A_MEMBER: u64 = EXTENDED + 1;
+    let (client, cluster) = connect_to_three_replicas().await;
+    let answers = [
+        assignment_at_commit(ADDED, GROUP_GENERATION, &[PARTITION]),
+        assignment_at_commit(UNCHANGED, GROUP_GENERATION, &[PARTITION]),
+        assignment_at_commit(
+            EXTENDED,
+            GROUP_GENERATION + 1,
+            &[OTHER_PARTITION, PARTITION],
+        ),
+        Answer::CommitBody(NOT_A_MEMBER, Vec::new()),
+    ];
+    let syncs = answers.len();
+    cluster.script(
+        &endpoint(METADATA_PRIMARY),
+        SYNC_CONSUMER_GROUP_CODE,
+        answers,
+    );
+    let (stream, topic, group) = (
+        identifier(STREAM_ID),
+        identifier(TOPIC_ID),
+        identifier(GROUP_ID),
+    );
+    let mut watermarks = Vec::with_capacity(syncs);
+
+    for _ in 0..syncs {
+        client
+            .sync_consumer_group(&stream, &topic, &group)
+            .await
+            .unwrap();
+        client
+            .send_raw_with_response(GET_STREAMS_CODE, Bytes::new())
+            .await
+            .unwrap();
+        let reads = cluster.received(GET_STREAMS_CODE);
+        watermarks.push(reads.last().unwrap().header.minimum_metadata_op);
+    }
+
+    assert_eq!(watermarks, [ADDED, ADDED, EXTENDED, EXTENDED]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2656,14 +2709,21 @@ fn assignment(partitions: &[u32]) -> Answer {
 
 /// The server bumps the generation of a group whenever the partitions of a member change.
 fn assignment_at(generation: u64, partitions: &[u32]) -> Answer {
-    Answer::Body(
-        SyncConsumerGroupResponse {
-            generation,
-            partitions: partitions.to_vec(),
-        }
-        .to_bytes()
-        .to_vec(),
-    )
+    Answer::Body(sync_body(generation, partitions))
+}
+
+/// [`assignment_at`] as a replica read it at the metadata commit `commit`.
+fn assignment_at_commit(commit: u64, generation: u64, partitions: &[u32]) -> Answer {
+    Answer::CommitBody(commit, sync_body(generation, partitions))
+}
+
+fn sync_body(generation: u64, partitions: &[u32]) -> Vec<u8> {
+    SyncConsumerGroupResponse {
+        generation,
+        partitions: partitions.to_vec(),
+    }
+    .to_bytes()
+    .to_vec()
 }
 
 /// Scripts `answers` for the next fetches on `PRIMARY`, then `SILENT_READS` fetches without a

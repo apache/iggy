@@ -29,6 +29,7 @@ import { COMMAND_CODE } from '../wire/command.code.js';
 import { groupConsumerStream, singleConsumerStream, type ConsumerStreamRequest } from '../stream/consumer-stream.js';
 import { LOGIN, LOGIN_WITH_TOKEN, LOGOUT } from '../wire/index.js';
 import { LEAVE_GROUP } from '../wire/consumer-group/leave-group.command.js';
+import { SYNC_GROUP } from '../wire/consumer-group/sync-group.command.js';
 import { UPDATE_USER } from '../wire/user/update-user.command.js';
 import { UPDATE_TOPIC } from '../wire/topic/update-topic.command.js';
 import { UPDATE_STREAM } from '../wire/stream/update-stream.command.js';
@@ -5869,6 +5870,15 @@ const fetchReplyBody = (...sections: ReplySection[]): Buffer => {
   return Buffer.concat([head, ...records]);
 };
 
+/** The body of a sync reply: the group generation and the partitions of the member. */
+const assignmentBody = (generation: bigint, partitions: number[]): Buffer => {
+  const body = Buffer.alloc(12 + 4 * partitions.length);
+  body.writeBigUInt64LE(generation, 0);
+  body.writeUInt32LE(partitions.length, 8);
+  partitions.forEach((partition, index) => body.writeUInt32LE(partition, 12 + 4 * index));
+  return body;
+};
+
 describe('consumer stream', () => {
   const POLLED_PARTITION = 3;
   const streamConfig = (port: number): ClientConfig => ({
@@ -5919,12 +5929,7 @@ describe('consumer stream', () => {
       group.writeUInt32LE(1, 0);
       socket.write(replyFrame(frame, Operation.NonReplicated, group));
     } else if (code === COMMAND_CODE.SyncGroup) {
-      const partitions = assigned();
-      const assignment = Buffer.alloc(12 + 4 * partitions.length);
-      assignment.writeBigUInt64LE(1n, 0);
-      assignment.writeUInt32LE(partitions.length, 8);
-      partitions.forEach((partition, index) => assignment.writeUInt32LE(partition, 12 + 4 * index));
-      socket.write(replyFrame(frame, Operation.NonReplicated, assignment));
+      socket.write(replyFrame(frame, Operation.NonReplicated, assignmentBody(1n, assigned())));
     } else return false;
     return true;
   };
@@ -7073,9 +7078,10 @@ describe('deferred requests', () => {
     };
   };
 
-  it('sends a fetch to the primary of its partitions with context zero, and gives each target of history 0 the ' +
-    'incarnation of its route and keeps its owner', async () => {
+  it('sends a fetch to the primary of its partitions with the metadata watermark, and gives each target of ' +
+    'history 0 the incarnation of its route and keeps its owner', async () => {
       const ROUTE_INCARNATION = 5n;
+      const WATERMARK = 50n;
       const fence = { incarnation: 3n, ownerGeneration: 9n, metadataOp: 0n };
       const historyless = { incarnation: 0n, ownerGeneration: 9n, metadataOp: 100n };
       const cluster = await startPollCluster((frame, socket) => {
@@ -7083,12 +7089,20 @@ describe('deferred requests', () => {
         socket.write(emptyFetch(frame));
         return true;
       }, (frame, socket) => {
+        if (frame[REQUEST_OFFSET.operation] === Operation.CreateStream) {
+          const reply = provedReply(frame);
+          reply.writeBigUInt64LE(WATERMARK, REPLY_OFFSET.op);
+          reply.writeBigUInt64LE(WATERMARK, REPLY_OFFSET.commit);
+          socket.write(reply);
+          return true;
+        }
         if (codeOf(frame) !== COMMAND_CODE.GetPartitionRoute) return false;
         socket.write(replyFrame(frame, Operation.NonReplicated,
           routingBody(frame.readBigUInt64LE(REQUEST_OFFSET.minimumMetadataOp) || 1n, ROUTE_INCARNATION)));
         return true;
       });
       try {
+        await cluster.client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0));
         await cluster.client.sendCommand(COMMAND_CODE.FetchMessages, fetchBody([
           { partitionId: 1, pollingStrategy: PollingStrategy.Offset(0n) },
           { partitionId: 2, pollingStrategy: PollingStrategy.Offset(4n), context: fence },
@@ -7096,8 +7110,8 @@ describe('deferred requests', () => {
           { partitionId: 4, pollingStrategy: PollingStrategy.Offset(0n), context: EMPTY_PARTITION_CONTEXT }
         ]));
         const [frame] = framesWith(cluster.primary, COMMAND_CODE.FetchMessages);
-        // A target has no field for an op, and the header names none.
-        assert.deepEqual(stampedContext(frame), EMPTY_PARTITION_CONTEXT);
+        // A target has no field for an op, and the header names the one that the session saw.
+        assert.deepEqual(stampedContext(frame), { ...EMPTY_PARTITION_CONTEXT, metadataOp: WATERMARK });
         assert.deepEqual(fetchOf(frame).targets.map(({ partitionId, incarnation, ownerGeneration }) =>
           ({ partitionId, incarnation, ownerGeneration })), [
           { partitionId: 1, incarnation: ROUTE_INCARNATION, ownerGeneration: 0n },
@@ -7106,6 +7120,40 @@ describe('deferred requests', () => {
           { partitionId: 4, incarnation: ROUTE_INCARNATION, ownerGeneration: 0n }
         ]);
         assert.equal(framesWith(cluster.coordinator, COMMAND_CODE.FetchMessages).length, 0);
+      } finally {
+        await cluster.close();
+      }
+    });
+
+  it('names in the next fetch the commit of a sync that returned a new assignment, and not that of a sync that ' +
+    'returned it again', async () => {
+      const ASSIGNED_AT = 60n;
+      const SYNCED_AGAIN_AT = 70n;
+      const ASSIGNMENT = { generation: 3n, partitions: [1] };
+      let syncCommit = ASSIGNED_AT;
+      const cluster = await startPollCluster((frame, socket) => {
+        if (codeOf(frame) !== COMMAND_CODE.FetchMessages) return false;
+        socket.write(emptyFetch(frame));
+        return true;
+      }, (frame, socket) => {
+        if (codeOf(frame) !== COMMAND_CODE.SyncGroup) return false;
+        const reply = replyFrame(frame, Operation.NonReplicated,
+          assignmentBody(ASSIGNMENT.generation, ASSIGNMENT.partitions));
+        reply.writeBigUInt64LE(syncCommit, REPLY_OFFSET.commit);
+        socket.write(reply);
+        return true;
+      });
+      const sync = SYNC_GROUP.serialize({ streamId: 1, topicId: 2, groupId: 1 });
+      const fetch = fetchBody(offsetTargets(1), { consumer: { kind: ConsumerKind.Group, id: 1 } });
+      try {
+        assert.deepEqual(SYNC_GROUP.deserialize(await cluster.client.sendCommand(COMMAND_CODE.SyncGroup, sync)),
+          ASSIGNMENT);
+        await cluster.client.sendCommand(COMMAND_CODE.FetchMessages, fetch);
+        syncCommit = SYNCED_AGAIN_AT;
+        await cluster.client.sendCommand(COMMAND_CODE.SyncGroup, sync);
+        await cluster.client.sendCommand(COMMAND_CODE.FetchMessages, fetch);
+        assert.deepEqual(framesWith(cluster.primary, COMMAND_CODE.FetchMessages).map(stampedContext),
+          Array(2).fill({ ...EMPTY_PARTITION_CONTEXT, metadataOp: ASSIGNED_AT }));
       } finally {
         await cluster.close();
       }

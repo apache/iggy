@@ -25,7 +25,7 @@ use crate::links::{
     pause_before_retry, read_reply,
 };
 use crate::session_owner::{LaneKey, LaneTicket, RetainedOperation, SessionEpoch, SessionOwner};
-use crate::vsr::decode_reply_for;
+use crate::vsr::{decode_reply_for, reply_commit};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use iggy_binary_protocol::codes::{
@@ -33,7 +33,7 @@ use iggy_binary_protocol::codes::{
     DELETE_CONSUMER_OFFSET_CODE, FETCH_MESSAGES_CODE, GET_CONSUMER_OFFSET_CODE,
     GET_PARTITION_ROUTE_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
     POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE, SEND_MESSAGES_CODE,
-    STORE_CONSUMER_OFFSET_CODE, UPDATE_RESOURCE_CODE,
+    STORE_CONSUMER_OFFSET_CODE, SYNC_CONSUMER_GROUP_CODE, UPDATE_RESOURCE_CODE,
 };
 use iggy_binary_protocol::consensus::{Operation, RequestHeader, operation_for_code};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
@@ -341,8 +341,11 @@ impl OperationDriver {
     }
 
     /// One fetch on the primary of its targets. The targets of a readiness
-    /// group share it, so the call routes by the first one. The header
-    /// carries context zero, and each target its own fence.
+    /// group share it, so the call routes by the first one. The header names
+    /// only the metadata that the session saw, and each target its own fence.
+    /// That metadata covers the handovers of the synced assignment, so a
+    /// replica that has not applied them yet refuses the fetch as not
+    /// accepted, not as a partition that the member does not own.
     pub(crate) async fn fetch_messages(
         &self,
         request: &FetchMessagesRequest,
@@ -397,7 +400,7 @@ impl OperationDriver {
                     stream_id: &stream_id,
                     topic_id: &topic_id,
                     partition_id,
-                    context: Some(PartitionContext::default()),
+                    context: Some(self.read_context()),
                 }),
                 operation_deadline(),
             );
@@ -544,6 +547,24 @@ impl OperationDriver {
         self.drive(Call::new(code, payload, target, deadline)).await
     }
 
+    /// The reply body of a `SyncConsumerGroup` and the metadata commit at
+    /// which the answering replica read the assignment.
+    pub(crate) async fn sync_group(&self, payload: Bytes) -> Result<(Bytes, u64), IggyError> {
+        let call = Call::new(
+            SYNC_CONSUMER_GROUP_CODE,
+            payload,
+            RequestTarget::Metadata,
+            operation_deadline(),
+        );
+        self.drive_reply(call)
+            .await
+            .map(|reply| (reply.body, reply.commit))
+    }
+
+    pub(crate) fn observe_metadata_commit(&self, commit: u64) {
+        self.session.observe_metadata_commit(commit);
+    }
+
     /// Replays the retained operation `op` until it has an outcome or
     /// `deadline` passes. A proved outcome frees the lane. An operation that
     /// is no longer retained returns the outcome that a replay proved for it.
@@ -585,6 +606,7 @@ impl OperationDriver {
                     return Ok(CallReply {
                         body,
                         uncertain_fetch,
+                        commit: call.reply_commit,
                     });
                 }
                 Err(next) => next,
@@ -750,6 +772,7 @@ impl OperationDriver {
                         return Err(Next::Fail(IggyError::Unauthenticated));
                     }
                     self.session.observe_metadata_reply(&reply.header);
+                    call.reply_commit = reply_commit(&reply.header);
                     let bound = self.session.epoch().bound;
                     close_if_detached(&hop.link, &outcome.result, bound);
                     if outcome.committed && call.uncertain {
@@ -1502,11 +1525,14 @@ struct Call {
     /// The request of a fetch. Its targets name the progress lanes and the
     /// routes of the call, and a refusal of the fetch concerns all of them.
     fetch: Option<FetchMessagesRequest>,
+    /// The metadata commit that the last reply named.
+    reply_commit: u64,
 }
 
 struct CallReply {
     body: Bytes,
     uncertain_fetch: Option<UncertainFetch>,
+    commit: u64,
 }
 
 /// Whether a committing fetch that failed with `error` can have taken effect. The HTTP client
@@ -1708,6 +1734,7 @@ impl Call {
             not_primary: false,
             restarted: false,
             fetch: None,
+            reply_commit: 0,
         }
     }
 
@@ -4285,12 +4312,21 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_a_fetch_of_1_or_1000_targets_when_sent_should_reach_their_primary_with_context_zero_and_fence_each_target()
+    async fn given_a_fetch_of_1_or_1000_targets_when_sent_should_reach_their_primary_with_the_session_watermark_and_fence_each_target()
      {
         const OWNER_GENERATION: u64 = 4;
         for targets in [1, MAX_PARTITIONS_PER_REQUEST] {
             for raw in [false, true] {
                 let f = Fixture::new().await;
+                f.cluster
+                    .script(&endpoint(0), CREATE_STREAM_CODE, [Answer::Commit(COMMIT)]);
+                f.call(CREATE_STREAM_CODE, RequestTarget::Metadata)
+                    .await
+                    .unwrap();
+                *f.cluster.route.lock().unwrap() = Some(PartitionRouteResponse {
+                    metadata_op: COMMIT,
+                    ..ROUTE
+                });
                 let mut request = fetch(0..targets, false, WirePollingStrategy::offset(0));
                 // The fence of the caller stays, also one of an older route.
                 request.targets[0].incarnation = RECREATED.incarnation;
@@ -4307,7 +4343,13 @@ mod tests {
                 reply.unwrap();
                 let fetches = f.cluster.received(FETCH_MESSAGES_CODE);
                 assert_eq!(endpoints(&fetches), [endpoint(PRIMARY)]);
-                assert_eq!(stamped_context(&fetches[0]), PartitionContext::default());
+                assert_eq!(
+                    stamped_context(&fetches[0]),
+                    PartitionContext {
+                        metadata_op: COMMIT,
+                        ..PartitionContext::default()
+                    }
+                );
                 let sent = FetchMessagesRequest::decode_from(&fetches[0].body).unwrap();
                 let fences: Vec<_> = sent
                     .targets

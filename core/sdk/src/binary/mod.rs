@@ -148,6 +148,17 @@ macro_rules! impl_binary_client {
                 self.driver.fetch_sections(request).await
             }
 
+            async fn send_group_sync_with_commit(
+                &self,
+                payload: bytes::Bytes,
+            ) -> Result<(bytes::Bytes, u64), iggy_common::IggyError> {
+                self.driver.sync_group(payload).await
+            }
+
+            fn observe_metadata_commit(&self, commit: u64) {
+                self.driver.observe_metadata_commit(commit);
+            }
+
             async fn send_poll_with_response_and_options(
                 &self,
                 request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,

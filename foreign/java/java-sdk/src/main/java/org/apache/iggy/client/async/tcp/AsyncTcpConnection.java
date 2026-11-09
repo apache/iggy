@@ -91,12 +91,10 @@ import java.util.function.LongConsumer;
  * Manages the connection lifecycle and request/response correlation.
  */
 public class AsyncTcpConnection {
-    // Transient VSR denials (not-committed / not-accepted) are replayed with
-    // the same encoded frame so the server's dedup sees the same request id.
-    // A not-committed outcome is unknown, so it replays for the whole budget.
-    // A not-accepted deny was refused outright (typically a demoted primary),
-    // so after a short same-node retry it is handed to the owning client for
-    // a leader recheck and safe replay.
+    // Transient VSR denials (not-committed / not-accepted) are replayed with the same encoded frame so the server's
+    // dedup sees the same request id. A not-committed outcome is unknown, so it replays for the whole budget. A
+    // not-accepted deny was refused outright (typically a demoted primary), so after a short same-node retry it is
+    // handed to the owning client for a leader recheck and safe replay.
     //
     // Package-private: the client classifies a failed sign-in by these codes,
     // and a transient one is not a rejected credential.
@@ -119,9 +117,8 @@ public class AsyncTcpConnection {
     // A missing reply must not hold the single VSR-pinned channel forever.
     private static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofSeconds(30);
     private static final long TRANSIENT_RETRY_INTERVAL_MS = 50;
-    // Each lifecycle retry commits another refusal, so its pause doubles from
-    // the transient interval up to this cap; mirrors LIFECYCLE_RETRY_MAX_INTERVAL
-    // in core/sdk/src/vsr.rs.
+    // Each lifecycle retry commits another refusal, so its pause doubles from the transient interval up to this cap;
+    // mirrors LIFECYCLE_RETRY_MAX_INTERVAL in core/sdk/src/vsr.rs.
     private static final Duration TRANSIENT_RETRY_BUDGET = Duration.ofSeconds(30);
     // Full-jitter refusal retries mirror core/sdk/src/links/mod.rs.
     private static final Duration RETRY_BACKOFF_BASE = Duration.ofMillis(50);
@@ -1326,6 +1323,7 @@ public class AsyncTcpConnection {
         // The operation stays uncertain, as in Rust, so a resolve can still prove it.
         boolean committed = pending.isCommitted() && (error == null || serverError != null);
         exchange.failoverState().committed = committed;
+        exchange.failoverState().replyCommit = pending.replyCommit();
         exchange.failoverState().linkFailed = pending.isFailedByLink();
         exchange.failoverState().detachedSession = pending.isSessionDetached();
         closeIfDetached(exchange, pending, serverError);
@@ -1422,11 +1420,10 @@ public class AsyncTcpConnection {
     }
 
     /**
-     * Only ordinary requests retry a lifecycle refusal, and only when the next
-     * attempt starts before the request deadline, as in Rust's TCP client. Routed
-     * exchanges hand it to their router. Sign-in and sign-out hold the
-     * channel lease until answered, so a pause there would stall every other
-     * request; the server never refuses them for a lifecycle change.
+     * Only ordinary requests retry a lifecycle refusal, and only when the next attempt starts before the request
+     * deadline, as in Rust's TCP client. Routed exchanges hand it to their router. Sign-in and sign-out hold the
+     * channel lease until answered, so a pause there would stall every other request; the server never refuses them
+     * for a lifecycle change.
      */
     private boolean scheduleLifecycleRetry(
             VsrExchange exchange,
@@ -1468,10 +1465,9 @@ public class AsyncTcpConnection {
     }
 
     /**
-     * Sends the refused request again under a fresh request id with the same
-     * payload and context, because the server's dedup answers the old id with
-     * its committed refusal. The frame is encoded after the pause so its id
-     * stays in order with the requests other callers sent meanwhile.
+     * Sends the refused request again under a fresh request id with the same payload and context, because the server's
+     * dedup answers the old id with its committed refusal. The frame is encoded after the pause so its id stays in
+     * order with the requests other callers sent meanwhile.
      */
     private void retryLifecycleBusy(
             VsrExchange exchange,
@@ -1775,9 +1771,8 @@ public class AsyncTcpConnection {
     }
 
     /**
-     * Fails a routed exchange that its link failed, by an eviction or a lost
-     * connection. An eviction carries the code of a reply, and only this tells
-     * the router to try the exchange again where a reply ends the call.
+     * Fails a routed exchange that its link failed, by an eviction or a lost connection. An eviction carries the code
+     * of a reply, and only this tells the router to try the exchange again where a reply ends the call.
      */
     static final class LinkFailure extends CompletionException {
         LinkFailure(Throwable cause) {
@@ -1793,6 +1788,7 @@ public class AsyncTcpConnection {
         private boolean retryAuthentication;
         private long requestId;
         private boolean committed;
+        private long replyCommit;
         private boolean linkFailed;
         private boolean detachedSession;
         private boolean uncertain;
@@ -1902,6 +1898,10 @@ public class AsyncTcpConnection {
 
         boolean committed() {
             return committed;
+        }
+
+        long replyCommit() {
+            return replyCommit;
         }
 
         void setLanes(List<ConsensusSession.LaneKey> lanes) {

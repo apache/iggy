@@ -54,6 +54,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientFetchMessagesTest.SINGLE_NODE_INCARNATION;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientFetchMessagesTest.assertCancels;
@@ -71,6 +72,9 @@ class AsyncIggyTcpClientReaderTest {
     private static final int CANCEL_CODE = CommandCode.Messages.CANCEL_DEFERRED_REQUEST.getValue();
     private static final int GET_OFFSET_CODE = CommandCode.ConsumerOffset.GET.getValue();
     private static final int POLL_DEFERRED_CODE = CommandCode.Messages.POLL_DEFERRED.getValue();
+    private static final int SYNC_CODE = CommandCode.ConsumerGroup.SYNC.getValue();
+    // The metadata commit of the replica that answers the first sync, above the commit of the sign-in.
+    private static final long ASSIGNED_AT = 7;
     private static final long CURRENT_OFFSET = 9;
     // The owner that the server installed for the member, as its poll reply names it.
     private static final PartitionContext INSTALLED = new PartitionContext(
@@ -294,6 +298,47 @@ class AsyncIggyTcpClientReaderTest {
         }
     }
 
+    /**
+     * A handover installs each owner in a later metadata op than the join. So a sync reply with a new assignment raises
+     * the watermark to its commit, and the next fetch names it. A sync reply with the same assignment at a later commit
+     * raises nothing.
+     */
+    @Test
+    void shouldNameTheCommitOfAChangedAssignmentInTheNextFetch() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            AtomicLong syncCommit = new AtomicLong(ASSIGNED_AT);
+            List<Long> fetchOps = new CopyOnWriteArrayList<>();
+            CompletableFuture<Void> served = singleNode(socket, request -> {
+                if (request.is(SYNC_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.committed(OPERATION_NON_REPLICATED, syncCommit.get(), assignment());
+                }
+                if (request.is(FETCH_CODE, OPERATION_NON_REPLICATED)) {
+                    fetchOps.add(request.metadataOp());
+                    return Response.success(OPERATION_NON_REPLICATED, emptySection(1));
+                }
+                return unexpected(request);
+            });
+            AsyncIggyTcpClient client = signedIn(socket);
+            try {
+                var transport = new TcpReaderTransport(client, StreamId.of(1L), TopicId.of(1L), Consumer.group(7L));
+                Map<Long, PollingStrategy> targets = Map.of(1L, PollingStrategy.offset(BigInteger.ZERO));
+                DeferredPollOptions options = PollOptions.waitFor(Duration.ZERO).deferredOptions();
+                assertThat(transport.metadataWatermark()).isLessThan(BigInteger.valueOf(ASSIGNED_AT));
+
+                transport.assignment().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                transport.read(targets, 1, false, options).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                syncCommit.set(ASSIGNED_AT + 1);
+                transport.assignment().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                transport.read(targets, 1, false, options).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+                assertThat(fetchOps).containsExactly(ASSIGNED_AT, ASSIGNED_AT);
+            } finally {
+                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            }
+            served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
     private static Set<?> committing(TcpReaderTransport transport) throws ReflectiveOperationException {
         Field field = TcpReaderTransport.class.getDeclaredField("committing");
         field.setAccessible(true);
@@ -318,5 +363,10 @@ class AsyncIggyTcpClientReaderTest {
                 .writeLongLE(INSTALLED.incarnation().longValueExact())
                 .writeLongLE(INSTALLED.ownerGeneration().longValueExact())
                 .writeLongLE(INSTALLED.metadataOp().longValueExact());
+    }
+
+    /** A sync reply that assigns partition 1 in generation 1. */
+    private static ByteBuf assignment() {
+        return Unpooled.buffer().writeLongLE(1).writeIntLE(1).writeIntLE(1);
     }
 }

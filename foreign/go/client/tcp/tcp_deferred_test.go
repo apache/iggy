@@ -623,8 +623,9 @@ func answerParked(t *testing.T, conn net.Conn, parked request, reply []byte) {
 }
 
 // A fetch goes to the primary of its first target in one request, because
-// its caller groups the targets. Its header carries no partition context,
-// because each target carries its own.
+// its caller groups the targets. Its header names the metadata that the
+// session saw, here the commit of the join, and no history or owner, because
+// each target carries its own fence.
 func TestFetchMessages_SendsOneRequestToThePrimaryOfItsFirstTarget(t *testing.T) {
 	fixture := newPrimaryPollFixture(t, func(_, _ int, read request) ([]byte, bool) {
 		if read.code() != uint32(command.FetchMessagesCode) {
@@ -635,6 +636,7 @@ func TestFetchMessages_SendsOneRequestToThePrimaryOfItsFirstTarget(t *testing.T)
 	}, nil)
 	streamId, topicId, consumer := groupConsumer(t)
 	next := iggcon.NextPollingStrategy()
+	require.NoError(t, fixture.client.JoinConsumerGroup(context.Background(), streamId, topicId, consumer.Id))
 
 	sections, err := fixture.client.FetchMessages(context.Background(), streamId, topicId, consumer,
 		[]iggcon.FetchMessagesTarget{{PartitionId: 1, Strategy: next}, {PartitionId: 0, Strategy: next}},
@@ -644,10 +646,12 @@ func TestFetchMessages_SendsOneRequestToThePrimaryOfItsFirstTarget(t *testing.T)
 	require.Len(t, sections, 2)
 	assert.ErrorIs(t, sections[1].Err, ierror.ErrNotPrimary)
 	fetch := recordedFetch(t, fixture.primaries[1].recorded())
-	assert.Equal(t, make([]byte, iggcon.PartitionContextSize), fetch.header[frameOffsetContext:frameOffsetContext+iggcon.PartitionContextSize])
+	assert.Equal(t, iggcon.PartitionContext{MetadataOp: 11}, stampedContext(t, fetch), "the header names the commit of the join")
 	targets := fetchTargets(t, fetch)
 	require.Len(t, targets, 2)
 	assert.Equal(t, []uint32{1, 0}, []uint32{targets[0].partition, targets[1].partition})
+	assert.Equal(t, []iggcon.PartitionContext{{Incarnation: 17}, {Incarnation: 17}},
+		[]iggcon.PartitionContext{targets[0].fence, targets[1].fence}, "each target keeps the fence of its route")
 	assert.Zero(t, requestCount(fixture.primaries[0].recorded(), command.FetchMessagesCode))
 	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.FetchMessagesCode))
 }

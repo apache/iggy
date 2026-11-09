@@ -35,8 +35,10 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
 /**
@@ -46,6 +48,8 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
     private static final Logger log = LoggerFactory.getLogger(ConsumerGroupsTcpClient.class);
 
     private final Supplier<AsyncTcpConnection> connectionSupplier;
+    // The assignment of the last sync reply of each group. A reply that names no membership removes it.
+    private final Map<ClientRoutingState.GroupKey, ConsumerGroupAssignment> synced = new ConcurrentHashMap<>();
 
     public ConsumerGroupsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
         this.connectionSupplier = connectionSupplier;
@@ -189,15 +193,26 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Syncing consumer group assignment - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
+        var group = ClientRoutingState.groupKey(streamId, topicId, groupId);
         // An empty body means "not a member", which exchangeForOptional maps
         // to an empty Optional; a member owning zero partitions still gets a
         // non-empty body with a zero partition count.
         return AsyncTcpConnection.mapResponse(
                 connection().send(CommandCode.ConsumerGroup.SYNC.getValue(), payload, deadline, state), response -> {
                     try {
-                        return response.isReadable()
-                                ? Optional.of(BytesDeserializer.readConsumerGroupAssignment(response))
-                                : Optional.empty();
+                        if (!response.isReadable()) {
+                            synced.remove(group);
+                            return Optional.empty();
+                        }
+                        var assignment = BytesDeserializer.readConsumerGroupAssignment(response);
+                        // A handover installs each owner in a later metadata op than the join, and a primary that has
+                        // not applied it refuses a read as not owned. So the reads of a changed assignment wait for
+                        // the commit that the reply was read at.
+                        if (!assignment.equals(synced.get(group))) {
+                            connection().sessionOwner().observeMetadata(state.replyCommit());
+                            synced.put(group, assignment);
+                        }
+                        return Optional.of(assignment);
                     } finally {
                         response.release();
                     }

@@ -495,7 +495,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider, ICons
                 // fence instead of a poll of another partition. A fully zero context counts as none.
                 if (pollingStrategy.Context is { } context && context != default)
                 {
-                    _groupState.InvalidateAssignment(key);
+                    _groupState.ExpireAssignment(key);
                     await SyncGroupAssignmentAsync(streamId, topicId, consumer.ConsumerId, token, startedUnder: generation);
                     throw;
                 }
@@ -511,7 +511,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider, ICons
                 rental.Dispose();
             }
 
-            _groupState.InvalidateAssignment(key);
+            _groupState.ExpireAssignment(key);
             await SyncGroupAssignmentAsync(streamId, topicId, consumer.ConsumerId, token, startedUnder: generation);
         }
 
@@ -528,7 +528,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider, ICons
         var key = new GroupKey(streamId, topicId, groupId);
         if (resync)
         {
-            _groupState.InvalidateAssignment(key);
+            _groupState.ExpireAssignment(key);
         }
 
         if (!_groupState.HasAssignment(key))
@@ -568,7 +568,12 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider, ICons
 
             var assignment = SyncConsumerGroupAssignment.Decode(responseBuffer.Memory.Span);
             _groupState.RegisterGroup(key, streamId, topicId, groupId);
-            _groupState.SetAssignment(key, assignment.Generation, assignment.Partitions);
+            // A handover installs each owner in a later op than the join, and a reply lists only what its node has
+            // installed. So reads of a changed assignment wait for its commit. An unchanged one raises nothing.
+            if (_groupState.SetAssignment(key, assignment.Generation, assignment.Partitions))
+            {
+                (responseBuffer as SyncConsumerGroupReply)?.RaiseWatermark();
+            }
         }
     }
 

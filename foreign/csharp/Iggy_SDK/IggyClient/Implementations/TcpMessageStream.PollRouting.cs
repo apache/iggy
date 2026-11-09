@@ -381,7 +381,8 @@ public sealed partial class TcpMessageStream
                         route = await GetPartitionRouteAsync(partition.Key, partition.Query, deadline, cancellation.Token,
                             askMetadataPrimaryFirst);
                         askMetadataPrimaryFirst = false;
-                        // A fetch names the history of each target in its body, so its own context stays zero.
+                        // A fetch fences each target in its body. Its header names the metadata the session saw, so a
+                        // replica that has not applied it answers 58 instead of judging targets on older group state.
                         captured = code == CommandCodes.FETCH_MESSAGES_CODE
                             ? captured ?? route.Route.Context
                             : HistoryContext(captured, route.Route.Context);
@@ -960,7 +961,7 @@ public sealed partial class TcpMessageStream
         {
             reply = await SendRoutedAsync(CommandCodes.FETCH_MESSAGES_CODE, new SendTarget(first, RouteQuery(first)),
                 TcpContracts.FetchMessages(consumer, streamId, topicId, left, count, autoCommit, left.MaxBytes, fenced),
-                default(PartitionContext), token, left.RequestTimeout, generation);
+                new PartitionContext(0, 0, _metadataWatermark), token, left.RequestTimeout, generation);
         }
         catch (IggyInvalidStatusCodeException error) when (error.StatusCode is VsrError.NOT_PRIMARY
                                                                or VsrError.HISTORY_UNAVAILABLE

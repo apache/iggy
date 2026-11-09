@@ -33,11 +33,11 @@ final class RoutedContext {
 
     /**
      * The context that a request of {@code command} sends on a route with context {@code route}. A fetch names the
-     * history of each partition in its targets, so its header keeps the zero context of the caller. Any other request
-     * without a caller context takes the context of the route. So does a context that is all zero, since its op 0 would
-     * bind owner 0 to no owner that the server installed. Any other caller context with incarnation 0 takes the
-     * incarnation of the route and keeps its owner and op. The router keeps the result for every attempt, so they all
-     * name the same history.
+     * history of each partition in its targets, so it keeps the context of the caller for them, and the encoder names
+     * only the session watermark in its header. Any other request without a caller context takes the context of the
+     * route. So does a context that is all zero, since its op 0 would bind owner 0 to no owner that the server
+     * installed. Any other caller context with incarnation 0 takes the incarnation of the route and keeps its owner
+     * and op. The router keeps the result for every attempt, so they all name the same history.
      */
     static PartitionContext of(int command, PartitionContext caller, PartitionContext route) {
         if (caller == null) {
