@@ -5908,6 +5908,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             // Keep the hash chain continuous: the next prepare must chain onto the
             // head this view adopted, not onto whatever was appended last.
             self.set_last_prepare_checksum(head.checksum);
+        } else if new_op == 0 {
+            // An empty log has no head. A checksum from a dropped WAL tail
+            // would break the chain of the first prepare.
+            // shortcut: only covers a merge at op 0, a merge above op 0 with no headers keeps the old checksum.
+            self.set_last_prepare_checksum(0);
         }
         for header in &merged.headers {
             self.observe_prepare_timestamp(header.timestamp);
