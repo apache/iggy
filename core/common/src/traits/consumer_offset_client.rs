@@ -36,7 +36,7 @@ use async_trait::async_trait;
 /// a zero context as a write without a context. A binary client gives any other context with
 /// incarnation 0 the incarnation of the route at the first attempt and keeps its owner and op,
 /// and every retry and replay names that history. HTTP has no route, so it sends such a context
-/// as it is, and the server refuses it.
+/// of [`Self::store_consumer_position`] as it is, and the server refuses it.
 #[async_trait]
 pub trait ConsumerOffsetClient {
     /// Commit a checkpoint without substituting a newer incarnation or owner for the ones that

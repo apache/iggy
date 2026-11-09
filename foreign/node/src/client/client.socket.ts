@@ -902,9 +902,8 @@ export class CommandResponseStream extends EventEmitter {
       if (!(attempt.error instanceof ResponseError) || !attempt.error.fromServer ||
           !isTransient(attempt.error.errorCode))
         throw attempt.error;
-      try { await waitWithin(pause(Math.floor(Math.random() * (retryDelay + 1)), signal), deadline, signal); }
+      try { retryDelay = await backOff(retryDelay, deadline, signal); }
       catch (error) { throw error instanceof VsrResponseTimeoutError ? attempt.error : error; }
-      retryDelay = Math.min(retryDelay * 2, MAX_RETRY_INTERVAL_MS);
       if (command === GET_CLUSTER_METADATA.code) {
         const alternative = [...this.replicas.values()].find((slot) =>
           slot.attached && slot.connection?.connected && slot.connection !== link);
@@ -931,9 +930,8 @@ export class CommandResponseStream extends EventEmitter {
         // Each pass starts at the metadata primary, which a roster read after
         // a namespace miss can have moved.
         previous = undefined;
-        try { await waitWithin(pause(Math.floor(Math.random() * (retryDelay + 1)), signal), deadline, signal); }
+        try { retryDelay = await backOff(retryDelay, deadline, signal); }
         catch (error) { throw error instanceof VsrResponseTimeoutError && lastRefusal ? lastRefusal : error; }
-        retryDelay = Math.min(retryDelay * 2, MAX_RETRY_INTERVAL_MS);
         continue;
       }
       visited.add(link);
@@ -1354,8 +1352,7 @@ export class CommandResponseStream extends EventEmitter {
         throw attempt.error;
       }
       if (attempt.error instanceof VsrEvictionError || attempt.error instanceof TypeError) throw attempt.error;
-      await waitWithin(pause(Math.floor(Math.random() * (retryDelay + 1)), sessionSignal), deadline, sessionSignal);
-      retryDelay = Math.min(retryDelay * 2, MAX_RETRY_INTERVAL_MS);
+      retryDelay = await backOff(retryDelay, deadline, sessionSignal);
     }
   }
 

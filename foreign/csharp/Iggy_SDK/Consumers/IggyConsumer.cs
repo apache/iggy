@@ -123,6 +123,11 @@ public partial class IggyConsumer : IAsyncDisposable
     ///     configuration asks for it, and starts the reader, which joins the group.
     /// </summary>
     /// <exception cref="ObjectDisposedException">The consumer was shut down.</exception>
+    /// <exception cref="VsrRequestOutcomeUnknownException">
+    ///     The create of the group or the join has an unknown outcome. The consumer abandons it in the client first, so
+    ///     the next init can create the group and join. A join that landed keeps the member in the group until the
+    ///     session ends.
+    /// </exception>
     public async Task InitAsync(CancellationToken ct = default)
     {
         await _initialization.WaitAsync(ct);
@@ -286,7 +291,8 @@ public partial class IggyConsumer : IAsyncDisposable
     ///     it, counts the last message of <see cref="ReceiveAsync" /> under <see cref="CommitAfter.Processing" />,
     ///     closes the reader through <see cref="PartitionReader.CloseAsync(CancellationToken)" /> with
     ///     <paramref name="token" />, which stores the counted positions or moves an on read offset back and leaves the
-    ///     group, and disposes a client that the consumer created.
+    ///     group, and disposes a client that the consumer created. <paramref name="token" /> does not end the wait for
+    ///     the handler.
     /// </summary>
     /// <remarks>
     ///     The shutdown belongs to its first call. A later call waits for the first shutdown and ends as it does,

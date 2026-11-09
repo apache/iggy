@@ -63,12 +63,13 @@ namespace Apache.Iggy.Consumers;
 ///             (Unauthorized), 3007 (PartitionNotFound) or 5009 (ConsumerGroupPartitionNotOwned), is retried after a
 ///             wait that doubles each time, and after six in a row it stops its partition until a
 ///             <see cref="SeekAsync" /> with one error. Status 5009 never stops it: each sixth in a row reports one
-///             error, and the partition reads on. Status 5009 alone is not a leave: the partition keeps its
-///             position and the state that the close needs, the reader asks for the assignment again, and the
-///             partition sends owner generation 0 until its next reply. Only an assignment without the partition
-///             drops that state. An offset write refused with status 5009 reads its partition once without a commit,
-///             and when that read is served in the incarnation of the write, the write goes once more under the owner of
-///             the reply. After a read whose outcome is unknown the partition waits the retry interval. With
+///             error, and the partition reads on. A new session starts the count and the wait again. Status 5009
+///             alone is not a leave: the partition keeps its position and the state that the close needs, the reader
+///             asks for the assignment again, and the partition sends owner generation 0 until its next reply. Only an
+///             assignment without the partition drops that state. An offset write refused with status 5009 reads its
+///             partition once without a commit, and when that read is served in the incarnation of the write, the
+///             write goes once more under the owner of the reply. After a read whose outcome is unknown the partition
+///             waits the retry interval. With
 ///             <see cref="CommitMode.OnRead" />, a read whose reply was lost is repaired: the next read finds the
 ///             messages that the lost read stored and reads them again without a commit before it goes on. A read
 ///             that starts past its position while no read was lost delivers from there.
@@ -87,6 +88,12 @@ public sealed class PartitionReader : IAsyncDisposable
     private const int MaxRequestsInFlight = 32;
     private const int ConsumerOffsetNotFound = 3021;
     internal static readonly TimeSpan GroupRefreshInterval = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    ///     How long after its start a close reads a partition for its owner again, so a close whose caller never
+    ///     cancels, such as <see cref="DisposeAsync" />, still ends while those reads stay refused.
+    /// </summary>
+    internal static readonly TimeSpan CloseOwnerReadBudget = TimeSpan.FromSeconds(10);
 
     /// <summary>
     ///     The pause before the next sync after a join, or after a sync that changed the partitions of the member. A
@@ -165,6 +172,10 @@ public sealed class PartitionReader : IAsyncDisposable
     private ulong _generations;
     private ulong _serves;
     private ulong _joinedSession;
+
+    /// <summary>The session whose refusals the partitions count, which only the worker reads and writes.</summary>
+    private ulong _refusalSession;
+
     private long _queuedBytes;
     private long _queuedMessages;
     private bool _resync;
@@ -188,6 +199,7 @@ public sealed class PartitionReader : IAsyncDisposable
         _prefetchMessages = Math.Max(settings.PrefetchMessages, (long)settings.Options.Count * MinPrefetchBatches);
         _logger = logger;
         _joinedSession = Session;
+        _refusalSession = _joinedSession;
         foreach (var partition in settings.Partitions)
         {
             _states[partition] = NewState();
@@ -628,8 +640,9 @@ public sealed class PartitionReader : IAsyncDisposable
     ///     unknown outcome, the close fails. The reader then releases it in the client, so a later reader of the
     ///     partition can write. A store or delete that the server refuses as not owned reads its partition for the
     ///     installed owner. That read goes again after each transient refusal until <paramref name="token" /> is
-    ///     canceled, and then the refusal stands. The same read for an automatic store or a seek in the background ends
-    ///     when the close starts. A group reader then leaves its group, also after a cancel. A
+    ///     canceled or 10 seconds after the close started. Then the refusal stands, and each later store or delete of
+    ///     the close goes once without that read. The same read for an automatic store or a seek in the background
+    ///     ends when the close starts. A group reader then leaves its group, also after a cancel. A
     ///     <see cref="NextAsync" /> that waits ends with <see cref="ObjectDisposedException" />.
     /// </summary>
     /// <remarks>
@@ -679,6 +692,8 @@ public sealed class PartitionReader : IAsyncDisposable
 
     private async Task CloseOnceAsync(CancellationToken token)
     {
+        using var retry = CancellationTokenSource.CreateLinkedTokenSource(token);
+        retry.CancelAfter(CloseOwnerReadBudget);
         CountUncounted();
         await _lifetime.CancelAsync();
         await _worker;
@@ -703,11 +718,11 @@ public sealed class PartitionReader : IAsyncDisposable
         Exception? failure = null;
         if (OnRead)
         {
-            failure = await RewindAsync(token);
+            failure = await RewindAsync(retry.Token);
         }
         else if (AutoSettings is not null)
         {
-            failure = await FlushCountedAsync(token);
+            failure = await FlushCountedAsync(retry.Token);
         }
 
         if (_assignment is not null)
@@ -1053,6 +1068,7 @@ public sealed class PartitionReader : IAsyncDisposable
             var failed = false;
             try
             {
+                ForgetEarlierSessionRefusals();
                 if (_assignment is not null)
                 {
                     await RefreshAssignmentAsync(token);
@@ -1094,6 +1110,29 @@ public sealed class PartitionReader : IAsyncDisposable
             catch (OperationCanceledException)
             {
                 return;
+            }
+        }
+    }
+
+    /// <summary>
+    ///     Starts the refusal count and the retry wait of every partition again at a new session, as the Rust reader
+    ///     does at each new epoch: a refusal of an earlier session says nothing about the new one.
+    /// </summary>
+    private void ForgetEarlierSessionRefusals()
+    {
+        var session = Session;
+        if (session == _refusalSession)
+        {
+            return;
+        }
+
+        _refusalSession = session;
+        lock (_gate)
+        {
+            foreach (var state in _states.Values)
+            {
+                state.Lasting = 0;
+                state.RetryAt = 0;
             }
         }
     }
@@ -1269,7 +1308,9 @@ public sealed class PartitionReader : IAsyncDisposable
 
         if (regroup is not null)
         {
+            // Only a wake after the end of the task lets the next pass start a lookup that came due during this one.
             _regrouping = RegroupAsync(regroup);
+            _regrouping.ContinueWith(_ => Wake(), TaskScheduler.Default);
         }
 
         if (lookups.Count > 0)
@@ -1327,7 +1368,6 @@ public sealed class PartitionReader : IAsyncDisposable
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
-            return;
         }
         catch (Exception error)
         {
@@ -1355,8 +1395,6 @@ public sealed class PartitionReader : IAsyncDisposable
                 Report(null, 0, error);
             }
         }
-
-        Wake();
     }
 
     /// <summary>Takes partitions out of their groups, under the lock, until a lookup groups them again.</summary>
@@ -2304,7 +2342,10 @@ public sealed class PartitionReader : IAsyncDisposable
     {
         return new ReadException(partition, VsrError.Exception(VsrError.FETCH_PROGRESS_UNCERTAIN,
             $"A lost read stored offsets {from} to {until} of partition {partition}, and " +
-            (gone ? "its history no longer holds them." : "the partition moved before they were read again.")));
+            (gone ? "its history no longer holds them." : "the partition moved before they were read again.")))
+        {
+            Lost = new OffsetRange(from, until)
+        };
     }
 
     private void Retry(Target target, long delay)

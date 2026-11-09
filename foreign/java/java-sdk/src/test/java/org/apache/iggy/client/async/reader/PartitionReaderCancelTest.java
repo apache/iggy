@@ -80,6 +80,31 @@ class PartitionReaderCancelTest {
     }
 
     /**
+     * Without a cancel, the close budget ends the owner read of the move back, so a lasting transient refusal cannot
+     * hold the close. The refusal stands, and the leave and the stop of the reader still run.
+     */
+    @Test
+    void shouldEndTheOwnerReadOfTheCloseAtItsBudgetUnderALastingTransientRefusal() throws Exception {
+        FakeTransport transport = new FakeTransport(true);
+        PartitionReader reader = memberWithANewOwner(transport);
+        long started = System.nanoTime();
+        CompletableFuture<Void> closed = reader.closeAsync();
+        long giveUp = started + PartitionReader.CLOSE_BUDGET.plus(TIMEOUT).toNanos();
+        while (!closed.isDone() && System.nanoTime() - giveUp < 0) {
+            Read ownerRead = transport.reads.poll(RETRY_INTERVAL.toMillis(), TimeUnit.MILLISECONDS);
+            if (ownerRead != null) {
+                ownerRead.answer(TRANSIENT_REFUSAL);
+            }
+        }
+
+        assertThat(closed).as("the close ends within its budget").isDone();
+        assertThat(System.nanoTime() - started).isGreaterThanOrEqualTo(PartitionReader.CLOSE_BUDGET.toNanos());
+        assertRefusedAsNotOwned(closed);
+        assertThat(transport.membership).containsExactly("join", "leave");
+        assertThat(transport.events).isEmpty();
+    }
+
+    /**
      * An interrupt of the thread that waits in {@link PartitionReader#close()} cancels the close, as in the blocking
      * reader, so a lasting transient refusal of the owner read holds that thread no longer. The refusal stands, and the
      * leave and the stop of the reader still run.

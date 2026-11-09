@@ -117,12 +117,14 @@ import static org.apache.iggy.client.async.reader.ReaderSupport.unwrap;
  *       refusal that a quick retry does not change, such as {@code Unauthorized}, is retried after a wait that doubles
  *       each time, and after six in a row it stops its partition until a {@link #seek} with one error. A refusal
  *       because another member owns a partition is not a leave: the partition keeps its state, names owner generation
- *       0, and asks for its assignment. Six such refusals in a row are reported once. After such a refusal of an
- *       offset write of a partition that stays assigned, the reader reads the partition once for the owner that the
- *       server installed. If that read serves the incarnation of the write, the write goes once more for that owner.
- *       {@link #closeAsync()} ends that read for a seek write and for an automatic store, and their refusal stands.
- *       A cancel of a {@link #commit} or of the first {@link #closeAsync()} ends that read for its own writes. A read
- *       in flight at that end can still get an answer, but that answer leads to no write.
+ *       0, and asks for its assignment. It reads again after a wait that doubles each time, and six such refusals in
+ *       a row are reported once. After such a refusal of an offset write of a partition that stays assigned, the
+ *       reader reads the partition once for the owner that the server installed. If that read serves the incarnation
+ *       of the write, the write goes once more for that owner. {@link #closeAsync()} ends that read for a seek write
+ *       and for an automatic store, and their refusal stands. A cancel of a {@link #commit} ends that read for its
+ *       write. The writes of {@link #closeAsync()} read their owner until a cancel of the first call, and at most
+ *       until 10 s after the close started. A read in flight at that end can still get an answer, but that answer
+ *       leads to no write.
  * </ul>
  *
  * <p>The futures of a reader complete on its own thread, so a callback must not block.
@@ -130,6 +132,9 @@ import static org.apache.iggy.client.async.reader.ReaderSupport.unwrap;
 public final class PartitionReader implements AutoCloseable {
     // A client admits 64 deferred requests, so one reader leaves the other half to the other readers.
     static final int MAX_READS_IN_FLIGHT = 32;
+    // The owner reads of the writes of a close end this long after the close starts, so a refusal that stays transient
+    // cannot hold the close.
+    static final Duration CLOSE_BUDGET = Duration.ofSeconds(10);
 
     private static final Logger log = LoggerFactory.getLogger(PartitionReader.class);
     private static final AtomicLong READERS = new AtomicLong();
@@ -150,9 +155,9 @@ public final class PartitionReader implements AutoCloseable {
     private final ScheduledThreadPoolExecutor loop;
     // The reader is the caller of a seek write and of an automatic store, so the close ends the read of their owner.
     private final BooleanSupplier untilClose;
-    // The close belongs to its first caller, so a write of the close reads its owner until that caller cancels. The
-    // close sets closed before its first write.
-    private final BooleanSupplier untilCloseCancel;
+    // The close belongs to its first caller, so a write of the close reads its owner until that caller cancels or the
+    // close budget ends. The close sets closeDeadline and closed before its first write.
+    private final BooleanSupplier untilCloseBudget;
     // Ends with the close. Every close call waits for it, so the cancel of one call ends no other.
     private final CompletableFuture<Void> closeEnded = new CompletableFuture<>();
 
@@ -165,10 +170,10 @@ public final class PartitionReader implements AutoCloseable {
     private final Set<CompletableFuture<?>> reads = new HashSet<>();
     // The probes in flight besides the first of each read: a read sends its probes before its own request.
     private int extraProbes;
-    // The reads of one partition each among the reads in flight, which leave a request for the read of each group.
-    private final Set<CompletableFuture<List<FetchedMessages>>> gapReads = new HashSet<>();
-    // The partition of the last gap read. The next turn starts after it, so the limit does not favor low ids.
-    private long gapCursor = Long.MIN_VALUE;
+    // The gap reads and checks in flight, each of one partition. They leave a request for the read of each group.
+    private final Set<CompletableFuture<?>> aloneReads = new HashSet<>();
+    // The partition of the last gap read or check. The next turn starts after it, so the limit does not favor low ids.
+    private long aloneCursor = Long.MIN_VALUE;
     // The committing requests of the reads in flight, which the close cancels with them.
     private final Set<CompletableFuture<List<FetchedMessages>>> sends = new HashSet<>();
     // The committing reads of each partition, of any generation, until the client released them. A seek waits for them.
@@ -193,6 +198,8 @@ public final class PartitionReader implements AutoCloseable {
     private ScheduledFuture<?> interval;
     // The future of the first close call.
     private volatile CompletableFuture<Void> closed;
+    // When the close budget ends, set once at the close start.
+    private volatile long closeDeadline;
 
     PartitionReader(
             ReaderTransport transport,
@@ -216,7 +223,7 @@ public final class PartitionReader implements AutoCloseable {
         });
         this.loop.setRemoveOnCancelPolicy(true);
         this.untilClose = () -> closed == null;
-        this.untilCloseCancel = () -> !closed.isCancelled();
+        this.untilCloseBudget = () -> !closed.isCancelled() && System.nanoTime() - closeDeadline < 0;
     }
 
     /** Starts the builder of a reader that sends its requests through {@code transport}. */
@@ -275,14 +282,15 @@ public final class PartitionReader implements AutoCloseable {
     }
 
     /**
-     * Stores the offset of a checkpoint that this reader delivered. A checkpoint of an older generation of its
-     * partition, or at or below the last commit of its generation, stores nothing. A store whose outcome stays unknown
+     * Stores the offset of a checkpoint that this reader delivered. A checkpoint that it did not deliver in the current
+     * generation of its partition, as one of an older generation, stores nothing, and so does a checkpoint at or below
+     * the last commit of the generation. A store whose outcome stays unknown
      * fails the commit, and the reader releases it in the client, so a retry can store. After a refusal as not the
      * owner, the commit reads the owner until its caller cancels the returned future or the reader stops, and then the
      * refusal stands.
      *
      * @return a future that fails with {@link IggyErrorCode#INVALID_COMMAND} under {@code OnRead}, and for a
-     *         checkpoint that this reader did not deliver, or with the error of the store
+     *         partition that this reader does not read, or with the error of the store
      */
     public CompletableFuture<Void> commit(Checkpoint checkpoint) {
         CompletableFuture<Void> result = new CompletableFuture<>();
@@ -390,8 +398,9 @@ public final class PartitionReader implements AutoCloseable {
      * A batch of an earlier assignment decides nothing. A group reader then leaves its group. A store or delete whose
      * outcome stays unknown fails the close, which releases it in the client for a later reader. The close belongs to
      * its first caller: a cancel of the future of the first call ends the owner reads of the writes of the close, and
-     * their refusal stands. The leave and the stop of the reader still run. A later call completes when the close
-     * ends, and its cancel does not end the close.
+     * so does the end of the close budget, 10 s after the close started. Their refusal then stands, and each write of
+     * the close that was not sent yet still goes once. The leave and the stop of the reader still run. A later call
+     * completes when the close ends, and its cancel does not end the close.
      *
      * @return a future that fails with the first failed store
      */
@@ -492,6 +501,7 @@ public final class PartitionReader implements AutoCloseable {
         if (closed != null) {
             return;
         }
+        closeDeadline = System.nanoTime() + CLOSE_BUDGET.toNanos();
         closed = result;
         cancel(wake);
         cancel(interval);
@@ -531,7 +541,7 @@ public final class PartitionReader implements AutoCloseable {
         }
         CompletableFuture<Void> pending = flushing == null ? CompletableFuture.completedFuture(null) : flushing;
         return pending.handle((ignored, error) -> null)
-                .thenComposeAsync(ignored -> storeCounted(untilCloseCancel), loop);
+                .thenComposeAsync(ignored -> storeCounted(untilCloseBudget), loop);
     }
 
     /**
@@ -608,13 +618,13 @@ public final class PartitionReader implements AutoCloseable {
             Supplier<CompletableFuture<Void>> move;
             if (delivered != null) {
                 PartitionContext context = writeContext(partition, delivered.context());
-                move = () -> owned(partition, delivered.offset(), context, ReaderTransport::store, untilCloseCancel);
+                move = () -> owned(partition, delivered.offset(), context, ReaderTransport::store, untilCloseBudget);
             } else if (partition.restorePoint != null && partition.received == null) {
                 // No batch decides the rewind, so the close undoes the seek write that can have moved the offset. A
                 // read that the close cancelled can have stored before that write, so it decides as a lost read does.
                 BigInteger point = reading.contains(partition.id) && before != null ? before : partition.restorePoint;
                 PartitionContext context = writeContext(partition, partition.context);
-                move = () -> owned(partition, point, context, ReaderSupport::restoreBefore, untilCloseCancel);
+                move = () -> owned(partition, point, context, ReaderSupport::restoreBefore, untilCloseBudget);
             } else if (before != null) {
                 PartitionContext context = writeContext(
                         partition,
@@ -626,7 +636,7 @@ public final class PartitionReader implements AutoCloseable {
                         before.signum() == 0 || (partition.received == null && partition.startFoundNoOffset)
                                 ? ReaderSupport::storeBeforeIfStored
                                 : ReaderSupport::storeBefore;
-                move = () -> owned(partition, before, context, write, untilCloseCancel);
+                move = () -> owned(partition, before, context, write, untilCloseBudget);
             } else {
                 log.warn("Cannot move the offset of partition {} back, no message of it was delivered", partition.id);
                 continue;
@@ -821,8 +831,8 @@ public final class PartitionReader implements AutoCloseable {
         }
         // Every gap read and every poll of a position that a fetch does not take starts here, so each partition waits
         // for its turn.
-        Map<Long, Partition> after = partitions.tailMap(gapCursor, false);
-        Map<Long, Partition> before = partitions.headMap(gapCursor, true);
+        Map<Long, Partition> after = partitions.tailMap(aloneCursor, false);
+        Map<Long, Partition> before = partitions.headMap(aloneCursor, true);
         for (Map<Long, Partition> turn : List.of(after, before)) {
             for (Partition partition : turn.values()) {
                 if (partition.inFlight
@@ -834,9 +844,7 @@ public final class PartitionReader implements AutoCloseable {
                 }
                 if (partition.gapFrom != null) {
                     readGap(partition);
-                } else if (needsCheck(partition.position)
-                        && !partition.startUnresolved
-                        && requestsInFlight() < MAX_READS_IN_FLIGHT) {
+                } else if (needsCheck(partition.position) && !partition.startUnresolved && roomAlone()) {
                     check(partition);
                 }
             }
@@ -966,7 +974,7 @@ public final class PartitionReader implements AutoCloseable {
         read.whenCompleteAsync(
                 (sections, error) -> {
                     reads.remove(sent);
-                    gapReads.remove(sent);
+                    aloneReads.remove(sent);
                     if (closed != null) {
                         return;
                     }
@@ -1059,9 +1067,12 @@ public final class PartitionReader implements AutoCloseable {
         CompletableFuture<PolledMessages> polled =
                 checkPoll(transport, options, partition.id, partition.position, options.maxWait());
         reads.add(polled);
+        aloneReads.add(polled);
+        aloneCursor = partition.id;
         polled.whenCompleteAsync(
                 (found, error) -> {
                     reads.remove(polled);
+                    aloneReads.remove(polled);
                     if (closed != null) {
                         return;
                     }
@@ -1071,8 +1082,10 @@ public final class PartitionReader implements AutoCloseable {
                     if (current && error != null) {
                         refuse(Map.of(partition.id, generation), error);
                     } else if (current && found.messages().isEmpty()) {
+                        partition.lastingRefusals = 0;
                         partition.retryAt = System.nanoTime() + retryIntervalNanos;
                     } else if (current) {
+                        partition.lastingRefusals = 0;
                         partition.position = partition.owners.fence(probed(partition.position, found));
                         partition.fromRead = true;
                         partition.context = partition.owners.take(found.context());
@@ -1358,7 +1371,7 @@ public final class PartitionReader implements AutoCloseable {
 
     /** Reads the messages between the last received one and the batch that a lost read moved past, without a store. */
     private void readGap(Partition partition) {
-        if (gapReads.size() >= gapReadLimit() || requestsInFlight() >= MAX_READS_IN_FLIGHT) {
+        if (!roomAlone()) {
             // The gap stays open, and its turn comes again when a read ends.
             return;
         }
@@ -1370,13 +1383,14 @@ public final class PartitionReader implements AutoCloseable {
         targets.put(
                 partition.id,
                 new PollingStrategy(PollingKind.Offset, partition.gapFrom, Optional.of(partition.context)));
-        gapReads.add(read(targets, count, false, false));
-        gapCursor = partition.id;
+        aloneReads.add(read(targets, count, false, false));
+        aloneCursor = partition.id;
     }
 
-    /** The gap reads in flight at once, which leave a request for the read of each group. */
-    private int gapReadLimit() {
-        return Math.max(MAX_READS_IN_FLIGHT - groups.size(), 1);
+    /** Whether a gap read or a check can start. Each group keeps a request for its read. */
+    private boolean roomAlone() {
+        return aloneReads.size() < Math.max(MAX_READS_IN_FLIGHT - groups.size(), 1)
+                && requestsInFlight() < MAX_READS_IN_FLIGHT;
     }
 
     private void acceptGap(Partition partition, PolledMessages read) {
@@ -1475,8 +1489,9 @@ public final class PartitionReader implements AutoCloseable {
             // the close needs, so the partition keeps it and its position.
             loseOwner(partition);
             refreshAt = now;
-            partition.retryAt = now + retryIntervalNanos;
-            if (++partition.lastingRefusals >= LASTING_REFUSALS_BEFORE_STOP) {
+            int refusals = ++partition.lastingRefusals;
+            partition.retryAt = now + backoff(refusals);
+            if (refusals >= LASTING_REFUSALS_BEFORE_STOP) {
                 partition.lastingRefusals = 0;
                 queue.addLast(new Entry(
                         partition.id,
@@ -1505,42 +1520,54 @@ public final class PartitionReader implements AutoCloseable {
             queue.addLast(new Entry(partition.id, partition.generation, null, failure));
             return;
         }
-        int shift = Math.min(partition.lastingRefusals - 1, MAX_BACKOFF_SHIFT);
-        partition.retryAt = now + (retryIntervalNanos << shift);
+        partition.retryAt = now + backoff(partition.lastingRefusals);
         log.warn("Partition {} refused a read, the reader retries it: {}", partition.id, error.getMessage());
+    }
+
+    /**
+     * The wait after the {@code refusals}-th refusal of a read in a row: the retry interval, doubled for each refusal
+     * before it, and at most 32 times the retry interval.
+     */
+    private long backoff(int refusals) {
+        return retryIntervalNanos << Math.min(refusals - 1, MAX_BACKOFF_SHIFT);
     }
 
     private void regroup() {
         grouping = true;
         regroup = false;
-        transport
-                .groups(List.copyOf(partitions.keySet()))
-                .whenCompleteAsync(
-                        (found, error) -> {
-                            grouping = false;
-                            if (closed != null) {
-                                return;
-                            }
-                            // Also after a failed lookup: while lookups fail, a refused partition tries its last group
-                            // once per lookup.
-                            partitions.values().forEach(partition -> partition.misrouted = false);
-                            if (error != null) {
-                                regroup = true;
-                                regroupAt = System.nanoTime() + retryIntervalNanos;
-                                log.warn(
-                                        "Failed to group the partitions of a reader, the reader tries again: {}",
-                                        error.getMessage());
-                            } else {
-                                groups = found;
-                            }
-                            pump();
-                        },
-                        loop);
+        CompletableFuture<List<List<Long>>> lookup;
+        try {
+            lookup = transport.groups(List.copyOf(partitions.keySet()));
+        } catch (RuntimeException refused) {
+            // A throw before the send fails as a failed lookup does, so grouping cannot stay set.
+            lookup = CompletableFuture.failedFuture(refused);
+        }
+        lookup.whenCompleteAsync(
+                (found, error) -> {
+                    grouping = false;
+                    if (closed != null) {
+                        return;
+                    }
+                    // Also after a failed lookup: while lookups fail, a refused partition tries its last group once
+                    // per lookup.
+                    partitions.values().forEach(partition -> partition.misrouted = false);
+                    if (error != null) {
+                        regroup = true;
+                        regroupAt = System.nanoTime() + retryIntervalNanos;
+                        log.warn(
+                                "Failed to group the partitions of a reader, the reader tries again: {}",
+                                error.getMessage());
+                    } else {
+                        groups = found;
+                    }
+                    pump();
+                },
+                loop);
     }
 
     private void refreshAssignment() {
         refreshing = true;
-        ReaderSupport.assignment(transport, this::loseMembership, loop)
+        ReaderSupport.assignment(transport, () -> closed != null, this::loseMembership, loop)
                 .whenCompleteAsync(
                         (assignment, error) -> {
                             refreshing = false;
@@ -1569,11 +1596,18 @@ public final class PartitionReader implements AutoCloseable {
                         loop);
     }
 
-    /** After a lost membership, as after a lost session, its owners are gone, and no partition that left can store. */
+    /**
+     * After a lost membership, as after a lost session, its owners are gone, and no partition that left can store. The
+     * refusals came from the lost membership, so each partition counts them again and reads at once.
+     */
     private void loseMembership() {
         joinedSinceSync = true;
         retiring.clear();
-        partitions.values().forEach(this::loseOwner);
+        partitions.values().forEach(partition -> {
+            loseOwner(partition);
+            partition.lastingRefusals = 0;
+            partition.retryAt = 0;
+        });
     }
 
     /** The server installs the owner again under a higher generation, so the partition names owner generation 0. */
@@ -1920,74 +1954,10 @@ public final class PartitionReader implements AutoCloseable {
         partition.seeks.clear();
     }
 
-    private static final class Partition {
-        private final long id;
-        private long generation;
-        private PollingStrategy position;
-        // The position came from a read, so it carries the history of the partition.
-        private boolean fromRead;
-        private boolean inFlight;
-        // The read in flight holds quiet partitions, so it may wait.
-        private boolean parked;
-        private long retryAt;
-        // The read turn that last returned messages of the partition.
-        private long servedAt;
-        // The last read ended before the head of the partition.
-        private boolean backlogged;
-        private int lastingRefusals;
-        private ReadException stopped;
-        private PartitionContext context = PartitionContext.EMPTY;
-        private final PartitionOwners owners = new PartitionOwners();
-        // The last offset that a read of the current generation returned.
-        private BigInteger received;
-        private BigInteger baseline;
-        private BigInteger firstDelivered;
-        private Checkpoint delivered;
-        private BigInteger committed;
-        // Under OnRead, the start of the messages that a lost read stored, and the batch read after them.
-        private BigInteger gapFrom;
-        private BigInteger gapEnd;
-        private PolledMessages held;
-        // Under OnRead, the start of what the server stored without handing it over, see lose().
-        private Lost lost;
-        // Under OnRead, a start other than Next that waits for the lookup of the stored offset, see resolveStart().
-        private boolean startUnresolved;
-        // Under OnRead, the lookup of the start found no stored offset. Until a batch arrives, the close moves back
-        // only what the reads stored, see rewind().
-        private boolean startFoundNoOffset;
-        // Under OnRead, after a seek write with an unknown outcome, the offset after the one that the server held
-        // before it, or 0 for none. Until a batch arrives, the close restores that, see abandonUnknown().
-        private BigInteger restorePoint;
-        // Under OnRead, the seeks that did not end, in call order. The first one runs once no read of the partition is
-        // in flight, and the partition starts no read until the last one ends.
-        private final Deque<Seek> seeks = new ArrayDeque<>();
-        // The writes of the first seek and its move, in flight. The next seek and the close wait for them.
-        private CompletableFuture<Void> seeking;
-        // The server refused a read with NotPrimary, so the partition reads nothing until the next lookup of the
-        // groups ends.
-        private boolean misrouted;
-        private Checkpoint counted;
-        private Checkpoint stored;
-        private long sinceStore;
-
-        private Partition(long id) {
-            this.id = id;
-        }
-
-        /** Whether this reader delivered {@code checkpoint} in the current generation of the partition. */
-        private boolean delivered(Checkpoint checkpoint) {
-            return delivered != null
-                    && firstDelivered != null
-                    && owners.named(checkpoint.context())
-                    && checkpoint.offset().compareTo(firstDelivered) >= 0
-                    && checkpoint.offset().compareTo(delivered.offset()) <= 0;
-        }
-    }
-
     private record Entry(long partition, long generation, PolledMessages batch, ReadException error) {}
 
     /** A seek under {@code OnRead}, which runs {@code applied} and completes {@code sought} once it moved or failed. */
-    private record Seek(PollingStrategy position, Consumer<Boolean> applied, CompletableFuture<Void> sought) {}
+    record Seek(PollingStrategy position, Consumer<Boolean> applied, CompletableFuture<Void> sought) {}
 
     /** A waiting call, which records the batch that it takes as delivered unless an {@link IggyConsumer} does. */
     private record Waiter(CompletableFuture<PolledMessages> future, boolean delivers) {}
@@ -1996,5 +1966,5 @@ public final class PartitionReader implements AutoCloseable {
 
     private record Retired(Partition partition, Checkpoint checkpoint) {}
 
-    private record Lost(BigInteger from, PartitionContext context) {}
+    record Lost(BigInteger from, PartitionContext context) {}
 }

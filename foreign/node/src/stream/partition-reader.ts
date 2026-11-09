@@ -73,6 +73,8 @@ const GROUP_REFRESH_MS = 1_000;
  * ownership only after the partition logs persist the new owner.
  */
 const ASSIGNMENT_SETTLE_PAUSE_MS = 10;
+/** A close reads for the installed owner of a refused write up to this long after it starts. */
+const CLOSE_BUDGET_MS = 10_000;
 const READER_CLOSED = 'the partition reader is closed';
 /** The wait of a reader read when the caller sets none. */
 export const DEFAULT_READER_MAX_WAIT_MS = 5_000;
@@ -114,7 +116,7 @@ export type PartitionReaderRequest = {
    * that the reader held, as `prefetchBytes` explains.
    */
   prefetchMessages?: number,
-  /** The wait in milliseconds before a refused partition reads again, 1 s by default. */
+  /** The wait in milliseconds before a refused partition reads again, 1 s by default. A finite number above 0. */
   retryInterval?: number
 };
 
@@ -140,7 +142,12 @@ export class ReadError extends Error {
      * The reader stopped the partition after refusals in a row or a lost
      * history. A `seek` to Next reads it again after its stored offset.
      */
-    readonly resumable = false
+    readonly resumable = false,
+    /**
+     * For messages that a lost read stored and that the reader cannot read
+     * again: their first and last offset. Undefined for every other error.
+     */
+    readonly lost?: { readonly first: bigint, readonly last: bigint }
   ) {
     super(partitionId === undefined ? `reading failed: ${String(error)}`
       : `reading partition ${partitionId} failed: ${String(error)}`, { cause: error });
@@ -393,9 +400,12 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
 
   /**
    * Checks the request, joins the group of a group reader and starts reading.
-   * A standalone consumer without partitions, a group with partitions, a
-   * continuation as the start and a read-ahead budget that is NaN, infinite or
-   * negative fail with 3.
+   * A standalone consumer without partitions, a group with partitions and a
+   * continuation as the start fail with 3. So do a read-ahead budget that is
+   * NaN, infinite or negative and a `retryInterval` that is not a finite
+   * number above 0. A join with an unknown outcome fails the open, which
+   * releases the join in the client, so a later open can join. A join that
+   * landed anyway keeps its member in the group until the session ends.
    */
   static async open(getClient: ClientProvider, request: PartitionReaderRequest): Promise<PartitionReader> {
     pollOptions({ maxWait: DEFAULT_READER_MAX_WAIT_MS, ...request.options });
@@ -411,6 +421,9 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
       if (budget != null && !(Number.isFinite(budget) && budget >= 0))
         throw responseError(0, INVALID_COMMAND, `${name} must be a finite number of at least 0, not ${budget}`);
     }
+    const { retryInterval } = request;
+    if (retryInterval != null && !(Number.isFinite(retryInterval) && retryInterval > 0))
+      throw responseError(0, INVALID_COMMAND, `retryInterval must be a finite number above 0, not ${retryInterval}`);
     const client = await getClient();
     if (group) {
       try {
@@ -428,6 +441,12 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
       reader.sessionResets += 1;
       // A reset drops every cached route, and the primaries may have moved meanwhile.
       reader.routeChanges += 1;
+      // The new session can serve what the old one refused, so each partition reads at once and counts its refusals
+      // again, as at a new epoch of the Rust reader.
+      for (const state of reader.states.values()) {
+        state.lasting = 0;
+        state.retryAt = 0;
+      }
       reader.wake();
     };
     client.on('sessionReset', onSessionReset);
@@ -627,7 +646,7 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
           await this.writeOffset(partitionId, null, context, this.lifetime.signal);
         }
       } catch (error) {
-        if (error instanceof OperationUncertainError) await this.abandonLost(error);
+        await this.abandonLost(error);
         // The write may have moved the offset, so the partition recovers as from a lost read of its position. A new
         // session gives a group partition a new owner, which reads on from the progress of the server instead.
         if (error instanceof OperationUncertainError && (!this.group || session === this.sessionResets)) {
@@ -813,11 +832,13 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
    * releases it in the client, so it does not block a later reader. When the
    * server refuses a store or delete of the close as not owned, a read finds
    * the installed owner for it. That read goes again after each transient
-   * refusal until `signal` of the first call aborts. Then that write fails
-   * with its refusal, and the close still leaves the group, so no read for
-   * the owner outlives it. The same read of a seek, a commit or an automatic
-   * store ends when the close starts. A second call waits for the first one
-   * and ends as it does. Its signal does not end the close.
+   * refusal until 10 s after the close started, or until `signal` of the
+   * first call aborts before that. Then that write fails with its refusal,
+   * and each later write of the close goes once without such a read. The
+   * close still leaves the group, so no read for the owner outlives it. The
+   * same read of a seek, a commit or an automatic store ends when the close
+   * starts. A second call waits for the first one and ends as it does. Its
+   * signal does not end the close.
    */
   close({ signal }: { signal?: AbortSignal } = {}): Promise<void> {
     this.closure ??= this.closeOnce(signal).finally(() => this.detachFromClient?.());
@@ -833,15 +854,24 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
     this.lifetime.abort();
     this.wake();
     this.storeDue.resolve();
-    await this.worker;
-    await this.regrouping;
-    await Promise.allSettled([...this.reads.keys()]);
-    // A seek whose write is in progress still applies, so the rewind sees its position and not the dropped batch.
-    await Promise.all([...this.seeking.values()]);
-    await this.committer;
+    // A refusal that stays transient repeats the reads for the owner without end, so the budget ends them. The writes
+    // and the leave do not take it, so each still goes once.
+    const budget = new AbortController();
+    const timer = setTimeout(() => budget.abort(), CLOSE_BUDGET_MS);
     let failure: unknown;
-    if (this.options.commit.kind === 'onRead') failure = await this.rewind(signal);
-    else if (this.options.commit.kind === 'auto') failure = await this.flushCounted(signal);
+    try {
+      await this.worker;
+      await this.regrouping;
+      await Promise.allSettled([...this.reads.keys()]);
+      // A seek whose write is in progress still applies, so the rewind sees its position and not the dropped batch.
+      await Promise.all([...this.seeking.values()]);
+      await this.committer;
+      const cancel = signal === undefined ? budget.signal : AbortSignal.any([signal, budget.signal]);
+      if (this.options.commit.kind === 'onRead') failure = await this.rewind(cancel);
+      else if (this.options.commit.kind === 'auto') failure = await this.flushCounted(cancel);
+    } finally {
+      clearTimeout(timer);
+    }
     if (this.group) {
       // A join with an unknown outcome would block the leave and every later metadata write of the client.
       await this.abandonLost(this.uncertainJoin);
@@ -1428,9 +1458,9 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
       let polled: PollMessagesResponse;
       try {
         polled = decodeFetchSection(section);
-      } catch (error) {
+      } catch {
         this.readAlone(target, section.nextOffset - BigInt(section.messagesCount), section.nextOffset,
-          section.context, error);
+          section.context);
         continue;
       }
       this.complete(target, polled, section.nextOffset, endsBeforeHead(section));
@@ -1474,7 +1504,7 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
       if (decodeFailed && target.sent.kind === PollingStrategyKind.Offset) {
         if (single) this.undecodable(target, error);
         else this.readAlone(target, target.sent.value, target.sent.value + BigInt(this.options.count),
-          (target.sent as Partial<Continuation>).context, error);
+          (target.sent as Partial<Continuation>).context);
         return;
       }
       await this.abandonLost(error);
@@ -1642,9 +1672,7 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
   }
 
   /** A section or a poll that did not decode: its partition reads that range one message at a time. */
-  private readAlone(target: Target, from: bigint, until: bigint, context: PartitionContext | undefined,
-    error: unknown): void {
-    void error;
+  private readAlone(target: Target, from: bigint, until: bigint, context: PartitionContext | undefined): void {
     const state = this.settle(target);
     if (!state) return;
     state.position = context ? continuation(target.partition, PollingStrategyKind.Offset, from, context)
@@ -1764,11 +1792,12 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
     const heldFirst = held?.messages[0].headers.offset ?? below;
     const lostBelow = heldFirst < below ? heldFirst : below;
     if (state.position.value < lostBelow) {
-      const lost = responseError(COMMAND_CODE.PollMessagesDeferred, FETCH_PROGRESS_UNCERTAIN,
-        `a lost read stored offsets ${state.position.value} to ${lostBelow - 1n} of partition ${partitionId}, ` +
+      const lost = { first: state.position.value, last: lostBelow - 1n };
+      const error = responseError(COMMAND_CODE.PollMessagesDeferred, FETCH_PROGRESS_UNCERTAIN,
+        `a lost read stored offsets ${lost.first} to ${lost.last} of partition ${partitionId}, ` +
         'which the reader could not read again');
       this.enqueue({ partitionId, generation: state.generation,
-        error: new ReadError(partitionId, lost), messages: 0, bytes: 0 });
+        error: new ReadError(partitionId, error, undefined, false, false, lost), messages: 0, bytes: 0 });
     }
     const messages = held?.messages.filter(({ headers }) =>
       headers.offset >= state.position.value && headers.offset < below) ?? [];

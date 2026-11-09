@@ -655,72 +655,38 @@ async fn given_each_commit_policy_when_initializing_should_refuse_only_the_polic
     );
 }
 
+/// The consumer abandons a join with an unknown outcome on the client at once, so the next
+/// `init()` joins again instead of finding the metadata lane blocked.
 #[tokio::test(start_paused = true)]
-async fn given_an_uncertain_join_when_resolution_is_uncertain_should_keep_the_operation() {
+async fn given_an_uncertain_join_when_initializing_again_should_abandon_it_and_join_again() {
+    const INITS: usize = 2;
     let (client, cluster) = connect_to_three_replicas().await;
     cluster.script(
         &endpoint(METADATA_PRIMARY),
         GET_CONSUMER_GROUP_CODE,
-        repeat_n(existing_consumer_group(), 2),
+        repeat_n(existing_consumer_group(), INITS),
     );
     cluster.script(
         &endpoint(METADATA_PRIMARY),
         JOIN_CONSUMER_GROUP_CODE,
-        [Answer::Silence, Answer::Silence, Answer::Commit(COMMIT_OP)],
+        [Answer::Silence, Answer::Commit(COMMIT_OP)],
     );
     let mut consumer = builder_on(client, group()).build();
     answer_lookups(&cluster);
     let first = consumer.init().await;
     let op = cluster.received(JOIN_CONSUMER_GROUP_CODE)[0].header.request;
     assert_eq!(first, Err(IggyError::OperationUncertain(op)));
-
-    answer_lookups(&cluster);
-    assert_eq!(
-        consumer.init().await,
-        Err(IggyError::OperationUncertain(op))
+    assert!(
+        !consumer.client.read().await.retains_operation(op).await,
+        "the failed init abandons its join"
     );
-    assert_eq!(cluster.count(GET_CONSUMER_GROUP_CODE), 1);
-    assert!(consumer.reader.is_none());
 
     answer_lookups(&cluster);
     consumer.init().await.unwrap();
+
     let joins = cluster.received(JOIN_CONSUMER_GROUP_CODE);
-    assert_eq!(joins.len(), 4);
-    assert_eq!(joins[1].header.request, op);
-    assert_eq!(joins[2].header.request, op);
-    assert_ne!(joins[3].header.request, op);
-}
-
-#[tokio::test(start_paused = true)]
-async fn given_an_uncertain_join_when_resolution_is_rejected_should_report_and_allow_a_new_join() {
-    let (client, cluster) = connect_to_three_replicas().await;
-    cluster.script(
-        &endpoint(METADATA_PRIMARY),
-        GET_CONSUMER_GROUP_CODE,
-        repeat_n(existing_consumer_group(), 2),
-    );
-    cluster.script(
-        &endpoint(METADATA_PRIMARY),
-        JOIN_CONSUMER_GROUP_CODE,
-        [
-            Answer::Silence,
-            Answer::CommitRejected(COMMIT_OP, IggyError::Unauthorized),
-        ],
-    );
-    let mut consumer = builder_on(client, group()).build();
-    answer_lookups(&cluster);
-    assert!(matches!(
-        consumer.init().await,
-        Err(IggyError::OperationUncertain(_))
-    ));
-
-    answer_lookups(&cluster);
-    assert_eq!(consumer.init().await, Err(IggyError::Unauthorized));
-    assert!(consumer.reader.is_none());
-
-    answer_lookups(&cluster);
-    consumer.init().await.unwrap();
-    assert_eq!(cluster.count(JOIN_CONSUMER_GROUP_CODE), 3);
+    assert_eq!(joins.len(), INITS);
+    assert_ne!(joins[1].header.request, op, "the init sends a new join");
 }
 
 #[tokio::test(start_paused = true)]

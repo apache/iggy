@@ -31,6 +31,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -127,6 +128,11 @@ pub struct ReadError {
     /// not change, such as `Unauthorized` (41). A `seek()` of the partition reads it again.
     #[pyo3(get)]
     is_lasting_refusal: bool,
+    /// For messages that a lost read committed and that the reader could not read again: their
+    /// first and last offset, as `(first, last)`. The error is then `FetchProgressUncertain`
+    /// (14010). `None` for every other error.
+    #[pyo3(get)]
+    lost: Option<(u64, u64)>,
 }
 
 #[gen_stub_pymethods]
@@ -142,7 +148,8 @@ impl ReadError {
 
     /// For a message that does not decode: the continuation after it. The messages before it
     /// arrive in a batch before this error, and the reader reads the message again until
-    /// `seek()` to this continuation skips it.
+    /// `seek()` to this continuation skips it. For a lost range: the continuation after the
+    /// last offset of `lost`. `None` for every other error.
     #[gen_stub(override_return_type(type_repr = "PollingStrategy | None"))]
     #[getter]
     fn skip(&self) -> Option<PollingStrategy> {
@@ -200,6 +207,7 @@ impl PyErrArguments for ReadErrorArguments {
             offset: error.offset,
             record: error.record,
             is_lasting_refusal,
+            lost: error.lost.map(RangeInclusive::into_inner),
         };
         exception_value(
             py,
@@ -2020,9 +2028,9 @@ impl IggyClient {
     /// Raises `IggyError` with `InvalidCommand` (3) for partitions of a group, a
     /// `Consumer.Single` without partitions or a continuation as `start`,
     /// `FeatureUnavailable` for a consumer group over HTTP, the errors of `options`, and the
-    /// error of the group join. A join with an unknown outcome raises `PendingOperationError`:
-    /// the client keeps it, so a new `reader()` raises `lane_blocked` until
-    /// `resolve_operation()` or `abandon_operation()` settles it.
+    /// error of the group join. A join with an unknown outcome raises `PendingOperationError`
+    /// after `reader()` abandoned it on the client, so the next `reader()` joins again. A join
+    /// that landed keeps its member in the group until the session ends.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         stream,
@@ -2522,14 +2530,11 @@ mod tests {
         Python::attach(|py| {
             for offset in [None, Some(10)] {
                 for record in [None, Some(Bytes::from_static(&[0, 255, 17, 128]))] {
-                    let error = to_read_error(RustReadError {
-                        partition_id: Some(7),
-                        error: IggyError::CannotReadMessage,
-                        skip: Some(RustPollingStrategy::offset(11)),
-                        offset,
-                        record: record.clone(),
-                        lost: None,
-                    });
+                    let mut read_error = RustReadError::new(Some(7), IggyError::CannotReadMessage);
+                    read_error.skip = Some(RustPollingStrategy::offset(11));
+                    read_error.offset = offset;
+                    read_error.record = record.clone();
+                    let error = to_read_error(read_error);
                     let value = error.value(py);
                     assert_eq!(
                         value
@@ -2563,14 +2568,8 @@ mod tests {
         Python::attach(|py| {
             let cause = IggyError::FetchProgressUncertain(OPERATION_ID);
             let code = cause.as_code();
-            let read_error = RustReadError {
-                partition_id: Some(PARTITION_ID),
-                error: cause,
-                skip: Some(RustPollingStrategy::offset(SKIP_OFFSET)),
-                offset: None,
-                record: None,
-                lost: None,
-            };
+            let mut read_error = RustReadError::new(Some(PARTITION_ID), cause);
+            read_error.skip = Some(RustPollingStrategy::offset(SKIP_OFFSET));
             let message = read_error.to_string();
 
             let error = to_read_error(read_error);
@@ -2623,14 +2622,7 @@ mod tests {
                 (None, IggyError::Unauthorized, false),
                 (Some(1), IggyError::HistoryUnavailable, false),
             ] {
-                let error = to_read_error(RustReadError {
-                    partition_id,
-                    error,
-                    skip: None,
-                    offset: None,
-                    record: None,
-                    lost: None,
-                });
+                let error = to_read_error(RustReadError::new(partition_id, error));
 
                 let value = error.value(py);
                 assert_eq!(
@@ -2650,21 +2642,45 @@ mod tests {
     fn given_read_error_of_the_whole_reader_when_mapping_should_have_no_partition_or_skip() {
         Python::initialize();
         Python::attach(|py| {
-            let error = to_read_error(RustReadError {
-                partition_id: None,
-                error: IggyError::Disconnected,
-                skip: None,
-                offset: None,
-                record: None,
-                lost: None,
-            });
+            let error = to_read_error(RustReadError::new(None, IggyError::Disconnected));
 
             let value = error.value(py);
             assert!(value.getattr("partition_id").unwrap().is_none());
             assert!(value.getattr("skip").unwrap().is_none());
+            assert!(value.getattr("lost").unwrap().is_none());
             let cause = value.getattr("error").unwrap();
             assert!(cause.is_instance_of::<PyIggyError>());
             assert!(!cause.is_instance_of::<PendingOperationError>());
+        });
+    }
+
+    #[test]
+    fn given_a_lost_range_when_mapping_read_error_should_expose_its_first_and_last_offset() {
+        const PARTITION_ID: u32 = 7;
+        const OPERATION_ID: u64 = 42;
+        const FIRST: u64 = 4;
+        const LAST: u64 = 9;
+        Python::initialize();
+        Python::attach(|py| {
+            let mut read_error = RustReadError::new(
+                Some(PARTITION_ID),
+                IggyError::FetchProgressUncertain(OPERATION_ID),
+            );
+            read_error.skip = Some(RustPollingStrategy::offset(LAST + 1));
+            read_error.lost = Some(FIRST..=LAST);
+
+            let error = to_read_error(read_error);
+
+            let value = error.value(py);
+            assert_eq!(
+                value
+                    .getattr("lost")
+                    .unwrap()
+                    .extract::<Option<(u64, u64)>>()
+                    .unwrap(),
+                Some((FIRST, LAST))
+            );
+            assert!(value.setattr("lost", py.None()).is_err());
         });
     }
 
@@ -2680,14 +2696,7 @@ mod tests {
                 let errors = (
                     to_runtime_error(IggyError::FetchProgressUncertain(OPERATION_ID)),
                     to_runtime_error(IggyError::InvalidOptionValue("count".to_owned())),
-                    to_read_error(RustReadError {
-                        partition_id: None,
-                        error: IggyError::Disconnected,
-                        skip: None,
-                        offset: None,
-                        record: None,
-                        lost: None,
-                    }),
+                    to_read_error(RustReadError::new(None, IggyError::Disconnected)),
                 );
                 let _ = built.send(errors);
             });

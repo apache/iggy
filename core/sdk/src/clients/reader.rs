@@ -38,7 +38,6 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at};
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::links::OPERATION_TIMEOUT;
 use membership::Membership;
 use progress::{Progress, in_background, in_close};
 use worker::Worker;
@@ -53,6 +52,9 @@ pub(crate) mod progress;
 mod worker;
 
 const ORDERING: Ordering = Ordering::SeqCst;
+/// The time from the close start in which a refused write of the close reads for the installed
+/// owner. So a refusal that stays transient holds the rest of the close at most this long.
+const CLOSE_BUDGET: Duration = Duration::from_secs(10);
 
 /// Reads the partitions of a topic in batches, with routing, prefetch and the positions of each
 /// partition inside. Build one with [`IggyClient::reader`](crate::prelude::IggyClient::reader).
@@ -118,7 +120,11 @@ struct Committer {
 }
 
 /// An error of a read. The reader stays usable after it and retries by itself.
+///
+/// Later releases can add fields. Code outside this crate builds one with [`ReadError::new`]
+/// and sets the other fields on it.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ReadError {
     /// The partition of the error. `None` for an error of the whole reader.
     pub partition_id: Option<u32>,
@@ -165,14 +171,13 @@ pub(crate) struct Shared {
     pub(super) progress: Arc<Progress>,
     /// A change of the connection moves it. Without `OnRead`, a reply of an older epoch is stale.
     pub(super) epoch: AtomicU64,
-    pub(super) wake: Arc<Notify>,
     /// With `OnRead`: a `next()` waits, and the queue and the channel are empty.
     pub(super) demand: AtomicBool,
     pub(super) closing: AtomicBool,
     pub(super) can_poll: AtomicBool,
     /// The partitions that the reader reads, for `partitions()` and `seek`.
     pub(super) partitions: Mutex<Vec<u32>>,
-    /// Shared with `IggyConsumer`, which keeps an uncertain create or join across builds.
+    /// Shared with `IggyConsumer`, which creates a missing group.
     pub(super) membership: Option<Arc<Membership>>,
     /// The group state and the key of a group reader.
     pub(super) assignment_state: Option<(Arc<ConsumerGroupClientState>, String)>,
@@ -284,7 +289,7 @@ impl PartitionReader {
             match self.receiver.poll_recv(cx) {
                 Poll::Pending => {
                     if self.config.on_read() && !self.shared.demand.swap(true, ORDERING) {
-                        self.shared.wake.notify_one();
+                        self.shared.progress.wake.notify_one();
                     }
                     return Poll::Pending;
                 }
@@ -356,11 +361,12 @@ impl PartitionReader {
     /// nothing. A failed read, store, lookup or delete fails the seek and nothing moves. Every
     /// other seek stores nothing and waits only for the seek of the partition in progress. A
     /// seek to an offset or a timestamp holds the reads of the partition until it returns. It
-    /// waits for the seek of the partition in progress and for the committing read in flight,
-    /// whose reply the new generation drops, and no read of the partition starts until the new
-    /// position takes effect or the seek fails. So no read from the old position commits after
-    /// the store or the delete, on any transport. The first read from the new position commits
-    /// as usual.
+    /// waits for the seek of the partition in progress and for the committing read in flight.
+    /// Except over HTTP, it cancels that read, which the server stops if nothing of it committed
+    /// yet. The new generation drops the reply of that read, and no read of the partition starts
+    /// until the new position takes effect or the seek fails. So no read from the old position
+    /// commits after the store or the delete, on any transport. The first read from the new
+    /// position commits as usual.
     ///
     /// A seek dropped before its store or delete changes nothing. Once that write starts, the
     /// seek finishes in the background: it keeps the hold, and it moves on success. A later
@@ -400,7 +406,7 @@ impl PartitionReader {
         let progress = Arc::clone(&self.shared.progress);
         if !self.config.on_read() {
             progress.seek(partition, start);
-            self.shared.wake.notify_one();
+            self.shared.progress.wake.notify_one();
             return Ok(());
         }
         let writes = matches!(start.kind, PollingKind::Offset | PollingKind::Timestamp);
@@ -426,7 +432,7 @@ impl PartitionReader {
         }
         // A seek to offset 0 deletes the stored offset, and a seek above 0 stores the offset
         // before it. Both carry the history of a continuation, else that of the last message
-        // delivered in the current assignment, else none.
+        // delivered in the current generation of the partition, else none.
         let context = start.context().or_else(|| {
             progress
                 .last_delivered(partition)
@@ -525,6 +531,13 @@ impl PartitionReader {
     /// offset at offset 0. It does not move the offset back over the batches of a partition that
     /// left the assignment. A group reader then leaves its group.
     ///
+    /// The close has one budget, 10 s from its start. A store or a delete of the close that the
+    /// server refuses as not owned goes once more under the owner that a read of the partition
+    /// shows, and that read retries a transient refusal until the budget ends. Then the refusal
+    /// stands, each store or delete that did not go yet still goes once under its own request
+    /// timeout, and the leave follows. A dropped close sends neither the writes that did not go
+    /// yet nor the leave, so a group member stays in its group until its session ends.
+    ///
     /// # Errors
     ///
     /// The first failed store of the `OnRead` or the `Auto` close. The close abandons a store or
@@ -532,11 +545,12 @@ impl PartitionReader {
     /// write. Otherwise [`IggyError::PartitionLaneBlocked`] for a partition with an unknown
     /// outcome: abandon its operation on the client before a new reader reads the partition.
     pub async fn close(mut self) -> Result<(), IggyError> {
+        let budget = Instant::now() + CLOSE_BUDGET;
         self.shared.progress.stop_background();
         // The rewind goes after each seek write, also of a seek dropped after its write started.
         self.shared.progress.close_seeks().await;
         self.shared.closing.store(true, ORDERING);
-        self.shared.wake.notify_one();
+        self.shared.progress.wake.notify_one();
         if let Some(task) = self.task.take() {
             // A worker that failed already ended, which is all that the close waits for.
             let _ = task.await;
@@ -555,7 +569,7 @@ impl PartitionReader {
         if self.config.on_read() {
             let owned = self.shared.owned_partitions();
             result = in_close(
-                Instant::now() + OPERATION_TIMEOUT,
+                budget,
                 self.shared.progress.rewind(undelivered, owned.as_deref()),
             )
             .await;
@@ -563,11 +577,7 @@ impl PartitionReader {
         self.count_uncounted();
         if let Some(committer) = self.committer.take() {
             committer.stop().await;
-            result = in_close(
-                Instant::now() + OPERATION_TIMEOUT,
-                self.shared.progress.flush_counted(),
-            )
-            .await;
+            result = in_close(budget, self.shared.progress.flush_counted()).await;
         }
         // The server refuses a store from a member that left, so the rewind goes first.
         if let Some(membership) = &self.shared.membership {
@@ -728,7 +738,8 @@ impl Drop for Committer {
 }
 
 impl ReadError {
-    pub(crate) fn new(partition_id: Option<u32>, error: IggyError) -> Self {
+    /// An error of `partition_id`, or of the whole reader for `None`, with no other field set.
+    pub fn new(partition_id: Option<u32>, error: IggyError) -> Self {
         Self {
             partition_id,
             error,
@@ -749,9 +760,13 @@ impl ReadError {
 impl Display for ReadError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.partition_id {
-            Some(partition_id) => write!(f, "partition ID: {partition_id}: {}", self.error),
-            None => Display::fmt(&self.error, f),
+            Some(partition_id) => write!(f, "partition ID: {partition_id}: {}", self.error)?,
+            None => Display::fmt(&self.error, f)?,
         }
+        if let Some(lost) = &self.lost {
+            write!(f, ", lost offsets: {} to {}", lost.start(), lost.end())?;
+        }
+        Ok(())
     }
 }
 
@@ -926,7 +941,10 @@ mod tests {
         partition_and_offsets, polled_answer_in, stored_offsets,
     };
     use super::progress::{PendingCommit, Progress, in_background};
-    use super::{Committer, FetchCapacity, ORDERING, PartitionReader, ReadError, Refusal, Reply};
+    use super::{
+        CLOSE_BUDGET, Committer, FetchCapacity, ORDERING, PartitionReader, ReadError, Refusal,
+        Reply,
+    };
     use crate::client_wrappers::client_wrapper::ClientWrapper;
     use crate::clients::reader_builder::{DEFAULT_PREFETCH_MESSAGES, ReaderBuilder};
     use crate::driver::with_deadline;
@@ -2245,6 +2263,53 @@ mod tests {
         }
     }
 
+    /// The store of a seek runs in a task of its own, which the deadline in force of the caller
+    /// still reaches. So that deadline ends the read for the owner of a store refused as not
+    /// owned, and the refusal stands.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_caller_deadline_when_the_read_for_the_owner_of_a_refused_seek_store_is_refused_for_now_should_fail_with_the_refusal_at_the_deadline()
+     {
+        /// Far shorter than the retries that the cluster refuses.
+        const CALLER_BUDGET: Duration = Duration::from_secs(10);
+        let (client, cluster) = connect_to_one_replica().await;
+        cluster.install_owner(CURRENT_OWNER);
+        let mut fed = FedReader::new(committing(builder_on(client, group())));
+        fed.assign(&[PARTITION]);
+        cluster.script(
+            &endpoint(PRIMARY),
+            GET_CONSUMER_OFFSET_CODE,
+            [lookup_answer(PARTITION, None)],
+        );
+        cluster.script(
+            &endpoint(PRIMARY),
+            POLL_MESSAGES_DEFERRED_CODE,
+            repeat_n(
+                Answer::Refuse(IggyError::TransientNotAccepted),
+                REFUSED_READS,
+            )
+            .chain(once(polled_answer_in(PARTITION, &[], CURRENT_OWNER))),
+        );
+        let started = Instant::now();
+
+        let sought = with_deadline(
+            started + CALLER_BUDGET,
+            fed.reader
+                .seek(PARTITION, PollingStrategy::offset(SEEK_OFFSET)),
+        )
+        .await;
+
+        assert!(
+            matches!(sought, Err(IggyError::ConsumerGroupPartitionNotOwned(..))),
+            "{sought:?}"
+        );
+        assert!(
+            (CALLER_BUDGET..OPERATION_TIMEOUT).contains(&started.elapsed()),
+            "the seek took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(cluster.count(STORE_CONSUMER_OFFSET_CODE), 1);
+    }
+
     /// The caller of a seek that finishes in the background is the reader, so the close ends the
     /// read for the owner of its refused store at once, and the refusal stands.
     #[tokio::test(start_paused = true)]
@@ -2367,7 +2432,11 @@ mod tests {
             matches!(closed, Err(IggyError::ConsumerGroupPartitionNotOwned(..))),
             "{closed:?}"
         );
-        assert!(started.elapsed() >= OPERATION_TIMEOUT);
+        assert!(
+            (CLOSE_BUDGET..OPERATION_TIMEOUT).contains(&started.elapsed()),
+            "the close took {:?}",
+            started.elapsed()
+        );
         assert_eq!(
             stored_offsets(&cluster),
             [BATCH.start() - 1, NEXT_BATCH.start() - 1]
@@ -2689,6 +2758,26 @@ mod tests {
     }
 
     #[test]
+    fn given_a_lost_range_when_displaying_a_read_error_should_print_its_first_and_last_offset() {
+        const OPERATION: u64 = 1;
+        let mut error = ReadError::new(
+            Some(PARTITION),
+            IggyError::FetchProgressUncertain(OPERATION),
+        );
+        let without_range = error.to_string();
+        error.lost = Some(BATCH);
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{without_range}, lost offsets: {} to {}",
+                BATCH.start(),
+                BATCH.end()
+            )
+        );
+    }
+
+    #[test]
     fn given_an_invalid_configuration_when_building_should_refuse_it() {
         let continuation =
             PollingStrategy::continuation(PARTITION, PollingKind::Offset, SEEK_OFFSET, CONTEXT);
@@ -2900,7 +2989,7 @@ mod tests {
                 result,
                 capacity: Arc::new(FetchCapacity {
                     permit: Some(Arc::clone(&self.slots).try_acquire_owned().unwrap()),
-                    wake: Arc::clone(&self.reader.shared.wake),
+                    wake: Arc::clone(&self.reader.shared.progress.wake),
                 }),
             }
         }

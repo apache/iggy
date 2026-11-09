@@ -28,6 +28,7 @@ use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     AutoCommit, Checkpoint, Client, CommitEvery, CommitPolicy, Consumer, ConsumerOffsetClient,
     Identifier, IggyError, PollOptions, PolledMessages, PollingKind, PollingStrategy, ReaderStamp,
+    binary_deadline_in_force,
 };
 use tokio::sync::{Notify, oneshot, watch};
 use tokio::time::{Instant, sleep_until};
@@ -36,7 +37,7 @@ use tracing::{error, warn};
 use super::ORDERING;
 use super::worker::transient_refusal;
 use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::driver::operation_deadline;
+use crate::driver::{operation_deadline, with_deadline};
 
 /// Reader ids start at 1, so no reader shares an id within the process.
 static NEXT_READER: AtomicU64 = AtomicU64::new(1);
@@ -46,7 +47,7 @@ tokio::task_local! {
 }
 
 /// The caller of a write that is not the application, which ends the retries of its read for
-/// the owner. The application ends them by dropping the write.
+/// the owner. The application ends them by dropping the write, or with a deadline in force.
 #[derive(Clone, Copy)]
 enum Caller {
     /// The reader itself: a seek after its caller returned, and an `Auto` store. The close
@@ -112,7 +113,7 @@ pub(crate) struct Progress {
     /// when the fetch loop ends.
     quiet: Notify,
     /// Wakes the fetch loop of the reader.
-    wake: Arc<Notify>,
+    pub(super) wake: Arc<Notify>,
     /// Set by a write refused as not owned, so the fetch loop refreshes the assignment at once.
     refresh_requested: AtomicBool,
     /// The pause before a read again after a transient refusal.
@@ -214,10 +215,6 @@ impl Progress {
             retry_interval,
             stopping: watch::Sender::new(false),
         }
-    }
-
-    pub(crate) fn wake(&self) -> Arc<Notify> {
-        Arc::clone(&self.wake)
     }
 
     pub(crate) fn stamp(&self, generation: u64) -> ReaderStamp {
@@ -898,6 +895,7 @@ impl Progress {
     ) -> Result<(), IggyError> {
         let mut failure = None;
         let mut rewound = BTreeSet::new();
+        let mut rewound_partitions = BTreeSet::new();
         for polled in undelivered {
             let partition_id = polled.partition_id;
             // A batch of an earlier assignment decides nothing: another member can have read the
@@ -929,6 +927,7 @@ impl Progress {
             if !rewound.insert(history) {
                 continue;
             }
+            rewound_partitions.insert(partition_id);
             if let Err(error) = self.abandon_unknown(self.rewind_before(first).await).await {
                 error!(
                     "Failed to rewind the offset before undelivered messages in partition: {partition_id}. {error}"
@@ -941,9 +940,7 @@ impl Progress {
             // A known batch or a delivered message names the rewind.
             if self.blocked.contains_key(&partition_id)
                 || owned.is_some_and(|owned| !owned.contains(&partition_id))
-                || rewound
-                    .iter()
-                    .any(|(batch_partition, ..)| *batch_partition == partition_id)
+                || rewound_partitions.contains(&partition_id)
                 || self.delivered_here(partition_id).is_some()
             {
                 continue;
@@ -972,10 +969,7 @@ impl Progress {
             if self.blocked.contains_key(&partition_id)
                 || owned.is_some_and(|owned| !owned.contains(&partition_id))
                 || restores.contains_key(&partition_id)
-                || (without_history
-                    && rewound
-                        .iter()
-                        .any(|(batch_partition, ..)| *batch_partition == partition_id))
+                || (without_history && rewound_partitions.contains(&partition_id))
                 || self.delivered_here(partition_id).is_some_and(|delivered| {
                     without_history
                         || same_incarnation_and_owner(delivered.context(), start.context())
@@ -1490,15 +1484,22 @@ impl SeekHold {
     /// Runs the writes of a seek and its move in a task of its own, which keeps the hold until
     /// they end. So a caller that drops the seek once the writes started still lets them finish,
     /// and the move follow on success. A later seek and the close wait for that task, and the
-    /// close ends its retries. The task logs a failure that no caller takes.
+    /// close ends its retries, as does a deadline of the caller. The task logs a failure that no
+    /// caller takes.
     pub(crate) async fn finish(
         self,
         write: impl Future<Output = Result<(), IggyError>> + Send + 'static,
     ) -> Result<(), IggyError> {
+        // The task runs outside the deadline scope of the caller.
+        let deadline = binary_deadline_in_force();
         let (sender, receiver) = oneshot::channel();
         tokio::spawn(async move {
             let partition = self.partition;
-            let result = in_background(write).await;
+            let write = in_background(write);
+            let result = match deadline {
+                Some(deadline) => with_deadline(deadline, write).await,
+                None => write.await,
+            };
             if let Err(error) = &result
                 && let Some(operation) = unknown_outcome(error)
             {

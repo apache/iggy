@@ -20,6 +20,8 @@
 package org.apache.iggy.client.async.reader;
 
 import org.apache.iggy.client.async.reader.FakeTransport.Read;
+import org.apache.iggy.client.async.reader.ReadException.OffsetRange;
+import org.apache.iggy.consumergroup.ConsumerGroupAssignment;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.message.PolledMessages;
@@ -27,7 +29,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.math.BigInteger;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -36,6 +40,7 @@ import static org.apache.iggy.client.async.reader.FakeTransport.section;
 import static org.apache.iggy.client.async.reader.PartitionReaderStoredOffsetTest.await;
 import static org.apache.iggy.client.async.reader.PartitionReaderTest.MANUAL;
 import static org.apache.iggy.client.async.reader.PartitionReaderTest.ON_READ;
+import static org.apache.iggy.client.async.reader.PartitionReaderTest.QUIET;
 import static org.apache.iggy.client.async.reader.PartitionReaderTest.assignment;
 import static org.apache.iggy.client.async.reader.PartitionReaderTest.closeGroupReader;
 import static org.apache.iggy.client.async.reader.PartitionReaderTest.member;
@@ -107,7 +112,9 @@ class PartitionReaderLeaveTest {
                 assertThatThrownBy(() -> second.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
                         .satisfies(error -> assertThat(error.getCause())
                                 .isInstanceOf(ReadException.class)
-                                .hasMessageContaining("Offsets 2 to 4 were stored by a read whose reply was lost"));
+                                .hasMessageContaining("Offsets 2 to 4 were stored by a read whose reply was lost"))
+                        .satisfies(error -> assertThat(((ReadException) error.getCause()).lost())
+                                .contains(new OffsetRange(BigInteger.TWO, BigInteger.valueOf(4))));
                 assertThat(offsets(reader.next().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)))
                         .containsExactly(5L, 6L);
             } else {
@@ -146,6 +153,32 @@ class PartitionReaderLeaveTest {
         assertThat(transport.written)
                 .as("the close writes no offset for the queued batch of the partition that left")
                 .isEmpty();
+    }
+
+    /**
+     * Under Manual the close sends the leave at once. A sync that answers after it finds the member gone, and the
+     * closed reader joins no more, so no member holds partitions that nobody reads.
+     */
+    @Test
+    void shouldNotJoinAgainForASyncThatAnswersAfterTheLeaveOfTheClose() throws Exception {
+        FakeTransport transport = new FakeTransport(true);
+        PartitionReader reader = member(transport, MANUAL);
+        assignment(transport, 1L);
+        CompletableFuture<Optional<ConsumerGroupAssignment>> sync =
+                transport.assignments.poll(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        assertThat(sync).as("the reader reads its assignment again").isNotNull();
+        transport.leaveReply = new CompletableFuture<>();
+        CompletableFuture<Void> closed = reader.closeAsync();
+        await(() -> transport.membership.contains("leave"));
+
+        sync.complete(Optional.empty());
+
+        assertThat(transport.assignments.poll(QUIET.toMillis(), TimeUnit.MILLISECONDS))
+                .as("a closed reader joins and syncs no more")
+                .isNull();
+        transport.leaveReply.complete(null);
+        closed.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        assertThat(transport.membership).containsExactly("join", "leave");
     }
 
     /** The next read of {@code partition}. A read of other partitions stays without a reply. */

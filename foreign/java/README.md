@@ -482,7 +482,7 @@ The effective `prefetchMessages` and `prefetchBytes` budgets each hold at least 
 
 The prefetch slots that the groups leave free spread the partitions whose last read ended before their head over reads of their own, each with the whole `count` and `maxBytes`, while the quiet partitions of a group share the one read that may wait. Under `OnRead` every read stores, so a group holds one read that may wait at a time, and a waiting `next()` fills the free slots with the backlogged partitions, one committing read per partition.
 
-A standalone consumer names its partitions. A consumer group reader joins its group, follows its assignment, and leaves the group on close. If a join or the leave ends with an unknown outcome, the reader abandons it, so the later metadata writes of the client go on.
+A standalone consumer names its partitions. A consumer group reader joins its group, follows its assignment, and leaves the group on close. If a join or the leave ends with an unknown outcome, the reader abandons it, so the later metadata writes of the client go on. Such a first join fails `build()` at once, and the next `build()` can join. If that join landed, the server keeps the member until the session of the client ends.
 
 If the group loses the member, for example with a lost session, the reader joins again. This is not a new assignment, so a partition that stays assigned keeps its state. Until a read names the new owner, each store of the reader names owner generation 0, which the server binds to the installed owner.
 The server binds owner generation 0 only to an owner that it installed at or below the metadata op of the write. So such a store keeps the incarnation of its read and names at least the op that the client saw committed.
@@ -493,7 +493,8 @@ A request without a context takes the whole context of the route, and so does a 
 The server can refuse a store or delete because another member owns the partition. If the partition is still assigned, the reader then reads it once, without a store and without a wait. That read uses only the context of its reply, so a message that does not decode cannot fail it. If that read serves the incarnation of the write, the write goes once more with the owner and op of that read. Otherwise, and for a partition that left the assignment, the refusal stands.
 The reader retries a transient refusal of that read after the retry interval. If such a read goes over the poll quota of the server, the server refuses the whole request, and the reader retries that refusal too.
 
-A seek write and an automatic store run in the background, so `closeAsync()` ends the retry of their read, and their refusal stands. A `commit()` and the writes of `closeAsync()` itself retry until their caller cancels. A cancel of the future of `commit()`, or of the first `closeAsync()`, ends that retry, and the refusal stands. A read in flight at that point can still get an answer, but that answer leads to no write.
+A seek write and an automatic store run in the background, so `closeAsync()` ends the retry of their read, and their refusal stands. A `commit()` retries until its caller cancels the future, and then the refusal stands.
+The writes of `closeAsync()` itself retry until a cancel of the future of the first `closeAsync()`. They retry for at most 10 s after the close started. Then the refusal stands, and each write of the close that was not sent yet still goes once, bounded by the request timeout. A read in flight at that point can still get an answer, but that answer leads to no write.
 The leave and the stop of the reader still run. A later `closeAsync()` waits for the end of the close, and a cancel of it does not end the close. The blocking reader turns an interrupt into such a cancel, and so does `close()` of the async reader. A cancel of `IggyConsumer.shutdown()` cancels its close.
 
 ```java
@@ -513,6 +514,7 @@ A fetch takes only an offset or `Next`. So the reader first polls a timestamp or
 
 - `Manual`: `commit(checkpoint)` stores the offset of a delivered checkpoint, forward only within a generation. A store whose outcome stays unknown fails the commit, and the reader releases it in the client, so a retry can store.
 - `OnRead`: the server stores each read, and the reader reads only for a waiting `next()`. After a read whose reply was lost, the reader abandons it and reads that partition again after its retry interval. That read starts after what the lost read stored, so the reader reads those messages again without a store and delivers them first.
+  If the partition no longer holds a part of that range, for example after retention, `next()` fails once with `FETCH_PROGRESS_UNCERTAIN` (14010). Its `ReadException` names that part in `lost()`, its first and last offset, and the reader reads on after it. A partition that leaves before the reader read such a range again reports it the same way.
 
   Only a lost read explains a read that starts past the expected offset: without one, the application or another session stored that offset, and the reader delivers from there. A partition that leaves the assignment still hands over the reads that the server stored for it.
   The close never moves back the offset of a partition that left. After the handoff, the server refuses that store, and during the handoff, a stored offset below the last served one blocks the handoff. So the batches of a left partition that the application did not take before the close are lost for the group.
@@ -546,7 +548,8 @@ The exception carries the bytes the server served for it: `record()` is the mess
 
 A refusal that a retry does not change is retried with a doubling wait and stops its partition after six in a row.
 The server can refuse a read because another member owns the partition (`CONSUMER_GROUP_PARTITION_NOT_OWNED`, 5009). This is no leave, because a new session and a move away and back look the same.
-The partition keeps its position and what the close needs, and asks for its assignment. From then on, it names owner generation 0 instead of each owner that it saw up to that refusal. It reads again after the retry interval. Only a leave that the assignment shows drops that state. Six such refusals in a row are reported once without a stop.
+The partition keeps its position and what the close needs, and asks for its assignment. From then on, it names owner generation 0 instead of each owner that it saw up to that refusal. After the n-th such refusal in a row, it reads again after the retry interval times 2^(n-1), at most 32 times the retry interval. Only a leave that the assignment shows drops that state. The sixth such refusal in a row is reported once without a stop, and the count starts again.
+After a lost membership, as after a lost session, the count also starts again, and the partition reads at once.
 
 The blocking client builds a blocking reader with `org.apache.iggy.client.blocking.reader.PartitionReader.build(client.reader(...))`, whose `next(Duration)` returns empty at its timeout and keeps the batch for the next call.
 

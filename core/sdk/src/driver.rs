@@ -593,7 +593,7 @@ impl OperationDriver {
             match next {
                 Next::Again if Instant::now() < call.attempt_deadline() => {}
                 Next::Again => return Err(call.expire()),
-                // The reader of the call closes and cancelled it, so its refusal is the answer.
+                // The reader of the call cancelled it, so its refusal is the answer.
                 Next::Pause | Next::AwaitLink(_)
                     if call.committing() && committing_cancel_requested() =>
                 {
@@ -1602,7 +1602,7 @@ enum Next {
     Again,
     Pause,
     /// No link serves the target yet. The pause also ends once a link starts to serve.
-    AwaitLink(watch::Receiver<u64>),
+    AwaitLink(watch::Receiver<()>),
     Fail(IggyError),
     Committed(IggyError),
 }
@@ -1872,10 +1872,11 @@ impl Call {
         }
     }
 
-    /// Fetches and deferred-poll retries leave time for the reply.
+    /// Fetches and deferred-poll retries leave time for the reply. The resend after a first
+    /// `NotPrimary` is a retry too, although it does not pause.
     fn attempt_deadline(&self) -> Instant {
         if self.code == FETCH_MESSAGES_CODE
-            || (self.code == POLL_MESSAGES_DEFERRED_CODE && self.retries > 0)
+            || (self.code == POLL_MESSAGES_DEFERRED_CODE && (self.retries > 0 || self.not_primary))
         {
             self.deadline
                 .checked_sub(Duration::from_micros(MIN_DEFERRED_POLL_REPLY_MARGIN_US))
@@ -2006,7 +2007,7 @@ fn close_if_detached(link: &Link, result: &Result<Bytes, IggyError>, bound: bool
 }
 
 /// Resolves once a link starts to serve requests after `ready_links` was taken.
-async fn link_ready(mut ready_links: watch::Receiver<u64>) {
+async fn link_ready(mut ready_links: watch::Receiver<()>) {
     if ready_links.changed().await.is_err() {
         // The links closed, so only the backoff ends the pause.
         pending::<()>().await;
@@ -4231,6 +4232,55 @@ mod tests {
                     "no attempt fits after the refusal"
                 );
             }
+        }
+    }
+
+    /// A first `NotPrimary` resends a deferred poll without a pause, and that resend leaves the
+    /// reply margin as every retry does.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_deferred_poll_refused_as_not_primary_when_only_the_reply_margin_remains_should_keep_the_refusal()
+     {
+        const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+        const REPLY_MARGIN: Duration = Duration::from_micros(MIN_DEFERRED_POLL_REPLY_MARGIN_US);
+        let refusal_delay = REQUEST_TIMEOUT - REPLY_MARGIN / 2;
+        for auto_commit in [false, true] {
+            let fixture = Fixture::new().await;
+            let poll = fixture.poll(auto_commit, WirePollingStrategy::offset(0));
+            let options = DeferredPollOptions {
+                max_wait: Duration::ZERO.into(),
+                request_timeout: REQUEST_TIMEOUT.into(),
+                ..DeferredPollOptions::default()
+            };
+            fixture.cluster.script(
+                &endpoint(PRIMARY),
+                POLL_MESSAGES_DEFERRED_CODE,
+                [Answer::Refuse(IggyError::NotPrimary)],
+            );
+            fixture.cluster.hold(POLL_MESSAGES_DEFERRED_CODE);
+            let started = Instant::now();
+
+            let (result, ()) = tokio::join!(
+                fixture.driver.poll_with_options(&poll, None, Some(options)),
+                async {
+                    eventually("deferred reply is held", || {
+                        fixture.cluster.count(POLL_MESSAGES_DEFERRED_CODE) == 1
+                    })
+                    .await;
+                    sleep_until(started + refusal_delay).await;
+                    fixture.cluster.release(POLL_MESSAGES_DEFERRED_CODE);
+                }
+            );
+
+            assert_eq!(
+                result.map(|_| ()),
+                Err(IggyError::TransientNotAccepted),
+                "auto_commit {auto_commit}"
+            );
+            assert_eq!(
+                fixture.cluster.count(POLL_MESSAGES_DEFERRED_CODE),
+                1,
+                "auto_commit {auto_commit}: no resend fits after the refusal"
+            );
         }
     }
 

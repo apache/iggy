@@ -87,6 +87,10 @@ const SETTLED_READ_MS = GROUP_REFRESH_MS / 2;
 const TIMER_SLACK_MS = 50;
 /** The retry interval of a reader that gets an unserved reply, long enough to tell its pause from timer slack. */
 const UNSERVED_RETRY_MS = 200;
+/** A close reads for the installed owner of a refused write up to this long after it starts. */
+const CLOSE_BUDGET_MS = 10_000;
+/** How long `waitFor` waits for its condition by default. */
+const WAIT_MS = 1_000;
 /** The pause between two next() calls of a busy member, so the test does not spin the CPU. */
 const NEXT_PAUSE_MS = 5;
 /** How soon a trigger that syncs at once leads to the sync, a fraction of the refresh interval. */
@@ -703,8 +707,8 @@ const openReinstalled = async (topic: FakeTopic) => {
 const offsets = (batches: { messages: { headers: { offset: bigint } }[] }[]): bigint[] =>
   batches.flatMap(({ messages }) => messages.map(({ headers }) => headers.offset));
 
-const waitFor = async (condition: () => boolean, what: string): Promise<void> => {
-  const deadline = Date.now() + 1_000;
+const waitFor = async (condition: () => boolean, what: string, within = WAIT_MS): Promise<void> => {
+  const deadline = Date.now() + within;
   while (!condition()) {
     assert.ok(Date.now() < deadline, what);
     await new Promise((resolve) => setTimeout(resolve, 5));
@@ -833,6 +837,24 @@ describe('partition reader', () => {
         await reader.close();
       }
     });
+
+  it('refuses a retry interval that is not a finite number above 0 before it connects', async () => {
+    const client = new FakeTopic().client();
+    let connections = 0;
+    const getClient = async () => {
+      connections += 1;
+      return client;
+    };
+    for (const retryInterval of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      // A reader that opens anyway closes at once, so it does not read on without a pause.
+      const failure = await PartitionReader.open(getClient, {
+        streamId: 1, topicId: 2, consumer, partitions: [1], options: { maxWait: 100 }, retryInterval
+      }).then((reader) => reader.close(), (error: unknown) => error);
+      assert.equal((failure as { errorCode?: number } | undefined)?.errorCode, INVALID_COMMAND,
+        `retryInterval ${retryInterval} opened a reader`);
+    }
+    assert.equal(connections, 0, 'a refused retry interval reached the client');
+  });
 
   it('keeps on-read demand and drains a busy primary while two empty primaries wait', async () => {
     const count = 2;
@@ -1201,13 +1223,14 @@ describe('partition reader', () => {
     }
   });
 
-  for (const [firstKept, lost, after] of [
-    [3n, '2 to 2', [[3n, 4n, 5n], [6n, 7n]]],
-    [5n, '2 to 3', [[4n], [5n], [6n, 7n]]],
-    [8n, '2 to 3', [[4n, 5n], [8n, 9n]]]
+  for (const [firstKept, last, after] of [
+    [3n, 2n, [[3n, 4n, 5n], [6n, 7n]]],
+    [5n, 3n, [[4n], [5n], [6n, 7n]]],
+    [8n, 3n, [[4n, 5n], [8n, 9n]]]
   ] as const) {
-    it(`reports offsets ${lost} once and reads on when retention leaves a catch-up from 2 only the offsets from ` +
-      `${firstKept}`, async () => {
+    const first = 2n;
+    it(`reports offsets ${first} to ${last} once, in the text and the lost range of its error, and reads on when ` +
+      `retention leaves a catch-up from ${first} only the offsets from ${firstKept}`, async () => {
       const topic = new FakeTopic(12n);
       topic.pollsHoldCount = true;
       const reader = await open(topic, [1], { commit: CommitPolicy.OnRead });
@@ -1216,10 +1239,13 @@ describe('partition reader', () => {
       topic.loseNextCommittingRead = true;
       topic.beforeUncommittedPoll = () => { topic.firstKept = firstKept; };
       try {
-        await assert.rejects(reader.next({ signal: AbortSignal.timeout(2_000) }), (error: unknown) =>
-          error instanceof ReadError && error.partitionId === 1 &&
-          (error.error as { errorCode: number }).errorCode === FETCH_PROGRESS_UNCERTAIN &&
-          String(error.error).includes(`offsets ${lost} of partition 1`));
+        await assert.rejects(reader.next({ signal: AbortSignal.timeout(2_000) }), (error: unknown) => {
+          assert.ok(error instanceof ReadError, String(error));
+          assert.deepEqual([error.partitionId, (error.error as { errorCode: number }).errorCode,
+            String(error.error).includes(`offsets ${first} to ${last} of partition 1`), error.lost],
+          [1, FETCH_PROGRESS_UNCERTAIN, true, { first, last }]);
+          return true;
+        });
         for (let read = 0; read < after.length; read += 1)
           batches.push(await reader.next({ signal: AbortSignal.timeout(2_000) }));
       } finally {
@@ -2177,6 +2203,41 @@ describe('partition reader', () => {
     const codes = failures.map((failure) => (failure as { errorCode?: number } | undefined)?.errorCode);
     assert.deepEqual([codes, topic.leaves, probesOf(topic, 1).length, timers],
       [[CONSUMER_GROUP_PARTITION_NOT_OWNED, CONSUMER_GROUP_PARTITION_NOT_OWNED], 1, probes, 0]);
+  });
+
+  it('ends the close without a signal at its budget with the refusal of its store, whose reads for the owner keep ' +
+    'getting a transient refusal, and still leaves the group', async () => {
+    const retryInterval = 20;
+    const topic = new FakeTopic(10n);
+    topic.assigned = [1];
+    const client = topic.client();
+    // Only the close counts the batch and stores it.
+    const reader = await PartitionReader.open(async () => client, {
+      streamId: 1, topicId: 2, consumer: { kind: ConsumerKind.Group, id: 5 },
+      options: { maxWait: 100, commit: CommitPolicy.Auto({ every: CommitEvery.Batch }) }, retryInterval
+    });
+    assert.deepEqual(offsets([await reader.next()]), [0n, 1n]);
+    topic.ownerGeneration += 1n;
+    topic.ownerInstalledAt = topic.metadataOp + 1n;
+    topic.refused.set(1, TRANSIENT_NOT_ACCEPTED);
+    const started = Date.now();
+    let ended: number | undefined;
+    let failure: unknown;
+    const closed = reader.close().catch((error: unknown) => { failure = error; })
+      .finally(() => { ended = Date.now(); });
+    try {
+      await waitFor(() => ended !== undefined, 'the close did not end at its budget', CLOSE_BUDGET_MS + WAIT_MS);
+    } finally {
+      // A close that did not end reads for the owner until the refusal ends.
+      topic.refused.delete(1);
+      await closed;
+    }
+    const probes = probesOf(topic, 1).length;
+    await new Promise((resolve) => setTimeout(resolve, 2 * retryInterval));
+    assert.ok(ended! - started >= CLOSE_BUDGET_MS - TIMER_SLACK_MS, `the close ended ${ended! - started} ms after it ` +
+      'started, before its budget');
+    assert.deepEqual([(failure as { errorCode?: number } | undefined)?.errorCode, topic.leaves, probes > 1,
+      probesOf(topic, 1).length], [CONSUMER_GROUP_PARTITION_NOT_OWNED, 1, true, probes]);
   });
 
   it('ends the close at an abort during the reads for the owner of the refused store of one partition, and stores ' +
@@ -3169,6 +3230,37 @@ describe('partition reader', () => {
     } finally {
       await consumer.shutdown();
     }
+  });
+
+  it('reads a partition that the server refused as not owned at once after a session reset, and waits one retry ' +
+    'interval after its next refusal', async () => {
+    // Long enough to tell one retry interval from two despite timer slack.
+    const retryInterval = 200;
+    const topic = new FakeTopic();
+    topic.assigned = [1];
+    topic.notOwned.add(1);
+    const client = topic.client();
+    const reader = await PartitionReader.open(async () => client, {
+      streamId: 1, topicId: 2, consumer: { kind: ConsumerKind.Group, id: 5 }, options: { maxWait: 100 }, retryInterval
+    });
+    const reads = () => topic.reads.filter(({ partition }) => partition === 1).map(({ at }) => at);
+    let reset = 0;
+    try {
+      // After its second refusal in a row the partition waits two retry intervals.
+      await waitFor(() => reads().length === 2, 'the partition was not refused twice');
+      reset = Date.now();
+      topic.changeSession();
+      // Counts kept from the old session would read again after two and then four retry intervals.
+      await waitFor(() => reads().length >= 4, 'the partition did not read twice after the session reset',
+        6 * retryInterval + WAIT_MS);
+    } finally {
+      await reader.close();
+    }
+    const [, , afterReset, next] = reads();
+    const pause = next - afterReset;
+    assert.ok(afterReset - reset < retryInterval, `read ${afterReset - reset} ms after the session reset`);
+    assert.ok(pause >= retryInterval - TIMER_SLACK_MS && pause < 2 * retryInterval - TIMER_SLACK_MS,
+      `read again ${pause} ms after the first refusal of the new session`);
   });
 
   it('reads on a group partition that the server refuses as not owned during the catch-up of a lost read, and ' +

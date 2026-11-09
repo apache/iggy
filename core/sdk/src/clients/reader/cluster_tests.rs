@@ -42,7 +42,7 @@ use iggy_binary_protocol::responses::messages::{FetchMessagesResponse, Partition
 use iggy_binary_protocol::{WireDecode, WireEncode, WireName};
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
-    BinaryTransport, Client, CommitPolicy, Consumer, ConsumerGroupClient, ConsumerOffsetClient,
+    BinaryTransport, CommitPolicy, Consumer, ConsumerGroupClient, ConsumerOffsetClient,
     DiagnosticEvent, Identifier, IggyDuration, IggyError, IggyTimestamp, PollOptions,
     PolledMessages, PollingStrategy, TopicClient, UserClient,
 };
@@ -59,7 +59,6 @@ use super::worker::{ASSIGNMENT_REFRESH_INTERVAL, MAX_LASTING_REFUSALS};
 use super::{ORDERING, PartitionReader, ReadError};
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::clients::reader_builder::ReaderBuilder;
-use crate::links::OPERATION_TIMEOUT;
 use crate::links::fake_cluster::{
     Answer, FakeCluster, Received, TEST_BUDGET, connected, endpoint, eventually,
 };
@@ -279,10 +278,11 @@ async fn given_a_missing_group_when_building_should_return_the_join_error() {
     );
 }
 
+/// A build abandons a join with an unknown outcome on the client at once, so the next build
+/// joins again instead of finding the metadata lane blocked.
 #[tokio::test(start_paused = true)]
-async fn given_an_uncertain_join_when_building_again_should_keep_it_until_the_caller_resolves_it() {
-    // Each build looks the group up, the blocked one too.
-    const BUILDS: usize = 3;
+async fn given_an_uncertain_join_when_building_again_should_abandon_it_and_join_again() {
+    const BUILDS: usize = 2;
     let (client, cluster) = connect_to_three_replicas().await;
     let metadata_primary = endpoint(METADATA_PRIMARY);
     cluster.script(
@@ -309,28 +309,16 @@ async fn given_an_uncertain_join_when_building_again_should_keep_it_until_the_ca
     let lost = reader().build().await.err();
     let op = cluster.received(JOIN_CONSUMER_GROUP_CODE)[0].header.request;
     assert_eq!(lost, Some(IggyError::OperationUncertain(op)));
-    assert_eq!(
-        reader().build().await.err(),
-        Some(IggyError::LaneBlocked(op)),
-        "the client keeps the join of the failed build"
+    assert!(
+        !client.read().await.retains_operation(op).await,
+        "the failed build abandons its join"
     );
-    assert_eq!(cluster.count(JOIN_CONSUMER_GROUP_CODE), 1);
 
-    client
-        .read()
-        .await
-        .resolve_operation(op, (Instant::now() + OPERATION_TIMEOUT).into_std())
-        .await
-        .unwrap();
     reader().build().await.unwrap();
 
     let joins = cluster.received(JOIN_CONSUMER_GROUP_CODE);
-    assert_eq!(joins.len(), 3);
-    assert_eq!(
-        joins[1].header.request, op,
-        "the resolution replays the lost join"
-    );
-    assert_ne!(joins[2].header.request, op);
+    assert_eq!(joins.len(), BUILDS);
+    assert_ne!(joins[1].header.request, op, "the build sends a new join");
 }
 
 #[tokio::test(start_paused = true)]
@@ -360,8 +348,8 @@ async fn given_a_lost_membership_when_the_join_fails_should_report_it_for_the_wh
     );
 }
 
-/// A join after a lost session has an unknown outcome, and the reader closes before a refresh
-/// resolves it. The close abandons it, so the join does not block the leave.
+/// A join after a lost session has an unknown outcome, and the reader closes before the next
+/// refresh. The join abandoned it at once, so it does not block the leave.
 #[tokio::test(start_paused = true)]
 async fn given_a_join_with_an_unknown_outcome_when_closing_should_abandon_it_and_leave() {
     let (client, cluster) = connect_to_three_replicas().await;
@@ -615,8 +603,10 @@ async fn given_a_commit_refused_as_not_owned_when_its_partition_stays_should_ref
     assert_eq!(cluster.count(SYNC_CONSUMER_GROUP_CODE), refreshes + 1);
 }
 
+/// A refresh abandons a create or a join with an unknown outcome at once. The next refresh looks
+/// the group up again, finds the group that the lost create made, and joins anew.
 #[tokio::test(start_paused = true)]
-async fn given_an_uncertain_group_mutation_when_the_refresh_joins_again_should_resolve_it_and_read()
+async fn given_an_uncertain_group_mutation_when_the_refresh_joins_again_should_abandon_it_and_read()
 {
     const OFFSET: u64 = 2;
     for mutation in [CREATE_CONSUMER_GROUP_CODE, JOIN_CONSUMER_GROUP_CODE] {
@@ -665,31 +655,27 @@ async fn given_an_uncertain_group_mutation_when_the_refresh_joins_again_should_r
         let read = timeout(TEST_BUDGET, reader.next()).await.unwrap();
 
         let requests = cluster.received(mutation);
-        let (lost, replayed) = (
-            &requests[earlier_mutations],
-            &requests[earlier_mutations + 1],
-        );
-        let op = lost.header.request;
+        let op = requests[earlier_mutations].header.request;
         assert_eq!(
             uncertain.unwrap_err(),
             ReadError::new(None, IggyError::OperationUncertain(op)),
             "mutation {mutation}"
         );
         assert!(read.is_ok(), "mutation {mutation}: {read:?}");
-        assert_eq!(
-            (replayed.header.request, &replayed.body),
-            (op, &lost.body),
-            "the next join resolves the mutation by its replay, mutation {mutation}"
+        assert!(
+            requests[earlier_mutations + 1..]
+                .iter()
+                .all(|later| later.header.request != op),
+            "the next join replays nothing, mutation {mutation}"
         );
-        assert_eq!(
-            reader
+        assert!(
+            !reader
                 .config
                 .client
                 .read()
                 .await
-                .resolve_operation(op, (Instant::now() + OPERATION_TIMEOUT).into_std())
+                .retains_operation(op)
                 .await,
-            Ok(()),
             "mutation {mutation}"
         );
     }

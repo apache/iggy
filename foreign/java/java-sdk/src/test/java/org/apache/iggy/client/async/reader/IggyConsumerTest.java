@@ -23,12 +23,14 @@ import org.apache.iggy.client.async.reader.FakeTransport.Store;
 import org.apache.iggy.consumergroup.ConsumerGroupAssignment;
 import org.apache.iggy.exception.IggyClientException;
 import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.exception.IggyValidationException;
 import org.apache.iggy.message.AutoCommit;
 import org.apache.iggy.message.CommitAfter;
 import org.apache.iggy.message.CommitEvery;
 import org.apache.iggy.message.CommitPolicy;
 import org.apache.iggy.message.FetchedMessages;
 import org.apache.iggy.message.PollOptions;
+import org.apache.iggy.message.PollingKind;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.partition.PartitionContext;
 import org.junit.jupiter.api.Test;
@@ -214,6 +216,39 @@ class IggyConsumerTest {
                     .hasCauseInstanceOf(IggyClientException.class);
             assertThat(offset(held)).isEqualTo(2);
             assertThat(offset(consumer.next())).isEqualTo(3);
+        } finally {
+            transport.storeReply.complete(null);
+            consumer.shutdown().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * A seek that the consumer refuses at once changes nothing. So the held message stays with the earlier seek of its
+     * partition, and that seek drops it when it moves.
+     */
+    @Test
+    void shouldLeaveTheHeldMessagesToTheEarlierSeekAfterARefusedOneUnderOnRead() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        IggyConsumer consumer = consumer(transport, WAIT.withCommit(CommitPolicy.onRead()));
+        try {
+            CompletableFuture<ReceivedMessage> first = consumer.next();
+            transport.nextRead().answer(section(1, 0, 1));
+            assertThat(offset(first)).isZero();
+            transport.storeReply = new CompletableFuture<>();
+            CompletableFuture<Void> sought = consumer.seek(1L, PollingStrategy.offset(BigInteger.TEN));
+            PollingStrategy ofAnotherPartition =
+                    new PollingStrategy(PollingKind.Offset, BigInteger.ONE, Optional.empty(), Optional.of(2L));
+
+            assertThatThrownBy(() -> consumer.seek(1L, ofAnotherPartition)).isInstanceOf(IggyValidationException.class);
+            transport.storeReply.complete(null);
+            sought.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+            CompletableFuture<ReceivedMessage> afterSeek = consumer.next();
+            assertThat(afterSeek)
+                    .as("the seek that moved dropped the held message")
+                    .isNotDone();
+            transport.nextRead().answer(section(1, 10));
+            assertThat(offset(afterSeek)).isEqualTo(10);
         } finally {
             transport.storeReply.complete(null);
             consumer.shutdown().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);

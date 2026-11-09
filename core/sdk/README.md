@@ -272,8 +272,10 @@ The SDK reads in three ways. Each one takes `PollOptions` and starts from a `Pol
 - `PartitionReader` reads many partitions and returns batches. Build one with
   `client.reader(stream, topic, consumer)`. A standalone `Consumer` reads the partitions of
   `.partitions(...)`. A consumer group member reads its assignment: the reader joins the group,
-  joins again after a session loss, and leaves the group in `close()`. The close abandons a join or
-  a leave with an unknown outcome, so the later metadata writes of the client go out.
+  joins again after a session loss, and leaves the group in `close()`. The reader abandons a
+  create, a join or a leave of the group with an unknown outcome at once. So the later metadata
+  writes of the client go out, and a new `build()` joins again. A join that landed for a failed
+  `build()` keeps the member in the group until its session ends.
 - `IggyConsumer` is a `Stream` of messages over one `PartitionReader`, with commit policies, group
   creation, init retries and a replay filter. A standalone consumer needs `.partitions(...)`.
 
@@ -479,10 +481,14 @@ for an error of the whole reader), `error` and `skip`. The reader stays usable a
 A group member whose store or delete gets `ConsumerGroupPartitionNotOwned` (5009) for a partition
 that it still has asks for a new assignment at once. It reads the partition once without a commit,
 for the owner that the server installed, and sends the write once more under that owner. It retries
-a transient refusal of that read until the caller of the write cancels it. For a `seek` that its
+a transient refusal of that read until the caller of the write drops it. For a `seek` that its
 caller dropped and for an `Auto` store, `close()` ends that retry, and the reader logs the first
-error. If the read gets another refusal or shows another history of the partition, the write fails
-with its first error. So does a write for a partition that left.
+error. For its own writes, `close()` has one budget, 10 s from its start. At the end of the budget,
+the retry stops. Each write of the close that did not go yet still goes once under its own request
+timeout, and then the leave goes. A dropped `close()` sends neither these writes nor the leave, so
+the member stays in its group until its session ends. If the retry stops, or the read gets another
+refusal or shows another history of the partition, the write fails with its first error. So does a
+write for a partition that left.
 
 A read without `OnRead` stores nothing, so a retry after a lost reply is safe. The binary transport
 sends such a poll again, with less wait and time left, unless it starts from `next`. A one-shot poll
@@ -561,7 +567,8 @@ its end before the next one starts. After a
 rebalance, a partition that stays with the member continues after its last delivered message. A
 newly assigned partition starts at the start of the builder: `.start(...)` on the reader,
 `.polling_strategy(...)` on the consumer. With `OnRead`, it resumes after its stored offset instead
-when the server holds one. In a new session, a group member starts every partition there again. `last` and `timestamp` starts read with single polls until the first message.
+when the server holds one. A new session is no leave, so a partition that stays with the member
+continues there too. `last` and `timestamp` starts read with single polls until the first message.
 
 On these transports, progress calls of one partition share a progress lane: polls and fetches from
 `next` or with `OnRead`, and offset reads, stores and deletes. Sends use a separate mutation lane,

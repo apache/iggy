@@ -286,9 +286,8 @@ pub struct IggyConsumer {
     polling_strategy: PollingStrategy,
     poll_options: PollOptions,
     prefetch_bytes: u32,
-    prefetch_messages: Option<u32>,
-    /// The membership of a group consumer. It outlives a failed `init()`, so the next attempt
-    /// resolves a create or a join of an unknown outcome instead of finding its lane blocked.
+    prefetch_messages: u32,
+    /// The membership of a group consumer, which creates a missing group.
     membership: Option<Arc<Membership>>,
     encryptor: Option<Arc<EncryptorKind>>,
     polling_retry_interval: NonZeroIggyDuration,
@@ -352,7 +351,7 @@ impl IggyConsumer {
         polling_strategy: PollingStrategy,
         poll_options: PollOptions,
         prefetch_bytes: u32,
-        prefetch_messages: Option<u32>,
+        prefetch_messages: u32,
         create_consumer_group_if_not_exists: bool,
         encryptor: Option<Arc<EncryptorKind>>,
         polling_retry_interval: NonZeroIggyDuration,
@@ -518,9 +517,11 @@ impl IggyConsumer {
     ///
     /// # Errors
     ///
-    /// [`IggyError::OperationUncertain`] means this store may have committed and remains retained.
-    /// [`IggyError::LaneBlocked`] means the earlier operation is still unresolved and this store
-    /// was not sent. Other failures include connection, permission, history and ownership errors.
+    /// [`IggyError::OperationUncertain`] means this store may have committed. The client retains
+    /// it, except with [`CommitPolicy::OnRead`], where the consumer abandons it, as a
+    /// [`seek`](Self::seek) does. [`IggyError::LaneBlocked`] means the earlier operation is still
+    /// unresolved and this store was not sent. Other failures include connection, permission,
+    /// history and ownership errors.
     pub async fn store_offset(
         &self,
         offset: u64,
@@ -581,8 +582,8 @@ impl IggyConsumer {
     /// # Errors
     ///
     /// Returns [`IggyError::ConsumerOffsetNotFound`] when nothing is stored for that partition, or
-    /// any other error the server raised. Uses the recovery and uncertainty contract of
-    /// [`Self::store_offset`].
+    /// any other error the server raised. Uses the recovery contract of [`Self::store_offset`].
+    /// The client retains a delete with an unknown outcome, also with [`CommitPolicy::OnRead`].
     pub async fn delete_offset(&self, partition_id: Option<u32>) -> Result<(), IggyError> {
         self.state.delete_offset(partition_id).await
     }
@@ -600,8 +601,9 @@ impl IggyConsumer {
     /// Sets the next read position of `partition`, as [`PartitionReader::seek`] does, and drops
     /// the rest of the batch of `partition` that the consumer yields from. With
     /// [`CommitPolicy::OnRead`], a seek to an offset above 0 first stores the offset before it,
-    /// so a restart resumes at the new position. A seek to a timestamp moves the stored offset
-    /// before the first message at the timestamp.
+    /// so a restart resumes at the new position. A seek to offset 0 or `First` deletes the stored
+    /// offset when the server holds one. A seek to a timestamp moves the stored offset before the
+    /// first message at the timestamp.
     ///
     /// # Errors
     ///
@@ -655,7 +657,8 @@ impl IggyConsumer {
     ///   while creating or joining the consumer group. Such an error ends initialization
     ///   immediately instead of consuming a retry.
     /// - [`IggyError::OperationUncertain`] for a create or a join of the group with an unknown
-    ///   outcome. Call `init()` again: it resolves that operation before it joins.
+    ///   outcome. The consumer abandons that operation on the client at once, so a new `init()`
+    ///   joins again. A join that landed keeps the member in the group until its session ends.
     pub async fn init(&mut self) -> Result<(), IggyError> {
         if self.initialized {
             return Ok(());
@@ -772,6 +775,7 @@ impl IggyConsumer {
         .start(self.polling_strategy)
         .options(self.poll_options)
         .prefetch_bytes(self.prefetch_bytes)
+        .prefetch_messages(self.prefetch_messages)
         .progress(Arc::clone(&self.state.progress))
         .retry_interval(self.polling_retry_interval.get_duration());
         if let Some(membership) = &self.membership {
@@ -779,9 +783,6 @@ impl IggyConsumer {
         }
         if let Some(partitions) = &self.partitions {
             builder = builder.partitions(partitions.iter().copied());
-        }
-        if let Some(prefetch_messages) = self.prefetch_messages {
-            builder = builder.prefetch_messages(prefetch_messages);
         }
         builder
     }

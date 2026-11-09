@@ -342,7 +342,7 @@ The partitions that a read served go last in the next read of their group, so a 
 
   A read that lost its reply, or a section whose error leaves the outcome unknown, may have stored messages that never arrived. The reader abandons that read and reads its partitions again after `retryInterval`: the next reply then starts past those messages, and the reader reads that gap again without a commit and delivers it first.
 
-  A forward jump without such a lost read is a store of the application or of another session, and the reader delivers from there. When the partition moved to another member before the gap was read, `next()` first throws `fetchProgressUncertain` with the lost range. Then it returns the batch after the gap. If the history no longer holds the gap or its start, for example after retention, the reader does the same with the missing range.
+  A forward jump without such a lost read is a store of the application or of another session, and the reader delivers from there. When the partition moved to another member before the gap was read, `next()` first throws `fetchProgressUncertain`, whose `lost` holds the first and the last offset of the range. Then it returns the batch after the gap. If the history no longer holds the gap or its start, for example after retention, the reader does the same with the missing range.
 
   A seek to an offset above zero stores the offset before it first, once the committing read of the partition in flight ended, so a restart resumes at the sought offset. If a stored offset exists, a seek to offset zero or to `.first` deletes it instead. A seek to a timestamp first reads the message at the timestamp without a commit, then works as a seek to its offset. Without such a message it stores nothing. A read never moves the stored offset back.
 
@@ -358,18 +358,22 @@ The partitions that a read served go last in the next read of their group, so a 
 
   `AutoCommit.default` stores every 10,000 messages or 5 seconds after `.processing`. A store only moves forward, and a position of an older generation is dropped.
 
-A failed read is thrown as a `ReadError` with the partition, the `IggyError` and, for a message that does not decode, its offset, its record and `skip`, the continuation after it. The reader reads its partitions again after `retryInterval`. A message that does not decode, and `historyUnavailable` for a position read in a history that is gone, stop the partition until a seek.
+A failed read is thrown as a `ReadError` with the partition, the `IggyError` and, for a message that does not decode, its offset, its record and `skip`, the continuation after it. For a lost range it has `lost`.
+The reader reads its partitions again after `retryInterval`. A message that does not decode, and `historyUnavailable` for a position read in a history that is gone, stop the partition until a seek.
 
-`consumerGroupPartitionNotOwned` on a read of a group member is not a leave. A new session and a move of the partition away and back look the same. The partition keeps its position and what `close()` needs of it. The reader syncs its assignment and reads the partition again after `retryInterval`. After each six refusals in a row, `next()` throws one `ReadError` for the partition, and the partition reads on. Only a leave that a sync shows drops the state of the partition.
+`consumerGroupPartitionNotOwned` on a read of a group member is not a leave. A new session and a move of the partition away and back look the same. The partition keeps its position and what `close()` needs of it. The reader syncs its assignment and reads the partition again after `retryInterval`.
+Each further refusal in a row doubles that wait, up to 32 times `retryInterval` at the sixth. The sixth refusal in a row also makes `next()` throw one `ReadError` for the partition, the partition reads on, and the count starts again. When the reader joins again after a new session or a lost membership, the count starts again and the partition reads at once. Only a leave that a sync shows drops the state of the partition.
 
 After a new session, the server installs the owner again under a new generation. Until a read of the new session names that owner, the reads and offset writes of the partition name owner generation 0. If such a write carries a metadata op at or after the install, the server binds it to the installed owner. When the client sends such a write, it raises the metadata op of the write to the newest op that it saw. A read keeps its op.
 
-A store or delete refused as not owned is not a leave either. If the reader no longer reads the partition, the write fails with the refusal. Otherwise the reader syncs its assignment, reads the partition once without a commit, and sends the write once more under the owner of that read. Only the context of that read counts, so a message that does not decode does not fail it. If that read fails other than by a transient refusal, or reads another history of the partition, the write fails with the refusal.
+A store or delete refused as not owned is not a leave either. Another member can own a partition that left, or can have read it while it was away. So if the reader no longer reads the partition, or the write belongs to an assignment of the partition that ended, the write fails with the refusal.
+Otherwise the reader syncs its assignment, reads the partition once without a commit, and sends the write once more under the owner of that read. Only the context of that read counts, so a message that does not decode does not fail it. If that read fails other than by a transient refusal, or reads another history of the partition, the write fails with the refusal.
 
 While a transient refusal or `notPrimary` answers that read, the reader reads again after `retryInterval`, until the caller of the write cancels. Then the write fails with the refusal, and the answer of a read in flight at that cancel sends no write.
-For a seek write and an `.auto` store in the background, the caller is the reader. So the start of `close()` ends their retry. If no caller waits for such a failure, the reader logs it. For a write of `close()` itself, the caller is the first caller of `close()`.
+For a seek write and an `.auto` store in the background, the caller is the reader. So the start of `close()` ends their retry, and the answer of a read in flight at that start sends no write. If no caller waits for such a failure, the reader logs it. For a write of `close()` itself, the caller is the first caller of `close()`.
 
 The close belongs to the caller that started it. If that caller is cancelled, the reader stops at once each retry of a read for the owner of a refused write. No such read starts after the cancel, and the write fails with its refusal. A read in flight at the cancel ends within the request timeout of the reader options, and its answer sends no write.
+For the writes of `close()` itself, the close deadline ends that retry in the same way, 10 seconds after the start of the close.
 The close still sends once each of its offset writes and lookups that it did not send yet, and then the leave. So a close that starts in a cancelled task also sends its writes and the leave.
 
 Each offset write and lookup ends within 30 seconds, a fixed limit that includes each resend after a transient refusal. The leave first waits for a join in flight, which sends up to three requests. So the leave can take up to four times the client `requestTimeout`. The close ends after the last request.
@@ -379,6 +383,7 @@ A later caller of `close()` waits for the same close and gets its result. A canc
 ### Consumer groups
 
 `joinConsumerGroup`, `leaveConsumerGroup`, `createConsumerGroup` and `getConsumerGroup` manage groups directly, but reading a group goes through a `PartitionReader` or an `IggyConsumer` that names `.group(id)`, which joins on its own. Membership belongs to the session. A reconnect resumes the session and keeps it.
+If the outcome of the join of a new reader, or of the group create before it, is unknown, building the reader fails with `transientNotCommitted`. The client keeps nothing of that request, so the next build starts over. A join that landed keeps the member in the group until the session ends.
 
 When the server no longer holds the session, the client signs in under a new one and the reader joins again. In a cluster, reads and offset writes go to the partition's primary over a second connection bound to the same session, and the heartbeat syncs every joined group.
 

@@ -6045,9 +6045,17 @@ class ReadException final : public IggyException {
 
     /**
      * @return For a message that does not decode, the continuation after it,
-     *         to pass to PartitionReader::Seek(), otherwise `nullptr`.
+     *         to pass to PartitionReader::Seek(). For a lost range, the
+     *         continuation after the last offset of Lost(). Otherwise `nullptr`.
      */
     [[nodiscard]] const ::iggy::Continuation *Skip() const noexcept { return skip_.get(); }
+
+    /**
+     * @return For messages that a lost read committed and that the reader
+     *         could not read again, their first and last offset, with the
+     *         error `fetch_progress_uncertain`. Otherwise `std::nullopt`.
+     */
+    [[nodiscard]] std::optional<std::pair<std::uint64_t, std::uint64_t>> Lost() const noexcept { return lost_; }
 
   private:
     ReadException(const std::string &message, ffi::ReadErrorInfo &error);
@@ -6058,6 +6066,7 @@ class ReadException final : public IggyException {
     std::optional<std::uint32_t> partition_id_;
     // Shared, so that copying the exception cannot throw.
     std::shared_ptr<const ::iggy::Continuation> skip_;
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> lost_;
 };
 
 /**
@@ -6176,6 +6185,10 @@ class PartitionReader final {
 
     /**
      * @brief Stores the offset of a checkpoint that this reader delivered.
+     *
+     * C++ cannot cancel the call, so it ends at a deadline 10 s after its
+     * start: after a refusal for an earlier owner (5009), the read of the new
+     * owner retries only until then, and the call throws the refusal.
      * @throws IggyException with CommitPolicy::OnRead, for a checkpoint this
      *         reader did not deliver, and for a failed store.
      */
@@ -6191,10 +6204,13 @@ class PartitionReader final {
      * @brief Sets the next read position of a partition and drops its queued batches.
      *
      * With CommitPolicy::OnRead, a seek to an offset above 0 first stores the
-     * offset before it, so a restart resumes at the new position. Every other
-     * seek stores nothing.
+     * offset before it, so a restart resumes at the new position. A seek to
+     * offset 0 or PollingStrategy::First() deletes the stored offset, and a
+     * seek to a timestamp stores the offset before the first message at the
+     * timestamp, if there is one. Every other seek stores nothing. The call
+     * ends at a deadline 10 s after its start, as Commit() does.
      * @throws IggyException for a partition this reader does not read, and for
-     *         a failed store, after which nothing moved.
+     *         a failed read, lookup, store or delete, after which nothing moved.
      */
     void Seek(std::uint32_t partition_id, const PollingStrategy &start);
 
@@ -6334,6 +6350,9 @@ class IggyConsumer final {
 
     /**
      * @brief Stores the offset of a checkpoint that this consumer handed over.
+     *
+     * The call ends at a deadline 10 s after its start, as
+     * PartitionReader::Commit() does.
      * @throws IggyException with CommitPolicy::OnRead and for a failed store.
      */
     void Commit(const Checkpoint &checkpoint);
@@ -6348,10 +6367,14 @@ class IggyConsumer final {
      * @brief Sets the next read position of a partition.
      *
      * With CommitPolicy::OnRead, a seek to an offset above 0 first stores the
-     * offset before it, so a restart resumes at the new position. Every other
-     * seek stores nothing.
+     * offset before it, so a restart resumes at the new position. A seek to
+     * offset 0 or PollingStrategy::First() deletes the stored offset, and a
+     * seek to a timestamp stores the offset before the first message at the
+     * timestamp, if there is one. Every other seek stores nothing. The call
+     * ends at a deadline 10 s after its start, as Commit() does.
      * @throws IggyException for a partition this consumer does not read, and
-     *         for a failed store, after which nothing moved.
+     *         for a failed read, lookup, store or delete, after which nothing
+     *         moved.
      */
     void Seek(std::uint32_t partition_id, const PollingStrategy &start);
     void Seek(std::uint32_t partition_id, const Continuation &continuation);

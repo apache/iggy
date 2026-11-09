@@ -22,6 +22,8 @@ use iggy::prelude::{
     PartitionReader as RustPartitionReader, PolledMessages as RustPolledMessages,
     PollingStrategy as RustPollingStrategy, ReadError,
 };
+use iggy_common::with_binary_deadline;
+use tokio::time::Instant;
 
 use crate::{
     RUNTIME, ffi,
@@ -29,6 +31,15 @@ use crate::{
 };
 
 const CLOSED: &str = "the reader is closed";
+
+/// C++ cannot cancel a blocking commit or seek, so each one ends at this deadline after its
+/// start. The read of the owner after a refusal (5009) retries only until then.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Runs a commit or a seek of a reader or a consumer, under a deadline of [`WRITE_TIMEOUT`].
+pub(crate) fn block_on_write<T>(write: impl Future<Output = T>) -> T {
+    RUNTIME.block_on(with_binary_deadline(Instant::now() + WRITE_TIMEOUT, write))
+}
 
 /// The C++ handle of a reader. `close` takes the reader out, so every later call fails, except
 /// a second `close`, which does nothing.
@@ -87,8 +98,7 @@ impl PartitionReader {
         let reader = reader
             .as_ref()
             .ok_or_else(|| format!("Could not commit checkpoint: {CLOSED}"))?;
-        RUNTIME
-            .block_on(reader.commit(checkpoint.0))
+        block_on_write(reader.commit(checkpoint.0))
             .inspect_err(|error| error_info.record(error))
             .map_err(|error| format!("Could not commit checkpoint: {error}"))
     }
@@ -141,8 +151,7 @@ impl PartitionReader {
         let reader = reader
             .as_mut()
             .ok_or_else(|| format!("Could not seek partition {partition_id}: {CLOSED}"))?;
-        RUNTIME
-            .block_on(reader.seek(partition_id, start))
+        block_on_write(reader.seek(partition_id, start))
             .inspect_err(|error| error_info.record(error))
             .map_err(|error| format!("Could not seek partition {partition_id}: {error}"))
     }
@@ -176,6 +185,9 @@ impl ffi::ReadErrorInfo {
             .map(|skip| Box::new(Continuation(skip)))
             .into_iter()
             .collect();
+        let lost = error.lost.as_ref().map(|lost| (*lost.start(), *lost.end()));
+        self.has_lost = lost.is_some();
+        (self.lost_first, self.lost_last) = lost.unwrap_or_default();
     }
 }
 
@@ -183,6 +195,7 @@ impl ffi::ReadErrorInfo {
 mod tests {
     use super::*;
     use iggy::prelude::{Checkpoint as RustCheckpoint, IggyError, PartitionContext, PollingKind};
+    use iggy_common::binary_operation_deadline;
     use std::thread;
 
     const PARTITION: u32 = 1;
@@ -277,15 +290,10 @@ mod tests {
     fn should_record_the_skip_of_a_read_error_as_one_continuation() {
         let skip = continuation_at(5);
         let mut info = ffi::ReadErrorInfo::default();
+        let mut undecoded = ReadError::new(Some(PARTITION), IggyError::InvalidMessagePayloadLength);
+        undecoded.skip = Some(skip);
 
-        info.record(&ReadError {
-            partition_id: Some(PARTITION),
-            error: IggyError::InvalidMessagePayloadLength,
-            skip: Some(skip),
-            offset: None,
-            record: None,
-            lost: None,
-        });
+        info.record(&undecoded);
         assert!(info.has_partition_id);
         assert_eq!(info.partition_id, PARTITION);
         assert_eq!(
@@ -296,18 +304,48 @@ mod tests {
             [skip]
         );
 
-        info.record(&ReadError {
-            partition_id: None,
-            error: IggyError::ClientShutdown,
-            skip: None,
-            offset: None,
-            record: None,
-            lost: None,
-        });
+        info.record(&ReadError::new(None, IggyError::ClientShutdown));
         assert!(!info.has_partition_id);
         assert!(
             info.skip.is_empty(),
             "a later error must not keep the skip of an earlier one"
+        );
+    }
+
+    #[test]
+    fn should_record_the_first_and_last_offset_of_a_lost_range() {
+        const FIRST: u64 = 4;
+        const LAST: u64 = 9;
+        const OPERATION: u64 = 42;
+        let mut info = ffi::ReadErrorInfo::default();
+        let mut lost = ReadError::new(
+            Some(PARTITION),
+            IggyError::FetchProgressUncertain(OPERATION),
+        );
+        lost.skip = Some(continuation_at(LAST + 1));
+        lost.lost = Some(FIRST..=LAST);
+
+        info.record(&lost);
+        assert!(info.has_lost);
+        assert_eq!((info.lost_first, info.lost_last), (FIRST, LAST));
+
+        info.record(&ReadError::new(Some(PARTITION), IggyError::ClientShutdown));
+        assert!(
+            !info.has_lost,
+            "a later error must not keep the lost range of an earlier one"
+        );
+        assert_eq!((info.lost_first, info.lost_last), (0, 0));
+    }
+
+    #[test]
+    fn given_a_blocking_commit_or_seek_when_running_should_end_at_the_write_timeout() {
+        let start = Instant::now();
+
+        let deadline = block_on_write(async { binary_operation_deadline() });
+
+        assert!(
+            deadline >= start + WRITE_TIMEOUT && deadline <= Instant::now() + WRITE_TIMEOUT,
+            "the write must run under a deadline {WRITE_TIMEOUT:?} after its start"
         );
     }
 }

@@ -57,10 +57,9 @@ public final class IggyConsumer {
     private final PartitionReader reader;
     private final CommitAfter after;
     private final Deque<Held> held = new ArrayDeque<>();
-    // The partitions of the seeks that the reader has not applied yet, each with the number of its latest seek.
-    private final Map<Long, Long> seeking = new HashMap<>();
-    // The batches of each partition in seeking. A seek that moves drops them, and a failed one hands them over.
-    private final Map<Long, List<Held>> parked = new HashMap<>();
+    // The partitions of the seeks that the reader has not applied yet, each with its latest seek and its batches. A
+    // seek that moves drops them, and a failed one hands them over.
+    private final Map<Long, Parked> parked = new HashMap<>();
     private long seeks;
     private ReceivedMessage uncounted;
     private CompletableFuture<ReceivedMessage> waiting;
@@ -116,12 +115,15 @@ public final class IggyConsumer {
      * seek that moves drops them, and a failed one hands them over.
      */
     public synchronized CompletableFuture<Void> seek(long partitionId, PollingStrategy start) {
+        // A refused seek changes nothing, so the batches stay with an earlier seek of the partition.
+        start.requirePartition(partitionId);
         if (uncounted != null && uncounted.partitionId() == partitionId) {
             uncounted = null;
         }
         long seek = ++seeks;
-        seeking.put(partitionId, seek);
-        List<Held> kept = parked.computeIfAbsent(partitionId, id -> new ArrayList<>());
+        Parked earlier = parked.get(partitionId);
+        List<Held> kept = earlier == null ? new ArrayList<>() : earlier.batches();
+        parked.put(partitionId, new Parked(seek, kept));
         for (Iterator<Held> batches = held.iterator(); batches.hasNext(); ) {
             Held next = batches.next();
             if (next.batch.partitionId() == partitionId) {
@@ -129,12 +131,7 @@ public final class IggyConsumer {
                 batches.remove();
             }
         }
-        try {
-            return reader.seek(partitionId, start, moved -> applied(partitionId, seek, moved));
-        } catch (RuntimeException refused) {
-            applied(partitionId, seek, false);
-            throw refused;
-        }
+        return reader.seek(partitionId, start, moved -> applied(partitionId, seek, moved));
     }
 
     /** The partitions of the reader. */
@@ -279,9 +276,9 @@ public final class IggyConsumer {
             }
             return;
         }
-        List<Held> kept = parked.get(next.partitionId());
+        Parked kept = parked.get(next.partitionId());
         if (kept != null) {
-            kept.add(new Held(next));
+            kept.batches().add(new Held(next));
         } else {
             held.addLast(new Held(next));
         }
@@ -289,17 +286,17 @@ public final class IggyConsumer {
     }
 
     private synchronized void applied(long partitionId, long seek, boolean moved) {
-        List<Held> kept = parked.get(partitionId);
+        Parked kept = parked.get(partitionId);
         if (kept == null) {
             return;
         }
         if (moved) {
-            kept.clear();
+            kept.batches().clear();
         }
         // A later seek of the partition decides what the batches before it become.
-        if (seeking.remove(partitionId, seek)) {
+        if (kept.seek() == seek) {
             parked.remove(partitionId);
-            held.addAll(kept);
+            held.addAll(kept.batches());
             resumeTake();
         }
     }
@@ -337,4 +334,7 @@ public final class IggyConsumer {
             this.batch = batch;
         }
     }
+
+    /** The number of the latest seek of a partition, and the batches of the partition that wait for it. */
+    private record Parked(long seek, List<Held> batches) {}
 }

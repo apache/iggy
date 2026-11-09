@@ -140,14 +140,18 @@ impl PartitionReader {
     ///
     /// With `CommitPolicy.OnRead()`, a seek to an offset above 0 first stores the offset before
     /// it, under the history of a continuation or else of the last delivered message, so a
-    /// restart resumes at the new position. A failed store fails the seek and nothing moves.
-    /// Every other seek stores nothing. The new position waits for the end of the committing
-    /// read in flight, whose reply the new generation drops.
+    /// restart resumes at the new position. A seek to offset 0 or `PollingStrategy.First()`
+    /// deletes the stored offset under the same history when the server holds one, because the
+    /// commit of a read never moves the offset back. A seek to a timestamp first reads one
+    /// message at the timestamp without a commit, and then acts as a seek to the offset of that
+    /// message. Without such a message it stores nothing. A failed read, lookup, store or delete
+    /// fails the seek and nothing moves. Every other seek stores nothing. The new position waits
+    /// for the end of the committing read in flight, whose reply the new generation drops.
     ///
     /// Raises `IggyError` with `InvalidCommand` (3) for a partition that the reader does not read
     /// and for a continuation of another partition, `PendingOperationError` with `OnRead` while
     /// a read of the partition has an unknown outcome (abandon its operation first), the errors
-    /// of the offset store with `OnRead`, and `RuntimeError` after `close()`.
+    /// of the read, lookup, store or delete with `OnRead`, and `RuntimeError` after `close()`.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn seek<'a>(
         &self,

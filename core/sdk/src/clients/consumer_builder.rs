@@ -16,7 +16,9 @@
 // under the License.
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::clients::reader_builder::{DEFAULT_MAX_WAIT, DEFAULT_PREFETCH_BYTES};
+use crate::clients::reader_builder::{
+    DEFAULT_MAX_WAIT, DEFAULT_PREFETCH_BYTES, DEFAULT_PREFETCH_MESSAGES,
+};
 use crate::prelude::IggyConsumer;
 use iggy_common::locking::IggyRwLock;
 use iggy_common::{
@@ -38,7 +40,7 @@ pub struct IggyConsumerBuilder {
     polling_strategy: PollingStrategy,
     poll_options: PollOptions,
     prefetch_bytes: u32,
-    prefetch_messages: Option<u32>,
+    prefetch_messages: u32,
     create_consumer_group_if_not_exists: bool,
     encryptor: Option<Arc<EncryptorKind>>,
     polling_retry_interval: NonZeroIggyDuration,
@@ -67,7 +69,7 @@ impl IggyConsumerBuilder {
             polling_strategy: PollingStrategy::next(),
             poll_options: PollOptions::wait(DEFAULT_MAX_WAIT.into()),
             prefetch_bytes: DEFAULT_PREFETCH_BYTES,
-            prefetch_messages: None,
+            prefetch_messages: DEFAULT_PREFETCH_MESSAGES,
             create_consumer_group_if_not_exists: true,
             encryptor,
             polling_retry_interval: NonZeroIggyDuration::ONE_SECOND,
@@ -133,7 +135,7 @@ impl IggyConsumerBuilder {
     /// raises the effective budget to at least 32 full batches of `count`.
     pub fn prefetch_messages(self, prefetch_messages: u32) -> Self {
         Self {
-            prefetch_messages: Some(prefetch_messages),
+            prefetch_messages,
             ..self
         }
     }

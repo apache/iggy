@@ -1216,7 +1216,7 @@ class PartitionReaderTest {
     @Test
     void shouldKeepThePositionWithoutItsOwnerAfterTheServerSaysAnotherOwnerHoldsThePartition() throws Exception {
         FakeTransport transport = new FakeTransport(true);
-        PartitionReader reader = member(transport, MANUAL);
+        PartitionReader reader = PartitionReaderPacingTest.memberRetryingSoon(transport);
         try {
             assignment(transport, 1L);
             transport.nextRead().answer(section(1, 0, 1));
@@ -1231,7 +1231,8 @@ class PartitionReaderTest {
             refusedRead.answer(refused(1, notOwned));
 
             Read again = transport.nextRead();
-            assertThat(System.nanoTime() - refusedAt).isGreaterThanOrEqualTo(RETRY_INTERVAL.toNanos());
+            assertThat(System.nanoTime() - refusedAt)
+                    .isGreaterThanOrEqualTo(PartitionReaderPacingTest.SHORT_RETRY.toNanos());
             assertThat(again.targets().get(1L)).isEqualTo(unowned);
             again.answer(refused(1, notOwned));
             for (int refusal = 2; refusal < 6; refusal++) {

@@ -155,7 +155,7 @@ struct LinksShared {
     sweep_stop: Notify,
     /// Changes each time a link starts to serve requests, so a request without a link goes out
     /// once one is ready instead of after its whole backoff.
-    ready_links: watch::Sender<u64>,
+    ready_links: watch::Sender<()>,
     events: Sender<DiagnosticEvent>,
     /// Never read. Each subscriber is a clone, so it replays the backlog.
     subscribers: Receiver<DiagnosticEvent>,
@@ -266,7 +266,7 @@ impl ReplicaLinks {
                 dial_permits: Semaphore::new(MAX_CONCURRENT_DIALS),
                 coordinator: ConnectCoordinator::new(),
                 sweep_stop: Notify::new(),
-                ready_links: watch::Sender::new(0),
+                ready_links: watch::Sender::new(()),
                 events,
                 subscribers,
             }),
@@ -406,7 +406,7 @@ impl ReplicaLinks {
     /// The link for `target`, or a receiver that changes once a link starts to
     /// serve requests. A link changes the table before it wakes the requests,
     /// so the second look finds a link that was ready before the subscription.
-    pub(crate) fn link_or_wait(&self, target: Target) -> Result<Arc<Link>, watch::Receiver<u64>> {
+    pub(crate) fn link_or_wait(&self, target: Target) -> Result<Arc<Link>, watch::Receiver<()>> {
         if let Ok(link) = self.link(target) {
             return Ok(link);
         }
@@ -1263,8 +1263,7 @@ impl LinksShared {
 
     /// Wakes the requests that wait for a link.
     fn wake_requests(&self) {
-        self.ready_links
-            .send_modify(|changes| *changes = changes.wrapping_add(1));
+        self.ready_links.send_replace(());
     }
 
     fn slot_down(&self, id: u8, link: &Arc<Link>) {

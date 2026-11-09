@@ -1676,7 +1676,7 @@ class PartitionReaderStoredOffsetTest {
      * Answers an assignment read with no membership, as after a lost session whose successor installed the owners
      * again, and the one after the join.
      */
-    private static void loseMembership(FakeTransport transport, Long... partitions) throws InterruptedException {
+    static void loseMembership(FakeTransport transport, Long... partitions) throws InterruptedException {
         CompletableFuture<Optional<ConsumerGroupAssignment>> sync =
                 transport.assignments.poll(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
         assertThat(sync).as("the reader reads its assignment").isNotNull();

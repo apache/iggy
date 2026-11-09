@@ -19,6 +19,8 @@ use std::time::Duration;
 
 use ext_php_rs::{exception::PhpResult, php_class, php_impl, types::Zval};
 use iggy::prelude::PartitionReader as RustPartitionReader;
+use iggy_common::with_binary_deadline;
+use tokio::time::Instant;
 
 use crate::client::optional_unsigned;
 use crate::error::to_php_exception;
@@ -26,6 +28,16 @@ use crate::receive_message::{Checkpoint, PolledMessages, PollingStrategy};
 use crate::runtime::runtime;
 
 const CLOSED: &str = "the reader is closed";
+
+/// PHP cannot cancel a blocking offset write (a commit, a seek, or a store or delete of an
+/// offset), so each one ends at this deadline after its start. The read of the owner after a
+/// refusal (5009) retries only until then.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Runs an offset write of a reader or a consumer, under a deadline of [`WRITE_TIMEOUT`].
+pub(crate) fn block_on_write<T>(write: impl Future<Output = T>) -> T {
+    runtime().block_on(with_binary_deadline(Instant::now() + WRITE_TIMEOUT, write))
+}
 
 /// Reads the partitions of a topic in batches, with routing, prefetch and the position of each
 /// partition inside. Build one with Client::reader() or Client::groupReader().
@@ -89,11 +101,13 @@ impl PartitionReader {
     /// A checkpoint of an older generation of its partition, or at or below the last commit of
     /// its generation, stores nothing. A checkpoint that this reader did not deliver, and every
     /// commit under CommitPolicy::onRead(), fail with InvalidCommand (3).
+    ///
+    /// PHP cannot cancel the call, so it ends at a deadline 10 s after its start: after a
+    /// refusal for an earlier owner (5009), the read of the new owner retries only until then,
+    /// and the call throws the refusal.
     pub fn commit(&self, checkpoint: &Checkpoint) -> PhpResult {
         let reader = self.open()?;
-        runtime()
-            .block_on(reader.commit(checkpoint.inner))
-            .map_err(to_php_exception)
+        block_on_write(reader.commit(checkpoint.inner)).map_err(to_php_exception)
     }
 
     /// Counts a checkpoint that this reader delivered under CommitPolicy::auto() and stores
@@ -112,18 +126,21 @@ impl PartitionReader {
     ///
     /// Under CommitPolicy::onRead(), a seek to an offset above 0 first stores the offset before
     /// it, under the history of a continuation or else of the last delivered message, so a
-    /// restart resumes at the new position. A failed store fails the seek with its exception and
-    /// nothing moves. Every other seek stores nothing. The new position waits for the end of the
-    /// committing read in flight, whose reply the new generation drops.
+    /// restart resumes at the new position. A seek to offset 0 or PollingStrategy::first()
+    /// deletes the stored offset under the same history when the server holds one, because the
+    /// commit of a read never moves the offset back. A seek to a timestamp first reads one
+    /// message at the timestamp without a commit, and then acts as a seek to the offset of that
+    /// message. Without such a message it stores nothing. A failed read, lookup, store or delete
+    /// fails the seek with its exception and nothing moves. Every other seek stores nothing. The
+    /// new position waits for the end of the committing read in flight, whose reply the new
+    /// generation drops. The call ends at a deadline 10 s after its start, as commit() does.
     ///
     /// A partition that the reader does not read, and a continuation of another partition,
     /// fail with InvalidCommand (3). Under CommitPolicy::onRead(), a read with an unknown
     /// outcome fails with PartitionLaneBlocked (14009): abandon its operation first.
     pub fn seek(&mut self, partition_id: u32, start: &PollingStrategy) -> PhpResult {
         let reader = self.open_mut()?;
-        runtime()
-            .block_on(reader.seek(partition_id, start.into()))
-            .map_err(to_php_exception)
+        block_on_write(reader.seek(partition_id, start.into())).map_err(to_php_exception)
     }
 
     /// The partitions that the reader reads: those of a standalone consumer, or the current
@@ -156,5 +173,23 @@ impl PartitionReader {
 
     fn open_mut(&mut self) -> PhpResult<&mut RustPartitionReader> {
         self.inner.as_mut().ok_or_else(|| to_php_exception(CLOSED))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_common::binary_operation_deadline;
+
+    #[test]
+    fn given_a_blocking_commit_or_seek_when_running_should_end_at_the_write_timeout() {
+        let start = Instant::now();
+
+        let deadline = block_on_write(async { binary_operation_deadline() });
+
+        assert!(
+            deadline >= start + WRITE_TIMEOUT && deadline <= Instant::now() + WRITE_TIMEOUT,
+            "the write must run under a deadline {WRITE_TIMEOUT:?} after its start"
+        );
     }
 }

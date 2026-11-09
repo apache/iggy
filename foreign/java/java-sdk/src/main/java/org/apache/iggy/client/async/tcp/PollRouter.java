@@ -53,7 +53,6 @@ import java.io.IOException;
 import java.time.Duration;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -333,6 +332,7 @@ final class PollRouter {
 
     /**
      * Fetches from the primary of {@code partition} using the encoded stream and topic in {@code topic}.
+     * Each target of a fetch carries its own fence, so the request header carries none.
      * Attempts stop {@link DeferredPollOptions#REPLY_MARGIN} before {@code deadline}, preserving the last capacity
      * refusal when no retry fits. In-flight replies keep the full deadline.
      */
@@ -1688,6 +1688,7 @@ final class PollRouter {
         }
     }
 
+    /** One poll or offset write, routed by the routing command and sent as the data command. */
     private static final class Poll {
         private final TargetKey key;
         private final byte[] routingBody;
@@ -1709,12 +1710,15 @@ final class PollRouter {
         private final boolean commits;
         private boolean historyRefreshed;
         private boolean retryingRefusal;
+        // The last capacity refusal, which the call reports when its deadline ends the retries. A budget too short
+        // for another attempt also ends them with 58, which would hide it.
         private IggyServerException capacityRefusal;
         private boolean notPrimarySeen;
         private long notPrimaryRetryMillis = RETRY_INTERVAL_MILLIS;
         private boolean terminalRoutingRefusal;
         private boolean dataSent;
-        // Start lookups at the metadata primary, ahead of backups that missed the namespace.
+        // The lookups until a route is used start at the metadata primary, which a backup that missed the namespace
+        // lags behind.
         private boolean backupMiss;
         private long lifecycleRetryMillis = RETRY_INTERVAL_MILLIS;
         private IggyServerException lifecycleRefusal;
@@ -1815,7 +1819,8 @@ final class PollRouter {
             }
         }
 
-        // A refusal survives route lookup; enqueue clears it before preparing the next exchange.
+        // A refusal leaves nothing in flight on a primary until the next route is known,
+        // so the flag must survive the route lookup that follows it.
         private synchronized void routed() {
             retryingRefusal = false;
             lifecycleRefusal = null;
@@ -1891,49 +1896,6 @@ final class PollRouter {
 
         private synchronized IggyServerException deadlineRefusal() {
             return capacityRefusal != null ? capacityRefusal : notAccepted();
-        }
-    }
-
-    /**
-     * The target bytes of a partition request, or their stream and topic prefix, compared by content. Nothing writes
-     * the bytes after a key holds them.
-     */
-    private static final class TargetKey {
-        private final byte[] target;
-        private final int length;
-        private final int hash;
-
-        private TargetKey(byte[] target, int length) {
-            this.target = target;
-            this.length = length;
-            int contentHash = 1;
-            for (int index = 0; index < length; index++) {
-                contentHash = 31 * contentHash + target[index];
-            }
-            this.hash = contentHash;
-        }
-
-        static TargetKey of(byte[] target) {
-            return new TargetKey(target, target.length);
-        }
-
-        /** The stream and topic of a partition target, without its trailing partition id. */
-        TargetKey topic() {
-            return new TargetKey(target, length - Integer.BYTES);
-        }
-
-        boolean startsWith(TargetKey prefix) {
-            return length >= prefix.length && Arrays.equals(target, 0, prefix.length, prefix.target, 0, prefix.length);
-        }
-
-        @Override
-        public boolean equals(Object other) {
-            return other instanceof TargetKey key && Arrays.equals(target, 0, length, key.target, 0, key.length);
-        }
-
-        @Override
-        public int hashCode() {
-            return hash;
         }
     }
 

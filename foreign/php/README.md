@@ -398,7 +398,10 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
 - With `CommitPolicy::onRead()`, the server stores the offset of each reply. A lost reply, also to a `disconnect()` while the poll waits, then throws `FetchProgressUncertain` (14010), and the partition stays blocked until `abandonOperation()`. `disconnect()` closes the connection until the next `connect()`, after which `loginUser()` signs in again.
 - `consumerGroup()` builds a member of a consumer group, and creates a missing group
   by default. `reader()` builds a batch reader of chosen partitions as a standalone
-  consumer, and `groupReader()` a batch reader of an existing consumer group.
+  consumer, and `groupReader()` a batch reader of an existing consumer group. A group
+  create or join with an unknown outcome throws its error, and the next `groupReader()`
+  or `consumerGroup()` joins again. A join that landed keeps its member in the group
+  until the session ends.
 - `PartitionReader::next()` waits until a batch arrives. Give `timeout_micros` to
   limit the wait. At the timeout, `next()` returns `null`, and the script gets control
   back. A batch that arrives later stays in the reader for the next call.
@@ -425,6 +428,8 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   commit after a recreation or an owner change is refused instead of landing on the newer
   partition. `storeOffset()` commits under the context of the latest message consumed
   from that partition. `PolledMessages::checkpoint()` covers the whole batch.
+- PHP cannot cancel `commit()` and `seek()` of a reader or a consumer, or `storeOffset()`
+  and `deleteOffset()` of a consumer, so each one ends at a deadline 10 s after its start.
 - `PolledMessages::continuation()` continues a poll after the batch, under the
   partition context of the batch. A read after a recreation fails with
   `HistoryUnavailable` (87). A continuation cannot move to another process: store a
@@ -437,7 +442,10 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   `getCode()` is the error code, `getPrevious()` the typed exception that a direct call
   would throw, `partition_id` the partition or `null`, and `skip` the continuation after
   a message that does not decode. The reader retries by itself. `HistoryUnavailable`
-  (87) stops the partition until `seek()`.
+  (87) stops the partition until `seek()`. A lost read can commit messages that the
+  reader cannot read again. Then the reader throws `FetchProgressUncertain` (14010)
+  once. Its `lost` holds the first and last offset of those messages as `[first, last]`,
+  and `skip` the continuation after them.
 - Call `close()` on a reader and `shutdown()` on a consumer before the script ends.
   Under `CommitPolicy::auto()`, they store the latest counted position first. Under
   `CommitPolicy::onRead()`, they move the offset back to the last delivered

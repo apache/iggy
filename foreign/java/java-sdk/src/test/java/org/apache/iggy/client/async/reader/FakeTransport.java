@@ -92,6 +92,8 @@ final class FakeTransport implements ReaderTransport {
     volatile CompletableFuture<Void> storeReply = CompletableFuture.completedFuture(null);
     // The reply to each lookup of the groups, which the test holds back.
     volatile CompletableFuture<Void> groupsReply = CompletableFuture.completedFuture(null);
+    // The refusal that the next lookup of the groups throws before it sends, as the client does for a bad partition id.
+    volatile RuntimeException groupsRefusal;
     final List<Long> abandoned = new CopyOnWriteArrayList<>();
     // The reply to each abandon, which the test holds back.
     volatile CompletableFuture<Void> abandonReply = CompletableFuture.completedFuture(null);
@@ -105,6 +107,8 @@ final class FakeTransport implements ReaderTransport {
     final List<String> membership = new CopyOnWriteArrayList<>();
     volatile RuntimeException joinFailure;
     volatile RuntimeException leaveFailure;
+    // The reply to each leave, which the test holds back.
+    volatile CompletableFuture<Void> leaveReply = CompletableFuture.completedFuture(null);
     // The reply to the cancel of the committing reads, which the test holds back.
     volatile CompletableFuture<Void> settled = CompletableFuture.completedFuture(null);
     // The operations of the committing reads whose outcome stayed unknown after the cancel.
@@ -182,6 +186,11 @@ final class FakeTransport implements ReaderTransport {
     @Override
     public CompletableFuture<List<List<Long>>> groups(List<Long> partitions) {
         groupings.add(partitions);
+        RuntimeException refusal = groupsRefusal;
+        if (refusal != null) {
+            groupsRefusal = null;
+            throw refusal;
+        }
         return groupsReply.thenApply(ignored -> grouper.apply(partitions));
     }
 
@@ -323,7 +332,7 @@ final class FakeTransport implements ReaderTransport {
     @Override
     public CompletableFuture<Void> leave() {
         membership.add("leave");
-        return groupWrite(leaveFailure);
+        return leaveReply.thenCompose(ignored -> groupWrite(leaveFailure));
     }
 
     /** A poll that the test answers with one section. */

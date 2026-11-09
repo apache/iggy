@@ -1328,6 +1328,7 @@ func TestPartitionReader_HandsOverTheBatchAfterALostReadWhenItsPartitionLeavesUn
 		require.NotNil(t, readError.PartitionID)
 		assert.Equal(t, uint32(1), *readError.PartitionID)
 		assert.Contains(t, readError.Error(), "offsets 2 to 4 ", "the report names the range that the lost read stored")
+		assert.Equal(t, &OffsetRange{First: 2, Last: 4}, readError.Lost)
 	case <-time.After(testTimeout):
 		t.Fatal("the reader reported no loss for the partition that left")
 	}
@@ -1629,13 +1630,13 @@ func TestPartitionReader_ReportsOnceThePartOfALostRangeThatTheHistoryNoLongerHol
 		name string
 		// replies answer the reads again in turn, the first one from offset 2.
 		replies []iggcon.FetchMessagesSection
-		lost    string
+		lost    OffsetRange
 		batches [][]uint64
 	}{
-		{"whole_range/empty_read", []iggcon.FetchMessagesSection{empty(5)}, "offsets 2 to 4 ", [][]uint64{{5, 6}}},
-		{"whole_range/read_after_it", []iggcon.FetchMessagesSection{section(1, 5, 6)}, "offsets 2 to 4 ", [][]uint64{{5, 6}}},
-		{"start/empty_read", []iggcon.FetchMessagesSection{empty(3), section(1, 3, 4)}, "offsets 2 to 2 ", [][]uint64{{3, 4}, {5, 6}}},
-		{"start/read_inside_it", []iggcon.FetchMessagesSection{section(1, 3, 4)}, "offsets 2 to 2 ", [][]uint64{{3, 4}, {5, 6}}},
+		{"whole_range/empty_read", []iggcon.FetchMessagesSection{empty(5)}, OffsetRange{First: 2, Last: 4}, [][]uint64{{5, 6}}},
+		{"whole_range/read_after_it", []iggcon.FetchMessagesSection{section(1, 5, 6)}, OffsetRange{First: 2, Last: 4}, [][]uint64{{5, 6}}},
+		{"start/empty_read", []iggcon.FetchMessagesSection{empty(3), section(1, 3, 4)}, OffsetRange{First: 2, Last: 2}, [][]uint64{{3, 4}, {5, 6}}},
+		{"start/read_inside_it", []iggcon.FetchMessagesSection{section(1, 3, 4)}, OffsetRange{First: 2, Last: 2}, [][]uint64{{3, 4}, {5, 6}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := newFakeClient()
@@ -1661,7 +1662,8 @@ func TestPartitionReader_ReportsOnceThePartOfALostRangeThatTheHistoryNoLongerHol
 			require.ErrorAs(t, err, &readError)
 			require.NotNil(t, readError.PartitionID)
 			assert.Equal(t, uint32(1), *readError.PartitionID)
-			assert.Contains(t, err.Error(), test.lost)
+			assert.Contains(t, err.Error(), fmt.Sprintf("offsets %d to %d ", test.lost.First, test.lost.Last))
+			assert.Equal(t, &test.lost, readError.Lost)
 			for _, batch := range test.batches {
 				assert.Equal(t, batch, offsets(next(t, reader)))
 			}
@@ -1693,11 +1695,19 @@ func TestPartitionReader_ReadsAPartitionRefusedAsNotOwnedAgainWithoutItsOwnerGen
 	assert.Equal(t, unowned, *retry.targets[0].Strategy.Context)
 }
 
-func TestPartitionReader_ReportsAPartitionThatStaysRefusedAsNotOwned(t *testing.T) {
+// Each refusal as not the owner in a row doubles the wait before the next read
+// of the partition, up to 32 times the retry interval. The sixth in a row
+// reports one error, and the partition is read again.
+func TestPartitionReader_ReportsAPartitionThatStaysRefusedAsNotOwnedAfterADoublingWait(t *testing.T) {
+	const interval = 10 * time.Millisecond
 	client := newFakeClient()
-	reader := member(t, client, waitOneSecond, 1)
-	for range lastingRefusalsBeforeStop {
-		client.nextRead(t).answer(iggcon.FetchMessagesSection{PartitionId: 1, Err: ierror.ErrConsumerGroupPartitionNotOwned})
+	reader := memberWith(t, client, []uint32{1}, WithPollOptions(waitOneSecond), WithRetryInterval(interval))
+	read := client.nextRead(t)
+	for refusal := range lastingRefusalsBeforeStop {
+		refused := time.Now()
+		read.answer(iggcon.FetchMessagesSection{PartitionId: 1, Err: ierror.ErrConsumerGroupPartitionNotOwned})
+		read = client.nextRead(t)
+		assert.GreaterOrEqual(t, time.Since(refused), interval<<refusal, "the wait after refusal %d in a row", refusal+1)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
@@ -1708,7 +1718,7 @@ func TestPartitionReader_ReportsAPartitionThatStaysRefusedAsNotOwned(t *testing.
 	require.ErrorAs(t, err, &readError)
 	require.ErrorIs(t, err, ierror.ErrConsumerGroupPartitionNotOwned)
 	assert.Equal(t, uint32(1), *readError.PartitionID)
-	client.nextRead(t).answer(section(1, 0))
+	read.answer(section(1, 0))
 	assert.Equal(t, []uint64{0}, offsets(next(t, reader)), "the partition is read again after the report")
 }
 
@@ -3067,8 +3077,9 @@ func TestPartitionReader_ReadsAgainWhatASeekStoreWithAnUnknownOutcomeSkippedUnde
 	assert.Equal(t, []store{{1, 2}, {1, 0}}, client.recordedStores())
 }
 
-// A seek waits for the store of an earlier seek only as long as its context lasts.
-func TestPartitionReader_EndsTheWaitOfASeekForTheStoreOfAnotherSeekWithItsContextUnderOnRead(t *testing.T) {
+// A seek waits for the store of an earlier seek of its partition only as long
+// as its context lasts.
+func TestPartitionReader_EndsTheWaitOfASeekForTheStoreOfAnEarlierSeekOfItsPartitionWithItsContextUnderOnRead(t *testing.T) {
 	client := newFakeClient()
 	client.storeStarted = make(chan context.Context, 4)
 	client.storeRelease = make(chan struct{})
@@ -3079,7 +3090,7 @@ func TestPartitionReader_EndsTheWaitOfASeekForTheStoreOfAnotherSeekWithItsContex
 			close(client.storeRelease)
 		}
 	}
-	reader := standalone(t, client, withCommit(waitOneSecond, iggcon.OnReadCommit()), 1, 2)
+	reader := standalone(t, client, withCommit(waitOneSecond, iggcon.OnReadCommit()), 1)
 	// Before the Close of the cleanup, so that it finds the first store released.
 	t.Cleanup(release)
 	first := make(chan error, 1)
@@ -3093,7 +3104,7 @@ func TestPartitionReader_EndsTheWaitOfASeekForTheStoreOfAnotherSeekWithItsContex
 	defer cancel()
 	second := make(chan error, 1)
 
-	go func() { second <- reader.Seek(ctx, 2, iggcon.OffsetPollingStrategy(5)) }()
+	go func() { second <- reader.Seek(ctx, 1, iggcon.OffsetPollingStrategy(5)) }()
 
 	select {
 	case err := <-second:
@@ -3104,6 +3115,30 @@ func TestPartitionReader_EndsTheWaitOfASeekForTheStoreOfAnotherSeekWithItsContex
 	release()
 	require.NoError(t, <-first)
 	assert.Equal(t, []store{{1, 2}}, client.recordedStores(), "the second seek stores nothing")
+}
+
+// A seek of one partition does not wait for the seek of another one, whose
+// store the server refused as not the owner and whose read for the installed
+// owner the server keeps refusing for now.
+func TestPartitionReader_SeeksAPartitionWhileASeekOfAnotherOneRetriesItsReadForTheInstalledOwnerUnderOnRead(t *testing.T) {
+	client := newFakeClient()
+	client.refusedProbes = map[uint32][]error{1: keptRefusals}
+	reader := member(t, client, withCommit(waitOneSecond, iggcon.OnReadCommit()), 1, 2)
+	require.Eventually(t, func() bool { return slices.Equal(reader.Partitions(), []uint32{1, 2}) }, testTimeout,
+		5*time.Millisecond, "the member holds the partitions")
+	installsTheOwnerAgain(client)
+	first := make(chan error, 1)
+	go func() { first <- reader.Seek(context.Background(), 1, iggcon.OffsetPollingStrategy(5)) }()
+	require.Eventually(t, func() bool { return len(client.recordedProbes()) > 0 }, testTimeout, 5*time.Millisecond,
+		"the read for the installed owner is refused")
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	require.NoError(t, reader.Seek(ctx, 2, iggcon.OffsetPollingStrategy(3)))
+
+	assert.Equal(t, []store{{2, 2}}, client.recordedStores())
+	require.NoError(t, reader.Close(context.Background()))
+	require.ErrorIs(t, <-first, ierror.ErrConsumerGroupPartitionNotOwned, "Close ends the retry of the first seek")
 }
 
 // A seek holds every read of its partition, also the read of what a lost reply
@@ -4015,6 +4050,31 @@ func TestPartitionReader_EndsTheRetryOfARewindRefusedAsNotOwnedWhenTheContextOfC
 	assert.Equal(t, []string{"join", "leave"}, client.membership)
 }
 
+// The close budget ends the retry of the read for the installed owner also
+// when the context of Close never ends. The refusal of the rewind then stands,
+// and the leave still goes.
+func TestPartitionReader_EndsTheRetryOfARewindRefusedAsNotOwnedAtTheCloseBudgetUnderOnRead(t *testing.T) {
+	client, reader := losesAReadAfterADelivery(t)
+	installsTheOwnerAgain(client)
+	client.mu.Lock()
+	client.refusedProbes = map[uint32][]error{1: slices.Repeat([]error{ierror.ErrTransientNotAccepted}, int(2*closeBudget/testRetryInterval))}
+	client.mu.Unlock()
+	started := time.Now()
+	closed := make(chan error, 1)
+
+	go func() { closed <- reader.Close(context.Background()) }()
+
+	select {
+	case err := <-closed:
+		require.ErrorIs(t, err, ierror.ErrConsumerGroupPartitionNotOwned)
+	case <-time.After(closeBudget + testTimeout):
+		t.Fatal("Close retries the read for the installed owner past its budget")
+	}
+	assert.GreaterOrEqual(t, time.Since(started), closeBudget, "the retry lasts until the budget ends")
+	assert.Equal(t, []iggcon.PartitionContext{testContext}, client.recordedStoreContexts(), "the rewind goes once")
+	assert.Equal(t, []string{"join", "leave"}, client.membership)
+}
+
 // A cancel while the read for the installed owner is in flight ends the retry
 // too, so the rewind goes no more after the reply, and its refusal stands.
 func TestPartitionReader_SendsNoRewindAgainWhenTheContextOfCloseEndsDuringTheReadForTheInstalledOwnerUnderOnRead(t *testing.T) {
@@ -4125,6 +4185,9 @@ var countsWithoutStoring = iggcon.AutoCommit{
 	After: iggcon.CommitAfterDelivery,
 }
 
+// storesEachBatch makes each delivered batch ask for a store in the background.
+var storesEachBatch = iggcon.AutoCommit{Every: iggcon.CommitEvery{Kind: iggcon.CommitEveryBatch}, After: iggcon.CommitAfterDelivery}
+
 // The flush on Close stores a counted position of a partition that stayed
 // across a new session under owner generation 0, which the server binds to
 // the owner that it installed for the new session.
@@ -4166,16 +4229,18 @@ func TestPartitionReader_CommitsACheckpointOfAReadBeforeANewSessionUnderTheInsta
 func TestPartitionReader_NeverStoresTheCountedPositionOfAnEarlierAssignmentAfterItsPartitionCameBack(t *testing.T) {
 	client := newFakeClient()
 	client.starts[2] = 4
-	reader := member(t, client, withCommit(waitOneSecond, iggcon.AutoCommitPolicy(countsWithoutStoring)), 1, 2)
+	client.storeStarted, client.storeRelease = make(chan context.Context, 4), make(chan struct{})
+	reader := member(t, client, withCommit(waitOneSecond, iggcon.AutoCommitPolicy(storesEachBatch)), 1, 2)
 	polled := nextInBackground(reader)
 	client.nextRead(t).answer(section(1, 0, 1), section(2, 4, 5))
 	require.NoError(t, (<-polled).err)
+	// One flush runs at a time, so the held store of the first batch holds the
+	// flush that the leave asks for until the partition is back.
+	storeStarts(t, client)
 	assert.Equal(t, []uint64{4, 5}, offsets(next(t, reader)))
-	// Holds the flush that the leave asks for until the partition is back.
-	reader.storeLock <- struct{}{}
 	assign(t, client, reader, 1)
 	assign(t, client, reader, 1, 2)
-	<-reader.storeLock
+	close(client.storeRelease)
 
 	require.NoError(t, reader.Close(context.Background()))
 
@@ -4189,17 +4254,19 @@ func TestPartitionReader_NeverStoresTheCountedPositionOfALeftPartitionUnderALost
 	client := newFakeClient()
 	client.starts[2] = 4
 	client.starts[3] = 7
-	reader := member(t, client, withCommit(waitOneSecond, iggcon.AutoCommitPolicy(countsWithoutStoring)), 1, 2, 3)
+	client.storeStarted, client.storeRelease = make(chan context.Context, 4), make(chan struct{})
+	reader := member(t, client, withCommit(waitOneSecond, iggcon.AutoCommitPolicy(storesEachBatch)), 1, 2, 3)
 	polled := nextInBackground(reader)
 	client.nextRead(t).answer(section(1, 0, 1), section(2, 4, 5), section(3, 7, 8))
 	require.NoError(t, (<-polled).err)
+	// One flush runs at a time, so the held store of the first batch holds the
+	// flush that the first leave asks for until the membership is lost.
+	storeStarts(t, client)
 	next(t, reader)
 	next(t, reader)
-	// Holds the flush that the first leave asks for until the membership is lost.
-	reader.storeLock <- struct{}{}
 	assign(t, client, reader, 1, 3)
 	losesItsSession(t, client, reader, 1)
-	<-reader.storeLock
+	close(client.storeRelease)
 
 	require.NoError(t, reader.Close(context.Background()))
 

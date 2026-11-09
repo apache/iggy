@@ -607,7 +607,9 @@ until `abandon_operation()`, as described above. `poll_messages()` refuses
 `reader()` returns a `PartitionReader`, which reads the partitions of a topic
 with prefetch and keeps the position of each one. A `Consumer.Single` reads the
 `partitions` that you pass. A `Consumer.Group` joins its group and reads the
-partitions that the server assigns to it. `next()` returns the next batch of
+partitions that the server assigns to it. A join with an unknown outcome raises
+its error, and the next `reader()` joins again. A join that landed keeps its
+member in the group until the session ends. `next()` returns the next batch of
 one partition and never an empty one, and `commit()` stores the offset of a
 checkpoint. The default options wait up to five seconds for messages. `next()`
 has no time limit. To bound it, use `asyncio.wait_for()`: a cancelled `next()`
@@ -686,6 +688,10 @@ itself. A partition that was deleted and created again stops with
 `HistoryUnavailable` (87) until `seek(partition_id, start)` picks a new start.
 `consume_messages()` then raises the error and stops. Call it again after the
 seek. If a message does not decode, pass `skip` to `seek()` to read past it.
+A lost read can commit messages that the reader cannot read again. Then the
+reader raises `FetchProgressUncertain` (14010) once. Its `lost` holds the first
+and last offset of those messages as `(first, last)`, and `skip` the
+continuation after them.
 
 ## Examples
 

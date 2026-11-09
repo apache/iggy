@@ -22,8 +22,11 @@ package org.apache.iggy.client.async.reader;
 import org.apache.iggy.client.async.reader.FakeTransport.Read;
 import org.apache.iggy.exception.IggyClientException;
 import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.message.PolledMessages;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -39,9 +42,37 @@ import static org.apache.iggy.client.async.reader.PartitionReaderTest.RETRY_INTE
 import static org.apache.iggy.client.async.reader.PartitionReaderTest.serverError;
 import static org.apache.iggy.client.async.reader.PartitionReaderTest.standalone;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** The reader against lookups of the groups of its partitions that fail after a good one. */
+/** The reader against failed lookups of the groups of its partitions, and against ids that a lookup refuses. */
 class PartitionReaderGroupingTest {
+    /** The client refuses a partition id outside the wire range unsent, so the build refuses it first. */
+    @ParameterizedTest
+    @ValueSource(longs = {-1, 0x1_0000_0000L})
+    void shouldRefuseAPartitionIdOutsideTheWireRange(long id) {
+        FakeTransport transport = new FakeTransport(false);
+
+        assertThatThrownBy(() -> PartitionReader.builder(transport)
+                        .partitions(List.of(id))
+                        .build())
+                .isInstanceOf(IggyInvalidArgumentException.class);
+        assertThat(transport.groupings).isEmpty();
+    }
+
+    /** A lookup that throws before it sends fails as a failed one does, so the reader looks up again and reads. */
+    @Test
+    void shouldLookUpAgainAfterALookupThatThrowsBeforeItSends() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        transport.groupsRefusal = new IggyClientException("The client refused the lookup");
+        PartitionReader reader = standalone(transport, MANUAL, 1L);
+        try {
+            assertThat(transport.nextRead().targets()).containsOnlyKeys(1L);
+            assertThat(transport.groupings).hasSize(2);
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
     /**
      * A lookup runs beside the reads, and a failed one keeps the last good groups. A partition that a primary refused
      * waits for the next lookup, so while lookups fail the moved primary gets one read per lookup.

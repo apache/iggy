@@ -278,7 +278,10 @@ try {
   follows rebalances and leaves the group in `close()`. The reader resolves a
   join with an unknown outcome before its next join. `close()` releases a join
   that is still unknown in the client, and also a leave with an unknown
-  outcome. So neither blocks a later metadata write of the client.
+  outcome. So neither blocks a later metadata write of the client. When the
+  join of `open()` has an unknown outcome, `open()` releases it in the client
+  and fails with it, so a later `open()` can join. A join that landed anyway
+  keeps its member in the group until the session ends.
 - `next()` returns one batch of one partition, never empty. A `ReadError`
   names the partition of an error, or none for an error of the whole reader,
   and the reader retries by itself. Error 87 stops a partition until `seek`
@@ -309,18 +312,18 @@ try {
   repaired: the next read finds what it stored, and the reader reads those
   messages again by offset without a commit. If the partition no longer holds
   a part of that range, for example after retention, `next()` fails once with
-  error 14010. Its `ReadError` names that part, and the reader reads on after
-  it. Only a lost read makes the reader
-  read skipped offsets again: when the stored offset moved ahead because the
+  error 14010. Its `ReadError` names that part, also as `lost`, the first and
+  last offset, and the reader reads on after it. Only a lost read makes the
+  reader read skipped offsets again: when the stored offset moved ahead because the
   application or another session stored it, the reader delivers from there. A
   batch that the server stored is handed over even when its partition left the
   assignment of the member. If a lost read of that partition stored a range
   that the reader did not read again, `next()` first fails with error 14010.
-  Its `ReadError` names that range. `close()` does not move the offset of a
-  partition that left, so the group loses its batches that `next()` did not
-  return. A `seek` first waits for each committing read of its partition in
-  flight, also one from before a new assignment. A `seek` to an offset above 0
-  then stores the offset before it,
+  Its `ReadError` names that range, also as `lost`. `close()` does not move
+  the offset of a partition that left, so the group loses its batches that
+  `next()` did not return. A `seek` first waits for each committing read of
+  its partition in flight, also one from before a new assignment. A `seek` to
+  an offset above 0 then stores the offset before it,
   so a restart resumes at the sought offset. If the server holds an offset, a
   `seek` to offset 0 or First deletes it instead, because the commit of a read
   never moves an offset back. A `seek` to a timestamp first reads the first
@@ -355,15 +358,17 @@ try {
   server serves the partition again, a catch-up after a lost read goes on. The
   wait before the next read starts at the retry interval and doubles after
   each 5009 in a row. Each sixth 5009 in a row gives one `ReadError`, and then
-  the count and the wait start again. A read that succeeds or a `seek` also
-  starts them again.
+  the count and the wait start again. A read that succeeds, a `seek` or a
+  session change also starts them again.
 - If an offset store or delete of a partition that is still assigned gets 5009,
   a read without a commit finds the installed owner. Then the write goes once
   more under that owner. A transient refusal of that read repeats it after the
   retry interval. If that read stops, the write fails with its refusal. The
-  read for a write of `close({ signal })` stops after `signal` of the first
-  call aborts, and the close still leaves the group. A second `close()` call
-  waits for the first one, and its signal does not stop the close. The read for
+  read for a write of `close({ signal })` stops 10 s after the close starts.
+  If `signal` of the first call aborts earlier, the read stops at that abort.
+  Each later write of the close then goes once without that read, and the
+  close still leaves the group. A second `close()` call waits for the first
+  one, and its signal does not stop the close. The read for
   `commit(checkpoint, { signal })` stops after `signal` aborts or `close()`
   starts. The read for a seek or an automatic store stops after `close()`
   starts. After such a stop, a reply to that read does not send the write
@@ -383,7 +388,8 @@ try {
   32 full batches, and larger configured budgets still apply. A budget that is
   NaN, infinite or negative is refused with error 3 before anything is sent.
   Without options a read waits up to 5 s. After a refused read, a lost read or
-  a failed refresh it waits `retryInterval`, 1 s by default.
+  a failed refresh it waits `retryInterval`, 1 s by default. A `retryInterval`
+  that is not a finite number above 0 is refused with error 3 too.
 - With `CommitPolicy.OnRead` the server stores the offset of each read before
   the application takes its batch. A crash, or a reader that stops without
   `close()`, loses the batches that the reader held: up to the effective
@@ -409,7 +415,9 @@ await consumer.shutdown();
 ```
 
 - `client.consumerGroup` creates the group when it is missing and joins it.
-  `client.consumer` reads the given `partitions` under the consumer `name`.
+  When that create has an unknown outcome, the call releases it in the client
+  and fails with it. `client.consumer` reads the given `partitions` under the
+  consumer `name`.
 - Under `CommitAfter.Processing` a message counts once the iterator is read
   again or its handler returns. A handler that throws ends `consume` with its
   error and leaves its message uncounted, and so does a shutdown while the
@@ -418,9 +426,10 @@ await consumer.shutdown();
   the first and ends as it does. `seek` drops the rest of the batch of its
   partition.
 - `commit(checkpoint, { signal })` and `shutdown({ signal })` give `signal` to
-  `commit()` and `close()` of the reader. If a store gets 5009, an abort of
-  `signal` stops the read for the owner, as for the reader. Only the signal of
-  the first `shutdown()` call can stop the shutdown.
+  `commit()` and `close()` of the reader. If a store gets 5009, the read for
+  the owner stops as for the reader: 10 s after the shutdown starts, or at an
+  earlier abort of `signal`. Only the signal of the first `shutdown()` call
+  can stop the shutdown.
 - A read error that the reader retries by itself goes to `onError` and the
   consumer goes on. A stop of a partition (`stopsPartition`) ends the
   iteration with its `ReadError`, and so does a message that does not decode,

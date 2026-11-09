@@ -2124,33 +2124,41 @@ public sealed class PartitionReaderTests
     }
 
     /// <summary>
-    ///     The server refuses the store of the close as not owned, and then refuses the read for the owner for its poll
-    ///     quota for longer than the client retries one read. The token of the close stays live, so the reader reads
-    ///     again after the client gave up, and the store goes again under the owner of the read.
+    ///     The server refuses a commit as not owned, and then refuses the read for the owner for its poll quota for
+    ///     longer than the client retries one read. The token of the commit stays live, so the reader reads again after
+    ///     the client gave up, and the store goes again under the owner of the read.
     /// </summary>
     [Fact]
-    public async Task given_on_read_when_the_read_for_the_owner_of_a_refused_close_store_hits_the_poll_quota_should_read_again_and_store()
+    public async Task given_a_commit_refused_as_not_owned_when_the_read_for_the_owner_hits_the_poll_quota_should_read_again_and_store()
     {
-        using var cluster = new ReaderCluster(1) { Limit = 6, Assignment = [1], HoldFetches = true };
-        cluster.Stored[1] = 3;
+        using var cluster = new ReaderCluster(1) { Assignment = [1] };
         using var client = await cluster.ConnectAsync();
         var reader = await client.Reader(Stream, Topic, Consumer.Group("readers"))
-            .WithOptions(new PollOptions { MaxWait = TimeSpan.FromMilliseconds(100), Commit = CommitPolicy.OnRead })
+            .WithOptions(new PollOptions { MaxWait = TimeSpan.FromMilliseconds(100) })
             .WithRetryInterval(RetryInterval).BuildAsync(Token);
-        await QueueFirstBatchAsync(cluster, reader);
-        cluster.NextStoreNotOwned = true;
-        cluster.ProbeRefusal = VsrError.DEFERRED_POLL_CAPACITY_EXCEEDED;
+        try
+        {
+            var batch = await reader.NextAsync(Token);
+            cluster.NextStoreNotOwned = true;
+            cluster.ProbeRefusal = VsrError.DEFERRED_POLL_CAPACITY_EXCEEDED;
 
-        var probes = cluster.Probes;
-        var closing = reader.CloseAsync(Token).AsTask();
-        await UntilAsync(() => cluster.Probes > probes);
-        // The client retries one read until its request timeout, which a read without a wait spends on the margin.
-        await Task.Delay(new PollOptions().RequestTimeout + SettleWindow, Token);
-        cluster.ProbeRefusal = null;
-        await closing.WaitAsync(PromptLimit, Token);
+            var probes = cluster.Probes;
+            var commit = reader.CommitAsync(batch.Checkpoint!, Token);
+            await UntilAsync(() => cluster.Probes > probes);
+            // The client retries one read until its request timeout, which a read without a wait spends on the margin.
+            await Task.Delay(new PollOptions().RequestTimeout + SettleWindow, Token);
+            cluster.ProbeRefusal = null;
+            await commit.WaitAsync(PromptLimit, Token);
 
-        Assert.Equal(3ul, cluster.Stored[1]);
-        Assert.Equal([ReaderCluster.Served.OwnerGeneration, ReaderCluster.Served.OwnerGeneration], cluster.StoreOwners);
+            Assert.Equal(batch.Checkpoint!.Offset, cluster.Stored[1]);
+            Assert.Equal([ReaderCluster.Served.OwnerGeneration, ReaderCluster.Served.OwnerGeneration],
+                cluster.StoreOwners);
+        }
+        finally
+        {
+            cluster.ProbeRefusal = null;
+            await reader.CloseAsync(Token);
+        }
     }
 
     /// <summary>
@@ -2229,6 +2237,38 @@ public sealed class PartitionReaderTests
         Assert.Equal(sent, (cluster.Polls.Count, cluster.Fetches.Count, cluster.Syncs, cluster.StoreOwners.Count));
         Assert.Equal(stores + 2, cluster.StoreOwners.Count);
         // The rewinds go one at a time, so only the partition of the first one was read for its owner.
+        Assert.Single(cluster.Polls.Skip(polls).Select(poll => poll.PartitionId).Distinct());
+        Assert.All(cluster.Stored.Values, stored => Assert.Equal(5ul, stored));
+        Assert.Equal(1, cluster.Leaves);
+    }
+
+    /// <summary>
+    ///     The server refuses every store of the close as not owned, and every read for the owner for its poll quota.
+    ///     <see cref="PartitionReader.DisposeAsync" /> closes with a token that is never canceled, so the budget of the
+    ///     close ends those reads, and the refusal stands. The budget counts once from the start of the close: the
+    ///     rewind of the other partition goes once, with no read for its owner, and the reader leaves the group.
+    /// </summary>
+    [Fact]
+    public async Task given_on_read_when_every_read_for_the_owner_of_a_refused_close_store_hits_the_poll_quota_should_end_the_dispose_at_the_close_budget()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 6, Assignment = [1, 2], HoldFetches = true };
+        cluster.Stored[1] = 3;
+        cluster.Stored[2] = 3;
+        using var client = await cluster.ConnectAsync();
+        var reader = await client.Reader(Stream, Topic, Consumer.Group("readers"))
+            .WithOptions(new PollOptions { MaxWait = TimeSpan.FromMilliseconds(100), Commit = CommitPolicy.OnRead })
+            .WithRetryInterval(RetryInterval).BuildAsync(Token);
+        await QueueFirstBatchAsync(cluster, reader);
+        cluster.StoresNotOwned = true;
+        cluster.ProbeRefusal = VsrError.DEFERRED_POLL_CAPACITY_EXCEEDED;
+
+        var (polls, stores) = (cluster.Polls.Count, cluster.StoreOwners.Count);
+        await reader.DisposeAsync().AsTask().WaitAsync(PartitionReader.CloseOwnerReadBudget + PromptLimit, Token);
+        var sent = (cluster.Polls.Count, cluster.Fetches.Count, cluster.Syncs, cluster.StoreOwners.Count);
+        await Task.Delay(RetryInterval * 2, Token);
+
+        Assert.Equal(sent, (cluster.Polls.Count, cluster.Fetches.Count, cluster.Syncs, cluster.StoreOwners.Count));
+        Assert.Equal(stores + 2, cluster.StoreOwners.Count);
         Assert.Single(cluster.Polls.Skip(polls).Select(poll => poll.PartitionId).Distinct());
         Assert.All(cluster.Stored.Values, stored => Assert.Equal(5ul, stored));
         Assert.Equal(1, cluster.Leaves);
@@ -2534,6 +2574,7 @@ public sealed class PartitionReaderTests
         var delivered = await ReadAsync(reader, 2);
 
         Assert.Contains("offsets 4 to 5", lost.Message);
+        Assert.Equal(new OffsetRange(4, 5), lost.Lost);
         Assert.Equal([6ul, 7ul, 8ul, 9ul, 14ul, 15ul, 16ul, 17ul],
             delivered.SelectMany(batch => batch.Messages).Select(message => message.Header.Offset));
     }
@@ -2555,6 +2596,7 @@ public sealed class PartitionReaderTests
         var delivered = await ReadAsync(reader, 3);
 
         Assert.Contains("offsets 4 to 4", lost.Message);
+        Assert.Equal(new OffsetRange(4, 4), lost.Lost);
         Assert.Equal(Enumerable.Range(5, 9).Select(offset => (ulong)offset),
             delivered.SelectMany(batch => batch.Messages).Select(message => message.Header.Offset));
     }
@@ -2902,6 +2944,45 @@ public sealed class PartitionReaderTests
     }
 
     /// <summary>
+    ///     The server refuses every read of the partition as not owned, so the wait before each read doubles. A new
+    ///     session starts the count and the wait again, as the Rust reader does at a new epoch. So the partition reads
+    ///     before the wait of the old session ends, and the wait after its next refusal is one retry interval.
+    /// </summary>
+    [Fact]
+    public async Task given_a_partition_refused_as_not_owned_when_the_session_changes_should_read_at_once_and_wait_one_retry_interval()
+    {
+        // The doubled wait of the old session must outlast the sync that finds the new session within a second.
+        var retryInterval = TimeSpan.FromSeconds(2);
+        using var cluster = new ReaderCluster(1) { Assignment = [1] };
+        cluster.NotOwned.Add(1);
+        using var client = await cluster.ConnectAsync();
+        var reader = await client.Reader(Stream, Topic, Consumer.Group("readers"))
+            .WithOptions(new PollOptions { MaxWait = TimeSpan.FromMilliseconds(100) })
+            .WithRetryInterval(retryInterval).BuildAsync(Token);
+        try
+        {
+            int Reads() => cluster.Fetches.Count + cluster.Polls.Count;
+
+            // After its second refusal in a row the partition waits two retry intervals.
+            await UntilAsync(() => Reads() >= 2);
+            var refused = Reads();
+            var sinceRefusal = Stopwatch.StartNew();
+            await client.LogoutUserAsync(Token);
+            await SignInAgainAsync(cluster, client);
+            await UntilAsync(() => Reads() > refused, (long)(retryInterval * 3).TotalMilliseconds);
+            Assert.InRange(sinceRefusal.Elapsed, TimeSpan.Zero, retryInterval * 1.5);
+
+            var sinceRead = Stopwatch.StartNew();
+            await UntilAsync(() => Reads() > refused + 1, (long)(retryInterval * 2).TotalMilliseconds);
+            Assert.InRange(sinceRead.Elapsed, retryInterval / 2, retryInterval * 1.5);
+        }
+        finally
+        {
+            await reader.CloseAsync(Token);
+        }
+    }
+
+    /// <summary>
     ///     A group member takes the start at each new assignment of a partition. With on read commits it looks up the
     ///     stored offset each time and resumes after it.
     /// </summary>
@@ -3063,6 +3144,7 @@ public sealed class PartitionReaderTests
             var lost = Assert.IsAssignableFrom<IggyInvalidStatusCodeException>(error.InnerException);
             Assert.Equal(VsrError.FETCH_PROGRESS_UNCERTAIN, lost.StatusCode);
             Assert.Contains("offsets 2 to 3", lost.Message);
+            Assert.Equal(new OffsetRange(2, 3), error.Lost);
             Assert.Equal([4ul, 5ul], (await reader.NextAsync(timeout.Token)).Messages.Select(message => message.Header.Offset));
             using var quiet = CancellationTokenSource.CreateLinkedTokenSource(Token);
             quiet.CancelAfter(SettleWindow);
@@ -4047,7 +4129,7 @@ public sealed class PartitionReaderTests
     }
 
     /// <summary>The next item of the reader, which must report a lost range that the history no longer holds.</summary>
-    private static async Task<IggyInvalidStatusCodeException> GoneRangeAsync(PartitionReader reader)
+    private static async Task<ReadException> GoneRangeAsync(PartitionReader reader)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(Token);
         timeout.CancelAfter(PromptLimit);
@@ -4055,7 +4137,7 @@ public sealed class PartitionReaderTests
         var lost = Assert.IsAssignableFrom<IggyInvalidStatusCodeException>(error.InnerException);
         Assert.Equal(VsrError.FETCH_PROGRESS_UNCERTAIN, lost.StatusCode);
         Assert.Contains("no longer holds", lost.Message);
-        return lost;
+        return error;
     }
 
     /// <summary>A reply of partition 1 with the two messages from <paramref name="from" />.</summary>

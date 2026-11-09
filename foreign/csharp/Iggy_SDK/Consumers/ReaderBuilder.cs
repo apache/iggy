@@ -139,6 +139,10 @@ public sealed class ReaderBuilder
     ///     join.
     /// </exception>
     /// <exception cref="FeatureUnavailableException">A consumer group on a transport without its assignment, such as HTTP.</exception>
+    /// <exception cref="VsrRequestOutcomeUnknownException">
+    ///     The join has an unknown outcome. The reader abandons it in the client first, so the next build can join. A
+    ///     join that landed keeps the member in the group until the session ends.
+    /// </exception>
     public async Task<PartitionReader> BuildAsync(CancellationToken token = default)
     {
         ArgumentNullException.ThrowIfNull(_options);

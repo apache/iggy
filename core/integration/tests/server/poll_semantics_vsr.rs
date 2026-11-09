@@ -693,6 +693,11 @@ async fn given_committing_poll_when_dropped_should_settle_through_its_one_reply(
     );
 }
 
+/// The first read after a join can meet 5009 while the server installs the owner, and the
+/// reader reads again after the retry interval. A short interval keeps that wait far below the
+/// deadline, so the deadline measures only the group fetch.
+const JOIN_RETRY_INTERVAL: &str = "100ms";
+
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
 async fn given_deferred_group_when_one_partition_is_empty_should_deliver_other_partition(
     harness: &TestHarness,
@@ -724,6 +729,7 @@ async fn given_deferred_group_when_one_partition_is_empty_should_deliver_other_p
             count: 1,
             ..PollOptions::wait(Duration::from_secs(2).into())
         })
+        .polling_retry_interval(NonZeroIggyDuration::from_str(JOIN_RETRY_INTERVAL).unwrap())
         .build();
     consumer.init().await.unwrap();
     let mut messages = vec![

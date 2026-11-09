@@ -45,6 +45,9 @@ public final class PartitionReaderBuilder {
     public static final Duration DEFAULT_RETRY_INTERVAL = Duration.ofSeconds(1);
     public static final int MIN_PREFETCH_SLOTS = 32;
 
+    // The wire carries a partition id as an unsigned 32-bit integer, and the client refuses any other id unsent.
+    private static final long MAX_PARTITION_ID = 0xFFFF_FFFFL;
+
     private final ReaderTransport transport;
     private List<Long> partitions;
     private PollingStrategy start = PollingStrategy.next();
@@ -117,12 +120,15 @@ public final class PartitionReaderBuilder {
     }
 
     /**
-     * Starts the reader. A consumer group reader joins its group first.
+     * Starts the reader. A consumer group reader joins its group first. A join whose outcome stays unknown fails the
+     * build, and the reader abandons it in the client, so the next build can join. If that join landed, the server
+     * keeps the member until the session of the client ends.
      *
      * @return the reader, or the error of the join
      * @throws IggyValidationException with {@link IggyErrorCode#INVALID_COMMAND} for partitions of a group, no
      *                                 partitions of a standalone consumer, or a continuation as the start
-     * @throws IggyInvalidArgumentException for a negative prefetch budget or a retry interval that is not positive
+     * @throws IggyInvalidArgumentException for a negative prefetch budget, a retry interval that is not positive, or a
+     *                                      partition id outside 0 to 4294967295
      */
     public CompletableFuture<PartitionReader> build() {
         options.validate();
@@ -139,6 +145,7 @@ public final class PartitionReaderBuilder {
             throw new IggyInvalidArgumentException(
                     "A reader needs nonnegative prefetch budgets and a positive retry interval");
         }
+        requireWirePartitionIds();
         long messages = prefetchMessages > 0 ? prefetchMessages : DEFAULT_PREFETCH_MESSAGES;
         int slots = (int) Math.min(
                 Integer.MAX_VALUE,
@@ -146,6 +153,12 @@ public final class PartitionReaderBuilder {
         var reader = new PartitionReader(
                 transport, partitions == null ? List.of() : partitions, startPosition(), options, slots, retryInterval);
         return reader.start();
+    }
+
+    private void requireWirePartitionIds() {
+        if (partitions != null && partitions.stream().anyMatch(id -> id < 0 || id > MAX_PARTITION_ID)) {
+            throw new IggyInvalidArgumentException("A partition id of a reader is between 0 and " + MAX_PARTITION_ID);
+        }
     }
 
     /** Under OnRead the start applies only without a stored offset, and then the server answers Next from offset 0. */

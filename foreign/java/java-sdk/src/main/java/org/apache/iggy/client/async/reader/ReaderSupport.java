@@ -42,7 +42,6 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.OptionalLong;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -76,16 +75,16 @@ final class ReaderSupport {
 
     /** The error of the offsets from {@code from} to before {@code end}, which a read whose reply was lost stored. */
     static ReadException lostRange(long partitionId, BigInteger from, BigInteger end) {
+        BigInteger last = end.subtract(BigInteger.ONE);
         return new ReadException(
-                OptionalLong.of(partitionId),
+                partitionId,
                 new IggyServerException(
                         IggyErrorCode.FETCH_PROGRESS_UNCERTAIN,
                         IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode(),
-                        "Offsets " + from + " to " + end.subtract(BigInteger.ONE)
-                                + " were stored by a read whose reply was lost",
+                        "Offsets " + from + " to " + last + " were stored by a read whose reply was lost",
                         Optional.empty(),
                         Optional.empty()),
-                Optional.empty());
+                new ReadException.OffsetRange(from, last));
     }
 
     /**
@@ -166,10 +165,7 @@ final class ReaderSupport {
     static CompletableFuture<List<FetchedMessages>> probe(
             ReaderTransport transport, PollOptions options, long id, PollingStrategy strategy) {
         return transport.read(
-                Map.of(id, strategy),
-                1,
-                false,
-                options.withMinCount(1).withMaxWait(options.maxWait()).deferredOptions());
+                Map.of(id, strategy), 1, false, options.withMinCount(1).deferredOptions());
     }
 
     /** A fetch starts only at an offset or at the next offset, so a poll finds the offset of any other position. */
@@ -188,15 +184,16 @@ final class ReaderSupport {
 
     /**
      * The assignment of the member. If the group lost the member, as after a lost session, the reader runs
-     * {@code lost} on {@code loop} and joins again first.
+     * {@code lost} on {@code loop} and joins again first. Once {@code closed} holds, the close leaves or left the group,
+     * so a lost member stays out, and the assignment is empty.
      */
     static CompletableFuture<Optional<ConsumerGroupAssignment>> assignment(
-            ReaderTransport transport, Runnable lost, Executor loop) {
+            ReaderTransport transport, BooleanSupplier closed, Runnable lost, Executor loop) {
         return transport
                 .assignment()
                 .thenComposeAsync(
                         assignment -> {
-                            if (assignment.isPresent()) {
+                            if (assignment.isPresent() || closed.getAsBoolean()) {
                                 return CompletableFuture.completedFuture(assignment);
                             }
                             lost.run();

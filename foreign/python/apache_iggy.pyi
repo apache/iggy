@@ -2182,9 +2182,9 @@ class IggyClient:
         Raises `IggyError` with `InvalidCommand` (3) for partitions of a group, a
         `Consumer.Single` without partitions or a continuation as `start`,
         `FeatureUnavailable` for a consumer group over HTTP, the errors of `options`, and the
-        error of the group join. A join with an unknown outcome raises `PendingOperationError`:
-        the client keeps it, so a new `reader()` raises `lane_blocked` until
-        `resolve_operation()` or `abandon_operation()` settles it.
+        error of the group join. A join with an unknown outcome raises `PendingOperationError`
+        after `reader()` abandoned it on the client, so the next `reader()` joins again. A join
+        that landed keeps its member in the group until the session ends.
         """
     def consumer_group(
         self,
@@ -2381,7 +2381,9 @@ class IggyConsumer:
         r"""
         Sets the next read position of a partition and drops the rest of its batch that the
         consumer yields from. With `CommitPolicy.OnRead()`, a seek to an offset above 0 first
-        stores the offset before it, so a restart resumes at the new position. Every other seek
+        stores the offset before it, so a restart resumes at the new position. A seek to offset 0
+        or `PollingStrategy.First()` deletes the stored offset. A seek to a timestamp stores the
+        offset before the first message at the timestamp, if there is one. Every other seek
         stores nothing. It resumes a stopped partition.
         `start` is a new strategy or a continuation of the same partition, such as
         `ReadError.skip`. After `HistoryUnavailable` (87), the partition reads nothing until
@@ -2389,9 +2391,9 @@ class IggyConsumer:
         Raises `IggyError` with `InvalidCommand` (3) for a partition that the consumer does not
         read and for a continuation of another partition, `PendingOperationError` under
         `CommitPolicy.OnRead()` while a read of the partition has an unknown outcome
-        (abandon its operation first), the errors of the offset store with `OnRead`, and
-        `RuntimeError` while `consume_messages()` runs, also from its callback: seek after the
-        run ends.
+        (abandon its operation first), the errors of the read, lookup, store or delete with
+        `OnRead`, and `RuntimeError` while `consume_messages()` runs, also from its callback:
+        seek after the run ends.
         """
     def delete_offset(
         self, partition_id: builtins.int | None
@@ -3944,14 +3946,18 @@ class PartitionReader:
 
         With `CommitPolicy.OnRead()`, a seek to an offset above 0 first stores the offset before
         it, under the history of a continuation or else of the last delivered message, so a
-        restart resumes at the new position. A failed store fails the seek and nothing moves.
-        Every other seek stores nothing. The new position waits for the end of the committing
-        read in flight, whose reply the new generation drops.
+        restart resumes at the new position. A seek to offset 0 or `PollingStrategy.First()`
+        deletes the stored offset under the same history when the server holds one, because the
+        commit of a read never moves the offset back. A seek to a timestamp first reads one
+        message at the timestamp without a commit, and then acts as a seek to the offset of that
+        message. Without such a message it stores nothing. A failed read, lookup, store or delete
+        fails the seek and nothing moves. Every other seek stores nothing. The new position waits
+        for the end of the committing read in flight, whose reply the new generation drops.
 
         Raises `IggyError` with `InvalidCommand` (3) for a partition that the reader does not read
         and for a continuation of another partition, `PendingOperationError` with `OnRead` while
         a read of the partition has an unknown outcome (abandon its operation first), the errors
-        of the offset store with `OnRead`, and `RuntimeError` after `close()`.
+        of the read, lookup, store or delete with `OnRead`, and `RuntimeError` after `close()`.
         """
     def partitions(self) -> collections.abc.Awaitable[list[builtins.int]]:
         r"""
@@ -4462,6 +4468,13 @@ class ReadError(IggyError):
         not change, such as `Unauthorized` (41). A `seek()` of the partition reads it again.
         """
     @property
+    def lost(self) -> tuple[builtins.int, builtins.int] | None:
+        r"""
+        For messages that a lost read committed and that the reader could not read again: their
+        first and last offset, as `(first, last)`. The error is then `FetchProgressUncertain`
+        (14010). `None` for every other error.
+        """
+    @property
     def error(self) -> IggyError:
         r"""
         The error as the client raises it for any other call: an `IggyError`, or a
@@ -4472,7 +4485,8 @@ class ReadError(IggyError):
         r"""
         For a message that does not decode: the continuation after it. The messages before it
         arrive in a batch before this error, and the reader reads the message again until
-        `seek()` to this continuation skips it.
+        `seek()` to this continuation skips it. For a lost range: the continuation after the
+        last offset of `lost`. `None` for every other error.
         """
     @property
     def record(self) -> bytes | None: ...

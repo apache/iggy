@@ -373,6 +373,7 @@ A join or a leave with an unknown outcome blocks the metadata writes of the clie
 The reader resolves such a join before its next sync.
 `Close` abandons a join that is still unknown, and a leave with an unknown outcome.
 If the first join has an unknown outcome, `reader.NewPartitionReader` abandons it and returns the error.
+If that join landed, the client stays a member of the group until its session ends.
 A later or concurrent `Close` waits for the first one and returns its result.
 If its own context ends first, it returns the error of that context.
 
@@ -391,15 +392,16 @@ err = partitionReader.Close(ctx)
 
 - `ManualCommit`: `Commit` stores the offset of a delivered checkpoint, forward only within a generation. The reader abandons a store with an unknown outcome, and `Commit` returns its error. So a retry of `Commit` can store.
 - `OnReadCommit`: the server stores each read, and the reader reads only for a waiting `Next`. After a read whose reply was lost, the reader abandons it, waits its retry interval, and its next read starts after what the lost read stored. The reader reads those messages again without a store and delivers them first.
-  If the partition no longer holds some of them, for example after retention, `Next` returns a `reader.ReadError` in their place. It wraps `errors.FetchProgressUncertain` and names their range. A forward jump without such a lost read is a store of the application or of another session, and the reader goes on from there.
+  If the partition no longer holds some of them, for example after retention, `Next` returns a `reader.ReadError` in their place. It wraps `errors.FetchProgressUncertain` and names their range in its text and in `Lost`, a `reader.OffsetRange`. A forward jump without such a lost read is a store of the application or of another session, and the reader goes on from there.
 
   The start of `reader.WithStart` applies only to a partition without a stored offset. A partition with one resumes after it. A seek moves the stored offset.
 
-  A partition that leaves the assignment still hands over the reads that the server stored for it. If a lost read of that partition stored a known range that the reader did not read again, `Next` first returns a `reader.ReadError` that wraps `errors.FetchProgressUncertain` and names that range. `Close` does not move the offset of a partition that left, so its batches that `Next` did not return before `Close` are lost for the group.
+  A partition that leaves the assignment still hands over the reads that the server stored for it. If a lost read of that partition stored a known range that the reader did not read again, `Next` first returns a `reader.ReadError` that wraps `errors.FetchProgressUncertain` and names that range the same way. `Close` does not move the offset of a partition that left, so its batches that `Next` did not return before `Close` are lost for the group.
 
   From its start until it moves or fails, a `Seek` holds back the reads of its partition.
-  It first waits for the committing read in flight of the partition and for the write of an earlier seek.
-  That read can wait on the server up to the max wait. Then a seek to an offset above 0 stores the offset before it.
+  It first waits for the committing read in flight of the partition and for the write of an earlier seek of the partition.
+  That read can wait on the server up to the max wait. The seek does not wait for the seeks of other partitions.
+  Then a seek to an offset above 0 stores the offset before it.
   If the partition has a stored offset, a seek to offset 0 or `First` deletes it instead,
   so the reads replay the partition.
   A seek to a timestamp first finds the first message at it with a read that stores nothing.
@@ -418,7 +420,7 @@ err = partitionReader.Close(ctx)
   The seek looks up the stored offset for it too,
   and after a write with an unknown outcome the partition reads on after that stored offset.
 
-  After such a delete, a restart applies the start again. A seek whose context ends before its write changes nothing. A seek whose context ends after it sent its write returns at once and finishes in the background. A later seek waits for it, and the logger reports a failure of that write.
+  After such a delete, a restart applies the start again. A seek whose context ends before its write changes nothing. A seek whose context ends after it sent its write returns at once and finishes in the background. A later seek of the partition waits for it, and the logger reports a failure of that write.
 
   `Close` waits for a seek in progress. Then it moves the offset of each partition with undelivered batches back to its last delivered message. A partition that delivered none moves before the first of those batches. A partition whose reads returned no batch moves back only over what they stored. A write of `Close` with an unknown outcome fails it. The reader abandons that write, so it does not block a later write of the partition on the same client. `Commit` and `Mark` are refused.
 
@@ -435,9 +437,10 @@ A `*reader.ReadError` names its partition. `errors.ErrHistoryUnavailable` stops 
 `errors.ErrConsumerGroupPartitionNotOwned` on a read is no leave,
 because a new session and a move of the partition away and back look the same.
 The partition keeps its position and what `Close` needs of it.
-The reader asks for a new assignment and reads the partition again after the retry interval.
+The reader asks for a new assignment and reads the partition again after a wait.
+The wait is the retry interval after the first refusal and doubles with each refusal in a row, up to 32 times the retry interval.
 Until a read names the new owner, the reads and writes of the partition name owner generation 0.
-Six refusals in a row are reported. Only a leave that a new assignment shows drops the state of the partition.
+The sixth refusal in a row reports one error, and the count starts again. Only a leave that a new assignment shows drops the state of the partition.
 A refusal that a retry does not change is retried with a doubling wait and stops its partition after six in a row.
 
 A store or delete refused as not the owner, of a partition that the reader still reads, is no leave either.
@@ -449,7 +452,7 @@ For a seek whose context ended, and for an `AutoCommitPolicy` store in the backg
 So when `Close` starts, their retry ends, and the logger reports the error.
 If that read is refused otherwise, or reads another history of the partition, the write fails with its first error.
 
-If the context of the first `Close` ends, `Close` stops its reads for the installed owner. Each write that needs such a read then fails with its first error. The other writes of `Close` and the leave still go once, within the request timeout of the client.
+At the end of the context of the first `Close`, or 10 s after its start, `Close` stops its reads for the installed owner. Each write that needs such a read then fails with its first error. The other writes of `Close` and the leave still go once, within the request timeout of the client.
 
 ### Consumer
 

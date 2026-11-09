@@ -51,12 +51,12 @@ pub struct ReaderBuilder {
     start: PollingStrategy,
     options: PollOptions,
     prefetch_bytes: u32,
-    prefetch_messages: Option<u32>,
+    prefetch_messages: u32,
     encryptor: Option<Arc<EncryptorKind>>,
     retry_interval: Duration,
     /// Set by `IggyConsumer`, which reports its deliveries to the same record.
     progress: Option<Arc<Progress>>,
-    /// Set by `IggyConsumer`, which keeps an uncertain create or join for its next `init()`.
+    /// Set by `IggyConsumer`, which creates a missing group.
     membership: Option<Arc<Membership>>,
 }
 
@@ -92,7 +92,7 @@ impl ReaderBuilder {
             start: PollingStrategy::next(),
             options: PollOptions::wait(IggyDuration::from(DEFAULT_MAX_WAIT)),
             prefetch_bytes: DEFAULT_PREFETCH_BYTES,
-            prefetch_messages: None,
+            prefetch_messages: DEFAULT_PREFETCH_MESSAGES,
             encryptor,
             retry_interval: DEFAULT_RETRY_INTERVAL,
             progress: None,
@@ -140,7 +140,7 @@ impl ReaderBuilder {
     /// default options.
     pub fn prefetch_messages(self, messages: u32) -> Self {
         Self {
-            prefetch_messages: Some(messages),
+            prefetch_messages: messages,
             ..self
         }
     }
@@ -194,9 +194,8 @@ impl ReaderBuilder {
     ///   the server would store the offset of a batch before it decrypts.
     /// - The errors of [`PollOptions::validate`], and the error of the first join.
     /// - [`IggyError::OperationUncertain`] for a create or a join of the group with an unknown
-    ///   outcome. The client keeps that operation, so a new `build()` gets
-    ///   [`IggyError::LaneBlocked`] until [`Client::resolve_operation`] or
-    ///   [`Client::abandon_operation`] settles it.
+    ///   outcome. The reader abandons that operation on the client at once, so a new `build()`
+    ///   joins again. A join that landed keeps the member in the group until its session ends.
     pub async fn build(self) -> Result<PartitionReader, IggyError> {
         let (config, mut shared) = self.into_parts()?;
         let events = {
@@ -278,8 +277,7 @@ impl ReaderBuilder {
             );
             return Err(IggyError::InvalidConfiguration);
         }
-        let prefetch_messages = self.prefetch_messages.unwrap_or(DEFAULT_PREFETCH_MESSAGES);
-        let slots = budget_slots(prefetch_messages, self.prefetch_bytes, self.options);
+        let slots = budget_slots(self.prefetch_messages, self.prefetch_bytes, self.options);
         // Without a stored offset the server answers `Next` from offset 0, so under `OnRead`
         // `First` needs no lookup.
         let start = if self.options.commit == CommitPolicy::OnRead
@@ -315,7 +313,6 @@ impl ReaderBuilder {
             })
         });
         let shared = Shared {
-            wake: progress.wake(),
             progress,
             epoch: AtomicU64::new(0),
             demand: AtomicBool::new(false),

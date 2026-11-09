@@ -54,6 +54,9 @@ const (
 	// followed its join or changed its partitions. A join moves ownership only
 	// after the partition logs persist the new owner, a few milliseconds later.
 	assignmentSettlePause = 10 * time.Millisecond
+	// closeBudget bounds the reads of Close for the installed owner, from the
+	// start of Close, so a refusal that stays transient cannot hold Close.
+	closeBudget = 10 * time.Second
 )
 
 // ReadError is an error of a read. The reader stays usable after it and retries by itself.
@@ -64,6 +67,16 @@ type ReadError struct {
 	// Skip is, for a message that does not decode, the continuation after it.
 	// The partition stops until a Seek, to Skip to step over the message.
 	Skip *iggcon.PollingStrategy
+	// Lost is, for a known lost range, the offsets that a read whose reply was
+	// lost stored and that the reader does not deliver. Err then wraps
+	// errors.FetchProgressUncertain.
+	Lost *OffsetRange
+}
+
+// OffsetRange holds the offsets of a partition from First to Last, both included.
+type OffsetRange struct {
+	First uint64
+	Last  uint64
 }
 
 func (e *ReadError) Error() string {
@@ -328,8 +341,9 @@ type PartitionReader struct {
 	uncounted       *uncounted
 	retiring        []iggcon.Checkpoint
 	closed          bool
-	// singleReads are the reads in flight of one partition alone: of a gap or of
-	// a section that did not decode.
+	// singleReads are the reads in flight of one partition alone: of a gap, of
+	// a section that did not decode, and the polls that find the offset of a
+	// timestamp or Last position.
 	singleReads int
 	// nextSingle is the partition from which the reads of one partition alone take turns.
 	nextSingle uint32
@@ -342,23 +356,24 @@ type PartitionReader struct {
 	// it, also those of the application. Only one refresh runs at a time, and
 	// Close reads it after the last one.
 	uncertainJoin *uint64
-	// seeking counts the seeks of each partition that hold back its committing
-	// reads until they move or fail.
+	// seeking counts the seeks of each partition. No read of the partition
+	// starts until they move or fail.
 	seeking map[uint32]int
 	// committing counts the committing reads in flight of each partition, also
 	// of a generation that left the assignment, which a seek waits for.
 	committing map[uint32]int
+	// seekWriting marks each partition whose seek writes and moves under
+	// OnRead, so the writes and moves of two seeks of a partition never
+	// interleave. A later seek of the partition waits for it only as long as
+	// its context lasts. The seeks of other partitions do not wait.
+	seekWriting map[uint32]bool
 
-	// storeLock orders the stores of a flush, and the write and the move of each
-	// seek under OnRead, so the writes and moves of two seeks never interleave.
-	// A seek waits for it only as long as its context lasts.
-	storeLock chan struct{}
-	storeDue  chan struct{}
-	wake      chan struct{}
-	run       context.Context
-	stop      context.CancelFunc
-	inFlight  sync.WaitGroup
-	loopDone  chan struct{}
+	storeDue chan struct{}
+	wake     chan struct{}
+	run      context.Context
+	stop     context.CancelFunc
+	inFlight sync.WaitGroup
+	loopDone chan struct{}
 	// closeDone closes when the first Close ends, with its result in closeErr.
 	closeDone chan struct{}
 	closeErr  error
@@ -366,7 +381,8 @@ type PartitionReader struct {
 
 // NewPartitionReader starts a reader. A consumer group reader joins its group first.
 // It abandons a join with an unknown outcome and returns its error, so that the
-// join does not block the metadata writes of the client.
+// join does not block the metadata writes of the client. If that join landed,
+// the client stays a member of the group until its session ends.
 func NewPartitionReader(
 	ctx context.Context,
 	client iggcon.Client,
@@ -425,8 +441,8 @@ func NewPartitionReader(
 		onRead:     cfg.options.Commit.Kind == iggcon.CommitOnRead,
 		partitions: make(map[uint32]*partition), changed: make(chan struct{}), regroup: true,
 		seekGenerations: make(map[uint32]uint64), seeking: make(map[uint32]int), committing: make(map[uint32]int),
-		storeLock: make(chan struct{}, 1), storeDue: make(chan struct{}, 1), wake: make(chan struct{}, 1), run: run, stop: stop,
-		loopDone: make(chan struct{}), closeDone: make(chan struct{}),
+		storeDue: make(chan struct{}, 1), wake: make(chan struct{}, 1), run: run, stop: stop,
+		loopDone: make(chan struct{}), closeDone: make(chan struct{}), seekWriting: make(map[uint32]bool),
 	}
 	if cfg.options.Commit.Kind == iggcon.CommitAuto {
 		auto := cfg.options.Commit.Auto
@@ -564,8 +580,9 @@ func (r *PartitionReader) Commit(ctx context.Context, checkpoint iggcon.Checkpoi
 // of it. It drops the queued batches of the partition and resumes a stopped
 // one. From its start until it moves or fails, no read of the partition
 // starts. Under CommitOnRead the seek first waits for the committing read in
-// flight of the partition and for the write of an earlier seek. That read can
-// wait on the server up to MaxWait. Then a seek to an offset above 0 stores the
+// flight of the partition and for the write of an earlier seek of the
+// partition. That read can wait on the server up to MaxWait. The seek does not
+// wait for the seeks of other partitions. Then a seek to an offset above 0 stores the
 // offset before it, so the next read of the server starts there. If the
 // partition has a stored offset, a seek to offset 0 or First deletes it
 // instead, so the reads replay the partition. A seek to a timestamp first
@@ -584,8 +601,9 @@ func (r *PartitionReader) Commit(ctx context.Context, checkpoint iggcon.Checkpoi
 // for it too, and after a write with an unknown outcome the partition reads on
 // after that stored offset. A seek whose ctx ends
 // before its write changes nothing. A seek whose ctx ends after it sent its
-// write returns at once and finishes in the background, and a later seek and
-// Close wait for it. The logger reports a failure of that write.
+// write returns at once and finishes in the background, and a later seek of
+// the partition and Close wait for it. The logger reports a failure of that
+// write.
 func (r *PartitionReader) Seek(ctx context.Context, partitionID uint32, start iggcon.PollingStrategy) error {
 	return r.seek(ctx, partitionID, start, func(move func()) { move() })
 }
@@ -659,7 +677,7 @@ func (r *PartitionReader) writeSeek(ctx context.Context, partitionID uint32, sta
 		return err
 	}
 	r.mu.Lock()
-	for r.committing[partitionID] > 0 {
+	for r.committing[partitionID] > 0 || r.seekWriting[partitionID] {
 		changed := r.changed
 		r.mu.Unlock()
 		select {
@@ -669,12 +687,13 @@ func (r *PartitionReader) writeSeek(ctx context.Context, partitionID uint32, sta
 		}
 		r.mu.Lock()
 	}
-	r.mu.Unlock()
-	if err := r.lockStores(ctx); err != nil {
-		return err
-	}
-	defer r.unlockStores()
-	r.mu.Lock()
+	r.seekWriting[partitionID] = true
+	defer func() {
+		r.mu.Lock()
+		delete(r.seekWriting, partitionID)
+		r.broadcastLocked()
+		r.mu.Unlock()
+	}()
 	p := r.partitions[partitionID]
 	if p == nil {
 		r.mu.Unlock()
@@ -797,19 +816,6 @@ func (r *PartitionReader) endSeek(partitionID uint32) {
 	r.signal()
 }
 
-func (r *PartitionReader) lockStores(ctx context.Context) error {
-	select {
-	case r.storeLock <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (r *PartitionReader) unlockStores() {
-	<-r.storeLock
-}
-
 // Partitions are the partitions that the reader reads now.
 func (r *PartitionReader) Partitions() []uint32 {
 	r.mu.Lock()
@@ -835,9 +841,10 @@ func (r *PartitionReader) Partitions() []uint32 {
 // unknown outcome, so that write does not block a later write of the partition
 // on the same client. For the same reason it abandons a rejoin that is still
 // unknown and a leave with an unknown outcome, which block the metadata writes
-// of the client. The end of ctx ends the reads for the installed owner after a
-// refusal as not the owner, and that refusal stands. Each lookup and write of
-// Close and the leave still go once, within the request timeout of the client.
+// of the client. The reads for the installed owner after a refusal as not the
+// owner end at the end of ctx, or 10 s after the start of Close, and that
+// refusal stands. Each lookup and write of Close and the leave still go once,
+// within the request timeout of the client.
 // With CommitAuto it first waits for the background stores that run, each
 // within that timeout too.
 // A later Close waits for the first one and returns its result, or the error
@@ -857,21 +864,23 @@ func (r *PartitionReader) Close(ctx context.Context) error {
 	r.countUncountedLocked()
 	r.broadcastLocked()
 	r.mu.Unlock()
+	retry, cancel := context.WithTimeout(ctx, closeBudget)
+	defer cancel()
 	r.stop()
 	<-r.loopDone
 	r.inFlight.Wait()
-	// The end of ctx ends only the reads for the installed owner. Each write of
-	// Close and the leave still go once, within the request timeout of the
+	// The end of retry ends only the reads for the installed owner. Each write
+	// of Close and the leave still go once, within the request timeout of the
 	// client, so a cancelled Close still moves the offsets back and leaves.
 	detached := context.WithoutCancel(ctx)
 	var failure error
 	if r.onRead {
-		if err := r.rewind(detached, ctx); err != nil && failure == nil {
+		if err := r.rewind(detached, retry); err != nil && failure == nil {
 			failure = err
 		}
 	}
 	if r.auto != nil {
-		if err := r.flush(detached, ctx); err != nil && failure == nil {
+		if err := r.flush(detached, retry); err != nil && failure == nil {
 			failure = err
 		}
 	}
@@ -1607,7 +1616,7 @@ func (r *PartitionReader) settleOnCloseLocked(generations map[uint32]uint64, sec
 		case section.Err == nil && section.MessageCount > 0 && section.NextOffset > 0:
 			if p.baseline == nil && p.received == nil {
 				// The first batch of the generation ended unseen, so the rewind moves the offset before it.
-				first := section.NextOffset - min(uint64(section.MessageCount), section.NextOffset)
+				first := firstOffset(section)
 				p.baseline = &first
 			}
 			last := section.NextOffset - 1
@@ -1665,21 +1674,18 @@ func (r *PartitionReader) refuseSectionLocked(p *partition, err error, now time.
 }
 
 // giveUpGapLocked reports what a lost read stored as lost, since another member
-// owns the partition now, and queues the batch read after it.
+// owns the partition now, and queues the batch read after it, as an empty read
+// that ends the gap does.
 func (r *PartitionReader) giveUpGapLocked(p *partition) {
-	r.loseGapLocked(p, p.gapEnd)
-	if len(p.held.Messages) > 0 {
-		r.queue = append(r.queue, entry{partition: int64(p.id), generation: p.generation, batch: p.held})
-	}
-	p.gapFrom = nil
-	p.held = nil
+	r.acceptGapLocked(p, &iggcon.PolledMessage{}, p.gapEnd)
 }
 
 // loseGapLocked reports the gap below until as lost and moves its start there,
 // so the report comes once and before the messages after it.
 func (r *PartitionReader) loseGapLocked(p *partition, until uint64) {
-	lost := &ReadError{PartitionID: &p.id, Err: fmt.Errorf("%w: offsets %d to %d were stored by a read whose reply was lost",
-		ierror.FetchProgressUncertain{}, *p.gapFrom, until-1)}
+	gone := OffsetRange{First: *p.gapFrom, Last: until - 1}
+	lost := &ReadError{PartitionID: &p.id, Lost: &gone, Err: fmt.Errorf("%w: offsets %d to %d were stored by a read whose reply was lost",
+		ierror.FetchProgressUncertain{}, gone.First, gone.Last)}
 	r.queue = append(r.queue, entry{partition: int64(p.id), generation: p.generation, err: lost})
 	p.gapFrom = &until
 }
@@ -1738,8 +1744,8 @@ func (r *PartitionReader) handleRefusalLocked(p *partition, err error, now time.
 		// after a move.
 		p.loseOwner()
 		r.refreshAt = now
-		p.retryAt = now.Add(r.config.retryInterval)
 		p.lastingRefusals++
+		p.retryAt = now.Add(backoff(r.config.retryInterval, p.lastingRefusals))
 		if p.lastingRefusals >= lastingRefusalsBeforeStop {
 			p.lastingRefusals = 0
 			r.queue = append(r.queue, entry{partition: int64(p.id), generation: p.generation, err: &ReadError{PartitionID: &p.id, Err: err}})
@@ -1761,9 +1767,14 @@ func (r *PartitionReader) handleRefusalLocked(p *partition, err error, now time.
 		r.queue = append(r.queue, entry{partition: int64(p.id), generation: p.generation, err: p.stopped})
 		return
 	}
-	shift := min(p.lastingRefusals-1, maxBackoffShift)
-	p.retryAt = now.Add(r.config.retryInterval << shift)
+	p.retryAt = now.Add(backoff(r.config.retryInterval, p.lastingRefusals))
 	r.config.logger.Warn("A partition refused a read, the reader retries it", "partition", p.id, "error", err)
+}
+
+// backoff is the wait after the refusals-th lasting refusal of a partition in
+// a row. It doubles with each refusal, up to 2^maxBackoffShift times interval.
+func backoff(interval time.Duration, refusals int) time.Duration {
+	return interval << min(refusals-1, maxBackoffShift)
 }
 
 // moveLocked starts a new generation of p at the start of a seek, without the
@@ -2030,12 +2041,10 @@ func (r *PartitionReader) flushInBackground() <-chan struct{} {
 
 // flush stores the retired positions, then each counted position ahead of its
 // last store, one at a time, and returns the first failure. retry bounds the
-// read of a store refused as not the owner, see writePosition.
+// read of a store refused as not the owner, see writePosition. The loop and
+// Close never run two flushes at once, so an older position never overwrites
+// a newer one.
 func (r *PartitionReader) flush(ctx, retry context.Context) error {
-	if err := r.lockStores(ctx); err != nil {
-		return err
-	}
-	defer r.unlockStores()
 	type pendingStore struct {
 		p          *partition
 		checkpoint iggcon.Checkpoint

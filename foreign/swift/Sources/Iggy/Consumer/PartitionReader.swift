@@ -35,6 +35,8 @@ public struct ReaderConfiguration: Sendable {
     /// many partitions as a whole.
     public var options: PollOptions
     /// The pause after a failed read before its partitions are read again.
+    /// After a read refused as not owned, the pause doubles with each such
+    /// refusal in a row, up to 32 times this interval.
     public var retryInterval: Duration
     /// Joins the group when the reader is built, and again after the
     /// membership was lost.
@@ -96,14 +98,22 @@ public struct ReadError: Error, Sendable, CustomStringConvertible {
     /// under ``CommitPolicy/onRead``) reads again by itself once
     /// ``IggyClient/abandonOperation(_:)`` took that operation.
     public let stopsPartition: Bool
+    /// For ``IggyErrorCode/fetchProgressUncertain``: the first and the last
+    /// offset of a range that a lost read stored and the reader never
+    /// delivered, or that the history no longer holds.
+    public let lost: ClosedRange<UInt64>?
 
-    init(partitionID: UInt32?, error: IggyError, skip: PollingStrategy? = nil, offset: UInt64? = nil, raw: [UInt8]? = nil, stopsPartition: Bool = false) {
+    init(
+        partitionID: UInt32?, error: IggyError, skip: PollingStrategy? = nil, offset: UInt64? = nil, raw: [UInt8]? = nil, stopsPartition: Bool = false,
+        lost: ClosedRange<UInt64>? = nil
+    ) {
         self.partitionID = partitionID
         self.error = error
         self.skip = skip
         self.offset = offset
         self.raw = raw
         self.stopsPartition = stopsPartition
+        self.lost = lost
     }
 
     public var description: String {
@@ -194,6 +204,14 @@ public actor PartitionReader: AsyncSequence {
     /// row reports one error and reads on, as `MAX_LASTING_REFUSALS` in the
     /// Rust SDK.
     static let notOwnedRefusalsPerReport = 6
+    /// The wait after a read refused as not owned doubles with each refusal
+    /// in a row at most this many times, as `MAX_REFUSAL_BACKOFF_STEPS` in
+    /// the Rust SDK.
+    static let maxRefusalBackoffSteps = 5
+    /// The reads that name the owner of a refused offset write of the close
+    /// stop this long after the close starts, so a refusal that stays
+    /// transient does not hold the close.
+    static let closeBudget: Duration = .seconds(10)
     /// Refusals that settle by themselves, so a join, a sync or a lookup that
     /// fails on one is not reported, as `refuse_refresh` in the Rust SDK, and
     /// the read that names the owner of a refused offset write goes again.
@@ -227,6 +245,10 @@ public actor PartitionReader: AsyncSequence {
     /// and the pause of such a read ends at once. Each pause that it ends
     /// takes a permit, so the cancel releases all of them.
     private let closeCancel = AsyncSemaphore(permits: 0)
+    /// Opened for good at the start of ``close()``, which ends the reads that
+    /// name the owner of a refused offset write of the reader itself, as
+    /// `closeCancel` ends them for the other writes.
+    private let closeStart = AsyncSemaphore(permits: 0)
     private let commitWakeups: AsyncStream<Void>
     private let commitWakeup: AsyncStream<Void>.Continuation
 
@@ -278,7 +300,7 @@ public actor PartitionReader: AsyncSequence {
     /// owner again under a higher generation.
     private var owners: [UInt32: (session: UInt64, generation: UInt64)] = [:]
     /// The reads of each partition refused as not owned since its last read
-    /// that succeeded.
+    /// that succeeded or the last join of the group.
     private var notOwnedRefusals: [UInt32: Int] = [:]
     private var lastGeneration: UInt64 = 0
     private var requests: [UInt64: Request] = [:]
@@ -440,6 +462,20 @@ public actor PartitionReader: AsyncSequence {
         var sinceStore: UInt32
     }
 
+    /// Who waits for an offset write. The end of its wait ends the retry of
+    /// the read that names the owner of a refused write, and the write keeps
+    /// its refusal.
+    private enum WriteCaller: Equatable {
+        /// The application, until its task or the first caller of
+        /// ``close()`` is cancelled.
+        case application
+        /// The reader itself, for a seek write and an `auto` store in the
+        /// background, until the close starts.
+        case reader
+        /// The close, until `deadline` or a cancel of its first caller.
+        case close(deadline: ContinuousClock.Instant)
+    }
+
     init(client: IggyClient, streamID: Identifier, topicID: Identifier, consumer: Consumer, configuration: ReaderConfiguration) throws {
         try configuration.validate(group: consumer.kind == .consumerGroup)
         id = Self.lastReaderID.withLockedValue { last in
@@ -558,11 +594,13 @@ public actor PartitionReader: AsyncSequence {
     ///
     /// The close belongs to its first caller. A cancel of that caller ends
     /// at once the retry of each read that names the owner of a refused
-    /// offset write. That write keeps its refusal, also when the read was in
-    /// flight at the cancel. The close still sends once each offset write
-    /// and lookup that it did not send yet, with no such read, and then the
-    /// leave. So a close that starts in a cancelled task also sends its
-    /// offset writes and the leave.
+    /// offset write. For the writes of the close itself, the close deadline
+    /// ends that retry too, 10 seconds after the start of the close. Such a
+    /// write keeps its refusal, also when the read was in flight at that
+    /// end. The close still sends once each offset write and lookup that it
+    /// did not send yet, with no such read, and then the leave. So a close
+    /// that starts in a cancelled task also sends its offset writes and the
+    /// leave.
     ///
     /// A read in flight ends within the request timeout of
     /// ``ReaderConfiguration/options``. An offset write or lookup ends within
@@ -582,9 +620,11 @@ public actor PartitionReader: AsyncSequence {
             return try await closeTask.value
         }
         isClosed = true
+        closeStart.release(.max)
         pauseWakeup?.finish()
+        let deadline = ContinuousClock.now + Self.closeBudget
         // The drain does not inherit a cancel, so the writes that it did not send yet and the leave still go.
-        let task = Task { try await self.drain() }
+        let task = Task { try await self.drain(ownerReadsUntil: deadline) }
         closeTask = task
         try await withTaskCancellationHandler {
             try await task.value
@@ -593,7 +633,8 @@ public actor PartitionReader: AsyncSequence {
         }
     }
 
-    private func drain() async throws {
+    private func drain(ownerReadsUntil deadline: ContinuousClock.Instant) async throws {
+        let caller = WriteCaller.close(deadline: deadline)
         groupLookup?.cancel()
         assignmentSync?.cancel()
         for (id, request) in requests {
@@ -617,12 +658,8 @@ public actor PartitionReader: AsyncSequence {
         intervalTask?.cancel()
         commitTask?.cancel()
         commitWakeup.finish()
-        // A seek that stores while the close starts applies before the rewind.
-        while !storesWaiting.isEmpty {
-            let (ended, wakeup) = AsyncStream<Void>.makeStream()
-            storeWakeups.append(wakeup)
-            for await _ in ended {}
-        }
+        // A seek that stores while the close starts applies before the rewind. No code cancels the drain.
+        try? await waitForEnds { storesWaiting.isEmpty }
         var failure: (any Error)?
         if configuration.options.commitsOnRead {
             for partition in uncertain {
@@ -643,7 +680,7 @@ public actor PartitionReader: AsyncSequence {
             }
             for (partition, span) in stored {
                 do {
-                    try await rewind(partition, over: span)
+                    try await rewind(partition, over: span, for: caller)
                 } catch {
                     failure = failure ?? error
                 }
@@ -651,7 +688,7 @@ public actor PartitionReader: AsyncSequence {
         }
         if configuration.options.autoCommit != nil {
             do {
-                try await flushCounted(inBackground: false)
+                try await flushCounted(for: caller)
             } catch {
                 failure = failure ?? error
             }
@@ -759,7 +796,7 @@ public actor PartitionReader: AsyncSequence {
         guard isCurrent(checkpoint) else {
             return
         }
-        try await store(checkpoint, inBackground: false)
+        try await store(checkpoint, for: .application)
     }
 
     /// Counts a checkpoint that this reader delivered, under
@@ -899,7 +936,7 @@ public actor PartitionReader: AsyncSequence {
                 endSeek(seek, of: partitionID)
             }
             do {
-                try await writeOffset(of: partitionID, under: fence, inBackground: true) { context in
+                try await writeOffset(of: partitionID, under: fence, generation: generation, for: .reader) { context in
                     if let before {
                         try await client.storeConsumerPosition(
                             consumer: consumer, streamID: streamID, topicID: topicID,
@@ -1037,6 +1074,10 @@ public actor PartitionReader: AsyncSequence {
         joinedGroup = true
         joinedSessionScope = client.core.groupState.sessionScope
         assignmentSyncPause = nil
+        // A refusal of the earlier membership says nothing of this one, so the count of refusals as not owned and every
+        // retry wait start again, as at the epoch rewind in the Rust SDK.
+        notOwnedRefusals.removeAll()
+        pausedUntil.removeAll()
     }
 
     /// Returns false once the client shut down, which ends the subscription.
@@ -1128,6 +1169,10 @@ public actor PartitionReader: AsyncSequence {
                 where assigned.contains(partition) && activeReads[partition] == nil && (pausedUntil[partition] ?? now) <= now
                     && awaitingLookup[partition] == nil
                 {
+                    // The close waits for this call, so a lookup after the close start only delays it.
+                    guard !isClosed else {
+                        break
+                    }
                     let generation = generations[partition]
                     do {
                         try await findStart(of: partition)
@@ -1227,11 +1272,13 @@ public actor PartitionReader: AsyncSequence {
         if let code, [.consumerGroupMemberNotFound, .disconnected, .unauthenticated, .staleClient].contains(code) {
             joinedGroup = false
         }
-        logger.error("Failed to join the consumer group or to group its partitions", metadata: metadata.merging(["error": "\(error)"]) { $1 })
-        if code == .consumerGroupMemberNotFound, configuration.autoJoinConsumerGroup {
+        let failure = metadata.merging(["error": "\(error)"]) { $1 }
+        if let code, Self.transientRefusals.contains(code) {
+            logger.warning("Failed to join the consumer group or to group its partitions", metadata: failure)
             return
         }
-        if let code, Self.transientRefusals.contains(code) {
+        logger.error("Failed to join the consumer group or to group its partitions", metadata: failure)
+        if code == .consumerGroupMemberNotFound, configuration.autoJoinConsumerGroup {
             return
         }
         report(ReadError(partitionID: nil, error: Self.iggyError(error)))
@@ -2245,13 +2292,14 @@ public actor PartitionReader: AsyncSequence {
     }
 
     private func reportLost(_ offsets: Range<UInt64>, of partition: UInt32) {
+        let lost = offsets.lowerBound...offsets.upperBound - 1
         report(
             ReadError(
                 partitionID: partition,
                 error: IggyError(
-                    .fetchProgressUncertain,
-                    context: "offsets \(offsets.lowerBound) to \(offsets.upperBound - 1) were stored by a read whose reply was lost",
-                    partitionID: partition)))
+                    .fetchProgressUncertain, context: "offsets \(lost.lowerBound) to \(lost.upperBound) were stored by a read whose reply was lost",
+                    partitionID: partition),
+                lost: lost))
     }
 
     /// Repairs what a failed read of `partitions` points at, and they wait
@@ -2260,7 +2308,8 @@ public actor PartitionReader: AsyncSequence {
     /// for a good lookup too, a position without a history reads again, a
     /// lost membership joins again. What the reader cannot repair is queued
     /// for ``next()``, and so is each ``notOwnedRefusalsPerReport``th
-    /// refusal of an owner in a row.
+    /// refusal of an owner in a row. The wait after a refusal of an owner
+    /// doubles with each refusal in a row, as `backoff` in the Rust SDK.
     private func failed(_ partitions: [UInt32], with error: IggyError) {
         let until = ContinuousClock.now + configuration.retryInterval
         var stops = false
@@ -2273,11 +2322,13 @@ public actor PartitionReader: AsyncSequence {
             // names an owner again, the requests of the partition name owner generation 0.
             for partition in partitions {
                 owners[partition] = nil
-                pausedUntil[partition] = until
-                notOwnedRefusals[partition, default: 0] += 1
-                if notOwnedRefusals[partition] == Self.notOwnedRefusalsPerReport {
+                let refusals = notOwnedRefusals[partition, default: 0] + 1
+                pausedUntil[partition] = .now + configuration.retryInterval * (1 << Swift.min(refusals - 1, Self.maxRefusalBackoffSteps))
+                if refusals == Self.notOwnedRefusalsPerReport {
                     notOwnedRefusals[partition] = nil
                     report(ReadError(partitionID: partition, error: error))
+                } else {
+                    notOwnedRefusals[partition] = refusals
                 }
             }
             // The next turn syncs the assignment. The cache of the client
@@ -2392,7 +2443,7 @@ public actor PartitionReader: AsyncSequence {
             return false
         }
         do {
-            try await flushCounted(inBackground: true)
+            try await flushCounted(for: .reader)
         } catch {
             logger.error("Failed to store the counted offsets", metadata: metadata.merging(["error": "\(error)"]) { $1 })
         }
@@ -2402,7 +2453,7 @@ public actor PartitionReader: AsyncSequence {
     /// Stores each counted position that is ahead of the last store of its
     /// generation, the retired ones first. Every partition is tried, and the
     /// first failure is thrown.
-    private func flushCounted(inBackground: Bool) async throws {
+    private func flushCounted(for caller: WriteCaller) async throws {
         var failure: (any Error)?
         // Owner generation 0 would store the position of an owner of an earlier session for the assignment the member
         // holds now, so a partition that left stores nothing then.
@@ -2410,7 +2461,7 @@ public actor PartitionReader: AsyncSequence {
         retiring.removeAll()
         for checkpoint in retired {
             do {
-                try await store(checkpoint, inBackground: inBackground)
+                try await store(checkpoint, for: caller)
             } catch {
                 failure = failure ?? error
             }
@@ -2418,7 +2469,7 @@ public actor PartitionReader: AsyncSequence {
         counted = counted.filter { isCurrent($0.value.checkpoint) }
         for (partition, entry) in counted {
             do {
-                try await store(entry.checkpoint, inBackground: inBackground)
+                try await store(entry.checkpoint, for: caller)
                 if var current = counted[partition] {
                     current.sinceStore = current.sinceStore >= entry.sinceStore ? current.sinceStore - entry.sinceStore : 0
                     counted[partition] = current
@@ -2435,7 +2486,7 @@ public actor PartitionReader: AsyncSequence {
     }
 
     /// Stores a checkpoint unless the last store of its history covers it.
-    private func store(_ checkpoint: Checkpoint, inBackground: Bool) async throws {
+    private func store(_ checkpoint: Checkpoint, for caller: WriteCaller) async throws {
         if committedCovers(checkpoint) {
             return
         }
@@ -2447,7 +2498,7 @@ public actor PartitionReader: AsyncSequence {
                 return
             }
             let fence = requestContext(checkpoint.context, of: checkpoint.partitionID)
-            try await writeOffset(of: checkpoint.partitionID, under: fence, inBackground: inBackground) { context in
+            try await writeOffset(of: checkpoint.partitionID, under: fence, generation: checkpoint.stamp?.generation, for: caller) { context in
                 try await client.storeConsumerPosition(
                     consumer: consumer, streamID: streamID, topicID: topicID,
                     checkpoint: Checkpoint(partitionID: checkpoint.partitionID, offset: checkpoint.offset, context: context))
@@ -2467,7 +2518,7 @@ public actor PartitionReader: AsyncSequence {
 
     /// Moves the offset of a partition back over the messages the server
     /// stored but nobody received, as `rewind` in the Rust SDK.
-    private func rewind(_ partition: UInt32, over span: Span) async throws {
+    private func rewind(_ partition: UInt32, over span: Span, for caller: WriteCaller) async throws {
         if isGroup, !assigned.contains(partition) {
             return
         }
@@ -2475,11 +2526,12 @@ public actor PartitionReader: AsyncSequence {
         if let last, last >= span.last {
             return
         }
+        let generation = generations[partition]
         try await afterProgress(of: partition) {
             let writes = offsetWrites(of: partition)
             try await writes.lock()
             defer { writes.unlock() }
-            try await writeOffset(of: partition, under: requestContext(span.context, of: partition), inBackground: false) { context in
+            try await writeOffset(of: partition, under: requestContext(span.context, of: partition), generation: generation, for: caller) { context in
                 if let last {
                     try await client.storeConsumerPosition(
                         consumer: consumer, streamID: streamID, topicID: topicID,
@@ -2504,31 +2556,35 @@ public actor PartitionReader: AsyncSequence {
         try await client.deleteConsumerOffset(consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partition, context: context)
     }
 
-    /// Runs an offset write of `partition` under `context`. A member's write
-    /// refused as not owned is not a leave. For a partition that left the
-    /// assignment the refusal stands. Otherwise the owner counts as lost, the
-    /// member syncs its assignment, a read without a commit names the
+    /// Runs an offset write of `partition` under `context`, a write of the
+    /// generation `generation` of the partition, nil when not known. A
+    /// member's write refused as not owned is not a leave. Another member can
+    /// own a partition that left, or can have read it while it was away, so
+    /// the refusal stands for a partition that left the assignment and for a
+    /// write of an assignment that ended. Otherwise the owner counts as lost,
+    /// the member syncs its assignment, a read without a commit names the
     /// installed owner, and the write goes once more under the owner and the
     /// metadata op of that read. A rebalance by another member installs the
     /// owner at an op of that member, which no reply to this client carries,
     /// so the op that the client raises at send time stays below it. A write
     /// that names no incarnation goes again in the history of that read, any
-    /// other write only in its own history. A write `inBackground` has the
-    /// reader as its caller, so the close ends the retry of that read.
+    /// other write only in its own history. `caller` says when the retry of
+    /// that read ends.
     private func writeOffset(
-        of partition: UInt32, under context: PartitionContext, inBackground: Bool, _ write: (PartitionContext) async throws -> Void
+        of partition: UInt32, under context: PartitionContext, generation: UInt64?, for caller: WriteCaller,
+        _ write: (PartitionContext) async throws -> Void
     ) async throws {
         do {
             try await write(context)
         } catch let refusal as IggyError where isGroup && refusal.code == .consumerGroupPartitionNotOwned {
-            guard assigned.contains(partition) else {
+            guard assigned.contains(partition), generation.map({ $0 >= assignedSince[partition, default: 0] }) ?? true else {
                 throw refusal
             }
             owners[partition] = nil
             lastAssignmentSync = nil
             dispatch()
             let session = client.core.groupState.sessionScope
-            guard let installed = await installedContext(of: partition, in: context, inBackground: inBackground),
+            guard let installed = await installedContext(of: partition, in: context, for: caller),
                 context.incarnation == 0 || installed.incarnation == context.incarnation
             else {
                 throw refusal
@@ -2543,29 +2599,31 @@ public actor PartitionReader: AsyncSequence {
     /// the installed owner. Only the context of the reply counts, so a
     /// message that does not decode does not fail the read. After a
     /// transient refusal it reads again once the retry interval passed,
-    /// until the caller is cancelled or, for a write `inBackground`, until
-    /// the close started. A cancel of the first caller of ``close()`` ends
-    /// the retry at once, and no read starts after it. Nil after any other
-    /// failure and once the retry ends. Nil also when the caller or the
-    /// close is cancelled while the read is in flight.
-    private func installedContext(of partition: UInt32, in context: PartitionContext, inBackground: Bool) async -> PartitionContext? {
+    /// until the task of the caller is cancelled or the retry ends as
+    /// `caller` says. No read starts after that end, and a pause ends at
+    /// once. Nil after any other failure and once the retry ends, also when
+    /// it ends while the read is in flight.
+    private func installedContext(of partition: UInt32, in context: PartitionContext, for caller: WriteCaller) async -> PartitionContext? {
         let unowned = PartitionContext(incarnation: context.incarnation, ownerGeneration: 0, metadataOp: context.metadataOp)
-        while closeCancel.availablePermits == 0 {
+        let end = caller == .reader ? closeStart : closeCancel
+        let deadline: ContinuousClock.Instant? = if case .close(let deadline) = caller { deadline } else { nil }
+        func ended() -> Bool {
+            end.availablePermits > 0 || Task.isCancelled || deadline.map { ContinuousClock.now >= $0 } == true
+        }
+        while !ended() {
             do {
                 let body = try await client.pollBody(
                     streamID: streamID, topicID: topicID, partitionID: partition, consumer: consumer,
                     strategy: .continuation(partitionID: partition, kind: .next, value: 0, context: unowned), count: 1, autoCommit: false,
                     options: probeOptions)
-                // After a cancel the first refusal stands, so the answer of a read that was in flight sends no write.
-                guard closeCancel.availablePermits == 0, !Task.isCancelled else {
+                // After the end of the retry the first refusal stands, so the answer of a read that was in flight sends no write.
+                guard !ended() else {
                     return nil
                 }
                 return try Responses.polledContext(body[...])
             } catch let refusal as IggyError where Self.transientRefusals.contains(refusal.code) {
-                _ = try? await closeCancel.acquire(1, deadline: ContinuousClock.now + configuration.retryInterval)
-                if Task.isCancelled || inBackground && isClosed {
-                    return nil
-                }
+                let pause = ContinuousClock.now + configuration.retryInterval
+                _ = try? await end.acquire(1, deadline: deadline.map { Swift.min($0, pause) } ?? pause)
             } catch {
                 return nil
             }
@@ -2709,7 +2767,10 @@ extension IggyClient {
     /// `.group(id)`, reads its assignment and joins the group here, after
     /// creating it when it is missing and named by name. Throws
     /// ``IggyErrorCode/invalidConfiguration`` for options out of range, and
-    /// what the join throws.
+    /// what the join throws. A join or a group create whose outcome is
+    /// unknown throws ``IggyErrorCode/transientNotCommitted``. The client
+    /// keeps nothing of it, so the next call starts over. A join that landed
+    /// keeps the member in the group until its session ends.
     public func reader(
         streamID: Identifier, topicID: Identifier, consumer: Consumer, configuration: ReaderConfiguration = ReaderConfiguration()
     ) async throws -> PartitionReader {

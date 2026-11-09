@@ -135,9 +135,14 @@ pub fn with_binary_deadline<F: Future>(
 
 #[doc(hidden)]
 pub fn binary_operation_deadline() -> Instant {
-    OPERATION_DEADLINE
-        .try_with(|deadline| *deadline)
-        .unwrap_or_else(|_| Instant::now() + BINARY_OPERATION_TIMEOUT)
+    binary_deadline_in_force().unwrap_or_else(|| Instant::now() + BINARY_OPERATION_TIMEOUT)
+}
+
+/// The deadline of the [`with_binary_deadline`] scope that the caller runs in. A task that the
+/// caller spawns runs outside that scope.
+#[doc(hidden)]
+pub fn binary_deadline_in_force() -> Option<Instant> {
+    OPERATION_DEADLINE.try_with(|deadline| *deadline).ok()
 }
 
 #[async_trait]
