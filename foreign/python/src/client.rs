@@ -26,7 +26,6 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDelta, PyList, PyType};
 use pyo3::{PyErrArguments, PyRef};
-use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use serde::Deserialize;
@@ -41,7 +40,7 @@ use crate::consumer::{
     ConsumerGroupDetails as PyConsumerGroupDetails, ConsumerOffsetInfo, IggyConsumer,
 };
 use crate::duration::{py_delta_to_iggy_duration, reject_zero};
-use crate::event_loop::on_event_loop;
+use crate::event_loop::{attach_unless_exiting, future_into_py, on_event_loop};
 use crate::identifier::PyIdentifier;
 use crate::metadata_changes::{
     MetadataChangeGroup, MetadataChangeStart, MetadataChanges, validated_query,
@@ -1431,7 +1430,7 @@ impl IggyClient {
                 .delete_segments(&stream_id, &topic_id, partition_id, segments_count)
                 .await
                 .map_err(to_runtime_error)?;
-            Ok(Python::attach(|py| py.None()))
+            attach_unless_exiting(|py| Ok(py.None()))
         })
     }
 
@@ -2271,7 +2270,7 @@ impl IggyClient {
                 .send_binary_request(code, Bytes::from(payload))
                 .await
                 .map_err(to_runtime_error)?;
-            Ok(Python::attach(|py| PyBytes::new(py, &response).unbind()))
+            attach_unless_exiting(|py| Ok(PyBytes::new(py, &response).unbind()))
         })
     }
 
@@ -2309,7 +2308,7 @@ impl IggyClient {
                 .send_binary_request_to_replica(code, Bytes::from(payload), replica_id)
                 .await
                 .map_err(to_runtime_error)?;
-            Ok(Python::attach(|py| PyBytes::new(py, &response).unbind()))
+            attach_unless_exiting(|py| Ok(PyBytes::new(py, &response).unbind()))
         })
     }
 }

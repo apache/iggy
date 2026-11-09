@@ -21,12 +21,11 @@ use iggy::prelude::PartitionReader as RustPartitionReader;
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use tokio::sync::Mutex;
 
 use crate::client::{to_read_error, to_runtime_error};
-use crate::event_loop::on_event_loop;
+use crate::event_loop::{future_into_py, on_event_loop};
 use crate::receive_message::{Checkpoint, PolledBatch, PollingStrategy};
 
 /// Reads the partitions of a topic in batches, with routing, prefetch and the position of each

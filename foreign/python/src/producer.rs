@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{str::FromStr, sync::Arc};
+use std::{convert::identity, str::FromStr, sync::Arc};
 
 use iggy::clients::producer_config::BackpressureMode as RustBackpressureMode;
 use iggy::prelude::{
@@ -28,13 +28,13 @@ use pyo3::conversion::FromPyObject;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDelta, PyInt, PyList, PyString};
-use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_pymethods};
 use pyo3_stub_gen::{PyStubType, TypeInfo};
 use tokio::sync::{RwLock, Semaphore};
 
 use crate::client::{PyIggyError, to_runtime_error};
 use crate::duration::{duration_repr, iggy_duration_to_py_delta, py_delta_to_iggy_duration};
+use crate::event_loop::{attach_unless_exiting, future_into_py};
 use crate::partitioning::Partitioning;
 use crate::send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
 
@@ -455,12 +455,12 @@ impl ProducerSendError {
         uncertain: usize,
         committed: Arc<Vec<RustSendMessagesConfirmationResponse>>,
     ) -> PyErr {
-        Python::attach(|py| {
+        attach_unless_exiting(|py| {
             let operation_id = cause.operation_id();
             let message = format!("Producer send failed: {cause}");
             let cause_message = cause.to_string();
             let cause_error = to_runtime_error(cause);
-            let instance = match Bound::new(
+            let instance = Bound::new(
                 py,
                 PyClassInitializer::from(coded).add_subclass(Self {
                     cause: cause_message,
@@ -469,17 +469,14 @@ impl ProducerSendError {
                     uncertain,
                     committed,
                 }),
-            ) {
-                Ok(instance) => instance,
-                Err(error) => return error,
-            };
-            if let Err(error) = instance.setattr("args", (message,)) {
-                return error;
-            }
+            )?;
+            instance.setattr("args", (message,))?;
             let error = PyErr::from_value(instance.into_any());
             error.set_cause(py, Some(cause_error));
-            error
+            Ok(error)
         })
+        // An error that prevents building this one is raised in its place.
+        .unwrap_or_else(identity)
     }
 }
 
@@ -638,7 +635,7 @@ impl IggyProducer {
         let inner = self.inner.clone();
         future_into_py(py, async move {
             shutdown(inner).await?;
-            Ok(Python::attach(|py| py.None()))
+            attach_unless_exiting(|py| Ok(py.None()))
         })
     }
 

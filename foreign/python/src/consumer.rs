@@ -33,15 +33,13 @@ use pyo3::intern;
 
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3_async_runtimes::tokio::{
-    future_into_py, get_current_locals, get_runtime, into_future, scope,
-};
+use pyo3_async_runtimes::tokio::{get_current_locals, get_runtime, into_future, scope};
 use pyo3_async_runtimes::{TaskLocals, into_future_with_locals};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
 use tokio::sync::{Mutex, oneshot, watch};
 
 use crate::client::{to_read_error, to_runtime_error};
-use crate::event_loop::on_event_loop;
+use crate::event_loop::{attach_unless_exiting, future_into_py, on_event_loop};
 use crate::identifier::PyIdentifier;
 use crate::poll_options::CommitPolicy;
 use crate::receive_message::{Checkpoint, PollingStrategy, ReceiveMessage};
@@ -686,7 +684,7 @@ impl MessageConsumer for PyCallbackConsumer {
         let message = ReceiveMessage::from(received);
         let called = get_runtime()
             .spawn(scope(task_locals, async move {
-                Python::attach(|py| {
+                attach_unless_exiting(|py| {
                     let callback = callback.bind(py);
                     let result = callback.as_any().call1((message,))?;
                     into_future(result)
