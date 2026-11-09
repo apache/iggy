@@ -3112,7 +3112,9 @@ where
             history_transition: self.history_transition,
             owner_retirement: self.owner_retirement.take(),
             producers: std::mem::take(&mut self.producers),
-            machines: (!self.state_machines.is_empty())
+            machines: self
+                .state_machines
+                .holds_state()
                 .then(|| self.state_machines.capture(self.consensus().commit_min())),
             durable_offset: self.offset.load(Ordering::Acquire),
             write_offset: self.dirty_offset.load(Ordering::Relaxed),

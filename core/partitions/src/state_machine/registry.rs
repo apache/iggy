@@ -91,6 +91,12 @@ pub trait PartitionStateMachine: Any {
     /// in [`Self::apply`] instead.
     fn snapshot_into(&self, out: &mut Vec<u8>);
 
+    /// Whether the machine holds state a command produced. One that does not
+    /// writes no part into a snapshot, so a partition whose machines hold no
+    /// state checkpoints and transfers byte for byte as one that registers
+    /// none, and a release without the machine can still read it.
+    fn holds_state(&self) -> bool;
+
     /// Replace the machine's state with a snapshot it produced.
     ///
     /// # Errors
@@ -196,6 +202,13 @@ impl StateMachines {
         self.machines.is_empty()
     }
 
+    /// Whether any machine holds state, see
+    /// [`PartitionStateMachine::holds_state`].
+    #[must_use]
+    pub fn holds_state(&self) -> bool {
+        self.machines.iter().any(|machine| machine.holds_state())
+    }
+
     #[must_use]
     pub fn owns(&self, kind: CommandKind) -> bool {
         self.owners.contains_key(&kind)
@@ -273,7 +286,7 @@ impl StateMachines {
     pub(crate) fn capture(&self, op: u64) -> StateMachineSnapshot {
         debug_assert!(op >= self.applied_op, "a snapshot cannot predate its state");
         let mut writer = SnapshotWriter::new(op.max(self.applied_op));
-        for machine in &self.machines {
+        for machine in self.machines.iter().filter(|machine| machine.holds_state()) {
             writer.machine(machine.id(), |out| machine.snapshot_into(out));
         }
         writer.finish()
@@ -481,6 +494,10 @@ pub mod tests {
             out.extend_from_slice(&self.total.to_le_bytes());
         }
 
+        fn holds_state(&self) -> bool {
+            self.total != 0
+        }
+
         fn restore(&mut self, snapshot: &[u8]) -> Result<(), MachineRestoreError> {
             let bytes = <[u8; 8]>::try_from(snapshot).map_err(|_| MachineRestoreError {
                 reason: "not 8 bytes",
@@ -570,6 +587,10 @@ pub mod tests {
         }
 
         fn snapshot_into(&self, _: &mut Vec<u8>) {}
+
+        fn holds_state(&self) -> bool {
+            false
+        }
 
         fn restore(&mut self, _: &[u8]) -> Result<(), MachineRestoreError> {
             Ok(())
@@ -688,13 +709,17 @@ pub mod tests {
         assert_eq!(target.applied_op(), 2);
         assert_eq!(
             target
+                .machine::<CounterMachine>(MachineId(2))
+                .map(|machine| machine.total),
+            Some(0)
+        );
+        // Started fresh, the second machine holds no state and writes no part.
+        assert_eq!(
+            target
                 .capture(target.applied_op())
                 .machines()
                 .collect::<Vec<_>>(),
-            vec![
-                (MachineId(1), &9u64.to_le_bytes()[..]),
-                (MachineId(2), &0u64.to_le_bytes()[..]),
-            ]
+            vec![(MachineId(1), &9u64.to_le_bytes()[..])]
         );
     }
 
@@ -724,6 +749,9 @@ pub mod tests {
             }
             fn snapshot_into(&self, out: &mut Vec<u8>) {
                 out.resize(out.len() + SNAPSHOT_BYTES_MAX, 0);
+            }
+            fn holds_state(&self) -> bool {
+                true
             }
             fn restore(&mut self, _: &[u8]) -> Result<(), MachineRestoreError> {
                 Ok(())
