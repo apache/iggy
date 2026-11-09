@@ -16,7 +16,9 @@
 // under the License.
 
 use actix_web::{HttpResponse, ResponseError};
+use bench_dashboard_shared::config::ConfigError;
 use serde_json::json;
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -35,6 +37,18 @@ pub enum IggyBenchDashboardServerError {
     BadRequest(String),
     #[error("Internal error: {0}")]
     InternalError(String),
+    #[error("Can't read the dashboard configuration file '{}': {source}", path.display())]
+    ConfigRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("Can't parse the dashboard configuration file '{}': {source}", path.display())]
+    ConfigParse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+    #[error("Invalid dashboard configuration file '{}': {source}", path.display())]
+    ConfigInvalid { path: PathBuf, source: ConfigError },
 }
 
 impl ResponseError for IggyBenchDashboardServerError {
@@ -49,23 +63,5 @@ impl ResponseError for IggyBenchDashboardServerError {
             }
             _ => HttpResponse::InternalServerError().json(json!({ "error": self.to_string() })),
         }
-    }
-}
-
-impl From<octocrab::Error> for IggyBenchDashboardServerError {
-    fn from(err: octocrab::Error) -> Self {
-        Self::InternalError(err.to_string())
-    }
-}
-
-impl From<zip::result::ZipError> for IggyBenchDashboardServerError {
-    fn from(err: zip::result::ZipError) -> Self {
-        Self::InternalError(err.to_string())
-    }
-}
-
-impl From<std::env::VarError> for IggyBenchDashboardServerError {
-    fn from(err: std::env::VarError) -> Self {
-        Self::InternalError(err.to_string())
     }
 }

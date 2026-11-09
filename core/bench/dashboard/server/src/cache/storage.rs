@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::BenchmarkCache;
+use super::{BenchmarkCache, SeriesCache};
 use bench_dashboard_shared::BenchmarkReportLight;
+use bench_dashboard_shared::summary::BenchmarkSummary;
 use std::path::PathBuf;
+use std::sync::{Arc, PoisonError};
 use uuid::Uuid;
 
 impl BenchmarkCache {
@@ -33,31 +35,27 @@ impl BenchmarkCache {
             .map(|ref_guard| ref_guard.value().1.clone().parent().unwrap().to_path_buf())
     }
 
-    pub fn get_benchmarks_for_gitref(&self, gitref: &str) -> Vec<BenchmarkReportLight> {
-        if let Some(benchmark_set) = self.gitref_to_benchmarks.get(gitref) {
-            benchmark_set
-                .iter()
-                .filter_map(|uuid| self.benchmarks.get(&uuid))
-                .map(|entry| entry.value().0.clone())
-                .collect()
-        } else {
-            Vec::new()
-        }
-    }
-
     pub fn get_benchmark_report_light(&self, uuid: &Uuid) -> Option<BenchmarkReportLight> {
         self.benchmarks
             .get(uuid)
             .map(|entry| entry.value().0.clone())
     }
 
-    pub fn results_dir(&self) -> &std::path::Path {
-        &self.results_dir
+    pub fn get_summaries(&self) -> Arc<Vec<BenchmarkSummary>> {
+        Arc::clone(
+            &self
+                .summaries
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    pub fn series(&self) -> &SeriesCache {
+        &self.series
     }
 
     pub(crate) fn clear(&self) {
+        self.series.clear();
         self.benchmarks.clear();
-        self.hardware_to_gitref.clear();
-        self.gitref_to_benchmarks.clear();
     }
 }

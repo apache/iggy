@@ -15,22 +15,37 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::artifacts;
+use crate::cache::{SeriesBuilder, SeriesKey};
 use crate::render::PngRenderPool;
 use crate::{cache::BenchmarkCache, error::IggyBenchDashboardServerError};
+use actix_files::NamedFile;
+use actix_web::http::header::{ContentDisposition, ContentType, DispositionParam, DispositionType};
 use actix_web::{HttpRequest, HttpResponse, get, web};
+use bench_dashboard_shared::config::DashboardConfig;
+use bench_dashboard_shared::series::{SeriesMetric, SeriesScope};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{info, warn};
+use std::time::Instant;
+use tracing::{error, info, warn};
 use uuid::Uuid;
-use walkdir::WalkDir;
-use zip::{ZipWriter, write::FileOptions};
 
 type Result<T> = std::result::Result<T, IggyBenchDashboardServerError>;
 
+/// Same-origin copy of the ECharts build that `charming` bundles, placed in the frontend dist
+/// by `frontend/scripts/copy_echarts.sh`.
+const ECHARTS_SCRIPT_PATH: &str = "/vendor/echarts-5.5.1.min.js";
+const EMBED_CACHE_DIR: &str = "embed";
+const ARTIFACTS_CACHE_DIR: &str = "artifacts";
+const UNKNOWN_API_PATH: &str = "Unknown API path";
+
 pub struct AppState {
     pub cache: Arc<BenchmarkCache>,
+    pub series_builder: Arc<SeriesBuilder>,
     pub render_pool: Arc<PngRenderPool>,
+    pub cache_dir: PathBuf,
+    pub config: Arc<DashboardConfig>,
 }
 
 #[get("/health")]
@@ -40,92 +55,28 @@ pub async fn health_check(req: HttpRequest) -> Result<HttpResponse> {
     Ok(HttpResponse::Ok().json(serde_json::json!({ "status": "healthy" })))
 }
 
-#[get("/api/hardware")]
-pub async fn list_hardware(data: web::Data<AppState>, req: HttpRequest) -> Result<HttpResponse> {
-    let client_addr = get_client_addr(&req);
-    info!("{}: Listing hardware configurations", client_addr);
-
-    let hardware_list = data.cache.get_hardware_configurations();
-
-    info!(
-        "{}: Found {} hardware configurations",
-        client_addr,
-        hardware_list.len()
-    );
-
-    Ok(HttpResponse::Ok().json(hardware_list))
-}
-
-#[get("/api/gitrefs/{hardware}")]
-pub async fn list_gitrefs_for_hardware(
+#[get("/api/benchmarks")]
+pub async fn list_benchmark_summaries(
     data: web::Data<AppState>,
-    hardware: web::Path<String>,
     req: HttpRequest,
 ) -> Result<HttpResponse> {
     let client_addr = get_client_addr(&req);
+    let summaries = data.cache.get_summaries();
     info!(
-        "{}: Listing git refs for hardware '{}'",
-        client_addr, hardware
-    );
-
-    let gitrefs = data.cache.get_gitrefs_for_hardware(&hardware);
-
-    info!(
-        "{}: Found {} git refs for hardware '{}'",
+        "{}: Listing {} benchmark summaries",
         client_addr,
-        gitrefs.len(),
-        hardware
+        summaries.len()
     );
-    Ok(HttpResponse::Ok().json(gitrefs))
+    Ok(HttpResponse::Ok().json(summaries.as_slice()))
 }
 
-#[get("/api/benchmarks/{gitref}")]
-pub async fn list_benchmarks_for_gitref(
+#[get("/api/config")]
+pub async fn get_dashboard_config(
     data: web::Data<AppState>,
-    gitref: web::Path<String>,
     req: HttpRequest,
 ) -> Result<HttpResponse> {
-    let client_addr = get_client_addr(&req);
-    let gitref = gitref.into_inner();
-    info!(
-        "{}: Listing benchmarks for git ref '{}'",
-        client_addr, gitref
-    );
-
-    let benchmarks = data.cache.get_benchmarks_for_gitref(&gitref);
-
-    info!(
-        "{}: Found {} benchmarks for git ref '{}'",
-        client_addr,
-        benchmarks.len(),
-        gitref
-    );
-    Ok(HttpResponse::Ok().json(benchmarks))
-}
-
-#[get("/api/benchmarks/{hardware}/{gitref}")]
-pub async fn list_benchmarks_for_hardware_and_gitref(
-    data: web::Data<AppState>,
-    path: web::Path<(String, String)>,
-    req: HttpRequest,
-) -> Result<HttpResponse> {
-    let client_addr = get_client_addr(&req);
-    let (hardware, gitref) = path.into_inner();
-    info!(
-        "{}: Listing benchmarks for git ref '{}'",
-        client_addr, gitref
-    );
-
-    let benchmarks = data
-        .cache
-        .get_benchmarks_for_hardware_and_gitref(&hardware, &gitref);
-    info!(
-        "{}: Found {} benchmarks for git ref '{}'",
-        client_addr,
-        benchmarks.len(),
-        gitref
-    );
-    Ok(HttpResponse::Ok().json(benchmarks))
+    info!("{}: Getting dashboard configuration", get_client_addr(&req));
+    Ok(HttpResponse::Ok().json(data.config.as_ref()))
 }
 
 #[get("/api/benchmark/full/{unique_id}")]
@@ -133,7 +84,7 @@ pub async fn get_benchmark_report_full(
     data: web::Data<AppState>,
     uuid_str: web::Path<String>,
     req: HttpRequest,
-) -> Result<HttpResponse> {
+) -> Result<NamedFile> {
     let client_addr = get_client_addr(&req);
     info!(
         "{}: Requesting full benchmark report '{}'",
@@ -148,7 +99,7 @@ pub async fn get_benchmark_report_full(
         IggyBenchDashboardServerError::NotFound(format!("Benchmark '{uuid_str}' not found"))
     })?;
 
-    let json_content = std::fs::read_to_string(&json_path).map_err(|e| {
+    let report = NamedFile::open(&json_path).map_err(|e| {
         IggyBenchDashboardServerError::NotFound(format!(
             "Report file not found for '{}': {}",
             json_path.display(),
@@ -160,9 +111,7 @@ pub async fn get_benchmark_report_full(
         "{}: Found full benchmark report for uuid '{}' at '{:?}'",
         client_addr, uuid_str, json_path
     );
-    Ok(HttpResponse::Ok()
-        .content_type("application/json")
-        .body(json_content))
+    Ok(report)
 }
 
 #[get("/api/benchmark/light/{unique_id}")]
@@ -209,37 +158,76 @@ pub async fn get_benchmark_report_light(
     }
 }
 
-#[get("/api/benchmark/trend/{hardware}/{params_identifier}")]
-pub async fn get_benchmark_trend(
+#[derive(Deserialize)]
+struct SeriesQuery {
+    metric: SeriesMetric,
+    scope: SeriesScope,
+}
+
+#[get("/api/benchmark/series/{unique_id}")]
+pub async fn get_benchmark_series(
     data: web::Data<AppState>,
-    path: web::Path<(String, String)>,
+    uuid_str: web::Path<String>,
     req: HttpRequest,
 ) -> Result<HttpResponse> {
-    let (hardware, params_identifier) = path.into_inner();
     let client_addr = get_client_addr(&req);
     info!(
-        "{}: Requesting trend data for hardware '{}' with params identifier '{}'",
-        client_addr, hardware, params_identifier
-    );
-
-    let trend_data = data
-        .cache
-        .get_benchmark_trend_data(&params_identifier, &hardware)
-        .ok_or_else(|| {
-            IggyBenchDashboardServerError::NotFound(format!(
-                "Trend data not found for hardware '{hardware}' with params identifier '{params_identifier}'"
-            ))
-        })?;
-
-    info!(
-        "{}: Found {} trend data points for hardware '{}' with params identifier '{}'",
+        "{}: Requesting series of '{}' with '{}'",
         client_addr,
-        trend_data.len(),
-        hardware,
-        params_identifier
+        uuid_str,
+        req.query_string()
     );
 
-    Ok(HttpResponse::Ok().json(trend_data))
+    let uuid = Uuid::parse_str(&uuid_str).map_err(|_| {
+        IggyBenchDashboardServerError::InvalidUuid(format!("Invalid UUID format: '{uuid_str}'"))
+    })?;
+    let query = web::Query::<SeriesQuery>::from_query(req.query_string())
+        .map_err(|e| IggyBenchDashboardServerError::BadRequest(e.to_string()))?;
+    let key = SeriesKey {
+        uuid,
+        metric: query.metric,
+        scope: query.scope,
+    };
+
+    // Taken before the report path, so a reload from here on keeps this build out of the cache.
+    let generation = data.cache.series().generation();
+    let json_path = data.cache.get_benchmark_json_path(&uuid).ok_or_else(|| {
+        IggyBenchDashboardServerError::NotFound(format!("Benchmark '{uuid_str}' not found"))
+    })?;
+
+    let json = match data.cache.series().get(&key) {
+        Some(json) => {
+            info!(
+                "{}: Serving {} cached bytes of series of '{}'",
+                client_addr,
+                json.len(),
+                uuid_str
+            );
+            json
+        }
+        None => {
+            let start = Instant::now();
+            let json = data
+                .series_builder
+                .build(json_path, key, generation)
+                .await
+                .inspect_err(|e| {
+                    error!("{client_addr}: Failed to build series of '{uuid_str}': {e}");
+                })?;
+            info!(
+                "{}: Built {} bytes of series of '{}' in {:.2?}",
+                client_addr,
+                json.len(),
+                uuid_str,
+                start.elapsed()
+            );
+            json
+        }
+    };
+
+    Ok(HttpResponse::Ok()
+        .content_type(ContentType::json())
+        .body(json))
 }
 
 #[get("/api/artifacts/{uuid}")]
@@ -247,7 +235,7 @@ pub async fn get_test_artifacts_zip(
     data: web::Data<AppState>,
     uuid_str: web::Path<String>,
     req: HttpRequest,
-) -> Result<HttpResponse> {
+) -> Result<NamedFile> {
     let client_addr = get_client_addr(&req);
     info!(
         "{}: Requesting test artifacts for uuid '{}'",
@@ -278,93 +266,39 @@ pub async fn get_test_artifacts_zip(
         }
     };
 
-    // Create a buffer for the zip file
-    let mut zip_buffer = Vec::new();
-    {
-        let mut zip = ZipWriter::new(std::io::Cursor::new(&mut zip_buffer));
-        let options = FileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated)
-            .unix_permissions(0o755)
-            as FileOptions<zip::write::ExtendedFileOptions>;
-
-        // Walk through all files in the directory
-        for entry in WalkDir::new(&artifacts_dir) {
-            let entry = entry.map_err(|e| {
-                IggyBenchDashboardServerError::InternalError(format!(
-                    "Error walking directory: {e}"
-                ))
-            })?;
-
-            if entry.file_type().is_file() {
-                let path = entry.path();
-                let relative_path = path.strip_prefix(&artifacts_dir).map_err(|e| {
-                    IggyBenchDashboardServerError::InternalError(format!(
-                        "Error creating relative path: {e}"
-                    ))
-                })?;
-
-                zip.start_file(
-                    relative_path.to_string_lossy().into_owned(),
-                    options.clone(),
-                )
-                .map_err(|e| {
-                    IggyBenchDashboardServerError::InternalError(format!(
-                        "Error adding file to zip: {e}"
-                    ))
-                })?;
-
-                let mut file = std::fs::File::open(path).map_err(|e| {
-                    IggyBenchDashboardServerError::InternalError(format!("Error opening file: {e}"))
-                })?;
-                std::io::copy(&mut file, &mut zip).map_err(|e| {
-                    IggyBenchDashboardServerError::InternalError(format!(
-                        "Error copying file to zip: {e}"
-                    ))
-                })?;
-            }
-        }
-
-        zip.finish().map_err(|e| {
-            IggyBenchDashboardServerError::InternalError(format!("Error finalizing zip file: {e}"))
-        })?;
+    let zip_path = data
+        .cache_dir
+        .join(ARTIFACTS_CACHE_DIR)
+        .join(format!("{uuid}.zip"));
+    let target = zip_path.clone();
+    let rebuilt = web::block(move || {
+        artifacts::refresh_zip(&artifacts_dir, &target).map_err(|e| {
+            IggyBenchDashboardServerError::InternalError(format!(
+                "Failed to zip '{}' into '{}': {e}",
+                artifacts_dir.display(),
+                target.display()
+            ))
+        })
+    })
+    .await
+    .map_err(|e| {
+        IggyBenchDashboardServerError::InternalError(format!("Artifacts zip task failed: {e}"))
+    })??;
+    if rebuilt {
+        info!(
+            "{}: Created zip archive for test artifacts of uuid '{}'",
+            client_addr, uuid_str
+        );
     }
 
-    info!(
-        "{}: Successfully created zip archive for test artifacts of uuid '{}'",
-        client_addr, uuid_str
-    );
-
-    Ok(HttpResponse::Ok()
-        .content_type("application/zip")
-        .append_header((
-            "Content-Disposition",
-            format!("attachment; filename=\"test_artifacts_{uuid_str}.zip\""),
-        ))
-        .body(zip_buffer))
-}
-
-#[get("/api/recent/{limit}")]
-pub async fn get_recent_benchmarks(
-    data: web::Data<AppState>,
-    path: web::Path<usize>,
-    req: HttpRequest,
-) -> Result<HttpResponse> {
-    let client_addr = get_client_addr(&req);
-    let limit = path.into_inner();
-    info!(
-        "{}: Requesting recent benchmarks with limit {}",
-        client_addr, limit
-    );
-
-    let benchmarks = data.cache.get_recent_benchmarks(limit);
-
-    info!(
-        "{}: Found {} recent benchmarks",
-        client_addr,
-        benchmarks.len()
-    );
-
-    Ok(HttpResponse::Ok().json(benchmarks))
+    Ok(
+        NamedFile::open(&zip_path)?.set_content_disposition(ContentDisposition {
+            disposition: DispositionType::Attachment,
+            parameters: vec![DispositionParam::Filename(format!(
+                "test_artifacts_{uuid}.zip"
+            ))],
+        }),
+    )
 }
 
 fn default_chart_type() -> String {
@@ -450,8 +384,21 @@ pub async fn embed_chart_png(
         )));
     }
 
-    let cache_dir = data.cache.results_dir().join("embed_cache");
-    let cached_path = png_cache_path(&cache_dir, &uuid, &query);
+    let theme = &query.theme;
+    let is_dark = theme == "dark" || theme == "dark_nobg";
+    let transparent = theme == "dark_nobg" || theme == "light_nobg";
+
+    if !matches!(
+        theme.as_str(),
+        "dark" | "light" | "dark_nobg" | "light_nobg"
+    ) {
+        return Err(IggyBenchDashboardServerError::BadRequest(format!(
+            "Invalid theme: '{theme}'. Must be 'dark', 'light', 'dark_nobg', or 'light_nobg'"
+        )));
+    }
+
+    let embed_dir = data.cache_dir.join(EMBED_CACHE_DIR);
+    let cached_path = png_cache_path(&embed_dir, &uuid, &query);
 
     if cached_path.exists() {
         info!("{}: Serving cached PNG for '{}'", client_addr, uuid_str);
@@ -479,19 +426,6 @@ pub async fn embed_chart_png(
                 "Failed to deserialize report: {e}"
             ))
         })?;
-
-    let theme = &query.theme;
-    let is_dark = theme == "dark" || theme == "dark_nobg";
-    let transparent = theme == "dark_nobg" || theme == "light_nobg";
-
-    if !matches!(
-        theme.as_str(),
-        "dark" | "light" | "dark_nobg" | "light_nobg"
-    ) {
-        return Err(IggyBenchDashboardServerError::BadRequest(format!(
-            "Invalid theme: '{theme}'. Must be 'dark', 'light', 'dark_nobg', or 'light_nobg'"
-        )));
-    }
 
     let hardware_line = format!(
         "{} @ {} (server {})",
@@ -614,7 +548,7 @@ pub async fn embed_chart_png(
         .await
         .map_err(IggyBenchDashboardServerError::InternalError)?;
 
-    std::fs::create_dir_all(&cache_dir).map_err(|e| {
+    std::fs::create_dir_all(&embed_dir).map_err(|e| {
         IggyBenchDashboardServerError::InternalError(format!(
             "Failed to create embed cache directory: {e}"
         ))
@@ -751,7 +685,7 @@ pub async fn embed_chart(
 <head>
 <meta charset="utf-8">
 <title>Downloading chart...</title>
-<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+<script src="{ECHARTS_SCRIPT_PATH}"></script>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ background: transparent; }}
@@ -789,7 +723,7 @@ pub async fn embed_chart(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Iggy Benchmark Chart</title>
-<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+<script src="{ECHARTS_SCRIPT_PATH}"></script>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ background: {bg_color}; overflow: hidden; }}
@@ -813,9 +747,380 @@ pub async fn embed_chart(
     Ok(HttpResponse::Ok().content_type("text/html").body(html))
 }
 
+/// Default service of the `/api` scope, so an unknown API path returns 404 JSON instead of the
+/// frontend page.
+pub async fn unknown_api_path(req: HttpRequest) -> Result<HttpResponse> {
+    Err(IggyBenchDashboardServerError::NotFound(format!(
+        "{UNKNOWN_API_PATH} '{}'",
+        req.path()
+    )))
+}
+
 fn get_client_addr(req: &HttpRequest) -> String {
     req.connection_info()
         .peer_addr()
         .unwrap_or("unknown")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config;
+    use actix_web::http::StatusCode;
+    use actix_web::http::header::CONTENT_TYPE;
+    use actix_web::{App, test};
+    use bench_dashboard_shared::series::BenchmarkSeries;
+    use bench_dashboard_shared::summary::BenchmarkSummary;
+    use std::path::Path;
+
+    const FIXTURE_RESULTS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../fixtures/results");
+    const SHIPPED_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../dashboard.toml");
+    /// An old cluster run left its bench.log in a sibling directory without a report.
+    const RUN_DIR_WITHOUT_REPORT: &str = "rc1-cluster3-pinned-producer-20p-800MB-bench-log";
+    /// 8 producers, 8 consumers, and the groups of producers, consumers, and both.
+    const PRODUCER_AND_CONSUMER_DIR: &str = "old-0.4.202-pinned-producer-and-consumer";
+    const PRODUCER_AND_CONSUMER_RUN: &str = "6b1e288a-9155-4da3-8d3f-ec4d929de3d3";
+    /// The fixture reports keep 3 points of every series.
+    const FIXTURE_SERIES_POINTS: usize = 3;
+    const LATENCY_OF_GROUPS: &str = "metric=latency&scope=group";
+    const REPORT_FILE: &str = "report.json";
+    const JSON_CONTENT_TYPE: &str = "application/json";
+
+    fn app_state() -> AppState {
+        app_state_with_results(Path::new(FIXTURE_RESULTS_DIR))
+    }
+
+    fn app_state_with_results(results_dir: &Path) -> AppState {
+        let config = config::load(Path::new(SHIPPED_CONFIG)).expect("the shipped config is valid");
+        let cache = BenchmarkCache::new(results_dir.to_path_buf(), config.thresholds);
+        cache.load().expect("the results directory is readable");
+        let cache = Arc::new(cache);
+        AppState {
+            series_builder: Arc::new(
+                SeriesBuilder::start(Arc::clone(&cache)).expect("the series build thread starts"),
+            ),
+            cache,
+            render_pool: Arc::new(PngRenderPool::new().expect("the render thread starts")),
+            cache_dir: std::env::temp_dir(),
+            config: Arc::new(config),
+        }
+    }
+
+    #[actix_web::test]
+    async fn given_fixture_runs_when_listing_benchmarks_should_return_every_run_newest_first() {
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(app_state()))
+                .service(list_benchmark_summaries),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/api/benchmarks").to_request(),
+        )
+        .await;
+
+        assert!(response.status().is_success(), "{}", response.status());
+        let summaries: Vec<BenchmarkSummary> = test::read_body_json(response).await;
+        let runs: Vec<_> = summaries
+            .iter()
+            .map(|summary| (summary.uuid.to_string(), summary.version.as_str()))
+            .collect();
+        assert!(
+            Path::new(FIXTURE_RESULTS_DIR)
+                .join(RUN_DIR_WITHOUT_REPORT)
+                .join("bench.log")
+                .is_file()
+        );
+        assert_eq!(
+            runs,
+            [
+                (
+                    "b5c560ad-1ad2-49f0-88dd-c29db75126aa".to_owned(),
+                    "0.10.0 at 53e3bf1e3"
+                ),
+                ("ea431315-8646-43cf-a068-926a8bff09d9".to_owned(), "0.10.0"),
+                ("48587edc-6d6b-4ab5-8316-c64be4a65135".to_owned(), "0.10.0"),
+                (
+                    "d7ef0e8c-d152-4c83-8036-4531c17c63ab".to_owned(),
+                    "0.9.0 at 71f29618b"
+                ),
+                ("6b1e288a-9155-4da3-8d3f-ec4d929de3d3".to_owned(), "0.4.202"),
+            ]
+        );
+    }
+
+    #[actix_web::test]
+    async fn given_config_file_when_requesting_config_should_return_parsed_file() {
+        let state = app_state();
+        let expected = state.config.as_ref().clone();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .service(get_dashboard_config),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/api/config").to_request(),
+        )
+        .await;
+
+        assert!(response.status().is_success(), "{}", response.status());
+        let config: DashboardConfig = test::read_body_json(response).await;
+        assert_eq!(config, expected);
+        assert_eq!(config.suites.len(), 3);
+        assert_eq!(config.headlines.len(), 4);
+    }
+
+    #[actix_web::test]
+    async fn given_unknown_api_path_when_requesting_should_answer_not_found_json() {
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(app_state()))
+                .service(get_dashboard_config)
+                .service(web::scope("/api").default_service(web::to(unknown_api_path))),
+        )
+        .await;
+
+        for uri in ["/api/hardware", "/api/does/not/exist"] {
+            let response =
+                test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some(JSON_CONTENT_TYPE),
+                "{uri}"
+            );
+            let body: serde_json::Value = test::read_body_json(response).await;
+            assert!(
+                body["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains(uri)),
+                "{uri}: {body}"
+            );
+        }
+
+        // A handler registered before the scope keeps its path.
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/api/config").to_request(),
+        )
+        .await;
+        assert!(response.status().is_success(), "{}", response.status());
+    }
+
+    fn series_uri(uuid: &str, query: &str) -> String {
+        format!("/api/benchmark/series/{uuid}?{query}")
+    }
+
+    fn producer_and_consumer_key(metric: SeriesMetric, scope: SeriesScope) -> SeriesKey {
+        SeriesKey {
+            uuid: PRODUCER_AND_CONSUMER_RUN
+                .parse()
+                .expect("the fixture uuid is valid"),
+            metric,
+            scope,
+        }
+    }
+
+    #[actix_web::test]
+    async fn given_fixture_run_when_requesting_each_series_should_send_every_point_and_cache_it() {
+        let state = web::Data::new(app_state());
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(get_benchmark_series),
+        )
+        .await;
+
+        // The group scope leaves out the combined group of producers and consumers.
+        for (query, metric, scope, unit, series_count) in [
+            (
+                LATENCY_OF_GROUPS,
+                SeriesMetric::Latency,
+                SeriesScope::Group,
+                "ms",
+                2,
+            ),
+            (
+                "metric=throughput&scope=group",
+                SeriesMetric::Throughput,
+                SeriesScope::Group,
+                "MB/s",
+                2,
+            ),
+            (
+                "metric=latency&scope=actors",
+                SeriesMetric::Latency,
+                SeriesScope::Actors,
+                "ms",
+                16,
+            ),
+            (
+                "metric=throughput&scope=actors",
+                SeriesMetric::Throughput,
+                SeriesScope::Actors,
+                "MB/s",
+                16,
+            ),
+        ] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(&series_uri(PRODUCER_AND_CONSUMER_RUN, query))
+                    .to_request(),
+            )
+            .await;
+
+            assert!(
+                response.status().is_success(),
+                "{query}: {}",
+                response.status()
+            );
+            let series: BenchmarkSeries = test::read_body_json(response).await;
+            assert_eq!(series.metric, metric, "{query}");
+            assert_eq!(series.unit, unit, "{query}");
+            assert_eq!(series.series.len(), series_count, "{query}");
+            for line in &series.series {
+                assert_eq!(
+                    line.points.len(),
+                    FIXTURE_SERIES_POINTS,
+                    "{query}: {:?}",
+                    line.source
+                );
+            }
+            assert!(
+                state
+                    .cache
+                    .series()
+                    .get(&producer_and_consumer_key(metric, scope))
+                    .is_some(),
+                "{query}"
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn given_unknown_run_when_requesting_series_should_answer_not_found() {
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(app_state()))
+                .service(get_benchmark_series),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&series_uri(&Uuid::nil().to_string(), LATENCY_OF_GROUPS))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert!(body["error"].is_string(), "{body}");
+    }
+
+    #[actix_web::test]
+    async fn given_unknown_metric_or_scope_when_requesting_series_should_answer_bad_request() {
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(app_state()))
+                .service(get_benchmark_series),
+        )
+        .await;
+
+        for uri in [
+            series_uri(PRODUCER_AND_CONSUMER_RUN, "metric=p99&scope=group"),
+            series_uri(PRODUCER_AND_CONSUMER_RUN, "metric=latency&scope=all"),
+            series_uri(PRODUCER_AND_CONSUMER_RUN, "metric=latency"),
+            series_uri("not-a-uuid", LATENCY_OF_GROUPS),
+        ] {
+            let response =
+                test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body: serde_json::Value = test::read_body_json(response).await;
+            assert!(body["error"].is_string(), "{uri}: {body}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn given_cached_series_when_results_reload_should_drop_it() {
+        let state = web::Data::new(app_state());
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(get_benchmark_series),
+        )
+        .await;
+        let key = producer_and_consumer_key(SeriesMetric::Latency, SeriesScope::Group);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&series_uri(PRODUCER_AND_CONSUMER_RUN, LATENCY_OF_GROUPS))
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success(), "{}", response.status());
+        assert!(state.cache.series().get(&key).is_some());
+
+        // The two steps of `BenchmarkCache::schedule_reload`.
+        state.cache.clear();
+        state
+            .cache
+            .load()
+            .expect("the fixture directory is readable");
+
+        assert!(state.cache.series().get(&key).is_none());
+    }
+
+    #[actix_web::test]
+    async fn given_report_broken_after_load_when_requesting_series_should_answer_internal_error() {
+        let results_dir = tempfile::tempdir().expect("a temporary directory is created");
+        let run_dir = results_dir.path().join(PRODUCER_AND_CONSUMER_DIR);
+        std::fs::create_dir(&run_dir).expect("the run directory is created");
+        let report = run_dir.join(REPORT_FILE);
+        std::fs::copy(
+            Path::new(FIXTURE_RESULTS_DIR)
+                .join(PRODUCER_AND_CONSUMER_DIR)
+                .join(REPORT_FILE),
+            &report,
+        )
+        .expect("the fixture report is copied");
+        let state = app_state_with_results(results_dir.path());
+        std::fs::write(&report, "{").expect("the report is overwritten");
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .service(get_benchmark_series),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&series_uri(PRODUCER_AND_CONSUMER_RUN, LATENCY_OF_GROUPS))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("Failed to parse report file")),
+            "{body}"
+        );
+    }
 }

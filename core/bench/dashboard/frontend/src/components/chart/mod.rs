@@ -15,28 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod plot_trend;
-pub mod single_chart;
-pub mod tail_chart;
-pub mod trend_chart;
-
 use wasm_bindgen::prelude::wasm_bindgen;
 use web_sys::Element;
-
-#[derive(Debug, Clone)]
-pub struct PlotConfig {
-    pub width: u32,
-    pub height: u32,
-    pub element_id: String,
-    pub is_dark: bool,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub enum PlotType {
-    Latency,
-    Throughput,
-}
 
 #[wasm_bindgen]
 extern "C" {
@@ -49,12 +29,9 @@ extern "C" {
     fn dispose(this: &EChartsInstance);
 }
 
-pub fn dispose_chart(element_id: &str) {
-    if let Some(window) = web_sys::window()
-        && let Some(document) = window.document()
-        && let Some(element) = document.get_element_by_id(element_id)
-        && let Some(instance) = getInstanceByDom(&element)
-    {
+/// Also works on an element that has left the page, so an unmounted component frees its chart.
+pub fn dispose_chart_at(element: &Element) {
+    if let Some(instance) = getInstanceByDom(element) {
         instance.dispose();
     }
 }

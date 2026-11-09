@@ -15,18 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::dedicated_thread::{DedicatedThread, ThreadStopped};
 use charming::Chart;
 use charming::renderer::image_renderer::{ImageFormat, ImageRenderer};
 use charming::theme::Theme;
-use std::sync::mpsc;
+use std::io;
 use tracing::info;
+
+const RENDER_THREAD: &str = "png-render";
 
 struct RenderJob {
     chart: Chart,
     width: u32,
     height: u32,
     dark: bool,
-    reply: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
 }
 
 /// Dedicated render thread for PNG generation.
@@ -36,28 +38,20 @@ struct RenderJob {
 /// thread; actix workers send jobs via channel and await results without blocking.
 /// Disk caching ensures only the first request for a given chart incurs render cost.
 pub struct PngRenderPool {
-    sender: mpsc::Sender<RenderJob>,
+    thread: DedicatedThread<RenderJob, Result<Vec<u8>, String>>,
 }
 
 impl PngRenderPool {
-    pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel::<RenderJob>();
-
-        std::thread::Builder::new()
-            .name("png-render".to_string())
-            .spawn(move || {
-                for job in rx {
-                    let result = Self::render(&job.chart, job.width, job.height, job.dark);
-                    let _ = job.reply.send(result);
-                }
-            })
-            .expect("failed to spawn png render thread");
+    pub fn new() -> io::Result<Self> {
+        let thread = DedicatedThread::start(RENDER_THREAD, |job: RenderJob| {
+            Self::render(&job.chart, job.width, job.height, job.dark)
+        })?;
 
         info!("PNG render thread started");
-        Self { sender: tx }
+        Ok(Self { thread })
     }
 
-    pub fn default_pool() -> Self {
+    pub fn default_pool() -> io::Result<Self> {
         Self::new()
     }
 
@@ -78,16 +72,14 @@ impl PngRenderPool {
         height: u32,
         dark: bool,
     ) -> Result<Vec<u8>, String> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.sender
-            .send(RenderJob {
+        self.thread
+            .run(RenderJob {
                 chart,
                 width,
                 height,
                 dark,
-                reply: tx,
             })
-            .map_err(|_| "render pool shut down".to_string())?;
-        rx.await.map_err(|_| "render worker dropped".to_string())?
+            .await
+            .map_err(|ThreadStopped| "render pool shut down".to_string())?
     }
 }

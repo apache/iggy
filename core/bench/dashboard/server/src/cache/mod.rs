@@ -17,94 +17,58 @@
 
 use crate::error::IggyBenchDashboardServerError;
 use bench_dashboard_shared::BenchmarkReportLight;
-use dashmap::{DashMap, DashSet};
+use bench_dashboard_shared::config::Thresholds;
+use bench_dashboard_shared::summary::BenchmarkSummary;
+use dashmap::DashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use tokio::fs::{File, OpenOptions};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use tracing::{error, info};
 use uuid::Uuid;
 
 mod loader;
-mod query;
+mod series;
 mod storage;
 mod watcher;
 
+use series::{SERIES_CACHE_MAX_BYTES, SeriesCache};
+
+pub use series::{SeriesBuilder, SeriesKey};
 pub use watcher::CacheWatcher;
 
 pub type Result<T> = std::result::Result<T, IggyBenchDashboardServerError>;
-pub type HardwareIdentifier = String;
-pub type Gitref = String;
 
-const WORKFLOW_FILE: &str = "gh_workflows.txt";
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BenchmarkCache {
     /// Map benchmark identifier to benchmark light report and path
     benchmarks: DashMap<Uuid, (BenchmarkReportLight, PathBuf)>,
 
-    /// Map hardware identifier to git ref
-    hardware_to_gitref: DashMap<HardwareIdentifier, DashSet<Gitref>>,
+    /// Summaries of all runs, newest first. A load swaps in the new list when it finishes, so a
+    /// request during a reload gets the previous list.
+    summaries: RwLock<Arc<Vec<BenchmarkSummary>>>,
 
-    /// Map git ref to benchmark directory names
-    gitref_to_benchmarks: DashMap<Gitref, DashSet<Uuid>>,
+    /// Thresholds for the badges of the summaries
+    thresholds: Thresholds,
+
+    /// Reduced time series, built on the first request. A reload clears them.
+    series: SeriesCache,
 
     /// Path to the results directory
     results_dir: PathBuf,
 
     /// Last reload request time
     last_reload_request: Arc<Mutex<Option<Instant>>>,
-
-    /// Workflows downloaded from GitHub
-    gh_workflows: DashSet<u64>,
-
-    /// File containing list of downloaded workflows
-    gh_workflows_file: Arc<Mutex<File>>,
 }
 
 impl BenchmarkCache {
-    pub async fn new(results_dir: PathBuf) -> Self {
-        let gh_workflows_path = results_dir
-            .join(WORKFLOW_FILE)
-            .to_str()
-            .unwrap()
-            .to_string();
-
-        info!("GH workflows path: {}", gh_workflows_path);
-
-        let gh_workflows_file = OpenOptions::new()
-            .write(true)
-            .read(true)
-            .append(true)
-            .create(true)
-            .open(&gh_workflows_path)
-            .await
-            .unwrap_or_else(|_| panic!("Failed to open GH workflows file: {gh_workflows_path}"));
-
+    pub fn new(results_dir: PathBuf, thresholds: Thresholds) -> Self {
         Self {
             benchmarks: DashMap::new(),
-            hardware_to_gitref: DashMap::new(),
-            gitref_to_benchmarks: DashMap::new(),
+            summaries: RwLock::default(),
+            thresholds,
+            series: SeriesCache::new(SERIES_CACHE_MAX_BYTES),
             results_dir,
             last_reload_request: Arc::new(Mutex::new(None)),
-            gh_workflows: DashSet::new(),
-            gh_workflows_file: Arc::new(Mutex::new(gh_workflows_file)),
-        }
-    }
-
-    pub fn is_gh_workflow_present(&self, workflow_id: u64) -> bool {
-        self.gh_workflows.contains(&workflow_id)
-    }
-
-    pub async fn insert_gh_workflow(&self, workflow_id: u64) {
-        let mut file = self.gh_workflows_file.lock().await;
-
-        if self.gh_workflows.insert(workflow_id)
-            && let Err(e) = file.write_all(format!("{workflow_id}\n").as_bytes()).await
-        {
-            error!("Failed to write GH workflow ID to file: {}", e);
         }
     }
 }

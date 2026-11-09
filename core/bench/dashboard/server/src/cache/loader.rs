@@ -18,43 +18,27 @@
 use super::{BenchmarkCache, Result};
 use crate::error::IggyBenchDashboardServerError;
 use bench_dashboard_shared::BenchmarkReportLight;
+use bench_dashboard_shared::summary::BenchmarkSummary;
 use std::path::Path;
-use tokio::io::AsyncReadExt;
+use std::sync::{Arc, PoisonError};
 use tracing::{error, info};
 
 impl BenchmarkCache {
-    pub async fn load(&self) -> Result<()> {
+    pub fn load(&self) -> Result<()> {
         info!(
             "Building benchmark cache from directory {}",
             self.results_dir.display()
         );
 
-        self.load_gh_workflows().await;
-
         let entries: Vec<_> = std::fs::read_dir(&self.results_dir)
             .map_err(IggyBenchDashboardServerError::Io)?
             .filter_map(|r: std::result::Result<std::fs::DirEntry, std::io::Error>| r.ok())
             .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            // Servers from before --cache-dir wrote their PNG cache here. It isn't a benchmark run.
             .filter(|entry| entry.file_name() != "embed_cache")
             .collect();
 
-        let mut total_removed_size = 0;
-
         entries.iter().for_each(|entry| {
-            // Remove HTML files from the directory
-            match self.remove_html_files(&entry.path()) {
-                Ok(size) => {
-                    total_removed_size += size;
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to remove HTML files from {}: {}",
-                        entry.path().display(),
-                        e
-                    );
-                }
-            }
-
             // Relative path to report.json, for example `./performance_results/poll_8_1000_100_10000_tcp_no_cache_e1393367_atlas/report.json`
             let path = entry.path().join("report.json");
 
@@ -72,44 +56,41 @@ impl BenchmarkCache {
 
             info!("Loaded light benchmark report for {:?}", &entry.path());
 
-            let identifier = if let Some(identifier) = &light_report.hardware.identifier {
-                identifier
-            } else {
+            if light_report.hardware.identifier.is_none() {
                 error!(
                     "No identifier found in benchmark report: {:#?}",
                     &entry.path()
                 );
                 return;
-            };
+            }
 
-            let gitref = if let Some(gitref) = &light_report.params.gitref {
-                gitref
-            } else {
+            if light_report.params.gitref.is_none() {
                 error!("No gitref found in benchmark report: {:#?}", &entry.path());
                 return;
-            };
-
-            // Update hardware to gitref mapping
-            self.hardware_to_gitref
-                .entry(identifier.clone())
-                .or_default()
-                .insert(gitref.clone());
-
-            // Update gitref to benchmarks mapping
-            self.gitref_to_benchmarks
-                .entry(gitref.clone())
-                .or_default()
-                .insert(light_report.uuid);
+            }
 
             // Store the benchmark report
             self.benchmarks
                 .insert(light_report.uuid, (light_report, path));
         });
 
-        info!(
-            "Remove HTML files of size: {:.2} MB",
-            total_removed_size as f64 / 1_048_576.0
-        );
+        let mut summaries: Vec<_> = self
+            .benchmarks
+            .iter()
+            .map(|entry| BenchmarkSummary::new(&entry.value().0, &self.thresholds))
+            .collect();
+        summaries.sort_by(|a, b| {
+            b.version_order
+                .timestamp_us
+                .cmp(&a.version_order.timestamp_us)
+                .then_with(|| a.uuid.cmp(&b.uuid))
+        });
+        info!("Built {} benchmark summaries", summaries.len());
+        // The writer only swaps an Arc, so a poisoned lock still holds a whole list.
+        *self
+            .summaries
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::new(summaries);
 
         Ok(())
     }
@@ -133,74 +114,5 @@ impl BenchmarkCache {
             );
             IggyBenchDashboardServerError::InvalidJson(e.to_string())
         })
-    }
-
-    async fn load_gh_workflows(&self) {
-        let mut data = String::new();
-        let read = self
-            .gh_workflows_file
-            .lock()
-            .await
-            .read_to_string(&mut data)
-            .await;
-
-        match read {
-            Ok(0) => {
-                info!("No GH workflows file found")
-            }
-            Ok(1_usize..) => {
-                info!("Loaded GH workflows file");
-                data.lines().for_each(|line| {
-                    info!("Adding GH workflow: {}", line);
-                    self.gh_workflows.insert(line.parse().unwrap());
-                });
-            }
-            Err(e) => {
-                info!("Error reading GH workflows file: {e}");
-            }
-        }
-    }
-
-    pub fn remove_html_files(&self, entry_path: &Path) -> std::io::Result<u64> {
-        let html_files: Vec<_> = std::fs::read_dir(entry_path)?
-            .filter_map(|r| r.ok())
-            .filter(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .map(|ext| ext == "html")
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        let mut total_size = 0;
-
-        for html_file in html_files {
-            let metadata = match html_file.metadata() {
-                Ok(meta) => meta,
-                Err(e) => {
-                    error!(
-                        "Failed to get metadata for file {}: {}",
-                        html_file.path().display(),
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            let file_size = metadata.len();
-            if let Err(e) = std::fs::remove_file(html_file.path()) {
-                error!(
-                    "Failed to remove HTML file {} (size: {} bytes): {}",
-                    html_file.path().display(),
-                    file_size,
-                    e
-                );
-            } else {
-                total_size += file_size;
-            }
-        }
-
-        Ok(total_size)
     }
 }

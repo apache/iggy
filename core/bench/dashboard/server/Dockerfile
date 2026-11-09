@@ -80,6 +80,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy the built binary and frontend files
 COPY --from=builder /usr/src/iggy-bench-dashboard/target/release/iggy-bench-dashboard-server /app/
 COPY --from=builder /usr/src/iggy-bench-dashboard/core/bench/dashboard/frontend/dist /app/frontend/dist
+COPY core/bench/dashboard/dashboard.toml /app/
 COPY --from=builder /usr/src/iggy-bench-dashboard/LICENSE-binary /usr/share/doc/iggy-bench-dashboard/LICENSE-binary
 COPY LICENSE NOTICE /usr/share/doc/iggy-bench-dashboard/
 

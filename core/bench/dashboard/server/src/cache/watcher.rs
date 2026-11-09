@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
+use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tracing::{error, info};
 
@@ -43,13 +44,6 @@ impl CacheWatcher {
                     event.kind,
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                 ) {
-                    let in_embed_cache = event
-                        .paths
-                        .iter()
-                        .all(|p| p.components().any(|c| c.as_os_str() == "embed_cache"));
-                    if in_embed_cache {
-                        return;
-                    }
                     let cache = Arc::clone(&cache_clone);
                     runtime_handle.spawn(async move {
                         cache.schedule_reload().await;
@@ -85,9 +79,14 @@ impl BenchmarkCache {
         sleep(Duration::from_secs(5)).await;
         info!("Reloading cache...");
 
-        self.clear();
-        if let Err(e) = self.load().await {
-            error!("Failed to reload cache: {}", e);
+        let reload = spawn_blocking(move || {
+            self.clear();
+            self.load()
+        });
+        match reload.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!("Failed to reload cache: {}", e),
+            Err(e) => error!("Cache reload task failed: {}", e),
         }
     }
 }
