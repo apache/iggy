@@ -133,7 +133,7 @@ That list is plugin-side only, not an inventory of every caller in the tree, and
 
 ### Errors
 
-- **Use `Error::PermanentHttpError` / `Error::SchemaMismatch` / `Error::CatalogCommitError` for non-retryable failures.** Returning a transient variant for bad data trips circuit breakers and hammers the backend.
+- **Use `Error::PermanentHttpError` / `Error::SchemaMismatch` for non-retryable failures.** Returning a transient variant for bad data trips circuit breakers and hammers the backend. `Error::is_permanent()` is the class an at-least-once sink is stopped or retried by. `Error::CatalogCommitError` is transient there: the plugin must not retry the consumed transaction itself, but the runtime's redelivery rebuilds it.
 - **No `unwrap()` / `expect()`** on Results from external I/O outside tests.
 
 ### Forward-compat config

@@ -17,7 +17,8 @@
 
 name: Issue Labeler / Assigner
 
-# Three add-only triage steps that run when a reporter opens or edits an issue:
+# Three add-only triage steps that run when a reporter opens or edits an issue,
+# and a fourth step that also runs when someone assigns an issue:
 #
 # 1. Label: maps the "Affected area / component" dropdown from the bug/feature
 #    issue forms (.github/ISSUE_TEMPLATE/) onto real repo labels, so reporters
@@ -32,24 +33,42 @@ name: Issue Labeler / Assigner
 #    self-tag the issue with the `good first issue` label. Maintainers remove it
 #    during triage if they disagree (add-only here, see below).
 #
+# 4. Good first issue limit: new contributors take one good first issue (see
+#    CONTRIBUTING.md). If a good first issue goes to someone who already holds
+#    another one, open or closed, post a note for maintainers, who decide
+#    whether the assignment stays. Assignees with write access or 3+ merged PRs
+#    are skipped. On `assigned` the step checks the new assignee. On `opened`
+#    and `edited` it checks the reporter, because step 2 assigns with
+#    GITHUB_TOKEN, and an assignment made with GITHUB_TOKEN fires no event.
+#
 # Add-only by design: no step removes anything. Reporters rarely deselect, and
-# removing would fight maintainers who labeled or reassigned by hand. Every API
-# call is idempotent, so re-running on `edited` is harmless.
+# removing would fight maintainers who labeled or reassigned by hand. Steps 1-3
+# skip `assigned`, so that step 2 does not add back a reporter whom a maintainer
+# replaced. The note carries a marker, so that it is posted once. Every other
+# API call is idempotent, so re-running on `edited` is harmless.
 #
 # SECURITY: the issue body is attacker-controlled text. The label step parses
 # it only for exact matches against the fixed AREA_LABELS allowlist below. The
 # assign and good-first-issue steps use the body only as a boolean gate; the
 # assignee comes from the trusted `payload.issue.user.login` and the label is a
-# fixed constant, never body-derived, so the body cannot inject either. No
-# checkout, no exec of issue contents, no token export.
+# fixed constant, never body-derived, so the body cannot inject either. The
+# limit step never reads the body. No checkout, no exec of issue contents, no
+# token export.
 
 on:
   issues:
-    types: [opened, edited]
+    types: [opened, edited, assigned]
 
 permissions:
   issues: write
   contents: read
+
+concurrency:
+  # One run per issue at a time, so that the limit step sees the note of the
+  # run before it. Keep every pending event instead of replacing it.
+  group: issue-labeler-assigner-${{ github.event.issue.number }}
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   triage:
@@ -57,6 +76,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Apply area labels from issue form
+        if: github.event.action != 'assigned'
         uses: actions/github-script@v9
         with:
           script: |
@@ -118,6 +138,7 @@ jobs:
             });
 
       - name: Assign author who volunteered to contribute
+        if: github.event.action != 'assigned'
         uses: actions/github-script@v9
         with:
           script: |
@@ -147,6 +168,7 @@ jobs:
             });
 
       - name: Self-tag good first issue
+        if: github.event.action != 'assigned'
         uses: actions/github-script@v9
         with:
           script: |
@@ -169,3 +191,96 @@ jobs:
               issue_number: context.payload.issue.number,
               labels: ['good first issue'],
             });
+
+      - name: Note a second good first issue
+        uses: actions/github-script@v9
+        with:
+          script: |
+            // New contributors take one good first issue, so that the others
+            // stay open for the next newcomer. A maintainer decides whether a
+            // second one stays, so this step only posts a note.
+            const GOOD_FIRST_ISSUE = 'good first issue';
+            // The same threshold as the PR issue check in pr-triage-apply.yml.
+            const REGULAR_CONTRIBUTOR_MERGED_PRS = 3;
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.issue.number;
+
+            // Step 2 assigns the reporter with GITHUB_TOKEN, which fires no
+            // `assigned` event, so opened and edited check the reporter.
+            const user = context.payload.action === 'assigned'
+              ? context.payload.assignee
+              : context.payload.issue.user;
+            if (!user || user.type === 'Bot') {
+              core.info('no human assignee to check');
+              return;
+            }
+            const login = user.login;
+
+            // Read the live issue, because the steps above can add the label
+            // and the assignee after GitHub took the event payload.
+            const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number });
+            const isGoodFirstIssue = issue.labels.some(
+              l => (typeof l === 'string' ? l : l.name) === GOOD_FIRST_ISSUE);
+            const isAssigned = (issue.assignees || []).some(a => a.login === login);
+            if (issue.state !== 'open' || !isGoodFirstIssue || !isAssigned) {
+              core.info(`${login} is not assigned to this open good first issue`);
+              return;
+            }
+
+            const { data: held } = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${owner}/${repo} is:issue label:"${GOOD_FIRST_ISSUE}" assignee:${login}`,
+              per_page: 20,
+            });
+            const others = held.items.map(i => i.number).filter(n => n !== issue_number);
+            if (others.length === 0) {
+              core.info(`${login} holds no other good first issue`);
+              return;
+            }
+
+            const { data: access } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner,
+              repo,
+              username: login,
+            });
+            if (access.permission === 'write' || access.permission === 'admin') {
+              core.info(`${login} has write access, skipped`);
+              return;
+            }
+            const { data: merged } = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${owner}/${repo} is:pr is:merged author:${login}`,
+              per_page: 1,
+            });
+            if (merged.total_count >= REGULAR_CONTRIBUTOR_MERGED_PRS) {
+              core.info(`${login} has ${merged.total_count} merged PRs, skipped`);
+              return;
+            }
+
+            // One note per person and issue, so that a later edit does not
+            // post it again. Only the bot's own comments count, so that a
+            // marker that someone else posted cannot hide the note.
+            const marker = `<!-- iggy-good-first-issue-limit:${login} -->`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            if (comments.some(c => c.user?.login === 'github-actions[bot]'
+                && c.body?.includes(marker))) {
+              core.info(`${login}: note already posted`);
+              return;
+            }
+            const list = others.map(n => `#${n}`).join(', ');
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body: [
+                marker,
+                `Note for maintainers: @${login} is also assigned to good first ` +
+                  `${others.length === 1 ? 'issue' : 'issues'} ${list}. ` +
+                  'New contributors take one good first issue. See ' +
+                  '[CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/CONTRIBUTING.md#good-first-issues).',
+              ].join('\n'),
+            });
+            core.info(`${login}: noted ${list}`);

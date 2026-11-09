@@ -30,6 +30,20 @@ pub enum RuntimeError {
         "Sink stream {0:?} sets poll_interval, which is no longer supported. Set max_wait and min_count to batch messages"
     )]
     UnsupportedPollInterval(String),
+    #[error("Sink plugin: {0} cannot deliver at least once: {1}")]
+    AtLeastOnceUnsupported(String, String),
+    /// The delivery of one topic of an at-least-once sink stopped at a message it cannot deliver,
+    /// so that its offset is not stored past it. The other topics of the sink keep delivering,
+    /// and a restart resumes this one at the stored offsets.
+    #[error(
+        "Delivery of stream: {stream}, topic: {topic}, partitions: {partitions:?} stopped before a message it could not deliver, which keeps the stored offsets below it. {reason}"
+    )]
+    DeliveryStopped {
+        stream: String,
+        topic: String,
+        partitions: Vec<u32>,
+        reason: String,
+    },
     #[error("Failed to serialize topic metadata")]
     FailedToSerializeTopicMetadata,
     #[error("Failed to serialize messages metadata")]
@@ -98,6 +112,7 @@ impl RuntimeError {
             RuntimeError::InvalidConfiguration(_) => "invalid_configuration",
             RuntimeError::InvalidConnectorKey(_) => "invalid_connector_key",
             RuntimeError::UnsupportedPollInterval(_) => "invalid_configuration",
+            RuntimeError::AtLeastOnceUnsupported(_, _) => "invalid_configuration",
             RuntimeError::HttpRequestFailed(_) => "http_request_failed",
             RuntimeError::StateLoadFailed { .. } => "state_load_failed",
             RuntimeError::TokenFileNotFound(_) => "invalid_configuration",

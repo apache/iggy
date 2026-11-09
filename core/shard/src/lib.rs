@@ -1158,7 +1158,8 @@ where
         partition: Box<IggyPartition<B, SB>>,
         epoch: u64,
     },
-    /// Seed a routing row for a partition owned by a peer shard.
+    /// Seed a routing row for a partition owned by a peer shard. The owner
+    /// also rewrites its own row this way when a live partition lost it.
     InsertRouted {
         namespace: IggyNamespace,
         owner: ShardId,
@@ -1172,6 +1173,21 @@ where
     ConfirmRemove { namespace: IggyNamespace },
     /// Drop a routing row (peer's partition gone from committed metadata).
     RemoveRouted { namespace: IggyNamespace },
+}
+
+impl<B, SB> ReconcileOp<B, SB>
+where
+    B: MessageBus,
+{
+    #[must_use]
+    pub const fn namespace(&self) -> IggyNamespace {
+        match self {
+            Self::InsertOwned { namespace, .. }
+            | Self::InsertRouted { namespace, .. }
+            | Self::ConfirmRemove { namespace }
+            | Self::RemoveRouted { namespace } => *namespace,
+        }
+    }
 }
 
 /// Inter-shard channel envelope.
@@ -1886,6 +1902,9 @@ where
     /// Reconciler → pump funnel. Borrow discipline: every push / drain
     /// runs without `.await` inside the borrow.
     reconcile_queue: RefCell<VecDeque<ReconcileOp<B, SB>>>,
+    /// Namespaces the reconciler must check again for a local change that no
+    /// metadata commit announces.
+    reconcile_needed: RefCell<BTreeSet<IggyNamespace>>,
     shutting_down: Cell<bool>,
 
     /// Partition-plane frames that arrived before this shard's reconciler
@@ -2214,6 +2233,7 @@ where
             metrics,
             metadata_tick_handler: RefCell::new(None),
             reconcile_queue: RefCell::new(VecDeque::new()),
+            reconcile_needed: RefCell::new(BTreeSet::new()),
             shutting_down: Cell::new(false),
             pending_partition_frames: RefCell::new(BTreeMap::new()),
             parked_partition_bytes: Cell::new(0),
@@ -3174,6 +3194,7 @@ where
             metrics,
             metadata_tick_handler: RefCell::new(None),
             reconcile_queue: RefCell::new(VecDeque::new()),
+            reconcile_needed: RefCell::new(BTreeSet::new()),
             shutting_down: Cell::new(false),
             pending_partition_frames: RefCell::new(BTreeMap::new()),
             parked_partition_bytes: Cell::new(0),
@@ -3293,6 +3314,21 @@ where
         self.wake_reconcile_apply();
     }
 
+    /// The namespaces recorded for the reconciler since the last call: every
+    /// op the pump applied, and every partition install that finished. An op
+    /// staged before a delete and applied after it leaves a ghost that only
+    /// this record names.
+    #[must_use]
+    pub fn take_reconcile_needed(&self) -> BTreeSet<IggyNamespace> {
+        self.reconcile_needed.take()
+    }
+
+    /// Whether `namespace` is recorded and not yet taken.
+    #[must_use]
+    pub fn reconcile_needed_contains(&self, namespace: IggyNamespace) -> bool {
+        self.reconcile_needed.borrow().contains(&namespace)
+    }
+
     /// Wake the pump after off-pump work becomes visible. A refused marker is
     /// safe because a full inbox has already woken the pump, whose frame and
     /// tick arms both apply staged reconciliation work.
@@ -3405,6 +3441,7 @@ where
         let partitions = self.plane.partitions();
         let mut confirmed_remove = false;
         for op in staged {
+            self.reconcile_needed.borrow_mut().insert(op.namespace());
             match op {
                 ReconcileOp::InsertOwned {
                     namespace,
@@ -3422,9 +3459,9 @@ where
                     // the first: its VSR group + segment writers leak and `len`
                     // inflates.
                     //
-                    // A backstop, not the mechanism. `reconcile_additions`
-                    // skips a namespace whose `InsertOwned` is already staged
-                    // ([`Self::has_staged_insert_owned`]), so a second op for a
+                    // A backstop, not the mechanism. The reconciler's target
+                    // check skips a namespace whose `InsertOwned` is already
+                    // staged ([`Self::has_staged_insert_owned`]), so a second op for a
                     // live namespace should not be built at all. Dropping one
                     // here is damage control rather than a free no-op: the
                     // build already planted its initial segment over the live
@@ -3772,9 +3809,11 @@ enum ParkOutcome<H> {
 /// incarnation - and never the frame's provenance.
 struct ParkedFrame {
     epoch: Option<u64>,
-    /// Reconciler passes survived. `reconcile_parked_frames` increments it and
-    /// answers CLIENT REQUESTS past [`MAX_PARKED_PASSES`], in units the
-    /// simulator's virtual clock controls.
+    /// Reconciler passes survived, counting only a pass that ends a round over
+    /// the work set. `reconcile_parked_frames` increments it and answers
+    /// CLIENT REQUESTS past [`MAX_PARKED_PASSES`], in units the simulator's
+    /// virtual clock controls. A pass that stops at its build cap does not
+    /// count, because the builds it leaves are queued for the next pass.
     ///
     /// Never expires a replicated prepare: no client can retry it, and forcing
     /// the same-view repair backstop to recover a gap is worse than retaining
@@ -3920,11 +3959,13 @@ const fn superblock_wedged(failures: u64, fatal_after: u64) -> bool {
     fatal_after != 0 && failures >= fatal_after
 }
 
-/// Reconciler passes a frame may survive before it is answered rather than held.
+/// Reconciler passes that end a round over the work set, which a frame may
+/// survive before it is answered rather than held.
 ///
 /// Passes, not seconds, and deliberately not described in seconds: a pass fires
-/// on the periodic interval OR on a commit-tick wake, so the wall-clock window
-/// this maps to spans orders of magnitude. `reconcile_periodic_interval` legally
+/// on the periodic interval OR on a commit-tick wake, and a large work set
+/// spreads one round over many passes, so the wall-clock window this maps to
+/// spans orders of magnitude. `reconcile_periodic_interval` legally
 /// reaches 30s, which would put four passes at 120s -- four times the SDK's
 /// response read-timeout, so the client times out first and the bound stops
 /// being the thing that answers it. Commit-tick wakes collapse it the other way,
@@ -4505,17 +4546,6 @@ where
         false
     }
 
-    /// Whether any frame is parked. Cheap enough for the reconciler's per-tick
-    /// fast-skip guard: a non-empty buffer means the shard is by definition not
-    /// converged, so the skip must not fire.
-    ///
-    /// Read from the map, not the byte cell: an empty entry is never left
-    /// behind, but keying convergence off bytes makes that a silent invariant.
-    #[must_use]
-    pub fn has_parked_partition_frames(&self) -> bool {
-        !self.pending_partition_frames.borrow().is_empty()
-    }
-
     /// Namespaces currently holding parked frames. The reconciler pairs this
     /// against committed metadata to find the ones that will never materialise,
     /// which no `ConfirmRemove` / `RemoveRouted` can reach: a namespace that was
@@ -4592,15 +4622,17 @@ where
         staged
     }
 
-    /// Age every frame under `namespace` by one pass, answering CLIENT REQUESTS
-    /// past `MAX_PARKED_PASSES`. Returns the number answered.
+    /// Age every frame under `namespace` by one pass that ended a round over
+    /// the work set, answering CLIENT REQUESTS past `MAX_PARKED_PASSES`.
+    /// Returns the number answered.
     ///
     /// Prepares age but never expire. Expiry would manufacture a gap that a
     /// later commit heartbeat must repair (see `ParkedFrame::passes`), and
-    /// passes are commit-driven: a non-empty buffer defeats the reconciler
-    /// fast-skip, so a create burst elapses four in milliseconds across every
-    /// parked namespace rather than the one it concerns. Byte budgets bound
-    /// them instead. Only [`Self::discard_parked_partition_frames`] still
+    /// passes are commit-driven and every pass that ends a round ages every
+    /// parked namespace. On a small work set each pass ends a round, so a
+    /// create burst elapses four in milliseconds across every parked
+    /// namespace rather than the one it concerns. Byte budgets bound them
+    /// instead. Only [`Self::discard_parked_partition_frames`] still
     /// destroys a prepare.
     ///
     /// Passes, not wall-clock, so the simulator's virtual clock governs it.
@@ -4811,7 +4843,7 @@ where
         let parked_bytes = self.parked_partition_bytes.get();
         // Read the entry without `entry().or_default()`: inserting first would
         // leave an empty entry behind on the overflow path below, which reads as
-        // a parked namespace to the reconciler sweep and its fast-skip guard.
+        // a parked namespace to the reconciler sweep.
         let existing = pending.get_mut(&namespace);
         let parked_len = existing.as_ref().map_or(0, |entry| entry.frames.len());
         let namespace_bytes = existing.as_ref().map_or(0, |entry| entry.bytes);
@@ -11013,9 +11045,13 @@ where
     const PARTITION_TRANSFER_TOTAL_LEN_MAX: u64 = 1 << 40;
 
     /// Bound the buffered offset and dedup state plus one maximum-sized
-    /// checkpoint prepare and its length prefix before allocating the artifact.
-    const CONSUMER_OFFSETS_ARTIFACT_LEN_MAX: u64 =
-        (32 << 20) + journal::partition_journal::PREPARE_BYTES_MAX as u64 + 4;
+    /// checkpoint prepare and state-machine snapshot, each with its length
+    /// prefix, before allocating the artifact.
+    const CONSUMER_OFFSETS_ARTIFACT_LEN_MAX: u64 = (32 << 20)
+        + journal::partition_journal::PREPARE_BYTES_MAX as u64
+        + 4
+        + partitions::state_machine::SNAPSHOT_BYTES_MAX as u64
+        + 4;
 
     /// Concurrent partition transfers this shard will run as a RECEIVER. A
     /// whole-node rejoin arms one per lagging partition; unbounded, the sum
@@ -12225,6 +12261,11 @@ where
             .set_state_transfer_stage(consensus::StateTransferStage::Idle);
         match outcome {
             Ok(outcome) => {
+                // The installed chain can start below the committed delete
+                // watermark, and only the reconciler trims to it.
+                self.reconcile_needed
+                    .borrow_mut()
+                    .insert(IggyNamespace::from_raw(namespace));
                 partition.note_transfer_progress();
                 partition.note_transfer_installed();
                 partition.transfer_rearm = None;

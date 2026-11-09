@@ -34,6 +34,19 @@ php -d extension="${PHP_IGGY_EXTENSION:-../../foreign/php/target/debug/libiggy_p
 php -d extension="${PHP_IGGY_EXTENSION:-../../foreign/php/target/debug/libiggy_php.so}" basic/consumer.php
 ```
 
+### Message Envelopes
+
+The message envelope pattern wraps each payload in a JSON object with a
+`message_type` and a `payload` string, so one topic can carry several kinds of
+messages. The producer sends `OrderCreated`, `OrderConfirmed` and
+`OrderRejected` messages, and the consumer dispatches on `message_type`. A
+message with an unknown type is logged and skipped.
+
+```bash
+php -d extension="${PHP_IGGY_EXTENSION:-../../foreign/php/target/debug/libiggy_php.so}" message-envelope/producer.php
+php -d extension="${PHP_IGGY_EXTENSION:-../../foreign/php/target/debug/libiggy_php.so}" message-envelope/consumer.php
+```
+
 The examples use `IGGY_CONNECTION_STRING` when it is set; use a binary transport
 with credentials for automatic login. Otherwise they connect over TCP using
 `IGGY_HOST` and `IGGY_PORT`, then log in with `IGGY_USERNAME` and `IGGY_PASSWORD`

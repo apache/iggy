@@ -16,3 +16,4 @@
 // under the License.
 
 mod iceberg_sink;
+mod iceberg_sink_delivery;

@@ -1383,10 +1383,10 @@ mod tests {
     #[test]
     fn reconciler_driven_ops_broadcast_a_commit_tick() {
         // `TruncatePartition` commits without touching the partition set, so
-        // nothing else signals the reconciler: `reconcile_segment_truncations`
-        // is the only code that turns it into on-disk effect, and it runs only
-        // when a pass runs. Dropping it from the filter silently downgrades it
-        // to the periodic tick.
+        // nothing else signals the reconciler: its trim check is the only code
+        // that turns it into on-disk effect, and it runs only when a pass runs.
+        // Dropping it from the filter silently downgrades it to the periodic
+        // tick.
         assert!(
             operation_triggers_partition_reconcile(Operation::TruncatePartition),
             "TruncatePartition is enforced by the reconciler and must wake it on commit"
