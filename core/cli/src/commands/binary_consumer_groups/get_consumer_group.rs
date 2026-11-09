@@ -127,10 +127,10 @@ impl CliCommand for GetConsumerGroupCmd {
             "Lag",
         ]);
 
-        let mut partitions: Vec<_> = topic.partitions.iter().collect();
+        let mut partitions = topic.partitions;
         partitions.sort_by_key(|partition| partition.id);
         let mut offset_error = None;
-        for partition in partitions {
+        for partition in &partitions {
             let partition_id = partition.id;
             let member = owners
                 .get(&partition_id)
@@ -1020,21 +1020,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn should_report_zero_lag_when_stored_offset_leads_current() {
-        let logs = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .without_time()
-            .with_target(false)
-            .with_level(false)
-            .with_writer(LogBuffer(Arc::clone(&logs)))
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let mut cmd = command();
         let mut partition = partition(0);
         partition.current_offset = 4;
-        cmd.execute_cmd(&ScriptedClient {
+        let output = rendered(&ScriptedClient {
             partitions_count: 1,
             topic: TopicReply::Partitions(vec![partition]),
             offset_fails: false,
@@ -1042,12 +1030,8 @@ mod tests {
             offset: Some((99, 10)),
             members: Vec::new(),
         })
-        .await
-        .expect("lag stays defined when the stored offset leads");
+        .await;
 
-        drop(_guard);
-        let output =
-            String::from_utf8(logs.lock().expect("log buffer").clone()).expect("log is utf-8");
         assert!(
             output.contains("4") && output.contains("10") && output.contains("| 0"),
             "lag should clamp to zero, got {output}"
