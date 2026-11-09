@@ -53,9 +53,9 @@ const PREPARE_QUEUE_DEPTH: usize = 32;
 /// takes 360 B. Const asserts next to `IggyPartition` and `VsrConsensus` pin
 /// each of those fields to the size of one pointer.
 const IDLE_PARTITION_BYTES_MAX: usize = 9 * 1024;
-/// A partition in its own `Box` takes a whole mimalloc size class: 5,120 B is
-/// one, and one byte more falls into the 6,144 B class.
-const BOXED_PARTITION_BYTES_MAX: usize = 5 * 1024;
+/// A partition in its own `Box` takes a whole mimalloc size class: 6,144 B is
+/// one, and one byte more falls into the 7,168 B class.
+const BOXED_PARTITION_BYTES_MAX: usize = 6 * 1024;
 /// A primary frees its queues at the second commit heartbeat after its last
 /// write.
 const IDLE_TICKS: u64 = 2 * TimeoutManager::COMMIT_MESSAGE_TICKS;
