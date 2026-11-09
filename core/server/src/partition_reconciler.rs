@@ -31,7 +31,9 @@
 //! node. Three sources fill [`ReconcilerCtx::pending`]:
 //!
 //! - the partition changes each commit records
-//!   (`StreamsInner::partition_changes_since`);
+//!   (`StreamsInner::partition_changes_since`), except consumer group
+//!   deletes, which leave the partition as it was and feed only the group
+//!   offset sweep;
 //! - the namespaces the pump records for local changes that no commit
 //!   announces: every applied `ReconcileOp`, and every finished partition
 //!   install (`IggyShard::take_reconcile_needed`);
@@ -45,6 +47,14 @@
 //! A namespace leaves the work set only when its check finds it converged.
 //! Work the check cannot finish now (a staged build, a deferred rebuild, a
 //! backoff, an incomplete trim) keeps it in the set for the next pass.
+//!
+//! A pass checks the work set in key order and stops after
+//! `DISK_VISITS_PER_PASS` builds or teardowns. The next pass resumes after
+//! the last namespace checked. A round over the work set ends after the last
+//! namespace the set held when the round started, and the next round starts
+//! again from the first namespace. New topics and streams take higher keys,
+//! so without that bound a create burst would hold a round open and leave
+//! the namespaces behind the cursor unchecked.
 //!
 //! # Materialisation race: the reply ships before the partition exists
 //!
@@ -316,8 +326,12 @@ pub struct ReconcilerCtx {
     /// The namespaces a pass must check. Ordered, so a capped pass resumes
     /// after the last namespace it checked.
     pending: RefCell<BTreeSet<IggyNamespace>>,
-    /// The last namespace a capped pass checked.
+    /// The last namespace a capped pass checked. `None` makes the next pass
+    /// start a round from the first namespace.
     resume_after: Cell<Option<IggyNamespace>>,
+    /// The last namespace of `pending` when the round under way started. A
+    /// namespace added above it waits for the next round.
+    round_last: Cell<Option<IggyNamespace>>,
     /// `Streams::revision` through which committed partition changes are in
     /// `pending`. `None` makes the next pass fill it from the whole tree.
     synced_revision: Cell<Option<u64>>,
@@ -359,6 +373,7 @@ impl ReconcilerCtx {
             unbuilt_owned: RefCell::new(AHashSet::new()),
             pending: RefCell::new(BTreeSet::new()),
             resume_after: Cell::new(None),
+            round_last: Cell::new(None),
             synced_revision: Cell::new(None),
             next_full_reconcile_at: Cell::new(Some(Instant::now() + FULL_RECONCILE_INTERVAL)),
             repair_scrub: RefCell::new(None),
@@ -410,7 +425,10 @@ impl ReconcilerCtx {
         let changed = self.shard.plane.metadata().mux_stm.streams().read(|inner| {
             synced
                 .and_then(|synced| inner.partition_changes_since(synced))
-                .is_none_or(|mut changes| changes.any(|change| change.namespace == ns))
+                .is_none_or(|mut changes| {
+                    changes
+                        .any(|change| change.namespace == ns && needs_partition_check(change.kind))
+                })
         });
         if changed {
             return;
@@ -616,12 +634,12 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
         ctx.config.consumer_group.rebalancing_timeout.as_micros(),
     );
 
-    let stream_may_be_gone = fold_changes(ctx).await;
+    let partition_may_be_gone = fold_changes(ctx).await;
     let mut counters = PassCounters::default();
     let capped = visit_pending(ctx, &mut counters).await;
     reconcile_parked_frames(ctx, !capped, &mut counters);
     reconcile_group_offsets(&ctx.shard, &ctx.group_offset_cleanup, &mut counters);
-    if stream_may_be_gone {
+    if partition_may_be_gone {
         reconcile_stream_keys(ctx);
     }
     report_lifecycles(ctx).await;
@@ -655,7 +673,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
 }
 
 /// Folds into the work set what changed since the last pass. Returns whether
-/// a stream may have gone: a change removed a partition, or a full fill ran.
+/// a partition may have gone: a change removed one, or a full fill ran.
 async fn fold_changes(ctx: &ReconcilerCtx) -> bool {
     ctx.add_announced(ctx.shard.take_reconcile_needed());
     let (revision, changes) = ctx
@@ -665,12 +683,17 @@ async fn fold_changes(ctx: &ReconcilerCtx) -> bool {
         .mux_stm
         .streams()
         .revision_and_partition_changes(ctx.synced_revision.get());
-    let mut stream_may_be_gone = true;
+    let mut partition_may_be_gone = true;
     if let Some(changes) = changes {
-        stream_may_be_gone = changes
+        partition_may_be_gone = changes
             .iter()
             .any(|change| change.kind == PartitionChangeKind::Removed);
-        ctx.add_announced(changes.iter().map(|change| change.namespace));
+        ctx.add_announced(
+            changes
+                .iter()
+                .filter(|change| needs_partition_check(change.kind))
+                .map(|change| change.namespace),
+        );
     } else {
         // The lost changes can name any namespace, so a repair round under way
         // can no longer tell what they announced.
@@ -687,9 +710,16 @@ async fn fold_changes(ctx: &ReconcilerCtx) -> bool {
         *ctx.repair_scrub.borrow_mut() = Some(announced);
         ctx.group_offset_cleanup.synced_revision.set(None);
         fill_pending(ctx).await;
-        stream_may_be_gone = true;
+        partition_may_be_gone = true;
     }
-    stream_may_be_gone
+    partition_may_be_gone
+}
+
+/// Whether a change can leave a partition's local state behind committed
+/// metadata. A consumer group delete leaves the partition as it was, and
+/// only the group offset sweep acts on it.
+fn needs_partition_check(kind: PartitionChangeKind) -> bool {
+    kind != PartitionChangeKind::ConsumerGroupDeleted
 }
 
 /// Puts every namespace that committed metadata or a local structure names
@@ -766,10 +796,15 @@ async fn add_committed_targets(ctx: &ReconcilerCtx) {
 }
 
 /// Checks the work set in key order, from the namespace after the last one
-/// checked. Returns `true` when the pass stopped at `DISK_VISITS_PER_PASS`
-/// with namespaces left to check.
+/// checked through the last namespace of the round. Returns `true` when the
+/// pass stopped at `DISK_VISITS_PER_PASS` with namespaces of the round left
+/// to check.
 async fn visit_pending(ctx: &ReconcilerCtx, counters: &mut PassCounters) -> bool {
     let mut last = ctx.resume_after.take();
+    if last.is_none() {
+        ctx.round_last.set(ctx.pending.borrow().last().copied());
+    }
+    let round_last = ctx.round_last.get();
     let mut visits = 0_usize;
     loop {
         let next = {
@@ -778,6 +813,7 @@ async fn visit_pending(ctx: &ReconcilerCtx, counters: &mut PassCounters) -> bool
                 || pending.first().copied(),
                 |last| pending.range((Excluded(last), Unbounded)).next().copied(),
             )
+            .filter(|ns| round_last.is_some_and(|round_last| *ns <= round_last))
         };
         let Some(ns) = next else {
             ctx.finish_round();
@@ -834,11 +870,13 @@ async fn yield_now() {
     .await;
 }
 
-/// Forget the keys of deleted stream incarnations, so a reused stream id can
-/// never meet a previous stream's key. Runs only after a pass that saw a
-/// partition removed or filled the work set: a key lookup includes
-/// `created_op`, so a key the sweep has not reached yet is kept but never
-/// served.
+/// Forget the key of a stream incarnation that is deleted or holds no
+/// partition, so a reused stream id can never meet a previous stream's key.
+/// Only a partition build opens a key, and every commit that removes a
+/// partition records it, so this runs only after a pass that saw a partition
+/// removed or filled the work set. A stream deleted after its last topic lost
+/// its key when that topic went. A key lookup includes `created_op`, so a key
+/// the sweep has not reached yet is kept but never served.
 fn reconcile_stream_keys(ctx: &ReconcilerCtx) {
     let partitions = ctx.shard.plane.partitions();
     if !partitions.has_stream_keys() {
@@ -846,10 +884,13 @@ fn reconcile_stream_keys(ctx: &ReconcilerCtx) {
     }
     let () = ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
         partitions.retain_stream_keys(|identity| {
-            inner
-                .items
-                .get(identity.stream_id)
-                .is_some_and(|stream| stream.created_op == identity.created_op)
+            inner.items.get(identity.stream_id).is_some_and(|stream| {
+                stream.created_op == identity.created_op
+                    && stream
+                        .topics
+                        .iter()
+                        .any(|(_, topic)| !topic.partitions.is_empty())
+            })
         });
     });
 }
@@ -2416,7 +2457,7 @@ mod tests {
         RETIRED_PARTITION_OP, retired_member_op,
     };
     use metadata::stm::stream::{
-        RECENT_PARTITION_CHANGES_RETAINED, Streams, TruncatePartitionRequest,
+        PartitionChangeKind, RECENT_PARTITION_CHANGES_RETAINED, Streams, TruncatePartitionRequest,
     };
     use metadata::stm::user::Users;
     use partitions::{
@@ -3403,6 +3444,31 @@ mod tests {
         assert!(!shard.plane.partitions().has_stream_keys());
     }
 
+    /// A stream with no topic records no partition change when it is deleted,
+    /// so the delete of its last topic must already drop its key.
+    #[compio::test]
+    async fn given_stream_deleted_after_its_last_topic_when_reconciling_should_forget_its_key() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let context = key_context(CONFIG_KEY);
+        let mux = TestMux::default();
+        seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&context, 1));
+        seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+        let shard = build_test_shard_with_keys(0, &config, mux, context);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        assert!(shard.plane.partitions().has_stream_keys());
+
+        let mux = &shard.plane.metadata().mux_stm;
+        seed_delete_topic(mux, 3, 0, 0);
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        seed_delete_stream(mux, 4, 0);
+        reconcile_pass(&ctx).await;
+
+        assert!(!shard.plane.partitions().has_stream_keys());
+    }
+
     /// A delete and a recreate of the same ids can commit while a pass runs,
     /// so the pass holds an older epoch than the committed partition. The
     /// directory of the committed incarnation must survive that deferral,
@@ -4211,8 +4277,53 @@ mod tests {
         assert!(ctx.pending.borrow().is_empty());
     }
 
+    /// A consumer group delete leaves its topic's partitions as they were, so
+    /// it puts none of them in the work set. Only the group sweep reads it.
+    #[compio::test]
+    async fn given_converged_shard_when_a_consumer_group_is_deleted_should_check_no_partition() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-group");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "topic-group",
+            vec![assignment(0, 1), assignment(1, 2)],
+        );
+        seed_create_consumer_group(&mux, 3, 0, 0, "group");
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(ctx.pending.borrow().is_empty());
+
+        let mux = &shard.plane.metadata().mux_stm;
+        seed_delete_consumer_group(mux, 4, 0, 0, 0);
+        let (_, changes) = mux
+            .streams()
+            .revision_and_partition_changes(ctx.synced_revision.get());
+        let kinds: Vec<PartitionChangeKind> = changes
+            .expect("the feed holds the delete")
+            .iter()
+            .map(|change| change.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![PartitionChangeKind::ConsumerGroupDeleted; 2],
+            "the delete must record one change per partition"
+        );
+        fold_changes(&ctx).await;
+
+        assert!(
+            ctx.pending.borrow().is_empty(),
+            "a group delete must not check its topic's partitions"
+        );
+    }
+
     /// A pass stops after `DISK_VISITS_PER_PASS` builds and says so, and the
-    /// next pass resumes after the last namespace it checked.
+    /// next pass builds the rest.
     #[compio::test]
     async fn given_more_builds_than_one_pass_allows_when_reconciling_should_finish_in_the_next_pass()
      {
@@ -4244,6 +4355,102 @@ mod tests {
         );
         shard.apply_reconcile_ops();
         assert_eq!(partitions.namespaces().count(), partitions_count);
+    }
+
+    /// A capped pass resumes after the last namespace it checked. The next
+    /// pass runs at once, before the pump may apply what the capped pass
+    /// staged, so it must go on to the rest instead of tearing the same
+    /// partitions down again.
+    #[compio::test]
+    async fn given_capped_teardowns_not_yet_applied_when_the_next_pass_runs_should_tear_down_the_rest()
+     {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        let partitions_count = DISK_VISITS_PER_PASS + 1;
+        seed_stream(&mux, 1, "stream-teardown");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "topic-teardown",
+            (0..u32::try_from(partitions_count).unwrap())
+                .map(|partition_id| assignment(partition_id, u64::from(partition_id) + 1))
+                .collect(),
+        );
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let partitions = shard.plane.partitions();
+        while reconcile_once(&ctx).await {
+            shard.apply_reconcile_ops();
+        }
+        reconcile_pass(&ctx).await;
+        assert_eq!(partitions.namespaces().count(), partitions_count);
+
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        assert!(
+            reconcile_once(&ctx).await,
+            "the teardowns must cap the pass"
+        );
+        assert!(
+            !reconcile_once(&ctx).await,
+            "the next pass must reach the partition the cap left"
+        );
+        shard.apply_reconcile_ops();
+        assert_eq!(partitions.namespaces().count(), 0);
+    }
+
+    /// A round ends after the last namespace the work set held when it
+    /// started. A create burst that adds more builds above the cursor than a
+    /// pass allows must not hold the round open, so a delete behind the
+    /// cursor is checked in the next round.
+    #[compio::test]
+    async fn given_create_burst_above_the_cursor_when_a_partition_behind_it_is_deleted_should_remove_it()
+     {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-early");
+        seed_topic(&mux, 2, 0, "topic-early", vec![assignment(0, 1)]);
+        seed_stream(&mux, 3, "stream-burst");
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let partitions = shard.plane.partitions();
+        let mux = &shard.plane.metadata().mux_stm;
+        let early = IggyNamespace::new(0, 0, 0);
+        reconcile_pass(&ctx).await;
+        assert!(partitions.contains(&early));
+
+        let burst_partitions = u32::try_from(DISK_VISITS_PER_PASS + 1).unwrap();
+        let seed_burst_topic = |op: u64, topic_id: u32| {
+            seed_topic(
+                mux,
+                op,
+                1,
+                &format!("topic-burst-{topic_id}"),
+                (0..burst_partitions)
+                    .map(|partition_id| {
+                        let group = topic_id * burst_partitions + partition_id;
+                        assignment(partition_id, u64::from(group) + 2)
+                    })
+                    .collect(),
+            );
+        };
+        seed_burst_topic(4, 0);
+        assert!(reconcile_once(&ctx).await, "the burst must cap the pass");
+        shard.apply_reconcile_ops();
+
+        seed_delete_topic(mux, 5, 0, 0);
+        for topic_id in 1..=3 {
+            seed_burst_topic(5 + u64::from(topic_id), topic_id);
+            reconcile_once(&ctx).await;
+            shard.apply_reconcile_ops();
+        }
+
+        assert!(
+            !partitions.contains(&early),
+            "the next round must remove the partition behind the cursor"
+        );
     }
 
     /// The change feed and the pump's records must leave nothing for a full

@@ -3809,9 +3809,11 @@ enum ParkOutcome<H> {
 /// incarnation - and never the frame's provenance.
 struct ParkedFrame {
     epoch: Option<u64>,
-    /// Reconciler passes survived. `reconcile_parked_frames` increments it and
-    /// answers CLIENT REQUESTS past [`MAX_PARKED_PASSES`], in units the
-    /// simulator's virtual clock controls.
+    /// Reconciler passes survived, counting only a pass that ends a round over
+    /// the work set. `reconcile_parked_frames` increments it and answers
+    /// CLIENT REQUESTS past [`MAX_PARKED_PASSES`], in units the simulator's
+    /// virtual clock controls. A pass that stops at its build cap does not
+    /// count, because the builds it leaves are queued for the next pass.
     ///
     /// Never expires a replicated prepare: no client can retry it, and forcing
     /// the same-view repair backstop to recover a gap is worse than retaining
@@ -3957,11 +3959,13 @@ const fn superblock_wedged(failures: u64, fatal_after: u64) -> bool {
     fatal_after != 0 && failures >= fatal_after
 }
 
-/// Reconciler passes a frame may survive before it is answered rather than held.
+/// Reconciler passes that end a round over the work set, which a frame may
+/// survive before it is answered rather than held.
 ///
 /// Passes, not seconds, and deliberately not described in seconds: a pass fires
-/// on the periodic interval OR on a commit-tick wake, so the wall-clock window
-/// this maps to spans orders of magnitude. `reconcile_periodic_interval` legally
+/// on the periodic interval OR on a commit-tick wake, and a large work set
+/// spreads one round over many passes, so the wall-clock window this maps to
+/// spans orders of magnitude. `reconcile_periodic_interval` legally
 /// reaches 30s, which would put four passes at 120s -- four times the SDK's
 /// response read-timeout, so the client times out first and the bound stops
 /// being the thing that answers it. Commit-tick wakes collapse it the other way,
@@ -4618,13 +4622,15 @@ where
         staged
     }
 
-    /// Age every frame under `namespace` by one pass, answering CLIENT REQUESTS
-    /// past `MAX_PARKED_PASSES`. Returns the number answered.
+    /// Age every frame under `namespace` by one pass that ended a round over
+    /// the work set, answering CLIENT REQUESTS past `MAX_PARKED_PASSES`.
+    /// Returns the number answered.
     ///
     /// Prepares age but never expire. Expiry would manufacture a gap that a
     /// later commit heartbeat must repair (see `ParkedFrame::passes`), and
-    /// passes are commit-driven and every pass ages every parked namespace, so
-    /// a create burst elapses four in milliseconds across every parked
+    /// passes are commit-driven and every pass that ends a round ages every
+    /// parked namespace. On a small work set each pass ends a round, so a
+    /// create burst elapses four in milliseconds across every parked
     /// namespace rather than the one it concerns. Byte budgets bound them
     /// instead. Only [`Self::discard_parked_partition_frames`] still
     /// destroys a prepare.
