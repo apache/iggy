@@ -24,6 +24,7 @@ use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMod
 use journal::partition_journal::FRONTIER_FILE_NAME;
 use server_common::fatal::NoteDescriptorExhaustion;
 
+use crate::segment_chain::CHAIN_FILE;
 use crate::{CREATED_REVISION_FILE, FILE_SYNC_CONCURRENCY};
 
 const BACKUP: &str = ".install-backup";
@@ -154,11 +155,12 @@ async fn link_tree<S: DurableStorage>(
             if entry.directory {
                 storage.create_directories(&destination).await?;
                 pending.push((source.join(&name), destination));
-            } else if name == FRONTIER_FILE_NAME {
+            } else if name == FRONTIER_FILE_NAME || name == CHAIN_FILE {
                 // The partition WAL publishes its frontier by overwriting one of
-                // two slots in place, so a hard link would not freeze it: the
-                // WAL reset this snapshot exists to roll back would rewrite the
-                // snapshot's own bytes. Two blocks, copied once per install.
+                // two slots in place, and a chain append overwrites a torn tail
+                // in place, so a hard link would not freeze either: a write
+                // after the snapshot would rewrite the snapshot's own bytes.
+                // Both are small, copied once per install.
                 copy_file(&source.join(&name), &destination, storage).await?;
             } else {
                 // Transfer unlinks or atomically replaces these frozen files.
@@ -218,6 +220,7 @@ fn is_scratch(name: &str) -> bool {
 mod tests {
     use super::*;
     use compio::fs::File;
+    use std::os::unix::fs::FileExt;
 
     #[compio::test]
     async fn interrupted_install_restores_segments_offsets_and_wal_together() {
@@ -260,6 +263,29 @@ mod tests {
         assert!(!root.join("99.log").exists());
         assert!(!root.join("0.index.staging").exists());
         recover(root).await.unwrap();
+    }
+
+    /// An append rewrites the chain in place, which a hard link would not
+    /// freeze.
+    #[compio::test]
+    async fn given_a_chain_written_in_place_after_begin_when_recovering_should_restore_its_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join(CHAIN_FILE), b"chain before").unwrap();
+        begin(root, &BTreeSet::new()).await.unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join(CHAIN_FILE))
+            .unwrap()
+            .write_all_at(b"CHAIN", 0)
+            .unwrap();
+
+        recover(root).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(root.join(CHAIN_FILE)).unwrap(),
+            b"chain before"
+        );
     }
 
     #[compio::test]

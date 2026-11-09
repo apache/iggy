@@ -959,3 +959,25 @@ fn given_machines_when_round_tripping_should_keep_their_snapshot() {
         ))
     );
 }
+
+/// The chain describes the refused history, so it is fenced with the segments
+/// rather than left to describe the rebuild.
+#[compio::test]
+async fn given_a_chain_when_quarantining_should_move_it_with_the_segment_files() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("partition");
+    std::fs::create_dir(&directory).unwrap();
+    for name in ["00000000000000000000.log", CHAIN_FILE] {
+        std::fs::write(directory.join(name), name).unwrap();
+    }
+
+    let fenced = quarantine_partition_files(&directory.to_string_lossy(), None)
+        .await
+        .unwrap();
+
+    assert!(!directory.join(CHAIN_FILE).exists());
+    assert_eq!(
+        std::fs::read(Path::new(&fenced).join(CHAIN_FILE)).unwrap(),
+        CHAIN_FILE.as_bytes()
+    );
+}

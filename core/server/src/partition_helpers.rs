@@ -49,7 +49,7 @@ use metadata::stm::stream::Partition;
 use metadata::{IdentityField, ReplicaIdentity};
 use partitions::{
     IggyPartition, IggyPartitions, PartitionPersistence, PartitionRecoveryError,
-    PartitionRecoveryRefusal, PartitionsConfig, RecoveredSegment, clamp_consumer_offsets,
+    PartitionRecoveryRefusal, PartitionsConfig, RecoveredLog, clamp_consumer_offsets,
     configure_consumer_offsets, create_partition_file_hierarchy, ensure_initial_segment,
     hydrate_partition_log, load_persisted_segments, load_persisted_segments_with_checkpoint,
     recover_consumer_offsets,
@@ -772,7 +772,7 @@ async fn load_partition(
         .restore_retry_checkpoint(recovered_persistence.0.checkpoint_op())
         .await
         .map_err(wal_error)?;
-    let recovered_segments = recover_partition_segments(
+    let recovered = recover_partition_segments(
         partitions_config,
         namespace,
         runtime_options,
@@ -786,7 +786,7 @@ async fn load_partition(
         stream_id,
         topic_id,
         partition_id,
-        recovered_segments,
+        recovered,
     )
     .await?;
 
@@ -908,7 +908,7 @@ async fn recover_partition_segments(
     runtime_options: TopicRuntimeOptions,
     stats: &PartitionStats,
     checkpoint: Option<SegmentPosition>,
-) -> Result<Vec<RecoveredSegment>, PartitionRecoveryError> {
+) -> Result<RecoveredLog, PartitionRecoveryError> {
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();

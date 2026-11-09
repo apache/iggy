@@ -65,7 +65,9 @@ use iggy_common::IggyError;
 pub use iggy_index::IggyIndex;
 pub use iggy_index_reader::IggyIndexReader;
 pub use iggy_index_writer::IggyIndexWriter;
-pub use iggy_partition::{IggyPartition, RetirementDebtStatus, SegmentRemoval};
+pub use iggy_partition::{
+    IggyPartition, LocalEnvelope, RetirementDebtStatus, SegmentEviction, SegmentRemoval,
+};
 pub use iggy_partitions::IggyPartitions;
 pub(crate) use io::PartitionIoVerdict;
 pub use io::{
@@ -113,8 +115,8 @@ pub use partition_storage::{
 pub use poll_plan::{DISK_POLL_CHUNK_MAX, PollPlan, PollReadResult};
 pub use segment::{Segment, SegmentLocation};
 pub use segment_recovery::{
-    PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredSegment, load_persisted_segments,
-    load_persisted_segments_with_checkpoint,
+    PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredLog, RecoveredSegment,
+    load_persisted_segments, load_persisted_segments_with_checkpoint,
 };
 use server_common::Message;
 pub use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessages};

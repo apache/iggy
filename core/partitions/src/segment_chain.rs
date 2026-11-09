@@ -30,7 +30,7 @@
 //!
 //! No partition enables a chain yet, so nothing in production writes one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 
@@ -39,6 +39,7 @@ use consensus::state_artifact_checksum;
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use server_common::fatal::NoteDescriptorExhaustion;
+use tracing::warn;
 
 use crate::IggyPartition;
 use crate::segment::Segment;
@@ -177,6 +178,15 @@ pub enum ChainRecord {
 }
 
 impl ChainRecord {
+    /// The segment a sealed or remote record describes.
+    #[must_use]
+    pub const fn segment(&self) -> Option<&SegmentRecord> {
+        match self {
+            Self::Sealed(segment) | Self::Remote(segment) => Some(segment),
+            Self::TrimPoint(_) => None,
+        }
+    }
+
     /// The record's fixed-size encoding, checksum included.
     #[must_use]
     pub fn encode(&self) -> [u8; RECORD_SIZE] {
@@ -264,6 +274,37 @@ pub struct Chain {
     /// The file ended in a record a crash cut short, which the next append
     /// overwrites.
     pub torn_tail: bool,
+}
+
+impl Chain {
+    /// The highest trim point the chain records. Retention raises it before it
+    /// unlinks anything, so every offset at or below it may be gone.
+    #[must_use]
+    pub fn trim_point(&self) -> Option<u64> {
+        self.records
+            .iter()
+            .filter_map(|record| match record {
+                ChainRecord::TrimPoint(offset) => Some(*offset),
+                ChainRecord::Sealed(_) | ChainRecord::Remote(_) => None,
+            })
+            .max()
+    }
+
+    /// The latest record of every segment the trim point has not retired, by
+    /// start offset.
+    #[must_use]
+    pub fn live_segments(&self) -> BTreeMap<u64, ChainRecord> {
+        let trim_point = self.trim_point();
+        let mut live = BTreeMap::new();
+        for record in &self.records {
+            if let Some(segment) = record.segment()
+                && trim_point.is_none_or(|trim_point| segment.end_offset > trim_point)
+            {
+                live.insert(segment.start_offset, *record);
+            }
+        }
+        live
+    }
 }
 
 /// Why a chain file cannot be read.
@@ -392,6 +433,21 @@ pub async fn read_chain(partition_dir: &str) -> Result<Option<Chain>, ChainError
     }
 }
 
+/// Cut the chain at `valid_len`, dropping the record a crash tore.
+///
+/// # Errors
+/// Any I/O failure, after which the torn bytes may remain.
+pub async fn truncate_chain(partition_dir: &str, valid_len: u64) -> io::Result<()> {
+    let path = chain_path(partition_dir);
+    let file = compio::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .await
+        .note_descriptor_exhaustion(|| format!("opening {path}"))?;
+    file.set_len(valid_len).await?;
+    file.sync_all().await
+}
+
 /// Write `record` at `at`, the chain's valid length, and make it durable.
 ///
 /// Writing at the valid length rather than the end of the file overwrites a
@@ -471,9 +527,18 @@ impl ChunkHasher for SegmentDigest {
 pub(crate) struct SegmentChain {
     path: String,
     prefix: ObjectPrefix,
+    /// Where the next append writes. Appends run one at a time on the
+    /// partition's I/O lane, each at the length it was captured with.
     valid_len: u64,
-    /// The latest record of every sealed segment, by start offset.
+    /// The latest record of every sealed segment the trim point has not
+    /// retired, by start offset.
     sealed: BTreeMap<u64, SegmentRecord>,
+    /// The sealed segments with a remote record. Their `.log` is gone, or a
+    /// crash cut their eviction short before the unlink.
+    remote: BTreeSet<u64>,
+    /// The sealed segments whose recorded hash a floor advance matched.
+    confirmed: BTreeSet<u64>,
+    trim_point: Option<u64>,
     /// The digest of the active segment, `None` once any of its bytes reached
     /// the segment without passing through it.
     digest: Option<Box<SegmentDigest>>,
@@ -481,7 +546,7 @@ pub(crate) struct SegmentChain {
 
 /// A record the rotation job appends before it creates the next segment, so the
 /// sealed segment's hash is durable from the moment it exists.
-pub(crate) struct ChainAppend {
+pub struct ChainAppend {
     pub(crate) path: String,
     pub(crate) at: u64,
     pub(crate) record: ChainRecord,
@@ -493,7 +558,95 @@ impl ChainAppend {
     }
 }
 
+/// Evicts one sealed segment: a durable remote record first, so no crash
+/// leaves the `.log` gone without a record standing in for it.
+pub struct EvictionJob {
+    pub(crate) start_offset: u64,
+    /// `None` when the record was already durable before a crash.
+    pub(crate) append: Option<ChainAppend>,
+    pub(crate) messages_path: Option<String>,
+}
+
+pub struct EvictionResult {
+    pub(crate) start_offset: u64,
+    /// This job made the remote record durable, even if the unlink failed
+    /// after it.
+    pub(crate) appended: bool,
+    pub(crate) outcome: Result<(), EvictionFailure>,
+}
+
+/// Which step of an eviction failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionFailure {
+    /// The remote record may not be durable, so the `.log` stayed.
+    Record,
+    /// The record is durable, but the `.log` is still there.
+    Unlink,
+}
+
+impl EvictionJob {
+    pub(crate) async fn execute(self) -> EvictionResult {
+        let Self {
+            start_offset,
+            append,
+            messages_path,
+        } = self;
+        if let Some(append) = &append
+            && let Err(error) = append.execute().await
+        {
+            warn!(path = append.path, start_offset, %error, "cannot append the evicted segment's remote record");
+            return EvictionResult {
+                start_offset,
+                appended: false,
+                outcome: Err(EvictionFailure::Record),
+            };
+        }
+        let outcome = match &messages_path {
+            Some(path) => match compio::fs::remove_file(path).await {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => {
+                    warn!(%path, start_offset, %error, "cannot unlink the evicted segment's log");
+                    Err(EvictionFailure::Unlink)
+                }
+            },
+            None => Ok(()),
+        };
+        EvictionResult {
+            start_offset,
+            appended: append.is_some(),
+            outcome,
+        }
+    }
+}
+
 impl SegmentChain {
+    fn load(path: String, chain: &Chain, active: Option<&Segment>) -> Self {
+        let mut sealed = BTreeMap::new();
+        let mut remote = BTreeSet::new();
+        for (start_offset, record) in chain.live_segments() {
+            if matches!(record, ChainRecord::Remote(_)) {
+                remote.insert(start_offset);
+            }
+            if let Some(segment) = record.segment() {
+                sealed.insert(start_offset, *segment);
+            }
+        }
+        let digest = active
+            .filter(|active| active.size.as_bytes_u64() == 0)
+            .map(|active| Box::new(SegmentDigest::new(active.start_offset)));
+        Self {
+            path,
+            prefix: chain.prefix,
+            valid_len: chain.valid_len,
+            sealed,
+            remote,
+            confirmed: BTreeSet::new(),
+            trim_point: chain.trim_point(),
+            digest,
+        }
+    }
+
     /// Take the digest that covers the first `size` bytes of the active segment
     /// starting at `start_offset`, for a materialization to feed. A digest that
     /// does not cover them is dropped: the segment can no longer be hashed on
@@ -519,16 +672,12 @@ impl SegmentChain {
             .digest
             .as_ref()
             .filter(|digest| digest.covers(segment.start_offset, segment.size.as_bytes_u64()))?;
-        Some(ChainAppend {
-            path: self.path.clone(),
-            at: self.valid_len,
-            record: ChainRecord::Sealed(SegmentRecord::new(
-                segment,
-                incarnation,
-                digest.finalize(),
-                HashSource::CommitPath,
-            )),
-        })
+        Some(self.append(ChainRecord::Sealed(SegmentRecord::new(
+            segment,
+            incarnation,
+            digest.finalize(),
+            HashSource::CommitPath,
+        ))))
     }
 
     /// Account for a seal: the appended record, if there was one, and a fresh
@@ -540,10 +689,80 @@ impl SegmentChain {
         self.digest = Some(Box::new(SegmentDigest::new(next_start)));
     }
 
-    fn note_appended(&mut self, record: &ChainRecord) {
+    /// The trim point retention appends before it unlinks the segment ending at
+    /// `end_offset`, `None` when the chain already holds one at least as high.
+    pub(crate) fn trim(&self, end_offset: u64) -> Option<ChainAppend> {
+        self.trim_point
+            .is_none_or(|trim_point| trim_point < end_offset)
+            .then(|| self.append(ChainRecord::TrimPoint(end_offset)))
+    }
+
+    /// Whether the segment from `start_offset` to `end_offset` may leave the
+    /// local disk: the chain records it and a floor advance matched its hash.
+    pub(crate) fn evictable(&self, start_offset: u64, end_offset: u64) -> bool {
+        self.confirmed.contains(&start_offset)
+            && self
+                .sealed
+                .get(&start_offset)
+                .is_some_and(|record| record.end_offset == end_offset)
+    }
+
+    /// The job that evicts the segment starting at `start_offset`. A record
+    /// that a crash left durable is not appended twice.
+    pub(crate) fn evict(
+        &self,
+        start_offset: u64,
+        messages_path: Option<String>,
+    ) -> Option<EvictionJob> {
+        let record = self.sealed.get(&start_offset)?;
+        let append = (!self.remote.contains(&start_offset))
+            .then(|| self.append(ChainRecord::Remote(*record)));
+        Some(EvictionJob {
+            start_offset,
+            append,
+            messages_path,
+        })
+    }
+
+    /// Account for the remote record an eviction appended for the segment
+    /// starting at `start_offset`.
+    pub(crate) fn note_evicted(&mut self, start_offset: u64) {
+        if let Some(segment) = self.sealed.get(&start_offset).copied() {
+            self.note_appended(&ChainRecord::Remote(segment));
+        }
+    }
+
+    pub(crate) fn note_appended(&mut self, record: &ChainRecord) {
         self.valid_len += RECORD_SIZE as u64;
-        if let ChainRecord::Sealed(segment) | ChainRecord::Remote(segment) = record {
-            self.sealed.insert(segment.start_offset, *segment);
+        match record {
+            ChainRecord::Sealed(segment) => {
+                self.sealed.insert(segment.start_offset, *segment);
+            }
+            ChainRecord::Remote(segment) => {
+                self.sealed.insert(segment.start_offset, *segment);
+                self.remote.insert(segment.start_offset);
+            }
+            ChainRecord::TrimPoint(offset) => {
+                let trim_point = self
+                    .trim_point
+                    .map_or(*offset, |trim_point| trim_point.max(*offset));
+                self.trim_point = Some(trim_point);
+                self.sealed
+                    .retain(|_, segment| segment.end_offset > trim_point);
+                let sealed = &self.sealed;
+                self.remote
+                    .retain(|start_offset| sealed.contains_key(start_offset));
+                self.confirmed
+                    .retain(|start_offset| sealed.contains_key(start_offset));
+            }
+        }
+    }
+
+    fn append(&self, record: ChainRecord) -> ChainAppend {
+        ChainAppend {
+            path: self.path.clone(),
+            at: self.valid_len,
+            record,
         }
     }
 }
@@ -578,37 +797,60 @@ where
                 torn_tail: false,
             }
         };
-        let mut sealed = BTreeMap::new();
-        for record in &chain.records {
-            if let ChainRecord::Sealed(segment) | ChainRecord::Remote(segment) = record {
-                sealed.insert(segment.start_offset, *segment);
-            }
+        self.adopt_segment_chain(&chain)
+    }
+
+    /// Keep the chain boot recovered beside the segments.
+    ///
+    /// # Errors
+    /// [`ChainError::NoDirectory`] when the partition has no directory, and
+    /// [`ChainError::Prefix`] when the chain names another partition or
+    /// incarnation.
+    pub fn adopt_segment_chain(&mut self, chain: &Chain) -> Result<(), ChainError> {
+        let directory = self
+            .partition_dir
+            .as_deref()
+            .ok_or(ChainError::NoDirectory)?;
+        let namespace = self.namespace();
+        let recorded = chain.prefix;
+        if (recorded.stream_id, recorded.topic_id, recorded.partition_id)
+            != (
+                namespace.stream_id() as u64,
+                namespace.topic_id() as u64,
+                namespace.partition_id() as u64,
+            )
+            || recorded.created_revision != self.created_revision()
+        {
+            return Err(ChainError::Prefix { recorded });
         }
-        let active = self.log.active_segment();
-        let digest = (active.size.as_bytes_u64() == 0)
-            .then(|| Box::new(SegmentDigest::new(active.start_offset)));
-        self.segment_chain = Some(SegmentChain {
-            path: chain_path(&directory),
-            prefix: chain.prefix,
-            valid_len: chain.valid_len,
-            sealed,
-            digest,
-        });
+        let active = self.log.segments().last();
+        self.segment_chain = Some(Box::new(SegmentChain::load(
+            chain_path(directory),
+            chain,
+            active,
+        )));
         Ok(())
     }
 
-    /// Stop hashing the active segment on the commit path: bytes reached it
-    /// another way, as a state transfer install does.
-    pub(crate) fn discard_segment_digest(&mut self) {
-        if let Some(chain) = self.segment_chain.as_mut() {
-            chain.digest = None;
-        }
+    /// Forget the chain: an install is replacing the segments it describes,
+    /// and its sweep removes the file.
+    pub(crate) fn drop_segment_chain(&mut self) {
+        self.segment_chain = None;
     }
 
     /// The object prefix the chain records, `None` without a chain.
     #[must_use]
     pub fn object_prefix(&self) -> Option<ObjectPrefix> {
         self.segment_chain.as_ref().map(|chain| chain.prefix)
+    }
+
+    /// The trim point the chain records, `None` without a chain or a trim
+    /// point.
+    #[must_use]
+    pub fn chain_trim_point(&self) -> Option<u64> {
+        self.segment_chain
+            .as_ref()
+            .and_then(|chain| chain.trim_point)
     }
 
     /// The chain's latest record of the sealed segment starting at
@@ -618,6 +860,30 @@ where
         self.segment_chain
             .as_ref()
             .and_then(|chain| chain.sealed.get(&start_offset).copied())
+    }
+
+    /// Match a floor advance against this replica's own record of the sealed
+    /// segment from `start_offset` to `end_offset`. Only a segment whose hash
+    /// matched is ever evicted, so a replica whose bytes diverged keeps them.
+    ///
+    /// Returns whether the record matched.
+    pub fn confirm_segment_hash(
+        &mut self,
+        start_offset: u64,
+        end_offset: u64,
+        hash: &[u8; SEGMENT_HASH_SIZE],
+    ) -> bool {
+        let Some(chain) = self.segment_chain.as_mut() else {
+            return false;
+        };
+        let matched = chain
+            .sealed
+            .get(&start_offset)
+            .is_some_and(|record| record.end_offset == end_offset && record.hash == *hash);
+        if matched {
+            chain.confirmed.insert(start_offset);
+        }
+        matched
     }
 }
 

@@ -37,6 +37,7 @@ use crate::producer_state::{
     PRODUCER_BATCHES_RETAINED, PRODUCERS_MAX, ProducerBatch, ProducerEntry,
 };
 use crate::segment_anchor::ANCHOR_SUFFIX;
+use crate::segment_chain::CHAIN_FILE;
 use crate::state_machine::{
     SNAPSHOT_BYTES_MAX, SnapshotDecodeError, StateMachineError, StateMachineSnapshot,
 };
@@ -2149,7 +2150,7 @@ pub async fn quarantine_partition_files(
         for entry in std::fs::read_dir(source)? {
             let path = entry?.path();
             let quarantined = path.to_str().is_some_and(|path| {
-                [".log", ".index", STAGING_SUFFIX, ANCHOR_SUFFIX]
+                [".log", ".index", STAGING_SUFFIX, ANCHOR_SUFFIX, CHAIN_FILE]
                     .iter()
                     .any(|suffix| path.ends_with(suffix))
             });
@@ -3612,7 +3613,7 @@ where
                         self.invalidate_poll_history();
                         self.log.invalidate_sealed_read_state();
                         self.segment_checksum_cache.borrow_mut().clear();
-                        self.discard_segment_digest();
+                        self.drop_segment_chain();
                         self.reuse_scan_memo.borrow_mut().take();
                         if let Some(persistence) = &self.persistence {
                             persistence.retire_offset_files();
@@ -3881,6 +3882,7 @@ where
                             self.anchor_cleanup_path(segment.start_offset),
                         ],
                         strict: true,
+                        trim: None,
                     },
                     InstallFilePhase::RemoveSegment,
                 )
@@ -4411,7 +4413,7 @@ where
             );
         }
         *self.segment_checksum_cache.borrow_mut() = memos;
-        self.discard_segment_digest();
+        self.drop_segment_chain();
         self.stats.zero_out_all();
         self.stats.increment_segments_count(
             u32::try_from(self.log.segments().len()).expect("manifest segment count fits u32"),
@@ -4458,7 +4460,7 @@ where
         self.consensus().clear_pipeline();
         self.clear_install_offsets(0);
         self.segment_checksum_cache.borrow_mut().clear();
-        self.discard_segment_digest();
+        self.drop_segment_chain();
         self.reuse_scan_memo.borrow_mut().take();
         let end = install.offsets_wire.next_offset.saturating_sub(1);
         self.offset.store(end, Ordering::Release);

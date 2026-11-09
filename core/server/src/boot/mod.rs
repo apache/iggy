@@ -88,7 +88,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-METADATA-CHANGE-LOG-1\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-TIERED-SEGMENT-CHAIN-1\n";
 
 /// Load the server configuration from the active config provider.
 ///
