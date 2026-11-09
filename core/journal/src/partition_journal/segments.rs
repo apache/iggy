@@ -962,6 +962,7 @@ mod tests {
     use super::*;
     use crate::durable_storage::DiskStorage;
     use crate::partition_journal::PARTITION_WAL_BYTES_MAX;
+    #[cfg(target_os = "linux")]
     use crate::partition_journal::tests::supports_preallocation;
     use tempfile::{TempDir, tempdir};
 
@@ -1005,6 +1006,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[compio::test]
     async fn given_a_segment_when_opening_and_reopening_should_record_what_its_reservation_covers()
     {
