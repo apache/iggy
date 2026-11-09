@@ -127,7 +127,9 @@ pub async fn dispatch(
         API_KEY_OFFSET_COMMIT => offset_commit::handle(state, connection, api_version, body).await,
         API_KEY_OFFSET_FETCH => offset_fetch::handle(state, connection, api_version, body).await,
         API_KEY_API_VERSIONS => api_versions::handle(connection, api_version, body).await,
-        API_KEY_CREATE_TOPICS => create_topics::handle(state, connection, api_version, body).await,
+        API_KEY_CREATE_TOPICS => {
+            create_topics::handle(state, connection, principal, api_version, body).await
+        }
         API_KEY_DELETE_TOPICS => {
             delete_topics::handle(state, connection, principal, api_version, body).await
         }

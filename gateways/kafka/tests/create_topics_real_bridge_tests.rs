@@ -37,14 +37,16 @@ use iggy::prelude::{
 use serial_test::serial;
 use tokio_util::sync::CancellationToken;
 
+use iggy_gateway_kafka::auth::AuthenticatedPrincipal;
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::bridge::topic_settings::replication_factor_of;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
+use iggy_gateway_kafka::protocol::acl::PrincipalPermissions;
 use iggy_gateway_kafka::protocol::api::{
     ConnectionState, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS,
     ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST,
     ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
-    ERROR_TOPIC_ALREADY_EXISTS, GatewayState,
+    ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED, GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::create_topics;
 
@@ -200,7 +202,7 @@ fn decode_first_in_full(body: Bytes) -> (i16, Option<String>, Vec<CreatedConfig>
 async fn send(state: &GatewayState, topics: &[TopicSpec<'_>], validate_only: bool) -> (i16, i32) {
     let body = build_request(topics, validate_only);
     let outcome =
-        create_topics::handle(state, &ConnectionState::default(), REQUEST_VERSION, body).await;
+        create_topics::handle(state, &ConnectionState::default(), None, REQUEST_VERSION, body).await;
     let resp_body = outcome.expect_response("CreateTopics request always answers");
     decode_first_result(resp_body)
 }
@@ -212,7 +214,7 @@ async fn send_all(
 ) -> Vec<(Option<String>, i16)> {
     let body = build_request(topics, validate_only);
     let outcome =
-        create_topics::handle(state, &ConnectionState::default(), REQUEST_VERSION, body).await;
+        create_topics::handle(state, &ConnectionState::default(), None, REQUEST_VERSION, body).await;
     let resp_body = outcome.expect_response("CreateTopics request always answers");
     decode_all_results(resp_body)
 }
@@ -360,7 +362,7 @@ async fn create_topics_with_a_config_iggy_cannot_hold_returns_invalid_config_and
         };
         let body = build_request(&[topic], false);
         let outcome =
-            create_topics::handle(&state, &ConnectionState::default(), REQUEST_VERSION, body).await;
+            create_topics::handle(&state, &ConnectionState::default(), None, REQUEST_VERSION, body).await;
         let (error_code, message, created) =
             decode_first_in_full(outcome.expect_response("CreateTopics answers"));
         assert_eq!(error_code, ERROR_INVALID_CONFIG, "{configs:?}");
@@ -397,7 +399,7 @@ async fn create_topics_stores_the_configs_iggy_holds_and_reports_them() {
     };
     let body = build_request(&[topic], false);
     let outcome =
-        create_topics::handle(&state, &ConnectionState::default(), REQUEST_VERSION, body).await;
+        create_topics::handle(&state, &ConnectionState::default(), None, REQUEST_VERSION, body).await;
     let (error_code, _, created) =
         decode_first_in_full(outcome.expect_response("CreateTopics answers"));
     assert_eq!(error_code, ERROR_NONE);
@@ -491,7 +493,7 @@ async fn create_topics_with_compact_keeps_every_record_and_leaves_the_policy_out
     };
     let body = build_request(&[topic], false);
     let outcome =
-        create_topics::handle(&state, &ConnectionState::default(), REQUEST_VERSION, body).await;
+        create_topics::handle(&state, &ConnectionState::default(), None, REQUEST_VERSION, body).await;
     let (error_code, message, created) =
         decode_first_in_full(outcome.expect_response("CreateTopics answers"));
     assert_eq!(error_code, ERROR_NONE, "{message:?}");
@@ -541,7 +543,7 @@ async fn create_topics_with_a_small_retention_keeps_one_segment_and_a_flush_pers
     };
     let body = build_request(&[topic], false);
     let outcome =
-        create_topics::handle(&state, &ConnectionState::default(), REQUEST_VERSION, body).await;
+        create_topics::handle(&state, &ConnectionState::default(), None, REQUEST_VERSION, body).await;
     let (error_code, message, created) =
         decode_first_in_full(outcome.expect_response("CreateTopics answers"));
     assert_eq!(error_code, ERROR_NONE, "{message:?}");
@@ -594,7 +596,7 @@ async fn create_topics_stores_the_replication_factor_up_to_the_node_count() {
         let state = &state;
         async move {
             let outcome =
-                create_topics::handle(state, &ConnectionState::default(), REQUEST_VERSION, body)
+                create_topics::handle(state, &ConnectionState::default(), None, REQUEST_VERSION, body)
                     .await;
             decode_first_factor(outcome.expect_response("CreateTopics answers"))
         }
@@ -672,6 +674,7 @@ async fn create_topics_v3_accepts_broker_default_sentinels() {
     let outcome = create_topics::handle(
         &state,
         &ConnectionState::default(),
+        None,
         3,
         build_v3_request("orders", -1, -1),
     )
@@ -803,7 +806,7 @@ async fn create_topics_error_message_does_not_repeat_the_topic_name() {
     let topic = TopicSpec::new(bad_name, 1);
     let body = build_request(&[topic], false);
     let outcome =
-        create_topics::handle(&state, &ConnectionState::default(), REQUEST_VERSION, body).await;
+        create_topics::handle(&state, &ConnectionState::default(), None, REQUEST_VERSION, body).await;
     let resp_body = outcome.expect_response("CreateTopics request always answers");
 
     let mut d = Decoder::new(resp_body);
@@ -926,4 +929,43 @@ async fn create_topics_waits_for_a_create_partitions_in_progress() {
     drop(held);
     let (error_code, _) = send(&state, &[TopicSpec::new("orders", 3)], false).await;
     assert_eq!(error_code, ERROR_NONE);
+}
+
+#[tokio::test]
+#[serial]
+async fn create_topics_with_unauthorized_principal_is_denied() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+
+    let principal = AuthenticatedPrincipal {
+        username: "unauthorized".to_string(),
+        user: None,
+        permissions: PrincipalPermissions {
+            manage_topics: false,
+            ..PrincipalPermissions::default()
+        },
+        permissions_known: true,
+    };
+    let topic = TopicSpec::new("orders", 1);
+    let body = build_request(&[topic], false);
+    let outcome = create_topics::handle(
+        &state,
+        &ConnectionState::default(),
+        Some(&principal),
+        REQUEST_VERSION,
+        body,
+    )
+    .await;
+    let (error_code, message, _) =
+        decode_first_in_full(outcome.expect_response("CreateTopics answers"));
+    assert_eq!(error_code, ERROR_TOPIC_AUTHORIZATION_FAILED);
+    assert_eq!(
+        message.as_deref(),
+        Some("the authenticated principal is not authorized to create topics")
+    );
+
+    let raw = raw_client(&server).await;
+    let streams = raw.get_streams().await.expect("get_streams call");
+    assert!(streams.is_empty(), "unauthorized topic must not be created");
 }
