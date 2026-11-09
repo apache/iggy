@@ -46,7 +46,11 @@ This RFC targets the following model: a replicated local log stays the write pat
 acknowledgement never waits on object storage, and sealed segments are copied out afterwards. It
 does not propose a diskless architecture. Object-storage-first systems were surveyed for mechanics
 worth borrowing (see [Prior art](#prior-art)). The write path they use is rejected here because the
-VSR log already sequences and replicates, which is the job their coordinators exist for. The README
+VSR log already sequences and replicates, which is the job their coordinators exist for. A topic mode
+with the semantics of Redpanda's cloud topics, where a write is acknowledged once its data is in
+object storage and the VSR log still orders it, is a planned follow-up built on this RFC, together
+with partitions that follow another cluster's bucket (see
+[Forward compatibility](#forward-compatibility)). The README
 advertises "data backups and archiving to disk or S3", and no archiver exists on master. This RFC
 is what makes that sentence true.
 
@@ -202,8 +206,10 @@ separates every offset space within one cluster lifetime. It restarts on fresh s
 upgrade needs, so `cluster_uid` is a random 128-bit id the metadata plane mints once when its log is
 created. Master's `cluster_id` cannot serve, since it is a hash of the cluster name, whose default
 every cluster shares. Keys never repeat across clusters sharing a bucket or across lifetimes of one
-cluster, and no cluster deletes, sweeps or reads under another's `cluster_uid`. The zero-padded stem
-matches the on-disk name, so a listing sorts by offset.
+cluster. No cluster deletes or sweeps under another's `cluster_uid`, and only a partition configured
+to follow another cluster reads under it. A partition builds every key from the prefix its chain
+file records (see [The local marker](#the-local-marker)), never from its local ids at read time. The
+zero-padded stem matches the on-disk name, so a listing sorts by offset.
 
 Objects are immutable. The `.log` object is canonical and identical whichever replica produced it,
 and for an encrypted stream it is the same ciphertext the segment holds. The `.index` object is the
@@ -216,8 +222,9 @@ checksum, so a listing plus HEAD rebuilds segment metadata without a download.
 A tiered segment leaves a marker, a small fixed-size record holding its offsets, timestamps, size,
 incarnation and commit-path checksum, with a checksum of its own. Markers live in one file per
 partition, `remote.chain`, rather than one per segment, which halves the files a remote segment
-leaves for the install backup to link under its deadline. The chain file holds the markers plus a
-trim point: the front the replica's own retention left, recorded when it applies the enable of
+leaves for the install backup to link under its deadline. The chain file records the partition's
+object prefix once, when the file is created, and holds the markers plus a trim point: the front
+the replica's own retention left, recorded when it applies the enable of
 `tiered_storage` and raised before any later front move unlinks anything. A partition created on a
 tiered topic gets the file with its directory. Writes to the file are crash-safe, and eviction
 appends and fsyncs a marker before it unlinks the `.log`. A lost chain file or a lost front is
@@ -574,11 +581,43 @@ shard loses primacy or whose incarnation retires is cancelled for good.
   revision snapshot and deletes incarnations absent from metadata, as a safety net.
 - **Manifest object.** The primary uploads `manifest.bin` under `meta/` when the remote set changes,
   rate-limited. It is derived, never the source of truth for a live cluster, and exists so a
-  partition can be restored into an empty cluster by reading one object and planting markers.
+  partition can be restored into an empty cluster by reading one object and planting markers. Its
+  format is versioned and documented, and it is written after every object it names, because a
+  restore or a follower reads it as the source of truth.
 - **Verify pass.** Housekeeping HEADs keys below the floor within a quota and compares each object's
   checksum with the marker's, so a missing or divergent object is reported as an anomaly rather than
   found by a reader. Such an object above what total retention removed is data loss, never
   repaired automatically.
+
+### Forward compatibility
+
+Two follow-ups are planned on top of this RFC: partitions that follow another cluster's bucket, so
+a cluster in another datacenter serves that data from object storage, and a topic mode with the
+semantics of Redpanda's cloud topics: a write is acknowledged once its data is in object storage,
+the VSR log still orders it, and any cluster that can read the bucket can serve it. Neither is
+designed here, and neither commits to Redpanda's mechanism. This RFC keeps both possible:
+
+- **Recorded prefixes.** Keys come from the prefix each chain file records, so a partition can name
+  objects it did not upload under its own ids, as a follower or a restored partition must.
+- **Read-only foreign prefixes.** A partition configured to follow another cluster reads under that
+  cluster's `cluster_uid` and runs none of the primary's store duties: no uploads, deletions, front
+  truncations or sweeps.
+- **The manifest as a contract.** It lists the floor, the trim point and the remote segments with
+  their checksums, in a versioned format.
+- **Both objects per segment.** The floor covers a segment only once its `.index` object is stored
+  too, since a reader without the uploader's local index needs it.
+- **Ranges, not segments.** A remote source in the poll plan names an object and a byte range in
+  it, so data a later mode stores in objects other than whole segments can be read through the same
+  plan, cache and deadline.
+- **Shared machinery.** The tier service, providers, credentials, store identity, cache and the
+  partition state-machine facility serve any later mode.
+
+Left to the follow-ups: retention that accounts for followers, since the deletion grace covers
+in-cluster readers only; missing objects that are transient under asynchronous bucket replication
+rather than lost; stream keys for encrypted topics read by another cluster; the live tail a follower
+needs before a segment seals; and the object-storage write path, its acknowledgement latency and how
+its data becomes per-partition objects, including whether that data lands as this RFC's segment
+objects, sharing one read path, retention and manifest, or in a format of its own.
 
 ### Configuration
 
@@ -833,7 +872,10 @@ and have a coordinator assign offsets after the PUT. Their ack floor is buffer p
 250 to 500 ms at p50. Iggy's VSR log already sequences and replicates, which is the job those
 coordinators exist for, and the only sub-10 ms diskless variants front object storage with a
 replicated-disk WAL, which is what Iggy already has. Tiered storage with prompt uploads and small
-local retention gives the same cost profile at lower ack latency.
+local retention gives the same cost profile at lower ack latency. The semantics of Redpanda's cloud
+topics fit, because there the replicated log stays the sequencer and only the payload reaches the
+store before the acknowledgement. Those semantics are a planned follow-up for topics that trade ack
+latency for cross-zone and cross-cluster reach (see [Forward compatibility](#forward-compatibility)).
 
 ### Impact of not doing this
 
@@ -855,7 +897,10 @@ not exist.
   explicit yields plus per-class caps instead of scheduling groups. Its state machines share the
   partition's Raft log with the data, and every machine sees every batch, so the slowest paces the
   rest. This RFC keeps the shared sequence and the per-machine snapshots, stores commands in their
-  own log and gives each command type one owner.
+  own log and gives each command type one owner. Its cloud topics replicate placeholders through
+  Raft for data uploaded in multi-partition objects before the ack, reconcile it into per-partition
+  objects, and let read replicas in another cluster follow the reconciled metadata from the bucket,
+  the semantics this RFC's planned follow-ups aim for.
 - **Apache Kafka KIP-405** tiered storage and **Apache Pulsar** ledger offload: the same shape as
   this RFC, whole sealed units copied to per-partition objects with an index object beside them.
 - **Rivet's SQLite storage engine** (July 2026): a replicated hot tier with S3 never on the write
@@ -897,8 +942,6 @@ Open design decisions:
   whole-object compression is not. If compression lands first, tiering uploads segments unchanged.
 - **Cache warmth after a primary move.** Warming the target during the drain, or accepting a burst
   of GETs after each move.
-- **Whether the floor requires the `.index` upload or only the `.log`.** Requiring both blocks
-  eviction on a transient index failure for data that is already safe.
 - **The idle-partition roll and an updatable age.** Both need a roll ordered with the batches, a
   data-log operation. Whether either is worth one is open.
 - **Self-healing from local copies.** Re-uploading a missing object from a backup's local copy is
@@ -916,10 +959,9 @@ Open design decisions:
   the files the install backup links stop growing with total retention, at the price of an index
   fetch on a cold poll.
 
-Out of scope for this RFC, addressable later independently of it: S3-direct storage modes (not
-planned, and Redpanda's cloud topics would be the shape), restore and mount from the manifest, whose
-markers must name the source cluster's prefix, read-replica topics that follow another cluster's
-manifests by ETag, adjacent-segment merging, compression at rest and log compaction,
+Out of scope for this RFC: the two follow-ups in [Forward compatibility](#forward-compatibility),
+which build on it, and, addressable later independently of it, restore and mount from the manifest,
+adjacent-segment merging, compression at rest and log compaction,
 protocol-aware recovery from a tiered object, stats wire fields, CLI and Web UI visibility,
 rehydration, advisory local retention once a disk-space manager exists, and direct I/O.
 
