@@ -346,7 +346,8 @@ impl IggyCmdTestCase for TestConsumerGroupGetLagCmd {
                     .success()
                     .stdout(contains("Stored offset"))
                     .stdout(contains(format!(
-                        "{current_offset}              | -             | {current_offset}"
+                        "{current_offset}              | -             | {}",
+                        self.messages_count
                     )));
             }
         }
