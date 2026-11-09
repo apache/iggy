@@ -47,9 +47,6 @@ struct TestMessagePollCmd {
     // These will be populated after creating the resources
     actual_stream_id: Option<u32>,
     actual_topic_id: Option<u32>,
-    /// Broker append time of the batch the timestamp poll cuts at, read back
-    /// after the sends.
-    boundary_timestamp: Option<u64>,
 }
 
 impl TestMessagePollCmd {
@@ -84,7 +81,6 @@ impl TestMessagePollCmd {
             headers,
             actual_stream_id: None,
             actual_topic_id: None,
-            boundary_timestamp: None,
         }
     }
 
@@ -189,11 +185,13 @@ impl IggyCmdTestCase for TestMessagePollCmd {
                 .poll_messages(
                     &stream.id.try_into().unwrap(),
                     &topic.id.try_into().unwrap(),
-                    Some(self.partition_id),
+                    self.partition_id,
                     &Consumer::default(),
                     &PollingStrategy::first(),
-                    u32::try_from(self.messages.len()).expect("seed count fits in u32"),
-                    false,
+                    PollOptions {
+                        count: u32::try_from(self.messages.len()).expect("seed count fits in u32"),
+                        ..Default::default()
+                    },
                 )
                 .await
                 .expect("reading back the seeded batches");
@@ -206,9 +204,8 @@ impl IggyCmdTestCase for TestMessagePollCmd {
             let boundary_timestamp = polled.messages[boundary].header.timestamp;
             assert!(
                 boundary_timestamp > polled.messages[0].header.timestamp,
-                "the second batch messages timestamp should bigger than the first batch's"
+                "the second batch timestamp should be greater than the first batch's"
             );
-            self.boundary_timestamp = Some(boundary_timestamp);
             self.strategy.set_value(boundary_timestamp);
         }
     }
@@ -285,12 +282,13 @@ impl IggyCmdTestCase for TestMessagePollCmd {
                     .fold(status, |status, message| status.stdout(contains(message)));
             }
             PollingKind::Timestamp => {
-                // Left at the `0` placeholder the poll would return every message
-                // and pass vacuously, so require the back-filled bound.
-                let boundary_timestamp = self
-                    .boundary_timestamp
-                    .expect("timestamp strategy was not back-filled from the seeded batches");
-                assert_eq!(self.strategy.value, boundary_timestamp);
+                // Without the back-fill the poll starts at `0`, so the first
+                // batch leaks into the output and fails below as a stray
+                // payload instead of naming the real cause.
+                assert_ne!(
+                    self.strategy.value, 0,
+                    "timestamp strategy was not back-filled from the seeded batches"
+                );
                 let boundary = SEED_BATCH_SIZES[0];
                 let status = self.messages[boundary..]
                     .iter()

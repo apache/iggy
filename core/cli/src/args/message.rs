@@ -268,17 +268,20 @@ fn parse_timestamp(value: &str) -> Result<IggyTimestamp, String> {
             .map(IggyTimestamp::from)
             .map_err(|error| format!("Invalid Unix microseconds '{value}': {error}"));
     }
-    IggyDuration::from_str(value)
-        .map(|duration| {
-            IggyTimestamp::from(
-                IggyTimestamp::now()
-                    .as_micros()
-                    .saturating_sub(u64::from(duration)),
-            )
-        })
-        .map_err(|error| {
-            format!("'{value}' is not an RFC 3339 time, Unix microseconds or a duration: {error}")
-        })
+    let s = value.to_lowercase();
+    if s == "unlimited" || s == "disabled" || s == "none" {
+        return Err(format!("'{value}' is not an eligible timestamp"));
+    }
+    let duration = IggyDuration::from_str(value).map_err(|error| {
+        format!("'{value}' is not an RFC 3339 time, Unix microseconds or a duration: {error}")
+    })?;
+    let micros = u64::try_from(duration.get_duration().as_micros())
+        .map_err(|_| format!("'{value}' is too long to be a relative duration"))?;
+    IggyTimestamp::now()
+        .as_micros()
+        .checked_sub(micros)
+        .map(IggyTimestamp::from)
+        .ok_or_else(|| format!("'{value}' is before the Unix epoch"))
 }
 
 #[cfg(test)]
