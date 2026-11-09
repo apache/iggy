@@ -592,6 +592,7 @@ async fn transfer_establishes_wal_body_ownership_without_losing_the_active_index
                 external_groups: Vec::new(),
                 dedup: Vec::new(),
                 retirement_paid_through: 0,
+                machines: None,
             };
             partition
                 .install_state_transfer(&repair_config(), 1, staged, &offsets.encode())

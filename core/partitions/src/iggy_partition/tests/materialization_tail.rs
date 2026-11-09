@@ -614,6 +614,7 @@ async fn given_installed_history_when_flushing_the_next_ops_should_write_them() 
         history_transition: None,
         owner_retirement: None,
         retirement_paid_through: 0,
+        machines: None,
     };
     partition
         .install_state_transfer(&repair_config(), INSTALLED_OPS, staged, &offsets.encode())

@@ -56,6 +56,7 @@ async fn given_empty_transfer_frontier_when_incoming_offsets_are_clamped_out_sho
         external_groups: Vec::new(),
         dedup: Vec::new(),
         retirement_paid_through: 0,
+        machines: None,
     };
     partition
         .install_state_transfer(&repair_config(), 1, Vec::new(), &wire.encode())

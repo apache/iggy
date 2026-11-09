@@ -698,6 +698,7 @@ async fn given_read_when_failed_install_converges_should_reject_the_previous_his
         external_groups: Vec::new(),
         dedup: Vec::new(),
         retirement_paid_through: 0,
+        machines: None,
     };
     let offered_commit_operation = 12;
     let install_error = partition

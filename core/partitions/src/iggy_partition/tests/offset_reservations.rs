@@ -481,6 +481,7 @@ async fn given_an_append_point_above_every_message_when_an_offer_arrives_should_
         external_groups: Vec::new(),
         dedup: Vec::new(),
         retirement_paid_through: 0,
+        machines: None,
     };
     let outcome = partition
         .install_state_transfer(&repair_config(), 12, Vec::new(), &offer.encode())

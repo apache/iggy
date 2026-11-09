@@ -33,6 +33,7 @@ use crate::poll_plan::{
 };
 use crate::producer_state::{ProducerAdmission, ProducerEntry, ProducerTable, StampedBatch};
 use crate::segment::Segment;
+use crate::state_machine::StateMachines;
 use crate::state_transfer::{
     PartitionTransferSession, PartitionTransferUnavailable, PendingTransferRearm, TransferPlanSlot,
 };
@@ -173,6 +174,8 @@ where
     pub(crate) owner_install_barrier: u64,
     pending_history_transition: Cell<Option<TransitionPartitionHistoryRequest>>,
     pub(crate) history_transition: Option<InstalledPartitionHistory>,
+    /// The partition's state machines, applied at commit in op order.
+    pub(crate) state_machines: StateMachines,
     pub stats: Arc<PartitionStats>,
     /// Widest batch committed here, the floor for a disk poll's first read.
     /// See [`Self::widest_committed_batch`].
@@ -264,7 +267,7 @@ where
     /// Fences the partition: every path that would advance or serve it turns
     /// into a no-op, so the shard's tick can observe the fault and shut the
     /// server down without the partition moving again in the meantime.
-    fatal: Option<FatalCommit>,
+    pub(crate) fatal: Option<FatalCommit>,
     pending_commit: Option<PendingCommit>,
     local_request_order: Cell<u64>,
     no_ack: VecDeque<PendingNoAck>,
@@ -926,6 +929,7 @@ where
             owner_install_barrier: 0,
             pending_history_transition: Cell::new(None),
             history_transition: None,
+            state_machines: StateMachines::default(),
             stats,
             widest_batch_bytes: Cell::new(0),
             committed_bytes: 0,
@@ -1823,6 +1827,9 @@ where
                 self.apply_replicated_operation(message).await?;
             }
         }
+        if persistence.holds_commands() {
+            self.log.journal().inner.retain_commands_from(checkpoint);
+        }
         if head > 0 {
             if self.consensus.replica_count() == 1 {
                 commit = head;
@@ -2418,7 +2425,7 @@ where
 
     const fn requires_persistence(&self, operation: Operation) -> bool {
         match operation {
-            Operation::RetireSession => true,
+            Operation::RetireSession | Operation::StateMachineCommand => true,
             Operation::SendMessages => self.durability().is_persisted(),
             Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
                 self.consumer_offset_durability().is_persisted()
@@ -3105,6 +3112,8 @@ where
             history_transition: self.history_transition,
             owner_retirement: self.owner_retirement.take(),
             producers: std::mem::take(&mut self.producers),
+            machines: (!self.state_machines.is_empty())
+                .then(|| self.state_machines.capture(self.consensus().commit_min())),
             durable_offset: self.offset.load(Ordering::Acquire),
             write_offset: self.dirty_offset.load(Ordering::Relaxed),
             offset_space: self.offset_space,
@@ -3146,7 +3155,25 @@ where
             history_transition,
             owner_retirement,
             producers,
+            machines,
         } = state;
+        // A restart that registers other machines than the process before it
+        // is refused the way a boot refuses a checkpoint of them.
+        if let Some(machines) = &machines
+            && let Err(error) = self.restore_machines(Some(machines), machines.op())
+        {
+            error!(
+                namespace_raw = self.namespace().inner(),
+                op = machines.op(),
+                %error,
+                "cannot restore the retained state machines"
+            );
+            self.fatal = Some(FatalCommit {
+                namespace_raw: self.namespace().inner(),
+                op: machines.op(),
+                operation: None,
+            });
+        }
         self.log = log;
         self.consumer_group_owners = consumer_group_owners;
         self.history_transition = history_transition;
@@ -4824,7 +4851,7 @@ where
         Ok(batches)
     }
 
-    fn local_request_must_queue(&self) -> bool {
+    pub(crate) fn local_request_must_queue(&self) -> bool {
         self.consensus.pipeline_is_full()
             || self
                 .consensus
@@ -7794,6 +7821,30 @@ where
                 } else {
                     None
                 };
+            if message.header().operation == Operation::StateMachineCommand
+                && let Some((error, reason)) =
+                    self.command_refusal(message.header(), message.body())
+            {
+                // The others are transient. This one is a caller's bug, and a
+                // server-originated command has no client to report it to.
+                if matches!(error, IggyError::InvalidCommand) {
+                    warn!(
+                        namespace_raw = message.header().group,
+                        client = message.header().client,
+                        reason,
+                        "refusing a state-machine command"
+                    );
+                }
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    error.as_code(),
+                    reason,
+                    reply.take(),
+                )
+                .await;
+                return;
+            }
             // Checked before dedup: a finalized session's cached receipt must
             // not be served either until the debt is paid.
             if !is_auto_commit_client(client_id) && self.owes_session_retirement() {
@@ -9427,6 +9478,12 @@ where
                 self.journal_append(frozen.clone()).await?;
                 Ok(frozen)
             }
+            Operation::StateMachineCommand => {
+                Self::check_replicated_command(message.body())?;
+                let frozen = message.into_frozen();
+                self.journal_append(frozen.clone()).await?;
+                Ok(frozen)
+            }
             Operation::RetireSession => {
                 let retirement = RetireSessionsRequest::decode_from(message.body())
                     .map_err(|_| IggyError::InvalidCommand)?;
@@ -10191,7 +10248,7 @@ where
         self.offset_reservations_need_resync.set(true);
         self.truncated_since_scan.set(true);
         drop(entries);
-        if self.log.journal().inner.is_empty() {
+        if self.log.journal().inner.holds_no_ops() {
             self.reset_proof_walk_memory();
         }
         Ok(removed)
@@ -11610,6 +11667,13 @@ where
                     return None;
                 }
             };
+            // After the receipt, so a commit that fences never leaves the
+            // machines applied past `commit_min`.
+            if header.operation == Operation::StateMachineCommand
+                && !self.apply_committed_command(header)
+            {
+                return None;
+            }
             self.consensus.advance_commit_min(header.op);
             // A lifecycle completion counts only once the reporter commits the
             // fence locally, so the backups must not wait for the heartbeat.
@@ -11646,10 +11710,32 @@ where
         }
         self.consensus.sync_prepare_timeout();
         self.evict_committed_prefix(pending.evictable);
+        self.release_checkpointed_commands();
         for touched in &self.consumer_offset_dirs_touched {
             touched.set(None);
         }
         Some(committed)
+    }
+
+    /// Commands leave memory only once a checkpoint covers them, so a repair
+    /// floor they lift sits where the WALs dropped them too. Past the
+    /// retention caps with nothing checkpointed to drop, ask for the
+    /// checkpoint.
+    fn release_checkpointed_commands(&self) {
+        let commit_min = self.consensus.commit_min();
+        let checkpoint_op = self
+            .persistence
+            .as_ref()
+            .map_or(commit_min, |persistence| persistence.checkpoint_op())
+            .min(commit_min);
+        let over = self
+            .log
+            .journal()
+            .inner
+            .release_checkpointed_commands(checkpoint_op);
+        if over && let Some(persistence) = &self.persistence {
+            persistence.request_checkpoint();
+        }
     }
 
     /// Every replica retains the committed result, so a promoted primary answers
@@ -11700,6 +11786,7 @@ where
                     | Operation::DeleteConsumerOffset
                     | Operation::InstallConsumerGroupOwner
                     | Operation::RetireConsumerGroupOwners
+                    | Operation::StateMachineCommand
             ) && (header.partition_incarnation != self.created_revision()
                 || self.history_deleted())
             {
@@ -11725,6 +11812,8 @@ where
                 .is_err()
                 || (header.operation == Operation::SendMessages && batch_stats.is_none())
                 || (header.operation == Operation::RetireSession && retirement.is_none())
+                || (header.operation == Operation::StateMachineCommand
+                    && !self.committed_command_is_held(header))
             {
                 error!(
                     namespace_raw,
@@ -13261,7 +13350,9 @@ where
         {
             // Offset continuity cannot certify that recovered bytes belong to
             // the adopted history. An evicted proof gap needs state transfer.
-            if self.consensus().view_log_unproven() {
+            // So does any jump past commands, which no machine would apply,
+            // while a transfer carries the machines' snapshot.
+            if self.consensus().view_log_unproven() || !self.state_machines.is_empty() {
                 self.repair = None;
                 return RepairConclusion::FloorRefused {
                     floor,
@@ -13866,7 +13957,7 @@ fn upsert_offset_max<K>(
 /// `PrepareHeader`, so reading the tag is a cheap cast, not a full batch decode;
 /// it tells a committed consumer-offset op (no segment bytes) apart from a
 /// `SendMessages` batch without relying on a decode failure to do so.
-fn peek_operation(entry: &Frozen<4096>) -> Operation {
+pub fn peek_operation(entry: &Frozen<4096>) -> Operation {
     bytemuck::checked::try_from_bytes::<PrepareHeader>(
         &entry[..std::mem::size_of::<PrepareHeader>()],
     )
@@ -14238,4 +14329,4 @@ fn nth_oldest_sealed_end(segments: &[Segment], count: u32) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests;
+pub mod tests;

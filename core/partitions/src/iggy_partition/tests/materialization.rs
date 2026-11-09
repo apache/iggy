@@ -52,6 +52,7 @@ async fn given_transfer_above_cap_when_file_write_fails_should_refuse_until_retr
         external_groups: Vec::new(),
         dedup: Vec::new(),
         retirement_paid_through: 0,
+        machines: None,
     };
     partition
         .install_state_transfer(&repair_config(), 12, Vec::new(), &wire.encode())

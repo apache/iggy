@@ -60,6 +60,7 @@ async fn state_transfer_rejects_corrupted_checkpoint_payload_with_zero_body_chec
         external_groups: Vec::new(),
         dedup: Vec::new(),
         retirement_paid_through: 0,
+        machines: None,
     };
     assert!(matches!(
         partition
@@ -744,6 +745,7 @@ async fn given_an_index_sync_failure_when_installing_state_transfer_should_refus
         history_transition: None,
         owner_retirement: None,
         retirement_paid_through: 0,
+        machines: None,
     };
 
     let result = partition
@@ -840,6 +842,7 @@ async fn given_multi_segment_transfer_when_installing_should_keep_writers_on_the
         external_groups: Vec::new(),
         dedup: Vec::new(),
         retirement_paid_through: 0,
+        machines: None,
     };
     partition
         .install_state_transfer(&repair_config(), 3, staged, &offsets.encode())

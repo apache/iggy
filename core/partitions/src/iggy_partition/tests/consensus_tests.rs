@@ -483,6 +483,7 @@ async fn given_an_acked_op_above_the_known_commit_when_installing_a_lower_offer_
         history_transition: None,
         owner_retirement: None,
         retirement_paid_through: 0,
+        machines: None,
     };
     let installed = backup
         .install_state_transfer(&repair_config(), 1, vec![staged], &offsets.encode())

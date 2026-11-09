@@ -52,6 +52,7 @@ async fn given_offer_below_local_counter_when_installed_should_refuse_rewind() {
         external_groups: Vec::new(),
         dedup: Vec::new(),
         retirement_paid_through: 0,
+        machines: None,
     };
     let refused = partition
         .install_state_transfer(&repair_config(), 12, Vec::new(), &behind.encode())
@@ -108,6 +109,7 @@ async fn given_an_empty_chain_installed_at_a_frontier_when_a_stale_offer_arrives
         external_groups: Vec::new(),
         dedup: Vec::new(),
         retirement_paid_through: 0,
+        machines: None,
     };
     let refused = partition
         .install_state_transfer(&repair_config(), 12, Vec::new(), &stale.encode())

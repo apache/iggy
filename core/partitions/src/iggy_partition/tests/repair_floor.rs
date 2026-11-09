@@ -223,6 +223,106 @@ async fn given_walks_sharing_a_node_budget_when_it_is_full_should_transfer_and_r
     );
 }
 
+/// The primary of a new view acts on its machines only once it applied
+/// every op of the log the view started with, here three commands. The
+/// view starts with them uncommitted in its rebuilt pipeline, so nothing
+/// else holds a new command back: no committed op is left unapplied.
+#[compio::test]
+async fn given_a_primary_behind_its_view_start_when_a_command_arrives_should_refuse_it_until_applied()
+ {
+    const VIEW: u32 = 4;
+    const HEAD: u64 = 3;
+    let (partition, _) = recording_partition_at(1, 3);
+    let mut partition = Box::new(partition);
+    partition
+        .register_state_machine(Box::new(
+            crate::state_machine::registry::tests::CounterMachine::new(1, &[COMMAND_KIND]),
+        ))
+        .unwrap();
+    let mut parent = 0;
+    let mut headers = Vec::new();
+    for op in 1..=HEAD {
+        // A view-change suffix runs down the log with falling timestamps.
+        let prepare = command_prepare(op, parent, COMMAND_KIND, op).transmute_header(
+            |mut header, next: &mut PrepareHeader| {
+                header.timestamp = op;
+                header.checksum = header.identity_checksum();
+                *next = header;
+            },
+        );
+        parent = prepare.header().checksum;
+        headers.push(*prepare.header());
+        Box::pin(partition.on_replicate(prepare)).await;
+    }
+    let body: Vec<u8> = headers
+        .iter()
+        .rev()
+        .flat_map(|header| bytemuck::bytes_of(header).to_vec())
+        .collect();
+    let size = size_of::<iggy_binary_protocol::DoViewChangeHeader>() + body.len();
+    let mut dvc = Message::<iggy_binary_protocol::GenericHeader>::new(size);
+    dvc.as_mut_slice()[size_of::<iggy_binary_protocol::DoViewChangeHeader>()..]
+        .copy_from_slice(&body);
+    let dvc = dvc.transmute_header(|_, header: &mut iggy_binary_protocol::DoViewChangeHeader| {
+        header.command = Command::DoViewChange;
+        header.size = u32::try_from(size).unwrap();
+        header.group = partition.consensus.group();
+        header.cluster = TEST_CLUSTER;
+        header.view = VIEW;
+        header.log_view = 0;
+        header.replica = 0;
+        header.op = HEAD;
+        header.commit = 0;
+        header.present_bitset = 0b111;
+    });
+    partition.consensus.handle_do_view_change(
+        consensus::PlaneKind::Partitions,
+        dvc.header(),
+        &dvc.as_slice()[size_of::<iggy_binary_protocol::DoViewChangeHeader>()..],
+    );
+    assert!(partition.consensus.is_primary_elect());
+    // Stands in for the shard's proof walk and pipeline rebuild.
+    partition.consensus.settle_view_log_proof();
+    let _ = partition
+        .consensus
+        .start_pending_view(consensus::PlaneKind::Partitions);
+    partition.consensus.with_pipeline_mut(|pipeline| {
+        for header in &headers {
+            pipeline.push(consensus::PipelineEntry::new(*header));
+        }
+    });
+    assert!(partition.consensus.is_primary() && partition.consensus.is_normal());
+    assert_eq!(partition.consensus.commit_min(), 0);
+    assert_eq!(partition.consensus.commit_max(), 0);
+    assert!(!partition.state_machines_current());
+
+    let command = |partition: &IggyPartition<RecordingBus>, request| {
+        partition
+            .command_request(
+                crate::state_machine::CommandKind(COMMAND_KIND),
+                &1u64.to_le_bytes(),
+                request,
+            )
+            .unwrap()
+    };
+    let (sender, refusal) = consensus::oneshot_channel();
+    Box::pin(partition.on_request(command(&partition, 1), Some(sender))).await;
+    // Checked before the await: an admitted command gets no reply here.
+    assert_eq!(partition.consensus.sequencer().current_sequence(), HEAD);
+    assert_eq!(
+        refusal.await.unwrap().header().status,
+        IggyError::TransientNotAccepted.as_code()
+    );
+
+    partition.consensus.advance_commit_max(HEAD);
+    Box::pin(partition.commit_journal(&repair_config())).await;
+    assert_eq!(partition.consensus.commit_min(), HEAD);
+    assert_eq!(partition.state_machines().applied_op(), HEAD);
+    assert!(partition.state_machines_current());
+    Box::pin(partition.on_request(command(&partition, 2), None)).await;
+    assert_eq!(partition.consensus.sequencer().current_sequence(), HEAD + 1);
+}
+
 #[compio::test]
 async fn given_a_primary_elect_when_repair_memory_is_exhausted_should_request_transfer() {
     const VIEW: u32 = 4;
@@ -700,6 +800,43 @@ async fn given_a_connecting_batch_from_an_earlier_session_when_the_floor_arrives
              commits the resident batches above it"
     );
     assert!(partition.repair.is_some());
+}
+
+/// The same connecting window as above, on a partition with a state
+/// machine: the jump would skip the commands committed below the floor
+/// without applying them, so the window goes to state transfer, which
+/// carries the machines' snapshot.
+#[compio::test]
+async fn given_state_machines_when_a_connecting_floor_arrives_should_refuse_the_jump() {
+    let mut partition = test_partition();
+    partition
+        .register_state_machine(Box::new(
+            crate::state_machine::registry::tests::CounterMachine::new(1, &[COMMAND_KIND]),
+        ))
+        .unwrap();
+    partition.consensus().advance_commit_max(300);
+    partition.recovered_durable_offset = Some(3);
+    partition.repair = Some(floorless_session(300, 300));
+    partition
+        .apply_repaired_prepare(repaired_send_prepare_at(6, 4, 0, 0x66))
+        .await;
+    partition
+        .apply_repaired_prepare(repaired_send_prepare_at(7, 5, 0x66, 0x77))
+        .await;
+    partition.repair = None;
+    partition.repair = Some(armed_session(300, 5));
+
+    let conclusion = partition.complete_repair(&repair_config()).await;
+
+    assert_eq!(
+        conclusion,
+        RepairConclusion::FloorRefused {
+            floor: 5,
+            to_op: 300
+        }
+    );
+    assert_eq!(partition.consensus().commit_min(), 0);
+    assert!(partition.repair.is_none());
 }
 
 /// The same shape as above with batches that start past the durable end:

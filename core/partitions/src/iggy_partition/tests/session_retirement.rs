@@ -909,6 +909,7 @@ async fn checkpoint_receipts_survive_deferred_completion_and_state_transfer() {
                 owners: Vec::new(),
                 history_transition: None,
                 retirement_paid_through: 0,
+                machines: None,
             };
             partition
                 .install_state_transfer(&config, 2, vec![staged], &offsets.encode())

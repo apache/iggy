@@ -128,6 +128,7 @@ fn table() -> ConsumerOffsetsWire {
             dedup_entry(usize::MAX as u128 + 5, 9, 91),
         ],
         retirement_paid_through: 0,
+        machines: None,
     }
 }
 
@@ -315,6 +316,7 @@ fn given_empty_table_when_encoded_should_round_trip() {
         external_groups: Vec::new(),
         dedup: Vec::new(),
         retirement_paid_through: 0,
+        machines: None,
     };
     let encoded = empty.encode();
     assert_eq!(
@@ -449,6 +451,7 @@ fn given_entry_in_every_section_when_encoded_should_match_the_version_pins() {
         }),
         retirement_paid_through: 0,
         producers: vec![producer_entry(1, &[(0, 2, 7)])],
+        machines: None,
     };
     let without_external = ConsumerOffsetsWire {
         external_groups: Vec::new(),
@@ -561,6 +564,7 @@ fn given_unordered_dedup_clients_when_decoded_should_reject() {
         external_groups: Vec::new(),
         dedup: vec![dedup_entry(9, 1, 1), dedup_entry(4, 2, 2)],
         retirement_paid_through: 0,
+        machines: None,
     };
     assert_eq!(
         ConsumerOffsetsWire::decode(&unordered.encode()),
@@ -586,6 +590,7 @@ fn given_reserved_client_in_dedup_when_decoded_should_reject() {
         external_groups: Vec::new(),
         dedup: vec![dedup_entry(0, 1, 1), dedup_entry(4, 2, 2)],
         retirement_paid_through: 0,
+        machines: None,
     };
     assert_eq!(
         ConsumerOffsetsWire::decode(&reserved.encode()),
@@ -725,6 +730,7 @@ fn given_duplicate_or_unordered_ids_when_decoded_should_reject() {
         external_groups: Vec::new(),
         dedup: Vec::new(),
         retirement_paid_through: 0,
+        machines: None,
     };
     assert_eq!(
         ConsumerOffsetsWire::decode(&duplicate.encode()),
@@ -749,6 +755,7 @@ fn given_duplicate_or_unordered_ids_when_decoded_should_reject() {
         external_groups: Vec::new(),
         dedup: Vec::new(),
         retirement_paid_through: 0,
+        machines: None,
     };
     assert_eq!(
         ConsumerOffsetsWire::decode(&unordered.encode()),
@@ -761,7 +768,11 @@ fn given_duplicate_or_unordered_ids_when_decoded_should_reject() {
 
 #[test]
 fn given_trailing_bytes_when_decoded_should_reject() {
-    let mut padded = table().encode();
+    let with_machines = ConsumerOffsetsWire {
+        machines: Some(StateMachineSnapshot::default()),
+        ..table()
+    };
+    let mut padded = with_machines.encode();
     let content_len = padded.len() - size_of::<u64>();
     padded.truncate(content_len);
     padded.push(0);
@@ -771,6 +782,19 @@ fn given_trailing_bytes_when_decoded_should_reject() {
         ConsumerOffsetsWire::decode(&padded),
         Err(ConsumerOffsetsWireError::TrailingBytes { extra: 1 }),
         "bytes past the last section must fail closed"
+    );
+
+    // Without machines the optional tail starts there, so a short tail is
+    // a truncated machine section, which fails closed as well.
+    let mut padded = table().encode();
+    let content_len = padded.len() - size_of::<u64>();
+    padded.truncate(content_len);
+    padded.push(0);
+    let trailer = state_artifact_checksum(&padded);
+    padded.extend_from_slice(&trailer.to_le_bytes());
+    assert_eq!(
+        ConsumerOffsetsWire::decode(&padded),
+        Err(ConsumerOffsetsWireError::Truncated)
     );
 }
 
@@ -897,4 +921,41 @@ fn given_version_8_offsets_artifact_when_decoded_should_read_no_producers() {
     released.extend_from_slice(&trailer.to_le_bytes());
 
     assert_eq!(ConsumerOffsetsWire::decode(&released), Ok(paid));
+}
+
+#[test]
+fn given_machines_when_round_tripping_should_keep_their_snapshot() {
+    let wire = ConsumerOffsetsWire {
+        machines: Some(StateMachineSnapshot::from_parts(
+            12,
+            &[
+                (crate::state_machine::MachineId(1), b"floor"),
+                (crate::state_machine::MachineId(3), b""),
+            ],
+        )),
+        ..table()
+    };
+    let encoded = wire.encode();
+    let snapshot_len = wire.machines.as_ref().unwrap().encoded_size();
+    assert_eq!(
+        encoded.len(),
+        table().encode().len() + size_of::<u32>() + snapshot_len,
+        "machines only append their own section to the version 9 layout"
+    );
+    assert_eq!(encoded[CONSUMER_OFFSETS_MAGIC.len()], 9);
+    assert_eq!(ConsumerOffsetsWire::decode(&encoded), Ok(wire));
+
+    let mut damaged = table().encode();
+    let content_len = damaged.len() - size_of::<u64>();
+    damaged.truncate(content_len);
+    damaged.extend_from_slice(&3u32.to_le_bytes());
+    damaged.extend_from_slice(&[1, 2, 3]);
+    let trailer = state_artifact_checksum(&damaged);
+    damaged.extend_from_slice(&trailer.to_le_bytes());
+    assert_eq!(
+        ConsumerOffsetsWire::decode(&damaged),
+        Err(ConsumerOffsetsWireError::InvalidStateMachines(
+            SnapshotDecodeError::Truncated
+        ))
+    );
 }

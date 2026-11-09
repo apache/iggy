@@ -112,7 +112,7 @@ fn build_segment_record_with_payload(
 /// One-message segment record in on-disk layout `[256B command header][blob]`
 /// stamped at `base_offset`, with a valid batch checksum so it decodes
 /// through `decode_batch_slice` and matches an `Offset` poll.
-fn build_segment_record(namespace: IggyNamespace, base_offset: u64) -> Vec<u8> {
+pub fn build_segment_record(namespace: IggyNamespace, base_offset: u64) -> Vec<u8> {
     build_segment_record_with_payload(namespace, base_offset, Bytes::from_static(b"abcdefgh"))
 }
 
@@ -120,7 +120,14 @@ fn test_partition() -> IggyPartition<IggyMessageBus> {
     test_partition_with_replicas(1)
 }
 
-fn test_partition_with_replicas(replica_count: u8) -> IggyPartition<IggyMessageBus> {
+pub fn test_partition_with_replicas(replica_count: u8) -> IggyPartition<IggyMessageBus> {
+    test_partition_with_pipeline(replica_count, LocalPipeline::new())
+}
+
+pub fn test_partition_with_pipeline(
+    replica_count: u8,
+    pipeline: LocalPipeline,
+) -> IggyPartition<IggyMessageBus> {
     let namespace = IggyNamespace::new(1, 1, 0);
     let consensus = VsrConsensus::new(
         TEST_CLUSTER,
@@ -128,7 +135,7 @@ fn test_partition_with_replicas(replica_count: u8) -> IggyPartition<IggyMessageB
         replica_count,
         namespace.inner(),
         IggyMessageBus::new(0),
-        LocalPipeline::new(),
+        pipeline,
     );
     consensus.init();
     IggyPartition::with_in_memory_storage(
@@ -138,7 +145,7 @@ fn test_partition_with_replicas(replica_count: u8) -> IggyPartition<IggyMessageB
     )
 }
 
-fn repair_config() -> PartitionsConfig {
+pub fn repair_config() -> PartitionsConfig {
     PartitionsConfig {
         messages_required_to_save: 1,
         size_of_messages_required_to_save: IggyByteSize::from(1024 * 1024),
@@ -152,7 +159,7 @@ fn repair_config() -> PartitionsConfig {
 
 /// A `SendMessages` request in the shape `convert_request_message` leaves at
 /// [`ChecksumMode::Skip`]: canonical batch, `batch_checksum` zeroed.
-fn checksumless_send_request(
+pub fn checksumless_send_request(
     namespace: IggyNamespace,
     message_count: u32,
 ) -> Message<RoutedRequestHeader> {
@@ -602,6 +609,36 @@ fn primary_transfer_grant<B: MessageBus, SB: SuperblockStore>(
         target: 1,
         expires_at: std::time::Instant::now() + TEST_GRANT_TTL,
     }
+}
+
+const COMMAND_KIND: u16 = 10;
+
+fn command_prepare(op: u64, parent: u128, kind: u16, value: u64) -> Message<PrepareHeader> {
+    let namespace = IggyNamespace::new(1, 1, 0);
+    let payload = value.to_le_bytes();
+    let body = crate::state_machine::MachineCommand {
+        kind: crate::state_machine::CommandKind(kind),
+        payload: &payload,
+    }
+    .encode()
+    .unwrap();
+    let total = size_of::<PrepareHeader>() + body.len();
+    let mut prepare = Message::<PrepareHeader>::new(total);
+    prepare.as_mut_slice()[size_of::<PrepareHeader>()..].copy_from_slice(&body);
+    prepare.transmute_header(|_, header: &mut PrepareHeader| {
+        header.command = Command::Prepare;
+        header.operation = Operation::StateMachineCommand;
+        header.cluster = TEST_CLUSTER;
+        header.group = namespace.inner();
+        header.op = op;
+        header.parent = parent;
+        header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+        header.request = op;
+        header.session = 1;
+        header.retry_capacity = u32::try_from(consensus::PARTITION_DEDUP_CLIENTS_MAX).unwrap();
+        header.size = u32::try_from(total).unwrap();
+        header.checksum = header.identity_checksum();
+    })
 }
 
 /// The primary's Commit heartbeat, handled as the shard's `on_commit` does.
@@ -1838,6 +1875,7 @@ mod repair_floor;
 mod repair_protocol;
 mod retention;
 mod session_retirement;
+mod state_machines;
 mod state_transfer_offer;
 mod state_transfer_segments;
 mod superblock;

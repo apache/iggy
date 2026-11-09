@@ -248,6 +248,7 @@ async fn given_read_when_state_is_installed_should_reject_the_previous_history()
         external_groups: Vec::new(),
         dedup: Vec::new(),
         retirement_paid_through: 0,
+        machines: None,
     };
     let installed_commit_operation = 12;
     partition
