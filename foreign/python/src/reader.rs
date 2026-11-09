@@ -25,6 +25,7 @@ use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use tokio::sync::Mutex;
 
+use crate::awaitable::none_future_into_py;
 use crate::client::{to_read_error, to_runtime_error};
 use crate::event_loop::on_event_loop;
 use crate::receive_message::{Checkpoint, PolledBatch, PollingStrategy};
@@ -100,7 +101,7 @@ impl PartitionReader {
     fn commit<'a>(&self, py: Python<'a>, checkpoint: &Checkpoint) -> PyResult<Bound<'a, PyAny>> {
         let checkpoint = checkpoint.inner;
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             let reader = inner.lock().await;
             reader
                 .as_ref()
@@ -122,7 +123,7 @@ impl PartitionReader {
     fn mark<'a>(&self, py: Python<'a>, checkpoint: &Checkpoint) -> PyResult<Bound<'a, PyAny>> {
         let checkpoint = checkpoint.inner;
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             let reader = inner.lock().await;
             reader
                 .as_ref()
@@ -156,7 +157,7 @@ impl PartitionReader {
     ) -> PyResult<Bound<'a, PyAny>> {
         let start = start.inner;
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             let mut reader = inner.lock().await;
             reader
                 .as_mut()
@@ -195,7 +196,7 @@ impl PartitionReader {
     /// before a new reader reads the partition.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn close<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
-        future_into_py(py, closing(self.inner.clone()))
+        none_future_into_py(py, closing(self.inner.clone()))
     }
 
     fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {

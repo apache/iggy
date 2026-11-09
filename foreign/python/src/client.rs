@@ -35,6 +35,7 @@ use std::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::awaitable::none_future_into_py;
 use crate::config::PyClientConfig;
 use crate::consumer::{
     Consumer as PyConsumer, ConsumerGroup as PyConsumerGroup,
@@ -395,7 +396,7 @@ impl IggyClient {
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn ping<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
-        future_into_py(
+        none_future_into_py(
             py,
             async move { inner.ping().await.map_err(to_runtime_error) },
         )
@@ -693,7 +694,7 @@ impl IggyClient {
         update_options.to_patch().map_err(to_runtime_error)?;
         let inner = self.inner.clone();
 
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .update_user(&user_id, &update_options)
                 .await
@@ -718,7 +719,7 @@ impl IggyClient {
         let user_id = Identifier::try_from(user_id)?;
         let inner = self.inner.clone();
 
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .delete_user(&user_id)
                 .await
@@ -756,7 +757,7 @@ impl IggyClient {
         let permissions = permissions.map(|permissions| permissions.inner);
         let inner = self.inner.clone();
 
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .update_permissions(&user_id, permissions)
                 .await
@@ -789,7 +790,7 @@ impl IggyClient {
         let user_id = Identifier::try_from(user_id)?;
         let inner = self.inner.clone();
 
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .change_password(&user_id, &current_password, &new_password)
                 .await
@@ -809,7 +810,7 @@ impl IggyClient {
     fn logout_user<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
 
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner.logout_user().await.map_err(to_runtime_error)?;
             Ok(())
         })
@@ -822,7 +823,7 @@ impl IggyClient {
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn connect<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner.connect().await.map_err(to_runtime_error)?;
             Ok(())
         })
@@ -843,7 +844,7 @@ impl IggyClient {
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn disconnect<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner.disconnect().await.map_err(to_runtime_error)?;
             Ok(())
         })
@@ -877,7 +878,7 @@ impl IggyClient {
             .checked_add(timeout)
             .ok_or_else(|| PyValueError::new_err("'timeout' is too large"))?;
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .resolve_operation(operation_id, deadline)
                 .await
@@ -894,7 +895,7 @@ impl IggyClient {
         operation_id: u64,
     ) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .abandon_operation(operation_id)
                 .await
@@ -915,7 +916,7 @@ impl IggyClient {
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn shutdown<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner.shutdown().await.map_err(to_runtime_error)?;
             Ok(())
         })
@@ -1056,7 +1057,7 @@ impl IggyClient {
         };
         update_options.to_patch().map_err(to_runtime_error)?;
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .update_stream(&stream_id, &update_options)
                 .await
@@ -1089,7 +1090,7 @@ impl IggyClient {
     ) -> PyResult<Bound<'a, PyAny>> {
         let stream_id = Identifier::try_from(stream_id)?;
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .delete_stream(&stream_id)
                 .await
@@ -1125,7 +1126,7 @@ impl IggyClient {
         let stream = Identifier::try_from(stream)?;
         let inner = self.inner.clone();
 
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .create_topic(&stream, &name, &topic_options)
                 .await
@@ -1260,7 +1261,7 @@ impl IggyClient {
         let topic_id = Identifier::try_from(topic_id)?;
         let inner = self.inner.clone();
 
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .update_topic(&stream_id, &topic_id, &update_options)
                 .await
@@ -1291,7 +1292,7 @@ impl IggyClient {
         let topic_id = Identifier::try_from(topic_id)?;
         let inner = self.inner.clone();
 
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .delete_topic(&stream_id, &topic_id)
                 .await
@@ -1334,7 +1335,7 @@ impl IggyClient {
         let topic_id = Identifier::try_from(topic_id)?;
         let inner = self.inner.clone();
 
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .create_partitions(&stream_id, &topic_id, partitions_count)
                 .await
@@ -1377,7 +1378,7 @@ impl IggyClient {
         let topic_id = Identifier::try_from(topic_id)?;
         let inner = self.inner.clone();
 
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .delete_partitions(&stream_id, &topic_id, partitions_count)
                 .await
@@ -1426,12 +1427,12 @@ impl IggyClient {
         let topic_id = Identifier::try_from(topic_id)?;
         let inner = self.inner.clone();
 
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .delete_segments(&stream_id, &topic_id, partition_id, segments_count)
                 .await
                 .map_err(to_runtime_error)?;
-            Ok(Python::attach(|py| py.None()))
+            Ok(())
         })
     }
 
@@ -1460,7 +1461,7 @@ impl IggyClient {
         let topic_id = Identifier::try_from(topic_id)?;
         let inner = self.inner.clone();
 
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .create_consumer_group(&stream_id, &topic_id, &name)
                 .await
@@ -1566,7 +1567,7 @@ impl IggyClient {
         let group_id = Identifier::try_from(group_id)?;
         let inner = self.inner.clone();
 
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .delete_consumer_group(&stream_id, &topic_id, &group_id)
                 .await
@@ -1604,7 +1605,7 @@ impl IggyClient {
         let group_id = Identifier::try_from(group_id)?;
         let inner = self.inner.clone();
 
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .join_consumer_group(&stream_id, &topic_id, &group_id)
                 .await
@@ -1644,7 +1645,7 @@ impl IggyClient {
         let group_id = Identifier::try_from(group_id)?;
         let inner = self.inner.clone();
 
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .leave_consumer_group(&stream_id, &topic_id, &group_id)
                 .await
@@ -1882,7 +1883,7 @@ impl IggyClient {
         let topic = Identifier::try_from(topic)?;
         let checkpoint = checkpoint.inner;
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .store_consumer_position(&consumer, &stream, &topic, &checkpoint)
                 .await
@@ -1909,7 +1910,7 @@ impl IggyClient {
         let stream = Identifier::try_from(stream)?;
         let topic = Identifier::try_from(topic)?;
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .store_consumer_offset(&consumer, &stream, &topic, Some(partition_id), offset)
                 .await
@@ -1964,7 +1965,7 @@ impl IggyClient {
         let stream = Identifier::try_from(stream)?;
         let topic = Identifier::try_from(topic)?;
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .delete_consumer_offset(&consumer, &stream, &topic, Some(partition_id))
                 .await
@@ -1995,7 +1996,7 @@ impl IggyClient {
         let topic = Identifier::try_from(topic)?;
         let checkpoint = checkpoint.inner;
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .delete_consumer_position(&consumer, &stream, &topic, &checkpoint)
                 .await

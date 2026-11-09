@@ -40,6 +40,7 @@ use pyo3_async_runtimes::{TaskLocals, into_future_with_locals};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
 use tokio::sync::{Mutex, oneshot, watch};
 
+use crate::awaitable::none_future_into_py;
 use crate::client::{to_read_error, to_runtime_error};
 use crate::event_loop::on_event_loop;
 use crate::identifier::PyIdentifier;
@@ -124,7 +125,7 @@ impl IggyConsumer {
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] partition_id: Option<u32>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let state = self.state.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             state
                 .store_offset(offset, partition_id)
                 .await
@@ -146,7 +147,7 @@ impl IggyConsumer {
     fn commit<'a>(&self, py: Python<'a>, checkpoint: &Checkpoint) -> PyResult<Bound<'a, PyAny>> {
         let state = self.state.clone();
         let checkpoint = checkpoint.inner;
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             state.commit(checkpoint).await.map_err(to_runtime_error)
         })
     }
@@ -194,7 +195,7 @@ impl IggyConsumer {
         }
         let inner = self.inner.clone();
         let start = start.inner;
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             inner
                 .lock()
                 .await
@@ -215,7 +216,7 @@ impl IggyConsumer {
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] partition_id: Option<u32>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let state = self.state.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             state
                 .delete_offset(partition_id)
                 .await
@@ -236,7 +237,7 @@ impl IggyConsumer {
     /// set the shutdown event or cancel the run instead.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn shutdown<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
-        future_into_py(py, self.shutting_down(py)?)
+        none_future_into_py(py, self.shutting_down(py)?)
     }
 
     #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[IggyConsumer]", imports=("collections.abc")))]
@@ -327,7 +328,7 @@ impl IggyConsumer {
             .map(|event| into_future_with_locals(&locals, event.call_method0("wait")?))
             .transpose()?;
 
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             // A dropped sender ends the run, so dropping this future, as a cancel does, ends it
             // too.
             let (stop, stopped) = oneshot::channel::<()>();
