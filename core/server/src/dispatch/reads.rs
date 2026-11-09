@@ -160,14 +160,14 @@ async fn handle_get_me<B, MJ, S, SB>(
 /// Commit broadcasts a held read waits out before it fails retryable.
 ///
 /// Sized for a node merely behind on its commit walk, NOT for a view change --
-/// detecting one costs `heartbeat_timeout` and escalating it another
+/// detecting one costs `commit_busy_heartbeat_timeout` and escalating it another
 /// `view_change_status_timeout`, and `recovery_barrier_deadline` budgets at
 /// least 15s for the same event, so a read that waits out an election is a read
 /// the caller should retry elsewhere.
 const READ_FRONTIER_BROADCASTS: u32 = 6;
 
 /// How long a held metadata read may wait for this node's applied frontier,
-/// sized from `[cluster] commit_broadcast_interval`: the thing the read is
+/// sized from `[cluster] commit_busy_heartbeat_interval`: the thing the read is
 /// short of is a commit broadcast, so the budget has to move with the
 /// configured cadence rather than with the compile-time default that
 /// `TimeoutManager::COMMIT_MESSAGE_TICKS` names (the runtime overrides it
@@ -179,7 +179,7 @@ const READ_FRONTIER_BROADCASTS: u32 = 6;
 pub fn read_frontier_budget(config: &ServerConfig) -> Duration {
     config
         .cluster
-        .commit_broadcast_interval
+        .commit_busy_heartbeat_interval
         .get_duration()
         // No config ceiling on the interval, so plain `*` can overflow.
         .saturating_mul(READ_FRONTIER_BROADCASTS)
@@ -1284,7 +1284,7 @@ mod tests {
     use std::time::Duration;
 
     /// The budget has to move with the CONFIGURED commit cadence, not with the
-    /// compile-time default: `[cluster] commit_broadcast_interval` is what
+    /// compile-time default: `[cluster] commit_busy_heartbeat_interval` is what
     /// sizes the timer the read is waiting on, and a cluster that widens it to
     /// 2s would otherwise get a budget of one and a half broadcasts and refuse
     /// reads on a backup that is merely a commit behind.
@@ -1300,7 +1300,7 @@ mod tests {
             "the config default must agree with the frontier's built-in fallback"
         );
 
-        config.cluster.commit_broadcast_interval = IggyDuration::from(Duration::from_secs(2));
+        config.cluster.commit_busy_heartbeat_interval = IggyDuration::from(Duration::from_secs(2));
         assert_eq!(
             read_frontier_budget(&config),
             Duration::from_secs(12),

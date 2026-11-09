@@ -2435,6 +2435,7 @@ mod tests {
             cluster_id: 1,
             self_id: 2,
             replica_count: 3,
+            heartbeat: crate::replica::auth::HeartbeatTimings::default(),
             auth: None,
             tls: None,
         });

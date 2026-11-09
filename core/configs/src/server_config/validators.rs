@@ -387,10 +387,10 @@ impl Validatable<ConfigurationError> for ServerConfig {
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
-        let cluster_timeout = self.cluster.heartbeat_timeout.get_duration();
+        let cluster_timeout = self.cluster.commit_busy_heartbeat_timeout.get_duration();
         if self.cluster.enabled && session_timeout <= cluster_timeout {
             eprintln!(
-                "{COMPONENT} the session timeout, 1.2 x heartbeat.interval ({session_timeout:?}), must exceed cluster.heartbeat_timeout ({cluster_timeout:?}). Raise heartbeat.interval"
+                "{COMPONENT} the session timeout, 1.2 x heartbeat.interval ({session_timeout:?}), must exceed cluster.commit_busy_heartbeat_timeout ({cluster_timeout:?}). Raise heartbeat.interval"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -1151,12 +1151,12 @@ mod tests {
     fn given_session_timeout_within_cluster_liveness_window_when_validating_should_reject() {
         for interval in ["12500ms", "15s"] {
             let config = config_with_override(&format!(
-                "[cluster]\nenabled = true\nheartbeat_timeout = \"18s\"\n[consumer_group]\nheartbeat_interval = \"500ms\"\n[heartbeat]\ninterval = \"{interval}\"\n"
+                "[cluster]\nenabled = true\ncommit_busy_heartbeat_timeout = \"18s\"\n[consumer_group]\nheartbeat_interval = \"500ms\"\n[heartbeat]\ninterval = \"{interval}\"\n"
             ));
             assert!(config.validate().is_err(), "accepted {interval}");
         }
         let config = config_with_override(
-            "[cluster]\nenabled = true\nheartbeat_timeout = \"18s\"\n[consumer_group]\nheartbeat_interval = \"500ms\"\n[heartbeat]\ninterval = \"16s\"\n",
+            "[cluster]\nenabled = true\ncommit_busy_heartbeat_timeout = \"18s\"\n[consumer_group]\nheartbeat_interval = \"500ms\"\n[heartbeat]\ninterval = \"16s\"\n",
         );
         assert!(config.validate().is_ok());
     }

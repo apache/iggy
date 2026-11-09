@@ -16,6 +16,7 @@
 // under the License.
 
 pub mod builder;
+pub mod commit_batch;
 pub mod config;
 pub mod coordinator;
 pub mod host;
@@ -63,9 +64,9 @@ use iggy_binary_protocol::primitives::partition_status::{
 };
 use iggy_binary_protocol::responses::system::GetMetadataChangesResponse;
 use iggy_binary_protocol::{
-    CHECKSUM_UNSEALED, Command, CommitHeader, CommitReplyHeader, ConsensusHeader, ConsumerSession,
-    ConsumerSessionHeartbeatHeader, DoViewChangeHeader, ForwardCompletionHeader,
-    ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
+    CHECKSUM_UNSEALED, Command, CommitEntry, CommitHeader, CommitReplyEntry, CommitReplyHeader,
+    ConsensusHeader, ConsumerSession, ConsumerSessionHeartbeatHeader, DoViewChangeHeader,
+    ForwardCompletionHeader, ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
     ForwardRegisterResultHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
     PrepareProgressHeader, RepairPrepareHeader, RepairRangeReplyHeader, RequestPreparesHeader,
     RequestStartViewHeader, RequestStateChunkHeader, RequestStateTransferHeader,
@@ -2051,8 +2052,21 @@ where
     /// discriminant (`Command` derives no `Hash`).
     incarnation_mismatch_warns: RefCell<HashMap<u8, WarnPace>>,
 
-    /// Shard ticks so far: the clock of every [`WarnPace`].
+    /// Shard ticks so far: the clock of every [`WarnPace`] and of the
+    /// heartbeat grid.
     ticks: Cell<u64>,
+    /// Whether the metadata tick counted the current shard tick, so the
+    /// partition tick does not count it again.
+    metadata_ticked: Cell<bool>,
+    /// The shard tick of the last Commit batch, so a debug build stops when a
+    /// shard sends two Commit batches in one tick.
+    last_commit_flush_tick: Cell<Option<u64>>,
+
+    /// Commits owed to each peer node, sent at the end of the shard tick.
+    commit_outbox: commit_batch::CommitOutbox,
+    /// Replies owed to each peer node, sent at the end of the partition tick
+    /// and at the start of the metadata tick.
+    reply_outbox: commit_batch::ReplyOutbox,
 
     /// Decode failures charged against one snapshot generation, as
     /// `(snapshot_seq, failures)`. `None` until a pulled artifact set first
@@ -2256,6 +2270,10 @@ where
             metadata_repair_conflict_warn: Cell::default(),
             incarnation_mismatch_warns: RefCell::default(),
             ticks: Cell::new(0),
+            metadata_ticked: Cell::new(false),
+            last_commit_flush_tick: Cell::new(None),
+            commit_outbox: commit_batch::CommitOutbox::default(),
+            reply_outbox: commit_batch::ReplyOutbox::default(),
             metadata_transfer_decode_failures: Cell::new(None),
         })
     }
@@ -3216,6 +3234,10 @@ where
             metadata_repair_conflict_warn: Cell::default(),
             incarnation_mismatch_warns: RefCell::default(),
             ticks: Cell::new(0),
+            metadata_ticked: Cell::new(false),
+            last_commit_flush_tick: Cell::new(None),
+            commit_outbox: commit_batch::CommitOutbox::default(),
+            reply_outbox: commit_batch::ReplyOutbox::default(),
             metadata_transfer_decode_failures: Cell::new(None),
         }
     }
@@ -5973,6 +5995,8 @@ where
         partition.notify_io();
     }
 
+    /// Handle each entry of a Commit batch alone. A bad entry does not stop
+    /// the other entries.
     #[allow(clippy::future_not_send)]
     async fn on_commit(&self, msg: &Message<CommitHeader>)
     where
@@ -5983,7 +6007,27 @@ where
         M: MetadataStm,
         T: ShardsTable,
     {
-        let header = *msg.header();
+        let Some(entries) =
+            commit_batch::verified_entries::<_, CommitEntry>(msg, msg.header().checksum_body)
+        else {
+            return;
+        };
+        for entry in &entries {
+            self.on_commit_entry(entry).await;
+        }
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn on_commit_entry(&self, header: &CommitEntry)
+    where
+        B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: MetadataStm,
+        T: ShardsTable,
+    {
+        let header = *header;
         let planes = self.plane.inner();
 
         if let Some(ref consensus) = planes.0.consensus
@@ -5993,8 +6037,8 @@ where
             // the real primary once this replica's view climbed alone.
             consensus.observe_primary(header.view, header.replica);
             let outcome = consensus.handle_commit(&header);
-            if let Some(action) = outcome.reply(&header) {
-                dispatch_vsr_actions::<B, _, MJ>(consensus, None, &[action]).await;
+            if outcome.reply(&header).is_some() {
+                commit_batch::queue_commit_reply(&self.reply_outbox, consensus, &header);
             }
             match outcome {
                 CommitOutcome::Advanced => {
@@ -6051,13 +6095,16 @@ where
             return;
         };
         let consensus = partition.consensus();
+        if !self.member_is_known(consensus.replica_count(), header.replica, "Commit entry") {
+            return;
+        }
         // Ahead of `handle_commit`: a replica whose view climbed through
         // elections nobody joined drops the real primary's lower-view
         // heartbeats there, and they are how it learns whom to repair from.
         consensus.observe_primary(header.view, header.replica);
         let outcome = consensus.handle_commit(&header);
-        if let Some(action) = outcome.reply(&header) {
-            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &[action]).await;
+        if outcome.reply(&header).is_some() {
+            commit_batch::queue_commit_reply(&self.reply_outbox, consensus, &header);
         }
         match outcome {
             CommitOutcome::Advanced => {
@@ -6090,17 +6137,124 @@ where
         }
     }
 
+    /// Count each valid entry of a reply batch. An invalid entry does not stop
+    /// the other entries.
     fn on_commit_reply(&self, msg: &Message<CommitReplyHeader>) {
-        let header = msg.header();
-        let planes = self.plane.inner();
-        if let Some(consensus) = &planes.0.consensus
-            && consensus.group() == header.group
-        {
-            consensus.handle_commit_reply(header);
+        let Some(entries) =
+            commit_batch::verified_entries::<_, CommitReplyEntry>(msg, msg.header().checksum_body)
+        else {
             return;
+        };
+        let planes = self.plane.inner();
+        for entry in &entries {
+            if let Some(consensus) = &planes.0.consensus
+                && consensus.group() == entry.group
+            {
+                consensus.handle_commit_reply(entry);
+            } else if let Some(partition) = self.resolve_partition_target(
+                &planes.1.0,
+                entry.group,
+                entry.partition_incarnation,
+                entry.view,
+                entry.replica,
+                Command::CommitReply,
+            ) && self.member_is_known(
+                partition.consensus().replica_count(),
+                entry.replica,
+                "CommitReply entry",
+            ) {
+                partition.consensus().handle_commit_reply(entry);
+            }
         }
-        if let Some(partition) = planes.1.0.get_by_ns(&IggyNamespace::from_raw(header.group)) {
-            partition.consensus().handle_commit_reply(header);
+    }
+
+    /// Send one Commit batch to each peer node with every Commit queued for
+    /// it. Each group then records whether its send reached a connected link.
+    ///
+    /// # Panics
+    /// Never returns when a batch does not fit in one frame: the server stops.
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn flush_commit_outbox(&self)
+    where
+        B: MessageBus,
+    {
+        let Some(batches) = self.commit_outbox.take() else {
+            return;
+        };
+        let tick = self.ticks.get();
+        debug_assert_ne!(
+            self.last_commit_flush_tick.replace(Some(tick)),
+            Some(tick),
+            "shard {} sent two Commit batches in shard tick {tick}",
+            self.id
+        );
+        for (peer, queued) in batches.peers {
+            let entries: Vec<CommitEntry> = queued.iter().map(|queued| queued.entry).collect();
+            let Some(message) =
+                commit_batch::encode_commit_batch(batches.cluster, batches.sender, &entries)
+            else {
+                fatal(
+                    FatalReason::CommitBatchOverflow,
+                    &format!(
+                        "shard {} owes peer node {peer} {} Commits, more than one frame holds. \
+                         The shard leads more groups than one CPU core serves, so the cluster \
+                         needs more shards",
+                        self.id,
+                        entries.len()
+                    ),
+                );
+            };
+            let sent = self
+                .bus
+                .send_to_replica(peer, message.into_generic().into_frozen())
+                .await;
+            if sent.is_ok() {
+                self.metrics.record_commit_batch_sent(entries.len());
+            }
+            let planes = self.plane.inner();
+            for queued in &queued {
+                let group = queued.entry.group;
+                if let Some(consensus) = &planes.0.consensus
+                    && consensus.group() == group
+                {
+                    consensus.record_member_send(queued.member, &sent);
+                } else if let Some(partition) =
+                    planes.1.0.get_by_ns(&IggyNamespace::from_raw(group))
+                {
+                    partition
+                        .consensus()
+                        .record_member_send(queued.member, &sent);
+                }
+            }
+        }
+    }
+
+    /// Send one reply batch to each peer node. A batch that fails to send is
+    /// dropped: the next Commit from the primary brings a new reply.
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn flush_reply_outbox(&self)
+    where
+        B: MessageBus,
+    {
+        let Some(batches) = self.reply_outbox.take() else {
+            return;
+        };
+        for (peer, entries) in batches.peers {
+            let Some(message) =
+                commit_batch::encode_commit_reply_batch(batches.cluster, batches.sender, &entries)
+            else {
+                continue;
+            };
+            match self
+                .bus
+                .send_to_replica(peer, message.into_generic().into_frozen())
+                .await
+            {
+                Ok(()) => self.metrics.record_commit_reply_batch_sent(entries.len()),
+                Err(error) => {
+                    tracing::debug!(shard = self.id, peer, "reply batch dropped: {error}");
+                }
+            }
         }
     }
 
@@ -9410,11 +9564,34 @@ where
         <MJ as JournalHandle>::Target:
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     {
+        let fatal = self.tick_partition_groups(namespace_scratch).await;
+        // One batch per peer node for this shard tick, with the Commits of
+        // both planes.
+        self.flush_commit_outbox().await;
+        self.flush_reply_outbox().await;
+        fatal
+    }
+
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    async fn tick_partition_groups(
+        &self,
+        namespace_scratch: &mut Vec<IggyNamespace>,
+    ) -> Option<FatalCommit>
+    where
+        B: MessageBus + 'static,
+        T: ShardsTable,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    {
         debug_assert!(
             namespace_scratch.is_empty(),
             "namespace_scratch must be empty on entry",
         );
-        self.ticks.set(self.ticks.get().wrapping_add(1));
+        // The metadata tick of this shard tick already counted it.
+        if !self.metadata_ticked.replace(false) {
+            self.ticks.set(self.ticks.get().wrapping_add(1));
+        }
         let partitions = self.plane.partitions();
         let repair_retry_ticks = self.repair_retry_ticks.get();
         // The serving side ages an idle offer on this clock, `max(1)` included.
@@ -9611,8 +9788,14 @@ where
                 refresh_partition_dvc_suffix(partition);
             }
             partition.ensure_materialization_recovery();
-            let actions = consensus
-                .tick_with_history_fence(PlaneKind::Partitions, partition.history_writes_pending());
+            let grid_tick = consensus
+                .heartbeat_schedule()
+                .is_grid_tick(self.ticks.get());
+            let actions = consensus.tick_with_grid(
+                PlaneKind::Partitions,
+                partition.history_writes_pending(),
+                grid_tick,
+            );
             partition.ensure_materialization_recovery();
             // The tick emits view-scoped sends (heartbeats, view-change
             // retransmits), so it persists first like every dispatch site;
@@ -9621,8 +9804,13 @@ where
             // Locals to the partition dispatcher only; see the view-change
             // sites for the rationale.
             dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
-            dispatch_partition_wire_actions::<B, _, MJ, _>(consensus, partition, wire_actions)
-                .await;
+            dispatch_partition_wire_actions_batched::<B, _, MJ, _>(
+                consensus,
+                partition,
+                wire_actions,
+                Some(&self.commit_outbox),
+            )
+            .await;
 
             // Finish a view change whose quorum decided ahead of the local log.
             self.advance_pending_partition_view(namespace).await;
@@ -12818,6 +13006,17 @@ where
                 metadata::stm::snapshot::MetadataSnapshot,
             >,
     {
+        // The flag is still set when the previous shard tick ran only the
+        // metadata plane. Then no partition tick sent its Commit batch, so
+        // this tick sends it first, under the number of the previous tick.
+        // Otherwise the partition tick at the end of this tick sends one batch
+        // with all entries.
+        if self.metadata_ticked.get() {
+            self.flush_commit_outbox().await;
+        }
+        self.ticks.set(self.ticks.get().wrapping_add(1));
+        self.metadata_ticked.set(true);
+        self.flush_reply_outbox().await;
         let metadata = self.plane.metadata();
         let Some(ref consensus) = metadata.consensus else {
             return;
@@ -12827,14 +13026,18 @@ where
         if consensus.status() != Status::Normal {
             refresh_metadata_dvc_suffix(consensus, metadata.journal.as_ref());
         }
-        let actions = consensus.tick(PlaneKind::Metadata);
+        let grid_tick = consensus
+            .heartbeat_schedule()
+            .is_grid_tick(self.ticks.get());
+        let actions = consensus.tick_with_grid(PlaneKind::Metadata, false, grid_tick);
         if !consensus.is_primary() || !primary_rebalance::consensus_ready(consensus) {
             self.primary_rebalance.borrow_mut().reset_authority();
         }
 
-        let (local_actions, wire_actions) = split_local_actions(actions);
+        let (local_actions, mut wire_actions) = split_local_actions(actions);
         dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &local_actions).await;
         if metadata.persist_superblock_if_needed(consensus).await {
+            commit_batch::queue_commits(&self.commit_outbox, consensus, &mut wire_actions);
             dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &wire_actions).await;
         }
         let superblock_failures = metadata.superblock_write_failures();
@@ -14930,48 +15133,50 @@ async fn dispatch_vsr_actions<B, P, J>(
             // Handled by the caller, which owns the plane's journal. Metadata
             // ignores `RetryLocalWrite` and re-acks via `repair_primary_self_acks`.
             VsrAction::CommitJournal | VsrAction::RetryLocalWrite { .. } => {}
+            // The ticks queue Commits and replies in the shard outboxes. Any
+            // that reach this point leave at once as a batch of one entry.
             VsrAction::SendCommitReply {
                 view,
                 group,
                 timestamp_monotonic,
                 target,
             } => {
-                let message = Message::<CommitReplyHeader>::new(size_of::<CommitReplyHeader>())
-                    .transmute_header(|_, header: &mut CommitReplyHeader| {
-                        header.command = Command::CommitReply;
-                        header.partition_incarnation = consensus.partition_incarnation();
-                        header.cluster = cluster;
-                        header.replica = self_id;
-                        header.view = *view;
-                        header.group = *group;
-                        header.timestamp_monotonic = *timestamp_monotonic;
-                        header.size = size_of::<CommitReplyHeader>() as u32;
-                        header.seal();
-                    });
-                send(*target, message.into_generic().into_frozen()).await;
+                let entry = CommitReplyEntry::new(
+                    *group,
+                    consensus.partition_incarnation(),
+                    *view,
+                    *timestamp_monotonic,
+                    self_id,
+                );
+                if let Some(message) =
+                    commit_batch::encode_commit_reply_batch(cluster, consensus.node_id(), &[entry])
+                {
+                    send(*target, message.into_generic().into_frozen()).await;
+                }
             }
             VsrAction::SendCommit {
                 view,
                 commit,
                 group,
                 timestamp_monotonic,
+                heartbeat_state,
                 target,
             } => {
-                let msg = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
-                    |_, h: &mut CommitHeader| {
-                        h.command = Command::Commit;
-                        h.partition_incarnation = consensus.partition_incarnation();
-                        h.cluster = cluster;
-                        h.replica = self_id;
-                        h.view = *view;
-                        h.commit = *commit;
-                        h.group = *group;
-                        h.timestamp_monotonic = *timestamp_monotonic;
-                        h.size = size_of::<CommitHeader>() as u32;
-                        h.seal();
-                    },
+                let entry = CommitEntry::new(
+                    *group,
+                    consensus.partition_incarnation(),
+                    *view,
+                    *commit,
+                    *timestamp_monotonic,
+                    *heartbeat_state,
+                    self_id,
                 );
-                let frozen = msg.into_generic().into_frozen();
+                let Some(message) =
+                    commit_batch::encode_commit_batch(cluster, consensus.node_id(), &[entry])
+                else {
+                    continue;
+                };
+                let frozen = message.into_generic().into_frozen();
                 match target {
                     Some(replica) => send(*replica, frozen).await,
                     None => broadcast(frozen).await,
@@ -14985,7 +15190,27 @@ async fn dispatch_vsr_actions<B, P, J>(
 async fn dispatch_partition_wire_actions<B, P, J, SB>(
     consensus: &VsrConsensus<B, P>,
     partition: &IggyPartition<B, SB>,
+    actions: Vec<VsrAction>,
+) where
+    B: MessageBus,
+    P: Pipeline<Entry = consensus::PipelineEntry>,
+    J: JournalHandle,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    SB: SuperblockStore,
+{
+    dispatch_partition_wire_actions_batched::<B, P, J, SB>(consensus, partition, actions, None)
+        .await;
+}
+
+/// [`dispatch_partition_wire_actions`] that queues each `Commit` in `commits`
+/// for the next batch. The superblock save comes first, so a group whose save
+/// fails sends its `Commit` in a later batch.
+#[allow(clippy::future_not_send)]
+async fn dispatch_partition_wire_actions_batched<B, P, J, SB>(
+    consensus: &VsrConsensus<B, P>,
+    partition: &IggyPartition<B, SB>,
     mut actions: Vec<VsrAction>,
+    commits: Option<&commit_batch::CommitOutbox>,
 ) where
     B: MessageBus,
     P: Pipeline<Entry = consensus::PipelineEntry>,
@@ -14999,6 +15224,9 @@ async fn dispatch_partition_wire_actions<B, P, J, SB>(
     }
     if partition.requires_state_transfer() {
         actions.retain(sendable_while_awaiting_transfer);
+    }
+    if let Some(outbox) = commits {
+        commit_batch::queue_commits(outbox, consensus, &mut actions);
     }
     dispatch_vsr_actions::<B, P, J>(consensus, None, &actions).await;
     dispatch_partition_journal_actions(consensus, partition, &actions).await;
@@ -16856,22 +17084,15 @@ mod adopted_view_retention_tests {
                     COMMITTED
                 );
                 old_primary.advance_commit_min(COMMITTED);
-                let heartbeat = Message::<iggy_binary_protocol::CommitHeader>::new(size_of::<
-                    iggy_binary_protocol::CommitHeader,
-                >(
-                ))
-                .transmute_header(
-                    |_, header: &mut iggy_binary_protocol::CommitHeader| {
-                        header.command = Command::Commit;
-                        header.size =
-                            u32::try_from(size_of::<iggy_binary_protocol::CommitHeader>()).unwrap();
-                        header.view = OLD_VIEW;
-                        header.replica = old_primary.replica();
-                        header.group = METADATA_GROUP;
-                        header.commit = COMMITTED;
-                    },
-                );
-                next_primary.handle_commit(heartbeat.header());
+                next_primary.handle_commit(&iggy_binary_protocol::CommitEntry::new(
+                    METADATA_GROUP,
+                    0,
+                    OLD_VIEW,
+                    COMMITTED,
+                    0,
+                    iggy_binary_protocol::HeartbeatState::Busy,
+                    old_primary.replica(),
+                ));
                 next_primary.advance_commit_min(COMMITTED);
                 let replacement = original.clone();
                 let abandoned = projected_stream(&old_primary, "abandoned");

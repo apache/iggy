@@ -1432,9 +1432,12 @@ impl ConsensusHeader for PrepareOkHeader {
     }
 }
 
-// CommitHeader - primary -> replicas (commit, header-only)
+// CommitHeader - primary -> peer node (batch of Commit entries)
 
-/// Primary -> replicas: commit up to this op. Header-only (no body).
+/// Primary -> peer node: a batch of [`super::CommitEntry`], one per group.
+///
+/// `replica` is the id of the sending node. The body holds `entry_count`
+/// entries and `checksum_body` covers it. A lone `Commit` is a batch of one.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct CommitHeader {
@@ -1448,22 +1451,13 @@ pub struct CommitHeader {
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
-    pub commit_checksum: u128,
-    pub timestamp_monotonic: u64,
-    pub commit: u64,
-    pub checkpoint_op: u64,
-    pub group: u64,
-    pub partition_incarnation: u64,
-    pub reserved: [u8; 72],
+    pub entry_count: u32,
+    pub reserved: [u8; 124],
 }
 const _: () = {
     assert!(size_of::<CommitHeader>() == HEADER_SIZE);
-    assert!(
-        offset_of!(CommitHeader, commit_checksum)
-            == offset_of!(CommitHeader, reserved_frame) + size_of::<[u8; 66]>()
-    );
-    assert!(offset_of!(CommitHeader, reserved) + size_of::<[u8; 72]>() == HEADER_SIZE);
-    assert!(offset_of!(CommitHeader, partition_incarnation) == 176);
+    assert!(offset_of!(CommitHeader, entry_count) == 128);
+    assert!(offset_of!(CommitHeader, reserved) + size_of::<[u8; 124]>() == HEADER_SIZE);
 };
 
 impl ConsensusHeader for CommitHeader {
@@ -1492,17 +1486,16 @@ impl ConsensusHeader for CommitHeader {
         if self.command != Command::Commit {
             return Err(ConsensusError::CommitInvalidCommand);
         }
-        if self.size != 256 {
-            return Err(ConsensusError::CommitInvalidSize(self.size));
-        }
-        Ok(())
+        validate_batch_size::<super::CommitEntry>(self.size, self.entry_count)
     }
 }
 
-/// Backup -> primary: echo a heartbeat counter for quorum liveness.
+/// Backup -> primary node: a batch of [`super::CommitReplyEntry`], each
+/// echoing a heartbeat counter for quorum liveness.
 ///
 /// This acknowledges connectivity, not journal or state-machine durability.
-/// Nodes using this message require a coordinated cluster upgrade.
+/// `replica` is the id of the sending node. The body holds `entry_count`
+/// entries and `checksum_body` covers it.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct CommitReplyHeader {
@@ -1515,17 +1508,14 @@ pub struct CommitReplyHeader {
     pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
-    pub timestamp_monotonic: u64,
-    pub group: u64,
-    pub partition_incarnation: u64,
-    pub reserved: [u8; 104],
+    pub entry_count: u32,
+    pub reserved: [u8; 124],
 }
 
 const _: () = {
     assert!(size_of::<CommitReplyHeader>() == HEADER_SIZE);
-    assert!(offset_of!(CommitReplyHeader, timestamp_monotonic) == 128);
-    assert!(offset_of!(CommitReplyHeader, partition_incarnation) == 144);
-    assert!(offset_of!(CommitReplyHeader, reserved) + size_of::<[u8; 104]>() == HEADER_SIZE);
+    assert!(offset_of!(CommitReplyHeader, entry_count) == 128);
+    assert!(offset_of!(CommitReplyHeader, reserved) + size_of::<[u8; 124]>() == HEADER_SIZE);
 };
 
 impl ConsensusHeader for CommitReplyHeader {
@@ -1555,16 +1545,27 @@ impl ConsensusHeader for CommitReplyHeader {
                 found: self.command,
             });
         }
-        if usize::try_from(self.size) != Ok(HEADER_SIZE) {
-            return Err(ConsensusError::InvalidField(
-                "commit_reply: invalid size".to_string(),
-            ));
-        }
         if self.release != 0 {
             return Err(ConsensusError::InvalidField("release != 0".to_string()));
         }
-        Ok(())
+        validate_batch_size::<super::CommitReplyEntry>(self.size, self.entry_count)
     }
+}
+
+/// A batch holds at least one entry, and its size matches its entry count.
+/// A revision 1 frame fails here: its bytes at the count either read zero or
+/// name a count that does not match its 256-byte size.
+fn validate_batch_size<E>(size: u32, entry_count: u32) -> Result<(), ConsensusError> {
+    let expected = usize::try_from(entry_count)
+        .ok()
+        .filter(|count| *count > 0)
+        .and_then(super::batch_frame_size::<E>);
+    if expected != Some(size) {
+        return Err(ConsensusError::InvalidField(format!(
+            "batch of {entry_count} entries cannot be {size} bytes"
+        )));
+    }
+    Ok(())
 }
 
 /// Correlates a replication checkpoint with the backup's contiguous prefixes.
@@ -3454,8 +3455,6 @@ mod tests {
             })+};
         }
         check_incarnation!(
-            CommitHeader,
-            CommitReplyHeader,
             PrepareProgressHeader,
             StartViewChangeHeader,
             DoViewChangeHeader,

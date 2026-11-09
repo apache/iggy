@@ -380,6 +380,8 @@ pub struct ShardMetrics {
     client_requests_denied_queue_full_total: Counter,
     replica_socket_reads_total: Counter,
     replica_inbound_frames_total: Counter,
+    commit_batches: BatchCounters,
+    commit_reply_batches: BatchCounters,
     replica_outbound_drops_total: Counter,
     replication_live_refusals_total: Counter,
     replication_replayed_prepares_total: Counter,
@@ -476,6 +478,8 @@ impl ShardMetrics {
             client_requests_denied_queue_full_total: Counter::default(),
             replica_socket_reads_total: Counter::default(),
             replica_inbound_frames_total: Counter::default(),
+            commit_batches: BatchCounters::default(),
+            commit_reply_batches: BatchCounters::default(),
             replica_outbound_drops_total: Counter::default(),
             replication_live_refusals_total: Counter::default(),
             replication_replayed_prepares_total: Counter::default(),
@@ -538,6 +542,39 @@ impl ShardMetrics {
     pub fn record_replica_reads(&self, metrics: &ReplicaReadMetrics) {
         self.replica_socket_reads_total.inc_by(metrics.reads);
         self.replica_inbound_frames_total.inc_by(metrics.frames);
+    }
+
+    /// Count one Commit batch of `entries` entries that this shard sent.
+    pub fn record_commit_batch_sent(&self, entries: usize) {
+        self.commit_batches.record_sent(entries);
+    }
+
+    /// Count one Commit batch of `entries` entries that this shard received.
+    pub fn record_commit_batch_received(&self, entries: usize) {
+        self.commit_batches.record_received(entries);
+    }
+
+    /// Count one reply batch of `entries` entries that this shard sent.
+    pub fn record_commit_reply_batch_sent(&self, entries: usize) {
+        self.commit_reply_batches.record_sent(entries);
+    }
+
+    /// Count one reply batch of `entries` entries that this shard received.
+    pub fn record_commit_reply_batch_received(&self, entries: usize) {
+        self.commit_reply_batches.record_received(entries);
+    }
+
+    /// Commit batch counts as `[batches sent, entries sent, batches received,
+    /// entries received]`.
+    #[must_use]
+    pub fn commit_batch_counts(&self) -> [u64; 4] {
+        self.commit_batches.values()
+    }
+
+    /// Reply batch counts, in the order of [`Self::commit_batch_counts`].
+    #[must_use]
+    pub fn commit_reply_batch_counts(&self) -> [u64; 4] {
+        self.commit_reply_batches.values()
     }
 
     /// Fold one sweep's replica link events in. The counters take deltas,
@@ -1302,6 +1339,9 @@ impl ShardMetrics {
             "frames decoded off this shard's plaintext replica links",
             self.replica_inbound_frames_total.clone(),
         );
+        self.commit_batches.register(registry, "commit", "Commit");
+        self.commit_reply_batches
+            .register(registry, "commit_reply", "CommitReply");
         registry.register(
             "replica_outbound_drops",
             "replica frames dropped because a peer send queue was full",
@@ -1844,5 +1884,58 @@ mod tests {
             })
             .get();
         assert_eq!(from_family, 1);
+    }
+}
+
+/// Batches and entries of one batched command that a shard sent and received.
+#[derive(Clone, Default)]
+struct BatchCounters {
+    batches_sent: Counter,
+    entries_sent: Counter,
+    batches_received: Counter,
+    entries_received: Counter,
+}
+
+impl BatchCounters {
+    fn record_sent(&self, entries: usize) {
+        self.batches_sent.inc();
+        self.entries_sent.inc_by(entries as u64);
+    }
+
+    fn record_received(&self, entries: usize) {
+        self.batches_received.inc();
+        self.entries_received.inc_by(entries as u64);
+    }
+
+    fn values(&self) -> [u64; 4] {
+        [
+            self.batches_sent.get(),
+            self.entries_sent.get(),
+            self.batches_received.get(),
+            self.entries_received.get(),
+        ]
+    }
+
+    fn register(&self, registry: &mut Registry, prefix: &str, command: &str) {
+        registry.register(
+            format!("{prefix}_batches_sent"),
+            format!("{command} batches that this shard sent"),
+            self.batches_sent.clone(),
+        );
+        registry.register(
+            format!("{prefix}_batch_entries_sent"),
+            format!("{command} entries in the batches that this shard sent"),
+            self.entries_sent.clone(),
+        );
+        registry.register(
+            format!("{prefix}_batches_received"),
+            format!("{command} batches that this shard received"),
+            self.batches_received.clone(),
+        );
+        registry.register(
+            format!("{prefix}_batch_entries_received"),
+            format!("{command} entries in the batches that this shard received"),
+            self.entries_received.clone(),
+        );
     }
 }

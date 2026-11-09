@@ -14083,7 +14083,7 @@ fn accumulate_committed_info(
 /// A SEGMENT budget standing in for a time bound, so the margin is filesystem
 /// specific: 16 segments is at most 32 unlinks (log plus index), a few hundred
 /// milliseconds on commodity `NVMe` against the shipped 5 s
-/// `cluster.heartbeat_timeout`, and still under 2 s if each unlink costs a
+/// `cluster.commit_busy_heartbeat_timeout`, and still under 2 s if each unlink costs a
 /// pathological 50 ms on a contended journal. Large enough that steady-state
 /// retention, which reclaims a handful of segments per interval, never reaches
 /// it -- only a backlog does, and that one drains over several passes.
@@ -14250,7 +14250,7 @@ mod tests {
     use consensus::LocalPipeline;
     use iggy_binary_protocol::batch::BATCH_MESSAGE_HEADER_SIZE;
     use iggy_binary_protocol::{
-        Command, CommitHeader, CommitReplyHeader, ConsensusHeader, HEADER_SIZE, ReplyHeader,
+        Command, CommitEntry, CommitReplyEntry, ConsensusHeader, HeartbeatState, ReplyHeader,
         StartViewHeader, WireConsumer, WireEncode, WireName,
     };
     use iggy_common::Aes256GcmEncryptor;
@@ -17599,17 +17599,9 @@ mod tests {
         commit: u64,
     ) {
         let group = partition.namespace().inner();
-        let heartbeat = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
-            |_, header: &mut CommitHeader| {
-                header.command = Command::Commit;
-                header.cluster = TEST_CLUSTER;
-                header.group = group;
-                header.commit = commit;
-                header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
-            },
-        );
+        let heartbeat = CommitEntry::new(group, 0, 0, commit, 0, HeartbeatState::Busy, 0);
         assert!(matches!(
-            partition.consensus().handle_commit(heartbeat.header()),
+            partition.consensus().handle_commit(&heartbeat),
             consensus::CommitOutcome::Advanced
         ));
         partition.commit_journal(config).await;
@@ -23547,6 +23539,7 @@ mod tests {
                 commit: 1,
                 group: partition.namespace().inner(),
                 timestamp_monotonic,
+                heartbeat_state: HeartbeatState::Busy,
                 target,
             };
 
@@ -31668,20 +31661,14 @@ mod tests {
             ..
         } = action
         {
-            let reply = Message::<CommitReplyHeader>::new(HEADER_SIZE).transmute_header(
-                |_, header: &mut CommitReplyHeader| {
-                    header.command = Command::CommitReply;
-                    header.size = u32::try_from(HEADER_SIZE).unwrap();
-                    header.cluster = partition.consensus().cluster();
-                    header.view = *view;
-                    header.replica = 1;
-                    header.group = *group;
-                    header.partition_incarnation = partition.consensus().partition_incarnation();
-                    header.timestamp_monotonic = *timestamp_monotonic;
-                    header.seal();
-                },
+            let reply = CommitReplyEntry::new(
+                *group,
+                partition.consensus().partition_incarnation(),
+                *view,
+                *timestamp_monotonic,
+                1,
             );
-            partition.consensus().handle_commit_reply(reply.header());
+            partition.consensus().handle_commit_reply(&reply);
         }
     }
 

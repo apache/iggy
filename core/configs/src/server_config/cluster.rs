@@ -31,18 +31,17 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::time::Duration;
 
-/// Absolute floor for the backup liveness window, independent of the
-/// commit-broadcast rate. The primary signals liveness through its commit
-/// broadcast (`commit_broadcast_interval`, 500ms by default); 2s spans several
-/// broadcasts, so a single delayed one never elects. The per-config
-/// `MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO` check scales the same headroom
-/// when the broadcast interval is retuned.
+/// Shard tick of the consensus timers, `CONSENSUS_TICK_INTERVAL` in
+/// `core/shard`. It is a copy, so that `core/configs` does not depend on
+/// `core/shard`. A static assert in `core/server` keeps the two equal.
+pub const CONSENSUS_TICK: Duration = Duration::from_millis(10);
+
+/// Floor for `commit_busy_heartbeat_timeout`, independent of the heartbeat rate.
 pub const MIN_CLUSTER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The backup liveness window (`heartbeat_timeout`) must span at least this
-/// many commit broadcasts (`commit_broadcast_interval`), so one dropped or
-/// delayed broadcast never trips a view change on a healthy primary.
-const MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO: u32 = 4;
+/// Each heartbeat timeout must span at least this many heartbeats, so one
+/// late heartbeat never starts an election.
+const HEARTBEATS_PER_TIMEOUT_MIN: u32 = 4;
 
 /// The view-change status backstop (`view_change_status_timeout`) must span at
 /// least this many retransmit intervals (`view_change_retransmit_interval`), so
@@ -108,20 +107,28 @@ const MAX_HOSTNAME_LEN: usize = 253;
 /// Per-label limit from RFC 1035.
 const MAX_HOSTNAME_LABEL_LEN: usize = 63;
 
-/// serde fallback for configs written before the field existed; the value
-/// itself lives in `core/server/config.toml` like every other default.
-fn default_heartbeat_timeout() -> IggyDuration {
-    SERVER_CONFIG.cluster.heartbeat_timeout.parse().unwrap()
+fn parse_default(value: &str) -> IggyDuration {
+    value.parse().unwrap()
 }
 
-/// serde fallback for configs written before the field existed; the value
-/// itself lives in `core/server/config.toml` like every other default.
-fn default_commit_broadcast_interval() -> IggyDuration {
-    SERVER_CONFIG
-        .cluster
-        .commit_broadcast_interval
-        .parse()
-        .unwrap()
+fn default_commit_heartbeat_grid() -> IggyDuration {
+    parse_default(SERVER_CONFIG.cluster.commit_heartbeat_grid)
+}
+
+fn default_commit_busy_heartbeat_interval() -> IggyDuration {
+    parse_default(SERVER_CONFIG.cluster.commit_busy_heartbeat_interval)
+}
+
+fn default_commit_busy_heartbeat_timeout() -> IggyDuration {
+    parse_default(SERVER_CONFIG.cluster.commit_busy_heartbeat_timeout)
+}
+
+fn default_commit_idle_heartbeat_interval() -> IggyDuration {
+    parse_default(SERVER_CONFIG.cluster.commit_idle_heartbeat_interval)
+}
+
+fn default_commit_idle_heartbeat_timeout() -> IggyDuration {
+    parse_default(SERVER_CONFIG.cluster.commit_idle_heartbeat_timeout)
 }
 
 /// serde fallback for configs written before the field existed; the value
@@ -216,28 +223,38 @@ fn default_superblock_wedged_fatal_timeout() -> IggyDuration {
 pub struct ClusterConfig {
     pub enabled: bool,
     pub name: String,
-    /// Liveness window for the primary and its replication quorum. Backups
-    /// vote after primary silence; a primary without heartbeat replies from
-    /// a quorum relinquishes leadership. Raise it on oversubscribed hosts where
-    /// scheduling stalls fake primary death; sub-`MIN_CLUSTER_HEARTBEAT_TIMEOUT`
-    /// values (including the `0` / `disabled` / `unlimited` sentinels, which
-    /// all parse to zero) are rejected at boot. On Linux it is also the
-    /// `TCP_USER_TIMEOUT` of every replica link.
-    #[serde(default = "default_heartbeat_timeout")]
+    /// Interval between grid ticks, the only shard ticks on which heartbeats
+    /// join a Commit batch. Must be a whole multiple of the 10 ms shard tick.
+    #[serde(default = "default_commit_heartbeat_grid")]
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
-    pub heartbeat_timeout: IggyDuration,
-    /// How often the primary broadcasts its commit point to every backup, the
-    /// cluster's primary-liveness signal. Each broadcast resets the backups'
-    /// `heartbeat_timeout` window, so that window must span several broadcasts:
-    /// boot rejects `heartbeat_timeout < MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO
-    /// * commit_broadcast_interval`. Sizes the consensus `CommitMessage` timer.
-    /// Zero (and the `0` / `disabled` / `unlimited` sentinels, which all parse
-    /// to zero) is rejected at boot.
-    #[serde(default = "default_commit_broadcast_interval")]
+    pub commit_heartbeat_grid: IggyDuration,
+    /// Interval between the heartbeats of a busy group, a whole multiple of
+    /// `commit_heartbeat_grid`.
+    #[serde(default = "default_commit_busy_heartbeat_interval")]
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
-    pub commit_broadcast_interval: IggyDuration,
+    pub commit_busy_heartbeat_interval: IggyDuration,
+    /// How long the backups of a busy group wait for a heartbeat before they
+    /// vote, and the quiet time before a group turns idle. It is also the quorum
+    /// window of a busy primary and, on Linux, the `TCP_USER_TIMEOUT` of every
+    /// replica link.
+    #[serde(default = "default_commit_busy_heartbeat_timeout")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub commit_busy_heartbeat_timeout: IggyDuration,
+    /// Interval between the heartbeats of an idle group, a whole multiple of
+    /// `commit_busy_heartbeat_interval`.
+    #[serde(default = "default_commit_idle_heartbeat_interval")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub commit_idle_heartbeat_interval: IggyDuration,
+    /// How long the backups of an idle group wait for a heartbeat. The backups
+    /// wait the larger of this value and `commit_busy_heartbeat_timeout`.
+    #[serde(default = "default_commit_idle_heartbeat_timeout")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub commit_idle_heartbeat_timeout: IggyDuration,
     /// How often the primary retransmits prepares a backup has not yet acked.
     /// Lower recovers faster from a dropped prepare at the cost of replica
     /// traffic. Sizes the consensus `Prepare` timer. Zero (and the `0` /
@@ -1045,6 +1062,97 @@ pub fn http_forwarding_key_material<'a>(
         .map(String::as_str)
 }
 
+/// A broken rule of the Commit heartbeat schedule. `G`, `H_B`, `T_B`, `H_I` and
+/// `T_I` are `commit_heartbeat_grid`, `commit_busy_heartbeat_interval`,
+/// `commit_busy_heartbeat_timeout`, `commit_idle_heartbeat_interval` and
+/// `commit_idle_heartbeat_timeout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeartbeatRule {
+    /// `G` is a whole multiple of the 10 ms shard tick.
+    GridIsTickMultiple,
+    /// `H_B = m * G` with a natural `m >= 1`.
+    BusyIntervalIsGridMultiple,
+    /// `T_B >= max(2s, 4 * H_B)`.
+    BusyTimeoutSpansBusyHeartbeats,
+    /// `H_I = k * H_B` with a natural `k >= 1`.
+    IdleIntervalIsBusyMultiple,
+    /// `max(T_I, T_B) >= 4 * H_I`.
+    IdleWaitSpansIdleHeartbeats,
+    /// `T_B >= 4 * H_I`.
+    QuorumWindowSpansIdleHeartbeats,
+}
+
+impl fmt::Display for HeartbeatRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rule = match self {
+            Self::GridIsTickMultiple => {
+                "rule grid_is_tick_multiple: cluster.commit_heartbeat_grid must be a nonzero \
+                 whole multiple of the 10ms shard tick"
+            }
+            Self::BusyIntervalIsGridMultiple => {
+                "rule busy_interval_is_grid_multiple: cluster.commit_busy_heartbeat_interval \
+                 must be a nonzero whole multiple of cluster.commit_heartbeat_grid"
+            }
+            Self::BusyTimeoutSpansBusyHeartbeats => {
+                "rule busy_timeout_spans_busy_heartbeats: cluster.commit_busy_heartbeat_timeout \
+                 must be at least 2s and at least 4x cluster.commit_busy_heartbeat_interval"
+            }
+            Self::IdleIntervalIsBusyMultiple => {
+                "rule idle_interval_is_busy_multiple: cluster.commit_idle_heartbeat_interval \
+                 must be a nonzero whole multiple of cluster.commit_busy_heartbeat_interval"
+            }
+            Self::IdleWaitSpansIdleHeartbeats => {
+                "rule idle_wait_spans_idle_heartbeats: the larger of \
+                 cluster.commit_idle_heartbeat_timeout and cluster.commit_busy_heartbeat_timeout \
+                 must be at least 4x cluster.commit_idle_heartbeat_interval"
+            }
+            Self::QuorumWindowSpansIdleHeartbeats => {
+                "rule quorum_window_spans_idle_heartbeats: \
+                 cluster.commit_busy_heartbeat_timeout must be at least 4x \
+                 cluster.commit_idle_heartbeat_interval"
+            }
+        };
+        f.write_str(rule)
+    }
+}
+
+/// Whether `value` is a nonzero whole multiple of `unit`.
+fn is_whole_multiple(value: Duration, unit: Duration) -> bool {
+    !value.is_zero() && !unit.is_zero() && value.as_nanos().is_multiple_of(unit.as_nanos())
+}
+
+impl ClusterConfig {
+    /// The first rule of the Commit heartbeat schedule these values break.
+    #[must_use]
+    pub fn heartbeat_schedule_violation(&self) -> Option<HeartbeatRule> {
+        let grid = self.commit_heartbeat_grid.get_duration();
+        let busy_interval = self.commit_busy_heartbeat_interval.get_duration();
+        let busy_timeout = self.commit_busy_heartbeat_timeout.get_duration();
+        let idle_interval = self.commit_idle_heartbeat_interval.get_duration();
+        let idle_timeout = self.commit_idle_heartbeat_timeout.get_duration();
+        let four = |interval: Duration| interval.saturating_mul(HEARTBEATS_PER_TIMEOUT_MIN);
+        if !is_whole_multiple(grid, CONSENSUS_TICK) {
+            return Some(HeartbeatRule::GridIsTickMultiple);
+        }
+        if !is_whole_multiple(busy_interval, grid) {
+            return Some(HeartbeatRule::BusyIntervalIsGridMultiple);
+        }
+        if busy_timeout < MIN_CLUSTER_HEARTBEAT_TIMEOUT.max(four(busy_interval)) {
+            return Some(HeartbeatRule::BusyTimeoutSpansBusyHeartbeats);
+        }
+        if !is_whole_multiple(idle_interval, busy_interval) {
+            return Some(HeartbeatRule::IdleIntervalIsBusyMultiple);
+        }
+        if idle_timeout.max(busy_timeout) < four(idle_interval) {
+            return Some(HeartbeatRule::IdleWaitSpansIdleHeartbeats);
+        }
+        if busy_timeout < four(idle_interval) {
+            return Some(HeartbeatRule::QuorumWindowSpansIdleHeartbeats);
+        }
+        None
+    }
+}
+
 impl Validatable<ConfigurationError> for ClusterConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
         // Ahead of the enabled gate: the top-level rule against
@@ -1089,52 +1197,16 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        // `0` / `disabled` / `unlimited` all parse to a zero duration and
-        // land here too: there is no way to switch the liveness window off.
-        if self.heartbeat_timeout.get_duration() < MIN_CLUSTER_HEARTBEAT_TIMEOUT {
-            eprintln!(
-                "Invalid cluster configuration: cluster.heartbeat_timeout '{}' must be at least {}s \
-                 (the primary signals liveness through its commit broadcast; a shorter window \
-                 elects on every scheduling hiccup)",
-                self.heartbeat_timeout,
-                MIN_CLUSTER_HEARTBEAT_TIMEOUT.as_secs()
-            );
+        if let Some(rule) = self.heartbeat_schedule_violation() {
+            eprintln!("Invalid cluster configuration: {rule}");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
-
-        // The commit broadcast is the cluster's liveness feed and the prepare
-        // retransmit its recovery timer; both size consensus timers that have
-        // to advance. `0` / `disabled` / `unlimited` all collapse to a zero
-        // duration, which would stall the timer - reject them.
-        if self.commit_broadcast_interval.get_duration().is_zero() {
-            eprintln!(
-                "Invalid cluster configuration: cluster.commit_broadcast_interval must be nonzero \
-                 (it drives the primary's liveness broadcast)"
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
+        // `0`, `disabled` and `unlimited` all parse to zero. A zero interval
+        // stops the prepare retransmit timer.
         if self.prepare_retransmit_interval.get_duration().is_zero() {
             eprintln!(
                 "Invalid cluster configuration: cluster.prepare_retransmit_interval must be \
                  nonzero (it drives prepare retransmission)"
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        // The liveness window must span several commit broadcasts so a single
-        // delayed broadcast never trips a view change on a healthy primary.
-        let min_heartbeat = self
-            .commit_broadcast_interval
-            .get_duration()
-            .saturating_mul(MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO);
-        if self.heartbeat_timeout.get_duration() < min_heartbeat {
-            eprintln!(
-                "Invalid cluster configuration: cluster.heartbeat_timeout '{}' must be at least \
-                 {}x cluster.commit_broadcast_interval '{}' so the liveness window spans several \
-                 broadcasts",
-                self.heartbeat_timeout,
-                MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO,
-                self.commit_broadcast_interval
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -1708,8 +1780,11 @@ mod tests {
         let config = ClusterConfig {
             enabled: true,
             name: "iggy-cluster".to_owned(),
-            heartbeat_timeout: default_heartbeat_timeout(),
-            commit_broadcast_interval: default_commit_broadcast_interval(),
+            commit_heartbeat_grid: default_commit_heartbeat_grid(),
+            commit_busy_heartbeat_interval: default_commit_busy_heartbeat_interval(),
+            commit_busy_heartbeat_timeout: default_commit_busy_heartbeat_timeout(),
+            commit_idle_heartbeat_interval: default_commit_idle_heartbeat_interval(),
+            commit_idle_heartbeat_timeout: default_commit_idle_heartbeat_timeout(),
             prepare_retransmit_interval: default_prepare_retransmit_interval(),
             view_change_retransmit_interval: default_view_change_retransmit_interval(),
             view_change_status_timeout: default_view_change_status_timeout(),
@@ -2138,8 +2213,11 @@ mod cluster_validate_tests {
         ClusterConfig {
             enabled: true,
             name: "iggy-cluster".to_string(),
-            heartbeat_timeout: default_heartbeat_timeout(),
-            commit_broadcast_interval: default_commit_broadcast_interval(),
+            commit_heartbeat_grid: default_commit_heartbeat_grid(),
+            commit_busy_heartbeat_interval: default_commit_busy_heartbeat_interval(),
+            commit_busy_heartbeat_timeout: default_commit_busy_heartbeat_timeout(),
+            commit_idle_heartbeat_interval: default_commit_idle_heartbeat_interval(),
+            commit_idle_heartbeat_timeout: default_commit_idle_heartbeat_timeout(),
             prepare_retransmit_interval: default_prepare_retransmit_interval(),
             view_change_retransmit_interval: default_view_change_retransmit_interval(),
             view_change_status_timeout: default_view_change_status_timeout(),
@@ -2192,24 +2270,104 @@ mod cluster_validate_tests {
         assert_eq!(material(&jwt("enc", "dec"), &cluster), None);
     }
 
-    #[test]
-    fn validate_rejects_sub_minimum_heartbeat_timeout() {
+    fn schedule(
+        grid_ms: u64,
+        busy_interval_ms: u64,
+        busy_timeout_ms: u64,
+        idle_interval_ms: u64,
+        idle_timeout_ms: u64,
+    ) -> ClusterConfig {
+        let ms = |value| IggyDuration::new(Duration::from_millis(value));
         let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
-        c.heartbeat_timeout = IggyDuration::new(Duration::from_millis(500));
-        assert!(c.validate().is_err());
-        // The "disabled" / "unlimited" sentinels collapse to zero and must
-        // be rejected the same way.
-        c.heartbeat_timeout = IggyDuration::new(Duration::ZERO);
-        assert!(c.validate().is_err());
+        c.commit_heartbeat_grid = ms(grid_ms);
+        c.commit_busy_heartbeat_interval = ms(busy_interval_ms);
+        c.commit_busy_heartbeat_timeout = ms(busy_timeout_ms);
+        c.commit_idle_heartbeat_interval = ms(idle_interval_ms);
+        c.commit_idle_heartbeat_timeout = ms(idle_timeout_ms);
+        c
     }
 
     #[test]
-    fn validate_rejects_zero_commit_broadcast_interval() {
-        // `0` / `disabled` / `unlimited` all collapse to zero and stall the
-        // liveness broadcast.
-        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
-        c.commit_broadcast_interval = IggyDuration::new(Duration::ZERO);
-        assert!(c.validate().is_err());
+    fn given_default_heartbeat_schedule_when_validating_should_pass_every_rule() {
+        let c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        assert_eq!(c.heartbeat_schedule_violation(), None);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn given_nearest_heartbeat_values_when_validating_should_accept_passing_and_name_failing_rule()
+    {
+        use HeartbeatRule::{
+            BusyIntervalIsGridMultiple, BusyTimeoutSpansBusyHeartbeats, GridIsTickMultiple,
+            IdleIntervalIsBusyMultiple, IdleWaitSpansIdleHeartbeats,
+            QuorumWindowSpansIdleHeartbeats,
+        };
+        // (passing values, failing values, rule the failing values break)
+        let cases = [
+            (
+                schedule(10, 500, 5000, 1000, 12000),
+                schedule(15, 500, 5000, 1000, 12000),
+                GridIsTickMultiple,
+            ),
+            (
+                schedule(10, 500, 5000, 1000, 12000),
+                schedule(0, 500, 5000, 1000, 12000),
+                GridIsTickMultiple,
+            ),
+            // m = 1 passes, m = 0 and m = 1.5 fail.
+            (
+                schedule(100, 100, 2000, 500, 12000),
+                schedule(100, 0, 2000, 500, 12000),
+                BusyIntervalIsGridMultiple,
+            ),
+            (
+                schedule(100, 100, 2000, 500, 12000),
+                schedule(100, 150, 2000, 450, 12000),
+                BusyIntervalIsGridMultiple,
+            ),
+            // T_B = max(2s, 4 H_B) passes, one tick less fails.
+            (
+                schedule(100, 500, 2000, 500, 2000),
+                schedule(100, 500, 1990, 500, 2000),
+                BusyTimeoutSpansBusyHeartbeats,
+            ),
+            (
+                schedule(100, 1000, 4000, 1000, 4000),
+                schedule(100, 1000, 3990, 1000, 4000),
+                BusyTimeoutSpansBusyHeartbeats,
+            ),
+            // k = 1 passes, k = 0 and k = 1.5 fail.
+            (
+                schedule(100, 500, 5000, 500, 12000),
+                schedule(100, 500, 5000, 0, 12000),
+                IdleIntervalIsBusyMultiple,
+            ),
+            (
+                schedule(100, 500, 5000, 1000, 12000),
+                schedule(100, 500, 5000, 750, 12000),
+                IdleIntervalIsBusyMultiple,
+            ),
+            // max(T_I, T_B) = 4 H_I passes, one tick less fails.
+            (
+                schedule(100, 500, 2000, 500, 2000),
+                schedule(100, 500, 2000, 1000, 3990),
+                IdleWaitSpansIdleHeartbeats,
+            ),
+            // T_B = 4 H_I passes, one tick less fails, with T_I large enough.
+            (
+                schedule(100, 500, 4000, 1000, 12000),
+                schedule(100, 500, 3990, 1000, 12000),
+                QuorumWindowSpansIdleHeartbeats,
+            ),
+        ];
+        for (passing, failing, rule) in cases {
+            assert_eq!(passing.heartbeat_schedule_violation(), None, "{rule:?}");
+            assert!(passing.validate().is_ok(), "{rule:?}");
+            assert_eq!(failing.heartbeat_schedule_violation(), Some(rule));
+            assert!(failing.validate().is_err(), "{rule:?}");
+            let message = rule.to_string();
+            assert!(message.starts_with("rule "), "{message}");
+        }
     }
 
     #[test]
@@ -2217,25 +2375,6 @@ mod cluster_validate_tests {
         let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
         c.prepare_retransmit_interval = IggyDuration::new(Duration::ZERO);
         assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_heartbeat_below_commit_broadcast_ratio() {
-        // 3s clears the absolute 2s floor but is still < 4x the 1s broadcast,
-        // so the ratio rule is what rejects here, not the floor.
-        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
-        c.heartbeat_timeout = IggyDuration::new(Duration::from_secs(3));
-        c.commit_broadcast_interval = IggyDuration::new(Duration::from_secs(1));
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn validate_accepts_heartbeat_at_commit_broadcast_ratio() {
-        // Exactly 4x the broadcast (and above the 2s floor) must pass.
-        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
-        c.heartbeat_timeout = IggyDuration::new(Duration::from_secs(4));
-        c.commit_broadcast_interval = IggyDuration::new(Duration::from_secs(1));
-        assert!(c.validate().is_ok());
     }
 
     #[test]

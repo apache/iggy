@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::commit_batch;
 use crate::metrics::{frame_drop_reason, frame_drop_variant};
 use crate::shards_table::{
     ShardsTable, calculate_shard_assignment, calculate_shard_from_consensus_ns,
@@ -24,14 +25,17 @@ use consensus::{MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use futures::FutureExt;
 use futures::future::poll_fn;
-use iggy_binary_protocol::{Command, ConsensusError, GenericHeader, Operation, PrepareHeader};
+use iggy_binary_protocol::{
+    Command, CommitEntry, CommitHeader, CommitReplyEntry, CommitReplyHeader, ConsensusError,
+    GenericHeader, Operation, PrepareHeader,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn, ReplicaLinkId};
 use partitions::{FatalCommit, PartitionIncarnation};
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, MessageBag};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -145,7 +149,94 @@ where
             }
         };
         let (operation, namespace) = bag.routing();
-        self.route_typed(operation, namespace, bag);
+        match bag {
+            MessageBag::Commit(message) => self.route_commit_batch(message, operation),
+            MessageBag::CommitReply(message) => self.route_commit_reply_batch(message, operation),
+            bag => self.route_typed(operation, namespace, bag),
+        }
+    }
+
+    /// Send each entry of a Commit batch to the shard that owns its group. A
+    /// body that does not match its checksum drops the whole frame.
+    fn route_commit_batch(&self, message: Message<CommitHeader>, operation: Operation) {
+        let header = *message.header();
+        let Some(entries) =
+            commit_batch::verified_entries::<_, CommitEntry>(&message, header.checksum_body)
+        else {
+            self.drop_corrupt_batch(header.command);
+            return;
+        };
+        self.metrics.record_commit_batch_received(entries.len());
+        let mut targets = self.entries_by_shard(entries, |entry| entry.group);
+        if targets.len() == 1
+            && let Some((target, _)) = targets.pop_first()
+        {
+            self.try_send_to_target(target, MessageBag::Commit(message), operation);
+            return;
+        }
+        for (target, entries) in targets {
+            if let Some(part) =
+                commit_batch::encode_commit_batch(header.cluster, header.replica, &entries)
+            {
+                self.try_send_to_target(target, MessageBag::Commit(part), operation);
+            }
+        }
+    }
+
+    /// Send each entry of a `CommitReply` batch to the shard that owns its
+    /// group. A body that does not match its checksum drops the whole frame.
+    fn route_commit_reply_batch(&self, message: Message<CommitReplyHeader>, operation: Operation) {
+        let header = *message.header();
+        let Some(entries) =
+            commit_batch::verified_entries::<_, CommitReplyEntry>(&message, header.checksum_body)
+        else {
+            self.drop_corrupt_batch(header.command);
+            return;
+        };
+        self.metrics
+            .record_commit_reply_batch_received(entries.len());
+        let mut targets = self.entries_by_shard(entries, |entry| entry.group);
+        if targets.len() == 1
+            && let Some((target, _)) = targets.pop_first()
+        {
+            self.try_send_to_target(target, MessageBag::CommitReply(message), operation);
+            return;
+        }
+        for (target, entries) in targets {
+            if let Some(part) =
+                commit_batch::encode_commit_reply_batch(header.cluster, header.replica, &entries)
+            {
+                self.try_send_to_target(target, MessageBag::CommitReply(part), operation);
+            }
+        }
+    }
+
+    fn entries_by_shard<E>(
+        &self,
+        entries: Vec<E>,
+        group: impl Fn(&E) -> u64,
+    ) -> BTreeMap<u16, Vec<E>> {
+        let mut targets: BTreeMap<u16, Vec<E>> = BTreeMap::new();
+        for entry in entries {
+            let group = group(&entry);
+            let target = if group == METADATA_GROUP {
+                0
+            } else {
+                calculate_shard_from_consensus_ns(group, self.shard_count)
+            };
+            targets.entry(target).or_default().push(entry);
+        }
+        targets
+    }
+
+    fn drop_corrupt_batch(&self, command: Command) {
+        self.metrics
+            .record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::UNPARSABLE);
+        tracing::warn!(
+            shard = self.id,
+            ?command,
+            "dropping a batch frame whose body does not match its checksum"
+        );
     }
 
     /// Invoke the client-request handler directly, exactly as the client-fd

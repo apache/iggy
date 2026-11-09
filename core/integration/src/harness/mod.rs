@@ -66,6 +66,7 @@ pub use handle::{
     StopOutcome,
 };
 pub use orchestrator::{TestHarness, TestHarnessBuilder, TestLogs};
+pub use peer_relay::PeerTraffic;
 pub use port_reserver::SinglePortReserver;
 pub use traits::{IggyServerDependent, Restartable, TestBinary};
 

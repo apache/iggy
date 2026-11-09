@@ -80,10 +80,25 @@ impl Default for ClusterConfig {
         ClusterConfig {
             enabled: SERVER_CONFIG.cluster.enabled,
             name: SERVER_CONFIG.cluster.name.parse().unwrap(),
-            heartbeat_timeout: SERVER_CONFIG.cluster.heartbeat_timeout.parse().unwrap(),
-            commit_broadcast_interval: SERVER_CONFIG
+            commit_heartbeat_grid: SERVER_CONFIG.cluster.commit_heartbeat_grid.parse().unwrap(),
+            commit_busy_heartbeat_interval: SERVER_CONFIG
                 .cluster
-                .commit_broadcast_interval
+                .commit_busy_heartbeat_interval
+                .parse()
+                .unwrap(),
+            commit_busy_heartbeat_timeout: SERVER_CONFIG
+                .cluster
+                .commit_busy_heartbeat_timeout
+                .parse()
+                .unwrap(),
+            commit_idle_heartbeat_interval: SERVER_CONFIG
+                .cluster
+                .commit_idle_heartbeat_interval
+                .parse()
+                .unwrap(),
+            commit_idle_heartbeat_timeout: SERVER_CONFIG
+                .cluster
+                .commit_idle_heartbeat_timeout
                 .parse()
                 .unwrap(),
             prepare_retransmit_interval: SERVER_CONFIG

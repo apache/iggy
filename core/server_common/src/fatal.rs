@@ -46,6 +46,10 @@ pub enum FatalReason {
     /// example a superblock that stays unwritable for lack of a descriptor
     /// exits 3. Their exit line then gives the time of the first one.
     DescriptorsExhausted = 4,
+    /// A shard owed one peer more Commits than one frame holds. The shard
+    /// leads more groups than its CPU core can serve, so the cluster needs
+    /// more shards.
+    CommitBatchOverflow = 5,
 }
 
 impl FatalReason {

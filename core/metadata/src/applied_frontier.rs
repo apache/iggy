@@ -128,7 +128,7 @@ impl AppliedFrontier {
     /// commit broadcasts at the built-in `COMMIT_MESSAGE_TICKS` interval.
     ///
     /// The server always overrides this from `[cluster]
-    /// commit_broadcast_interval`, and a test asserts the two agree at the
+    /// commit_busy_heartbeat_interval`, and a test asserts the two agree at the
     /// config default; this is what the simulator and unit fixtures get.
     pub const DEFAULT_READ_BUDGET: Duration = Duration::from_millis(3_000);
 

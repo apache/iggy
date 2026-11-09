@@ -668,10 +668,11 @@ where
         }
         match step {
             partitions::PartitionIoStep::WireActions(actions) => {
-                crate::dispatch_partition_wire_actions::<B, _, MJ, _>(
+                crate::dispatch_partition_wire_actions_batched::<B, _, MJ, _>(
                     partition.consensus(),
                     partition,
                     actions,
+                    Some(&self.commit_outbox),
                 )
                 .await;
                 self.partition_io.continue_ready(namespace, incarnation);
@@ -796,9 +797,9 @@ mod tests {
     use std::time::Duration;
 
     use consensus::{
-        ArtifactProgress, Consensus, DvcSuffix, LocalPipeline, PartitionsHandle, Pipeline, Plane,
-        REPLICATION_BATCH_BYTES_MAX, ReplicationSend, Sequencer, StateArtifact, StateTransferStage,
-        TimeoutManager, VsrAction, VsrConsensus, artifact_kind,
+        ArtifactProgress, Consensus, DvcSuffix, HeartbeatSchedule, LocalPipeline, PartitionsHandle,
+        Pipeline, Plane, PlaneKind, REPLICATION_BATCH_BYTES_MAX, ReplicationSend, Sequencer,
+        StateArtifact, StateTransferStage, TimeoutManager, VsrAction, VsrConsensus, artifact_kind,
     };
     use futures::FutureExt;
     use futures::channel::oneshot;
@@ -809,12 +810,12 @@ mod tests {
     use iggy_binary_protocol::requests::users::CreateUserRequest;
     use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
     use iggy_binary_protocol::{
-        AckLevel, Command, CommitHeader, ConsensusHeader, DoViewChangeHeader, GenericHeader,
-        Operation, PrepareHeader, PrepareOkHeader, RepairRangeReplyHeader, ReplyHeader,
-        RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
-        RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
-        StateChunkHeader, StateTransferTargetHeader, WireEncode, WireIdentifier, WireName,
-        WireOptions,
+        AckLevel, Command, CommitEntry, CommitHeader, CommitReplyEntry, CommitReplyHeader,
+        ConsensusHeader, DoViewChangeHeader, GenericHeader, HEADER_SIZE, HeartbeatState, Operation,
+        PrepareHeader, PrepareOkHeader, RepairRangeReplyHeader, ReplyHeader, RequestPreparesHeader,
+        RequestStartViewHeader, RequestStateChunkHeader, RequestStateTransferHeader,
+        RoutedRequestHeader, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
+        StateTransferTargetHeader, WireEncode, WireIdentifier, WireName, WireOptions,
     };
     use iggy_common::{
         ConsumerGroupOffsets, ConsumerKind, ConsumerOffsets, Durability, IggyByteSize,
@@ -823,7 +824,7 @@ mod tests {
     use journal::Journal;
     use journal::prepare_journal::PrepareJournal;
     use journal::superblock::{SuperblockContents, SuperblockStore};
-    use message_bus::{IggyMessageBus, MessageBus};
+    use message_bus::{IggyMessageBus, MessageBus, SendError};
     use metadata::stm::stream::{Partition, Stream, Streams, StreamsInner, Topic};
     use metadata::stm::user::{Users, UsersInner};
     use metadata::{IggyMetadata, MuxStateMachine};
@@ -843,8 +844,9 @@ mod tests {
     use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
     use server_common::{Message, MessageBag, SegmentStorage};
 
+    use crate::commit_batch::{QueuedCommit, encode_commit_batch};
     use crate::host::NoopHost;
-    use crate::metrics::ShardMetrics;
+    use crate::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
     use crate::shards_table::{PapayaShardsTable, ShardsTable};
     use crate::test_support::connect_replica_on;
     use crate::{
@@ -880,30 +882,26 @@ mod tests {
                 partitions.insert(namespace, partition);
                 let message = if command == Command::Commit {
                     MessageBag::Commit(
-                        Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
-                            |_, header: &mut CommitHeader| {
-                                header.command = Command::Commit;
-                                header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
-                                header.cluster = 1;
-                                header.group = namespace.inner();
-                                header.replica = REPAIR_PRIMARY;
-                                header.view = REPAIR_VIEW;
-                                header.commit = NEXT_COMMIT;
-                                header.seal();
-                            },
-                        ),
+                        encode_commit_batch(
+                            1,
+                            REPAIR_PRIMARY,
+                            &[CommitEntry::new(
+                                namespace.inner(),
+                                incoming,
+                                REPAIR_VIEW,
+                                NEXT_COMMIT,
+                                0,
+                                HeartbeatState::Busy,
+                                REPAIR_PRIMARY,
+                            )],
+                        )
+                        .unwrap(),
                     )
                 } else {
                     view_control_message(namespace, command, REPAIR_VIEW + 3, REPAIR_PRIMARY)
                 };
                 let message = match message {
-                    MessageBag::Commit(message) => MessageBag::Commit(message.transmute_header(
-                        |old, header: &mut CommitHeader| {
-                            *header = old;
-                            header.partition_incarnation = incoming;
-                            header.seal();
-                        },
-                    )),
+                    MessageBag::Commit(message) => MessageBag::Commit(message),
                     MessageBag::StartViewChange(message) => MessageBag::StartViewChange(
                         message.transmute_header(|old, header: &mut StartViewChangeHeader| {
                             *header = old;
@@ -1005,6 +1003,7 @@ mod tests {
                     commit: 0,
                     group,
                     timestamp_monotonic: 1,
+                    heartbeat_state: HeartbeatState::Busy,
                     target: None,
                 },
             ];
@@ -1900,7 +1899,9 @@ mod tests {
     fn control_frame_incarnation(frame: &[u8]) -> u64 {
         let message = Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame)).unwrap();
         let offset = match message.header().command {
-            Command::Commit => std::mem::offset_of!(CommitHeader, partition_incarnation),
+            Command::Commit => {
+                HEADER_SIZE + std::mem::offset_of!(CommitEntry, partition_incarnation)
+            }
             Command::StartViewChange => {
                 std::mem::offset_of!(StartViewChangeHeader, partition_incarnation)
             }
@@ -6361,17 +6362,20 @@ mod tests {
         }
         consensus.sequencer().set_sequence(HEAD);
         assert!(consensus.local_dvc_suffix_stale());
-        let heartbeat = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
-            |_, header: &mut CommitHeader| {
-                header.command = Command::Commit;
-                header.cluster = 1;
-                header.group = METADATA_GROUP;
-                header.replica = 2;
-                header.view = VIEW - 1;
-                header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
-                header.seal();
-            },
-        );
+        let heartbeat = encode_commit_batch(
+            1,
+            2,
+            &[CommitEntry::new(
+                METADATA_GROUP,
+                0,
+                VIEW - 1,
+                0,
+                0,
+                HeartbeatState::Busy,
+                2,
+            )],
+        )
+        .unwrap();
 
         owner.on_commit(&heartbeat).await;
 
@@ -6871,18 +6875,20 @@ mod tests {
         owner.plane.partitions().remove(&namespace).unwrap();
         owner.plane.partitions().insert(namespace, partition);
         sent.borrow_mut().clear();
-        let heartbeat = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
-            |_, header: &mut CommitHeader| {
-                header.command = Command::Commit;
-                header.cluster = 1;
-                header.group = namespace.inner();
-                header.partition_incarnation = INCARNATION;
-                header.replica = 0;
-                header.view = REPAIR_VIEW - 1;
-                header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
-                header.seal();
-            },
-        );
+        let heartbeat = encode_commit_batch(
+            1,
+            0,
+            &[CommitEntry::new(
+                namespace.inner(),
+                INCARNATION,
+                REPAIR_VIEW - 1,
+                0,
+                0,
+                HeartbeatState::Busy,
+                0,
+            )],
+        )
+        .unwrap();
 
         owner.on_commit(&heartbeat).await;
 
@@ -11395,6 +11401,416 @@ mod tests {
 
         fn read_latest(&self) -> impl Future<Output = io::Result<SuperblockContents>> {
             std::future::ready(Ok(SuperblockContents::Empty))
+        }
+    }
+
+    /// Frames the shard sent to peer nodes, as `(peer, frame)`.
+    type SentFrames = Rc<RefCell<Vec<(u8, Message<GenericHeader>)>>>;
+
+    /// A shard that hosts a 3-member metadata group as member `replica` in
+    /// `view`. Its bus records each frame for the peer nodes, and refuses each
+    /// frame for the peer in `refused`.
+    fn batch_owner(
+        replica: u8,
+        view: u32,
+        refused: &Rc<Cell<Option<u8>>>,
+    ) -> (IoTestShard, SentFrames) {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let sent: SentFrames = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&sent);
+        let refused = Rc::clone(refused);
+        bus.set_replica_forward_fn(Box::new(move |peer, _, frame| {
+            if refused.get() == Some(peer) {
+                return Err(SendError::ReplicaNotConnected(peer));
+            }
+            let message =
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            captured.borrow_mut().push((peer, message));
+            Ok(())
+        }));
+        for peer in (0..3).filter(|peer| *peer != replica) {
+            crate::test_support::connect_replica_on(&bus, peer, 1);
+        }
+        let (mut owner, _sender) = test_owner(&bus, None);
+        let mut consensus = VsrConsensus::new(
+            1,
+            replica,
+            3,
+            METADATA_GROUP,
+            Rc::clone(&bus),
+            LocalPipeline::new(),
+        );
+        consensus.set_view(view);
+        consensus.set_log_view(view);
+        consensus.mark_superblock_durable(view, view);
+        owner.plane.inner_mut().0.consensus = Some(consensus);
+        (owner, sent)
+    }
+
+    fn metadata_consensus(owner: &IoTestShard) -> &VsrConsensus<Rc<IggyMessageBus>> {
+        owner.plane.inner().0.consensus.as_ref().unwrap()
+    }
+
+    fn metadata_commit(view: u32, timestamp: u64, state: u8, replica: u8) -> CommitEntry {
+        let mut entry = CommitEntry::new(
+            METADATA_GROUP,
+            0,
+            view,
+            0,
+            timestamp,
+            HeartbeatState::Busy,
+            replica,
+        );
+        entry.heartbeat_state = state;
+        entry
+    }
+
+    /// The entries of each batch of `command` in `sent`, as `(peer, entries)`.
+    fn sent_batches<E: bytemuck::Pod>(sent: &SentFrames, command: Command) -> Vec<(u8, Vec<E>)> {
+        sent.borrow()
+            .iter()
+            .filter(|(_, message)| message.header().command == command)
+            .map(|(peer, message)| {
+                let size = message.header().size as usize;
+                let body = &message.as_slice()[HEADER_SIZE..size];
+                (*peer, iggy_binary_protocol::batch_entries(body).collect())
+            })
+            .collect()
+    }
+
+    #[compio::test]
+    async fn given_a_batch_with_an_unknown_heartbeat_state_when_received_should_reject_only_that_entry()
+     {
+        const VIEW: u32 = 1;
+        let (owner, sent) = batch_owner(0, VIEW, &Rc::new(Cell::new(None)));
+        metadata_consensus(&owner).init();
+        let entries = [
+            metadata_commit(VIEW, 5, 9, 1),
+            metadata_commit(VIEW, 6, HeartbeatState::Busy as u8, 1),
+        ];
+
+        owner
+            .on_commit(&encode_commit_batch(1, 1, &entries).unwrap())
+            .await;
+        owner.flush_reply_outbox().await;
+
+        let replies = sent_batches::<CommitReplyEntry>(&sent, Command::CommitReply);
+        assert_eq!(replies.len(), 1, "one reply batch for the primary node");
+        let (peer, replies) = &replies[0];
+        assert_eq!(*peer, 1);
+        assert_eq!(
+            replies
+                .iter()
+                .map(|reply| reply.timestamp_monotonic)
+                .collect::<Vec<_>>(),
+            [6],
+            "only the valid entry gets a reply"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_stale_commit_when_received_should_not_restart_the_heartbeat_timeout() {
+        const VIEW: u32 = 1;
+        const TIMEOUT: u64 = 10;
+        let busy = HeartbeatState::Busy as u8;
+        let cases = [
+            (
+                "a member that is not the primary",
+                metadata_commit(VIEW, 20, busy, 2),
+                true,
+            ),
+            (
+                "an older view",
+                metadata_commit(VIEW - 1, 20, busy, 0),
+                true,
+            ),
+            (
+                "an older timestamp",
+                metadata_commit(VIEW, 5, busy, 1),
+                true,
+            ),
+            ("the primary", metadata_commit(VIEW, 20, busy, 1), false),
+        ];
+        for (source, late, should_fire) in cases {
+            let (owner, _sent) = batch_owner(0, VIEW, &Rc::new(Cell::new(None)));
+            let consensus = metadata_consensus(&owner);
+            consensus.init();
+            consensus.set_heartbeat_schedule(HeartbeatSchedule {
+                busy_timeout_ticks: TIMEOUT,
+                ..HeartbeatSchedule::default()
+            });
+            let first = metadata_commit(VIEW, 10, busy, 1);
+            owner
+                .on_commit(&encode_commit_batch(1, 1, &[first]).unwrap())
+                .await;
+            for _ in 0..TIMEOUT - 4 {
+                consensus.tick(PlaneKind::Metadata);
+            }
+            owner
+                .on_commit(&encode_commit_batch(1, late.replica, &[late]).unwrap())
+                .await;
+            let fired = (0..4).any(|_| {
+                consensus
+                    .tick(PlaneKind::Metadata)
+                    .iter()
+                    .any(|action| matches!(action, VsrAction::SendStartViewChange { .. }))
+            });
+            assert_eq!(fired, should_fire, "Commit from {source}");
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_corrupt_or_revision_one_batch_when_routed_should_drop_the_whole_frame() {
+        let (owner, _sent) = batch_owner(0, 1, &Rc::new(Cell::new(None)));
+        let unparsable = || {
+            owner
+                .metrics
+                .frame_drop_count(frame_drop_variant::CONSENSUS, frame_drop_reason::UNPARSABLE)
+        };
+        let commit = encode_commit_batch(
+            1,
+            1,
+            &[metadata_commit(1, 1, HeartbeatState::Busy as u8, 1)],
+        )
+        .unwrap();
+        let reply = crate::commit_batch::encode_commit_reply_batch(
+            1,
+            1,
+            &[CommitReplyEntry::new(METADATA_GROUP, 0, 1, 1, 1)],
+        )
+        .unwrap();
+        let flip_body = |message: Message<GenericHeader>| {
+            let mut bytes = message.as_slice().to_vec();
+            bytes[HEADER_SIZE] ^= 1;
+            Message::<GenericHeader>::try_from(Owned::copy_from_slice(&bytes)).unwrap()
+        };
+        let reply_count_mismatch = forge::<CommitReplyHeader>(reply.as_slice(), |header| {
+            header.entry_count = 2;
+        });
+        // Revision 1 put the group of a lone Commit in the header and sent no
+        // body. Its header-only frame cannot match any entry count.
+        let revision_one_commit =
+            forge::<CommitHeader>(&commit.as_slice()[..HEADER_SIZE], |header| {
+                header.size = u32::try_from(HEADER_SIZE).unwrap();
+            });
+        let revision_one_reply =
+            forge::<CommitReplyHeader>(&reply.as_slice()[..HEADER_SIZE], |header| {
+                header.size = u32::try_from(HEADER_SIZE).unwrap();
+            });
+        let frames = [
+            flip_body(commit.clone().into_generic()),
+            flip_body(reply.clone().into_generic()),
+            reply_count_mismatch,
+            revision_one_commit,
+            revision_one_reply,
+        ];
+        let dropped = frames.len() as u64;
+
+        for frame in frames {
+            owner.dispatch(frame);
+        }
+
+        assert_eq!(unparsable(), dropped);
+        assert_eq!(owner.metrics.commit_batch_counts()[2], 0);
+        assert_eq!(owner.metrics.commit_reply_batch_counts()[2], 0);
+        owner.dispatch(commit.into_generic());
+        owner.dispatch(reply.into_generic());
+        assert_eq!(unparsable(), dropped, "valid frames pass");
+        assert_eq!(owner.metrics.commit_batch_counts()[2], 1);
+        assert_eq!(owner.metrics.commit_reply_batch_counts()[2], 1);
+    }
+
+    /// A copy of `bytes` with an edited and sealed header of type `H`. The
+    /// typed checks do not run, so the frame can break them.
+    fn forge<H>(bytes: &[u8], edit: impl FnOnce(&mut H)) -> Message<GenericHeader>
+    where
+        H: ConsensusHeader + bytemuck::CheckedBitPattern + bytemuck::NoUninit,
+    {
+        let mut bytes = bytes.to_vec();
+        let header: &mut H = bytemuck::checked::from_bytes_mut(&mut bytes[..size_of::<H>()]);
+        edit(header);
+        header.seal();
+        Message::<GenericHeader>::try_from(Owned::copy_from_slice(&bytes)).unwrap()
+    }
+
+    #[compio::test]
+    async fn given_manual_ticks_when_a_group_starts_should_send_heartbeats_on_the_grid_and_eager_commits_at_once()
+     {
+        const START_TICK: u64 = 3;
+        let (owner, sent) = batch_owner(0, 0, &Rc::new(Cell::new(None)));
+        let schedule = HeartbeatSchedule::default();
+        let mut scratch = Vec::new();
+        // The shard ticks that sent metadata Commit entries, and those entries.
+        let mut commits_by_tick: Vec<(u64, Vec<CommitEntry>)> = Vec::new();
+        let consensus = metadata_consensus(&owner);
+        consensus.set_commit_message_ticks(schedule.busy_interval_ticks);
+        for tick in 1..=START_TICK {
+            shard_tick(&owner, &mut scratch).await;
+            take_metadata_commits(&sent, tick, &mut commits_by_tick);
+        }
+        consensus.init();
+        let first_grid = START_TICK.next_multiple_of(schedule.grid_ticks);
+        let second = first_grid + schedule.busy_interval_ticks;
+        for tick in START_TICK + 1..=second {
+            shard_tick(&owner, &mut scratch).await;
+            take_metadata_commits(&sent, tick, &mut commits_by_tick);
+        }
+        assert_eq!(
+            commits_by_tick
+                .iter()
+                .map(|(tick, entries)| (*tick, entries[0].heartbeat_state()))
+                .collect::<Vec<_>>(),
+            [
+                (first_grid, Ok(HeartbeatState::Busy)),
+                (second, Ok(HeartbeatState::Busy)),
+            ],
+            "first heartbeat on the next grid tick, the next one period later"
+        );
+
+        let prepare = metadata_prepares(1, 0).remove(0);
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        let _ = consensus.handle_prepare_ok(
+            PlaneKind::Metadata,
+            &PrepareOkHeader {
+                command: Command::PrepareOk,
+                replica: 1,
+                view: 0,
+                op: 1,
+                prepare_checksum: prepare.header().checksum,
+                ..Default::default()
+            },
+        );
+        consensus.advance_commit_max(1);
+        assert_eq!(consensus.pop_committed_prepare().unwrap().header.op, 1);
+        consensus.advance_commit_min(1);
+        consensus.request_eager_commit();
+        commits_by_tick.clear();
+        let eager_tick = second + 1;
+        assert!(!schedule.is_grid_tick(eager_tick));
+        shard_tick(&owner, &mut scratch).await;
+        take_metadata_commits(&sent, eager_tick, &mut commits_by_tick);
+        assert_eq!(
+            commits_by_tick
+                .iter()
+                .map(|(tick, entries)| (*tick, entries[0].heartbeat_state(), entries[0].commit))
+                .collect::<Vec<_>>(),
+            [(eager_tick, Ok(HeartbeatState::Eager), 1)],
+            "an eager Commit leaves in the batch of the same shard tick"
+        );
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn shard_tick(owner: &IoTestShard, scratch: &mut Vec<IggyNamespace>) {
+        owner.tick_metadata().await;
+        let _ = owner.tick_partitions(scratch).await;
+    }
+
+    /// Move the metadata Commit entries sent to node 1 out of `sent`, and
+    /// record them for shard tick `tick`.
+    fn take_metadata_commits(
+        sent: &SentFrames,
+        tick: u64,
+        commits_by_tick: &mut Vec<(u64, Vec<CommitEntry>)>,
+    ) {
+        let entries: Vec<CommitEntry> = sent_batches::<CommitEntry>(sent, Command::Commit)
+            .into_iter()
+            .filter(|(peer, _)| *peer == 1)
+            .flat_map(|(_, entries)| entries)
+            .filter(|entry| entry.group == METADATA_GROUP)
+            .collect();
+        sent.borrow_mut().clear();
+        if !entries.is_empty() {
+            commits_by_tick.push((tick, entries));
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_refused_reply_batch_when_flushed_should_drop_it_and_reply_again_on_the_next_commit()
+     {
+        const VIEW: u32 = 1;
+        let refused = Rc::new(Cell::new(Some(1)));
+        let (owner, sent) = batch_owner(0, VIEW, &refused);
+        metadata_consensus(&owner).init();
+        let busy = HeartbeatState::Busy as u8;
+
+        owner
+            .on_commit(&encode_commit_batch(1, 1, &[metadata_commit(VIEW, 1, busy, 1)]).unwrap())
+            .await;
+        owner.flush_reply_outbox().await;
+        assert!(
+            owner.reply_outbox.is_empty(),
+            "the refused batch is dropped"
+        );
+        assert_eq!(owner.metrics.commit_reply_batch_counts()[0], 0);
+
+        refused.set(None);
+        owner.flush_reply_outbox().await;
+        assert!(
+            sent.borrow().is_empty(),
+            "the dropped batch is not sent again"
+        );
+        owner
+            .on_commit(&encode_commit_batch(1, 1, &[metadata_commit(VIEW, 2, busy, 1)]).unwrap())
+            .await;
+        owner.flush_reply_outbox().await;
+        let replies = sent_batches::<CommitReplyEntry>(&sent, Command::CommitReply);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].1.len(), 1);
+        assert_eq!(
+            replies[0].1[0].timestamp_monotonic, 2,
+            "a new reply for the new Commit"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_commit_replayed_between_ticks_when_the_shard_ticks_should_send_one_batch_per_peer()
+     {
+        const START_TICK: u64 = 3;
+        const REPLAYED_GROUP: u64 = 42;
+        let (owner, sent) = batch_owner(0, 0, &Rc::new(Cell::new(None)));
+        let schedule = HeartbeatSchedule::default();
+        let mut scratch = Vec::new();
+        let consensus = metadata_consensus(&owner);
+        consensus.set_commit_message_ticks(schedule.busy_interval_ticks);
+        for _ in 1..=START_TICK {
+            shard_tick(&owner, &mut scratch).await;
+        }
+        consensus.init();
+        let first_grid = START_TICK.next_multiple_of(schedule.grid_ticks);
+        for _ in START_TICK + 1..first_grid {
+            shard_tick(&owner, &mut scratch).await;
+        }
+        sent.borrow_mut().clear();
+
+        // The pump replays a deferred Commit between two shard ticks.
+        let replayed = CommitEntry::new(REPLAYED_GROUP, 0, 0, 0, 0, HeartbeatState::Busy, 0);
+        for peer in [1, 2] {
+            owner.commit_outbox.push(
+                consensus.cluster(),
+                consensus.node_id(),
+                peer,
+                QueuedCommit {
+                    entry: replayed,
+                    member: peer,
+                },
+            );
+        }
+        shard_tick(&owner, &mut scratch).await;
+
+        let batches = sent_batches::<CommitEntry>(&sent, Command::Commit);
+        for peer in [1, 2] {
+            let to_peer: Vec<&Vec<CommitEntry>> = batches
+                .iter()
+                .filter(|(to, _)| *to == peer)
+                .map(|(_, entries)| entries)
+                .collect();
+            assert_eq!(to_peer.len(), 1, "one Commit batch for node {peer}");
+            let groups: Vec<u64> = to_peer[0].iter().map(|entry| entry.group).collect();
+            assert!(
+                groups.contains(&REPLAYED_GROUP) && groups.contains(&METADATA_GROUP),
+                "the batch for node {peer} holds the replayed entry and the heartbeat"
+            );
         }
     }
 }
