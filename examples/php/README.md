@@ -73,3 +73,27 @@ string and the development CA certificate:
 IGGY_CONNECTION_STRING="iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=../../core/certs/iggy_ca_cert.pem" \
 php -d extension="${PHP_IGGY_EXTENSION:-../../foreign/php/target/debug/libiggy_php.so}" getting-started/producer.php
 ```
+
+### Sink Data Producer
+
+The sink data producer generates JSON records and publishes them to an Apache Iggy stream and topic.
+It creates the stream and topic if they do not exist, then publishes 100 batches of 100 to 499
+records each. The stream and topic are retained after execution.
+
+Each record contains: `user_id`, `user_type`, `email`, `source`, `state`, `created_at`,
+and `message`.
+
+Environment variables:
+
+- `IGGY_STREAM` - stream name (default: `qw`)
+- `IGGY_TOPIC` - topic name (default: `records`)
+
+Execute the producer from `examples/php`:
+
+```bash
+# Default stream and topic
+php -d extension="${PHP_IGGY_EXTENSION:-../../foreign/php/target/debug/libiggy_php.so}" sink-data-producer/producer.php
+
+# With custom stream and topic
+IGGY_STREAM=test-stream IGGY_TOPIC=test-topic php -d extension="${PHP_IGGY_EXTENSION:-../../foreign/php/target/debug/libiggy_php.so}" sink-data-producer/producer.php
+```
