@@ -1541,6 +1541,7 @@ async fn assert_topic_recovered(
             .preallocate_segments
             .and(recovered.preallocate_segments),
         replication_factor: seed.replication_factor.and(recovered.replication_factor),
+        segment_max_age: seed.segment_max_age.and(recovered.segment_max_age),
         raw: BTreeMap::new(),
     };
     assert_eq!(

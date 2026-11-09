@@ -185,6 +185,13 @@ std::map<std::string, ScopeSurface> TypedSurface() {
                [] { return TopicCreateOptions().SetPreallocateSegments(true).PreallocateSegments().has_value(); }},
               {"replication_factor",
                [] { return TopicCreateOptions().SetReplicationFactor(1).ReplicationFactor().has_value(); }},
+              {"segment_max_age",
+               [] {
+                   return TopicCreateOptions()
+                       .SetSegmentMaxAge(iggy::Expiry::NeverExpire())
+                       .SegmentMaxAge()
+                       .has_value();
+               }},
           },
           {
               {"name", [] { return TopicUpdateOptions().SetName("renamed").Name().has_value(); }},

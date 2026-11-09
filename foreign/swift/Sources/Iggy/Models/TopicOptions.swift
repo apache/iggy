@@ -33,6 +33,7 @@ public enum TopicOptionKey: String, Sendable, Hashable, CaseIterable {
     case sizeOfMessagesRequiredToSave = "size_of_messages_required_to_save"
     case preallocateSegments = "preallocate_segments"
     case replicationFactor = "replication_factor"
+    case segmentMaxAge = "segment_max_age"
 }
 
 /// How far a write has to get before the server completes it.
@@ -91,6 +92,14 @@ public struct TopicCreateOptions: Sendable, Hashable {
     /// refuses an out-of-range value with
     /// ``IggyErrorCode/invalidReplicationFactor``.
     public var replicationFactor: UInt32?
+    /// How long after the active segment's first batch a batch starts the
+    /// next segment. Nil or ``IggyExpiry/serverDefault`` leaves the server
+    /// default, ``IggyExpiry/never``, so segments roll by size alone.
+    /// Create-only.
+    ///
+    /// The server refuses less than ten minutes, and any age together with
+    /// `preallocateSegments`.
+    public var segmentMaxAge: IggyExpiry?
     public var raw: [String: String]
 
     public init(
@@ -98,7 +107,7 @@ public struct TopicCreateOptions: Sendable, Hashable {
         maxTopicSize: MaxTopicSize? = nil, segmentSizeBytes: UInt64? = nil, durability: Durability = .replicated,
         consumerOffsetDurability: Durability = .replicated, partitionResizePolicy: PartitionResizePolicy? = nil, messagesRequiredToSave: UInt32? = nil,
         sizeOfMessagesRequiredToSaveBytes: UInt64? = nil, preallocateSegments: Bool? = nil, replicationFactor: UInt32? = nil,
-        raw: [String: String] = [:]
+        segmentMaxAge: IggyExpiry? = nil, raw: [String: String] = [:]
     ) {
         self.partitionsCount = partitionsCount
         self.compressionAlgorithm = compressionAlgorithm
@@ -112,6 +121,7 @@ public struct TopicCreateOptions: Sendable, Hashable {
         self.sizeOfMessagesRequiredToSaveBytes = sizeOfMessagesRequiredToSaveBytes
         self.preallocateSegments = preallocateSegments
         self.replicationFactor = replicationFactor
+        self.segmentMaxAge = segmentMaxAge
         self.raw = raw
     }
 
@@ -162,6 +172,9 @@ public struct TopicCreateOptions: Sendable, Hashable {
         }
         if let replicationFactor {
             options[TopicOptionKey.replicationFactor.rawValue] = .explicit(.uint32(replicationFactor))
+        }
+        if let segmentMaxAge, let microseconds = try segmentMaxAge.wireMicroseconds() {
+            options[TopicOptionKey.segmentMaxAge.rawValue] = .explicit(.uint64(microseconds))
         }
         return options
     }
@@ -237,6 +250,7 @@ extension TopicOptionKey: CatalogOptionKey {
         switch self {
         case .name: .updatable
         case .messageExpiry, .maxTopicSize: [.updatable, .resettable]
+        case .segmentMaxAge: .critical
         default: []
         }
     }
@@ -245,7 +259,7 @@ extension TopicOptionKey: CatalogOptionKey {
 extension Topic {
     /// How long messages are kept, from ``options``.
     public var messageExpiry: IggyExpiry {
-        resolvedMessageExpiry(options)
+        resolvedExpiry(options, .messageExpiry)
     }
 
     /// The compression label the topic was created with, from ``options``.
@@ -256,13 +270,19 @@ extension Topic {
     /// The topic's size cap, from ``options``.
     public var maxTopicSize: MaxTopicSize {
         resolvedMaxTopicSize(options)
+    }
+
+    /// How long after a segment's first batch a batch starts the next one,
+    /// from ``options``.
+    public var segmentMaxAge: IggyExpiry {
+        resolvedExpiry(options, .segmentMaxAge)
     }
 }
 
 extension TopicDetails {
     /// How long messages are kept, from ``options``.
     public var messageExpiry: IggyExpiry {
-        resolvedMessageExpiry(options)
+        resolvedExpiry(options, .messageExpiry)
     }
 
     /// The compression label the topic was created with, from ``options``.
@@ -274,12 +294,18 @@ extension TopicDetails {
     public var maxTopicSize: MaxTopicSize {
         resolvedMaxTopicSize(options)
     }
+
+    /// How long after a segment's first batch a batch starts the next one,
+    /// from ``options``.
+    public var segmentMaxAge: IggyExpiry {
+        resolvedExpiry(options, .segmentMaxAge)
+    }
 }
 
 // An unreported or unreadable key resolves to its catalog default, as in the Rust crate.
 
-private func resolvedMessageExpiry(_ options: ResourceOptions) -> IggyExpiry {
-    guard let microseconds = options[TopicOptionKey.messageExpiry.rawValue]?.value.uint64Value, microseconds != 0 else {
+private func resolvedExpiry(_ options: ResourceOptions, _ key: TopicOptionKey) -> IggyExpiry {
+    guard let microseconds = options[key.rawValue]?.value.uint64Value, microseconds != 0 else {
         return .never
     }
     return IggyExpiry(wireMicroseconds: microseconds)

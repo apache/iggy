@@ -73,6 +73,14 @@ export type TopicOptions = {
    */
   replicationFactor?: number,
   /**
+   * Rolls the active segment once a batch is stamped this long after the
+   * segment's first batch, in microseconds (u64 max = never). `0n` is not
+   * "never": it omits the key so the server resolves its own default, reported
+   * back as a derived option on `getTopic`. The server refuses values under 10
+   * minutes, and the key alongside `preallocateSegments: true`.
+   */
+  segmentMaxAge?: bigint,
+  /**
    * Option keys with no field of their own, for a key the server catalog gained
    * after this build shipped. A field above wins on collision, since the block
    * must not carry a key twice. Call `describeOptions` for the keys a server
@@ -117,6 +125,7 @@ export const CREATE_TOPIC = {
     sizeOfMessagesRequiredToSave,
     preallocateSegments,
     replicationFactor,
+    segmentMaxAge = 0n,
     options: extraOptions = []
   }: CreateTopic
   ) => {
@@ -131,9 +140,9 @@ export const CREATE_TOPIC = {
 
     // partitions_count rides the command's own fixed field, never the
     // options block: the server rejects it as an unsupported option key.
-    // Server-default sentinels (expiry 0, size 0, compression none) and
-    // unset optionals are omitted so the server resolves them from its own
-    // config and reports them back as derived options.
+    // Server-default sentinels (expiry and segment age 0, size 0, compression
+    // none) and unset optionals are omitted so the server resolves them from
+    // its own config and reports them back as derived options.
     // Caller keys first so a typed field below overwrites one of them.
     const options: OptionEntry[] = [...extraOptions];
     if (compressionAlgorithm !== CompressionAlgorithm.None)
@@ -192,6 +201,10 @@ export const CREATE_TOPIC = {
       options.push({
         key: 'replication_factor',
         value: HeaderValue.Uint32(replicationFactor)
+      });
+    if (segmentMaxAge !== 0n)
+      options.push({
+        key: 'segment_max_age', value: HeaderValue.Uint64(segmentMaxAge)
       });
     const b = Buffer.allocUnsafe(4 + 1);
     b.writeUInt32LE(partitionCount, 0);

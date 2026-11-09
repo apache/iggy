@@ -74,4 +74,9 @@ public record TopicDetails(
     public Optional<BigInteger> maxTopicSize() {
         return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.MAX_TOPIC_SIZE);
     }
+
+    /** Segment age roll in microseconds, {@code 2^64 - 1} meaning never. */
+    public Optional<BigInteger> segmentMaxAge() {
+        return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.SEGMENT_MAX_AGE);
+    }
 }

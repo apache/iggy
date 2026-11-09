@@ -3667,12 +3667,17 @@ where
                         start_offset: segment.start_offset,
                         length: segment.size.as_bytes_u64(),
                         next_offset: install.next_offset,
+                        first_timestamp: segment.start_timestamp,
                     };
                     persistence.reset_with_segments(
                         install.commit_op,
                         install.offsets_wire.prepare_checksum,
                         prepare,
-                        Some((position, segment.max_size.as_bytes_u64())),
+                        Some((
+                            position,
+                            segment.max_size.as_bytes_u64(),
+                            self.effective_segment_max_age(),
+                        )),
                     );
                     self.start_persistence();
                     install.drain = Some(persistence.begin_drain());

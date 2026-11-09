@@ -32,10 +32,11 @@ public sealed class TopicOptionsTests
             MessagesRequiredToSave = 1024,
             SizeOfMessagesRequiredToSave = 1048576,
             PreallocateSegments = false,
-            ReplicationFactor = 3
+            ReplicationFactor = 3,
+            SegmentMaxAge = TimeSpan.FromHours(1)
         }.ToDictionary();
 
-        Assert.Equal(7, options.Count);
+        Assert.Equal(8, options.Count);
 
         Assert.Equal(HeaderKind.Uint64, options["segment_size"].Kind);
         Assert.Equal(134217728UL, options["segment_size"].ToUInt64());
@@ -54,6 +55,9 @@ public sealed class TopicOptionsTests
 
         Assert.Equal(HeaderKind.Uint32, options["replication_factor"].Kind);
         Assert.Equal(3U, options["replication_factor"].ToUInt32());
+
+        Assert.Equal(HeaderKind.Uint64, options["segment_max_age"].Kind);
+        Assert.Equal(3_600_000_000UL, options["segment_max_age"].ToUInt64());
     }
 
     [Fact]

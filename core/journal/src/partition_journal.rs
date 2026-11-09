@@ -61,6 +61,11 @@ const FRONTIER_BYTES: usize = FRONTIER_SLOTS * PARTITION_WAL_BLOCK_SIZE;
 /// layout reads back as sequence zero.
 const FRONTIER_SEQUENCE_OFFSET: usize = SEALED_STATE_MAGIC_OFFSET + size_of::<u64>();
 const _: () = assert!(FRONTIER_SEQUENCE_OFFSET + size_of::<u64>() <= PARTITION_WAL_BLOCK_SIZE);
+/// The age roll's state, after every field a size-only layout writes, so that
+/// layout stays byte-identical. Inside the checksummed range, and zero in every
+/// frontier that does not roll by age.
+const SEGMENT_AGE_OFFSET: usize = FRONTIER_SEQUENCE_OFFSET + size_of::<u64>();
+const _: () = assert!(SEGMENT_AGE_OFFSET + segments::SEGMENT_AGE_BYTES <= PARTITION_WAL_BLOCK_SIZE);
 pub const PREPARE_BYTES_MAX: usize = 64 * 1024 * 1024;
 /// Two-slot frontier. `IGGYWAL1` and `IGGYWAL2` were the single-block layout.
 /// `IGGYWAL3` kept a purge marker in bytes 104..120, which are reserved now,
@@ -198,6 +203,9 @@ struct StoredPrepare {
     checksum: u128,
     reference: Option<SegmentReference>,
     next_offset: Option<u64>,
+    /// First batch timestamp of the segment the body lives in, so a rewind to
+    /// this prepare restores the age roll's cursor. Zero without the age roll.
+    segment_first_timestamp: u64,
     retained_bytes: u64,
 }
 
@@ -976,6 +984,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                     checksum: header.checksum,
                     reference,
                     next_offset,
+                    segment_first_timestamp: state.tail_first_timestamp(reference),
                     retained_bytes: body_bytes,
                 },
                 index,
@@ -1071,13 +1080,20 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         let mut position = 0;
         let mut previous = state.checkpoint;
         let mut checksum = state.checkpoint_checksum;
+        let mut previous_segment = None;
         while position < state.length {
             let (header, length, prepare, reference) =
                 self.read_record(position, state.length).await?;
-            let next_offset = if state.segment_storage.is_some() && reference.is_some() {
-                Some(segments::batch_next_offset(prepare.as_slice())?)
-            } else {
-                None
+            let (next_offset, segment_first_timestamp) = match (state.segment_storage, reference) {
+                (Some(segments), Some(reference)) => (
+                    Some(segments::batch_next_offset(prepare.as_slice())?),
+                    segments.recovered_first_timestamp(
+                        reference,
+                        prepare.as_slice(),
+                        &mut previous_segment,
+                    )?,
+                ),
+                _ => (None, 0),
             };
             self.recovered_prepares.push(prepare);
             let checkpoint_prepare = position == 0 && state.checkpoint_prepare;
@@ -1104,6 +1120,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                     checksum: header.checksum,
                     reference,
                     next_offset,
+                    segment_first_timestamp,
                     retained_bytes: record_length(header.size as usize)? as u64,
                 },
             );
@@ -1199,6 +1216,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                     checksum: header.checksum,
                     reference,
                     next_offset,
+                    segment_first_timestamp: state.tail_first_timestamp(reference),
                     retained_bytes: body_bytes,
                 },
             );
@@ -1557,6 +1575,13 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                     checksum,
                     reference,
                     next_offset: None,
+                    segment_first_timestamp: state
+                        .segment_storage
+                        .zip(reference)
+                        .and_then(|(segments, reference)| {
+                            segments.cursor_first_timestamp(reference)
+                        })
+                        .unwrap_or(0),
                     retained_bytes: record_length(prepare.len())? as u64,
                 },
             );
@@ -1630,6 +1655,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                     checksum: entry.checksum,
                     reference,
                     next_offset,
+                    segment_first_timestamp: if converted {
+                        state.tail_first_timestamp(reference)
+                    } else {
+                        entry.segment_first_timestamp
+                    },
                     retained_bytes: entry.retained_bytes,
                 },
             );
@@ -1678,6 +1708,15 @@ impl<S: DurableStorage> DurableAppend for PartitionPrepareJournal<S> {
 }
 
 impl JournalState {
+    /// The first batch timestamp of the tail segment, for a body just reserved
+    /// there. Zero for a prepare with no body in a segment.
+    const fn tail_first_timestamp(&self, reference: Option<SegmentReference>) -> u64 {
+        match (self.segment_storage, reference) {
+            (Some(segments), Some(_)) => segments.tail.position.first_timestamp,
+            _ => 0,
+        }
+    }
+
     /// The checkpoint's checksum is the parent of the op right above it. A
     /// sparse WAL whose first op skips past that one learns nothing from it,
     /// which is fine only at the genesis checkpoint, whose checksum is zero.
@@ -1722,12 +1761,22 @@ impl JournalState {
         bytes[98] = u8::from(self.certified_log_view.is_some());
         bytes[120..124].copy_from_slice(&self.certified_log_view.unwrap_or(0).to_le_bytes());
         // Bytes 104..120 are reserved and stay zero.
-        bytes[segments::SEGMENT_STATE_FLAG] = u8::from(self.segment_storage.is_some());
+        bytes[segments::SEGMENT_STATE_FLAG] = match self.segment_storage {
+            None => segments::SEGMENTS_ABSENT,
+            Some(segments) if segments.max_age.is_none() => segments::SEGMENTS_BY_SIZE,
+            Some(_) => segments::SEGMENTS_BY_SIZE_AND_AGE,
+        };
         if let Some(segments) = self.segment_storage {
             segments.encode(
                 &mut bytes[segments::SEGMENT_STATE_OFFSET
                     ..segments::SEGMENT_STATE_OFFSET + segments::SEGMENT_STATE_BYTES],
             );
+            if segments.max_age.is_some() {
+                segments.encode_age(
+                    &mut bytes
+                        [SEGMENT_AGE_OFFSET..SEGMENT_AGE_OFFSET + segments::SEGMENT_AGE_BYTES],
+                );
+            }
         }
         // Repeat the format tag inside the existing checksum range.
         bytes.copy_within(..8, SEALED_STATE_MAGIC_OFFSET);
@@ -1760,14 +1809,20 @@ impl JournalState {
             1 => true,
             _ => return Err(invalid("invalid segment reference flag")),
         };
+        let segment_state = &bytes[segments::SEGMENT_STATE_OFFSET
+            ..segments::SEGMENT_STATE_OFFSET + segments::SEGMENT_STATE_BYTES];
+        let segment_age =
+            &bytes[SEGMENT_AGE_OFFSET..SEGMENT_AGE_OFFSET + segments::SEGMENT_AGE_BYTES];
         let state = Self {
             segment_references,
             segment_storage: match bytes[segments::SEGMENT_STATE_FLAG] {
-                0 => None,
-                1 if segment_references => Some(SegmentState::decode(
-                    &bytes[segments::SEGMENT_STATE_OFFSET
-                        ..segments::SEGMENT_STATE_OFFSET + segments::SEGMENT_STATE_BYTES],
-                )?),
+                segments::SEGMENTS_ABSENT => None,
+                segments::SEGMENTS_BY_SIZE if segment_references => {
+                    Some(SegmentState::decode(segment_state, None)?)
+                }
+                segments::SEGMENTS_BY_SIZE_AND_AGE if segment_references => {
+                    Some(SegmentState::decode(segment_state, Some(segment_age))?)
+                }
                 _ => return Err(invalid("invalid segment storage flag")),
             },
             group: read_u64(16)?,
@@ -3021,6 +3076,7 @@ mod tests {
                     Some(prepare.clone().into_frozen()),
                     SegmentPosition::default(),
                     BODY_BYTES as u64,
+                    None,
                 )
                 .await
                 .is_err()
@@ -3033,6 +3089,7 @@ mod tests {
             start_offset: 0,
             length: BODY_BYTES as u64,
             next_offset: 1,
+            first_timestamp: 0,
         };
         journal
             .reset_with_segment_checkpoint(
@@ -3041,6 +3098,7 @@ mod tests {
                 Some(prepare.into_frozen()),
                 initial,
                 BODY_BYTES as u64,
+                None,
             )
             .await
             .unwrap();
@@ -3067,7 +3125,7 @@ mod tests {
         let wal = std::fs::read(data_path(&directory, journal.state.generation)).unwrap();
         assert!(
             journal
-                .enable_segment_storage(SegmentPosition::default(), BODY_BYTES as u64)
+                .enable_segment_storage(SegmentPosition::default(), BODY_BYTES as u64, None)
                 .await
                 .is_err()
         );
@@ -3094,7 +3152,11 @@ mod tests {
             .await
             .unwrap();
         journal
-            .enable_segment_storage(SegmentPosition::default(), PARTITION_WAL_BLOCK_SIZE as u64)
+            .enable_segment_storage(
+                SegmentPosition::default(),
+                PARTITION_WAL_BLOCK_SIZE as u64,
+                None,
+            )
             .await
             .unwrap();
         let offset = prepare(1, 0).transmute_header(|original, header: &mut PrepareHeader| {
@@ -3128,7 +3190,7 @@ mod tests {
             .await
             .unwrap();
         journal
-            .enable_segment_storage(SegmentPosition::default(), BODY_BYTES as u64)
+            .enable_segment_storage(SegmentPosition::default(), BODY_BYTES as u64, None)
             .await
             .unwrap();
         let first = segment_prepare(1, 0, 0, BODY_BYTES);
@@ -3160,6 +3222,7 @@ mod tests {
                 start_offset: 1,
                 length: BODY_BYTES as u64,
                 next_offset: 2,
+                first_timestamp: 0,
             })
         );
         assert_eq!(journal.prepares().await.unwrap().len(), 1);
@@ -3185,7 +3248,11 @@ mod tests {
                 .await
                 .unwrap();
             journal
-                .enable_segment_storage(SegmentPosition::default(), PARTITION_WAL_BLOCK_SIZE as u64)
+                .enable_segment_storage(
+                    SegmentPosition::default(),
+                    PARTITION_WAL_BLOCK_SIZE as u64,
+                    None,
+                )
                 .await
                 .unwrap();
             let mut state = journal.state;
@@ -3239,7 +3306,7 @@ mod tests {
             .await
             .unwrap();
         journal
-            .enable_segment_storage(SegmentPosition::default(), (4 * BODY_BYTES) as u64)
+            .enable_segment_storage(SegmentPosition::default(), (4 * BODY_BYTES) as u64, None)
             .await
             .unwrap();
         let first = segment_prepare(1, 0, 0, BODY_BYTES);
@@ -3261,7 +3328,11 @@ mod tests {
             .await
             .unwrap();
         journal
-            .enable_segment_storage(SegmentPosition::default(), PARTITION_WAL_BLOCK_SIZE as u64)
+            .enable_segment_storage(
+                SegmentPosition::default(),
+                PARTITION_WAL_BLOCK_SIZE as u64,
+                None,
+            )
             .await
             .unwrap();
         let mut state = journal.state;
@@ -3338,7 +3409,7 @@ mod tests {
             .await
             .unwrap();
         journal
-            .enable_segment_storage(SegmentPosition::default(), (4 * BODY_BYTES) as u64)
+            .enable_segment_storage(SegmentPosition::default(), (4 * BODY_BYTES) as u64, None)
             .await
             .unwrap();
         let first = segment_prepare(1, 0, 0, BODY_BYTES);
@@ -3374,6 +3445,7 @@ mod tests {
                 start_offset: RESERVED_OFFSET,
                 length: 0,
                 next_offset: RESERVED_OFFSET,
+                first_timestamp: 0,
             })
         );
         assert_eq!(
@@ -3406,7 +3478,7 @@ mod tests {
             .await
             .unwrap();
         journal
-            .enable_segment_storage(SegmentPosition::default(), (2 * BODY_BYTES) as u64)
+            .enable_segment_storage(SegmentPosition::default(), (2 * BODY_BYTES) as u64, None)
             .await
             .unwrap();
         let first = segment_prepare(1, 0, 0, BODY_BYTES);
@@ -3431,6 +3503,7 @@ mod tests {
             start_offset: 0,
             length: BODY_BYTES as u64,
             next_offset: 1,
+            first_timestamp: 0,
         };
         assert_eq!(journal.segment_checkpoint(), Some(checkpoint));
         journal.truncate_from(2).await.unwrap();
@@ -3467,7 +3540,7 @@ mod tests {
             .await
             .unwrap();
         journal
-            .enable_segment_storage(SegmentPosition::default(), BODY_BYTES as u64)
+            .enable_segment_storage(SegmentPosition::default(), BODY_BYTES as u64, None)
             .await
             .unwrap();
         let first = segment_prepare(1, 0, 0, BODY_BYTES);
@@ -3508,7 +3581,7 @@ mod tests {
             .await
             .unwrap();
         journal
-            .enable_segment_storage(SegmentPosition::default(), (2 * BODY_BYTES) as u64)
+            .enable_segment_storage(SegmentPosition::default(), (2 * BODY_BYTES) as u64, None)
             .await
             .unwrap();
         let first = segment_prepare(1, 0, 0, BODY_BYTES);
@@ -3562,6 +3635,243 @@ mod tests {
         }
     }
 
+    const AGE_BODY_BYTES: usize = 4096;
+    const AGE_SEGMENT_BYTES: u64 = 1024 * 1024;
+    const MAX_AGE: u64 = 100;
+
+    /// A WAL rolling by age, with segments too large for any test to fill.
+    async fn aged_journal(partition: &Path) -> PartitionPrepareJournal {
+        let mut journal = PartitionPrepareJournal::open(&partition.join("prepares-7"), 42, 7)
+            .await
+            .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), AGE_SEGMENT_BYTES, Some(MAX_AGE))
+            .await
+            .unwrap();
+        journal
+    }
+
+    /// Append one batch per stamp, continuing the op chain and offsets from
+    /// `parent` (op `first_op - 1`) and returning the last prepare's checksum.
+    async fn append_stamped(
+        journal: &mut PartitionPrepareJournal,
+        first_op: u64,
+        mut parent: u128,
+        stamps: &[u64],
+    ) -> u128 {
+        for (op, stamp) in (first_op..).zip(stamps) {
+            let prepare = timed_segment_prepare(op, parent, op - 1, AGE_BODY_BYTES, *stamp);
+            parent = prepare.header().checksum;
+            journal.append(prepare.into_frozen()).await.unwrap();
+        }
+        parent
+    }
+
+    fn segment_starts(journal: &PartitionPrepareJournal) -> Vec<u64> {
+        let mut starts: Vec<_> = journal
+            .written_segment_references(0)
+            .map(|(_, reference)| reference.start_offset)
+            .collect();
+        starts.dedup();
+        starts
+    }
+
+    fn published_frontier(directory: &Path) -> Vec<u8> {
+        let bytes = std::fs::read(directory.join(FRONTIER_FILE_NAME)).unwrap();
+        bytes
+            .chunks(PARTITION_WAL_BLOCK_SIZE)
+            .filter_map(|slot| {
+                JournalState::decode(slot)
+                    .ok()
+                    .map(|(_, sequence)| (sequence, slot))
+            })
+            .max_by_key(|(sequence, _)| *sequence)
+            .map(|(_, slot)| slot.to_vec())
+            .unwrap()
+    }
+
+    #[compio::test]
+    async fn given_an_age_bound_when_a_batch_is_stamped_past_it_should_start_a_segment_at_that_batch()
+     {
+        let partition = tempdir().unwrap();
+        let mut journal = aged_journal(partition.path()).await;
+
+        append_stamped(
+            &mut journal,
+            1,
+            0,
+            &[1_000, 1_050, 1_099, 1_100, 1_150, 1_199],
+        )
+        .await;
+
+        assert_eq!(segment_starts(&journal), [0, 3]);
+        assert_eq!(
+            segment_names(partition.path()),
+            ["00000000000000000000.log", "00000000000000000003.log"]
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_first_stamp_from_a_clock_that_ran_ahead_when_later_stamps_are_behind_it_should_not_roll()
+     {
+        let partition = tempdir().unwrap();
+        let mut journal = aged_journal(partition.path()).await;
+
+        append_stamped(
+            &mut journal,
+            1,
+            0,
+            &[1_000_000, 500, 900_000, 1_000_099, 1_000_100],
+        )
+        .await;
+
+        assert_eq!(segment_starts(&journal), [0, 4]);
+    }
+
+    #[compio::test]
+    async fn given_an_aged_layout_when_reopened_should_roll_from_the_durable_first_stamp() {
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = aged_journal(partition.path()).await;
+        let parent = append_stamped(&mut journal, 1, 0, &[1_000, 1_050]).await;
+        journal.checkpoint(1).await.unwrap();
+        drop(journal);
+
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        append_stamped(&mut journal, 3, parent, &[1_099, 1_100]).await;
+
+        assert_eq!(segment_starts(&journal), [0, 3]);
+    }
+
+    #[compio::test]
+    async fn given_a_rewind_into_an_aged_segment_when_appending_again_should_roll_from_its_first_stamp()
+     {
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = aged_journal(partition.path()).await;
+        // Segment 0 opens at 1_000, segment 2 at 1_100.
+        let first = append_stamped(&mut journal, 1, 0, &[1_000]).await;
+        let second = append_stamped(&mut journal, 2, first, &[1_050]).await;
+        let third = append_stamped(&mut journal, 3, second, &[1_100]).await;
+        append_stamped(&mut journal, 4, third, &[1_150]).await;
+        journal.checkpoint(2).await.unwrap();
+        drop(journal);
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+
+        // Back into segment 2: its first stamp comes from the retained op 3.
+        journal.truncate_from(4).await.unwrap();
+        append_stamped(&mut journal, 4, third, &[1_199, 1_200]).await;
+        assert_eq!(segment_starts(&journal), [0, 2, 4]);
+
+        // Back into segment 0, which opened before the oldest retained record.
+        journal.truncate_from(3).await.unwrap();
+        append_stamped(&mut journal, 3, second, &[1_099, 1_100]).await;
+        assert_eq!(segment_starts(&journal), [0, 3]);
+    }
+
+    #[compio::test]
+    async fn given_layouts_with_and_without_an_age_bound_when_published_should_flag_only_the_aged_one()
+     {
+        let sized = tempdir().unwrap();
+        let sized_directory = sized.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&sized_directory, 42, 7)
+            .await
+            .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), AGE_SEGMENT_BYTES, None)
+            .await
+            .unwrap();
+        append_stamped(&mut journal, 1, 0, &[1_000]).await;
+        let frontier = published_frontier(&sized_directory);
+        assert_eq!(
+            frontier[segments::SEGMENT_STATE_FLAG],
+            segments::SEGMENTS_BY_SIZE
+        );
+        assert!(frontier[SEGMENT_AGE_OFFSET..].iter().all(|byte| *byte == 0));
+
+        let aged = tempdir().unwrap();
+        let mut journal = aged_journal(aged.path()).await;
+        append_stamped(&mut journal, 1, 0, &[1_000]).await;
+        let frontier = published_frontier(&aged.path().join("prepares-7"));
+        assert_eq!(
+            frontier[segments::SEGMENT_STATE_FLAG],
+            segments::SEGMENTS_BY_SIZE_AND_AGE
+        );
+        let age = &frontier[SEGMENT_AGE_OFFSET..SEGMENT_AGE_OFFSET + segments::SEGMENT_AGE_BYTES];
+        assert_eq!(&age[..8], &MAX_AGE.to_le_bytes());
+        assert_eq!(&age[8..16], &1_000_u64.to_le_bytes());
+    }
+
+    #[compio::test]
+    async fn given_an_age_bound_that_differs_or_rolls_every_batch_when_enabling_should_refuse_it() {
+        let partition = tempdir().unwrap();
+        let mut journal = aged_journal(partition.path()).await;
+        for max_age in [None, Some(MAX_AGE + 1)] {
+            assert!(
+                journal
+                    .enable_segment_storage(SegmentPosition::default(), AGE_SEGMENT_BYTES, max_age)
+                    .await
+                    .is_err()
+            );
+        }
+
+        let fresh = tempdir().unwrap();
+        let mut journal = PartitionPrepareJournal::open(&fresh.path().join("prepares-7"), 42, 7)
+            .await
+            .unwrap();
+        assert!(
+            journal
+                .enable_segment_storage(SegmentPosition::default(), AGE_SEGMENT_BYTES, Some(0))
+                .await
+                .is_err()
+        );
+    }
+
+    #[compio::test]
+    async fn given_an_installed_aged_segment_when_appending_should_roll_from_its_installed_first_stamp()
+     {
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let installed = timed_segment_prepare(5, 0, 0, AGE_BODY_BYTES, 1_000);
+        std::fs::write(
+            partition.path().join("00000000000000000000.log"),
+            &installed.as_slice()[size_of::<PrepareHeader>()..],
+        )
+        .unwrap();
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        journal
+            .reset_with_segment_checkpoint(
+                5,
+                Some(installed.header().checksum),
+                Some(installed.clone().into_frozen()),
+                SegmentPosition {
+                    start_offset: 0,
+                    length: AGE_BODY_BYTES as u64,
+                    next_offset: 1,
+                    first_timestamp: 1_000,
+                },
+                AGE_SEGMENT_BYTES,
+                Some(MAX_AGE),
+            )
+            .await
+            .unwrap();
+
+        let mut parent = installed.header().checksum;
+        for (op, stamp) in [(6, 1_099), (7, 1_100)] {
+            let prepare = timed_segment_prepare(op, parent, op - 5, AGE_BODY_BYTES, stamp);
+            parent = prepare.header().checksum;
+            journal.append(prepare.into_frozen()).await.unwrap();
+        }
+
+        assert_eq!(segment_starts(&journal), [0, 2]);
+    }
+
     fn segment_names(partition: &Path) -> Vec<String> {
         let mut names: Vec<_> = std::fs::read_dir(partition)
             .unwrap()
@@ -3585,7 +3895,7 @@ mod tests {
             .await
             .unwrap();
         journal
-            .enable_segment_storage(SegmentPosition::default(), (4 * BODY_BYTES) as u64)
+            .enable_segment_storage(SegmentPosition::default(), (4 * BODY_BYTES) as u64, None)
             .await
             .unwrap();
         let first = segment_prepare(1, 0, 0, BODY_BYTES);
@@ -3648,7 +3958,7 @@ mod tests {
             .await
             .unwrap();
             journal
-                .enable_segment_storage(SegmentPosition::default(), SEGMENT_BYTES)
+                .enable_segment_storage(SegmentPosition::default(), SEGMENT_BYTES, None)
                 .await
                 .unwrap();
             let first = segment_prepare(1, 0, 0, usize::try_from(SEGMENT_BYTES).unwrap());
@@ -3737,7 +4047,7 @@ mod tests {
             .await
             .unwrap();
             journal
-                .enable_segment_storage(SegmentPosition::default(), (4 * BODY_BYTES) as u64)
+                .enable_segment_storage(SegmentPosition::default(), (4 * BODY_BYTES) as u64, None)
                 .await
                 .unwrap();
             let original = segment_prepare(1, 0, 0, BODY_BYTES);
@@ -3750,12 +4060,14 @@ mod tests {
                     start_offset: 5,
                     length: BODY_BYTES as u64,
                     next_offset: 6,
+                    first_timestamp: 0,
                 }
             } else {
                 SegmentPosition {
                     start_offset: 6,
                     length: 0,
                     next_offset: 6,
+                    first_timestamp: 0,
                 }
             };
             journal
@@ -3765,6 +4077,7 @@ mod tests {
                     Some(checkpoint.clone().into_frozen()),
                     initial,
                     (4 * BODY_BYTES) as u64,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3832,7 +4145,7 @@ mod tests {
             .await
             .unwrap();
         journal
-            .enable_segment_storage(SegmentPosition::default(), (4 * BODY_BYTES) as u64)
+            .enable_segment_storage(SegmentPosition::default(), (4 * BODY_BYTES) as u64, None)
             .await
             .unwrap();
         let first = segment_prepare(1, 0, 0, BODY_BYTES);
@@ -3885,9 +4198,10 @@ mod tests {
             start_offset: 0,
             length: BODY_BYTES as u64,
             next_offset: 1,
+            first_timestamp: 0,
         };
         journal
-            .enable_segment_storage(checkpoint, (4 * BODY_BYTES) as u64)
+            .enable_segment_storage(checkpoint, (4 * BODY_BYTES) as u64, None)
             .await
             .unwrap();
         assert_eq!(
@@ -3923,11 +4237,22 @@ mod tests {
         offset: u64,
         body_length: usize,
     ) -> Message<PrepareHeader> {
+        timed_segment_prepare(op, parent, offset, body_length, 0)
+    }
+
+    fn timed_segment_prepare(
+        op: u64,
+        parent: u128,
+        offset: u64,
+        body_length: usize,
+        base_timestamp: u64,
+    ) -> Message<PrepareHeader> {
         let template = sized_prepare(op, parent, size_of::<PrepareHeader>() + body_length);
         let mut bytes = Owned::copy_from_slice(template.as_slice());
         let body = &mut bytes.as_mut_slice()[size_of::<PrepareHeader>()..];
         let mut batch = BatchHeader::new(42, 0, body_length as u64, 1);
         batch.base_offset = offset;
+        batch.base_timestamp = base_timestamp;
         batch.batch_checksum = batch.checksum_for_blob(&body[BATCH_HEADER_SIZE..]);
         batch.encode_into(body);
         let checksum = XxHash3_64::oneshot(body);

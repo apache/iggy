@@ -1858,6 +1858,9 @@ fn main() {
         size_of_messages_required_to_save: Some(IggyByteSize::from(4096)),
         preallocate_segments: Some(false),
         replication_factor: Some(2),
+        segment_max_age: Some(IggyExpiry::ExpireDuration(IggyDuration::new_from_secs(
+            3_600,
+        ))),
         raw: BTreeMap::new(),
     };
     add(

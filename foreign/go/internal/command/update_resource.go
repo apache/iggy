@@ -75,6 +75,7 @@ var optionCatalog = []optionRule{
 	{key: string(iggcon.StreamOptionEncryptionKeySource), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream}, readOnly: true},
 	{key: string(iggcon.StreamOptionEncryptionKeyFingerprint), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream}, readOnly: true},
 	{key: string(iggcon.StreamOptionEncryptionKekFingerprint), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream}, readOnly: true},
+	{key: string(iggcon.TopicOptionSegmentMaxAge), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}},
 	{key: "critical_keys", scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream, iggcon.OptionsScopeTopic, iggcon.OptionsScopeUser}, readOnly: true},
 }
 

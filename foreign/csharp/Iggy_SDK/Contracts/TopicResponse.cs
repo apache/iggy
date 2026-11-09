@@ -76,6 +76,14 @@ public sealed class TopicResponse
     public ulong MaxTopicSize => OptionValues.UInt64(Options, DerivedOptions, TopicOptionKey.MaxTopicSize);
 
     /// <summary>
+    ///     How long after the active segment's first batch a batch starts the next segment, read from the topic's
+    ///     options. <see cref="TimeSpan.MaxValue" /> never rolls by age.
+    /// </summary>
+    [JsonIgnore]
+    public TimeSpan SegmentMaxAge =>
+        DurationHelpers.FromDuration(OptionValues.UInt64(Options, DerivedOptions, TopicOptionKey.SegmentMaxAge));
+
+    /// <summary>
     ///     Number of messages in the topic.
     /// </summary>
     public required ulong MessagesCount { get; init; }

@@ -62,9 +62,29 @@ pub(super) fn checksummed_segment_prepare(
     offset: u64,
     payload: &[u8],
 ) -> Message<PrepareHeader> {
+    stamped_segment_prepare(op, parent, offset, payload, 0)
+}
+
+/// A one-message prepare the primary stamped at `timestamp`, which a backup
+/// requires to match the batch's base timestamp.
+pub(super) fn stamped_segment_prepare(
+    op: u64,
+    parent: u128,
+    offset: u64,
+    payload: &[u8],
+    timestamp: u64,
+) -> Message<PrepareHeader> {
     let namespace = IggyNamespace::new(1, 1, 0);
-    let body =
+    let mut body =
         build_segment_record_with_payload(namespace, offset, Bytes::copy_from_slice(payload));
+    if timestamp != 0 {
+        let mut header =
+            iggy_binary_protocol::batch::BatchHeader::decode(&body[..COMMAND_HEADER_SIZE])
+                .expect("segment record header");
+        header.base_timestamp = timestamp;
+        header.batch_checksum = header.checksum_for_blob(&body[COMMAND_HEADER_SIZE..]);
+        header.encode_into(&mut body[..COMMAND_HEADER_SIZE]);
+    }
     let total = std::mem::size_of::<PrepareHeader>() + body.len();
     let mut prepare = Message::<PrepareHeader>::new(total);
     prepare.as_mut_slice()[std::mem::size_of::<PrepareHeader>()..].copy_from_slice(&body);
@@ -75,6 +95,7 @@ pub(super) fn checksummed_segment_prepare(
         header.group = namespace.inner();
         header.op = op;
         header.parent = parent;
+        header.timestamp = timestamp;
         header.client = 1;
         header.request = op;
         header.session = 1;
@@ -1854,6 +1875,7 @@ async fn partition_with_pending_durable_ack() -> (
     (directory, partition, header)
 }
 
+mod age_roll;
 mod consensus_tests;
 mod consumer_group_ownership;
 mod disk_poll;

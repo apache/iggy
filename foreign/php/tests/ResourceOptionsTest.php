@@ -63,7 +63,10 @@ final class ResourceOptionsTest extends TestCase
     private const IN_SYNC_WAIT_SECONDS = 15.0;
     private const STREAM_DERIVED_KEYS = ['encryption_kek_fingerprint', 'encryption_key_fingerprint', 'encryption_key_source'];
     // Create and update arguments named after the unit they take rather than the option key.
-    private const PARAMETER_NAMES = ['message_expiry' => 'message_expiry_micros'];
+    private const PARAMETER_NAMES = [
+        'message_expiry' => 'message_expiry_micros',
+        'segment_max_age' => 'segment_max_age_micros',
+    ];
 
     private array $createdStreams = [];
 

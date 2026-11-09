@@ -19,11 +19,11 @@ use super::codec::{OptionValueCodec, invalid};
 use super::key::OptionKey;
 use super::{
     DEFAULT_MAX_TOPIC_SIZE, DEFAULT_MESSAGE_EXPIRY, DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
-    DEFAULT_PREALLOCATE_SEGMENTS, DEFAULT_SEGMENT_SIZE, DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
-    Durability, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_PREALLOCATED_TOPIC_BYTES,
-    MAX_REPLICATION_FACTOR, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, MAX_TOPIC_SEGMENT_SIZE,
-    MIN_TOPIC_SEGMENT_SIZE, OptionValue, OptionsScope, PartitionResizePolicy, ResourceOptions,
-    erase_options,
+    DEFAULT_PREALLOCATE_SEGMENTS, DEFAULT_SEGMENT_MAX_AGE, DEFAULT_SEGMENT_SIZE,
+    DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, Durability, MAX_MESSAGES_REQUIRED_TO_SAVE,
+    MAX_PREALLOCATED_TOPIC_BYTES, MAX_REPLICATION_FACTOR, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+    MAX_TOPIC_SEGMENT_SIZE, MIN_SEGMENT_MAX_AGE, MIN_TOPIC_SEGMENT_SIZE, OptionValue, OptionsScope,
+    PartitionResizePolicy, ResourceOptions, erase_options,
 };
 use crate::http::users::defaults::{MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
@@ -68,7 +68,7 @@ const TOPIC_ONLY: &[OptionsScope] = &[OptionsScope::Topic];
 const USER_ONLY: &[OptionsScope] = &[OptionsScope::User];
 
 /// Every option key, indexed by its `OptionKey` discriminant.
-pub static CATALOG: [OptionDescriptor; 20] = [
+pub static CATALOG: [OptionDescriptor; 21] = [
     OptionDescriptor {
         key: OptionKey::Name,
         scopes: STREAM_AND_TOPIC,
@@ -378,6 +378,28 @@ pub static CATALOG: [OptionDescriptor; 20] = [
              comma-separated: one outside a key rotation, one per configured server key \
              during it. Absent when the source is none"
                 .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::SegmentMaxAge,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::CreateOnly,
+        default: OptionDefault::Const(|| Ok(HeaderValue::from(DEFAULT_SEGMENT_MAX_AGE))),
+        visibility: OptionVisibility::Public,
+        // A node that ignored it would roll segments at different batches
+        // from its peers.
+        critical: true,
+        description: || {
+            format!(
+                "Start a new segment once a batch is stamped this long after the active \
+                 segment's first batch, in microseconds or a humantime string (e.g. 1h); at \
+                 least {} minutes, or never. Bounds how long a slow partition's active segment \
+                 stays unsealed, so retention and tiering reach it. A fully idle partition \
+                 stays open. Refused together with preallocate_segments",
+                MIN_SEGMENT_MAX_AGE / 60_000_000
+            )
         },
     },
     OptionDescriptor {
@@ -779,7 +801,7 @@ pub fn canonical_value(
 ) -> Result<Option<HeaderValue>, IggyError> {
     let value = match key {
         OptionKey::CompressionAlgorithm => CompressionAlgorithm::decode(key, entry)?.encode()?,
-        OptionKey::MessageExpiry => {
+        OptionKey::MessageExpiry | OptionKey::SegmentMaxAge => {
             let expiry = IggyExpiry::decode(key, entry)?;
             if expiry == IggyExpiry::ServerDefault {
                 return Ok(None);
@@ -1173,6 +1195,7 @@ mod tests {
                 topic_option_keys::REPLICATION_FACTOR,
                 OptionKey::ReplicationFactor,
             ),
+            (topic_option_keys::SEGMENT_MAX_AGE, OptionKey::SegmentMaxAge),
         ] {
             assert_eq!(constant, key.to_string());
         }

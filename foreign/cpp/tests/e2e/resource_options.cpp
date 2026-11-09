@@ -72,6 +72,7 @@ constexpr iggy::TopicOptionKey kTopicOptionKeys[] = {
     iggy::TopicOptionKey::SizeOfMessagesRequiredToSave,
     iggy::TopicOptionKey::PreallocateSegments,
     iggy::TopicOptionKey::ReplicationFactor,
+    iggy::TopicOptionKey::SegmentMaxAge,
 };
 
 constexpr iggy::UserOptionKey kUserOptionKeys[] = {
