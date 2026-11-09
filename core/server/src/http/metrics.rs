@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use configs::http::HttpMetricsConfig;
 use iggy_common::{IggyError, stats_rollup_underflows};
 use prometheus_client::collector::Collector;
-use prometheus_client::encoding::text::encode;
+use prometheus_client::encoding::text::{encode_eof, encode_registry};
 use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric};
 use prometheus_client::metrics::MetricType;
 use prometheus_client::metrics::counter::{ConstCounter, Counter};
@@ -180,6 +180,9 @@ fn encode_topic_gauge(
 /// Unlike `volume_used_bytes`, it does not move with deletes or with other
 /// processes on the volume.
 ///
+/// Both describe the host's volume, which `/stats` shows only to a user its
+/// rule admits, so they live in [`HttpMetrics`]' stats registry.
+///
 /// It holds the estimate it reads, so a test can export one of its own
 /// instead of the process-wide one other tests charge concurrently.
 #[derive(Debug)]
@@ -217,6 +220,10 @@ impl Collector for DiskUsageMetrics {
 /// describes.
 pub(in crate::http) struct HttpMetrics {
     registry: Registry,
+    /// The per-topic and disk series. They name every stream and topic and
+    /// describe the host's volume, so a scrape encodes them only for a user
+    /// the `/stats` rule admits.
+    stats_registry: Registry,
     http_requests: Counter,
     pub(in crate::http) streams: Gauge,
     pub(in crate::http) topics: Gauge,
@@ -292,9 +299,10 @@ impl HttpMetrics {
         // Not a legacy-parity metric, and not a mirrored one: the source is a
         // process-wide static the scrape reads directly.
         registry.register_collector(Box::new(StatsRollupUnderflows));
+        let mut stats_registry = Registry::default();
         let topic_usage = TopicUsage::default();
-        registry.register_collector(Box::new(topic_usage.clone()));
-        registry.register_collector(Box::new(DiskUsageMetrics(&DISK_USAGE)));
+        stats_registry.register_collector(Box::new(topic_usage.clone()));
+        stats_registry.register_collector(Box::new(DiskUsageMetrics(&DISK_USAGE)));
         // Every shard's drop / reconcile / partition counters, one
         // `shard`-labelled sub-registry per shard so series stay per-shard
         // without a `shard_id` label in the counter label sets (see
@@ -310,6 +318,7 @@ impl HttpMetrics {
         }
         Self {
             registry,
+            stats_registry,
             http_requests,
             streams,
             topics,
@@ -333,14 +342,24 @@ impl HttpMetrics {
         self.http_requests.clone()
     }
 
-    pub(in crate::http) fn formatted_output(&self) -> String {
+    /// The exposition for one scrape, with the stats registry only when
+    /// `exports_stats` says that the `/stats` rule admits the user.
+    pub(in crate::http) fn formatted_output(&self, exports_stats: bool) -> String {
         let last = self.last_output_len.load(Ordering::Relaxed);
         let mut buffer = String::with_capacity(last + last / 8);
-        if let Err(error) = encode(&mut buffer, &self.registry) {
+        if let Err(error) = self.encode(&mut buffer, exports_stats) {
             error!(%error, "failed to encode metrics");
         }
         self.last_output_len.store(buffer.len(), Ordering::Relaxed);
         buffer
+    }
+
+    fn encode(&self, buffer: &mut String, exports_stats: bool) -> Result<(), std::fmt::Error> {
+        encode_registry(buffer, &self.registry)?;
+        if exports_stats {
+            encode_registry(buffer, &self.stats_registry)?;
+        }
+        encode_eof(buffer)
     }
 }
 
@@ -380,6 +399,7 @@ pub(in crate::http) fn gauge_value(count: u64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prometheus_client::encoding::text::encode;
     use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
 
     const MIB: u64 = 1024 * 1024;
@@ -389,7 +409,7 @@ mod tests {
         let shard_metrics = ShardMetrics::for_shard();
         shard_metrics.record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::FULL);
         let metrics = HttpMetrics::init(&[shard_metrics]);
-        let output = metrics.formatted_output();
+        let output = metrics.formatted_output(true);
         assert!(
             output.contains("frame_drops_total"),
             "shard frame-drop counter missing from exposition:\n{output}"
@@ -421,7 +441,7 @@ mod tests {
     #[test]
     fn formatted_output_exposes_every_parity_metric() {
         let metrics = HttpMetrics::init(&[]);
-        let output = metrics.formatted_output();
+        let output = metrics.formatted_output(true);
         for name in PARITY_METRIC_NAMES {
             assert!(
                 output.contains(&format!("# TYPE {name} ")),
@@ -442,7 +462,7 @@ mod tests {
     #[test]
     fn rollup_underflow_collector_lands_in_the_exposition() {
         let metrics = HttpMetrics::init(&[]);
-        let output = metrics.formatted_output();
+        let output = metrics.formatted_output(true);
         assert!(
             output.contains("# TYPE stats_rollup_underflows counter\n"),
             "expected the collector's series in the exposition:\n{output}"
@@ -459,7 +479,7 @@ mod tests {
     #[test]
     fn registered_metrics_include_both_disk_usage_series() {
         DISK_USAGE.rebase(|| Some(((), 1)));
-        let output = HttpMetrics::init(&[]).formatted_output();
+        let output = HttpMetrics::init(&[]).formatted_output(true);
         for series in ["volume_used_bytes gauge", "disk_allocated_bytes counter"] {
             assert!(
                 output.contains(&format!("# TYPE {series}\n")),
@@ -506,6 +526,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn given_a_scrape_without_the_stats_permission_when_encoding_should_omit_topic_and_disk_series()
+    {
+        let metrics = HttpMetrics::init(&[]);
+        let stats_series = ["topic_size_bytes", "disk_allocated_bytes"];
+
+        metrics
+            .topic_usage
+            .replace(vec![topic_sample("orders", "eu", None)]);
+        let denied = metrics.formatted_output(false);
+        let allowed = metrics.formatted_output(true);
+
+        for name in stats_series {
+            assert!(
+                !denied.contains(name),
+                "a scrape without the permission must not export {name}:\n{denied}"
+            );
+            assert!(
+                allowed.contains(name),
+                "a scrape with the permission must export {name}:\n{allowed}"
+            );
+        }
+        assert!(
+            denied.contains("\nstreams ") && denied.ends_with("# EOF\n"),
+            "a denied scrape still gets the aggregates and the trailer:\n{denied}"
+        );
+    }
+
     /// Both disk usage series of `usage`, encoded as `/metrics` would.
     fn disk_usage_exposition(usage: &'static DiskUsage) -> String {
         let mut registry = Registry::default();
@@ -526,7 +574,7 @@ mod tests {
         metrics.users.set(6);
         metrics.clients.set(7);
         metrics.request_counter().inc();
-        let output = metrics.formatted_output();
+        let output = metrics.formatted_output(true);
         for line in [
             "streams 1",
             "topics 2",
@@ -581,7 +629,7 @@ mod tests {
             topic_sample("orders", "eu", Some(1_000_000)),
             topic_sample("orders", "us", None),
         ]);
-        let output = metrics.formatted_output();
+        let output = metrics.formatted_output(true);
         for line in [
             "# TYPE topic_size_bytes gauge",
             "# TYPE topic_messages gauge",
@@ -610,7 +658,7 @@ mod tests {
             .topic_usage
             .replace(vec![topic_sample("orders", "eu", None)]);
         metrics.topic_usage.replace(Vec::new());
-        let output = metrics.formatted_output();
+        let output = metrics.formatted_output(true);
         assert!(
             !output.contains(r#"topic="eu""#),
             "a deleted topic must not outlive the next scrape:\n{output}"
@@ -623,12 +671,12 @@ mod tests {
         metrics
             .topic_usage
             .replace(vec![topic_sample("orders", "eu", None)]);
-        let first = metrics.formatted_output();
+        let first = metrics.formatted_output(true);
         assert!(
             first.contains(r#"topic="eu""#),
             "the snapshot must be encoded before it is released:\n{first}"
         );
-        let second = metrics.formatted_output();
+        let second = metrics.formatted_output(true);
         assert!(
             !second.contains(r#"topic="eu""#),
             "the snapshot must not outlive the scrape that encoded it:\n{second}"
@@ -641,7 +689,7 @@ mod tests {
         metrics
             .topic_usage
             .replace(vec![topic_sample("a\"b", "c\\d\ne", None)]);
-        let output = metrics.formatted_output();
+        let output = metrics.formatted_output(true);
         assert!(
             output.contains(r#"topic_messages{stream="a\"b",topic="c\\d\ne"} 20"#),
             "label values must be escaped:\n{output}"
