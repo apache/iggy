@@ -134,6 +134,18 @@ async fn given_commands_between_sends_when_committed_should_apply_them_in_op_ord
 }
 
 #[compio::test]
+async fn given_a_fatal_failure_when_asking_for_primacy_should_deny_it() {
+    let mut partition = partition_with_counter(1);
+    assert!(partition.state_machines_current());
+    partition.fatal = Some(crate::types::FatalCommit {
+        namespace_raw: partition.namespace().inner(),
+        op: 0,
+        operation: None,
+    });
+    assert!(!partition.state_machines_current());
+}
+
+#[compio::test]
 async fn given_unowned_or_client_commands_when_requested_should_refuse_them() {
     let mut partition = partition_with_counter(1);
     let unowned = partition

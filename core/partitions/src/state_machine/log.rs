@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 
 use iggy_binary_protocol::PrepareHeader;
 use server_common::iobuf::Frozen;
@@ -62,7 +62,7 @@ impl StateMachineLog {
 
     /// Held ops in `ops`, ascending.
     pub fn ops(&self, ops: impl RangeBounds<u64>) -> impl DoubleEndedIterator<Item = u64> + '_ {
-        self.commands.range(ops).map(|(op, _)| *op)
+        self.commands.range(window(&ops)).map(|(op, _)| *op)
     }
 
     /// Held headers in `ops`, ascending.
@@ -71,7 +71,7 @@ impl StateMachineLog {
         ops: impl RangeBounds<u64>,
     ) -> impl Iterator<Item = (u64, PrepareHeader)> + '_ {
         self.commands
-            .range(ops)
+            .range(window(&ops))
             .filter_map(|(op, prepare)| header_of(prepare).map(|header| (*op, header)))
     }
 
@@ -99,7 +99,11 @@ impl StateMachineLog {
     /// Drop the held commands in `ops`, returning how many went. They stay
     /// refillable: the retained floor does not move.
     pub fn remove(&mut self, ops: impl RangeBounds<u64>) -> usize {
-        let removed: Vec<u64> = self.commands.range(ops).map(|(op, _)| *op).collect();
+        let removed: Vec<u64> = self
+            .commands
+            .range(window(&ops))
+            .map(|(op, _)| *op)
+            .collect();
         for op in &removed {
             if let Some(prepare) = self.commands.remove(op) {
                 self.bytes -= memory_bytes(&prepare);
@@ -153,6 +157,27 @@ impl StateMachineLog {
     /// does after restoring machines whose snapshot covers them.
     pub fn set_retained_from(&mut self, op: u64) {
         self.retained_from = self.retained_from.max(op);
+    }
+}
+
+/// `ops` as bounds `BTreeMap::range` accepts. Callers derive op windows from
+/// consensus state, and one that is empty or reversed, such as the window
+/// above a repair that already reached its target, selects nothing instead
+/// of panicking.
+fn window(ops: &impl RangeBounds<u64>) -> (Bound<u64>, Bound<u64>) {
+    let start = match ops.start_bound() {
+        Bound::Included(op) => Some(*op),
+        Bound::Excluded(op) => op.checked_add(1),
+        Bound::Unbounded => Some(0),
+    };
+    let end = match ops.end_bound() {
+        Bound::Included(op) => Some(*op),
+        Bound::Excluded(op) => op.checked_sub(1),
+        Bound::Unbounded => Some(u64::MAX),
+    };
+    match (start, end) {
+        (Some(start), Some(end)) if start <= end => (Bound::Included(start), Bound::Included(end)),
+        _ => (Bound::Included(0), Bound::Excluded(0)),
     }
 }
 
@@ -239,6 +264,23 @@ mod tests {
         assert!(!log.release_checkpointed(6, usize::MAX, 0));
         assert!(log.is_empty());
         assert_eq!(log.bytes(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::reversed_empty_ranges)]
+    fn given_empty_or_reversed_windows_when_selecting_should_select_nothing() {
+        let mut log = StateMachineLog::default();
+        for op in [1, 5, 9] {
+            log.insert(op, prepare(op, 0));
+        }
+        assert_eq!(log.ops(6..=5).count(), 0);
+        assert_eq!(log.ops(5..5).count(), 0);
+        assert_eq!(log.ops(10..=u64::MAX).count(), 0);
+        assert_eq!(log.headers(9..=1).count(), 0);
+        assert_eq!(log.remove(9..=1), 0);
+        assert_eq!(log.ops(5..=5).collect::<Vec<_>>(), vec![5]);
+        assert_eq!(log.ops(..).collect::<Vec<_>>(), vec![1, 5, 9]);
+        assert_eq!(log.ops(..u64::MAX).count(), 3);
     }
 
     #[test]

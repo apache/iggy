@@ -1842,6 +1842,10 @@ where
     /// The evicted ring is deliberately NOT consulted, matching the op-by-op
     /// form: consulting it would change the floor-refusal verdict.
     pub fn repaired_window_shape(&self, floor: u64, to_op: u64) -> RepairedWindowShape {
+        // A repair that reached its target asks about an empty window.
+        if floor >= to_op {
+            return RepairedWindowShape { complete: true };
+        }
         let headers = unsafe { &*self.headers.get() };
         let commands = self.commands.borrow();
         let expected = to_op.saturating_sub(floor);
@@ -3352,6 +3356,20 @@ mod tests {
         assert_eq!(unretained.commands_in(..), 1);
         assert_eq!(unretained.commands_in(4..=4), 1);
         assert_eq!(unretained.repair_retained_from(), Some(4));
+    }
+
+    /// A completed suffix repair asks about the window above its target,
+    /// which is empty, while commands are still held.
+    #[compio::test]
+    #[allow(clippy::reversed_empty_ranges)]
+    async fn given_held_commands_when_the_repair_window_is_empty_should_report_it_complete() {
+        let journal =
+            journal_with(&[build_message_prepare(1, 0, 1, 8), build_command_prepare(2)]).await;
+        assert!(journal.repaired_window_shape(2, 2).complete);
+        assert!(journal.repaired_window_shape(5, 2).complete);
+        assert!(journal.repaired_window_shape(0, 2).complete);
+        assert!(!journal.repaired_window_shape(0, 3).complete);
+        assert!(!journal.holds_op_in(3..=2));
     }
 
     fn entry_ops(entries: &[Frozen<4096>]) -> Vec<u64> {

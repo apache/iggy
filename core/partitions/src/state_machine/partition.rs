@@ -72,12 +72,13 @@ where
     }
 
     /// Whether this replica may act on its machines' state as the primary: it
-    /// is the primary of a running view and applied every command committed
-    /// before that view started.
+    /// is the primary of a running view, applied every command committed
+    /// before that view started, and has not stopped on a fatal failure.
     #[must_use]
     pub fn state_machines_current(&self) -> bool {
         let consensus = self.consensus();
-        consensus.is_primary()
+        self.fatal.is_none()
+            && consensus.is_primary()
             && consensus.is_normal()
             && !consensus.is_transferring()
             && consensus.applied_view_start()
