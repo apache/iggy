@@ -412,6 +412,28 @@ impl IggyConsumer {
         self.client.read().await.can_recover().await
     }
 
+    /// Whether a read error ends consumption. Any other error is logged and reading goes on.
+    /// See `consume_messages` for the full rules.
+    pub async fn read_error_ends_consumption(&self, error: &ReadError) -> bool {
+        error.skip.is_some()
+            || matches!(
+                error.error,
+                IggyError::InvalidServerAddress
+                    | IggyError::InvalidClientAddress
+                    | IggyError::InvalidConfiguration
+                    | IggyError::LaneBlocked(_)
+                    | IggyError::PartitionLaneBlocked(..)
+                    | IggyError::FetchProgressUncertain(_)
+                    | IggyError::HistoryUnavailable
+                    | IggyError::InvalidNumberEncoding
+                    | IggyError::InvalidMessagePayloadLength
+                    | IggyError::InvalidMessagesCount
+                    | IggyError::ClientShutdown
+            )
+            || error.is_lasting_refusal()
+            || !self.client_can_recover().await
+    }
+
     /// Returns the name of the consumer.
     ///
     /// For a consumer group this is also the name of the group.

@@ -44,6 +44,7 @@ pub use repair_memory::RepairMemoryBudget;
 mod segment;
 pub mod segment_anchor;
 mod segment_recovery;
+pub mod state_machine;
 pub mod state_transfer;
 mod stream_keyring;
 mod types;
@@ -162,6 +163,7 @@ pub struct RetainedPartitionState {
     pub(crate) owner_retirement:
         Option<iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest>,
     pub(crate) producers: producer_state::ProducerTable,
+    pub(crate) machines: Option<state_machine::StateMachineSnapshot>,
 }
 
 /// Partition-level data plane operations.
