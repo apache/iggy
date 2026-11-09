@@ -115,6 +115,7 @@ async fn given_three_nodes_when_creating_topics_should_store_the_factor_and_repo
     let outcome = create_topics::handle(
         &state,
         &ConnectionState::default(),
+        None,
         CREATE_TOPICS_VERSION,
         encode(&request, CREATE_TOPICS_VERSION),
     )
