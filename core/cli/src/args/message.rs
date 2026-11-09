@@ -224,6 +224,13 @@ pub(crate) struct PollMessagesArgs {
     #[clap(verbatim_doc_comment)]
     #[clap(short, long, default_value_t = false, group = "polling_strategy")]
     pub(crate) next: bool,
+    /// Polling strategy - start polling at or after this time
+    ///
+    /// Accepts an RFC 3339 time, Unix microseconds, or a duration relative to
+    /// now such as 1h or 30min.
+    #[clap(verbatim_doc_comment)]
+    #[clap(long, visible_alias = "since", group = "polling_strategy", value_parser = parse_timestamp)]
+    pub(crate) timestamp: Option<IggyTimestamp>,
     /// Regular consumer which will poll messages
     ///
     /// Consumer ID can be specified as a consumer name or ID
@@ -248,6 +255,33 @@ pub(crate) struct PollMessagesArgs {
     #[clap(verbatim_doc_comment)]
     #[clap(long, value_parser = NonEmptyStringValueParser::new())]
     pub(crate) output_file: Option<String>,
+}
+fn parse_timestamp(value: &str) -> Result<IggyTimestamp, String> {
+    if let Ok(datetime) = chrono::DateTime::parse_from_rfc3339(value) {
+        return u64::try_from(datetime.timestamp_micros())
+            .map(IggyTimestamp::from)
+            .map_err(|_| format!("'{value}' is before the Unix epoch"));
+    }
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return value
+            .parse::<u64>()
+            .map(IggyTimestamp::from)
+            .map_err(|error| format!("Invalid Unix microseconds '{value}': {error}"));
+    }
+    let s = value.to_lowercase();
+    if s == "unlimited" || s == "disabled" || s == "none" {
+        return Err(format!("'{value}' is not an eligible timestamp"));
+    }
+    let duration = IggyDuration::from_str(value).map_err(|error| {
+        format!("'{value}' is not an RFC 3339 time, Unix microseconds or a duration: {error}")
+    })?;
+    let micros = u64::try_from(duration.get_duration().as_micros())
+        .map_err(|_| format!("'{value}' is too long to be a relative duration"))?;
+    IggyTimestamp::now()
+        .as_micros()
+        .checked_sub(micros)
+        .map(IggyTimestamp::from)
+        .ok_or_else(|| format!("'{value}' is before the Unix epoch"))
 }
 
 #[cfg(test)]

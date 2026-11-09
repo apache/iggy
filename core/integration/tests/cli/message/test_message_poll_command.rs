@@ -22,10 +22,17 @@ use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy::prelude::*;
+use predicates::boolean::PredicateBooleanExt;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
 use std::collections::BTreeMap;
 use std::str::FromStr;
+
+/// The seeded messages are sent as three separate batches, so the broker stamps
+/// three distinct timestamps. A single batch would make a timestamp poll
+/// indistinguishable from one that ignores the strategy: every message would
+/// share the bound, and "at or after it" would equal "all of them".
+const SEED_BATCH_SIZES: [usize; 3] = [3, 4, 3];
 
 struct TestMessagePollCmd {
     stream_name: String,
@@ -57,6 +64,11 @@ impl TestMessagePollCmd {
     ) -> Self {
         assert!(partition_id < partitions_count);
         assert!(message_count < messages.len());
+        assert_eq!(
+            SEED_BATCH_SIZES.iter().sum::<usize>(),
+            messages.len(),
+            "seed batch sizes must cover every message"
+        );
         Self {
             stream_name,
             topic_name,
@@ -76,7 +88,7 @@ impl TestMessagePollCmd {
         let mut command = match self.strategy.kind {
             PollingKind::Offset => vec!["--offset".into(), format!("{}", self.strategy.value)],
             PollingKind::Timestamp => {
-                todo!("Timestamp based message polling is not supported yet")
+                vec!["--timestamp".into(), format!("{}", self.strategy.value)]
             }
             PollingKind::First => vec!["--first".into()],
             PollingKind::Next => vec!["--next".into()],
@@ -150,15 +162,52 @@ impl IggyCmdTestCase for TestMessagePollCmd {
             })
             .collect::<Vec<_>>();
 
-        let send_status = client
-            .send_messages(
-                &stream.id.try_into().unwrap(),
-                &topic.id.try_into().unwrap(),
-                &Partitioning::partition_id(self.partition_id),
-                &mut messages,
-            )
-            .await;
-        assert!(send_status.is_ok());
+        let mut seeded = 0;
+        for batch_size in SEED_BATCH_SIZES {
+            let send_status = client
+                .send_messages(
+                    &stream.id.try_into().unwrap(),
+                    &topic.id.try_into().unwrap(),
+                    &Partitioning::partition_id(self.partition_id),
+                    &mut messages[seeded..seeded + batch_size],
+                )
+                .await;
+            assert!(send_status.is_ok());
+            seeded += batch_size;
+        }
+
+        // The broker stamps `base_timestamp` once per batch, so the exact value a
+        // timestamp poll is compared against does not exist until after the send.
+        // Read it back rather than guessing a wall-clock bound: a guess never
+        // equals a batch, and so cannot tell `>=` from `>`.
+        if self.strategy.kind == PollingKind::Timestamp {
+            let polled = client
+                .poll_messages(
+                    &stream.id.try_into().unwrap(),
+                    &topic.id.try_into().unwrap(),
+                    self.partition_id,
+                    &Consumer::default(),
+                    &PollingStrategy::first(),
+                    PollOptions {
+                        count: u32::try_from(self.messages.len()).expect("seed count fits in u32"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("reading back the seeded batches");
+            assert_eq!(
+                polled.messages.len(),
+                self.messages.len(),
+                "read-back must return every seeded message"
+            );
+            let boundary = SEED_BATCH_SIZES[0];
+            let boundary_timestamp = polled.messages[boundary].header.timestamp;
+            assert!(
+                boundary_timestamp > polled.messages[0].header.timestamp,
+                "the second batch timestamp should be greater than the first batch's"
+            );
+            self.strategy.set_value(boundary_timestamp);
+        }
     }
 
     fn get_command(&self) -> IggyCmdCommand {
@@ -232,7 +281,24 @@ impl IggyCmdTestCase for TestMessagePollCmd {
                     .take(self.message_count)
                     .fold(status, |status, message| status.stdout(contains(message)));
             }
-            _ => {}
+            PollingKind::Timestamp => {
+                // Without the back-fill the poll starts at `0`, so the first
+                // batch leaks into the output and fails below as a stray
+                // payload instead of naming the real cause.
+                assert_ne!(
+                    self.strategy.value, 0,
+                    "timestamp strategy was not back-filled from the seeded batches"
+                );
+                let boundary = SEED_BATCH_SIZES[0];
+                let status = self.messages[boundary..]
+                    .iter()
+                    .fold(status, |status, message| status.stdout(contains(message)));
+                self.messages[..boundary]
+                    .iter()
+                    .fold(status, |status, message| {
+                        status.stdout(contains(message).not())
+                    });
+            }
         }
     }
 
@@ -282,6 +348,16 @@ pub async fn should_be_successful() {
         (3, 5, PollingStrategy::first(), true),
         (0, 4, PollingStrategy::last(), true),
         (1, 3, PollingStrategy::next(), false),
+        // The timestamp value is a placeholder; `prepare_server_state` replaces it
+        // with the boundary batch's broker-stamped `base_timestamp`. The count is
+        // everything from the cut onwards, derived rather than hand-summed so a
+        // change to `SEED_BATCH_SIZES` cannot silently leave it behind.
+        (
+            3,
+            SEED_BATCH_SIZES[1] + SEED_BATCH_SIZES[2],
+            PollingStrategy::timestamp(IggyTimestamp::from(0)),
+            true,
+        ),
     ];
 
     iggy_cmd_test.setup().await;
@@ -322,7 +398,7 @@ Examples:
  iggy message poll --offset 0 1 topic 1
  iggy message poll --offset 0 stream topic 1
 
-{USAGE_PREFIX} message poll [OPTIONS] <--offset <OFFSET>|--first|--last|--next> <STREAM_ID> <TOPIC_ID> <PARTITION_ID>
+{USAGE_PREFIX} message poll [OPTIONS] <--offset <OFFSET>|--first|--last|--next|--timestamp <TIMESTAMP>> <STREAM_ID> <TOPIC_ID> <PARTITION_ID>
 
 Arguments:
   <STREAM_ID>
@@ -367,6 +443,14 @@ Options:
           Start polling after the last polled message based
           on the stored consumer offset
 
+      --timestamp <TIMESTAMP>
+          Polling strategy - start polling at or after this time
+{CLAP_INDENT}
+          Accepts an RFC 3339 time, Unix microseconds, or a duration relative to
+          now such as 1h or 30min.
+{CLAP_INDENT}
+          [alias: --since]
+
   -c, --consumer <CONSUMER>
           Regular consumer which will poll messages
 {CLAP_INDENT}
@@ -409,7 +493,7 @@ pub async fn should_short_help_match() {
             format!(
                 r#"Poll messages from given topic ID and given stream ID
 
-{USAGE_PREFIX} message poll [OPTIONS] <--offset <OFFSET>|--first|--last|--next> <STREAM_ID> <TOPIC_ID> <PARTITION_ID>
+{USAGE_PREFIX} message poll [OPTIONS] <--offset <OFFSET>|--first|--last|--next|--timestamp <TIMESTAMP>> <STREAM_ID> <TOPIC_ID> <PARTITION_ID>
 
 Arguments:
   <STREAM_ID>     ID of the stream from which message will be polled
@@ -423,6 +507,7 @@ Options:
   -f, --first                          Polling strategy - start polling from the first message in the partition
   -l, --last                           Polling strategy - start polling from the last message in the partition
   -n, --next                           Polling strategy - start polling from the next message
+      --timestamp <TIMESTAMP>          Polling strategy - start polling at or after this time [alias: --since]
   -c, --consumer <CONSUMER>            Regular consumer which will poll messages [default: 0]
   -s, --show-headers                   Include the message headers in the output
       --output-file <OUTPUT_FILE>      Store polled message into file in binary format
