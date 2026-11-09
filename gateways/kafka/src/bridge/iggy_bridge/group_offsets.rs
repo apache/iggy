@@ -40,7 +40,6 @@ use super::{
     IggyBridge, KafkaTopicMetadata, LazyClient, OffsetGroups, REQUEST_TIMEOUT, SLOT_LIMIT,
     ScannedGroups, TopicTarget, permit_by, resolve_blocker, write_with_recovery,
 };
-use crate::auth::TopicReads;
 use crate::bridge::error::BridgeError;
 use crate::group::is_valid_group_id;
 use crate::protocol::api::{ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_UNKNOWN_TOPIC_OR_PARTITION};
@@ -73,47 +72,6 @@ const OFFSET_SLOTS: usize = 4;
 /// The slot of a call that belongs to no partition. Any slot will do.
 const LISTING_SLOT: usize = 0;
 
-/// Where a commit may create the Iggy group that holds a Kafka group's offsets on a topic.
-///
-/// The gateway creates the group in its own name, and Iggy would create it for the principal only
-/// if the principal may read the topic. So a commit checks the principal's grants first.
-#[derive(Debug, Clone)]
-pub enum GroupCreation {
-    /// On every topic: no principal, the anonymous one, or a global grant.
-    Any,
-    /// On the topics that these stream and topic grants cover.
-    Scoped(Arc<TopicReads>),
-    /// On no topic.
-    Never,
-}
-
-impl GroupCreation {
-    /// Whether a commit may create a group on `topic`, on `client`. The grants name streams and
-    /// topics by numeric id, so a scoped check reads both ids. A stream or topic that is gone by
-    /// then gets no group.
-    async fn allows(&self, client: &IggyClient, topic: &TopicTarget) -> Result<bool, BridgeError> {
-        let reads = match self {
-            Self::Any => return Ok(true),
-            Self::Never => return Ok(false),
-            Self::Scoped(reads) => reads,
-        };
-        let ids = async {
-            let stream = client.get_stream(&topic.stream_id).await?;
-            let found = client.get_topic(&topic.stream_id, &topic.topic_id).await?;
-            Ok::<_, IggyError>(
-                stream
-                    .zip(found)
-                    .map(|(stream, found)| (stream.id, found.id)),
-            )
-        };
-        match ids.await.map_err(BridgeError::Iggy) {
-            Ok(ids) => Ok(ids.is_some_and(|(stream, topic)| reads.covers(stream, topic))),
-            Err(error) if topic_deleted(&error) => Ok(false),
-            Err(error) => Err(error),
-        }
-    }
-}
-
 /// The offset calls of one Kafka request. A request queues at most one call per slot, so a
 /// request with many partitions cannot hold up the others.
 pub struct OffsetCalls {
@@ -122,8 +80,6 @@ pub struct OffsetCalls {
     queued: [Arc<Semaphore>; OFFSET_SLOTS],
     /// Kept by each write until no Iggy call of it can land. See [`Self::keeping`].
     kept: Option<Arc<dyn Any + Send + Sync>>,
-    /// Where a commit may create the Iggy group that holds the offsets. See [`Self::creating`].
-    creation: GroupCreation,
 }
 
 impl OffsetCalls {
@@ -134,17 +90,7 @@ impl OffsetCalls {
             deadline,
             queued: std::array::from_fn(|_| Arc::new(Semaphore::new(1))),
             kept: None,
-            creation: GroupCreation::Any,
         }
-    }
-
-    /// These calls, with commits that create the Iggy group holding a Kafka group's offsets on a
-    /// topic only where `creation` allows. Elsewhere, a commit that finds no such group fails with
-    /// [`BridgeError::GroupCreationRefused`] and stores nothing.
-    #[must_use]
-    pub fn creating(mut self, creation: GroupCreation) -> Self {
-        self.creation = creation;
-        self
     }
 
     /// These calls, with `kept` held by each commit and each group deletion until no Iggy call of
@@ -180,8 +126,8 @@ impl IggyBridge {
     ///
     /// A negative offset deletes the key instead. Kafka consumers read any negative offset as
     /// none, and Iggy cannot store one. A key or a group that is not there counts as deleted. A
-    /// store that finds no Iggy group for the offsets creates it, unless `calls` create none
-    /// ([`OffsetCalls::creating`]). A replay that Iggy already applied counts as done.
+    /// store that finds no Iggy group for the offsets creates it. A replay that Iggy already
+    /// applied counts as done.
     ///
     /// Commits on one slot start one at a time, in the order given. A stored offset adds `group`
     /// to [`Self::offset_groups`] at once. Each topic that a commit stored to, or may have, counts
@@ -191,9 +137,8 @@ impl IggyBridge {
     /// # Errors
     ///
     /// Per commit: [`BridgeError::Iggy`] if Iggy refuses it or `group` names no valid Iggy group,
-    /// [`BridgeError::GroupCreationRefused`] if it needs a group that `calls` may not create, and
-    /// [`BridgeError::Timeout`] if it does not end by the deadline of `calls`. A commit that has
-    /// not started by then never starts.
+    /// and [`BridgeError::Timeout`] if it does not end by the deadline of `calls`. A commit that
+    /// has not started by then never starts.
     pub async fn commit_group_offsets(
         &self,
         group: &str,
@@ -215,20 +160,11 @@ impl IggyBridge {
             let (names, topic) = (Arc::clone(&names), topic.clone());
             let storing = if offset >= 0 { storing.clone() } else { None };
             let held = storing.clone();
-            let creation = calls.creation.clone();
             let commit = move |client: Arc<IggyClient>| async move {
                 let mut created = None;
-                let written = commit_on(
-                    &client,
-                    &names,
-                    &topic,
-                    partition,
-                    offset,
-                    &creation,
-                    |id| {
-                        created = Some(id);
-                    },
-                )
+                let written = commit_on(&client, &names, &topic, partition, offset, |id| {
+                    created = Some(id);
+                })
                 .await;
                 if let Some(storing) = storing
                     && may_have_stored(&written, created)
@@ -313,21 +249,7 @@ impl IggyBridge {
     }
 
     /// Deletes the Iggy group that holds the offsets of each Kafka group of `groups`, on every
-    /// Kafka topic. Iggy deletes the offsets with it. One result per group, in order: whether any
-    /// topic held the group.
-    ///
-    /// Lists the topics, then the Iggy groups of each topic, on the scan client, so the listing
-    /// neither waits behind `OffsetFetch` nor costs it its client. That costs one call per topic,
-    /// and at least two per deletion. The scan client can read a replica that missed a recent
-    /// commit, so the topics that commits through this gateway stored to lately come too, with
-    /// the numeric id of the Iggy group when a commit created it. Each deletion runs on the commit
-    /// lane of partition 0 of its topic (see `delete_offset_group_on`), and keeps what `calls`
-    /// keep until it can no longer land, also past their deadline. A topic deleted since the
-    /// listing holds none. A group whose deletions all ended leaves [`Self::offset_groups`] at
-    /// once.
-    ///
-    /// A deletion can end after its request answered. The retry of that request then finds no
-    /// topic that holds the group, and still counts it as held, once, for up to a minute.
+    /// Kafka topic: [`Self::list_offset_groups`], then [`Self::delete_listed_offset_groups`].
     ///
     /// # Errors
     ///
@@ -335,16 +257,95 @@ impl IggyBridge {
     /// not end by the deadline of `calls`, or [`IggyError::Unauthorized`] when the bridge user may
     /// not list the groups of a Kafka topic, or may not read an override topic, which the listing
     /// then leaves out. A group can hold offsets there. Per group, as
-    /// [`Self::commit_group_offsets`]: a deletion that does not end by the deadline of `calls` is
-    /// [`BridgeError::Timeout`], and can still land.
+    /// [`Self::delete_listed_offset_groups`].
     pub async fn delete_offset_groups(
         &self,
         groups: &[&str],
         calls: &OffsetCalls,
     ) -> Result<Vec<Result<bool, BridgeError>>, BridgeError> {
-        let deletions = timeout_at(calls.deadline, self.offset_group_topics(groups))
+        let listing = timeout_at(calls.deadline, self.list_offset_groups(groups))
             .await
             .map_err(|_elapsed| BridgeError::Timeout)??;
+        if !listing.unlisted.is_empty() {
+            error!(
+                kafka_topics = ?listing.unlisted,
+                "the bridge user may not list the Iggy groups of these Kafka topics, so DeleteGroups \
+                 deletes nothing"
+            );
+            return Err(BridgeError::Iggy(IggyError::Unauthorized));
+        }
+        Ok(self
+            .delete_listed_offset_groups(groups, &listing, calls)
+            .await)
+    }
+
+    /// The Iggy groups that hold the offsets of each Kafka group of `groups`, on every Kafka
+    /// topic, and the topics whose groups the bridge user may not list.
+    ///
+    /// Lists the topics, then the Iggy groups of each topic, on the scan client, so the listing
+    /// neither waits behind `OffsetFetch` nor costs it its client. That costs one call per topic.
+    /// A topic deleted meanwhile holds none.
+    ///
+    /// # Errors
+    ///
+    /// [`BridgeError::Iggy`] when a listing fails.
+    pub async fn list_offset_groups(
+        &self,
+        groups: &[&str],
+    ) -> Result<OffsetGroupListing, BridgeError> {
+        let client = self.scan_client.connected(&self.config).await?;
+        let listing = self.kafka_topic_listing_on(&client).await?;
+        let mut unlisted = listing.unreadable;
+        let requested: HashSet<&str> = groups.iter().copied().collect();
+        let mut found: HashMap<String, Vec<(TopicTarget, u32)>> = HashMap::new();
+        let mut listings = pin!(self.kafka_groups_by_topic(&client, &listing.topics));
+        while let Some((topic, listed)) = listings.next().await {
+            let (target, groups) = match listed {
+                Ok(listed) => listed,
+                Err(error) if topic_deleted(&error) => continue,
+                Err(BridgeError::Iggy(IggyError::Unauthorized)) => {
+                    unlisted.push(topic.to_owned());
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for listed in groups {
+                if requested.contains(listed.group.as_str()) {
+                    found
+                        .entry(listed.group)
+                        .or_default()
+                        .push((target.clone(), listed.id));
+                }
+            }
+        }
+        Ok(OffsetGroupListing { found, unlisted })
+    }
+
+    /// Deletes the Iggy group that holds the offsets of each Kafka group of `groups` on each topic
+    /// that `listing` found it on. Iggy deletes the offsets with it. One result per group, in
+    /// order: whether any topic held the group.
+    ///
+    /// The scan client that listed can read a replica that missed a recent commit, so the topics
+    /// that commits through this gateway stored to lately come too, with the numeric id of the
+    /// Iggy group when a commit created it. Each deletion runs on the commit lane of partition 0
+    /// of its topic (see `delete_offset_group_on`), and keeps what `calls` keep until it can no
+    /// longer land, also past their deadline. A group whose deletions all ended leaves
+    /// [`Self::offset_groups`] at once.
+    ///
+    /// A deletion can end after its request answered. The retry of that request then finds no
+    /// topic that holds the group, and still counts it as held, once, for up to a minute.
+    ///
+    /// # Errors
+    ///
+    /// Per group, as [`Self::commit_group_offsets`]: a deletion that does not end by the deadline
+    /// of `calls` is [`BridgeError::Timeout`], and can still land.
+    pub async fn delete_listed_offset_groups(
+        &self,
+        groups: &[&str],
+        listing: &OffsetGroupListing,
+        calls: &OffsetCalls,
+    ) -> Vec<Result<bool, BridgeError>> {
+        let deletions = self.deletions(groups, listing);
         let deleted = join_all(deletions.iter().map(|deletion| {
             self.delete_offset_group_on(groups[deletion.at], &deletion.topic, deletion.id, calls)
         }))
@@ -371,7 +372,7 @@ impl IggyBridge {
                 self.group_index.forget(group);
             }
         }
-        Ok(results)
+        results
     }
 
     /// The Iggy topic of `kafka_topic` and its partition count, read on an offset slot. `None`
@@ -393,6 +394,32 @@ impl IggyBridge {
         // Any slot will do. Partition 0's keeps the choice fixed.
         let count = self.read_in_slot(slot_of(&topic, 0), calls, lookup).await?;
         Ok(count.map(|count| (topic, count)))
+    }
+
+    /// Iggy's numeric ids of the stream and the topic of `kafka_topic`, which permission grants
+    /// name, read on an offset slot. `None` when either does not exist.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::topic_target`]. [`BridgeError::Iggy`] when a read fails, and
+    /// [`BridgeError::Timeout`] past the deadline of `calls`.
+    pub async fn topic_ids(
+        &self,
+        kafka_topic: &str,
+        calls: &OffsetCalls,
+    ) -> Result<Option<(u32, u32)>, BridgeError> {
+        let topic = self.topic_target(kafka_topic)?;
+        let slot = slot_of(&topic, 0);
+        let lookup = |client: Arc<IggyClient>| async move {
+            let read = async {
+                let stream = client.get_stream(&topic.stream_id).await?;
+                let found = client.get_topic(&topic.stream_id, &topic.topic_id).await?;
+                Ok::<_, IggyError>(stream.zip(found))
+            };
+            let found = read.await.map_err(BridgeError::Iggy)?;
+            Ok(found.map(|(stream, found)| (stream.id, found.id)))
+        };
+        self.read_in_slot(slot, calls, lookup).await
     }
 
     /// [`Self::list_kafka_topics`] on an offset slot's read client, so it never waits behind
@@ -487,51 +514,30 @@ impl IggyBridge {
         }
     }
 
-    /// Each Iggy group that holds offsets of a group of `groups`: those that the scan client
-    /// lists, then those on the topics that commits through this gateway stored to lately.
-    async fn offset_group_topics(
-        &self,
-        groups: &[&str],
-    ) -> Result<Vec<GroupToDelete>, BridgeError> {
-        let client = self.scan_client.connected(&self.config).await?;
-        let listing = self.kafka_topic_listing_on(&client).await?;
-        let mut unexamined = listing.unreadable;
+    /// Each Iggy group that holds offsets of a group of `groups`: those that `listing` found, then
+    /// those on the topics that commits through this gateway stored to lately.
+    fn deletions(&self, groups: &[&str], listing: &OffsetGroupListing) -> Vec<GroupToDelete> {
         // The handler answers a repeated group id once, so each id has one index.
         let requested: HashMap<&str, usize> = groups
             .iter()
             .enumerate()
             .map(|(at, group)| (*group, at))
             .collect();
-        let mut deletions = Vec::new();
-        let mut listings = pin!(self.kafka_groups_by_topic(&client, &listing.topics));
-        while let Some((topic, listed)) = listings.next().await {
-            let (target, found) = match listed {
-                Ok(listed) => listed,
-                Err(error) if topic_deleted(&error) => continue,
-                Err(BridgeError::Iggy(IggyError::Unauthorized)) => {
-                    unexamined.push(topic.to_owned());
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            for listed in found {
-                if let Some(&at) = requested.get(listed.group.as_str()) {
-                    deletions.push(GroupToDelete {
+        let listed = requested
+            .iter()
+            .flat_map(|(group, &at)| {
+                listing
+                    .found
+                    .get(*group)
+                    .into_iter()
+                    .flatten()
+                    .map(move |(topic, id)| GroupToDelete {
                         at,
-                        topic: target.clone(),
-                        id: OffsetGroupId::Listed(listed.id),
-                    });
-                }
-            }
-        }
-        if !unexamined.is_empty() {
-            error!(
-                kafka_topics = ?unexamined,
-                "the bridge user may not list the Iggy groups of these Kafka topics, so DeleteGroups \
-                 deletes nothing"
-            );
-            return Err(BridgeError::Iggy(IggyError::Unauthorized));
-        }
+                        topic: topic.clone(),
+                        id: OffsetGroupId::Listed(*id),
+                    })
+            })
+            .collect();
         let stored = groups
             .iter()
             .enumerate()
@@ -546,7 +552,7 @@ impl IggyBridge {
                     })
             })
             .collect();
-        Ok(with_stored(deletions, stored))
+        with_stored(listed, stored)
     }
 
     /// The Kafka groups with offsets on each topic of `topics`, listed on `client`,
@@ -834,7 +840,18 @@ struct ListedGroup {
     id: u32,
 }
 
-/// One Iggy group for `IggyBridge::delete_offset_groups` to delete.
+/// The Iggy groups that hold the offsets of some Kafka groups, as one listing found them. See
+/// [`IggyBridge::list_offset_groups`].
+#[derive(Debug, Default)]
+pub struct OffsetGroupListing {
+    /// Each Kafka group found, with the Iggy topics and the numeric ids of the groups there.
+    found: HashMap<String, Vec<(TopicTarget, u32)>>,
+    /// The Kafka topics whose Iggy groups the bridge user may not list. A group can hold offsets
+    /// there.
+    pub unlisted: Vec<String>,
+}
+
+/// One Iggy group for `IggyBridge::delete_listed_offset_groups` to delete.
 struct GroupToDelete {
     /// The index of its Kafka group in the request.
     at: usize,
@@ -1144,15 +1161,14 @@ pub(super) fn kafka_group_of(name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// One commit on `client`. A store that finds no Iggy group creates it where `creation` allows,
-/// passes its numeric id to `created`, and stores again.
+/// One commit on `client`. A store that finds no Iggy group creates it, passes its numeric id to
+/// `created`, and stores again.
 async fn commit_on(
     client: &IggyClient,
     names: &OffsetNames,
     topic: &TopicTarget,
     partition: u32,
     offset: i64,
-    creation: &GroupCreation,
     created: impl FnOnce(u32),
 ) -> Result<(), BridgeError> {
     let deadline = (Instant::now() + SLOT_LIMIT).into_std();
@@ -1176,9 +1192,6 @@ async fn commit_on(
     };
     match store().await {
         Err(IggyError::ConsumerGroupNameNotFound(..)) => {
-            if !creation.allows(client, topic).await? {
-                return Err(BridgeError::GroupCreationRefused);
-            }
             if let Some(id) = create_offset_group(client, stream_id, topic_id, &names.group).await?
             {
                 created(id);

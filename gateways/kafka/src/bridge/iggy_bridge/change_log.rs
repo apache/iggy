@@ -73,6 +73,9 @@ pub struct TopicShape {
     /// name gets another.
     pub incarnation: u64,
     pub partitions: u32,
+    /// Iggy's numeric ids of the stream and the topic, which permission grants name.
+    pub stream_id: u32,
+    pub topic_id: u32,
 }
 
 /// A Kafka topic that the change log shows deleted.
@@ -177,6 +180,20 @@ impl PermissionBoard {
             .filter(|(_, entry)| entry.username == username)
             .max_by_key(|(user, _)| user.created_at)
             .map(|(_, entry)| entry.access.clone())
+    }
+
+    /// The newest user named `username` and its grants, while the change log shows it active.
+    #[must_use]
+    pub fn active_user(&self, username: &str) -> Option<(UserKey, Grants)> {
+        lock(&self.users)
+            .by_key
+            .iter()
+            .filter(|(_, entry)| entry.username == username)
+            .max_by_key(|(user, _)| user.created_at)
+            .and_then(|(user, entry)| match &entry.access {
+                UserAccess::Active(grants) => Some((*user, grants.clone())),
+                UserAccess::Revoked => None,
+            })
     }
 
     fn set(&self, user: UserKey, username: &str, access: UserAccess) {
@@ -771,6 +788,8 @@ impl Mirror {
                 let shape = TopicShape {
                     incarnation: topic.key.topic_created_op,
                     partitions: topic.partitions,
+                    stream_id: topic.key.stream_id,
+                    topic_id: topic.key.topic_id,
                 };
                 Some((kafka_topic.to_owned(), shape))
             })
@@ -1357,6 +1376,8 @@ mod tests {
             Some(&TopicShape {
                 incarnation: 10,
                 partitions: 5,
+                stream_id: KAFKA,
+                topic_id: 1,
             })
         );
     }
@@ -1590,6 +1611,26 @@ mod tests {
             Some(manages_topics())
         );
         assert_eq!(board.access("alice"), Some(manages_topics()), "the newest");
+    }
+
+    /// A connection whose permission read failed at login reads its user and grants here.
+    #[test]
+    fn given_a_username_should_find_its_newest_user_only_while_active() {
+        let board = PermissionBoard::default();
+        apply_users(
+            &board,
+            &[
+                MetadataChange::UserCreated(user(ALICE, "alice", UserStatus::Active, false)),
+                MetadataChange::UserCreated(user(ALICE_AGAIN, "alice", UserStatus::Active, true)),
+                MetadataChange::UserCreated(user(BOB, "bob", UserStatus::Inactive, true)),
+            ],
+        );
+
+        let (found, grants) = board.active_user("alice").expect("alice is active");
+        assert_eq!(found, ALICE_AGAIN, "the newest");
+        assert_eq!(UserAccess::Active(grants), manages_topics());
+        assert_eq!(board.active_user("bob"), None, "inactive");
+        assert_eq!(board.active_user("carol"), None, "never shown");
     }
 
     /// A connection whose permission read failed knows only its username.

@@ -319,7 +319,7 @@ impl PartitionLog {
             claim: claimed.claim,
             node_id,
             checkpoint_records: config.checkpoint_records,
-            unchanged_refresh: unchanged_refresh(config.offsets_retention),
+            unchanged_refresh: unchanged_refresh(config.retention()),
             max_send_bytes: link.max_send_bytes(),
             state: tokio::sync::Mutex::new(claimed.state),
             checkpoint: AtomicU64::new(checkpoint),

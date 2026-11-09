@@ -62,8 +62,8 @@ use kafka_protocol::protocol::{Decodable, Encodable};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::time::Instant;
 
-use crate::auth::AuthenticatedPrincipal;
-use crate::bridge::{BridgeError, GroupCreation};
+use crate::auth::{AuthenticatedPrincipal, TopicReads};
+use crate::bridge::BridgeError;
 use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_PARTITIONS, API_KEY_CREATE_TOPICS,
@@ -212,27 +212,37 @@ fn may_delete_groups(principal: Option<&AuthenticatedPrincipal>, api: &str) -> b
     principal.permissions.manage_topics
 }
 
-/// Where `principal` may create a group: the Iggy group that holds its offsets on a topic, which
-/// the first commit there creates. `None` means no listener of this gateway names principals, and
-/// `ANONYMOUS` comes from a listener that authenticates no one. Both create groups, as any client
-/// there can.
+/// The topics a principal may commit offsets to. See [`commit_access`].
+#[derive(Debug, Clone)]
+pub(crate) enum CommitAccess {
+    /// Every topic.
+    Any,
+    /// The topics that these stream and topic grants cover.
+    Scoped(Arc<TopicReads>),
+    /// No topic.
+    Never,
+}
+
+/// Where `principal` may commit offsets. `None` means no listener of this gateway names principals,
+/// and `ANONYMOUS` comes from a listener that authenticates no one. Both commit anywhere.
 ///
-/// Kafka asks for `READ` on the group. Iggy lets a user create a consumer group on a topic it may
-/// read: a read or manage permission on topics or streams, globally (`read_topics`, which
-/// `DescribeAcls` shows as that `READ`), on the topic's stream, or on the topic. A principal whose
-/// permissions were never read creates none.
-fn group_creation(principal: Option<&AuthenticatedPrincipal>) -> GroupCreation {
+/// Kafka asks for `READ` on the group. Iggy creates a consumer group only for a user that may read
+/// the topic: a read or manage permission on topics or streams, globally (`read_topics`, which
+/// `DescribeAcls` shows as that `READ`), on the topic's stream, or on the topic. Every commit asks
+/// for the same, so whether it may store does not depend on whether the group exists yet. A
+/// principal whose permissions were never read commits nowhere.
+fn commit_access(principal: Option<&AuthenticatedPrincipal>) -> CommitAccess {
     let Some(principal) = principal.filter(|principal| !principal.is_anonymous()) else {
-        return GroupCreation::Any;
+        return CommitAccess::Any;
     };
     if !principal.permissions_known {
-        GroupCreation::Never
+        CommitAccess::Never
     } else if principal.permissions.read_topics {
-        GroupCreation::Any
+        CommitAccess::Any
     } else if principal.topic_reads.is_empty() {
-        GroupCreation::Never
+        CommitAccess::Never
     } else {
-        GroupCreation::Scoped(Arc::clone(&principal.topic_reads))
+        CommitAccess::Scoped(Arc::clone(&principal.topic_reads))
     }
 }
 

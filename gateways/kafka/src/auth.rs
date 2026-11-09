@@ -208,8 +208,8 @@ pub struct AuthenticatedPrincipal {
     /// the user failed.
     pub user: Option<UserKey>,
     pub permissions: PrincipalPermissions,
-    /// The topics that the principal's stream and topic grants let it read. A commit checks them
-    /// before it creates the Iggy group that holds a Kafka group's offsets.
+    /// The topics that the principal's stream and topic grants let it read. Each commit checks
+    /// them.
     pub topic_reads: Arc<TopicReads>,
     /// Whether [`Self::permissions`] and [`Self::topic_reads`] are a real answer or a fallback.
     ///
@@ -648,7 +648,7 @@ impl Grants {
 /// `get_topic` in `core/metadata/src/permissioner/permissioner_rules/`. A global grant covers
 /// every topic, and [`PrincipalPermissions::read_topics`] holds it. A stream grant covers the
 /// topics of its stream, and a topic grant its topic. Kafka has no resource above a topic, so only
-/// the creation of groups reads these.
+/// `OffsetCommit` reads these.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TopicReads {
     /// Streams whose every topic the principal may read.

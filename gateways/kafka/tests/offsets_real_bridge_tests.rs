@@ -29,6 +29,7 @@ mod wire;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use iggy::prelude::{
@@ -43,7 +44,8 @@ use iggy_gateway_kafka::bridge::{IggyBridge, OFFSET_GROUP_PREFIX};
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::acl::PrincipalPermissions;
 use iggy_gateway_kafka::protocol::api::{
-    ConnectionState, ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_NONE, GatewayState,
+    ConnectionState, ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_NONE,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::{offset_commit, offset_fetch};
 
@@ -266,12 +268,12 @@ async fn given_a_commit_the_offset_should_live_under_an_external_group_in_iggy()
     assert_eq!(stored(Consumer::group(group)).await, None);
 }
 
-/// A principal that may poll but holds no read or manage permission on topics or streams creates
-/// no group, as Iggy creates none for such a user. It still commits to a group that exists. A
-/// listener that authenticates no one creates groups as before.
+/// A principal that may poll but holds no read or manage permission on topics or streams commits
+/// nothing, also to a group that exists, as Iggy would create no group for it. A listener that
+/// authenticates no one commits as before.
 #[tokio::test]
 #[serial]
-async fn given_a_principal_without_a_read_permission_should_commit_only_to_groups_that_exist() {
+async fn given_a_principal_without_a_read_permission_should_commit_nothing() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     seed_topic(&server, "orders").await;
@@ -292,10 +294,6 @@ async fn given_a_principal_without_a_read_permission_should_commit_only_to_group
             .is_none(),
         "the refused commit creates no Iggy group"
     );
-    assert_eq!(
-        fetch(&state, "fresh", "orders").await,
-        (ERROR_NONE, UNKNOWN_OFFSET, ERROR_NONE)
-    );
 
     assert_eq!(
         commit_by(&state, Some(&principal(true)), "fresh", "orders", 8).await,
@@ -303,12 +301,12 @@ async fn given_a_principal_without_a_read_permission_should_commit_only_to_group
     );
     assert_eq!(
         commit_by(&state, Some(&poller), "fresh", "orders", 9).await,
-        ERROR_NONE,
-        "the group exists now"
+        ERROR_GROUP_AUTHORIZATION_FAILED,
+        "also once the group exists"
     );
     assert_eq!(
         fetch(&state, "fresh", "orders").await,
-        (ERROR_NONE, 9, ERROR_NONE)
+        (ERROR_NONE, 8, ERROR_NONE)
     );
 
     let anonymous = AuthenticatedPrincipal::anonymous();
@@ -334,16 +332,24 @@ fn on_stream(stream: usize, granted: StreamPermissions) -> Permissions {
 }
 
 /// Iggy creates a consumer group for a user with a read or manage grant on the topic's stream, or
-/// on the topic, and not only for one with a global grant. A principal with such a grant creates
-/// the group of its offsets there, and nowhere else.
+/// on the topic, and not only for one with a global grant. A principal with such a grant commits
+/// there, and nowhere else. The ids come from the change log, as the grants do.
 #[tokio::test]
 #[serial]
-async fn given_a_stream_or_topic_grant_should_create_groups_only_where_it_may_read() {
+async fn given_a_stream_or_topic_grant_should_commit_only_where_it_may_read() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     seed_topic(&server, "orders").await;
     seed_topic(&server, "refunds").await;
     let state = connected_state(&server).await;
+    let bridge = state.bridge.as_ref().expect("a bridge");
+    let shown = tokio::time::timeout(Duration::from_secs(10), async {
+        while bridge.topic_shape("orders").is_none() || bridge.topic_shape("refunds").is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(shown.is_ok(), "the change log shows both topics");
     let raw = iggy_server::raw_client(&server).await;
     let stream = raw
         .get_stream(&iggy_id("kafka"))
@@ -416,6 +422,11 @@ async fn given_a_stream_or_topic_grant_should_create_groups_only_where_it_may_re
         commit_by(&state, Some(&other_stream), "elsewhere", "orders", 7).await,
         ERROR_GROUP_AUTHORIZATION_FAILED,
         "a grant on another stream"
+    );
+    assert_eq!(
+        commit_by(&state, Some(&only_orders), "narrow", "gone", 8).await,
+        ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+        "a topic the change log does not show, which clients retry"
     );
 }
 

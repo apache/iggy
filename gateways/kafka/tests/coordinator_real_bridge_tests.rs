@@ -33,12 +33,14 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use iggy::prelude::{
     Consumer, ConsumerGroupClient, GlobalPermissions, Identifier, IggyMessage, MessageClient,
     Partitioning, Permissions, PollOptions, PollingStrategy, StreamClient, StreamCreateOptions,
     TopicClient, TopicCreateOptions, UserClient, UserCreateOptions, UserStatus,
 };
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
+use kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol;
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
 use kafka_protocol::messages::offset_commit_request::{
     OffsetCommitRequestPartition, OffsetCommitRequestTopic,
@@ -46,34 +48,36 @@ use kafka_protocol::messages::offset_commit_request::{
 use kafka_protocol::messages::offset_fetch_request::OffsetFetchRequestTopic;
 use kafka_protocol::messages::{
     CreateTopicsRequest, CreateTopicsResponse, DescribeGroupsRequest, DescribeGroupsResponse,
-    GroupId, MetadataRequest, MetadataResponse, OffsetCommitRequest, OffsetCommitResponse,
+    GroupId, JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse,
+    MetadataRequest, MetadataResponse, OffsetCommitRequest, OffsetCommitResponse,
     OffsetFetchRequest, OffsetFetchResponse, TopicName,
 };
 use kafka_protocol::protocol::StrBytes;
 use secrecy::SecretString;
 use serial_test::serial;
-use tokio::time::Instant;
+use tokio::sync::broadcast;
+use tokio::time::{Instant, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::auth::{AuthenticatedPrincipal, UserKey};
 use iggy_gateway_kafka::bridge::{
-    COORDINATOR_LEASE_GROUP, COORDINATOR_LOG_TOPIC, cluster_id_stream,
+    COORDINATOR_LEASE_GROUP, COORDINATOR_LOG_TOPIC, IggyBridgeConfig, cluster_id_stream,
 };
 use iggy_gateway_kafka::coordinator::record::{Body, Record};
 use iggy_gateway_kafka::coordinator::{
-    Coordination, CoordinationConfig, PARTITIONS, partition_of_group,
+    Coordination, CoordinationConfig, ExpiryStep, PARTITIONS, partition_of_group,
 };
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
-use iggy_gateway_kafka::listener::parse_brokers;
+use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol, parse_brokers};
 use iggy_gateway_kafka::protocol::acl::PrincipalPermissions;
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_CREATE_TOPICS, API_KEY_DESCRIBE_GROUPS, API_KEY_METADATA, API_KEY_OFFSET_COMMIT,
-    API_KEY_OFFSET_FETCH, ConnectionState, ERROR_COORDINATOR_LOAD_IN_PROGRESS,
-    ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_NOT_COORDINATOR,
-    GatewayState, handle_connection_request,
+    API_KEY_CREATE_TOPICS, API_KEY_DESCRIBE_GROUPS, API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP,
+    API_KEY_METADATA, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_FETCH, ConnectionState,
+    ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_NONE,
+    ERROR_NOT_CONTROLLER, ERROR_NOT_COORDINATOR, GatewayState, handle_connection_request,
 };
-use iggy_gateway_kafka::server::bind_listener;
-use iggy_gateway_kafka::{CoordinatorLog, GatewayConfig};
+use iggy_gateway_kafka::server::{BoundListener, bind_listener};
+use iggy_gateway_kafka::{CoordinatorLog, GatewayConfig, KafkaGateway};
 
 use gateways::{
     Gateway, SETTLE, TOPIC, agreed_coordinator, call, commit, connect, coordinators, create_topic,
@@ -582,32 +586,7 @@ async fn given_a_bridge_user_without_manage_servers_when_the_log_is_on_by_defaul
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     create_topic(server.test_config()).await;
-    let username = "no-servers";
-    raw_client(&server)
-        .await
-        .create_user(
-            username,
-            "no-servers-password",
-            UserStatus::Active,
-            Some(Permissions {
-                global: GlobalPermissions {
-                    manage_streams: true,
-                    read_streams: true,
-                    manage_topics: true,
-                    read_topics: true,
-                    poll_messages: true,
-                    send_messages: true,
-                    ..GlobalPermissions::default()
-                },
-                ..Permissions::default()
-            }),
-            &UserCreateOptions::default(),
-        )
-        .await
-        .expect("create the user");
-    let mut bridge = server.test_config();
-    bridge.username = username.to_string();
-    bridge.password = SecretString::from("no-servers-password");
+    let bridge = without_manage_servers(&server).await;
     let group = "fallback";
 
     let socket = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
@@ -714,7 +693,7 @@ async fn given_a_group_without_commits_for_the_retention_should_delete_its_offse
     let brokers = parse_brokers(&format!("1@{addr}")).expect("one listed gateway");
     let config = GatewayConfig {
         coordination: CoordinationConfig {
-            offsets_retention: retention,
+            offsets_retention: Some(retention),
             retention_check: Duration::from_millis(200),
             ..CoordinationConfig::default()
         },
@@ -780,59 +759,440 @@ async fn given_a_group_without_commits_for_the_retention_should_delete_its_offse
     gateway.stop().await;
 }
 
-/// A principal that may not create groups commits only to groups that exist. Its refused commit
-/// never reaches the log, so `OffsetFetch`, which the log answers, does not return it.
+/// A principal without a read or manage permission commits nothing, also once the group exists.
+/// Its refused commit never reaches the log, so `OffsetFetch`, which the log answers, does not
+/// return it.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn given_a_principal_that_may_not_create_groups_when_it_commits_to_a_new_group_should_log_nothing()
- {
+async fn given_a_principal_without_a_read_permission_when_it_commits_should_log_nothing() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     create_topic(server.test_config()).await;
-    let bridge = Arc::new(connect(server.test_config()).await);
-    // As a gateway starts: the cluster id creates the stream that the log lives in.
-    bridge.load_cluster_id().await.expect("load the cluster id");
-    let groups = GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new());
-    let coordination = Coordination::start(
-        &bridge,
-        groups.clone(),
-        1,
-        CoordinationConfig::default(),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("coordinate the groups");
-    let state = GatewayState::new(Some(bridge), 8 * 1024 * 1024, 1, groups)
-        .with_coordination(Arc::clone(&coordination));
+    let direct = Direct::start(&server, CoordinationConfig::default()).await;
     let poller = principal(false);
 
     let refused = eventually(SETTLE, "a coordinator for the group", || async {
-        let code = commit_by(&state, &poller, "fresh", 7).await;
+        let code = commit_by(&direct.state, Some(&poller), "fresh", 7).await;
         (code != ERROR_COORDINATOR_LOAD_IN_PROGRESS && code != ERROR_NOT_COORDINATOR)
             .then_some(code)
     })
     .await;
     assert_eq!(refused, ERROR_GROUP_AUTHORIZATION_FAILED);
     assert_eq!(
-        committed(&state, "fresh").await,
+        committed(&direct.state, "fresh").await,
         -1,
         "the log holds nothing"
     );
 
     assert_eq!(
-        commit_by(&state, &principal(true), "fresh", 8).await,
+        commit_by(&direct.state, Some(&principal(true)), "fresh", 8).await,
         ERROR_NONE
     );
     assert_eq!(
-        commit_by(&state, &poller, "fresh", 9).await,
-        ERROR_NONE,
-        "the group exists now"
+        commit_by(&direct.state, Some(&poller), "fresh", 9).await,
+        ERROR_GROUP_AUTHORIZATION_FAILED,
+        "also once the group exists"
     );
-    assert_eq!(committed(&state, "fresh").await, 9);
+    assert_eq!(committed(&direct.state, "fresh").await, 8);
 
-    coordination
-        .shutdown(Instant::now() + Duration::from_secs(5))
-        .await;
+    direct.stop().await;
+}
+
+/// A live group can go longer than the retention without a commit, as a consumer whose position
+/// does not move. Its offsets stay until a retention after its last member left, as Kafka counts
+/// it (KIP-211).
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn given_a_member_that_leaves_after_the_retention_should_keep_the_offsets_a_retention_longer()
+{
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    create_topic(server.test_config()).await;
+    let retention = Duration::from_secs(6);
+    let socket = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = socket.local_addr().expect("local addr");
+    let brokers = parse_brokers(&format!("1@{addr}")).expect("one listed gateway");
+    let config = GatewayConfig {
+        coordination: CoordinationConfig {
+            offsets_retention: Some(retention),
+            retention_check: Duration::from_millis(200),
+            ..CoordinationConfig::default()
+        },
+        ..gateway_config(1, brokers)
+    };
+    let gateway = start_gateway(server.test_config(), config, socket, addr).await;
+    let group = "steady";
+    agreed_coordinator(&[&gateway], group).await;
+    let (member_id, generation) = join_and_sync(addr, group).await;
+    assert_eq!(
+        commit(addr, group, &member_id, generation, 5, "").await,
+        ERROR_NONE
+    );
+    let committed_at = Instant::now();
+    while committed_at.elapsed() < retention + Duration::from_secs(1) {
+        assert_eq!(
+            heartbeat(addr, group, &member_id, generation).await,
+            ERROR_NONE
+        );
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    assert_eq!(leave(addr, group, &member_id).await, ERROR_NONE);
+    let left_at = Instant::now();
+    let raw = raw_client(&server).await;
+    // The log drops the group's state within 5 s of the leave, and a check runs every 200 ms.
+    while left_at.elapsed() < Duration::from_millis(5_500) {
+        assert!(
+            offset_group_exists(&raw, group).await,
+            "deleted {:?} after the leave",
+            left_at.elapsed()
+        );
+        assert_eq!(fetch(addr, group).await, (ERROR_NONE, 5, String::new()));
+        sleep(Duration::from_millis(250)).await;
+    }
+    eventually(
+        SETTLE,
+        "the deletion a retention after the leave",
+        || async { (!offset_group_exists(&raw, group).await).then_some(()) },
+    )
+    .await;
+    assert!(
+        left_at.elapsed() >= retention.saturating_sub(Duration::from_millis(500)),
+        "deleted {:?} after the leave, before the retention",
+        left_at.elapsed()
+    );
+
+    gateway.stop().await;
+}
+
+/// A group that commits on keeps its offsets, also when each commit repeats the last: the log
+/// writes such a commit again a quarter of the retention later, so its commit time stays fresh.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn given_a_group_that_commits_the_same_offset_past_the_retention_should_keep_it() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    create_topic(server.test_config()).await;
+    let retention = Duration::from_secs(2);
+    let direct = Direct::start(&server, expiry_config(retention)).await;
+    direct.first_commits(&["steady", "quiet"], 5).await;
+
+    let until = Instant::now() + retention + retention / 2;
+    while Instant::now() < until {
+        assert_eq!(direct.commit("steady", 5).await, ERROR_NONE);
+        sleep(Duration::from_millis(200)).await;
+    }
+    assert!(direct.coordination.expire_now().await);
+
+    let raw = raw_client(&server).await;
+    assert!(offset_group_exists(&raw, "steady").await);
+    assert_eq!(committed(&direct.state, "steady").await, 5);
+    assert!(
+        !offset_group_exists(&raw, "quiet").await,
+        "a group that stopped committing expires"
+    );
+    direct.stop().await;
+}
+
+/// A check finds the expired groups before it fences them. A group that a commit or a join reaches
+/// in between keeps its offsets.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn given_an_expired_group_when_it_commits_or_joins_before_the_fence_should_keep_its_offsets()
+{
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    create_topic(server.test_config()).await;
+    let retention = Duration::from_secs(1);
+    let direct = Direct::start(&server, expiry_config(retention)).await;
+    direct.first_commits(&["committer", "joiner"], 3).await;
+    sleep(retention + Duration::from_millis(200)).await;
+
+    let hold = direct.coordination.hold_expiry(ExpiryStep::Found).await;
+    let check = direct.check_until(ExpiryStep::Found).await;
+    assert_eq!(direct.commit("committer", 4).await, ERROR_NONE);
+    assert_eq!(join(&direct.state, "joiner").await, ERROR_NONE);
+    drop(hold);
+    assert!(check.await.expect("the check ends"));
+
+    let raw = raw_client(&server).await;
+    for group in ["committer", "joiner"] {
+        assert!(offset_group_exists(&raw, group).await, "{group}");
+    }
+    assert_eq!(committed(&direct.state, "committer").await, 4);
+    assert_eq!(committed(&direct.state, "joiner").await, 3);
+    direct.stop().await;
+}
+
+/// While a check deletes a group's offsets, its commits and joins answer 14, which clients retry,
+/// so none lands in what the deletion wipes. Once the deletion ends, the group starts from
+/// scratch.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn given_an_expiry_in_flight_when_its_group_commits_or_joins_should_wait_for_it() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    create_topic(server.test_config()).await;
+    let retention = Duration::from_secs(1);
+    let direct = Direct::start(&server, expiry_config(retention)).await;
+    direct.first_commits(&["gone"], 3).await;
+    sleep(retention + Duration::from_millis(200)).await;
+
+    let hold = direct.coordination.hold_expiry(ExpiryStep::Fenced).await;
+    let check = direct.check_until(ExpiryStep::Fenced).await;
+    assert_eq!(
+        direct.commit("gone", 6).await,
+        ERROR_COORDINATOR_LOAD_IN_PROGRESS
+    );
+    assert_eq!(
+        join(&direct.state, "gone").await,
+        ERROR_COORDINATOR_LOAD_IN_PROGRESS
+    );
+    drop(hold);
+    assert!(check.await.expect("the check ends"));
+
+    let raw = raw_client(&server).await;
+    assert!(!offset_group_exists(&raw, "gone").await);
+    assert_eq!(committed(&direct.state, "gone").await, -1);
+    assert_eq!(direct.commit("gone", 7).await, ERROR_NONE);
+    assert_eq!(committed(&direct.state, "gone").await, 7);
+    direct.stop().await;
+}
+
+/// One check takes at most `expiries_per_check` groups, `expiries_per_deletion` at a time, and the
+/// next check takes the rest.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn given_more_expired_groups_than_a_check_takes_should_expire_them_over_several_checks() {
+    const COUNTED: &[&str] = &["a0", "a1", "a2", "a3", "a4"];
+    const PROBED: &[&str] = &["b0", "b1", "b2", "b3", "b4"];
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    create_topic(server.test_config()).await;
+    let retention = Duration::from_secs(1);
+    let config = CoordinationConfig {
+        expiries_per_check: 3,
+        expiries_per_deletion: 2,
+        ..expiry_config(retention)
+    };
+    let direct = Direct::start(&server, config).await;
+    let raw = raw_client(&server).await;
+    let held = |groups: &'static [&'static str]| {
+        let raw = &raw;
+        async move {
+            let mut held = 0;
+            for group in groups {
+                held += usize::from(offset_group_exists(raw, group).await);
+            }
+            held
+        }
+    };
+
+    direct.first_commits(COUNTED, 1).await;
+    sleep(retention + Duration::from_millis(200)).await;
+    assert!(direct.coordination.expire_now().await);
+    assert_eq!(held(COUNTED).await, 2, "one check takes 3 groups");
+    assert!(direct.coordination.expire_now().await);
+    assert_eq!(held(COUNTED).await, 0, "the next takes the rest");
+
+    direct.first_commits(PROBED, 1).await;
+    sleep(retention + Duration::from_millis(200)).await;
+    let hold = direct.coordination.hold_expiry(ExpiryStep::Fenced).await;
+    let check = direct.check_until(ExpiryStep::Fenced).await;
+    let mut fenced = 0;
+    for group in PROBED {
+        fenced += usize::from(direct.commit(group, 2).await == ERROR_COORDINATOR_LOAD_IN_PROGRESS);
+    }
+    drop(hold);
+    assert!(check.await.expect("the check ends"));
+    assert_eq!(fenced, 2, "one deletion fences 2 groups");
+    assert_eq!(
+        held(PROBED).await,
+        3,
+        "the groups that committed meanwhile stay"
+    );
+    direct.stop().await;
+}
+
+/// A gateway that falls back to running without the coordinator log refuses an offsets
+/// retention, which only the log keeps, rather than ignore it.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn given_an_offsets_retention_when_the_gateway_falls_back_without_the_log_should_refuse_it() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = without_manage_servers(&server).await;
+    let socket = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = socket.local_addr().expect("local addr");
+    let brokers = parse_brokers(&format!("1@{addr}")).expect("one listed gateway");
+    let config = GatewayConfig {
+        coordinator_log: CoordinatorLog::Preferred,
+        coordination: CoordinationConfig {
+            offsets_retention: Some(Duration::from_mins(60)),
+            ..CoordinationConfig::default()
+        },
+        ..gateway_config(1, brokers)
+    };
+    let listener = BoundListener::new(
+        ListenerConfig::new(SecurityProtocol::Plaintext, addr.to_string()),
+        socket,
+    );
+    let gateway = KafkaGateway::new(config).with_bridge(Some(Arc::new(connect(bridge).await)));
+    let (_shutdown, receiver) = broadcast::channel(1);
+
+    let ran = timeout(SETTLE, gateway.run(vec![listener], receiver))
+        .await
+        .expect("the gateway stops at once");
+
+    let error = ran.expect_err("the retention is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("IGGY_KAFKA_OFFSETS_RETENTION_MINUTES"),
+        "{error}"
+    );
+}
+
+/// A gateway's coordination without its listener, driven through its handlers, so a test reaches
+/// its expiry checks.
+struct Direct {
+    state: GatewayState,
+    coordination: Arc<Coordination>,
+}
+
+impl Direct {
+    async fn start(server: &TestServer, config: CoordinationConfig) -> Self {
+        let bridge = Arc::new(connect(server.test_config()).await);
+        // As a gateway starts: the cluster id creates the stream that the log lives in.
+        bridge.load_cluster_id().await.expect("load the cluster id");
+        let groups = GroupCoordinator::new(
+            GroupCoordinatorConfig {
+                initial_rebalance_delay: Duration::ZERO,
+                ..GroupCoordinatorConfig::default()
+            },
+            CancellationToken::new(),
+        );
+        let coordination =
+            Coordination::start(&bridge, groups.clone(), 1, config, CancellationToken::new())
+                .await
+                .expect("coordinate the groups");
+        let state = GatewayState::new(Some(bridge), 8 * 1024 * 1024, 1, groups)
+            .with_coordination(Arc::clone(&coordination));
+        Self {
+            state,
+            coordination,
+        }
+    }
+
+    async fn stop(self) {
+        self.coordination
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await;
+    }
+
+    /// Commits `offset` for `group` on a listener that names no principal.
+    async fn commit(&self, group: &str, offset: i64) -> i16 {
+        commit_by(&self.state, None, group, offset).await
+    }
+
+    /// Commits `offset` for each of `groups`, once this gateway serves their partitions.
+    async fn first_commits(&self, groups: &[&str], offset: i64) {
+        for group in groups {
+            let code = eventually(SETTLE, "a coordinator for the group", || async {
+                let code = self.commit(group, offset).await;
+                (code != ERROR_COORDINATOR_LOAD_IN_PROGRESS && code != ERROR_NOT_COORDINATOR)
+                    .then_some(code)
+            })
+            .await;
+            assert_eq!(code, ERROR_NONE, "{group}");
+        }
+    }
+
+    /// Starts an expiry check, and returns once it waits at `step`, which the caller holds.
+    async fn check_until(&self, step: ExpiryStep) -> tokio::task::JoinHandle<bool> {
+        let coordination = Arc::clone(&self.coordination);
+        let check = tokio::spawn(async move { coordination.expire_now().await });
+        timeout(SETTLE, self.coordination.expiry_waiting_at(step))
+            .await
+            .expect("the check reaches the held step");
+        check
+    }
+}
+
+/// A retention of `retention`, and checks only when a test runs one.
+fn expiry_config(retention: Duration) -> CoordinationConfig {
+    CoordinationConfig {
+        offsets_retention: Some(retention),
+        retention_check: Duration::from_hours(1),
+        ..CoordinationConfig::default()
+    }
+}
+
+/// A bridge config for a new Iggy user that may do all but read Iggy's metadata change log.
+async fn without_manage_servers(server: &TestServer) -> IggyBridgeConfig {
+    let username = "no-servers";
+    raw_client(server)
+        .await
+        .create_user(
+            username,
+            "no-servers-password",
+            UserStatus::Active,
+            Some(Permissions {
+                global: GlobalPermissions {
+                    manage_streams: true,
+                    read_streams: true,
+                    manage_topics: true,
+                    read_topics: true,
+                    poll_messages: true,
+                    send_messages: true,
+                    ..GlobalPermissions::default()
+                },
+                ..Permissions::default()
+            }),
+            &UserCreateOptions::default(),
+        )
+        .await
+        .expect("create the user");
+    let mut bridge = server.test_config();
+    bridge.username = username.to_string();
+    bridge.password = SecretString::from("no-servers-password");
+    bridge
+}
+
+/// A member joins `group` through `state`. Its code.
+async fn join(state: &GatewayState, group: &str) -> i16 {
+    let request = JoinGroupRequest::default()
+        .with_group_id(GroupId(StrBytes::from_string(group.to_string())))
+        .with_session_timeout_ms(30_000)
+        .with_rebalance_timeout_ms(30_000)
+        .with_member_id(StrBytes::new())
+        .with_protocol_type(StrBytes::from_static_str("consumer"))
+        .with_protocols(vec![
+            JoinGroupRequestProtocol::default()
+                .with_name(StrBytes::from_static_str("range"))
+                .with_metadata(Bytes::from_static(b"subscription")),
+        ]);
+    let body = handle_connection_request(
+        state,
+        &ConnectionState::default(),
+        None,
+        API_KEY_JOIN_GROUP,
+        3,
+        wire::encode(&request, 3),
+    )
+    .await
+    .expect_response("JoinGroup answers");
+    let response: JoinGroupResponse = wire::decode(body, 3);
+    response.error_code
+}
+
+/// Member `member_id` leaves `group` at `addr`. Its code.
+async fn leave(addr: std::net::SocketAddr, group: &str, member_id: &StrBytes) -> i16 {
+    let request = LeaveGroupRequest::default()
+        .with_group_id(GroupId(StrBytes::from_string(group.to_string())))
+        .with_member_id(member_id.clone());
+    let response: LeaveGroupResponse = call(addr, API_KEY_LEAVE_GROUP, 1, &request).await;
+    response.error_code
 }
 
 /// Whether Iggy holds the group that keeps the offsets of Kafka group `group` on [`TOPIC`].
@@ -870,7 +1230,7 @@ fn principal(read_topics: bool) -> AuthenticatedPrincipal {
 /// partition's code.
 async fn commit_by(
     state: &GatewayState,
-    principal: &AuthenticatedPrincipal,
+    principal: Option<&AuthenticatedPrincipal>,
     group: &str,
     offset: i64,
 ) -> i16 {
@@ -889,7 +1249,7 @@ async fn commit_by(
     let body = handle_connection_request(
         state,
         &ConnectionState::default(),
-        Some(principal),
+        principal,
         API_KEY_OFFSET_COMMIT,
         7,
         wire::encode(&request, 7),

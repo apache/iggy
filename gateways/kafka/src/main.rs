@@ -385,7 +385,7 @@ fn load_config() -> Result<GatewayConfig, String> {
     config.coordinator_log = load_coordinator_log(&config, bridge_enabled()?)?;
     if let Some(raw) = env_var("IGGY_KAFKA_OFFSETS_RETENTION_MINUTES") {
         config.coordination.offsets_retention =
-            load_offsets_retention(&raw, config.coordinator_log)?;
+            Some(load_offsets_retention(&raw, config.coordinator_log)?);
     }
     config.auto_topic_creation = load_auto_topic_creation(bridge_enabled()?)?;
     if config.auto_topic_creation.enabled {
@@ -438,7 +438,8 @@ fn load_coordinator_log(
 
 /// `IGGY_KAFKA_OFFSETS_RETENTION_MINUTES`, Kafka's `offsets.retention.minutes`. Only the
 /// coordinator log knows when a group last committed, so without it no offset expires, and the
-/// variable is refused rather than ignored.
+/// variable is refused rather than ignored: here, and by a gateway that falls back to running
+/// without the log.
 fn load_offsets_retention(raw: &str, log: CoordinatorLog) -> Result<Duration, String> {
     if log == CoordinatorLog::Off {
         return Err(
@@ -1000,7 +1001,7 @@ mod tests {
         .expect("a retention with the log loads");
         assert_eq!(
             config.coordination.offsets_retention,
-            Duration::from_mins(90)
+            Some(Duration::from_mins(90))
         );
 
         let unset = load_with(&[
@@ -1008,8 +1009,9 @@ mod tests {
             ("IGGY_KAFKA_COORDINATOR_LOG", "true"),
         ])
         .expect("the log loads without a retention");
+        assert_eq!(unset.coordination.offsets_retention, None);
         assert_eq!(
-            unset.coordination.offsets_retention,
+            unset.coordination.retention(),
             Duration::from_hours(24 * 7),
             "Kafka's offsets.retention.minutes default"
         );

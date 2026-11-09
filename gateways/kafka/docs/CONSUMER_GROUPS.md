@@ -293,9 +293,9 @@ a warning. A gateway with `IGGY_KAFKA_COORDINATOR_LOG=true` does not start. The 
   the checkpoint's chunks, so a commit waits for one chunk at most. Iggy keeps the log for 2 days.
 - A commit equal to the logged one writes nothing, until the logged one reaches its refresh age.
   That age is an hour, or a quarter of the offsets retention, whichever is less.
-- The owner deletes the offsets of a group without members 7 days after its last commit, Kafka's
-  `offsets.retention.minutes` default (`IGGY_KAFKA_OFFSETS_RETENTION_MINUTES`). It deletes them
-  in Iggy first, then in the log
+- The owner deletes the offsets of a group without members 7 days after its last commit or after
+  its last member left, whichever is later (`IGGY_KAFKA_OFFSETS_RETENTION_MINUTES`, Kafka's
+  `offsets.retention.minutes`). It deletes them in Iggy first, then in the log
   ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md#more-than-one-gateway)).
 - Every record starts with a format version, a kind, its claim and the last checkpoint, and a
   claim's body starts with its node id, in every version. So an older gateway still sees a newer

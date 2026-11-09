@@ -31,13 +31,14 @@ mod tcp;
 #[path = "common/wire.rs"]
 mod wire;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy::prelude::{
-    GlobalPermissions, Identifier, IggyClient, Permissions, SystemClient, TopicClient, UserClient,
-    UserCreateOptions, UserStatus,
+    ConsumerGroupClient, GlobalPermissions, Identifier, IggyClient, Permissions, StreamClient,
+    StreamPermissions, SystemClient, TopicClient, UserClient, UserCreateOptions, UserStatus,
 };
 use secrecy::SecretString;
 use serial_test::serial;
@@ -51,8 +52,8 @@ use iggy_gateway_kafka::bridge::{IggyBridge, IggyBridgeConfig, OffsetGroupSource
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::listener::SecurityProtocol;
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_LIST_GROUPS, API_KEY_OFFSET_COMMIT, ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_NONE,
-    GatewayState, handle_request_bounded,
+    API_KEY_LIST_GROUPS, API_KEY_OFFSET_COMMIT, ERROR_COORDINATOR_LOAD_IN_PROGRESS,
+    ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_NONE, GatewayState, handle_request_bounded,
 };
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
@@ -389,6 +390,124 @@ async fn given_a_sasl_connection_when_its_user_changes_should_take_the_change_an
         "the connection of a deleted user closes, got {read:?}"
     );
     drop(shutdown);
+}
+
+/// A user whose only grant is to read one stream signs in over SASL. Its first commit creates
+/// the Iggy group of its offsets there, and once the grant goes, its next commit answers 30 on
+/// the open connection.
+#[tokio::test]
+#[serial]
+async fn given_a_sasl_user_with_a_stream_grant_should_commit_until_the_grant_goes() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    seed_topic(&server, "orders").await;
+    let raw = iggy_server::raw_client(&server).await;
+    let kafka = Identifier::named("kafka").expect("a stream name");
+    let stream_id = raw
+        .get_stream(&kafka)
+        .await
+        .expect("read the stream")
+        .expect("the stream exists")
+        .id;
+    let reads_stream = Permissions {
+        global: GlobalPermissions::default(),
+        streams: Some(BTreeMap::from([(
+            usize::try_from(stream_id).expect("a stream id fits usize"),
+            StreamPermissions {
+                read_stream: true,
+                ..StreamPermissions::default()
+            },
+        )])),
+    };
+    let alice = raw
+        .create_user(
+            "alice",
+            PASSWORD,
+            UserStatus::Active,
+            Some(reads_stream),
+            &UserCreateOptions::default(),
+        )
+        .await
+        .expect("create alice")
+        .id;
+    let bridge = Arc::new(
+        IggyBridge::connect(server.test_config())
+            .await
+            .expect("bridge should connect"),
+    );
+    assert!(
+        wait_for(|| bridge.topic_shape("orders").is_some()).await,
+        "the change log shows the topic"
+    );
+    let address = server.test_config().address;
+    let config = GatewayConfig {
+        listeners: vec![server::listener(SecurityProtocol::SaslPlaintext)],
+        ..GatewayConfig::default()
+    };
+    let gateway_bridge = Arc::clone(&bridge);
+    let (addresses, shutdown) = server::spawn_gateway(
+        move |config| {
+            KafkaGateway::new(config)
+                .with_authenticator(Arc::new(IggyAuthenticator::new(address)))
+                .with_bridge(Some(gateway_bridge))
+        },
+        config,
+    );
+    let mut stream = TcpStream::connect(addresses[0]).await.expect("connect");
+    authenticate(&mut stream, "alice").await;
+
+    let first = commit_on(&mut stream, 3, "reporting", "orders").await;
+    let created = raw
+        .get_consumer_group(
+            &kafka,
+            &Identifier::named("orders").expect("a topic name"),
+            &Identifier::named("kafka.cg.reporting").expect("a group name"),
+        )
+        .await
+        .expect("read the group")
+        .is_some();
+    raw.update_permissions(
+        &Identifier::numeric(alice).expect("a user id"),
+        Some(Permissions::default()),
+    )
+    .await
+    .expect("revoke the stream grant");
+    let started = Instant::now();
+    let mut refused = ERROR_NONE;
+    let mut correlation_id = 4;
+    while refused == ERROR_NONE && started.elapsed() < ABOUT_A_SECOND * 4 {
+        sleep(Duration::from_millis(50)).await;
+        refused = commit_on(&mut stream, correlation_id, "reporting", "orders").await;
+        correlation_id += 1;
+    }
+
+    assert_eq!(first, ERROR_NONE, "the stream grant covers the topic");
+    assert!(created, "the commit creates the Iggy group");
+    assert_eq!(
+        refused, ERROR_GROUP_AUTHORIZATION_FAILED,
+        "the grant is gone"
+    );
+    drop(shutdown);
+}
+
+/// Commits offset 1 for partition 0 of `topic` in `group` on `stream`. The partition's code.
+async fn commit_on(stream: &mut TcpStream, correlation_id: i32, group: &str, topic: &str) -> i16 {
+    let body = build_offset_commit_request(COMMIT_VERSION, group, topic, 1);
+    let response = send(
+        stream,
+        API_KEY_OFFSET_COMMIT,
+        COMMIT_VERSION,
+        correlation_id,
+        &body,
+    )
+    .await;
+    let mut d = Decoder::new(response);
+    let _throttle_time_ms = d.read_i32().expect("throttle_time_ms");
+    assert_eq!(d.read_varint().expect("topics"), 2, "one topic");
+    let _name = d.read_compact_nullable_string().expect("topic name");
+    assert_eq!(d.read_varint().expect("partitions"), 2, "one partition");
+    let _index = d.read_i32().expect("partition_index");
+    d.read_i16().expect("error_code")
 }
 
 /// Polls `done` every 50 ms for up to four times [`ABOUT_A_SECOND`]. Whether it held.
