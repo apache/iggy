@@ -662,6 +662,10 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     }
 
     async fn drop_tail(&mut self, from_op: u64) -> io::Result<()> {
+        let dropped_segments = self
+            .written_segment_references(from_op)
+            .map(|(_, reference)| reference.start_offset)
+            .collect();
         self.rewrite(
             self.state.checkpoint,
             self.state.checkpoint_checksum,
@@ -669,7 +673,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             None,
         )
         .await?;
-        self.truncate_segment_tail().await
+        self.truncate_segment_tail(&dropped_segments).await
     }
 
     /// Synchronize required materialized files before removing their WAL coverage.
@@ -3436,7 +3440,7 @@ mod tests {
                 .len(),
             BODY_BYTES as u64
         );
-        assert!(partition.path().join("00000000000000000002.log").exists());
+        assert!(!partition.path().join("00000000000000000002.log").exists());
         let replacement = segment_prepare(2, first.header().checksum, 1, BODY_BYTES / 2);
         journal
             .append(replacement.clone().into_frozen())
@@ -3492,6 +3496,84 @@ mod tests {
         let recovered = journal.prepares().await.unwrap();
         assert_eq!(recovered[0].as_slice(), first.as_slice());
         assert_eq!(recovered[1].as_slice(), replacement.as_slice());
+    }
+
+    #[compio::test]
+    async fn given_a_rewind_across_two_rolls_when_the_replacement_rolls_elsewhere_should_leave_no_orphan_segment()
+     {
+        const BODY_BYTES: usize = 8192;
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), (2 * BODY_BYTES) as u64)
+            .await
+            .unwrap();
+        let first = segment_prepare(1, 0, 0, BODY_BYTES);
+        journal.append(first.clone().into_frozen()).await.unwrap();
+        let mut parent = first.header().checksum;
+        for (op, offset) in (2..=5).zip(1..) {
+            let dropped = segment_prepare(op, parent, offset, BODY_BYTES);
+            parent = dropped.header().checksum;
+            journal.append(dropped.into_frozen()).await.unwrap();
+        }
+        assert_eq!(
+            segment_names(partition.path()),
+            [
+                "00000000000000000000.log",
+                "00000000000000000002.log",
+                "00000000000000000004.log"
+            ]
+        );
+
+        journal.truncate_from(2).await.unwrap();
+        // Shorter bodies fill segment 0 through offset 2, so the replacement
+        // rolls at 3 and the dropped segment at 2 would sit inside segment 0.
+        let mut replacements = Vec::new();
+        let mut parent = first.header().checksum;
+        for (op, offset, body) in [
+            (2, 1, BODY_BYTES / 2),
+            (3, 2, BODY_BYTES / 2),
+            (4, 3, BODY_BYTES),
+        ] {
+            let replacement = segment_prepare(op, parent, offset, body);
+            parent = replacement.header().checksum;
+            journal
+                .append(replacement.clone().into_frozen())
+                .await
+                .unwrap();
+            replacements.push(replacement);
+        }
+        let expected = ["00000000000000000000.log", "00000000000000000003.log"];
+        assert_eq!(segment_names(partition.path()), expected);
+        drop(journal);
+
+        let journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(segment_names(partition.path()), expected);
+        let recovered = journal.prepares().await.unwrap();
+        assert_eq!(recovered.len(), 4);
+        assert_eq!(recovered[0].as_slice(), first.as_slice());
+        for (recovered, replacement) in recovered[1..].iter().zip(&replacements) {
+            assert_eq!(recovered.as_slice(), replacement.as_slice());
+        }
+    }
+
+    fn segment_names(partition: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(partition)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "log" || extension == "index")
+            })
+            .map(|path| path.file_name().unwrap().to_str().unwrap().to_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     #[compio::test]

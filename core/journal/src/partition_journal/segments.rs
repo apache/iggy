@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 use iggy_binary_protocol::batch::BatchHeader;
@@ -630,12 +631,31 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         Ok(())
     }
 
-    pub(super) async fn truncate_segment_tail(&mut self) -> io::Result<()> {
+    /// Roll the physical tail back to the published cursor and unlink the
+    /// public names of the `dropped_segments` the truncated suffix rolled into.
+    pub(super) async fn truncate_segment_tail(
+        &mut self,
+        dropped_segments: &BTreeSet<u64>,
+    ) -> io::Result<()> {
         let Some(segments) = self.state.segment_storage else {
             return Ok(());
         };
         self.poisoned = true;
         let cursor = segments.tail;
+        // A partition may already have rotated into the segment at `next_offset`,
+        // and the next batch rolls there again, replacing the name. A name above
+        // it holds only the dropped suffix. Left in place, a replacement that
+        // rolls elsewhere would cover it, and recovery refuses that overlap.
+        // Recovery also unlinks every name above the tail, so a crash that loses
+        // these unlinks needs no directory barrier.
+        let parent = self.segment_directory()?.to_path_buf();
+        for start_offset in dropped_segments.range((
+            Bound::Excluded(cursor.position.next_offset),
+            Bound::Unbounded,
+        )) {
+            self.remove_segment_name(&parent.join(format!("{start_offset:020}.log")))
+                .await?;
+        }
         let key = (cursor.generation, cursor.position.start_offset);
         if !self.segment_files.contains_key(&key) {
             let path = cursor.path(&self.directory);
@@ -652,8 +672,6 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 Err(error) => return Err(error),
             }
         }
-        // Live partitions own the public log/index names and may still hold their
-        // descriptors. Namespace reconciliation belongs to startup recovery.
         let file = self
             .segment_files
             .get(&key)
