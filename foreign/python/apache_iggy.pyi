@@ -3903,8 +3903,9 @@ class PartitionReader:
     - The reader stays usable after a `ReadError` and retries by itself. `HistoryUnavailable`
       (87) stops its partition until `seek()`. With `OnRead`, an unknown outcome stops its
       partition until `IggyClient.abandon_operation()` and `seek()`.
-    - The calls on one reader run one at a time, so a call waits for a pending `next()`.
-      `next()` is cancel safe: cancel it before `close()`.
+    - The calls on one reader run one at a time, so each call waits for the pending ones, and
+      `close()` waits for all of them. `next()` is cancel safe. Cancel a pending `next()` or
+      `commit()` before `close()`.
     - Dropping the reader stops its tasks without waiting, and it moves no offset back.
     - `async for` reads its batches until `close()`, and `async with` closes it on exit.
     """
@@ -3920,6 +3921,13 @@ class PartitionReader:
         Stores the offset of a checkpoint that this reader delivered, which covers every earlier
         message of its partition. A checkpoint of an older generation of its partition, or at or
         below the last commit of its generation, stores nothing.
+
+        When the offset store gets `ConsumerGroupPartitionNotOwned` (5009) for a partition that
+        the reader still has, `commit()` reads the owner of the partition again. The server can
+        refuse that read for a short time, and `commit()` repeats it after each such refusal, with
+        no time limit. To bound `commit()`, use `asyncio.wait_for()`. A cancelled `commit()` sends
+        nothing more, but a write that it already sent can still take effect. `close()` waits for
+        a pending `commit()`, so cancel it before `close()`.
 
         Raises `IggyError` with `InvalidCommand` (3) under `CommitPolicy.OnRead()` and for a
         checkpoint that this reader did not deliver, the errors of the offset store, and
@@ -4050,7 +4058,10 @@ class Partitioning:
 @typing.final
 class PendingOperationError(IggyError):
     r"""
-    An operation whose retained identity is needed to recover or release its lane.
+    An operation with an unknown outcome, or a call that such an operation blocks. `operation_id`
+    names the operation for `IggyClient.resolve_operation()` and `IggyClient.abandon_operation()`.
+    The client retains no operation for kind `not_retained`, and none for a group join that
+    `reader()` abandoned.
     """
     @property
     def operation_id(self) -> builtins.int: ...

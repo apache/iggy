@@ -275,10 +275,10 @@ try {
 
 - A consumer group reads the assignment of its member:
   `{ consumer: Consumer.Group('g') }` without `partitions` joins the group,
-  follows rebalances and leaves the group in `close()`. The reader resolves a
-  join with an unknown outcome before its next join. `close()` releases a join
-  that is still unknown in the client, and also a leave with an unknown
-  outcome. So neither blocks a later metadata write of the client. When the
+  follows rebalances and leaves the group in `close()`. The reader releases a
+  join with an unknown outcome in the client at once and joins again after
+  the retry interval. `close()` releases a leave with an unknown outcome the
+  same way. So neither blocks a later metadata write of the client. When the
   join of `open()` has an unknown outcome, `open()` releases it in the client
   and fails with it, so a later `open()` can join. A join that landed anyway
   keeps its member in the group until the session ends.
@@ -367,8 +367,10 @@ try {
   read for a write of `close({ signal })` stops 10 s after the close starts.
   If `signal` of the first call aborts earlier, the read stops at that abort.
   Each later write of the close then goes once without that read, and the
-  close still leaves the group. A second `close()` call waits for the first
-  one, and its signal does not stop the close. The read for
+  close still leaves the group. During an outage `close()` can take about one
+  30 s operation budget of the client for each partition with a pending
+  store. A second `close()` call waits for the first one, and its signal does
+  not stop the close. The read for
   `commit(checkpoint, { signal })` stops after `signal` aborts or `close()`
   starts. The read for a seek or an automatic store stops after `close()`
   starts. After such a stop, a reply to that read does not send the write
@@ -388,8 +390,11 @@ try {
   32 full batches, and larger configured budgets still apply. A budget that is
   NaN, infinite or negative is refused with error 3 before anything is sent.
   Without options a read waits up to 5 s. After a refused read, a lost read or
-  a failed refresh it waits `retryInterval`, 1 s by default. A `retryInterval`
-  that is not a finite number above 0 is refused with error 3 too.
+  a failed refresh it waits `retryInterval`, 1 s by default. While a refresh
+  of the group assignment fails or gets no answer, the reader reads on under
+  its last assignment. After a new session or a lost membership, it starts no
+  read until a refresh confirmed the assignment. A `retryInterval` that is not
+  a finite number above 0 is refused with error 3 too.
 - With `CommitPolicy.OnRead` the server stores the offset of each read before
   the application takes its batch. A crash, or a reader that stops without
   `close()`, loses the batches that the reader held: up to the effective
@@ -436,7 +441,9 @@ await consumer.shutdown();
   whose `skip` passes it with `seek`. A `resumable` stop reads again after a
   `seek` to Next. A stop while a committing read that lost its reply is still
   pending reports that read as 14010 instead, since a seek to Next would skip
-  what it stored.
+  what it stored. A lost range (`lost`, error 14010) ends the iteration with
+  its `ReadError` too. The reader reads on after that range, so a new
+  iteration hands over the messages after it.
 - `toReadable()` takes the next message only when its own reader asks for it,
   and destroying it shuts the consumer down.
 

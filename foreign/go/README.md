@@ -364,16 +364,18 @@ It groups the partitions by their primary and reads the partitions of a group to
 It puts the partitions that a read served last at the end of the next one so a busy partition does not starve the others, and spreads the partitions that hold more messages than their last read returned over the free prefetch slots, one read each with the whole `Count` and `MaxBytes`, while the quiet partitions of a group share one read that waits on the server.
 
 Under `OnReadCommit` every read stores, so a group holds one read that waits at a time, and a waiting `Next` fills the free slots with the backlogged partitions, one committing read per partition.
+The reader asks for the first unread message of a partition with no wait on the server.
+Without one, it asks again after each retry interval, so that message can arrive up to one retry interval late.
 
 It regroups after a primary moves, keeps a prefetch, and stays usable after an error. If a lookup of the groups fails, the partitions read on with the last good groups, and the lookup runs again after the retry interval. A partition that its primary refused waits for the end of the next lookup.
 
 A standalone consumer names its partitions with `reader.WithPartitions`.
 A consumer group reader joins its group, follows its assignment and leaves the group in `Close`.
 A join or a leave with an unknown outcome blocks the metadata writes of the client, also the writes of the application.
-The reader resolves such a join before its next sync.
-`Close` abandons a join that is still unknown, and a leave with an unknown outcome.
-If the first join has an unknown outcome, `reader.NewPartitionReader` abandons it and returns the error.
+So the reader abandons such a join at once, and `Close` abandons such a leave.
+If the first join has an unknown outcome, `reader.NewPartitionReader` returns the error.
 If that join landed, the client stays a member of the group until its session ends.
+After a lost session the reader joins again. If that join has an unknown outcome, the next sync shows whether it landed, and the reader joins once more if it did not.
 A later or concurrent `Close` waits for the first one and returns its result.
 If its own context ends first, it returns the error of that context.
 
@@ -448,11 +450,12 @@ The reader reads the partition once without a store, for the owner that the serv
 and sends the write once more under that owner.
 It retries a transient refusal of that read until the caller of the write cancels.
 The refusal of a primary that moved is transient too.
+The start of `Close` ends the retry of a `Commit` too. That `Commit` returns its first error and stores nothing more.
 For a seek whose context ended, and for an `AutoCommitPolicy` store in the background, the caller is the reader.
 So when `Close` starts, their retry ends, and the logger reports the error.
 If that read is refused otherwise, or reads another history of the partition, the write fails with its first error.
 
-At the end of the context of the first `Close`, or 10 s after its start, `Close` stops its reads for the installed owner. Each write that needs such a read then fails with its first error. The other writes of `Close` and the leave still go once, within the request timeout of the client.
+At the end of the context of the first `Close`, or 10 s after its start, `Close` stops its reads for the installed owner. Each write that needs such a read then fails with its first error. The other writes of `Close` and the leave still go once, within the request timeout of the client. `Close` sends these writes one after the other. So during an outage it can take about one request timeout for each partition with a pending store.
 
 ### Consumer
 

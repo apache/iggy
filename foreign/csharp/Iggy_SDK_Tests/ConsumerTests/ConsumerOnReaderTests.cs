@@ -334,6 +334,55 @@ public sealed class ConsumerOnReaderTests
     }
 
     /// <summary>
+    ///     A lost read stored offsets 4 and 5, and retention deleted them before the reader read them again. The
+    ///     reader reports that range once and stops no partition. The stream ends with that error, as the Rust
+    ///     consumer does, because nothing else tells the application of the loss. The next stream reads on after
+    ///     the range.
+    /// </summary>
+    [Fact]
+    public async Task given_on_read_with_a_lost_range_when_receiving_should_end_the_stream_with_the_range()
+    {
+        var log = new PartitionReaderTests.ScriptedLog { End = 4, RecoveryRetainsFrom = 14 };
+        await using var consumer = new IggyConsumer(log.Client(), new IggyConsumerConfig
+        {
+            StreamId = Stream,
+            TopicId = Topic,
+            Consumer = Consumer.New(4),
+            Partitions = [1],
+            PollOptions = new PollOptions
+            {
+                Count = 4,
+                MaxWait = TimeSpan.FromMilliseconds(100),
+                Commit = CommitPolicy.OnRead
+            },
+            RetryInterval = RetryInterval
+        }, NullLoggerFactory.Instance);
+        await consumer.InitAsync(Token);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(Token);
+        timeout.CancelAfter(PromptLimit);
+        List<ulong> offsets = [];
+
+        var error = await Assert.ThrowsAsync<ReadException>(async () =>
+        {
+            await foreach (var message in consumer.ReceiveAsync(timeout.Token))
+            {
+                offsets.Add(message.CurrentOffset);
+                if (message.CurrentOffset == 0)
+                {
+                    // The loss is armed first, so no read takes the new messages before it.
+                    log.LoseNextCommittingRead = true;
+                    log.End = 6;
+                }
+            }
+        });
+        var resumed = await ReceiveAsync(consumer, 1);
+
+        Assert.Equal([0ul, 1ul, 2ul, 3ul], offsets);
+        Assert.Equal((new OffsetRange(4, 5), false), (error.Lost, error.StopsPartition));
+        Assert.Equal([6ul], resumed.Select(message => message.CurrentOffset));
+    }
+
+    /// <summary>
     ///     The create of a missing group lands, but its reply is lost. The init fails with the unknown outcome and
     ///     releases the create in the client, so the later metadata writes of the client go out.
     /// </summary>

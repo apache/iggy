@@ -87,6 +87,8 @@ const SETTLED_READ_MS = GROUP_REFRESH_MS / 2;
 const TIMER_SLACK_MS = 50;
 /** The retry interval of a reader that gets an unserved reply, long enough to tell its pause from timer slack. */
 const UNSERVED_RETRY_MS = 200;
+/** The retry interval of a member whose rejoin loses its reply, so a write of the test comes before the next join. */
+const REJOIN_RETRY_MS = 200;
 /** A close reads for the installed owner of a refused write up to this long after it starts. */
 const CLOSE_BUDGET_MS = 10_000;
 /** How long `waitFor` waits for its condition by default. */
@@ -163,13 +165,9 @@ class FakeTopic {
   leaves = 0;
   /**
    * The next group write with this command code lands and then fails with an unknown outcome. The client keeps that
-   * operation, so each later group write fails with 14007 until the reader resolves or abandons it.
+   * operation, so each later group write fails with 14007 until the reader abandons it.
    */
   uncertainGroupWrite?: number;
-  /** A resolve of the group write with an unknown outcome finds its outcome unknown again. */
-  resolvesUncertain = false;
-  /** The operations that the reader resolved. */
-  readonly resolved: bigint[] = [];
   /** The group write with an unknown outcome that blocks the metadata lane of the client. */
   private metadataBlocker?: bigint;
   /** Fails every route lookup, as a client without a link does. */
@@ -307,11 +305,6 @@ class FakeTopic {
         this.abandoned.push(operationId);
         for (const [partition, blocking] of this.uncertainWrites)
           if (blocking === operationId) this.uncertainWrites.delete(partition);
-        if (this.metadataBlocker === operationId) this.metadataBlocker = undefined;
-      },
-      resolveOperation: async (operationId: bigint) => {
-        this.resolved.push(operationId);
-        if (this.resolvesUncertain) throw new OperationUncertainError(operationId, new Error('replay reply lost'));
         if (this.metadataBlocker === operationId) this.metadataBlocker = undefined;
       },
       destroy: () => {},
@@ -2458,6 +2451,38 @@ describe('partition reader', () => {
     });
   }
 
+  it('stores no counted checkpoint of a group partition that left and came back while an automatic store of ' +
+    'another partition waited', async () => {
+    const topic = new FakeTopic(10n);
+    topic.assigned = [1, 2];
+    const client = topic.client();
+    const reader = await PartitionReader.open(async () => client, {
+      streamId: 1, topicId: 2, consumer: { kind: ConsumerKind.Group, id: 5 }, retryInterval: 20,
+      options: { maxWait: 100, commit: CommitPolicy.Auto({ every: CommitEvery.Message, after: CommitAfter.Marked }) }
+    });
+    try {
+      const checkpoints = [(await nextOf(reader, 1)).checkpoint()!, (await nextOf(reader, 2)).checkpoint()!];
+      topic.holdOffsetWrites = true;
+      // Both marks come before the store loop runs, so one pass of it holds both checkpoints.
+      for (const checkpoint of checkpoints) reader.mark(checkpoint);
+      await waitFor(() => topic.heldOffsetWrites.length === 1, 'the store of partition 1 did not start');
+      topic.assigned = [1];
+      while (reader.partitions().includes(2)) await once(topic.emitter, 'synced');
+      // The worker waits for the store of the partition that left, so that store ends before the next sync.
+      await waitFor(() => topic.heldOffsetWrites.length === 2, 'the store of the partition that left did not start');
+      topic.heldOffsetWrites.pop()!();
+      topic.assigned = [1, 2];
+      while (!reader.partitions().includes(2)) await once(topic.emitter, 'synced');
+      // Another member moved the offset while the partition was away.
+      topic.stored.set(2, 7n);
+      topic.holdOffsetWrites = false;
+      topic.heldOffsetWrites.shift()!();
+    } finally {
+      await reader.close();
+    }
+    assert.deepEqual([topic.stored.get(2), topic.offsetStores], [7n, [1, 2]]);
+  });
+
   it('reads no batch on read after the only waiting next() aborts, so the server stores none that nobody takes',
     async () => {
       const topic = new FakeTopic(10n);
@@ -3232,6 +3257,43 @@ describe('partition reader', () => {
     }
   });
 
+  it('starts the count of refusals as not owned again at a served check of an on read start, so six such refusals ' +
+    'report no error and each waits one retry interval', async () => {
+    // Long enough to tell one retry interval from two despite timer slack.
+    const retryInterval = 200;
+    const topic = new FakeTopic(0n);
+    topic.assigned = [1];
+    const client = topic.client();
+    const send = client.sendCommand;
+    client.sendCommand = async (code, payload, options) => {
+      // The server refuses each other check as not owned and serves the one after it, so no two refusals are in a row.
+      if (code === COMMAND_CODE.PollMessagesDeferred && !topic.notOwned.delete(1)) topic.notOwned.add(1);
+      return send(code, payload, options);
+    };
+    const reader = await PartitionReader.open(async () => client, {
+      streamId: 1, topicId: 2, consumer: { kind: ConsumerKind.Group, id: 5 },
+      options: { maxWait: 100, commit: CommitPolicy.OnRead }, retryInterval
+    });
+    const reads = () => topic.reads.filter(({ partition }) => partition === 1).map(({ at }) => at);
+    const waiting = new AbortController();
+    // An on read reader reads only while a next() waits.
+    const ended = reader.next({ signal: waiting.signal }).then(() => undefined, (error: unknown) => error);
+    try {
+      await waitFor(() => reads().length >= 2 * MAX_LASTING_REFUSALS, 'the partition did not read after six refusals',
+        MAX_LASTING_REFUSALS * retryInterval + WAIT_MS);
+    } finally {
+      waiting.abort();
+      await reader.close();
+    }
+    const outcome = await ended;
+    const checks = reads();
+    const pauses = Array.from({ length: MAX_LASTING_REFUSALS }, (_, refusal) =>
+      checks[2 * refusal + 1] - checks[2 * refusal]);
+    assert.ok(!(outcome instanceof ReadError), `the reader reported a refusal: ${String(outcome)}`);
+    assert.ok(pauses.every((pause) => pause >= retryInterval - TIMER_SLACK_MS &&
+      pause < 2 * retryInterval - TIMER_SLACK_MS), `read again ${pauses.join(', ')} ms after each refusal`);
+  });
+
   it('reads a partition that the server refused as not owned at once after a session reset, and waits one retry ' +
     'interval after its next refusal', async () => {
     // Long enough to tell one retry interval from two despite timer slack.
@@ -3421,18 +3483,61 @@ describe('partition reader', () => {
       }
     });
 
-  it('resolves a join with an unknown outcome before it joins again, and reads on without a blocked lane', async () => {
+  for (const outcome of ['fails', 'never completes'] as const) {
+    it(`keeps reading its partition while each later sync of its assignment ${outcome}`, async () => {
+      const topic = new FakeTopic();
+      topic.assigned = [1];
+      const client = topic.client();
+      const send = client.sendCommand;
+      let syncs = 0;
+      let reads = 0;
+      let laterSyncStarted!: () => void;
+      const laterSync = new Promise<void>((resolve) => { laterSyncStarted = resolve; });
+      let endSync = () => {};
+      client.sendCommand = async (command, payload, options) => {
+        if (command === COMMAND_CODE.SyncGroup && ++syncs > 1) {
+          laterSyncStarted();
+          if (outcome === 'never completes') await new Promise<void>((resolve) => { endSync = resolve; });
+          throw responseError(command, TRANSIENT_NOT_ACCEPTED);
+        }
+        // The first read ends after a later sync started, so a second read can start only while that sync fails or
+        // waits for its answer.
+        const read = command === COMMAND_CODE.FetchMessages || command === COMMAND_CODE.PollMessagesDeferred;
+        if (read && ++reads === 1) await laterSync;
+        return send(command, payload, options);
+      };
+      const reader = await openGroup(client);
+      try {
+        assert.deepEqual(offsets([await nextOf(reader, 1)]), [0n, 1n]);
+        await waitFor(() => topic.reads.filter(({ partition }) => partition === 1).length > 1,
+          'the member did not read its partition again');
+      } finally {
+        endSync();
+        await reader.close();
+      }
+    });
+  }
+
+  it('releases a rejoin with an unknown outcome at once, so it blocks no metadata write of the client, and joins ' +
+    'again after its retry interval', async () => {
     const topic = new FakeTopic(0n);
     topic.assigned = [1];
-    const reader = await openGroup(topic.client());
+    const client = topic.client();
+    const reader = await PartitionReader.open(async () => client, {
+      streamId: 1, topicId: 2, consumer: { kind: ConsumerKind.Group, id: 5 }, options: { maxWait: 100 },
+      retryInterval: REJOIN_RETRY_MS
+    });
     try {
       topic.uncertainGroupWrite = COMMAND_CODE.JoinGroup;
       topic.emitter.emit('sessionReset');
       await waitFor(() => topic.joins.length === 2, 'the member did not join after the session reset');
+      await client.sendCommand(COMMAND_CODE.CreateGroup, Buffer.alloc(0))
+        .catch((error: unknown) => assert.fail(`the lost join blocked a metadata write: ${String(error)}`));
       topic.limit = 2n;
+      // The reads go on under the last assignment during the retry interval, so the batch can come before the join.
       const batch = await reader.next({ signal: AbortSignal.timeout(2_000) });
-      assert.deepEqual([offsets([batch]), topic.resolved, topic.joins.length],
-        [[0n, 1n], [UNCERTAIN_GROUP_OPERATION], 3]);
+      await waitFor(() => topic.joins.length === 3, 'the member did not join again after the lost join');
+      assert.deepEqual([offsets([batch]), topic.abandoned], [[0n, 1n], [UNCERTAIN_GROUP_OPERATION]]);
     } finally {
       await reader.close();
     }
@@ -3443,17 +3548,6 @@ describe('partition reader', () => {
       const reader = await openGroup(client);
       topic.uncertainGroupWrite = COMMAND_CODE.LeaveGroup;
       await reader.close();
-    }],
-    ['at the close a join whose resolves left its outcome unknown', async (topic: FakeTopic, client: RawClient) => {
-      const reader = await openGroup(client);
-      try {
-        topic.resolvesUncertain = true;
-        topic.uncertainGroupWrite = COMMAND_CODE.JoinGroup;
-        topic.emitter.emit('sessionReset');
-        await waitFor(() => topic.resolved.length > 0, 'the reader did not resolve the join');
-      } finally {
-        await reader.close();
-      }
     }],
     ['the join of an open with an unknown outcome', async (topic: FakeTopic, client: RawClient) => {
       topic.uncertainGroupWrite = COMMAND_CODE.JoinGroup;
@@ -3983,6 +4077,29 @@ describe('consumer', () => {
       assert.deepEqual([stopped.partitionId, (stopped.error as { errorCode: number }).errorCode,
         stopped.stopsPartition, stopped.resumable], [1, FETCH_PROGRESS_UNCERTAIN, true, true],
         'a seek to Next would skip what the lost read stored, so the stop reports that read');
+    } finally {
+      await consumer.shutdown();
+    }
+  });
+
+  it('ends the iteration with the error of a lost range, and a new iteration reads on after that range', async () => {
+    const topic = new FakeTopic(8n);
+    const errors: ReadError[] = [];
+    const consumer = new IggyConsumer(await open(topic, [1], { commit: CommitPolicy.OnRead }), undefined,
+      (error) => { errors.push(error); });
+    try {
+      const messages = consumer[Symbol.asyncIterator]();
+      const first = [await messages.next(), await messages.next()];
+      // The next read stores 2 and 3 and loses its reply, and the catch-up by offset finds them gone.
+      topic.loseNextCommittingRead = true;
+      topic.emptyOffsetReads = true;
+      const ended = await messages.next().then(() => undefined, (error: unknown) => error);
+      const resumed = await consumer[Symbol.asyncIterator]().next();
+
+      assert.deepEqual(first.map((read) => read.value?.message.headers.offset), [0n, 1n]);
+      assert.ok(ended instanceof ReadError, `the iteration did not end with the lost range: ${String(ended)}`);
+      assert.deepEqual([ended.partitionId, (ended.error as { errorCode: number }).errorCode, ended.lost,
+        resumed.value?.message.headers.offset, errors], [1, FETCH_PROGRESS_UNCERTAIN, { first: 2n, last: 3n }, 4n, []]);
     } finally {
       await consumer.shutdown();
     }

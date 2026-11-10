@@ -70,7 +70,9 @@ export type ConsumerGroupRequest = Omit<ConsumerRequest, 'partitions'>;
  * to `onError` and the consumer goes on. A stop of a partition
  * (`stopsPartition`) ends the iteration with its `ReadError`, and so does a
  * message that does not decode, whose `skip` passes it with `seek`. A
- * `resumable` stop reads again after a `seek` to Next.
+ * `resumable` stop reads again after a `seek` to Next. A lost range (`lost`)
+ * ends the iteration with its `ReadError` too. The reader reads on after
+ * that range, so a new iteration hands over the messages after it.
  */
 export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
   private uncounted?: { checkpoint: Checkpoint, endsBatch: boolean };
@@ -198,7 +200,7 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
         return await this.reader.next();
       } catch (error) {
         if (this.stopped && !(error instanceof ReadError)) return undefined;
-        if (!(error instanceof ReadError) || error.skip || error.stopsPartition) throw error;
+        if (!(error instanceof ReadError) || error.skip || error.stopsPartition || error.lost) throw error;
         this.onError?.(error);
       }
     }

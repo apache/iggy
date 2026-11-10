@@ -21,8 +21,8 @@
 //! applies a request twice.
 
 use crate::links::{
-    Frame, LateReply, Link, ReplicaLinks, Reply, Target, committing_cancel_requested, lost_link,
-    pause_before_retry, read_reply,
+    Frame, LateReply, Link, ReplicaLinks, Reply, Target, committing_cancel_requested,
+    committing_cancelled, lost_link, pause_before_retry, read_reply,
 };
 use crate::session_owner::{LaneKey, LaneTicket, RetainedOperation, SessionEpoch, SessionOwner};
 use crate::vsr::{decode_reply_for, reply_commit};
@@ -1914,12 +1914,18 @@ impl Call {
     }
 
     /// Sleeps before the next attempt, or less once `wake` resolves. Returns
-    /// false instead if the attempt cannot start before the deadline.
+    /// false instead if the attempt cannot start before the deadline, or if
+    /// the reader of a committing call cancels it.
     async fn pause(&mut self, wake: impl Future<Output = ()>) -> bool {
         let retry = self.retries;
         self.retries = retry.saturating_add(1);
         let deadline = self.attempt_deadline();
+        let committing = self.committing();
         tokio::select! {
+            biased;
+            // The refusal of a cancelled call is its answer. The cancel is
+            // first, so no attempt starts after it.
+            () = committing_cancelled(), if committing => false,
             resumed = pause_before_retry(retry, deadline, rand::random()) => resumed,
             () = wake => Instant::now() < deadline,
         }
@@ -2044,6 +2050,7 @@ async fn link_ready(mut ready_links: watch::Receiver<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::links::CANCEL_COMMITTING;
     use crate::links::OPERATION_TIMEOUT;
     use crate::links::RETRY_BACKOFF_MAX;
     use crate::links::fake_cluster::{
@@ -4260,6 +4267,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A seek or a close cancels the committing read of a reader and waits for its end. A read
+    /// that the server keeps refusing spends its time in the pauses between its attempts, so
+    /// the cancel ends a pause.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_refused_committing_fetch_when_cancelled_during_its_pause_should_end_without_another_attempt()
+     {
+        let f = Fixture::new().await;
+        f.cluster.script(
+            &endpoint(PRIMARY),
+            FETCH_MESSAGES_CODE,
+            repeat_n(Answer::Refuse(IggyError::TransientNotAccepted), ENDLESS),
+        );
+        let request = fetch([PARTITION_ID], true, WirePollingStrategy::offset(0));
+        let (cancel, cancelled) = watch::channel(false);
+        let fetched = CANCEL_COMMITTING.scope(cancelled, f.driver.fetch_sections(&request));
+        tokio::pin!(fetched);
+        // The replica refuses at once, so the call spends this time in its pauses. The sleep is
+        // polled first, so the call sends nothing between the count below and its cancel.
+        tokio::select! {
+            biased;
+            () = sleep(CALLER_TIMEOUT) => {}
+            _ = &mut fetched => panic!("the call ended before its cancel"),
+        }
+        let attempts = f.cluster.count(FETCH_MESSAGES_CODE);
+        assert_ne!(attempts, 0, "the replica refused the fetch");
+
+        cancel.send_replace(true);
+        let result = fetched.await;
+
+        assert_eq!(result.err(), Some(IggyError::TransientNotAccepted));
+        assert_eq!(
+            f.cluster.count(FETCH_MESSAGES_CODE),
+            attempts,
+            "no attempt follows the cancel"
+        );
     }
 
     /// A first `NotPrimary` resends a deferred poll without a pause, and that resend leaves the

@@ -119,8 +119,18 @@ public class MessagesTcpClient implements MessagesClient {
 
     MessagesTcpClient(
             Supplier<AsyncTcpConnection> connectionSupplier, ClientRoutingState routingState, PollRouter pollRouter) {
+        this(connectionSupplier, routingState, pollRouter, new ConsumerGroupsTcpClient(connectionSupplier));
+    }
+
+    // The joins of the client must go through this consumer groups client: a join clears the last sync reply of its
+    // group there, and a group poll compares its sync reply with it.
+    MessagesTcpClient(
+            Supplier<AsyncTcpConnection> connectionSupplier,
+            ClientRoutingState routingState,
+            PollRouter pollRouter,
+            ConsumerGroupsTcpClient consumerGroupsClient) {
         this.routingState = routingState;
-        this.consumerGroupsClient = new ConsumerGroupsTcpClient(connectionSupplier);
+        this.consumerGroupsClient = consumerGroupsClient;
         this.pollRouter = pollRouter == null ? new PollRouter(connectionSupplier, null) : pollRouter;
     }
 

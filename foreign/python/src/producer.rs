@@ -632,11 +632,7 @@ impl IggyProducer {
     /// Background shutdown flushes every accepted buffered message before returning.
     #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        future_into_py(py, async move {
-            shutdown(inner).await?;
-            attach_unless_exiting(|py| Ok(py.None()))
-        })
+        future_into_py(py, shutdown(self.inner.clone()))
     }
 
     #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[IggyProducer]", imports=("collections.abc")))]

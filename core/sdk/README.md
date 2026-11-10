@@ -472,8 +472,10 @@ for an error of the whole reader), `error` and `skip`. The reader stays usable a
 - `HistoryUnavailable` (87) stops its partition until `seek(partition, start)`, because an old
   offset names no position in the new history. The other partitions go on.
 - `ConsumerGroupPartitionNotOwned` (5009) on a read is no leave. The reader asks for a new
-  assignment and reads the partition again after a wait that doubles each time. Each sixth
-  refusal in a row comes out as one error, and the reader reads on.
+  assignment and reads the partition again after a wait. The wait starts at the retry interval,
+  1 s by default (`polling_retry_interval` on the consumer builder). It doubles with each refusal
+  in a row, up to 32 times that interval. Each sixth refusal in a row comes out as one error,
+  the wait starts again, and the reader reads on.
 - A message that does not decode or decrypt comes out as an error after the batch of the messages
   before it. Its `skip` is the continuation after the message. The reader reads the message again
   until `seek(partition, skip)` moves past it.
@@ -481,14 +483,17 @@ for an error of the whole reader), `error` and `skip`. The reader stays usable a
 A group member whose store or delete gets `ConsumerGroupPartitionNotOwned` (5009) for a partition
 that it still has asks for a new assignment at once. It reads the partition once without a commit,
 for the owner that the server installed, and sends the write once more under that owner. It retries
-a transient refusal of that read until the caller of the write drops it. For a `seek` that its
-caller dropped and for an `Auto` store, `close()` ends that retry, and the reader logs the first
-error. For its own writes, `close()` has one budget, 10 s from its start. At the end of the budget,
-the retry stops. Each write of the close that did not go yet still goes once under its own request
-timeout, and then the leave goes. A dropped `close()` sends neither these writes nor the leave, so
-the member stays in its group until its session ends. If the retry stops, or the read gets another
-refusal or shows another history of the partition, the write fails with its first error. So does a
-write for a partition that left.
+a transient refusal of that read until the caller of the write drops it. The start of `close()` or
+`shutdown()` ends that retry too, and so does the drop of the reader. This holds for a `commit`, for
+a `seek` that its caller dropped and for an `Auto` store. The write then does not go again, and the
+reader logs the first error of a write that has no caller. For its own writes, `close()` has one
+budget, 10 s from its start. At the end of the budget, the retry stops. Each write of the close that
+did not go yet still goes once under its own request timeout, and then the leave goes. So during an
+outage, a close can take about one request timeout for each partition with a pending store. A
+dropped `close()` sends neither these writes nor the leave, so the member stays in its group until
+its session ends. If the retry stops, or the read gets another refusal or shows another history of
+the partition, the write fails with its first error. So does a write for a partition that left, and
+for one that left during that read and came back.
 
 A read without `OnRead` stores nothing, so a retry after a lost reply is safe. The binary transport
 sends such a poll again, with less wait and time left, unless it starts from `next`. A one-shot poll
@@ -519,11 +524,14 @@ commit and hand them over first. A later `Next` read that returns the expected o
 because its store fences out the lost read. A read that starts past the last delivered message
 without a lost read goes on from there: the application or another session stored that offset. Under
 `OnRead`, `IggyConsumer::store_offset` also moves the reader to the message after the stored offset,
-and it holds the reads of the partition as a `seek` does. Once `shutdown()` waited for the stores
-in progress, such a store fails with `InvalidConfiguration`.
-Only a rebalance that moves the partition to another member before the catch-up loses messages that
-a lost read stored. The reader then returns one `FetchProgressUncertain` error for that partition,
-with the first and last offset of those messages in `lost`.
+and it holds the reads of the partition as a `seek` does. Once `shutdown()` started, such a store
+fails with `InvalidConfiguration`, unless its write already started: `shutdown()` waits for that
+write.
+If the reader cannot read again the messages that a lost read stored, those messages are lost.
+That has three causes. A rebalance moved the partition to another member before the catch-up. The
+partition no longer holds the messages, for example after retention deleted them. Lasting refusals
+stopped the partition during the catch-up. The reader then returns one `FetchProgressUncertain`
+error for that partition, with the first and last offset of those messages in `lost`.
 `close()` and `shutdown()` cancel each `OnRead` read in flight on TCP, QUIC and
 WebSocket and take its one reply, which tells what the server stored, so a read that waits on the
 server ends at once. Over HTTP, which has no cancel, they wait until the deadline of the read. Then

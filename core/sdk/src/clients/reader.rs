@@ -39,7 +39,7 @@ use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at};
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use membership::Membership;
-use progress::{Progress, in_background, in_close};
+use progress::{Progress, in_close};
 use worker::Worker;
 use worker::{lasting_refusal, probe_options};
 
@@ -86,7 +86,8 @@ const CLOSE_BUDGET: Duration = Duration::from_secs(10);
 ///   stops its partition until a `seek` when the position came from an earlier read of a history
 ///   that is gone. A refusal that a quick retry does not change, such as `Unauthorized`,
 ///   `PartitionNotFound`, or `ConsumerGroupPartitionNotOwned` again after the refresh that each
-///   one starts, is retried after a wait that doubles each time. Six in a row give one error.
+///   one starts, is retried after a wait. The wait starts at the retry interval and doubles with
+///   each refusal in a row, up to 32 times that interval. Six in a row give one error.
 ///   They also stop the partition until a `seek`, except `ConsumerGroupPartitionNotOwned`: the
 ///   partition is no leave, so it reads on, and the count starts again.
 /// - With `OnRead`, the reader reads each partition from its stored offset after a delivery, so
@@ -95,8 +96,10 @@ const CLOSE_BUDGET: Duration = Duration::from_secs(10);
 ///   holds that lost read, a next read that starts past the last delivered message makes it read
 ///   the skipped messages again by offset without a commit and hand them over first. Without a
 ///   lost read, such a read goes on from where it starts, because the application or another
-///   session stored that offset. Messages that a lost read committed are lost only when a
-///   rebalance moves their partition to another member before that.
+///   session stored that offset. Messages that a lost read committed are lost when the reader
+///   cannot read them again: a rebalance moved their partition to another member before that,
+///   the partition no longer holds them, or lasting refusals stopped the partition. The reader
+///   then returns one error with their range in [`ReadError::lost`].
 /// - Dropping the reader stops its tasks without waiting, and it moves no offset back.
 pub struct PartitionReader {
     config: Arc<Config>,
@@ -131,7 +134,9 @@ pub struct ReadError {
     pub error: IggyError,
     /// For a message that does not decode: the continuation after it. The reader reads the
     /// message again until a [`seek`](PartitionReader::seek) to this continuation skips it. The
-    /// messages before it arrive in a batch before this error.
+    /// messages before it arrive in a batch before this error. For a lost range (`lost`): the
+    /// continuation after the range. The reader already reads on from there, unless the error
+    /// stopped the partition or the partition left.
     pub skip: Option<PollingStrategy>,
     /// For a message that does not decode: its offset, when its frame decoded and a later step
     /// failed. `None` when the framing is malformed, so no record can be isolated.
@@ -354,14 +359,17 @@ impl PartitionReader {
     ///
     /// With `OnRead`, a seek to an offset above 0 first stores the offset before it, under the
     /// history of a continuation or else of the last delivered message, so a restart resumes at
-    /// the new position. A seek to offset 0 or `First` deletes the stored offset under the same
-    /// history when the server holds one, because the commit of a read never moves the offset
-    /// back. A seek to a timestamp first reads one message at the timestamp without a commit,
-    /// and then acts as a seek to the offset of that message. Without such a message it stores
-    /// nothing. A failed read, store, lookup or delete fails the seek and nothing moves. Every
-    /// other seek stores nothing and waits only for the seek of the partition in progress. A
-    /// seek to an offset or a timestamp holds the reads of the partition until it returns. It
-    /// waits for the seek of the partition in progress and for the committing read in flight.
+    /// the new position. A partition that stopped with `HistoryUnavailable` stores without the
+    /// history of its last delivered message, because the server lost that history. A seek to
+    /// offset 0 or `First` deletes the stored offset under the same history when the server
+    /// holds one, because the commit of a read never moves the offset back. A seek to a
+    /// timestamp first reads one message at the timestamp without a commit, and then acts as a
+    /// seek to the offset of that message under the history of that read. Without such a message
+    /// it stores nothing. A failed read, store, lookup or delete fails the seek and nothing
+    /// moves. Every other seek stores nothing and waits only for the seek of the partition in
+    /// progress. A seek to an offset or a timestamp holds the reads of the partition until it
+    /// returns. It waits for the seek of the partition in progress and for the committing read
+    /// in flight.
     /// Except over HTTP, it cancels that read, which the server stops if nothing of it committed
     /// yet. The new generation drops the reply of that read, and no read of the partition starts
     /// until the new position takes effect or the seek fails. So no read from the old position
@@ -390,6 +398,8 @@ impl PartitionReader {
     ///   a committing read of the partition with an unknown outcome. Call `abandon_operation`
     ///   with its operation first.
     /// - The errors of the offset store, and of the read at a timestamp, with `OnRead`.
+    /// - [`IggyError::TransientNotAccepted`] with `OnRead` for a seek to a timestamp whose read
+    ///   the partition did not serve: its reply is empty and names no history. Seek again.
     pub async fn seek(&mut self, partition: u32, start: PollingStrategy) -> Result<(), IggyError> {
         start.validate_partition(partition)?;
         if !self.shared.partitions().contains(&partition) {
@@ -432,11 +442,14 @@ impl PartitionReader {
         }
         // A seek to offset 0 deletes the stored offset, and a seek above 0 stores the offset
         // before it. Both carry the history of a continuation, else that of the last message
-        // delivered in the current generation of the partition, else none.
+        // delivered in the current generation of the partition, else none. The server refuses a
+        // write under a history that it lost, so a partition that stopped for one carries none.
         let context = start.context().or_else(|| {
             progress
                 .last_delivered(partition)
-                .filter(|delivered| progress.is_current(delivered))
+                .filter(|delivered| {
+                    progress.is_current(delivered) && !progress.lost_history(partition)
+                })
                 .map(|delivered| delivered.context())
         });
         let Some(before) = start.value.checked_sub(1) else {
@@ -507,10 +520,20 @@ impl PartitionReader {
                 },
             )
             .await?;
-        Ok(probed
-            .messages
-            .first()
-            .map_or(start, |first| PollingStrategy::offset(first.header.offset)))
+        match (probed.messages.first(), probed.context().non_zero()) {
+            // The store of the seek names the history and the owner that served this read.
+            (Some(first), Some(context)) => Ok(PollingStrategy::continuation(
+                partition,
+                PollingKind::Offset,
+                first.header.offset,
+                context,
+            )),
+            (Some(first), None) => Ok(PollingStrategy::offset(first.header.offset)),
+            (None, Some(_)) => Ok(start),
+            // The empty reply of a partition that could not serve the read has the zero context.
+            // It does not show that no message lies at the timestamp.
+            (None, None) => Err(IggyError::TransientNotAccepted),
+        }
     }
 
     /// The partitions that the reader reads: those of a standalone consumer, or the current
@@ -535,8 +558,11 @@ impl PartitionReader {
     /// server refuses as not owned goes once more under the owner that a read of the partition
     /// shows, and that read retries a transient refusal until the budget ends. Then the refusal
     /// stands, each store or delete that did not go yet still goes once under its own request
-    /// timeout, and the leave follows. A dropped close sends neither the writes that did not go
-    /// yet nor the leave, so a group member stays in its group until its session ends.
+    /// timeout, and the leave follows. So during an outage, the close can take about one request
+    /// timeout for each partition with a pending store. The start of the close ends the same
+    /// retry of every other write, such as a commit of the application: its refusal stands, and
+    /// it does not go again. A dropped close sends neither the writes that did not go yet nor
+    /// the leave, so a group member stays in its group until its session ends.
     ///
     /// # Errors
     ///
@@ -546,7 +572,7 @@ impl PartitionReader {
     /// outcome: abandon its operation on the client before a new reader reads the partition.
     pub async fn close(mut self) -> Result<(), IggyError> {
         let budget = Instant::now() + CLOSE_BUDGET;
-        self.shared.progress.stop_background();
+        self.shared.progress.stop_retries();
         // The rewind goes after each seek write, also of a seek dropped after its write started.
         self.shared.progress.close_seeks().await;
         self.shared.closing.store(true, ORDERING);
@@ -594,14 +620,16 @@ impl PartitionReader {
 
     /// Under `CommitPolicy::Auto`, stops the store task once its store in flight ends, which ends
     /// the retries of that store, and stores the latest counted position of each partition. The
-    /// reader stores nothing more after it, also not in [`close`](Self::close).
+    /// reader stores nothing more after it, also not in [`close`](Self::close). So these are
+    /// stores of the close, with a budget of their own from the start of the flush.
     pub(crate) async fn flush(&mut self) -> Result<(), IggyError> {
         let Some(committer) = self.committer.take() else {
             return Ok(());
         };
-        self.shared.progress.stop_background();
+        let budget = Instant::now() + CLOSE_BUDGET;
+        self.shared.progress.stop_retries();
         committer.stop().await;
-        self.shared.progress.flush_counted().await
+        in_close(budget, self.shared.progress.flush_counted()).await
     }
 
     /// Under `CommitAfter::Processing`, the batch that the application took last counts once
@@ -688,7 +716,7 @@ impl Debug for PartitionReader {
 
 impl Drop for PartitionReader {
     fn drop(&mut self) {
-        self.shared.progress.stop_background();
+        self.shared.progress.stop_retries();
         if let Some(task) = &self.task {
             task.abort();
         }
@@ -715,7 +743,7 @@ impl Committer {
                     () = next_tick(&mut ticks) => {}
                 }
                 // The flush logs each failure, and the next one stores the position again.
-                let _ = in_background(progress.flush_counted()).await;
+                let _ = progress.flush_counted().await;
             }
         });
         Self { stop, task }
@@ -940,7 +968,7 @@ mod tests {
         committing, connect_to_one_replica, group, identifier, lookup_answer, message_at,
         partition_and_offsets, polled_answer_in, stored_offsets,
     };
-    use super::progress::{PendingCommit, Progress, in_background};
+    use super::progress::{PendingCommit, Progress};
     use super::{
         CLOSE_BUDGET, Committer, FetchCapacity, ORDERING, PartitionReader, ReadError, Refusal,
         Reply,
@@ -2218,9 +2246,48 @@ mod tests {
         assert_eq!(cluster.count(POLL_MESSAGES_DEFERRED_CODE), 0);
     }
 
+    /// A partition that left during the read for the owner of its refused store starts a new
+    /// assignment when it comes back, and another member can have read it in between. So the
+    /// refusal of that store stands, also when the read is served.
+    #[tokio::test]
+    async fn given_a_refused_store_when_its_partition_leaves_and_comes_back_during_the_read_for_the_owner_should_fail_without_a_second_store()
+     {
+        let (client, cluster) = connect_to_one_replica().await;
+        cluster.install_owner(CURRENT_OWNER);
+        let fed = FedReader::new(builder_on(client, group()));
+        fed.assign(&[PARTITION]);
+        let checkpoint = fed.checkpoint(PARTITION, DELIVERED_OFFSET, REPLACED_OWNER);
+        cluster.script(
+            &endpoint(PRIMARY),
+            POLL_MESSAGES_DEFERRED_CODE,
+            [polled_answer_in(PARTITION, &[], CURRENT_OWNER)],
+        );
+        cluster.hold(POLL_MESSAGES_DEFERRED_CODE);
+        let rebalance = async {
+            eventually("the read for the owner is on the wire", || {
+                cluster.count(POLL_MESSAGES_DEFERRED_CODE) == 1
+            })
+            .await;
+            fed.assign(&[]);
+            fed.assign(&[PARTITION]);
+            cluster.release(POLL_MESSAGES_DEFERRED_CODE);
+        };
+
+        let (committed, ()) = tokio::join!(fed.reader.commit(checkpoint), rebalance);
+
+        assert!(
+            matches!(
+                committed,
+                Err(IggyError::ConsumerGroupPartitionNotOwned(..))
+            ),
+            "{committed:?}"
+        );
+        assert_eq!(cluster.count(STORE_CONSUMER_OFFSET_CODE), 1);
+    }
+
     /// The read for the owner of a store refused as not owned goes again after each transient
     /// refusal, also after one of a poll over the quota of the server, until the caller of the
-    /// write drops it. So it outlasts the deadline of one request.
+    /// write drops it or the reader closes. So it outlasts the deadline of one request.
     #[tokio::test(start_paused = true)]
     async fn given_a_refused_seek_store_when_its_read_for_the_owner_is_refused_for_now_past_an_operation_timeout_should_store_under_the_installed_owner()
      {
@@ -2310,8 +2377,8 @@ mod tests {
         assert_eq!(cluster.count(STORE_CONSUMER_OFFSET_CODE), 1);
     }
 
-    /// The caller of a seek that finishes in the background is the reader, so the close ends the
-    /// read for the owner of its refused store at once, and the refusal stands.
+    /// A seek that finishes in the background writes outside the close, so the close start ends
+    /// the read for the owner of its refused store at once, and the refusal stands.
     #[tokio::test(start_paused = true)]
     async fn given_a_dropped_seek_whose_read_for_the_owner_is_refused_for_now_when_closing_should_end_that_read_at_once()
      {
@@ -2447,11 +2514,11 @@ mod tests {
         );
     }
 
-    /// The close start ends the retries of a write of the reader itself. Its read for the owner
-    /// in flight then can still be answered, but the answer leads to no write, and the refusal
-    /// stands.
+    /// The close start ends the retries of a write outside the close, also of a write of the
+    /// application. Its read for the owner in flight then can still be answered, but the answer
+    /// leads to no write, and the refusal stands.
     #[tokio::test(start_paused = true)]
-    async fn given_a_background_write_whose_read_for_the_owner_is_in_flight_when_the_close_starts_should_not_write_again()
+    async fn given_a_write_whose_read_for_the_owner_is_in_flight_when_the_close_starts_should_not_write_again()
      {
         /// The answer and the close start are both there when the write runs again, so a choice
         /// between them that is left to chance fails in some round.
@@ -2467,11 +2534,11 @@ mod tests {
                 [polled_answer_in(PARTITION, &[], CURRENT_OWNER)],
             );
             cluster.hold(POLL_MESSAGES_DEFERRED_CODE);
-            let mut write = pin!(in_background(fed.progress().store(fed.checkpoint(
+            let mut write = pin!(fed.progress().store(fed.checkpoint(
                 PARTITION,
                 DELIVERED_OFFSET,
                 REPLACED_OWNER
-            ))));
+            )));
             tokio::select! {
                 written = &mut write => panic!("the write ended before its read: {written:?}"),
                 () = eventually("the read for the owner is on the wire", || {
@@ -2481,7 +2548,7 @@ mod tests {
             cluster.release(POLL_MESSAGES_DEFERRED_CODE);
             // The answer arrives while nothing runs the write.
             sleep(CANCEL_AFTER).await;
-            fed.progress().stop_background();
+            fed.progress().stop_retries();
 
             let written = write.await;
 
@@ -2491,6 +2558,37 @@ mod tests {
             );
             assert_eq!(cluster.count(STORE_CONSUMER_OFFSET_CODE), 1);
         }
+    }
+
+    /// The last flush ends the retries of every write outside the close, and its own stores are
+    /// the ones of the close. So a store of it that is refused as not owned still reads for the
+    /// owner and goes once more.
+    #[tokio::test]
+    async fn given_auto_commit_when_a_store_of_the_last_flush_is_refused_as_not_owned_should_store_under_the_installed_owner()
+     {
+        let (client, cluster) = connect_to_one_replica().await;
+        cluster.install_owner(CURRENT_OWNER);
+        let mut fed =
+            FedReader::new(builder_on(client, group()).options(auto(None, CommitAfter::Delivery)));
+        fed.assign(&[PARTITION]);
+        fed.reader.count(
+            fed.checkpoint(PARTITION, DELIVERED_OFFSET, REPLACED_OWNER),
+            1,
+            true,
+        );
+        cluster.script(
+            &endpoint(PRIMARY),
+            POLL_MESSAGES_DEFERRED_CODE,
+            [polled_answer_in(PARTITION, &[], CURRENT_OWNER)],
+        );
+
+        let flushed = fed.reader.flush().await;
+
+        assert_eq!(flushed, Ok(()));
+        assert_eq!(
+            histories(&cluster, STORE_CONSUMER_OFFSET_CODE),
+            [history(REPLACED_OWNER), history(CURRENT_OWNER)]
+        );
     }
 
     #[tokio::test]

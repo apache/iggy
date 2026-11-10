@@ -349,13 +349,10 @@ type PartitionReader struct {
 	nextSingle uint32
 	// refreshPause is the pause after the last sync that read the assignment.
 	refreshPause time.Duration
-	// joined marks a join whose assignment no sync has read yet.
+	// joined marks that no sync has read the assignment since the first join
+	// or a lost membership. The join after a lost membership can land with an
+	// unknown outcome, so the lost membership sets it, not that join.
 	joined bool
-	// uncertainJoin is the operation of a rejoin with an unknown outcome. The
-	// client blocks its metadata writes until the reader resolves or abandons
-	// it, also those of the application. Only one refresh runs at a time, and
-	// Close reads it after the last one.
-	uncertainJoin *uint64
 	// seeking counts the seeks of each partition. No read of the partition
 	// starts until they move or fail.
 	seeking map[uint32]int
@@ -543,6 +540,10 @@ func (r *PartitionReader) Mark(checkpoint iggcon.Checkpoint) error {
 // generation, stores nothing. It fails with ierror.ErrInvalidCommand under
 // CommitOnRead and for a partition that the reader does not read. It abandons
 // a store with an unknown outcome and returns its error, so a retry can store.
+// After a store refused as not the owner, it reads the partition for the
+// installed owner and stores once more under that owner. It retries a
+// transient refusal of that read until ctx ends or Close starts. Then it
+// returns the refusal of the store and stores nothing more.
 func (r *PartitionReader) Commit(ctx context.Context, checkpoint iggcon.Checkpoint) error {
 	r.mu.Lock()
 	if r.onRead {
@@ -562,7 +563,13 @@ func (r *PartitionReader) Commit(ctx context.Context, checkpoint iggcon.Checkpoi
 	position := checkpointPosition(checkpoint)
 	position.Context = r.writeContext(p, position.Context)
 	r.mu.Unlock()
-	if err := r.writePosition(ctx, ctx, r.client.StoreConsumerPosition, p, position); err != nil {
+	// The leave of Close gives the partition away, so the start of Close ends
+	// the read for the installed owner too, and the store goes no more.
+	retry, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(r.run, cancel)
+	defer stop()
+	if err := r.writePosition(ctx, retry, r.client.StoreConsumerPosition, p, position); err != nil {
 		// A retry of the commit, and every later write of the partition, can then go out.
 		r.abandonUncertain(err)
 		return err
@@ -839,14 +846,16 @@ func (r *PartitionReader) Partitions() []uint32 {
 // for the group. A group reader then leaves its group. It returns the first
 // failed lookup, store, delete or leave. It abandons a store or delete with an
 // unknown outcome, so that write does not block a later write of the partition
-// on the same client. For the same reason it abandons a rejoin that is still
-// unknown and a leave with an unknown outcome, which block the metadata writes
-// of the client. The reads for the installed owner after a refusal as not the
-// owner end at the end of ctx, or 10 s after the start of Close, and that
-// refusal stands. Each lookup and write of Close and the leave still go once,
-// within the request timeout of the client.
+// on the same client. For the same reason it abandons a leave with an unknown
+// outcome, which blocks the metadata writes of the client. The reads for the
+// installed owner after a refusal as not the owner end at the end of ctx, or
+// 10 s after the start of Close, and that refusal stands. Each lookup and
+// write of Close and the leave still go once, within the request timeout of
+// the client.
 // With CommitAuto it first waits for the background stores that run, each
 // within that timeout too.
+// These writes go one after the other, so during an outage Close can take
+// about one request timeout for each partition with a pending store.
 // A later Close waits for the first one and returns its result, or the error
 // of its own ctx when that ends first.
 func (r *PartitionReader) Close(ctx context.Context) error {
@@ -885,9 +894,6 @@ func (r *PartitionReader) Close(ctx context.Context) error {
 		}
 	}
 	if r.group {
-		if r.uncertainJoin != nil {
-			r.abandon(*r.uncertainJoin)
-		}
 		// A member that the server no longer knows, after a lost session, has left already.
 		err := r.client.LeaveConsumerGroup(detached, r.stream, r.topic, r.consumer.Id)
 		r.abandonUncertain(err)
@@ -1245,13 +1251,15 @@ func (r *PartitionReader) fetchOptions(count uint32) iggcon.DeferredPollOptions 
 	return options
 }
 
-// probe reads one message of target without a store. It returns a refusal of
-// the partition apart from an error of the request. Only the context and the
-// offsets of the section count, so it does not decode the message, and a
-// message that does not decode fails only the read that delivers it.
+// probe reads one message of target without a store. It waits for no message,
+// so a partition without one does not hold the committing read of its group.
+// It returns a refusal of the partition apart from an error of the request.
+// Only the context and the offsets of the section count, so it does not decode
+// the message, and a message that does not decode fails only the read that
+// delivers it.
 func (r *PartitionReader) probe(ctx context.Context, target iggcon.FetchMessagesTarget, options iggcon.DeferredPollOptions,
 ) (probed *iggcon.FetchMessagesSection, refusal, err error) {
-	options.MinCount = 1
+	options.MinCount, options.MaxWait = 1, 0
 	sections, err := r.transport.FetchMessages(ctx, r.stream, r.topic, r.consumer, []iggcon.FetchMessagesTarget{target}, 1, false, options)
 	for index := range sections {
 		section := &sections[index]
@@ -1673,13 +1681,6 @@ func (r *PartitionReader) refuseSectionLocked(p *partition, err error, now time.
 	r.handleRefusalLocked(p, err, now)
 }
 
-// giveUpGapLocked reports what a lost read stored as lost, since another member
-// owns the partition now, and queues the batch read after it, as an empty read
-// that ends the gap does.
-func (r *PartitionReader) giveUpGapLocked(p *partition) {
-	r.acceptGapLocked(p, &iggcon.PolledMessage{}, p.gapEnd)
-}
-
 // loseGapLocked reports the gap below until as lost and moves its start there,
 // so the report comes once and before the messages after it.
 func (r *PartitionReader) loseGapLocked(p *partition, until uint64) {
@@ -1826,10 +1827,10 @@ func (r *PartitionReader) moveBefore(ctx, retry context.Context, p *partition, f
 // write, or the write names none, the write goes once more under the context
 // of that read, whose owner belongs to the history it names. Without p, as for
 // a partition that left, or after a leave meanwhile, the refusal stands. retry
-// is the context of the caller of the write, or r.run for a write in the
-// background, whose caller is the reader. Its end ends that read, also after
-// its reply, and the refusal stands. So Close ends the read of a write in the
-// background.
+// is the context of the caller of the write, which for a Commit ends also when
+// Close starts, or r.run for a write in the background, whose caller is the
+// reader. Its end ends that read, also after its reply, and the refusal
+// stands. So Close ends the read of a Commit and of a write in the background.
 func (r *PartitionReader) writePosition(ctx, retry context.Context,
 	write func(context.Context, iggcon.Consumer, iggcon.Identifier, iggcon.Identifier, iggcon.ConsumerPosition) error,
 	p *partition, position iggcon.ConsumerPosition,
@@ -1868,8 +1869,6 @@ func (r *PartitionReader) writePosition(ctx, retry context.Context,
 // failure.
 func (r *PartitionReader) installedContext(ctx context.Context, partitionID uint32) (iggcon.PartitionContext, bool) {
 	options := r.fetchOptions(1)
-	// Only the context of the reply counts, so the read waits for no message.
-	options.MaxWait = 0
 	target := iggcon.FetchMessagesTarget{PartitionId: partitionID, Strategy: iggcon.NextPollingStrategy()}
 	for {
 		probed, refusal, err := r.probe(ctx, target, options)
@@ -2175,34 +2174,40 @@ func (r *PartitionReader) regroupPartitions(ids []uint32) {
 
 func (r *PartitionReader) refreshAssignment() {
 	defer r.inFlight.Done()
-	rejoined := false
-	var assignment *iggcon.ConsumerGroupAssignment
-	err := r.resolveJoin()
-	if err == nil {
-		assignment, err = r.client.SyncConsumerGroup(r.run, r.stream, r.topic, r.consumer.Id)
-	}
+	assignment, err := r.client.SyncConsumerGroup(r.run, r.stream, r.topic, r.consumer.Id)
 	lost := err != nil && errors.Is(err, ierror.ErrConsumerGroupMemberNotFound)
 	if lost {
-		err = r.client.JoinConsumerGroup(r.run, r.stream, r.topic, r.consumer.Id)
-		var unknown ierror.OperationUncertain
-		switch {
-		case err == nil:
-			rejoined = true
+		if err = r.client.JoinConsumerGroup(r.run, r.stream, r.topic, r.consumer.Id); err == nil {
 			assignment, err = r.client.SyncConsumerGroup(r.run, r.stream, r.topic, r.consumer.Id)
-		case errors.As(err, &unknown):
-			r.uncertainJoin = &unknown.OperationID
+		} else {
+			// A join with an unknown outcome blocks the metadata writes of the
+			// client, also those of the application. The next sync shows whether
+			// it landed. If it did not, the reader joins again.
+			r.abandonUncertain(err)
 		}
 	}
 	r.mu.Lock()
 	r.refreshing = false
 	if lost {
 		r.loseOwnersLocked()
+		r.joined = true
 	}
-	r.joined = r.joined || rejoined
 	pause := r.config.retryInterval
 	if err != nil {
 		r.config.logger.Warn("Failed to read the group assignment of a reader, it tries again", "error", err)
 	} else if assignment != nil {
+		if r.joined {
+			// The server can refuse the first read of a new session while it
+			// installs the owner. So that refusal counts as the first one, and no
+			// wait of the lost session holds back the read. A join with an
+			// unknown outcome can have landed, so only a sync that read the
+			// assignment shows the new session. Each refusal starts a refresh,
+			// so a reset at a failed one would end the wait and the report.
+			for _, p := range r.partitions {
+				p.lastingRefusals = 0
+				p.retryAt = time.Time{}
+			}
+		}
 		pause = r.nextRefreshPauseLocked(r.assignLocked(assignment.Partitions))
 	}
 	r.refreshAt = time.Now().Add(pause)
@@ -2233,24 +2238,6 @@ func (p *partition) loseOwner() {
 		p.position = p.position.WithContext(unowned)
 	}
 	p.takeContext(p.context)
-}
-
-// resolveJoin resolves a rejoin with an unknown outcome before the next sync,
-// because a sync that finds the member does not join again. The sync after it
-// tells whether the member is in the group.
-func (r *PartitionReader) resolveJoin() error {
-	if r.uncertainJoin == nil {
-		return nil
-	}
-	err := r.client.ResolveOperation(r.run, *r.uncertainJoin)
-	if errors.Is(err, ierror.OperationUncertain{}) {
-		return err
-	}
-	r.uncertainJoin = nil
-	if errors.Is(err, ierror.ErrOperationNotRetained) {
-		return nil
-	}
-	return err
 }
 
 // nextRefreshPauseLocked returns the pause after a sync that read the
@@ -2286,7 +2273,10 @@ func (r *PartitionReader) assignLocked(assigned []uint32) bool {
 		if !r.onRead {
 			r.dropQueuedLocked(id)
 		} else if p.gapFrom != nil {
-			r.giveUpGapLocked(p)
+			// Another member owns the partition now, so what a lost read stored
+			// is reported as lost, and the batch read after it is queued, as an
+			// empty read that ends the gap does.
+			r.acceptGapLocked(p, &iggcon.PolledMessage{}, p.gapEnd)
 		}
 		if p.counted != nil && (p.stored == nil || p.counted.Offset() > p.stored.Offset()) && !p.ownerLost(p.counted.Context()) {
 			// The partition goes to another member, so its counted position is stored first.

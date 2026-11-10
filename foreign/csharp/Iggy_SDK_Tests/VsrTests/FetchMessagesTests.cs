@@ -196,6 +196,28 @@ public sealed class FetchMessagesTests
     }
 
     /// <summary>
+    ///     The coordinator answers the sync of a client that is no member of the group with an empty body. An empty
+    ///     list would read as a member that owns nothing, so the read of the assignment fails as member not found,
+    ///     and the caller can join again.
+    /// </summary>
+    [Fact]
+    public async Task given_a_sync_reply_without_a_member_when_the_assignment_is_read_should_fail_as_member_not_found()
+    {
+        using var node = new MockNode();
+        node.Serve(request => request.Code == CommandCodes.SYNC_CONSUMER_GROUP_CODE
+            ? Reply(OPERATION_NON_REPLICATED, [])
+            : Standalone(node, request));
+        using var client = await ConnectAsync(node);
+        var assignments = (IConsumerGroupAssignmentProvider)client;
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
+            assignments.GetAssignedPartitionsAsync(Stream, Topic, Identifier.Numeric(3), false,
+                TestContext.Current.CancellationToken));
+
+        Assert.Equal(VsrError.CONSUMER_GROUP_MEMBER_NOT_FOUND, error.StatusCode);
+    }
+
+    /// <summary>
     ///     Each target follows the history rule of its own partition. A fully zero fence takes the context of its
     ///     route, and a fence of incarnation 0 with an owner generation takes only the incarnation of the route.
     /// </summary>

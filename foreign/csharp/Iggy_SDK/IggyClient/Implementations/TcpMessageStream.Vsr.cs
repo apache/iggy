@@ -536,6 +536,13 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider, ICons
             await SyncGroupAssignmentAsync(streamId, topicId, groupId, token, startedUnder: generation);
         }
 
+        // An empty list would read as a member that owns nothing, so the caller would never join again.
+        if (!_groupState.IsRegistered(key))
+        {
+            throw VsrError.Exception(VsrError.CONSUMER_GROUP_MEMBER_NOT_FOUND,
+                $"Client is not a member of consumer group {groupId} on topic {topicId}.");
+        }
+
         return _groupState.AssignedPartitions(key);
     }
 

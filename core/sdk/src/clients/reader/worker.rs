@@ -156,6 +156,12 @@ impl Active {
     fn cancelled(&self) -> bool {
         self.cancel.as_ref().is_some_and(|cancel| *cancel.borrow())
     }
+
+    /// Whether the read can commit. Checks and lookups commit nothing. A catch-up poll counts
+    /// too, because it returns at once.
+    fn may_commit(&self) -> bool {
+        !matches!(self.kind, FetchKind::Check | FetchKind::Lookup)
+    }
 }
 
 /// The assignment that a refresh read.
@@ -194,7 +200,7 @@ pub(super) struct Worker {
     /// arrives. A lost read only moves the stored offset forward, which the next `Next` read
     /// detects, but the write can have moved it back or deleted it. So an empty read by offset
     /// reads on by offset, not `Next`.
-    lost_writes: BTreeSet<u32>,
+    read_by_offset_after_lost_write: BTreeSet<u32>,
     request_capacity: Arc<Semaphore>,
     tasks: JoinSet<Completed>,
     /// At most one refresh, apart from the fetches, so a slow one never holds
@@ -289,7 +295,7 @@ impl Worker {
             recovery_capacity: Arc::new(Semaphore::new(1)),
             retained_batches: BTreeMap::new(),
             lost_operations: BTreeMap::new(),
-            lost_writes: BTreeSet::new(),
+            read_by_offset_after_lost_write: BTreeSet::new(),
             request_capacity: Arc::new(Semaphore::new(MAX_DEFERRED_REQUESTS_PER_CONSUMER)),
             epoch: shared.epoch.load(ORDERING),
             config,
@@ -351,6 +357,12 @@ impl Worker {
                 self.finish_fetches().await;
                 // The close rewinds from the positions of the seeks and of their lost writes.
                 self.apply_seeks();
+                // A batch that the application took after a loss recorded its commit again, but
+                // the lost read or write can have stored an offset past it.
+                drop(PendingCommit::new(
+                    Arc::clone(&self.shared.progress),
+                    self.lost_operations.keys().copied().collect(),
+                ));
                 // The close then stores the last delivered offset over what they committed.
                 self.abandon_lost().await;
                 return;
@@ -420,11 +432,18 @@ impl Worker {
                 Some(completed) = self.tasks.join_next(), if !self.tasks.is_empty() => {
                     match completed {
                         Ok(completed) => {
+                            let epoch = self.epoch;
                             self.complete(completed);
                             if self.partitions.is_empty() {
-                                refresh.reset_after(
-                                    self.config.retry_interval.min(self.refresh_pause),
-                                );
+                                let pause = if self.epoch == epoch {
+                                    self.config.retry_interval.min(self.refresh_pause)
+                                } else {
+                                    // A refusal that invalidated the fetch state repeats while
+                                    // its cause lasts, so the next refresh waits as a retry does,
+                                    // not the short pause after a join.
+                                    self.config.retry_interval
+                                };
+                                refresh.reset_after(pause);
                             }
                         },
                         // A restart cancelled the fetch.
@@ -568,7 +587,7 @@ impl Worker {
             self.catch_up.remove(&partition);
             self.retained_batches.remove(&partition);
             self.lost_operations.remove(&partition);
-            self.lost_writes.remove(&partition);
+            self.read_by_offset_after_lost_write.remove(&partition);
             self.lasting_refusals.remove(&partition);
             self.probing.remove(&partition);
             self.backlogged.remove(&partition);
@@ -589,7 +608,7 @@ impl Worker {
             }
             // The write can have moved the stored offset that a `Next` read follows, so the
             // partition reads by offset until a batch arrives.
-            self.lost_writes.insert(partition);
+            self.read_by_offset_after_lost_write.insert(partition);
             if let Some(position) = self.positions.get_mut(&partition)
                 && position.kind == PollingKind::Next
                 && let Some(context) = position.context()
@@ -631,7 +650,7 @@ impl Worker {
     fn answer_holds(&self) {
         for partition in &self.held {
             match self.active.get(partition) {
-                Some(active) if self.may_commit(*partition) => active.cancel(),
+                Some(active) if active.may_commit() => active.cancel(),
                 _ => self
                     .shared
                     .progress
@@ -761,7 +780,7 @@ impl Worker {
             self.checked_empty.retain(stays);
             self.seek_starts.retain(|partition, _| stays(partition));
             self.stopped.retain(stays);
-            self.lost_writes.retain(stays);
+            self.read_by_offset_after_lost_write.retain(stays);
             self.lost_operations.retain(|partition, _| stays(partition));
             self.pending_errors.retain(|partition, refusal| {
                 partition.as_ref().is_none_or(stays)
@@ -1263,14 +1282,6 @@ impl Worker {
             && !self.retry_at.contains_key(&partition)
             && !self.stopped.contains(&partition)
             && self.shared.progress.blocked(partition).is_none()
-    }
-
-    /// Whether a read of `partition` that can commit is in flight. Checks and lookups commit
-    /// nothing. A catch-up poll counts too, because it returns at once.
-    fn may_commit(&self, partition: u32) -> bool {
-        self.active
-            .get(&partition)
-            .is_some_and(|active| !matches!(active.kind, FetchKind::Check | FetchKind::Lookup))
     }
 
     /// A read names no stale owner: the server serves an owner-0 read for the owner that it
@@ -1938,7 +1949,7 @@ impl Worker {
         }
         let position = if section.messages_count == 0
             && sent.kind == PollingKind::Offset
-            && self.lost_writes.contains(&partition)
+            && self.read_by_offset_after_lost_write.contains(&partition)
         {
             continuation_at(partition, section.next_offset, section.context)
         } else {
@@ -1952,7 +1963,7 @@ impl Worker {
         }
         if section.messages_count > 0 {
             self.served.insert(partition, self.replies);
-            self.lost_writes.remove(&partition);
+            self.read_by_offset_after_lost_write.remove(&partition);
         }
         true
     }
@@ -2370,7 +2381,7 @@ impl Worker {
         next: u64,
         context: PartitionContext,
     ) -> PollingStrategy {
-        self.lost_writes.remove(&partition);
+        self.read_by_offset_after_lost_write.remove(&partition);
         if self
             .read_alone_until
             .get(&partition)
@@ -2666,6 +2677,7 @@ impl Worker {
                     self.positions.remove(&partition);
                     self.retry_at.remove(&partition);
                     self.stopped.insert(partition);
+                    self.shared.progress.lose_history(partition);
                     if !reported && !self.report_pending_loss(partition) {
                         self.report(ReadError::new(Some(partition), error.clone()));
                     }
@@ -2986,9 +2998,9 @@ mod tests {
     use iggy_binary_protocol::requests::messages::DeferredPollMessagesRequest;
     use iggy_common::locking::IggyRwLock;
     use iggy_common::{Aes256GcmEncryptor, AutoCommit, Consumer, Identifier, IggyTimestamp};
-    use tokio::sync::Notify;
+    use tokio::sync::{Notify, oneshot};
     use tokio::task::yield_now;
-    use tokio::time::{advance, timeout};
+    use tokio::time::{advance, sleep, timeout};
     use tracing::span::{Attributes, Id, Record};
     use tracing::{Event, Level, Metadata, Subscriber};
 
@@ -7949,10 +7961,65 @@ mod tests {
         worker.complete(stale);
 
         assert!(
-            !worker.may_commit(0),
+            !worker.active.get(&0).is_some_and(Active::may_commit),
             "the hold of a seek of the partition waits for no read"
         );
         assert!(worker.is_idle(0), "the partition reads again");
+    }
+
+    /// A refusal that ends the membership repeats while its cause lasts. The refresh that joins
+    /// again waits as a retry does, not the short pause that follows a join.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_read_refused_as_a_stale_client_after_a_join_when_less_than_the_retry_interval_passes_should_not_refresh()
+     {
+        /// Longer than the pause after a join, shorter than the retry interval.
+        const WAITED: Duration = Duration::from_millis(100);
+        /// The read ends after the worker applied the join.
+        const READ_TIME: Duration = Duration::from_millis(1);
+        let (client, cluster) = connect_to_one_replica().await;
+        let (mut worker, mut replies) = worker_of(builder_on(client, group()));
+        assert!(ASSIGNMENT_SETTLE_PAUSE < WAITED && WAITED < worker.config.retry_interval);
+        assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0]])));
+        let joined = grouped(&worker, SESSION, VERSION, vec![vec![0]]);
+        worker.refreshing.spawn(async move { Ok(joined) });
+        let (refuse, refused) = oneshot::channel();
+        let task = worker.tasks.spawn(async move {
+            sleep(READ_TIME).await;
+            refused.await.expect("the test hands the refusal over")
+        });
+        worker.active.insert(
+            0,
+            Active {
+                task,
+                kind: FetchKind::Alone,
+                fetch: worker.fetches,
+                cancel: None,
+            },
+        );
+        let refusal = polled(
+            &worker,
+            FetchKind::Alone,
+            worker.position(0),
+            0,
+            Err(IggyError::StaleClient),
+        );
+        assert!(refuse.send(refusal).is_ok());
+        let frames = || cluster.codes(&endpoint(PRIMARY)).len();
+        let _worker = tokio::spawn(worker.run());
+        let reported = timeout(WAITED, replies.recv()).await;
+        assert!(
+            matches!(reported, Ok(Some(_))),
+            "the refusal reaches the application"
+        );
+        let frames_at_refusal = frames();
+
+        sleep(WAITED).await;
+
+        assert_eq!(
+            frames(),
+            frames_at_refusal,
+            "the refresh that joins again waits for the retry interval"
+        );
     }
 
     fn group() -> Consumer {

@@ -231,6 +231,21 @@ internal sealed class ReaderCluster : IDisposable
     /// <summary>Each sync finds the group in a new generation, as hand-overs between other members leave it.</summary>
     internal bool RebalancesEachSync { get; init; }
 
+    /// <summary>
+    ///     The group holds no member of the client, as after a delete and a new create of the group. As on the server,
+    ///     a sync then gets an empty body until the client joins again.
+    /// </summary>
+    internal bool MemberForgotten { get; set; }
+
+    /// <summary>Every join is refused with this status, as for a group that stays deleted.</summary>
+    internal int? JoinRefusal { get; set; }
+
+    /// <summary>Every sync is refused with this status, as by a node that cannot answer it yet.</summary>
+    internal int? SyncRefusal { get; set; }
+
+    /// <summary>Syncs get no reply, as from a node that is cut off.</summary>
+    internal bool SyncsUnanswered { get; set; }
+
     internal HashSet<ulong> Undecodable { get; } = [];
 
     internal ConcurrentBag<uint> HistoryRefused { get; } = [];
@@ -385,6 +400,12 @@ internal sealed class ReaderCluster : IDisposable
                 return Answer(request);
             case VsrOperation.JoinConsumerGroup:
                 Interlocked.Increment(ref _joins);
+                if (JoinRefusal is { } refused)
+                {
+                    return Reply(request.Operation, [], (uint)refused);
+                }
+
+                MemberForgotten = false;
                 return GroupReply(request);
             case VsrOperation.LeaveConsumerGroup:
                 Interlocked.Increment(ref _leaves);
@@ -421,6 +442,21 @@ internal sealed class ReaderCluster : IDisposable
                 return Offset(request);
             case CommandCodes.SYNC_CONSUMER_GROUP_CODE:
                 Interlocked.Increment(ref _syncs);
+                if (SyncsUnanswered)
+                {
+                    return null;
+                }
+
+                if (SyncRefusal is { } unsynced)
+                {
+                    return Reply(OPERATION_NON_REPLICATED, [], (uint)unsynced);
+                }
+
+                if (MemberForgotten)
+                {
+                    return Reply(OPERATION_NON_REPLICATED, []);
+                }
+
                 if (RebalancesEachSync)
                 {
                     Interlocked.Increment(ref _groupGeneration);

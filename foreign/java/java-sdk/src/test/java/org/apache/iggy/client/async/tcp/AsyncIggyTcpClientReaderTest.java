@@ -339,6 +339,101 @@ class AsyncIggyTcpClientReaderTest {
         }
     }
 
+    /**
+     * A group that was deleted and created again counts its sync generation from 0, so its sync reply can equal the one
+     * of the old group. A client becomes a member only by its own join. So the first sync reply after a join raises the
+     * watermark to its commit, also with the assignment of the last reply before the join.
+     */
+    @Test
+    void shouldNameTheCommitOfTheFirstSyncAfterAJoinInTheNextFetch() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            long joinedAt = ASSIGNED_AT + 1;
+            long syncedAfterTheJoinAt = joinedAt + 1;
+            AtomicLong syncCommit = new AtomicLong(ASSIGNED_AT);
+            List<Long> fetchOps = new CopyOnWriteArrayList<>();
+            CompletableFuture<Void> served = singleNode(socket, request -> {
+                if (request.is(SYNC_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.committed(OPERATION_NON_REPLICATED, syncCommit.get(), assignment());
+                }
+                if (request.operation() == VsrOperation.JOIN_CONSUMER_GROUP) {
+                    return Response.committed(
+                            request.operation(), joinedAt, Unpooled.buffer().writeIntLE(0));
+                }
+                if (request.is(FETCH_CODE, OPERATION_NON_REPLICATED)) {
+                    fetchOps.add(request.metadataOp());
+                    return Response.success(OPERATION_NON_REPLICATED, emptySection(1));
+                }
+                return unexpected(request);
+            });
+            AsyncIggyTcpClient client = signedIn(socket);
+            try {
+                var transport = new TcpReaderTransport(client, StreamId.of(1L), TopicId.of(1L), Consumer.group(7L));
+                Map<Long, PollingStrategy> targets = Map.of(1L, PollingStrategy.offset(BigInteger.ZERO));
+                DeferredPollOptions options = PollOptions.waitFor(Duration.ZERO).deferredOptions();
+
+                transport.assignment().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                transport.join().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                syncCommit.set(syncedAfterTheJoinAt);
+                transport.assignment().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                transport.read(targets, 1, false, options).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+                assertThat(fetchOps).containsExactly(syncedAfterTheJoinAt);
+            } finally {
+                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            }
+            served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * A group poll of the messages client syncs through the consumer groups client of its TCP client. So a join through
+     * that client makes the first sync of a group poll raise the watermark to its commit, also with the assignment of
+     * the last reply before the join. A member that owns no partition syncs again at each poll, so no cached
+     * assignment hides the second sync.
+     */
+    @Test
+    void shouldRaiseTheWatermarkAtTheFirstSyncOfAGroupPollAfterAJoin() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            long joinedAt = ASSIGNED_AT + 1;
+            long syncedAfterTheJoinAt = joinedAt + 1;
+            AtomicLong syncCommit = new AtomicLong(ASSIGNED_AT);
+            CompletableFuture<Void> served = singleNode(socket, request -> {
+                if (request.is(SYNC_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.committed(OPERATION_NON_REPLICATED, syncCommit.get(), noPartitions());
+                }
+                if (request.operation() == VsrOperation.JOIN_CONSUMER_GROUP) {
+                    return Response.committed(
+                            request.operation(), joinedAt, Unpooled.buffer().writeIntLE(0));
+                }
+                return unexpected(request);
+            });
+            AsyncIggyTcpClient client = signedIn(socket);
+            try {
+                Consumer group = Consumer.group(7L);
+
+                pollGroup(client, group);
+                client.consumerGroups()
+                        .joinConsumerGroup(StreamId.of(1L), TopicId.of(1L), group.id())
+                        .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                syncCommit.set(syncedAfterTheJoinAt);
+                pollGroup(client, group);
+
+                assertThat(client.metadataWatermark()).isEqualTo(syncedAfterTheJoinAt);
+            } finally {
+                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            }
+            served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** A poll that names no partition, so the messages client syncs the assignment of the member first. */
+    private static void pollGroup(AsyncIggyTcpClient client, Consumer group) throws Exception {
+        client.messages()
+                .pollMessages(
+                        StreamId.of(1L), TopicId.of(1L), Optional.empty(), group, PollingStrategy.next(), 1L, false)
+                .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+    }
+
     private static Set<?> committing(TcpReaderTransport transport) throws ReflectiveOperationException {
         Field field = TcpReaderTransport.class.getDeclaredField("committing");
         field.setAccessible(true);
@@ -368,5 +463,10 @@ class AsyncIggyTcpClientReaderTest {
     /** A sync reply that assigns partition 1 in generation 1. */
     private static ByteBuf assignment() {
         return Unpooled.buffer().writeLongLE(1).writeIntLE(1).writeIntLE(1);
+    }
+
+    /** A sync reply of a member in generation 1 that owns no partition. */
+    private static ByteBuf noPartitions() {
+        return Unpooled.buffer().writeLongLE(1).writeIntLE(0);
     }
 }

@@ -2162,6 +2162,37 @@ public sealed class PartitionReaderTests
     }
 
     /// <summary>
+    ///     The server refuses a commit as not owned, and then every read for the owner for its poll quota. The token
+    ///     of the commit stays live, but the start of the close ends those reads, so the commit fails with the refusal
+    ///     of its store. The close does not wait for the commit. After the reader left the group, the server would
+    ///     serve a read for the owner, and still no second store goes out.
+    /// </summary>
+    [Fact]
+    public async Task given_a_commit_refused_as_not_owned_when_the_close_starts_during_its_reads_for_the_owner_should_fail_with_the_refusal_and_not_store_again()
+    {
+        using var cluster = new ReaderCluster(1) { Assignment = [1] };
+        using var client = await cluster.ConnectAsync();
+        await using var reader = await client.Reader(Stream, Topic, Consumer.Group("readers"))
+            .WithOptions(new PollOptions { MaxWait = TimeSpan.FromMilliseconds(100) })
+            .WithRetryInterval(RetryInterval).BuildAsync(Token);
+        var batch = await reader.NextAsync(Token);
+        cluster.NextStoreNotOwned = true;
+        cluster.ProbeRefusal = VsrError.DEFERRED_POLL_CAPACITY_EXCEEDED;
+        var probes = cluster.Probes;
+        var commit = reader.CommitAsync(batch.Checkpoint!, Token);
+        await UntilAsync(() => cluster.Probes > probes);
+
+        await reader.CloseAsync(Token).AsTask().WaitAsync(PromptLimit, Token);
+        cluster.ProbeRefusal = null;
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(
+            () => commit.WaitAsync(PromptLimit, Token));
+
+        Assert.Equal(VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED, error.StatusCode);
+        Assert.Single(cluster.StoreOwners);
+        Assert.Equal(1, cluster.Leaves);
+    }
+
+    /// <summary>
     ///     The server refuses the store of the close as not owned, and then every read for the owner for its poll
     ///     quota. A cancel of the token of a later close neither ends those reads nor that close. A cancel of the token
     ///     of the first close ends them, and both closes fail with the refusal of the store after the reader left the
@@ -3484,6 +3515,144 @@ public sealed class PartitionReaderTests
     }
 
     /// <summary>
+    ///     The group drops the member inside its session, as after a delete and a new create of the group, and answers
+    ///     its sync with an empty body. The reader joins again by itself and reports no error. The partition that the
+    ///     new member still owns keeps its position, so the next batch follows the first one.
+    /// </summary>
+    [Fact]
+    public async Task given_a_group_that_forgot_its_member_when_reading_should_join_again_and_read_on()
+    {
+        using var cluster = new ReaderCluster(1) { Assignment = [1] };
+        using var client = await cluster.ConnectAsync();
+        var session = ((ISessionGenerationProvider)client).SessionGeneration;
+        var reader = await client.Reader(Stream, Topic, Consumer.Group("readers"))
+            .WithOptions(new PollOptions { MaxWait = TimeSpan.FromMilliseconds(100) })
+            .WithRetryInterval(RetryInterval).BuildAsync(Token);
+        try
+        {
+            var first = await reader.NextAsync(Token);
+            cluster.MemberForgotten = true;
+            await UntilAsync(() => cluster.Joins == 2);
+            cluster.Limit = 4;
+
+            var next = (await ReadAsync(reader, 1))[0];
+
+            Assert.Equal([0ul, 1ul], first.Messages.Select(message => message.Header.Offset));
+            Assert.Equal((1u, 2ul), (next.PartitionId, next.Messages[0].Header.Offset));
+            Assert.Equal(2, cluster.Joins);
+            Assert.Equal(session, ((ISessionGenerationProvider)client).SessionGeneration);
+        }
+        finally
+        {
+            await reader.CloseAsync(Token);
+        }
+    }
+
+    /// <summary>
+    ///     The group forgot the member and stays deleted, so the server refuses the join of the reader. The reader
+    ///     hides only the sync that found no member. The refused join is an error of the whole reader.
+    /// </summary>
+    [Fact]
+    public async Task given_a_group_that_forgot_its_member_when_the_server_refuses_the_join_should_report_the_refusal()
+    {
+        using var cluster = new ReaderCluster(1) { Assignment = [1] };
+        using var client = await cluster.ConnectAsync();
+        var reader = await client.Reader(Stream, Topic, Consumer.Group("readers"))
+            .WithOptions(new PollOptions { MaxWait = TimeSpan.FromMilliseconds(100) })
+            .WithRetryInterval(RetryInterval).BuildAsync(Token);
+        try
+        {
+            await reader.NextAsync(Token);
+            cluster.JoinRefusal = VsrError.UNAUTHORIZED;
+            cluster.MemberForgotten = true;
+
+            var error = await NextErrorAsync(reader);
+
+            Assert.Equal(((uint?)null, VsrError.UNAUTHORIZED), (error.PartitionId,
+                Assert.IsType<IggyInvalidStatusCodeException>(error.InnerException).StatusCode));
+        }
+        finally
+        {
+            await reader.CloseAsync(Token);
+        }
+    }
+
+    /// <summary>
+    ///     The server refuses every read of the partition as not owned, and the sixth refusal in a row reports one
+    ///     error. A group that forgot the member starts that count again, as a new session does. So the error comes
+    ///     after more than six refused reads in all.
+    /// </summary>
+    [Fact]
+    public async Task given_a_partition_refused_as_not_owned_when_the_group_forgets_its_member_should_count_the_refusals_again()
+    {
+        const int RefusedBefore = 2;
+        const int ReportedRefusal = 6;
+        using var cluster = new ReaderCluster(1) { Assignment = [1] };
+        cluster.NotOwned.Add(1);
+        using var client = await cluster.ConnectAsync();
+        var reader = await client.Reader(Stream, Topic, Consumer.Group("readers"))
+            .WithOptions(new PollOptions { MaxWait = TimeSpan.FromMilliseconds(100) })
+            .WithRetryInterval(RetryInterval).BuildAsync(Token);
+        try
+        {
+            int Reads() => cluster.Fetches.Count + cluster.Polls.Count;
+
+            await UntilAsync(() => Reads() >= RefusedBefore);
+            cluster.MemberForgotten = true;
+            var error = await NextErrorAsync(reader);
+            var reads = Reads();
+
+            Assert.Equal((1u, VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED), (error.PartitionId,
+                Assert.IsType<IggyInvalidStatusCodeException>(error.InnerException).StatusCode));
+            Assert.True(reads > ReportedRefusal, $"The error came after {reads} refused reads.");
+            Assert.Equal(2, cluster.Joins);
+        }
+        finally
+        {
+            await reader.CloseAsync(Token);
+        }
+    }
+
+    /// <summary>
+    ///     A later sync of the assignment is refused, or gets no reply, while the node still serves the reads. The
+    ///     refresh runs apart from the reads, so the reader reads on under its last assignment and delivers the next
+    ///     batch.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task given_a_group_reader_when_a_later_sync_fails_or_hangs_should_read_on_under_the_last_assignment(bool unanswered)
+    {
+        using var cluster = new ReaderCluster(1) { Assignment = [1] };
+        using var client = await cluster.ConnectAsync();
+        var reader = await client.Reader(Stream, Topic, Consumer.Group("readers"))
+            .WithOptions(new PollOptions { MaxWait = TimeSpan.FromMilliseconds(100) })
+            .WithRetryInterval(RetryInterval).BuildAsync(Token);
+        try
+        {
+            int Reads() => cluster.Fetches.Count + cluster.Polls.Count;
+
+            var first = await reader.NextAsync(Token);
+            var syncs = cluster.Syncs;
+            cluster.SyncsUnanswered = unanswered;
+            cluster.SyncRefusal = unanswered ? null : VsrError.TRANSIENT_NOT_ACCEPTED;
+            await UntilAsync(() => cluster.Syncs > syncs);
+            var reads = Reads();
+            await UntilAsync(() => Reads() > reads);
+            cluster.Limit = 4;
+
+            var next = (await ReadAsync(reader, 1))[0];
+
+            Assert.Equal([0ul, 1ul], first.Messages.Select(message => message.Header.Offset));
+            Assert.Equal((1u, 2ul), (next.PartitionId, next.Messages[0].Header.Offset));
+        }
+        finally
+        {
+            await reader.CloseAsync(Token);
+        }
+    }
+
+    /// <summary>
     ///     The coordinator hands a joining member its partitions one at a time, so the first assignment holds only
     ///     partition 1. The reader asks again within its refresh interval and reads partition 3 well before the client
     ///     cache of the assignment expires.
@@ -4210,7 +4379,7 @@ public sealed class PartitionReaderTests
     ///     serves its count from its start, and a committing one stores its last offset. The committing poll after
     ///     <see cref="LoseNextCommittingRead" /> stores, loses its reply and finds the log grown to 20 messages.
     /// </summary>
-    private sealed class ScriptedLog
+    internal sealed class ScriptedLog
     {
         private readonly object _gate = new();
         private ulong _firstKept;

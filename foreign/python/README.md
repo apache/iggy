@@ -618,6 +618,15 @@ reader in `async with`, which closes it. `async for` reads batches until
 `close()`. `delete_consumer_position()` deletes the offset stored for the
 partition of a checkpoint.
 
+When the offset store of `commit()` gets `ConsumerGroupPartitionNotOwned` (5009)
+for a partition that the reader still has, `commit()` reads the owner of the
+partition again. The server can refuse that read for a short time, and
+`commit()` repeats it after each such refusal, with no time limit. To bound
+`commit()`, use `asyncio.wait_for()`. A cancelled `commit()` sends nothing more,
+but a write that it already sent can still take effect. `close()` waits for
+every pending call of the reader, so cancel a pending `commit()` before
+`close()`.
+
 ```python
 from apache_iggy import Consumer, IggyClient, PollingStrategy
 
@@ -692,6 +701,25 @@ A lost read can commit messages that the reader cannot read again. Then the
 reader raises `FetchProgressUncertain` (14010) once. Its `lost` holds the first
 and last offset of those messages as `(first, last)`, and `skip` the
 continuation after them.
+
+## Interpreter Exit
+
+Before the interpreter exits, shut the SDK down: await `shutdown()` on each
+consumer and producer, and `close()` on each reader.
+
+The SDK registers an `atexit` handler at its first import. From that handler
+on, the threads of the SDK hand no result to Python. A thread that enters
+Python during finalization can abort the process. After that handler:
+
+- A call in flight can stay pending and never complete.
+- A call from a thread other than the exiting main thread raises
+  `RuntimeError`. An example is a daemon thread that runs the event loop.
+- A `consume_messages()` run ends and calls its callback no more.
+
+Python runs `atexit` handlers in reverse order of registration. A handler that
+you register before the first import of `apache_iggy` runs after the handler of
+the SDK. A wait for the SDK in such a handler can hang. Before you register
+such a handler, import `apache_iggy`, or shut the SDK down before the exit.
 
 ## Examples
 

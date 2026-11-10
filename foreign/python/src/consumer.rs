@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::future::poll_fn;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
+use std::task::Poll;
 
 use futures::StreamExt;
 use futures::future::{Either, select};
@@ -39,7 +41,9 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen
 use tokio::sync::{Mutex, oneshot, watch};
 
 use crate::client::{to_read_error, to_runtime_error};
-use crate::event_loop::{attach_unless_exiting, future_into_py, on_event_loop};
+use crate::event_loop::{
+    attach_unless_exiting, exit_gate_closed, future_into_py, gated, on_event_loop,
+};
 use crate::identifier::PyIdentifier;
 use crate::poll_options::CommitPolicy;
 use crate::receive_message::{Checkpoint, PollingStrategy, ReceiveMessage};
@@ -324,7 +328,7 @@ impl IggyConsumer {
             failure: failure.clone(),
         };
         let shutdown_requested = shutdown_event
-            .map(|event| into_future_with_locals(&locals, event.call_method0("wait")?))
+            .map(|event| into_future_with_locals(&locals, event.call_method0("wait")?).map(gated))
             .transpose()?;
 
         future_into_py(py, async move {
@@ -334,7 +338,17 @@ impl IggyConsumer {
             let run = get_runtime().spawn(async move {
                 let mut inner = inner.lock().await;
                 let _consuming = Consuming::start(consuming);
-                inner.consume_messages(&consumer, stopped).await
+                let mut consume = pin!(inner.consume_messages(&consumer, stopped));
+                // Behind the closed exit gate no callback runs, so a run that went on would
+                // count and store messages that no callback saw.
+                poll_fn(|cx| {
+                    if exit_gate_closed() {
+                        Poll::Ready(Ok(()))
+                    } else {
+                        consume.as_mut().poll(cx)
+                    }
+                })
+                .await
             });
             let outcome = match shutdown_requested {
                 None => run.await,
@@ -686,11 +700,11 @@ impl MessageConsumer for PyCallbackConsumer {
         let message = ReceiveMessage::from(received);
         let called = get_runtime()
             .spawn(scope(task_locals, async move {
-                attach_unless_exiting(|py| {
+                gated(attach_unless_exiting(|py| {
                     let callback = callback.bind(py);
                     let result = callback.as_any().call1((message,))?;
                     into_future(result)
-                })?
+                })?)
                 .await
             }))
             .await

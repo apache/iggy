@@ -36,7 +36,9 @@ namespace Apache.Iggy.Consumers;
 ///         <item>
 ///             A standalone consumer reads the partitions of its builder. A consumer group reads the assignment of its
 ///             member: the reader joins the group, joins again after a session loss and leaves it in
-///             <see cref="CloseAsync(CancellationToken)" />.
+///             <see cref="CloseAsync(CancellationToken)" />. It also joins again when the group no longer holds its
+///             member, for example after the group was deleted and created again, and reports no error for that. A
+///             join that the server refuses is an error of the reader.
 ///         </item>
 ///         <item>
 ///             Over TCP the reader reads the partitions of one primary in one request, and finds a moved primary by
@@ -63,7 +65,8 @@ namespace Apache.Iggy.Consumers;
 ///             (Unauthorized), 3007 (PartitionNotFound) or 5009 (ConsumerGroupPartitionNotOwned), is retried after a
 ///             wait that doubles each time, and after six in a row it stops its partition until a
 ///             <see cref="SeekAsync" /> with one error. Status 5009 never stops it: each sixth in a row reports one
-///             error, and the partition reads on. A new session starts the count and the wait again. Status 5009
+///             error, and the partition reads on. A new session starts the count and the wait again, and so does a
+///             group that no longer holds the member of the reader. Status 5009
 ///             alone is not a leave: the partition keeps its position and the state that the close needs, the reader
 ///             asks for the assignment again, and the partition sends owner generation 0 until its next reply. Only an
 ///             assignment without the partition drops that state. An offset write refused with status 5009 reads its
@@ -171,16 +174,36 @@ public sealed class PartitionReader : IAsyncDisposable
     private ulong _claims;
     private ulong _generations;
     private ulong _serves;
+    /// <summary>The session of the last join, under the lock: a refresh writes it and the worker reads it.</summary>
     private ulong _joinedSession;
+
+    /// <summary>
+    ///     A sync found no member of the client in the group, so the next refresh joins again. Under the lock, as
+    ///     <see cref="_joinedSession" />.
+    /// </summary>
+    private bool _memberLost;
 
     /// <summary>The session whose refusals the partitions count, which only the worker reads and writes.</summary>
     private ulong _refusalSession;
 
     private long _queuedBytes;
     private long _queuedMessages;
+
+    /// <summary>
+    ///     The refresh of the assignment in flight. It runs apart from the reads, as in the Rust reader, so a slow or
+    ///     failed one holds no read of the assignment that the last refresh confirmed.
+    /// </summary>
+    private Task _refreshing = Task.CompletedTask;
+
+    /// <summary>When the next refresh of the assignment may start after a failed one, under the lock.</summary>
+    private long _refreshAt;
+
     private bool _resync;
 
-    /// <summary>When the last sync or change of the assignment came, or null when none came since the last join.</summary>
+    /// <summary>
+    ///     When the last sync or change of the assignment came, under the lock, or null when none came since the last
+    ///     join.
+    /// </summary>
     private long? _syncedAt;
 
     /// <summary>The pause after <see cref="_syncedAt" /> before the next sync of the assignment.</summary>
@@ -334,11 +357,15 @@ public sealed class PartitionReader : IAsyncDisposable
 
     /// <summary>
     ///     Stores the offset of a checkpoint that this reader delivered. A checkpoint of an older generation of its
-    ///     partition, or at or below the last commit of its generation, stores nothing.
+    ///     partition, or at or below the last commit of its generation, stores nothing. A store that the server
+    ///     refuses as not owned reads its partition for the installed owner and goes once more under that owner. That
+    ///     read goes again after each transient refusal until <paramref name="token" /> is canceled or
+    ///     <see cref="CloseAsync(CancellationToken)" /> starts. Then the commit fails with the refusal, and its store
+    ///     does not go again.
     /// </summary>
     /// <exception cref="IggyInvalidStatusCodeException">
     ///     Status 3 with <see cref="CommitMode.OnRead" />, and for a checkpoint that this reader did not deliver. The
-    ///     errors of the offset store.
+    ///     errors of the offset store, such as status 5009 (ConsumerGroupPartitionNotOwned).
     /// </exception>
     /// <exception cref="VsrRequestOutcomeUnknownException">
     ///     The store has an unknown outcome. The reader releases it in the client, so a retry of the commit can store.
@@ -365,9 +392,10 @@ public sealed class PartitionReader : IAsyncDisposable
             owned = Owned(state, checkpoint);
         }
 
+        using var retry = LinkToCloseStart(token);
         try
         {
-            await StoreAsync(owned, token, token);
+            await StoreAsync(owned, token, retry.Token);
         }
         catch (VsrRequestOutcomeUnknownException error)
         {
@@ -641,13 +669,16 @@ public sealed class PartitionReader : IAsyncDisposable
     ///     partition can write. A store or delete that the server refuses as not owned reads its partition for the
     ///     installed owner. That read goes again after each transient refusal until <paramref name="token" /> is
     ///     canceled or 10 seconds after the close started. Then the refusal stands, and each later store or delete of
-    ///     the close goes once without that read. The same read for an automatic store or a seek in the background
-    ///     ends when the close starts. A group reader then leaves its group, also after a cancel. A
+    ///     the close goes once without that read. The same read for an automatic store, for a seek in the background
+    ///     or for a <see cref="CommitAsync" /> of the application ends when the close starts, and the close does not
+    ///     wait for that commit. A group reader then leaves its group, also after a cancel. A
     ///     <see cref="NextAsync" /> that waits ends with <see cref="ObjectDisposedException" />.
     /// </summary>
     /// <remarks>
     ///     The close belongs to its first call. A later call waits for the first close and ends as it does, and its
-    ///     token does not end that close.
+    ///     token does not end that close. The stores and deletes of the close go one at a time, and the request
+    ///     timeout of the client bounds each one. So during an outage a close can take about one request timeout for
+    ///     each partition with a pending store.
     /// </remarks>
     /// <exception cref="Exception">The first failed store of the close.</exception>
     public async ValueTask CloseAsync(CancellationToken token)
@@ -697,6 +728,7 @@ public sealed class PartitionReader : IAsyncDisposable
         CountUncounted();
         await _lifetime.CancelAsync();
         await _worker;
+        await _refreshing;
         await _regrouping;
         await _lookingUp;
         Task[] reads;
@@ -1064,48 +1096,23 @@ public sealed class PartitionReader : IAsyncDisposable
         var token = _lifetime.Token;
         while (!token.IsCancellationRequested)
         {
-            TimeSpan wait;
-            var failed = false;
             try
             {
-                ForgetEarlierSessionRefusals();
-                if (_assignment is not null)
+                TimeSpan wait;
+                try
                 {
-                    await RefreshAssignmentAsync(token);
+                    ForgetEarlierSessionRefusals();
+                    wait = StartReads();
                 }
-
-                wait = StartReads();
-            }
-            catch (OperationCanceledException) when (token.IsCancellationRequested)
-            {
-                return;
-            }
-            catch (Exception error)
-            {
-                if (IsTransient(error))
+                catch (Exception error)
                 {
-                    _logger.LogWarning(error, "The partition reader retries a refused refresh.");
-                }
-                else
-                {
+                    // A worker that ended here would stop every read without an error, and the close awaits it.
                     Report(null, 0, error);
+                    await Task.Delay(_settings.RetryInterval, token);
+                    continue;
                 }
 
-                wait = _settings.RetryInterval;
-                failed = true;
-            }
-
-            try
-            {
-                // A caller that asks again after a failure does not cut the retry interval short.
-                if (failed)
-                {
-                    await Task.Delay(wait, token);
-                }
-                else
-                {
-                    await _wake.WaitAsync(wait, token);
-                }
+                await _wake.WaitAsync(wait, token);
             }
             catch (OperationCanceledException)
             {
@@ -1127,6 +1134,12 @@ public sealed class PartitionReader : IAsyncDisposable
         }
 
         _refusalSession = session;
+        ForgetRefusals();
+    }
+
+    /// <summary>Starts the refusal count and the retry wait of every partition again.</summary>
+    private void ForgetRefusals()
+    {
         lock (_gate)
         {
             foreach (var state in _states.Values)
@@ -1137,26 +1150,86 @@ public sealed class PartitionReader : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    ///     Refreshes the assignment in a task of its own. A failed refresh keeps the partitions and is retried after
+    ///     the retry interval, also when a caller asks again before.
+    /// </summary>
+    private async Task RefreshAsync()
+    {
+        var token = _lifetime.Token;
+        try
+        {
+            await RefreshAssignmentAsync(token);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+        }
+        catch (Exception error)
+        {
+            lock (_gate)
+            {
+                // The sync that a refusal as not owned asked for is still owed.
+                _resync = true;
+                _refreshAt = Environment.TickCount64 + (long)_settings.RetryInterval.TotalMilliseconds;
+            }
+
+            if (IsTransient(error) || IsMemberLost(error))
+            {
+                _logger.LogWarning(error, "The partition reader retries a refused refresh.");
+            }
+            else
+            {
+                Report(null, 0, error);
+            }
+        }
+    }
+
     private async Task RefreshAssignmentAsync(CancellationToken token)
     {
-        if (_client is ISessionGenerationProvider session && session.SessionGeneration != _joinedSession)
-        {
-            var generation = session.SessionGeneration;
-            await JoinGroupAsync(_client, _logger, _settings.StreamId, _settings.TopicId,
-                _settings.Consumer.ConsumerId, token);
-            _joinedSession = generation;
-            _syncedAt = null;
-        }
-
-        bool resync;
+        var session = Session;
+        bool join;
         lock (_gate)
         {
-            resync = _resync || UntilSync(Environment.TickCount64) <= 0;
+            join = _memberLost || session != _joinedSession;
+        }
+
+        if (join)
+        {
+            await JoinGroupAsync(_client, _logger, _settings.StreamId, _settings.TopicId,
+                _settings.Consumer.ConsumerId, token);
+        }
+
+        lock (_gate)
+        {
+            if (join)
+            {
+                _joinedSession = session;
+                _memberLost = false;
+                _syncedAt = null;
+            }
+
             _resync = false;
         }
 
-        var assigned = await _assignment!.GetAssignedPartitionsAsync(_settings.StreamId, _settings.TopicId,
-            _settings.Consumer.ConsumerId, resync, token);
+        IReadOnlyList<uint> assigned;
+        try
+        {
+            // The worker starts a refresh only when a sync is due, so the client always asks the coordinator.
+            assigned = await _assignment!.GetAssignedPartitionsAsync(_settings.StreamId, _settings.TopicId,
+                _settings.Consumer.ConsumerId, true, token);
+        }
+        catch (Exception error) when (IsMemberLost(error))
+        {
+            // The partitions stay, as after a new session, and a refusal so far says nothing about the next member.
+            lock (_gate)
+            {
+                _memberLost = true;
+            }
+
+            ForgetRefusals();
+            throw;
+        }
+
         List<Checkpoint> leaving = [];
         lock (_gate)
         {
@@ -1165,13 +1238,10 @@ public sealed class PartitionReader : IAsyncDisposable
             // Only its own partitions count: hand-overs between other members move the group generation too.
             var changed = _syncedAt is null || !owned.SetEquals(_states.Keys);
             _regroupDue |= changed;
-            if (changed || resync)
-            {
-                _syncPause = changed
-                    ? AssignmentSettlePause
-                    : TimeSpan.FromTicks(Math.Min(_syncPause.Ticks * 2, GroupRefreshInterval.Ticks));
-                _syncedAt = Environment.TickCount64;
-            }
+            _syncPause = changed
+                ? AssignmentSettlePause
+                : TimeSpan.FromTicks(Math.Min(_syncPause.Ticks * 2, GroupRefreshInterval.Ticks));
+            _syncedAt = Environment.TickCount64;
 
             var left = _states.Keys.Where(partition => !owned.Contains(partition)).ToList();
             foreach (var partition in left)
@@ -1209,12 +1279,6 @@ public sealed class PartitionReader : IAsyncDisposable
         }
     }
 
-    /// <summary>The milliseconds until the next sync of the assignment is due, 0 or less once it is due.</summary>
-    private long UntilSync(long now)
-    {
-        return _syncedAt is { } synced ? synced + (long)_syncPause.TotalMilliseconds - now : 0;
-    }
-
     /// <summary>
     ///     Starts the reads that may start now, at most <see cref="MaxRequestsInFlight" /> in flight, and returns how
     ///     long the worker may sleep. Over TCP the partitions of one primary share one request, and the fetches start
@@ -1228,7 +1292,9 @@ public sealed class PartitionReader : IAsyncDisposable
     private TimeSpan StartReads()
     {
         var now = Environment.TickCount64;
+        var session = Session;
         var nextRetry = long.MaxValue;
+        var refresh = false;
         List<uint>? regroup = null;
         IReadOnlyList<IReadOnlyList<uint>> groups;
         HashSet<uint> grouped = [];
@@ -1237,7 +1303,23 @@ public sealed class PartitionReader : IAsyncDisposable
         int aloneLimit;
         lock (_gate)
         {
-            if (_fetcher is not null && _regroupDue && _regrouping.IsCompleted)
+            // A refresh runs apart from the reads, so a later one that fails or gets no reply holds no read. After a
+            // new session or a lost membership nothing else starts until a refresh confirmed the assignment, as in
+            // the Rust reader.
+            var synced = _memberLost || session != _joinedSession ? null : _syncedAt;
+            var confirmed = _assignment is null || synced is not null;
+            if (_assignment is not null && _refreshing.IsCompleted)
+            {
+                var due = Math.Max(_refreshAt,
+                    synced is { } last && !_resync ? last + (long)_syncPause.TotalMilliseconds : now);
+                refresh = due <= now;
+                if (!refresh)
+                {
+                    nextRetry = due;
+                }
+            }
+
+            if (confirmed && _fetcher is not null && _regroupDue && _regrouping.IsCompleted)
             {
                 if (_regroupAt <= now)
                 {
@@ -1246,7 +1328,7 @@ public sealed class PartitionReader : IAsyncDisposable
                 }
                 else
                 {
-                    nextRetry = _regroupAt;
+                    nextRetry = Math.Min(nextRetry, _regroupAt);
                 }
             }
 
@@ -1257,9 +1339,9 @@ public sealed class PartitionReader : IAsyncDisposable
             var lookupRoom = _lookingUp.IsCompleted
                 ? Math.Min(aloneLimit - Polling, MaxRequestsInFlight - Requests)
                 : 0;
-            var reading = OnRead
+            var reading = confirmed && (OnRead
                 ? _demand && _queue.Count == 0
-                : _queuedMessages < _prefetchMessages && _queuedBytes < _prefetchBytes;
+                : _queuedMessages < _prefetchMessages && _queuedBytes < _prefetchBytes);
             if (reading)
             {
                 foreach (var (partition, state) in _states)
@@ -1306,6 +1388,13 @@ public sealed class PartitionReader : IAsyncDisposable
             _lookups += lookups.Count;
         }
 
+        if (refresh)
+        {
+            // The wake after its end starts the reads of a changed assignment and times the next refresh.
+            _refreshing = RefreshAsync();
+            _refreshing.ContinueWith(_ => Wake(), TaskScheduler.Default);
+        }
+
         if (regroup is not null)
         {
             // Only a wake after the end of the task lets the next pass start a lookup that came due during this one.
@@ -1326,19 +1415,9 @@ public sealed class PartitionReader : IAsyncDisposable
 
         StartPolls(alone, aloneLimit);
 
-        var wait = nextRetry == long.MaxValue
+        return nextRetry == long.MaxValue
             ? Timeout.InfiniteTimeSpan
             : TimeSpan.FromMilliseconds(Math.Max(1, nextRetry - Environment.TickCount64));
-        if (_assignment is not null)
-        {
-            var untilSync = TimeSpan.FromMilliseconds(Math.Max(1, UntilSync(Environment.TickCount64)));
-            if (wait == Timeout.InfiniteTimeSpan || wait > untilSync)
-            {
-                wait = untilSync;
-            }
-        }
-
-        return wait;
     }
 
     /// <summary>
@@ -2433,14 +2512,29 @@ public sealed class PartitionReader : IAsyncDisposable
     }
 
     /// <summary>
+    ///     A source that <paramref name="token" /> cancels, and so does the start of the close. A store that went out
+    ///     after the close could land after the leave. The close disposes the lifetime in the end, so a call after its
+    ///     start links a canceled token instead.
+    /// </summary>
+    private CancellationTokenSource LinkToCloseStart(CancellationToken token)
+    {
+        lock (_gate)
+        {
+            return CancellationTokenSource.CreateLinkedTokenSource(token,
+                _closed ? new CancellationToken(true) : _lifetime.Token);
+        }
+    }
+
+    /// <summary>
     ///     Sends an offset write of the partition. A not owned refusal alone is not a leave: the server can have
     ///     installed the owner again, also at a metadata op that this client never saw. So while the partition stays
     ///     in the assignment, the reader treats its owner as lost, asks for the assignment again and reads the
     ///     partition once. When that read is served in the incarnation of the write, the write goes once more under the
     ///     context of the reply. Otherwise the refusal stands, also for a partition that left the assignment.
-    ///     <paramref name="retry" /> ends the retries of that read: the token of the caller, or for a write in the
-    ///     background the lifetime of the reader, which the close ends. A cancel of it after the reply of that read
-    ///     also keeps the refusal.
+    ///     <paramref name="retry" /> ends the retries of that read. For a commit of the application it is the token of
+    ///     the caller or the start of the close, whichever comes first. For a write in the background it is the
+    ///     lifetime of the reader, which the close ends. For a write of the close it is the deadline of the close. A
+    ///     cancel of it after the reply of that read also keeps the refusal.
     /// </summary>
     private async Task WriteAsync(uint partition, PartitionContext context, Func<PartitionContext, Task> write,
         CancellationToken retry)
@@ -2660,6 +2754,15 @@ public sealed class PartitionReader : IAsyncDisposable
             StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.TRANSIENT_NOT_COMMITTED or VsrError.NOT_PRIMARY
             or VsrError.DEFERRED_POLL_CAPACITY_EXCEEDED or VsrError.LIFECYCLE_BUSY
         };
+    }
+
+    /// <summary>
+    ///     A sync that found no member of the client in the group, for example after the group was deleted and created
+    ///     again. The reader joins again by itself, so it reports no error for it.
+    /// </summary>
+    private static bool IsMemberLost(Exception error)
+    {
+        return error is IggyInvalidStatusCodeException { StatusCode: VsrError.CONSUMER_GROUP_MEMBER_NOT_FOUND };
     }
 
     /// <summary>A refusal that a retry soon after does not change.</summary>

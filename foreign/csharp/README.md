@@ -806,7 +806,11 @@ while (true)
   joins the group, follows rebalances and leaves the group in `CloseAsync`. Over HTTP a group reader is not
   available. If the join has an unknown outcome, the reader abandons it in the client at once, and `BuildAsync`
   throws `VsrRequestOutcomeUnknownException`. So the next build can join. A join that landed keeps the member in
-  the group until the session ends.
+  the group until the session ends. The group can drop the member, for example after a delete and a new create
+  of the group. Then the reader joins again after its retry interval and reports no error. A join that the
+  server refuses gives a `ReadException` without a partition. While a later sync of the assignment fails or gets
+  no reply, the reader reads on under its last assignment. After a new session or a lost membership, it starts no
+  read until a refresh confirmed the assignment.
 - `NextAsync` returns one batch of one partition, never empty. A canceled call leaves the batches in the
   reader. `ReadException` names the partition of an error, and the reader retries by itself. Status 87 stops a
   partition until `SeekAsync` when its position came from an earlier read, and so do status 80 and a refusal
@@ -815,7 +819,8 @@ while (true)
   (`ConsumerGroupPartitionNotOwned`) alone is not a leave, and it never stops a partition. The wait before the next
   read starts at the retry interval and doubles after each 5009 in a row, up to 32 times the interval. Each sixth
   5009 in a row gives one error without `StopsPartition`, the count starts again, and the partition reads on. A new
-  session also starts the count and the wait again. The partition keeps its position and the state that the close
+  session also starts the count and the wait again, and so does a group that no longer holds the member. The
+  partition keeps its position and the state that the close
   needs, and the reader asks for the assignment again. Until the next reply of the partition, its reads and offset
   writes carry owner generation 0. The refusal of a read also loses the owner of its position and each owner that
   the partition showed before. A later read or offset write that names such an owner carries owner generation 0.
@@ -832,9 +837,13 @@ while (true)
   transient refusal of that read, the reader repeats the read after the retry interval. After any other failure,
   also an unknown outcome, the write fails with status 5009. When the token of the caller is canceled, the read
   stops and the write fails. When `CloseAsync` starts, the read stops for an
-  automatic store and for a seek after its caller left. The writes of the close repeat the read until the token of
+  automatic store and for a seek after its caller left. It also stops for a `CommitAsync` of the application.
+  That commit fails with status 5009, its store does not go again, and the close does not wait for it. The
+  writes of the close repeat the read until the token of
   the first `CloseAsync` call is canceled or 10 seconds after the close started. Then the refusal stands, and each
-  later write of the close goes once without the read. The close still leaves the group. `CloseAsync()` and
+  later write of the close goes once without the read. The close still leaves the group. The writes of the close
+  go one at a time. So during an outage a close can take about one request timeout for each partition with a
+  pending store. `CloseAsync()` and
   `DisposeAsync` pass a token that is never canceled, so only the 10 seconds end the read. A later call waits for
   the first close and ends as it does.
 - For a message that does not decode, `ReadException` carries `Skip`, `Offset` and `Record`. `Record` is the
@@ -1269,11 +1278,14 @@ for a position whose history is gone, and status 80 for a `Last` start whose fir
 a read. The partition reads nothing until `SeekAsync`, and `IsResumable` says that a seek to `PollingStrategy.Next()`
 reads it again after its stored offset. A stop while a committing read that lost its reply is still pending reports
 that read as status 14010 instead, since a seek to Next would skip what it stored.
+A lost range (`ReadException.Lost`, status 14010) also ends the loop with its `ReadException`. It stops no
+partition, so the next loop reads on after the range.
 `DisposeAsync` calls `ShutdownAsync()`. It waits for a handler of `ConsumeAsync` that runs, unless that handler calls
 it, counts the last message of `ReceiveAsync` under `CommitAfter.Processing`, stores or rewinds the offsets, and
 leaves the group. `ShutdownAsync(token)` closes the reader with that token. So a cancel ends the reads for the owner
 of a refused store of the close, as for `CloseAsync`, and the refusal stands. Those reads also end 10 seconds after
-the close started. The token does not end the wait for a running handler. `ShutdownAsync()` passes a token that is
+the close started. During an outage a shutdown can take about one request timeout for each partition with a
+pending store. The token does not end the wait for a running handler. `ShutdownAsync()` passes a token that is
 never canceled. A later call waits for the first shutdown and ends as it does.
 
 For automatic deserialization:

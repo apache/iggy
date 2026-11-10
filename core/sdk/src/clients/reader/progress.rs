@@ -17,7 +17,6 @@
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::pending;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -43,30 +42,17 @@ use crate::driver::{operation_deadline, with_deadline};
 static NEXT_READER: AtomicU64 = AtomicU64::new(1);
 
 tokio::task_local! {
-    static CALLER: Caller;
-}
-
-/// The caller of a write that is not the application, which ends the retries of its read for
-/// the owner. The application ends them by dropping the write, or with a deadline in force.
-#[derive(Clone, Copy)]
-enum Caller {
-    /// The reader itself: a seek after its caller returned, and an `Auto` store. The close
-    /// start ends the retries.
-    Reader,
-    /// The close, whose budget ends at this instant. Then no read for the owner starts, so
-    /// each write of the close that did not go yet still goes, under its own request timeout.
-    Close(Instant),
-}
-
-/// Runs `write` as a write of the reader itself, so the close ends its retries.
-pub(crate) fn in_background<F: Future>(write: F) -> impl Future<Output = F::Output> {
-    CALLER.scope(Caller::Reader, write)
+    /// Set for the writes of a close: the instant at which its budget ends. Then no read for
+    /// the owner starts, so each write of the close that did not go yet still goes, under its
+    /// own request timeout. Every other write retries its read for the owner until the close
+    /// starts, until its caller drops it, or until a deadline in force.
+    static CLOSE_BUDGET_END: Instant;
 }
 
 /// Runs the writes of a close, so the end of `budget` ends the retries of their reads for the
 /// owner.
 pub(crate) fn in_close<F: Future>(budget: Instant, writes: F) -> impl Future<Output = F::Output> {
-    CALLER.scope(Caller::Close(budget), writes)
+    CLOSE_BUDGET_END.scope(budget, writes)
 }
 
 #[derive(Clone, Copy)]
@@ -118,7 +104,8 @@ pub(crate) struct Progress {
     refresh_requested: AtomicBool,
     /// The pause before a read again after a transient refusal.
     retry_interval: Duration,
-    /// True once the reader closes or drops, which ends the retries of its own writes.
+    /// True once the reader closes or drops. Then only a write of the close retries its read
+    /// for the owner.
     stopping: watch::Sender<bool>,
 }
 
@@ -151,12 +138,9 @@ struct Generations {
     /// The generation that the last seek of each partition started.
     sought: BTreeMap<u32, u64>,
     /// With `OnRead`: the partitions whose reads a seek holds while it writes their stored
-    /// offset. True once the fetch loop holds them and no read of them that can commit is in
-    /// flight.
-    held: BTreeMap<u32, bool>,
-    /// The held partitions whose position named no offset when the fetch loop answered the hold.
-    unnamed: BTreeSet<u32>,
-    /// The close waited for the seeks, so a later seek would write beside its rewind.
+    /// offset.
+    held: BTreeMap<u32, Held>,
+    /// The close started, so a seek that starts its writes now would write beside its rewind.
     closed: bool,
     /// A fetch loop runs, which answers the holds.
     reading: bool,
@@ -166,6 +150,22 @@ struct Generations {
     /// batch and no delivered message of the partition decide its rewind, and the partition did
     /// not leave the assignment since.
     restores: BTreeMap<u32, Option<u64>>,
+    /// The partitions that stopped because the server lost the history of their position. Until
+    /// a seek, the last delivered message of such a partition names that history.
+    lost_histories: BTreeSet<u32>,
+}
+
+/// The state of the hold that a seek has on the reads of its partition.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// The fetch loop did not answer the hold yet.
+    Taken,
+    /// The fetch loop holds the reads, and no read that can commit is in flight.
+    Quiet,
+    /// As `Quiet`, and the position named no offset when the fetch loop answered.
+    QuietUnnamed,
+    /// The writes of the seek started, so the close waits for them.
+    Writing,
 }
 
 /// A seek write with an unknown outcome that the fetch loop did not take yet.
@@ -269,6 +269,10 @@ impl Progress {
         generations
             .restores
             .retain(|partition, _| staying.binary_search(partition).is_ok());
+        // The fetch loop drops the stop of a partition outside `staying`.
+        generations
+            .lost_histories
+            .retain(|partition| staying.binary_search(partition).is_ok());
         for partition in assigned {
             if staying.binary_search(partition).is_err()
                 || !generations.current.contains_key(partition)
@@ -301,25 +305,28 @@ impl Progress {
         self.refresh_requested.swap(false, ORDERING)
     }
 
-    /// Ends the retries of the writes that run in the background, so the close does not wait
-    /// for them without end. Their refusal stands.
-    pub(crate) fn stop_background(&self) {
+    /// The reader closes or drops, which ends the retries of each write outside the close: a
+    /// write of the application, a seek that finishes after its caller dropped it, and an `Auto`
+    /// store. So no such write goes again beside the close, and the close does not wait for one
+    /// without end. Their refusal stands.
+    pub(crate) fn stop_retries(&self) {
         self.stopping.send_replace(true);
     }
 
-    /// Resolves once the caller of the write ends the retries of its read for the owner.
+    /// Resolves once the retries of the read for the owner of a write end: at the end of the
+    /// budget for a write of the close, and once the reader closes or drops for every other
+    /// write.
     async fn cancelled(&self) {
-        match CALLER.try_with(|caller| *caller) {
-            Ok(Caller::Reader) => {
+        match CLOSE_BUDGET_END.try_get() {
+            // A sleep past its deadline can wait for the next turn of the timer, and a read
+            // would start before it.
+            Ok(budget) if Instant::now() < budget => sleep_until(budget).await,
+            Ok(_) => {}
+            Err(_) => {
                 let mut stopping = self.stopping.subscribe();
                 // The sender lives as long as the progress.
                 let _ = stopping.wait_for(|stopping| *stopping).await;
             }
-            // A sleep past its deadline can wait for the next turn of the timer, and a read
-            // would start before it.
-            Ok(Caller::Close(budget)) if Instant::now() < budget => sleep_until(budget).await,
-            Ok(Caller::Close(_)) => {}
-            Err(_) => pending().await,
         }
     }
 
@@ -356,6 +363,17 @@ impl Progress {
             .is_some_and(|owners| owners.stale > 0 && context.owner_generation <= owners.stale)
     }
 
+    /// The server lost the history that the position of `partition` names, so the partition
+    /// stops until a seek.
+    pub(crate) fn lose_history(&self, partition: u32) {
+        self.generations().lost_histories.insert(partition);
+    }
+
+    /// Whether `partition` stopped for a lost history, and no seek started it again.
+    pub(crate) fn lost_history(&self, partition: u32) -> bool {
+        self.generations().lost_histories.contains(&partition)
+    }
+
     /// Starts a new generation of `partition` that reads from `start`, and returns it.
     pub(crate) fn seek(&self, partition: u32, start: PollingStrategy) -> u64 {
         let mut generations = self.generations_mut();
@@ -364,6 +382,7 @@ impl Progress {
         generations.current.insert(partition, generation);
         generations.seeks.insert(partition, start);
         generations.sought.insert(partition, generation);
+        generations.lost_histories.remove(&partition);
         generation
     }
 
@@ -415,10 +434,14 @@ impl Progress {
     /// With `OnRead`: takes the turn of `partition`, and waits until no read of it that can
     /// commit is in flight. A transport lane alone is not enough: HTTP has none, and a read from
     /// the old position that enters a lane after the writes still commits after them.
+    ///
+    /// # Errors
+    ///
+    /// [`IggyError::InvalidConfiguration`] once the close started, also while it waits.
     pub(crate) async fn hold(self: &Arc<Self>, partition: u32) -> Result<SeekHold, IggyError> {
         let mut hold = self.take_turn(partition).await?;
         self.wake.notify_one();
-        self.quiet(partition).await;
+        self.quiet(partition).await?;
         (hold.generation, hold.session) = {
             let generations = self.generations();
             (
@@ -434,17 +457,15 @@ impl Progress {
     ///
     /// # Errors
     ///
-    /// [`IggyError::InvalidConfiguration`] once the close waited for the seeks.
+    /// [`IggyError::InvalidConfiguration`] once the close started, also while it waits.
     pub(crate) async fn take_turn(self: &Arc<Self>, partition: u32) -> Result<SeekHold, IggyError> {
         loop {
             let released = self.quiet.notified();
             {
                 let mut generations = self.generations();
-                if generations.closed {
-                    return Err(IggyError::InvalidConfiguration);
-                }
+                generations.admit()?;
                 if let Entry::Vacant(free) = generations.held.entry(partition) {
-                    free.insert(false);
+                    free.insert(Held::Taken);
                     break;
                 }
             }
@@ -459,13 +480,22 @@ impl Progress {
         })
     }
 
+    /// The writes of the seek that holds `partition` start, so the close waits for them.
+    ///
+    /// # Errors
+    ///
+    /// [`IggyError::InvalidConfiguration`] once the close started. The seek then writes
+    /// nothing, so no write starts beside the close.
+    fn start_writes(&self, partition: u32) -> Result<(), IggyError> {
+        let mut generations = self.generations();
+        generations.admit()?;
+        generations.held.insert(partition, Held::Writing);
+        Ok(())
+    }
+
     /// A seek that moves publishes its new position first.
     fn release(&self, partition: u32) {
-        {
-            let mut generations = self.generations();
-            generations.held.remove(&partition);
-            generations.unnamed.remove(&partition);
-        }
+        self.generations().held.remove(&partition);
         self.quiet.notify_waiters();
         self.wake.notify_one();
     }
@@ -474,17 +504,22 @@ impl Progress {
         self.generations().held.keys().copied().collect()
     }
 
-    /// Waits until no seek holds a partition, also a seek that finishes after its caller
-    /// dropped it. Every later seek fails, so none writes beside the close.
+    /// The close starts. A seek that did not start its writes fails from now on, also one that
+    /// waits for its turn or for the fetch loop, so none writes beside the close. Then waits for
+    /// each seek that writes, also one that finishes after its caller dropped it, so the rewind
+    /// of the close goes after its writes. Those end within their request timeouts.
     pub(crate) async fn close_seeks(&self) {
+        self.generations().closed = true;
+        self.quiet.notify_waiters();
         loop {
             let released = self.quiet.notified();
-            {
-                let mut generations = self.generations();
-                if generations.held.is_empty() {
-                    generations.closed = true;
-                    return;
-                }
+            let writing = self
+                .generations()
+                .held
+                .values()
+                .any(|held| *held == Held::Writing);
+            if !writing {
+                return;
             }
             released.await;
         }
@@ -550,30 +585,34 @@ impl Progress {
     /// The fetch loop holds the reads of `partition`, and no read of it that can commit is in
     /// flight, so its seek can write. `unnamed` tells that the position names no offset.
     pub(crate) fn set_quiet(&self, partition: u32, unnamed: bool) {
-        let mut guard = self.generations();
-        let generations = &mut *guard;
-        if let Some(quiet) = generations.held.get_mut(&partition)
-            && !*quiet
+        let mut generations = self.generations();
+        if let Some(held) = generations.held.get_mut(&partition)
+            && *held == Held::Taken
         {
-            *quiet = true;
-            if unnamed {
-                generations.unnamed.insert(partition);
-            }
+            *held = if unnamed {
+                Held::QuietUnnamed
+            } else {
+                Held::Quiet
+            };
             self.quiet.notify_waiters();
         }
     }
 
     /// Waits until the fetch loop answers the hold of `partition`. Without a fetch loop, no read
     /// is in flight.
-    async fn quiet(&self, partition: u32) {
+    ///
+    /// # Errors
+    ///
+    /// [`IggyError::InvalidConfiguration`] once the close started.
+    async fn quiet(&self, partition: u32) -> Result<(), IggyError> {
         loop {
             let answered = self.quiet.notified();
-            let waiting = {
+            {
                 let generations = self.generations();
-                generations.reading && generations.held.get(&partition) == Some(&false)
-            };
-            if !waiting {
-                return;
+                generations.admit()?;
+                if !generations.reading || generations.held.get(&partition) != Some(&Held::Taken) {
+                    return Ok(());
+                }
             }
             answered.await;
         }
@@ -1261,9 +1300,10 @@ impl Progress {
     /// the fetch loop refreshes the assignment, and a read without a commit under owner 0 shows
     /// the installed owner. The write goes once more under the owner that it shows, in its own
     /// history only. Another member can own a partition that left, or can have read it while it
-    /// was away, so a write of an assignment that ended keeps its refusal. So does a write whose
-    /// caller ends the retries of its read: the close start for a write of the reader itself,
-    /// and the end of the close budget for a write of the close.
+    /// was away, so a write of an assignment that ended keeps its refusal, also when the
+    /// assignment ended during that read. So does a write whose read ends its retries: at the
+    /// end of the close budget for a write of the close, and at the close start for every other
+    /// write.
     async fn for_installed_owner(
         &self,
         mutation: OffsetMutation,
@@ -1300,13 +1340,16 @@ impl Progress {
             ),
             None => PollingStrategy::offset(offset),
         };
-        // A read answered as its caller ends the retries leads to no write either.
+        // A read answered as its retries end leads to no write either.
         let installed = tokio::select! {
             biased;
             () = self.cancelled() => None,
             installed = self.installed_context(partition, &strategy) => installed,
         }?;
-        if history.is_some_and(|context| context.incarnation != installed.incarnation) {
+        // A partition that left during the read and came back started a new assignment.
+        if self.assignment(partition, None) != assignment
+            || history.is_some_and(|context| context.incarnation != installed.incarnation)
+        {
             return None;
         }
         self.see_owner(partition, installed);
@@ -1438,6 +1481,20 @@ impl Progress {
     }
 }
 
+impl Generations {
+    /// Lets a seek go on only while the close did not start.
+    ///
+    /// # Errors
+    ///
+    /// [`IggyError::InvalidConfiguration`] once the close started.
+    fn admit(&self) -> Result<(), IggyError> {
+        if self.closed {
+            return Err(IggyError::InvalidConfiguration);
+        }
+        Ok(())
+    }
+}
+
 /// Holds the reads of a partition while its seek writes the stored offset. Dropping it lets them
 /// start again.
 pub(crate) struct SeekHold {
@@ -1473,12 +1530,13 @@ impl SeekHold {
     /// Without a delivered message of the current assignment, the close can restore no other
     /// offset.
     fn needs_before(&self) -> bool {
-        let unnamed = self
+        let held = self
             .progress
             .generations()
-            .unnamed
-            .contains(&self.partition);
-        unnamed || self.progress.delivered_here(self.partition).is_none()
+            .held
+            .get(&self.partition)
+            .copied();
+        held == Some(Held::QuietUnnamed) || self.progress.delivered_here(self.partition).is_none()
     }
 
     /// Runs the writes of a seek and its move in a task of its own, which keeps the hold until
@@ -1486,16 +1544,21 @@ impl SeekHold {
     /// and the move follow on success. A later seek and the close wait for that task, and the
     /// close ends its retries, as does a deadline of the caller. The task logs a failure that no
     /// caller takes.
+    ///
+    /// # Errors
+    ///
+    /// [`IggyError::InvalidConfiguration`] once the close started: the seek then writes nothing.
+    /// Otherwise the error of `write`.
     pub(crate) async fn finish(
         self,
         write: impl Future<Output = Result<(), IggyError>> + Send + 'static,
     ) -> Result<(), IggyError> {
+        self.progress.start_writes(self.partition)?;
         // The task runs outside the deadline scope of the caller.
         let deadline = binary_deadline_in_force();
         let (sender, receiver) = oneshot::channel();
         tokio::spawn(async move {
             let partition = self.partition;
-            let write = in_background(write);
             let result = match deadline {
                 Some(deadline) => with_deadline(deadline, write).await,
                 None => write.await,

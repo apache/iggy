@@ -129,8 +129,6 @@ type fakeClient struct {
 	uncertainLeaves int
 	metadataBlocked *uint64
 	resolved        []uint64
-	// unresolved makes each resolve end with an unknown outcome again.
-	unresolved bool
 	// memberMissing makes the next sync miss the member, as after a lost session.
 	memberMissing bool
 	// refusedProbes holds the refusals of the next probes of each partition, one
@@ -139,7 +137,10 @@ type fakeClient struct {
 	failedProbes  map[uint32][]error
 	// undecodableProbes names the partitions whose probes read a message that does not decode.
 	undecodableProbes map[uint32]bool
-	probes            []uint32
+	// idleProbes names the partitions whose probes find no message. As the
+	// server does, the fake holds such a probe for its max wait.
+	idleProbes map[uint32]bool
+	probes     []uint32
 	// probeStarted, when set, receives each probe, which then waits until probeRelease closes.
 	probeStarted chan struct{}
 	probeRelease chan struct{}
@@ -205,11 +206,18 @@ func (f *fakeClient) FetchMessages(ctx context.Context, _, _ iggcon.Identifier, 
 		}
 		partition := targets[0].PartitionId
 		f.mu.Lock()
-		started, release := f.probeStarted, f.probeRelease
+		started, release, idle := f.probeStarted, f.probeRelease, f.idleProbes[partition]
 		f.mu.Unlock()
 		if started != nil {
 			started <- struct{}{}
 			<-release
+		}
+		if idle {
+			select {
+			case <-time.After(options.MaxWait):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -221,6 +229,9 @@ func (f *fakeClient) FetchMessages(ctx context.Context, _, _ iggcon.Identifier, 
 		if refusals := f.refusedProbes[partition]; len(refusals) > 0 {
 			f.refusedProbes[partition] = refusals[1:]
 			return []iggcon.FetchMessagesSection{{PartitionId: partition, Err: refusals[0]}}, nil
+		}
+		if idle {
+			return []iggcon.FetchMessagesSection{{PartitionId: partition, Context: testContext}}, nil
 		}
 		first := f.starts[partition]
 		if stored, ok := f.offsets[partition]; ok {
@@ -461,9 +472,6 @@ func (f *fakeClient) ResolveOperation(_ context.Context, operationID uint64) err
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.resolved = append(f.resolved, operationID)
-	if f.unresolved {
-		return ierror.OperationUncertain{OperationID: operationID}
-	}
 	if f.metadataBlocked != nil && *f.metadataBlocked == operationID {
 		f.metadataBlocked = nil
 	}
@@ -925,6 +933,36 @@ func TestPartitionReader_RunsAtMost32ProbesAtOnceUnderOnRead(t *testing.T) {
 	read := client.nextRead(t)
 	assert.Len(t, client.recordedProbes(), maxReads, "the probes of one read take at most 32 requests")
 	assert.Equal(t, partitions[:maxReads], partitionsOf(read), "a partition without a probe waits for a later read")
+}
+
+// A committing read waits for its probes, so a probe waits for no message.
+// A partition without one then holds back no read of its group, neither at
+// the start nor when the reader probes it again after the retry interval.
+func TestPartitionReader_HoldsBackNoReadOfAGroupForAPartitionWithoutAMessageUnderOnRead(t *testing.T) {
+	client := newFakeClient()
+	client.idleProbes = map[uint32]bool{2: true}
+	// A probe that waited this long would outlast the wait of the test for a read.
+	options := withCommit(iggcon.WaitPollOptions(2*testTimeout), iggcon.OnReadCommit())
+	reader := standalone(t, client, options, 1, 2)
+	delivers := func(offset uint64) {
+		t.Helper()
+		polled := nextInBackground(reader)
+		read := client.nextRead(t)
+		require.Equal(t, []uint32{1}, partitionsOf(read), "the read goes without the partition that has no message")
+		read.answer(section(1, offset))
+		result := <-polled
+		require.NoError(t, result.err)
+		assert.Equal(t, []uint64{offset}, offsets(result.polled))
+	}
+
+	delivers(0)
+	// Only then is the partition without a message ready for its next probe.
+	time.Sleep(testRetryInterval)
+	delivers(1)
+
+	probes := client.recordedProbes()
+	slices.Sort(probes)
+	assert.Equal(t, []uint32{1, 2, 2}, probes, "each read probes the partition without a message once")
 }
 
 // Reads of one partition alone can wait on the server, so they leave a request
@@ -1722,6 +1760,60 @@ func TestPartitionReader_ReportsAPartitionThatStaysRefusedAsNotOwnedAfterADoubli
 	assert.Equal(t, []uint64{0}, offsets(next(t, reader)), "the partition is read again after the report")
 }
 
+// A new session starts the count of the refusals as not the owner again and
+// ends the wait of the lost session. The server can refuse the first read of
+// the new session while it installs the owner. That refusal is then the first
+// in a row, not the sixth, so it reports no error.
+func TestPartitionReader_StartsTheCountAndTheWaitOfRefusalsAsNotOwnedAgainAfterANewSession(t *testing.T) {
+	const (
+		interval = 50 * time.Millisecond
+		// One more refusal in a row would report the error.
+		refusals = lastingRefusalsBeforeStop - 1
+	)
+	client := newFakeClient()
+	reader := memberWith(t, client, []uint32{1}, WithPollOptions(waitOneSecond), WithRetryInterval(interval))
+	notOwned := iggcon.FetchMessagesSection{PartitionId: 1, Err: ierror.ErrConsumerGroupPartitionNotOwned}
+	var refused time.Time
+	for range refusals {
+		read := client.nextRead(t)
+		refused = time.Now()
+		read.answer(notOwned)
+	}
+
+	losesItsSession(t, client, reader, 1)
+
+	read := client.nextRead(t)
+	assert.Less(t, time.Since(refused), interval<<(refusals-1), "the wait of the lost session holds back no read of the new one")
+	read.answer(notOwned)
+	client.nextRead(t).answer(section(1, 0))
+	assert.Equal(t, []uint64{0}, offsets(next(t, reader)), "the refusal of the new session is the first in a row")
+}
+
+// A rejoin with an unknown outcome can have landed. The next sync then finds
+// the member, so the reader joins no more. That sync starts the count of the
+// refusals as not the owner again, as the sync after a rejoin does.
+func TestPartitionReader_StartsTheCountOfRefusalsAsNotOwnedAgainAfterARejoinWithAnUnknownOutcomeThatLanded(t *testing.T) {
+	const (
+		interval = 50 * time.Millisecond
+		// One more refusal in a row would report the error.
+		refusals = lastingRefusalsBeforeStop - 1
+	)
+	client := newFakeClient()
+	reader := memberWith(t, client, []uint32{1}, WithPollOptions(waitOneSecond), WithRetryInterval(interval))
+	notOwned := iggcon.FetchMessagesSection{PartitionId: 1, Err: ierror.ErrConsumerGroupPartitionNotOwned}
+	for range refusals {
+		client.nextRead(t).answer(notOwned)
+	}
+
+	rejoinUncertainly(t, client)
+	// The join landed, so the next sync finds the member.
+	client.assignments <- []uint32{1}
+
+	client.nextRead(t).answer(notOwned)
+	client.nextRead(t).answer(section(1, 0))
+	assert.Equal(t, []uint64{0}, offsets(next(t, reader)), "the refusal after the rejoin is the first in a row")
+}
+
 // Under OnRead the partitions of a group share a read, so a refusal of the
 // probe of one partition counts against that partition only.
 func TestPartitionReader_StopsOnlyThePartitionWhoseProbeStaysRefusedAndKeepsReadingItsGroupUnderOnRead(t *testing.T) {
@@ -2152,55 +2244,36 @@ func TestPartitionReader_AbandonsAFirstJoinWithAnUnknownOutcome(t *testing.T) {
 	assert.Nil(t, client.metadataBlocked, "the metadata writes of the client go on")
 }
 
-// A sync that finds the member does not join again, so the next refresh
-// resolves a rejoin with an unknown outcome before its sync.
-func TestPartitionReader_ResolvesARejoinWithAnUnknownOutcomeAtTheNextRefresh(t *testing.T) {
+// The reader abandons a rejoin with an unknown outcome at once too, and does
+// not keep it until the next refresh. The server keeps a member that joins
+// again in its session as it is, so a later join does no harm if this one
+// landed.
+func TestPartitionReader_AbandonsARejoinWithAnUnknownOutcomeAtOnce(t *testing.T) {
 	client := newFakeClient()
 	reader := member(t, client, waitOneSecond, 1)
 	rejoinUncertainly(t, client)
 
-	require.Eventually(t, func() bool {
-		client.mu.Lock()
-		defer client.mu.Unlock()
-		return client.metadataBlocked == nil
-	}, testTimeout, 5*time.Millisecond, "the metadata writes of the client go on")
+	require.Eventually(t, func() bool { return len(client.recordedAbandons()) > 0 }, testTimeout, 5*time.Millisecond,
+		"the reader abandons the join")
 	require.NoError(t, reader.Close(context.Background()))
 
-	assert.Equal(t, []uint64{uncertainOperation}, client.resolved)
-	assert.Empty(t, client.abandoned)
+	assert.Equal(t, []uint64{uncertainOperation}, client.abandoned)
+	assert.Empty(t, client.resolved, "the reader keeps no join to resolve")
+	assert.Nil(t, client.metadataBlocked, "the metadata writes of the client go on")
 	assert.Equal(t, []string{"join", "join", "leave"}, client.membership)
 }
 
-// Close abandons a rejoin whose outcome is still unknown, so its leave can go
-// out, and a leave with an unknown outcome, which it returns.
-func TestPartitionReader_AbandonsAGroupWriteWithAnUnknownOutcomeOnClose(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		rejoin bool
-		err    error
-	}{
-		{"rejoin still unknown", true, nil},
-		{"leave", false, ierror.OperationUncertain{OperationID: uncertainOperation}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			client := newFakeClient()
-			client.unresolved = true
-			reader := member(t, client, waitOneSecond, 1)
-			if test.rejoin {
-				rejoinUncertainly(t, client)
-			} else {
-				client.mu.Lock()
-				client.uncertainLeaves = 1
-				client.mu.Unlock()
-			}
+// Close abandons a leave with an unknown outcome, which it returns.
+func TestPartitionReader_AbandonsALeaveWithAnUnknownOutcomeOnClose(t *testing.T) {
+	client := newFakeClient()
+	client.uncertainLeaves = 1
+	reader := member(t, client, waitOneSecond, 1)
 
-			assert.Equal(t, test.err, reader.Close(context.Background()))
+	assert.Equal(t, ierror.OperationUncertain{OperationID: uncertainOperation}, reader.Close(context.Background()))
 
-			assert.Equal(t, []uint64{uncertainOperation}, client.abandoned)
-			assert.Nil(t, client.metadataBlocked, "the metadata writes of the client go on")
-			assert.Equal(t, "leave", client.membership[len(client.membership)-1])
-		})
-	}
+	assert.Equal(t, []uint64{uncertainOperation}, client.abandoned)
+	assert.Nil(t, client.metadataBlocked, "the metadata writes of the client go on")
+	assert.Equal(t, "leave", client.membership[len(client.membership)-1])
 }
 
 // rejoinUncertainly makes a sync of a group reader after its first one miss
@@ -4403,8 +4476,40 @@ func TestPartitionReader_EndsTheRetryOfACommitRefusedAsNotOwnedWhenItsContextEnd
 	assert.Empty(t, client.recordedStores())
 }
 
+// The leave of Close gives the partition away. So the start of Close ends the
+// retry of the read for the installed owner of a commit too, also one whose
+// context never ends. The refusal of the store stands, and the store goes no
+// more.
+func TestPartitionReader_EndsTheRetryOfACommitRefusedAsNotOwnedWhenCloseStarts(t *testing.T) {
+	client := newFakeClient()
+	client.refusedProbes = map[uint32][]error{1: keptRefusals}
+	reader := member(t, client, waitOneSecond, 1)
+	client.nextRead(t).answer(section(1, 3, 4))
+	checkpoint, _ := next(t, reader).Checkpoint()
+	installsTheOwnerAgain(client)
+	committed := make(chan error, 1)
+	go func() { committed <- reader.Commit(context.Background(), checkpoint) }()
+	require.Eventually(t, func() bool { return len(client.recordedProbes()) > 0 }, testTimeout, 5*time.Millisecond,
+		"the read for the installed owner is refused")
+
+	require.NoError(t, reader.Close(context.Background()))
+
+	select {
+	case err := <-committed:
+		require.ErrorIs(t, err, ierror.ErrConsumerGroupPartitionNotOwned)
+	case <-time.After(testTimeout):
+		// The read then gets its reply, so the commit ends after the test.
+		client.mu.Lock()
+		client.refusedProbes = nil
+		client.mu.Unlock()
+		t.Fatal("Commit retries the read after Close started")
+	}
+	assert.Len(t, client.recordedStoreContexts(), 1, "the store goes no more")
+}
+
 // keptRefusals are more transient refusals of a read than a test waits
-// through, so the retry of that read ends only when its caller cancels.
+// through, so the retry of that read ends only when its caller cancels or
+// Close starts.
 var keptRefusals = slices.Repeat([]error{ierror.ErrTransientNotAccepted}, int(2*testTimeout/testRetryInterval))
 
 // closeDuringTheRetry closes reader while a read for the installed owner keeps

@@ -21,12 +21,15 @@ package org.apache.iggy.client.async.reader;
 
 import org.apache.iggy.client.async.reader.FakeTransport.Read;
 import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.junit.jupiter.api.Test;
 
+import java.math.BigInteger;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.LongStream;
 
@@ -35,6 +38,7 @@ import static org.apache.iggy.client.async.reader.FakeTransport.refused;
 import static org.apache.iggy.client.async.reader.FakeTransport.section;
 import static org.apache.iggy.client.async.reader.PartitionReaderStoredOffsetTest.loseMembership;
 import static org.apache.iggy.client.async.reader.PartitionReaderTest.MANUAL;
+import static org.apache.iggy.client.async.reader.PartitionReaderTest.ON_READ;
 import static org.apache.iggy.client.async.reader.PartitionReaderTest.QUIET;
 import static org.apache.iggy.client.async.reader.PartitionReaderTest.RETRY_INTERVAL;
 import static org.apache.iggy.client.async.reader.PartitionReaderTest.assignment;
@@ -84,6 +88,37 @@ class PartitionReaderPacingTest {
                     .as("the freed request goes to the read of the group")
                     .isFalse();
             assertThat(freed.targets()).containsOnlyKeys(partition);
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * A check stores nothing, so it is not the read of its group that may wait. While the check of one partition waits,
+     * the other partitions of the group still read for a waiting call.
+     */
+    @Test
+    void shouldReadTheOtherPartitionsOfAGroupWhileACheckWaitsUnderOnRead() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, PollingStrategy.timestamp(BigInteger.TEN), ON_READ, 1L, 2L);
+        try {
+            CompletableFuture<PolledMessages> waiting = reader.next();
+            List<Read> checks = List.of(transport.nextRead(), transport.nextRead());
+            assertThat(checks).allMatch(Read::poll);
+            Read found = checks.stream()
+                    .filter(check -> check.targets().containsKey(1L))
+                    .findFirst()
+                    .orElseThrow();
+            found.answer(section(1, 5));
+
+            Read read = transport.nextRead();
+            assertThat(read.commit())
+                    .as("partition 1 reads while the check of partition 2 waits")
+                    .isTrue();
+            assertThat(read.targets()).containsOnlyKeys(1L);
+            read.answer(section(1, 5));
+            assertThat(offsets(waiting.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)))
+                    .containsExactly(5L);
         } finally {
             reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
         }

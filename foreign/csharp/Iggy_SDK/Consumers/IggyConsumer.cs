@@ -48,7 +48,9 @@ namespace Apache.Iggy.Consumers;
 ///         <see cref="SubscribeToErrorEvents" />. An error that stops a partition (<see cref="ReadException.StopsPartition" />)
 ///         ends the stream with its <see cref="ReadException" />, as a message that does not decode does, and the
 ///         partition reads nothing until <see cref="SeekAsync" />. <see cref="ReadException.IsResumable" /> says that a
-///         seek to <see cref="PollingStrategy.Next" /> reads it again after its stored offset.
+///         seek to <see cref="PollingStrategy.Next" /> reads it again after its stored offset. A lost range
+///         (<see cref="ReadException.Lost" />, status 14010) also ends the stream with its <see cref="ReadException" />,
+///         as the Rust consumer does. It stops no partition, so the next stream reads on after the range.
 ///     </para>
 /// </remarks>
 public partial class IggyConsumer : IAsyncDisposable
@@ -261,9 +263,15 @@ public partial class IggyConsumer : IAsyncDisposable
         }
     }
 
-    /// <summary>Stores the offset of a checkpoint that this consumer handed over.</summary>
+    /// <summary>
+    ///     Stores the offset of a checkpoint that this consumer handed over, as
+    ///     <see cref="PartitionReader.CommitAsync" /> does. A cancel of <paramref name="ct" />, or the close of the
+    ///     reader in <see cref="ShutdownAsync(CancellationToken)" />, ends the reads for the owner of a store refused
+    ///     as not owned. The commit then fails with that refusal.
+    /// </summary>
     /// <exception cref="IggyInvalidStatusCodeException">
-    ///     Status 3 with <see cref="CommitMode.OnRead" />, and for a checkpoint of another consumer.
+    ///     Status 3 with <see cref="CommitMode.OnRead" />, and for a checkpoint of another consumer. The errors of the
+    ///     offset store, such as status 5009 (ConsumerGroupPartitionNotOwned).
     /// </exception>
     public Task CommitAsync(Checkpoint checkpoint, CancellationToken ct = default)
     {
@@ -296,7 +304,9 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     /// <remarks>
     ///     The shutdown belongs to its first call. A later call waits for the first shutdown and ends as it does,
-    ///     unless the handler that the first one waits for makes it, and its token does not end that shutdown.
+    ///     unless the handler that the first one waits for makes it, and its token does not end that shutdown. As for
+    ///     the close of the reader, during an outage a shutdown can take about one request timeout for each partition
+    ///     with a pending store.
     /// </remarks>
     /// <exception cref="Exception">The first failed store of the close.</exception>
     public async Task ShutdownAsync(CancellationToken token)
@@ -406,8 +416,9 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <summary>
     ///     The next batch of the reader, or null once the consumer shut down or <paramref name="ct" /> was canceled. A
     ///     read error that the reader retries goes to the error events and the reader goes on. A message that does
-    ///     not decode, whose <see cref="ReadException.Skip" /> passes it, and an error that stops a partition end the
-    ///     stream with their <see cref="ReadException" />.
+    ///     not decode, whose <see cref="ReadException.Skip" /> passes it, an error that stops a partition and a lost
+    ///     range end the stream with their <see cref="ReadException" />. Only the error tells of a lost range, and
+    ///     the error events can have no subscriber.
     /// </summary>
     private protected async Task<PolledMessages?> NextBatchAsync(CancellationToken ct)
     {
@@ -418,7 +429,7 @@ public partial class IggyConsumer : IAsyncDisposable
             {
                 return await Reader.NextAsync(cancellation.Token);
             }
-            catch (ReadException error) when (error.Skip is null && !error.StopsPartition)
+            catch (ReadException error) when (error.Skip is null && !error.StopsPartition && error.Lost is null)
             {
                 _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(error, error.Message));
             }

@@ -91,7 +91,10 @@ impl From<&IggyError> for PyIggyError {
     }
 }
 
-/// An operation whose retained identity is needed to recover or release its lane.
+/// An operation with an unknown outcome, or a call that such an operation blocks. `operation_id`
+/// names the operation for `IggyClient.resolve_operation()` and `IggyClient.abandon_operation()`.
+/// The client retains no operation for kind `not_retained`, and none for a group join that
+/// `reader()` abandoned.
 #[gen_stub_pyclass]
 #[pyclass(frozen, extends=PyIggyError)]
 pub struct PendingOperationError {
@@ -1437,8 +1440,7 @@ impl IggyClient {
             inner
                 .delete_segments(&stream_id, &topic_id, partition_id, segments_count)
                 .await
-                .map_err(to_runtime_error)?;
-            attach_unless_exiting(|py| Ok(py.None()))
+                .map_err(to_runtime_error)
         })
     }
 

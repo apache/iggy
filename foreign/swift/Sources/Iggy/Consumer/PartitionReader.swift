@@ -246,8 +246,9 @@ public actor PartitionReader: AsyncSequence {
     /// takes a permit, so the cancel releases all of them.
     private let closeCancel = AsyncSemaphore(permits: 0)
     /// Opened for good at the start of ``close()``, which ends the reads that
-    /// name the owner of a refused offset write of the reader itself, as
-    /// `closeCancel` ends them for the other writes.
+    /// name the owner of a refused offset write other than a write of the
+    /// close, as `closeCancel` ends them for the writes of the close. It
+    /// also ends each pause of a read call.
     private let closeStart = AsyncSemaphore(permits: 0)
     private let commitWakeups: AsyncStream<Void>
     private let commitWakeup: AsyncStream<Void>.Continuation
@@ -259,6 +260,8 @@ public actor PartitionReader: AsyncSequence {
     /// out and can come back on its own.
     private var canRead = true
     private var joinedGroup = false
+    /// The session of the last join of the reader. For a member that the
+    /// application joins, the last session that ``prepare()`` saw.
     private var joinedSessionScope: UInt64?
     private var lastAssignmentSync: ContinuousClock.Instant?
     /// Nil until the first sync after a join.
@@ -351,8 +354,6 @@ public actor PartitionReader: AsyncSequence {
     private var stopped: Set<UInt32> = []
     private var pollCursor: UInt32?
     private var readerWakeup: AsyncStream<Void>.Continuation?
-    /// Ends the pause of a read call once the close begins.
-    private var pauseWakeup: AsyncStream<Void>.Continuation?
     private(set) var storesWaiting: [UInt32: Int] = [:]
     private var storeWakeups: [AsyncStream<Void>.Continuation] = []
     /// With `onRead`: the seeks in flight of each partition, oldest first. A
@@ -466,11 +467,8 @@ public actor PartitionReader: AsyncSequence {
     /// the read that names the owner of a refused write, and the write keeps
     /// its refusal.
     private enum WriteCaller: Equatable {
-        /// The application, until its task or the first caller of
-        /// ``close()`` is cancelled.
-        case application
-        /// The reader itself, for a seek write and an `auto` store in the
-        /// background, until the close starts.
+        /// The open reader, for a commit of the application, a seek write
+        /// and an `auto` store in the background, until the close starts.
         case reader
         /// The close, until `deadline` or a cancel of its first caller.
         case close(deadline: ContinuousClock.Instant)
@@ -592,21 +590,28 @@ public actor PartitionReader: AsyncSequence {
     /// with an unknown outcome. A partition that left the assignment keeps
     /// its offset. A group member then leaves its group.
     ///
-    /// The close belongs to its first caller. A cancel of that caller ends
-    /// at once the retry of each read that names the owner of a refused
-    /// offset write. For the writes of the close itself, the close deadline
-    /// ends that retry too, 10 seconds after the start of the close. Such a
-    /// write keeps its refusal, also when the read was in flight at that
-    /// end. The close still sends once each offset write and lookup that it
-    /// did not send yet, with no such read, and then the leave. So a close
-    /// that starts in a cancelled task also sends its offset writes and the
-    /// leave.
+    /// The start of the close ends the retry of each read that names the
+    /// owner of a refused offset write of a ``commit(_:)``, a seek or an
+    /// `auto` store. Such a write fails with its refusal and is not sent
+    /// again, so the close waits for it no longer than one request in
+    /// flight.
+    ///
+    /// The close belongs to its first caller. For the writes of the close
+    /// itself, a cancel of that caller ends that retry at once, and the
+    /// close deadline ends it too, 10 seconds after the start of the close.
+    /// Such a write keeps its refusal, also when the read was in flight at
+    /// that end. The close still sends once each offset write and lookup
+    /// that it did not send yet, with no such read, and then the leave. So a
+    /// close that starts in a cancelled task also sends its offset writes
+    /// and the leave.
     ///
     /// A read in flight ends within the request timeout of
     /// ``ReaderConfiguration/options``. An offset write or lookup ends within
     /// 30 seconds, a fixed limit that includes each resend after a transient
-    /// refusal. The leave first waits for a join in flight, which sends up to
-    /// three requests. So the leave can take up to four times
+    /// refusal. The close sends them one after another. So during an outage
+    /// it can take about 30 seconds for each partition with a pending store.
+    /// The leave first waits for a join in flight, which sends up to three
+    /// requests. So the leave can take up to four times
     /// ``ClientConfiguration/requestTimeout``. The close ends after the last
     /// request.
     ///
@@ -621,7 +626,6 @@ public actor PartitionReader: AsyncSequence {
         }
         isClosed = true
         closeStart.release(.max)
-        pauseWakeup?.finish()
         let deadline = ContinuousClock.now + Self.closeBudget
         // The drain does not inherit a cancel, so the writes that it did not send yet and the leave still go.
         let task = Task { try await self.drain(ownerReadsUntil: deadline) }
@@ -779,9 +783,9 @@ public actor PartitionReader: AsyncSequence {
     /// a store refused as not owned goes once more, under the owner that a
     /// read without a commit names. A transient refusal of that read goes
     /// again after ``ReaderConfiguration/retryInterval`` until the caller is
-    /// cancelled, or until the first caller of ``close()`` is cancelled.
-    /// After such a cancel, the commit fails with the refusal, also when
-    /// that read was in flight.
+    /// cancelled or ``close()`` starts. After that end the commit fails with
+    /// the refusal and stores nothing again, also when that read was in
+    /// flight.
     ///
     /// Throws ``IggyErrorCode/invalidCommand`` with ``CommitPolicy/onRead``
     /// and for a checkpoint that this reader did not deliver, and the errors
@@ -796,7 +800,7 @@ public actor PartitionReader: AsyncSequence {
         guard isCurrent(checkpoint) else {
             return
         }
-        try await store(checkpoint, for: .application)
+        try await store(checkpoint, for: .reader)
     }
 
     /// Counts a checkpoint that this reader delivered, under
@@ -1113,44 +1117,50 @@ public actor PartitionReader: AsyncSequence {
     /// Pauses a read call until `deadline`. The close ends the pause at once,
     /// so neither a waiting `next()` nor the close waits for it.
     private func pause(until deadline: ContinuousClock.Instant) async throws {
-        let (ended, wakeup) = AsyncStream<Void>.makeStream()
-        pauseWakeup = wakeup
-        defer { pauseWakeup = nil }
-        let timer = Task {
-            try? await Task.sleep(until: deadline, clock: .continuous)
-            wakeup.finish()
-        }
-        defer { timer.cancel() }
-        if !isClosed {
-            for await _ in ended {}
-        }
+        _ = try await closeStart.acquire(1, deadline: deadline)
         try Task.checkCancellation()
     }
 
-    /// Joins again once the membership was lost, syncs an assignment the
-    /// client does not hold or that is due, and groups the partitions by
-    /// primary the first time. Later syncs and lookups also run beside the
-    /// reads. Returns false when nothing can be read yet: a member without
-    /// partitions once its next sync is due, else after the retry interval.
-    /// A failure is queued for ``next()``.
+    /// Joins again once the membership was lost, waits for the sync of a
+    /// member that holds no partitions to read under, and groups the
+    /// partitions by primary the first time. A later sync that is due starts
+    /// here without a wait, and the later lookups also run beside the reads.
+    /// So while a later sync fails or hangs, the reads go on under the last
+    /// assignment. Returns false when nothing can be read yet: a member
+    /// without partitions once its next sync is due, else after the retry
+    /// interval. A failure is queued for ``next()``.
     private func prepare() async -> Bool {
         do {
             if isGroup {
-                if configuration.autoJoinConsumerGroup, !joinedGroup || joinedSessionScope != client.core.groupState.sessionScope {
+                let session = client.core.groupState.sessionScope
+                if configuration.autoJoinConsumerGroup, !joinedGroup || joinedSessionScope != session {
                     try await joinGroup()
+                } else if !configuration.autoJoinConsumerGroup, joinedSessionScope != session {
+                    // The application joins this member, so no join of the reader starts the count of refusals as not
+                    // owned and the retry waits again. A new session does.
+                    joinedSessionScope = session
+                    notOwnedRefusals.removeAll()
+                    pausedUntil.removeAll()
                 }
                 if isClosed {
                     return false
                 }
-                if assignmentSync != nil || !client.core.groupState.hasAssignment(groupKey) || nextAssignmentSync <= .now {
+                let syncIsPending = assignmentSync != nil || nextAssignmentSync <= .now
+                if !client.core.groupState.hasAssignment(groupKey) || (assigned.isEmpty && syncIsPending) {
                     guard await syncAssignment().value else {
                         if !isClosed {
                             try? await pause(until: ContinuousClock.now + configuration.retryInterval)
                         }
                         return false
                     }
+                } else if syncIsPending {
+                    _ = syncAssignment()
                 }
-                try takeAssignment(synced: false)
+                // The end of a sync in flight takes the assignment and sets the pause before the next sync from what
+                // it changed. A pass that took a new assignment first would hide that change from it.
+                if assignmentSync == nil {
+                    try takeAssignment(synced: false)
+                }
             }
             if assigned.isEmpty {
                 try await pause(until: isGroup ? nextAssignmentSync : ContinuousClock.now + configuration.retryInterval)
@@ -1487,7 +1497,8 @@ public actor PartitionReader: AsyncSequence {
         guard arrivals.isEmpty else {
             return
         }
-        var wakeAt = isGroup ? nextAssignmentSync : ContinuousClock.now + Self.assignmentCheckInterval
+        // A sync in flight is past its due time and wakes the reader when it ends. A wait until that time would spin.
+        var wakeAt = isGroup && assignmentSync == nil ? nextAssignmentSync : ContinuousClock.now + Self.assignmentCheckInterval
         if let pauseEnd = pausedUntil.values.min() {
             wakeAt = Swift.min(wakeAt, pauseEnd)
         }
@@ -2124,8 +2135,12 @@ public actor PartitionReader: AsyncSequence {
             undecodable(partition, body: body, error: error, of: request)
             return
         }
-        // Only a reply in the incarnation of its gap tells what that history holds. A gap always names an incarnation,
-        // so this also catches the fail-fast reply of the server, whose context is fully zero.
+        // An empty reply with a fully zero context is the fail-fast reply of the server, which decides nothing.
+        if polled.messages.isEmpty, polled.context == .empty {
+            notServed(partition)
+            return
+        }
+        // Only a reply in the incarnation of its gap tells what that history holds.
         if request.kind == .gap, let gap = gaps[partition], polled.context.incarnation != gap.context.incarnation {
             notServed(partition)
             return
@@ -2387,10 +2402,12 @@ public actor PartitionReader: AsyncSequence {
     }
 
     /// Queues an error for ``next()``. The latest one of each partition and
-    /// of the whole reader waits, as `pending_errors` in the Rust SDK.
+    /// of the whole reader waits, as `pending_errors` in the Rust SDK. A
+    /// lost range is the exception: it stays until ``next()`` takes it, as
+    /// only its report names the offsets that the reader skipped.
     private func report(_ error: ReadError) {
         arrivals.removeAll { arrival in
-            if case .failure(let queued) = arrival { queued.partitionID == error.partitionID } else { false }
+            if case .failure(let queued) = arrival { queued.partitionID == error.partitionID && queued.lost == nil } else { false }
         }
         arrivals.append(.failure(error))
     }
@@ -2577,14 +2594,18 @@ public actor PartitionReader: AsyncSequence {
         do {
             try await write(context)
         } catch let refusal as IggyError where isGroup && refusal.code == .consumerGroupPartitionNotOwned {
-            guard assigned.contains(partition), generation.map({ $0 >= assignedSince[partition, default: 0] }) ?? true else {
+            func isOfCurrentAssignment() -> Bool {
+                assigned.contains(partition) && (generation.map { $0 >= assignedSince[partition, default: 0] } ?? true)
+            }
+            guard isOfCurrentAssignment() else {
                 throw refusal
             }
             owners[partition] = nil
             lastAssignmentSync = nil
             dispatch()
             let session = client.core.groupState.sessionScope
-            guard let installed = await installedContext(of: partition, in: context, for: caller),
+            // The partition can leave and come back during the read, which ends the assignment of the write.
+            guard let installed = await installedContext(of: partition, in: context, for: caller), isOfCurrentAssignment(),
                 context.incarnation == 0 || installed.incarnation == context.incarnation
             else {
                 throw refusal
@@ -2636,7 +2657,10 @@ public actor PartitionReader: AsyncSequence {
     /// generation 0, which the server reads and writes for the installed
     /// owner. When the client sends a group write with owner generation 0, it
     /// raises the metadata op of the write to the newest op that it saw.
-    /// Inside one session an older owner goes out unchanged, so the server
+    /// After a refusal as not owned, each request of the partition names
+    /// owner generation 0 until a read names an owner again. An owner below
+    /// that one still goes as owner generation 0. Before such a refusal,
+    /// inside one session an older owner goes out unchanged, so the server
     /// refuses a write of an earlier assignment.
     private func requestContext(_ context: PartitionContext, of partition: UInt32) -> PartitionContext {
         guard namesLostOwner(context, of: partition) else {

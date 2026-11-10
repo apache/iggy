@@ -506,8 +506,10 @@ impl IggyConsumer {
     /// after `offset`, and the offset counts as the last consumed message, so
     /// [`shutdown()`](Self::shutdown) keeps it. A skip past a message is therefore never
     /// delivered again. A failed store moves nothing, and a dropped store finishes as a dropped
-    /// seek does. A store that starts after [`shutdown()`](Self::shutdown) waited for the stores
-    /// in progress fails with [`IggyError::InvalidConfiguration`], so none lands beside the close.
+    /// seek does. A store that starts after [`shutdown()`](Self::shutdown) started fails with
+    /// [`IggyError::InvalidConfiguration`], and so does a store whose write did not start by
+    /// then. So none lands beside the close, and `shutdown()` waits only for a write that
+    /// started.
     ///
     /// On binary transports, a retained operation blocking this partition is resolved before
     /// the requested store. Recovery and the new store share one operation deadline. The store

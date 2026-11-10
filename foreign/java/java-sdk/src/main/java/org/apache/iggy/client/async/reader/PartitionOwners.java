@@ -55,7 +55,12 @@ final class PartitionOwners {
      * partition names an owner that no read of this assignment named, so it decides nothing.
      */
     boolean named(PartitionContext context) {
-        return named.stream().anyMatch(owner -> sameIncarnationAndOwner(owner, context));
+        for (PartitionContext owner : named) {
+            if (sameIncarnationAndOwner(owner, context)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

@@ -48,7 +48,8 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
     private static final Logger log = LoggerFactory.getLogger(ConsumerGroupsTcpClient.class);
 
     private final Supplier<AsyncTcpConnection> connectionSupplier;
-    // The assignment of the last sync reply of each group. A reply that names no membership removes it.
+    // The assignment of the last sync reply of each group. A reply that names no membership removes it, and so does a
+    // join.
     private final Map<ClientRoutingState.GroupKey, ConsumerGroupAssignment> synced = new ConcurrentHashMap<>();
 
     public ConsumerGroupsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
@@ -148,6 +149,10 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Joining consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
+        // A group that was deleted and created again counts its sync generation from 0, so its sync reply can equal
+        // the one of the old group. A client becomes a member only by its own join, so the first sync after a join
+        // counts as a changed assignment.
+        synced.remove(ClientRoutingState.groupKey(streamId, topicId, groupId));
         return connection().sendAndRelease(CommandCode.ConsumerGroup.JOIN, payload);
     }
 

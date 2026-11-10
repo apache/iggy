@@ -22,7 +22,7 @@ Python 3.11 to 3.13 end a thread that takes the GIL after finalization starts
 with pthread_exit, which aborts the process when it unwinds through Rust
 frames. The script keeps the interpreter finalizing for a while, so that a
 thread of the SDK that takes the GIL in that time is caught. Pass a scenario
-name as the only argument.
+name as the first argument.
 """
 
 import asyncio
@@ -43,6 +43,10 @@ POLL_SECONDS = 0.01
 STDOUT = 1
 FINALIZED = b"finalized"
 MAIN_THREAD = threading.get_ident()
+GROUP = "exiting"
+CALLBACK_TIMEOUT_SECONDS = 10
+# Takes the address of a server, a stream and a topic after its name.
+CONSUMING = "consuming"
 
 
 class SlowFinalization:
@@ -118,10 +122,36 @@ def exit_with_result_after_finalization_starts() -> object:
     return pending
 
 
+def exit_with_consume_run_waiting(address: str, stream: str, topic: str) -> object:
+    # The loop stops with the callback and the wait for the event scheduled on
+    # it, so the close frees both unfinished after finalization starts.
+    loop = asyncio.new_event_loop()
+    called = threading.Event()
+
+    def callback(_message: object) -> asyncio.Future:
+        called.set()
+        return loop.create_future()
+
+    async def start_consuming() -> object:
+        client = IggyClient(address)
+        await client.connect()
+        await client.login_user("iggy", "iggy")
+        consumer = await client.consumer_group(GROUP, stream, topic)
+        return client, consumer, consumer.consume_messages(callback, asyncio.Event())
+
+    pending = loop.run_until_complete(start_consuming())
+    if not called.wait(CALLBACK_TIMEOUT_SECONDS):
+        sys.exit("consume_messages() did not call back")
+    keep_finalizing(first=loop.close)
+    return pending
+
+
 SCENARIOS = {
     "in-flight": exit_with_result_in_flight,
     "late": exit_with_result_after_finalization_starts,
 }
 
 if __name__ == "__main__":
-    pending = SCENARIOS[sys.argv[1]]()
+    scenario, *arguments = sys.argv[1:]
+    scenarios = SCENARIOS | {CONSUMING: exit_with_consume_run_waiting}
+    pending = scenarios[scenario](*arguments)

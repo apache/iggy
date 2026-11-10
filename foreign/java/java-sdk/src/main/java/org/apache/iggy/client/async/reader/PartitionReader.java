@@ -120,11 +120,11 @@ import static org.apache.iggy.client.async.reader.ReaderSupport.unwrap;
  *       0, and asks for its assignment. It reads again after a wait that doubles each time, and six such refusals in
  *       a row are reported once. After such a refusal of an offset write of a partition that stays assigned, the
  *       reader reads the partition once for the owner that the server installed. If that read serves the incarnation
- *       of the write, the write goes once more for that owner. {@link #closeAsync()} ends that read for a seek write
- *       and for an automatic store, and their refusal stands. A cancel of a {@link #commit} ends that read for its
- *       write. The writes of {@link #closeAsync()} read their owner until a cancel of the first call, and at most
- *       until 10 s after the close started. A read in flight at that end can still get an answer, but that answer
- *       leads to no write.
+ *       of the write, the write goes once more for that owner. The start of {@link #closeAsync()} ends that read for a
+ *       seek write, for an automatic store and for a {@link #commit}, and their refusal stands. A cancel of a
+ *       {@link #commit} ends that read for its write too. The writes of {@link #closeAsync()} read their owner until a
+ *       cancel of the first call, and at most until 10 s after the close started. A read in flight at that end can
+ *       still get an answer, but that answer leads to no write.
  * </ul>
  *
  * <p>The futures of a reader complete on its own thread, so a callback must not block.
@@ -154,6 +154,7 @@ public final class PartitionReader implements AutoCloseable {
     private final Optional<AutoCommit> autoCommit;
     private final ScheduledThreadPoolExecutor loop;
     // The reader is the caller of a seek write and of an automatic store, so the close ends the read of their owner.
+    // It ends that read for a commit too, so no write of a commit starts after the close started.
     private final BooleanSupplier untilClose;
     // The close belongs to its first caller, so a write of the close reads its owner until that caller cancels or the
     // close budget ends. The close sets closeDeadline and closed before its first write.
@@ -286,15 +287,15 @@ public final class PartitionReader implements AutoCloseable {
      * generation of its partition, as one of an older generation, stores nothing, and so does a checkpoint at or below
      * the last commit of the generation. A store whose outcome stays unknown
      * fails the commit, and the reader releases it in the client, so a retry can store. After a refusal as not the
-     * owner, the commit reads the owner until its caller cancels the returned future or the reader stops, and then the
-     * refusal stands.
+     * owner, the commit reads the owner until its caller cancels the returned future or {@link #closeAsync()} starts.
+     * Then the refusal stands: the commit fails with it and sends no further store.
      *
      * @return a future that fails with {@link IggyErrorCode#INVALID_COMMAND} under {@code OnRead}, and for a
      *         partition that this reader does not read, or with the error of the store
      */
     public CompletableFuture<Void> commit(Checkpoint checkpoint) {
         CompletableFuture<Void> result = new CompletableFuture<>();
-        BooleanSupplier retries = () -> !result.isCancelled() && !loop.isShutdown();
+        BooleanSupplier retries = () -> !result.isCancelled() && untilClose.getAsBoolean();
         this.<CompletableFuture<Void>>call(() -> {
                     if (onRead) {
                         throw invalid("The server stores the offsets of a reader with OnRead");
@@ -399,8 +400,10 @@ public final class PartitionReader implements AutoCloseable {
      * outcome stays unknown fails the close, which releases it in the client for a later reader. The close belongs to
      * its first caller: a cancel of the future of the first call ends the owner reads of the writes of the close, and
      * so does the end of the close budget, 10 s after the close started. Their refusal then stands, and each write of
-     * the close that was not sent yet still goes once. The leave and the stop of the reader still run. A later call
-     * completes when the close ends, and its cancel does not end the close.
+     * the close that was not sent yet still goes once. The close sends its writes one at a time, each bounded by the
+     * request timeout of the client. So during an outage, a close can take about one request timeout for each partition
+     * with a pending store. The leave and the stop of the reader still run. A later call completes when the close ends,
+     * and its cancel does not end the close.
      *
      * @return a future that fails with the first failed store
      */
@@ -648,9 +651,7 @@ public final class PartitionReader implements AutoCloseable {
                         return null;
                     }));
         }
-        return chain.thenCompose(ignored -> failures.isEmpty()
-                ? CompletableFuture.completedFuture(null)
-                : CompletableFuture.failedFuture(failures.get(0)));
+        return chain.thenCompose(ignored -> outcome(failures.isEmpty() ? null : failures.get(0)));
     }
 
     /**
@@ -871,7 +872,7 @@ public final class PartitionReader implements AutoCloseable {
     @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
     private void readGroups(int budget, long now) {
         int first = groupCursor;
-        List<GroupPlan<Partition>> plans = new ArrayList<>();
+        List<GroupPlan> plans = new ArrayList<>();
         for (boolean waiting : new boolean[] {false, true}) {
             for (int turn = 0; turn < groups.size(); turn++) {
                 int index = (first + turn) % groups.size();
@@ -881,7 +882,7 @@ public final class PartitionReader implements AutoCloseable {
                         .anyMatch(partition -> partition != null && partition.inFlight && partition.parked);
                 List<Partition> ready = parked == waiting ? ready(group, now, parked) : List.of();
                 if (!ready.isEmpty() && plans.size() < budget) {
-                    plans.add(new GroupPlan<>(index, ready, partition -> partition.backlogged));
+                    plans.add(new GroupPlan(index, ready));
                 }
             }
         }
@@ -889,7 +890,7 @@ public final class PartitionReader implements AutoCloseable {
         // A lookup of the start that finds a stored offset leads to a probe.
         Predicate<Partition> probes =
                 partition -> onRead && (partition.startUnresolved || needsProbe(partition, partition.position));
-        for (GroupPlan<Partition> plan : plans) {
+        for (GroupPlan plan : plans) {
             List<Partition> waiting = plan.waiting();
             if (!waiting.isEmpty()) {
                 extra -= GroupPlan.fitProbes(waiting, extra, probes);
@@ -1063,6 +1064,7 @@ public final class PartitionReader implements AutoCloseable {
      */
     private void check(Partition partition) {
         partition.inFlight = true;
+        partition.parked = false;
         long generation = partition.generation;
         CompletableFuture<PolledMessages> polled =
                 checkPoll(transport, options, partition.id, partition.position, options.maxWait());
@@ -1218,12 +1220,11 @@ public final class PartitionReader implements AutoCloseable {
             if (generation == null || !keeps(section.partitionId(), generation)) {
                 continue;
             }
-            if (commit && (partition == null || partition.generation != generation)) {
-                // The server stored this read, so a partition that left the assignment still hands it over.
-                receiveStored(section, generations.get(section.partitionId()));
-                continue;
-            }
-            if (partition == null || partition.generation != generations.getOrDefault(section.partitionId(), -1L)) {
+            if (partition == null || partition.generation != generation) {
+                if (commit) {
+                    // The server stored this read, so a partition that left the assignment still hands it over.
+                    receiveStored(section, generation);
+                }
                 continue;
             }
             if (unknown.isPresent()) {
@@ -1812,9 +1813,7 @@ public final class PartitionReader implements AutoCloseable {
                             },
                             loop));
         }
-        return chain.thenCompose(ignored -> failures.isEmpty()
-                ? CompletableFuture.completedFuture(null)
-                : CompletableFuture.failedFuture(failures.get(0)));
+        return chain.thenCompose(ignored -> outcome(failures.isEmpty() ? null : failures.get(0)));
     }
 
     /** The context of an offset write of {@code partition} from {@code source}, as {@link PartitionOwners#write}. */

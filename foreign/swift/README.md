@@ -325,7 +325,9 @@ for try await batch in reader {
 
 The reader groups its partitions by their primary and reads each group with one request, which the server holds until a message arrives or the wait runs out. A moved primary, a rebalance and a lost connection are repaired inside, so a caller never groups partitions or handles `notPrimary`.
 
-The reader looks up the primaries beside its reads, also while batches wait for `next()`. A group member syncs its assignment the same way. After a good lookup, a failed one keeps the last groups. The reads go on with them, and the reader looks up again after `retryInterval`. Unless its refusal is transient, a failed lookup is thrown once as a `ReadError` without a partition. A partition refused as not primary waits for the next good lookup.
+The reader looks up the primaries beside its reads, also while batches wait for `next()`. After a good lookup, a failed one keeps the last groups. The reads go on with them, and the reader looks up again after `retryInterval`. Unless its refusal is transient, a failed lookup is thrown once as a `ReadError` without a partition. A partition refused as not primary waits for the next good lookup.
+
+A group member syncs its assignment beside its reads in the same way. After a good sync, a sync that fails or gets no reply keeps the last assignment, and the reads go on under it.
 
 The partitions that a read served go last in the next read of their group, so a backlog does not starve the other partitions. The partitions whose last read ended before their head are spread over the free requests of the reader, each share in a fetch of its own with the full `count` and `maxBytes`, while the quiet partitions of a group share one fetch that may wait.
 
@@ -362,21 +364,23 @@ A failed read is thrown as a `ReadError` with the partition, the `IggyError` and
 The reader reads its partitions again after `retryInterval`. A message that does not decode, and `historyUnavailable` for a position read in a history that is gone, stop the partition until a seek.
 
 `consumerGroupPartitionNotOwned` on a read of a group member is not a leave. A new session and a move of the partition away and back look the same. The partition keeps its position and what `close()` needs of it. The reader syncs its assignment and reads the partition again after `retryInterval`.
-Each further refusal in a row doubles that wait, up to 32 times `retryInterval` at the sixth. The sixth refusal in a row also makes `next()` throw one `ReadError` for the partition, the partition reads on, and the count starts again. When the reader joins again after a new session or a lost membership, the count starts again and the partition reads at once. Only a leave that a sync shows drops the state of the partition.
+Each further refusal in a row doubles that wait, up to 32 times `retryInterval` at the sixth. The sixth refusal in a row also makes `next()` throw one `ReadError` for the partition, the partition reads on, and the count starts again.
+
+When the reader joins again after a new session or a lost membership, the count starts again and the partition reads at once. If the application joins the member (`autoJoinConsumerGroup` is `false`), a new session starts the count again in the same way. Only a leave that a sync shows drops the state of the partition.
 
 After a new session, the server installs the owner again under a new generation. Until a read of the new session names that owner, the reads and offset writes of the partition name owner generation 0. If such a write carries a metadata op at or after the install, the server binds it to the installed owner. When the client sends such a write, it raises the metadata op of the write to the newest op that it saw. A read keeps its op.
 
 A store or delete refused as not owned is not a leave either. Another member can own a partition that left, or can have read it while it was away. So if the reader no longer reads the partition, or the write belongs to an assignment of the partition that ended, the write fails with the refusal.
 Otherwise the reader syncs its assignment, reads the partition once without a commit, and sends the write once more under the owner of that read. Only the context of that read counts, so a message that does not decode does not fail it. If that read fails other than by a transient refusal, or reads another history of the partition, the write fails with the refusal.
 
-While a transient refusal or `notPrimary` answers that read, the reader reads again after `retryInterval`, until the caller of the write cancels. Then the write fails with the refusal, and the answer of a read in flight at that cancel sends no write.
-For a seek write and an `.auto` store in the background, the caller is the reader. So the start of `close()` ends their retry, and the answer of a read in flight at that start sends no write. If no caller waits for such a failure, the reader logs it. For a write of `close()` itself, the caller is the first caller of `close()`.
+While a transient refusal or `notPrimary` answers that read, the reader reads again after `retryInterval`. A cancel of the caller of the write ends that retry, and so does the start of `close()`. Then the write fails with the refusal, and the answer of a read in flight at that end sends no write. So `close()` waits for a `commit(_:)` no longer than one request in flight.
+The same rule holds for a seek write and an `.auto` store in the background. If no caller waits for such a failure, the reader logs it.
 
-The close belongs to the caller that started it. If that caller is cancelled, the reader stops at once each retry of a read for the owner of a refused write. No such read starts after the cancel, and the write fails with its refusal. A read in flight at the cancel ends within the request timeout of the reader options, and its answer sends no write.
-For the writes of `close()` itself, the close deadline ends that retry in the same way, 10 seconds after the start of the close.
+The writes of `close()` itself retry that read too. The close belongs to the caller that started it. If that caller is cancelled, the reader stops each such retry at once. No such read starts after the cancel, and the write fails with its refusal. A read in flight at the cancel ends within the request timeout of the reader options, and its answer sends no write.
+The close deadline ends that retry in the same way, 10 seconds after the start of the close.
 The close still sends once each of its offset writes and lookups that it did not send yet, and then the leave. So a close that starts in a cancelled task also sends its writes and the leave.
 
-Each offset write and lookup ends within 30 seconds, a fixed limit that includes each resend after a transient refusal. The leave first waits for a join in flight, which sends up to three requests. So the leave can take up to four times the client `requestTimeout`. The close ends after the last request.
+Each offset write and lookup ends within 30 seconds, a fixed limit that includes each resend after a transient refusal. The close sends them one after another. So during an outage it can take about 30 seconds for each partition with a pending store. The leave first waits for a join in flight, which sends up to three requests. So the leave can take up to four times the client `requestTimeout`. The close ends after the last request.
 
 A later caller of `close()` waits for the same close and gets its result. A cancel of a later caller cancels nothing. `IggyConsumer` cancels the close at `offsetDrainTimeout`.
 
@@ -452,7 +456,7 @@ A handler that throws leaves its message uncounted and ends `consumeMessages(_:)
 
 `pollingStrategy` says where a partition without a position starts. With `.onRead` it applies only to a partition without a stored offset, and a partition with one resumes after it. A failed read is thrown as a `ReadError` and leaves the consumer usable: a caller of `next()` can call it again, and `consumeMessages(_:)` logs it and keeps reading.
 
-`consumeMessages(_:)` ends with the error once the client cannot come back on its own, and for a message that does not decode or `historyUnavailable`, which stop the partition until a seek.
+`consumeMessages(_:)` ends with the error once the client cannot come back on its own, and for a message that does not decode or `historyUnavailable`, which stop the partition until a seek. A lost range (`ReadError.lost`, error 14010) ends `consumeMessages(_:)` with that error. A new call reads on.
 
 It also ends with `partitionLaneBlocked` under `.onRead`: a lost committing read of another caller blocks the partition until `abandonOperation(_:)` takes that operation, after which the reader reads it again by itself. Without `allowReplay` a message at or below the last one handed over from the same partition history is skipped, unless `seek(partitionID:to:)` moved the partition back.
 

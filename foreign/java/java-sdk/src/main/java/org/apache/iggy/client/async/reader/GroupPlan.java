@@ -28,19 +28,17 @@ import java.util.function.Predicate;
  * The reads of one group in one turn of a {@link PartitionReader}. Its quiet partitions share the one read that may
  * wait. Its backlogged partitions spread over the extra slots that the group gets, each slot a read of its own that
  * returns at once.
- *
- * @param <P> the partition state of the reader
  */
-final class GroupPlan<P> {
+final class GroupPlan {
     private final int index;
-    private final List<P> quiet = new ArrayList<>();
+    private final List<Partition> quiet = new ArrayList<>();
     // The least recently served first.
-    private final List<P> backlogged = new ArrayList<>();
+    private final List<Partition> backlogged = new ArrayList<>();
     private int extra;
 
-    GroupPlan(int index, List<P> ready, Predicate<P> isBacklogged) {
+    GroupPlan(int index, List<Partition> ready) {
         this.index = index;
-        ready.forEach(partition -> (isBacklogged.test(partition) ? backlogged : quiet).add(partition));
+        ready.forEach(partition -> (partition.backlogged ? backlogged : quiet).add(partition));
     }
 
     /**
@@ -48,12 +46,12 @@ final class GroupPlan<P> {
      *
      * @return the slots that no plan has room for
      */
-    static <P> int deal(List<GroupPlan<P>> plans, int slots) {
+    static int deal(List<GroupPlan> plans, int slots) {
         int left = slots;
         boolean dealt = true;
         while (left > 0 && dealt) {
             dealt = false;
-            for (GroupPlan<P> plan : plans) {
+            for (GroupPlan plan : plans) {
                 if (left > 0 && plan.extra < plan.room()) {
                     plan.extra++;
                     left--;
@@ -71,9 +69,9 @@ final class GroupPlan<P> {
      *
      * @return the slots of {@code room} that the probes take
      */
-    static <P> int fitProbes(List<P> targets, int room, Predicate<P> probes) {
+    static int fitProbes(List<Partition> targets, int room, Predicate<Partition> probes) {
         int probing = 0;
-        for (Iterator<P> iterator = targets.iterator(); iterator.hasNext(); ) {
+        for (Iterator<Partition> iterator = targets.iterator(); iterator.hasNext(); ) {
             if (probes.test(iterator.next())) {
                 if (probing > room) {
                     iterator.remove();
@@ -90,8 +88,8 @@ final class GroupPlan<P> {
     }
 
     /** The partitions of the read that may wait: the quiet ones, and the backlogged ones if no read returns at once. */
-    List<P> waiting() {
-        List<P> waiting = new ArrayList<>(quiet);
+    List<Partition> waiting() {
+        List<Partition> waiting = new ArrayList<>(quiet);
         if (reads() == 0) {
             waiting.addAll(backlogged);
         }
@@ -99,9 +97,9 @@ final class GroupPlan<P> {
     }
 
     /** The partitions of each read that returns at once. */
-    List<List<P>> spread() {
+    List<List<Partition>> spread() {
         int reads = reads();
-        List<List<P>> spread = new ArrayList<>();
+        List<List<Partition>> spread = new ArrayList<>();
         for (int read = 0; read < reads; read++) {
             spread.add(new ArrayList<>());
         }

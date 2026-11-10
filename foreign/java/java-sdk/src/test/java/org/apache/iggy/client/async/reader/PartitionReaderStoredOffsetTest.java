@@ -1486,6 +1486,52 @@ class PartitionReaderStoredOffsetTest {
                 .containsExactly(BigInteger.ONE, BigInteger.ZERO, INSTALLED.ownerGeneration());
     }
 
+    /**
+     * The close ends the read for the owner of a commit of the application too. The commit fails with its refusal
+     * before the close ends, and no further store of it goes out: not once the wait for a retry of that read ends, and
+     * not for an answer of that read that comes after the close started.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldEndTheOwnerReadOfACommitWhenTheCloseStarts(boolean waitsForRetry) throws Exception {
+        FakeTransport transport = new FakeTransport(true);
+        // The close starts long before the retry of a refused read.
+        PartitionReader reader = PartitionReader.builder(transport)
+                .options(MANUAL)
+                .retryInterval(RETRY_INTERVAL.multipliedBy(10))
+                .build()
+                .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        assignment(transport, 1L);
+        CompletableFuture<PolledMessages> next = reader.next();
+        transport.nextRead().answer(section(1, 10, 11));
+        Checkpoint delivered =
+                next.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS).checkpoint().orElseThrow();
+        transport.installOwner(INSTALLED.ownerGeneration(), INSTALLED.metadataOp());
+        // The leave waits, so the close cannot end before the commit does.
+        transport.leaveReply = new CompletableFuture<>();
+        CompletableFuture<Void> commit = reader.commit(delivered);
+        Read ownerRead = nextPoll(transport);
+
+        if (waitsForRetry) {
+            ownerRead.answer(FakeTransport.refused(1, IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode()));
+        }
+        CompletableFuture<Void> closed = startClose(reader);
+        if (!waitsForRetry) {
+            ownerRead.answer(section(1, INSTALLED, 12));
+        }
+
+        assertThatThrownBy(() -> commit.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                .hasCauseInstanceOf(IggyServerException.class)
+                .satisfies(error -> assertThat(((IggyServerException) error.getCause()).getRawErrorCode())
+                        .isEqualTo(IggyErrorCode.CONSUMER_GROUP_PARTITION_NOT_OWNED.getCode()));
+        assertThat(closed).as("the commit ends before the close").isNotDone();
+        transport.assignments.forEach(sync -> sync.complete(Optional.of(new ConsumerGroupAssignment(1, List.of(1L)))));
+        transport.leaveReply.complete(null);
+        closed.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        assertThat(transport.reads).noneMatch(Read::poll);
+        assertThat(transport.sent).containsExactly(new Store(1, 11));
+    }
+
     /** A write of a partition that left the assignment keeps the refusal of the server, and reads nothing for it. */
     @Test
     void shouldFailACommitThatTheServerRefusesAfterItsPartitionLeft() throws Exception {

@@ -1826,6 +1826,12 @@ final class PollRouter {
             lifecycleRefusal = null;
         }
 
+        /**
+         * Whether a refused attempt gets a retry after {@code delayMillis}. A retry of a deferred poll leaves
+         * {@link DeferredPollOptions#REPLY_MARGIN} for the reply, as each attempt of a fetch does, and the resend after
+         * a first NOT_PRIMARY is a retry too. So a poll with that margin or less of its budget left gets no retry, also
+         * a poll without a wait whose whole budget is that short. It ends with {@link #deadlineRefusal()}.
+         */
         private synchronized boolean retryRefusal(long delayMillis, IggyServerException refusal) {
             retryingRefusal = true;
             if (dataCommand == CommandCode.Messages.POLL_DEFERRED.getValue()) {

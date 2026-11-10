@@ -18,6 +18,8 @@
 //! The commit and shutdown tests of the consumer.
 
 use std::convert::identity;
+use std::iter::repeat_n;
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +35,7 @@ use iggy_common::{
     NonZeroIggyDuration, PollOptions, PollingStrategy,
 };
 use tokio::sync::oneshot;
+use tokio::task::yield_now;
 use tokio::time::{Instant, sleep, timeout};
 
 use super::{
@@ -758,6 +761,140 @@ async fn given_on_read_when_a_store_starts_after_the_shutdown_should_fail_and_se
 
     assert_eq!(stored, Err(IggyError::InvalidConfiguration));
     assert!(stored_offsets(&cluster).is_empty());
+}
+
+/// The close refuses each new store from its start, also while it waits for a store on the
+/// wire. So a store of another partition that starts then fails as a store of a closed consumer
+/// and writes nothing beside the rewind.
+#[tokio::test(start_paused = true)]
+async fn given_on_read_and_a_store_on_the_wire_when_another_store_starts_after_the_shutdown_started_should_fail_and_send_nothing()
+ {
+    const OTHER_PARTITION: u32 = 0;
+    let (client, cluster) = connect_to_three_replicas().await;
+    answer_lookups(&cluster);
+    let mut consumer = builder_on(client, standalone())
+        .partitions([OTHER_PARTITION, POLLED_PARTITION])
+        .poll_options(PollOptions {
+            commit: CommitPolicy::OnRead,
+            ..PollOptions::default()
+        })
+        .build();
+    consumer.init().await.unwrap();
+    let state = consumer.state();
+    cluster.hold(STORE_CONSUMER_OFFSET_CODE);
+    let on_the_wire = state.clone();
+    let first = tokio::spawn(async move {
+        on_the_wire
+            .store_offset(STORED_OFFSET, Some(POLLED_PARTITION))
+            .await
+    });
+    eventually("the first store arrives", || {
+        cluster.count(STORE_CONSUMER_OFFSET_CODE) == 1
+    })
+    .await;
+    let mut shutdown = pin!(consumer.shutdown());
+    assert!(
+        futures::poll!(&mut shutdown).is_pending(),
+        "the shutdown waits for the store on the wire"
+    );
+
+    let second = timeout(
+        POLL_TIMEOUT,
+        state.store_offset(LOWER_OFFSET, Some(OTHER_PARTITION)),
+    )
+    .await;
+    cluster.release(STORE_CONSUMER_OFFSET_CODE);
+
+    assert_eq!(second, Ok(Err(IggyError::InvalidConfiguration)));
+    assert_eq!(first.await.unwrap(), Ok(()));
+    assert_eq!(shutdown.await, Ok(()));
+    assert_eq!(
+        stored_offsets(&cluster),
+        [(POLLED_PARTITION, STORED_OFFSET)]
+    );
+}
+
+/// A store that the application stops polling before its write starts cannot hold the close.
+/// The close goes on without it, and the store fails once it is polled again, so it writes
+/// nothing beside the rewind.
+#[tokio::test(start_paused = true)]
+async fn given_on_read_and_a_store_left_unpolled_before_its_write_when_shutting_down_should_not_wait_for_it_and_fail_it_without_a_write()
+ {
+    let (mut consumer, cluster) = committing_consumer(0).await;
+    let state = consumer.state();
+    cluster.hold(GET_CONSUMER_OFFSET_CODE);
+    let lookups = cluster.count(GET_CONSUMER_OFFSET_CODE);
+    let mut store = pin!(state.store_offset(STORED_OFFSET, Some(POLLED_PARTITION)));
+    timeout(TEST_BUDGET, async {
+        while cluster.count(GET_CONSUMER_OFFSET_CODE) == lookups {
+            assert!(futures::poll!(&mut store).is_pending());
+            yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let shut_down = timeout(POLL_TIMEOUT, consumer.shutdown()).await;
+    cluster.release(GET_CONSUMER_OFFSET_CODE);
+    let stored = store.await;
+
+    assert_eq!(
+        shut_down,
+        Ok(Ok(())),
+        "the shutdown goes on without a store that nothing polls"
+    );
+    assert_eq!(stored, Err(IggyError::InvalidConfiguration));
+    assert!(stored_offsets(&cluster).is_empty());
+}
+
+/// The start of the shutdown ends the retries of the read for the owner of a commit refused as
+/// not owned. So the commit fails with that refusal and does not go again beside the close.
+#[tokio::test(start_paused = true)]
+async fn given_a_commit_whose_read_for_the_owner_is_refused_for_now_when_the_shutdown_starts_should_fail_with_the_refusal_and_store_nothing_more()
+ {
+    /// Far more transient refusals than the driver retries before the shutdown starts: it
+    /// waits up to a second before each retry.
+    const REFUSED_READS: usize = 64;
+    let (mut consumer, cluster) = reading_consumer(CommitPolicy::Manual, &[&BATCH]).await;
+    let checkpoint = next_message(&mut consumer).await.checkpoint();
+    script_primary(
+        &cluster,
+        STORE_CONSUMER_OFFSET_CODE,
+        [Answer::Refuse(IggyError::ConsumerGroupPartitionNotOwned(
+            0,
+            POLLED_PARTITION,
+        ))],
+    );
+    // A commit that read on for the owner would get the served read and go again.
+    script_primary(
+        &cluster,
+        POLL_MESSAGES_DEFERRED_CODE,
+        repeat_n(
+            Answer::Refuse(IggyError::TransientNotAccepted),
+            REFUSED_READS,
+        )
+        .chain([poll_reply_of(&[BATCH[0]])]),
+    );
+    let reads = cluster.count(POLL_MESSAGES_DEFERRED_CODE);
+    let state = consumer.state();
+    let commit = tokio::spawn(async move { state.commit(checkpoint).await });
+    eventually("the read for the owner arrives", || {
+        cluster.count(POLL_MESSAGES_DEFERRED_CODE) > reads
+    })
+    .await;
+
+    let shut_down = consumer.shutdown().await;
+    let committed = commit.await.unwrap();
+
+    assert_eq!(shut_down, Ok(()));
+    assert!(
+        matches!(
+            committed,
+            Err(IggyError::ConsumerGroupPartitionNotOwned(..))
+        ),
+        "{committed:?}"
+    );
+    assert_eq!(stored_offsets(&cluster), [(POLLED_PARTITION, BATCH[0])]);
 }
 
 /// A restart resumes at the sought offset, because the seek stored the one before it.

@@ -913,6 +913,54 @@ struct ConsumerTests {
         await server.stop()
     }
 
+    /// A member reads on under its last assignment while a later sync of the
+    /// assignment hangs, and after one failed. The read call waits neither
+    /// for that sync nor for the retry pause after its refusal, so the next
+    /// batch arrives long before either ends.
+    @Test(arguments: [false, true], [CommitPolicy.manual, .onRead])
+    func aMemberReadsOnWhileALaterAssignmentSyncHangsOrFails(fails: Bool, commit: CommitPolicy) async throws {
+        let retryPause: Duration = .seconds(20)
+        let readBound: Duration = .seconds(2)
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 2], assignment: [1])
+        let syncs = Locked(0)
+        let laterSyncReplies = AsyncSemaphore(permits: 0)
+        await serve(server, topic: topic) { request in
+            guard request.code == CommandCode.syncConsumerGroup.rawValue else {
+                return nil
+            }
+            let sync = syncs.withLock { count in
+                count += 1
+                return count
+            }
+            guard sync > 1 else {
+                return nil
+            }
+            _ = try? await laterSyncReplies.acquire(1)
+            return fails ? .status(IggyErrorCode.deferredPollCapacityExceeded.rawValue) : nil
+        }
+        let client = try await signedInClient(server)
+        let reader = try await member(client, commit: commit, retryInterval: retryPause)
+        #expect(try await batches(reader, 1) == [[0, 1]])
+
+        let reading = Task { try await withDeadline(.now + readBound) { try await batches(reader, 1) } }
+        try #require(await eventually { syncs.withLock { $0 } > 1 }, "the member did not sync a second time")
+        // The read call is at the held sync before the messages arrive.
+        try await Task.sleep(for: waitEntryPause)
+        topic.append(2, to: 1)
+        if fails {
+            laterSyncReplies.release(.max)
+        }
+
+        #expect(try await reading.value == [[2, 3]], "the read call waited for the sync, or for the retry pause after its refusal")
+        if !fails {
+            laterSyncReplies.release(.max)
+        }
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
     /// A slow application under `manual` leaves replies of a backlog waiting
     /// for `next()`. The lookup after a refusal as not primary, and the
     /// assignment sync after a refusal as not owned, still run beside the
@@ -1037,6 +1085,82 @@ struct ConsumerTests {
         #expect(lost.lost == 2...2)
         #expect(try await batches(reader, 2) == [[3], [4, 5]])
         #expect(await requests(server, .pollMessagesDeferred).count == 1)
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// A lost range that waits for `next()` stays queued when a later read
+    /// of its partition fails. The reader throws the range first, delivers
+    /// the batch after it, then throws the later error and reads on.
+    @Test func aLaterErrorOfThePartitionKeepsTheQueuedLostRange() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 9])
+        let gapReads = Locked(0)
+        let gapReadWaits = AsyncSemaphore(permits: 0)
+        let gapReply = AsyncSemaphore(permits: 0)
+        let gapReadRefused = AsyncSemaphore(permits: 0)
+        await serve(server, topic: topic) { request in
+            guard request.code == CommandCode.pollMessagesDeferred.rawValue, !polledStrategy(request).autoCommit else {
+                return nil
+            }
+            let gapRead = gapReads.withLock { count in
+                count += 1
+                return count
+            }
+            switch gapRead {
+            case 1:
+                gapReadWaits.release(1)
+                _ = try? await gapReply.acquire(1)
+                return .ok(FakeVSRServer.polledBody(partitionID: 1, offsets: [4]))
+            case 2:
+                gapReadRefused.release(1)
+                return .status(IggyErrorCode.invalidCommand.rawValue)
+            default:
+                return nil
+            }
+        }
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, count: 3, commit: .onRead)
+        #expect(try await batches(reader, 1) == [[0, 1, 2]])
+        topic.loseReplies(1)
+        // The application takes nothing while the gap reads end, so both errors wait in the queue.
+        let pending = Task { try? await reader.next() }
+        try #require(try await gapReadWaits.acquire(1, deadline: ContinuousClock.now + .seconds(2)), "the gap read did not start")
+        pending.cancel()
+        _ = await pending.value
+        gapReply.release(1)
+        try #require(try await gapReadRefused.acquire(1, deadline: ContinuousClock.now + .seconds(2)), "the second gap read did not start")
+        // The reader takes the refusal well within the quiet period.
+        try await Task.sleep(for: quietPeriod)
+
+        let lost = try #require(await readError(reader), "the later error replaced the lost range")
+        #expect(lost.partitionID == 1 && lost.error.code == .fetchProgressUncertain)
+        #expect(lost.lost == 3...3)
+        #expect(try await batches(reader, 1) == [[4]])
+        let refusal = try #require(await readError(reader), "the later error was not reported")
+        #expect(refusal.partitionID == 1 && refusal.error.code == .invalidCommand)
+        #expect(refusal.lost == nil)
+        #expect(try await batches(reader, 2) == [[5], [6, 7, 8]])
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// The fail-fast reply of the server tells nothing about a message of a
+    /// section that did not decode. The reader reports nothing, reads the
+    /// same message again after the retry interval and delivers it.
+    @Test func theFailFastReplyToAReadOfOneMessageReadsTheSameMessageAgain() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 5], undecodable: [1])
+        // Without a commit on read, the first poll is the read of the first message of the section.
+        await serve(server, topic: topic, script: firstGapRead(answeredWith: FakeVSRServer.polledBody(partitionID: 1, context: .empty)))
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, start: .first, count: 3)
+
+        try #require(try await batches(reader, 1) == [[0]], "the fail-fast reply ended the reads of the section")
+        let reads = await requests(server, .pollMessagesDeferred).map(polledStrategy).prefix(2)
+        #expect(reads.map(\.value) == [0, 0] && reads.allSatisfy { $0.count == 1 })
         try await reader.close()
         await client.shutdown()
         await server.stop()
@@ -2362,6 +2486,57 @@ struct ConsumerTests {
         await server.stop()
     }
 
+    /// A member that the application joins has no join of the reader that
+    /// starts the count of the reads refused as not owned again. So the
+    /// reader starts the count and the wait again when it sees a new
+    /// session. A partition that three refusals in a row paused for four
+    /// retry intervals reads before that pause ends, and its next refusal
+    /// waits one retry interval.
+    @Test func aNewSessionStartsTheCountOfNotOwnedRefusalsAgainForAMemberThatTheApplicationJoins() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 2], assignment: [1])
+        let refusedBefore = 3
+        let reads = Locked<[ContinuousClock.Instant]>([])
+        await serve(server, topic: topic) { request in
+            guard request.code == CommandCode.fetchMessages.rawValue || request.code == CommandCode.pollMessagesDeferred.rawValue else {
+                return nil
+            }
+            let refused = reads.withLock { reads in
+                reads.append(.now)
+                return reads.count <= refusedBefore + 1
+            }
+            return refused ? .status(IggyErrorCode.consumerGroupPartitionNotOwned.rawValue) : nil
+        }
+        let client = try await signedInClient(server)
+        try await client.joinConsumerGroup(streamID: 1, topicID: 2, groupID: 3)
+        // The pause after the third refusal, four retry intervals, outlasts the longest wait for the next check of the assignment.
+        let retryInterval = PartitionReader.assignmentCheckInterval / 2
+        let reader = try await client.reader(
+            streamID: 1, topicID: 2, consumer: .group(3),
+            configuration: ReaderConfiguration(
+                start: .next, options: PollOptions(count: 2, maxWait: .milliseconds(200), commit: .manual), retryInterval: retryInterval,
+                autoJoinConsumerGroup: false))
+        let reading = Task { try await batches(reader, 1) }
+        try #require(await eventually { reads.withLock { $0.count } == refusedBefore }, "the reads before the session change were not refused")
+        // The reader takes the third refusal before the session changes.
+        try await Task.sleep(for: waitEntryPause)
+
+        client.core.groupState.clearSessionScoped()
+        try await client.joinConsumerGroup(streamID: 1, topicID: 2, groupID: 3)
+
+        #expect(try await reading.value == [[0, 1]])
+        let times = reads.withLock { $0 }
+        try #require(times.count >= refusedBefore + 2, "\(times.count) reads")
+        let pauseBefore = retryInterval * (1 << (refusedBefore - 1))
+        let sinceRefusal = times[refusedBefore] - times[refusedBefore - 1]
+        #expect(sinceRefusal < pauseBefore, "the read after the session change waited \(sinceRefusal), the pause of the session before")
+        let wait = times[refusedBefore + 1] - times[refusedBefore]
+        #expect(wait >= retryInterval && wait < retryInterval * 2, "the first refusal of the new session waited \(wait)")
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
     /// A read refused as not owned before a sync shows a leave keeps the
     /// state of its partition. After the retry interval the partition reads
     /// again, finds the gap of the lost read before it and delivers its range.
@@ -2621,6 +2796,59 @@ struct ConsumerTests {
         #expect(storesAfterReturn.withLock { $0 } == 1, "the store went again")
         try await reader.close()
         _ = await reading.result
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// The partition of a commit refused as not owned can leave and come
+    /// back while the read that names its owner keeps getting a transient
+    /// refusal. The commit still belongs to the assignment that ended, and
+    /// another member can have stored a later offset meanwhile. So the
+    /// refusal stands once that read is served, and the store does not go
+    /// again.
+    @Test func aCommitRefusedAsNotOwnedStandsWhenItsPartitionLeftAndCameBackDuringItsOwnerRead() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 2, 2: 2], assignment: [1, 2])
+        let refused = Locked(false)
+        let ownerReads = Locked(0)
+        let cameBack = Locked(false)
+        await serve(server, topic: topic) { request in
+            if request.code == CommandCode.storeConsumerOffset.rawValue, !refused.exchange(true) {
+                return .status(IggyErrorCode.consumerGroupPartitionNotOwned.rawValue)
+            }
+            guard isOwnerRead(request), !cameBack.withLock({ $0 }) else {
+                return nil
+            }
+            ownerReads.withLock { $0 += 1 }
+            // The client hands `notPrimary` of a deferred poll over at once, so the reader reads again after each pause.
+            return .status(IggyErrorCode.notPrimary.rawValue)
+        }
+        let client = try await signedInClient(server)
+        let reader = try await member(client, commit: .manual)
+        var checkpoints: [UInt32: Checkpoint] = [:]
+        while checkpoints.count < 2, let batch = try await reader.next() {
+            checkpoints[batch.partitionID] = batch.checkpoint
+        }
+        let checkpoint = try #require(checkpoints[1])
+        let committing = Task { try await reader.commit(checkpoint) }
+        try #require(await eventually { ownerReads.withLock { $0 } >= 1 }, "the refused commit did not read its owner")
+        topic.assign([2])
+        client.core.groupState.invalidateAssignment(memberGroupKey)
+        // A waiting read takes each new assignment.
+        let reading = Task { try? await reader.next() }
+        try #require(await eventually { await reader.partitions == [2] }, "partition 1 did not leave")
+        topic.assign([1, 2])
+        client.core.groupState.invalidateAssignment(memberGroupKey)
+        try #require(await eventually { await reader.partitions == [1, 2] }, "partition 1 did not come back")
+
+        cameBack.withLock { $0 = true }
+
+        let refusal = await #expect(throws: IggyError.self) { try await committing.value }
+        #expect(refusal?.code == .consumerGroupPartitionNotOwned)
+        #expect(await requests(server, .storeConsumerOffset).count == 1, "the commit of the assignment that ended stored again")
+        #expect(topic.stored[1] == nil)
+        try await reader.close()
+        _ = await reading.value
         await client.shutdown()
         await server.stop()
     }
@@ -3053,6 +3281,52 @@ struct ConsumerTests {
         let rewound = await requests(server, .storeConsumerOffset).map(storedPartition).sorted()
         #expect(rewound == [1, 2], "a rewind did not go exactly once")
         #expect(topic.stored.values.sorted() == [4, 6], "\(topic.stored)")
+        #expect(await requests(server, .leaveConsumerGroup).count == 1, "the close did not leave the group")
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// The start of the close ends the retry of the read that names the
+    /// owner of a refused commit, with no cancel. The commit fails with its
+    /// refusal and stores nothing again. So the close does not wait for the
+    /// close deadline, and the member leaves the group.
+    @Test func theCloseStartEndsTheOwnerReadOfARefusedCommit() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 2], assignment: [1])
+        let ownerReads = Locked(0)
+        await serve(server, topic: topic) { request in
+            if request.code == CommandCode.storeConsumerOffset.rawValue {
+                return .status(IggyErrorCode.consumerGroupPartitionNotOwned.rawValue)
+            }
+            guard isOwnerRead(request) else {
+                return nil
+            }
+            ownerReads.withLock { $0 += 1 }
+            // The client hands `notPrimary` of a deferred poll over at once, so the reader reads again after each pause.
+            return .status(IggyErrorCode.notPrimary.rawValue)
+        }
+        let client = try await signedInClient(server)
+        let reader = try await member(client, commit: .manual)
+        let checkpoint = try #require(try await reader.next()?.checkpoint)
+        let committing = Task { try await reader.commit(checkpoint) }
+        try #require(await eventually { ownerReads.withLock { $0 } >= 2 }, "the owner read did not go again after a transient refusal")
+        let closed = Locked(false)
+
+        let closing = Task {
+            defer { closed.withLock { $0 = true } }
+            try await reader.close()
+        }
+
+        let ended = await eventually(timeout: PartitionReader.closeBudget / 2) { closed.withLock { $0 } }
+        if !ended {
+            // Only a cancel ends the owner reads of the commit when the close start does not.
+            closing.cancel()
+        }
+        #expect(ended, "the close waited for the owner read of the commit")
+        try await closing.value
+        let refusal = await #expect(throws: IggyError.self) { try await committing.value }
+        #expect(refusal?.code == .consumerGroupPartitionNotOwned)
+        #expect(await requests(server, .storeConsumerOffset).count == 1, "the commit stored again after the close started")
         #expect(await requests(server, .leaveConsumerGroup).count == 1, "the close did not leave the group")
         await client.shutdown()
         await server.stop()
@@ -4277,6 +4551,39 @@ struct ConsumerTests {
 
         #expect(error?.partitionID == 1 && error?.error.code == .historyUnavailable)
         #expect(handled.withLock { $0 } == [0])
+        await consumer.shutdown()
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// A lost range is the only report of that loss, so the handler run ends
+    /// with it instead of logging it and reading on. Its partition does not
+    /// stop: the next read hands over the batch after the range.
+    @Test func aLostRangeEndsConsumeMessages() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 6])
+        await serve(server, topic: topic, script: firstGapRead(answeredWith: FakeVSRServer.polledBody(partitionID: 1, offsets: [])))
+        let client = try await signedInClient(server)
+        let consumer = try client.consumer(
+            name: "reader", streamID: 1, topicID: 2, partitions: [1],
+            configuration: ConsumerConfiguration(
+                pollOptions: PollOptions(count: 2, maxWait: .milliseconds(200), commit: .onRead), pollingRetryInterval: readerRetryInterval))
+        try await consumer.initialize()
+        #expect(try await read(consumer, 2) == [0, 1])
+        topic.loseReplies(1)
+        let handled = Locked<[UInt64]>([])
+
+        let error = try await #require(throws: ReadError.self, "the run did not end with the lost range within 2 seconds") {
+            try await withDeadline(.now + .seconds(2)) {
+                try await consumer.consumeMessages { received in
+                    handled.withLock { $0.append(received.message.offset) }
+                }
+            }
+        }
+
+        #expect(error.partitionID == 1 && error.lost == 2...3)
+        #expect(handled.withLock { $0 } == [])
+        #expect(try await read(consumer, 2) == [4, 5])
         await consumer.shutdown()
         await client.shutdown()
         await server.stop()

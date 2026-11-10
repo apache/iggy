@@ -18,9 +18,7 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { debug } from '../client/client.debug.js';
 import type { ClientProvider, RawClient } from '../client/client.type.js';
-import {
-  FetchProgressUncertainError, OperationNotRetainedError, OperationUncertainError
-} from '../client/client.operation.js';
+import { FetchProgressUncertainError, OperationUncertainError } from '../client/client.operation.js';
 import { COMMAND_CODE } from '../wire/command.code.js';
 import { DeserializeError, ResponseError, responseError } from '../wire/error.utils.js';
 import type { Id } from '../wire/identifier.utils.js';
@@ -306,8 +304,6 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
    */
   private readonly seeking = new Map<number, Promise<void>>();
   private readonly lifetime = new AbortController();
-  private readonly closing = new Promise<void>((resolve) =>
-    this.lifetime.signal.addEventListener('abort', () => resolve(), { once: true }));
   private readonly options: PollOptions;
   private readonly start: PollingStrategy;
   /** Under `CommitPolicy.OnRead` a start other than Next applies only to a partition without a stored offset. */
@@ -329,15 +325,15 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
   private syncRequested = false;
   /** A read found the member gone, so the next pass joins again before it syncs. */
   private memberLost = false;
-  /**
-   * A join with an unknown outcome. It holds the metadata lane of the client, so the next join resolves it first,
-   * and the close abandons it while its outcome stays unknown.
-   */
-  private uncertainJoin?: OperationUncertainError;
   /** The pause after the last sync before the next one is due. */
   private syncPause = ASSIGNMENT_SETTLE_PAUSE_MS;
   /** When the last sync was answered, on the monotonic clock, so a wall clock step cannot hold the syncs back. */
   private syncedAt = 0;
+  /**
+   * The refresh of the assignment in flight, with the retry pause after a failed one. The reads never wait for it, so
+   * a slow or failed refresh keeps the last assignment.
+   */
+  private refreshing?: Promise<void>;
   private queuedMessages = 0;
   private queuedBytes = 0;
   private generations = 0;
@@ -825,9 +821,11 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
    * at or past the start of the read, since a read past the end stores
    * nothing. It restores the offset from before a seek write with an unknown
    * outcome, as `seek` describes. A group reader then leaves its group. It
-   * releases a join that is still unknown and a leave with an unknown outcome
-   * in the client, so neither blocks a later metadata write of the client.
-   * Rejects with the first failed store, lookup or delete.
+   * releases a leave with an unknown outcome in the client, so the leave
+   * blocks no later metadata write of the client.
+   * Rejects with the first failed store, lookup or delete. During an outage
+   * the close can take about one 30 s operation budget of the client for
+   * each partition with a pending store.
    * A store or delete with an unknown outcome still rejects, but the close
    * releases it in the client, so it does not block a later reader. When the
    * server refuses a store or delete of the close as not owned, a read finds
@@ -861,6 +859,9 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
     let failure: unknown;
     try {
       await this.worker;
+      // A refresh in flight can still join the group or store an offset, so the writes and the leave of the close
+      // come after it.
+      await this.refreshing;
       await this.regrouping;
       await Promise.allSettled([...this.reads.keys()]);
       // A seek whose write is in progress still applies, so the rewind sees its position and not the dropped batch.
@@ -873,8 +874,6 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
       clearTimeout(timer);
     }
     if (this.group) {
-      // A join with an unknown outcome would block the leave and every later metadata write of the client.
-      await this.abandonLost(this.uncertainJoin);
       try {
         await leaveGroup(this.getClient)({ streamId: this.request.streamId, topicId: this.request.topicId,
           groupId: this.request.consumer.id });
@@ -1015,6 +1014,9 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
       .map((state) => state.counted!);
     let failure: unknown;
     for (const checkpoint of due) {
+      // A partition can leave and come back while an earlier store of this loop waits. Its checkpoint from before the
+      // leave then stores nothing, as in `commit`.
+      if (this.states.get(checkpoint.partitionId)?.generation !== checkpoint.stamp?.generation) continue;
       try {
         await this.storeCheckpoint(checkpoint, cancel);
         this.recordStored(checkpoint);
@@ -1086,22 +1088,18 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
   private async run(): Promise<void> {
     while (!this.closed) {
       let wait: number | undefined;
-      let failed = false;
       try {
-        if (this.group) await this.refreshAssignment();
+        this.startRefresh();
         this.startRegroup();
         wait = this.startReads();
       } catch (error) {
-        if (this.closed) return;
+        // A worker that ended here would stop every read without an error. A wake does not cut this pause short.
         this.reportFailure(error);
-        wait = this.retryInterval;
-        failed = true;
+        await sleep(this.retryInterval, undefined, { signal: this.lifetime.signal }).catch(() => undefined);
+        continue;
       }
-      // A caller that asks again after a failure does not cut its retry interval short. The pause
-      // keeps the process alive like a read in flight, until the reader closes.
-      const woken = failed ? this.closing : this.wakeUp.promise;
       let timer: NodeJS.Timeout | undefined;
-      await Promise.race([woken, ...(wait === undefined ? []
+      await Promise.race([this.wakeUp.promise, ...(wait === undefined ? []
         : [new Promise<void>((resolve) => { timer = setTimeout(resolve, wait); })])]);
       // A pause that a wake or the close ends early clears its timer, so a pass per read does not pile up timers.
       clearTimeout(timer);
@@ -1109,17 +1107,40 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
     }
   }
 
-  private async refreshAssignment(): Promise<void> {
+  /**
+   * Refreshes the assignment apart from the reads, when a refresh is due and
+   * none is in flight. So the reads go on under the last assignment while a
+   * refresh fails or gets no answer. After a failed refresh the next one
+   * waits for the retry interval, and a caller that asks again does not cut
+   * that pause short. The pause keeps the process alive like a read in
+   * flight, until the reader closes.
+   */
+  private startRefresh(): void {
+    if (!this.group || this.refreshing) return;
+    const rejoin = this.memberLost || this.joinedResets !== this.sessionResets;
+    // Each sync is a request to the server, so a pass that a read, a next() or a seek woke keeps the last assignment.
+    if (!rejoin && !this.resync && !this.syncRequested && performance.now() < this.syncedAt + this.syncPause) return;
+    this.refreshing = this.refreshAssignment(rejoin)
+      .catch(async (error: unknown) => {
+        if (this.closed) return;
+        this.reportFailure(error);
+        await sleep(this.retryInterval, undefined, { signal: this.lifetime.signal }).catch(() => undefined);
+      })
+      .finally(() => {
+        this.refreshing = undefined;
+        this.wake();
+      });
+  }
+
+  private async refreshAssignment(rejoin: boolean): Promise<void> {
     const { streamId, topicId, consumer } = this.request;
-    if (this.memberLost || this.joinedResets !== this.sessionResets) {
+    if (rejoin) {
       const resets = this.sessionResets;
       await this.join();
       this.joinedResets = resets;
       this.memberLost = false;
       this.resync = true;
     }
-    // Each sync is a request to the server, so a pass that a read, a next() or a seek woke keeps the last assignment.
-    if (!this.resync && !this.syncRequested && performance.now() < this.syncedAt + this.syncPause) return;
     // Cleared before the request, so a refusal 5009 that arrives while it is in flight asks again.
     this.syncRequested = false;
     let assignment;
@@ -1165,34 +1186,18 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
   }
 
   /**
-   * Joins the group, as `core/sdk/src/clients/reader/membership.rs` does. A join with an unknown outcome blocks the
-   * metadata lane of the client, so this join resolves it first. The server takes a second join from the same session
-   * as a no-op, so this join runs also when the earlier one landed.
+   * Joins the group, as `core/sdk/src/clients/reader/membership.rs` does. A join with an unknown outcome would block
+   * the metadata lane of the client, so the reader releases it in the client at once. The next pass joins again. The
+   * server takes a second join from the same session as a no-op, so that join changes nothing when the lost one landed.
    */
   private async join(): Promise<void> {
     const { streamId, topicId, consumer } = this.request;
-    const operationId = this.uncertainJoin?.operationId;
-    if (operationId !== undefined) {
-      const client = await this.getClient();
-      try {
-        if (client.resolveOperation) await client.resolveOperation(operationId);
-        else client.abandonOperation?.(operationId);
-        this.uncertainJoin = undefined;
-      } catch (error) {
-        if (error instanceof OperationUncertainError) throw error;
-        // The replay proved a refusal, or a session reset or an abandon came first. Either way the lane is free.
-        this.uncertainJoin = undefined;
-        if (!(error instanceof OperationNotRetainedError)) throw error;
-      }
-    }
     try {
       await joinGroup(this.getClient)({ streamId, topicId, groupId: consumer.id });
     } catch (error) {
-      if (error instanceof OperationUncertainError) {
-        this.uncertainJoin = error;
-        // The member may have joined or not, so the next pass joins again.
-        this.memberLost = true;
-      }
+      // The member may have joined or not, so the next pass joins again.
+      if (error instanceof OperationUncertainError) this.memberLost = true;
+      await this.abandonLost(error);
       throw error;
     }
   }
@@ -1243,9 +1248,13 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
     const lookups: number[] = [];
     const idle = new Set<number>();
     const alone: number[] = [];
-    const reading = this.options.commit.kind === 'onRead'
+    // After a new session or a lost membership no read starts until a refresh confirmed the assignment, as in the
+    // Rust reader. The server would refuse a read before the join, and its partition would wait a retry interval.
+    const confirmed = !this.group ||
+      !(this.memberLost || this.joinedResets !== this.sessionResets || this.resync);
+    const reading = confirmed && (this.options.commit.kind === 'onRead'
       ? this.waiting > 0 && this.queue.length === 0
-      : this.queuedMessages < this.prefetchMessages && this.queuedBytes < this.prefetchBytes;
+      : this.queuedMessages < this.prefetchMessages && this.queuedBytes < this.prefetchBytes);
     if (reading) {
       // A partition in no group polls alone. While a grouping is in flight it waits for its group instead, so its
       // polls do not take the requests of the groups, but after a failed grouping it polls alone until one succeeds.
@@ -1278,11 +1287,12 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
       if (this.pollsInFlight >= aloneLimit || this.requestRoom() <= 0) break;
       this.startPoll(partition);
     }
-    let wait = Number.isFinite(nextRetry) ? Math.max(1, nextRetry - Date.now()) : undefined;
+    const wait = Number.isFinite(nextRetry) ? Math.max(1, nextRetry - Date.now()) : undefined;
+    // A refresh in flight wakes the worker at its end, so only a group reader without one sets a timer for its sync.
+    if (!this.group || this.refreshing) return wait;
     // A timer truncates its delay, so the wait rounds up to wake after the sync is due, not just before.
     const untilSync = Math.max(1, Math.ceil(this.syncedAt + this.syncPause - performance.now()));
-    if (this.group && (wait === undefined || wait > untilSync)) wait = untilSync;
-    return wait;
+    return wait === undefined || wait > untilSync ? untilSync : wait;
   }
 
   /**
@@ -1519,6 +1529,7 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
           state.retryAt = Date.now() + this.retryInterval;
           return;
         }
+        state.lasting = 0;
         state.atEnd = polled.messages.length === 0;
         this.notify();
         // Next reads on after the stored offset. A timestamp or Last position reads from its first message by offset.
@@ -1537,7 +1548,7 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
    * Abandons an operation of this reader with an unknown outcome, a committing
    * read or an offset write of a seek, of a commit or of the close, so the
    * client takes the next read and write of its partition, also of a later
-   * reader. The close abandons a join or a leave the same way.
+   * reader. The worker abandons a join the same way, and the close a leave.
    */
   private abandonLost(error: unknown): Promise<void> {
     return PartitionReader.abandonUnknown(this.getClient, error);
