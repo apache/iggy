@@ -22,7 +22,6 @@ use crate::segment_chain::{
 };
 
 pub(super) const PREFIX: ObjectPrefix = ObjectPrefix {
-    cluster_uid: 1,
     stream_id: 1,
     topic_id: 1,
     partition_id: 0,
@@ -255,7 +254,7 @@ async fn given_a_chain_on_disk_when_a_partition_reopens_it_should_know_the_seale
     let mut other = Box::new(test_partition_with_replicas(3));
     other.set_partition_dir(path);
     let foreign = ObjectPrefix {
-        cluster_uid: 2,
+        created_revision: PREFIX.created_revision + 1,
         ..PREFIX
     };
     assert!(matches!(

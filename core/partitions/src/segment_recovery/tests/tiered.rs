@@ -31,7 +31,6 @@ use std::fs;
 use tempfile::{TempDir, tempdir};
 
 const PREFIX: ObjectPrefix = ObjectPrefix {
-    cluster_uid: 7,
     stream_id: STREAM_ID as u64,
     topic_id: TOPIC_ID as u64,
     partition_id: PARTITION_ID as u64,
