@@ -253,6 +253,11 @@ jobs:
 
             // Parse Docker images
             ('${{ inputs.publish_dockerhub }}').split(',').map(s => s.trim()).filter(Boolean).forEach(img => {
+              // With use_latest_ci off, the config of a commit from before the move still lists
+              // this image. This workflow no longer selects the glibc build that the image needs.
+              if (img === 'rust-connectors') {
+                throw new Error('rust-connectors moved to apache/iggy-connectors. Publish the image from that repository.');
+              }
               if (cfg[img]?.registry === 'dockerhub') wants.push(img);
               else core.warning(`Unknown Docker image: ${img}`);
             });
