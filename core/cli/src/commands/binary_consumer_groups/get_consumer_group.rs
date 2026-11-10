@@ -22,7 +22,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::{Table, presets::ASCII_NO_BORDERS};
 use iggy_common::Client;
-use iggy_common::{Consumer, Identifier};
+use iggy_common::{Consumer, ConsumerGroupDetails, Identifier};
 use tracing::{Level, event};
 
 pub struct GetConsumerGroupCmd {
@@ -68,22 +68,6 @@ impl CliCommand for GetConsumerGroupCmd {
 
         let consumer_group = consumer_group.unwrap();
 
-        let topic = client
-            .get_topic(&self.stream_id, &self.topic_id)
-            .await
-            .with_context(|| {
-                format!(
-                    "Problem getting topic with ID: {} in stream with ID: {}",
-                    self.topic_id, self.stream_id
-                )
-            })?
-            .with_context(|| {
-                format!(
-                    "Topic with ID: {} in stream with ID: {} was not found",
-                    self.topic_id, self.stream_id
-                )
-            })?;
-
         let consumer = Consumer::group(self.group_id.clone());
         let mut owners = HashMap::with_capacity(
             consumer_group
@@ -116,6 +100,35 @@ impl CliCommand for GetConsumerGroupCmd {
                 ]);
             }
         }
+
+        let topic = match client.get_topic(&self.stream_id, &self.topic_id).await {
+            Ok(Some(topic)) => topic,
+            Ok(None) => {
+                log_consumer_group(
+                    &consumer_group,
+                    render_members.then_some(&members_table),
+                    None,
+                );
+                return Err(anyhow::anyhow!(
+                    "Topic with ID: {} in stream with ID: {} was not found",
+                    self.topic_id,
+                    self.stream_id
+                ));
+            }
+            Err(error) => {
+                log_consumer_group(
+                    &consumer_group,
+                    render_members.then_some(&members_table),
+                    None,
+                );
+                return Err(error).with_context(|| {
+                    format!(
+                        "Problem getting topic with ID: {} in stream with ID: {}",
+                        self.topic_id, self.stream_id
+                    )
+                });
+            }
+        };
 
         let mut partitions_table = Table::new();
         partitions_table.load_style(ASCII_NO_BORDERS);
@@ -191,36 +204,46 @@ impl CliCommand for GetConsumerGroupCmd {
             ]);
         }
 
-        let mut table = Table::new();
-
-        table.set_header(vec!["Property", "Value"]);
-        table.add_row(vec![
-            "Consumer group id",
-            format!("{}", consumer_group.id).as_str(),
-        ]);
-        table.add_row(vec!["Consumer group name", consumer_group.name.as_str()]);
-        table.add_row(vec![
-            "Partitions count",
-            format!("{}", consumer_group.partitions_count).as_str(),
-        ]);
-        table.add_row(vec![
-            "Members count",
-            format!("{}", consumer_group.members_count).as_str(),
-        ]);
-
-        if render_members {
-            table.add_row(vec!["Members", members_table.to_string().as_str()]);
-        }
-
-        table.add_row(vec!["Partitions", partitions_table.to_string().as_str()]);
-
-        event!(target: PRINT_TARGET, Level::INFO,"{table}");
+        log_consumer_group(
+            &consumer_group,
+            render_members.then_some(&members_table),
+            Some(&partitions_table),
+        );
 
         if let Some(error) = offset_error {
             return Err(error);
         }
         Ok(())
     }
+}
+
+fn log_consumer_group(
+    consumer_group: &ConsumerGroupDetails,
+    members: Option<&Table>,
+    partitions: Option<&Table>,
+) {
+    let mut table = Table::new();
+    table.set_header(vec!["Property", "Value"]);
+    table.add_row(vec![
+        "Consumer group id",
+        format!("{}", consumer_group.id).as_str(),
+    ]);
+    table.add_row(vec!["Consumer group name", consumer_group.name.as_str()]);
+    table.add_row(vec![
+        "Partitions count",
+        format!("{}", consumer_group.partitions_count).as_str(),
+    ]);
+    table.add_row(vec![
+        "Members count",
+        format!("{}", consumer_group.members_count).as_str(),
+    ]);
+    if let Some(members) = members {
+        table.add_row(vec!["Members", members.to_string().as_str()]);
+    }
+    if let Some(partitions) = partitions {
+        table.add_row(vec!["Partitions", partitions.to_string().as_str()]);
+    }
+    event!(target: PRINT_TARGET, Level::INFO, "{table}");
 }
 
 #[cfg(test)]
@@ -342,6 +365,24 @@ mod tests {
         cmd.execute_cmd(client)
             .await
             .expect_err("consumer group get should fail")
+    }
+
+    async fn printed_error(client: &ScriptedClient) -> (String, anyhow::Error) {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_level(false)
+            .with_writer(LogBuffer(Arc::clone(&logs)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let error = error_from(client).await;
+        drop(_guard);
+        let output =
+            String::from_utf8(logs.lock().expect("log buffer").clone()).expect("log is utf-8");
+        (output, error)
     }
 
     async fn rendered(client: &ScriptedClient) -> String {
@@ -816,9 +857,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn should_report_topic_fetch_failure() {
-        let error = error_from(&ScriptedClient {
+        let (output, error) = printed_error(&ScriptedClient {
             partitions_count: 1,
             topic: TopicReply::Error,
             offset_fails: false,
@@ -829,11 +870,12 @@ mod tests {
         .await;
 
         assert!(error.to_string().contains("Problem getting topic"));
+        assert!(output.contains("group"), "{output}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn should_report_missing_topic() {
-        let error = error_from(&ScriptedClient {
+        let (output, error) = printed_error(&ScriptedClient {
             partitions_count: 1,
             topic: TopicReply::Missing,
             offset_fails: false,
@@ -844,6 +886,8 @@ mod tests {
         .await;
 
         assert!(error.to_string().contains("was not found"));
+        assert!(output.contains("group"), "{output}");
+        assert!(!output.contains("Current offset"), "{output}");
     }
 
     #[tokio::test(flavor = "current_thread")]
