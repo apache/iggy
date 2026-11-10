@@ -784,6 +784,7 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::SendMessages => "send_messages",
         Operation::StoreConsumerOffset => "store_consumer_offset",
         Operation::DeleteConsumerOffset => "delete_consumer_offset",
+        Operation::StateMachineCommand => "state_machine_command",
         Operation::RollSegment => "roll_segment",
     }
 }
@@ -1032,7 +1033,7 @@ impl StructuredSimEvent for ControlActionLogEvent {
 }
 
 #[cfg(test)]
-mod tests {
+mod roll_segment_tests {
     use super::operation_as_str;
     use iggy_binary_protocol::Operation;
 

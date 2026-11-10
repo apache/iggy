@@ -453,6 +453,7 @@ pub(crate) fn authorize(
         | Operation::TransitionPartitionHistory
         | Operation::InstallConsumerGroupOwner
         | Operation::RetireConsumerGroupOwners
+        | Operation::StateMachineCommand
         | Operation::RollSegment => None,
     }
 }

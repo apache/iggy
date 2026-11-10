@@ -117,10 +117,15 @@ pub enum Operation {
     InstallConsumerGroupOwner = 167,
     TransitionPartitionHistory = 168,
     RetireConsumerGroupOwners = 169,
+    /// Server-originated: a command for one of the partition's state
+    /// machines. Shares the partition group's op sequence with the data ops
+    /// but is stored in the partition's state-machine log, never in its
+    /// segments. The body names the command kind. No client wire code.
+    StateMachineCommand = 170,
     /// Server-originated: seal a non-empty active segment before retention
     /// removes it. The primary submits this through partition consensus so
     /// every replica rotates at the same log position.
-    RollSegment = 170,
+    RollSegment = 171,
 }
 
 impl Operation {
@@ -167,6 +172,7 @@ impl Operation {
                     | Self::InstallConsumerGroupOwner
                     | Self::TransitionPartitionHistory
                     | Self::RetireConsumerGroupOwners
+                    | Self::StateMachineCommand
                     | Self::RollSegment
             )
     }
@@ -303,6 +309,7 @@ impl Operation {
             | Self::InstallConsumerGroupOwner
             | Self::TransitionPartitionHistory
             | Self::RetireConsumerGroupOwners
+            | Self::StateMachineCommand
             | Self::RollSegment => None,
             Self::CreateStream
             | Self::DeleteStream

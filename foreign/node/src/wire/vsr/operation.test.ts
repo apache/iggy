@@ -120,6 +120,10 @@ describe('VSR operation classification', () => {
     assert.equal(isKnownOperation(Operation.FinalizeSession), true);
     assert.equal(isKnownOperation(Operation.RetireConsumerGroupOwners), true);
     assert.equal(isInternal(Operation.RetireConsumerGroupOwners), true);
+    assert.equal(isKnownOperation(Operation.StateMachineCommand), true);
+    assert.equal(isInternal(Operation.StateMachineCommand), true);
+    assert.equal(isKnownOperation(Operation.RollSegment), true);
+    assert.equal(isInternal(Operation.RollSegment), true);
     for (const undeclared of [69, 76, 127, 129, 131, 133, 135, 142, 151, 159, 163, 164, 165, 255])
       assert.equal(isKnownOperation(undeclared), false);
   });
