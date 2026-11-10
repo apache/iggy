@@ -136,14 +136,14 @@ class RuntimeBuildSelection(unittest.TestCase):
         git.write_text(f"#!/bin/sh\ncase $1 in\n  rev-parse) echo {self.revision} ;;\n  cat-file) echo 'parent fixture' ;;\n  *) exit 1 ;;\nesac\n")
         git.chmod(0o755)
         self.runtime_files = {
-            "iggy-connectors": ("bin", "target/debug/iggy-connectors"),
-            "iggy_connector_stdout_sink": ("cdylib", "target/debug/libiggy_connector_stdout_sink.so"),
-            "iggy-bench-dashboard-server": ("bin", "target/debug/iggy-bench-dashboard-server"),
-            "kafka-message-gen": ("bin", "target/debug/kafka-message-gen"),
+            "iggy-bench": "target/debug/iggy-bench",
+            "iggy-mcp": "target/debug/iggy-mcp",
+            "iggy-bench-dashboard-server": "target/debug/iggy-bench-dashboard-server",
+            "kafka-message-gen": "target/debug/kafka-message-gen",
         }
         packages = []
         artifacts = []
-        for package, (kind, filename) in self.runtime_files.items():
+        for package, filename in self.runtime_files.items():
             package_id = f"path+file://{self.root}/{package}#0.1.0"
             packages.append({"name": package, "id": package_id})
             binary = self.root / filename
@@ -151,9 +151,8 @@ class RuntimeBuildSelection(unittest.TestCase):
             binary.write_text(package)
             artifacts.append({
                 "reason": "compiler-artifact", "package_id": package_id,
-                "target": {"name": binary.stem, "kind": [kind], "crate_types": [kind]},
-                "executable": str(binary) if kind == "bin" else None,
-                "filenames": [str(binary)],
+                "target": {"name": binary.stem, "kind": ["bin"]},
+                "executable": str(binary),
             })
         (self.root / "metadata.json").write_text(json.dumps({"packages": packages}))
         (self.root / "build.jsonl").write_text("\n".join(json.dumps(artifact) for artifact in artifacts))
@@ -190,7 +189,7 @@ elif sys.argv[1] in ('build', 'metadata'):
         self.assertEqual(calls[1], ["nextest", "archive", "--locked", "--profile", "ci",
                                    "--workspace",
                                    "--archive-file", str(artifact / "nextest.tar.zst")])
-        self.assert_runtime_archive([filename for _, filename in self.runtime_files.values()])
+        self.assert_runtime_archive(list(self.runtime_files.values()))
         self.assertEqual((artifact / "kafka-fixtures").read_text(), "true\n")
         self.assertEqual((self.root / "kafka-message-gen").read_text(),
                          str(self.root / "target/debug/kafka-message-gen"))
@@ -228,14 +227,14 @@ elif sys.argv[1] in ('build', 'metadata'):
 
     def test_affected_packages_keep_workspace_builds_and_filter_only_the_archive(self):
         calls = self.select(["integration", "iggy"],
-                            runtime_packages=["iggy-connectors", "iggy_connector_stdout_sink"])
+                            runtime_packages=["iggy-bench", "iggy-mcp"])
         self.assertEqual(calls[0], ["build", "--locked", "--workspace", "--exclude", "server",
                                    "--exclude", "iggy-cli", "--message-format=json-render-diagnostics"])
         self.assertEqual(calls[-1], ["nextest", "archive", "--locked", "--profile", "ci",
                                    "--workspace", "-E", "package(=integration) | package(=iggy)",
                                    "--archive-file", str(self.root / "rust-test-build/nextest.tar.zst")])
-        self.assert_runtime_archive(["target/debug/iggy-connectors",
-                                     "target/debug/libiggy_connector_stdout_sink.so"])
+        self.assert_runtime_archive(["target/debug/iggy-bench",
+                                     "target/debug/iggy-mcp"])
         self.assertEqual((self.root / "rust-test-build/scope").read_text(), "packages\n")
         self.assertEqual((self.root / "rust-test-build/kafka-fixtures").read_text(), "false\n")
 
