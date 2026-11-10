@@ -84,7 +84,8 @@ is what tests use and what "archive to disk" means.
 
 Every node must reach the same store, and matching configuration cannot prove it: per-node `fs`
 directories at one path, or a MinIO on each node's `localhost`, look identical. The cluster writes a
-store identity object under its prefix once, and a node uploads, evicts or reads remote segments
+store identity object carrying its `cluster_uid` (see [Object layout](#object-layout)) under its
+prefix once, and a node uploads, evicts or reads remote segments
 only after reading that object back through its own backend since it booted. Enabling tiering on a
 topic is refused while any node cannot. A store that becomes unreachable later is an outage, during
 which eviction of floored segments continues, while an identity found missing or different stops
@@ -195,21 +196,24 @@ Verified on `master @ 6ce2f92a9`.
 ### Object layout
 
 ```text
-{prefix}/{cluster_uid}/{stream_id}/{topic_id}/{partition_id}/{created_revision}/{start_offset:020}.log
-{prefix}/{cluster_uid}/{stream_id}/{topic_id}/{partition_id}/{created_revision}/{start_offset:020}.index
-{prefix}/{cluster_uid}/meta/{stream_id}/{topic_id}/{partition_id}/{created_revision}/manifest.bin
+{prefix}/{stream_id}/{topic_id}/{partition_id}/{created_revision}/{start_offset:020}.log
+{prefix}/{stream_id}/{topic_id}/{partition_id}/{created_revision}/{start_offset:020}.index
+{prefix}/meta/{stream_id}/{topic_id}/{partition_id}/{created_revision}/manifest.bin
 ```
 
 Stream, topic and partition ids are reused after deletion, so `created_revision`, unique across the
-cluster, identifies the partition incarnation. Offsets never restart within an incarnation, so it
-separates every offset space within one cluster lifetime. It restarts on fresh storage, which every
-upgrade needs, so `cluster_uid` is a random 128-bit id the metadata plane mints once when its log is
-created. Master's `cluster_id` cannot serve, since it is a hash of the cluster name, whose default
-every cluster shares. Keys never repeat across clusters sharing a bucket or across lifetimes of one
-cluster. No cluster deletes or sweeps under another's `cluster_uid`, and only a partition configured
-to follow another cluster reads under it. A partition builds every key from the prefix its chain
-file records (see [The local marker](#the-local-marker)), never from its local ids at read time. The
-zero-padded stem matches the on-disk name, so a listing sorts by offset.
+cluster, identifies the partition incarnation. Offsets never restart within an incarnation, so keys
+never repeat within one cluster lifetime, and a prefix belongs to exactly one. The cluster claims
+its prefix through the store identity object, which carries `cluster_uid`, a random 128-bit id the
+metadata plane mints once when its log is created. Master's `cluster_id` cannot serve, since it is
+a hash of the cluster name, whose default every cluster shares. A node whose `cluster_uid` differs
+from the identity object's neither uploads, evicts, deletes nor reads remote segments under that
+prefix, so a second cluster, or a cluster rebuilt empty, pointed at an occupied prefix is refused
+instead of overwriting or deleting what is there: the operator picks a new prefix or restores from
+it. Only a partition configured to follow another cluster reads under that cluster's prefix. A
+partition builds every key from the prefix its chain file records (see
+[The local marker](#the-local-marker)), never from its local ids at read time. The zero-padded stem
+matches the on-disk name, so a listing sorts by offset.
 
 Objects are immutable. The `.log` object is canonical and identical whichever replica produced it,
 and for an encrypted stream it is the same ciphertext the segment holds. The `.index` object is the
@@ -447,7 +451,7 @@ local already evicted re-plans it as remote instead of failing the poll.
 #### Chunk cache
 
 A directory under the node's data path holds chunks of remote `.log` objects under their full object
-key, so `cluster_uid` and `created_revision` are part of every path and no incarnation ever reads
+key, so the prefix and `created_revision` are part of every path and no incarnation ever reads
 another's chunks. Chunk boundaries snap to batch boundaries through the sparse index, so a batch
 never costs two GETs. A miss reserves cache space before it downloads. Chunks need no fsync: a
 chunk whose length or batch checksums do not match is dropped and fetched again.
@@ -577,7 +581,7 @@ shard loses primacy or whose incarnation retires is cancelled for good.
   command commits after it, and the next incarnation starts with an empty floor. When metadata
   completes the delete, the reconciler removes the directory and the
   incarnation's cache chunks, and the metadata primary queues its prefix for object deletion. An
-  orphan sweep lists `{prefix}/{cluster_uid}/` at incarnation granularity under a metadata
+  orphan sweep lists `{prefix}/` at incarnation granularity under a metadata
   revision snapshot and deletes incarnations absent from metadata, as a safety net.
 - **Manifest object.** The primary uploads `manifest.bin` under `meta/` when the remote set changes,
   rate-limited. It is derived, never the source of truth for a live cluster, and exists so a
@@ -600,7 +604,7 @@ designed here, and neither commits to Redpanda's mechanism. This RFC keeps both 
 - **Recorded prefixes.** Keys come from the prefix each chain file records, so a partition can name
   objects it did not upload under its own ids, as a follower or a restored partition must.
 - **Read-only foreign prefixes.** A partition configured to follow another cluster reads under that
-  cluster's `cluster_uid` and runs none of the primary's store duties: no uploads, deletions, front
+  cluster's prefix and runs none of the primary's store duties: no uploads, deletions, front
   truncations or sweeps.
 - **The manifest as a contract.** It lists the floor, the trim point and the remote segments with
   their checksums, in a versioned format.
