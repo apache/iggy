@@ -13950,11 +13950,12 @@ mod metadata_repair_driver_tests {
     use super::*;
     use consensus::{Sequencer, Status};
     use futures::FutureExt;
-    use iggy_binary_protocol::RequestStateTransferHeader;
+    use iggy_binary_protocol::{ConsensusHeader, RequestStateTransferHeader};
     use journal::Journal;
     use packet::Packet;
+    use server_common::MessageBag;
     use server_common::sharding::METADATA_GROUP;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     /// Chain replication runs 0 -> 1 -> 2 and stops before the primary, so
     /// replica 2 is the only one whose losses cannot starve the group of
@@ -13985,6 +13986,17 @@ mod metadata_repair_driver_tests {
     /// Quiet ticks for the repair stream to land, kept under
     /// `NORMAL_HEARTBEAT_TICKS` (500) so no election can be the healer.
     const QUIET_STEPS: usize = 160;
+
+    /// The view 0 primary, stopped with submits in its journal section.
+    const STOPPED_PRIMARY: u8 = 0;
+
+    /// The primary of the view the others elect without it.
+    const NEXT_PRIMARY: u8 = 1;
+
+    const PARKED_SUBMITS_SEED: u64 = 0x5EED_0B54;
+
+    /// Budget for the others to time the stopped primary out and elect a view.
+    const ELECTION_STEPS: usize = 4000;
 
     /// Budget for the group to settle once the fault is lifted; the drain
     /// loop breaks on convergence.
@@ -14540,6 +14552,382 @@ mod metadata_repair_driver_tests {
             "the walk never resumed over resident committed ops: walkable to \
              {commit_min}, committed through {commit_max}, every op between resident"
         );
+    }
+
+    /// A primary stops with two submits inside the journal section, one in the
+    /// append and one waiting for it, and resumes after the others elected a view
+    /// and committed past them. The `StartView` is the first thing it handles.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_a_primary_stopped_inside_the_journal_section_when_it_adopts_the_next_view_before_the_writes_land_should_not_keep_its_stale_prepares()
+     {
+        static START_VIEW_DELIVERED: AtomicBool = AtomicBool::new(false);
+        fn all_but_the_first_start_view(packet: &Packet) -> bool {
+            packet.message.header().command != Command::StartView
+                || START_VIEW_DELIVERED.swap(true, Ordering::Relaxed)
+        }
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let network_options = packet::PacketSimulatorOptions {
+            node_count: 3,
+            client_count: 3,
+            seed: PARKED_SUBMITS_SEED,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim =
+            Simulator::with_shards_shell(3, 1, [1u128, 2, 3].into_iter(), network_options);
+        let clients = [SimClient::new(1), SimClient::new(2), SimClient::new(3)];
+        sim.shell_login(&clients[0]);
+        sim.shell_login(&clients[1]);
+        let warm = super::tests::submit_and_wait_for_reply(
+            &mut sim,
+            1,
+            STOPPED_PRIMARY,
+            clients[0].create_stream("warm"),
+        );
+        assert_eq!(iggy_binary_protocol::result_code(warm.body()), Some(0));
+        let (_, _, stopped_at, _) = metadata_state(&sim, STOPPED_PRIMARY);
+
+        sim.replicas[usize::from(STOPPED_PRIMARY)]
+            .metadata_journal
+            .hold_appends();
+        sim.submit_request(
+            1,
+            STOPPED_PRIMARY,
+            clients[0].create_stream("parked-0").into_generic(),
+        );
+        sim.submit_request(
+            2,
+            STOPPED_PRIMARY,
+            clients[1].create_stream("parked-1").into_generic(),
+        );
+        for _ in 0..STEPS_PER_SEND {
+            sim.step();
+        }
+        let stopped = &sim.replicas[usize::from(STOPPED_PRIMARY)];
+        let consensus = stopped.shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .unwrap();
+        assert_eq!(consensus.pipeline_len(), 2, "both submits must be parked");
+        assert_eq!(consensus.sequencer().current_sequence(), stopped_at + 2);
+        assert_eq!(stopped.metadata_journal.last_op(), Some(stopped_at));
+
+        for peer in [NEXT_PRIMARY, LAGGING] {
+            sim.network.clog(
+                ProcessId::Replica(peer),
+                ProcessId::Replica(STOPPED_PRIMARY),
+            );
+            sim.network.clog(
+                ProcessId::Replica(STOPPED_PRIMARY),
+                ProcessId::Replica(peer),
+            );
+        }
+
+        let mut elected_view = None;
+        for _ in 0..ELECTION_STEPS {
+            sim.step();
+            let (status, view, _, _) = metadata_state(&sim, NEXT_PRIMARY);
+            if view >= 1 && status == Status::Normal {
+                elected_view = Some(view);
+                break;
+            }
+        }
+        let elected_view =
+            elected_view.expect("the others never elected a view without the stopped primary");
+        sim.shell_login_via(&clients[2], NEXT_PRIMARY);
+        for index in 0..GAP_SENDS {
+            let reply = super::tests::submit_and_wait_for_reply(
+                &mut sim,
+                3,
+                NEXT_PRIMARY,
+                clients[2].create_stream(&format!("after-{index}")),
+            );
+            assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        }
+
+        // One `StartView` and nothing else while the writes are held: the pump waits
+        // on the journal gate behind them, and a frame queued behind a waiting pump
+        // trips the simulator's lost-wakeup check.
+        for peer in [NEXT_PRIMARY, LAGGING] {
+            *sim.network.link_drop_packet_fn(
+                ProcessId::Replica(peer),
+                ProcessId::Replica(STOPPED_PRIMARY),
+            ) = Some(all_but_the_first_start_view);
+            sim.network.unclog(
+                ProcessId::Replica(peer),
+                ProcessId::Replica(STOPPED_PRIMARY),
+            );
+            sim.network.unclog(
+                ProcessId::Replica(STOPPED_PRIMARY),
+                ProcessId::Replica(peer),
+            );
+        }
+        for _ in 0..STEPS_PER_SEND {
+            sim.step();
+            if START_VIEW_DELIVERED.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        assert!(
+            START_VIEW_DELIVERED.load(Ordering::Relaxed),
+            "the resumed replica must receive StartView while the writes are held"
+        );
+        sim.replicas[usize::from(STOPPED_PRIMARY)]
+            .metadata_journal
+            .release_appends();
+        for peer in [NEXT_PRIMARY, LAGGING] {
+            *sim.network.link_drop_packet_fn(
+                ProcessId::Replica(peer),
+                ProcessId::Replica(STOPPED_PRIMARY),
+            ) = None;
+        }
+
+        for _ in 0..DRAIN_STEPS {
+            sim.step();
+            let (_, _, applied, _) = metadata_state(&sim, STOPPED_PRIMARY);
+            let (_, _, committed, _) = metadata_state(&sim, NEXT_PRIMARY);
+            if applied == committed {
+                break;
+            }
+        }
+
+        let (_, _, committed, _) = metadata_state(&sim, NEXT_PRIMARY);
+        let journal = &sim.replicas[usize::from(STOPPED_PRIMARY)].metadata_journal;
+        #[allow(clippy::cast_possible_truncation)]
+        let stale: Vec<u64> = (stopped_at + 1..=committed)
+            .filter(|&op| {
+                journal
+                    .header(op as usize)
+                    .is_some_and(|header| header.view < elected_view)
+            })
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "the resumed replica journaled prepares of the view it left at ops {stale:?}, \
+             above its commit point {stopped_at} when it stopped"
+        );
+        let (status, _, applied, _) = metadata_state(&sim, STOPPED_PRIMARY);
+        assert_eq!(
+            (status, applied),
+            (Status::Normal, committed),
+            "the resumed replica never reached the group's commit point"
+        );
+        let primary_journal = &sim.replicas[usize::from(NEXT_PRIMARY)].metadata_journal;
+        for op in stopped_at + 1..=committed {
+            let slot = usize::try_from(op).unwrap();
+            let expected = primary_journal
+                .header(slot)
+                .expect("primary holds the committed op");
+            let recovered = journal
+                .header(slot)
+                .expect("resumed replica holds the committed op");
+            assert_eq!(
+                recovered.checksum, expected.checksum,
+                "the resumed replica must hold the group's prepare at op {op}"
+            );
+        }
+    }
+
+    /// A primary is elected for a later view while a submit is in its append,
+    /// and the tick starts the parked view before the write lands.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_a_primary_elect_with_a_submit_in_its_append_when_the_tick_starts_the_view_should_not_keep_the_stale_prepare()
+     {
+        const ELECTED_VIEW: u32 = 3;
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let network_options = packet::PacketSimulatorOptions {
+            node_count: 3,
+            client_count: 2,
+            seed: PARKED_SUBMITS_SEED,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::with_shards_shell(3, 1, [1u128, 2].into_iter(), network_options);
+        let clients = [SimClient::new(1), SimClient::new(2)];
+        sim.shell_login(&clients[0]);
+        let warm = super::tests::submit_and_wait_for_reply(
+            &mut sim,
+            1,
+            STOPPED_PRIMARY,
+            clients[0].create_stream("warm"),
+        );
+        assert_eq!(iggy_binary_protocol::result_code(warm.body()), Some(0));
+        let (_, _, stopped_at, _) = metadata_state(&sim, STOPPED_PRIMARY);
+        for _ in 0..DRAIN_STEPS {
+            if metadata_state(&sim, NEXT_PRIMARY).2 == stopped_at
+                && metadata_state(&sim, LAGGING).2 == stopped_at
+            {
+                break;
+            }
+            sim.step();
+        }
+
+        let elect = Rc::clone(&sim.replicas[usize::from(STOPPED_PRIMARY)].shards[0]);
+        let elect_state = |sim: &Simulator| {
+            let consensus = sim.replicas[usize::from(STOPPED_PRIMARY)].shards[0]
+                .plane
+                .metadata()
+                .consensus
+                .as_ref()
+                .unwrap();
+            (
+                consensus.status(),
+                consensus.view(),
+                consensus.sequencer().current_sequence(),
+                sim.replicas[usize::from(STOPPED_PRIMARY)]
+                    .metadata_journal
+                    .last_op(),
+            )
+        };
+
+        sim.replicas[usize::from(STOPPED_PRIMARY)]
+            .metadata_journal
+            .hold_appends();
+        sim.submit_request(
+            1,
+            STOPPED_PRIMARY,
+            clients[0].create_stream("in-append").into_generic(),
+        );
+        for _ in 0..STEPS_PER_SEND {
+            sim.step();
+        }
+        assert_eq!(
+            elect_state(&sim),
+            (Status::Normal, 0, stopped_at + 1, Some(stopped_at)),
+            "the submit must be inside its append"
+        );
+
+        // The others moved on to a view this replica leads and report their logs.
+        let do_view_change = {
+            let consensus = elect.plane.metadata().consensus.as_ref().unwrap();
+            let committed = *sim.replicas[usize::from(STOPPED_PRIMARY)]
+                .metadata_journal
+                .header(usize::try_from(stopped_at).unwrap())
+                .expect("the committed head is journaled");
+            let header_size = size_of::<iggy_binary_protocol::DoViewChangeHeader>();
+            let mut message = Message::<iggy_binary_protocol::DoViewChangeHeader>::new(
+                header_size + size_of::<PrepareHeader>(),
+            );
+            consensus::encode_prepare_headers(
+                &[committed],
+                &mut message.as_mut_slice()[header_size..],
+            );
+            let checksum_body = u128::from(iggy_common::calculate_checksum(
+                &message.as_slice()[header_size..],
+            ));
+            let total = message.as_slice().len();
+            message.transmute_header(|_, header: &mut iggy_binary_protocol::DoViewChangeHeader| {
+                header.command = Command::DoViewChange;
+                header.cluster = consensus.cluster();
+                header.group = METADATA_GROUP;
+                header.view = ELECTED_VIEW;
+                header.replica = NEXT_PRIMARY;
+                header.log_view = committed.view;
+                header.op = stopped_at;
+                header.commit = stopped_at;
+                header.present_bitset = 1;
+                header.size = u32::try_from(total).unwrap();
+                header.checksum_body = checksum_body;
+                header.seal();
+            })
+        };
+        sim.executor.spawn({
+            let elect = Rc::clone(&elect);
+            async move {
+                elect
+                    .on_message(MessageBag::DoViewChange(do_view_change))
+                    .await;
+            }
+        });
+        sim.run_pumps();
+        assert_eq!(
+            elect_state(&sim),
+            (
+                Status::ViewChange,
+                ELECTED_VIEW,
+                stopped_at + 1,
+                Some(stopped_at)
+            ),
+            "the view change parks its merged log while the write is in flight"
+        );
+
+        // The tick starts the parked view, then the write lands.
+        sim.tick();
+        sim.replicas[usize::from(STOPPED_PRIMARY)]
+            .metadata_journal
+            .release_appends();
+        for _ in 0..DRAIN_STEPS {
+            sim.step();
+            let (status, view, _, _) = metadata_state(&sim, LAGGING);
+            if status == Status::Normal && view == ELECTED_VIEW {
+                break;
+            }
+        }
+        let (status, view, head, _) = elect_state(&sim);
+        assert_eq!(
+            (status, view),
+            (Status::Normal, ELECTED_VIEW),
+            "the elected replica never started its view"
+        );
+        let journal = &sim.replicas[usize::from(STOPPED_PRIMARY)].metadata_journal;
+        #[allow(clippy::cast_possible_truncation)]
+        let stale: Vec<u64> = (head + 1..=stopped_at + 1)
+            .filter(|&op| journal.header(op as usize).is_some())
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "the primary of view {ELECTED_VIEW} holds prepares of the view it left at ops \
+             {stale:?}, above the head {head} its view started at"
+        );
+
+        // The next ops of the view must be the ones every replica commits.
+        sim.shell_login_via(&clients[1], STOPPED_PRIMARY);
+        for index in 0..WARMUP_SENDS {
+            let reply = super::tests::submit_and_wait_for_reply(
+                &mut sim,
+                2,
+                STOPPED_PRIMARY,
+                clients[1].create_stream(&format!("elected-{index}")),
+            );
+            assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        }
+        let (_, _, _, committed) = metadata_state(&sim, STOPPED_PRIMARY);
+        for _ in 0..DRAIN_STEPS {
+            if metadata_state(&sim, NEXT_PRIMARY).2 == committed
+                && metadata_state(&sim, LAGGING).2 == committed
+            {
+                break;
+            }
+            sim.step();
+        }
+        let journal = &sim.replicas[usize::from(STOPPED_PRIMARY)].metadata_journal;
+        for backup in [NEXT_PRIMARY, LAGGING] {
+            assert_eq!(
+                metadata_state(&sim, backup).2,
+                committed,
+                "replica {backup} never reached the commit point of the view"
+            );
+            let backup_journal = &sim.replicas[usize::from(backup)].metadata_journal;
+            for op in stopped_at + 1..=committed {
+                let slot = usize::try_from(op).unwrap();
+                assert_eq!(
+                    journal.header(slot).map(|header| header.checksum),
+                    backup_journal.header(slot).map(|header| header.checksum),
+                    "replica {backup} and the primary disagree on the prepare at op {op}"
+                );
+            }
+        }
     }
 
     #[test]
