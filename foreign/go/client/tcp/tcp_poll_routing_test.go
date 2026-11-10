@@ -951,6 +951,130 @@ func TestStoreConsumerPosition_KeepsTheContextOfThePollAcrossARetry(t *testing.T
 	}
 }
 
+// The server refuses a poll or an offset write that names no history. A
+// context without one, as of a seek before the first read, takes the
+// incarnation of the route and keeps its owner generation and op. A zero
+// context names nothing, so it takes the whole context of the route.
+func TestPartitionRequests_TakeTheHistoryOfTheRouteForAContextWithoutOne(t *testing.T) {
+	stream, topic, consumer := groupConsumer(t)
+	partition := uint32(4)
+	kinds := []struct {
+		name string
+		send func(*IggyTcpClient, iggcon.PartitionContext) error
+	}{
+		{"store", func(client *IggyTcpClient, captured iggcon.PartitionContext) error {
+			position := iggcon.ConsumerPosition{PartitionId: partition, Offset: 42, Context: captured}
+			return client.StoreConsumerPosition(context.Background(), consumer, stream, topic, position)
+		}},
+		{"delete", func(client *IggyTcpClient, captured iggcon.PartitionContext) error {
+			position := iggcon.ConsumerPosition{PartitionId: partition, Context: captured}
+			return client.DeleteConsumerPosition(context.Background(), consumer, stream, topic, position)
+		}},
+		{"poll", func(client *IggyTcpClient, captured iggcon.PartitionContext) error {
+			_, err := client.pollMessages(context.Background(), stream, topic, consumer,
+				iggcon.OffsetPollingStrategy(0).WithContext(captured), 1, false, &partition)
+			return err
+		}},
+	}
+	contexts := []struct {
+		name   string
+		caller iggcon.PartitionContext
+		sent   iggcon.PartitionContext
+	}{
+		{"without_a_history", iggcon.PartitionContext{OwnerGeneration: 3, MetadataOp: 9},
+			iggcon.PartitionContext{Incarnation: routedIncarnation, OwnerGeneration: 3, MetadataOp: 9}},
+		{"zero", iggcon.PartitionContext{},
+			iggcon.PartitionContext{Incarnation: routedIncarnation, MetadataOp: routedMetadataOp}},
+	}
+	for _, kind := range kinds {
+		for _, tt := range contexts {
+			t.Run(kind.name+"/"+tt.name, func(t *testing.T) {
+				client, serverConn := newPipeClient(t)
+				server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+					if read.operation() == vsr.OperationNonReplicated {
+						return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(partition))
+					}
+					return replyFrame(read.operation(), resultSection())
+				})
+
+				require.NoError(t, kind.send(client, tt.caller))
+
+				sent := partitionRequests(server.recorded())
+				require.Len(t, sent, 1)
+				assert.Equal(t, tt.sent, stampedContext(t, sent[0]))
+			})
+		}
+	}
+}
+
+// A route that names no history is not ready yet. A request that the server
+// fences by history fails as transient before it is sent, and the next call
+// looks the route up again.
+func TestPartitionRequests_TreatARouteWithoutAHistoryAsNotReady(t *testing.T) {
+	calls := newLaneCalls(t)
+	kinds := []struct {
+		name string
+		send func(*IggyTcpClient) error
+	}{
+		{"poll", func(client *IggyTcpClient) error {
+			return calls.poll(context.Background(), client, iggcon.OffsetPollingStrategy(0), false)
+		}},
+		{"store", func(client *IggyTcpClient) error {
+			return calls.storeOffset(context.Background(), client)
+		}},
+		{"fetch", func(client *IggyTcpClient) error {
+			_, err := client.FetchMessages(context.Background(), calls.stream, calls.topic, calls.consumer,
+				[]iggcon.FetchMessagesTarget{{PartitionId: calls.partition, Strategy: iggcon.OffsetPollingStrategy(0)}},
+				1, false, deferredOptions(0, 2*time.Second))
+			return err
+		}},
+	}
+	for _, kind := range kinds {
+		t.Run(kind.name, func(t *testing.T) {
+			client, serverConn := newPipeClient(t)
+			var incarnation atomic.Uint64
+			server := serve(serverConn, func(_ int, read request) []byte {
+				switch {
+				case read.code() == uint32(command.GetPartitionRouteCode):
+					return partitionRouteFrame(incarnation.Load(), calls.partition+1)
+				case read.code() == uint32(command.FetchMessagesCode):
+					return replyFrame(vsr.OperationNonReplicated, fetchBody(fetchSection{partition: calls.partition, next: 1}))
+				case read.operation() == vsr.OperationNonReplicated:
+					return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(calls.partition))
+				default:
+					return replyFrame(read.operation(), resultSection())
+				}
+			})
+
+			require.ErrorIs(t, kind.send(client), ierror.ErrTransientNotAccepted)
+			assert.Empty(t, partitionRequests(server.recorded()))
+
+			incarnation.Store(routedIncarnation)
+			require.NoError(t, kind.send(client))
+
+			assert.Equal(t, 2, requestCount(server.recorded(), command.GetPartitionRouteCode))
+			sent := partitionRequests(server.recorded())
+			require.Len(t, sent, 1)
+			if read := sent[0]; read.code() == uint32(command.FetchMessagesCode) {
+				assert.Equal(t, uint64(routedIncarnation), fetchTargets(t, read)[0].fence.Incarnation)
+			} else {
+				assert.Equal(t, uint64(routedIncarnation), stampedContext(t, read).Incarnation)
+			}
+		})
+	}
+}
+
+// partitionRequests are the requests of reads other than route lookups.
+func partitionRequests(reads []request) []request {
+	var sent []request
+	for _, read := range reads {
+		if read.code() != uint32(command.GetPartitionRouteCode) {
+			sent = append(sent, read)
+		}
+	}
+	return sent
+}
+
 func stampedContext(t *testing.T, read request) iggcon.PartitionContext {
 	t.Helper()
 	var stamped iggcon.PartitionContext

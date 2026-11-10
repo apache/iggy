@@ -623,8 +623,9 @@ func answerParked(t *testing.T, conn net.Conn, parked request, reply []byte) {
 }
 
 // A fetch goes to the primary of its first target in one request, because
-// its caller groups the targets. Its header carries no partition context,
-// because each target carries its own.
+// its caller groups the targets. Its header names the metadata that the
+// session saw, here the commit of the join, and no history or owner, because
+// each target carries its own fence.
 func TestFetchMessages_SendsOneRequestToThePrimaryOfItsFirstTarget(t *testing.T) {
 	fixture := newPrimaryPollFixture(t, func(_, _ int, read request) ([]byte, bool) {
 		if read.code() != uint32(command.FetchMessagesCode) {
@@ -635,6 +636,7 @@ func TestFetchMessages_SendsOneRequestToThePrimaryOfItsFirstTarget(t *testing.T)
 	}, nil)
 	streamId, topicId, consumer := groupConsumer(t)
 	next := iggcon.NextPollingStrategy()
+	require.NoError(t, fixture.client.JoinConsumerGroup(context.Background(), streamId, topicId, consumer.Id))
 
 	sections, err := fixture.client.FetchMessages(context.Background(), streamId, topicId, consumer,
 		[]iggcon.FetchMessagesTarget{{PartitionId: 1, Strategy: next}, {PartitionId: 0, Strategy: next}},
@@ -644,10 +646,12 @@ func TestFetchMessages_SendsOneRequestToThePrimaryOfItsFirstTarget(t *testing.T)
 	require.Len(t, sections, 2)
 	assert.ErrorIs(t, sections[1].Err, ierror.ErrNotPrimary)
 	fetch := recordedFetch(t, fixture.primaries[1].recorded())
-	assert.Equal(t, make([]byte, iggcon.PartitionContextSize), fetch.header[frameOffsetContext:frameOffsetContext+iggcon.PartitionContextSize])
+	assert.Equal(t, iggcon.PartitionContext{MetadataOp: 11}, stampedContext(t, fetch), "the header names the commit of the join")
 	targets := fetchTargets(t, fetch)
 	require.Len(t, targets, 2)
 	assert.Equal(t, []uint32{1, 0}, []uint32{targets[0].partition, targets[1].partition})
+	assert.Equal(t, []iggcon.PartitionContext{{Incarnation: 17}, {Incarnation: 17}},
+		[]iggcon.PartitionContext{targets[0].fence, targets[1].fence}, "each target keeps the fence of its route")
 	assert.Zero(t, requestCount(fixture.primaries[0].recorded(), command.FetchMessagesCode))
 	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.FetchMessagesCode))
 }
@@ -1083,7 +1087,10 @@ func TestFetchMessages_UnknownCommitBlocksProgressWithAnExplicitZeroContext(t *t
 	assert.Zero(t, requestCount(server.recorded(), command.PollMessagesDeferredCode))
 }
 
-func TestFetchMessages_ExplicitZeroContextKeepsItsWireFenceAcrossAStaleRoute(t *testing.T) {
+// A store whose context names no history takes the history of its route. A
+// stale route names a history that the server refuses, so the store cannot
+// commit past an unknown fetch of the newer history.
+func TestFetchMessages_ExplicitZeroContextTakesTheHistoryOfAStaleRoute(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	var applied atomic.Bool
 	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
@@ -1107,10 +1114,10 @@ func TestFetchMessages_ExplicitZeroContextKeepsItsWireFenceAcrossAStaleRoute(t *
 	position := iggcon.ConsumerPosition{PartitionId: 1, Offset: 7, Context: iggcon.PartitionContext{OwnerGeneration: 9, MetadataOp: 100}}
 	err := client.StoreConsumerPosition(context.Background(), calls.consumer, calls.stream, calls.topic, position)
 	require.ErrorIs(t, err, ierror.ErrHistoryUnavailable)
-	assert.False(t, applied.Load(), "the server rejects a zero header incarnation before progress admission")
+	assert.False(t, applied.Load(), "the server refuses the history of the stale route")
 	stores := requestsFor(server.recorded(), vsr.OperationForCode(uint32(command.StoreOffsetCode)))
 	require.Len(t, stores, 1)
-	assert.Zero(t, stores[0].incarnation(), "local lane normalization preserves the caller's explicit wire fence")
+	assert.Equal(t, uint64(routedIncarnation), stores[0].incarnation(), "the store names the history of its route")
 	assert.Equal(t, position.Context.OwnerGeneration, binary.LittleEndian.Uint64(stores[0].header[frameOffsetContext+8:]))
 	assert.Equal(t, position.Context.MetadataOp, binary.LittleEndian.Uint64(stores[0].header[frameOffsetContext+16:]))
 	position.Context.Incarnation = 18
