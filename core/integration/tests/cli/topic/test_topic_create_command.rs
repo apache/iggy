@@ -17,7 +17,7 @@
 
 use crate::cli::common::{
     CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
-    USAGE_PREFIX,
+    USAGE_PREFIX, printed_id,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
@@ -28,9 +28,11 @@ use iggy::prelude::IggyByteSize;
 use iggy::prelude::IggyExpiry;
 use iggy::prelude::MaxTopicSize;
 use iggy::prelude::StreamCreateOptions;
+use iggy::prelude::TopicCreateOptions;
 use predicates::str::diff;
 use serial_test::parallel;
 use std::str::FromStr;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 struct TestTopicCreateCmd {
@@ -42,6 +44,7 @@ struct TestTopicCreateCmd {
     message_expiry: Option<Vec<String>>,
     max_topic_size: MaxTopicSize,
     using_identifier: TestStreamId,
+    printed_id: OnceLock<u32>,
 }
 
 impl TestTopicCreateCmd {
@@ -65,6 +68,7 @@ impl TestTopicCreateCmd {
             message_expiry,
             max_topic_size,
             using_identifier,
+            printed_id: OnceLock::new(),
         }
     }
 
@@ -94,6 +98,16 @@ impl IggyCmdTestCase for TestTopicCreateCmd {
             .create_stream(&self.stream_name, &StreamCreateOptions::default())
             .await;
         assert!(stream.is_ok());
+
+        // A topic that already exists takes ID 0, so the new topic gets a nonzero ID.
+        client
+            .create_topic(
+                &self.stream_name.clone().try_into().unwrap(),
+                &format!("{}-neighbor", self.topic_name),
+                &TopicCreateOptions::default(),
+            )
+            .await
+            .expect("create neighbor topic");
     }
 
     fn get_command(&self) -> IggyCmdCommand {
@@ -120,11 +134,19 @@ impl IggyCmdTestCase for TestTopicCreateCmd {
 
         let max_topic_size = self.max_topic_size.to_string();
 
+        let topic_id = printed_id(
+            &command_state,
+            &format!("Topic with name: {topic_name}, ID: "),
+        );
+        self.printed_id
+            .set(topic_id)
+            .expect("verify_command runs once");
+
         let message = format!(
             "Executing create topic with name: {topic_name}, message expiry: {message_expiry}, \
             compression algorithm: {compression_algorithm}, max topic size: {max_topic_size} \
             in stream with ID: {stream_id}\n\
-            Topic with name: {topic_name}, partitions count: {partitions_count}, compression algorithm: {compression_algorithm}, message expiry: {message_expiry}, \
+            Topic with name: {topic_name}, ID: {topic_id}, partitions count: {partitions_count}, compression algorithm: {compression_algorithm}, message expiry: {message_expiry}, \
             max topic size: {max_topic_size} created in stream with ID: {stream_id}\n",
         );
 
@@ -141,6 +163,7 @@ impl IggyCmdTestCase for TestTopicCreateCmd {
         assert!(topic.is_ok());
         let topic_details = topic.unwrap().expect("Topic not found");
         assert_eq!(topic_details.name, self.topic_name);
+        assert_eq!(self.printed_id.get().copied(), Some(topic_details.id));
         assert_eq!(topic_details.partitions_count, self.partitions_count);
         assert_eq!(topic_details.messages_count, 0);
 

@@ -37,18 +37,13 @@ impl CreateConsumerGroupCmd {
             },
         }
     }
-
-    fn get_group_id_info(&self) -> String {
-        "ID auto incremented".to_string()
-    }
 }
 
 #[async_trait]
 impl CliCommand for CreateConsumerGroupCmd {
     fn explain(&self) -> String {
         format!(
-            "create consumer group: {}, name: {} for topic with ID: {} and stream with ID: {}",
-            self.get_group_id_info(),
+            "create consumer group with name: {} for topic with ID: {} and stream with ID: {}",
             self.create_consumer_group.name,
             self.create_consumer_group.topic_id,
             self.create_consumer_group.stream_id,
@@ -56,20 +51,20 @@ impl CliCommand for CreateConsumerGroupCmd {
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
-        client
+        let group = client
             .create_consumer_group(&self.create_consumer_group.stream_id, &self.create_consumer_group.topic_id, &self.create_consumer_group.name)
             .await
             .with_context(|| {
                 format!(
-                    "Problem creating consumer group ({}, name: {}) for topic with ID: {} and stream with ID: {}",
-                    self.get_group_id_info(), self.create_consumer_group.name, self.create_consumer_group.topic_id, self.create_consumer_group.stream_id
+                    "Problem creating consumer group (name: {}) for topic with ID: {} and stream with ID: {}",
+                    self.create_consumer_group.name, self.create_consumer_group.topic_id, self.create_consumer_group.stream_id
                 )
             })?;
 
         event!(target: PRINT_TARGET, Level::INFO,
-            "Consumer group: {}, name: {} created for topic with ID: {} and stream with ID: {}",
-            self.get_group_id_info(),
+            "Consumer group with name: {} and ID: {} created for topic with ID: {} and stream with ID: {}",
             self.create_consumer_group.name,
+            group.id,
             self.create_consumer_group.topic_id,
             self.create_consumer_group.stream_id,
         );

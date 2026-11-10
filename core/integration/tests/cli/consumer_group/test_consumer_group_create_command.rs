@@ -17,7 +17,7 @@
 
 use crate::cli::common::{
     CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
-    TestTopicId, USAGE_PREFIX,
+    TestTopicId, USAGE_PREFIX, printed_id,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
@@ -25,6 +25,7 @@ use iggy::prelude::StreamCreateOptions;
 use iggy::prelude::{Client, IggyExpiry, TopicCreateOptions};
 use predicates::str::diff;
 use serial_test::parallel;
+use std::sync::OnceLock;
 
 struct TestConsumerGroupCreateCmd {
     stream_id: u32,
@@ -34,6 +35,7 @@ struct TestConsumerGroupCreateCmd {
     group_name: String,
     using_stream_id: TestStreamId,
     using_topic_id: TestTopicId,
+    printed_id: OnceLock<u32>,
 }
 
 impl TestConsumerGroupCreateCmd {
@@ -54,6 +56,7 @@ impl TestConsumerGroupCreateCmd {
             group_name,
             using_stream_id,
             using_topic_id,
+            printed_id: OnceLock::new(),
         }
     }
 
@@ -98,6 +101,16 @@ impl IggyCmdTestCase for TestConsumerGroupCreateCmd {
         assert!(topic.is_ok());
         let topic_details = topic.unwrap();
         self.topic_id = topic_details.id;
+
+        // A group that already exists takes ID 0, so the new group gets a nonzero ID.
+        client
+            .create_consumer_group(
+                &self.stream_id.try_into().unwrap(),
+                &self.topic_id.try_into().unwrap(),
+                &format!("{}-neighbor", self.group_name),
+            )
+            .await
+            .expect("create neighbor consumer group");
     }
 
     fn get_command(&self) -> IggyCmdCommand {
@@ -119,18 +132,18 @@ impl IggyCmdTestCase for TestConsumerGroupCreateCmd {
             TestTopicId::Named => self.topic_name.clone(),
         };
 
-        let group_id = "ID auto incremented";
+        let group_name = &self.group_name;
+        let group_id = printed_id(
+            &command_state,
+            &format!("Consumer group with name: {group_name} and ID: "),
+        );
+        self.printed_id
+            .set(group_id)
+            .expect("verify_command runs once");
 
         let message = format!(
-            "Executing create consumer group: {}, name: {} for topic with ID: {} and stream with ID: {}\nConsumer group: {}, name: {} created for topic with ID: {} and stream with ID: {}\n",
-            group_id,
-            self.group_name,
-            topic_id,
-            stream_id,
-            group_id,
-            self.group_name,
-            topic_id,
-            stream_id
+            "Executing create consumer group with name: {group_name} for topic with ID: {topic_id} and stream with ID: {stream_id}\n\
+            Consumer group with name: {group_name} and ID: {group_id} created for topic with ID: {topic_id} and stream with ID: {stream_id}\n",
         );
 
         command_state.success().stdout(diff(message));
@@ -149,6 +162,10 @@ impl IggyCmdTestCase for TestConsumerGroupCreateCmd {
             .unwrap()
             .expect("Failed to get consumer group");
         assert_eq!(consumer_group_details.name, self.group_name);
+        assert_eq!(
+            self.printed_id.get().copied(),
+            Some(consumer_group_details.id)
+        );
 
         let topic = client
             .delete_topic(
