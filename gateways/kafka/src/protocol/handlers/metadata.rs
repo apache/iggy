@@ -741,7 +741,7 @@ mod tests {
         // Stub path collapses null topics array to empty vector.
         let body = Bytes::from_static(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
         let topics = decode_topics(9, body, TEST_MAX_FRAME_SIZE).unwrap();
-        assert!(topics.is_empty());
+        assert_eq!(topics, [] as [StrBytes; 0]);
     }
 
     #[test]
