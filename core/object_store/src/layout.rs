@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::error::ObjectStoreError;
-use crate::store::{MAX_KEY_LEN, validate_key};
+use crate::store::{MAX_KEY_LEN, MAX_KEY_SEGMENTS, validate_key};
 
 const META: &str = "meta";
 const MANIFEST: &str = "manifest.bin";
@@ -28,6 +28,11 @@ const U64_DIGITS: usize = 20;
 const LONGEST_SUFFIX_LEN: usize = 5 * (1 + U64_DIGITS) + 1 + SegmentObject::Index.extension().len();
 /// The longest root that leaves room for every key under it.
 const MAX_ROOT_LEN: usize = MAX_KEY_LEN - LONGEST_SUFFIX_LEN;
+/// The most segments that a key adds after the root: `meta`, four ids and
+/// `manifest.bin`.
+const MOST_SUFFIX_SEGMENTS: usize = 6;
+/// The most segments of a root that leaves room for every key under it.
+const MAX_ROOT_SEGMENTS: usize = MAX_KEY_SEGMENTS - MOST_SUFFIX_SEGMENTS;
 
 /// Where the objects of one partition incarnation live.
 ///
@@ -88,6 +93,12 @@ pub struct SegmentKey {
 /// decimal and never `meta`, so no segment key falls under `{root}/meta/`.
 /// The cluster's identity is not part of any key: the store identity object
 /// claims the root for one cluster.
+///
+/// Roots never nest in the keys of another root, so two clusters can share a
+/// bucket under roots such as `iggy` and `iggy/b`. A listing under a root
+/// still returns the keys of every longer root, so retire and the orphan
+/// sweep delete only the keys that [`Self::parse_segment_key`] accepts and
+/// the keys that [`Self::manifest_key`] builds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyLayout {
     root: String,
@@ -99,20 +110,26 @@ impl KeyLayout {
     /// # Errors
     /// [`ObjectStoreError::InvalidKey`] when `root` is not a valid key, for
     /// example when it is empty or ends with `/`. The same error comes for a
-    /// root longer than 913 bytes, because the longest key under it would
-    /// then break [`MAX_KEY_LEN`].
+    /// root longer than 913 bytes or with more than 248 segments, because
+    /// the longest key under it would then break [`MAX_KEY_LEN`] or
+    /// [`MAX_KEY_SEGMENTS`]. It also comes for a root with a segment after
+    /// its first that is all digits or `meta`. The keys under the shorter
+    /// root continue with such a segment, so the two roots would share keys.
     pub fn new(root: impl Into<String>) -> Result<Self, ObjectStoreError> {
-        // The docs and the reason below spell out this limit.
-        const _: () = assert!(MAX_ROOT_LEN == 913);
+        // The docs and the reasons below spell out these limits.
+        const _: () = assert!(MAX_ROOT_LEN == 913 && MAX_ROOT_SEGMENTS == 248);
         let root = root.into();
         validate_key(&root)?;
-        if root.len() > MAX_ROOT_LEN {
-            return Err(ObjectStoreError::InvalidKey {
-                key: root,
-                reason: "is longer than 913 bytes, the most that a root can take",
-            });
-        }
-        Ok(Self { root })
+        let reason = if root.len() > MAX_ROOT_LEN {
+            "is longer than 913 bytes, the most that a root can take"
+        } else if root.split('/').count() > MAX_ROOT_SEGMENTS {
+            "has more than 248 segments, the most that a root can take"
+        } else if root.split('/').skip(1).any(continues_another_root) {
+            "has a segment after the first that is all digits or \"meta\", as in the keys of a shorter root"
+        } else {
+            return Ok(Self { root });
+        };
+        Err(ObjectStoreError::InvalidKey { key: root, reason })
     }
 
     #[must_use]
@@ -188,6 +205,12 @@ impl KeyLayout {
     }
 }
 
+/// Whether a root segment can follow a shorter root in its own keys, where
+/// only ids and `meta` come.
+fn continues_another_root(segment: &str) -> bool {
+    segment == META || segment.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// An id as [`KeyLayout`] writes it: decimal, with no sign and no leading
 /// zero.
 fn parse_id(part: &str) -> Option<u64> {
@@ -211,6 +234,7 @@ fn parse_offset(stem: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::MAX_KEY_SEGMENT_LEN;
 
     const PREFIX: ObjectPrefix = ObjectPrefix {
         stream_id: 1,
@@ -310,32 +334,80 @@ mod tests {
         assert!(keys.is_sorted(), "{keys:?}");
     }
 
+    const WIDEST: ObjectPrefix = ObjectPrefix {
+        stream_id: u64::MAX,
+        topic_id: u64::MAX,
+        partition_id: u64::MAX,
+        created_revision: u64::MAX,
+    };
+
+    /// A root of `len` bytes in segments of the longest length.
+    fn root_of_len(len: usize) -> String {
+        let segment = "r".repeat(MAX_KEY_SEGMENT_LEN);
+        let mut root = String::new();
+        while root.len() < len {
+            if !root.is_empty() {
+                root.push('/');
+            }
+            let segment_len = (len - root.len()).min(MAX_KEY_SEGMENT_LEN);
+            root.push_str(&segment[..segment_len]);
+        }
+        root
+    }
+
+    fn widest_keys(layout: &KeyLayout) -> [String; 2] {
+        let index = layout.segment_key(&SegmentKey {
+            prefix: WIDEST,
+            start_offset: u64::MAX,
+            object: SegmentObject::Index,
+        });
+        [index, layout.manifest_key(&WIDEST)]
+    }
+
     #[test]
     fn given_invalid_root_when_building_layout_should_refuse() {
-        for root in ["", "iggy/", "/iggy", "a//b", ".iggy"] {
+        for root in ["", "iggy/", "/iggy", "a//b", ".iggy", "iggy."] {
             assert!(KeyLayout::new(root).is_err(), "{root:?}");
         }
         assert_eq!(KeyLayout::new("iggy").unwrap().root(), "iggy");
     }
 
     #[test]
+    fn given_root_that_nests_in_another_when_building_layout_should_refuse() {
+        for root in [
+            "iggy/1",
+            "iggy/meta",
+            "iggy/1/x",
+            "iggy/x/0",
+            "tenant/42/iggy",
+        ] {
+            assert!(
+                matches!(
+                    KeyLayout::new(root),
+                    Err(ObjectStoreError::InvalidKey { reason, .. }) if reason.contains("all digits")
+                ),
+                "{root:?}"
+            );
+        }
+        for root in [
+            "1",
+            "meta",
+            "iggy/b",
+            "iggy/1a",
+            "iggy/meta2",
+            "tenant-42/iggy",
+        ] {
+            assert!(KeyLayout::new(root).is_ok(), "{root:?}");
+        }
+    }
+
+    #[test]
     fn given_longest_root_when_building_widest_keys_should_keep_them_valid() {
-        let root = format!("{}r", "r/".repeat(MAX_ROOT_LEN / 2));
+        let root = root_of_len(MAX_ROOT_LEN);
         assert_eq!(root.len(), MAX_ROOT_LEN);
         let layout = KeyLayout::new(root).unwrap();
-        let widest = ObjectPrefix {
-            stream_id: u64::MAX,
-            topic_id: u64::MAX,
-            partition_id: u64::MAX,
-            created_revision: u64::MAX,
-        };
 
-        let index = layout.segment_key(&SegmentKey {
-            prefix: widest,
-            start_offset: u64::MAX,
-            object: SegmentObject::Index,
-        });
-        let manifest = layout.manifest_key(&widest);
+        let [index, manifest] = widest_keys(&layout);
 
         assert_eq!(index.len(), MAX_KEY_LEN);
         assert!(validate_key(&index).is_ok());
@@ -344,12 +416,33 @@ mod tests {
 
     #[test]
     fn given_root_past_longest_when_building_layout_should_refuse() {
-        let root = format!("{}rr", "r/".repeat(MAX_ROOT_LEN / 2));
-        assert_eq!(root.len(), MAX_ROOT_LEN + 1);
+        let root = root_of_len(MAX_ROOT_LEN + 1);
 
         assert!(matches!(
             KeyLayout::new(root),
-            Err(ObjectStoreError::InvalidKey { .. })
+            Err(ObjectStoreError::InvalidKey { reason, .. }) if reason.contains("913 bytes")
+        ));
+    }
+
+    #[test]
+    fn given_root_with_most_segments_when_building_widest_keys_should_keep_them_valid() {
+        let root = format!("{}r", "r/".repeat(MAX_ROOT_SEGMENTS - 1));
+        let layout = KeyLayout::new(root).unwrap();
+
+        let [index, manifest] = widest_keys(&layout);
+
+        assert_eq!(manifest.split('/').count(), MAX_KEY_SEGMENTS);
+        assert!(validate_key(&index).is_ok());
+        assert!(validate_key(&manifest).is_ok());
+    }
+
+    #[test]
+    fn given_root_past_most_segments_when_building_layout_should_refuse() {
+        let root = format!("{}r", "r/".repeat(MAX_ROOT_SEGMENTS));
+
+        assert!(matches!(
+            KeyLayout::new(root),
+            Err(ObjectStoreError::InvalidKey { reason, .. }) if reason.contains("248 segments")
         ));
     }
 }

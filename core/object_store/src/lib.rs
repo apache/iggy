@@ -25,8 +25,8 @@
 //! deletes hand work to the tier service of a shard.
 //!
 //! [`MemoryStore`] and [`InlineTierExecutor`] stand in for a provider and for
-//! the tier service in tests, and [`contract`] holds the cases that every
-//! provider passes.
+//! the tier service in tests, and [`contract`] holds the cases that providers
+//! pass.
 
 // Every future here runs on the shard that owns it and never crosses threads.
 #![allow(clippy::future_not_send)]
@@ -47,9 +47,9 @@ pub use memory::MemoryStore;
 pub use segment_metadata::{SEGMENT_HASH_LEN, SegmentMetadata, SegmentMetadataError};
 pub use store::{
     DeleteFailure, DeleteOutcome, ListPage, ListRequest, ListedObject, MAX_KEY_LEN,
-    MAX_KEY_SEGMENT_LEN, MAX_KEYS_PER_REQUEST, MAX_METADATA_LEN, ObjectMeta, ObjectStore, PutBody,
-    PutMode, PutOptions, UserMetadata, validate_delete, validate_key, validate_metadata,
-    validate_prefix, validate_range,
+    MAX_KEY_SEGMENT_LEN, MAX_KEY_SEGMENTS, MAX_KEYS_PER_REQUEST, MAX_METADATA_LEN, ObjectMeta,
+    ObjectRange, ObjectStore, PutBody, PutMode, PutOptions, UserMetadata, validate_delete,
+    validate_key, validate_metadata, validate_prefix, validate_range,
 };
 pub use tier::{
     ScopeCancelled, TierExecutor, TierJobCancelled, TierJobClass, TierJobHandle, TierJobRequest,

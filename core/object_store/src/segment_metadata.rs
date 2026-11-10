@@ -49,8 +49,8 @@ pub struct SegmentMetadata {
     pub max_timestamp: u64,
     /// The segment's committed size, which is the object's size.
     pub size: u64,
-    /// BLAKE3 of the object's bytes: the segment's commit-path hash, which
-    /// the marker in the chain file records too.
+    /// BLAKE3 of the object's bytes: the hash that the chain file records
+    /// for the segment, taken on the commit path or from disk.
     pub hash: [u8; SEGMENT_HASH_LEN],
 }
 

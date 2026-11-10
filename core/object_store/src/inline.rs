@@ -38,7 +38,13 @@ type DetachedJobs = Rc<RefCell<Vec<LocalBoxFuture<'static, ()>>>>;
 /// at once, so a job against a [`crate::MemoryStore`] finishes there. The rest
 /// of a job that waits runs while its handle is polled. Once the handle is
 /// dropped or detached, the executor keeps the job, and the test runs it on
-/// with [`Self::run_detached`]. Cancellation works as in the tier service.
+/// with [`Self::run_detached`].
+///
+/// A cancelled scope stops a job only when the job is next polled. A detached
+/// job of a cancelled scope is dropped at the next [`Self::run_detached`], and
+/// holds the store and its captures until then. A job whose scope is
+/// cancelled while the job itself is polled runs on to its next await that
+/// does not complete at once, and can still finish with its output.
 pub struct InlineTierExecutor<S> {
     store: Rc<S>,
     detached: DetachedJobs,
@@ -100,7 +106,8 @@ impl<S: ObjectStore + 'static> TierExecutor for InlineTierExecutor<S> {
         let mut run = async move {
             let cancelled = pin!(scope.cancelled());
             let job = pin!(job(store));
-            // Cancellation is polled first, so a job never outlives its scope.
+            // Cancellation is polled first, so a job is never polled again
+            // once its scope is cancelled before a poll.
             match future::select(cancelled, job).await {
                 Either::Left(((), _)) => Err(TierJobCancelled),
                 Either::Right((output, _)) => Ok(output),

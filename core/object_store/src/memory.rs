@@ -25,16 +25,17 @@ use futures::StreamExt;
 
 use crate::error::ObjectStoreError;
 use crate::store::{
-    DeleteFailure, DeleteOutcome, ListPage, ListRequest, ListedObject, ObjectMeta, ObjectStore,
-    PutBody, PutMode, PutOptions, UserMetadata, validate_delete, validate_key, validate_metadata,
-    validate_prefix, validate_range,
+    DeleteFailure, DeleteOutcome, ListPage, ListRequest, ListedObject, ObjectMeta, ObjectRange,
+    ObjectStore, PutBody, PutMode, PutOptions, UserMetadata, validate_delete, validate_key,
+    validate_metadata, validate_prefix, validate_range,
 };
 
 /// An [`ObjectStore`] in memory, with no faults.
 ///
-/// Every call answers at once, except that a put waits for its body. It lets
-/// tests run against the trait before any provider exists. It keeps the
-/// contract, which [`crate::contract`] checks.
+/// Every call answers at once, except that a put waits for its body. A put
+/// decides [`PutMode::IfAbsent`] after its body ends, when it inserts the
+/// object. It lets tests run against the trait before any provider exists.
+/// It keeps the contract, which [`crate::contract`] checks.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     objects: RefCell<BTreeMap<String, StoredObject>>,
@@ -115,11 +116,16 @@ impl ObjectStore for MemoryStore {
         Ok(())
     }
 
-    async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Bytes, ObjectStoreError> {
+    async fn get_range(
+        &self,
+        key: &str,
+        range: Range<u64>,
+    ) -> Result<ObjectRange, ObjectStoreError> {
         validate_key(key)?;
         validate_range(&range)?;
         let objects = self.objects.borrow();
-        let bytes = &objects.get(key).ok_or_else(|| not_found(key))?.bytes;
+        let object = objects.get(key).ok_or_else(|| not_found(key))?;
+        let bytes = &object.bytes;
         let start = usize::try_from(range.start)
             .ok()
             .filter(|&start| start < bytes.len())
@@ -129,7 +135,11 @@ impl ObjectStore for MemoryStore {
                 end: range.end,
             })?;
         let end = usize::try_from(range.end).map_or(bytes.len(), |end| end.min(bytes.len()));
-        Ok(bytes.slice(start..end))
+        Ok(ObjectRange {
+            bytes: bytes.slice(start..end),
+            etag: object.etag.clone(),
+            size: bytes.len() as u64,
+        })
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {

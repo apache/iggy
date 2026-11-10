@@ -216,9 +216,20 @@ impl TierJobRequest {
         }
     }
 
-    /// The same job, moving about `bytes` bytes: the length of a fetched
-    /// range or of an uploaded segment. A class with a byte-counted cap admits
-    /// the job against it.
+    /// The same job, moving about `bytes` bytes. A class can cap the bytes of
+    /// its running jobs as well as their number, and the bytes count a
+    /// different thing in each class:
+    ///
+    /// - A fetch, on demand or speculative, holds its whole range in memory.
+    ///   Its bytes are the length of the range, and the cap bounds memory.
+    /// - An upload streams its segment and holds only a few pieces at once.
+    ///   Its bytes are the length of the segment, and the cap bounds the
+    ///   bytes in flight to the store.
+    /// - Deletes and housekeeping count only jobs, and keep 0 bytes.
+    ///
+    /// A job with more bytes than the cap of its class runs alone, once no
+    /// other job of its class runs, so a segment above the upload cap still
+    /// uploads.
     #[must_use]
     pub const fn with_bytes(mut self, bytes: u64) -> Self {
         self.bytes = bytes;
@@ -255,6 +266,11 @@ pub trait TierExecutor {
     /// [`TierJobCancelled`] when the scope is cancelled before the job
     /// finishes. Dropping the handle does not cancel the job, so a fetch
     /// that a poll stopped waiting for still warms the cache.
+    ///
+    /// Reusable cases for these promises come with the tier service, which
+    /// has the queue and the caps that they test.
+    /// [`crate::InlineTierExecutor`] has neither, and its own tests cover
+    /// only what it models.
     #[must_use = "await the handle, or detach it to let the job run on"]
     fn submit<T, F, Fut>(&self, request: TierJobRequest, job: F) -> TierJobHandle<T>
     where

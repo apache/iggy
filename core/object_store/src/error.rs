@@ -26,7 +26,8 @@ pub enum ErrorClass {
     /// A conditional create found an object under the key.
     PreconditionFailed,
     /// The same call can succeed after a backoff. A put that failed this way
-    /// can still have stored its object, see [`crate::ObjectStore::put`].
+    /// can still have stored its object, unless the error is a checksum
+    /// mismatch, see [`crate::ObjectStore::put`].
     Transient,
     /// The same call cannot succeed until an operator or the caller changes
     /// something, such as the credentials or the request.
@@ -34,6 +35,7 @@ pub enum ErrorClass {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ObjectStoreError {
     #[error("no object under {key:?}")]
     NotFound { key: String },
@@ -48,8 +50,13 @@ pub enum ObjectStoreError {
     /// name lookup or a failed TLS handshake.
     #[error("transport failed: {0}")]
     Transport(String),
-    /// The store received bytes whose CRC32C differs from the one sent with
-    /// them, so they changed on the way.
+    /// The bytes of a put hash to another CRC32C than the one they were
+    /// checked against, so the put stored nothing.
+    ///
+    /// Only a mismatch against a CRC32C that the provider computed as it sent
+    /// the body is worth a retry, because then the bytes changed on the way.
+    /// A mismatch against the caller's [`crate::PutOptions::crc32c`] fails
+    /// again on every retry while the body differs from that value.
     #[error("the store received a body for {key:?} whose CRC32C does not match")]
     ChecksumMismatch { key: String },
     #[error("the store refused the credentials: {0}")]
@@ -67,6 +74,11 @@ pub enum ObjectStoreError {
     InvalidKey { key: String, reason: &'static str },
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    /// The provider cannot do what the call asks safely, such as a
+    /// [`crate::PutMode::IfAbsent`] that its store cannot decide atomically,
+    /// or a put mode that the provider does not know.
+    #[error("the store does not support {0}")]
+    Unsupported(String),
     /// The caller's [`crate::PutBody`] failed or broke its declared length.
     /// It holds the body's own error, unchanged.
     #[error("the put body failed: {0}")]
@@ -94,6 +106,7 @@ impl ObjectStoreError {
             | Self::InvalidRange { .. }
             | Self::InvalidKey { .. }
             | Self::InvalidRequest(_)
+            | Self::Unsupported(_)
             | Self::Body(_) => ErrorClass::Permanent,
         }
     }
@@ -164,6 +177,10 @@ mod tests {
             ),
             (
                 ObjectStoreError::InvalidRequest("empty range".to_owned()),
+                ErrorClass::Permanent,
+            ),
+            (
+                ObjectStoreError::Unsupported("IfAbsent".to_owned()),
                 ErrorClass::Permanent,
             ),
             (

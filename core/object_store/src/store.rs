@@ -40,6 +40,10 @@ pub const MAX_KEY_LEN: usize = 1024;
 /// filesystem store has room to add a scratch suffix to any segment.
 pub const MAX_KEY_SEGMENT_LEN: usize = 200;
 
+/// Most segments in one key: Azure Blob's limit without a hierarchical
+/// namespace.
+pub const MAX_KEY_SEGMENTS: usize = 254;
+
 /// Most bytes of user metadata on one object, names and values together:
 /// S3's limit.
 pub const MAX_METADATA_LEN: usize = 2048;
@@ -59,9 +63,15 @@ pub type UserMetadata = BTreeMap<String, String>;
 /// the directory of another, such as `a/b` and `a/b/c`, because a filesystem
 /// store cannot hold both.
 ///
-/// A put or a delete that returns `Ok` is durable: it survives a crash of the
-/// store, and every later call sees it. A filesystem store, for example, syncs
-/// the file and its directory before it answers.
+/// A put or a delete that returns `Ok` is durable: it survives a crash or a
+/// power loss of the store, and every later call from any node sees it. A
+/// filesystem store syncs the file, its directory and the parent of each
+/// directory that the put created before it answers, and a delete syncs the
+/// parent directory after the unlink. A filesystem that several nodes share
+/// keeps this promise only when it caches no negative lookup, because a node
+/// would then miss an object that another node put. An NFS mount, for
+/// example, needs `lookupcache=positive` or `lookupcache=none`, and no
+/// `nocto`.
 ///
 /// Retries and timeouts belong to the caller, which branches on
 /// [`ObjectStoreError::class`]. A provider runs on the shard that owns it and
@@ -69,26 +79,39 @@ pub type UserMetadata = BTreeMap<String, String>;
 pub trait ObjectStore {
     /// Stores `body` under `key` with the user metadata of `options`.
     ///
-    /// The object appears whole or not at all, and [`PutMode::IfAbsent`]
-    /// refuses a key that holds an object. The store checks the bytes it
-    /// received against a CRC32C before it stores them, when it can: the one
-    /// in `options`, or else one that the provider computes as it sends them.
+    /// The object appears whole or not at all. An object that the put
+    /// replaces stays whole until the put commits.
     ///
-    /// A failed put stores nothing and leaves an earlier object as it was. A
-    /// put that was cancelled, or that failed with a
-    /// [`crate::ErrorClass::Transient`] error or with
-    /// [`ObjectStoreError::Malformed`], is the exception. The store can commit
-    /// the whole body and then lose its answer, so a retry with `IfAbsent` can
-    /// meet the caller's own object.
+    /// With [`PutMode::IfAbsent`], the store decides at commit whether the key
+    /// holds an object, so of the puts that race on one key, at most one
+    /// succeeds. A provider whose store cannot decide that atomically refuses
+    /// `IfAbsent` with [`ObjectStoreError::Unsupported`], and never emulates
+    /// it with a check before the write. It refuses a mode that it does not
+    /// know the same way, and never falls back to an overwrite.
+    ///
+    /// With [`PutOptions::crc32c`], the put stores nothing unless the bytes
+    /// hash to that value. A provider whose store keeps no CRC32C compares the
+    /// value itself before it sends the last byte.
+    ///
+    /// A failed put stores nothing and leaves an earlier object as it was, and
+    /// so does a put that is dropped before the provider took its whole body.
+    /// A put that ends without an answer after the provider took the whole
+    /// body is the exception: one dropped then, or one that failed with
+    /// [`ObjectStoreError::Malformed`] or with a
+    /// [`crate::ErrorClass::Transient`] error other than
+    /// [`ObjectStoreError::ChecksumMismatch`]. The store can commit such a put
+    /// and lose its answer, so a retry with `IfAbsent` can meet the caller's
+    /// own object, which [`ObjectMeta::crc32c`] tells apart.
     ///
     /// # Errors
     /// [`ObjectStoreError::InvalidKey`] for a key that [`validate_key`]
     /// refuses, [`ObjectStoreError::InvalidRequest`] for metadata that
-    /// [`validate_metadata`] refuses, [`ObjectStoreError::PreconditionFailed`]
-    /// when `IfAbsent` finds an object, [`ObjectStoreError::ChecksumMismatch`]
-    /// when the CRC32C differs, [`ObjectStoreError::Body`] when the body fails
-    /// or yields a length other than the one it declared, and any error the
-    /// store returns.
+    /// [`validate_metadata`] refuses, [`ObjectStoreError::Unsupported`] for a
+    /// mode that the provider cannot honor,
+    /// [`ObjectStoreError::PreconditionFailed`] when `IfAbsent` finds an
+    /// object, [`ObjectStoreError::ChecksumMismatch`] when the CRC32C differs,
+    /// [`ObjectStoreError::Body`] when the body fails or yields a length other
+    /// than the one it declared, and any error the store returns.
     fn put(
         &self,
         key: &str,
@@ -96,7 +119,9 @@ pub trait ObjectStore {
         options: &PutOptions,
     ) -> impl Future<Output = Result<(), ObjectStoreError>>;
 
-    /// Reads `range` of the object under `key`.
+    /// Reads `range` of the object under `key`, with the etag and the size of
+    /// the object that the bytes come from, so a reader needs no separate
+    /// head that can race with an overwrite.
     ///
     /// A range that runs past the end returns the bytes up to the end, so
     /// `0..u64::MAX` reads a whole object of unknown size. An empty object has
@@ -113,7 +138,7 @@ pub trait ObjectStore {
         &self,
         key: &str,
         range: Range<u64>,
-    ) -> impl Future<Output = Result<Bytes, ObjectStoreError>>;
+    ) -> impl Future<Output = Result<ObjectRange, ObjectStoreError>>;
 
     /// Returns what the store knows about the object under `key`, without
     /// its bytes.
@@ -129,7 +154,8 @@ pub trait ObjectStore {
     /// A missing key counts as deleted, so a caller can send a failed batch
     /// again whole. A key that [`validate_key`] refuses, or that the store
     /// refuses alone, goes to [`DeleteOutcome::failed`], and the other keys
-    /// are still deleted.
+    /// are still deleted. `Ok` means only that every key outside
+    /// [`DeleteOutcome::failed`] is gone, durably.
     ///
     /// # Errors
     /// [`ObjectStoreError::InvalidRequest`] for too many keys, and an error
@@ -143,9 +169,12 @@ pub trait ObjectStore {
     /// prefix, in the byte order of their keys.
     ///
     /// A page holds at most [`ListRequest::page_len`] objects, and it can hold
-    /// fewer when more follow. Following [`ListPage::next`] until it is `None`
-    /// visits once every object that existed for the whole listing. The
-    /// listing can show or miss an object put or deleted while it runs.
+    /// fewer when more follow. [`ListPage::next`] resumes the listing strictly
+    /// after the last key of its page, and it is never an offset. So puts and
+    /// deletes between pages never make the listing skip or repeat a key that
+    /// existed for the whole listing, and following `next` until it is `None`
+    /// visits each such key once. The listing can show or miss an object put
+    /// or deleted while it runs.
     ///
     /// A listing can return a key that [`validate_key`] refuses, such as one
     /// that another client wrote. The other calls refuse such a key, and a
@@ -206,7 +235,9 @@ impl PutBody {
 
     /// The pieces for a provider to send, checked against the declared
     /// length: the stream ends with an error instead of ending short or
-    /// running past the length. Any other error is the body's own.
+    /// running past the length. Any other error is the body's own. Empty
+    /// pieces are dropped, so a provider never sends an empty write or a
+    /// zero-length chunk, which ends a chunked body.
     ///
     /// The piece that completes the declared length comes only after the body
     /// ends without an error. So a provider that stops at the declared length,
@@ -249,7 +280,7 @@ impl Stream for ExactLen {
         }
         loop {
             let failure = match ready!(self.pieces.poll_next_unpin(context)) {
-                Some(Ok(piece)) if piece.is_empty() => return Poll::Ready(Some(Ok(piece))),
+                Some(Ok(piece)) if piece.is_empty() => continue,
                 Some(Ok(piece)) => match self.remaining.checked_sub(piece.len() as u64) {
                     Some(0) => {
                         self.remaining = 0;
@@ -285,12 +316,19 @@ impl Stream for ExactLen {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// What a put does when an object exists under its key.
+///
+/// A provider refuses a mode that it does not know with
+/// [`ObjectStoreError::Unsupported`], and never falls back to an overwrite,
+/// so a later mode, such as a compare-and-swap on the etag, stays safe.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PutMode {
     /// Replace any object under the key.
     #[default]
     Overwrite,
-    /// Create the object only when no object exists under the key.
+    /// Create the object only when no object exists under the key when the
+    /// put commits. Of the puts that race on one key, at most one succeeds.
     IfAbsent,
 }
 
@@ -298,10 +336,11 @@ pub enum PutMode {
 pub struct PutOptions {
     pub mode: PutMode,
     pub metadata: UserMetadata,
-    /// CRC32C of the whole body, for a caller that knows it before the put.
-    /// The store refuses the put when the bytes it received hash to another
-    /// value. Without it, the provider computes the CRC32C as it sends the
-    /// body, so a caller never reads a body twice to get one.
+    /// CRC32C of the whole body, which the put compares with the bytes, see
+    /// [`ObjectStore::put`]. A provider never holds a whole body in memory or
+    /// reads it twice to compute a CRC32C. So without this value, only a
+    /// provider that can send a checksum after the body, as S3 can in a
+    /// trailer, compares one.
     pub crc32c: Option<u32>,
 }
 
@@ -312,17 +351,36 @@ pub struct ObjectMeta {
     /// Changes when the object is replaced with other bytes. Compare it,
     /// never parse it.
     pub etag: String,
+    /// When the store committed the object, by the store's clock, to the
+    /// second or finer. Housekeeping compares it with its grace period, so it
+    /// is never a time that a writer chose.
     pub last_modified: SystemTime,
     pub metadata: UserMetadata,
-    /// CRC32C of the bytes the store holds, which the store checked when it
-    /// took them. A hash in `metadata` only repeats what the writer declared
-    /// before it sent the body. `None` when the store keeps no CRC32C for the
-    /// object, as Azure Blob does.
+    /// CRC32C that the store computed over the bytes it holds, never one that
+    /// a writer declared, as a hash in `metadata` is. A caller that finds an
+    /// object under its own key after a lost answer accepts it as its own only
+    /// when this value equals the CRC32C that the caller recorded. `None` when
+    /// the store keeps no CRC32C, as Azure Blob does, and the caller then
+    /// reads the object back to compare it.
     pub crc32c: Option<u32>,
+}
+
+/// What [`ObjectStore::get_range`] returns: the bytes of a range, and the
+/// object that they come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectRange {
+    /// The bytes of the range, cut at the end of the object.
+    pub bytes: Bytes,
+    /// The etag of the object that the bytes come from, as
+    /// [`ObjectStore::head`] reports it.
+    pub etag: String,
+    /// The size of the whole object, not of the range.
+    pub size: u64,
 }
 
 /// One page of a listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ListRequest<'a> {
     /// Lists the keys that start with it. An empty prefix lists every key.
     pub prefix: &'a str,
@@ -368,7 +426,8 @@ impl<'a> ListRequest<'a> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ListPage {
     pub objects: Vec<ListedObject>,
-    /// Opaque continuation, `None` on the last page.
+    /// Opaque continuation that resumes the listing strictly after the last
+    /// key of this page, `None` on the last page.
     pub next: Option<String>,
 }
 
@@ -378,11 +437,13 @@ pub struct ListedObject {
     pub size: u64,
     /// The same value [`ObjectStore::head`] reports.
     pub etag: String,
+    /// The time [`ObjectStore::head`] reports, at least to the second.
     pub last_modified: SystemTime,
 }
 
 /// What a batch delete left undone.
 #[derive(Debug, Default)]
+#[must_use = "a delete returns `Ok` with the keys that it did not delete"]
 pub struct DeleteOutcome {
     /// The keys of the batch that were not deleted, each with its reason:
     /// [`ObjectStoreError::InvalidKey`] for a key that [`validate_key`]
@@ -406,10 +467,12 @@ pub struct DeleteFailure {
 
 /// Checks `key` against the rules every provider enforces.
 ///
-/// A key is at most [`MAX_KEY_LEN`] bytes of `/`-separated segments, each at
-/// most [`MAX_KEY_SEGMENT_LEN`] bytes. No segment is empty or starts with `.`,
-/// which keeps `.` and `..` out of filesystem paths and leaves dot-names free
-/// for a provider's scratch files. No key holds a control character or `\`.
+/// A key is at most [`MAX_KEY_LEN`] bytes of at most [`MAX_KEY_SEGMENTS`]
+/// `/`-separated segments, each at most [`MAX_KEY_SEGMENT_LEN`] bytes. No
+/// segment is empty or starts with `.`, which keeps `.` and `..` out of
+/// filesystem paths and leaves dot-names free for a provider's scratch files.
+/// No segment ends with `.`, and no key holds a Unicode noncharacter, because
+/// Azure Blob refuses both. No key holds a control character or `\`.
 ///
 /// # Errors
 /// [`ObjectStoreError::InvalidKey`] that names the broken rule.
@@ -489,10 +552,12 @@ pub fn validate_delete(keys: &[String]) -> Result<(), ObjectStoreError> {
     Ok(())
 }
 
-/// The rule `key` breaks. In a prefix, the last segment can be empty.
+/// The rule `key` breaks. In a prefix, the last segment is partial, so it can
+/// be empty or end with `.`.
 fn check_key(key: &str, prefix: bool) -> Result<(), &'static str> {
     // The reasons below spell out these limits.
-    const _: () = assert!(MAX_KEY_LEN == 1024 && MAX_KEY_SEGMENT_LEN == 200);
+    const _: () =
+        assert!(MAX_KEY_LEN == 1024 && MAX_KEY_SEGMENT_LEN == 200 && MAX_KEY_SEGMENTS == 254);
     if key.is_empty() {
         return Err("is empty");
     }
@@ -505,6 +570,12 @@ fn check_key(key: &str, prefix: bool) -> Result<(), &'static str> {
     {
         return Err("holds a control character or a backslash");
     }
+    if key.chars().any(is_noncharacter) {
+        return Err("holds a Unicode noncharacter");
+    }
+    if key.split('/').count() > MAX_KEY_SEGMENTS {
+        return Err("has more than 254 segments");
+    }
     let mut segments = key.split('/').peekable();
     while let Some(segment) = segments.next() {
         if segment.starts_with('.') {
@@ -513,12 +584,21 @@ fn check_key(key: &str, prefix: bool) -> Result<(), &'static str> {
         if segment.len() > MAX_KEY_SEGMENT_LEN {
             return Err("has a segment longer than 200 bytes");
         }
-        let last = segments.peek().is_none();
-        if segment.is_empty() && !(prefix && last) {
+        let partial = prefix && segments.peek().is_none();
+        if segment.is_empty() && !partial {
             return Err("has an empty segment");
+        }
+        if segment.ends_with('.') && !partial {
+            return Err("has a segment that ends with '.'");
         }
     }
     Ok(())
+}
+
+/// U+FDD0 to U+FDEF, and the last two code points of every plane.
+fn is_noncharacter(character: char) -> bool {
+    let code = u32::from(character);
+    (0xFDD0..=0xFDEF).contains(&code) || (code & 0xFFFE) == 0xFFFE
 }
 
 fn invalid_key(key: &str, reason: &'static str) -> ObjectStoreError {
@@ -587,6 +667,18 @@ mod tests {
         let body = PutBody::from_stream(6, pieces(&[b"ab", b"", b"cdef"]));
 
         assert_eq!(drain(body).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn given_empty_pieces_when_draining_should_never_yield_them() {
+        let body = PutBody::from_stream(4, pieces(&[b"", b"12", b"", b"34", b""]));
+        let empty = PutBody::from_stream(0, pieces(&[b"", b""]));
+
+        let yielded: Vec<Bytes> = block_on(body.into_pieces().try_collect()).unwrap();
+        let from_empty: Vec<Bytes> = block_on(empty.into_pieces().try_collect()).unwrap();
+
+        assert_eq!(yielded, ["12", "34"]);
+        assert!(from_empty.is_empty(), "{from_empty:?}");
     }
 
     #[test]
@@ -686,7 +778,11 @@ mod tests {
 
     #[test]
     fn given_traversal_hidden_empty_or_long_parts_when_validating_key_should_refuse() {
-        let longest = format!("{}xx", "x/".repeat(MAX_KEY_LEN / 2 - 1));
+        let longest = format!(
+            "{}/{}",
+            vec!["x".repeat(MAX_KEY_SEGMENT_LEN); 5].join("/"),
+            "x".repeat(MAX_KEY_LEN - 5 * (MAX_KEY_SEGMENT_LEN + 1))
+        );
         assert_eq!(longest.len(), MAX_KEY_LEN);
         let too_long = format!("{longest}x");
         let longest_segment = format!("a/{}", "x".repeat(MAX_KEY_SEGMENT_LEN));
@@ -720,14 +816,45 @@ mod tests {
     }
 
     #[test]
+    fn given_parts_azure_refuses_when_validating_key_should_refuse() {
+        let most_segments = format!("{}a", "a/".repeat(MAX_KEY_SEGMENTS - 1));
+        let too_many_segments = format!("a/{most_segments}");
+        for key in [
+            "a/b.",
+            "a./b",
+            "a/b..",
+            "a\u{fdd0}",
+            "a\u{fdef}",
+            "a\u{fffe}",
+            "a/\u{ffff}",
+            "a\u{1fffe}",
+            "a\u{10ffff}",
+            &too_many_segments,
+        ] {
+            assert!(validate_key(key).is_err(), "{key:?} should be refused");
+        }
+        for key in [
+            "a.b/c",
+            "a\u{fdcf}",
+            "a\u{fdf0}",
+            "a\u{fffd}",
+            "caf\u{e9}/\u{65e5}\u{672c}/\u{1f600}",
+            "space and+plus%20?#",
+            &most_segments,
+        ] {
+            assert!(validate_key(key).is_ok(), "{key:?} should be accepted");
+        }
+    }
+
+    #[test]
     fn given_partial_last_segment_when_validating_prefix_should_accept() {
-        for prefix in ["", "a/", "a/b", "a/b/0000"] {
+        for prefix in ["", "a/", "a/b", "a/b/0000", "a/b."] {
             assert!(
                 validate_prefix(prefix).is_ok(),
                 "{prefix:?} should be accepted"
             );
         }
-        for prefix in ["/", "a//", "../", "a/.", "a/../b"] {
+        for prefix in ["/", "a//", "../", "a/.", "a/../b", "a./"] {
             assert!(
                 validate_prefix(prefix).is_err(),
                 "{prefix:?} should be refused"
