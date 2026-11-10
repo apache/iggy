@@ -152,7 +152,7 @@ try await client.updateTopic(
 try await client.updateUser("alice", options: UserUpdateOptions(status: .inactive))
 ```
 
-Only `message_expiry` and `max_topic_size` can be reset. Compression and the other topic settings are fixed at create, and no stream or user key is resettable yet. A typed update that breaks these rules fails before anything is sent, with the error the server would return.
+Only `message_expiry`, `max_topic_size`, `local_retention_age` and `local_retention_size` can be reset. An update can turn `tiered_storage` on, never off. Compression and the other topic settings are fixed at create, and no stream or user key is resettable yet. A typed update that breaks these rules fails before anything is sent, with the error the server would return.
 
 Everything else, such as a taken name or a missing resource, is refused by the server. `describeOptions(scope:)` lists every key of a scope with flags saying what an update may do with it. Renaming the signed-in user, through `username` or a raw `username` entry, moves the credentials later reconnects use.
 

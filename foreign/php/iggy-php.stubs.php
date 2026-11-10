@@ -180,6 +180,13 @@ namespace Iggy {
          * segments by size alone. The server refuses a duration together with
          * `preallocate_segments`.
          *
+         * `tiered_storage` moves sealed segments to the object store. Null leaves it off, and the
+         * server refuses true with `Feature is unavailable` until it tiers topics.
+         * `local_retention_age_micros` is how long a tiered topic keeps an uploaded segment on local
+         * disk, one day when null, and `local_retention_size` caps the uploaded segments it keeps
+         * there, unlimited when null. The server refuses an age above a finite message expiry and a
+         * size above a finite `max_topic_size`.
+         *
          * @param mixed $stream
          * @param string $name
          * @param int $partitions_count
@@ -195,10 +202,13 @@ namespace Iggy {
          * @param string|null $partition_resize_policy
          * @param mixed $replication_factor
          * @param mixed $segment_max_age_micros
+         * @param bool|null $tiered_storage
+         * @param mixed $local_retention_age_micros
+         * @param mixed $local_retention_size
          * @param array|null $raw
          * @return void
          */
-        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, mixed $replication_factor = null, mixed $segment_max_age_micros = null, ?array $raw = null): void {}
+        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, mixed $replication_factor = null, mixed $segment_max_age_micros = null, ?bool $tiered_storage = null, mixed $local_retention_age_micros = null, mixed $local_retention_size = null, ?array $raw = null): void {}
 
         /**
          * Deletes the offset stored on `partition_id` for a standalone consumer, or for a consumer
@@ -560,6 +570,12 @@ namespace Iggy {
          * decides whether each one may be set or reset. `raw` is marked
          * `#[\SensitiveParameter]`, because an unknown key may hold a secret.
          *
+         * `tiered_storage` set to true turns tiered storage on. The server refuses false, an update
+         * never turns it off, and refuses true with `Feature is unavailable` until it tiers topics.
+         * `local_retention_age_micros` and `local_retention_size` change how long and how much a
+         * tiered topic keeps on local disk after upload, with the same int or decimal string values
+         * and the same refusal of 0 as the expiry and the size cap.
+         *
          * @param mixed $stream
          * @param mixed $topic
          * @param string|null $name
@@ -568,9 +584,12 @@ namespace Iggy {
          * @param array $reset
          * @param array|null $raw
          * @param array|null $raw_reset
+         * @param bool|null $tiered_storage
+         * @param mixed $local_retention_age_micros
+         * @param mixed $local_retention_size
          * @return void
          */
-        public function updateTopic(mixed $stream, mixed $topic, ?string $name = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, array $reset = [], ?array $raw = null, ?array $raw_reset = null): void {}
+        public function updateTopic(mixed $stream, mixed $topic, ?string $name = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, array $reset = [], ?array $raw = null, ?array $raw_reset = null, ?bool $tiered_storage = null, mixed $local_retention_age_micros = null, mixed $local_retention_size = null): void {}
     }
 
     /**
@@ -2703,8 +2722,8 @@ namespace Iggy {
     /**
      * Topic option keys, as the cases an update's reset list takes.
      *
-     * Only `MessageExpiry` and `MaxTopicSize` are resettable in this release. The server refuses
-     * every other case with its own category.
+     * Only `MessageExpiry`, `MaxTopicSize`, `LocalRetentionAge` and `LocalRetentionSize` are
+     * resettable in this release. The server refuses every other case with its own category.
      */
     enum TopicOptionKey: string {
       case Name = 'name';
@@ -2720,6 +2739,9 @@ namespace Iggy {
       case PreallocateSegments = 'preallocate_segments';
       case ReplicationFactor = 'replication_factor';
       case SegmentMaxAge = 'segment_max_age';
+      case TieredStorage = 'tiered_storage';
+      case LocalRetentionAge = 'local_retention_age';
+      case LocalRetentionSize = 'local_retention_size';
     }
 }
 

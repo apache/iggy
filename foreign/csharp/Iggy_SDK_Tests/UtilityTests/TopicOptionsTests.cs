@@ -33,10 +33,13 @@ public sealed class TopicOptionsTests
             SizeOfMessagesRequiredToSave = 1048576,
             PreallocateSegments = false,
             ReplicationFactor = 3,
-            SegmentMaxAge = TimeSpan.FromHours(1)
+            SegmentMaxAge = TimeSpan.FromHours(1),
+            TieredStorage = false,
+            LocalRetentionAge = TimeSpan.FromHours(6),
+            LocalRetentionSize = 536870912
         }.ToDictionary();
 
-        Assert.Equal(8, options.Count);
+        Assert.Equal(11, options.Count);
 
         Assert.Equal(HeaderKind.Uint64, options["segment_size"].Kind);
         Assert.Equal(134217728UL, options["segment_size"].ToUInt64());
@@ -58,6 +61,15 @@ public sealed class TopicOptionsTests
 
         Assert.Equal(HeaderKind.Uint64, options["segment_max_age"].Kind);
         Assert.Equal(3_600_000_000UL, options["segment_max_age"].ToUInt64());
+
+        Assert.Equal(HeaderKind.Bool, options["tiered_storage"].Kind);
+        Assert.False(options["tiered_storage"].ToBool());
+
+        Assert.Equal(HeaderKind.Uint64, options["local_retention_age"].Kind);
+        Assert.Equal(21_600_000_000UL, options["local_retention_age"].ToUInt64());
+
+        Assert.Equal(HeaderKind.Uint64, options["local_retention_size"].Kind);
+        Assert.Equal(536870912UL, options["local_retention_size"].ToUInt64());
     }
 
     [Fact]

@@ -53,7 +53,11 @@ public class OptionsTests
         "messages_required_to_save",
         "size_of_messages_required_to_save",
         "preallocate_segments",
-        "replication_factor"
+        "replication_factor",
+        "segment_max_age",
+        "tiered_storage",
+        "local_retention_age",
+        "local_retention_size"
     ];
 
     private static readonly string[] NeverReturnedKeys = ["encryption_key", "encryption_key_wrapped", "critical_keys"];

@@ -19,7 +19,8 @@ namespace Apache.Iggy.Contracts;
 
 /// <summary>
 ///     The client-visible option keys of a topic, in catalog order. Names a key to reset in a
-///     <see cref="TopicUpdate" />: only <see cref="MessageExpiry" /> and <see cref="MaxTopicSize" /> reset to a default.
+///     <see cref="TopicUpdate" />: only <see cref="MessageExpiry" />, <see cref="MaxTopicSize" />,
+///     <see cref="LocalRetentionAge" /> and <see cref="LocalRetentionSize" /> reset to a default.
 /// </summary>
 public enum TopicOptionKey
 {
@@ -60,5 +61,14 @@ public enum TopicOptionKey
     ReplicationFactor,
 
     /// <summary><c>segment_max_age</c>, create-only.</summary>
-    SegmentMaxAge
+    SegmentMaxAge,
+
+    /// <summary><c>tiered_storage</c>, enable-only: an update turns it on and never off.</summary>
+    TieredStorage,
+
+    /// <summary><c>local_retention_age</c>, updatable and resettable to one day.</summary>
+    LocalRetentionAge,
+
+    /// <summary><c>local_retention_size</c>, updatable and resettable to unlimited.</summary>
+    LocalRetentionSize
 }
