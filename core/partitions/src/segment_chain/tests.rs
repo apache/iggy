@@ -23,7 +23,6 @@ use super::{
 use crate::state_transfer::ChunkHasher;
 
 const PREFIX: ObjectPrefix = ObjectPrefix {
-    cluster_uid: 0x0123_4567_89ab_cdef_0011_2233_4455_6677,
     stream_id: 3,
     topic_id: 5,
     partition_id: 7,
