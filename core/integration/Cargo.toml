@@ -37,6 +37,8 @@ configs = { workspace = true }
 # Decodes a metadata replica's durable `VsrState` off disk in the superblock
 # recovery test.
 consensus = { workspace = true }
+# statvfs of the data volume, as the server's disk usage sampler reads it.
+fs2 = { workspace = true }
 futures = { workspace = true }
 harness_derive = { workspace = true }
 iggy = { workspace = true }
@@ -89,6 +91,7 @@ ring = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serial_test = { workspace = true }
+server_common = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
