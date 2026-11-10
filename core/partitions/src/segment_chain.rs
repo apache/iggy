@@ -54,9 +54,9 @@ pub const CHAIN_FILE: &str = "remote.chain";
 /// Bytes in a segment hash.
 pub const SEGMENT_HASH_SIZE: usize = 32;
 
-/// `magic | cluster_uid u128 | stream_id | topic_id | partition_id |
-/// created_revision | checksum`, the rest `u64`, all little-endian.
-pub const HEADER_SIZE: usize = 64;
+/// `magic | stream_id | topic_id | partition_id | created_revision |
+/// checksum`, all `u64` little-endian.
+pub const HEADER_SIZE: usize = 48;
 
 /// `kind u8 | source u8 | 6 zero bytes | start_offset | end_offset |
 /// start_timestamp | end_timestamp | max_timestamp | size | incarnation | hash
@@ -79,7 +79,6 @@ const DISK: u8 = 2;
 /// depend on local ids that another reader of the bucket may not share.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectPrefix {
-    pub cluster_uid: u128,
     pub stream_id: u64,
     pub topic_id: u64,
     pub partition_id: u64,
@@ -91,7 +90,6 @@ impl ObjectPrefix {
         let mut header = [0; HEADER_SIZE];
         let mut writer = FieldWriter::new(&mut header);
         writer.u64(HEADER_MAGIC);
-        writer.bytes(&self.cluster_uid.to_le_bytes());
         writer.u64(self.stream_id);
         writer.u64(self.topic_id);
         writer.u64(self.partition_id);
@@ -107,7 +105,6 @@ impl ObjectPrefix {
             return None;
         }
         let prefix = Self {
-            cluster_uid: u128::from_le_bytes(reader.array()),
             stream_id: reader.u64(),
             topic_id: reader.u64(),
             partition_id: reader.u64(),
