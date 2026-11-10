@@ -1198,7 +1198,7 @@ func (r *PartitionReader) handleRefusalLocked(p *partition, err error, now time.
 	}
 	p.lastingRefusals++
 	if errors.Is(err, ierror.ErrHistoryUnavailable) || errors.Is(err, ierror.ErrInvalidSizeBytes) ||
-		p.lastingRefusals >= lastingRefusalsBeforeStop {
+		errors.Is(err, ierror.ErrTieredReadFailed) || p.lastingRefusals >= lastingRefusalsBeforeStop {
 		p.stopped = &ReadError{PartitionID: &p.id, Err: err}
 		r.queue = append(r.queue, entry{partition: int64(p.id), generation: p.generation, err: p.stopped})
 		return

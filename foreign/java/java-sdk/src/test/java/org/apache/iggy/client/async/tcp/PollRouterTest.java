@@ -809,6 +809,88 @@ class PollRouterTest {
     }
 
     /**
+     * A pause is a random time up to its ceiling. The ceiling of the later pauses of a call is the maximum, so one of
+     * them is longer than the first ceiling unless every draw falls in its lowest twentieth.
+     */
+    @Test
+    void shouldGrowThePauseAfterEachNotAcceptedReplyUpToTheMaximumAndStartOverInTheNextCall() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        try {
+            router.poll(pollPayload(), Optional.empty())
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    .release();
+            int refusals = 20;
+            for (int refusal = 0; refusal < refusals; refusal++) {
+                primary.replies.add(CompletableFuture.failedFuture(
+                        IggyServerException.fromTcpResponse(AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED, new byte[0])));
+            }
+            primary.replies.add(CompletableFuture.completedFuture(emptyPoll(0)));
+            var refused = router.poll(pollPayload(), Optional.empty());
+            List<Long> pauses = new ArrayList<>();
+            for (int refusal = 0; refusal < refusals; refusal++) {
+                pauses.add(timers.delaysMillis.get(timers.delaysMillis.size() - 1));
+                timers.runLast();
+            }
+            refused.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS).release();
+            for (int refusal = 0; refusal < refusals; refusal++) {
+                assertThat(pauses.get(refusal))
+                        .isBetween(0L, Math.min(RetryBackoff.MAX_MILLIS, RetryBackoff.BASE_MILLIS << refusal));
+            }
+            assertThat(pauses).anyMatch(pause -> pause > RetryBackoff.BASE_MILLIS);
+
+            primary.replies.add(CompletableFuture.failedFuture(
+                    IggyServerException.fromTcpResponse(AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED, new byte[0])));
+            primary.replies.add(CompletableFuture.completedFuture(emptyPoll(0)));
+            var next = router.poll(pollPayload(), Optional.empty());
+            assertThat(timers.delaysMillis.get(timers.delaysMillis.size() - 1)).isBetween(0L, RetryBackoff.BASE_MILLIS);
+            timers.runLast();
+            next.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS).release();
+            assertThat(primary.sentContexts).hasSize(1 + refusals + 1 + 2);
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    /** The object store failed for good, so the poll is not sent again. */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldReturnATieredReadFailureWithoutSendingThePollAgain(boolean deferred) throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        try {
+            routedPoll(router, pollPayload(), deferred)
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    .release();
+            primary.replies.add(CompletableFuture.failedFuture(
+                    IggyServerException.fromTcpResponse(IggyErrorCode.TIERED_READ_FAILED.getCode(), new byte[0])));
+            ByteBuf payload = tracked(pollPayload());
+            int timersBefore = timers.scheduled.size();
+
+            var polled = routedPoll(router, payload, deferred);
+
+            assertServerError(polled, IggyErrorCode.TIERED_READ_FAILED.getCode());
+            assertThat(primary.sentContexts).hasSize(2);
+            assertThat(timers.delaysMillis.subList(timersBefore, timers.delaysMillis.size()))
+                    .as("only the deadline of the poll is scheduled, and no retry")
+                    .allMatch(delay -> delay > 1000L);
+            assertThat(payload.refCnt()).isZero();
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
      * A dead primary answers nothing, so only its lost link can move the partition. The next attempt reads the route
      * again on the replica after the dead one, which a view change makes the next primary.
      */

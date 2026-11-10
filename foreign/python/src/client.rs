@@ -125,7 +125,8 @@ pub struct ReadError {
     offset: Option<u64>,
     record: Option<Bytes>,
     /// Whether the reader stopped the partition after six refusals in a row that a retry does
-    /// not change, such as `Unauthorized` (41). A `seek()` of the partition reads it again.
+    /// not change, such as `Unauthorized` (41), or after one `TieredReadFailed` (96). A `seek()`
+    /// of the partition reads it again.
     #[pyo3(get)]
     is_lasting_refusal: bool,
 }
@@ -2636,6 +2637,56 @@ mod tests {
                 );
                 assert!(value.setattr("is_lasting_refusal", false).is_err());
             }
+        });
+    }
+
+    #[test]
+    fn given_tiered_read_failure_when_mapping_should_keep_its_code_and_flag_the_stop() {
+        const TIERED_READ_FAILED_CODE: u32 = 96;
+        const PARTITION_ID: u32 = 1;
+        Python::initialize();
+        Python::attach(|py| {
+            let raised = to_runtime_error(IggyError::TieredReadFailed);
+            assert!(raised.is_instance_of::<PyIggyError>(py));
+            assert!(!raised.is_instance_of::<OptionError>(py));
+            assert!(!raised.is_instance_of::<PendingOperationError>(py));
+            assert_eq!(
+                raised
+                    .value(py)
+                    .getattr("code")
+                    .unwrap()
+                    .extract::<u32>()
+                    .unwrap(),
+                TIERED_READ_FAILED_CODE
+            );
+
+            let read = to_read_error(RustReadError {
+                partition_id: Some(PARTITION_ID),
+                error: IggyError::TieredReadFailed,
+                skip: None,
+                offset: None,
+                record: None,
+            });
+
+            assert!(read.is_instance_of::<ReadError>(py));
+            let value = read.value(py);
+            assert_eq!(
+                value.getattr("code").unwrap().extract::<u32>().unwrap(),
+                TIERED_READ_FAILED_CODE
+            );
+            assert!(
+                value
+                    .getattr("is_lasting_refusal")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap(),
+                "the first tiered read failure stops its partition"
+            );
+            let cause = value.getattr("error").unwrap();
+            assert_eq!(
+                cause.getattr("code").unwrap().extract::<u32>().unwrap(),
+                TIERED_READ_FAILED_CODE
+            );
         });
     }
 

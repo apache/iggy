@@ -142,7 +142,8 @@ impl ReadException {
     }
 
     /// Whether the reader stopped the partition after six refusals in a row that a retry does
-    /// not change, such as Unauthorized (41). A seek of the partition reads it again.
+    /// not change, such as Unauthorized (41), or after one TieredReadFailed (96). A seek of the
+    /// partition reads it again.
     #[php(getter, change_case = "snake_case")]
     pub fn is_lasting_refusal(&self) -> bool {
         self.lasting_refusal
@@ -394,5 +395,29 @@ mod tests {
             }
         }
         assert!(PendingOperationException::from_error(&IggyError::InvalidCommand).is_none());
+    }
+
+    #[test]
+    fn given_tiered_read_failure_when_classifying_should_keep_its_code_and_not_be_transient() {
+        let error = IggyError::TieredReadFailed;
+        assert_eq!(error.as_code(), 96);
+        assert_eq!(error.as_string(), "tiered_read_failed");
+        assert!(matches!(
+            PhpExceptionKind::from(&error),
+            PhpExceptionKind::Base
+        ));
+
+        let read = ReadError {
+            partition_id: Some(1),
+            error,
+            skip: None,
+            offset: None,
+            record: None,
+        };
+        assert_eq!(read.error.as_code(), 96);
+        assert!(
+            read.is_lasting_refusal(),
+            "the first tiered read failure stops its partition"
+        );
     }
 }

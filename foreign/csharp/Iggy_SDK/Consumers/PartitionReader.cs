@@ -59,7 +59,8 @@ namespace Apache.Iggy.Consumers;
 ///         <item>
 ///             The reader stays usable after a <see cref="ReadException" /> and retries by itself. Status 87
 ///             (HistoryUnavailable) stops its partition until a <see cref="SeekAsync" /> when the position came from an
-///             earlier read of a history that is gone. A refusal that a quick retry does not change, such as status 41
+///             earlier read of a history that is gone. Status 96 (TieredReadFailed) stops its partition at once,
+///             because no retry changes it. A refusal that a quick retry does not change, such as status 41
 ///             (Unauthorized), 3007 (PartitionNotFound) or 5009 (ConsumerGroupPartitionNotOwned), is retried after a
 ///             wait that doubles each time, and after six in a row it stops its partition until a
 ///             <see cref="SeekAsync" /> with one error. Status 5009 also drops the position of its partition, which
@@ -1462,8 +1463,8 @@ public sealed class PartitionReader : IAsyncDisposable
     }
 
     /// <summary>
-    ///     A read that did not return its partition. A refusal before the read retries, and only a lasting or a
-    ///     history refusal stops the partition until a seek.
+    ///     A read that did not return its partition. A refusal before the read retries, and only a lasting, a
+    ///     history or a tiered read refusal stops the partition until a seek.
     /// </summary>
     private void Refuse(Target target, Exception error)
     {
@@ -1510,10 +1511,13 @@ public sealed class PartitionReader : IAsyncDisposable
                         target.Partition);
                     state.RetryAt = now + interval;
                     return;
-                case IggyInvalidStatusCodeException { StatusCode: VsrError.HISTORY_UNAVAILABLE or VsrError.INVALID_SIZE_BYTES } refusal:
+                case IggyInvalidStatusCodeException
+                {
+                    StatusCode: VsrError.HISTORY_UNAVAILABLE or VsrError.INVALID_SIZE_BYTES or VsrError.TIERED_READ_FAILED
+                } refusal:
                     GiveUpGap(target.Partition, state);
                     report = StopReport(target.Partition, state, error,
-                        refusal.StatusCode == VsrError.HISTORY_UNAVAILABLE);
+                        refusal.StatusCode != VsrError.INVALID_SIZE_BYTES);
                     state.Stopped = report;
                     break;
                 case IggyInvalidStatusCodeException status when IsLasting(status.StatusCode):

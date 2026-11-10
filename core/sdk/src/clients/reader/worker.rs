@@ -2220,6 +2220,11 @@ impl Worker {
                     }
                 }
             }
+            error if permanent_refusal(&error) => {
+                for &partition in partitions {
+                    self.stop_refused(partition, &error);
+                }
+            }
             error if lasting_refusal(&error) => self.count_lasting(partitions, &error),
             error => {
                 self.retry(partitions);
@@ -2247,12 +2252,18 @@ impl Worker {
                 self.retry_at.insert(partition, Instant::now() + delay);
                 continue;
             }
-            self.lasting_refusals.remove(&partition);
-            self.retry_at.remove(&partition);
-            self.stopped.insert(partition);
-            if !self.interrupt_catch_up(partition) && !self.report_pending_loss(partition) {
-                self.report(ReadError::new(Some(partition), error.clone()));
-            }
+            self.stop_refused(partition, error);
+        }
+    }
+
+    /// Stops `partition` until a seek and reports `error` once, or the range
+    /// that a lost read of the partition stored.
+    fn stop_refused(&mut self, partition: u32, error: &IggyError) {
+        self.lasting_refusals.remove(&partition);
+        self.retry_at.remove(&partition);
+        self.stopped.insert(partition);
+        if !self.interrupt_catch_up(partition) && !self.report_pending_loss(partition) {
+            self.report(ReadError::new(Some(partition), error.clone()));
         }
     }
 
@@ -2423,6 +2434,11 @@ pub(crate) fn lasting_refusal(error: &IggyError) -> bool {
             | IggyError::TopicIdNotFound(..)
             | IggyError::TopicNameNotFound(..)
     )
+}
+
+/// A refusal that no retry changes, so its partition stops at the first one.
+pub(crate) fn permanent_refusal(error: &IggyError) -> bool {
+    matches!(error, IggyError::TieredReadFailed)
 }
 
 /// The wait after the `refusals`-th lasting refusal in a row.
@@ -4828,6 +4844,34 @@ mod tests {
             next_error(&mut receiver),
             ReadError::new(Some(0), IggyError::Unauthorized)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_tiered_read_failure_when_a_poll_returns_it_should_stop_the_partition_without_a_retry()
+     {
+        let (mut worker, mut receiver) = worker_of(standalone([0]));
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+
+        worker.complete(polled(
+            &worker,
+            FetchKind::Alone,
+            PollingStrategy::next(),
+            0,
+            Err(IggyError::TieredReadFailed),
+        ));
+
+        assert!(
+            !worker.retry_at.contains_key(&0),
+            "no retry is scheduled for a failure that a retry does not change"
+        );
+        assert!(
+            worker.stopped.contains(&0),
+            "the partition stops until a seek"
+        );
+        worker.flush_errors();
+        let error = next_error(&mut receiver);
+        assert_eq!(error, ReadError::new(Some(0), IggyError::TieredReadFailed));
+        assert!(error.is_lasting_refusal());
     }
 
     /// A seek resumes a stopped partition and drops its catch-up, so a lasting stop during a

@@ -98,7 +98,6 @@ final class PollRouter {
     private static final int MAX_CONNECTIONS = 256;
     private static final int MAX_PENDING_POLLS = 4096;
     private static final long RETRY_INTERVAL_MILLIS = 50;
-    private static final long MAX_RETRY_INTERVAL_MILLIS = 1000;
     private static final long MAX_REDIAL_MILLIS = 2000;
 
     private final Supplier<AsyncTcpConnection> coordinator;
@@ -1185,12 +1184,12 @@ final class PollRouter {
     }
 
     private void retry(Poll poll, boolean notPrimary, IggyServerException refusal) {
-        long delay = notPrimary ? poll.notPrimarySeen ? poll.notPrimaryRetryMillis : 0 : RETRY_INTERVAL_MILLIS;
+        long delay = notPrimary ? poll.notPrimarySeen ? poll.notPrimaryRetryMillis : 0 : poll.refusals.nextMillis();
         if (!poll.retryRefusal(delay, refusal)) {
             return;
         }
         if (notPrimary && poll.notPrimarySeen) {
-            poll.notPrimaryRetryMillis = Math.min(delay * 2, MAX_RETRY_INTERVAL_MILLIS);
+            poll.notPrimaryRetryMillis = Math.min(delay * 2, RetryBackoff.MAX_MILLIS);
         }
         poll.notPrimarySeen |= notPrimary;
         coordinator.get().eventLoop().schedule(() -> attempt(poll), delay, TimeUnit.MILLISECONDS);
@@ -1714,6 +1713,7 @@ final class PollRouter {
         // The last capacity refusal, which the call reports when its deadline ends the retries. A budget too short
         // for another attempt also ends them with 58, which would hide it.
         private IggyServerException capacityRefusal;
+        private final RetryBackoff refusals = new RetryBackoff();
         private boolean notPrimarySeen;
         private long notPrimaryRetryMillis = RETRY_INTERVAL_MILLIS;
         private boolean terminalRoutingRefusal;

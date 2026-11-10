@@ -48,6 +48,7 @@ const HISTORY_UNAVAILABLE = 87;
 const LIFECYCLE_BUSY = 88;
 const NOT_PRIMARY = 89;
 const DEFERRED_POLL_CAPACITY_EXCEEDED = 90;
+const TIERED_READ_FAILED = 96;
 const PARTITION_NOT_FOUND = 3007;
 const CONSUMER_OFFSET_NOT_FOUND = 3021;
 const CONSUMER_GROUP_MEMBER_NOT_FOUND = 5006;
@@ -209,8 +210,9 @@ const isAbort = (error: unknown): boolean => error instanceof Error && error.nam
  *   reader counts each batch as its `after` says, or each `mark`, and stores
  *   the latest counted position at its interval or event and in `close()`.
  * - A `ReadError` leaves the reader usable. A history refusal (87) of a
- *   position from an earlier read, an oversized `Last` start (80) and a refusal
- *   that six retries did not change stop their partition until a `seek`.
+ *   position from an earlier read, an oversized `Last` start (80), a tiered
+ *   read that the object store refuses for good (96) and a refusal that six
+ *   retries did not change stop their partition until a `seek`.
  */
 export class PartitionReader implements AsyncIterable<PolledBatch> {
   private readonly id = ++readers;
@@ -1026,7 +1028,8 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
 
   /**
    * A read that did not return its partition. A refusal before the read
-   * retries, and only a lasting or a history refusal stops the partition.
+   * retries, and only a lasting, a history or a tiered read refusal stops
+   * the partition.
    */
   private refuse(target: Target, error: unknown): void {
     const state = this.settle(target);
@@ -1063,8 +1066,8 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
       state.retryAt = now + this.retryInterval;
       return;
     }
-    if (code === HISTORY_UNAVAILABLE || code === INVALID_SIZE_BYTES) {
-      report(true, code === HISTORY_UNAVAILABLE);
+    if (code === HISTORY_UNAVAILABLE || code === INVALID_SIZE_BYTES || code === TIERED_READ_FAILED) {
+      report(true, code !== INVALID_SIZE_BYTES);
       return;
     }
     if (code !== undefined && LASTING_REFUSALS.has(code)) {

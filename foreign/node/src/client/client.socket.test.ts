@@ -85,6 +85,7 @@ const INVALID_SIZE_BYTES = 80;
 const HISTORY_UNAVAILABLE = 87;
 const LIFECYCLE_BUSY = 88;
 const NOT_PRIMARY = 89;
+const TIERED_READ_FAILED = 96;
 const TRANSIENT_NOT_COMMITTED = 57;
 const TRANSIENT_NOT_ACCEPTED = 58;
 const REQUEST_ALREADY_APPLIED = 59;
@@ -2788,6 +2789,32 @@ describe('VSR client socket', () => {
       assert.deepEqual(server.frames
         .filter((frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.PollMessages)
         .map((frame) => stampedContext(frame).incarnation), [1n, 1n, 2n]);
+    } finally {
+      client.destroy();
+      await server.close();
+    }
+  });
+
+  it('sends a poll once that the server fails with a tiered read failure', async () => {
+    const server = await startVsrServer((frame, socket) => {
+      const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+      if (code === COMMAND_CODE.GetPartitionRoute) {
+        socket.write(replyFrame(frame, Operation.NonReplicated, routingBody(1n, 1n, 0)));
+        return;
+      }
+      if (code === COMMAND_CODE.PollMessages) {
+        socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), TIERED_READ_FAILED));
+        return;
+      }
+      singleNodeHandler(server.port)(frame, socket);
+    });
+    const client = new CommandResponseStream(vsrConfig(server.port));
+    try {
+      await assert.rejects(() => client.sendCommand(POLL_MESSAGES.code, groupPollPayload(false)),
+        (error: unknown) => error instanceof ResponseError && error.fromServer &&
+          error.commandCode === COMMAND_CODE.PollMessages && error.errorCode === TIERED_READ_FAILED);
+      assert.equal(countCommand(server, COMMAND_CODE.PollMessages), 1, 'the poll went out again');
+      assert.equal(countCommand(server, COMMAND_CODE.GetPartitionRoute), 1, 'the refusal invalidated the route');
     } finally {
       client.destroy();
       await server.close();

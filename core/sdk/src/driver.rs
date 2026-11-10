@@ -3429,6 +3429,24 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn given_a_tiered_read_failure_when_polling_should_return_it_without_a_resend() {
+        let f = Fixture::new().await;
+        f.cluster.script(
+            &endpoint(PRIMARY),
+            POLL_MESSAGES_CODE,
+            repeat_n(Answer::Refuse(IggyError::TieredReadFailed), ENDLESS),
+        );
+
+        let polled = f
+            .driver
+            .poll(&f.poll(false, WirePollingStrategy::next()), None)
+            .await;
+
+        assert_eq!(polled, Err(IggyError::TieredReadFailed));
+        assert_eq!(f.cluster.count(POLL_MESSAGES_CODE), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn given_a_retained_send_when_progress_poll_enters_should_keep_progress_independent() {
         let fixture = Fixture::new().await;
         let op = fixture.uncertain_send().await;

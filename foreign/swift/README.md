@@ -344,7 +344,9 @@ The partitions that a read served go last in the next read of their group, so a 
 
   `AutoCommit.default` stores every 10,000 messages or 5 seconds after `.processing`. A store only moves forward, and a position of an older generation is dropped.
 
-A failed read is thrown as a `ReadError` with the partition, the `IggyError` and, for a message that does not decode, its offset, its record and `skip`, the continuation after it. The reader reads its partitions again after `retryInterval`. A message that does not decode, and `historyUnavailable` for a position read in a history that is gone, stop the partition until a seek.
+A failed read is thrown as a `ReadError` with the partition, the `IggyError` and, for a message that does not decode, its offset, its record and `skip`, the continuation after it. The reader reads its partitions again after `retryInterval`. A message that does not decode, `historyUnavailable` for a position read in a history that is gone, and `tieredReadFailed` for tiered data that the object store refuses for good, stop the partition until a seek.
+
+A read refused with `tieredReadFailed` is never sent again.
 
 ### Consumer groups
 
@@ -417,7 +419,7 @@ A handler that throws leaves its message uncounted and ends `consumeMessages(_:)
 
 `pollingStrategy` says where a partition without a position starts. A failed read is thrown as a `ReadError` and leaves the consumer usable: a caller of `next()` can call it again, and `consumeMessages(_:)` logs it and keeps reading.
 
-`consumeMessages(_:)` ends with the error once the client cannot come back on its own, and for a message that does not decode or `historyUnavailable`, which stop the partition until a seek.
+`consumeMessages(_:)` ends with the error once the client cannot come back on its own, and for a message that does not decode, `historyUnavailable` or `tieredReadFailed`, which stop the partition until a seek.
 
 It also ends with `partitionLaneBlocked` under `.onRead`: a lost committing read of another caller blocks the partition until `abandonOperation(_:)` takes that operation, after which the reader reads it again by itself. Without `allowReplay` a message at or below the last one handed over from the same partition history is skipped, unless `seek(partitionID:to:)` moved the partition back.
 

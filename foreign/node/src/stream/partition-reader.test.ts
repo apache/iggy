@@ -45,6 +45,7 @@ const FETCH_PROGRESS_UNCERTAIN = 14010;
 const INVALID_COMMAND = 3;
 const UNAUTHORIZED = 41;
 const INVALID_SIZE_BYTES = 80;
+const TIERED_READ_FAILED = 96;
 const CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009;
 /** A poll body ends with the strategy kind and value, the count and the auto-commit flag. */
 const POLL_SUFFIX_SIZE = 1 + 8 + 4 + 1;
@@ -981,6 +982,32 @@ describe('partition reader', () => {
 
     assert.ok(error instanceof ReadError);
     assert.equal(error.partitionId, 1);
+    assert.ok(others.every(({ partitionId }) => partitionId === 3));
+    assert.equal(resumed.messages[0].headers.offset, 0n);
+  });
+
+  it('sends a read once that fails with a tiered read failure, and stops its partition until a seek', async () => {
+    const topic = new FakeTopic(1_000n);
+    topic.refused.set(1, TIERED_READ_FAILED);
+    const reader = await open(topic, [1, 3]);
+    const readsOf = (partition: number) => topic.reads.filter((read) => read.partition === partition).length;
+
+    let stopped: unknown;
+    while (!stopped) stopped = await reader.next().then(() => undefined, (failure: unknown) => failure);
+    const others = [await reader.next(), await reader.next()];
+    // Several retry intervals, in which a refusal that retries reads again.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const refusedReads = readsOf(1);
+    topic.refused.delete(1);
+    await reader.seek(1, PollingStrategy.Offset(0n));
+    let resumed = await reader.next();
+    while (resumed.partitionId !== 1) resumed = await reader.next();
+    await reader.close();
+
+    assert.ok(stopped instanceof ReadError);
+    assert.deepEqual([stopped.partitionId, (stopped.error as { errorCode: number }).errorCode,
+      stopped.stopsPartition, stopped.resumable], [1, TIERED_READ_FAILED, true, true]);
+    assert.equal(refusedReads, 1, 'the refused read went out again');
     assert.ok(others.every(({ partitionId }) => partitionId === 3));
     assert.equal(resumed.messages[0].headers.offset, 0n);
   });

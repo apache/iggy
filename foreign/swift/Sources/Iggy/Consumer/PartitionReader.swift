@@ -89,7 +89,8 @@ public struct ReadError: Error, Sendable, CustomStringConvertible {
     public let raw: [UInt8]?
     /// Whether the partition reads nothing until a
     /// ``PartitionReader/seek(partitionID:to:)``: a message that does not
-    /// decode, or a position whose history is gone. A partition that a lost
+    /// decode, a position whose history is gone, or tiered data that the
+    /// object store refuses for good. A partition that a lost
     /// committing read of another caller blocks (``IggyErrorCode/partitionLaneBlocked``
     /// under ``CommitPolicy/onRead``) reads again by itself once
     /// ``IggyClient/abandonOperation(_:)`` took that operation.
@@ -147,8 +148,9 @@ public struct ReadError: Error, Sendable, CustomStringConvertible {
 ///   ``PollOptions/maxWait``, a partition that a read found empty waits it
 ///   too.
 ///   ``IggyErrorCode/historyUnavailable`` for a position read in a history
-///   that is gone, and a message that does not decode, stop the partition
-///   until a seek.
+///   that is gone, ``IggyErrorCode/tieredReadFailed`` and a message that does
+///   not decode stop the partition until a seek, and the read is not sent
+///   again.
 public actor PartitionReader: AsyncSequence {
     public typealias Element = PolledMessages
 
@@ -1663,8 +1665,9 @@ public actor PartitionReader: AsyncSequence {
     /// Repairs what a failed read of `partitions` points at, and they wait
     /// for the retry interval: a moved primary groups again, a lost owner
     /// syncs the assignment, a position without a history reads again, a lost
-    /// membership joins again. What the reader cannot repair is queued for
-    /// ``next()``.
+    /// membership joins again. Tiered data that the object store refuses for
+    /// good stops its partitions without a wait. What the reader cannot
+    /// repair is queued for ``next()``.
     private func failed(_ partitions: [UInt32], with error: IggyError) {
         let until = ContinuousClock.now + configuration.retryInterval
         var stops = false
@@ -1693,6 +1696,14 @@ public actor PartitionReader: AsyncSequence {
                 }
             }
             client.core.pollRouter.dropRoutes(partitions.map { PollRouter.RouteKey(stream: streamID, topic: topicID, partitionID: $0) })
+            return
+        case .tieredReadFailed:
+            // The object store refused the read for good, so the same read
+            // gets the same answer: the partition stops at the first one.
+            for partition in partitions {
+                stopped.insert(partition)
+                report(ReadError(partitionID: partition, error: error, stopsPartition: true))
+            }
             return
         case .consumerGroupMemberNotFound:
             joinedGroup = false
