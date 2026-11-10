@@ -158,7 +158,7 @@ impl ProduceSessionLimits {
 ///
 /// `Debug` is safe to derive: `password` is `SecretString`, which redacts on `Debug` by design
 /// (`secrecy` crate) - never add a plain `String` credential field here without the same
-/// treatment (see `connector-pr-review` blocker B1 in the connectors subsystem for why).
+/// treatment.
 #[derive(Debug, Clone)]
 pub struct IggyBridgeConfig {
     pub address: String,

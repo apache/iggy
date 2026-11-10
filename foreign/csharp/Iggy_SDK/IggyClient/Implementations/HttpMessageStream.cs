@@ -313,10 +313,8 @@ public class HttpMessageStream : IIggyClient
     {
         ArgumentNullException.ThrowIfNull(options);
         options.ValidatePoll(partitionId, strategy);
-        var polled = await PollAsync(streamId, topicId, partitionId, consumer, strategy, options.Count,
+        return await PollAsync(streamId, topicId, partitionId, consumer, strategy, options.Count,
             options.Commit.Mode == CommitMode.OnRead, options.Wire, token);
-        polled.RequestStart = strategy;
-        return polled;
     }
 
     /// <inheritdoc />
@@ -375,7 +373,9 @@ public class HttpMessageStream : IIggyClient
         }
 
         var partitionIdParam = partitionId.HasValue ? $"&partition_id={partitionId.Value}" : string.Empty;
-        var contextParam = pollingStrategy.Context is { } context
+        // A fully zero context counts as none. HTTP has no route to fill another context of incarnation 0 from, so it
+        // goes as it is and the server refuses it with status 87. A drop would remove the owner fence of the caller.
+        var contextParam = pollingStrategy.Context is { } context && context != default
             ? $"&context={Uri.EscapeDataString(JsonSerializer.Serialize(context, _jsonSerializerOptions))}"
             : string.Empty;
         var deferredPath = deferred is null ? string.Empty : "/deferred";
@@ -419,6 +419,7 @@ public class HttpMessageStream : IIggyClient
                 DecryptMessages(pollMessages.Messages, pollMessages.PartitionId);
             }
 
+            pollMessages.RequestStart = pollingStrategy;
             return pollMessages;
         }
 
@@ -578,9 +579,10 @@ public class HttpMessageStream : IIggyClient
         {
             foreach (var (operation, blocked) in _progressBlocks)
             {
+                // Incarnation 0 names no partition, so only the names can match it.
                 if (blocked.Partition == call.Partition
                     && (blocked.Stream == call.Stream && blocked.Topic == call.Topic
-                        || blocked.Incarnation is { } incarnation && incarnation == call.Incarnation))
+                        || blocked.Incarnation is not (null or 0) && blocked.Incarnation == call.Incarnation))
                 {
                     throw new VsrPartitionLaneBlockedException(operation, call.Partition);
                 }
@@ -662,8 +664,10 @@ public class HttpMessageStream : IIggyClient
     public Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset,
         uint partitionId, PartitionContext context, CancellationToken token = default)
     {
+        // A fully zero context counts as none. Any other context goes as it is, as in a poll.
         return PutOffsetAsync(streamId, topicId,
-            new StoreOffsetRequest(consumer, partitionId, offset) { Context = context }, token);
+            new StoreOffsetRequest(consumer, partitionId, offset) { Context = context == default ? null : context },
+            token);
     }
 
     /// <inheritdoc />
@@ -683,11 +687,39 @@ public class HttpMessageStream : IIggyClient
         var json = JsonSerializer.Serialize(request, _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
-        var response
-            = await _httpClient.PutAsync($"/streams/{streamId}/topics/{topicId}/consumer-offsets", data, token);
-        if (!response.IsSuccessStatusCode)
+        await WriteOffsetAsync(
+            () => _httpClient.PutAsync($"/streams/{streamId}/topics/{topicId}/consumer-offsets", data, token), token);
+    }
+
+    /// <summary>
+    ///     Sends a store or a delete of an offset. The server may have applied it before a server error other than 503,
+    ///     a timeout or a connection lost after the send, so these end with an unknown outcome, as on TCP.
+    /// </summary>
+    /// <exception cref="VsrRequestOutcomeUnknownException">The write may have landed.</exception>
+    private async Task WriteOffsetAsync(Func<Task<HttpResponseMessage>> send, CancellationToken token)
+    {
+        HttpResponseMessage response;
+        try
+        {
+            response = await send();
+        }
+        catch (HttpRequestException error) when (error.HttpRequestError != HttpRequestError.ConnectionError)
+        {
+            throw new VsrRequestOutcomeUnknownException(error);
+        }
+        catch (OperationCanceledException error) when (!token.IsCancellationRequested)
+        {
+            throw new VsrRequestOutcomeUnknownException(error);
+        }
+
+        try
         {
             await HandleResponseAsync(response);
+        }
+        catch (IggyInvalidStatusCodeException error) when (response.StatusCode >= HttpStatusCode.InternalServerError
+                                                           && response.StatusCode != HttpStatusCode.ServiceUnavailable)
+        {
+            throw new VsrRequestOutcomeUnknownException(error);
         }
     }
 
@@ -714,9 +746,8 @@ public class HttpMessageStream : IIggyClient
     {
         ThrowIfProgressBlocked(new ProgressKey(streamId.ToString(), topicId.ToString(), partitionId ?? 0, null));
         var partitionIdParam = partitionId.HasValue ? $"?partition_id={partitionId.Value}" : string.Empty;
-        var response = await _httpClient.DeleteAsync(
-            $"/streams/{streamId}/topics/{topicId}/consumer-offsets/{consumer}{partitionIdParam}", token);
-        await HandleResponseAsync(response);
+        await WriteOffsetAsync(() => _httpClient.DeleteAsync(
+            $"/streams/{streamId}/topics/{topicId}/consumer-offsets/{consumer}{partitionIdParam}", token), token);
     }
 
     /// <inheritdoc />
