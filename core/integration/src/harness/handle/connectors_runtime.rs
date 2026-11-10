@@ -28,6 +28,7 @@ use crate::harness::error::TestBinaryError;
 use crate::harness::port_reserver::SinglePortReserver;
 use crate::harness::traits::{IggyServerDependent, TestBinary};
 use assert_cmd::prelude::CommandCargoExt;
+use configs::CONNECTORS_CONFIG_PATH_ENV;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -128,7 +129,7 @@ impl ConnectorsRuntimeHandle {
 
         if let Some(ref config_path) = self.config.config_path {
             self.envs.insert(
-                "IGGY_CONNECTORS_CONFIG_PATH".to_string(),
+                CONNECTORS_CONFIG_PATH_ENV.to_string(),
                 config_path.display().to_string(),
             );
         }

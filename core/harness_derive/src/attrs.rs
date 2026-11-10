@@ -82,9 +82,9 @@ pub struct McpAttrs {
 /// Connectors runtime configuration attributes.
 ///
 /// Only the tests in apache/iggy-connectors use `connectors_runtime(...)`.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct ConnectorsRuntimeAttrs {
-    pub config_path: Option<String>,
+    pub config_path: String,
 }
 
 #[cfg(test)]
@@ -434,14 +434,9 @@ fn parse_server_attrs(input: ParseStream) -> syn::Result<ServerAttrs> {
                 server.mcp = Some(mcp);
             }
             "connectors_runtime" => {
-                let attrs = if input.peek(syn::token::Paren) {
-                    let content;
-                    parenthesized!(content in input);
-                    parse_connectors_runtime_attrs(&content)?
-                } else {
-                    ConnectorsRuntimeAttrs::default()
-                };
-                server.connectors_runtime = Some(attrs);
+                let content;
+                parenthesized!(content in input);
+                server.connectors_runtime = Some(parse_connectors_runtime_attrs(&content)?);
             }
             "tls" => {
                 input.parse::<Token![=]>()?;
@@ -522,13 +517,13 @@ fn parse_mcp_attrs(input: ParseStream) -> syn::Result<McpAttrs> {
 }
 
 fn parse_connectors_runtime_attrs(input: ParseStream) -> syn::Result<ConnectorsRuntimeAttrs> {
-    let mut attrs = ConnectorsRuntimeAttrs::default();
+    let mut config_path = None;
 
     let items: Punctuated<KeyValueAttrItem, Token![,]> = Punctuated::parse_terminated(input)?;
 
     for item in items {
         match item.key.as_str() {
-            "config_path" => attrs.config_path = Some(item.value),
+            "config_path" => config_path = Some(item.value),
             other => {
                 return Err(syn::Error::new(
                     Span::call_site(),
@@ -538,7 +533,11 @@ fn parse_connectors_runtime_attrs(input: ParseStream) -> syn::Result<ConnectorsR
         }
     }
 
-    Ok(attrs)
+    config_path
+        .map(|config_path| ConnectorsRuntimeAttrs { config_path })
+        .ok_or_else(|| {
+            syn::Error::new(Span::call_site(), "connectors_runtime requires config_path")
+        })
 }
 
 struct KeyValueAttrItem {
@@ -717,6 +716,24 @@ mod tests {
         let mcp = attrs.server.mcp.unwrap();
         assert_eq!(mcp.consumer_name, Some("test".to_string()));
         assert_eq!(mcp.http_path, Some("/custom".to_string()));
+    }
+
+    #[test]
+    fn parse_connectors_runtime_with_config_path() {
+        let attrs: IggyTestAttrs =
+            syn::parse_quote!(server(connectors_runtime(config_path = "tests/sink.toml")));
+        let runtime = attrs.server.connectors_runtime.unwrap();
+        assert_eq!(runtime.config_path, "tests/sink.toml");
+    }
+
+    #[test]
+    fn parse_connectors_runtime_without_config_path_fails() {
+        for input in ["server(connectors_runtime)", "server(connectors_runtime())"] {
+            assert!(
+                syn::parse_str::<IggyTestAttrs>(input).is_err(),
+                "`{input}` must not parse, because no default config file exists"
+            );
+        }
     }
 
     #[test]
