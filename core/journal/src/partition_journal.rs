@@ -760,6 +760,24 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.rewrite(through_op, checksum, None, None).await
     }
 
+    pub async fn advance_checkpoint(&mut self, through_op: u64, checksum: u128) -> io::Result<()> {
+        self.ensure_healthy()?;
+        if through_op <= self.state.checkpoint {
+            return Ok(());
+        }
+        match self.entries.get(&through_op) {
+            Some(entry) if entry.checksum != checksum => {
+                return Err(invalid("WAL checkpoint checksum mismatch"));
+            }
+            None if !self.sparse => return Err(invalid("unknown WAL checkpoint")),
+            _ => {}
+        }
+        self.state.anchor_known = true;
+        self.state.checkpoint = through_op;
+        self.state.checkpoint_checksum = checksum;
+        Ok(())
+    }
+
     /// [`Self::checkpoint_files`] through [`Self::checkpoint_at`].
     ///
     /// # Errors
