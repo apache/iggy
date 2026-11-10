@@ -56,7 +56,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use iggy::prelude::IggyError;
 use iggy_kafka_wire::codec;
-use kafka_protocol::messages::TransactionalId;
+use kafka_protocol::messages::{MetadataRequest, TransactionalId};
 use kafka_protocol::protocol::{Decodable, Encodable};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::time::Instant;
@@ -255,6 +255,15 @@ pub(crate) fn decode_guarded<T: Decodable>(
     validate: impl FnOnce(i16, &Bytes) -> iggy_kafka_wire::Result<()>,
 ) -> Result<T> {
     codec::decode_guarded(version, body, validate).map_err(Into::into)
+}
+
+/// [`codec::decode_metadata_guarded`] with the error lifted into this crate's [`Result`].
+pub(crate) fn decode_metadata_guarded(
+    version: i16,
+    body: Bytes,
+    validate: impl FnOnce(i16, &Bytes) -> iggy_kafka_wire::Result<()>,
+) -> Result<MetadataRequest> {
+    codec::decode_metadata_guarded(version, body, validate).map_err(Into::into)
 }
 
 /// Turn an encode [`Result`] into a [`HandleOutcome`], closing the connection when encoding

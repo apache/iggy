@@ -32,6 +32,13 @@ use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
+
+#[cfg(unix)]
+use libc::{EHOSTDOWN, SOMAXCONN};
+#[cfg(not(unix))]
+const SOMAXCONN: i32 = 128;
+#[cfg(not(unix))]
+const EHOSTDOWN: i32 = 10064;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
@@ -300,7 +307,7 @@ pub fn bind_listener(addr: &str) -> Result<TcpListener> {
     )?;
     socket.set_reuse_address(true)?;
     socket.bind(&socket_addr.into())?;
-    socket.listen(libc::SOMAXCONN)?;
+    socket.listen(SOMAXCONN)?;
     socket.set_nonblocking(true)?;
     let std_listener: std::net::TcpListener = socket.into();
     Ok(TcpListener::from_std(std_listener)?)
@@ -1052,7 +1059,7 @@ fn is_connection_accept_error(error: &io::Error) -> bool {
             | io::ErrorKind::HostUnreachable
     ) || matches!(
         error.raw_os_error(),
-        Some(libc::EPROTO | libc::ENOPROTOOPT | libc::EHOSTDOWN | libc::EOPNOTSUPP)
+        Some(libc::EPROTO | libc::ENOPROTOOPT | EHOSTDOWN | libc::EOPNOTSUPP)
     )
 }
 
@@ -2176,7 +2183,7 @@ mod tests {
             io::Error::from_raw_os_error(libc::ENETUNREACH),
             io::Error::from_raw_os_error(libc::EHOSTUNREACH),
             io::Error::from_raw_os_error(libc::EPROTO),
-            io::Error::from_raw_os_error(libc::EHOSTDOWN),
+            io::Error::from_raw_os_error(EHOSTDOWN),
         ] {
             assert_eq!(backoff.after(&error), None, "{error}");
         }

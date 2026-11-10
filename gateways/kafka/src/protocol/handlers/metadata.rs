@@ -25,7 +25,7 @@ use iggy_kafka_wire::KafkaWireError;
 use kafka_protocol::messages::metadata_response::{
     MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
 };
-use kafka_protocol::messages::{BrokerId, MetadataRequest, MetadataResponse, TopicName};
+use kafka_protocol::messages::{BrokerId, MetadataResponse, TopicName};
 use kafka_protocol::protocol::{Encodable, StrBytes};
 
 use crate::auth::AuthenticatedPrincipal;
@@ -43,7 +43,7 @@ use crate::protocol::api::{
 use crate::protocol::auto_topic_creation::is_internal_topic_name;
 use crate::protocol::bounds_guard::validate_metadata_shape;
 use crate::protocol::dedup::dedup_first_seen;
-use crate::protocol::handlers::{decode_guarded, encode_message, respond_or_close};
+use crate::protocol::handlers::{decode_metadata_guarded, encode_message, respond_or_close};
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_METADATA,
@@ -85,8 +85,9 @@ pub async fn handle(
         match decode_requested_topics(api_version, body, state.max_frame_size) {
             Ok(requested) => requested,
             Err(error) => {
-                tracing::debug!(
+                tracing::warn!(
                     %error,
+                    api_key = API_KEY_METADATA,
                     api_version,
                     "Failed to decode Metadata request; closing connection"
                 );
@@ -234,9 +235,9 @@ fn stub_response(
         Err(error) => {
             // Metadata has no top-level error field; a malformed body cannot carry
             // INVALID_REQUEST in a version-correct way for every client. Close.
-            // debug!, not warn!: attacker-controlled, not operator-actionable.
-            tracing::debug!(
+            tracing::warn!(
                 %error,
+                api_key = API_KEY_METADATA,
                 api_version,
                 "Failed to decode Metadata request; closing connection"
             );
@@ -623,7 +624,7 @@ fn response_brokers(
 /// empty list for this stub. A null per-topic `name` (v10+ allows topic-id-only lookups) has no
 /// name to echo, so it errors rather than silently dropping the topic from the response.
 fn decode_topics(api_version: i16, body: Bytes, max_frame_size: usize) -> Result<Vec<StrBytes>> {
-    let req = decode_guarded::<MetadataRequest>(api_version, body, |v, b| {
+    let req = decode_metadata_guarded(api_version, body, |v, b| {
         validate_metadata_shape(v, b, max_frame_size)
     })?;
     req.topics
@@ -654,7 +655,7 @@ fn decode_requested_topics(
     body: Bytes,
     max_frame_size: usize,
 ) -> Result<(Option<Vec<StrBytes>>, bool)> {
-    let req = decode_guarded::<MetadataRequest>(api_version, body, |v, b| {
+    let req = decode_metadata_guarded(api_version, body, |v, b| {
         validate_metadata_shape(v, b, max_frame_size)
     })?;
     let allow_auto_topic_creation = req.allow_auto_topic_creation;
@@ -723,6 +724,45 @@ mod tests {
         // topics = null (all topics) but missing allow_auto / auth flags / tagged fields.
         let body = Bytes::from_static(&[0x00]);
         assert!(decode_topics(9, body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn decode_requested_topics_librdkafka_30_byte_all_topics_v9_accepted() {
+        // Captured 30-byte librdkafka 2.x request body (8 bytes, 3 trailing zero bytes from placeholder).
+        let body = Bytes::from_static(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let (requested, allow_auto) =
+            decode_requested_topics(9, body, TEST_MAX_FRAME_SIZE).unwrap();
+        assert_eq!(requested, None); // None means all topics
+        assert!(!allow_auto);
+    }
+
+    #[test]
+    fn decode_topics_librdkafka_30_byte_all_topics_v9_accepted() {
+        // Stub path collapses null topics array to empty vector.
+        let body = Bytes::from_static(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let topics = decode_topics(9, body, TEST_MAX_FRAME_SIZE).unwrap();
+        assert!(topics.is_empty());
+    }
+
+    #[test]
+    fn decode_requested_topics_v9_standard_5_byte_all_topics_accepted() {
+        let body = Bytes::from_static(&[0x00, 0x00, 0x00, 0x00, 0x00]);
+        let (requested, allow_auto) =
+            decode_requested_topics(9, body, TEST_MAX_FRAME_SIZE).unwrap();
+        assert_eq!(requested, None);
+        assert!(!allow_auto);
+    }
+
+    #[test]
+    fn decode_requested_topics_v9_excessive_trailing_bytes_rejected() {
+        let body = Bytes::from_static(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert!(decode_requested_topics(9, body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn decode_requested_topics_v9_nonzero_trailing_bytes_rejected() {
+        let body = Bytes::from_static(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        assert!(decode_requested_topics(9, body, TEST_MAX_FRAME_SIZE).is_err());
     }
 
     #[test]
