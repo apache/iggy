@@ -64,6 +64,7 @@ members = [
     "core/kafka_wire",
     "core/message_bus",
     "core/metadata",
+    "core/object_store",
     "core/partitions",
     "core/sdk",
     "core/server",
@@ -226,6 +227,7 @@ iggy_common = { path = "core/common", version = "0.12.0" }
 iggy_connector_doris_sink = { path = "core/connectors/sinks/doris_sink" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.6.0" }
 iggy_kafka_wire = { path = "core/kafka_wire" }
+iggy_object_store = { path = "core/object_store" }
 indexmap = "2.14.2"
 integration = { path = "core/integration" }
 ipnet = "2.12.2"
