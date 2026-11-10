@@ -49,8 +49,9 @@ use futures::stream;
 
 use crate::error::ObjectStoreError;
 use crate::store::{
-    ListRequest, ListedObject, MAX_KEY_LEN, MAX_KEYS_PER_REQUEST, MAX_METADATA_LEN, ObjectStore,
-    PutBody, PutMode, PutOptions, UserMetadata,
+    DeleteFailure, DeleteOutcome, ListRequest, ListedObject, MAX_KEY_LEN, MAX_KEY_SEGMENT_LEN,
+    MAX_KEYS_PER_REQUEST, MAX_METADATA_LEN, ObjectStore, PutBody, PutMode, PutOptions,
+    UserMetadata,
 };
 
 /// Calls `$callback!` with the name of every case in [`crate::contract`], so
@@ -66,7 +67,9 @@ macro_rules! contract_cases {
             given_streamed_body_when_putting_should_store_pieces_in_order,
             given_short_body_when_putting_should_fail_and_store_nothing,
             given_long_body_when_putting_should_fail_and_store_nothing,
+            given_extra_piece_after_declared_length_when_putting_should_fail_and_store_nothing,
             given_failing_body_when_putting_should_keep_previous_object,
+            given_error_after_declared_length_when_putting_should_keep_previous_object,
             given_wrong_checksum_when_putting_should_fail_and_store_nothing,
             given_object_when_reading_ranges_should_honor_edges,
             given_empty_object_when_reading_should_refuse_every_range,
@@ -75,6 +78,7 @@ macro_rules! contract_cases {
             given_many_keys_when_paging_should_visit_each_once_in_order,
             given_no_match_when_listing_should_return_one_empty_page,
             given_batch_when_deleting_should_remove_only_its_keys,
+            given_invalid_key_in_batch_when_deleting_should_report_it_and_delete_the_rest,
             given_too_many_keys_when_deleting_should_refuse_before_any_io,
             given_invalid_key_when_calling_should_refuse_before_any_io,
             given_non_portable_metadata_when_putting_should_refuse,
@@ -87,18 +91,24 @@ pub async fn given_object_when_heading_should_report_size_and_metadata(
     root: &str,
 ) {
     let key = format!("{root}/1/2/3/4/00000000000000000000.log");
+    let bytes = Bytes::from_static(b"segment bytes");
     let metadata = metadata(&[("end-offset", "99"), ("start-offset", "0")]);
     let options = PutOptions {
         metadata: metadata.clone(),
         ..PutOptions::default()
     };
 
-    put(store, &key, Bytes::from_static(b"segment bytes"), &options).await;
+    put(store, &key, bytes.clone(), &options).await;
     let head = store.head(&key).await.expect("head");
 
     assert_eq!(head.size, 13);
     assert_eq!(head.metadata, metadata);
     assert_ne!(head.etag, "");
+    assert!(
+        head.crc32c
+            .is_none_or(|stored| stored == crc32c::crc32c(&bytes)),
+        "the stored CRC32C must match the bytes: {head:?}"
+    );
 }
 
 pub async fn given_existing_key_when_putting_if_absent_should_refuse_and_keep_object(
@@ -237,6 +247,30 @@ pub async fn given_long_body_when_putting_should_fail_and_store_nothing(
     assert_absent(store, &key).await;
 }
 
+/// The extra piece comes only after the declared length is complete, so a
+/// provider that stops reading there must still refuse the body.
+pub async fn given_extra_piece_after_declared_length_when_putting_should_fail_and_store_nothing(
+    store: &impl ObjectStore,
+    root: &str,
+) {
+    let key = format!("{root}/overrun");
+    let body = PutBody::from_stream(
+        4,
+        stream::iter([
+            Ok(Bytes::from_static(b"1234")),
+            Ok(Bytes::from_static(b"5")),
+        ]),
+    );
+
+    let result = store.put(&key, body, &PutOptions::default()).await;
+
+    assert!(
+        matches!(result, Err(ObjectStoreError::Body(_))),
+        "{result:?}"
+    );
+    assert_absent(store, &key).await;
+}
+
 pub async fn given_failing_body_when_putting_should_keep_previous_object(
     store: &impl ObjectStore,
     root: &str,
@@ -261,6 +295,37 @@ pub async fn given_failing_body_when_putting_should_keep_previous_object(
 
     assert!(
         matches!(&result, Err(ObjectStoreError::Body(error)) if error.to_string() == "disk read failed"),
+        "the body's own error must come back unchanged: {result:?}"
+    );
+    assert_eq!(read_all(store, &key).await, Bytes::from_static(b"previous"));
+}
+
+/// The body fails only after its last byte, as an upload does when the hash
+/// of the whole segment does not match.
+pub async fn given_error_after_declared_length_when_putting_should_keep_previous_object(
+    store: &impl ObjectStore,
+    root: &str,
+) {
+    let key = format!("{root}/verified");
+    put(
+        store,
+        &key,
+        Bytes::from_static(b"previous"),
+        &PutOptions::default(),
+    )
+    .await;
+    let failing = PutBody::from_stream(
+        4,
+        stream::iter([
+            Ok(Bytes::from_static(b"next")),
+            Err(io::Error::other("hash mismatch")),
+        ]),
+    );
+
+    let result = store.put(&key, failing, &PutOptions::default()).await;
+
+    assert!(
+        matches!(&result, Err(ObjectStoreError::Body(error)) if error.to_string() == "hash mismatch"),
         "the body's own error must come back unchanged: {result:?}"
     );
     assert_eq!(read_all(store, &key).await, Bytes::from_static(b"previous"));
@@ -485,6 +550,28 @@ pub async fn given_batch_when_deleting_should_remove_only_its_keys(
     assert_eq!(keys(&listed), [key("b"), key("d")]);
 }
 
+/// A listing can return a key that `validate_key` refuses, such as a folder
+/// marker that another client wrote, and a delete of the listed keys still
+/// removes the valid ones.
+pub async fn given_invalid_key_in_batch_when_deleting_should_report_it_and_delete_the_rest(
+    store: &impl ObjectStore,
+    root: &str,
+) {
+    let key = |name: &str| format!("{root}/mixed/{name}");
+    for name in ["a", "b"] {
+        put(store, &key(name), pattern(2, 12), &PutOptions::default()).await;
+    }
+    let marker = key("");
+    let batch = [key("a"), marker.clone(), key("missing")];
+
+    let outcome = store.delete(&batch).await.expect("delete");
+
+    assert!(refused_only(&outcome, &marker), "{outcome:?}");
+    assert!(!outcome.is_complete());
+    let listed = list_all(store, &format!("{root}/mixed/"), MAX_KEYS_PER_REQUEST).await;
+    assert_eq!(keys(&listed), [key("b")]);
+}
+
 pub async fn given_too_many_keys_when_deleting_should_refuse_before_any_io(
     store: &impl ObjectStore,
     root: &str,
@@ -513,7 +600,8 @@ pub async fn given_invalid_key_when_calling_should_refuse_before_any_io(
 ) {
     let kept = format!("{root}/valid");
     put(store, &kept, pattern(1, 11), &PutOptions::default()).await;
-    let too_long = format!("{root}/{}", "x".repeat(MAX_KEY_LEN));
+    let too_long = format!("{root}/{}x", "x/".repeat(MAX_KEY_LEN / 2));
+    let long_segment = format!("{root}/{}", "x".repeat(MAX_KEY_SEGMENT_LEN + 1));
     let invalid = [
         String::new(),
         format!("/{root}/leading"),
@@ -524,6 +612,7 @@ pub async fn given_invalid_key_when_calling_should_refuse_before_any_io(
         format!("{root}/back\\slash"),
         format!("{root}/new\nline"),
         too_long,
+        long_segment,
     ];
 
     for key in &invalid {
@@ -536,7 +625,7 @@ pub async fn given_invalid_key_when_calling_should_refuse_before_any_io(
             .await;
         let head = store.head(key).await;
         let read = store.get_range(key, 0..1).await;
-        let deleted = store.delete(&[kept.clone(), key.clone()]).await;
+        let deleted = store.delete(std::slice::from_ref(key)).await;
         assert!(
             matches!(stored, Err(ObjectStoreError::InvalidKey { .. })),
             "put {key:?}: {stored:?}"
@@ -550,7 +639,7 @@ pub async fn given_invalid_key_when_calling_should_refuse_before_any_io(
             "get {key:?}: {read:?}"
         );
         assert!(
-            matches!(deleted, Err(ObjectStoreError::InvalidKey { .. })),
+            matches!(&deleted, Ok(outcome) if refused_only(outcome, key)),
             "delete {key:?}: {deleted:?}"
         );
     }
@@ -630,6 +719,17 @@ async fn assert_absent(store: &impl ObjectStore, key: &str) {
         matches!(head, Err(ObjectStoreError::NotFound { .. })),
         "{key:?} must hold no object: {head:?}"
     );
+}
+
+/// Whether `key` is the one failure of `outcome`, refused as an invalid key.
+fn refused_only(outcome: &DeleteOutcome, key: &str) -> bool {
+    matches!(
+        outcome.failed.as_slice(),
+        [DeleteFailure {
+            key: refused,
+            error: ObjectStoreError::InvalidKey { .. },
+        }] if refused == key
+    )
 }
 
 /// Every object under `prefix`, page by page, checking each page's length.

@@ -36,6 +36,10 @@ pub const MAX_KEYS_PER_REQUEST: usize = 1000;
 /// Longest key, in bytes: S3's limit.
 pub const MAX_KEY_LEN: usize = 1024;
 
+/// Longest segment of a key, in bytes. A Linux file name holds 255 bytes, so a
+/// filesystem store has room to add a scratch suffix to any segment.
+pub const MAX_KEY_SEGMENT_LEN: usize = 200;
+
 /// Most bytes of user metadata on one object, names and values together:
 /// S3's limit.
 pub const MAX_METADATA_LEN: usize = 2048;
@@ -55,23 +59,36 @@ pub type UserMetadata = BTreeMap<String, String>;
 /// the directory of another, such as `a/b` and `a/b/c`, because a filesystem
 /// store cannot hold both.
 ///
+/// A put or a delete that returns `Ok` is durable: it survives a crash of the
+/// store, and every later call sees it. A filesystem store, for example, syncs
+/// the file and its directory before it answers.
+///
 /// Retries and timeouts belong to the caller, which branches on
 /// [`ObjectStoreError::class`]. A provider runs on the shard that owns it and
 /// never blocks the shard thread. Dropping a call's future cancels the call.
 pub trait ObjectStore {
     /// Stores `body` under `key` with the user metadata of `options`.
     ///
-    /// The object appears whole or not at all. A failed or cancelled put
-    /// leaves no part of the body under `key`, and an object that was there
-    /// stays as it was. [`PutMode::IfAbsent`] refuses a key that holds an
-    /// object. With a CRC32C in `options`, the store checks the bytes it
-    /// received against it before it stores them.
+    /// The object appears whole or not at all, and [`PutMode::IfAbsent`]
+    /// refuses a key that holds an object. The store checks the bytes it
+    /// received against a CRC32C before it stores them, when it can: the one
+    /// in `options`, or else one that the provider computes as it sends them.
+    ///
+    /// A failed put stores nothing and leaves an earlier object as it was. A
+    /// put that was cancelled, or that failed with a
+    /// [`crate::ErrorClass::Transient`] error or with
+    /// [`ObjectStoreError::Malformed`], is the exception. The store can commit
+    /// the whole body and then lose its answer, so a retry with `IfAbsent` can
+    /// meet the caller's own object.
     ///
     /// # Errors
-    /// [`ObjectStoreError::PreconditionFailed`] when `IfAbsent` finds an
-    /// object, [`ObjectStoreError::ChecksumMismatch`] when the CRC32C differs,
-    /// [`ObjectStoreError::Body`] when the body fails or yields a length other
-    /// than the one it declared, and any error the store returns.
+    /// [`ObjectStoreError::InvalidKey`] for a key that [`validate_key`]
+    /// refuses, [`ObjectStoreError::InvalidRequest`] for metadata that
+    /// [`validate_metadata`] refuses, [`ObjectStoreError::PreconditionFailed`]
+    /// when `IfAbsent` finds an object, [`ObjectStoreError::ChecksumMismatch`]
+    /// when the CRC32C differs, [`ObjectStoreError::Body`] when the body fails
+    /// or yields a length other than the one it declared, and any error the
+    /// store returns.
     fn put(
         &self,
         key: &str,
@@ -87,7 +104,8 @@ pub trait ObjectStore {
     /// the range.
     ///
     /// # Errors
-    /// [`ObjectStoreError::NotFound`] without an object,
+    /// [`ObjectStoreError::InvalidKey`] for a key that [`validate_key`]
+    /// refuses, [`ObjectStoreError::NotFound`] without an object,
     /// [`ObjectStoreError::InvalidRange`] when `range` starts at or past the
     /// end, [`ObjectStoreError::InvalidRequest`] when `range` is empty, and
     /// any error the store returns.
@@ -101,15 +119,17 @@ pub trait ObjectStore {
     /// its bytes.
     ///
     /// # Errors
-    /// [`ObjectStoreError::NotFound`] without an object, and any error the
-    /// store returns.
+    /// [`ObjectStoreError::InvalidKey`] for a key that [`validate_key`]
+    /// refuses, [`ObjectStoreError::NotFound`] without an object, and any
+    /// error the store returns.
     fn head(&self, key: &str) -> impl Future<Output = Result<ObjectMeta, ObjectStoreError>>;
 
     /// Deletes the objects under up to [`MAX_KEYS_PER_REQUEST`] keys.
     ///
     /// A missing key counts as deleted, so a caller can send a failed batch
-    /// again whole. A key that the store refuses alone goes to
-    /// [`DeleteOutcome::failed`], and the other keys are still deleted.
+    /// again whole. A key that [`validate_key`] refuses, or that the store
+    /// refuses alone, goes to [`DeleteOutcome::failed`], and the other keys
+    /// are still deleted.
     ///
     /// # Errors
     /// [`ObjectStoreError::InvalidRequest`] for too many keys, and an error
@@ -124,8 +144,12 @@ pub trait ObjectStore {
     ///
     /// A page holds at most [`ListRequest::page_len`] objects, and it can hold
     /// fewer when more follow. Following [`ListPage::next`] until it is `None`
-    /// visits once every object that existed for the whole listing. An object
-    /// put or deleted during the listing may or may not appear.
+    /// visits once every object that existed for the whole listing. The
+    /// listing can show or miss an object put or deleted while it runs.
+    ///
+    /// A listing can return a key that [`validate_key`] refuses, such as one
+    /// that another client wrote. The other calls refuse such a key, and a
+    /// delete reports it in [`DeleteOutcome::failed`].
     ///
     /// # Errors
     /// [`ObjectStoreError::InvalidKey`] for a prefix that [`validate_prefix`]
@@ -159,7 +183,9 @@ impl PutBody {
     /// A body of exactly `len` bytes that `pieces` yields in order.
     ///
     /// A stream that yields an error, or a total other than `len`, fails the
-    /// put with [`ObjectStoreError::Body`], and the put stores nothing.
+    /// put with [`ObjectStoreError::Body`], and the put stores nothing. The
+    /// stream can also fail after its last piece, for example when a hash of
+    /// the whole body does not match, and the put still stores nothing.
     #[must_use]
     pub fn from_stream(len: u64, pieces: impl Stream<Item = io::Result<Bytes>> + 'static) -> Self {
         Self {
@@ -181,13 +207,19 @@ impl PutBody {
     /// The pieces for a provider to send, checked against the declared
     /// length: the stream ends with an error instead of ending short or
     /// running past the length. Any other error is the body's own.
-    pub fn into_pieces(self) -> LocalBoxStream<'static, io::Result<Bytes>> {
+    ///
+    /// The piece that completes the declared length comes only after the body
+    /// ends without an error. So a provider that stops at the declared length,
+    /// as an HTTP client with a `Content-Length` does, never sends the last
+    /// byte of a failed body. An empty body has no last byte, so a provider
+    /// reads it to its end before it sends the request.
+    pub fn into_pieces(self) -> impl Stream<Item = io::Result<Bytes>> + Unpin + 'static {
         ExactLen {
             pieces: self.pieces,
             remaining: self.len,
+            last: None,
             done: false,
         }
-        .boxed_local()
     }
 }
 
@@ -203,6 +235,8 @@ impl fmt::Debug for PutBody {
 struct ExactLen {
     pieces: LocalBoxStream<'static, io::Result<Bytes>>,
     remaining: u64,
+    /// The piece that completes the declared length, held until the body ends.
+    last: Option<Bytes>,
     done: bool,
 }
 
@@ -213,32 +247,41 @@ impl Stream for ExactLen {
         if self.done {
             return Poll::Ready(None);
         }
-        let failure = match ready!(self.pieces.poll_next_unpin(context)) {
-            Some(Ok(piece)) => match self.remaining.checked_sub(piece.len() as u64) {
-                Some(remaining) => {
-                    self.remaining = remaining;
-                    return Poll::Ready(Some(Ok(piece)));
+        loop {
+            let failure = match ready!(self.pieces.poll_next_unpin(context)) {
+                Some(Ok(piece)) if piece.is_empty() => return Poll::Ready(Some(Ok(piece))),
+                Some(Ok(piece)) => match self.remaining.checked_sub(piece.len() as u64) {
+                    Some(0) => {
+                        self.remaining = 0;
+                        self.last = Some(piece);
+                        continue;
+                    }
+                    Some(remaining) => {
+                        self.remaining = remaining;
+                        return Poll::Ready(Some(Ok(piece)));
+                    }
+                    None => io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the body yields more bytes than its declared length",
+                    ),
+                },
+                Some(Err(error)) => error,
+                None if self.remaining == 0 => {
+                    self.done = true;
+                    return Poll::Ready(self.last.take().map(Ok));
                 }
                 None => io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "the body yields more bytes than its declared length",
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "the body ends {} bytes short of its declared length",
+                        self.remaining
+                    ),
                 ),
-            },
-            Some(Err(error)) => error,
-            None if self.remaining == 0 => {
-                self.done = true;
-                return Poll::Ready(None);
-            }
-            None => io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "the body ends {} bytes short of its declared length",
-                    self.remaining
-                ),
-            ),
-        };
-        self.done = true;
-        Poll::Ready(Some(Err(failure)))
+            };
+            self.last = None;
+            self.done = true;
+            return Poll::Ready(Some(Err(failure)));
+        }
     }
 }
 
@@ -255,8 +298,10 @@ pub enum PutMode {
 pub struct PutOptions {
     pub mode: PutMode,
     pub metadata: UserMetadata,
-    /// CRC32C of the whole body. The store refuses the put when the bytes it
-    /// received hash to another value.
+    /// CRC32C of the whole body, for a caller that knows it before the put.
+    /// The store refuses the put when the bytes it received hash to another
+    /// value. Without it, the provider computes the CRC32C as it sends the
+    /// body, so a caller never reads a body twice to get one.
     pub crc32c: Option<u32>,
 }
 
@@ -269,6 +314,11 @@ pub struct ObjectMeta {
     pub etag: String,
     pub last_modified: SystemTime,
     pub metadata: UserMetadata,
+    /// CRC32C of the bytes the store holds, which the store checked when it
+    /// took them. A hash in `metadata` only repeats what the writer declared
+    /// before it sent the body. `None` when the store keeps no CRC32C for the
+    /// object, as Azure Blob does.
+    pub crc32c: Option<u32>,
 }
 
 /// One page of a listing.
@@ -310,14 +360,8 @@ impl<'a> ListRequest<'a> {
     /// `max_keys` clamped to `1..=MAX_KEYS_PER_REQUEST`: the most objects a
     /// provider returns for this request.
     #[must_use]
-    pub const fn page_len(&self) -> usize {
-        if self.max_keys == 0 {
-            1
-        } else if self.max_keys > MAX_KEYS_PER_REQUEST {
-            MAX_KEYS_PER_REQUEST
-        } else {
-            self.max_keys
-        }
+    pub fn page_len(&self) -> usize {
+        self.max_keys.clamp(1, MAX_KEYS_PER_REQUEST)
     }
 }
 
@@ -340,7 +384,9 @@ pub struct ListedObject {
 /// What a batch delete left undone.
 #[derive(Debug, Default)]
 pub struct DeleteOutcome {
-    /// The keys the store refused, each once, with the store's reason.
+    /// The keys of the batch that were not deleted, each with its reason:
+    /// [`ObjectStoreError::InvalidKey`] for a key that [`validate_key`]
+    /// refuses, or the error that the store returned for the key.
     pub failed: Vec<DeleteFailure>,
 }
 
@@ -360,10 +406,10 @@ pub struct DeleteFailure {
 
 /// Checks `key` against the rules every provider enforces.
 ///
-/// A key is at most [`MAX_KEY_LEN`] bytes of `/`-separated segments. No
-/// segment is empty or starts with `.`, which keeps `.` and `..` out of
-/// filesystem paths and leaves dot-names free for a provider's scratch files.
-/// No key holds a control character or `\`.
+/// A key is at most [`MAX_KEY_LEN`] bytes of `/`-separated segments, each at
+/// most [`MAX_KEY_SEGMENT_LEN`] bytes. No segment is empty or starts with `.`,
+/// which keeps `.` and `..` out of filesystem paths and leaves dot-names free
+/// for a provider's scratch files. No key holds a control character or `\`.
 ///
 /// # Errors
 /// [`ObjectStoreError::InvalidKey`] that names the broken rule.
@@ -427,11 +473,12 @@ pub fn validate_range(range: &Range<u64>) -> Result<(), ObjectStoreError> {
     Ok(())
 }
 
-/// Checks a delete batch: at most [`MAX_KEYS_PER_REQUEST`] keys, each valid.
+/// Checks the size of a delete batch. A provider then checks each key with
+/// [`validate_key`], and reports a refused key in [`DeleteOutcome::failed`].
 ///
 /// # Errors
-/// [`ObjectStoreError::InvalidRequest`] for too many keys and
-/// [`ObjectStoreError::InvalidKey`] for the first invalid one.
+/// [`ObjectStoreError::InvalidRequest`] for more than
+/// [`MAX_KEYS_PER_REQUEST`] keys.
 pub fn validate_delete(keys: &[String]) -> Result<(), ObjectStoreError> {
     if keys.len() > MAX_KEYS_PER_REQUEST {
         return Err(ObjectStoreError::InvalidRequest(format!(
@@ -439,11 +486,13 @@ pub fn validate_delete(keys: &[String]) -> Result<(), ObjectStoreError> {
             keys.len()
         )));
     }
-    keys.iter().try_for_each(|key| validate_key(key))
+    Ok(())
 }
 
 /// The rule `key` breaks. In a prefix, the last segment can be empty.
 fn check_key(key: &str, prefix: bool) -> Result<(), &'static str> {
+    // The reasons below spell out these limits.
+    const _: () = assert!(MAX_KEY_LEN == 1024 && MAX_KEY_SEGMENT_LEN == 200);
     if key.is_empty() {
         return Err("is empty");
     }
@@ -460,6 +509,9 @@ fn check_key(key: &str, prefix: bool) -> Result<(), &'static str> {
     while let Some(segment) = segments.next() {
         if segment.starts_with('.') {
             return Err("has a segment that starts with '.'");
+        }
+        if segment.len() > MAX_KEY_SEGMENT_LEN {
+            return Err("has a segment longer than 200 bytes");
         }
         let last = segments.peek().is_none();
         if segment.is_empty() && !(prefix && last) {
@@ -491,6 +543,9 @@ fn is_portable_value(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::task::Waker;
+
+    use futures::channel::mpsc;
     use futures::executor::block_on;
     use futures::stream::TryStreamExt;
 
@@ -504,6 +559,23 @@ mod tests {
                     Ok(collected)
                 }),
         )
+    }
+
+    /// Takes pieces until it holds the declared length, and then stops
+    /// without polling for the end, as an HTTP client with a `Content-Length`
+    /// does.
+    fn send_declared_length(body: PutBody) -> io::Result<Vec<u8>> {
+        let len = body.len();
+        let mut pieces = body.into_pieces();
+        let mut sent = Vec::new();
+        while (sent.len() as u64) < len {
+            match block_on(pieces.next()) {
+                Some(Ok(piece)) => sent.extend_from_slice(&piece),
+                Some(Err(error)) => return Err(error),
+                None => return Err(io::ErrorKind::UnexpectedEof.into()),
+            }
+        }
+        Ok(sent)
     }
 
     fn pieces(parts: &'static [&'static [u8]]) -> impl Stream<Item = io::Result<Bytes>> + 'static {
@@ -549,6 +621,60 @@ mod tests {
     }
 
     #[test]
+    fn given_error_after_last_piece_when_sending_declared_length_should_never_send_last_byte() {
+        let body = PutBody::from_stream(
+            4,
+            stream::iter([
+                Ok(Bytes::from_static(b"12")),
+                Ok(Bytes::from_static(b"34")),
+                Err(io::Error::other("hash mismatch")),
+            ]),
+        );
+
+        let error = send_declared_length(body).unwrap_err();
+
+        assert_eq!(error.to_string(), "hash mismatch");
+    }
+
+    #[test]
+    fn given_extra_piece_after_declared_length_when_sending_should_never_send_last_byte() {
+        let body = PutBody::from_stream(4, pieces(&[b"1234", b"5"]));
+
+        let error = send_declared_length(body).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn given_clean_body_when_sending_declared_length_should_send_every_byte() {
+        let body = PutBody::from_stream(6, pieces(&[b"12", b"", b"3456"]));
+
+        assert_eq!(send_declared_length(body).unwrap(), b"123456");
+    }
+
+    #[test]
+    fn given_last_piece_when_end_is_pending_should_hold_piece_until_end() {
+        let (sender, receiver) = mpsc::unbounded::<io::Result<Bytes>>();
+        let mut pieces = PutBody::from_stream(4, receiver).into_pieces();
+        let mut context = Context::from_waker(Waker::noop());
+        sender
+            .unbounded_send(Ok(Bytes::from_static(b"1234")))
+            .unwrap();
+
+        assert!(pieces.poll_next_unpin(&mut context).is_pending());
+        drop(sender);
+
+        assert!(matches!(
+            pieces.poll_next_unpin(&mut context),
+            Poll::Ready(Some(Ok(piece))) if piece == "1234"
+        ));
+        assert!(matches!(
+            pieces.poll_next_unpin(&mut context),
+            Poll::Ready(None)
+        ));
+    }
+
+    #[test]
     fn given_bytes_when_building_body_should_declare_their_length() {
         let body = PutBody::from_bytes(Bytes::from_static(b"segment"));
 
@@ -559,20 +685,35 @@ mod tests {
     }
 
     #[test]
-    fn given_traversal_hidden_or_empty_segments_when_validating_key_should_refuse() {
-        let too_long = "a".repeat(MAX_KEY_LEN + 1);
+    fn given_traversal_hidden_empty_or_long_parts_when_validating_key_should_refuse() {
+        let longest = format!("{}xx", "x/".repeat(MAX_KEY_LEN / 2 - 1));
+        assert_eq!(longest.len(), MAX_KEY_LEN);
+        let too_long = format!("{longest}x");
+        let longest_segment = format!("a/{}", "x".repeat(MAX_KEY_SEGMENT_LEN));
+        let too_long_segment = format!("{longest_segment}x");
         for key in [
-            "", "/a", "a/", "a//b", "../a", "a/..", "a/.tmp", ".a", "a\\b", "a\nb", &too_long,
+            "",
+            "/a",
+            "a/",
+            "a//b",
+            "../a",
+            "a/..",
+            "a/.tmp",
+            ".a",
+            "a\\b",
+            "a\nb",
+            &too_long,
+            &too_long_segment,
         ] {
             assert!(validate_key(key).is_err(), "{key:?} should be refused");
         }
-        let longest = "a".repeat(MAX_KEY_LEN);
         for key in [
             "a",
             "a/b",
             "iggy/1/2/3/4/00000000000000000000.log",
             "a-b_c.d",
             &longest,
+            &longest_segment,
         ] {
             assert!(validate_key(key).is_ok(), "{key:?} should be accepted");
         }
@@ -643,5 +784,12 @@ mod tests {
             Err(ObjectStoreError::InvalidRequest(_))
         ));
         assert!(validate_delete(&keys[..MAX_KEYS_PER_REQUEST]).is_ok());
+    }
+
+    #[test]
+    fn given_invalid_key_when_validating_delete_should_leave_it_to_each_key() {
+        let keys = ["a/1".to_owned(), "a//2".to_owned()];
+
+        assert!(validate_delete(&keys).is_ok());
     }
 }

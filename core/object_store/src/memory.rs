@@ -25,9 +25,9 @@ use futures::StreamExt;
 
 use crate::error::ObjectStoreError;
 use crate::store::{
-    DeleteOutcome, ListPage, ListRequest, ListedObject, ObjectMeta, ObjectStore, PutBody, PutMode,
-    PutOptions, UserMetadata, validate_delete, validate_key, validate_metadata, validate_prefix,
-    validate_range,
+    DeleteFailure, DeleteOutcome, ListPage, ListRequest, ListedObject, ObjectMeta, ObjectStore,
+    PutBody, PutMode, PutOptions, UserMetadata, validate_delete, validate_key, validate_metadata,
+    validate_prefix, validate_range,
 };
 
 /// An [`ObjectStore`] in memory, with no faults.
@@ -47,6 +47,7 @@ struct StoredObject {
     metadata: UserMetadata,
     etag: String,
     last_modified: SystemTime,
+    crc32c: u32,
 }
 
 impl MemoryStore {
@@ -87,10 +88,8 @@ impl ObjectStore for MemoryStore {
             bytes.extend_from_slice(&piece.map_err(ObjectStoreError::Body)?);
         }
         let bytes = bytes.freeze();
-        if options
-            .crc32c
-            .is_some_and(|expected| crc32c::crc32c(&bytes) != expected)
-        {
+        let crc32c = crc32c::crc32c(&bytes);
+        if options.crc32c.is_some_and(|expected| expected != crc32c) {
             return Err(ObjectStoreError::ChecksumMismatch {
                 key: key.to_owned(),
             });
@@ -110,6 +109,7 @@ impl ObjectStore for MemoryStore {
                 metadata: options.metadata.clone(),
                 etag: format!("{version:016x}"),
                 last_modified: SystemTime::now(),
+                crc32c,
             },
         );
         Ok(())
@@ -141,16 +141,26 @@ impl ObjectStore for MemoryStore {
             etag: object.etag.clone(),
             last_modified: object.last_modified,
             metadata: object.metadata.clone(),
+            crc32c: Some(object.crc32c),
         })
     }
 
     async fn delete(&self, keys: &[String]) -> Result<DeleteOutcome, ObjectStoreError> {
         validate_delete(keys)?;
         let mut objects = self.objects.borrow_mut();
+        let mut outcome = DeleteOutcome::default();
         for key in keys {
-            objects.remove(key);
+            match validate_key(key) {
+                Ok(()) => {
+                    objects.remove(key);
+                }
+                Err(error) => outcome.failed.push(DeleteFailure {
+                    key: key.clone(),
+                    error,
+                }),
+            }
         }
-        Ok(DeleteOutcome::default())
+        Ok(outcome)
     }
 
     async fn list(&self, request: &ListRequest<'_>) -> Result<ListPage, ObjectStoreError> {
@@ -220,6 +230,7 @@ mod tests {
         assert!(first.last_modified >= before);
         assert!(first.last_modified <= SystemTime::now() + Duration::from_secs(1));
         assert_ne!(first.etag, second.etag);
+        assert_eq!(second.crc32c, Some(crc32c::crc32c(b"second")));
         assert_eq!(store.len(), 1);
         assert!(!store.is_empty());
     }

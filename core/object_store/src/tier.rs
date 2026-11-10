@@ -18,10 +18,10 @@
 //! How uploads, cold reads and deletes hand object store work to the tier
 //! service of the shard that owns the partition.
 //!
-//! A job is an async closure that reaches the store through its
-//! [`TierJobContext`]. The tier service runs each job as a detached task on
-//! the shard, never inline in a frame handler and never on the partition I/O
-//! lane, and caps how many jobs of each [`TierJobClass`] run at once. Every job
+//! A job is an async closure that gets the store of the shard. The tier
+//! service runs each job as a detached task on the shard, never inline in a
+//! frame handler and never on the partition I/O lane, and caps how many jobs
+//! of each [`TierJobClass`] run at once. Every job
 //! belongs to a [`TierScope`]. When the scope is cancelled, its queued jobs
 //! never start and its running jobs stop at their next await.
 
@@ -241,31 +241,11 @@ impl TierJobRequest {
     }
 }
 
-/// What a running job reaches the store through.
-#[derive(Debug)]
-pub struct TierJobContext<S> {
-    store: Rc<S>,
-}
-
-impl<S> TierJobContext<S> {
-    /// The context an executor hands to a job.
-    #[must_use]
-    pub const fn new(store: Rc<S>) -> Self {
-        Self { store }
-    }
-
-    #[must_use]
-    pub fn store(&self) -> &S {
-        &self.store
-    }
-}
-
 /// Runs object store work for one shard: the tier service in the server, and
 /// [`crate::InlineTierExecutor`] in tests.
 pub trait TierExecutor {
-    /// The store that jobs reach through their context. The tier service can
-    /// wrap its provider here, for example to watch the progress of an
-    /// upload.
+    /// The store that jobs get. The tier service can wrap its provider here,
+    /// for example to watch the progress of an upload.
     type Store: ObjectStore + 'static;
 
     /// Submits `job` under the class and scope of `request`.
@@ -279,7 +259,7 @@ pub trait TierExecutor {
     fn submit<T, F, Fut>(&self, request: TierJobRequest, job: F) -> TierJobHandle<T>
     where
         T: 'static,
-        F: FnOnce(TierJobContext<Self::Store>) -> Fut + 'static,
+        F: FnOnce(Rc<Self::Store>) -> Fut + 'static,
         Fut: Future<Output = T> + 'static;
 }
 
@@ -300,12 +280,6 @@ impl<T: 'static> TierJobHandle<T> {
     /// The handle of a job that already finished.
     pub fn ready(result: Result<T, TierJobCancelled>) -> Self {
         Self::new(future::ready(result))
-    }
-
-    pub(crate) const fn from_boxed(
-        result: LocalBoxFuture<'static, Result<T, TierJobCancelled>>,
-    ) -> Self {
-        Self { result }
     }
 }
 

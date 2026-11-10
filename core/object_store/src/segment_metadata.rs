@@ -58,8 +58,13 @@ pub struct SegmentMetadata {
 pub enum SegmentMetadataError {
     #[error("segment metadata has no {0:?} entry")]
     Missing(&'static str),
-    #[error("segment metadata entry {name:?} holds {value:?}")]
-    Invalid { name: &'static str, value: String },
+    #[error("segment metadata entry {name:?} holds {value:?}, not {expected}")]
+    Invalid {
+        name: &'static str,
+        value: String,
+        /// The form that the entry takes.
+        expected: &'static str,
+    },
     #[error("segment metadata version {0:?} is not supported")]
     UnsupportedVersion(String),
     #[error("segment metadata ends at offset {end_offset}, before it starts at {start_offset}")]
@@ -128,23 +133,26 @@ fn integer(metadata: &UserMetadata, name: &'static str) -> Result<u64, SegmentMe
         .all(|byte| byte.is_ascii_digit())
         .then(|| value.parse().ok())
         .flatten()
-        .ok_or_else(|| invalid(name, value))
+        .ok_or_else(|| invalid(name, value, "a decimal u64"))
 }
 
 fn hash(
     metadata: &UserMetadata,
     name: &'static str,
 ) -> Result<[u8; SEGMENT_HASH_LEN], SegmentMetadataError> {
+    // The expected form below spells out this length.
+    const _: () = assert!(SEGMENT_HASH_LEN == 32);
     let value = entry(metadata, name)?;
     let mut hash = [0; SEGMENT_HASH_LEN];
-    hex::decode_to_slice(value, &mut hash).map_err(|_| invalid(name, value))?;
+    hex::decode_to_slice(value, &mut hash).map_err(|_| invalid(name, value, "64 hex digits"))?;
     Ok(hash)
 }
 
-fn invalid(name: &'static str, value: &str) -> SegmentMetadataError {
+fn invalid(name: &'static str, value: &str, expected: &'static str) -> SegmentMetadataError {
     SegmentMetadataError::Invalid {
         name,
         value: value.to_owned(),
+        expected,
     }
 }
 
@@ -252,6 +260,24 @@ mod tests {
                 "{name} = {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn given_malformed_values_when_decoding_should_name_expected_form() {
+        let decode = |name: &str, value: &str| {
+            let mut encoded = UserMetadata::from(&SEGMENT);
+            encoded.insert(name.to_owned(), value.to_owned());
+            SegmentMetadata::try_from(&encoded).unwrap_err().to_string()
+        };
+
+        assert_eq!(
+            decode("size", "-1"),
+            r#"segment metadata entry "size" holds "-1", not a decimal u64"#
+        );
+        assert_eq!(
+            decode("blake3", "ab"),
+            r#"segment metadata entry "blake3" holds "ab", not 64 hex digits"#
+        );
     }
 
     #[test]

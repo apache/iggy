@@ -25,7 +25,8 @@ pub enum ErrorClass {
     NotFound,
     /// A conditional create found an object under the key.
     PreconditionFailed,
-    /// The same call can succeed after a backoff.
+    /// The same call can succeed after a backoff. A put that failed this way
+    /// can still have stored its object, see [`crate::ObjectStore::put`].
     Transient,
     /// The same call cannot succeed until an operator or the caller changes
     /// something, such as the credentials or the request.
@@ -47,8 +48,8 @@ pub enum ObjectStoreError {
     /// name lookup or a failed TLS handshake.
     #[error("transport failed: {0}")]
     Transport(String),
-    /// The store received bytes whose CRC32C differs from the one the put
-    /// declared, so they changed on the way.
+    /// The store received bytes whose CRC32C differs from the one sent with
+    /// them, so they changed on the way.
     #[error("the store received a body for {key:?} whose CRC32C does not match")]
     ChecksumMismatch { key: String },
     #[error("the store refused the credentials: {0}")]

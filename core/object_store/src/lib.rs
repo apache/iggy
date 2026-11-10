@@ -47,11 +47,11 @@ pub use memory::MemoryStore;
 pub use segment_metadata::{SEGMENT_HASH_LEN, SegmentMetadata, SegmentMetadataError};
 pub use store::{
     DeleteFailure, DeleteOutcome, ListPage, ListRequest, ListedObject, MAX_KEY_LEN,
-    MAX_KEYS_PER_REQUEST, MAX_METADATA_LEN, ObjectMeta, ObjectStore, PutBody, PutMode, PutOptions,
-    UserMetadata, validate_delete, validate_key, validate_metadata, validate_prefix,
-    validate_range,
+    MAX_KEY_SEGMENT_LEN, MAX_KEYS_PER_REQUEST, MAX_METADATA_LEN, ObjectMeta, ObjectStore, PutBody,
+    PutMode, PutOptions, UserMetadata, validate_delete, validate_key, validate_metadata,
+    validate_prefix, validate_range,
 };
 pub use tier::{
-    ScopeCancelled, TierExecutor, TierJobCancelled, TierJobClass, TierJobContext, TierJobHandle,
-    TierJobRequest, TierScope, TierScopeToken,
+    ScopeCancelled, TierExecutor, TierJobCancelled, TierJobClass, TierJobHandle, TierJobRequest,
+    TierScope, TierScopeToken,
 };

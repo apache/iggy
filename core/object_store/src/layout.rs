@@ -16,11 +16,18 @@
 // under the License.
 
 use crate::error::ObjectStoreError;
-use crate::store::validate_key;
+use crate::store::{MAX_KEY_LEN, validate_key};
 
 const META: &str = "meta";
 const MANIFEST: &str = "manifest.bin";
-const OFFSET_DIGITS: usize = 20;
+/// Decimal digits of `u64::MAX`: the most that an id takes, and the width of
+/// a zero-padded offset.
+const U64_DIGITS: usize = 20;
+/// The longest part of a key after the root: the `.index` key of a segment
+/// whose four ids and start offset are all `u64::MAX`.
+const LONGEST_SUFFIX_LEN: usize = 5 * (1 + U64_DIGITS) + 1 + SegmentObject::Index.extension().len();
+/// The longest root that leaves room for every key under it.
+const MAX_ROOT_LEN: usize = MAX_KEY_LEN - LONGEST_SUFFIX_LEN;
 
 /// Where the objects of one partition incarnation live.
 ///
@@ -48,6 +55,8 @@ pub enum SegmentObject {
 }
 
 impl SegmentObject {
+    pub const ALL: [Self; 2] = [Self::Log, Self::Index];
+
     #[must_use]
     pub const fn extension(self) -> &'static str {
         match self {
@@ -89,10 +98,20 @@ impl KeyLayout {
     ///
     /// # Errors
     /// [`ObjectStoreError::InvalidKey`] when `root` is not a valid key, for
-    /// example when it is empty or ends with `/`.
+    /// example when it is empty or ends with `/`. The same error comes for a
+    /// root longer than 913 bytes, because the longest key under it would
+    /// then break [`MAX_KEY_LEN`].
     pub fn new(root: impl Into<String>) -> Result<Self, ObjectStoreError> {
+        // The docs and the reason below spell out this limit.
+        const _: () = assert!(MAX_ROOT_LEN == 913);
         let root = root.into();
         validate_key(&root)?;
+        if root.len() > MAX_ROOT_LEN {
+            return Err(ObjectStoreError::InvalidKey {
+                key: root,
+                reason: "is longer than 913 bytes, the most that a root can take",
+            });
+        }
         Ok(Self { root })
     }
 
@@ -122,7 +141,7 @@ impl KeyLayout {
             self.incarnation_prefix(&key.prefix),
             key.start_offset,
             key.object.extension(),
-            width = OFFSET_DIGITS
+            width = U64_DIGITS
         )
     }
 
@@ -158,11 +177,9 @@ impl KeyLayout {
         if parts.next().is_some() {
             return None;
         }
-        let object = match extension {
-            "log" => SegmentObject::Log,
-            "index" => SegmentObject::Index,
-            _ => return None,
-        };
+        let object = SegmentObject::ALL
+            .into_iter()
+            .find(|object| object.extension() == extension)?;
         Some(SegmentKey {
             prefix,
             start_offset: parse_offset(stem)?,
@@ -184,7 +201,7 @@ fn parse_id(part: &str) -> Option<u64> {
 
 /// A start offset as [`KeyLayout`] writes it: exactly 20 decimal digits.
 fn parse_offset(stem: &str) -> Option<u64> {
-    if stem.len() == OFFSET_DIGITS && stem.bytes().all(|byte| byte.is_ascii_digit()) {
+    if stem.len() == U64_DIGITS && stem.bytes().all(|byte| byte.is_ascii_digit()) {
         stem.parse().ok()
     } else {
         None
@@ -239,7 +256,7 @@ mod tests {
     #[test]
     fn given_built_keys_when_parsing_should_round_trip() {
         for start_offset in [0, 1, 1_000, u64::MAX] {
-            for object in [SegmentObject::Log, SegmentObject::Index] {
+            for object in SegmentObject::ALL {
                 let segment = SegmentKey {
                     prefix: PREFIX,
                     start_offset,
@@ -299,5 +316,40 @@ mod tests {
             assert!(KeyLayout::new(root).is_err(), "{root:?}");
         }
         assert_eq!(KeyLayout::new("iggy").unwrap().root(), "iggy");
+    }
+
+    #[test]
+    fn given_longest_root_when_building_widest_keys_should_keep_them_valid() {
+        let root = format!("{}r", "r/".repeat(MAX_ROOT_LEN / 2));
+        assert_eq!(root.len(), MAX_ROOT_LEN);
+        let layout = KeyLayout::new(root).unwrap();
+        let widest = ObjectPrefix {
+            stream_id: u64::MAX,
+            topic_id: u64::MAX,
+            partition_id: u64::MAX,
+            created_revision: u64::MAX,
+        };
+
+        let index = layout.segment_key(&SegmentKey {
+            prefix: widest,
+            start_offset: u64::MAX,
+            object: SegmentObject::Index,
+        });
+        let manifest = layout.manifest_key(&widest);
+
+        assert_eq!(index.len(), MAX_KEY_LEN);
+        assert!(validate_key(&index).is_ok());
+        assert!(validate_key(&manifest).is_ok());
+    }
+
+    #[test]
+    fn given_root_past_longest_when_building_layout_should_refuse() {
+        let root = format!("{}rr", "r/".repeat(MAX_ROOT_LEN / 2));
+        assert_eq!(root.len(), MAX_ROOT_LEN + 1);
+
+        assert!(matches!(
+            KeyLayout::new(root),
+            Err(ObjectStoreError::InvalidKey { .. })
+        ));
     }
 }
