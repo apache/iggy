@@ -966,6 +966,7 @@ mod tests {
             username: username.to_string(),
             user: None,
             permissions: PrincipalPermissions::default(),
+            topic_reads: Arc::default(),
             permissions_known: true,
         }
     }

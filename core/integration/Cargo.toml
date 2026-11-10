@@ -22,111 +22,81 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
-# `rust-s3`'s lib target is `s3`, so machete greps for `rust_s3`, never finds
-# it, and reports the crate unused. It is used (`use s3::{Bucket, Region}` in
-# the connector S3 fixture); removing it breaks the whole test build.
 [package.metadata.cargo-machete]
-ignored = ["cfg_aliases", "rust-s3"]
+ignored = ["cfg_aliases"]
 
 [features]
 default = ["login-session"]
 login-session = ["dep:zbus-secret-service-keyring-store"]
 
 [dependencies]
-apache-avro = { workspace = true }
-arrow = { workspace = true }
 assert_cmd = { workspace = true }
 async-trait = { workspace = true }
-base64 = { workspace = true }
-# Derives the HTTP relay proof key the way a cluster node does, so a test can
-# pose as a node relaying a partition request.
-blake3 = { workspace = true }
 bon = { workspace = true }
-bytemuck = { workspace = true }
-bytes = { workspace = true }
-compio = { workspace = true }
 configs = { workspace = true }
-configs_derive = { workspace = true }
 # Decodes a metadata replica's durable `VsrState` off disk in the superblock
 # recovery test.
 consensus = { workspace = true }
-ctor = { workspace = true }
-deltalake = { workspace = true }
-dtor = { workspace = true }
-figment = { workspace = true }
 # statvfs of the data volume, as the server's disk usage sampler reads it.
 fs2 = { workspace = true }
 futures = { workspace = true }
 harness_derive = { workspace = true }
-hex = { workspace = true }
-humantime = { workspace = true }
 iggy = { workspace = true }
-iggy-cli = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
-# Path-dep only so the Doris integration test can reuse the connector's pure
-# `build_label` function — keeping the test and production label format in lock-step.
-# The only connector crate `integration` can depend on. Every plugin exports the
-# same no_mangle `iggy_sink_*` symbols, so a second one fails the test binary
-# link with duplicate symbols. Scoping a plugin's tests into a CI run needs no
-# dependency.
-iggy_connector_doris_sink = { workspace = true }
-iggy_connector_sdk = { workspace = true, features = ["api"] }
 # Locates and decodes the on-disk superblock slot files in the recovery test
 # (`SLOT_FILE_NAMES`, `decode_slots`).
 journal = { workspace = true }
-jsonwebtoken = { workspace = true }
-keyring-core = { workspace = true }
-lapin = { workspace = true }
-lazy_static = { workspace = true }
 libc = { workspace = true }
-mongodb = { workspace = true }
-parquet = { workspace = true }
-pgwire = { workspace = true }
-predicates = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
 reqwest = { workspace = true, features = ["http2", "json"] }
-reqwest-middleware = { workspace = true }
-reqwest-retry = { workspace = true }
-ring = { workspace = true }
 rmcp = { workspace = true, features = [
     "client",
     "reqwest",
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
 ] }
-rumqttc-v4 = { workspace = true }
-rumqttc-v5 = { workspace = true }
-rust-s3 = { workspace = true }
-secrecy = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
-serial_test = { workspace = true }
-server_common = { workspace = true }
-sqlparser = { workspace = true }
-sqlx = { workspace = true }
-sysinfo = { workspace = true }
-tempfile = { workspace = true }
-test-case = { workspace = true }
-testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true }
-tokio = { workspace = true, features = ["full", "test-util"] }
-tokio-postgres = { workspace = true }
+tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-twox-hash = { workspace = true }
-url = { workspace = true }
 uuid = { workspace = true }
 wiremock = { workspace = true }
-zip = { workspace = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 zbus-secret-service-keyring-store = { workspace = true, optional = true }
 
 [build-dependencies]
 cfg_aliases = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }
+blake3 = { workspace = true }
+bytemuck = { workspace = true }
+bytes = { workspace = true }
+compio = { workspace = true }
+configs_derive = { workspace = true }
+ctor = { workspace = true }
+dtor = { workspace = true }
+figment = { workspace = true }
+hex = { workspace = true }
+humantime = { workspace = true }
+iggy-cli = { workspace = true }
+jsonwebtoken = { workspace = true }
+keyring-core = { workspace = true }
+predicates = { workspace = true }
+ring = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serial_test = { workspace = true }
+server_common = { workspace = true }
+sysinfo = { workspace = true }
+tempfile = { workspace = true }
+test-case = { workspace = true }
+twox-hash = { workspace = true }
+zip = { workspace = true }
 
 [lints]
 workspace = true
